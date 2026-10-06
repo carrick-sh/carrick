@@ -276,8 +276,8 @@ impl AliasAccess {
 }
 
 /// Access authority for an exact COW span. Tagged private leaves record their
-/// own write intent. Other backend-owned user leaves carry the per-page write
-/// decisions already established by the exact-MM protection authority.
+/// own write intent. Backend user maintenance additionally carries native
+/// per-page permission ceilings; recorded intent cannot widen those ceilings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CowRepointAccess {
     /// Owner maintenance replaces backing without making a retired leaf valid.
@@ -285,6 +285,7 @@ pub enum CowRepointAccess {
     RecordedPrivate,
     User {
         writable_pages: u8,
+        executable_pages: u8,
     },
     Kernel,
 }
@@ -295,7 +296,10 @@ impl CowRepointAccess {
             Self::Retired => 3,
             Self::RecordedPrivate => 0,
             Self::Kernel => 1,
-            Self::User { writable_pages } => 2 | (u64::from(writable_pages) << 8),
+            Self::User {
+                writable_pages,
+                executable_pages,
+            } => 2 | (u64::from(writable_pages) << 8) | (u64::from(executable_pages) << 16),
         }
     }
 
@@ -304,8 +308,9 @@ impl CowRepointAccess {
             3 => Some(Self::Retired),
             0 => Some(Self::RecordedPrivate),
             1 => Some(Self::Kernel),
-            value if value & !0xf00 == 2 => Some(Self::User {
-                writable_pages: (value >> 8) as u8,
+            value if value & !0xf0f00 == 2 => Some(Self::User {
+                writable_pages: ((value >> 8) & 0xf) as u8,
+                executable_pages: ((value >> 16) & 0xf) as u8,
             }),
             _ => None,
         }
@@ -313,7 +318,10 @@ impl CowRepointAccess {
 
     fn covers(self, len: u64) -> bool {
         match self {
-            Self::User { writable_pages } => u64::from(writable_pages) < (1_u64 << (len / PT_PAGE)),
+            Self::User {
+                writable_pages,
+                executable_pages,
+            } => u64::from(writable_pages | executable_pages) < (1_u64 << (len / PT_PAGE)),
             _ => true,
         }
     }
@@ -2363,16 +2371,28 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                         }
                         return Ok(output | super::KERNEL_PAGE_FLAGS | NON_GLOBAL);
                     }
-                    CowRepointAccess::User { writable_pages } => {
-                        let repointed = (descriptor & !PA_MASK_4KIB) | output;
+                    CowRepointAccess::User {
+                        writable_pages,
+                        executable_pages,
+                    } => {
+                        let wants_write = writable_pages & (1 << ((base - va) / PT_PAGE)) != 0;
+                        let permits_execute =
+                            executable_pages & (1 << ((base - va) / PT_PAGE)) != 0;
+                        let mut repointed = (descriptor & !PA_MASK_4KIB) | output;
+                        if !permits_execute {
+                            repointed = (repointed | UXN) & !SW_EL1_MAY_EXEC;
+                        }
+                        if !wants_write {
+                            repointed &= !SW_EL1_MAY_WRITE;
+                            if descriptor & (1 << 6) != 0 {
+                                repointed = (repointed & !AP_MASK) | AP_RO;
+                            }
+                        }
                         if descriptor & VALID == 0 {
-                            // Retired/prepared backing maintenance must leave
-                            // the page inaccessible until its later publication.
                             return Ok(repointed);
                         }
                         if descriptor & SW_EL1_PRIVATE == 0 {
-                            let wants_write = writable_pages & (1 << ((base - va) / PT_PAGE)) != 0;
-                            if wants_write && descriptor & AP_MASK == AP_PRIV_RO {
+                            if wants_write && descriptor & (1 << 6) == 0 {
                                 return Err(DescriptorRefusal::PermissionDenied);
                             }
                             return Ok(if wants_write {
@@ -2381,8 +2401,22 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                                 repointed
                             });
                         }
-                        // Tagged pages belong to EL1's permission authority;
-                        // backend metadata must not override its recorded intent.
+                        if state != El1PrivateLeafState::Resident || !el1_cow(descriptor) {
+                            return Err(DescriptorRefusal::NotCowArmed);
+                        }
+                        // Native custody is a ceiling even for imported private
+                        // leaves. EL1's intent can restrict, never widen it.
+                        let private = repointed & !SW_EL1_COW;
+                        return Ok(
+                            if wants_write
+                                && descriptor & SW_EL1_MAY_WRITE != 0
+                                && descriptor & (1 << 6) != 0
+                            {
+                                (private & !AP_MASK) | AP_RW
+                            } else {
+                                private
+                            },
+                        );
                     }
                     CowRepointAccess::RecordedPrivate => {}
                 }
@@ -2971,6 +3005,7 @@ mod tests {
             DescriptorOp::CowRepoint {
                 access: CowRepointAccess::User {
                     writable_pages: 0b0101,
+                    executable_pages: 0b1111,
                 },
                 len: 4 * PT_PAGE,
                 va: 0x9000,
@@ -4313,7 +4348,7 @@ mod tests {
             let attrs = [
                 (USER_PAGE_FLAGS & !AP_MASK) | AP_RO | NON_GLOBAL | UXN,
                 (USER_PAGE_FLAGS & !AP_MASK) | AP_RO | NON_GLOBAL | UXN,
-                ((USER_PAGE_FLAGS & !AP_MASK) | AP_PRIV_RO | NON_GLOBAL | UXN) & !VALID,
+                ((USER_PAGE_FLAGS & !AP_MASK) | NON_GLOBAL | UXN) & !VALID,
                 (USER_PAGE_FLAGS | NON_GLOBAL | UXN) & !VALID,
             ];
             for (index, flags) in attrs.iter().enumerate() {
@@ -4328,6 +4363,7 @@ mod tests {
                 DescriptorOp::CowRepoint {
                     access: CowRepointAccess::User {
                         writable_pages: 0b1001,
+                        executable_pages: 0b1111,
                     },
                     va: VA,
                     len: 4 * PT_PAGE,
@@ -4398,6 +4434,7 @@ mod tests {
                 (
                     CowRepointAccess::User {
                         writable_pages: 0b0011,
+                        executable_pages: 0b1111,
                     },
                     flags,
                 ),
@@ -4441,6 +4478,7 @@ mod tests {
                     DescriptorOp::CowRepoint {
                         access: CowRepointAccess::User {
                             writable_pages: 0b0011,
+                            executable_pages: 0b0011,
                         },
                         va: VA,
                         len: 2 * PT_PAGE,
@@ -4455,7 +4493,38 @@ mod tests {
         }
 
         #[test]
-        fn cow_tagged_write_intent_is_not_overridden_by_legacy_mask() {
+        fn cow_native_readonly_vvar_caps_real_imported_leaf_permissions() {
+            let words = fixture(3);
+            // Exact retained N1 child leaf: private+COW, MAY_WRITE+MAY_EXEC,
+            // AP_RO but executable. Native vvar custody is read-only and NX.
+            let imported = 0x07a0_002e_0000_0fc3;
+            words.set(leaf_pa(VA), imported);
+            let destination = 0x009d_0000_0000;
+            applied(run(
+                &words,
+                DescriptorOp::CowRepoint {
+                    access: CowRepointAccess::User {
+                        writable_pages: 0,
+                        executable_pages: 0,
+                    },
+                    va: VA,
+                    len: PT_PAGE,
+                    old_ipa: SubstrateGpa(imported & PA_MASK_4KIB),
+                    new_ipa: SubstrateGpa(destination),
+                    backing: backing(80),
+                },
+                &TableGrants::NONE,
+            ));
+            let leaf = words.get(leaf_pa(VA));
+            assert_eq!(leaf & PA_MASK_4KIB, destination);
+            assert!(!el1_cow(leaf));
+            assert_eq!(leaf & AP_MASK, AP_RO, "native vvar must stay read-only");
+            assert_ne!(leaf & UXN, 0, "native vvar must stay non-executable");
+            assert_eq!(leaf & (SW_EL1_MAY_WRITE | SW_EL1_MAY_EXEC), 0);
+        }
+
+        #[test]
+        fn cow_tagged_write_intent_is_capped_by_native_readonly_authority() {
             let words = fixture(3);
             words.set(
                 leaf_pa(VA),
@@ -4469,7 +4538,10 @@ mod tests {
             applied(run(
                 &words,
                 DescriptorOp::CowRepoint {
-                    access: CowRepointAccess::User { writable_pages: 0 },
+                    access: CowRepointAccess::User {
+                        writable_pages: 0,
+                        executable_pages: 0,
+                    },
                     va: VA,
                     len: PT_PAGE,
                     old_ipa: SubstrateGpa(IPA),
@@ -4478,7 +4550,7 @@ mod tests {
                 },
                 &TableGrants::NONE,
             ));
-            assert!(terminal_descriptor_permits_el0(
+            assert!(!terminal_descriptor_permits_el0(
                 words.get(leaf_pa(VA)),
                 LeafAccess::Write
             ));

@@ -882,18 +882,19 @@ fn finalize_hvf_initial_image(
     let requires_syscall_traps = requires_syscall_traps || dispatcher.requires_syscall_traps();
     let image = image.with_el0_trampoline_bytes(HvfArch::entry_trampoline_bytes())?;
     let image = with_hvf_syscall_mailbox(image, requires_syscall_traps)?;
-    let image = image.with_hvpatch_stage1_page_tables()?;
-    with_optional_vdso_for_clock_with_visibility::<HvfArch>(
+    let image = with_optional_vdso_for_clock_with_visibility::<HvfArch>(
         image,
         dispatcher.container().clock(),
         requires_syscall_traps,
-    )
+    )?;
+    // Seal every user mapping, including the newly-added vvar/vDSO pages.
+    image.with_hvpatch_stage1_page_tables()
 }
 
 /// Finish a freshly-loaded image (its initial stack already set, if any) and
-/// run it: install the EL0 trampoline, EL1 vectors, stage-1 page tables and
-/// vDSO, optionally dump debug state, then enter the HVF run loop. This
-/// trampoline→vectors→page-tables→vdso→dump→run tail was duplicated verbatim
+/// run it: install the EL0 trampoline, EL1 vectors and vDSO, seal stage-1
+/// permissions, optionally dump debug state, then enter the HVF run loop. This
+/// trampoline→vectors→vdso→page-tables→dump→run tail was duplicated verbatim
 /// across every `run_*` entry point; the entry points now differ only in how
 /// they obtain the image bytes (host file / raw bytes / rootfs / overlay) and
 /// set up identity + Rosetta redirection.
@@ -3144,6 +3145,35 @@ mod tests {
         assert!(clock_stub.perms.execute);
         let vdso = image_region(&image, carrick_mem::vdso::LINUX_VDSO_BASE);
         assert_eq!(&vdso[..HvfArch::vdso_bytes().len()], HvfArch::vdso_bytes());
+    }
+
+    #[test]
+    fn initial_vvar_stage1_is_readonly_and_nonexecutable_before_owner_import() {
+        let image = finalize_hvf_initial_image(
+            AddressSpace::from_regions(0x4000, Vec::new()).unwrap(),
+            &SyscallDispatcher::new(),
+            false,
+        )
+        .unwrap();
+        let region = image
+            .regions()
+            .iter()
+            .find(|region| region.start == carrick_mem::memory::LINUX_PAGE_TABLES_BASE)
+            .unwrap();
+        let manager = carrick_mmu_core::aarch64::PageTableManager::new(
+            region.bytes().to_vec(),
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        let leaf = carrick_mmu_core::aarch64::terminal_descriptor(
+            manager.debug_walk(carrick_mem::vdso::LINUX_VVAR_BASE),
+        );
+        assert_eq!(
+            leaf & (0b11 << 6),
+            0b11 << 6,
+            "vvar stage-1 AP must be read-only"
+        );
+        assert_ne!(leaf & (1 << 54), 0, "vvar stage-1 must be NX");
     }
 
     #[test]

@@ -2519,7 +2519,7 @@ pub(crate) fn perform_foreign_cow_transaction(
     let old_offset = old_ipa
         .checked_sub(old_physical_ipa)
         .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
-    let source_alias_guest_writable = alias_registry()
+    let (source_alias_guest_writable, source_native_executable) = alias_registry()
         .lock()
         .newest_matching_for_process(runtime.mm_root_slot, runtime.container_root, |alias| {
             let semantic_offset = span.va.checked_sub(alias.start);
@@ -2543,7 +2543,7 @@ pub(crate) fn perform_foreign_cow_transaction(
                 && alias.physical_host_addr == old_extent.owner.ptr() as usize
                 && alias.owner_generation == old_extent.owner.generation()
         })
-        .map(|alias| alias.guest_writable)
+        .map(|alias| (alias.guest_writable, alias.perms & 4 != 0))
         .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
     let source_guest_writable = source_alias_guest_writable;
     if (!source_guest_writable
@@ -2616,6 +2616,7 @@ pub(crate) fn perform_foreign_cow_transaction(
                 old_ipa,
                 old_offset,
                 source_guest_writable,
+                source_native_executable,
                 executable_authorized,
                 shape: CowInventorySplitShape {
                     old_key,
@@ -3115,6 +3116,7 @@ struct ForeignGuestCow<'a> {
     old_ipa: u64,
     old_offset: u64,
     source_guest_writable: bool,
+    source_native_executable: bool,
     executable_authorized: bool,
     shape: CowInventorySplitShape,
 }
@@ -3141,6 +3143,7 @@ fn perform_foreign_guest_cow(
         old_ipa,
         old_offset,
         source_guest_writable,
+        source_native_executable,
         executable_authorized,
         shape:
             CowInventorySplitShape {
@@ -3285,6 +3288,11 @@ fn perform_foreign_guest_cow(
             carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp::CowRepoint {
                 access: carrick_mmu_core::aarch64::descriptor_txn::CowRepointAccess::User {
                     writable_pages,
+                    executable_pages: if source_native_executable {
+                        (1_u8 << (span.len / 4096)) - 1
+                    } else {
+                        0
+                    },
                 },
                 va: span.va,
                 len: span.len as u64,

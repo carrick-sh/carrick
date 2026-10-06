@@ -4000,16 +4000,38 @@ impl HvfTaskState {
                     CowRepointAccess::Kernel
                 } else {
                     let mut writable_pages = 0_u8;
+                    let mut executable_pages = 0_u8;
                     for index in 0..(span.len as u64 / PAGE_SIZE) {
                         if source_guest_writable
-                            && !self.protections.legacy().is_none_or(|protections| {
+                            && !self.protections.legacy().is_some_and(|protections| {
                                 protections.range_write_denied(span.va + index * PAGE_SIZE, 1)
                             })
                         {
                             writable_pages |= 1 << index;
                         }
+                        let executable = self
+                            .with_mapping_for_range_in(
+                                custody,
+                                span.va + index * PAGE_SIZE,
+                                1,
+                                |source| match source {
+                                    super::host_writes::MappingSource::Region(row) => {
+                                        u64::from(row.perms) & 4 != 0
+                                    }
+                                    super::host_writes::MappingSource::Alias(row) => {
+                                        row.perms & 4 != 0
+                                    }
+                                },
+                            )
+                            .unwrap_or(false);
+                        if executable {
+                            executable_pages |= 1 << index;
+                        }
                     }
-                    CowRepointAccess::User { writable_pages }
+                    CowRepointAccess::User {
+                        writable_pages,
+                        executable_pages,
+                    }
                 };
                 let tables = self.page_tables_authority();
                 let mm_key = std::num::NonZeroU64::new(identity.mm)

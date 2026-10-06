@@ -1720,6 +1720,7 @@ fn foreign_el1_publisher_authenticates_the_exact_target_before_submission() {
             carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp::CowRepoint {
                 access: carrick_mmu_core::aarch64::descriptor_txn::CowRepointAccess::User {
                     writable_pages: 0,
+                    executable_pages: 0,
                 },
                 va: TEST_VA,
                 len: 4096,
@@ -2421,7 +2422,8 @@ fn rx_ptrace_text_cow_case(guest: bool) {
             [
                 carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp::CowRepoint {
                     access: carrick_mmu_core::aarch64::descriptor_txn::CowRepointAccess::User {
-                        writable_pages: 0
+                        writable_pages: 0,
+                        executable_pages: 0,
                     },
                     ..
                 }
