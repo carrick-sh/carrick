@@ -193,3 +193,87 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
             .is_some_and(|n| n >= 2)
     );
 }
+
+#[test]
+fn mounted_static_x86_elf_matches_native_anonymous_memory() {
+    if !std::path::Path::new("/dev/kvm").exists() {
+        let message = b"SKIP x86 KVM memory run: /dev/kvm is absent on this host\n";
+        // SAFETY: fixed diagnostic bytes to the test process stderr.
+        unsafe { libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len()) };
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("memory-only");
+    let source =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/x86_memory_only.S");
+    let compile = Command::new("cc")
+        .timeout(Duration::from_secs(15))
+        .args([
+            "-nostdlib",
+            "-static",
+            "-no-pie",
+            "-Wl,--build-id=none",
+            "-o",
+        ])
+        .arg(&elf)
+        .arg(&source)
+        .output()
+        .expect("compile native x86 memory oracle");
+    assert!(
+        compile.status.success(),
+        "cc stderr: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .expect("run native x86 memory oracle");
+    assert_eq!(native.stdout, b"M\n");
+    assert!(native.stderr.is_empty());
+    assert_eq!(native.status.code(), Some(7));
+
+    let archive = dir.path().join("image.tar");
+    std::fs::write(&archive, empty_image_archive()).unwrap();
+    let cli = assert_cmd::cargo::cargo_bin("carrick");
+    let home = dir.path().join("home");
+    let load = Command::new(&cli)
+        .timeout(Duration::from_secs(5))
+        .env("CARRICK_HOME", &home)
+        .args(["load", "--input", archive.to_str().unwrap()])
+        .output()
+        .expect("load local image");
+    assert!(
+        load.status.success(),
+        "load stderr: {}",
+        String::from_utf8_lossy(&load.stderr)
+    );
+    let run = Command::new(&cli)
+        .timeout(Duration::from_secs(5))
+        .env("CARRICK_HOME", &home)
+        .env("CARRICK_RUN_ID", "x86-kvm-memory-only-test")
+        .args([
+            "run",
+            "--platform",
+            "linux/amd64",
+            "--pull",
+            "never",
+            "--volume",
+            &format!("{}:/hello:ro", elf.display()),
+            "x86-kvm-hello:latest",
+        ])
+        .output()
+        .expect("run mounted memory oracle through carrick");
+    assert_eq!(
+        run.stdout,
+        native.stdout,
+        "Carrick stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        run.status.code(),
+        native.status.code(),
+        "Carrick stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(run.stderr.is_empty());
+}
