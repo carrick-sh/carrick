@@ -25,3 +25,7 @@ mod x86_context_words_tests;
 #[cfg(test)]
 #[path = "isa/x86/initial_mm.rs"]
 mod x86_initial_mm_tests;
+
+#[cfg(test)]
+#[path = "isa/x86/user_tables.rs"]
+mod x86_user_tables_tests;
