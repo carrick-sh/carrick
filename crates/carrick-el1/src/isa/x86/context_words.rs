@@ -111,7 +111,17 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use carrick_guest_arch::{ContextGeneration, MmGeneration};
-    use carrick_sched_core::{SlotId, ThreadIdentity, ZoneTables};
+    use carrick_sched_core::object_wait::OwnedObjectWakeEffects;
+    use carrick_sched_core::spaces::notification::{SpaceReleaseVenue, SpaceWaitCause};
+    use carrick_sched_core::{BoundedSpin, SlotId, ThreadIdentity, Waker, ZoneTables};
+
+    fn deliver_x86_notification(
+        _: &ZoneTables<ParkedContextWords>,
+        _: Waker,
+        effects: OwnedObjectWakeEffects<'_, ParkedContextWords>,
+    ) {
+        let _ = effects.deliver_handbacks(&mut |_| {});
+    }
 
     #[test]
     fn zero_or_recycled_context_cannot_become_live_native_state() {
@@ -195,5 +205,35 @@ mod tests {
             }),
             Err(ArchError::InvalidContext)
         ));
+    }
+
+    #[test]
+    fn x86_zone_owns_exact_space_notification_custody() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        // SAFETY: the scheduler table and x86 context words are zero-valid;
+        // this allocation owns the full aligned table for the fixture.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            std::boxed::Box::from_raw(ptr)
+        };
+        zone.spaces.publish_closed(11, 0x6000, 0).unwrap();
+        let entry = zone.space_entry(NonZeroU64::new(11).unwrap()).unwrap();
+        let incarnation = NonZeroU64::new(1).unwrap();
+        entry
+            .admit_notifications(incarnation, &BoundedSpin(0), &|effects| {
+                let _ = effects.deliver_handbacks(&mut |_| {});
+            })
+            .unwrap();
+        let lease = entry.notifications(incarnation).unwrap();
+        assert_eq!(lease.key(SpaceWaitCause::Gate).generation(), 1);
+        let venue = SpaceReleaseVenue {
+            zone: &zone,
+            waker: Waker::Host,
+            deliver: deliver_x86_notification,
+        };
+        drop(lease);
+        entry.close_notifications(incarnation, venue).unwrap();
+        entry.retire_entry(venue);
     }
 }
