@@ -10,6 +10,42 @@ pub const LAPIC_VA: u64 = 0xffff_ffff_d000_0000;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimerTicks(pub u32);
 
+/// One calibrated APIC segment. A long TSC deadline is split at the hardware
+/// counter limit; the scheduler retains the original deadline and re-arms
+/// after this segment's interrupt if that deadline is still in the future.
+pub fn calibrated_timer_ticks(delta_tsc: u64, apic_hz: u64, tsc_hz: u64) -> Option<TimerTicks> {
+    if apic_hz == 0 || tsc_hz == 0 {
+        return None;
+    }
+    let ticks = (u128::from(delta_tsc) * u128::from(apic_hz) / u128::from(tsc_hz))
+        .clamp(1, u128::from(u32::MAX));
+    u32::try_from(ticks).ok().map(TimerTicks)
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+
+    #[test]
+    fn calibrated_long_deadline_clamps_then_scheduler_can_rearm() {
+        let tsc_hz = 1_000_000_000;
+        let apic_hz = 1_000_000_000;
+        assert_eq!(
+            calibrated_timer_ticks(10 * tsc_hz, apic_hz, tsc_hz),
+            Some(TimerTicks(u32::MAX))
+        );
+        assert_eq!(
+            calibrated_timer_ticks(tsc_hz / 10, apic_hz, tsc_hz),
+            Some(TimerTicks(100_000_000))
+        );
+        assert_eq!(
+            calibrated_timer_ticks(0, apic_hz, tsc_hz),
+            Some(TimerTicks(1))
+        );
+        assert_eq!(calibrated_timer_ticks(1, 0, tsc_hz), None);
+    }
+}
+
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ApicId(pub u8);
