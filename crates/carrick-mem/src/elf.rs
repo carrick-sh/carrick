@@ -6,8 +6,6 @@ use std::path::Path;
 use goblin::elf::Elf;
 use goblin::elf::header::{EM_AARCH64, EM_X86_64, ET_DYN, ET_EXEC};
 use goblin::elf::program_header::{PF_R, PF_W, PF_X, PT_LOAD};
-use serde::Serialize;
-use thiserror::Error;
 
 /// Default load base for ET_DYN (PIE) main executables. Linux places an
 /// ET_DYN image high (`ELF_ET_DYN_BASE = 2/3 * TASK_SIZE`), leaving the low
@@ -23,21 +21,21 @@ use thiserror::Error;
 /// /proc/*/maps; the freed low region is what conformance measures.
 pub const LINUX_PIE_DEFAULT_BASE: u64 = 0x88_0000_0000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ElfClass {
     Elf32,
     Elf64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ElfEndianness {
     Little,
     Big,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Machine {
     Aarch64,
@@ -45,7 +43,7 @@ pub enum Machine {
     Other(u16),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ElfType {
     Exec,
@@ -53,7 +51,7 @@ pub enum ElfType {
     Other(u16),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize)]
 pub struct ElfMetadata {
     pub class: ElfClass,
     pub endianness: ElfEndianness,
@@ -67,7 +65,7 @@ pub struct ElfMetadata {
     pub e_type: ElfType,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize)]
 pub struct LoadPlan {
     pub entry: u64,
     /// Validated PT_INTERP pathname bytes, up to the first NUL.
@@ -111,7 +109,7 @@ impl LoadPlan {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize)]
 pub struct LoadSegment {
     pub file_offset: u64,
     pub virtual_address: u64,
@@ -121,7 +119,7 @@ pub struct LoadSegment {
     pub perms: SegmentPerms,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ::serde::Serialize)]
 pub struct SegmentPerms {
     pub read: bool,
     pub write: bool,
@@ -136,7 +134,7 @@ pub struct SegmentPerms {
 /// re-applied at the STAGE-1/PML4 leaf level from these spans — otherwise a
 /// guest store to its own `.rodata` silently succeeds (Go reflect
 /// `TestTypeFieldReadOnly`, LTP mmap fault-delivery family).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize)]
 pub struct RoSpan {
     /// Page-aligned guest VA of the first read-only page.
     pub start: u64,
@@ -260,7 +258,7 @@ pub fn ro_page_spans(plan: &LoadPlan) -> Vec<RoSpan> {
 /// is merged/escalated (see [`RoSpan`]), so the stage-1 leaf permission is
 /// re-applied from these spans — otherwise every `.data`/`.bss` page
 /// inherits the merged region's execute permission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize)]
 pub struct RwSpan {
     /// Page-aligned guest VA of the first writable page.
     pub start: u64,
@@ -342,7 +340,7 @@ pub fn rw_page_spans(plan: &LoadPlan) -> Vec<RwSpan> {
     out
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, ::thiserror::Error)]
 pub enum ElfInspectError {
     #[error("failed to read ELF binary: {0}")]
     Io(#[from] std::io::Error),

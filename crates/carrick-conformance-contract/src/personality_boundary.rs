@@ -31,7 +31,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use syn::spanned::Spanned;
 use syn::visit::Visit;
-use thiserror::Error;
 
 /// Default allowlist of substrate crates subject to boundary verification.
 pub const DEFAULT_SUBSTRATE_ALLOWLIST: &[&str] = &[
@@ -129,7 +128,7 @@ pub const FORBIDDEN_ERRNO_SYMBOLS: &[&str] = &[
     "EPOLLONESHOT",
 ];
 
-#[derive(Debug, Error)]
+#[derive(Debug, ::thiserror::Error)]
 pub enum BoundaryError {
     #[error("allowlisted substrate crate `{crate_name}` was not found in metadata at {}", path.display())]
     MissingCrate { crate_name: String, path: PathBuf },

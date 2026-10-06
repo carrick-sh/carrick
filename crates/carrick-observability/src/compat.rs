@@ -39,8 +39,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
+use serde::{Deserialize as _, Serialize as _};
 
 /// Optional per-event probe hook, fired for every recorded [`CompatEvent`] before
 /// aggregation. A DTrace-capable backend (macOS/FreeBSD) installs its
@@ -58,7 +57,7 @@ pub fn set_probe_hook(hook: fn(&CompatEvent)) {
     let _ = PROBE_HOOK.set(hook);
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ::serde::Serialize, ::serde::Deserialize)]
 pub struct SyscallArgs(pub [u64; 6]);
 
 pub const MAX_RECORDED_REWRITES: usize = 128;
@@ -114,7 +113,7 @@ impl From<[u64; 6]> for SyscallArgs {
 /// are load-bearing — the matching `gregs_t` in `guest_stack.d` mirrors
 /// this layout. Keep all fields u64 so offsets are a clean 8*index.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct GuestRegs {
     pub pc: u64,
     pub sp: u64,
@@ -142,7 +141,7 @@ pub struct GuestRegs {
     pub stack_guest_end: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CompatEvent {
     SyscallEntry {
@@ -499,7 +498,7 @@ impl CompatReporter {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct CompatReport {
     pub summary: CompatSummary,
     /// Execution-lane counters captured after the final guest exit.
@@ -528,14 +527,14 @@ pub struct CompatReport {
     pub fast_path_blind_spots: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct ExecutionWitness {
     pub backend: String,
     pub guest_entries: u64,
     pub host_forwards: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct UnknownFlagsCount {
     pub number: u64,
     pub name: String,
@@ -572,7 +571,7 @@ fn sorted_unknown_flags(src: HashMap<(u64, String, u32, u64), u64>) -> Vec<Unkno
     entries
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct CompatSummary {
     pub syscall_invocations: u64,
     pub syscall_returns_ok: u64,
@@ -775,14 +774,14 @@ impl std::fmt::Display for CompatReportFormat {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct SyscallCount {
     pub number: u64,
     pub name: String,
     pub count: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct PartialSyscallCount {
     pub number: u64,
     pub name: String,
@@ -790,7 +789,7 @@ pub struct PartialSyscallCount {
     pub count: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct SyscallRewriteCount {
     pub number: u64,
     pub name: String,
@@ -799,26 +798,26 @@ pub struct SyscallRewriteCount {
     pub count: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct IoctlCount {
     pub request: u64,
     pub count: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct PathCount {
     pub path: String,
     pub count: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct SignalCount {
     pub signum: i32,
     pub reason: String,
     pub count: u64,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, ::thiserror::Error)]
 pub enum CompatReportRenderError {
     #[error("failed to serialize compatibility report: {0}")]
     Json(#[from] serde_json::Error),

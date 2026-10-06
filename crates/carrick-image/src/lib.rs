@@ -101,7 +101,7 @@ use oci_client::manifest::{
     OciImageManifest,
 };
 use oci_client::secrets::RegistryAuth;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize as _, Serialize as _};
 use tokio::fs;
 
 pub use carrick_spec::{ImageConfig, ImageReference, OciBootstrapError};
@@ -179,7 +179,7 @@ impl ImageStore {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct PullSummary {
     pub image: String,
     pub digest: Option<String>,
@@ -188,7 +188,7 @@ pub struct PullSummary {
     pub layers: Vec<LayerSummary>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct LayerSummary {
     pub digest: String,
     pub media_type: String,
@@ -581,18 +581,18 @@ fn layer_summaries_in_manifest_order(
     )
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize)]
 pub struct ResolvedImage {
     pub layers: Vec<camino::Utf8PathBuf>,
     pub config: ImageConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize)]
 struct OciImageConfigContainer {
     config: Option<OciImageConfigInner>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct OciImageConfigInner {
     user: Option<String>,
@@ -927,7 +927,7 @@ impl ImageStore {
 /// kaniko `--tar-path`). `config` and `layers` are *entry paths inside the
 /// tar*, attacker-influenced; they are matched against tar entry names but
 /// never used as host paths.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, ::serde::Deserialize)]
 struct DockerArchiveManifestEntry {
     #[serde(rename = "Config")]
     config: String,

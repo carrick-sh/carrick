@@ -69,7 +69,6 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use carrick_runtime::linux_abi::CanonicalNr;
 use carrick_runtime::syscall::lookup_aarch64;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
@@ -119,7 +118,7 @@ const WINDOW_INHERITED_END: &str = "inherited-end";
 /// guest op — are ratios that get compared across captures, so they are carried
 /// as the arithmetic that produced them rather than as a rounded quotient. This
 /// mirrors `debug_jit_shape`'s `CensusFraction`.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LedgerFraction {
     pub(crate) numerator: u64,
@@ -153,7 +152,7 @@ impl LedgerFraction {
 /// typed-domain rule applied to this boundary — the D program deliberately
 /// carries the NUMBER (no `copyinstr`), and a ledger row for an op carrick
 /// cannot name is a corrupt stream, not a row to print with a placeholder.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GuestOp {
     // PRIVATE, like `HostCall`/`MachTrap`: public fields would let a struct
@@ -201,7 +200,9 @@ impl GuestOp {
 }
 
 /// A Darwin syscall name as `probefunc` reported it.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+#[derive(
+    Clone, Debug, Eq, Ord, PartialEq, PartialOrd, ::serde::Deserialize, ::serde::Serialize,
+)]
 #[serde(transparent)]
 pub(crate) struct HostCall(String);
 
@@ -209,7 +210,9 @@ pub(crate) struct HostCall(String);
 /// syscalls, which is the whole reason this instrument joins both — a
 /// `syscall:::`-only census missed two thirds of the large-zone allocation mass
 /// because libmalloc reaches the kernel through `mach_vm_allocate`.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+#[derive(
+    Clone, Debug, Eq, Ord, PartialEq, PartialOrd, ::serde::Deserialize, ::serde::Serialize,
+)]
 #[serde(transparent)]
 pub(crate) struct MachTrap(String);
 
@@ -252,7 +255,7 @@ impl MachTrap {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FaultCounts {
     pub(crate) as_fault: u64,
@@ -281,7 +284,7 @@ impl FaultCounts {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LedgerProvenance {
     pub(crate) binary_sha256: String,
@@ -305,7 +308,9 @@ impl From<ProfileProvenance> for LedgerProvenance {
     }
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+#[derive(
+    Clone, Debug, Eq, Ord, PartialEq, PartialOrd, ::serde::Deserialize, ::serde::Serialize,
+)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TerminalCall {
     pub(crate) provider: String,
@@ -314,7 +319,7 @@ pub(crate) struct TerminalCall {
 }
 
 /// What makes the capture evidence rather than output.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LedgerAuthority {
     pub(crate) program_sha256: String,
@@ -361,7 +366,7 @@ pub(crate) struct LedgerAuthority {
 
 const CONSUMER_DROP_ENFORCEMENT: &str = "in-band-consumer-drops-record";
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LedgerTotals {
     pub(crate) guest_syscalls: u64,
@@ -388,7 +393,7 @@ pub(crate) struct LedgerTotals {
 /// Ranked by CPU-ns, then by count, then by name — CPU because that is the
 /// currency the budget is denominated in, and the two tie-breaks because a
 /// published artifact has to be byte-reproducible.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DominantHostCall {
     pub(crate) name: HostCall,
@@ -397,7 +402,7 @@ pub(crate) struct DominantHostCall {
     pub(crate) max_ns: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GuestOpRow {
     pub(crate) guest_op: GuestOp,
@@ -414,7 +419,7 @@ pub(crate) struct GuestOpRow {
     pub(crate) dominant_host_call: Option<DominantHostCall>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct HostCallRow {
     pub(crate) name: HostCall,
@@ -422,7 +427,7 @@ pub(crate) struct HostCallRow {
     pub(crate) cpu_ns: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MachTrapRow {
     pub(crate) trap: MachTrap,
@@ -430,14 +435,14 @@ pub(crate) struct MachTrapRow {
     pub(crate) cpu_ns: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BucketTotals {
     pub(crate) host_calls: u64,
     pub(crate) host_cpu_ns: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct InstrumentBucket {
     pub(crate) host_calls: u64,
@@ -451,7 +456,7 @@ pub(crate) struct InstrumentBucket {
 /// the enforcement mechanism.** The fs-census entry stated "carrick-only is
 /// never a ratio" in prose; here there is no cell to put one in, so the rule
 /// cannot be forgotten by a later editor, only removed on purpose.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CarrickOnly {
     pub(crate) host_calls: u64,
@@ -471,7 +476,7 @@ pub(crate) struct CarrickOnly {
 /// independent, ungrouped total. Both sides are published because the receipt
 /// is the point; they are equal by construction, and a published ledger whose
 /// two sides disagree is refused on parse.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ClosureCheck {
     pub(crate) per_op_sum: u64,
@@ -486,7 +491,7 @@ pub(crate) struct ClosureCheck {
 /// (`exit`, `bsdthread_terminate`) do the same by design and are marked. What
 /// IS asserted is the sum: the per-call return counts must equal the program's
 /// independent return total.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UnreturnedHostCall {
     pub(crate) name: HostCall,
@@ -495,7 +500,7 @@ pub(crate) struct UnreturnedHostCall {
     pub(crate) qualified_terminal: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UnreturnedMachTrap {
     pub(crate) trap: MachTrap,
@@ -504,7 +509,7 @@ pub(crate) struct UnreturnedMachTrap {
     pub(crate) qualified_terminal: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LedgerClosure {
     pub(crate) guest_syscalls: ClosureCheck,
@@ -528,7 +533,7 @@ pub(crate) struct LedgerClosure {
 /// The capture's own kernel-CPU decomposition, in exact nanoseconds.
 ///
 /// No external denominator appears here on purpose — see this module's header.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LedgerBudget {
     /// Host syscall + mach trap CPU inside some guest service window.
@@ -544,7 +549,7 @@ pub(crate) struct LedgerBudget {
     pub(crate) probable_instrument_share: LedgerFraction,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AmplificationLedgerV1 {
     pub(crate) schema: String,
@@ -1745,7 +1750,7 @@ pub(crate) const COMPARISON_SCHEMA: &str = "carrick.amplification-comparison.v1"
 /// `i128` because both sides are `u64` and the difference is signed; publishing
 /// the operands next to the result is what lets a reader check the subtraction
 /// without the original ledgers.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CountDelta {
     pub(crate) a: u64,
@@ -1776,7 +1781,7 @@ impl CountDelta {
 /// across captures, and a rounded quotient would make "did this lever move the
 /// `mmap` row" a question about the host's floating-point unit. This mirrors
 /// `debug_jit_shape`'s `ComparisonFraction`.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SignedFraction {
     pub(crate) numerator: i128,
@@ -1807,7 +1812,7 @@ fn fraction_delta(a: &LedgerFraction, b: &LedgerFraction) -> Result<SignedFracti
 ///
 /// Published as ONE copy of each field, because they are equal by
 /// construction — a drifted determinant is a refusal, not a row.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ComparisonDeterminants {
     pub(crate) ledger_schema: String,
@@ -1830,14 +1835,14 @@ pub(crate) struct ComparisonDeterminants {
     pub(crate) quiet_host_preflighted: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ComparisonSides<T> {
     pub(crate) a: T,
     pub(crate) b: T,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TotalsComparison {
     pub(crate) guest_syscalls: CountDelta,
@@ -1853,7 +1858,7 @@ pub(crate) struct TotalsComparison {
 /// `carrick-only` differences its own bucket and NEVER acquires a ratio here
 /// either: the struct has no amplification field for the same reason
 /// [`CarrickOnly`] has none.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CarrickOnlyComparison {
     pub(crate) host_calls: CountDelta,
@@ -1867,7 +1872,7 @@ pub(crate) struct CarrickOnlyComparison {
     pub(crate) excluding_probable_instrument_cpu_ns: CountDelta,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BudgetComparison {
     pub(crate) guest_attributed_cpu_ns: CountDelta,
@@ -1879,7 +1884,7 @@ pub(crate) struct BudgetComparison {
 
 /// One guest operation, on both sides, with the two ratios the whole instrument
 /// exists to move.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GuestOpComparison {
     pub(crate) guest_op: GuestOp,
@@ -1906,7 +1911,7 @@ pub(crate) struct GuestOpComparison {
 /// 2–4x, so a wall difference between two captures is a difference between two
 /// perturbations. Counts, CPU-ns and same-instrument ratios are the citable
 /// quantities and are the only ones differenced.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AmplificationComparisonV1 {
     pub(crate) schema: String,

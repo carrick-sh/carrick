@@ -93,8 +93,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use flate2::read::GzDecoder;
-use serde::Serialize;
-use thiserror::Error;
+use serde::Serialize as _;
 
 use crate::fs_backend::{FsBackend, HostFsBackend, ImmutableHostFileOpen, RealStat};
 
@@ -107,7 +106,7 @@ pub enum LayerSource {
     TarGz(Vec<u8>),
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, ::serde::Serialize)]
 pub struct RootFs {
     files: HashMap<PathBuf, FileEntry>,
     directories: HashSet<PathBuf>,
@@ -205,7 +204,7 @@ impl PartialEq for RootFs {
 
 impl Eq for RootFs {}
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize)]
 pub struct FileEntry {
     pub path: PathBuf,
     pub mode: u32,
@@ -214,7 +213,7 @@ pub struct FileEntry {
     contents: Arc<[u8]>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize)]
 pub struct SymlinkEntry {
     path: PathBuf,
     target: PathBuf,
@@ -227,14 +226,14 @@ impl FileEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize)]
 pub struct RootFsSummary {
     pub file_count: usize,
     pub directory_count: usize,
     pub symlink_count: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RootFsEntryKind {
     File,
@@ -260,7 +259,7 @@ pub enum RootFsEntryKind {
     Socket,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize)]
 pub struct RootFsMetadata {
     pub path: PathBuf,
     pub kind: RootFsEntryKind,
@@ -268,7 +267,7 @@ pub struct RootFsMetadata {
     pub size: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize)]
 pub struct RootFsDirEntry {
     pub name: String,
     pub metadata: RootFsMetadata,
@@ -279,7 +278,7 @@ pub struct RootFsDirEntry {
     pub ino: u64,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, ::thiserror::Error)]
 pub enum RootFsError {
     #[error("failed to decode OCI layer: {0}")]
     Io(#[from] std::io::Error),

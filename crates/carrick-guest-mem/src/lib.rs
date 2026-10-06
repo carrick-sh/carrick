@@ -79,8 +79,7 @@ pub use deferred_anonymous::{
     DeferredAnonymousTransition, DeferredPrivateFileSnapshot, DeferredPrivateFileTransition,
 };
 
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
+use serde::{Deserialize as _, Serialize as _};
 
 pub const HOST_PAGE_GRANULE: u64 = 0x4000; // 16 KiB: the host page granule every lane shares today.
 
@@ -97,7 +96,7 @@ pub mod protections;
 /// The Linux AArch64 syscall argument registers carrick reads at an `svc` trap
 /// (`x0`–`x5` args, `x8` syscall number).
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize)]
 pub struct Aarch64SyscallFrame {
     pub x0: u64,
     pub x1: u64,
@@ -113,7 +112,7 @@ pub struct Aarch64SyscallFrame {
 /// rax; args rdi, rsi, rdx, r10, r8, r9; return in rax; rcx/r11 are the
 /// hardware SYSCALL clobbers (return RIP/RFLAGS) and never carry arguments.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize)]
 pub struct X8664SyscallFrame {
     pub rax: u64,
     pub rdi: u64,
@@ -150,7 +149,18 @@ pub enum PrivateFileSource {
 /// `u64`s in mapping signatures like `map_aliased(va, gpa, len)` — a va↔gpa
 /// transposition is page-aligned on both sides, so alignment guards cannot
 /// catch it; only the type can.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Debug,
+    ::serde::Serialize,
+    ::serde::Deserialize,
+)]
 pub struct GuestVa(pub u64);
 
 impl GuestVa {
@@ -176,7 +186,18 @@ impl From<GuestVa> for u64 {
 }
 
 /// A contiguous range of guest virtual addresses `[start, start + len)`.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Debug,
+    ::serde::Serialize,
+    ::serde::Deserialize,
+)]
 pub struct GuestVaRange {
     start: GuestVa,
     len: usize,
@@ -276,7 +297,7 @@ impl GuestVaRange {
 /// bare `u64`s in mapping signatures like `map_aliased(va, gpa, len)` — a
 /// va↔gpa transposition is page-aligned on both sides, so alignment guards
 /// cannot catch it; only the type can.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, ::serde::Serialize)]
 pub struct Gpa(pub u64);
 
 impl Gpa {
@@ -294,7 +315,7 @@ impl Gpa {
 /// three as adjacent bare integers — a swap is page-aligned and alignment
 /// guards cannot catch it; only the type can. Deref via `raw()` at the
 /// pointer boundary.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, ::serde::Serialize)]
 pub struct HostVa(pub usize);
 
 impl HostVa {
@@ -312,7 +333,7 @@ impl HostVa {
 /// are unchanged): the neutral page-geometry vocabulary embeds this leaf type,
 /// and it must stay off carrick-spec's heavyweight (oci-client/rustls)
 /// dependency graph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NativePageProfile {
     Native16k,
@@ -321,7 +342,7 @@ pub enum NativePageProfile {
 
 /// The page-size triple a resolved native run executes under. See
 /// [`NativePageProfile`] for why this lives here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize, serde::Deserialize)]
 pub struct NativePageGeometry {
     pub host_page_size: u64,
     pub linux_page_size: u64,
@@ -329,7 +350,7 @@ pub struct NativePageGeometry {
 }
 
 /// Stable identity of a host file backing a guest shared futex mapping.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, ::serde::Serialize)]
 pub struct SharedFutexFileIdentity {
     pub device: u64,
     pub inode: u64,
@@ -338,7 +359,7 @@ pub struct SharedFutexFileIdentity {
 /// Equality for carrier futex queues. Hashing may choose a shard but must
 /// never replace this full identity: different file words can share a 64-bit
 /// hash, while aliases of one file word must rendezvous on one queue.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, ::serde::Serialize)]
 pub enum SharedFutexKey {
     Direct(usize),
     File {
@@ -354,7 +375,7 @@ pub enum SharedFutexKey {
 /// identity and offset, even when two mappings use different host addresses.
 /// [`SharedFutexLocation::Mirror`] uses a fork-shared mirror word and supplies
 /// the waiter-counter address required by some native host primitives.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ::serde::Serialize)]
 pub enum SharedFutexLocation {
     Direct {
         word: HostVa,
@@ -474,7 +495,7 @@ pub enum MappingSharing {
 /// example, after writing live page tables but before a TLB flush completed);
 /// returning to the guest or recycling either backing would risk use-after-free
 /// through an unknown live translation, so the process must fail stopped.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, ::thiserror::Error)]
 pub enum RepointPrivateError {
     #[error("private repoint failed before publication: {0}")]
     Clean(#[source] MemoryError),
@@ -1279,7 +1300,7 @@ impl<M: GuestMemory + ?Sized> Drop for HostWriteGuard<'_, M> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, ::thiserror::Error)]
 pub enum MemoryError {
     #[error("owner memory incarnation retired: {0:?}")]
     OwnerRetired(carrick_el1_abi::El1MmHandle),

@@ -10,7 +10,7 @@ use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_ulong, c_void};
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize as _, Serialize as _};
 use sha2::{Digest, Sha256};
 
 pub const KERNEL_SYMBOL_SCHEMA: &str = "carrick.kernel-symbols.v1";
@@ -95,7 +95,7 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, ::serde::Deserialize, PartialEq, Eq, ::serde::Serialize)]
 pub struct KernelIdentity {
     pub osversion: String,
     pub version: String,
@@ -104,7 +104,7 @@ pub struct KernelIdentity {
     pub bootsessionuuid: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, ::serde::Deserialize, PartialEq, Eq, ::serde::Serialize)]
 pub struct KernelObjectRange {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -115,7 +115,7 @@ pub struct KernelObjectRange {
     pub text_size: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, ::serde::Deserialize, PartialEq, Eq, ::serde::Serialize)]
 pub struct KernelSymbolRange {
     pub address: u64,
     pub object: String,
@@ -126,7 +126,7 @@ pub struct KernelSymbolRange {
     pub offset: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, ::serde::Deserialize, PartialEq, Eq, ::serde::Serialize)]
 pub struct KernelSymbolSnapshot {
     pub schema: String,
     pub identity: KernelIdentity,
@@ -134,7 +134,7 @@ pub struct KernelSymbolSnapshot {
     pub symbols: Vec<KernelSymbolRange>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, ::serde::Deserialize, Eq, PartialEq, ::serde::Serialize)]
 pub struct SampledKernelSymbol {
     pub address: u64,
     pub symbol: String,
@@ -143,14 +143,14 @@ pub struct SampledKernelSymbol {
     pub offset: u64,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, ::serde::Deserialize, Eq, PartialEq, ::serde::Serialize)]
 pub struct UnresolvedKernelAddress {
     pub address: u64,
     pub status: c_int,
     pub dtrace_errno: c_int,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, ::serde::Deserialize, Eq, PartialEq, ::serde::Serialize)]
 pub struct SampledKernelSymbolOverlay {
     pub schema: String,
     pub identity: KernelIdentity,

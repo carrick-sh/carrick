@@ -17,7 +17,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::trace_profile::ProfileCaptureStatus;
@@ -56,7 +55,9 @@ pub(crate) fn program_sha256() -> String {
 }
 
 /// The distinct fault classes specified for carrier CPU attribution.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, ::serde::Serialize, ::serde::Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum FaultClass {
     FirstTouch,
@@ -84,7 +85,9 @@ impl FaultClass {
 
 /// Process-lifecycle work that runs on executor threads (or the CLI main
 /// thread) but is neither per-quantum scheduling nor syscall service.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, ::serde::Serialize, ::serde::Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum LifecycleClass {
     /// Serving fork/clone: building the child's spec and plan, its task
@@ -113,7 +116,7 @@ impl LifecycleClass {
 }
 
 /// Primary attribution categories for carrier CPU.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(tag = "category", content = "detail", rename_all = "kebab-case")]
 pub(crate) enum CpuCategory {
     GuestExecution,
@@ -780,7 +783,7 @@ pub(crate) fn classify_stack(frames: &[&str]) -> CpuCategory {
 }
 
 /// Machine-readable summary of HVPatch carrier CPU attribution.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub(crate) struct HvpatchCarrierCpuAttributionSummary {
     pub(crate) sample_population: u64,
     pub(crate) stack_population: u64,

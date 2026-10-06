@@ -74,9 +74,8 @@ use oci_client::Reference;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
-use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, ::thiserror::Error)]
 pub enum OciBootstrapError {
     #[error("invalid OCI image reference: {0}")]
     ParseReference(#[from] oci_client::ParseError),
@@ -171,7 +170,7 @@ impl<'de> Deserialize<'de> for ImageReference {
 
 /// The source of a runnable container/guest image: an OCI image reference or
 /// a freestanding host ELF binary with optional rootfs layers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub enum ImageSource {
     Oci(String),
     HostElf {
@@ -199,7 +198,7 @@ impl From<&str> for ImageSource {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize, Default)]
 #[serde(default)]
 pub struct ImageConfig {
     pub entrypoint: Option<Vec<String>>,
@@ -214,19 +213,19 @@ pub struct ImageConfig {
     pub stop_signal: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct Mount {
     pub source: Utf8PathBuf,
     pub target: Utf8PathBuf,
     pub readonly: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub enum NamespaceMode {
     Host,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct NamespaceConfig {
     pub network: NamespaceMode,
     pub pid: NamespaceMode,
@@ -249,7 +248,7 @@ impl Default for NamespaceConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ::serde::Serialize, ::serde::Deserialize)]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum FsBackendKind {
     /// In-memory writable overlay. Gated behind the default-off `fs-memory`
@@ -263,7 +262,7 @@ pub enum FsBackendKind {
     Host,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ::serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecBackendRequest {
     #[default]
@@ -335,7 +334,7 @@ pub use carrick_guest_mem::{NativePageGeometry, NativePageProfile};
 /// in a fresh PID namespace (its init is pid 1, ns-local child pids, ns-filtered
 /// /proc — docs/namespaces-design.md §5.2). `Host` shares the host PID namespace
 /// (no remap; getpid returns the real host pid), like `docker run --pid=host`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum PidMode {
@@ -346,7 +345,7 @@ pub enum PidMode {
     Host,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum NetworkMode {
@@ -372,7 +371,7 @@ pub enum NetworkMode {
 ///
 /// A `tty: true` run allocates a pty and ignores this field; tty output modes
 /// are outside the embed v1 surface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StdioMode {
     #[default]
@@ -393,7 +392,7 @@ pub enum StdioMode {
 /// 2026-07-10). `ContainerDefault` is the serde default so a persisted
 /// container spec is docker-shaped; bare-ELF developer fixtures explicitly
 /// choose `Unconfined`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SeccompPolicy {
     /// Model of Docker's default seccomp profile (a launch-time syscall-deny
@@ -405,7 +404,7 @@ pub enum SeccompPolicy {
     Unconfined,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, ::serde::Serialize, ::serde::Deserialize)]
 pub struct NetworkNamespaceId(String);
 
 impl NetworkNamespaceId {
@@ -448,7 +447,7 @@ impl NetworkNamespaceId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, ::serde::Serialize, ::serde::Deserialize)]
 pub struct BridgeId(String);
 
 impl BridgeId {
@@ -465,14 +464,14 @@ impl BridgeId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PortProtocol {
     Tcp,
     Udp,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct PortMapping {
     pub host_ip: Option<IpAddr>,
     pub host_port: Option<u16>,
@@ -480,7 +479,7 @@ pub struct PortMapping {
     pub protocol: PortProtocol,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
 pub struct NetworkAttachmentSpec {
     pub bridge_id: BridgeId,
@@ -519,7 +518,7 @@ impl Default for NetworkAttachmentSpec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
 pub struct NetworkNamespaceSpec {
     pub mode: NetworkMode,
@@ -653,7 +652,7 @@ impl Default for NetworkNamespaceSpec {
 }
 
 /// The instruction-set architecture of the Linux container to run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Platform {
     /// AArch64 / arm64 — native on Apple Silicon and arm64 Linux hosts.
@@ -851,7 +850,7 @@ impl Default for Platform {
 ///
 /// Older serialized specs have no field and therefore retain their resolved
 /// uid/gid behavior through the default.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InitialIdentity {
     #[default]
@@ -879,7 +878,7 @@ pub enum InitialIdentity {
 ///
 /// The sub-specs and trailing fields carry `#[serde(default)]` so a `RunSpec`
 /// persisted by an older build still deserializes.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
 pub struct ProcessSpec {
     pub executable: String,
@@ -911,7 +910,7 @@ pub struct ProcessSpec {
 }
 
 /// Filesystem and mount configuration for the container root and overlays.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
 pub struct MountSpec {
     pub rootfs_layers: Vec<Utf8PathBuf>,
@@ -920,7 +919,7 @@ pub struct MountSpec {
 }
 
 /// Network configuration, namespace parameters, and host identity.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
 pub struct NetworkSpec {
     /// Network namespace mode and resolved bridge view.
@@ -937,7 +936,7 @@ pub struct NetworkSpec {
 }
 
 /// Resource constraints and debug dump paths.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
 pub struct ResourceSpec {
     pub max_traps: usize,
@@ -945,7 +944,7 @@ pub struct ResourceSpec {
 }
 
 /// Security policies and Linux capability sets.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
 pub struct SecuritySpec {
     /// Launch-time container syscall policy (`--security-opt seccomp=...`).
@@ -961,7 +960,7 @@ pub struct SecuritySpec {
     pub cap_add: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
 pub struct RunSpec {
     pub process: ProcessSpec,

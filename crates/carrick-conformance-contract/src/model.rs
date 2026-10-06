@@ -1,8 +1,8 @@
 use std::fmt;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer};
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, ::serde::Serialize)]
 #[serde(transparent)]
 pub struct ContractId(String);
 
@@ -52,7 +52,7 @@ impl<'de> Deserialize<'de> for ContractId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExecutionLayer {
     VmFree,
@@ -76,7 +76,7 @@ impl fmt::Display for ExecutionLayer {
 
 pub use carrick_observability::work_meter::WorkMetric;
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Budget {
     Exact {
@@ -94,7 +94,7 @@ pub enum Budget {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize)]
 pub struct StructuralBudget {
     #[serde(flatten)]
     pub budget: Budget,
@@ -173,7 +173,7 @@ where
     value.ok_or_else(|| E::custom(format_args!("{kind} budget requires {field}")))
 }
 
-#[derive(Deserialize)]
+#[derive(::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StructuralBudgetWire {
     kind: BudgetKind,
@@ -188,7 +188,7 @@ struct StructuralBudgetWire {
     rationale: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(::serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum BudgetKind {
     Exact,
@@ -196,7 +196,7 @@ enum BudgetKind {
     Affine,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LayerBindings {
     /// Explicit open binding work. Never authorizes execution or acceptance.
@@ -209,14 +209,14 @@ pub struct LayerBindings {
     pub ecosystem: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TimingStatistic {
     P50,
     P95,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeRatioPolicy {
     pub maximum: f64,
@@ -224,7 +224,7 @@ pub struct RuntimeRatioPolicy {
     pub minimum_samples: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConformanceContract {
     pub schema_version: u32,
@@ -240,21 +240,21 @@ pub struct ConformanceContract {
     pub rationale: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SurfaceAssignment {
     pub path: String,
     pub contracts: Vec<ContractId>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SurfaceRegistry {
     pub schema_version: u32,
     pub surfaces: Vec<SurfaceAssignment>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, ::serde::Serialize)]
 #[serde(transparent)]
 pub struct ClaimId(String);
 
@@ -298,7 +298,7 @@ impl<'de> Deserialize<'de> for ClaimId {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(tag = "class", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum CapabilityClass {
     VmFreeExisting {
@@ -313,7 +313,7 @@ pub enum CapabilityClass {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]
 pub enum CoverageState {
     Declared,
@@ -335,7 +335,7 @@ impl<'de> Deserialize<'de> for CoverageState {
     where
         D: Deserializer<'de>,
     {
-        #[derive(Deserialize)]
+        #[derive(::serde::Deserialize)]
         #[serde(tag = "status", rename_all = "kebab-case", deny_unknown_fields)]
         enum CoverageStateWire {
             Declared,
@@ -382,7 +382,7 @@ impl<'de> Deserialize<'de> for CoverageState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Claim {
     pub id: ClaimId,

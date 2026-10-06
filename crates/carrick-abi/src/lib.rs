@@ -102,7 +102,7 @@
 pub use carrick_syscall_abi::*;
 
 use bitflags::bitflags;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
+use zerocopy::{FromBytes as _, Immutable, IntoBytes, KnownLayout as _, Unaligned as _};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum LinuxGuestAbi {
@@ -609,7 +609,16 @@ pub const LINUX_DIRENT64_HEADER_SIZE: usize = core::mem::size_of::<LinuxDirent64
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxStat {
     pub st_dev: u64,
@@ -643,7 +652,16 @@ pub struct LinuxStat {
 /// this record writer instead of the canonical `newfstatat(2)` writer.
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxX8664Stat {
     pub st_dev: u64,
@@ -668,7 +686,16 @@ pub struct LinuxX8664Stat {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxStatfs {
     pub f_type: i64,
@@ -687,7 +714,16 @@ pub struct LinuxStatfs {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxStatxTimestamp {
     pub tv_sec: i64,
@@ -707,7 +743,16 @@ impl LinuxStatxTimestamp {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxStatx {
     pub stx_mask: u32,
@@ -745,7 +790,16 @@ pub struct LinuxStatx {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxWinsize {
     pub ws_row: u16,
@@ -796,7 +850,16 @@ pub const LINUX_CS8: u32 = 0o000060;
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxTermios {
     pub c_iflag: u32,
@@ -846,7 +909,16 @@ impl LinuxTermios {
 /// Linux `struct termio` (TCGETA/TCSETA) wire format (18 bytes).
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxTermio {
     pub c_iflag: u16,
@@ -860,7 +932,16 @@ pub struct LinuxTermio {
 /// Linux x86 FXSAVE 32-byte header wire layout.
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxFxsaveHeader {
     pub fcw: u16,
@@ -876,7 +957,16 @@ pub struct LinuxFxsaveHeader {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxEventfdValue {
     pub value: u64,
@@ -884,7 +974,16 @@ pub struct LinuxEventfdValue {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxEpollEvent {
     pub events: u32,
@@ -900,7 +999,16 @@ pub struct LinuxEpollEvent {
 /// internal canonical representation for dispatcher state.
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxX8664EpollEvent {
     pub events: u32,
@@ -909,7 +1017,16 @@ pub struct LinuxX8664EpollEvent {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxPollFd {
     pub fd: i32,
@@ -919,7 +1036,16 @@ pub struct LinuxPollFd {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxMsghdr {
     pub name: u64,
@@ -935,7 +1061,16 @@ pub struct LinuxMsghdr {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxMmsghdr {
     pub msg_hdr: LinuxMsghdr,
@@ -945,7 +1080,16 @@ pub struct LinuxMmsghdr {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxCapabilityHeader {
     pub version: u32,
@@ -954,7 +1098,16 @@ pub struct LinuxCapabilityHeader {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxCapabilityData {
     pub effective: u32,
@@ -978,7 +1131,16 @@ impl LinuxCapabilityData {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxFdPair {
     pub read_fd: i32,
@@ -1000,7 +1162,16 @@ pub struct LinuxFdPair {
 /// a `u32` would invite exactly that mistake.
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxIpMreqSource {
     pub multiaddr: [u8; 4],
@@ -1018,7 +1189,16 @@ pub struct LinuxIpMreqSource {
 /// `struct nlmsghdr` — header on every netlink message.
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxNlMsgHdr {
     pub nlmsg_len: u32,
@@ -1031,7 +1211,16 @@ pub struct LinuxNlMsgHdr {
 /// `struct ifinfomsg` — payload of an RTM_NEWLINK message.
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxIfInfoMsg {
     pub ifi_family: u8,
@@ -1045,7 +1234,16 @@ pub struct LinuxIfInfoMsg {
 /// `struct ifaddrmsg` — payload of an RTM_NEWADDR message.
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxIfAddrMsg {
     pub ifa_family: u8,
@@ -1058,7 +1256,16 @@ pub struct LinuxIfAddrMsg {
 /// `struct rtmsg` — payload of an RTM_NEWROUTE message (a routing-table entry).
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxRtMsg {
     pub rtm_family: u8,
@@ -1075,7 +1282,16 @@ pub struct LinuxRtMsg {
 /// `struct ndmsg` — payload of an RTM_NEWNEIGH message (a neighbour entry).
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxNdMsg {
     pub ndm_family: u8,
@@ -1090,7 +1306,16 @@ pub struct LinuxNdMsg {
 /// `struct rtattr` — TLV attribute header used inside rtnetlink payloads.
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxRtAttr {
     pub rta_len: u16,
@@ -1159,7 +1384,16 @@ pub const LINUX_IFA_INFINITY_LIFE_TIME: u32 = u32::MAX;
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxDirent64Header {
     pub d_ino: u64,
@@ -1170,7 +1404,16 @@ pub struct LinuxDirent64Header {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxAuxvEntry {
     pub a_type: u64,
@@ -1193,7 +1436,16 @@ impl LinuxAuxvEntry {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxIovec {
     pub iov_base: u64,
@@ -1208,7 +1460,16 @@ impl LinuxIovec {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxOpenHow {
     pub flags: u64,
@@ -1218,7 +1479,16 @@ pub struct LinuxOpenHow {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxCloneArgs {
     pub flags: u64,
@@ -1236,7 +1506,16 @@ pub struct LinuxCloneArgs {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxTimespec {
     pub tv_sec: i64,
@@ -1251,7 +1530,16 @@ impl LinuxTimespec {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxItimerspec {
     pub it_interval: LinuxTimespec,
@@ -1269,7 +1557,16 @@ impl LinuxItimerspec {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxTimerfdExpirations {
     pub expirations: u64,
@@ -1281,7 +1578,16 @@ pub struct LinuxTimerfdExpirations {
 /// fields and zeroes the reserved tail.
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxMqAttr {
     /// O_NONBLOCK iff the queue description is non-blocking (the only bit Linux
@@ -1306,7 +1612,16 @@ pub struct LinuxMqAttr {
 /// offsets: value@0, signo@8, notify@12.
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxSigevent {
     /// `union sigval` — the value delivered with a SIGEV_SIGNAL notification.
@@ -1327,7 +1642,16 @@ pub const LINUX_SIGEV_THREAD: i32 = 2;
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxTimeval {
     pub tv_sec: i64,
@@ -1389,7 +1713,16 @@ pub const LINUX_ADJ_OFFSET_SINGLESHOT_FLAG_ONLY: u32 = 0x8000;
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxTimex {
     pub modes: u32,
@@ -1455,7 +1788,16 @@ impl LinuxTimex {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxItimerval {
     pub it_interval: LinuxTimeval,
@@ -1480,7 +1822,16 @@ impl LinuxItimerval {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxTimezone {
     pub tz_minuteswest: i32,
@@ -1522,7 +1873,16 @@ pub const CARRICK_KERNEL_VERSION: &str = "#1 SMP PREEMPT_DYNAMIC";
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxUtsname {
     pub sysname: [u8; LINUX_UTSNAME_FIELD_SIZE],
@@ -1595,7 +1955,16 @@ impl LinuxUtsname {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxRlimit {
     pub rlim_cur: u64,
@@ -1610,7 +1979,16 @@ impl LinuxRlimit {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxTms {
     pub tms_utime: i64,
@@ -1632,7 +2010,16 @@ impl LinuxTms {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxRusage {
     pub ru_utime: LinuxTimeval,
@@ -1678,7 +2065,16 @@ impl LinuxRusage {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxSysinfo {
     pub uptime: i64,
@@ -1705,7 +2101,16 @@ pub struct LinuxSysinfo {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxSigaction {
     pub sa_handler: u64,
@@ -1750,7 +2155,16 @@ pub const LINUX_POLL_MSG: i32 = 3;
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxSiginfo {
     pub si_signo: i32,
@@ -1863,7 +2277,16 @@ impl LinuxSiginfo {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxSignalStack {
     pub ss_sp: u64,
@@ -1885,7 +2308,16 @@ impl LinuxSignalStack {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxSignalContext {
     pub fault_address: u64,
@@ -1913,7 +2345,16 @@ impl LinuxSignalContext {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxUcontext {
     pub uc_flags: u64,
@@ -1953,7 +2394,16 @@ pub const LINUX_FPSIMD_MAGIC: u32 = 0x4650_8001;
 /// fpcr 4, vregs 512 = 528 bytes; `vregs` at offset 16).
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxFpsimdContext {
     pub magic: u32,
@@ -1988,7 +2438,16 @@ pub const CARRICK_SIGFRAME_MAGIC: u64 = 0x4361_7272_6963_6b53; // 'CarrickS'
 /// are consumed only by Carrick's own `rt_sigreturn` handler.
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct CarrickSigframe {
     // siginfo / ucontext MUST be first — Rosetta trampoline: `mov x1, sp`.
@@ -2064,7 +2523,16 @@ pub const LINUX_X8664_USER_DS: u16 = 0x1b;
 /// clean-room signal-frame probes; component offsets come from CPUID leaf 0xD.
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct X8664FpxSwBytes {
     pub magic1: u32,
@@ -2091,7 +2559,16 @@ impl X8664FpxSwBytes {
 /// the Linux software descriptor occupying its final 48 bytes.
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct X8664Fpstate {
     pub cwd: u16,
@@ -2131,7 +2608,16 @@ impl X8664Fpstate {
 /// Linux signal frame: `xcomp_bv` must be zero and all reserved words zero.
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct X8664XsaveHeader {
     pub xstate_bv: u64,
@@ -2160,7 +2646,16 @@ pub const CARRICK_X8664_XSTATE_TRAILER_VERSION: u16 = 3;
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct CarrickX8664XstateTrailer {
     pub magic: u64,
@@ -2196,7 +2691,16 @@ impl CarrickX8664XstateTrailer {
 /// (which alias the packed `REG_CSGSFS` u64: cs | gs<<16 | fs<<32 | ss<<48).
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct X8664Sigcontext {
     pub r8: u64,
@@ -2271,7 +2775,16 @@ impl X8664Sigcontext {
 /// fields in the kernel-provided stack image.
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct X8664Ucontext {
     pub uc_flags: u64,
@@ -2301,7 +2814,16 @@ impl X8664Ucontext {
 /// frame extent.
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct X8664Rtsigframe {
     pub pretcode: u64,
@@ -2393,7 +2915,16 @@ mod x8664_sigframe_tests {
 
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxSigaltstack {
     pub ss_sp: u64,
@@ -2431,11 +2962,11 @@ impl LinuxSigaltstack {
     PartialEq,
     Eq,
     Default,
-    FromBytes,
-    IntoBytes,
-    KnownLayout,
-    Immutable,
-    Unaligned,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxFlock64 {
     pub l_type: i16,
@@ -2456,11 +2987,11 @@ pub struct LinuxFlock64 {
     PartialEq,
     Eq,
     Default,
-    FromBytes,
-    IntoBytes,
-    KnownLayout,
-    Immutable,
-    Unaligned,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxFOwnerEx {
     pub owner_type: i32,
@@ -2470,7 +3001,16 @@ pub struct LinuxFOwnerEx {
 /// Linux `struct ifreq` used by network ioctl requests (`SIOCGIFNAME`, `SIOCGIFINDEX`, `SIOCGIFFLAGS`, etc.).
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxIfreq {
     pub ifr_name: [u8; LINUX_IFNAMSIZ],
@@ -2486,11 +3026,11 @@ pub struct LinuxIfreq {
     PartialEq,
     Eq,
     Default,
-    FromBytes,
-    IntoBytes,
-    KnownLayout,
-    Immutable,
-    Unaligned,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxIfconf {
     pub ifc_len: i32,
@@ -2508,11 +3048,11 @@ pub struct LinuxIfconf {
     PartialEq,
     Eq,
     Default,
-    FromBytes,
-    IntoBytes,
-    KnownLayout,
-    Immutable,
-    Unaligned,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxProcmapQuery {
     pub size: u64,
@@ -2543,11 +3083,11 @@ pub struct LinuxProcmapQuery {
     PartialEq,
     Eq,
     Default,
-    FromBytes,
-    IntoBytes,
-    KnownLayout,
-    Immutable,
-    Unaligned,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxPidfdInfo {
     pub mask: u64,
@@ -2580,11 +3120,11 @@ pub struct LinuxPidfdInfo {
     PartialEq,
     Eq,
     Default,
-    FromBytes,
-    IntoBytes,
-    KnownLayout,
-    Immutable,
-    Unaligned,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxSigsetArgpack {
     pub ss: u64,
@@ -2600,11 +3140,11 @@ pub struct LinuxSigsetArgpack {
     PartialEq,
     Eq,
     Default,
-    FromBytes,
-    IntoBytes,
-    KnownLayout,
-    Immutable,
-    Unaligned,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxInotifyEventHeader {
     pub wd: i32,
@@ -2622,11 +3162,11 @@ pub struct LinuxInotifyEventHeader {
     PartialEq,
     Eq,
     Default,
-    FromBytes,
-    IntoBytes,
-    KnownLayout,
-    Immutable,
-    Unaligned,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxIocb {
     pub aio_data: u64,
@@ -2652,11 +3192,11 @@ pub struct LinuxIocb {
     PartialEq,
     Eq,
     Default,
-    FromBytes,
-    IntoBytes,
-    KnownLayout,
-    Immutable,
-    Unaligned,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxIoEvent {
     pub data: u64,
@@ -2969,10 +3509,10 @@ assert_layout!(LinuxIoEvent, size = 32, data @ 0, obj @ 8, result @ 16, result2 
     Default,
     serde::Serialize,
     serde::Deserialize,
-    FromBytes,
-    IntoBytes,
-    KnownLayout,
-    Immutable,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
 )]
 pub struct HostUid(pub u32);
 
@@ -3029,10 +3569,10 @@ impl From<HostUid> for u32 {
     Default,
     serde::Serialize,
     serde::Deserialize,
-    FromBytes,
-    IntoBytes,
-    KnownLayout,
-    Immutable,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
 )]
 pub struct NsUid(pub u32);
 
@@ -3089,10 +3629,10 @@ impl From<NsUid> for u32 {
     Default,
     serde::Serialize,
     serde::Deserialize,
-    FromBytes,
-    IntoBytes,
-    KnownLayout,
-    Immutable,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
 )]
 pub struct HostGid(pub u32);
 
@@ -3149,10 +3689,10 @@ impl From<HostGid> for u32 {
     Default,
     serde::Serialize,
     serde::Deserialize,
-    FromBytes,
-    IntoBytes,
-    KnownLayout,
-    Immutable,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
 )]
 pub struct NsGid(pub u32);
 
@@ -5643,7 +6183,16 @@ pub const LINUX_IPV6_RECVERR: i32 = 25;
 /// IMMEDIATELY after this struct (`SO_EE_OFFENDER`).
 #[repr(C, packed)]
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 pub struct LinuxSockExtendedErr {
     pub ee_errno: u32,
@@ -5760,7 +6309,17 @@ pub const LINUX_TP_STATUS_BLK_TMO: u32 = 1 << 5;
 
 /// `struct sockaddr_ll` (`linux/if_packet.h`).
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+)]
 pub struct LinuxSockaddrLl {
     pub sll_family: u16,
     pub sll_protocol: u16,
@@ -5773,7 +6332,17 @@ pub struct LinuxSockaddrLl {
 
 /// `struct tpacket_req` (`linux/if_packet.h`) for TPACKET_V1 and TPACKET_V2.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+)]
 pub struct LinuxTpacketReq {
     pub tp_block_size: u32,
     pub tp_block_nr: u32,
@@ -5783,7 +6352,17 @@ pub struct LinuxTpacketReq {
 
 /// `struct tpacket_req3` (`linux/if_packet.h`) for TPACKET_V3.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+)]
 pub struct LinuxTpacketReq3 {
     pub tp_block_size: u32,
     pub tp_block_nr: u32,
@@ -5796,7 +6375,17 @@ pub struct LinuxTpacketReq3 {
 
 /// `struct tpacket_bd_ts` (`linux/if_packet.h`).
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+)]
 pub struct LinuxTpacketBdTs {
     pub ts_sec: u32,
     pub ts_usec: u32,
@@ -5804,7 +6393,17 @@ pub struct LinuxTpacketBdTs {
 
 /// `struct tpacket_hdr_v1` (`linux/if_packet.h`).
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+)]
 pub struct LinuxTpacketHdrV1 {
     pub block_status: u32,
     pub num_pkts: u32,
@@ -5817,7 +6416,17 @@ pub struct LinuxTpacketHdrV1 {
 
 /// `struct tpacket_block_desc` (`linux/if_packet.h`) for TPACKET_V3.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+)]
 pub struct LinuxTpacketBlockDesc {
     pub version: u32,
     pub offset_to_priv: u32,
@@ -5826,7 +6435,17 @@ pub struct LinuxTpacketBlockDesc {
 
 /// `struct tpacket_hdr_variant1` (`linux/if_packet.h`).
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+)]
 pub struct LinuxTpacketHdrVariant1 {
     pub rxhash: u32,
     pub vlan_tci: u32,
@@ -5836,7 +6455,17 @@ pub struct LinuxTpacketHdrVariant1 {
 
 /// `struct tpacket3_hdr` (`linux/if_packet.h`) for TPACKET_V3 packet header.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+)]
 pub struct LinuxTpacket3Hdr {
     pub tp_next_offset: u32,
     pub tp_sec: u32,
@@ -5852,7 +6481,17 @@ pub struct LinuxTpacket3Hdr {
 
 /// `struct tpacket2_hdr` (`linux/if_packet.h`) for TPACKET_V2 packet header.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+)]
 pub struct LinuxTpacket2Hdr {
     pub tp_status: u32,
     pub tp_len: u32,
@@ -5876,7 +6515,17 @@ pub struct LinuxTpacket2Hdr {
 /// unions for several fields; we flatten to the members carrick's phase-1
 /// opcodes touch (`off`/`addr`/`len`/`op_flags` cover the rw + fsync ops).
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+)]
 pub struct LinuxIoUringSqe {
     pub opcode: u8,
     pub flags: u8,
@@ -5895,7 +6544,17 @@ pub struct LinuxIoUringSqe {
 
 /// `struct io_uring_cqe` — a 16-byte completion-queue entry.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+)]
 pub struct LinuxIoUringCqe {
     pub user_data: u64,
     pub res: i32,
@@ -5906,7 +6565,16 @@ pub struct LinuxIoUringCqe {
 /// SQ region, reported back to the guest by `io_uring_setup`.
 #[repr(C)]
 #[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
 )]
 pub struct LinuxIoSqringOffsets {
     pub head: u32,
@@ -5923,7 +6591,16 @@ pub struct LinuxIoSqringOffsets {
 /// `struct io_cqring_offsets`.
 #[repr(C)]
 #[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
 )]
 pub struct LinuxIoCqringOffsets {
     pub head: u32,
@@ -5940,7 +6617,16 @@ pub struct LinuxIoCqringOffsets {
 /// `struct io_uring_params` — in/out argument of `io_uring_setup`.
 #[repr(C)]
 #[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
 )]
 pub struct LinuxIoUringParams {
     pub sq_entries: u32,
