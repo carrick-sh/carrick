@@ -87,6 +87,8 @@ pub mod completion_queue;
 pub mod object_wait;
 pub mod occupancy;
 pub mod spaces;
+mod x86_context;
+pub use x86_context::{ParkedContextWords, X86_XSAVE_BYTES};
 
 pub use occupancy::{
     AddressSpaceKey, EXECUTION_SLOTS, ExecutionSlot, HOST_EXECUTION_SLOTS, Occupancy, SlotBusy,
