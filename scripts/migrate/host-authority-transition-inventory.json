@@ -6540,18 +6540,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:119 in `Cpl0Carrier::boot`, `std::fs::read` reads only the caller-selected CPL0 bootstrap ELF, whose segments and entry are validated before the fixture registers memory or runs either vCPU; no guest syscall argument or guest identity selects this host path.",
+    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:132 in `Cpl0Carrier::boot`, `std::fs::read` reads only the caller-selected CPL0 bootstrap ELF, whose segments and entry are validated before the fixture registers memory or runs either vCPU; no guest syscall argument or guest identity selects this host path.",
     "review_id": "HA-000752",
     "source": {
-      "byte_end": 3721,
-      "byte_start": 3708,
+      "byte_end": 4147,
+      "byte_start": 4134,
       "column": 21,
       "column_end": 34,
       "column_start": 21,
       "file": "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
-      "line": 119,
-      "line_end": 119,
-      "line_start": 119
+      "line": 132,
+      "line_end": 132,
+      "line_start": 132
     }
   },
   {
