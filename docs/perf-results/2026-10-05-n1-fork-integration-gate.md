@@ -100,7 +100,7 @@ tests (including the two neutral witnesses and all five native owner-fork
 tests), workspace all-target clippy, fmt-check and diff-check. This is VM-free
 proof, not a signed improvement claim.
 
-## Whole rebased-stack audit
+## Initial rebased-stack audit, before restoration
 
 The director requested a witness audit of every pre-rebase fork fix, plus
 the anonymous owner-fault correction. `stack-audit.tsv` in the evidence
@@ -128,8 +128,8 @@ file is restored byte-for-byte in a `finally` block. All eleven positive
 tests pass again after restoration. Core extent red/green receipts are
 separate; none of these VM-free controls requires an HVF VM.
 
-Audit receipts are under `stack-audit/`: `controls.tsv`,
-`owner-venue-controls.tsv`, semantic reversal diffs, and per-command logs.
+Initial audit receipts are under `stack-audit/`: the preserved `attempt1/`
+receipts, `owner-venue-controls.tsv`, and source comparisons.
 `dropped-witnesses.json` verifies all eight original witness names or
 fixture shapes present at `50d648e76` and absent at `452fd0e67`.
 `integration-dropped-code.patch` and the original fix patches preserve
@@ -140,9 +140,67 @@ one-page fork fixture green: that fixture proves the owner handoff, while
 the two ISA fixtures prove neighborhood clipping. Both guarantees have
 qualified negative controls; the incomplete reversal is also retained.
 
-The four dropped guarantees are **not repaired by the extent port**. They
-need correction in the shared owner path with restored red-first witnesses;
+The four dropped guarantees were **not repaired by the extent port**. They
+needed correction in the shared owner path with restored red-first witnesses;
 old AArch64 frame retirement authorities must remain retired. Their original
 signed failures are obscured on this artifact by the earlier inventory
 error. No signed pass or complete integration closure is claimed, and no
 file-table, clone-TID, copyout or anonymous-brk code was changed.
+
+## Restored ports and order 4 audit
+
+The director requested restoration of all four dropped guarantees, one
+commit each. These ports now accompany the physical extent correction:
+
+| Original fix | Port after rebase | Restored guarantee |
+| --- | --- | --- |
+| `be40000e3` | `29ccd7263` | Core-owned canonical physical extent selection and deduplication |
+| `e6411c853` | `65bab0a1d` | Initial/exec vvar sealing and native RO/NX permission ceilings |
+| `1ce444334` | `9aeaf6611` | Readonly native leaf adoption by the existing fork-arm hook |
+| `2414ef7dd` | `561712029` | Actual page-table arena resolution through retained custody |
+| `efc86a9fd` | `6607b0281` | Closed identity-word publication through the shared MM owner |
+
+The identity capability and validation live in `carrick-core-abi` and
+`carrick-core`. AArch64 supplies the control-page location and hardware
+translation facts, then transports the admitted word through the existing
+owned transfer. An x86 projection tests the same core policy. The split
+memory view forwards that capability without granting ordinary user writes.
+Native descriptor encoding, physical pins and table transport stay in their
+existing backend; no retired native frame authority was restored.
+
+Each port restores its original witness and records a behavioral red before
+correction. The four ports were developed on the physical-extent tip
+`452fd0e67`; table-custody tests also require readonly adoption to reach the
+table lookup. Port receipts are `ports/e641-red.log`, `ports/1ce-red.log`,
+`ports/2414-red.log`, and `ports/efc-red2.log`, with green receipts beside
+them. Early compile errors and fixture-adaptation failures are retained and
+excluded from red or green claims. The identity port additionally has an
+x86 semantic reversal and a split-view forwarding reversal.
+
+The completed stack rebases onto x86 order 4 at
+`56bf8c0caefe39fcc2260345d0a54772a74bffad`. The only conflict was the
+generated macOS authority capture, where the new base was retained pending
+recapture. The fixture-lock commit was already upstream and was omitted.
+`ports/order4-rebase.log` records this transition; the previous stack remains
+on `n1-cm-before-order4-ee105fb96`.
+
+The repeated whole-stack audit on source
+`6607b02817c24a93156e49f3abc149aa591f47d6` classifies **five kept, five
+ported, zero dropped**. Nineteen negative commands produce behavioral test
+failures covering every guarantee. After exact restoration, all 25 positive
+tests pass. All temporarily edited files are restored byte-for-byte and the
+tracked tree is clean. Authoritative final receipts are
+`stack-audit-order4.tsv`, `stack-audit-order4/controls.tsv`,
+`stack-audit-order4/summary.json`, and `stack-audit-order4-gate.log`.
+The final audit initially reused negative-control filenames; those final
+receipts were moved into `stack-audit-order4/`. Initial `attempt1/` and
+separate owner-venue receipts remain. Signed evidence was not overwritten.
+
+## Pause boundary
+
+The director paused N1 in favor of settling x86 on the shared core. All
+ports are committed; no fix is in progress and no further signed cycle will
+run during the pause. The exact `ea0b4c26b` signed result remains red for all
+five tests. The new ports have VM-free verification, not a signed pass.
+The handoff in `2026-10-05-n1-cm-pause-handoff.md` lists every fix, open
+failures and the next verification step after the settled-core rebase.
