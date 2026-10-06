@@ -35,8 +35,13 @@ impl owner::ReservationGeometry for X86Cpl0ReservationGeometry {
 }
 pub type X86Cpl0Reservations =
     owner::SharedReservations<LinuxReservationPolicy, X86Cpl0ReservationGeometry>;
-pub type X86Cpl0RootReleaseVenue<'a> =
-    owner::RootReleaseVenue<'a, LinuxReservationPolicy, X86Cpl0ReservationGeometry>;
+pub type X86Cpl0Zone = carrick_sched_core::ZoneTables<carrick_sched_core::ParkedContextWords>;
+pub type X86Cpl0RootReleaseVenue<'a> = owner::RootReleaseVenue<
+    'a,
+    LinuxReservationPolicy,
+    X86Cpl0ReservationGeometry,
+    carrick_sched_core::ParkedContextWords,
+>;
 const _: () = assert!(
     carrick_el1_abi::X86_CPL0_RESERVATIONS_OFFSET as usize
         + core::mem::size_of::<X86Cpl0Reservations>()
