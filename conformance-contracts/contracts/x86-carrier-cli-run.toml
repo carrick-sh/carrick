@@ -1,7 +1,7 @@
 schema_version = 1
 id = "x86.carrier.cli-run"
 title = "Linux x86_64 CLI execution uses the shared CPL0 kernel"
-guest_surfaces = ["cli:run", "vmm:kvm", "syscall:write", "syscall:exit", "syscall:exit_group", "syscall:poll", "syscall:arch_prctl", "syscall:mmap", "syscall:munmap", "syscall:brk", "syscall:fork", "syscall:wait4"]
+guest_surfaces = ["cli:run", "vmm:kvm", "syscall:write", "syscall:exit", "syscall:exit_group", "syscall:poll", "syscall:arch_prctl", "syscall:set_tid_address", "syscall:mmap", "syscall:munmap", "syscall:brk", "syscall:fork", "syscall:wait4"]
 semantic_authority = [
   "Native x86_64 Linux execution of the exact static ELF: write(1, hello\\n, 6) emits exactly hello\\n and exit(7) yields process status 7",
   "Native x86_64 Linux execution of the same static MM/fork/wait ELF supplies the syscall-result and output oracle",
@@ -27,4 +27,4 @@ not execution bindings for this contract.
 [bindings.unresolved]
 vm_free = "The shared MM and task policies have separate VM-free contracts; this composite CLI execution has no VM-free binding yet."
 embed_structural = "The KVM production carrier and exact work observations are not bound; the red CLI test is not an accepted binding."
-docker = "This x86 worker has no Docker; native x86 Linux execution of the exact ELF is the milestone oracle."
+docker = "Docker is director-owned on this x86 worker; native x86 Linux execution of the exact ELF is the milestone oracle."
