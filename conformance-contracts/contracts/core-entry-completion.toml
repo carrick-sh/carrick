@@ -16,8 +16,12 @@ exact task, execution generation, MM and thread generation in one non-copying
 completion token. Completion authenticates that complete binding. In-zone Born
 entries use a distinct lifetime-bound token that authenticates the exact OnCpu
 record/claim/incarnation and installed MM without fabricating host adoption.
-A switched or parked turn consumes its entry token while the existing exact
-wait record retains the continuation. Pending
+A switched or parked turn authenticates its initiating execution binding and
+exact scheduler record epoch against an owned receipt issued by the successful
+existing park/retirement transition, then consumes its entry token. The existing
+wait record retains the continuation. Stale handoff cannot publish completion
+or work. Lifecycle results and original arguments publish only after successful
+authentication in the Linux owner. Pending
 return work marks the admitted call complete exactly once; it cannot send the
 same syscall through a semantic host dispatcher. Unknown native ordinals are
 counted refusals with zero Linux-side publication.

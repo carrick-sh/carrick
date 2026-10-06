@@ -13,7 +13,7 @@ retain their two's-complement bits. No errno is translated by core.
 
 | Pre-move condition / result | Order 5 boundary / exact result |
 | --- | --- |
-| Robust-list native x86 273 / ARM 99, length 24: served `0` | Linux codec → real EL1 pending robust-list body → sole Linux finish; served `0`, one publication |
+| Robust-list native x86 273 / ARM 99, length 24: served `0` | Linux codec → Linux robust-list policy over real EL1 metadata venue → sole Linux finish; served `0`, one publication |
 | Admitted robust-list length other than 24: served `-22` (`EINVAL`) | Same body returns `-22`; no head publication or sibling mutation |
 | Missing task or cleared ordinary execution generation: Forward | Core ordinary admission refuses; Forward before family effects |
 | Closed lifecycle gate, setup hatch off, absent exact lifecycle slot: Forward | Pending family refuses; Forward, unchanged head and arguments |
@@ -29,11 +29,11 @@ retain their two's-complement bits. No errno is translated by core.
 | Pending work at entry, no retained operation/setup exception | Forward before fresh family or descriptor lookup; same decline accounting |
 | Pending work plus retained IPC operation | Original operation offered before fresh fd lookup; progress and endpoint custody retained |
 | IPC explicit decline | File fallback only after Forward; Handback cannot fall through or replay the operation |
-| Family parks or native scheduler switches the running record | Entry-turn token consumed by handoff; existing exact-record wait/scheduler owns continuation; no second continuation ledger or fabricated short completion |
+| Family parks or native scheduler switches the running record | Exact initiating binding/record authenticated against an owned receipt from successful scheduler/wait publication or retirement; token consumed once, existing continuation retained |
 | IPC/lifecycle/futex returned value, signed failure or positive byte/count/TID result | Named pending hook returns identical `i64`; native argument preservation and register install unchanged |
 | IPC idle / handback | Idle / Forward respectively; retained operation authority unchanged |
 | Anonymous Forward / Return(value) / Work / Unavailable(reason) | Exact variants retained by shared Linux helper; counters publish only for Forward/Return; owned work/refusal unchanged |
-| Already-accounted anonymous completion/decline/park | Accounted disposition avoids a second counter; original result and work flags retained |
+| Delegated anonymous completion/decline; prepared wait | Resource primitive publishes no entry counter; Linux publishes exactly one served/forwarded count. Prepared park retains its historical uncounted suspension; result and work flags are unchanged |
 | Delegated read/write/lseek/pread/pwrite and inotify refusal | Forward unchanged; per-family locking, notifications, fd pinning and all signed results unchanged |
 | Unsupported/misaligned futex op, zero MM, invalid user word or disallowed timed wait | Forward (`None`), unchanged frame; no wait submission |
 | Futex value mismatch | Exact `-11` (`EAGAIN`), selected in Linux scheduler policy |
@@ -295,7 +295,7 @@ index 46c6fb4d8..61a8c37f2 100644
 The eleven frame-independent dispatch assertions now reside in
 `carrick-personality-linux/tests/x86_wave2/dispatch.rs`; their native fixture
 hooks still execute the real `El1PendingFamilies` implementation. EL1 retains
-seven native/diagnostic dispatch witnesses. The Linux entry owner now also
+nine native/diagnostic dispatch witnesses. The Linux entry owner now also
 owns file/inotify fallback, original-argument publication, owed-wake lowering,
 accounted scheduler-result lowering and delegated-anonymous ordering. The
 native hooks retain validated copying, region lookup, native frames and the
@@ -309,12 +309,12 @@ its physically separate Linux state, with the same atomic ordering.
 | IPC/futex progress → Linux transfer lowering | Forward remains Forward; Handback remains Handback (never file fallback); Idle suspends; switched return does not overwrite its successor's original argument; unswitched return records the original argument and preserves every signed result |
 | Native file operation → Linux file entry | `None` forwards without result/work/original-argument publication; `Some(i64)` preserves its exact signed value; read alone falls back to inotify after native file refusal |
 | Watch add/remove → Linux work lowering | Add never marks an owed wake; remove marks it only after a served operation with an owed wake; native result precedes original-argument store, pending-work Release publication and entry completion |
-| Anonymous delegated operation → Linux ordering | NotDelegated alone permits permission/retirement fallback; PreparedConflict enrolls once or hands back; Served/Forward preserve accounted completion/forwarding without double counters |
+| Anonymous delegated operation → Linux ordering | NotDelegated alone permits permission/retirement fallback; PreparedConflict enrolls once or hands back; Served/Forward are resource outcomes; sole Linux finish publishes their one completion/forward counter |
 | Anonymous permission/retirement → Linux result | Every returned signed result is unchanged; permission CommitOwed and retirement Retired install 0 and preserve original argument before requesting replay; the historical missing-task permission return and retirement forwarding remain distinct |
 | Native scheduler → accounted entry lowering | Returned(false), Returned(true), Idle map one-to-one to AccountedComplete, AccountedSwitched, AccountedSuspended; no new continuation ledger |
 | Lifecycle entry-work refusal → Linux diagnostic | Exact native exit (93) and clone (220) decline cells increment once, with no effect or errno change |
 
-The new real-path red control inverts the owed-wake condition in the moved
+The initial real-path red control inverts the owed-wake condition in the moved
 Linux file entry. `dispatch::test_in_guest_read_queues_in_access_and_owes_an_observed_waiter_a_wake`
 then fails (Served versus ServedWithWork). Restoring that condition passes all
 nineteen Linux entry/dispatch witnesses, including the original-argument check.
@@ -331,12 +331,12 @@ strict test-only attributes removed alongside their items.
 
 | ARM-resident source | Before production | After production | Before tests | After tests |
 | --- | ---: | ---: | ---: | ---: |
-| carrick-el1 | 8,613 | 8,614 | 15,536 | 14,715 |
+| carrick-el1 | 8,613 | 8,579 | 15,536 | 15,029 |
 | carrick-el1-abi | 7,066 | 7,055 | 3,876 | 3,885 |
 | carrick-aarch64 | 10,491 | 10,491 | 5,229 | 5,229 |
-| Total | 26,170 | 26,160 | 24,641 | 23,829 |
+| Total | 26,170 | 26,125 | 24,641 | 24,143 |
 
-Net production reduction is **10 lines**; net test reduction is **812 lines**.
+Net production reduction is **45 lines**; net test reduction is **498 lines**.
 This falls far short of the plan's 1,700–2,100 production forecast. The entry
 cut removes policy bodies but replaces them with explicit exact-binding,
 Born authentication, result-transport and pending-family native hooks; later
@@ -417,4 +417,181 @@ b=json.loads(Path('/tmp/ord5-before-census.json').read_text())['files'];a=json.l
 for p in a:
  d=a[p]['production']-b[p]['production']
  if d:print(d,p)
+```
+
+## Director review: authenticating handoff and removing residual entry owners
+
+The three review findings are fixed in separate commits. Their controls use the
+real `El1PendingFamilies`, not a synthetic family implementation.
+
+| Review boundary | Preserved answer / newly enforced ownership |
+| --- | --- |
+| Pending host work and gettid 178 | Forward with unchanged x0/original argument, zero served/work publication; only 99/132/135 remain setup exceptions |
+| Ordinary suspended/switched turn | Authenticate all execution/MM words and scheduler-region/slot/record epoch against the owned receipt from the actual successful park or retirement |
+| Born suspended/switched turn | Authenticate exact owner, slot, task/MM/thread serial, pre-publication claim sequence and incarnation; no current/successor record substitutes for the initiating record |
+| Lifecycle primitive return | Decoded `LifecycleCall` in, typed `LifecycleOutcome` out. Linux stages the identical signed result and saved argument, authenticates completion, then installs x0 and original argument and selects completion/work |
+| Lifecycle exit switches/parks | Primitive returns neutral progress and successor's opaque result; Linux uses the handoff receipt, preserves successor frame/original argument and chooses switched/suspended completion |
+| Anonymous settlement/refusal | Native resource authentication, rollback, root completion and exact 0/brk/-12/other result remain unchanged; resource primitive no longer publishes served/forwarded counters. Linux final owner publishes once |
+| Anonymous PreparedConflict / unavailable/busy/declined root | Same enrollment/refusal and diagnostic leave reason; counters retain their historical final values and park remains uncounted |
+| Robust-list setup | Length, closed-gate/hatch ordering, 0/-22/refusal and publication budget moved once to Linux. Native metadata venue performs only lookup and supplied head/length storage |
+
+`EntryHandoffReceipt` is non-copying historical evidence, issued by core only
+around an actual existing park/retirement transition. It is not a new scheduler
+or continuation ledger. It retains the initiating record epoch before ownership
+can transfer; no post-publication record read tries to authenticate a successor.
+The core token borrows its exact scheduler region. Real futex controls cover
+ordinary generation drift and Born claim-sequence/incarnation drift, both
+idle and switched paths, at scales 1/2/8. They fail the old unconditional handoff
+path; weakening only Born handoff authentication reproduces a stale suspension
+failure. Restored authentication passes all 228 EL1 library witnesses.
+
+The gettid control fails the old setup exception (ServedWithWork versus Forward)
+and restores all 21 lifecycle witnesses. The real lifecycle result control
+changes the loaded generation during native venue lookup and observes that
+InvalidCompletion leaves x0, original argument, served counter and work flags
+untouched. Reinstating result installation before authentication makes it fail
+again (41 versus saved 0xfeed). Native anonymous resource witnesses fail when a
+counter publisher is reinstated; their fixtures then model the Linux caller's
+boundary and retain every original final-counter assertion. Those are actual
+resource primitives, not a KVM anonymous-family admission or host-side substitute
+for that admission (which remains order 7).
+
+Order 6 still owns extraction of clone birth, clear-tid/exit, signal-mask and
+altstack semantic bodies and lifecycle publication. The native selector matches
+only an already-decoded operation enum; it has no ordinal routing, final-result
+store, original-argument store, host-work choice or entry completion. The
+frame-independent robust-list policy was moved here because X4 already admits it;
+there is one body shared by ARM and x86. Native IRQ/idle/save/restore remain ISA
+mechanics. No order-4b protect/retire/editor algorithm was changed: director review
+explicitly requested removing the resource entry counters and nested routing.
+
+Additional owner greps, excluding test modules, must yield no matches:
+
+```sh
+sed '/^\/\/\/ The running thread/,$d' crates/carrick-el1/src/personality/lifecycle.rs | rg -n 'match nr|FamilyCompletion|completion_route|has_pending_host_work|orig_arg0|frame\.x\[0\] =|is_lifecycle_syscall'
+sed '/^#\[cfg(test)\]/,$d' crates/carrick-el1/src/memory.rs | rg -n 'counters\.(served|forwarded)|dispatch_anonymous_with_reservations'
+rg -n 'pub fn serve\b|is_lifecycle_syscall' crates/carrick-el1/src/personality/lifecycle.rs
+```
+
+The complete resource counter/routing patch (no editor bodies) follows:
+
+```diff
+diff --git a/crates/carrick-el1/src/memory.rs b/crates/carrick-el1/src/memory.rs
+index 962a7faa0..2a13ca548 100644
+--- a/crates/carrick-el1/src/memory.rs
++++ b/crates/carrick-el1/src/memory.rs
+@@ -100,3 +100,2 @@ impl PendingReservationSyscall {
+         current: &CurrentTask,
+-        counters: &carrick_el1_abi::Counters,
+         model: &mut reservations::Reservations<'_>,
+@@ -104,3 +103,3 @@ impl PendingReservationSyscall {
+     ) -> Result<(), reservations::Refusal> {
+-        self.complete_as(frame, current, counters, model, completion, None)
++        self.complete_as(frame, current, model, completion, None)
+     }
+@@ -114,3 +113,2 @@ impl PendingReservationSyscall {
+         current: &CurrentTask,
+-        counters: &carrick_el1_abi::Counters,
+         model: &mut reservations::Reservations<'_>,
+@@ -119,3 +117,3 @@ impl PendingReservationSyscall {
+     ) -> Result<(), reservations::Refusal> {
+-        self.complete_as(frame, current, counters, model, completion, Some(slot))
++        self.complete_as(frame, current, model, completion, Some(slot))
+     }
+@@ -125,3 +123,2 @@ impl PendingReservationSyscall {
+         current: &CurrentTask,
+-        counters: &carrick_el1_abi::Counters,
+         model: &mut reservations::Reservations<'_>,
+@@ -141,3 +138,2 @@ impl PendingReservationSyscall {
+         frame.x[0] = result;
+-        counters.served[self.syscall as usize].fetch_add(1, Ordering::Relaxed);
+         Ok(())
+@@ -156,3 +152,2 @@ impl PendingReservationSyscall {
+         current: &CurrentTask,
+-        counters: &carrick_el1_abi::Counters,
+         model: &mut reservations::Reservations<'_>,
+@@ -168,3 +163,2 @@ impl PendingReservationSyscall {
+         };
+-        counters.served[self.syscall as usize].fetch_add(1, Ordering::Relaxed);
+         Ok(())
+@@ -667,3 +661,3 @@ pub enum DelegatedAnonymous {
+ /// receipt at its next boundary. Everything else refuses the proposal and
+-/// forwards. Counts served or forwarded exactly once.
++/// forwards. The Linux entry owner publishes the completion/refusal counter.
+ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
+@@ -682,3 +676,2 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
+     let forward = |why: carrick_el1_abi::AnonymousLeave| {
+-        counters.forwarded[nr as usize].fetch_add(1, Ordering::Relaxed);
+         counters.anonymous_leaves[why as usize].fetch_add(1, Ordering::Relaxed);
+@@ -691,22 +684,13 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
+     };
+-    let mut pending = match crate::personality::dispatch::dispatch_anonymous_with_reservations(
+-        frame, counters, current, &mut model,
+-    ) {
+-        crate::personality::dispatch::AnonymousReservationRoute::Action(
+-            carrick_el1_abi::Action::Served,
+-        ) => return DelegatedAnonymous::Served,
+-        // `forwarded[nr]` counted by the route.
+-        crate::personality::dispatch::AnonymousReservationRoute::Action(_) => {
+-            counters.anonymous_leaves[Leave::RootDeclined as usize].fetch_add(1, Ordering::Relaxed);
+-            return DelegatedAnonymous::Forward;
++    let mut pending = match decide_anonymous_syscall(frame, current, &mut model) {
++        ReservationDisposition::Return(value) => {
++            frame.x[0] = value as u64;
++            return DelegatedAnonymous::Served;
+         }
+-        crate::personality::dispatch::AnonymousReservationRoute::Unavailable(
+-            reservations::Refusal::PreparedConflict,
+-        ) => {
++        ReservationDisposition::Forward => return forward(Leave::RootDeclined),
++        ReservationDisposition::Unavailable(reservations::Refusal::PreparedConflict) => {
+             return DelegatedAnonymous::PreparedConflict;
+         }
+-        crate::personality::dispatch::AnonymousReservationRoute::Unavailable(_) => {
+-            return forward(Leave::RootUnavailable);
+-        }
+-        crate::personality::dispatch::AnonymousReservationRoute::Work(pending) => pending,
++        ReservationDisposition::Unavailable(_) => return forward(Leave::RootUnavailable),
++        ReservationDisposition::Work(pending) => pending,
+     };
+@@ -841,7 +825,6 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
+     let completed = match (completion, owed_return) {
+-        (Some(completion), Some(slot)) => pending
+-            .complete_deferring_return(frame, current, counters, &mut model, completion, slot),
+-        (Some(completion), None) => {
+-            pending.complete(frame, current, counters, &mut model, completion)
++        (Some(completion), Some(slot)) => {
++            pending.complete_deferring_return(frame, current, &mut model, completion, slot)
+         }
++        (Some(completion), None) => pending.complete(frame, current, &mut model, completion),
+         (None, slot) => {
+@@ -1446,2 +1429,4 @@ mod tests {
+             frame.x[..6].copy_from_slice(&args);
++            let served_before = counters.served[nr as usize].load(Ordering::Relaxed);
++            let forwarded_before = counters.forwarded[nr as usize].load(Ordering::Relaxed);
+             let route = serve_delegated_anonymous(
+@@ -1454,2 +1439,23 @@ mod tests {
+             );
++            assert_eq!(
++                counters.served[nr as usize].load(Ordering::Relaxed),
++                served_before,
++                "resource primitive cannot publish entry completion"
++            );
++            assert_eq!(
++                counters.forwarded[nr as usize].load(Ordering::Relaxed),
++                forwarded_before,
++                "resource primitive cannot publish entry refusal"
++            );
++            // This fixture models the caller's Linux boundary after the actual
++            // resource primitive, keeping all historical final-count assertions.
++            let entry = carrick_personality_linux::dispatch::EntryCounters {
++                served: &counters.served,
++                forwarded: &counters.forwarded,
++            };
++            match route {
++                DelegatedAnonymous::Served => entry.served(nr),
++                DelegatedAnonymous::Forward => entry.forwarded(nr),
++                _ => {}
++            }
+             (route, frame.x[0] as i64)
 ```

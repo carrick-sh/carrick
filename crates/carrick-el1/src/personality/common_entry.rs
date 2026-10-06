@@ -1,5 +1,5 @@
 //! ARM image adapter for the single Linux entry dispatcher.
-use super::thread_setup::{self, LifecycleVenue, RobustListHead, RobustListLen, RobustListSlot};
+use super::thread_setup::{LifecycleVenue, RobustListHead, RobustListLen, RobustListSlot};
 use carrick_el1_abi::{Counters, CurrentTask};
 use carrick_personality_linux::dispatch::EntryCounters;
 use carrick_personality_linux::entry::CanonicalCall;
@@ -32,9 +32,8 @@ pub fn serve_canonical(
             },
             robust_list: |head, len| {
                 venue.thread(task).and_then(|thread| {
-                    thread_setup::set_robust_list(
-                        thread.page,
-                        RobustListSlot::new(thread.slot, publications),
+                    carrick_personality_linux::pending_lifecycle::set_robust_list(
+                        &RobustListSlot::new(thread.page, thread.slot, publications),
                         RobustListHead::new(head),
                         RobustListLen::new(len),
                     )

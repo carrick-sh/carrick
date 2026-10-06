@@ -42,9 +42,9 @@ pub fn serve(
         }
         DelegatedStep::Served(result) => {
             record_original(venue, original);
-            return FamilyCompletion::AccountedComplete(result.raw());
+            return FamilyCompletion::Complete(result.raw());
         }
-        DelegatedStep::Forward => return FamilyCompletion::AccountedForward,
+        DelegatedStep::Forward => return FamilyCompletion::Forward,
         DelegatedStep::NotDelegated => {}
     }
     match call {

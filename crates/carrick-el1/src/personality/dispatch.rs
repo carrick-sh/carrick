@@ -20,6 +20,7 @@ use carrick_personality_linux::dispatch::{FamilyCompletion, PendingFamilies};
 #[cfg(target_os = "none")]
 use carrick_personality_linux::pending_anonymous::{DelegatedStep, PermissionStep, RetirementStep};
 use carrick_personality_linux::pending_file::PendingFileVenue;
+use carrick_personality_linux::pending_lifecycle::{LifecycleCall, LifecycleOutcome};
 use core::sync::atomic::Ordering;
 
 /// T2's SVC integration point. A Work result is an owned continuation, not a
@@ -45,14 +46,15 @@ pub fn dispatch_anonymous_with_reservations(
             ReservationDecision::Unavailable(reason)
         }
     };
+    let entry = EntryCounters {
+        served: &counters.served,
+        forwarded: &counters.forwarded,
+    };
     let route = carrick_personality_linux::dispatch::dispatch_anonymous(decision, |served| {
-        let table = if served {
-            &counters.served
+        if served {
+            entry.served(frame.x[8]);
         } else {
-            &counters.forwarded
-        };
-        if let Some(counter) = table.get(frame.x[8] as usize) {
-            counter.fetch_add(1, Ordering::Relaxed);
+            entry.forwarded(frame.x[8]);
         }
     });
     match route {
@@ -394,7 +396,13 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> Pending
     fn epoll_wait(&mut self) -> FamilyCompletion {
         self.ipc_transfer()
     }
-    fn lifecycle(&mut self, _: u64) -> FamilyCompletion {
+    fn original_argument0(&self) -> u64 {
+        self.frame.x[0]
+    }
+    fn install_result(&mut self, result: SyscallResult) {
+        self.frame.x[0] = result.raw() as u64;
+    }
+    fn lifecycle(&mut self, call: LifecycleCall) -> Option<LifecycleOutcome> {
         let frame = &mut *self.frame;
         let counters = self.counters;
         let zone = &mut self.zone;
@@ -417,13 +425,10 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> Pending
                 task,
                 validator: &file::HardwareValidator,
             };
-            if let Some(action) = lifecycle::serve(frame, counters, task, sched, *venue, &mut user)
-            {
-                return action;
-            }
+            return lifecycle::invoke(call, frame, counters, task, sched, *venue, &mut user);
         }
 
-        FamilyCompletion::Forward
+        None
     }
     fn futex(&mut self) -> FamilyCompletion {
         let frame = &mut *self.frame;
@@ -1011,6 +1016,71 @@ pub unsafe fn serve_locked_file_op(
 mod tests {
     use super::*;
     use core::sync::atomic::Ordering;
+
+    #[test]
+    fn invalid_lifecycle_entry_does_not_publish_result_or_original_argument() {
+        use super::super::thread_setup::{LifecycleThread, LifecycleVenue};
+        use carrick_el1_abi::{LifecycleHatches, ThreadControlSlot, ThreadLifecyclePage};
+        struct Venue {
+            page: ThreadLifecyclePage,
+            control: ThreadControlSlot,
+        }
+        impl LifecycleVenue for Venue {
+            fn thread<'a>(&'a self, task: &'a CurrentTask) -> Option<LifecycleThread<'a>> {
+                task.execution.generation.store(12, Ordering::Release);
+                Some(LifecycleThread {
+                    page: &self.page,
+                    slot: &self.control,
+                })
+            }
+            fn born_slot(
+                &self,
+                _: &ThreadLifecyclePage,
+                _: carrick_el1_abi::EntryRef,
+            ) -> Option<&ThreadControlSlot> {
+                None
+            }
+        }
+        for scale in [1, 2, 8] {
+            for _ in 0..scale {
+                let venue = Venue {
+                    page: ThreadLifecyclePage::with_hatches(LifecycleHatches::ON),
+                    control: ThreadControlSlot::new(),
+                };
+                assert!(venue.control.publish_visible_tid(41));
+                let tasks = [CurrentTask::new()];
+                tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+                tasks[0].linux.orig_arg0.store(77, Ordering::Relaxed);
+                let counters = Counters::default();
+                let mut frame = TrapFrame::default();
+                frame.x[0] = 0xfeed;
+                frame.x[8] = 178;
+                let mut pending = El1PendingFamilies {
+                    handoff: None,
+                    frame: &mut frame,
+                    counters: &counters,
+                    current_tasks: &tasks,
+                    fd_map: &[],
+                    object_table: &[],
+                    open_table: &[],
+                    inotify_table: &[],
+                    name_cache: &InotifyNameCache::new(),
+                    zone: None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
+                    ipc: None,
+                    lifecycle: Some(&venue),
+                    cache_lookup: |_| core::ptr::null_mut(),
+                };
+                assert_eq!(
+                    carrick_personality_linux::dispatch::dispatch(178, u64::MAX, &mut pending),
+                    carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion
+                );
+                assert_eq!(frame.x[0], 0xfeed);
+                assert_eq!(tasks[0].linux.orig_arg0.load(Ordering::Relaxed), 77);
+                assert_eq!(counters.served[178].load(Ordering::Relaxed), 0);
+                assert_eq!(tasks[0].linux.served_with_work.load(Ordering::Acquire), 0);
+            }
+        }
+    }
 
     #[test]
     fn stale_futex_handoffs_refuse_the_initiating_entry() {
