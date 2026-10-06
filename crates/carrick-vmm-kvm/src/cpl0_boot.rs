@@ -15,7 +15,8 @@ use carrick_el1_abi::Lifecycle;
 use carrick_el1_abi::{
     BlockedMask, Counters, CurrentTask, EL1_BOOTSTRAP_METADATA_SIZE, El1TaskId, ThreadControlSlot,
     ThreadLifecyclePage, X86_CPL0_BOOTSTRAP_METADATA_BASE, X86_CPL0_DYNAMIC_METADATA_BASE,
-    X86_CPL0_INITIAL_EXTENT_MAX_SIZE, X86_CPL0_INITIAL_EXTENT_VA, X86_CPL0_REGION_BASE,
+    X86_CPL0_INITIAL_EXTENT_GPA, X86_CPL0_INITIAL_EXTENT_MAX_SIZE, X86_CPL0_INITIAL_EXTENT_VA,
+    X86_CPL0_REGION_BASE,
 };
 use carrick_el1_abi::{ReservationMm, ReservationRange};
 use carrick_el1_abi::{
@@ -55,10 +56,9 @@ const META_GPA: u64 = 0xc0_0000;
 const META_LEN: u64 = 0x10_0000;
 const PRODUCTION_METADATA_GPA: u64 = META_GPA;
 const ALLOCATOR_GPA: u64 = 0x20_00000;
-const INITIAL_EXTENT_GPA: u64 = 0x40_00000;
+const INITIAL_EXTENT_GPA: u64 = X86_CPL0_INITIAL_EXTENT_GPA;
 const KERNEL_REGION_GPA: u64 = 0x1_0000_0000;
 const INITIAL_MM_KEY: u64 = 301;
-static NEXT_EXTENT_ID: AtomicU64 = AtomicU64::new(1);
 const INITIAL_STACK_TOP: u64 = 0x7fff_0000;
 const INITIAL_STACK_SIZE: u64 = 0x1_0000;
 const COUNTERS_OFFSET: u64 = 0x1_0000;
@@ -71,6 +71,10 @@ const _: () = {
     assert!(size_of::<CpuBinding>() <= STRIDE as usize);
     assert!(ROUTES_OFFSET >= 0xc000 + 9 * size_of::<ThreadControlSlot>() as u64);
     assert!(ROUTES_OFFSET + size_of::<PublishedApicIds>() as u64 <= COUNTERS_OFFSET);
+    assert!(
+        carrick_el1_abi::X86_CPL0_RESERVATIONS_OFFSET + size_of::<X86Cpl0Reservations>() as u64
+            <= META_LEN
+    );
 };
 const IST_STACK_BASE: u64 = 0xf0_0000;
 const IMAGE_VA: u64 = 0xffff_ffff_8000_0000;
@@ -87,6 +91,107 @@ const _: () = assert!(FIXTURE_PML4_CAPACITY == carrick_x86::X86_PML4_CAPACITY);
 
 fn fail(message: impl Into<String>) -> TrapError {
     TrapError::Hypervisor(message.into())
+}
+
+fn backing_identity(ids: &ObjectIdRegistry) -> Result<BackingIdentity, TrapError> {
+    Ok(BackingIdentity {
+        frame_id: NonZeroU64::new(
+            ids.frame_id()
+                .map_err(|error| fail(format!("carrier frame identity: {error}")))?
+                .raw(),
+        )
+        .ok_or_else(|| fail("carrier frame identity zero"))?,
+        mapping_id: NonZeroU64::new(
+            ids.mapping_id()
+                .map_err(|error| fail(format!("carrier mapping identity: {error}")))?
+                .raw(),
+        )
+        .ok_or_else(|| fail("carrier mapping identity zero"))?,
+        owner_generation: NonZeroU64::MIN,
+        inventory_revision: NonZeroU64::MIN,
+    })
+}
+
+/// Authenticate the guest's mutable completion against the retained host
+/// request before any reply field sizes a read, indexes a grant, or subtracts
+/// a stack bound. The stopped carrier still owns all unpublished grants on
+/// refusal, so dropping its inventory rolls the transaction back.
+fn validate_initial_reply(
+    request: &X86InitialBootRequest,
+    reply: &X86InitialBootRequest,
+    grant_count: usize,
+    root_gpa: u64,
+    initial_break: u64,
+) -> Result<(), TrapError> {
+    let host_grants = (request.table_grant_count as usize)
+        .checked_add(request.data_grant_count as usize)
+        .ok_or_else(|| fail("initial MM host grant count overflow"))?;
+    let stack_base = request
+        .stack_top
+        .checked_sub(request.stack_size)
+        .ok_or_else(|| fail("initial MM host stack underflow"))?;
+    if reply.result_status != X86_INITIAL_BOOT_LOADED
+        || reply.magic != request.magic
+        || reply.version != request.version
+        || reply.region_count != request.region_count
+        || reply.entry != request.entry
+        || reply.phdr != request.phdr
+        || reply.phent != request.phent
+        || reply.phnum != request.phnum
+        || reply.argc != request.argc
+        || reply.envc != request.envc
+        || reply.regions_gpa != request.regions_gpa
+        || reply.strings_gpa != request.strings_gpa
+        || reply.grants_gpa != request.grants_gpa
+        || reply.table_grant_count != request.table_grant_count
+        || reply.data_grant_count != request.data_grant_count
+        || reply.publications_gpa != request.publications_gpa
+        || reply.publication_capacity != request.publication_capacity
+        || reply.stack_top != request.stack_top
+        || reply.stack_size != request.stack_size
+        || reply.random != request.random
+        || reply.extent_pages != request.extent_pages
+        || reply.mm_key != request.mm_key
+        || reply.generation != request.generation
+        || host_grants != grant_count
+        || request.table_grant_count == 0
+        || request.data_grant_count == 0
+        || reply.publication_count == 0
+        || reply.publication_count != request.data_grant_count
+        || reply.result_data_used != reply.publication_count
+        || reply.result_root_gpa != root_gpa
+        || reply.result_table_used == 0
+        || reply.result_table_used > request.table_grant_count
+        || reply.result_initial_break != initial_break
+        || reply.result_rsp < stack_base
+        || reply.result_rsp >= request.stack_top
+    {
+        return Err(fail("production initial MM reply identity"));
+    }
+    Ok(())
+}
+
+fn initial_stack_pages(
+    image: &carrick_mem::x86_initial_image::X86InitialImage<'_>,
+    argv: &[String],
+    env: &[String],
+) -> Result<usize, TrapError> {
+    use carrick_el1::isa::x86_initial_mm::{InitialStackSpec, build_initial_stack};
+    let argv_bytes: Vec<&[u8]> = argv.iter().map(|value| value.as_bytes()).collect();
+    let env_bytes: Vec<&[u8]> = env.iter().map(|value| value.as_bytes()).collect();
+    let stack = build_initial_stack(&InitialStackSpec {
+        entry: image.entry,
+        phdr: image.phdr,
+        phent: image.phent,
+        phnum: image.phnum,
+        argv: &argv_bytes,
+        envp: &env_bytes,
+        random: [0; 16],
+        stack_top: INITIAL_STACK_TOP,
+        stack_size: INITIAL_STACK_SIZE,
+    })
+    .map_err(|error| fail(format!("initial stack sizing: {error:?}")))?;
+    Ok(stack.bytes.len() / 4096)
 }
 
 fn record_bytes<T: Copy>(record: &T) -> &[u8] {
@@ -106,7 +211,7 @@ fn append_records<T: Copy>(buffer: &mut Vec<u8>, records: &[T]) -> Result<u64, T
 }
 
 struct InitialInventory {
-    authority: FrameInventoryAuthority,
+    authority: Arc<FrameInventoryAuthority>,
     receipt: Option<carrick_hal::FrameInventoryApplyReceipt>,
     frames: Vec<(FrameGpa, BackingIdentity)>,
     expected: usize,
@@ -114,11 +219,15 @@ struct InitialInventory {
 }
 impl InitialInventory {
     fn stage(
+        authority: Arc<FrameInventoryAuthority>,
+        ids: &ObjectIdRegistry,
         gpas: impl IntoIterator<Item = FrameGpa>,
+        table_grants: usize,
     ) -> Result<(Self, Vec<X86InitialBootGrant>), TrapError> {
         let gpas: Vec<_> = gpas.into_iter().collect();
-        let authority = FrameInventoryAuthority::new();
-        let ids = ObjectIdRegistry::new();
+        if table_grants == 0 || table_grants >= gpas.len() {
+            return Err(fail("initial inventory grant partition"));
+        }
         let capacity = FrameEventCapacity::for_event_count(
             gpas.len()
                 .checked_mul(2)
@@ -126,7 +235,7 @@ impl InitialInventory {
         )
         .map_err(|error| fail(format!("initial inventory capacity: {error}")))?;
         let mut reservation = authority
-            .reserve(&ids, gpas.len(), gpas.len(), capacity)
+            .reserve(ids, gpas.len(), gpas.len(), capacity)
             .map_err(|error| fail(format!("initial inventory reserve: {error}")))?;
         let transaction = reservation.transaction();
         let generation = MappingGeneration::from_backend_counter(NonZeroU64::MIN);
@@ -134,45 +243,47 @@ impl InitialInventory {
             NonZeroU64::new(4096).ok_or_else(|| fail("initial frame length"))?,
         );
         let mut rows = Vec::with_capacity(gpas.len());
-        for gpa in gpas {
+        for (index, gpa) in gpas.into_iter().enumerate() {
             let frame = reservation
                 .claim_frame()
                 .map_err(|error| fail(format!("initial frame candidate: {error}")))?;
             let mapping = reservation
                 .claim_mapping()
                 .map_err(|error| fail(format!("initial mapping candidate: {error}")))?;
-            reservation
-                .push(FrameInventoryEvent::PrepareMapping {
-                    transaction,
-                    frame,
-                    mapping,
-                    generation,
-                    gpa: carrick_guest_mem::Gpa(gpa.raw()),
-                    length,
-                    permissions: MemPerms {
-                        read: true,
-                        write: true,
-                        exec: false,
-                    },
-                })
-                .map_err(|error| fail(format!("initial inventory prepare: {error}")))?;
-            reservation
-                .push(FrameInventoryEvent::PublishMapping {
-                    transaction,
-                    mapping,
-                    generation,
-                })
-                .map_err(|error| fail(format!("initial inventory publish: {error}")))?;
-            rows.push((gpa, frame, mapping));
+            if index >= table_grants {
+                reservation
+                    .push(FrameInventoryEvent::PrepareMapping {
+                        transaction,
+                        frame,
+                        mapping,
+                        generation,
+                        gpa: carrick_guest_mem::Gpa(gpa.raw()),
+                        length,
+                        permissions: MemPerms {
+                            read: true,
+                            write: true,
+                            exec: false,
+                        },
+                    })
+                    .map_err(|error| fail(format!("initial inventory prepare: {error}")))?;
+                reservation
+                    .push(FrameInventoryEvent::PublishMapping {
+                        transaction,
+                        mapping,
+                        generation,
+                    })
+                    .map_err(|error| fail(format!("initial inventory publish: {error}")))?;
+            }
+            rows.push((gpa, frame, mapping, index >= table_grants));
         }
         let mm = MmId::from_raw_u64(INITIAL_MM_KEY).ok_or_else(|| fail("initial inventory MM"))?;
         let (_, receipt) = authority
             .apply_with_receipt(mm, reservation.commit(()))
             .map_err(|error| fail(format!("initial inventory apply: {error}")))?;
-        let mut frames = Vec::with_capacity(rows.len());
+        let mut frames = Vec::with_capacity(rows.len() - table_grants);
         let mut grants = Vec::with_capacity(rows.len());
-        for (gpa, frame, mapping) in rows {
-            if !receipt.authorizes(mapping, frame) {
+        for (gpa, frame, mapping, is_data) in rows {
+            if is_data && !receipt.authorizes(mapping, frame) {
                 return Err(fail("initial inventory missing mapping"));
             }
             let identity = BackingIdentity {
@@ -184,7 +295,9 @@ impl InitialInventory {
                 inventory_revision: NonZeroU64::new(receipt.revision())
                     .ok_or_else(|| fail("initial inventory revision"))?,
             };
-            frames.push((gpa, identity));
+            if is_data {
+                frames.push((gpa, identity));
+            }
             grants.push(X86InitialBootGrant {
                 gpa: gpa.raw(),
                 frame_id: frame.raw(),
@@ -354,6 +467,8 @@ pub struct Cpl0Carrier {
     pub(crate) ram: Arc<GuestRam>,
     initial_extent: Option<(BackingHandle, usize)>,
     _kernel_region: Option<BackingHandle>,
+    frame_inventory: Arc<FrameInventoryAuthority>,
+    object_ids: Arc<ObjectIdRegistry>,
     initial_inventory: Option<InitialInventory>,
     metadata_base: NonNull<u8>,
     host_forwards: u64,
@@ -372,7 +487,6 @@ impl Cpl0Carrier {
         env: &[String],
     ) -> Result<usize, TrapError> {
         const PAGE: usize = 4096;
-        const STACK_PAGES: usize = 16;
         const MAX_BYTES: usize = X86_CPL0_INITIAL_EXTENT_MAX_SIZE as usize;
         let mut image_pages = 0usize;
         let mut initialized = 0usize;
@@ -392,7 +506,7 @@ impl Cpl0Carrier {
             .try_fold(0usize, |sum, value| sum.checked_add(value.len()))
             .ok_or_else(|| fail("initial argv/env bytes"))?;
         let user_pages = image_pages
-            .checked_add(STACK_PAGES)
+            .checked_add(initial_stack_pages(image, argv, env)?)
             .ok_or_else(|| fail("initial user pages"))?;
         let table_pages = user_pages
             .checked_mul(3)
@@ -502,6 +616,15 @@ impl Cpl0Carrier {
             && identity.mm == INITIAL_MM_KEY
             && identity.lifecycle_page == METADATA_VA
             && identity.control_slot == METADATA_VA + CONTROL_OFFSET
+    }
+
+    /// Initial data publications belong to the carrier's one frame inventory,
+    /// which remains available to subsequent fault and fork services.
+    pub fn initial_inventory_custody(&self) -> bool {
+        self.initial_inventory.as_ref().is_some_and(|initial| {
+            Arc::ptr_eq(&self.frame_inventory, &initial.authority)
+                && initial.authority.snapshot().mappings.len() == initial.expected
+        })
     }
 
     pub fn retained_bytes(&self) -> usize {
@@ -618,7 +741,7 @@ impl Cpl0Carrier {
             .map(|r| ((r.end - r.start) / 4096) as usize)
             .sum();
         let data_grants = image_pages
-            .checked_add((INITIAL_STACK_SIZE / 4096) as usize)
+            .checked_add(initial_stack_pages(image, argv, env)?)
             .ok_or_else(|| fail("initial data grants"))?;
         let table_grants = data_grants
             .checked_mul(3)
@@ -672,9 +795,14 @@ impl Cpl0Carrier {
         {
             return Err(fail("initial extent too small for frame grants"));
         }
-        let (mut inventory, grants) = InitialInventory::stage((0..grant_count).map(|index| {
-            FrameGpa::new(INITIAL_EXTENT_GPA + (frame_offset + index * 4096) as u64)
-        }))?;
+        let (mut inventory, grants) = InitialInventory::stage(
+            Arc::clone(&self.frame_inventory),
+            &self.object_ids,
+            (0..grant_count).map(|index| {
+                FrameGpa::new(INITIAL_EXTENT_GPA + (frame_offset + index * 4096) as u64)
+            }),
+            table_grants,
+        )?;
         inventory
             .publish()
             .map_err(|error| fail(error.to_string()))?;
@@ -688,7 +816,12 @@ impl Cpl0Carrier {
         // unpublished root cannot be in any live vCPU TLB. Both vCPUs are
         // stopped here; reject a reused root before the first descriptor edit.
         for cpu in &self.cpus {
-            if cpu.get_gpr(X86Reg::Cr3)? == grants[0].gpa {
+            if cpu.get_gpr(X86Reg::Cr3)?
+                == grants
+                    .first()
+                    .ok_or_else(|| fail("initial root grant absent"))?
+                    .gpa
+            {
                 return Err(fail("initial root already live in a vCPU"));
             }
         }
@@ -802,11 +935,7 @@ impl Cpl0Carrier {
         cpu.fd()
             .set_regs(&regs)
             .map_err(|error| fail(error.to_string()))?;
-        let watchdog = Watchdog::start();
         let exit = HvVcpu::run(&mut self.cpus[0])?;
-        if watchdog.expired() {
-            return Err(fail("production initial MM deadline"));
-        }
         if !matches!(
             exit,
             VcpuExit::IoOut {
@@ -841,28 +970,21 @@ impl Cpl0Carrier {
                 reply.result_status
             )));
         }
-        if reply.magic != request.magic
-            || reply.version != request.version
-            || reply.mm_key != INITIAL_MM_KEY
-            || reply.generation != 1
-            || reply.result_data_used != reply.publication_count
-            || reply.publication_count == 0
-            || reply.publication_count > reply.publication_capacity
-            || reply.result_root_gpa != grants[0].gpa
-            || reply.result_table_used == 0
-            || reply.result_table_used > reply.table_grant_count
-            || reply.result_initial_break
-                != image
-                    .regions
-                    .iter()
-                    .map(|region| region.end)
-                    .max()
-                    .unwrap_or(0)
-            || reply.result_rsp >= reply.stack_top
-            || reply.result_rsp < reply.stack_top - reply.stack_size
-        {
-            return Err(fail("production initial MM reply identity"));
-        }
+        validate_initial_reply(
+            &request,
+            &reply,
+            grants.len(),
+            grants
+                .first()
+                .ok_or_else(|| fail("initial root grant absent"))?
+                .gpa,
+            image
+                .regions
+                .iter()
+                .map(|region| region.end)
+                .max()
+                .unwrap_or(0),
+        )?;
         let mm = NonZeroU64::new(reply.mm_key).ok_or_else(|| fail("initial MM key"))?;
         let generation =
             NonZeroU64::new(reply.generation).ok_or_else(|| fail("initial MM generation"))?;
@@ -873,9 +995,6 @@ impl Cpl0Carrier {
             mm: MmGeneration::new(mm),
             generation: ContextGeneration::new(generation),
         };
-        self._vm
-            .install_root(mm, context)
-            .map_err(|error| fail(error.to_string()))?;
         let publication_bytes = self
             ._vm
             .read(
@@ -894,7 +1013,27 @@ impl Cpl0Carrier {
                     .read_unaligned()
             });
         }
-        let tables: Vec<RootGpa> = grants[1..reply.result_table_used as usize]
+        let linked_tables = publications.iter().try_fold(1usize, |count, publication| {
+            if publication.revision != GuestMmuPublication::REVISION
+                || publication.outcome != GuestMmuPublication::APPLIED
+                || publication.mm_key != mm.get()
+                || publication.root_gpa != root.address().raw()
+                || publication.generation != generation.get()
+                || publication.span_len != 4096
+            {
+                return None;
+            }
+            count.checked_add(publication.tables_linked as usize)
+        });
+        if linked_tables != Some(reply.result_table_used as usize) {
+            return Err(fail("initial publication table receipt count"));
+        }
+        self._vm
+            .install_root(mm, context)
+            .map_err(|error| fail(error.to_string()))?;
+        let tables: Vec<RootGpa> = grants
+            .get(1..reply.result_table_used as usize)
+            .ok_or_else(|| fail("initial table grant range"))?
             .iter()
             .map(|grant| {
                 RootGpa::page_aligned(FrameGpa::new(grant.gpa))
@@ -912,7 +1051,11 @@ impl Cpl0Carrier {
                     executable: region.perms.execute,
                     user: true,
                 }
-            } else if publication.span_va >= reply.stack_top - reply.stack_size
+            } else if publication.span_va
+                >= reply
+                    .stack_top
+                    .checked_sub(reply.stack_size)
+                    .ok_or_else(|| fail("initial stack bound"))?
                 && publication.span_va < reply.stack_top
             {
                 Permissions {
@@ -923,8 +1066,13 @@ impl Cpl0Carrier {
             } else {
                 return Err(fail("initial publication outside ELF and stack"));
             };
-            let output = FrameGpa::new(grants[table_grants + index].gpa);
-            let grant = grants[table_grants + index];
+            let grant_index = table_grants
+                .checked_add(index)
+                .ok_or_else(|| fail("initial data grant index overflow"))?;
+            let grant = *grants
+                .get(grant_index)
+                .ok_or_else(|| fail("initial data grant absent"))?;
+            let output = FrameGpa::new(grant.gpa);
             let identity = BackingIdentity {
                 frame_id: NonZeroU64::new(grant.frame_id)
                     .ok_or_else(|| fail("initial frame identity"))?,
@@ -1541,6 +1689,8 @@ impl Cpl0Carrier {
             }
         }
         let ram = Arc::new(ram);
+        let frame_inventory = Arc::new(FrameInventoryAuthority::new());
+        let object_ids = Arc::new(ObjectIdRegistry::new());
         let mut memory = CarrierMemory::create().map_err(|e| fail(e.to_string()))?;
         if interrupts {
             crate::carrier_interrupts::create_irqchip(memory.vm())?;
@@ -1549,7 +1699,7 @@ impl Cpl0Carrier {
             .install_bootstrap(Arc::clone(&ram))
             .map_err(|e| fail(e.to_string()))?;
         let kernel_region = if initial_extent_bytes.is_some() {
-            let identity = NonZeroU64::new(0x101).ok_or_else(|| fail("kernel region identity"))?;
+            let identity = backing_identity(&object_ids)?;
             let extent = BackingExtent::private(
                 FrameGpa::new(KERNEL_REGION_GPA),
                 carrick_el1_abi::EL1_REGION_SIZE as usize,
@@ -1558,12 +1708,7 @@ impl Cpl0Carrier {
             let handles = memory
                 .install(&[PreparedBacking {
                     extent: Arc::new(extent),
-                    identity: BackingIdentity {
-                        frame_id: identity,
-                        mapping_id: identity,
-                        owner_generation: identity,
-                        inventory_revision: identity,
-                    },
+                    identity,
                 }])
                 .map_err(|e| fail(e.to_string()))?;
             Some(handles[0])
@@ -1571,19 +1716,13 @@ impl Cpl0Carrier {
             None
         };
         let initial_extent = if let Some(len) = initial_extent_bytes {
-            let identity = NonZeroU64::new(NEXT_EXTENT_ID.fetch_add(1, Ordering::Relaxed))
-                .ok_or_else(|| fail("initial backing identity exhausted"))?;
+            let identity = backing_identity(&object_ids)?;
             let extent = BackingExtent::private(FrameGpa::new(INITIAL_EXTENT_GPA), len)
                 .map_err(|e| fail(e.to_string()))?;
             let handles = memory
                 .install(&[PreparedBacking {
                     extent: Arc::new(extent),
-                    identity: BackingIdentity {
-                        frame_id: identity,
-                        mapping_id: identity,
-                        owner_generation: identity,
-                        inventory_revision: identity,
-                    },
+                    identity,
                 }])
                 .map_err(|e| fail(e.to_string()))?;
             Some((handles[0], len))
@@ -1717,6 +1856,8 @@ impl Cpl0Carrier {
             ram,
             initial_extent,
             _kernel_region: kernel_region,
+            frame_inventory,
+            object_ids,
             initial_inventory: None,
             metadata_base,
             host_forwards: 0,
@@ -1998,6 +2139,94 @@ impl Cpl0Carrier {
             }
         }
         Err(fail("CPL0 control exit budget exceeded"))
+    }
+}
+
+#[cfg(test)]
+mod initial_reply_tests {
+    use super::*;
+
+    #[test]
+    fn initial_inventory_publishes_data_frames_without_table_grants() {
+        let base = INITIAL_EXTENT_GPA + 0x20_000;
+        let (inventory, grants) = InitialInventory::stage(
+            Arc::new(FrameInventoryAuthority::new()),
+            &ObjectIdRegistry::new(),
+            (0..4).map(|index| FrameGpa::new(base + index * 4096)),
+            2,
+        )
+        .expect("staged exact grants");
+        assert_eq!(grants.len(), 4);
+        let rows = inventory.authority.snapshot().mappings;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].gpa.0, grants[2].gpa);
+        assert_eq!(rows[1].gpa.0, grants[3].gpa);
+    }
+
+    #[test]
+    fn corrupted_guest_reply_cannot_change_host_grant_or_stack_geometry() {
+        let request = X86InitialBootRequest {
+            magic: X86_INITIAL_BOOT_MAGIC,
+            version: X86_INITIAL_BOOT_VERSION,
+            table_grant_count: 5,
+            data_grant_count: 2,
+            publication_capacity: 2,
+            publications_gpa: INITIAL_EXTENT_GPA + 4096,
+            stack_top: INITIAL_STACK_TOP,
+            stack_size: INITIAL_STACK_SIZE,
+            mm_key: INITIAL_MM_KEY,
+            generation: 1,
+            ..Default::default()
+        };
+        let valid = X86InitialBootRequest {
+            result_status: X86_INITIAL_BOOT_LOADED,
+            publication_count: 2,
+            result_data_used: 2,
+            result_table_used: 2,
+            result_root_gpa: INITIAL_EXTENT_GPA + 0x2000,
+            result_initial_break: 0x401000,
+            result_rsp: INITIAL_STACK_TOP - 16,
+            ..request
+        };
+        assert!(
+            validate_initial_reply(&request, &valid, 7, valid.result_root_gpa, 0x401000).is_ok()
+        );
+        for corrupted in [
+            X86InitialBootRequest {
+                table_grant_count: u32::MAX,
+                ..valid
+            },
+            X86InitialBootRequest {
+                publication_capacity: u32::MAX,
+                ..valid
+            },
+            X86InitialBootRequest {
+                publications_gpa: u64::MAX,
+                ..valid
+            },
+            X86InitialBootRequest {
+                stack_top: 0,
+                ..valid
+            },
+            X86InitialBootRequest {
+                stack_size: u64::MAX,
+                ..valid
+            },
+            X86InitialBootRequest {
+                publication_count: u32::MAX,
+                ..valid
+            },
+            X86InitialBootRequest {
+                result_table_used: u32::MAX,
+                ..valid
+            },
+        ] {
+            assert!(
+                validate_initial_reply(&request, &corrupted, 7, valid.result_root_gpa, 0x401000)
+                    .is_err(),
+                "accepted corrupted guest reply: {corrupted:?}"
+            );
+        }
     }
 }
 
