@@ -2735,7 +2735,7 @@ impl Thread {
             window
                 .borrow()
                 .as_ref()
-                .and_then(SystemChargeWindow::live)
+                .and_then(|window| window.live())
                 .is_some_and(|live| Arc::ptr_eq(&live, self))
         });
         if already_current {
