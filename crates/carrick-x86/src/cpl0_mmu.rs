@@ -14,7 +14,6 @@ use carrick_mmu_core::aarch64::descriptor_txn::{
 use carrick_mmu_core::x86::owner_mmu::X86Mmu;
 use carrick_personality_linux::mm::LinuxReservationPolicy;
 use carrick_sched_core::ZoneTables;
-use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub const PROGRESS_RESERVATIONS: u64 = 0x160_0000;
@@ -35,9 +34,34 @@ unsafe impl PinnedMetadataExtent for GuestMetadataPin {
 
 /// Direct supervisor physical descriptor words. In CPL0, page tables
 /// are identity-mapped in the supervisor page table range.
-pub struct Cpl0DirectWords;
+pub struct Cpl0DirectWords {
+    start: u64,
+    end: u64,
+}
 
 impl Cpl0DirectWords {
+    /// Construct a descriptor view over an identity-mapped supervisor range.
+    ///
+    /// # Safety
+    ///
+    /// Every byte in `start..end` must remain mapped, writable, naturally
+    /// aligned table memory for the lifetime of the returned view. No host
+    /// caller may construct this from guest physical addresses.
+    pub unsafe fn from_identity_mapped_range(start: u64, end: u64) -> Option<Self> {
+        (start != 0 && start < end && start.is_multiple_of(4096) && end.is_multiple_of(4096))
+            .then_some(Self { start, end })
+    }
+
+    fn word(&self, pa: u64) -> Result<*const AtomicU64, DescriptorRefusal> {
+        if !pa.is_multiple_of(8)
+            || pa < self.start
+            || pa.checked_add(8).is_none_or(|end| end > self.end)
+        {
+            return Err(DescriptorRefusal::TableOutsidePrimary);
+        }
+        Ok(pa as *const AtomicU64)
+    }
+
     pub fn invalidate_range(&self, va: u64, len: u64) {
         for page in (va..va.saturating_add(len)).step_by(4096) {
             #[cfg(target_os = "none")]
@@ -52,20 +76,16 @@ impl Cpl0DirectWords {
 
 impl LiveDescriptorWords for Cpl0DirectWords {
     fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
-        if !pa.is_multiple_of(8) {
-            return Err(DescriptorRefusal::BadRange);
-        }
-        let ptr = pa as *const AtomicU64;
-        // SAFETY: supervisor direct identity map covers page-table physical memory.
+        let ptr = self.word(pa)?;
+        // SAFETY: construction proves the complete word lies in the retained,
+        // identity-mapped table-memory view and `word` proves alignment.
         Ok(unsafe { (*ptr).load(Ordering::Acquire) })
     }
 
     fn compare_exchange(&self, pa: u64, current: u64, new: u64) -> Result<bool, DescriptorRefusal> {
-        if !pa.is_multiple_of(8) {
-            return Err(DescriptorRefusal::BadRange);
-        }
-        let ptr = pa as *const AtomicU64;
-        // SAFETY: supervisor direct identity map covers page-table physical memory.
+        let ptr = self.word(pa)?;
+        // SAFETY: construction proves the complete word lies in the retained,
+        // identity-mapped table-memory view and `word` proves alignment.
         Ok(unsafe {
             (*ptr)
                 .compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
@@ -74,11 +94,9 @@ impl LiveDescriptorWords for Cpl0DirectWords {
     }
 
     fn store_unlinked(&self, pa: u64, value: u64) -> Result<(), DescriptorRefusal> {
-        if !pa.is_multiple_of(8) {
-            return Err(DescriptorRefusal::BadRange);
-        }
-        let ptr = pa as *const AtomicU64;
-        // SAFETY: supervisor direct identity map covers page-table physical memory.
+        let ptr = self.word(pa)?;
+        // SAFETY: construction proves the complete word lies in the retained,
+        // identity-mapped table-memory view and `word` proves alignment.
         unsafe { (*ptr).store(value, Ordering::Release) };
         Ok(())
     }
@@ -190,9 +208,17 @@ pub fn serve_cpl0_grant(binding: &CpuBinding, slot_index: usize) -> u32 {
         PROGRESS_PORTAL
     };
 
+    // SAFETY: the carrier retains these published supervisor records for the
+    // vCPU lifetime and binds their exact mapped addresses before entry.
     let zone = unsafe { &*zone_ptr };
+    // SAFETY: checked nonzero above; the carrier publishes and retains the
+    // correctly aligned shared reservation record at this address.
     let reservations = unsafe { &*(reservations_addr as *const SharedReservations) };
+    // SAFETY: checked nonzero above; the carrier publishes and retains the
+    // correctly aligned residency record at this address.
     let residency = unsafe { &*(residency_addr as *const FrameGrantResidencyTable) };
+    // SAFETY: checked nonzero above; the carrier publishes and retains the
+    // correctly aligned portal slots at this address.
     let portal_slots = unsafe { &*(portal_addr as *const MmPortalSlots) };
 
     let Some(grant_slot) = portal_slots.grant(slot_index) else {
@@ -200,7 +226,7 @@ pub fn serve_cpl0_grant(binding: &CpuBinding, slot_index: usize) -> u32 {
         return 22;
     };
 
-    let carrier = portal_slots.carrier().unwrap_or(NonZeroU64::MIN);
+    let carrier = portal_slots.carrier().unwrap_or(core::num::NonZeroU64::MIN);
 
     let portal = carrick_core::mm::transaction::MmPortal::<
         GuestMetadataPin,
@@ -210,7 +236,17 @@ pub fn serve_cpl0_grant(binding: &CpuBinding, slot_index: usize) -> u32 {
     >::for_zone(carrier, reservations, zone)
     .with_mmu(X86Mmu);
 
-    let words = Cpl0DirectWords;
+    // SAFETY: the CPL0 carrier binds only the retained identity-mapped table
+    // arena; host builds never call this entry over guest physical addresses.
+    let Some(words) = (unsafe {
+        Cpl0DirectWords::from_identity_mapped_range(
+            binding.table_memory_start,
+            binding.table_memory_end,
+        )
+    }) else {
+        binding.completions.fetch_add(1, Ordering::Relaxed);
+        return MmError::Invalid.errno();
+    };
     let window_opt = grant_slot.window();
     let result = serve_grant(&portal, grant_slot, &words, residency, binding.slot, || {
         if let Some(w) = window_opt {
@@ -243,6 +279,24 @@ pub fn serve_cpl0_grant(binding: &CpuBinding, slot_index: usize) -> u32 {
                 MmError::Fault => 405,
                 _ => 408,
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_words_refuse_every_address_outside_the_qualified_view() {
+        // SAFETY: the test never accesses the declared fake range; every
+        // attempted word is deliberately outside it and must be refused.
+        let words = unsafe { Cpl0DirectWords::from_identity_mapped_range(0x2000, 0x3000) }.unwrap();
+        for address in [0, 0x1ff8, 0x3000, 0x4000] {
+            assert_eq!(
+                words.load(address),
+                Err(DescriptorRefusal::TableOutsidePrimary)
+            );
         }
     }
 }

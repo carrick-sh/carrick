@@ -457,6 +457,8 @@ impl Cpl0Carrier {
                     } else {
                         0
                     },
+                    table_memory_start: LAYOUT.pml4_base,
+                    table_memory_end: 0xc0_0000,
                 });
             }
         }

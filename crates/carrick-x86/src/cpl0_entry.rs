@@ -96,6 +96,10 @@ pub struct CpuBinding {
     pub residency_address: u64,
     /// Published MmPortalSlots guest address; 0 in legacy M2.
     pub portal_address: u64,
+    /// Inclusive start of the authenticated supervisor table-memory view.
+    pub table_memory_start: u64,
+    /// Exclusive end of the authenticated supervisor table-memory view.
+    pub table_memory_end: u64,
 }
 const _: () = assert!(core::mem::offset_of!(CpuBinding, self_address) == 16);
 
