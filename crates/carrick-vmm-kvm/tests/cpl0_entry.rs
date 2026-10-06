@@ -226,6 +226,17 @@ fn make_shared_carrier(
     p: &[u8],
     mutate: impl FnOnce(&ZoneTables, &mut ContextBinding),
 ) -> Result<Cpl0Carrier, carrick_hal::TrapError> {
+    make_shared_carrier_at_root(
+        p,
+        RootGpa::page_aligned(FrameGpa::new(0x60_0000)).unwrap(),
+        mutate,
+    )
+}
+fn make_shared_carrier_at_root(
+    p: &[u8],
+    root: RootGpa,
+    mutate: impl FnOnce(&ZoneTables, &mut ContextBinding),
+) -> Result<Cpl0Carrier, carrick_hal::TrapError> {
     let slot = SlotId::new(0);
     let mut mutate_opt = Some(mutate);
     Cpl0Carrier::boot_shared(&image(), p, slot, move |zone| {
@@ -234,7 +245,7 @@ fn make_shared_carrier(
         zone.enter_guest(slot);
 
         let mm = 11u64;
-        let root = RootGpa::page_aligned(FrameGpa::new(0x60_0000)).unwrap();
+
         let space = zone
             .spaces
             .publish_closed(mm, root.address().raw(), 0)
@@ -421,4 +432,52 @@ fn x1_boot_shared_substrate() {
         0,
         "refusal vacates occupancy"
     );
+}
+
+#[test]
+fn shared_admission_installs_the_issued_hardware_root() {
+    let root = RootGpa::page_aligned(FrameGpa::new(0x68_0000)).unwrap();
+    let va = 0x4000_0000u64;
+    let mut p = program(&[(0x1234, 24)]);
+    p.truncate(p.len() - 2);
+    p.extend_from_slice(&[0x48, 0xbb]);
+    p.extend_from_slice(&va.to_le_bytes());
+    p.extend_from_slice(&[0x0f, 0xb6, 0x3b, 0x48, 0xb8]); // movzx edi,[rbx]
+    p.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    p.extend_from_slice(&[0x0f, 0x05]);
+    let mut carrier = make_shared_carrier_at_root(&p, root, |_, _| {}).unwrap();
+    for (root, ipa, byte) in [
+        (
+            RootGpa::page_aligned(FrameGpa::new(0x60_0000)).unwrap(),
+            0x80_0000,
+            0x41,
+        ),
+        (root, 0xa0_0000, 0x42),
+    ] {
+        carrier.write_guest_bytes(ipa, &[byte]).unwrap();
+        carrier
+            .prepare_root(
+                root,
+                &[carrick_mem::pml4::Pml4MapSpec {
+                    va,
+                    gpa: ipa,
+                    len: 4096,
+                    user: true,
+                    write: true,
+                    exec: false,
+                }],
+            )
+            .unwrap();
+    }
+    let admitted = carrier.observe(0).unwrap();
+    assert_eq!(admitted.admissions[0], 1);
+    assert_eq!(admitted.result, 0);
+    let bytes = carrier.observe(0).unwrap();
+    assert_eq!(
+        bytes.result, 0x42,
+        "shared admission left the bootstrap hardware root installed"
+    );
+    assert_eq!(bytes.entries[0], 1);
+    assert_eq!(bytes.completions[0], 1);
+    assert_eq!(bytes.semantic_host_exits, 0);
 }

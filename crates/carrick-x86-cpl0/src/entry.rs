@@ -184,6 +184,10 @@ mod kernel {
                 doorbell(FATAL_PORT, frame);
                 halt();
             }
+            // SAFETY: native entry authenticated the exact retained sidecar
+            // and its published MM root. Hardware preparation retains the same
+            // supervisor mappings in that root through execution and retirement.
+            unsafe { super::scheduler::install_root(context_binding.context.address.root) };
             binding.admissions.fetch_add(1, Ordering::Release);
         }
         if frame.rax == OBSERVE_NATIVE {

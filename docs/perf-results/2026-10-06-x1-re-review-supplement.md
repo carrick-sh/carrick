@@ -29,3 +29,15 @@ The flag is experimental, as documented by [Miri](https://github.com/rust-lang/m
 This is a type-validity witness, paired with both real KVM suites on the newly
 built image, not a substitute for hardware execution. Receipts:
 `target/x1-review/review2-init-{miri-red,miri-green,image,kvm-green,x86,clippy,fmt}.log`.
+
+## Installed native root
+
+`shared_admission_installs_the_issued_hardware_root` publishes MM11 with
+retained root 0x680000 while bootstrap starts at 0x600000. Both hardware roots
+map the same user VA to distinguishable real bytes (0x42 vs 0x41), using the
+existing PML4 builder for physical preparation. The first ordinary syscall
+must authenticate and install the issued root before returning to user code.
+Restoring the missing installation yields byte 65 instead of 66 while shared
+admission reports success. No host callback applies a semantic owner edit.
+Both KVM suites are green on the rebuilt image. Receipts:
+`target/x1-review/review2-root-{old-image,red,image,green,clippy,fmt}.log`.

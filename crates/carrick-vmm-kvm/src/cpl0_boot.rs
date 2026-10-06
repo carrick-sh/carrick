@@ -114,6 +114,7 @@ pub struct Cpl0Carrier {
     pub(crate) _vm: KvmVm,
     pub(crate) ram: GuestRam,
     metadata_base: NonNull<u8>,
+    boot_maps: Vec<Pml4MapSpec>,
     host_forwards: AtomicU64,
     kicks: AtomicU64,
     work_exits: AtomicU64,
@@ -596,11 +597,40 @@ impl Cpl0Carrier {
             _vm: vm,
             ram,
             metadata_base,
+            boot_maps: maps,
             host_forwards: AtomicU64::new(0),
             kicks: AtomicU64::new(0),
             work_exits: AtomicU64::new(0),
             handbacks: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Prepare retained hardware tables with the same supervisor mappings as
+    /// bootstrap. This supplies physical translation, never MM owner decisions.
+    pub fn prepare_root(
+        &mut self,
+        root: carrick_guest_arch::RootGpa,
+        extra: &[Pml4MapSpec],
+    ) -> Result<(), TrapError> {
+        let address = root.address().raw();
+        let remaining = 0x80_0000u64
+            .checked_sub(address)
+            .filter(|remaining| *remaining >= 4096)
+            .ok_or_else(|| fail("root outside retained hardware table arena"))?;
+        if address < LAYOUT.pml4_base {
+            return Err(fail("root outside retained hardware table arena"));
+        }
+        let mut maps = self.boot_maps.clone();
+        maps.extend_from_slice(extra);
+        let tables = pml4_tables(
+            &maps,
+            address,
+            remaining.min(carrick_x86::X86_PML4_CAPACITY) as usize,
+        )
+        .map_err(|error| fail(format!("retained root: {error:?}")))?;
+        self.ram
+            .write_gpa(address, &tables)
+            .map_err(|error| fail(error.to_string()))
     }
 
     pub fn zone(&self) -> Result<&ZoneTables, TrapError> {
