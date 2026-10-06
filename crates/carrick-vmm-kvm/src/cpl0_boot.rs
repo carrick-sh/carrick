@@ -1,14 +1,16 @@
 //! Bounded M2 hardware binding: one VM, two issued live task slots, native
 //! SYSCALL entry and IRETQ return. This is not an OCI/runtime/MM-owner binding.
 //! Observation and kick doorbells are declared fixture control transport.
+use crate::carrier_memory::{CarrierMachine, CarrierMemory};
 use crate::guest_setup::{GuestRam, WindowKind};
-use crate::{KvmKickHandle, KvmVcpu, KvmVm};
+use crate::{KvmKickHandle, KvmVcpu};
 use carrick_el1_abi::Lifecycle;
 use carrick_el1_abi::{
     BlockedMask, Counters, CurrentTask, EL1_BOOTSTRAP_METADATA_SIZE, El1TaskId, ThreadControlSlot,
     ThreadLifecyclePage, X86_CPL0_BOOTSTRAP_METADATA_BASE, X86_CPL0_DYNAMIC_METADATA_BASE,
 };
-use carrick_hal::{HvVcpu, HvVm, MemPerms, TrapError, VcpuExit, VcpuKick};
+use carrick_guest_arch::FrameGpa;
+use carrick_hal::{HvVcpu, TrapError, VcpuExit, VcpuKick};
 use carrick_mem::pml4::{Pml4MapSpec, pml4_tables};
 use carrick_x86::cpl0_entry::*;
 use carrick_x86::{BringupLayout, X86Reg, X86Vcpu};
@@ -125,8 +127,8 @@ pub struct EntryState {
 /// No run handle or host pointer escapes this fixture owner.
 pub struct Cpl0Carrier {
     pub(crate) cpus: [KvmVcpu; 2],
-    pub(crate) _vm: KvmVm,
-    pub(crate) ram: GuestRam,
+    pub(crate) _vm: CarrierMemory,
+    pub(crate) ram: Arc<GuestRam>,
     metadata_base: NonNull<u8>,
     host_forwards: u64,
     host_yields: u64,
@@ -135,6 +137,14 @@ pub struct Cpl0Carrier {
 }
 
 impl Cpl0Carrier {
+    pub fn physical_slot_count(&self) -> usize {
+        self._vm.slot_count()
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        self._vm.retained_bytes()
+    }
+
     /// Enable architectural SMAP before either fixture vCPU starts. The
     /// caller uses this only on KVM hosts whose guest CPUID advertises SMAP.
     pub fn enable_smap(&mut self) -> Result<(), TrapError> {
@@ -471,25 +481,18 @@ impl Cpl0Carrier {
                 });
             }
         }
-        let mut vm = KvmVm::create_empty().map_err(|e| fail(e.to_string()))?;
+        let ram = Arc::new(ram);
+        let mut memory = CarrierMemory::create().map_err(|e| fail(e.to_string()))?;
         if interrupts {
-            crate::carrier_interrupts::create_irqchip(&vm)?;
+            crate::carrier_interrupts::create_irqchip(memory.vm())?;
         }
-        for (gpa, ptr, len) in ram.windows_for_kvm() {
-            vm.map_memory(
-                gpa,
-                ptr,
-                len,
-                MemPerms {
-                    read: true,
-                    write: true,
-                    exec: true,
-                },
-            )
+        memory
+            .install_bootstrap(Arc::clone(&ram))
             .map_err(|e| fail(e.to_string()))?;
-        }
-        let mut a = vm.add_vcpu().map_err(|e| fail(e.to_string()))?;
-        let mut b = vm.add_vcpu().map_err(|e| fail(e.to_string()))?;
+        let machine = CarrierMachine::from_memory(memory, 2).map_err(|e| fail(e.to_string()))?;
+        let (cpus, vm) = machine.into_parts();
+        let [mut a, mut b]: [KvmVcpu; 2] =
+            cpus.try_into().map_err(|_| fail("carrier vCPU count"))?;
         for (index, cpu) in [&mut a, &mut b].into_iter().enumerate() {
             let mut layout = LAYOUT;
             layout.trampoline_base = plan.entry;
@@ -1006,16 +1009,16 @@ impl Cpl0Carrier {
                 })
                 .map_err(|e| fail(e.to_string()))?;
             carrier
-                .ram
-                .write_gpa(
-                    LIFECYCLE_DATA + index as u64 * 4096 + 0x180,
+                ._vm
+                .write(
+                    FrameGpa::new(LIFECYCLE_DATA + index as u64 * 4096 + 0x180),
                     &[0x5a + index as u8; 16],
                 )
                 .map_err(|e| fail(e.to_string()))?;
             carrier
-                .ram
-                .write_gpa(
-                    LIFECYCLE_DATA + index as u64 * 4096 + 0x100,
+                ._vm
+                .write(
+                    FrameGpa::new(LIFECYCLE_DATA + index as u64 * 4096 + 0x100),
                     &(0xf500u64 + index as u64).to_le_bytes(),
                 )
                 .map_err(|e| fail(e.to_string()))?;
