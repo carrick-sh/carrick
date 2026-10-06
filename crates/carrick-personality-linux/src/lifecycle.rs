@@ -7,6 +7,7 @@ pub enum LifecycleCall {
     SigAltStack,
     SigProcMask,
     SetRobustList,
+    SetTidAddress,
     GetTid,
     Clone,
 }
@@ -91,6 +92,9 @@ pub trait LifecycleNative<'a>: UserCopy {
         )
         .linux_result()
         .map(SyscallResult::new)
+    }
+    fn register_tid_address(&self, address: UserVa) -> Option<SyscallResult> {
+        set_tid_address(self.thread()?, self.binding()?, address)
     }
     fn thread(&self) -> Option<LifecycleThread<'a>>;
     fn born_slot(
@@ -213,6 +217,12 @@ pub fn invoke<'a>(
     if call == LifecycleCall::SetRobustList {
         return Some(returned(
             native.register_robust_list(args[0], args[1])?,
+            false,
+        ));
+    }
+    if call == LifecycleCall::SetTidAddress {
+        return Some(returned(
+            native.register_tid_address(UserVa::new(args[0]))?,
             false,
         ));
     }

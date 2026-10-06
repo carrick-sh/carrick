@@ -86,11 +86,17 @@ another task-context registry.
 With TLS implemented, the same musl fixture exposed native `set_tid_address`
 (218). The shared personality now registers the typed user pointer in the
 calling thread's existing lifecycle control slot and returns its Linux-visible
-TID. It authenticates a born-in-zone pool entry and incarnation separately
+TID, as specified by [set_tid_address(2)](https://man7.org/linux/man-pages/man2/set_tid_address.2.html).
+It authenticates a born-in-zone pool entry and incarnation separately
 from that visible TID. A VM-free red-first test registers after clone without
 `CLONE_CHILD_CLEARTID`, then exercises existing shared `serve_exit`: clear
 before one wake and retirement, with another MM untouched. The ARM entry
 routing remains unchanged.
+
+A second red-first test caught an adapter return bypassing pending-work
+completion. The x86 setup call now routes through the same shared dispatcher
+admission/completion owner, counts once and retains its original argument when
+host work is pending; ARM's ordinal routing stays unchanged.
 
 The migrated musl CLI test remains red at native `poll` (7). Production
 shared host-dispatch binding and real scheduler/futex exit custody are tracked
