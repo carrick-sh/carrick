@@ -36,6 +36,9 @@ pub struct AcceptArgs {
         help = "Path to write receipt JSON file (defaults to target/el1-gate/<head>/receipt.json)"
     )]
     pub receipt: Option<PathBuf>,
+    /// Checkout-lock ownership for post-lease cleanup of a gate worktree.
+    #[arg(long)]
+    pub owned_gate_run_id: Option<String>,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1802,6 +1805,7 @@ mod tests {
                 phase: AcceptPhase::Signed,
                 profile: AcceptProfile::LinuxPortable,
                 receipt: None,
+                owned_gate_run_id: None,
             },
         )
         .unwrap_err()
