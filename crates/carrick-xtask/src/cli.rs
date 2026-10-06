@@ -41,6 +41,11 @@ pub enum Commands {
     #[command(about = "Live position-free authority debt and PR-base ratchet")]
     AuthorityDebt(crate::authority_debt::AuthorityDebtArgs),
 
+    #[command(
+        about = "Emit source-bound Rust dialect and production verdicts for retained scanners"
+    )]
+    AuthorityCensus,
+
     #[command(about = "Per-landing Carrick vs native Docker receipts")]
     Impact(crate::impact::ImpactArgs),
 
@@ -421,6 +426,28 @@ where
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }
+            Ok(())
+        }
+        Commands::AuthorityCensus => {
+            let root = match cli.root.as_deref() {
+                Some(path) => path.canonicalize().map_err(|source| CliError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?,
+                None => resolve_repo_info(None)?.repository_root,
+            };
+            let verdict = match crate::authority_source::SourceCensus::load(&root) {
+                Ok(source) => source.verdict(&root)?,
+                Err(error) => {
+                    serde_json::json!({"schema": 1, "rejections": [error.to_string()], "files": {}})
+                }
+            };
+            writeln!(writer, "{}", serde_json::to_string(&verdict)?).map_err(|source| {
+                CliError::Io {
+                    path: PathBuf::from("stdout"),
+                    source,
+                }
+            })?;
             Ok(())
         }
         Commands::AuthorityDebt(args) => {

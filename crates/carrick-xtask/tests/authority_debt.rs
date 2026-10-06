@@ -182,6 +182,14 @@ fn restricted_dialect_error(source: &str, expected: &str) {
         error.contains("lib.rs:"),
         "missing precise source location: {error}"
     );
+    let verification_error =
+        carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
+            .unwrap_err()
+            .to_string();
+    assert!(
+        verification_error.contains(expected),
+        "zero/structural gate must reject the dialect input: {verification_error}"
+    );
 }
 
 #[test]
@@ -2548,4 +2556,125 @@ retirement_wrap_module! { mod hidden; }
             "module selection in macro input is unsupported",
         );
     }
+}
+
+#[test]
+fn review_restricted_macro_use_test_binding_is_rejected() {
+    for import in [
+        "#[macro_use(test)] extern crate custom_test;",
+        "#[macro_use] extern crate custom_test;",
+    ] {
+        restricted_dialect_error(
+            &format!(
+                "{import} #[test] fn hidden(table: &Table) {{ table.read_open_files(); this.proc.lock(); std::process::abort(); }}"
+            ),
+            "macro_use import is unresolved",
+        );
+    }
+}
+
+#[test]
+fn review_restricted_sensitive_self_glob_and_calls_are_rejected() {
+    for source in [
+        "use std::process::{self}; fn hidden() { process::abort(); }",
+        "use std::env::*; fn hidden() { var(\"CARRICK_RUN_ID\"); }",
+        "use std::process::*; fn hidden() { abort(); }",
+        "use std::env::{self}; fn hidden() { env::var(\"CARRICK_RUN_ID\"); }",
+        "fn hidden() { var(\"CARRICK_RUN_ID\"); }",
+        "fn hidden() { abort(); }",
+        "fn hidden() { (abort)(); }",
+        "fn hidden() { (var)(\"CARRICK_RUN_ID\"); }",
+    ] {
+        restricted_dialect_error(source, "canonical path");
+    }
+}
+
+#[test]
+fn review_restricted_clap_environment_metadata_is_rejected() {
+    for helper in ["arg", "clap"] {
+        restricted_dialect_error(
+            &format!(
+                "#[derive(::clap::Parser)] struct Data {{ #[{helper}(long, env = \"CARRICK_RUN_ID\")] run: String }}"
+            ),
+            "generated environment read",
+        );
+    }
+}
+
+#[test]
+fn review_restricted_compiler_derive_bindings_are_rejected() {
+    for source in [
+        "use custom_derive::Clone; #[derive(Clone)] struct Data;",
+        "use custom_derive::Other as Clone; #[derive(Clone)] struct Data;",
+        "use custom_derive::Clone as Other; #[derive(Other)] struct Data;",
+        "#[macro_use(Clone)] extern crate custom_derive; #[derive(Clone)] struct Data;",
+        "use custom_derive::*; #[derive(Clone)] struct Data;",
+    ] {
+        restricted_dialect_error(source, "restricted census dialect");
+    }
+}
+
+#[test]
+fn review_generated_metadata_requires_the_declared_owner() {
+    use carrick_xtask::authority_source::SourceCensus;
+    let root = source_fixture();
+    let cli = root.path().join("crates/carrick-cli/src");
+    std::fs::create_dir_all(&cli).unwrap();
+    write_source(cli.join("main.rs"), "mod args;").unwrap();
+    write_source(
+        cli.join("args.rs"),
+        r#"#[derive(::clap::Parser)] struct Cli { #[arg(env="CARRICK_HOME")] home: String }"#,
+    )
+    .unwrap();
+    SourceCensus::load(root.path()).unwrap();
+    write_source(
+        root.path().join("crates/carrick-kernel/src/lib.rs"),
+        r#"#[path="../../carrick-cli/src/args.rs"] mod injected;"#,
+    )
+    .unwrap();
+    assert_dialect_rejection(root.path(), "generated environment read");
+}
+
+#[test]
+fn review_verdict_records_item_scope_and_rejects_changed_inputs() {
+    use carrick_xtask::authority_source::SourceCensus;
+    let root = source_fixture();
+    let file = "crates/carrick-kernel/src/lib.rs";
+    write_source(
+        root.path().join(file),
+        "#[cfg(test)] fn hidden() { this.proc.lock(); } fn shown() { this.proc.lock(); }",
+    )
+    .unwrap();
+    let source = SourceCensus::load(root.path()).unwrap();
+    let verdict = source.verdict(root.path()).unwrap();
+    assert_eq!(verdict["dialect"], "strict");
+    assert_eq!(verdict["rejections"], serde_json::json!([]));
+    let items = verdict["files"][file]["items"].as_array().unwrap();
+    assert!(items.iter().any(|i| i["production"] == false));
+    assert!(items.iter().any(|i| i["production"] == true));
+    write_source(root.path().join(file), "fn changed() {}").unwrap();
+    assert!(
+        source
+            .verdict(root.path())
+            .unwrap_err()
+            .to_string()
+            .contains("source changed during census")
+    );
+}
+
+#[test]
+fn review_retained_verdict_transport_exceeds_one_argument() {
+    let root = source_fixture();
+    let mut source = "pub fn poll(table: &Table) { table.read_open_files(); }\n".to_owned();
+    for index in 0..5000 {
+        source.push_str(&format!("fn helper_{index}() {{}}\n"));
+    }
+    write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), source).unwrap();
+    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    let proof = serde_json::to_vec(&census.verdict(root.path()).unwrap()).unwrap();
+    assert!(
+        proof.len() > 131_072,
+        "fixture must exceed Linux's single-argument limit"
+    );
+    carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1)).unwrap();
 }

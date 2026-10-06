@@ -327,21 +327,23 @@ m = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = m
 spec.loader.exec_module(m)
 root = pathlib.Path(sys.argv[2])
-test_files = set(json.loads(sys.argv[3]))
+m_verdict = m.census_verdict.CensusVerdict(json.loads(pathlib.Path(sys.argv[3]).read_text()))
+m_verdict.validate_tree(root)
 if hasattr(m, 'scan_sources'):
-    errors = m.validate_sysv_lock_authority_rules(root)
+    errors = m.validate_sysv_lock_authority_rules(root, verdict=m_verdict)
     if errors: raise ValueError('\n'.join(errors))
-    findings = m.scan_sources(root, test_files=test_files)
+    findings = m.scan_sources(root, verdict=m_verdict)
 elif hasattr(m, 'discover_runtime_aborts'):
-    findings = m.discover_runtime_aborts(root, test_files=test_files)
+    findings = m.discover_runtime_aborts(root, verdict=m_verdict)
     raw = [f for f in findings if f.sink == 'raw']
     if raw: raise ValueError('raw termination forbidden: ' + raw[0].file + '::' + raw[0].function)
 else:
-    m.validate_concurrent_tree(root, test_files=test_files)
-    findings = m.discover(root, test_files=test_files)
+    m.validate_concurrent_tree(root, verdict=m_verdict)
+    findings = m.discover(root, verdict=m_verdict)
 print(json.dumps([dataclasses.asdict(f) for f in findings]))
 "#;
-    let proof = serde_json::to_string(source.test_file_names())?;
+    let proof = tempfile::NamedTempFile::new()?;
+    serde_json::to_writer(proof.as_file(), &source.verdict(root)?)?;
     let output = command::run_checked(
         "python3",
         [
@@ -351,7 +353,7 @@ print(json.dumps([dataclasses.asdict(f) for f in findings]))
                 .join(format!("scripts/migrate/{checker}.py"))
                 .as_os_str(),
             root.as_os_str(),
-            std::ffi::OsStr::new(&proof),
+            proof.path().as_os_str(),
         ],
         Some(root),
     )?;
@@ -538,7 +540,12 @@ fn base_policy(root: &Path, base: &str) -> Result<AuthorityDebtCeilings, DebtErr
 }
 // One-time transition from the actual PR-base ledgers. Their locations serve
 // only to recover symbolic cohorts from that revision, never as head identity.
-fn legacy_discover(root: &Path, tools: &Path, checker: &str) -> Result<Value, DebtError> {
+fn legacy_discover(
+    root: &Path,
+    tools: &Path,
+    checker: &str,
+    source: &SourceCensus,
+) -> Result<Value, DebtError> {
     if root.join(CEILINGS_PATH).exists() {
         return fail("legacy discovery is unreachable with the ceilings schema");
     }
@@ -554,16 +561,18 @@ spec = importlib.util.spec_from_file_location('legacy_snapshot', sys.argv[1])
 m = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = m
 spec.loader.exec_module(m)
-scope = m._scope_scanner() if hasattr(m, '_scope_scanner') else m
-scope.validate_test_dialect = lambda *_: None
+verdict = m.census_verdict.CensusVerdict(json.loads(pathlib.Path(sys.argv[3]).read_text()), allow_historical_snapshot=True)
+verdict.validate_tree(root)
 if hasattr(m, 'scan_sources'):
-    findings = m.scan_sources(root)
+    findings = m.scan_sources(root, verdict=verdict)
 elif hasattr(m, 'discover_runtime_aborts'):
-    findings = m.discover_runtime_aborts(root)
+    findings = m.discover_runtime_aborts(root, verdict=verdict)
 else:
-    findings = m.discover(root)
+    findings = m.discover(root, verdict=verdict)
 print(json.dumps([dataclasses.asdict(f) for f in findings]))
 "#;
+    let proof = tempfile::NamedTempFile::new()?;
+    serde_json::to_writer(proof.as_file(), &source.verdict(root)?)?;
     let output = command::run_checked(
         "python3",
         [
@@ -573,6 +582,7 @@ print(json.dumps([dataclasses.asdict(f) for f in findings]))
                 .join(format!("scripts/migrate/{checker}.py"))
                 .as_os_str(),
             root.as_os_str(),
+            proof.path().as_os_str(),
         ],
         Some(root),
     )?;
@@ -587,6 +597,7 @@ fn legacy_policy_with_tools(root: &Path, tools: &Path) -> Result<AuthorityDebtCe
         root,
         tools,
         "check-dispatch-lock-authority",
+        &source,
     )?)? {
         let file = text(row, "file")?;
         if source.is_outside_production_at(
@@ -701,7 +712,7 @@ fn legacy_policy_with_tools(root: &Path, tools: &Path) -> Result<AuthorityDebtCe
     // The old "test_only" label included unconditional production failpoints.
     // Filter real test scopes, rather than trusting those labels as scope.
     // The stronger zero rule applies to head, not to this historical census.
-    let production = legacy_discover(root, tools, "check-runtime-global-state")?;
+    let production = legacy_discover(root, tools, "check-runtime-global-state", &source)?;
     let mut global_classes = BTreeMap::new();
     for row in rows(&read_json(&root.join("scripts/migrate/runtime-global-state.json"))?["rows"])? {
         let family: Family = serde_json::from_value(Value::String(format!(
@@ -758,7 +769,12 @@ fn legacy_policy_with_tools(root: &Path, tools: &Path) -> Result<AuthorityDebtCe
             *entry = (*entry).max(family);
         }
     }
-    for row in rows(&legacy_discover(root, tools, "check-runtime-aborts")?)? {
+    for row in rows(&legacy_discover(
+        root,
+        tools,
+        "check-runtime-aborts",
+        &source,
+    )?)? {
         let file = text(row, "file")?;
         let key = (
             file.to_owned(),

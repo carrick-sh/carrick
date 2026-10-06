@@ -5,7 +5,32 @@
   },
   {
     "name": "arg",
-    "reason": "clap_derive 4.6.1 derive helper: constructs Arg metadata, never a Carrick authority operation or raw process termination. Nonliteral values are restricted by the census to constant/variant paths; blocks and calls are rejected. Provider: Cargo.lock clap_derive; src/item.rs and src/derives/args.rs."
+    "reason": "clap_derive 4.6.1 derive helper: constructs Arg metadata, never a Carrick authority operation or raw process termination. Nonliteral values are restricted by the census to constant/variant paths; blocks and calls are rejected. Provider: Cargo.lock clap_derive; src/item.rs and src/derives/args.rs. The env option expands to Arg::env; clap_builder 4.6.0 reads std::env::var_os while building the Command. Only the audited CLI configuration owners and keys listed here may generate that read. CARRICK_RUN_ID must remain an explicit LaunchContext read and is never admitted as helper metadata. The conformance harness Args is also an audited host configuration boundary for the listed harness keys.",
+    "generated_options": [
+      {
+        "option": "env",
+        "operation": "environment_read",
+        "permitted_owners": {
+          "carrick_cli::args::Cli": [
+            "CARRICK_HOME"
+          ],
+          "carrick_cli::args::RunArgs": [
+            "CARRICK_EXEC_BACKEND"
+          ],
+          "carrick_conformance::target_main::Args": [
+            "LIMA_INSTANCE",
+            "CARRICK_CONFORMANCE_LOCAL_TIMEOUT_SCALE",
+            "CARRICK_CONFORMANCE_FAST_TIMEOUT_S",
+            "CARRICK_CONFORMANCE_TIMEOUT_CAP_S",
+            "CARRICK_CONFORMANCE_WORKERS",
+            "CARRICK_CONFORMANCE_CPYTHON_WORKERS",
+            "CARRICK_CONFORMANCE_FLAKE_RETRIES",
+            "CARRICK_CONFORMANCE_MAX_GATING",
+            "CARRICK_CONFORMANCE_SERIAL_CONFIRM_BUDGET_S"
+          ]
+        }
+      }
+    ]
   },
   {
     "name": "serde",
@@ -21,7 +46,32 @@
   },
   {
     "name": "command",
-    "reason": "clap_derive 4.6.1 derive helper: literal command metadata constructs the command schema, not authority or raw termination calls. Expressions are rejected. Cargo.lock clap_derive, src/item.rs."
+    "reason": "clap_derive 4.6.1 derive helper: literal command metadata constructs the command schema, not authority or raw termination calls. Expressions are rejected. Cargo.lock clap_derive, src/item.rs. The env option expands to Arg::env; clap_builder 4.6.0 reads std::env::var_os while building the Command. Only the audited CLI configuration owners and keys listed here may generate that read. CARRICK_RUN_ID must remain an explicit LaunchContext read and is never admitted as helper metadata. The conformance harness Args is also an audited host configuration boundary for the listed harness keys.",
+    "generated_options": [
+      {
+        "option": "env",
+        "operation": "environment_read",
+        "permitted_owners": {
+          "carrick_cli::args::Cli": [
+            "CARRICK_HOME"
+          ],
+          "carrick_cli::args::RunArgs": [
+            "CARRICK_EXEC_BACKEND"
+          ],
+          "carrick_conformance::target_main::Args": [
+            "LIMA_INSTANCE",
+            "CARRICK_CONFORMANCE_LOCAL_TIMEOUT_SCALE",
+            "CARRICK_CONFORMANCE_FAST_TIMEOUT_S",
+            "CARRICK_CONFORMANCE_TIMEOUT_CAP_S",
+            "CARRICK_CONFORMANCE_WORKERS",
+            "CARRICK_CONFORMANCE_CPYTHON_WORKERS",
+            "CARRICK_CONFORMANCE_FLAKE_RETRIES",
+            "CARRICK_CONFORMANCE_MAX_GATING",
+            "CARRICK_CONFORMANCE_SERIAL_CONFIRM_BUDGET_S"
+          ]
+        }
+      }
+    ]
   },
   {
     "name": "value",
@@ -29,7 +79,32 @@
   },
   {
     "name": "clap",
-    "reason": "clap_derive 4.6.1 compatibility derive helper used by the current CLI structs: literal metadata builds the same argument/command schema as arg/command helpers; no Carrick authority acquisition or raw termination. Executable arguments are rejected. Cargo.lock clap_derive, src/item.rs."
+    "reason": "clap_derive 4.6.1 compatibility derive helper used by the current CLI structs: literal metadata builds the same argument/command schema as arg/command helpers; no Carrick authority acquisition or raw termination. Executable arguments are rejected. Cargo.lock clap_derive, src/item.rs. The env option expands to Arg::env; clap_builder 4.6.0 reads std::env::var_os while building the Command. Only the audited CLI configuration owners and keys listed here may generate that read. CARRICK_RUN_ID must remain an explicit LaunchContext read and is never admitted as helper metadata. The conformance harness Args is also an audited host configuration boundary for the listed harness keys.",
+    "generated_options": [
+      {
+        "option": "env",
+        "operation": "environment_read",
+        "permitted_owners": {
+          "carrick_cli::args::Cli": [
+            "CARRICK_HOME"
+          ],
+          "carrick_cli::args::RunArgs": [
+            "CARRICK_EXEC_BACKEND"
+          ],
+          "carrick_conformance::target_main::Args": [
+            "LIMA_INSTANCE",
+            "CARRICK_CONFORMANCE_LOCAL_TIMEOUT_SCALE",
+            "CARRICK_CONFORMANCE_FAST_TIMEOUT_S",
+            "CARRICK_CONFORMANCE_TIMEOUT_CAP_S",
+            "CARRICK_CONFORMANCE_WORKERS",
+            "CARRICK_CONFORMANCE_CPYTHON_WORKERS",
+            "CARRICK_CONFORMANCE_FLAKE_RETRIES",
+            "CARRICK_CONFORMANCE_MAX_GATING",
+            "CARRICK_CONFORMANCE_SERIAL_CONFIRM_BUDGET_S"
+          ]
+        }
+      }
+    ]
   },
   {
     "name": "usdt::provider",
@@ -49,19 +124,19 @@
   },
   {
     "name": "clap::Args",
-    "reason": "Locked clap Args derive emits trait/data-layout glue, not synthesized Carrick authority acquisitions or std::process abort/exit. Input items remain scanned. Helper attributes are separately restricted/audited; arbitrary derive macros are rejected. Provider: clap_derive 4.6.1 src/derives/{args,parser,subcommand,value_enum}.rs."
+    "reason": "Locked clap Args derive emits Command/Arg construction and parser glue, not synthesized Carrick authority acquisitions or std::process abort/exit. Input items remain scanned. Helper attributes are separately restricted/audited; arbitrary derive macros are rejected. Provider: clap_derive 4.6.1 src/derives/{args,parser,subcommand,value_enum}.rs. Helper metadata can generate environment reads through Arg::env, so helper options carry separate operation/owner/value restrictions."
   },
   {
     "name": "clap::Parser",
-    "reason": "Locked clap Parser derive emits trait/data-layout glue, not synthesized Carrick authority acquisitions or std::process abort/exit. Input items remain scanned. Helper attributes are separately restricted/audited; arbitrary derive macros are rejected. Provider: clap_derive 4.6.1 src/derives/{args,parser,subcommand,value_enum}.rs."
+    "reason": "Locked clap Parser derive emits Command/Arg construction and parser glue, not synthesized Carrick authority acquisitions or std::process abort/exit. Input items remain scanned. Helper attributes are separately restricted/audited; arbitrary derive macros are rejected. Provider: clap_derive 4.6.1 src/derives/{args,parser,subcommand,value_enum}.rs. Helper metadata can generate environment reads through Arg::env, so helper options carry separate operation/owner/value restrictions."
   },
   {
     "name": "clap::Subcommand",
-    "reason": "Locked clap Subcommand derive emits trait/data-layout glue, not synthesized Carrick authority acquisitions or std::process abort/exit. Input items remain scanned. Helper attributes are separately restricted/audited; arbitrary derive macros are rejected. Provider: clap_derive 4.6.1 src/derives/{args,parser,subcommand,value_enum}.rs."
+    "reason": "Locked clap Subcommand derive emits Command/Arg construction and parser glue, not synthesized Carrick authority acquisitions or std::process abort/exit. Input items remain scanned. Helper attributes are separately restricted/audited; arbitrary derive macros are rejected. Provider: clap_derive 4.6.1 src/derives/{args,parser,subcommand,value_enum}.rs. Helper metadata can generate environment reads through Arg::env, so helper options carry separate operation/owner/value restrictions."
   },
   {
     "name": "clap::ValueEnum",
-    "reason": "Locked clap ValueEnum derive emits trait/data-layout glue, not synthesized Carrick authority acquisitions or std::process abort/exit. Input items remain scanned. Helper attributes are separately restricted/audited; arbitrary derive macros are rejected. Provider: clap_derive 4.6.1 src/derives/{args,parser,subcommand,value_enum}.rs."
+    "reason": "Locked clap ValueEnum derive emits Command/Arg construction and parser glue, not synthesized Carrick authority acquisitions or std::process abort/exit. Input items remain scanned. Helper attributes are separately restricted/audited; arbitrary derive macros are rejected. Provider: clap_derive 4.6.1 src/derives/{args,parser,subcommand,value_enum}.rs. Helper metadata can generate environment reads through Arg::env, so helper options carry separate operation/owner/value restrictions."
   },
   {
     "name": "zerocopy::FromBytes",

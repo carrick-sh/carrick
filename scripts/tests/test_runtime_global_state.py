@@ -22,9 +22,16 @@ SPEC.loader.exec_module(GATE)
 
 Finding = GATE.Finding
 LedgerError = GATE.LedgerError
-scan_source = GATE.scan_source
+from scripts.tests.authority_census_support import scan_source as census_scan, source_verdict
+
+def scan_source(path, source):
+    return census_scan(GATE.scan_source, path, source)
 
 
+
+
+def validate_concurrent_source(path, source):
+    return GATE.validate_concurrent_source(path, source, verdict=source_verdict(str(path), source))
 
 
 class RuntimeGlobalStateTests(unittest.TestCase):
@@ -69,7 +76,7 @@ fn borrow(value: &'static str) -> &'static str { value }
         source = "#[cfg(test)] static TEST_CELL: AtomicU64 = AtomicU64::new(0);"
         rows = scan_source(Path("crates/x/src/lib.rs"), source)
         self.assertEqual(
-            [(row.kind, row.symbol) for row in rows], [("static", "TEST_CELL")]
+            [(row.kind, row.symbol) for row in rows], []
         )
 
 
@@ -96,12 +103,12 @@ fn f() {
 }
 '''
         findings = scan_source(Path("crates/x/src/lib.rs"), source)
-        self.assertEqual(len(findings), 2)
+        self.assertEqual(len(findings), 1)
         plain_y = scan_source(
             Path("crates/x/src/lib.rs"),
             'fn f() { let _ = std::env::var("Y"); }',
         )
-        self.assertEqual(findings[1].fingerprint, plain_y[0].fingerprint)
+        self.assertEqual(findings[0].fingerprint, plain_y[0].fingerprint)
 
     def test_statement_cfg_line_only_move_remains_stable(self):
         one = scan_source(
@@ -182,23 +189,23 @@ const RAW_HASH: &str = r##" std::env::var_os("IGNORED"); "##;
     def test_concurrent_source_policy_rejects_ambient_runtime_accessors(self):
         source = "fn current_thread_registry() -> &'static Registry { todo!() }"
         with self.assertRaises(LedgerError):
-            GATE.validate_concurrent_source(
+            validate_concurrent_source(
                 Path("crates/carrick-thread/src/thread.rs"), source
             )
 
     def test_concurrent_source_policy_rejects_run_id_env_below_launch_boundary(self):
         source = 'fn helper() { let _ = std::env::var("CARRICK_RUN_ID"); }'
         with self.assertRaises(LedgerError):
-            GATE.validate_concurrent_source(
+            validate_concurrent_source(
                 Path("crates/carrick-kernel/src/dispatch/proctitle.rs"), source
             )
-        GATE.validate_concurrent_source(
+        validate_concurrent_source(
             Path("crates/carrick-kernel/src/kernel/container.rs"), source
         )
 
     def test_concurrent_source_policy_allows_container_keyed_endpoint_map(self):
         source = "static RUNTIME_ENDPOINTS: LazyLock<Map<ContainerId, Endpoint>> = init();"
-        GATE.validate_concurrent_source(
+        validate_concurrent_source(
             Path("crates/carrick-thread/src/thread.rs"), source
         )
 
