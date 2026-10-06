@@ -267,7 +267,7 @@ core::arch::global_asm!(
 
 unsafe extern "C" { fn carrick_x86_boot_iret(entry: u64, stack: u64) -> !; }
 
-fn fatal_boot() -> ! {
+pub(super) fn fatal_boot() -> ! {
     // SAFETY: the carrier owns this fatal control doorbell; HLT prevents a
     // refused boot from spinning inside KVM_RUN if the host resumes it.
     unsafe { core::arch::asm!("out dx, al", in("dx") super::FATAL_PORT, in("al") 0_u8, options(nostack, preserves_flags)); }
