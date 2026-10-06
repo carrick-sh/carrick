@@ -498,13 +498,13 @@ mod kernel {
             use carrick_guest_arch::{EditPermissions, MmuBackend};
             // The test stages one already-parsed ET_EXEC image in its RX code
             // page. No guest ELF parser or second host descriptor author runs.
-            if frame.rdi != 0x10100 || frame.rsi != 0xc0 {
+            if frame.rdi != 0x10100 || !(0xc0..=0xf00).contains(&frame.rsi) {
                 doorbell(FATAL_PORT, frame);
                 halt();
             }
             // SAFETY: this exact RX user fixture page remains mapped under
             // the still-live source root until the new MM has copied its bytes.
-            let elf = unsafe { core::slice::from_raw_parts(frame.rdi as *const u8, 0xc0) };
+            let elf = unsafe { core::slice::from_raw_parts(frame.rdi as *const u8, frame.rsi as usize) };
             if &elf[..4] != b"\x7fELF" {
                 doorbell(FATAL_PORT, frame);
                 halt();
