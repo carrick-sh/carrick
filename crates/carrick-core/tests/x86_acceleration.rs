@@ -278,60 +278,84 @@ fn x86_wrong_output_pin_refuses_before_preparing_copy() {
     let view = nodes(&region);
     let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view)
         .with_mmu(carrick_mmu_core::x86::owner_mmu::X86Mmu);
-    let tables = Tables::new(ROOT, IPA, 1);
-    for (entry, offset) in [(0, 4096), (513, 8192), (1024, 12288)] {
-        tables.words[entry].store((ROOT + offset) | PRESENT | WRITE | USER, Ordering::Relaxed);
+    let tables = [
+        Tables::new(ROOT, IPA, 1),
+        Tables::new(ROOT + 0x10000, IPA + 0x1000000, 1),
+    ];
+    for (index, table) in tables.iter().enumerate() {
+        for (entry, offset) in [(0, 4096), (513, 8192), (1024, 12288)] {
+            table.words[entry].store(
+                (ROOT + index as u64 * 0x10000 + offset) | PRESENT | WRITE | USER,
+                Ordering::Relaxed,
+            );
+        }
+        table.words[1536].store(
+            (IPA + index as u64 * 0x1000000) | PRESENT | WRITE | USER | NX,
+            Ordering::Relaxed,
+        );
     }
-    tables.words[1536].store(IPA | PRESENT | WRITE | USER | NX, Ordering::Relaxed);
-    let maintenance = CallerInvalidatesAsid;
-    let words = tables.live(&maintenance);
-    let transfer = portal
-        .begin(
-            portal.admitted_handle(mms[0], 0).unwrap(),
-            GuestVa::new(VA),
-            4096,
-            TransferIntent::UserWrite,
-            0,
-        )
-        .unwrap();
-    let TransferStep::Selected(selected) = portal
-        .select(
-            &transfer,
-            &words,
-            carrick_core::mm::transaction::SelectionVenues {
-                prepared: &mut NoopPreparedResolver,
-                cow: &mut NoopCowResolver,
-                residency: &residency(),
-                slot: 0,
-            },
-        )
-        .unwrap()
-    else {
-        panic!("resident page must select")
-    };
-    let mut request = selected
-        .request(
-            TransferIntent::UserWrite,
-            carrick_core_abi::PortalRetainedData {
-                record: NonZeroU64::new(7).unwrap(),
-                vm_generation: NonZeroU64::new(1).unwrap(),
-                owner: Some((NonZeroU64::new(3).unwrap(), NonZeroU64::new(1).unwrap())),
-            },
-        )
-        .unwrap();
-    request.selected.ipa += 0x1000000; // same VA, peer physical output
-    assert!(
-        prepare_transfer(&portal, request, &words, 0)
+    for index in 0..2 {
+        let maintenance = CallerInvalidatesAsid;
+        let words = tables[index].live(&maintenance);
+        let transfer = portal
+            .begin(
+                portal.admitted_handle(mms[index], 0).unwrap(),
+                GuestVa::new(VA),
+                4096,
+                TransferIntent::UserWrite,
+                0,
+            )
+            .unwrap();
+        let TransferStep::Selected(selected) = portal
+            .select(
+                &transfer,
+                &words,
+                carrick_core::mm::transaction::SelectionVenues {
+                    prepared: &mut NoopPreparedResolver,
+                    cow: &mut NoopCowResolver,
+                    residency: &residency(),
+                    slot: 0,
+                },
+            )
             .unwrap()
-            .is_none()
-    );
-    assert!(
-        !region
-            .table()
-            .lock(spaces.find(mms[0].raw()).unwrap().index(), mms[0])
+        else {
+            panic!("resident page must select")
+        };
+        let mut request = selected
+            .request(
+                TransferIntent::UserWrite,
+                carrick_core_abi::PortalRetainedData {
+                    record: NonZeroU64::new(7).unwrap(),
+                    vm_generation: NonZeroU64::new(1).unwrap(),
+                    owner: Some((NonZeroU64::new(3).unwrap(), NonZeroU64::new(1).unwrap())),
+                },
+            )
+            .unwrap();
+        request.selected.ipa = IPA + (1 - index) as u64 * 0x1000000;
+        let slot = PortalTransferSlot::new();
+        let mut ticket = slot.submit(request).unwrap();
+        let admission = carrick_core::mm::transaction::admit_transfer_service(&portal, &slot)
             .unwrap()
-            .has_prepared_copy()
-    );
+            .unwrap();
+        let carrick_core::mm::transaction::TransferServiceAdmission::NeedsWords { service, grant } =
+            admission
+        else {
+            panic!("one-shot transfer must revalidate words")
+        };
+        assert_eq!(grant.ttbr0, ROOT + index as u64 * 0x10000);
+        serve_transfer(&portal, service, &words, 0, || {
+            panic!("peer physical pin must refuse before copy")
+        })
+        .unwrap();
+        assert!(ticket.take_prepare_suspension().is_some());
+        assert!(
+            !region
+                .table()
+                .lock(spaces.find(mms[index].raw()).unwrap().index(), mms[index])
+                .unwrap()
+                .has_prepared_copy()
+        );
+    }
 }
 
 /// VM-free order-1 witness. CPL0 execution remains a separate integration gate.

@@ -94,13 +94,14 @@ pub(super) fn prepared_copy_commit_and_cancel_never_acquire_held_root_or_editor(
         .unwrap();
     let slot = carrick_core_abi::PortalTransferSlot::new();
     let mut ticket = slot.submit_prepare(request).unwrap();
-    serve_transfer(
-        &portal,
-        slot.claim().unwrap(),
-        &tables.live(&maintenance),
-        0,
-        || panic!("prepare must not copy"),
-    )
+    let admission = admit_transfer_service(&portal, &slot).unwrap().unwrap();
+    let TransferServiceAdmission::NeedsWords { service, grant } = admission else {
+        panic!("prepare must authenticate its live root")
+    };
+    assert_eq!(grant.ttbr0, ROOT);
+    serve_transfer(&portal, service, &tables.live(&maintenance), 0, || {
+        panic!("prepare must not copy")
+    })
     .unwrap();
     let permit = ticket.take_prepared().unwrap();
     // A non-overlapping committed edit changes the MM generation, preserving

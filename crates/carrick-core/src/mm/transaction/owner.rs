@@ -886,6 +886,56 @@ pub fn serve_transfer<
     settle_prepared_service(portal, service, permit, slot, host_copy)
 }
 
+/// Neutral slot-transport admission shared by hardware owner entries.
+///
+/// Slot claiming, carrier authentication, phase routing, and exact-root
+/// admission are protocol work rather than ISA descriptor work. Hardware
+/// adapters only construct their bounded table view for `NeedsWords`.
+pub enum TransferServiceAdmission<'a> {
+    Settle {
+        service: carrick_core_abi::PortalTransferService<'a>,
+        permit: carrick_core_abi::PortalPreparedPermit,
+    },
+    NeedsWords {
+        service: carrick_core_abi::PortalTransferService<'a>,
+        grant: carrick_sched_core::spaces::SpaceGrant,
+    },
+}
+
+pub fn admit_transfer_service<'a, P, Policy, Geometry, Venue, B>(
+    portal: &MmPortal<'_, P, Policy, Geometry, Venue, B>,
+    slot: &'a carrick_core_abi::PortalTransferSlot,
+) -> Result<Option<TransferServiceAdmission<'a>>, MmError>
+where
+    P: PinnedMetadataExtent,
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    Venue: OwnerVenue,
+    B: OwnerMmu,
+{
+    let Some(service) = slot.claim() else {
+        return Ok(None);
+    };
+    let request = service.request();
+    if request.operation.carrier != portal.carrier {
+        service.complete(0, Venue::encode_error(MmError::Stale));
+        return Err(MmError::Stale);
+    }
+    if matches!(
+        service.phase(),
+        carrick_core_abi::PortalTransferPhase::Commit
+            | carrick_core_abi::PortalTransferPhase::Cancel
+    ) {
+        let Some(permit) = service.permit() else {
+            service.complete(0, Venue::encode_error(MmError::Stale));
+            return Err(MmError::Stale);
+        };
+        return Ok(Some(TransferServiceAdmission::Settle { service, permit }));
+    }
+    Ok(admit_service_root(portal, service)
+        .map(|(service, grant)| TransferServiceAdmission::NeedsWords { service, grant }))
+}
+
 /// Exact prepared settlement has no descriptor-table or live-MM gate input.
 pub fn settle_prepared_service<
     P: PinnedMetadataExtent,

@@ -4,8 +4,9 @@ use super::{El1MmHandle, GuestVa, TransferIntent};
 use super::{MmError, MmErrorLinux};
 use crate::memory::reservations::NativeReservationGeometry;
 pub use carrick_core::mm::transaction::{
-    SelectionVenues, TRANSFER_CHUNK_BYTES, TransferStep, admit_service_root, bind_service_root,
-    grant_target, prepare_transfer, serve_transfer, settle_prepared_service,
+    SelectionVenues, TRANSFER_CHUNK_BYTES, TransferServiceAdmission, TransferStep,
+    admit_service_root, admit_transfer_service, bind_service_root, grant_target, prepare_transfer,
+    serve_transfer, settle_prepared_service,
 };
 #[cfg(target_os = "none")]
 use carrick_el1_abi::PinnedMetadataExtent;
@@ -76,45 +77,36 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     use carrick_mmu_core::aarch64::descriptor_txn::{CallerInvalidatesAsid, PrimaryTableWords};
     let slots =
         unsafe { &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots) };
-    let Some(service) = slots
-        .slot(frame.slot as usize)
-        .and_then(|slot| slot.claim())
-    else {
+    let Some(slot) = slots.slot(frame.slot as usize) else {
         return;
     };
-    let request = service.request();
-    if slots.carrier() != Some(request.operation.carrier) {
-        service.complete(0, 3);
-        return;
-    }
     let zone = unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
+    let Some(carrier) = slots.carrier() else {
+        return;
+    };
     let portal = MmPortal::<GuestMetadataPin> {
         backend: core::marker::PhantomData,
-        carrier: request.operation.carrier,
+        carrier,
         roots: crate::memory::reservations::shared_guest(),
         spaces: &zone.spaces,
         nodes: None,
         zone: Some(zone),
     };
-    if matches!(
-        service.phase(),
-        carrick_el1_abi::PortalTransferPhase::Commit | carrick_el1_abi::PortalTransferPhase::Cancel
-    ) {
-        let Some(permit) = service.permit() else {
-            service.complete(0, 3);
+    let Ok(Some(admission)) = admit_transfer_service(&portal, slot) else {
+        return;
+    };
+    let (service, grant) = match admission {
+        TransferServiceAdmission::Settle { service, permit } => {
+            let _ = settle_prepared_service(
+                &portal,
+                service,
+                permit,
+                frame.slot as u32,
+                yield_host_effect,
+            );
             return;
-        };
-        let _ = settle_prepared_service(
-            &portal,
-            service,
-            permit,
-            frame.slot as u32,
-            yield_host_effect,
-        );
-        return;
-    }
-    let Some((service, grant)) = admit_service_root(&portal, service) else {
-        return;
+        }
+        TransferServiceAdmission::NeedsWords { service, grant } => (service, grant),
     };
     let live_ttbr: u64;
     unsafe {
