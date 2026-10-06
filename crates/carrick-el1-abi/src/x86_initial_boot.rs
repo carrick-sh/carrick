@@ -6,8 +6,6 @@ pub const X86_INITIAL_BOOT_MAGIC: u64 = u64::from_le_bytes(*b"CXRUN001");
 pub const X86_INITIAL_BOOT_VERSION: u32 = 2;
 pub const X86_INITIAL_BOOT_HEADER_GPA: u64 = 0x1e_0000;
 pub const X86_INITIAL_BOOT_PORT: u16 = 0xc6;
-/// Shared scheduler tables within the production CPL0 metadata aperture.
-pub const X86_CPL0_ZONE_OFFSET: u64 = 0x40_0000;
 pub const X86_INITIAL_MAX_REGIONS: usize = 32;
 pub const X86_INITIAL_MAX_STRINGS: usize = 256;
 /// CPL0's retained metadata binds the neutral reservation and zone owners

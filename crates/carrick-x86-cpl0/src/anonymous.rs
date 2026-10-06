@@ -86,8 +86,7 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
         let table_end = TABLE_END.load(Ordering::Acquire);
         let table_start = TABLE_START.load(Ordering::Relaxed);
         if table_start == 0 || table_end <= table_start { return DelegatedStep::Forward; }
-        let zone_address = carrick_el1_abi::X86_CPL0_DYNAMIC_METADATA_BASE
-            + carrick_el1_abi::X86_CPL0_ZONE_OFFSET;
+        let zone_address = carrick_el1::isa::x86_kernel_layout().zone.raw();
         // SAFETY: the carrier retains and maps the aligned zone with the
         // reservation store throughout this initial MM's execution.
         let zone = unsafe { &*(zone_address as *const X86Cpl0Zone) };
