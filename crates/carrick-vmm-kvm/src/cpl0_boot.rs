@@ -206,6 +206,24 @@ impl Cpl0Carrier {
         Self::boot_inner(image, programs, true)
     }
 
+    /// Boot the compiled production image in the same retained carrier used
+    /// by the hardware fixtures. Guest MM publication follows while stopped.
+    pub fn boot_production() -> Result<Self, TrapError> {
+        const IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/carrick-x86-cpl0"));
+        Self::boot_bytes_inner(IMAGE, [&[], &[]], false)
+    }
+
+    /// The guest MM owner supplies the executable and stack publication here.
+    /// This is the sole unbound seam between a stopped production carrier and
+    /// EL0 admission; no fixture user page is used as an ELF loader.
+    pub fn load_guest_mm(
+        &mut self,
+        _plan: &carrick_mem::elf::LoadPlan,
+        _bytes: &[u8],
+    ) -> Result<(), TrapError> {
+        Err(fail("x86 CPL0 guest MM loader is not yet bound"))
+    }
+
     pub(crate) fn boot_inner(
         image: &Path,
         programs: [&[u8]; 2],
@@ -215,7 +233,15 @@ impl Cpl0Carrier {
             .file_name()
             .is_some_and(|name| name == "carrick-x86-cpl0-fixture");
         let bytes = std::fs::read(image).map_err(|e| fail(format!("CPL0 image: {e}")))?;
-        let plan = carrick_mem::elf::plan_elf_load_bytes_for(&bytes, 62)
+        Self::boot_bytes_inner(&bytes, programs, interrupts)
+    }
+
+    fn boot_bytes_inner(
+        bytes: &[u8],
+        programs: [&[u8]; 2],
+        interrupts: bool,
+    ) -> Result<Self, TrapError> {
+        let plan = carrick_mem::elf::plan_elf_load_bytes_for(bytes, 62)
             .map_err(|e| fail(format!("CPL0 ELF: {e}")))?;
         if !(IMAGE_VA..IMAGE_VA + 0x10_0000).contains(&plan.entry) {
             return Err(fail("CPL0 entry outside its supervisor image"));
