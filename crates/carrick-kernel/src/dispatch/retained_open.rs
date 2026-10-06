@@ -13,7 +13,7 @@ use carrick_abi::{LINUX_O_ACCMODE, LINUX_O_CLOEXEC, LINUX_O_RDWR, LINUX_O_WRONLY
 use super::fd_table::{HostFdRef, HostWriteKind};
 use super::fs::host_inode_pipe_id;
 use super::{
-    DispatchOutcome, OpenDescription, OpenDescriptionBase, OpenFile, SyscallDispatcher,
+    DispatchOutcome, OpenDescription, OpenDescriptionBase, SyscallDispatcher,
     linux_fd_flags_from_open_flags,
 };
 use crate::kernel::objects::FileSlotReservation;
@@ -152,11 +152,12 @@ impl BlockingOpen {
                     stdio_stream: None,
                 };
                 let status = *flags & !LINUX_O_CLOEXEC;
-                let open_file = OpenFile::from_open_description_with_status_flags(
-                    Arc::new(RwLock::new(description)),
-                    status,
-                    linux_fd_flags_from_open_flags(*flags),
-                );
+                let open_file =
+                    crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                        Arc::new(RwLock::new(description)),
+                        status,
+                        linux_fd_flags_from_open_flags(*flags),
+                    );
                 let Some(res) = reservation.take() else {
                     return BlockingOpenStep::Wait(self.clone());
                 };
@@ -193,11 +194,12 @@ impl BlockingOpen {
                     stdio_stream: None,
                 };
                 let status = *flags & !LINUX_O_CLOEXEC;
-                let open_file = OpenFile::from_open_description_with_status_flags(
-                    Arc::new(RwLock::new(description)),
-                    status,
-                    linux_fd_flags_from_open_flags(*flags),
-                );
+                let open_file =
+                    crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                        Arc::new(RwLock::new(description)),
+                        status,
+                        linux_fd_flags_from_open_flags(*flags),
+                    );
                 let Some(res) = reservation.take() else {
                     return BlockingOpenStep::Wait(self.clone());
                 };

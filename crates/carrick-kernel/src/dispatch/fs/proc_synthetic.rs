@@ -600,11 +600,12 @@ impl<'a> FsView<'a> {
                 }
             }
             ReopenAction::CopyDescription(new_desc, new_common, fd_flags) => {
-                let open_file = OpenFile::from_open_description_with_common(
-                    Arc::new(RwLock::new(*new_desc)),
-                    new_common,
-                    fd_flags,
-                );
+                let open_file =
+                    crate::dispatch::fd_table::OpenFile::from_open_description_with_common(
+                        Arc::new(RwLock::new(*new_desc)),
+                        new_common,
+                        fd_flags,
+                    );
                 match self.install_admitted_open_file(reservation, open_file) {
                     Ok(fd) => Ok(DispatchOutcome::returned_i32(fd)),
                     Err(e) => Ok(DispatchOutcome::errno(e)),
@@ -710,16 +711,17 @@ impl<'a> FsView<'a> {
         reservation: &mut Option<crate::kernel::objects::FileSlotReservation>,
     ) -> DispatchOutcome {
         let status = flags & !LINUX_O_CLOEXEC;
-        let open_file = OpenFile::from_open_description_with_status_flags(
-            Arc::new(RwLock::new(OpenDescription::SyntheticFile {
-                path: path.to_string(),
-                contents,
-                offset: 0,
-                base: OpenDescriptionBase::new(status),
-            })),
-            status,
-            linux_fd_flags_from_open_flags(flags),
-        );
+        let open_file =
+            crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+                    path: path.to_string(),
+                    contents,
+                    offset: 0,
+                    base: OpenDescriptionBase::new(status),
+                })),
+                status,
+                linux_fd_flags_from_open_flags(flags),
+            );
         match self.install_admitted_open_file(reservation, open_file) {
             Ok(fd) => DispatchOutcome::returned_i32(fd),
             Err(e) => DispatchOutcome::errno(e),
@@ -734,15 +736,16 @@ impl<'a> FsView<'a> {
         reservation: &mut Option<crate::kernel::objects::FileSlotReservation>,
     ) -> DispatchOutcome {
         let status = flags & !LINUX_O_CLOEXEC;
-        let open_file = OpenFile::from_open_description_with_status_flags(
-            Arc::new(RwLock::new(OpenDescription::ProcExecutable {
-                offset: 0,
-                base: OpenDescriptionBase::new(status),
-                executable,
-            })),
-            status,
-            linux_fd_flags_from_open_flags(flags),
-        );
+        let open_file =
+            crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::ProcExecutable {
+                    offset: 0,
+                    base: OpenDescriptionBase::new(status),
+                    executable,
+                })),
+                status,
+                linux_fd_flags_from_open_flags(flags),
+            );
         match self.install_admitted_open_file(reservation, open_file) {
             Ok(fd) => DispatchOutcome::returned_i32(fd),
             Err(e) => DispatchOutcome::errno(e),

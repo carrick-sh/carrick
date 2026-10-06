@@ -342,7 +342,7 @@ impl<'a> FsView<'a> {
         common: Arc<crate::kernel::DescriptionCommon>,
         fd_flags: u64,
     ) -> DispatchOutcome {
-        let open_file = OpenFile::from_open_description_with_common(
+        let open_file = crate::dispatch::fd_table::OpenFile::from_open_description_with_common(
             Arc::new(RwLock::new(description)),
             common,
             fd_flags,
