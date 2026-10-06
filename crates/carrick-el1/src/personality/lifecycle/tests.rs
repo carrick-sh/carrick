@@ -526,6 +526,23 @@ fn clone_tid_copy_faults_restore_the_preimages_and_forward() {
 const SIGUSR1_BIT: u64 = 1 << 9; // signal 10
 
 #[test]
+fn pending_host_work_gettid_forwards_without_completion() {
+    for scale in [1, 2, 8] {
+        let mut w = World::new(LifecycleHatches::ON);
+        assert!(w.venue.leader_slot().publish_visible_tid(41));
+        w.task().linux.mark_pending_host_work();
+        for _ in 0..scale {
+            let (action, frame) = w.syscall(SYS_GETTID, &[0xfeed]);
+            assert_eq!(action, Action::Forward);
+            assert_eq!(frame.x[0], 0xfeed);
+            assert_eq!(w.task().linux.served_with_work.load(Ordering::Acquire), 0);
+        }
+        assert_eq!(w.served(SYS_GETTID), 0);
+        assert_eq!(w.forwarded(SYS_GETTID), scale);
+    }
+}
+
+#[test]
 fn lifecycle_setup_completes_once_before_pending_host_work() {
     for nr in [SYS_RT_SIGPROCMASK, SYS_SIGALTSTACK, SYS_SET_ROBUST_LIST] {
         let mut w = World::new(LifecycleHatches::ON);
