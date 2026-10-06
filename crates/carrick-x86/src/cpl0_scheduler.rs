@@ -17,6 +17,13 @@ pub struct InterruptFrame {
     pub rsp: u64,
     pub ss: u64,
 }
+impl InterruptFrame {
+    pub fn valid_user_return(&self) -> bool {
+        self.cs == 0x23
+            && self.ss == 0x1b
+            && carrick_sched_core::valid_user_return_words(self.rip, self.rsp, self.flags)
+    }
+}
 const _: () = assert!(core::mem::size_of::<InterruptFrame>() == 160);
 const _: () = {
     assert!(core::mem::offset_of!(InterruptFrame, gpr) == 0);
@@ -89,15 +96,19 @@ pub fn restore_native_context(
     }
     let mut gpr = [0; 15];
     gpr.copy_from_slice(&words.frame[..15]);
+    let frame = InterruptFrame {
+        gpr,
+        rip: words.frame[15],
+        cs: words.frame[16],
+        flags: words.frame[17],
+        rsp: words.frame[18],
+        ss: words.frame[19],
+    };
+    if !frame.valid_user_return() {
+        return None;
+    }
     Some(NativeContext {
-        frame: InterruptFrame {
-            gpr,
-            rip: words.frame[15],
-            cs: words.frame[16],
-            flags: words.frame[17],
-            rsp: words.frame[18],
-            ss: words.frame[19],
-        },
+        frame,
         address: expected,
         fs_base: words.fs_base,
         gs_base: words.gs_base,
@@ -204,6 +215,46 @@ mod tests {
     use carrick_guest_arch::{ContextGeneration, FrameGpa, MmGeneration};
     use carrick_sched_core::ThreadIdentity;
     use std::num::NonZeroU64;
+
+    #[test]
+    fn native_restore_rejects_invalid_iret_user_state() {
+        let root = RootGpa::page_aligned(FrameGpa::new(0x60_0000)).unwrap();
+        let address = AddressContext {
+            root,
+            mm: MmGeneration::new(NonZeroU64::new(1).unwrap()),
+            generation: ContextGeneration::new(NonZeroU64::new(1).unwrap()),
+        };
+        let context = NativeContext {
+            frame: InterruptFrame {
+                rip: 0x40_0000,
+                cs: 0x23,
+                flags: 0x202,
+                rsp: 0x7fff_0000,
+                ss: 0x1b,
+                ..InterruptFrame::default()
+            },
+            address,
+            fs_base: 0,
+            gs_base: 0,
+            xsave: XsaveArea::ZERO,
+        };
+        let words = park_native_context(&context);
+        assert!(restore_native_context(words, address).is_some());
+        for (index, value) in [
+            (15, 1_u64 << 47), // non-user RIP
+            (16, 0x1b),        // data selector as CS
+            (17, 0x3002),      // privileged IOPL
+            (18, 1_u64 << 47), // non-user stack
+            (19, 0x23),        // code selector as SS
+        ] {
+            let mut invalid = words;
+            invalid.frame[index] = value;
+            assert!(
+                restore_native_context(invalid, address).is_none(),
+                "word {index}"
+            );
+        }
+    }
 
     #[test]
     fn shared_queue_cross_mm_admission_refuses_stale_native_custody() {

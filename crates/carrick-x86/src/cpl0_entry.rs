@@ -132,12 +132,7 @@ impl NativeFrame {
     /// IRETQ handles all admitted returns, including TF/RF. Reject privileged
     /// flags and non-user targets before constructing the return frame.
     pub fn valid_user_return(&self) -> bool {
-        self.rcx != 0
-            && self.rcx < (1 << 47)
-            && self.rsp != 0
-            && self.rsp < (1 << 47)
-            && self.r11 & 2 != 0
-            && self.r11 & ((3 << 12) | (1 << 14) | (1 << 17) | (1 << 19) | (1 << 20)) == 0
+        carrick_sched_core::valid_user_return_words(self.rcx, self.rsp, self.r11)
     }
 }
 
