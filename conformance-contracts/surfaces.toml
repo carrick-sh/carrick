@@ -914,3 +914,7 @@ contracts = ["kernel.el1.thread-lifecycle"]
 [[surfaces]]
 path = "crates/carrick-personality-linux/tests/x86_wave2/lifecycle.rs"
 contracts = ["kernel.el1.thread-lifecycle"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/personality/x86_native.rs"
+contracts = ["x86.context.tls-base"]

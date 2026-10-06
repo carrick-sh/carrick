@@ -1352,7 +1352,7 @@ mod kernel {
         let native_call = carrick_personality_linux::abi::x86_64::lookup_native_x86_64(call.native.raw());
         let handled_by_native = if let Some(carrick_personality_linux::abi::x86_64::NativeX86Call::ArchPrctl) = native_call {
             let operation = carrick_personality_linux::abi::x86_64::ArchPrctlOperation::decode(call.args[0]);
-            match carrick_el1::isa::x86::context::arch_prctl(
+            match carrick_el1::personality::x86_native::arch_prctl(
                 task, operation, carrick_guest_arch::UserVa::new(call.args[1]),
             ) {
                 Ok(result) => frame.rax = result.raw() as u64,

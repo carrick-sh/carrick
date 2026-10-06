@@ -11,3 +11,6 @@ pub mod lifecycle;
 pub mod mm_portal;
 pub mod sched;
 pub mod thread_setup;
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub mod x86_native;
