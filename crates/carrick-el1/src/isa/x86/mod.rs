@@ -8,6 +8,7 @@ pub mod interrupt;
 mod mmu;
 pub mod transport;
 pub mod user_access;
+pub mod user_tables;
 
 pub mod interrupts;
 
