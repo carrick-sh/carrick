@@ -162,6 +162,9 @@ impl AnonymousBackingProbe for LiveProbe {
     fn stock_span(&mut self, _mm: u64, _va: u64) -> Option<(u64, u64)> {
         None
     }
+    fn retired(&mut self, _mm: u64, _va: u64, _len: u64) {
+        panic!("lazy-only witness must not retire residency")
+    }
 }
 impl AnonymousPermissionEditor for LiveProbe {
     fn protect_and_invalidate(
