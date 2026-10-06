@@ -108,6 +108,56 @@ fn apply(words: &Words, op: DescriptorOp, tables: &[RootGpa]) -> DescriptorOutco
     .outcome
 }
 #[test]
+fn lower_half_supervisor_and_upper_half_user_leaves_are_refused_before_stores() {
+    for (va, user) in [(0x4000, false), (0xffff_8000_0000_4000, true)] {
+        let words = Words::new();
+        let op = DescriptorOp::Map {
+            span: PageSpan::new(va, PAGE),
+            output: FrameGpa::new(0x800000),
+            permissions: Permissions {
+                writable: true,
+                executable: false,
+                user,
+            },
+            size: LeafSize::Page,
+            resident: true,
+            backing: backing(),
+        };
+        assert_eq!(
+            apply(&words, op, &[root(0x2000), root(0x3000), root(0x4000)]),
+            DescriptorOutcome::Refused(DescriptorRefusal::PermissionDenied)
+        );
+        assert_eq!(words.stores.get(), 0);
+    }
+}
+#[test]
+fn lower_half_user_and_upper_half_supervisor_leaves_are_accepted() {
+    for (va, user) in [(0x4000, true), (0xffff_8000_0000_4000, false)] {
+        let words = Words::new();
+        let op = DescriptorOp::Map {
+            span: PageSpan::new(va, PAGE),
+            output: FrameGpa::new(0x800000),
+            permissions: Permissions {
+                writable: true,
+                executable: false,
+                user,
+            },
+            size: LeafSize::Page,
+            resident: true,
+            backing: backing(),
+        };
+        assert!(matches!(
+            apply(&words, op, &[root(0x2000), root(0x3000), root(0x4000)]),
+            DescriptorOutcome::Applied { .. }
+        ));
+        let leaf_index = (va >> 12) & 511;
+        assert_eq!(
+            words.load(0x4000 + leaf_index * 8).unwrap() & USER != 0,
+            user
+        );
+    }
+}
+#[test]
 fn builds_all_four_levels_and_nonidentity_output() {
     let words = Words::new();
     assert!(matches!(
@@ -378,7 +428,8 @@ fn first_touch_cow_nx_and_protection_have_distinct_classes() {
             &words,
             DescriptorOp::Publish {
                 span,
-                expected: FrameGpa::new(0x800000)
+                expected: FrameGpa::new(0x800000),
+                access: Access::Read,
             },
             &[]
         ),
@@ -416,6 +467,42 @@ fn first_touch_cow_nx_and_protection_have_distinct_classes() {
     );
     assert_eq!(walk(Access::Write), Err(FaultClass::Protection));
     assert_eq!(walk(Access::Execute), Ok(FrameGpa::new(0x900000 + 19)));
+}
+
+#[test]
+fn prepared_readonly_leaf_refuses_write_publication_without_a_store() {
+    let words = Words::new();
+    let span = PageSpan::new(0x4000, PAGE);
+    let op = DescriptorOp::Map {
+        span,
+        output: FrameGpa::new(0x800000),
+        permissions: Permissions {
+            writable: false,
+            executable: false,
+            user: true,
+        },
+        size: LeafSize::Page,
+        resident: false,
+        backing: backing(),
+    };
+    assert!(matches!(
+        apply(&words, op, &[root(0x2000), root(0x3000), root(0x4000)]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let before = words.words.borrow().clone();
+    assert_eq!(
+        apply(
+            &words,
+            DescriptorOp::Publish {
+                span,
+                expected: FrameGpa::new(0x800000),
+                access: Access::Write,
+            },
+            &[]
+        ),
+        DescriptorOutcome::Refused(DescriptorRefusal::PermissionDenied),
+    );
+    assert_eq!(*words.words.borrow(), before);
 }
 #[test]
 fn split_and_coalesce_preserve_pat_output_and_neighbors() {

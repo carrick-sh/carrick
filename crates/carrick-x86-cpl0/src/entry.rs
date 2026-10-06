@@ -298,39 +298,45 @@ mod kernel {
             return;
         }
         if frame.rax == OBSERVE_DESCRIPTOR_PROTECT {
-            use carrick_guest_arch::{FrameGpa, RootGpa};
-            use carrick_mmu_core::x86::descriptor_txn::{
-                DescriptorOp, DescriptorOutcome, DescriptorTxn, DescriptorTxnId, PageSpan,
-                Permissions,
+            use carrick_guest_arch::{
+                EditIntent, EditOperation, EditOwner, EditPermissions, FrameGpa, GuestLen,
+                MmuEditArch, RootGpa, UserRange, UserVa,
             };
+            use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
             let Some(root) = RootGpa::page_aligned(FrameGpa::new(0x60_0000)) else {
                 doorbell(FATAL_PORT, frame);
                 halt();
             };
-            let txn = DescriptorTxn {
-                id: DescriptorTxnId {
-                    mm_key: core::num::NonZeroU64::MIN,
-                    generation: core::num::NonZeroU64::MIN,
-                },
-                root,
-                op: DescriptorOp::Protect {
-                    span: PageSpan::new(0x3_0000, 4096),
-                    permissions: Permissions {
+            // SAFETY: this fixture runs one vCPU at a time with a retained
+            // root, so the native page-table editor is exclusive here.
+            let owner = unsafe {
+                EditOwner::issue(root, core::num::NonZeroU64::MIN, core::num::NonZeroU64::MIN)
+            };
+            let Some(range) = UserRange::checked(UserVa::new(0x3_0000), GuestLen::new(4096)) else {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            };
+            let Some(intent) = EditIntent::checked(
+                owner,
+                range,
+                EditOperation::Protect {
+                    permissions: EditPermissions {
+                        readable: true,
                         writable: false,
                         executable: false,
                         user: true,
                     },
                 },
-                tables: &[],
+                &[],
+            ) else {
+                doorbell(FATAL_PORT, frame);
+                halt();
             };
             // SAFETY: this KVM fixture exclusively owns a retained, identity
             // mapped 448-page PML4 window while its sibling vCPU is stopped.
+            let mut arch = carrick_el1::isa::x86::Kernel::new(carrick_el1::isa::x86::X86Backend);
             let receipt = unsafe {
-                carrick_el1::isa::x86::execute_native_descriptor_txn(
-                    &txn,
-                    root.address().raw(),
-                    FIXTURE_PML4_CAPACITY,
-                )
+                arch.execute_edit(intent, root.address(), GuestLen::new(FIXTURE_PML4_CAPACITY))
             };
             frame.rax = match receipt {
                 Ok(receipt) if matches!(receipt.outcome, DescriptorOutcome::Applied { .. }) => 1,
