@@ -301,6 +301,8 @@ pub struct InitialMmImage {
     pub address: AddressContext<RootGpa>,
     pub context: ParkedContextWords,
     pub stack_pointer: u64,
+    /// First byte beyond the highest ELF PT_LOAD page; Linux brk begins here.
+    pub initial_break: UserVa,
     pub publications: Vec<GuestMmuPublication>,
 }
 
@@ -408,6 +410,14 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
     }) {
         return Err(InitialMmError::InvalidRange);
     }
+    let initial_break = UserVa::new(
+        image
+            .regions
+            .iter()
+            .map(|region| region.start.raw() + region.len.raw())
+            .max()
+            .ok_or(InitialMmError::InvalidRange)?,
+    );
     let root = source
         .take_zeroed_table()
         .ok_or(InitialMmError::FrameUnavailable)?;
@@ -522,6 +532,7 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
         address,
         context: ParkedContextWords::from_parts(frame, address, 0, 0, [0; X86_XSAVE_BYTES]),
         stack_pointer: stack.rsp,
+        initial_break,
         publications,
     })
 }
@@ -718,6 +729,7 @@ mod tests {
         }
         .unwrap();
         assert_eq!(loaded.publications.len(), 3);
+        assert_eq!(loaded.initial_break.raw(), 0x403000);
         assert_eq!(loaded.context.frame[15], 0x400000);
         assert_eq!(loaded.context.frame[16], 0x23);
         assert_eq!(loaded.context.frame[17], 0x202);
