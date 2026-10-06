@@ -1,8 +1,8 @@
 //! Native fatal and host-effect transport for CPL0.
 
+use super::X86Backend;
 use super::context::native::{FATAL_PORT, YIELD_PORT};
-use super::{ArchError, X86Backend};
-use carrick_guest_arch::{CrossingBackend, FatalReport, OwnedHostRequest, RequestToken};
+use carrick_guest_arch::{CrossingBackend, FatalReport};
 
 pub fn yield_host_effect() {
     // SAFETY: CPL0 exits to the KVM host through YIELD_PORT. The host
@@ -39,21 +39,6 @@ impl CrossingBackend for X86Backend {
     fn yield_host_effect(&mut self) -> Result<(), Self::Error> {
         yield_host_effect();
         Ok(())
-    }
-    fn submit_host_request(
-        &mut self,
-        _request: OwnedHostRequest<Self::HostPayload>,
-    ) -> Result<RequestToken<Self::HostTicket>, Self::Error> {
-        Err(ArchError::Unbound)
-    }
-    fn consume_completion(
-        &mut self,
-        _token: RequestToken<Self::HostTicket>,
-    ) -> Result<Self::HostCompletion, Self::Error> {
-        Err(ArchError::Unbound)
-    }
-    fn leave_idle(&mut self) -> Result<(), Self::Error> {
-        Err(ArchError::Unbound)
     }
     fn report_fatal(&mut self, _report: FatalReport) -> ! {
         fatal_entry_binding()
