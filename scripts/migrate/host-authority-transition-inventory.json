@@ -3878,7 +3878,7 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
-      "resource": "Cargo-built production CPL0 image copied from its build target directory into this build script OUT_DIR"
+      "resource": "Cargo-built production and fixture CPL0 images copied from its build target directory into this build script OUT_DIR"
     },
     "expansion": null,
     "operation": "std::fs::copy",
@@ -3886,7 +3886,7 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/build.rs:65 in `main`, `std::fs::copy` copies only the Cargo-built production CPL0 image into this build script OUT_DIR; no guest path or identity selects either host file.",
+    "rationale": "At crates/carrick-vmm-kvm/build.rs:65 in `main`, `std::fs::copy` copies only the Cargo-built production and fixture CPL0 images into this build script OUT_DIR; no guest path or identity selects either host file.",
     "review_id": "HA-000759",
     "source": {
       "byte_end": 2582,
