@@ -3,6 +3,34 @@
 mod common_entry;
 #[path = "x86_wave2/dispatch.rs"]
 mod dispatch;
+
+#[test]
+fn poll_decode_preserves_integer_timeout_and_has_no_sigmask() {
+    use carrick_personality_linux::abi::x86_64::PollTimeout;
+    for milliseconds in [-1_i32, 0, 1, i32::MAX] {
+        let raw = milliseconds as u32 as u64;
+        let call = carrick_personality_linux::entry::decode_x86_64(
+            7,
+            [0x4000, 3, raw, 0xBAD, 0xBAD, 0xBAD],
+            0x8000,
+        );
+        assert_eq!(
+            call.canonical.raw(),
+            carrick_syscall_abi::CARRICK_PRIVATE_X86_POLL
+        );
+        assert_eq!(call.native.raw(), 7);
+        assert_eq!(call.args, [0x4000, 3, raw, 0, 0, 0]);
+        assert_eq!(call.stack.raw(), 0x8000);
+        assert_eq!(
+            PollTimeout::from_register(call.args[2]).duration(),
+            if milliseconds < 0 {
+                None
+            } else {
+                Some(core::time::Duration::from_millis(milliseconds as u64))
+            }
+        );
+    }
+}
 #[test]
 fn x4_linux_common_entry() {
     common_entry::x4_linux_common_entry();
