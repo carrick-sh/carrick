@@ -77,6 +77,9 @@ ASSEMBLY_BOUNDARIES = frozenset(
         PurePosixPath("crates/carrick-el1/src/isa/x86/user_access.rs"),
         # Reviewed x86 CPL0 hardware boundary: entry/return, port I/O and halt; no host operation.
         PurePosixPath("crates/carrick-x86-cpl0/src/entry.rs"),
+        # Native IRQ entry saves registers and xstate, validates the local
+        # xAPIC vector, then IRETs or uses the declared guest fatal port.
+        PurePosixPath("crates/carrick-x86-cpl0/src/native_irq.rs"),
         # CPL0 initial-image IRET and the declared KVM carrier completion
         # port execute only in the guest; no host syscall or other port.
         PurePosixPath("crates/carrick-x86-cpl0/src/initial_boot.rs"),
