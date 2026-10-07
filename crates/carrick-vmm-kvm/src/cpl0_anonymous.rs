@@ -8,11 +8,34 @@ use carrick_mmu_core::aarch64::descriptor_txn::{
 use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa};
 use carrick_mmu_core::x86::owner_mmu::X86Mmu;
 
+#[derive(Clone, Copy)]
+struct GrantExecution {
+    cpu: carrick_guest_arch::CpuId,
+    binding: carrick_el1_abi::ExecutionBinding,
+    context: AddressContext<RootGpa>,
+}
+impl GrantExecution {
+    fn matches(self, current: Self) -> bool {
+        self.cpu == current.cpu
+            && self.binding == current.binding
+            && self.context == current.context
+    }
+}
+
+fn reserve_table_stock(stock: &mut Vec<RootGpa>) -> Vec<RootGpa> {
+    let count = stock
+        .len()
+        .min(carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS);
+    stock.drain(..count).collect()
+}
+
 pub(super) struct PendingGrant {
     window: PortalGrantWindow,
     txn: WireTxn,
     inventory: InitialInventory,
     handle: BackingHandle,
+    execution: GrantExecution,
+    tables: Vec<RootGpa>,
 }
 
 impl Cpl0Carrier {
@@ -41,15 +64,43 @@ impl Cpl0Carrier {
         Ok(())
     }
 
-    pub(super) fn service_anonymous_grant(&mut self) -> Result<(), TrapError> {
-        if self.cpus[0].get_gpr(X86Reg::Rax)? != 0 {
-            return Err(fail("owner grant CPU slot"));
+    pub(super) fn service_anonymous_grant(
+        &mut self,
+        cpu: carrick_guest_arch::CpuId,
+    ) -> Result<(), TrapError> {
+        let index = cpu.raw() as usize;
+        let lane = self
+            .cpus
+            .get(index)
+            .ok_or_else(|| fail("owner grant CPU slot"))?;
+        if lane.get_gpr(X86Reg::Rax)? != u64::from(cpu.raw()) {
+            return Err(fail("owner grant CPU identity"));
         }
-        let mm = NonZeroU64::new(INITIAL_MM_KEY).ok_or_else(|| fail("owner grant MM"))?;
-        if let Some(mut pending) = self.anonymous_pending.take() {
+        let task = self.task(index);
+        let binding = carrick_core::entry::binding(&task.execution, &task.mm);
+        let mm = NonZeroU64::new(binding.mm.raw()).ok_or_else(|| fail("owner grant MM"))?;
+        let context = self._vm.root(mm).ok_or_else(|| fail("owner grant root"))?;
+        if !binding.issued()
+            || binding.thread_generation.raw() == 0
+            || context.mm.raw() != mm
+            || lane.get_gpr(X86Reg::Cr3)? != context.root.address().raw()
+        {
+            return Err(fail("owner grant inactive execution/root"));
+        }
+        let execution = GrantExecution {
+            cpu,
+            binding,
+            context,
+        };
+        if let Some(pending) = &self.anonymous_pending[index]
+            && !pending.execution.matches(execution)
+        {
+            return Err(fail("owner grant stale execution/root"));
+        }
+        if let Some(mut pending) = self.anonymous_pending[index].take() {
             let receipt = self
                 .grant_portal()?
-                .grant(0)
+                .grant(index)
                 .ok_or_else(|| fail("owner grant slot"))?
                 .take_receipt(pending.window, &pending.txn)
                 .ok_or_else(|| fail("owner grant receipt absent"))?;
@@ -70,15 +121,15 @@ impl Cpl0Carrier {
             if used > pending.txn.tables.len() {
                 return Err(fail("owner grant table receipt"));
             }
-            self.grant_tables.drain(..used);
+            self.grant_tables.extend(pending.tables.drain(used..));
             // Retained stage-2 custody now belongs to the live guest graph.
             let _retained = pending.handle;
             return Ok(());
         }
-        let far = self.cpus[0].get_gpr(X86Reg::Cr2)?;
+        let far = self.cpus[index].get_gpr(X86Reg::Cr2)?;
         let (_, window) = self
             .grant_portal()?
-            .grant(0)
+            .grant(index)
             .ok_or_else(|| fail("owner grant slot"))?
             .pending_fault_selection(mm.get(), far)
             .ok_or_else(|| fail("owner fault selection absent"))?;
@@ -88,14 +139,7 @@ impl Cpl0Carrier {
         {
             return Err(fail("owner grant selection identity"));
         }
-        let root = self
-            ._vm
-            .root(mm)
-            .ok_or_else(|| fail("owner grant root"))?
-            .root;
-        if self.cpus[0].get_gpr(X86Reg::Cr3)? != root.address().raw() {
-            return Err(fail("owner grant inactive root"));
-        }
+        let root = context.root;
         let gpa = self.anonymous_next_gpa;
         let len = window.range.len();
         self.anonymous_next_gpa = FrameGpa::new(
@@ -133,10 +177,9 @@ impl Cpl0Carrier {
             .map_err(|error| fail(error.to_string()))?;
         let handle = handles[0];
         let grant = grants[0];
-        let tables: Vec<_> = self
-            .grant_tables
+        let owned_tables = reserve_table_stock(&mut self.grant_tables);
+        let tables: Vec<_> = owned_tables
             .iter()
-            .take(carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS)
             .map(|table| SubstrateGpa(table.address().raw()))
             .collect();
         let txn = WireTxn {
@@ -164,12 +207,11 @@ impl Cpl0Carrier {
         };
         let admission = X86Mmu::project_grant(root.address().raw(), &txn, |native| {
             self._vm.admit_guest_edit(native)
-        })
-        .map_err(|error| fail(format!("owner grant projection: {error:?}")))?;
-        if admission.is_err()
+        });
+        if !matches!(admission, Ok(Ok(())))
             || !self
                 .grant_portal()?
-                .grant(0)
+                .grant(index)
                 .ok_or_else(|| fail("owner grant slot"))?
                 .submit(window, &txn)
         {
@@ -177,6 +219,7 @@ impl Cpl0Carrier {
             // admitted. The fresh extent has never been guest-visible.
             unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
                 .map_err(|error| fail(error.to_string()))?;
+            self.grant_tables.extend(owned_tables);
             return Err(fail("owner grant admission refused"));
         }
         inventory.expected = 1;
@@ -184,12 +227,78 @@ impl Cpl0Carrier {
         // if the carrier never receives a verifiable completion. Keep physical
         // custody through carrier teardown rather than rolling inventory back.
         inventory.guest_exposed = true;
-        self.anonymous_pending = Some(PendingGrant {
+        self.anonymous_pending[index] = Some(PendingGrant {
             window,
             txn,
             inventory,
             handle,
+            execution,
+            tables: owned_tables,
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod custody_tests {
+    use super::*;
+    use carrick_el1_abi::{
+        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+    };
+    fn execution() -> GrantExecution {
+        GrantExecution {
+            cpu: carrick_guest_arch::CpuId::new(1),
+            binding: ExecutionBinding {
+                task: EntryTaskKey::from_raw(42),
+                generation: EntryGeneration::from_raw(12),
+                mm: EntryMmKey::from_raw(302),
+                thread_generation: EntryThreadGeneration::from_raw(102),
+            },
+            context: AddressContext {
+                root: RootGpa::page_aligned(FrameGpa::new(0x7000)).unwrap(),
+                mm: MmGeneration::new(NonZeroU64::new(302).unwrap()),
+                generation: ContextGeneration::new(NonZeroU64::new(17).unwrap()),
+            },
+        }
+    }
+    #[test]
+    fn owner_grant_receipt_refuses_recycled_execution_or_root() {
+        let admitted = execution();
+        assert!(admitted.matches(admitted));
+        let mut foreign = admitted;
+        foreign.binding.task = EntryTaskKey::from_raw(43);
+        assert!(!admitted.matches(foreign));
+        let mut foreign = admitted;
+        foreign.binding.generation = EntryGeneration::from_raw(13);
+        assert!(!admitted.matches(foreign));
+        let mut foreign = admitted;
+        foreign.binding.mm = EntryMmKey::from_raw(303);
+        assert!(!admitted.matches(foreign));
+        let mut foreign = admitted;
+        foreign.binding.thread_generation = EntryThreadGeneration::from_raw(103);
+        assert!(!admitted.matches(foreign));
+        let mut foreign = admitted;
+        foreign.cpu = carrick_guest_arch::CpuId::new(0);
+        assert!(!admitted.matches(foreign));
+        let mut foreign = admitted;
+        foreign.context.root = RootGpa::page_aligned(FrameGpa::new(0x8000)).unwrap();
+        assert!(!admitted.matches(foreign));
+        let mut foreign = admitted;
+        foreign.context.generation = ContextGeneration::new(NonZeroU64::new(18).unwrap());
+        assert!(!admitted.matches(foreign));
+        let mut foreign = admitted;
+        foreign.context.mm = MmGeneration::new(NonZeroU64::new(303).unwrap());
+        assert!(!admitted.matches(foreign));
+    }
+    #[test]
+    fn owner_grants_reserve_disjoint_table_stock_before_receipt() {
+        let mut stock: Vec<_> = (1..=32)
+            .map(|n| RootGpa::page_aligned(FrameGpa::new(n * 4096)).unwrap())
+            .collect();
+        let first = reserve_table_stock(&mut stock);
+        let second = reserve_table_stock(&mut stock);
+        assert!(!first.is_empty());
+        assert!(first.iter().all(|frame| !second.contains(frame)));
     }
 }

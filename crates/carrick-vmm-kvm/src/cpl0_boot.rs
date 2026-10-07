@@ -837,7 +837,7 @@ pub struct Cpl0Carrier {
     initial_inventory: Option<InitialInventory>,
     grant_tables: Vec<RootGpa>,
     anonymous_next_gpa: FrameGpa,
-    anonymous_pending: Option<anonymous_owner::PendingGrant>,
+    anonymous_pending: [Option<anonymous_owner::PendingGrant>; 2],
     anonymous_private_pages: u64,
     owner_grant_crossings: u64,
     metadata_base: NonNull<u8>,
@@ -1704,7 +1704,7 @@ impl Cpl0Carrier {
                 }
             ) {
                 self.record_physical_crossing(PhysicalCrossingFamily::OwnerGrant)?;
-                self.service_anonymous_grant()?;
+                self.service_anonymous_grant(carrick_guest_arch::CpuId::new(0))?;
                 continue;
             }
             let VcpuExit::IoOut {
@@ -2478,7 +2478,7 @@ impl Cpl0Carrier {
             initial_inventory: None,
             grant_tables: Vec::new(),
             anonymous_next_gpa: FrameGpa::new(0x2_0000_0000),
-            anonymous_pending: None,
+            anonymous_pending: [None, None],
             anonymous_private_pages: 0,
             owner_grant_crossings: 0,
             metadata_base,

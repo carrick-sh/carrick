@@ -1263,7 +1263,7 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         frame.far,
         arm_fault_class(frame.esr),
         counters,
-        current_tasks,
+        current_tasks.get(frame.slot as usize),
         spaces,
         mailboxes.into(),
         prepared,
@@ -1281,21 +1281,21 @@ pub fn dispatch_x86_fault_with_prepared<
     G: carrick_core::mm::reservation::ReservationGeometry,
     Context: Copy + Send + Sync + zerocopy::FromZeros,
 >(
-    slot: u64,
+    slot: carrick_guest_arch::CpuId,
     fault: carrick_guest_arch::FaultInfo,
     counters: &Counters,
-    current_tasks: &[CurrentTask],
+    current_task: &CurrentTask,
     spaces: SpaceAccess<'_, Context>,
     supply: impl Into<FaultSupply<'supply>>,
     prepared: Option<PreparedFaultPath<'_, P, G>>,
     cow_resolver: &mut C,
 ) -> Action {
     dispatch_classified_fault(
-        slot,
+        u64::from(slot.raw()),
         fault.address.raw(),
         x86_fault_class(fault),
         counters,
-        current_tasks,
+        Some(current_task),
         spaces,
         supply.into(),
         prepared,
@@ -1314,7 +1314,7 @@ fn dispatch_classified_fault<
     far: u64,
     fault: FaultClass,
     counters: &Counters,
-    current_tasks: &[CurrentTask],
+    current_task: Option<&CurrentTask>,
     spaces: SpaceAccess<'_, Context>,
     supply: FaultSupply<'_>,
     mut prepared: Option<PreparedFaultPath<'_, P, G>>,
@@ -1323,7 +1323,7 @@ fn dispatch_classified_fault<
     use carrick_core::mm::fault::RootFaultAdmission;
     counters.fault_taken.fetch_add(1, Ordering::Relaxed);
     if fault == FaultClass::WritePermission {
-        let Some(task) = current_tasks.get(slot as usize) else {
+        let Some(task) = current_task else {
             return Action::Forward;
         };
         let mm_key = task.mm.key.load(Ordering::Acquire);
@@ -1379,7 +1379,7 @@ fn dispatch_classified_fault<
 
     if let FaultClass::Protection(access) = fault {
         if let FaultSupply::Owner(_) = supply
-            && let Some(task) = current_tasks.get(slot as usize)
+            && let Some(task) = current_task
             && root_fault_admission(
                 prepared.as_ref().and_then(|path| path.roots),
                 spaces,
@@ -1400,7 +1400,7 @@ fn dispatch_classified_fault<
     else {
         return Action::Forward;
     };
-    let Some(task) = current_tasks.get(slot as usize) else {
+    let Some(task) = current_task else {
         return Action::Forward;
     };
     let mm_key = task.mm.key.load(Ordering::Acquire);
@@ -1676,14 +1676,67 @@ mod tests {
         let counters = Counters::default();
         assert_eq!(
             dispatch_x86_fault_with_prepared(
-                0,
+                carrick_guest_arch::CpuId::new(0),
                 FaultInfo {
                     address: UserVa::new(va),
                     access: Access::Read,
                     present: false,
                 },
                 &counters,
-                &tasks,
+                &tasks[0],
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+                GrantMailboxes::own(&mailbox),
+                Some(PreparedFaultPath::<_> {
+                    residency: &residency,
+                    resolver: &mut prepared,
+                    roots: None,
+                    file_slots: None,
+                }),
+                &mut NoopCowResolver,
+            ),
+            Action::Served
+        );
+        assert_eq!(prepared.calls, vec![(0x8800_0000, va, 0x9000_0000)]);
+        assert!(residency.is_guest_committed(mm, va));
+        assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
+        assert!(!mailbox.has_guest_work());
+    }
+
+    #[test]
+    fn x86_cpu1_fault_uses_bound_task_without_cpu0_padding() {
+        use carrick_guest_arch::{Access, FaultInfo, UserVa};
+        let mm = 91;
+        let va = 0x4000_1000;
+        let residency = carrick_el1_abi::FrameGrantResidencyTable::new();
+        residency
+            .publish(carrick_el1_abi::FrameGrantResidencyIdentity {
+                mm_key: mm,
+                semantic_base: va,
+                physical_ipa: 0x9000_0000,
+                len: 4096,
+                mapping_id: 11,
+                frame_id: 12,
+                owner_generation: 13,
+                inventory_revision: 14,
+            })
+            .unwrap();
+        let task = CurrentTask::new();
+        task.mm.key.store(mm, Ordering::Release);
+        let tasks = [task];
+        let spaces = published_space(mm, 0x8800_0000);
+        let mailbox = FrameGrantMailbox::new();
+        let mut prepared = RecordingPreparedResolver::default();
+        let counters = Counters::default();
+        assert_eq!(
+            dispatch_x86_fault_with_prepared(
+                carrick_guest_arch::CpuId::new(1),
+                FaultInfo {
+                    address: UserVa::new(va),
+                    access: Access::Read,
+                    present: false,
+                },
+                &counters,
+                &tasks[0],
                 carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                 GrantMailboxes::own(&mailbox),
                 Some(PreparedFaultPath::<_> {

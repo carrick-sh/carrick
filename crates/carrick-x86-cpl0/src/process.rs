@@ -328,7 +328,7 @@ fn prepare_parent_output(
     if translate_leaf(&InitialWords::fixture(),root,address,Access::Write,true).is_err() {
         let mut cow=X86CowResolver { pool:&SHARED_COW_POOL,residency:residency()?,completion:None };
         let result=dispatch_x86_fault_with_prepared(
-            0,FaultInfo {address,access:FaultAccess::Write,present:true},lane.counters,core::slice::from_ref(lane.task),
+            carrick_guest_arch::CpuId::new(0),FaultInfo {address,access:FaultAccess::Write,present:true},lane.counters,lane.task,
             carrick_el1::substrate::sched::object_wait::space_access(lane.zone,lane.lane.slot),
             GrantMailboxes::own(&super::SHARED_FAULT_MAILBOX),
             None::<carrick_el1::fault::PreparedFaultPath<'_,NoopPreparedResolver>>,&mut cow,
