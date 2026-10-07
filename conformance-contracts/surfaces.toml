@@ -823,6 +823,18 @@ path = "crates/carrick-vmm-kvm/tests/cpl0_entry.rs"
 contracts = ["core.entry.completion"]
 
 [[surfaces]]
+path = "crates/carrick-vmm-kvm/tests/cpl0_shared_entry.rs"
+contracts = ["core.entry.completion", "kernel.el1.thread-lifecycle", "kernel.el1.signal-delivery-owner"]
+
+[[surfaces]]
+path = "crates/carrick-el1/tests/x86_production_forward.rs"
+contracts = ["core.entry.completion", "kernel.el1.files", "kernel.el1.inotify", "kernel.el1.anonymous-reservations", "kernel.el1.futex-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-x86-cpl0/src/lib.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
 path = "crates/carrick-cli/tests/x86_kvm_run.rs"
 contracts = ["x86.carrier.cli-run"]
 
