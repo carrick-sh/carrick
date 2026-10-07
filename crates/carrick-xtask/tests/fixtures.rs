@@ -889,8 +889,12 @@ impl Preparation {
         let scratch = CanonicalTempDir::new();
         let archive = scratch.path().join("fixtures.tar.gz");
         let bundle = f.path.parent().unwrap();
+        // macOS bsdtar otherwise emits `._*` AppleDouble members for files
+        // carrying extended attributes (e.g. provenance), which the strict
+        // bundle unpacker correctly rejects as undeclared entries.
         assert!(
             Command::new("tar")
+                .env("COPYFILE_DISABLE", "1")
                 .args(["-czf"])
                 .arg(&archive)
                 .arg("-C")
