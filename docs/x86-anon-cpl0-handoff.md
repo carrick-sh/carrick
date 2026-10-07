@@ -699,3 +699,29 @@ The director reports zero failures in 50 focused and 20 complete shootdown
 runs. Retarget its IRQ #PF header to PR #82's existing user-fault entry, remove
 its additional fault receiver, and put settlement and the fixture completion
 suffix into the single entry. Then require zero failures in the full KVM gate.
+
+
+## Shared-kernel integration at the exit-effects boundary (2026-10-07)
+
+Director-authorized merge: shared-kernel 51236d3d5 after clean exit-effects
+commits 7993539f3 and fcf245ed5. The exit-effects clean domain gate passed,
+including the live Linux subset (572 reviewed rows); non-Linux compiler
+profiles remain explicitly pending on this host.
+
+The shared IRQ header now points to PR #82's `carrick_x86_user_page_fault`.
+The additional `carrick_x86_page_fault` assembly and Rust receiver are removed;
+there is one production user-fault path. Its shared-policy handler settles
+published shootdown debt before handling/reporting a fault. The terminal
+fixture suffix is retained in that same path, gated by `fixture_stmt!`;
+production keeps its terminal halt. Check the live MM window before forming
+production-region references, so cold fixtures do not borrow an unmapped region.
+The automatic merge's duplicate fault-port declaration is removed.
+
+Red: removing only this single entry's settlement call fails the held-IPI
+KVM test with "running CPU must acknowledge shootdown", recorded in
+`/tmp/x86-process-owner-single-pf-red.log`. The earlier compile failure for a
+duplicate port declaration is separate in
+`/tmp/x86-process-owner-single-pf-merge-build-red.log` and is not semantic red
+proof. Green: all three `two_running_vcpus_` tests pass with the call restored,
+in `/tmp/x86-process-owner-single-pf-green.log`. Full KVM, clean inventory,
+clippy and assembly push gates follow; no two-MM witness green is claimed.
