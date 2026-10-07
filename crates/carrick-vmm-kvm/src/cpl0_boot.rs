@@ -30,12 +30,12 @@ use carrick_mmu_core::x86::descriptor_txn::{
 };
 use carrick_x86::cpl0_entry::*;
 use carrick_x86::{BringupLayout, X86Reg, X86Vcpu};
-use kvm_bindings::{KVM_MP_STATE_RUNNABLE, Msrs, kvm_mp_state, kvm_msr_entry};
+use kvm_bindings::{KVM_MP_STATE_RUNNABLE, Msrs, kvm_mp_state, kvm_msi, kvm_msr_entry};
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -183,6 +183,12 @@ enum WatchdogControl {
     Resume,
     Pause,
     Cancel,
+}
+
+#[derive(Clone, Copy)]
+enum FixtureStopCondition {
+    UserByte(u64),
+    PendingKick(usize),
 }
 impl Watchdog {
     pub(crate) fn start() -> Self {
@@ -1530,6 +1536,13 @@ impl Cpl0Carrier {
                 USER_CODE + index as u64 * 4096,
                 0x3_1ff0 + index as u64 * 0x1_0000,
             )?;
+            if hardware_interrupts && initial_extent_bytes.is_none() {
+                // This fixture enters CPL3 directly. Unlike the production
+                // initial-MM IRET frame, the generic x86 bootstrap flags
+                // still have IF clear for CPL0 bringup. Admit native APIC
+                // interrupts before the first fixture user instruction.
+                cpu.set_gpr(X86Reg::Rflags, boot.rflags | (1 << 9))?;
+            }
             carrick_x86::program_fault_segments(cpu, LAYOUT, index as u64)?;
             let mut system = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
             if initial_extent_bytes.is_some() {
@@ -1782,6 +1795,143 @@ impl Cpl0Carrier {
             return Err(fail("unknown CPL0 CPU slot"));
         }
         Ok(self.binding(index).pending_irqs.load(Ordering::Acquire))
+    }
+
+    /// Queue the native KICK on a stopped CPL3 vCPU before its next KVM_RUN.
+    /// KVM_INTERRUPT rejects an in-kernel IRQ chip; the retained APIC ID
+    /// addresses an MSI directly to this CPU's local APIC instead.
+    pub fn queue_resume_kick(&mut self, index: usize) -> Result<(), TrapError> {
+        let cpu = self
+            .cpus
+            .get(index)
+            .ok_or_else(|| fail("unknown CPL0 CPU slot"))?;
+        let sregs = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
+        let regs = cpu.fd().get_regs().map_err(|e| fail(e.to_string()))?;
+        if sregs.cs.dpl != 3 || sregs.cs.selector & 3 != 3 || regs.rflags & (1 << 9) == 0 {
+            return Err(fail(format!(
+                "resume kick requires CPL3 with IF set: cs={:#x} dpl={} rip={:#x} rflags={:#x}",
+                sregs.cs.selector, sregs.cs.dpl, regs.rip, regs.rflags
+            )));
+        }
+        let events = cpu
+            .fd()
+            .get_vcpu_events()
+            .map_err(|e| fail(e.to_string()))?;
+        if events.interrupt.shadow != 0 || events.interrupt.injected != 0 {
+            return Err(fail(
+                "resume kick has an interrupt shadow or injected vector",
+            ));
+        }
+        let apic_id = self.lapic_register(index, 0x20)? >> 24;
+        let msi = kvm_msi {
+            address_lo: 0xfee0_0000 | (apic_id << 12),
+            data: u32::from(carrick_x86::interrupts::KICK_VECTOR),
+            ..Default::default()
+        };
+        if self
+            ._vm
+            .vm()
+            .vm
+            .signal_msi(msi)
+            .map_err(|e| fail(format!("KVM_SIGNAL_MSI: {e}")))?
+            <= 0
+        {
+            return Err(fail("resume kick MSI was blocked"));
+        }
+        Ok(())
+    }
+
+    fn fixture_run_until(
+        &mut self,
+        index: usize,
+        condition: FixtureStopCondition,
+    ) -> Result<(), TrapError> {
+        if index >= self.cpus.len() {
+            return Err(fail("unknown CPL0 CPU slot"));
+        }
+        let (address, pending) = match condition {
+            FixtureStopCondition::UserByte(gpa) => {
+                let pointer = self
+                    .ram
+                    .host_ptr(gpa, 1)
+                    .ok_or_else(|| fail("fixture user flag outside backing"))?;
+                (pointer as usize, false)
+            }
+            FixtureStopCondition::PendingKick(slot) => {
+                let offset = BINDING_OFFSET + slot as u64 * STRIDE;
+                let pointer = self
+                    .ram
+                    .host_ptr(META_GPA + offset, size_of::<CpuBinding>())
+                    .ok_or_else(|| fail("fixture IRQ binding outside backing"))?
+                    .cast::<CpuBinding>();
+                // SAFETY: the retained metadata page contains this initialized
+                // per-CPU binding through both the watcher and stopped vCPU.
+                let pending = unsafe { &(*pointer).pending_irqs };
+                (pending as *const AtomicU32 as usize, true)
+            }
+        };
+        let retained_ram = Arc::clone(&self.ram);
+        let stopped = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let kick = KvmKickHandle::for_current_thread();
+            let stopped_ref = &stopped;
+            let watcher = scope.spawn(move || {
+                let _retained_ram = retained_ram;
+                let start = std::time::Instant::now();
+                loop {
+                    // SAFETY: the retained GuestRam owns the backing; the
+                    // guest writes the byte atomically and the binding field
+                    // is AtomicU32. The watcher never mutates either record.
+                    let reached = unsafe {
+                        if pending {
+                            (&*(address as *const AtomicU32)).load(Ordering::Acquire) & 2 != 0
+                        } else {
+                            (&*(address as *const AtomicU8)).load(Ordering::Acquire) == 1
+                        }
+                    };
+                    if reached {
+                        kick.kick();
+                        return true;
+                    }
+                    if stopped_ref.load(Ordering::Acquire) {
+                        return false;
+                    }
+                    if start.elapsed() >= Duration::from_secs(5) {
+                        kick.kick();
+                        return false;
+                    }
+                    std::hint::spin_loop();
+                }
+            });
+            let exit = HvVcpu::run(&mut self.cpus[index]);
+            stopped.store(true, Ordering::Release);
+            let reached = watcher
+                .join()
+                .map_err(|_| fail("fixture stop watcher panicked"))?;
+            if !reached {
+                return Err(fail("fixture stop condition was not reached"));
+            }
+            if !matches!(exit?, VcpuExit::Kicked) {
+                return Err(fail("fixture stop did not interrupt KVM_RUN"));
+            }
+            Ok(())
+        })
+    }
+
+    /// Stop a running CPL3 loop only after its first user byte store reached
+    /// retained host backing. This leaves the exact guest registers stopped.
+    pub fn fixture_stop_after_user_byte(
+        &mut self,
+        index: usize,
+        gpa: u64,
+    ) -> Result<(), TrapError> {
+        self.fixture_run_until(index, FixtureStopCondition::UserByte(gpa))
+    }
+
+    /// Stop the resumed CPU as soon as its own native KICK gate published the
+    /// pending mailbox bit, before another fixture operation changes state.
+    pub fn fixture_run_until_pending_kick(&mut self, index: usize) -> Result<(), TrapError> {
+        self.fixture_run_until(index, FixtureStopCondition::PendingKick(index))
     }
     /// Exact retained generations and acknowledgements for a stopped fixture.
     pub fn fixture_shootdown_state(&self) -> [(u64, u64, [u64; 2]); 2] {
