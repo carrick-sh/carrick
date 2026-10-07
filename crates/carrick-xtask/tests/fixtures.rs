@@ -166,6 +166,15 @@ fn write(root: &Path, path: &str, bytes: &[u8]) {
 fn hash(bytes: &[u8]) -> ContentHash {
     format!("{:x}", Sha256::digest(bytes)).try_into().unwrap()
 }
+/// Independent statement of the source entry framing: domain with the entry
+/// type, big-endian u64 length, then the bytes.
+fn source_hash(bytes: &[u8]) -> ContentHash {
+    let mut digest = Sha256::new();
+    digest.update(b"carrick.fixtures.source.v1\0regular\0");
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+    format!("{:x}", digest.finalize()).try_into().unwrap()
+}
 fn elf(target: GuestTarget, marker: u8) -> Vec<u8> {
     let mut bytes = vec![0; 160];
     bytes[..4].copy_from_slice(b"\x7fELF");
@@ -250,17 +259,13 @@ impl Fixture {
             "conformance-probes/probe-inventory.json",
             &serde_json::to_vec(&inventory).unwrap(),
         );
-        std::os::unix::fs::symlink(
-            "src/lib.rs",
-            root.join("crates/carrick-el1-abi/source-link"),
-        )
-        .unwrap();
         // Real, registry-free Cargo graphs exercise direct and transitive closure.
         for name in [
             "carrick-el1-abi",
             "fixture-transitive",
             "fixture-builder",
             "carrick-runtime",
+            "fixture-host-helper",
         ] {
             let dependency = if name == "carrick-el1-abi" {
                 "[dependencies]\nfixture-transitive = { path = \"../fixture-transitive\" }\n"
@@ -278,6 +283,10 @@ impl Fixture {
             "Cargo.toml",
             b"[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\n",
         );
+        write(root, "shared/banner.txt", b"fixture banner\n");
+        // Same bytes as a symlink to `actual.txt` would hash under link text.
+        write(root, "conformance-probes/actual.txt", b"actual\n");
+        write(root, "conformance-probes/alias.txt", b"actual.txt");
         for directory in [
             "conformance-probes",
             "fixtures/linux-aarch64-hello",
@@ -288,13 +297,22 @@ impl Fixture {
         ] {
             let name = directory.rsplit('/').next().unwrap();
             let dependency = if name == "embed-el1-sched" {
-                "[dependencies]\ncarrick-el1-abi = { path = \"../../crates/carrick-el1-abi\" }\n[build-dependencies]\nfixture-builder = { path = \"../../crates/fixture-builder\" }\n[dev-dependencies]\ncarrick-runtime = { path = \"../../crates/carrick-runtime\" }\n"
+                "[dependencies]\ncarrick-el1-abi = { path = \"../../crates/carrick-el1-abi\" }\n[build-dependencies]\nfixture-builder = { path = \"../../crates/fixture-builder\" }\n[dev-dependencies]\ncarrick-runtime = { path = \"../../crates/carrick-runtime\" }\n[target.'cfg(target_arch = \"x86_64\")'.build-dependencies]\nfixture-host-helper = { path = \"../../crates/fixture-host-helper\" }\n"
             } else {
                 ""
             };
             write(root, &format!("{directory}/Cargo.toml"),
                 format!("[workspace]\n[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n{dependency}").as_bytes());
-            write(root, &format!("{directory}/src/lib.rs"), b"// source\n");
+            if name == "conformance-probes" {
+                // A compiler input outside every resolved package directory.
+                write(
+                    root,
+                    &format!("{directory}/src/lib.rs"),
+                    b"pub const BANNER: &str = include_str!(\"../../shared/banner.txt\");\n",
+                );
+            } else {
+                write(root, &format!("{directory}/src/lib.rs"), b"// source\n");
+            }
             if name == "embed-el1-sched" {
                 write(root, &format!("{directory}/build.rs"), b"fn main() {}\n");
             }
@@ -320,21 +338,7 @@ impl Fixture {
                 && !p.starts_with("crates/carrick-runtime/")
         }) {
             let source = root.join(path);
-            let digest = if fs::symlink_metadata(&source)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-            {
-                hash(
-                    fs::read_link(source)
-                        .unwrap()
-                        .as_os_str()
-                        .as_encoded_bytes(),
-                )
-            } else {
-                hash(&fs::read(source).unwrap())
-            };
-            sources.insert(path.to_owned(), digest);
+            sources.insert(path.to_owned(), source_hash(&fs::read(source).unwrap()));
         }
         let store = CanonicalTempDir::new();
         let mut executables = Vec::new();
@@ -359,8 +363,10 @@ impl Fixture {
             });
         }
         let manifest = Manifest {
-            schema: "carrick.fixtures.v2".into(),
+            schema: "carrick.fixtures.v3".into(),
             source_head: sha.try_into().unwrap(),
+            // What dep-info reports beyond the Cargo closure: the include_str!.
+            compiler_inputs: vec!["shared/banner.txt".into()],
             sources,
             build_policy: fixtures::BuildPolicy::default(),
             toolchain: Toolchain {
@@ -541,7 +547,8 @@ fn clean_restore_then_unrelated_edit_preserves_fixtures() {
     let mut f = Fixture::new();
     // Use the publisher's inventory for this behavioral witness. The other
     // tests retain their independent expected inventory to check scope.
-    f.manifest.sources = fixtures::source_hashes(f.repo.path()).unwrap();
+    f.manifest.sources =
+        fixtures::source_hashes(f.repo.path(), &f.manifest.compiler_inputs).unwrap();
     f.republish();
     fixtures::restore(f.repo.path(), &f.path, None).unwrap();
     println!("clean restore succeeded before unrelated edit");
@@ -735,9 +742,7 @@ fn unrelated_workspace_edits_preserve_fixture_identity() {
     );
     assert_eq!(
         validation["inputs_sha256"],
-        String::from(hash(
-            &serde_json::to_vec(&(&f.manifest.sources, &f.manifest.build_policy)).unwrap()
-        ))
+        String::from(input_identity(&f.manifest))
     );
     assert!(carrick_xtask::accept::verify_signed_fixtures(f.repo.path()).is_err());
     fixtures::restore(f.repo.path(), &f.path, None).unwrap();
@@ -807,7 +812,14 @@ fn commit(root: &Path, path: &str, bytes: &[u8], message: &str) -> String {
 }
 
 fn input_identity(manifest: &Manifest) -> ContentHash {
-    hash(&serde_json::to_vec(&(&manifest.sources, &manifest.build_policy)).unwrap())
+    hash(
+        &serde_json::to_vec(&(
+            &manifest.sources,
+            &manifest.compiler_inputs,
+            &manifest.build_policy,
+        ))
+        .unwrap(),
+    )
 }
 
 fn assert_identity_refusal(f: &Fixture, case: &str) {
@@ -930,6 +942,53 @@ fn toolchain_pin_change_refuses() {
     assert!(fixtures::verify_installed(root).is_err());
     assert!(fixtures::verify_bundle(root, &f.path, None).is_err());
     assert!(carrick_xtask::accept::verify_signed_fixtures(root).is_err());
+}
+
+#[test]
+fn compiler_input_outside_package_directories_refuses() {
+    // `conformance-probes/src/lib.rs` include_str!s `shared/banner.txt`.
+    let f = Fixture::new();
+    let root = f.repo.path();
+    fixtures::restore(root, &f.path, None).unwrap();
+    commit(
+        root,
+        "shared/banner.txt",
+        b"changed banner\n",
+        "change an included file",
+    );
+    assert_identity_refusal(&f, "shared/banner.txt");
+}
+
+#[test]
+fn symlink_with_identical_link_text_refuses() {
+    // Regular `alias.txt` holds the bytes `actual.txt`; replacing it with a
+    // symlink to `actual.txt` must not keep the same identity.
+    let f = Fixture::new();
+    let root = f.repo.path();
+    fixtures::restore(root, &f.path, None).unwrap();
+    fs::remove_file(root.join("conformance-probes/alias.txt")).unwrap();
+    std::os::unix::fs::symlink("actual.txt", root.join("conformance-probes/alias.txt")).unwrap();
+    git(root, &["add", "--", "conformance-probes/alias.txt"]);
+    git(root, &["commit", "-qm", "alias becomes a symlink"]);
+    assert!(fixtures::verify_installed(root).is_err());
+    assert!(fixtures::verify_bundle(root, &f.path, None).is_err());
+    assert!(carrick_xtask::accept::verify_signed_fixtures(root).is_err());
+}
+
+#[test]
+fn target_cfg_build_dependency_is_a_fixture_input() {
+    // `embed-el1-sched` has an x86_64-only build-dependency: a publisher on
+    // x86_64 compiles it, so it is an input whatever the verifier's host.
+    let f = Fixture::new();
+    let root = f.repo.path();
+    fixtures::restore(root, &f.path, None).unwrap();
+    commit(
+        root,
+        "crates/fixture-host-helper/src/lib.rs",
+        b"// changed host-only build helper\n",
+        "change target-cfg build helper",
+    );
+    assert_identity_refusal(&f, "crates/fixture-host-helper/src/lib.rs");
 }
 
 fn copy_bundle(from: &Path, to: &Path) {
@@ -2329,4 +2388,200 @@ fn archive_verification_records_scoped_evidence_atomically() {
         old_bytes, b"previous receipt",
         "verification overwrote a published receipt inode"
     );
+}
+
+#[test]
+fn cargo_dep_info_records_out_of_package_compiler_inputs() {
+    // A real Cargo build reports `#[path]` modules, `include_str!` targets
+    // outside the package and build-script `rerun-if-changed` files.
+    let snapshot = CanonicalTempDir::new();
+    let root = snapshot.path();
+    write(root, "shared/banner.txt", b"banner\n");
+    write(root, "shared/build-input.txt", b"build input\n");
+    write(root, "outside/abi.rs", b"pub const ABI: u32 = 1;\n");
+    write(
+        root,
+        "fixtures/probe/Cargo.toml",
+        b"[workspace]\n[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n",
+    );
+    write(
+        root,
+        "fixtures/probe/build.rs",
+        b"fn main() { println!(\"cargo:rerun-if-changed=../../shared/build-input.txt\"); }\n",
+    );
+    write(
+        root,
+        "fixtures/probe/src/main.rs",
+        b"#[path = \"../../../outside/abi.rs\"]\nmod abi;\nconst BANNER: &str = include_str!(\"../../../shared/banner.txt\");\nfn main() { println!(\"{} {}\", abi::ABI, BANNER); }\n",
+    );
+    let output = Command::new(env!("CARGO"))
+        .current_dir(root.join("fixtures/probe"))
+        .args(["build", "--offline", "--quiet"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let dep_info = root.join("fixtures/probe/target/debug/probe.d");
+    let sysroot = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .unwrap();
+    let sysroot = PathBuf::from(String::from_utf8(sysroot.stdout).unwrap().trim());
+    let recorded = fixtures::dep_info::classify(root, &[dep_info], &[sysroot]).unwrap();
+    assert_eq!(
+        recorded,
+        [
+            "fixtures/probe/build.rs",
+            "fixtures/probe/src/main.rs",
+            "outside/abi.rs",
+            "shared/banner.txt",
+            "shared/build-input.txt",
+        ]
+    );
+}
+
+#[test]
+fn dep_info_classification_fails_closed() {
+    let snapshot = CanonicalTempDir::new();
+    let root = snapshot.path();
+    let elsewhere = CanonicalTempDir::new();
+    write(root, "src/main.rs", b"");
+    write(root, "target/release/build/out/generated.rs", b"");
+    write(elsewhere.path(), "foreign.rs", b"");
+    let case = |name: &str, body: String| {
+        write(root, &format!("dep/{name}.d"), body.as_bytes());
+        fixtures::dep_info::classify(root, &[root.join(format!("dep/{name}.d"))], &[])
+            .unwrap_err()
+            .to_string()
+    };
+    let main = root.join("src/main.rs").display().to_string();
+    assert!(
+        case(
+            "generated",
+            format!(
+                "out: {main} {}\n",
+                root.join("target/release/build/out/generated.rs").display()
+            )
+        )
+        .contains("under target/")
+    );
+    assert!(
+        case(
+            "foreign",
+            format!(
+                "out: {main} {}\n",
+                elsewhere.path().join("foreign.rs").display()
+            )
+        )
+        .contains("outside the checkout")
+    );
+    assert!(case("relative", "out: src/main.rs\n".into()).contains("relative compiler input"));
+    assert!(case("empty", "out:\n".into()).contains("names no inputs"));
+    assert!(
+        fixtures::dep_info::classify(root, &[root.join("dep/missing.d")], &[])
+            .unwrap_err()
+            .to_string()
+            .contains("missing or unreadable fixture dep-info")
+    );
+    // Escaped spaces, continuations and comments parse as Make does.
+    assert_eq!(
+        fixtures::dep_info::parse("out: /a\\ b.rs \\\n /c.rs\n# env-dep:X=1\n/a\\ b.rs:\n"),
+        [PathBuf::from("/a b.rs"), PathBuf::from("/c.rs")]
+    );
+}
+
+#[test]
+fn every_executable_has_a_declared_dep_info_location() {
+    let f = Fixture::new();
+    let embed = [
+        ("embed-interceptor-probe", "interceptor-probe"),
+        ("embed-zone-readers", "zone-readers"),
+        ("embed-icache-reuse", "icache-reuse"),
+        ("embed-el1-sched", "el1-sched"),
+    ];
+    for path in fixtures::executable_inventory(f.repo.path())
+        .unwrap()
+        .keys()
+    {
+        let dep_info = fixtures::dep_info::dep_info_path(path, &embed).unwrap();
+        if path == "target/embed-fixtures/el1-sched-aarch64" {
+            assert_eq!(
+                dep_info,
+                "fixtures/embed-el1-sched/target/aarch64-unknown-linux-musl/release/el1-sched.d"
+            );
+        } else if !path.starts_with("target/embed-fixtures/") {
+            assert_eq!(dep_info, format!("{path}.d"));
+        }
+    }
+    assert!(
+        fixtures::dep_info::dep_info_path("target/embed-fixtures/unknown-aarch64", &embed).is_err()
+    );
+}
+
+#[test]
+fn recorded_compiler_inputs_must_be_tracked_sources() {
+    for (inputs, expected) in [
+        (vec!["target/generated.rs".to_owned()], "under target/"),
+        (vec!["shared/missing.txt".to_owned()], "not a tracked file"),
+        (vec!["../escape.rs".to_owned()], "unsafe fixture path"),
+        (
+            vec![
+                "shared/banner.txt".to_owned(),
+                "conformance-probes/actual.txt".to_owned(),
+            ],
+            "noncanonical",
+        ),
+    ] {
+        let mut f = Fixture::new();
+        f.manifest.compiler_inputs = inputs;
+        f.republish();
+        f.rejected(expected);
+    }
+    // Deleting a recorded input is a dirty input, never a silent omission.
+    let f = Fixture::new();
+    fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+    fs::remove_file(f.repo.path().join("shared/banner.txt")).unwrap();
+    assert!(
+        fixtures::verify_installed(f.repo.path())
+            .unwrap_err()
+            .to_string()
+            .contains("dirty fixture source")
+    );
+}
+
+#[test]
+fn source_entries_hash_with_type_and_length_framing() {
+    let f = Fixture::new();
+    let root = f.repo.path();
+    assert_eq!(
+        fixtures::hash_source(root, "conformance-probes/alias.txt").unwrap(),
+        source_hash(b"actual.txt")
+    );
+    assert_ne!(
+        fixtures::hash_source(root, "conformance-probes/alias.txt").unwrap(),
+        hash(b"actual.txt"),
+        "source digests carry a type domain, not raw content hashes"
+    );
+    fs::remove_file(root.join("conformance-probes/alias.txt")).unwrap();
+    std::os::unix::fs::symlink("actual.txt", root.join("conformance-probes/alias.txt")).unwrap();
+    assert!(
+        fixtures::hash_source(root, "conformance-probes/alias.txt")
+            .unwrap_err()
+            .to_string()
+            .contains("not a regular file")
+    );
+}
+
+#[test]
+fn unfiltered_graph_includes_host_only_build_dependencies() {
+    let f = Fixture::new();
+    let sources = fixtures::source_hashes(f.repo.path(), &[]).unwrap();
+    assert!(sources.contains_key("crates/fixture-host-helper/src/lib.rs"));
+    assert!(sources.contains_key("crates/fixture-host-helper/Cargo.toml"));
+    // The include_str! target is not in the Cargo closure; only dep-info
+    // (the manifest's compiler_inputs) brings it in.
+    assert!(!sources.contains_key("shared/banner.txt"));
 }
