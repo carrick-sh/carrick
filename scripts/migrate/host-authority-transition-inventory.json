@@ -6567,18 +6567,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:1222 in `Cpl0Carrier::boot`, `std::fs::read` reads only the caller-selected CPL0 bootstrap ELF, whose segments and entry are validated before the fixture registers memory or runs either vCPU; no guest syscall argument or guest identity selects this host path.",
+    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:1206 in `Cpl0Carrier::boot`, `std::fs::read` reads only the caller-selected CPL0 bootstrap ELF, whose segments and entry are validated before the fixture registers memory or runs either vCPU; no guest syscall argument or guest identity selects this host path.",
     "review_id": "HA-000752",
     "source": {
-      "byte_end": 48386,
-      "byte_start": 48373,
+      "byte_end": 47554,
+      "byte_start": 47541,
       "column": 21,
       "column_end": 34,
       "column_start": 21,
       "file": "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
-      "line": 1222,
-      "line_end": 1222,
-      "line_start": 1222
+      "line": 1206,
+      "line_end": 1206,
+      "line_start": 1206
     }
   },
   {
@@ -18232,18 +18232,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:295 in `Watchdog::start`, `std::thread::spawn` creates one bounded timeout witness for the current KVM_RUN host thread in fixture and production entry. Its retained KvmKickHandle targets that exact host thread; cancellation and Drop join retain its lifetime. It neither creates a guest task nor implements a guest wait, and no guest identity selects the host target.",
+    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:279 in `Watchdog::start`, `std::thread::spawn` creates one bounded timeout witness for the current KVM_RUN host thread in fixture and production entry. Its retained KvmKickHandle targets that exact host thread; cancellation and Drop join retain its lifetime. It neither creates a guest task nor implements a guest wait, and no guest identity selects the host target.",
     "review_id": "HA-000753",
     "source": {
-      "byte_end": 11509,
-      "byte_start": 11491,
+      "byte_end": 10677,
+      "byte_start": 10659,
       "column": 22,
       "column_end": 40,
       "column_start": 22,
       "file": "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
-      "line": 295,
-      "line_end": 295,
-      "line_start": 295
+      "line": 279,
+      "line_end": 279,
+      "line_start": 279
     }
   },
   {

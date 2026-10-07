@@ -187,6 +187,9 @@ impl UserTransfer {
 /// Number of initial bytes whose live stage-1 walk grants the requested user
 /// access. A later unmap is still caught by the guarded load/copy.
 pub fn accessible_bytes(address: u64, len: usize, write: bool) -> usize {
+    if super::interrupt::sync_user_memory_generation().is_err() {
+        return 0;
+    }
     if len == 0 || !lower_half_range(address, len as u64) {
         return 0;
     }
@@ -250,6 +253,9 @@ pub fn read_u64(task: &CurrentTask, address: u64) -> Option<u64> {
 }
 
 fn guarded_read_u64(task: &CurrentTask, address: u64) -> Option<u64> {
+    if super::interrupt::sync_user_memory_generation().is_err() {
+        return None;
+    }
     let fixup = &task.linux.fixup_pc as *const _ as *const u64;
     let mut value = 0_u64;
     let mut ok = 1_u64;
@@ -281,6 +287,9 @@ fn guarded_read_u64(task: &CurrentTask, address: u64) -> Option<u64> {
 
 /// Read a 32-bit user word as one x86 memory operation.
 pub fn read_u32(task: &CurrentTask, address: u64) -> Option<u32> {
+    if super::interrupt::sync_user_memory_generation().is_err() {
+        return None;
+    }
     if !current_task(task) || accessible_bytes(address, 4, false) != 4 {
         return None;
     }
@@ -336,6 +345,9 @@ pub unsafe fn copy(
 }
 
 unsafe fn guarded_copy(task: &CurrentTask, dst: *mut u8, src: *const u8, len: usize) -> bool {
+    if super::interrupt::sync_user_memory_generation().is_err() {
+        return false;
+    }
     let fixup = &task.linux.fixup_pc as *const _ as *const u64;
     let mut ok = 1_u64;
     // SAFETY: REP MOVSB is guarded by the task-local fixup, and the caller
@@ -367,6 +379,9 @@ unsafe fn guarded_copy(task: &CurrentTask, dst: *mut u8, src: *const u8, len: us
 /// The fixture returns Linux EFAULT on a failed read/copy and the exact word
 /// on success. The address is from the test's CPL3 register frame.
 pub fn witness(task: &CurrentTask, address: u64, mode: u64) -> u64 {
+    if super::interrupt::sync_user_memory_generation().is_err() {
+        return (-14_i64) as u64;
+    }
     use carrick_guest_arch::{Access, MmuBackend, UserRange};
     let mut backend = super::X86Backend;
     match mode {
