@@ -12,6 +12,7 @@ const FIXTURES: &[&str] = &[
     "fixtures/embed-interceptor-probe",
     "fixtures/embed-zone-readers",
     "fixtures/embed-icache-reuse",
+    "fixtures/embed-copyout",
     "fixtures/embed-el1-sched",
 ];
 const BUILD_INPUTS: &[&str] = &[
@@ -24,6 +25,7 @@ const BUILD_INPUTS: &[&str] = &[
     "scripts/build-embed-interceptor-probe.sh",
     "scripts/build-embed-zone-readers.sh",
     "scripts/build-embed-icache-reuse.sh",
+    "scripts/build-embed-copyout.sh",
     "scripts/build-embed-el1-sched.sh",
     // The publisher itself constructs the Cargo commands and probe selection.
     "crates/carrick-xtask/src/fixtures.rs",
