@@ -950,6 +950,29 @@ impl<'a> FsView<'a> {
             let nonblock = flags & LINUX_O_NONBLOCK;
             let fd_flags = linux_fd_flags_from_open_flags(flags);
 
+            let owner_output = memory.user_memory_venue()
+                == carrick_guest_mem::UserMemoryVenue::Owner;
+            let mut prepared = None;
+            if owner_output
+                && let Some(range) = carrick_guest_mem::GuestWriteRange::new(
+                    carrick_guest_mem::GuestVa(address), LinuxFdPair::ABI_SIZE,
+                )
+            {
+                match memory.prepare_write(&[range]) {
+                    Ok(permit) => prepared = Some(permit),
+                    // Resource errors retain their existing precedence over a
+                    // genuine bad destination. Only owned dependencies leave
+                    // before creation, so resumption cannot replay a pipe.
+                    Err(
+                        carrick_guest_mem::MemoryPrepareError::Fault(_)
+                        | carrick_guest_mem::MemoryPrepareError::Limit(_),
+                    ) => {},
+                    Err(dependency) => {
+                        return Ok(crate::el1_delegation::owner_prepare_refusal(dependency));
+                    }
+                }
+            }
+
             let pipe_id = next_pipe_id();
             // Only the authority's own host memory is ENOMEM; creation
             // refusals are typed Linux limits (ENFILE), never a table size.
@@ -985,7 +1008,18 @@ impl<'a> FsView<'a> {
                 return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
             };
             let pair = LinuxFdPair { read_fd, write_fd };
-            if write_kernel_struct_raw(memory, address, &pair).is_err() {
+            let copied = if owner_output {
+                if let Some(permit) = prepared.take() {
+                    permit.commit(&[pair.abi_bytes()]);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                drop(prepared);
+                write_kernel_struct_raw(memory, address, &pair).is_ok()
+            };
+            if !copied {
                 let removed = {
                     let files = this.captured_file_table();
                     let mut table = files.write_open_files();
