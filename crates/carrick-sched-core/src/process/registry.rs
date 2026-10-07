@@ -122,6 +122,63 @@ mod tests {
         );
         assert!(!owner.process_groups.contains_key(&b));
     }
+    #[test]
+    fn last_member_retirement_preserves_other_namespace_and_exact_generation() {
+        let mut owner = registry();
+        let a = ProcessGroupId::from_abi_positive(10).unwrap();
+        let b = ProcessGroupId::from_abi_positive(11).unwrap();
+        let key = TaskKey {
+            id: TaskId::from_abi_positive(10).unwrap(),
+            serial: super::super::TaskSerial::from_raw_u64(2).unwrap(),
+        };
+        let stale = TaskKey {
+            serial: super::super::TaskSerial::from_raw_u64(1).unwrap(),
+            ..key
+        };
+        let other_key = TaskKey {
+            id: TaskId::from_abi_positive(11).unwrap(),
+            serial: super::super::TaskSerial::from_raw_u64(3).unwrap(),
+        };
+        for (id, scope) in [(a, Scope(1)), (b, Scope(2))] {
+            owner.publish_process_group(
+                id,
+                ProcessGroupRecord {
+                    object: (),
+                    members: BTreeSet::from([if id == a { key } else { other_key }]),
+                    container: scope,
+                    namespace_id: 1,
+                },
+            );
+            owner.publish_session(
+                SessionId::from_abi_positive(id.raw()).unwrap(),
+                SessionRecord {
+                    object: (),
+                    process_groups: BTreeSet::from([id]),
+                    container: scope,
+                    namespace_id: 1,
+                },
+            );
+        }
+        let session = SessionId::from_abi_positive(a.raw()).unwrap();
+        owner.remove_group_member(a, session, stale);
+        assert!(owner.process_groups.contains_key(&a));
+        assert!(owner.sessions.contains_key(&session));
+        owner.remove_group_member(a, session, key);
+        assert!(!owner.process_groups.contains_key(&a));
+        assert!(!owner.sessions.contains_key(&session));
+        assert_eq!(
+            owner.process_group_by_namespace.get(&(Scope(2), 1)),
+            Some(&b)
+        );
+        assert_eq!(
+            owner.session_by_namespace.get(&(Scope(2), 1)),
+            Some(&SessionId::from_abi_positive(b.raw()).unwrap())
+        );
+        assert_eq!(
+            owner.process_groups[&b].members,
+            BTreeSet::from([other_key])
+        );
+    }
 }
 
 /// Consumer effect after the shared owner detects an impossible graph state.
@@ -166,6 +223,35 @@ pub struct ProcessRegistry<C, L, Z, R, Reservation, Retired, Group, Session, Fai
 impl<C: Copy + Ord, L, Z, R, Reservation, Retired, Group, Session, Failure: RegistryFailure>
     ProcessRegistry<C, L, Z, R, Reservation, Retired, Group, Session, Failure>
 {
+    /// Retire a group's last exact task member and then its empty session.
+    /// Namespace indexes are retired by the same owner as the records.
+    pub fn remove_group_member(
+        &mut self,
+        group_id: ProcessGroupId,
+        session_id: SessionId,
+        task: TaskKey,
+    ) {
+        let remove_group = if let Some(group) = self.process_groups.get_mut(&group_id) {
+            group.members.remove(&task);
+            group.members.is_empty()
+        } else {
+            false
+        };
+        if !remove_group {
+            return;
+        }
+        self.remove_process_group(group_id);
+        let remove_session = if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.process_groups.remove(&group_id);
+            session.process_groups.is_empty()
+        } else {
+            false
+        };
+        if remove_session {
+            self.remove_session(session_id);
+        }
+    }
+
     pub fn publish_epoch(&mut self) {
         self.epoch = self
             .epoch
