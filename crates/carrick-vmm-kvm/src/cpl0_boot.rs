@@ -118,30 +118,67 @@ impl InventoryTransaction for InitialInventory {
     }
 }
 
-/// RAII deadline: one bounded blocking wait, one kick on expiry, always joined.
+/// Bound one guest execution interval and pause while the carrier serves an
+/// exit. The worker is joined before its owning carrier can be released.
 pub(crate) struct Watchdog {
-    cancel: mpsc::Sender<()>,
+    control: mpsc::Sender<WatchdogControl>,
     worker: Option<std::thread::JoinHandle<()>>,
     pub(crate) expired: Arc<AtomicBool>,
+    active: Arc<AtomicBool>,
+}
+enum WatchdogControl {
+    Resume,
+    Pause,
+    Cancel,
 }
 impl Watchdog {
     pub(crate) fn start() -> Self {
+        Self::start_with_timeout(Duration::from_secs(5))
+    }
+    fn start_with_timeout(timeout: Duration) -> Self {
         let kick = KvmKickHandle::for_current_thread();
-        let (cancel, receiver) = mpsc::channel();
+        let (control, receiver) = mpsc::channel();
         let expired = Arc::new(AtomicBool::new(false));
         let signal = Arc::clone(&expired);
+        let active = Arc::new(AtomicBool::new(false));
+        let in_guest = Arc::clone(&active);
         let worker = std::thread::spawn(move || {
-            if receiver.recv_timeout(Duration::from_secs(5)) == Err(mpsc::RecvTimeoutError::Timeout)
-            {
-                signal.store(true, Ordering::Release);
-                kick.kick();
+            let mut armed = false;
+            loop {
+                let event = if armed {
+                    receiver.recv_timeout(timeout).ok()
+                } else {
+                    receiver.recv().ok()
+                };
+                match event {
+                    Some(WatchdogControl::Resume) => armed = true,
+                    Some(WatchdogControl::Pause) => armed = false,
+                    Some(WatchdogControl::Cancel) => break,
+                    None if armed && in_guest.load(Ordering::Acquire) => {
+                        signal.store(true, Ordering::Release);
+                        kick.kick();
+                        break;
+                    }
+                    None => break,
+                }
             }
         });
         Self {
-            cancel,
+            control,
             worker: Some(worker),
             expired,
+            active,
         }
+    }
+    /// Apply the safety kick to one guest execution interval. Each guest exit
+    /// is progress; host service time does not consume the next interval.
+    pub(crate) fn during_guest<T>(&self, run: impl FnOnce() -> T) -> T {
+        self.active.store(true, Ordering::Release);
+        let _ = self.control.send(WatchdogControl::Resume);
+        let result = run();
+        self.active.store(false, Ordering::Release);
+        let _ = self.control.send(WatchdogControl::Pause);
+        result
     }
     pub(crate) fn expired(&self) -> bool {
         self.expired.load(Ordering::Acquire)
@@ -149,7 +186,7 @@ impl Watchdog {
 }
 impl Drop for Watchdog {
     fn drop(&mut self) {
-        let _ = self.cancel.send(());
+        let _ = self.control.send(WatchdogControl::Cancel);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -619,7 +656,7 @@ impl Cpl0Carrier {
             .set_regs(&regs)
             .map_err(|error| fail(error.to_string()))?;
         let watchdog = Watchdog::start();
-        let exit = HvVcpu::run(&mut self.cpus[0])?;
+        let exit = watchdog.during_guest(|| HvVcpu::run(&mut self.cpus[0]))?;
         if watchdog.expired() {
             return Err(fail("production initial MM deadline"));
         }
@@ -781,18 +818,21 @@ impl Cpl0Carrier {
         start: u64,
         len: usize,
     ) -> Result<Vec<u8>, TrapError> {
-        if len > 1024 * 1024 {
-            return Err(fail("initial stdout write exceeds bounded transfer"));
-        }
-        let mut bytes = Vec::with_capacity(len);
-        while bytes.len() < len {
-            let va = start
-                .checked_add(bytes.len() as u64)
-                .ok_or_else(|| fail("initial user pointer overflow"))?;
-            let leaf = translate_leaf(&self._vm.words(), root, UserVa::new(va), Access::Read, true)
-                .map_err(|error| fail(format!("initial user read fault: {error:?}")))?;
+        // A bounded host crossing may complete a short write. An unmapped
+        // next page returns the already copied prefix, as Linux write does.
+        let limit = len.min(1024 * 1024);
+        let mut bytes = Vec::with_capacity(limit);
+        while bytes.len() < limit {
+            let Some(va) = start.checked_add(bytes.len() as u64) else {
+                break;
+            };
+            let Ok(leaf) =
+                translate_leaf(&self._vm.words(), root, UserVa::new(va), Access::Read, true)
+            else {
+                break;
+            };
             let span = (4096 - (va & 4095)) as usize;
-            let count = span.min(len - bytes.len());
+            let count = span.min(limit - bytes.len());
             bytes.extend(
                 self._vm
                     .read(leaf.output, count)
@@ -817,7 +857,7 @@ impl Cpl0Carrier {
             .root;
         let watchdog = Watchdog::start();
         for exits in 1..=max_exits {
-            let exit = HvVcpu::run(&mut self.cpus[0])?;
+            let exit = watchdog.during_guest(|| HvVcpu::run(&mut self.cpus[0]))?;
             if watchdog.expired() {
                 return Err(fail("initial process deadline"));
             }
@@ -839,7 +879,7 @@ impl Cpl0Carrier {
                         let VcpuExit::IoOut {
                             port: carrick_x86::FAULT_DOORBELL_PORT,
                             data,
-                        } = HvVcpu::run(&mut self.cpus[0])?
+                        } = watchdog.during_guest(|| HvVcpu::run(&mut self.cpus[0]))?
                         else {
                             return Err(fail("initial fault record interrupted"));
                         };
@@ -882,12 +922,15 @@ impl Cpl0Carrier {
             self.host_forwards += 1;
             match frame.rax {
                 1 => {
-                    let fd =
-                        i32::try_from(frame.rdi).map_err(|_| fail("initial write fd range"))?;
+                    let fd = frame.rdi as u32 as i32;
                     let len =
                         usize::try_from(frame.rdx).map_err(|_| fail("initial write size range"))?;
                     let bytes = self.read_initial_user(root, frame.rsi, len)?;
-                    frame.rax = stdio(fd, &bytes) as u64;
+                    frame.rax = if len != 0 && bytes.is_empty() {
+                        (-14_i64) as u64 // EFAULT before any byte was copied
+                    } else {
+                        stdio(fd, &bytes) as u64
+                    };
                 }
                 60 | 231 => return Ok(((frame.rdi & 255) as i32, exits)),
                 call => return Err(fail(format!("unported initial x86 syscall {call}"))),
@@ -1657,7 +1700,9 @@ impl Cpl0Carrier {
         }
         let watchdog = Watchdog::start();
         for _ in 0..32 {
-            let exit = HvVcpu::run(&mut self.cpus[index]).map_err(|e| fail(e.to_string()))?;
+            let exit = watchdog
+                .during_guest(|| HvVcpu::run(&mut self.cpus[index]))
+                .map_err(|e| fail(e.to_string()))?;
             if watchdog.expired.load(Ordering::Acquire) {
                 let mut detail = "CPL0 fixture deadline".to_owned();
                 self.cpus[index].append_debug_state(&mut detail);
@@ -1770,6 +1815,19 @@ impl Cpl0Carrier {
             }
         }
         Err(fail("CPL0 control exit budget exceeded"))
+    }
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::*;
+
+    #[test]
+    fn host_service_time_does_not_consume_the_next_guest_interval() {
+        let watchdog = Watchdog::start_with_timeout(Duration::from_millis(100));
+        watchdog.during_guest(|| ());
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!watchdog.expired());
     }
 }
 
