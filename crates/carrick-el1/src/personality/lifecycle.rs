@@ -53,12 +53,12 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame
 {
     fn arguments(&self) -> [u64; 6] {
         [
-            self.frame.argument(0),
-            self.frame.argument(1),
-            self.frame.argument(2),
-            self.frame.argument(3),
-            self.frame.argument(4),
-            self.frame.argument(5),
+            self.frame.argument(0).unwrap_or(0),
+            self.frame.argument(1).unwrap_or(0),
+            self.frame.argument(2).unwrap_or(0),
+            self.frame.argument(3).unwrap_or(0),
+            self.frame.argument(4).unwrap_or(0),
+            self.frame.argument(5).unwrap_or(0),
         ]
     }
     fn binding(&self) -> Option<carrick_el1_abi::ExecutionBinding> {

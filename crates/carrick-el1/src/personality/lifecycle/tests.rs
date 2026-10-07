@@ -1111,8 +1111,8 @@ fn x86_split_result_does_not_read_argument_zero() {
         fn canonical_ordinal(&self) -> CanonicalNr {
             CanonicalNr::new(93)
         }
-        fn argument(&self, _: usize) -> u64 {
-            self.argument
+        fn argument(&self, _: usize) -> Option<u64> {
+            Some(self.argument)
         }
         fn result(&self) -> NativeReturnWord {
             NativeReturnWord(self.result)

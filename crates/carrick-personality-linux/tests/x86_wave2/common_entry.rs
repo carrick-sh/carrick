@@ -33,8 +33,8 @@ impl SyscallFrame for X86Frame<'_> {
     fn canonical_ordinal(&self) -> CanonicalNr {
         self.canonical
     }
-    fn argument(&self, index: usize) -> u64 {
-        self.args[index]
+    fn argument(&self, index: usize) -> Option<u64> {
+        self.args.get(index).copied()
     }
     fn result(&self) -> NativeReturnWord {
         NativeReturnWord(self.rax)
