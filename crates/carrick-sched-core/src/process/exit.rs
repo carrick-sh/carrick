@@ -470,6 +470,11 @@ impl<Transaction: Copy> TaskGraphReservation<Transaction> {
     pub fn permits_nonfinal_thread_exit(&self) -> bool {
         matches!(self.scope, TaskReservationScope::ExitParticipant(_))
     }
+    /// New process topology needs an exclusive admission. A live exit
+    /// participant retains its already-admitted thread membership work only.
+    pub fn permits_process_birth(&self) -> bool {
+        matches!(self.scope, TaskReservationScope::Exclusive)
+    }
     pub fn prepare_membership_revision(
         &self,
         task: TaskKey,
@@ -495,6 +500,13 @@ pub struct ReservedTaskSet<Transaction> {
     task_ids: Vec<TaskId>,
     incarnation: Arc<TaskReservationIncarnation>,
     transaction: Transaction,
+}
+impl<Transaction> ReservedTaskSet<Transaction> {
+    /// Coverage is meaningful only after the registry has authenticated this
+    /// permit's transaction and opaque incarnation with `validate_task_set`.
+    pub fn covers(&self, task: TaskId) -> bool {
+        self.task_ids.contains(&task)
+    }
 }
 impl<
     C: Copy + Ord,

@@ -7,6 +7,7 @@ use core::marker::PhantomData;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RegistryInvariant {
     EpochExhausted,
+    BirthPayloadMismatch,
     ProcessGroupCollision,
     ProcessGroupIndexLost,
     SessionCollision,

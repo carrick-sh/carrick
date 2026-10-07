@@ -2804,6 +2804,10 @@ impl carrick_sched_core::process::registry::RegistryFailure for HostRegistryFail
     fn fail(invariant: carrick_sched_core::process::registry::RegistryInvariant) -> ! {
         use carrick_sched_core::process::registry::RegistryInvariant;
         match invariant {
+            RegistryInvariant::BirthPayloadMismatch => carrick_fatal!(
+                "kernel::process_birth",
+                "process birth payload lost its admitted identity or registry custody"
+            ),
             RegistryInvariant::EpochExhausted => carrick_fatal!(
                 "kernel::registry_epoch",
                 "Kernel RegistryState epoch counter overflow"
