@@ -3,7 +3,7 @@
 use carrick_guest_arch::{
     CpuId, GuestIsa, NativeAbi, NativeEntrySnapshot, X86Register, X86Registers,
 };
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64};
+use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
 
 /// One xAPIC destination published for an issued scheduler CPU slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,6 +105,10 @@ impl Default for ShootdownMember {
     }
 }
 
+pub const FIXTURE_HOLD_NONE: u32 = 0;
+pub const FIXTURE_HOLD_IPI: u32 = 1;
+pub const FIXTURE_HOLD_PUBLISH: u32 = 2;
+
 /// Retained publication shared by the exact CPU bindings in one carrier.
 pub struct ShootdownTable {
     pub next_generation: AtomicU64,
@@ -113,8 +117,8 @@ pub struct ShootdownTable {
     pub kick_checks: [AtomicU64; CPL0_CPU_COUNT],
     /// Fixture-only two-live-CPU start barrier; production ignores it.
     pub fixture_arrived: AtomicU32,
-    /// Fixture hook: hold shootdown IPI dispatch until cleared.
-    pub fixture_hold_ipi: AtomicBool,
+    /// Fixture hook: hold shootdown dispatch or publication until cleared.
+    pub fixture_hold_ipi: AtomicU32,
     pub requests: [ShootdownRequest; CPL0_CPU_COUNT],
     pub members: [ShootdownMember; CPL0_CPU_COUNT],
 }
@@ -125,7 +129,7 @@ impl ShootdownTable {
             next_generation: AtomicU64::new(0),
             kick_checks: [const { AtomicU64::new(0) }; CPL0_CPU_COUNT],
             fixture_arrived: AtomicU32::new(0),
-            fixture_hold_ipi: AtomicBool::new(false),
+            fixture_hold_ipi: AtomicU32::new(FIXTURE_HOLD_NONE),
             requests: [const { ShootdownRequest::new() }; CPL0_CPU_COUNT],
             members: [const { ShootdownMember::new() }; CPL0_CPU_COUNT],
         }
