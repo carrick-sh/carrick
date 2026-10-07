@@ -11,7 +11,6 @@ pub mod nr {
 
     pub const EXIT_GROUP: CanonicalNr = CanonicalNr(94);
     pub const WAIT4: CanonicalNr = CanonicalNr(260);
-    pub const CARRICK_PRIVATE_X86_FORK: CanonicalNr = CanonicalNr(super::CARRICK_PRIVATE_X86_FORK);
 }
 
 /// A CANONICAL syscall number — the asm-generic/aarch64 numbering every guest
@@ -31,6 +30,9 @@ pub mod nr {
 pub struct CanonicalNr(pub u64);
 
 impl CanonicalNr {
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
     /// The bare canonical number, for match scrutinees / table lookups /
     /// formatting. All syscall-table arms stay integer-literal patterns; the
     /// conversion happens ONCE at each scrutinee.
@@ -79,7 +81,6 @@ enum PrivateX86Ordinal {
     EpollCreate,
     Alarm,
     Time,
-    Fork,
 }
 
 /// The private numbers grow DOWN from `u64::MAX - 0x20`, far outside any real
@@ -184,15 +185,13 @@ pub const CARRICK_PRIVATE_X86_ALARM: u64 = private_x86_number(PrivateX86Ordinal:
 /// entry. The private handler returns realtime seconds and optionally writes
 /// the same 64-bit `time_t` through the guest pointer.
 pub const CARRICK_PRIVATE_X86_TIME: u64 = private_x86_number(PrivateX86Ordinal::Time);
-/// Canonical guest-kernel route for x86 `fork`, which asm-generic lacks.
-pub const CARRICK_PRIVATE_X86_FORK: u64 = private_x86_number(PrivateX86Ordinal::Fork);
 
 // Every CARRICK_PRIVATE_X86_* number must be UNIQUE: a collision silently
 // routes one syscall through another's handler (alarm(2) briefly shared
 // 0x2a with epoll_create, so guest alarm() returned fresh epoll FDS — LTP
 // alarm02's "invalid retval 4/5/6"). Compile-time, like the SIG* table.
 const _: () = {
-    const PRIVATE_X86: [u64; 14] = [
+    const PRIVATE_X86: [u64; 13] = [
         CARRICK_PRIVATE_X86_DUP2,
         CARRICK_PRIVATE_X86_STAT,
         CARRICK_PRIVATE_X86_FSTAT,
@@ -206,7 +205,6 @@ const _: () = {
         CARRICK_PRIVATE_X86_EPOLL_CREATE,
         CARRICK_PRIVATE_X86_ALARM,
         CARRICK_PRIVATE_X86_TIME,
-        CARRICK_PRIVATE_X86_FORK,
     ];
     let mut i = 0;
     while i < PRIVATE_X86.len() {

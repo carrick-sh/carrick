@@ -7,6 +7,7 @@
 //! This crate contains no Linux syscall policy, task allocator or memory ledger.
 #![no_std]
 
+pub use carrick_syscall_abi::CanonicalNr;
 use core::num::NonZeroU64;
 
 mod sealed {
@@ -32,19 +33,62 @@ ordinal!(
     GuestLen,
     CounterTick,
     NativeOrdinal,
-    CanonicalSyscall,
     UserFlags,
     FatalCode
 );
 
+/// A vCPU slot (the syscall-mailbox slot index).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[repr(transparent)]
+pub struct SlotId(u8);
+
+impl SlotId {
+    pub const fn new(raw: u8) -> Self {
+        Self(raw)
+    }
+
+    /// A slot from a mailbox slot index; `None` beyond 255.
+    pub fn from_index(index: usize) -> Option<Self> {
+        u8::try_from(index).ok().map(Self)
+    }
+
+    pub const fn raw(self) -> u8 {
+        self.0
+    }
+
+    /// `slot + 1`, the encoding of an optional slot in a record word.
+    pub const fn plus_one(self) -> u32 {
+        self.0 as u32 + 1
+    }
+
+    /// The slot a `slot + 1` word names (0: none).
+    pub fn from_plus_one(word: u32) -> Option<Self> {
+        word.checked_sub(1)
+            .and_then(|index| u8::try_from(index).ok())
+            .map(Self)
+    }
+
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// Registers needed by the shared Linux syscall families. Native frames
 /// implement this directly; no ISA-shaped substitute frame is constructed.
 pub trait SyscallFrame {
-    fn canonical_ordinal(&self) -> CanonicalSyscall;
+    fn canonical_ordinal(&self) -> CanonicalNr;
     fn argument(&self, index: usize) -> u64;
+    fn result(&self) -> NativeReturnWord;
     fn set_result(&mut self, result: NativeReturnWord);
-    fn slot(&self) -> u64;
-    fn user_pc(&self) -> UserVa;
+    fn slot(&self) -> Option<SlotId>;
+    fn slot_index(&self) -> usize {
+        self.slot().map_or(usize::MAX, SlotId::index)
+    }
+    /// Index within the supplied task slice. A projected one-task x86 slice
+    /// uses index zero while retaining its real CPU slot in `slot()`.
+    fn task_index(&self) -> usize {
+        self.slot_index()
+    }
     fn user_sp(&self) -> Option<UserVa>;
 }
 

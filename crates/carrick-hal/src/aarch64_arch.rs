@@ -77,7 +77,7 @@ impl SyscallTable for Aarch64SyscallTable {
     /// produce `Unknown` (honest -ENOSYS).
     fn remap(number: u64) -> SyscallRemap {
         if Self::is_known(number) {
-            SyscallRemap::Direct(number)
+            SyscallRemap::Direct(carrick_abi::CanonicalNr(number))
         } else {
             SyscallRemap::Unknown
         }

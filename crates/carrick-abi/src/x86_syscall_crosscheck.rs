@@ -4,10 +4,6 @@ use crate::syscall_x86_64::{SyscallRemap, X86_64_SYSCALLS};
 fn guest_lifecycle_numbers_match_the_canonical_table() {
     assert_eq!(crate::nr::WAIT4, crate::syscall::nr::WAIT4);
     assert_eq!(crate::nr::EXIT_GROUP, crate::syscall::nr::EXIT_GROUP);
-    assert_eq!(
-        crate::nr::CARRICK_PRIVATE_X86_FORK,
-        crate::syscall::nr::CARRICK_PRIVATE_X86_FORK,
-    );
 }
 
 /// The real cross-check the file's doc comment promises: for every
@@ -30,20 +26,28 @@ fn every_direct_canonical_matches_aarch64_by_name() {
         if let SyscallRemap::Direct(canonical) = e.remap {
             let found = aarch64
                 .iter()
-                .find(|a| a.number == canonical)
+                .find(|a| a.number == canonical.raw())
                 .unwrap_or_else(|| {
                     panic!(
                         "x86_64 {}={} maps to canonical {} which is absent from AARCH64_SYSCALLS",
-                        e.name, e.number, canonical
+                        e.name,
+                        e.number,
+                        canonical.raw()
                     )
                 });
             if e.name == "poll" && found.name == "ppoll" {
                 continue; // documented bring-up exception (see comment above)
             }
             assert_eq!(
-                found.name, e.name,
+                found.name,
+                e.name,
                 "x86_64 {}={} → Direct({}) but AARCH64_SYSCALLS[{}] is named {:?}, not {:?}",
-                e.name, e.number, canonical, canonical, found.name, e.name
+                e.name,
+                e.number,
+                canonical.raw(),
+                canonical.raw(),
+                found.name,
+                e.name
             );
         }
     }

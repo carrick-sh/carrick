@@ -1096,3 +1096,88 @@ impl UserCopy for FaultingUser {
         crate::file::UserCopy::copy_out(self, dst.raw(), src)
     }
 }
+
+#[test]
+fn x86_split_result_does_not_read_argument_zero() {
+    use crate::personality::dispatch::{El1PendingFamilies, GuestDispatchFrame};
+    use carrick_guest_arch::{CanonicalNr, NativeReturnWord, SyscallFrame};
+    use core::sync::atomic::AtomicU64;
+
+    struct SplitFrame {
+        argument: u64,
+        result: u64,
+    }
+    impl SyscallFrame for SplitFrame {
+        fn canonical_ordinal(&self) -> CanonicalNr {
+            CanonicalNr::new(93)
+        }
+        fn argument(&self, _: usize) -> u64 {
+            self.argument
+        }
+        fn result(&self) -> NativeReturnWord {
+            NativeReturnWord(self.result)
+        }
+        fn set_result(&mut self, result: NativeReturnWord) {
+            self.result = result.0;
+        }
+        fn slot(&self) -> Option<SlotId> {
+            Some(SlotId::new(0))
+        }
+        fn user_sp(&self) -> Option<UserVa> {
+            Some(UserVa::new(0x7000))
+        }
+    }
+    impl GuestDispatchFrame for SplitFrame {
+        fn arm_frame(&mut self) -> Option<&mut TrapFrame> {
+            None
+        }
+        fn arm_frame_ref(&self) -> Option<&TrapFrame> {
+            None
+        }
+        fn arm_scheduler(&self) -> bool {
+            false
+        }
+        fn robust_publications(&self) -> Option<&AtomicU64> {
+            None
+        }
+    }
+    let mut frame = SplitFrame {
+        argument: 0xdead,
+        result: 0x1234,
+    };
+    let counters = Counters::new();
+    let tasks = [CurrentTask::new()];
+    let cache = InotifyNameCache::new();
+    let pending = El1PendingFamilies {
+        handoff: None,
+        lifecycle_user: None,
+        frame: &mut frame,
+        counters: &counters,
+        current_tasks: &tasks,
+        fd_map: &[],
+        object_table: &[],
+        open_table: &[],
+        inotify_table: &[],
+        name_cache: &cache,
+        zone: None::<Zone<'_, FakeCpu, HardwareUserWord>>,
+        ipc: None,
+        lifecycle: None,
+        cache_lookup: |_| core::ptr::null_mut(),
+    };
+    assert_eq!(LifecycleNative::result(&pending).raw(), 0x1234);
+    assert!(!LifecycleNative::can_prepare_child(
+        &pending,
+        UserVa::new(0),
+        None
+    ));
+}
+
+#[test]
+fn arm_frame_rejects_slot_outside_mailbox_capacity() {
+    use carrick_guest_arch::SyscallFrame;
+    let frame = TrapFrame {
+        slot: 256,
+        ..Default::default()
+    };
+    assert_eq!(frame.slot(), None);
+}
