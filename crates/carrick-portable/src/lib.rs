@@ -128,10 +128,7 @@ pub enum SparseSeek {
 /// macOS, FreeBSD and Linux implement both whences natively, so this is the
 /// host `lseek`. NetBSD's lseek(2) accepts only `SEEK_SET`/`SEEK_CUR`/
 /// `SEEK_END` (and the libc crate has no `SEEK_DATA`/`SEEK_HOLE` there), so
-/// the NetBSD path reports the whole file as one data extent — the answer
-/// lseek(2) defines for a filesystem without hole support: `SEEK_DATA`
-/// returns `offset`, `SEEK_HOLE` returns the file size, and an `offset` that
-/// is negative or at/after end of file fails with `ENXIO`.
+/// NetBSD uses [`lseek_sparse_whole_file`].
 #[inline]
 pub fn lseek_sparse(fd: libc::c_int, offset: libc::off_t, kind: SparseSeek) -> libc::off_t {
     #[cfg(not(target_os = "netbsd"))]
@@ -145,22 +142,98 @@ pub fn lseek_sparse(fd: libc::c_int, offset: libc::off_t, kind: SparseSeek) -> l
     }
     #[cfg(target_os = "netbsd")]
     {
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: `st` is a valid, writable `stat` for the call.
-        if unsafe { libc::fstat(fd, &mut st) } != 0 {
-            return -1;
+        lseek_sparse_whole_file(fd, offset, kind)
+    }
+}
+
+/// The `SEEK_DATA`/`SEEK_HOLE` answer for a file with no holes, the answer
+/// lseek(2) defines for a filesystem without hole support: the whole file is
+/// one data extent, so `SEEK_DATA` returns `offset`, `SEEK_HOLE` returns
+/// `size`, and an `offset` that is negative or at/after end of file has no
+/// answer (`None`, which callers report as `ENXIO`).
+#[inline]
+pub fn sparse_seek_whole_file(
+    offset: libc::off_t,
+    size: libc::off_t,
+    kind: SparseSeek,
+) -> Option<libc::off_t> {
+    if offset < 0 || offset >= size {
+        return None;
+    }
+    Some(match kind {
+        SparseSeek::Data => offset,
+        SparseSeek::Hole => size,
+    })
+}
+
+/// [`lseek_sparse`] for a host without native `SEEK_DATA`/`SEEK_HOLE`:
+/// answers with [`sparse_seek_whole_file`] against the descriptor's current
+/// size and moves the file position to the result like the native call.
+/// Returns `-1` with `errno` set (`ENXIO` when there is no answer). Built on
+/// every host so its semantics are tested everywhere; only NetBSD routes
+/// guest seeks through it.
+pub fn lseek_sparse_whole_file(
+    fd: libc::c_int,
+    offset: libc::off_t,
+    kind: SparseSeek,
+) -> libc::off_t {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `st` is a valid, writable `stat` for the call.
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return -1;
+    }
+    let Some(next) = sparse_seek_whole_file(offset, st.st_size, kind) else {
+        set_errno(libc::ENXIO);
+        return -1;
+    };
+    // SAFETY: lseek takes no pointers; a bad fd fails with EBADF.
+    unsafe { libc::lseek(fd, next, libc::SEEK_SET) }
+}
+
+#[cfg(test)]
+mod lseek_sparse_whole_file_tests {
+    use super::{SparseSeek, errno, lseek_sparse_whole_file, sparse_seek_whole_file};
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn whole_file_answers_follow_lseek_without_hole_support() {
+        assert_eq!(sparse_seek_whole_file(0, 100, SparseSeek::Data), Some(0));
+        assert_eq!(sparse_seek_whole_file(42, 100, SparseSeek::Data), Some(42));
+        assert_eq!(sparse_seek_whole_file(99, 100, SparseSeek::Data), Some(99));
+        assert_eq!(sparse_seek_whole_file(0, 100, SparseSeek::Hole), Some(100));
+        assert_eq!(sparse_seek_whole_file(99, 100, SparseSeek::Hole), Some(100));
+        for kind in [SparseSeek::Data, SparseSeek::Hole] {
+            assert_eq!(sparse_seek_whole_file(100, 100, kind), None, "at EOF");
+            assert_eq!(sparse_seek_whole_file(101, 100, kind), None, "past EOF");
+            assert_eq!(sparse_seek_whole_file(-1, 100, kind), None, "negative");
+            assert_eq!(sparse_seek_whole_file(0, 0, kind), None, "empty file");
         }
-        let size = st.st_size;
-        if offset < 0 || offset >= size {
-            set_errno(libc::ENXIO);
-            return -1;
+    }
+
+    #[test]
+    fn whole_file_seek_moves_the_position_and_reports_enxio() {
+        let mut file = tempfile::tempfile().expect("tempfile");
+        file.write_all(&[7u8; 100]).expect("write");
+        let fd = file.as_raw_fd();
+        let position = || unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+
+        assert_eq!(lseek_sparse_whole_file(fd, 10, SparseSeek::Data), 10);
+        assert_eq!(position(), 10);
+        assert_eq!(lseek_sparse_whole_file(fd, 10, SparseSeek::Hole), 100);
+        assert_eq!(position(), 100);
+
+        unsafe { libc::lseek(fd, 5, libc::SEEK_SET) };
+        for (offset, kind) in [
+            (100, SparseSeek::Data),
+            (100, SparseSeek::Hole),
+            (-1, SparseSeek::Data),
+            (-1, SparseSeek::Hole),
+        ] {
+            assert_eq!(lseek_sparse_whole_file(fd, offset, kind), -1);
+            assert_eq!(errno(), libc::ENXIO, "offset {offset} {kind:?}");
+            assert_eq!(position(), 5, "a failed seek leaves the position");
         }
-        let next = match kind {
-            SparseSeek::Data => offset,
-            SparseSeek::Hole => size,
-        };
-        // SAFETY: lseek takes no pointers; a bad fd fails with EBADF.
-        unsafe { libc::lseek(fd, next, libc::SEEK_SET) }
     }
 }
 
