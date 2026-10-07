@@ -488,7 +488,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/directory.rs",
-      "line": 184,
+      "line": 274,
       "categories": [
         "description_guard"
       ],
@@ -499,7 +499,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/directory.rs",
-      "line": 521,
+      "line": 611,
       "categories": [
         "description_guard"
       ],
@@ -510,7 +510,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/directory.rs",
-      "line": 695,
+      "line": 794,
       "categories": [
         "description_guard"
       ],
@@ -521,7 +521,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/directory.rs",
-      "line": 704,
+      "line": 803,
       "categories": [
         "description_backing",
         "mapping"
@@ -533,7 +533,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/directory.rs",
-      "line": 709,
+      "line": 808,
       "categories": [
         "description_guard"
       ],
