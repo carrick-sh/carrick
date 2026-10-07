@@ -11024,3 +11024,62 @@ fn exec_image_cache_single_flights_one_key() {
     });
     assert_eq!(builds.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
+
+#[test]
+fn pathname_resolution_owner_wait_returns_owner_memory_wait_not_efault() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{GuestMemory, MemoryError};
+    use carrick_observability::compat::SyscallArgs;
+    use std::num::NonZeroU64;
+
+    struct WaitingMemory(PortalOwnerWait);
+    impl GuestMemory for WaitingMemory {
+        fn read_bytes_raw(&self, _address: u64, _length: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::OwnerWait(self.0))
+        }
+        fn write_bytes_raw(&mut self, _address: u64, _bytes: &[u8]) -> Result<(), MemoryError> {
+            Ok(())
+        }
+    }
+    impl CurrentMmMemory for WaitingMemory {}
+
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(2).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Editor,
+            7,
+        )
+    };
+    let mut memory = WaitingMemory(wait);
+    let dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let reporter = CompatReporter::default();
+
+    // SYS_NEWFSTATAT (79): fstatat(dirfd, pathname, statbuf, flags)
+    let outcome = lower_handler_result(
+        dispatcher
+            .dispatch_normalized(
+                &context,
+                SyscallRequest::new(79, SyscallArgs::from([carrick_abi::LINUX_AT_FDCWD as u64, 0x1000, 0x2000, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+                None,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome,
+        DispatchOutcome::OwnerMemoryWait {
+            wait,
+            committed: 0,
+        },
+        "pathname owner wait must return OwnerMemoryWait, not EFAULT"
+    );
+}
+
