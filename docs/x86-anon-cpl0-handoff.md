@@ -5,7 +5,8 @@
 Pushed work/x86-process-owner through 3a81f3092. Local 64c68767f binds
 native fault/grant custody to the exact executing CPU/MM; d9adc7077 moves
 process birth admission/publication into the sole shared registry. Final
-checkpoint gates are running, with .status files as the authoritative verdicts.
+checkpoint host gate is red; other required gates passed except the inherited
+N1 difference. The latest attribution section below is authoritative.
 No extraction PR, two-MM green or review-ready milestone is claimed.
 The old shootdown red below is historical: the authorized shared-kernel
 single-entry settlement was merged and its foreground KVM gates passed.
@@ -951,3 +952,40 @@ fork/wait4/exit_group and CPU1 park/restore/dispatch, exact completion identity,
 and actual PRIVATE leaf witnesses per MM, no aliases and an active peer lane.
 The preserved two-MM probe in 6d4905e12 remains red on 710980f1c with fork ENOSYS
 (exit91); do not claim it is included or green in this checkpoint.
+
+## Final watchdog blocker: arena host gate (2026-10-07)
+
+Full just test exits one: fork_storm_never_exposes_incomplete_records sees
+published host PID with parent zero at prefork_registration.rs:145.
+/tmp/x86-process-birth-host.log:8728 records the actual gate failure. The nested
+host_lease fork_without_exec_fixture failure later in the log is an intentional
+SIGKILL negative fixture whose enclosing test passes; it is not another red.
+KVM133/0/5, separate kernel-semantics, workspace clippy and clean domains exit
+zero. Parent ASM is zero; N1 remains inherited one, with no new ARM drift.
+
+Arena source/test/Cargo inputs are unchanged by this checkpoint; the crate
+only depends on bitflags/libc. Pure pushed 3a81f3092 was git-archived into
+/tmp/x86-process-arena-baseline-3a81 and built independently. Fixed quiet25
+cohorts pass on both baseline and current. Fixed50 cohorts under the same
+bounded eight-yes CPU load fail 2/50 on BOTH baseline and current, with the
+same parent-zero assertion. Receipts /tmp/x86-process-arena-attribution.json,
+/tmp/x86-process-arena-load-attribution.json and individual sample logs retain
+all verdicts. This attributes a pre-existing timing-dependent arena/scanner
+failure; it does not close that architectural defect or make the host gate green.
+All eight load generators were terminated/reaped and pgrep yes/stress/stress-ng
+reported none. No arena code, ignores, retries-to-green or timeouts were changed.
+
+Normal push is held: the director's existing work-branch exception covers only
+the separately owned shootdown red, not this newly attributed host-gate red.
+Last remote checkpoint remains 3a81f3092 until an explicit labelled-push decision.
+All new source is committed locally (64c68767f, d9adc7077 and inventory/docs
+9abd66f48); the final documentation-only handoff commit records this blocker.
+Director was notified with A/B counts. Do not rerun until green and call it closed.
+
+Exact next step is the director's host-gate ownership/push decision, then apply
+/tmp/x86-process-owner-payload-draft.rs and
+/tmp/x86-process-owner-payload-tests-draft.rs. The implementer finished the actual
+adapter and twelve tests outside the tracked tree; only rustfmt parsing ran.
+They have not compiled or passed tests. Read its appended task-1-report.md
+assumptions, run genuine red-first binding tests, review, commit and continue
+native MM fork/COW/CPU1 integration. The two-MM PRIVATE witness remains open.
