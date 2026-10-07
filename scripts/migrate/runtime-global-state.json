@@ -1027,14 +1027,6 @@
     },
     {
       "kind": "env_var_os",
-      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "symbol": "new::CARRICK_TRACE_TRAPS",
-      "fingerprint": "32eac70bf993d040c3eacedbffa49fd74f7077a8bf566fe086a309d83c6fc598",
-      "classification": "config_debug",
-      "rationale": "Environment variable CARRICK_TRACE_TRAPS read in new::CARRICK_TRACE_TRAPS (crates/carrick-runtime/src/vcpu_loop/mod.rs) configuring carrier behavior or debug logging."
-    },
-    {
-      "kind": "env_var_os",
       "file": "crates/carrick-thread/src/thread.rs",
       "symbol": "tests::set::key",
       "fingerprint": "ac8124cbc29687037b55a81ab069be0cf9a4462aadd314e5102b4014a46f0403",

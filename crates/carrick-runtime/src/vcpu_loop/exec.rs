@@ -2667,6 +2667,7 @@ pub(crate) mod tests {
             Arc::new(carrick_hal::GenericVcpuRegistry::new()),
             carrick_hal::InGuestFlag::for_guest_thread(),
             1_000,
+            carrick_kernel::kernel::TrapTrace::Off,
         );
         state.service_kernel_context = Some(root.retain_exact());
         (kernel, root, state)
@@ -2894,6 +2895,7 @@ pub(crate) mod tests {
             Arc::new(carrick_hal::GenericVcpuRegistry::new()),
             carrick_hal::InGuestFlag::for_guest_thread(),
             1_000,
+            carrick_kernel::kernel::TrapTrace::Off,
         );
         state.service_kernel_context = Some(root.retain_exact());
 
@@ -3152,6 +3154,7 @@ pub(crate) mod tests {
             Arc::clone(&kicker),
             carrick_hal::InGuestFlag::for_guest_thread(),
             1_000,
+            carrick_kernel::kernel::TrapTrace::Off,
         );
         state
             .execution_lease
@@ -3408,6 +3411,7 @@ pub(crate) mod tests {
             Arc::clone(&kicker),
             carrick_hal::InGuestFlag::for_guest_thread(),
             1_000,
+            carrick_kernel::kernel::TrapTrace::Off,
         );
         state
             .execution_lease
@@ -3690,6 +3694,7 @@ pub(crate) mod tests {
                 Arc::clone(&kicker),
                 carrick_hal::InGuestFlag::for_guest_thread(),
                 1_000,
+                carrick_kernel::kernel::TrapTrace::Off,
             );
             state.guest_execution = Some(
                 kernel
@@ -3949,6 +3954,7 @@ pub(crate) mod tests {
                 Arc::clone(&kicker),
                 carrick_hal::InGuestFlag::for_guest_thread(),
                 1_000,
+                carrick_kernel::kernel::TrapTrace::Off,
             );
             state.guest_execution = Some(
                 kernel
@@ -4198,6 +4204,7 @@ pub(crate) mod tests {
             Arc::clone(&kicker),
             carrick_hal::InGuestFlag::for_guest_thread(),
             1_000,
+            carrick_kernel::kernel::TrapTrace::Off,
         );
         state.guest_execution = Some(
             kernel
@@ -4858,6 +4865,7 @@ pub(crate) mod tests {
             Arc::clone(&kicker),
             carrick_hal::InGuestFlag::for_guest_thread(),
             1_000,
+            carrick_kernel::kernel::TrapTrace::Off,
         );
         state.execution_lease.lock().set_lease(running.take_lease());
         state.service_kernel_context = Some(context.retain_exact());
@@ -6634,6 +6642,7 @@ pub(crate) mod tests {
             Arc::new(carrick_hal::GenericVcpuRegistry::new()),
             carrick_hal::InGuestFlag::for_guest_thread(),
             1_000,
+            carrick_kernel::kernel::TrapTrace::Off,
         );
         state.service_kernel_context = Some(root.retain_exact());
 
@@ -6820,6 +6829,7 @@ pub(crate) mod tests {
             Arc::new(carrick_hal::GenericVcpuRegistry::new()),
             carrick_hal::InGuestFlag::for_guest_thread(),
             1_000,
+            carrick_kernel::kernel::TrapTrace::Off,
         );
         state.service_kernel_context = Some(root.retain_exact());
         let mut engine = CrashCaptureTestEngine::default();
@@ -6926,6 +6936,7 @@ pub(crate) mod tests {
             Arc::new(carrick_hal::GenericVcpuRegistry::new()),
             carrick_hal::InGuestFlag::for_guest_thread(),
             1_000,
+            carrick_kernel::kernel::TrapTrace::Off,
         );
         state.service_kernel_context = Some(root.retain_exact());
         state.begin_internal_control_exec().unwrap();

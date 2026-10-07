@@ -972,7 +972,10 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// of a registration cannot drift apart.
     pub(super) in_guest: carrick_hal::InGuestFlag,
     pub(super) max_traps: usize,
-    pub(super) trace: bool,
+    /// This launch's per-trap stderr log, carried from
+    /// [`carrick_kernel::kernel::LaunchContext::trap_trace`] and inherited by
+    /// every thread and process child this thread creates.
+    pub(super) trace: carrick_kernel::kernel::TrapTrace,
     /// Set on a vfork (`CLONE_VM|CLONE_VFORK`) CHILD: the write end of the pipe
     /// whose read end the suspended PARENT blocks on. `None` on the parent and on
     /// ordinary (non-vfork) children.
@@ -1012,6 +1015,7 @@ where
         kicker: Arc<dyn VcpuRegistry>,
         in_guest: carrick_hal::InGuestFlag,
         max_traps: usize,
+        trace: carrick_kernel::kernel::TrapTrace,
     ) -> Self {
         Self {
             registry,
@@ -1043,7 +1047,7 @@ where
             kicker,
             in_guest,
             max_traps,
-            trace: std::env::var_os("CARRICK_TRACE_TRAPS").is_some(),
+            trace,
             #[cfg(test)]
             crash_lease_drain_budget: CrashLeaseDrainBudget::DEFAULT,
             vfork_release_fd: None,
@@ -1162,7 +1166,7 @@ where
     }
 
     pub(super) fn trace_syscall(&self, traps: usize, frame: carrick_hal::RawSyscall) {
-        if !self.trace {
+        if !self.trace.is_enabled() {
             return;
         }
         // The frame carries the RAW per-ISA number, so the name comes from this
@@ -1204,7 +1208,7 @@ where
 
     /// Return-side companion to [`Self::trace_syscall`].
     pub(super) fn trace_syscall_return(&self, traps: usize, ret: Option<i64>) {
-        if !self.trace {
+        if !self.trace.is_enabled() {
             return;
         }
         let Some(ret) = ret else { return };

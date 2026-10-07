@@ -1146,6 +1146,7 @@ mod tests {
             kicker,
             owner_in_guest,
             1_000,
+            carrick_kernel::kernel::TrapTrace::Off,
         );
         state.install_crash_lease_drain_budget_for_test(CrashLeaseDrainBudget {
             timeout: Duration::ZERO,
@@ -1246,6 +1247,7 @@ mod tests {
             kicker,
             owner_in_guest,
             1_000,
+            carrick_kernel::kernel::TrapTrace::Off,
         );
         state.service_kernel_context = Some(worker.retain_exact());
 
@@ -1433,6 +1435,7 @@ mod tests {
             kicker,
             owner_in_guest,
             1_000,
+            carrick_kernel::kernel::TrapTrace::Off,
         );
         state.service_kernel_context = Some(worker.retain_exact());
 
