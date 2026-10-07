@@ -3,6 +3,8 @@ name: Kernel runtime · trusted hardware
 on:
   push:
     branches: [main]
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
   schedule:
     - cron: "0 9 * * *"
@@ -20,7 +22,7 @@ env:
 jobs:
   signed-fixtures:
     name: Linux ARM64 · exact-SHA signed fixtures
-    if: ${{ vars.CARRICK_SELF_HOSTED == 'true' }}
+    if: ${{ vars.CARRICK_SELF_HOSTED == 'true' && github.event_name != 'merge_group' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:
@@ -60,7 +62,7 @@ jobs:
   # the nested virtualization HVPatch requires.
   hvf-kernel:
     name: HVF · signed embed + cached probes
-    if: ${{ vars.CARRICK_SELF_HOSTED == 'true' }}
+    if: ${{ vars.CARRICK_SELF_HOSTED == 'true' && github.event_name != 'merge_group' }}
     needs: [signed-fixtures]
     runs-on: [self-hosted, macos, arm64, carrick-hvf]
     timeout-minutes: 180
@@ -183,14 +185,15 @@ jobs:
           just conformance-closure-scope
 
   # A real KVM device is the contract. An incidental or software-emulated
-  # hosted environment is not accepted as this smoke lane.
-  kvm-cpl0-entry:
-    name: KVM · x86 CPL0 entry smoke
-    if: >-
-      ${{ vars.CARRICK_SELF_HOSTED_KVM == 'true' &&
-          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+  # hosted environment is not accepted as this lane. Every `kvm`-lane test
+  # target runs (`just test-kvm`, derived from Cargo metadata), on every event
+  # this workflow sees, merge queue included. Pull requests are not run here:
+  # this is a self-hosted runner and fork PR code must not reach it.
+  kvm-tests:
+    name: KVM · x86 kvm-lane tests
+    if: ${{ vars.CARRICK_SELF_HOSTED_KVM == 'true' }}
     runs-on: [self-hosted, linux, x64, kvm, carrick-kvm]
-    timeout-minutes: 60
+    timeout-minutes: 90
     concurrency:
       group: carrick-kvm-${{ github.repository }}
       cancel-in-progress: false
@@ -210,12 +213,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
       - name: Install per-user compiler cache
         run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
-      - name: Build x86 CPL0 image
-        run: |
-          rustup target add x86_64-unknown-none
-          cargo build --locked --release -p carrick-x86-cpl0 --target x86_64-unknown-none
 
-      - name: x86 CPL0 entry smoke
-        run: cargo test --locked -p carrick-vmm-kvm --test cpl0_entry
+      - name: Install x86 image and fixture targets
+        run: rustup target add x86_64-unknown-none x86_64-unknown-linux-musl
+
+      - name: KVM-lane tests (CARRICK_REQUIRE_KVM=1)
+        run: just test-kvm
