@@ -606,6 +606,38 @@ impl<'a> SpaceAccess<'a> {
             self.spaces.lower(index);
         }
     }
+    /// Publish an owner metadata capacity event. This advances the metadata
+    /// revision and wakes any thread parked on SpaceWaitCause::Metadata for
+    /// this address space.
+    pub fn publish_metadata(self, index: SpaceIndex) {
+        let entry = self.spaces.entry(index);
+        if !entry.notifications.attached() {
+            return;
+        }
+        let Some(venue) = self.venue else {
+            return;
+        };
+        let Some(lease) = venue
+            .zone
+            .editor_notification(index, self.spaces.key(index))
+        else {
+            return;
+        };
+        let completion =
+            |effects: OwnedObjectWakeEffects<'_>| (venue.deliver)(venue.zone, venue.waker, effects);
+        let publication = lease
+            .reserve(SpaceWaitCause::Metadata)
+            .advance_revision(venue.waker, &completion);
+        publication.publish();
+    }
+    /// Publish an owner metadata capacity event to every attached address space.
+    pub fn publish_metadata_all(self) {
+        for index in 0..super::ADDRESS_SPACES {
+            if let Some(index) = SpaceIndex::from_index(index) {
+                self.publish_metadata(index);
+            }
+        }
+    }
     pub fn try_begin_edit(
         self,
         index: SpaceIndex,
