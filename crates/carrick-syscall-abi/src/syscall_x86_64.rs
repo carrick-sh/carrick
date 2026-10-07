@@ -43,7 +43,7 @@
 pub enum SyscallRemap {
     /// Same semantics, different number: dispatch as `canonical` with args
     /// unchanged.
-    Direct(u64),
+    Direct(crate::CanonicalNr),
     /// Canonical Carrick route for an x86 call absent from asm-generic.
     Private(crate::CanonicalNr),
     /// ISA-private syscall the backend services natively (x86_64 `arch_prctl`).
@@ -65,15 +65,7 @@ const fn direct(number: u64, name: &'static str, canonical: u64) -> X8664Syscall
     X8664Syscall {
         number,
         name,
-        remap: SyscallRemap::Direct(canonical),
-    }
-}
-
-const fn private(number: u64, name: &'static str, canonical: crate::CanonicalNr) -> X8664Syscall {
-    X8664Syscall {
-        number,
-        name,
-        remap: SyscallRemap::Private(canonical),
+        remap: SyscallRemap::Direct(crate::CanonicalNr(canonical)),
     }
 }
 
@@ -98,7 +90,7 @@ pub fn lookup_x86_64(number: u64) -> Option<&'static X8664Syscall> {
 /// Resolve a native x86 number into the typed canonical dispatch domain.
 pub fn canonical_x86_64(number: crate::NativeNr) -> Option<crate::CanonicalNr> {
     match lookup_x86_64(number.raw())?.remap {
-        SyscallRemap::Direct(canonical) => Some(crate::CanonicalNr(canonical)),
+        SyscallRemap::Direct(canonical) => Some(canonical),
         SyscallRemap::Private(canonical) => Some(canonical),
         SyscallRemap::Native | SyscallRemap::Unknown => None,
     }
@@ -250,9 +242,8 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // vs the asm-generic order the dispatcher expects — the x86 engine normalizes
     // it (x8664_arch::normalize_syscall). Source: clone(2) man-page.
     direct(56, "clone", 220),
-    // No asm-generic fork ordinal. The shared guest kernel owns this call;
-    // host backends lower it to clone before consulting this table.
-    private(57, "fork", crate::nr::CARRICK_PRIVATE_X86_FORK),
+    // DO NOT add fork(57): no canonical handler exists; host backends lower
+    // fork/vfork to clone before consulting this table.
     // x86_64=58 vfork remains desugared to clone by host backends.
     // x86_64=59 (syscalls(2)/filippo) → canonical execve=221.
     // glibc/musl execve() lowers to SYS_execve(59); the shared dispatcher's
@@ -936,77 +927,78 @@ mod tests {
     fn write_remaps_to_canonical_64() {
         let e = lookup_x86_64(1).expect("write must be in the table");
         assert_eq!(e.name, "write");
-        assert_eq!(e.remap, SyscallRemap::Direct(64));
+        assert_eq!(e.remap, SyscallRemap::Direct(crate::CanonicalNr(64)));
     }
 
     #[test]
     fn exit_remaps_to_canonical_93() {
         let e = lookup_x86_64(60).expect("exit must be in the table");
         assert_eq!(e.name, "exit");
-        assert_eq!(e.remap, SyscallRemap::Direct(93));
+        assert_eq!(e.remap, SyscallRemap::Direct(crate::CanonicalNr(93)));
     }
 
     #[test]
     fn exit_group_remaps_to_canonical_94() {
         let e = lookup_x86_64(231).expect("exit_group must be in the table");
         assert_eq!(e.name, "exit_group");
-        assert_eq!(e.remap, SyscallRemap::Direct(94));
+        assert_eq!(e.remap, SyscallRemap::Direct(crate::CanonicalNr(94)));
     }
 
     #[test]
     fn brk_remaps_to_canonical_214() {
         let e = lookup_x86_64(12).expect("brk must be in the table");
         assert_eq!(e.name, "brk");
-        assert_eq!(e.remap, SyscallRemap::Direct(214));
+        assert_eq!(e.remap, SyscallRemap::Direct(crate::CanonicalNr(214)));
     }
 
     #[test]
     fn mmap_remaps_to_canonical_222() {
         let e = lookup_x86_64(9).expect("mmap must be in the table");
         assert_eq!(e.name, "mmap");
-        assert_eq!(e.remap, SyscallRemap::Direct(222));
+        assert_eq!(e.remap, SyscallRemap::Direct(crate::CanonicalNr(222)));
     }
 
     #[test]
     fn rt_sigreturn_remaps_to_canonical_139() {
         let e = lookup_x86_64(15).expect("rt_sigreturn must be in the table");
         assert_eq!(e.name, "rt_sigreturn");
-        assert_eq!(e.remap, SyscallRemap::Direct(139));
+        assert_eq!(e.remap, SyscallRemap::Direct(crate::CanonicalNr(139)));
     }
 
     #[test]
     fn clone_remaps_to_canonical_220() {
         let e = lookup_x86_64(56).expect("clone must be in the table");
         assert_eq!(e.name, "clone");
-        assert_eq!(e.remap, SyscallRemap::Direct(220));
-    }
-
-    #[test]
-    fn fork_has_its_own_private_canonical_route() {
-        let native = crate::NativeNr(57);
-        let entry = lookup_x86_64(native.raw()).expect("fork table entry");
-        assert_eq!(
-            entry.remap,
-            SyscallRemap::Private(crate::nr::CARRICK_PRIVATE_X86_FORK)
-        );
-        assert_eq!(
-            canonical_x86_64(native),
-            Some(crate::nr::CARRICK_PRIVATE_X86_FORK)
-        );
+        assert_eq!(e.remap, SyscallRemap::Direct(crate::CanonicalNr(220)));
     }
 
     #[test]
     fn wait4_remaps_to_canonical_260() {
         let e = lookup_x86_64(61).expect("wait4 must be in the table");
         assert_eq!(e.name, "wait4");
-        assert_eq!(e.remap, SyscallRemap::Direct(260));
+        assert_eq!(e.remap, SyscallRemap::Direct(crate::CanonicalNr(260)));
+    }
+
+    #[test]
+    fn fork_without_a_canonical_handler_stays_unmapped() {
+        assert!(lookup_x86_64(57).is_none());
+        assert_eq!(canonical_x86_64(crate::NativeNr(57)), None);
     }
 
     #[test]
     fn futex_gettid_set_robust_list_present() {
-        assert_eq!(lookup_x86_64(202).unwrap().remap, SyscallRemap::Direct(98)); // futex
-        assert_eq!(lookup_x86_64(186).unwrap().remap, SyscallRemap::Direct(178)); // gettid
-        assert_eq!(lookup_x86_64(273).unwrap().remap, SyscallRemap::Direct(99)); // set_robust_list
+        assert_eq!(
+            lookup_x86_64(202).unwrap().remap,
+            SyscallRemap::Direct(crate::CanonicalNr(98))
+        ); // futex
+        assert_eq!(
+            lookup_x86_64(186).unwrap().remap,
+            SyscallRemap::Direct(crate::CanonicalNr(178))
+        ); // gettid
+        assert_eq!(
+            lookup_x86_64(273).unwrap().remap,
+            SyscallRemap::Direct(crate::CanonicalNr(99))
+        ); // set_robust_list
     }
 
     #[test]
