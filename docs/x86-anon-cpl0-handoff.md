@@ -1,9 +1,9 @@
 # x86 anonymous CPL0 handoff (partial, 2026-10-07)
 
-## Current gate status: extraction push held
+## Current gate status: labelled extraction work-branch push
 
 PR102 follow-up 83364467d is pushed. The extraction registry foundation
-through 09df94f4e is local, and no extraction review-ready or two-live-MM
+through 7f25ac48f is ready for the authorized work-branch push, and no extraction review-ready or two-live-MM
 milestone is claimed. Full host, separate kernel-semantics, clippy and clean
 Linux domain lint pass. N1's inherited ARM hvc #3 difference is unchanged;
 comparison against imported shared-kernel 6d6bcf26c has zero failures.
@@ -18,7 +18,10 @@ and five existing ignores. The sole failure is the separately owned known
 shootdown test: two_running_vcpus_drop_stale_translation_on_shootdown,
 cpl0_entry.rs:1264, "running CPU must acknowledge shootdown". The earlier
 same-code gate reported 128/0/5. This is not retry-until-green; the fresh
-red gate is authoritative and the extraction push is held. Shootdown code
+red gate is authoritative. The director explicitly authorized pushing this
+work branch with this separately owned red labelled. Pure 7d6daf287 failed
+22/50 runs; the independent review comparison failed 25/50. These A/B
+numbers attribute the defect and do not claim closure. Shootdown code
 was not edited. The director was notified with ref 09df94f4e.
 Receipts: /tmp/x86-process-registry-{committed-kvm,clean-image-kvm}.log.
 
