@@ -97,7 +97,10 @@ impl<'a> PortalWaitEnrollment<'a> {
             record,
             operation,
             completion,
-            || self.source.is_live(),
+            || {
+                self.source.is_live()
+                    && (self.cause != SpaceWaitCause::Editor || self.source.editor_held())
+            },
         )
     }
 }
@@ -122,6 +125,67 @@ pub struct ObjectParkRequest {
     pub snapshot: ObjectWaitSnapshot,
     pub operation: OperationToken,
     pub deadline: Option<u64>,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use carrick_sched_core::spaces::notification::SpaceReleaseVenue;
+    use carrick_sched_core::{BoundedSpin, ThreadIdentity, Waker};
+    use core::{alloc::Layout, num::NonZeroU64};
+
+    fn deliver(_: &ZoneTables, _: Waker, effects: OwnedObjectWakeEffects<'_>) {
+        let _ = effects.deliver_handbacks(&mut |_| {});
+    }
+
+    #[test]
+    fn editor_wait_refuses_after_release_at_same_observed_revision() {
+        let ptr = unsafe { alloc::alloc::alloc_zeroed(Layout::new::<ZoneTables>()) };
+        assert!(!ptr.is_null());
+        let zone = unsafe { alloc::boxed::Box::from_raw(ptr.cast::<ZoneTables>()) };
+        let index = zone.spaces.publish_closed(77, 0x30000, 0x30000).unwrap();
+        let entry = zone.space_entry(NonZeroU64::new(77).unwrap()).unwrap();
+        let complete = |effects: OwnedObjectWakeEffects<'_>| {
+            let _ = effects.deliver_handbacks(&mut |_| {});
+        };
+        entry
+            .admit_notifications(NonZeroU64::new(1).unwrap(), &BoundedSpin(0), &complete)
+            .unwrap();
+        let access = SpaceAccess::notified(SpaceReleaseVenue {
+            zone: &zone,
+            waker: Waker::Host,
+            deliver,
+        });
+        access.open(index);
+        let editor = access
+            .try_begin_edit(index, 77, NonZeroU64::new(1).unwrap())
+            .unwrap();
+        drop(editor);
+        let source = entry.notifications(NonZeroU64::new(1).unwrap()).unwrap();
+        let revision = source.observe(SpaceWaitCause::Editor).revision();
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                tid: 77,
+                serial: 1,
+                mm: 77,
+                file_table: 1,
+                generation: 1,
+                affinity: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
+            })
+            .unwrap();
+        let operation = OperationToken::new(77, 1).unwrap();
+        let enrollment = PortalWaitEnrollment::new(source, SpaceWaitCause::Editor, revision);
+        assert!(
+            matches!(
+                enrollment.park_host(record, operation, &complete),
+                Err((ObjectWaitError::Changed, _))
+            ),
+            "the revision can advance while the editor is held; a later park must recheck the editor"
+        );
+    }
 }
 
 impl ObjectParkRequest {
