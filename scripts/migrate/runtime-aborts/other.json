@@ -1058,6 +1058,17 @@
       "rationale": "The native adapter cannot replay or return a completed family effect after exact entry binding authentication failed. Host-only fail-stop uses the shared typed fatal sink; the freestanding ARM adapter retains HVC fatal transport. This is carrier invariant corruption, never a guest errno.",
       "sink": "fatal",
       "domain": "el1::entry_completion"
+    },
+    {
+      "file": "crates/carrick-el1/src/personality/process_owner.rs",
+      "function": "<GuestRegistryFailure as GuestProcessFailure>::fail_process",
+      "ordinal_in_function": 1,
+      "fingerprint": "6171f54063ff3fb4b4e5280c6751823bb212cff684ef80697114112cc7ab2e0d",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1::process_owner",
+      "rationale": "Shared guest process graph corruption or abandoned irreversible exit custody cannot be represented by a recoverable guest errno. Exact reservation, topology publication and numeric claim custody must fail closed through the existing native fatal transport.",
+      "sink": "fatal",
+      "domain": "el1::process_owner"
     }
   ]
 }
