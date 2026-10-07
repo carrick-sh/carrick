@@ -16691,7 +16691,7 @@
       "macos-runtime-default"
     ],
     "rationale": "At crates/carrick-kernel/src/el1_delegation/owned_recall.rs:51 in `driver`, `std::thread::Builder::new` creates exactly two carrier-owned storage workers. `RecallJob::step` waits through the inode notification authority, then `execute_recall` withdraws guest mutation and `InodeWriteback::apply` writes retained bytes to the exact host file. The inode owner retains cleanup after requester cancellation. Guest result interest uses an owned WaitQueue continuation; these workers carry no guest execution lease. This real host-storage crossing is identical on Linux and macOS.",
-    "review_id": "HA-000757",
+    "review_id": "HA-000762",
     "source": {
       "byte_end": 1981,
       "byte_start": 1956,
