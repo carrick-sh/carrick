@@ -1441,13 +1441,13 @@ impl Cpl0Carrier {
         }
         if hardware_interrupts {
             use carrick_x86::interrupts::{
-                IRQ_HEADER_GPA, IRQ_HEADER_MAGIC, KICK_VECTOR, RESCHED_VECTOR, SHOOTDOWN_VECTOR,
-                TIMER_VECTOR,
+                IRQ_HEADER_GPA, IRQ_HEADER_MAGIC, KICK_VECTOR, PAGE_FAULT_VECTOR, RESCHED_VECTOR,
+                SHOOTDOWN_VECTOR, TIMER_VECTOR,
             };
             let header = ram
-                .read(IRQ_HEADER_GPA, 5 * size_of::<u64>())
+                .read(IRQ_HEADER_GPA, 6 * size_of::<u64>())
                 .map_err(|error| fail(format!("native IRQ header: {error}")))?;
-            let mut words = [0_u64; 5];
+            let mut words = [0_u64; 6];
             for (word, bytes) in words.iter_mut().zip(header.chunks_exact(8)) {
                 *word = u64::from_le_bytes(
                     bytes
@@ -1464,9 +1464,15 @@ impl Cpl0Carrier {
             }
             for index in 0..2 {
                 let idt = carrick_x86::fault_slot_gpa(carrick_x86::fault_idt_base(LAYOUT), index)?;
-                for (vector, entry) in [TIMER_VECTOR, KICK_VECTOR, RESCHED_VECTOR, SHOOTDOWN_VECTOR]
-                    .into_iter()
-                    .zip(words[1..].iter().copied())
+                for (vector, entry) in [
+                    TIMER_VECTOR,
+                    KICK_VECTOR,
+                    RESCHED_VECTOR,
+                    SHOOTDOWN_VECTOR,
+                    PAGE_FAULT_VECTOR,
+                ]
+                .into_iter()
+                .zip(words[1..].iter().copied())
                 {
                     ram.write_gpa(
                         idt + u64::from(vector) * 16,
@@ -2503,6 +2509,34 @@ impl Cpl0Carrier {
         fault_rip: u64,
         fault_va: u64,
     ) -> Result<u64, TrapError> {
+        self.fixture_two_running_cpus_shootdown_fault_inner(
+            editor, reader, fault_rip, fault_va, false,
+        )
+    }
+
+    /// Run both vCPUs concurrently with the shootdown IPI held until the reader
+    /// has faulted on the retired leaf. Forces the exact interleaving where the
+    /// running peer takes a page fault before the IPI is delivered.
+    pub fn fixture_two_running_cpus_shootdown_fault_held_ipi(
+        &mut self,
+        editor: usize,
+        reader: usize,
+        fault_rip: u64,
+        fault_va: u64,
+    ) -> Result<u64, TrapError> {
+        self.fixture_two_running_cpus_shootdown_fault_inner(
+            editor, reader, fault_rip, fault_va, true,
+        )
+    }
+
+    fn fixture_two_running_cpus_shootdown_fault_inner(
+        &mut self,
+        editor: usize,
+        reader: usize,
+        fault_rip: u64,
+        fault_va: u64,
+        hold_ipi: bool,
+    ) -> Result<u64, TrapError> {
         if editor >= 2 || reader >= 2 || editor == reader {
             return Err(fail("invalid fixture CPU slots"));
         }
@@ -2518,6 +2552,9 @@ impl Cpl0Carrier {
         let vm = &self._vm.vm().vm;
         let [a, b] = &mut self.cpus;
         let (editor_cpu, reader_cpu) = if editor == 0 { (a, b) } else { (b, a) };
+        if hold_ipi {
+            table.fixture_hold_ipi.store(true, Ordering::Release);
+        }
 
         let (editor_res, reader_res) = std::thread::scope(|scope| {
             let reader_handle = scope.spawn(|| {
@@ -2534,6 +2571,9 @@ impl Cpl0Carrier {
                         data,
                     } = exit
                     {
+                        if hold_ipi {
+                            table.fixture_hold_ipi.store(false, Ordering::Release);
+                        }
                         words.push(u32::from_le_bytes(
                             data.as_slice()
                                 .try_into()
@@ -2555,16 +2595,18 @@ impl Cpl0Carrier {
             let editor_handle = scope.spawn(|| {
                 let watchdog = Watchdog::start();
                 let start = std::time::Instant::now();
-                while ram
-                    .host_ptr(0x4_0000, 1)
-                    .map(|p| unsafe { *p })
-                    .unwrap_or(0)
-                    != 0x11
-                {
-                    if start.elapsed() > Duration::from_secs(5) {
-                        return Err(fail("running reader never completed loop iteration"));
+                if !hold_ipi {
+                    while ram
+                        .host_ptr(0x4_0000, 1)
+                        .map(|p| unsafe { *p })
+                        .unwrap_or(0)
+                        != 0x11
+                    {
+                        if start.elapsed() > Duration::from_secs(5) {
+                            return Err(fail("running reader never completed loop iteration"));
+                        }
+                        std::hint::spin_loop();
                     }
-                    std::hint::spin_loop();
                 }
                 for _ in 0..32 {
                     let exit =
