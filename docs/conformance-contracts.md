@@ -591,6 +591,13 @@ retiring children in a blocking wait, and sample the parent's wake generation
 in the scan that found no event. Revision or topology admission failure must
 leave the zombie, child edge and CPU ledger unchanged.
 
+Consuming reap returns the removed non-cloneable consumer payload alongside
+the semantic exit receipt, retaining exact numeric/native custody until the
+caller releases the result. `consuming_wait_retains_only_selected_owned_claim_until_result_release`
+proves two selected claims remain independent and release exactly once. The
+same selection consumes topology and charges CPU once, with no extra scan.
+The host drops its returned payload under the registry guard before observers.
+
 The VM-free binding is `carrick-sched-core::process::wait_tests`, exercised by
 `just test`. It covers two children, stale serials, observe/consume, ptrace
 stops outside the child class, reservations and revision exhaustion. At 1, 8,
