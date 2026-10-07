@@ -222,3 +222,16 @@ finite table stock/refill and exhaustion witness, physical owed-return
 settlement, CPU1/second-MM production admission and exact incarnation checks,
 concurrent busy recovery, and real-signal PROT_NONE/RO/munmap probes.
 The adjacent-map green does not close these independent audit items.
+
+Director policy confirmed after this correction: until process-owner
+extraction binds task-local termination, infrastructure refusal reason 9
+remains carrier-fail-closed. Indeterminate custody is retained or
+quarantined, never freed. It must not become a false SIGSEGV; Linux policy
+declines remain reason 6. The review correction can be pushed separately
+with this limitation explicit; process extraction then resumes.
+
+Correction gates: EL1 249 passed; requested asm comparison to github/work/n1
+has its one inherited ARM fatal_entry_binding hvc difference. Comparison to
+710980f1c passes with zero failures, including no new ARM drift. Receipts:
+`/tmp/x86-anon-review-el1.log`, `/tmp/x86-anon-review-asm-n1.log`, and
+`/tmp/x86-anon-review-asm-milestone.log`.
