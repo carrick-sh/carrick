@@ -1128,6 +1128,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn test_launch() -> LaunchContext {
         LaunchContext::from_process_env().expect("a foreground launch context needs no env")
     }

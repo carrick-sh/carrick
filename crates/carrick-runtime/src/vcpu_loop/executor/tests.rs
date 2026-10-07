@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use carrick_abi::LinuxCloneFlags;
 use carrick_hal::ThreadId;
 use carrick_hal::threaded::{Aarch64SyscallContinuationV1, Aarch64TaskCpuStateV1, GuestCpuState};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use carrick_kernel::kernel::CarrierProcess;
 
 use super::{
