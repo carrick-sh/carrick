@@ -37,7 +37,7 @@ pub(crate) fn deliver_completion(
         {
             let target = zone.slot(slot).sgi_target();
             if target != 0 {
-                cpu.send_sgi(target | (u64::from(carrick_el1_abi::GIC_RESCHED_INTID) << 24));
+                cpu.send_resched(slot, target);
             }
         }
         if effects.misplaced

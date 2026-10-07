@@ -297,38 +297,34 @@ impl ThreadCpu for HardwareCpu {
             crate::isa::x86::fatal_entry_binding();
         }
     }
-    fn send_sgi(&mut self, sgi1r: u64) {
-        use carrick_guest_arch::InterruptBackend;
-        let target = carrick_guest_arch::CpuTarget {
-            cpu: carrick_guest_arch::CpuId::new(sgi1r as u32),
-            generation: carrick_guest_arch::CpuGeneration::new(core::num::NonZeroU64::MIN),
-        };
-        let token = carrick_guest_arch::WakeToken {
-            task: carrick_guest_arch::TaskIdentity {
-                carrier: carrick_guest_arch::CarrierGeneration::new(core::num::NonZeroU64::MIN),
-                task: carrick_guest_arch::TaskSerial::new(core::num::NonZeroU64::MIN),
-                execution: carrick_guest_arch::ExecutionGeneration::new(core::num::NonZeroU64::MIN),
-            },
-            operation: carrick_guest_arch::OperationSequence::new(core::num::NonZeroU64::MIN),
-        };
-        if <crate::isa::x86::X86Backend as InterruptBackend>::send_wake(
-            &mut crate::isa::x86::X86Backend,
-            target,
-            token,
-        )
-        .is_err()
-        {
+    fn send_sgi(&mut self, _sgi1r: u64) {
+        // An ARM ICC_SGI1R word has no x86 destination interpretation.
+        crate::isa::x86::fatal_entry_binding();
+    }
+    fn send_resched(&mut self, slot: carrick_sched_core::SlotId, _target: u64) {
+        if crate::isa::x86::interrupt::send_resched(slot).is_err() {
             crate::isa::x86::fatal_entry_binding();
         }
     }
     fn ack_irq(&mut self) -> u32 {
         use carrick_guest_arch::InterruptBackend;
-        <crate::isa::x86::X86Backend as InterruptBackend>::ack_interrupt(
+        let ack = <crate::isa::x86::X86Backend as InterruptBackend>::ack_interrupt(
             &mut crate::isa::x86::X86Backend,
         )
-        .ok()
-        .flatten()
-        .map_or(0xff, |ack| ack.hardware)
+        .unwrap_or_else(|_| crate::isa::x86::fatal_entry_binding());
+        match ack.map(|ack| ack.hardware) {
+            None => carrick_el1_abi::GIC_SPURIOUS_INTID,
+            Some(vector) if vector == u32::from(crate::isa::x86::interrupts::TIMER_VECTOR) => {
+                carrick_el1_abi::GIC_VTIMER_INTID
+            }
+            Some(vector) if vector == u32::from(crate::isa::x86::interrupts::KICK_VECTOR) => {
+                carrick_el1_abi::GIC_KICK_INTID
+            }
+            Some(vector) if vector == u32::from(crate::isa::x86::interrupts::RESCHED_VECTOR) => {
+                carrick_el1_abi::GIC_RESCHED_INTID
+            }
+            Some(_) => crate::isa::x86::fatal_entry_binding(),
+        }
     }
     fn end_irq(&mut self, intid: u32) {
         use carrick_guest_arch::InterruptBackend;
@@ -354,6 +350,7 @@ impl ThreadCpu for HardwareCpu {
     }
     fn own_sgi_target(&self) -> u64 {
         crate::isa::x86::context::current_thread_cpu()
+            .and_then(|slot| slot.checked_add(1))
             .unwrap_or_else(|| crate::isa::x86::fatal_entry_binding())
     }
 }

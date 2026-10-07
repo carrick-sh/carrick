@@ -342,7 +342,7 @@ fn shared_kernel_x86_descriptor_protects_a_user_page() {
         1
     );
     let leaf = carrier
-        .fixture_user_leaf(0x3_0000)
+        .fixture_user_leaf(0x3_6000)
         .expect("4 KiB user leaf");
     assert_ne!(leaf & 1, 0, "mapping remains present");
     assert_eq!(leaf & 2, 0, "RW is cleared by the shared-kernel edit");
@@ -439,7 +439,7 @@ fn shared_kernel_retired_page_repoints_without_user_publication() {
     let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
     assert_eq!(carrier.observe(0).expect("owner retirement").result, 1);
     let leaf = carrier
-        .fixture_user_leaf_raw(0x3_4000)
+        .fixture_user_leaf_raw(0x3_7000)
         .expect("retired leaf");
     assert_eq!(leaf & 0x000f_ffff_ffff_f000, 0x91_5000);
     assert_eq!(leaf & ((1 << 0) | (1 << 9)), 0, "still inaccessible");
@@ -1019,5 +1019,59 @@ fn shared_kernel_peer_apic_queues_wake_for_runnable_cpu() {
             .expect("peer must run after reschedule IPI")
             .result,
         0
+    );
+}
+
+#[test]
+fn shared_kernel_scheduler_routes_reschedule_to_peer_apic() {
+    const INTERRUPT_WITNESS: u64 = 0xffff_ffff_ffff_ff40;
+    let mut sender = vec![0x48, 0xbe]; // mov rsi, peer scheduler slot
+    sender.extend_from_slice(&1_u64.to_le_bytes());
+    sender.extend_from_slice(&[0x48, 0xbf]); // mov rdi, scheduler reschedule witness
+    sender.extend_from_slice(&4_u64.to_le_bytes());
+    sender.extend_from_slice(&[0x48, 0xb8]);
+    sender.extend_from_slice(&INTERRUPT_WITNESS.to_le_bytes());
+    sender.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    sender.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    sender.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let receiver = program(&[(0xaced, 24)]);
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&sender, &receiver])
+        .expect("two real KVM CPUs and shared CPL0 kernel");
+    assert_eq!(
+        carrier.observe(1).expect("peer baseline completion").result,
+        0
+    );
+    assert_eq!(
+        carrier
+            .observe(0)
+            .expect("scheduler send completion")
+            .result,
+        0
+    );
+    assert_ne!(
+        carrier.lapic_register(1, 0x270).expect("peer IRR") & (1 << 2),
+        0,
+        "native reschedule vector must be queued on the peer APIC"
+    );
+}
+
+#[test]
+fn shared_kernel_scheduler_ack_uses_spurious_sentinel() {
+    const INTERRUPT_WITNESS: u64 = 0xffff_ffff_ffff_ff40;
+    let mut program = vec![0x48, 0xbf]; // mov rdi, scheduler ack witness
+    program.extend_from_slice(&5_u64.to_le_bytes());
+    program.extend_from_slice(&[0x48, 0xb8]);
+    program.extend_from_slice(&INTERRUPT_WITNESS.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier =
+        Cpl0Carrier::boot_with_interrupts(&image(), [&program, &program]).expect("KVM image");
+    assert_eq!(
+        carrier
+            .observe(0)
+            .expect("scheduler interrupt acknowledgment")
+            .result,
+        i64::from(carrick_el1_abi::GIC_SPURIOUS_INTID)
     );
 }

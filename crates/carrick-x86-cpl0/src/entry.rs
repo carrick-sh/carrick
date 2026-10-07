@@ -633,7 +633,8 @@ mod kernel {
         }
         if crate::fixture_image() && frame.rax == OBSERVE_RETIRE_REPOINT {
             use carrick_guest_arch::{
-                EditBacking, EditCowAccess, EditLeafSize, EditOperation, EditPermissions, FrameGpa,
+                EditBacking, EditCowAccess, EditOperation, EditPermissions, FrameGpa, GuestLen,
+                UserRange, UserVa,
             };
             use carrick_mmu_core::x86::descriptor_txn::{DescriptorOutcome, DescriptorReceipt};
             let one = core::num::NonZeroU64::MIN;
@@ -647,10 +648,14 @@ mod kernel {
                 receipt
                     .is_ok_and(|value| matches!(value.outcome, DescriptorOutcome::Applied { .. }))
             };
+            let Some(resident) = UserRange::checked(UserVa::new(0x3_7000), GuestLen::new(4096)) else {
+                frame.rax = 0;
+                return;
+            };
             let mapped = fixture_edit(
-                0x3_4000,
+                0x3_7000,
                 one,
-                EditOperation::Map {
+                EditOperation::Prepare {
                     output: FrameGpa::new(0x91_1000),
                     permissions: EditPermissions {
                         readable: true,
@@ -658,16 +663,15 @@ mod kernel {
                         executable: false,
                         user: true,
                     },
-                    size: EditLeafSize::Page,
-                    resident: true,
+                    resident,
                     backing,
                 },
             );
             let retired =
-                applied(mapped) && applied(fixture_edit(0x3_4000, one, EditOperation::Unmap));
+                applied(mapped) && applied(fixture_edit(0x3_7000, one, EditOperation::Unmap));
             let repointed = retired
                 && applied(fixture_edit(
-                    0x3_4000,
+                    0x3_7000,
                     one,
                     EditOperation::CowRepoint {
                         old: FrameGpa::new(0x91_1000),
@@ -704,11 +708,42 @@ mod kernel {
             return;
         }
         if crate::fixture_image() && frame.rax == OBSERVE_DESCRIPTOR_PROTECT {
-            use carrick_guest_arch::{EditOperation, EditPermissions};
+            use carrick_guest_arch::{
+                EditBacking, EditOperation, EditPermissions, FrameGpa, GuestLen, UserRange, UserVa,
+            };
             use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
+            let one = core::num::NonZeroU64::MIN;
+            let Some(resident) = UserRange::checked(UserVa::new(0x3_6000), GuestLen::new(4096)) else {
+                frame.rax = 0;
+                return;
+            };
+            let prepared = fixture_edit(
+                0x3_6000,
+                one,
+                EditOperation::Prepare {
+                    output: FrameGpa::new(0x91_6000),
+                    permissions: EditPermissions {
+                        readable: true,
+                        writable: true,
+                        executable: false,
+                        user: true,
+                    },
+                    resident,
+                    backing: EditBacking {
+                        frame_id: one,
+                        mapping_id: one,
+                        owner_generation: one,
+                        inventory_revision: one,
+                    },
+                },
+            );
+            if !matches!(prepared, Ok(receipt) if matches!(receipt.outcome, DescriptorOutcome::Applied { .. })) {
+                frame.rax = 0;
+                return;
+            }
             let receipt = fixture_edit(
-                0x3_0000,
-                core::num::NonZeroU64::MIN,
+                0x3_6000,
+                one,
                 EditOperation::Protect {
                     permissions: EditPermissions {
                         readable: true,

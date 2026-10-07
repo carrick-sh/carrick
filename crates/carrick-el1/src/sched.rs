@@ -36,6 +36,11 @@ pub trait ThreadCpu {
     fn set_timer(&mut self, cval: Option<u64>);
     /// Write `ICC_SGI1R_EL1` (after making prior stores visible).
     fn send_sgi(&mut self, sgi1r: u64);
+    /// Publish a scheduler reschedule to one issued CPU slot. `target` is the
+    /// architecture's stored route; ARM retains its exact SGI encoding.
+    fn send_resched(&mut self, _slot: SlotId, target: u64) {
+        self.send_sgi(target | (u64::from(GIC_RESCHED_INTID) << 24));
+    }
     /// Acknowledge the highest-priority pending interrupt (`ICC_IAR1_EL1`);
     /// [`GIC_SPURIOUS_INTID`] when none is pending.
     fn ack_irq(&mut self) -> u32;
@@ -654,8 +659,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             if target == 0 {
                 continue;
             }
-            self.cpu
-                .send_sgi(target | (u64::from(GIC_RESCHED_INTID) << 24));
+            self.cpu.send_resched(slot, target);
             self.zone.counters.el1_sgis.fetch_add(1, Ordering::Relaxed);
         }
     }
