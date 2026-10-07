@@ -122,8 +122,13 @@ pub fn owner_fault_plan<
         // overlapping grant. The fault page itself must reach the host's
         // exact-generation peer-resident alias retry; treating it as a
         // neighbor returns Busy without any release producer.
-        if va != fault_page && residency.table.lookup(residency.mm.raw(), va).is_some() {
-            return Ok(false);
+        if residency.table.lookup(residency.mm.raw(), va).is_some() {
+            // A fault on a grant-owned page must reach the host's exact
+            // peer-resident resolution even when its old stage-1 terminal is
+            // still VALID. That terminal can name physical custody already
+            // retired from stage-2; returning Busy here leaves no publisher
+            // to wake the fault. Neighboring grants remain hard boundaries.
+            return Ok(va == fault_page);
         }
         let mut table = table;
         for (level, shift) in [39, 30, 21, 12].into_iter().enumerate() {

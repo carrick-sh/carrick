@@ -19,6 +19,7 @@ fn first_touch_window<B: OwnerForkMmu + Copy>(
     prepared: u64,
     neighbors: bool,
     fault_resident_grant: bool,
+    fault_terminal: u64,
 ) {
     let region = Region::new();
     let spaces = AddressSpaces::new();
@@ -39,6 +40,9 @@ fn first_touch_window<B: OwnerForkMmu + Copy>(
     if neighbors {
         tables.words[1536].store(IPA | resident, Ordering::Release);
         tables.words[1538].store((IPA + 8192) | prepared, Ordering::Release);
+    }
+    if fault_terminal != 0 {
+        tables.words[1537].store((IPA + 4096) | fault_terminal, Ordering::Release);
     }
     let inherited: Vec<_> = tables
         .words
@@ -91,34 +95,39 @@ fn first_touch_window<B: OwnerForkMmu + Copy>(
             "publish an uncommitted grant at the fault page"
         );
     }
-    let TransferStep::Supply(window) = portal
-        .select(
-            &transfer,
-            &words,
-            SelectionVenues {
-                prepared: &mut NoopPreparedResolver,
-                cow: &mut NoopCowResolver,
-                residency: &grant_residency,
-                slot: 0,
-            },
-        )
-        .unwrap()
-    else {
-        panic!("untouched owner page must select supply")
+    let window = if fault_terminal == 0 {
+        let TransferStep::Supply(window) = portal
+            .select(
+                &transfer,
+                &words,
+                SelectionVenues {
+                    prepared: &mut NoopPreparedResolver,
+                    cow: &mut NoopCowResolver,
+                    residency: &grant_residency,
+                    slot: 0,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("untouched owner page must select supply")
+        };
+        assert_eq!(
+            window.range.start(),
+            if neighbors { VA + 4096 } else { VA },
+            "owner supply must exclude the inherited resident predecessor"
+        );
+        assert_eq!(
+            window.range.end(),
+            if neighbors { VA + 8192 } else { VA + 16384 },
+            "owner supply must exclude the inherited prepared successor"
+        );
+        assert_eq!(window.operation.mm, mm);
+        assert_eq!(window.generation, owner_identity.2.generation);
+        assert_eq!(window.host_backing, None);
+        Some(window)
+    } else {
+        None
     };
-    assert_eq!(
-        window.range.start(),
-        if neighbors { VA + 4096 } else { VA },
-        "owner supply must exclude the inherited resident predecessor"
-    );
-    assert_eq!(
-        window.range.end(),
-        if neighbors { VA + 8192 } else { VA + 16384 },
-        "owner supply must exclude the inherited prepared successor"
-    );
-    assert_eq!(window.operation.mm, mm);
-    assert_eq!(window.generation, owner_identity.2.generation);
-    assert_eq!(window.host_backing, None);
     let slots = Box::new(carrick_el1_abi::MmPortalSlots::new());
     assert!(slots.bind_carrier(NonZeroU64::new(1).unwrap()));
     let mailbox = carrick_core_abi::FrameGrantMailbox::new();
@@ -137,16 +146,25 @@ fn first_touch_window<B: OwnerForkMmu + Copy>(
         .unwrap()
         .fault_selection(mm.raw(), request.request_generation)
         .unwrap();
-    assert_eq!(fault_window.range, window.range);
-    assert_eq!(fault_window.generation, window.generation);
+    if let Some(window) = window {
+        assert_eq!(fault_window.range, window.range);
+    } else {
+        assert_eq!(fault_window.range.start(), VA + 4096);
+        assert_eq!(fault_window.range.end(), VA + 8192);
+    }
+    assert_eq!(fault_window.generation, owner_identity.2.generation);
     assert_eq!(fault_window.operation.mm, mm);
-    assert_eq!(
-        fault_window.operation.incarnation,
-        window.operation.incarnation
-    );
-    assert_ne!(fault_window.operation.sequence, window.operation.sequence);
+    if let Some(window) = window {
+        assert_eq!(
+            fault_window.operation.incarnation,
+            window.operation.incarnation
+        );
+    }
+    if let Some(window) = window {
+        assert_ne!(fault_window.operation.sequence, window.operation.sequence);
+    }
     assert_eq!(fault_window.host_backing, None);
-    assert_eq!(request.requested_len, window.range.len());
+    assert_eq!(request.requested_len, fault_window.range.len());
     assert!(
         slots
             .grant(0)
@@ -184,6 +202,7 @@ fn aarch64_owner_fault_window_excludes_inherited_backing() {
         (RW | (1 << 56) | (1 << 57)) & !1,
         true,
         false,
+        0,
     );
 }
 
@@ -197,27 +216,44 @@ fn x86_owner_fault_window_excludes_inherited_backing() {
         PREPARED | USER | WRITE | NX | MAY_WRITE,
         true,
         false,
+        0,
     );
 }
 
 #[test]
 fn aarch64_owner_fault_batches_unbacked_reservation() {
-    first_touch_window(Aarch64Mmu, 3, 0, 0, false, false);
+    first_touch_window(Aarch64Mmu, 3, 0, 0, false, false, 0);
 }
 
 #[test]
 fn x86_owner_fault_batches_unbacked_reservation() {
     use carrick_mmu_core::x86::descriptor_txn::{PRESENT, USER, WRITE};
-    first_touch_window(X86Mmu, PRESENT | USER | WRITE, 0, 0, false, false);
+    first_touch_window(X86Mmu, PRESENT | USER | WRITE, 0, 0, false, false, 0);
 }
 
 #[test]
 fn aarch64_owner_fault_reselects_an_uncommitted_grant_page() {
-    first_touch_window(Aarch64Mmu, 3, 0, 0, false, true);
+    first_touch_window(Aarch64Mmu, 3, 0, 0, false, true, 0);
 }
 
 #[test]
 fn x86_owner_fault_reselects_an_uncommitted_grant_page() {
     use carrick_mmu_core::x86::descriptor_txn::{PRESENT, USER, WRITE};
-    first_touch_window(X86Mmu, PRESENT | USER | WRITE, 0, 0, false, true);
+    first_touch_window(X86Mmu, PRESENT | USER | WRITE, 0, 0, false, true, 0);
+}
+
+#[test]
+fn aarch64_owner_fault_resolves_grant_with_live_stale_terminal() {
+    // A physical grant can still own this page when the live stage-1 leaf
+    // names a frame the host can no longer translate. The owner must select
+    // the exact existing grant so the host can restore its physical alias.
+    first_touch_window(
+        Aarch64Mmu,
+        3,
+        RW | (1 << 56) | (1 << 57),
+        (RW | (1 << 56) | (1 << 57)) & !1,
+        true,
+        true,
+        RW | (1 << 56) | (1 << 57),
+    );
 }
