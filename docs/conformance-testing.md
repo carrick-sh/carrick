@@ -599,7 +599,7 @@ cargo run -p carrick-conformance -- --lane kvm-local --oracle native \
 
 Native execution requires passwordless `sudo`, util-linux `unshare`, GNU
 `chroot`/`cp`, and mount permissions. Each command runs in fresh mount, PID,
-UTS and IPC namespaces, with a waiting PID-1 shell inside the chroot, private procfs,
+UTS and IPC namespaces. The image command execs as PID 1 inside the chroot, with private procfs,
 devpts and shared-memory tmpfs, and only the standard null/zero/random devices.
 Init owns a fresh session with positive namespace pgrp/sid. Timeout cleanup
 authenticates init by host PID and start ticks, kills only init, and lets
@@ -638,7 +638,8 @@ CARRICK_PROBE_LIBC=musl CARRICK_PROBE_FILTER=mmapzerofill,mmapmunmap \
 ```
 
 The identical ELF executes under the native namespace/chroot envelope; musl
-requires no image. GNU blessing resolves the amd64 probe image and uses its
+requires no image. Probe captures retain the existing harness's waiting PID-1
+shell inside that root, so the tested ELF runs as its child. GNU blessing resolves the amd64 probe image and uses its
 loader, not host libc. Native outputs live in `probe-oracle/amd64native-{musl,gnu}`
 with `PROVENANCE.json` recording full kernel release, distro, namespace flags,
 extractor policy, init policy and source-hash scheme. Static roots include the
