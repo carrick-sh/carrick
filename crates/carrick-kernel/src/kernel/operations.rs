@@ -942,7 +942,7 @@ impl Kernel {
                     .map_err(|_| KernelOperationError::PidNamespaceMembership(child_id))?;
                 Some(
                     region
-                        .reserve_identity(child, parent_id)
+                        .reserve_identity(self.ids(), child, parent_id)
                         .ok_or(KernelOperationError::PidNamespaceMembership(child_id))?,
                 )
             }

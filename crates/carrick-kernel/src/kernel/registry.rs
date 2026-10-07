@@ -1,6 +1,7 @@
-use carrick_sched_core::process::identity_allocator::{ClaimKind, NamespaceState};
+use carrick_sched_core::process::identity_allocator::{
+    ClaimKind, InternalIdentity, NamespaceState, VisibleIdentity, VisibleNamespace,
+};
 pub use carrick_sched_core::process::identity_allocator::{IdError, IdRegistryCounts};
-use std::num::NonZeroI32;
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -39,13 +40,13 @@ impl IdRegistry {
 
     pub fn reserve_task(&self) -> Result<(TaskId, TaskReservation), IdError> {
         let reservation = self.reserve_next(ClaimKind::Task)?;
-        let id = TaskId::from_registry_allocation(reservation.raw);
+        let id = TaskId::from_registry_allocation(reservation.raw.nonzero());
         Ok((id, TaskReservation(reservation)))
     }
 
     pub fn reserve_thread(&self) -> Result<(LinuxTid, ThreadReservation), IdError> {
         let reservation = self.reserve_next(ClaimKind::Thread)?;
-        let id = LinuxTid::from_registry_allocation(reservation.raw);
+        let id = LinuxTid::from_registry_allocation(reservation.raw.nonzero());
         Ok((id, ThreadReservation(reservation)))
     }
 
@@ -73,6 +74,15 @@ impl IdRegistry {
             .map(SessionClaim)
     }
 
+    pub(crate) fn reserve_visible(&self, namespace: VisibleNamespace) -> Option<VisibleIdentity> {
+        self.state.lock().reserve_visible(namespace)
+    }
+    pub(crate) fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+    pub(crate) fn retire_visible_namespace(&self, namespace: VisibleNamespace) {
+        self.state.lock().retire_visible_namespace(namespace);
+    }
     pub fn is_reserved_number(&self, raw: i32) -> bool {
         self.state.lock().is_reserved_number(raw)
     }
@@ -116,13 +126,13 @@ impl IdRegistry {
 #[derive(Debug)]
 struct ReservationToken {
     state: Arc<Mutex<NamespaceState>>,
-    raw: NonZeroI32,
+    raw: InternalIdentity,
     kind: ClaimKind,
     active: bool,
 }
 
 impl ReservationToken {
-    fn new(state: Arc<Mutex<NamespaceState>>, raw: NonZeroI32, kind: ClaimKind) -> Self {
+    fn new(state: Arc<Mutex<NamespaceState>>, raw: InternalIdentity, kind: ClaimKind) -> Self {
         Self {
             state,
             raw,
@@ -148,13 +158,13 @@ impl Drop for ReservationToken {
 #[derive(Debug)]
 struct ClaimToken {
     state: Arc<Mutex<NamespaceState>>,
-    raw: NonZeroI32,
+    raw: InternalIdentity,
     kind: ClaimKind,
     active: bool,
 }
 
 impl ClaimToken {
-    fn new(state: Arc<Mutex<NamespaceState>>, raw: NonZeroI32, kind: ClaimKind) -> Self {
+    fn new(state: Arc<Mutex<NamespaceState>>, raw: InternalIdentity, kind: ClaimKind) -> Self {
         Self {
             state,
             raw,
