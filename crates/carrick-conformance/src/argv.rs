@@ -177,11 +177,14 @@ pub fn native_argv(
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("non-UTF8 rootfs path"))?;
     // All data is positional argv, never interpolated into a shell program.
-    // PID 1 remains the waiting shell. Namespace exit kills orphaned descendants;
-    // --kill-child also covers death of the outer unshare supervisor.
+    // PID 1 waits INSIDE the chroot: /proc/1/root must describe the image,
+    // never the host. Namespace exit kills orphaned descendants.
     const SETUP: &str = r#"
 root=$1
 shift
+read -r init_stat < /proc/self/fd/4/self/stat
+exec 4<&-
+printf '%s\n' "$init_stat" > "$root/../init.stat"
 mount --make-rprivate /
 mkdir -p "$root/proc" "$root/dev" "$root/tmp"
 chmod 1777 "$root/tmp"
@@ -199,15 +202,24 @@ ln -s /proc/self/fd "$root/dev/fd"
 ln -s /proc/self/fd/0 "$root/dev/stdin"
 ln -s /proc/self/fd/1 "$root/dev/stdout"
 ln -s /proc/self/fd/2 "$root/dev/stderr"
-set +e
-"$@"
-rc=$?
-exit "$rc"
+exec 3> "$root/../init-ready"
+exec "$@"
 "#;
-    let mut argv: Vec<String> = ["sudo", "-n", "unshare"]
-        .into_iter()
-        .map(String::from)
-        .collect();
+    // Retain a host-proc directory only until PID 1 records its host incarnation.
+    // setsid gives init and its children ordinary positive namespace pgrp/sid.
+    let mut argv: Vec<String> = [
+        "sudo",
+        "-n",
+        "/bin/sh",
+        "-eu",
+        "-c",
+        "exec 4< /proc; exec \"$@\"",
+        "native-unshare",
+        "unshare",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
     argv.extend(
         crate::native::UNSHARE_FLAGS
             .iter()
@@ -215,6 +227,7 @@ exit "$rc"
     );
     argv.extend(
         [
+            "setsid",
             "/bin/sh",
             "-eu",
             "-c",
@@ -223,12 +236,19 @@ exit "$rc"
             root,
             "env",
             "-i",
+            "--",
         ]
         .into_iter()
         .map(String::from),
     );
     argv.push("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
     argv.extend(rootfs.env.iter().cloned());
+    anyhow::ensure!(
+        rootfs.env.iter().all(|value| value
+            .split_once('=')
+            .is_some_and(|(key, _)| !key.is_empty())),
+        "native image environment must contain NAME=value assignments"
+    );
     argv.extend(
         suite
             .env
@@ -237,6 +257,12 @@ exit "$rc"
             .map(|kv| format!("{}={}", kv.key, kv.val)),
     );
     argv.extend(["/usr/sbin/chroot".into(), root.into()]);
+    argv.extend([
+        "/bin/sh".into(),
+        "-c".into(),
+        "printf 'ready\\n' >&3; exec 3>&-; \"$@\"; rc=$?; exit \"$rc\"".into(),
+        "native-init".into(),
+    ]);
     let workdir = suite
         .workdir
         .as_deref()
