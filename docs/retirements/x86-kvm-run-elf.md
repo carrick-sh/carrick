@@ -147,3 +147,30 @@ poll-to-ppoll number mapping is invalid. The remaining legacy shape audit is
 The required `just test-kvm` gate runs CLI hello and TLS, refuses a missing or
 inaccessible `/dev/kvm`, and is wired into linux-portable acceptance and both
 KVM workflows. The musl ignore is deliberate and names PR #81.
+
+## Completion disposition at the native work doorbell
+
+Every `WORK_PORT` exit carries a recorded completion. Shared
+`finish`/`publish_work` records `ServedWithWork` before the doorbell. If an
+entry kick precedes a forwarded syscall, host forwarding completes first;
+if a return kick follows a plain `Served`, the syscall already completed.
+These two paths record the outstanding work disposition before ringing
+`WORK_PORT`, preserving any existing shared completion/commit disposition.
+Neither path redispatches the syscall or republishes its Linux effects.
+
+Real CPL0 red-first witnesses
+`entry_kick_then_forward_records_completion_before_work_exit` and
+`return_kick_after_served_records_completion_before_work_exit` both failed
+with `work exit without completed syscall` before the boundary fix. Both
+now pass with exactly one entry, completion and work exit per call, on two
+live tasks. `sigprocmask_unblock_publishes_completion_before_work_exit`
+checks the already-published shared work route with a pending SIGUSR1.
+Receipts: `target/x86-legacy-retire/round2/{red,green}-work.log`.
+
+Private x86 operations use separate diagnostic slots starting at 480,
+derived from the private syscall enum. Canonical getgroups retains slot
+158, while arch_prctl uses slot 494; the panic sentinel retains slot 511.
+The counter arrays and ARM ABI are unchanged. The arch_prctl admission
+witness was red for the slot-158 collision; a VM-free test checks that all
+private served/forwarded slots are disjoint, and a canonical-table guard
+checks that Linux entries leave the private slots free.

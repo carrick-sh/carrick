@@ -32,6 +32,53 @@ fn poll_decode_preserves_integer_timeout_and_has_no_sigmask() {
     }
 }
 #[test]
+#[cfg(target_arch = "x86_64")]
+fn private_x86_counters_have_disjoint_canonical_and_sentinel_slots() {
+    use carrick_syscall_abi::*;
+    use core::sync::atomic::Ordering;
+    let counters = carrick_el1_abi::Counters::new();
+    let entry = carrick_personality_linux::dispatch::EntryCounters {
+        served: &counters.served,
+        forwarded: &counters.forwarded,
+    };
+    let private = [
+        CARRICK_PRIVATE_X86_DUP2,
+        CARRICK_PRIVATE_X86_STAT,
+        CARRICK_PRIVATE_X86_FSTAT,
+        CARRICK_PRIVATE_X86_LSTAT,
+        CARRICK_PRIVATE_X86_NEWFSTATAT,
+        CARRICK_PRIVATE_X86_UNSUPPORTED,
+        CARRICK_PRIVATE_X86_UTIME,
+        CARRICK_PRIVATE_X86_UTIMES,
+        CARRICK_PRIVATE_X86_POLL,
+        CARRICK_PRIVATE_X86_SELECT,
+        CARRICK_PRIVATE_X86_EPOLL_CREATE,
+        CARRICK_PRIVATE_X86_ALARM,
+        CARRICK_PRIVATE_X86_TIME,
+        CARRICK_PRIVATE_X86_ARCH_PRCTL,
+    ];
+    for number in private {
+        entry.served(number);
+        entry.forwarded(number);
+    }
+    for number in private {
+        let slot = private_x86_counter_slot(CanonicalNr(number)).unwrap();
+        assert!((480..511).contains(&slot));
+        assert_eq!(counters.served[slot].load(Ordering::Relaxed), 1);
+        assert_eq!(counters.forwarded[slot].load(Ordering::Relaxed), 1);
+    }
+    for canonical in [0, 158, 467, 511, u64::MAX] {
+        assert_eq!(private_x86_counter_slot(CanonicalNr(canonical)), None);
+    }
+    entry.served(158);
+    entry.forwarded(158);
+    assert_eq!(counters.served[158].load(Ordering::Relaxed), 1);
+    assert_eq!(counters.forwarded[158].load(Ordering::Relaxed), 1);
+    assert_eq!(counters.served[511].load(Ordering::Relaxed), 0);
+    assert_eq!(counters.forwarded[511].load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn x4_linux_common_entry() {
     common_entry::x4_linux_common_entry();
 }

@@ -144,11 +144,15 @@ pub struct EntryCounters<'a> {
 }
 impl EntryCounters<'_> {
     pub fn served(&self, ordinal: u64) {
+        #[cfg(target_arch = "x86_64")]
+        let ordinal = crate::entry::native_diagnostic_ordinal(ordinal);
         if let Some(counter) = self.served.get(ordinal as usize) {
             counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
     pub fn forwarded(&self, ordinal: u64) {
+        #[cfg(target_arch = "x86_64")]
+        let ordinal = crate::entry::native_diagnostic_ordinal(ordinal);
         if let Some(counter) = self.forwarded.get(ordinal as usize) {
             counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
@@ -212,23 +216,11 @@ pub trait PendingFamilies<'a> {
     }
     fn record_served(&self, ordinal: u64) {
         if let Some(counters) = self.entry_counters() {
-            #[cfg(target_arch = "x86_64")]
-            let ordinal = if ordinal == carrick_syscall_abi::CARRICK_PRIVATE_X86_ARCH_PRCTL {
-                crate::abi::x86_64::ARCH_PRCTL_X86_NR
-            } else {
-                ordinal
-            };
             counters.served(ordinal);
         }
     }
     fn record_forwarded(&self, ordinal: u64) {
         if let Some(counters) = self.entry_counters() {
-            #[cfg(target_arch = "x86_64")]
-            let ordinal = if ordinal == carrick_syscall_abi::CARRICK_PRIVATE_X86_ARCH_PRCTL {
-                crate::abi::x86_64::ARCH_PRCTL_X86_NR
-            } else {
-                ordinal
-            };
             counters.forwarded(ordinal);
         }
     }
