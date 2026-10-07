@@ -1098,6 +1098,16 @@ impl PreparedRun {
                 }
             })?;
             let (guest_entries, portal_exits) = machine.initial_execution_witness();
+            let physical_crossing_families: Vec<_> = machine
+                .physical_crossing_counts()
+                .into_iter()
+                .filter(|(_, count)| *count != 0)
+                .map(|(family, count)| crate::compat::ExecutionFamilyCount {
+                    family: family.as_str().to_owned(),
+                    count,
+                })
+                .collect();
+            let physical_exits: u64 = physical_crossing_families.iter().map(|row| row.count).sum();
             let count_family = |families: std::collections::BTreeMap<&'static str, u64>| {
                 families
                     .into_iter()
@@ -1112,9 +1122,10 @@ impl PreparedRun {
             report.execution_witness = Some(crate::compat::ExecutionWitness {
                 backend: "kvm-x86-cpl0".to_owned(),
                 guest_entries,
-                portal_exits,
+                portal_exits: portal_exits + physical_exits,
                 host_forwards,
                 anonymous_private_pages: machine.anonymous_private_pages(),
+                physical_crossing_families,
                 host_forward_families: count_family(forward_families),
                 guest_refusal_families: count_family(refusal_families),
             });

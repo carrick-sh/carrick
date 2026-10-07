@@ -174,3 +174,51 @@ claim. Final full lint passed on the clean tree. Receipt:
 `/tmp/x86-anon-lint-domains-final.log`. Live authority execution covered
 linux-cli and linux-runtime (569 reviewed rows); other host profiles remain
 pending as expected on this Linux host.
+
+## Independent review correction work (2026-10-07, not review-ready)
+
+The current review branch starts at `710980f1c` and merges shared-kernel
+`7d6daf287` in `5b9d8e2ab`. The two-live-process red probe is preserved in
+`6d4905e12` on `work/x86-anon-step2-checkpoint`: native prints Q and exits 7;
+710980f1c exits 91 because production fork is refused with ENOSYS. No
+second-MM green is claimed. The extraction design is in `03fdb4a92` on
+that branch. Unfinished extraction is isolated in local checkpoint
+`aca49a046` on `work/x86-process-extraction-checkpoint`; it is not verified
+or suitable for landing.
+
+Review correction evidence on the current branch:
+
+- Adjacent fixed mappings: `/tmp/x86-anon-adjacent-red-fixed-placement.log`
+  records native A/7 versus Carrick 125, Occupied grant refusal. The green
+  `/tmp/x86-anon-adjacent-green.log` keeps both bytes independent. The shared
+  guest selector avoids a bulk window containing existing residency and
+  falls back to the fault page; the host still supplies only selected stock.
+- Physical owner-grant service crossings are typed and counted, including
+  their contribution to total portal exits. The single-page and two-page
+  probes require respectively two and four crossings. Red missing counts:
+  `/tmp/x86-anon-crossing-count-red.log`; green:
+  `/tmp/x86-anon-counted-grants-green.log`.
+- Production COW now refuses before constructing another descriptor window
+  or dereferencing the ARM pool. InitialWords remains the production
+  descriptor authority. This is fail-closed partial coverage, not COW
+  support. Fixture COW remains a fixture. Anonymous regression green after
+  this change: `/tmp/x86-anon-fail-closed-green.log`.
+- Grant target authentication compares the actual portal carrier identity.
+  Inventory publication checks each exact GPA, length, MM and identity,
+  rather than only the receipt's identity. The different-GPA test failed
+  before and passed after restoring this check:
+  `/tmp/x86-anon-inventory-gpa-{red,green}.log`.
+- Window selection, descriptor edit ranges and the physical GPA cursor use
+  domain types. Explicit production panic/unreachable sites named by the
+  review have been replaced with named refusals/fatal entry binding.
+
+The unique-operation binding test failed with zero bound IDs, then passed
+with two distinct reservation-owner sequences. The production editor now
+uses that sequence, not the root generation. Receipts:
+`/tmp/x86-anon-operation-{red,green}.log`.
+
+Still open: safe general grant-refusal recovery,
+finite table stock/refill and exhaustion witness, physical owed-return
+settlement, CPU1/second-MM production admission and exact incarnation checks,
+concurrent busy recovery, and real-signal PROT_NONE/RO/munmap probes.
+The adjacent-map green does not close these independent audit items.

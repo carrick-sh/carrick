@@ -1475,12 +1475,12 @@ fn dispatch_classified_fault<
             let mm = carrick_el1_abi::ReservationMm::new(mm_key)?;
             let index = spaces.find(mm_key)?;
             let mut root = roots.lock_in(spaces, index.index(), mm, slot as u32).ok()?;
-            let window = match carrick_core::mm::fault::select_fault_window(
+            let mut window = match carrick_core::mm::fault::select_fault_window(
                 &mut root,
                 owner.slots.carrier()?,
-                far,
-                carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE,
-                access,
+                carrick_guest_arch::UserVa::new(far),
+                carrick_guest_arch::GuestLen::new(carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE),
+                carrick_el1_abi::ReservationProtection::from_bits(access)?,
             ) {
                 Ok(window) => window,
                 Err(
@@ -1492,6 +1492,23 @@ fn dispatch_classified_fault<
                 }
                 Err(_) => return None,
             };
+            // Coalescing adjacent reservations does not erase existing PRIVATE
+            // or prepared custody. A bulk Prepare must never cover those pages.
+            // The retained residency owner includes prepared neighbors, too.
+            let residency = prepared.as_ref()?.residency;
+            if (window.range.start()..window.range.end())
+                .step_by(4096)
+                .any(|page| residency.lookup(mm_key, page).is_some())
+            {
+                window = carrick_core::mm::fault::select_fault_window(
+                    &mut root,
+                    owner.slots.carrier()?,
+                    carrick_guest_arch::UserVa::new(far),
+                    carrick_guest_arch::GuestLen::new(4096),
+                    carrick_el1_abi::ReservationProtection::from_bits(access)?,
+                )
+                .ok()?;
+            }
             if window.host_backing.is_some() {
                 return None;
             }

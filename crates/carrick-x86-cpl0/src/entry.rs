@@ -365,7 +365,8 @@ mod kernel {
     /// reservation/editor/COW owner as ARM's data-abort policy.
     #[unsafe(no_mangle)]
     extern "C" fn carrick_x86_handle_user_page_fault(frame: &PageFaultStack) -> u64 {
-        use carrick_el1::fault::{X86CowResolver, dispatch_x86_fault_with_prepared};
+        use carrick_el1::fault::{NoopCowResolver, dispatch_x86_fault_with_prepared};
+        fixture_items! { use carrick_el1::fault::X86CowResolver; }
         use carrick_el1_abi::Action;
         let far: u64;
         // SAFETY: CR2 is the architectural fault address for this #PF entry.
@@ -430,17 +431,16 @@ mod kernel {
         // SAFETY: production KVM bootstrap maps and zero-initializes the
         // retained x86 kernel region at this typed upper-half layout before
         // admitting CPL3. The region owner keeps it live until CPU retirement.
-        let (residency, pool, portal) = unsafe {
+        let (residency, portal) = unsafe {
             (
                 &*(venues.residency.raw() as *const carrick_el1_abi::FrameGrantResidencyTable),
-                &*(venues.cow_pool.raw() as *const carrick_el1_abi::CowGrantPool),
                 &*(layout.portal.raw() as *const carrick_el1_abi::MmPortalSlots),
             )
         };
         // SAFETY: the boot owner retains the compact zone and its parked ABI.
         let zone = unsafe { &*(venues.zone.raw() as *const carrick_el1::memory::reservations::X86Cpl0Zone) };
         let mm_key = task.mm.key.load(Ordering::Acquire);
-        let Some(words) = anonymous::live_words(mm_key) else { return 9; };
+        let Some(words) = anonymous::live_words(match carrick_el1_abi::ReservationMm::new(mm_key) { Some(mm) => mm, None => return 9 }) else { return 9; };
         let roots = carrick_el1::memory::reservations::shared_x86_cpl0_guest();
         let spaces = carrick_core::wait::space_access(zone, slot, anonymous::initial_release);
         let supply = carrick_el1::fault::OwnerFaultSupply::new(portal);
@@ -448,7 +448,7 @@ mod kernel {
         // every prepared commit; InitialWords retains its native context.
         let Some(prepared_mm) = core::num::NonZeroU64::new(mm_key) else { return 9; };
         let mut prepared = unsafe { carrick_el1::fault::X86PreparedResolver::under_editor(prepared_mm, &words) };
-        let mut cow = X86CowResolver { pool, residency, completion: None };
+        let mut cow = NoopCowResolver;
         let result = dispatch_x86_fault_with_prepared(
             0, fault, counters, core::slice::from_ref(task), spaces,
             carrick_el1::fault::FaultSupply::Owner(&supply),
@@ -471,7 +471,8 @@ mod kernel {
                 let Some(index) = spaces.find(mm_key) else { return 9; };
                 let Ok(mut root) = roots.lock_in(spaces, index.index(), window.operation.mm, 0) else { return 9; };
                 let Ok(target) = carrick_core::mm::frames::grant_target_in(
-                    window.operation.carrier, window, spaces, 0, &mut root) else { return 9; };
+                    match portal.carrier() { Some(carrier) => carrier, None => return 9 },
+                    window, spaces, 0, &mut root) else { return 9; };
                 let receipt = carrick_core::mm::frames::apply_grant::<carrick_mmu_core::x86::owner_mmu::X86Mmu, _>(
                     grant_slot, &words, residency, target,
                     // The ISA executor already completed InitialWords' checked

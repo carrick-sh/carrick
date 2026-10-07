@@ -617,6 +617,8 @@ pub fn classify_anonymous_range<A: AnonymousDescriptorDecode>(
 
 /// Exact-MM read of the live stage-1 graph behind the syscall policy.
 pub trait AnonymousBackingProbe {
+    /// Bind the reservation owner's unique operation identity before edits.
+    fn bind_operation(&mut self, _sequence: carrick_el1_abi::ReservationSequence) {}
     fn backing(&mut self, ttbr0: u64, va: u64, len: u64) -> Stage1Backing;
     /// `[start, end)` of the live first-touch grant of exactly `mm_key`
     /// that prepared `va`, if any: stock this MM may hand to a new mapping.
@@ -775,6 +777,7 @@ pub fn serve_delegated_anonymous<
     let Some(_editor_guard) = spaces.try_begin_edit(index, mm_key, owner) else {
         return refuse(pending, &mut model, Leave::EditorBusy);
     };
+    editor.bind_operation(request.sequence);
     let (va, len) = (request.range.start(), request.range.len());
     if request.operation == carrick_el1_abi::ReservationOperation::Move {
         return refuse(pending, &mut model, Leave::RootDeclined);
@@ -1464,6 +1467,7 @@ mod tests {
             /// Backed runs to report; `None`: the whole queried range.
             runs: Option<&'static [(u64, u64)]>,
             calls: Vec<Call>,
+            sequences: Vec<ReservationSequence>,
         }
         impl Editor {
             fn over(backing: RangeBacking) -> Self {
@@ -1473,10 +1477,14 @@ mod tests {
                     stock: None,
                     runs: None,
                     calls: Vec::new(),
+                    sequences: Vec::new(),
                 }
             }
         }
         impl AnonymousBackingProbe for Editor {
+            fn bind_operation(&mut self, sequence: ReservationSequence) {
+                self.sequences.push(sequence);
+            }
             fn backing(&mut self, ttbr0: u64, va: u64, len: u64) -> Stage1Backing {
                 self.calls.push(Call::Probe(ttbr0, va, len));
                 match self.runs {
@@ -1576,6 +1584,30 @@ mod tests {
             let mut owed = Vec::new();
             model.observe_deferred_returns(&mut |entry| owed.push(entry));
             owed
+        }
+
+        #[test]
+        fn delegated_descriptor_steps_bind_distinct_owner_operations() {
+            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
+            let delegated = mm(&spaces, &table, 17, true);
+            let mut editor = Editor::over(RangeBacking::Empty);
+            for address in [ARENA, ARENA + 0x1000] {
+                assert_eq!(
+                    syscall(
+                        &delegated,
+                        &spaces,
+                        &table,
+                        &counters,
+                        &mut editor,
+                        SYS_MMAP,
+                        mmap_fixed(address, 0x1000)
+                    )
+                    .0,
+                    DelegatedAnonymous::Served
+                );
+            }
+            assert_eq!(editor.sequences.len(), 2);
+            assert!(editor.sequences[0].raw() < editor.sequences[1].raw());
         }
 
         #[test]

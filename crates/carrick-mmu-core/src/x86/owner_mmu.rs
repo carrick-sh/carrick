@@ -153,7 +153,7 @@ impl crate::owner_mmu::OwnerGrantMmu for X86Mmu {
                         crate::aarch64::descriptor_txn::DescriptorOp::Prepare {
                             resident, ..
                         } => resident,
-                        _ => unreachable!(),
+                        _ => return WireOutcome::Refused(DescriptorRefusal::BadEncoding),
                     },
                     tables_linked,
                     reclaimed: ReclaimedTables::NONE,

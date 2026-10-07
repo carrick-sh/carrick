@@ -539,6 +539,9 @@ pub struct ExecutionWitness {
     /// PRIVATE pages authenticated against live CPL0 descriptors at grant settlement.
     #[serde(default)]
     pub anonymous_private_pages: u64,
+    /// Real stage-2 physical services, counted separately from Linux host dispatch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub physical_crossing_families: Vec<ExecutionFamilyCount>,
     /// Temporary host semantic scaffolding, counted by crossing family.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_forward_families: Vec<ExecutionFamilyCount>,
