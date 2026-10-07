@@ -37,6 +37,49 @@ fn tiny_elf() -> Vec<u8> {
     bytes
 }
 
+fn write_then_exit_elf(pointer: u64, count: u32) -> Vec<u8> {
+    let mut bytes = tiny_elf();
+    let mut code = vec![0xb8, 1, 0, 0, 0, 0xbf, 1, 0, 0, 0]; // write(1, ...)
+    code.extend_from_slice(&[0x48, 0xbe]); // movabs rsi, pointer
+    code.extend_from_slice(&pointer.to_le_bytes());
+    code.push(0xba); // mov edx, count
+    code.extend_from_slice(&count.to_le_bytes());
+    code.extend_from_slice(&[0x0f, 0x05, 0x89, 0xc7]); // syscall; mov edi, eax
+    code.extend_from_slice(&[0xb8, 231, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b]);
+    let end = 0xb0 + code.len();
+    bytes.resize(end, 0);
+    bytes[96..104].copy_from_slice(&(end as u64).to_le_bytes());
+    bytes[0xb0..end].copy_from_slice(&code);
+    bytes
+}
+
+#[test]
+fn initial_write_returns_prefix_or_efault_without_aborting_carrier() {
+    for (pointer, count, expected_exit, expected_bytes) in [
+        (0x400ff0, 0x10_0001, 16, 16),
+        (0x7_0000, 32, 242, 0), // -EFAULT = -14, low exit byte 242
+    ] {
+        let elf = write_then_exit_elf(pointer, count);
+        let image = prepare_static_x86_elf(&elf).expect("static write ELF");
+        let extent =
+            Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("initial grant extent");
+        let mut carrier = Cpl0Carrier::boot_production(extent).expect("production KVM boot");
+        carrier
+            .load_guest_mm(&image, &[], &[])
+            .expect("shared MM owner");
+        let mut observed_bytes = 0;
+        let (status, _) = carrier
+            .run_initial_process(8, |fd, bytes| {
+                assert_eq!(fd, 1);
+                observed_bytes += bytes.len();
+                bytes.len() as i64
+            })
+            .expect("bounded initial process completion");
+        assert_eq!(status, expected_exit);
+        assert_eq!(observed_bytes, expected_bytes);
+    }
+}
+
 #[test]
 fn shared_guest_owner_loads_static_elf_and_exits_seven() {
     let elf = tiny_elf();
