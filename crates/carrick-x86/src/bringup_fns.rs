@@ -1,8 +1,7 @@
 //! The `X86Vcpu`/`X86Vmm`-generic x86 guest bring-up free functions (design §2.2).
 //!
 //! These are the Axis-2 *pure functions* the spec hoists out of the per-VMM
-//! copies (`carrick-vmm-kvm/src/{guest_setup_x86,trap_engine_x86,run_elf_x86}.rs`
-//! and bhyve's analogues): the window plan, the long-mode programming sequence,
+//! copies retained by bhyve/NVMM (the standalone KVM engine is retired): the window plan, the long-mode programming sequence,
 //! the snapshot/restore/seed triple, and the M2 run-elf service loop. Each is
 //! generic over the thin [`crate::X86Vcpu`]/[`crate::X86Vmm`] trait pair, so a backend that
 //! implements the pair gets all of this for free.

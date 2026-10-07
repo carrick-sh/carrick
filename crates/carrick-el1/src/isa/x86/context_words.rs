@@ -26,13 +26,14 @@ pub fn tls_base(words: &ParkedContextWords, register: TlsRegister) -> carrick_gu
 }
 
 /// Edit only the selected task-owned base; refuse supervisor/noncanonical
-/// addresses before either saved state or native MSRs can change.
+/// addresses, including the reserved final lower-half page, before either
+/// saved state or native MSRs can change.
 pub fn set_tls_base(
     words: &mut ParkedContextWords,
     register: TlsRegister,
     base: carrick_guest_arch::UserVa,
 ) -> Result<(), ArchError> {
-    if base.raw() >= 0x0000_8000_0000_0000 {
+    if base.raw() >= 0x0000_7fff_ffff_f000 {
         return Err(ArchError::InvalidContext);
     }
     match register {
@@ -103,7 +104,12 @@ mod tests {
         assert_eq!(tls_base(&a, TlsRegister::Fs).raw(), 0x7000);
         assert_eq!(tls_base(&a, TlsRegister::Gs).raw(), 0x9000);
         let before = a;
-        for invalid in [0x0000_8000_0000_0000, 0xffff_8000_0000_0000, u64::MAX] {
+        for invalid in [
+            0x0000_7fff_ffff_f000,
+            0x0000_8000_0000_0000,
+            0xffff_8000_0000_0000,
+            u64::MAX,
+        ] {
             assert_eq!(
                 set_tls_base(
                     &mut a,

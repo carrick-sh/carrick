@@ -7,7 +7,7 @@ semantic_authority = [
   "Native x86_64 Linux execution of the same static MM/fork/wait ELF supplies the syscall-result and output oracle",
   "Native execution and committed hello-x86_64/oracle.expected: Rust/std musl startup initializes TLS, writes the exact hello line and exits zero",
 ]
-fixture = "carrick-cli::x86_kvm_run::{mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel,musl_static_hello_runs_through_shared_kernel}"
+fixture = "carrick-cli::x86_kvm_run::{mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel,arch_prctl_tls_and_errno_match_native_linux_through_shared_kernel,musl_static_hello_runs_through_shared_kernel}; required just test-kvm gate"
 scale_points = [1, 2, 8]
 structural_budgets = []
 rationale = """
@@ -15,7 +15,8 @@ The CLI must load an x86 ELF into a Carrick-owned guest MM and execute it in
 the production CPL0 shared kernel under KVM. In-zone identity, MM, child and
 wait operations must use the common kernel graph; only stdout bytes and other
 real host crossings use the host transport. Fork must create no host process.
-The first CLI test is deliberately red on the current plan refusal. The
+CLI hello and TLS run in the required KVM gate; musl remains ignored with
+a PR #81 startup/exit binding dependency. The
 production carrier, physical/MM custody, task scheduling and work counters
 must be bound before this contract can claim a structural or runtime pass.
 The one-page, two-slot Cpl0Carrier fixture and retired bringup_fns path are
@@ -26,5 +27,5 @@ not execution bindings for this contract.
 
 [bindings.unresolved]
 vm_free = "The shared MM and task policies have separate VM-free contracts; this composite CLI execution has no VM-free binding yet."
-embed_structural = "The KVM production carrier and exact work observations are not bound; the red CLI test is not an accepted binding."
+embed_structural = "Hello and TLS have exact native-ELF output/status witnesses. PR #81 must bind the shared host dispatcher, read/writev/close, brk, anonymous mmap, munmap/mprotect, rt_sigaction/sigprocmask/sigaltstack, poll/ppoll, tkill abort status 134, vDSO/AT_SYSINFO_EHDR and terminal clear-tid custody before musl or composite structural coverage is claimed."
 docker = "Docker is director-owned on this x86 worker; native x86 Linux execution of the exact ELF is the milestone oracle."
