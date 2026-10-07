@@ -13,6 +13,7 @@ pub(super) const FIXTURES: &[&str] = &[
     "fixtures/embed-interceptor-probe",
     "fixtures/embed-zone-readers",
     "fixtures/embed-icache-reuse",
+    "fixtures/embed-copyout",
     "fixtures/embed-el1-sched",
 ];
 /// Inputs outside the Cargo graph. Workspace manifests, lockfiles and Cargo
