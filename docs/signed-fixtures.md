@@ -77,13 +77,45 @@ The source inventory is the union of two derivations:
   recorded input from the checkout; one that is missing, untracked, dirty or
   under `target/` is refused.
 
+The inventory follows a **restricted dialect**: what the publisher cannot
+prove is an input is refused rather than chased.
+
+- **No symlinks on a compiler-reported path.** Each dep-info path is walked
+  component by component as written, before any canonicalization; a symlink
+  at any component (or a path reaching the checkout through an outside
+  symlink) fails the publish. Recording a link's current referent would let a
+  retarget keep the identity.
+- **Reviewed build code.** Build scripts and proc-macros can read files that
+  dep-info never names (a `build.rs` that `fs::read`s a file and emits
+  `rustc-env` without `rerun-if-changed`). Every build script and proc-macro
+  in a fixture's unfiltered, non-dev graph must be listed in the committed
+  `fixtures/reviewed-build-code.json`, keyed by package, location
+  (`path:<manifest>` or `<cargo source>#<name>@<version>`), kind and entry
+  source, with the typed digest of that entry source. Publish and admission
+  refuse an unlisted, changed or stale entry, and the list is itself an
+  inventory input. `carrick-xtask fixtures build-code` prints the current
+  set; review each new or changed entry for undeclared reads before copying
+  it into the list. The seeded list holds the locked registry build scripts
+  of `crc32fast` 1.5.0, `libc` 0.2.186 and `libc` 0.2.189 (each reads only
+  environment variables and compiler version); no checkout package has a
+  build script or proc-macro.
+- **Linker inputs.** Linkers read files dep-info does not name. Builder
+  scripts and every inventoried `.cargo/config(.toml)` are scanned for
+  linker-script and response-file references (`-T <f>`, `-T<f>`,
+  `--script[=]<f>`, `@<f>`, any `*.ld`/`*.lds` token, including inside
+  `-Wl,` and `link-arg=` values). A reference must resolve, relative to the
+  file, its parent package or the checkout root, to an inventoried source;
+  shell expansions and absolute paths cannot be proven and are refused. At
+  publish, every build-script `output` in the fixture target directories is
+  scanned the same way for `cargo:rustc-link-arg*` values.
+- **No generated sources.** A compiler input under any `target/` directory
+  (an `OUT_DIR` `include!`) is refused. No fixture uses one today; adding one
+  needs a design change, not an exception.
+
 Each source entry digest is SHA-256 over a domain naming the entry type
 (`carrick.fixtures.source.v1\0regular\0`), the big-endian u64 length and
 the bytes. Only regular files are inputs: a symlink anywhere in the inventory
-is refused, so link text can never stand in for file contents. Linker
-arguments live in tracked Cargo configuration or the builder scripts, which
-are inputs; dep-info does not name files a linker reads, so a fixture must
-not reference an untracked linker script.
+is refused, so link text can never stand in for file contents.
 
 ## Bundle and restore
 
@@ -397,3 +429,11 @@ refuse. `cargo_dep_info_records_out_of_package_compiler_inputs` runs a real
 Cargo build and checks the recorded `#[path]`, `include_str!`, build-script
 and `rerun-if-changed` inputs; `dep_info_classification_fails_closed` and
 `recorded_compiler_inputs_must_be_tracked_sources` cover the refusals.
+
+A second review round found three more holes, closed red-first in the same
+dialect. Against `a4395e7e5`: `dep_info_refuses_compiler_inputs_reached_through_symlinks`
+recorded only `shared/a.txt` for `shared/current.txt -> a.txt` (a retarget
+kept the identity); `unreviewed_build_script_refuses_publish_and_admission`
+inventoried a new `build.rs` that reads `../../shared/banner.txt` without
+complaint; `linker_script_reference_must_be_an_inventoried_input` admitted a
+repo-root `link.ld` named by `link-arg=-T../link.ld`. All three now refuse.
