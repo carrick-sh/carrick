@@ -31,7 +31,13 @@
 use carrick_guest_mem::GuestMemory;
 use carrick_hal::{SyscallTrap, ThreadedEngine};
 use carrick_mem::elf::SegmentPerms;
-use carrick_mem::memory::{AddressSpace, IDENTITY_OFF_PID, LINUX_IDENTITY_PAGE_BASE};
+use carrick_mem::memory::{
+    AddressSpace, IDENTITY_OFF_PID, IDENTITY_OFF_SHIM_ENABLED, LINUX_IDENTITY_PAGE_BASE,
+};
+use carrick_vmm_hvf::hvf_aarch64_engine::{
+    HvfAarch64Vmm, HvpatchPersistentExecutorFactoryAuthority, attach_task_engine,
+    persistent_executor_factory_authority, split_initial_task_engine,
+};
 use carrick_vmm_hvf::trap::{
     HvfTrapEngine, TrapBackend, TrapError, hvf_capabilities, new_hvf_trap_engine,
 };
@@ -125,34 +131,96 @@ fn trap_engine_hvf_bare_image_parks_vcpu_at_entry() {
     });
 }
 
-// ---- EL1 syscall-shim identity fast path (end-to-end on real HVF) ----
-// These run a 4-instruction guest under a real vCPU. With the shim, the
-// identity syscall is serviced entirely at EL1 and never reaches the host; the
-// FIRST host-visible trap is `exit_group` (x8=94) carrying the result in x0.
-// The legacy control proves the setup is honest: without the shim, `getpid`
-// DOES trap.
+// ---- EL1 identity fast path, end to end on a LIVE executor vCPU ----
+//
+// A root from `new_hvf_trap_engine` is STAGED: it holds registers as data and
+// has no vCPU until its first executor load, so `next_syscall` on it fails
+// ("a staged root has none until its first executor load"). Production loads
+// it onto a persistent executor; `load_on_executor` performs that same public
+// sequence (the one `el1_descriptor_service.rs` uses): snapshot the root's
+// CPU, take the carrier's executor factory, split the root into task state,
+// create the executor's live vCPU, attach, and overlay the root's CPU.
+//
+// The images are the production transport shape (`with_hvf_syscall_mailbox`
+// in carrick-runtime): mailbox vectors, the identity page when the fast path
+// is compiled in, the syscall mailbox arena, the carrier maintenance root and
+// the fd-ceiling control page.
 
-const SHIM_PROBE_ENTRY: u64 = 0x10000; // low user VA (EL0-executable)
+const PROBE_ENTRY: u64 = 0x10000; // low user VA (EL0-executable)
 // movz x8,#172 ; svc #0 ; movz x8,#94 ; svc #0  (getpid then exit_group)
 const GETPID_PROBE_CODE: [u32; 4] = [0xD280_1588, 0xD400_0001, 0xD280_0BC8, 0xD400_0001];
 // movz x8,#178 ; svc #0 ; movz x8,#94 ; svc #0  (gettid then exit_group)
 const GETTID_PROBE_CODE: [u32; 4] = [0xD280_1648, 0xD400_0001, 0xD280_0BC8, 0xD400_0001];
 
-fn probe_image(code: [u32; 4], shim: bool) -> AddressSpace {
+const SYS_GETPID: u64 = 172;
+const SYS_GETTID: u64 = 178;
+const SYS_EXIT_GROUP: u64 = 94;
+
+fn probe_image(code: [u32; 4], identity_fast_path: bool) -> AddressSpace {
     let bytes: Vec<u8> = code.iter().flat_map(|i| i.to_le_bytes()).collect();
-    let base = exec_segment(SHIM_PROBE_ENTRY, bytes, 16)
+    let image = exec_segment(PROBE_ENTRY, bytes, 16)
         .with_el0_trampoline()
+        .and_then(|a| a.with_el1_vectors_mailbox(identity_fast_path))
         .unwrap();
-    let base = if shim {
-        base.with_el1_vectors_shim()
-            .and_then(|a| a.with_identity_page())
-            .unwrap()
+    let image = if identity_fast_path {
+        image.with_identity_page().unwrap()
     } else {
-        base.with_el1_vectors().unwrap()
+        image
     };
-    base.with_stage1_page_tables()
+    image
+        .with_syscall_mailbox_arena()
+        .and_then(|a| a.with_carrier_maintenance_root())
+        .and_then(|a| a.with_fd_ceiling_control())
+        .and_then(|a| a.with_stage1_page_tables())
         .and_then(|a| a.with_linux_initial_stack(vec!["t"], Vec::<&str>::new()))
         .unwrap()
+}
+
+/// A root loaded onto a live persistent-executor vCPU. The executor's
+/// lifecycle half and the carrier factory stay alive as long as the engine.
+struct LoadedEngine {
+    engine: HvfTrapEngine,
+    _lifecycle: HvfAarch64Vmm,
+    _factory: HvpatchPersistentExecutorFactoryAuthority,
+}
+
+/// Production's first executor load, through its public steps.
+fn load_on_executor(image: &AddressSpace) -> LoadedEngine {
+    let mut staged = engine(image);
+    let cpu = staged
+        .snapshot_guest_state_for_publication()
+        .expect("snapshot the staged root CPU");
+    let factory =
+        persistent_executor_factory_authority(&mut staged).expect("carrier executor factory");
+    let (task, staged_cpu) = split_initial_task_engine(staged);
+    drop(staged_cpu);
+    let (mut lifecycle, vcpu) = factory
+        .create_executor_parts()
+        .expect("create the executor's live vCPU");
+    let mut engine = attach_task_engine(task, &mut lifecycle, vcpu);
+    engine
+        .overlay_task_state_on_live_executor(&cpu)
+        .expect("overlay the root CPU on the live executor");
+    LoadedEngine {
+        engine,
+        _lifecycle: lifecycle,
+        _factory: factory,
+    }
+}
+
+/// Publish the process identity the way `identity_page::stamp_identity_values`
+/// does: close the gate, write the pid, then set the gate to `gate`.
+fn stamp_identity(engine: &mut HvfTrapEngine, pid: u32, gate: u32) {
+    let base = LINUX_IDENTITY_PAGE_BASE;
+    engine
+        .write_bytes(base + IDENTITY_OFF_SHIM_ENABLED, &0_u32.to_le_bytes())
+        .unwrap();
+    engine
+        .write_bytes(base + IDENTITY_OFF_PID, &pid.to_le_bytes())
+        .unwrap();
+    engine
+        .write_bytes(base + IDENTITY_OFF_SHIM_ENABLED, &gate.to_le_bytes())
+        .unwrap();
 }
 
 #[test]
@@ -161,23 +229,21 @@ fn trap_engine_hvf_el1_shim_services_getpid_without_a_host_trap() {
     in_fresh_process(
         "trap_engine_hvf_el1_shim_services_getpid_without_a_host_trap",
         || {
-            let mut engine = engine(&probe_image(GETPID_PROBE_CODE, true));
-            // Boot-stamp the identity page exactly like the runtime does.
+            let mut loaded = load_on_executor(&probe_image(GETPID_PROBE_CODE, true));
             const SENTINEL_PID: u32 = 0xABCD;
-            engine
-                .write_bytes(
-                    LINUX_IDENTITY_PAGE_BASE + IDENTITY_OFF_PID,
-                    &SENTINEL_PID.to_le_bytes(),
-                )
-                .unwrap();
+            stamp_identity(&mut loaded.engine, SENTINEL_PID, 1);
 
-            // The first host-visible trap must be exit_group (94), NOT getpid
-            // (172), and x0 must carry the stamped pid: the EL1 handler read the
-            // identity page and returned it as the syscall result.
-            let frame = engine.next_syscall().unwrap().expect("guest must trap");
+            // The first host-visible trap must be exit_group, NOT getpid, and
+            // x0 must carry the stamped pid: EL1 read the identity page and
+            // returned it as the syscall result.
+            let frame = loaded
+                .engine
+                .next_syscall()
+                .unwrap()
+                .expect("guest must trap");
             assert_eq!(
                 frame.number.raw(),
-                94,
+                SYS_EXIT_GROUP,
                 "getpid (172) must NOT reach the host; first trap is exit_group"
             );
             assert_eq!(
@@ -191,16 +257,44 @@ fn trap_engine_hvf_el1_shim_services_getpid_without_a_host_trap() {
 
 #[test]
 #[ignore = "requires signed HVF execution through just test-hvf-trap-engine"]
+fn trap_engine_hvf_closed_identity_gate_traps_getpid_to_the_host() {
+    in_fresh_process(
+        "trap_engine_hvf_closed_identity_gate_traps_getpid_to_the_host",
+        || {
+            // Same shim-capable vectors, gate closed (how observers and
+            // interceptors keep identity calls visible): getpid MUST trap.
+            let mut loaded = load_on_executor(&probe_image(GETPID_PROBE_CODE, true));
+            stamp_identity(&mut loaded.engine, 0xABCD, 0);
+            let frame = loaded
+                .engine
+                .next_syscall()
+                .unwrap()
+                .expect("guest must trap");
+            assert_eq!(
+                frame.number.raw(),
+                SYS_GETPID,
+                "a closed identity gate must trap getpid to the host"
+            );
+        },
+    );
+}
+
+#[test]
+#[ignore = "requires signed HVF execution through just test-hvf-trap-engine"]
 fn trap_engine_hvf_legacy_vectors_trap_getpid_to_the_host() {
     in_fresh_process(
         "trap_engine_hvf_legacy_vectors_trap_getpid_to_the_host",
         || {
-            // Same guest, legacy vectors (no shim): getpid MUST trap first.
-            let mut engine = engine(&probe_image(GETPID_PROBE_CODE, false));
-            let frame = engine.next_syscall().unwrap().expect("guest must trap");
+            // Mailbox vectors without the identity fast path: getpid MUST trap.
+            let mut loaded = load_on_executor(&probe_image(GETPID_PROBE_CODE, false));
+            let frame = loaded
+                .engine
+                .next_syscall()
+                .unwrap()
+                .expect("guest must trap");
             assert_eq!(
                 frame.number.raw(),
-                172,
+                SYS_GETPID,
                 "without the shim, getpid must trap to the host"
             );
         },
@@ -209,47 +303,26 @@ fn trap_engine_hvf_legacy_vectors_trap_getpid_to_the_host() {
 
 #[test]
 #[ignore = "requires signed HVF execution through just test-hvf-trap-engine"]
-fn trap_engine_hvf_el1_shim_services_gettid_from_tpidr_el1() {
-    in_fresh_process(
-        "trap_engine_hvf_el1_shim_services_gettid_from_tpidr_el1",
-        || {
-            // gettid (178) is serviced at EL1 from the per-vCPU TPIDR_EL1 tid,
-            // stamped through `ThreadedEngine::set_guest_thread_id` (the
-            // `Aarch64Vcpu::stamp_guest_thread_id` seam; HVF writes TPIDR_EL1).
-            let mut engine = engine(&probe_image(GETTID_PROBE_CODE, true));
-            const SENTINEL_TID: u64 = 0x4321;
-            engine.set_guest_thread_id(SENTINEL_TID).unwrap();
-
-            let frame = engine.next_syscall().unwrap().expect("guest must trap");
-            assert_eq!(
-                frame.number.raw(),
-                94,
-                "gettid (178) must be serviced at EL1; first host trap is exit_group"
-            );
-            assert_eq!(
-                frame.args[0], SENTINEL_TID,
-                "fast-path gettid must return the per-vCPU TPIDR_EL1 tid stamped via \
-                 the stamp_guest_thread_id seam"
-            );
-        },
-    );
-}
-
-#[test]
-#[ignore = "requires signed HVF execution through just test-hvf-trap-engine"]
-fn trap_engine_hvf_el1_shim_gettid_guard_traps_when_tpidr_el1_unstamped() {
-    in_fresh_process(
-        "trap_engine_hvf_el1_shim_gettid_guard_traps_when_tpidr_el1_unstamped",
-        || {
-            // TPIDR_EL1 left 0: the cbz guard must fall through to the host
-            // trap rather than return a wrong gettid == 0.
-            let mut engine = engine(&probe_image(GETTID_PROBE_CODE, true));
-            let frame = engine.next_syscall().unwrap().expect("guest must trap");
-            assert_eq!(
-                frame.number.raw(),
-                178,
-                "unstamped TPIDR_EL1 must trap gettid to the host (cbz guard), not return 0"
-            );
-        },
-    );
+fn trap_engine_hvf_unseeded_gettid_traps_to_the_host() {
+    in_fresh_process("trap_engine_hvf_unseeded_gettid_traps_to_the_host", || {
+        // gettid has no vector-level answer: the TPIDR_EL1 handler was
+        // deleted (8603357b2) and EL1 serves gettid only through the
+        // lifecycle venue from a seeded thread control slot. A task with
+        // no seeded slot, even with an open identity gate and a stamped
+        // EL0 identity, must forward gettid to the host, never return a
+        // made-up tid.
+        let mut loaded = load_on_executor(&probe_image(GETTID_PROBE_CODE, true));
+        stamp_identity(&mut loaded.engine, 0xABCD, 1);
+        loaded.engine.set_guest_thread_id(0x4321).unwrap();
+        let frame = loaded
+            .engine
+            .next_syscall()
+            .unwrap()
+            .expect("guest must trap");
+        assert_eq!(
+            frame.number.raw(),
+            SYS_GETTID,
+            "an unseeded gettid must trap to the host"
+        );
+    });
 }
