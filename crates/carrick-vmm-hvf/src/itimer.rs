@@ -29,13 +29,6 @@ pub fn arm(which: usize, spec: TimerSpecNs, needs_periodic: bool) -> u64 {
     carrick_timer_core::itimer::arm_with_cpu_now(which, spec, needs_periodic, cpu_now)
 }
 
-/// Decide CPU timer expiry using host CPU time and active vCPU count.
-pub fn cpu_timer_decision(which: usize) -> Option<CpuTimerDecision> {
-    let now = carrick_host::guest_cpu::total_ns_including_active();
-    let active = carrick_host::guest_cpu::active_count() as u64;
-    carrick_timer_core::itimer::cpu_timer_decision(which, now, active)
-}
-
 /// Host CPU sampler for HVF backed by carrick-host guest_cpu counters.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HvfCpuSampler;
