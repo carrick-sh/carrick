@@ -21,9 +21,11 @@ workspace = true
 [build-dependencies]
 # build.rs derives the CPL0 image inputs from `cargo metadata` (cpl0_inputs.rs).
 serde_json.workspace = true
+carrick-guest-image-build = { path = "../carrick-guest-image-build" }
 
 [dev-dependencies]
 serde_json.workspace = true
+carrick-guest-image-build = { path = "../carrick-guest-image-build" }
 
 [dependencies]
 carrick-guest-arch = { path = "../carrick-guest-arch" }

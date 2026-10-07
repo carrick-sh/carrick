@@ -184,14 +184,18 @@ fn main() {
     let sysroot = get_sysroot();
 
     // Verify that the aarch64-unknown-none-softfloat target is installed
-    let target_dir = Path::new(&sysroot).join("lib/rustlib/aarch64-unknown-none-softfloat");
+    let target_dir = Path::new(&sysroot)
+        .join("lib/rustlib")
+        .join(carrick_guest_image_build::EL1_TARGET);
     if !target_dir.exists() {
         panic!(
             "\n\n======================================================================\n\
-             ERROR: Target 'aarch64-unknown-none-softfloat' is required to build carrick-el1-image.\n\
+             ERROR: Target '{}' is required to build carrick-el1-image.\n\
              Install it with:\n\
-                 rustup target add aarch64-unknown-none-softfloat\n\
-             ======================================================================\n\n"
+                 rustup target add {}\n\
+             ======================================================================\n\n",
+            carrick_guest_image_build::EL1_TARGET,
+            carrick_guest_image_build::EL1_TARGET
         );
     }
 
@@ -201,35 +205,23 @@ fn main() {
     let el1_target_dir = Path::new(&out_dir).join("el1-target");
 
     // Build carrick-el1 for aarch64-unknown-none-softfloat --release
+    let allocator_test_control = std::env::var_os("CARGO_FEATURE_ALLOCATOR_TEST_CONTROL").is_some();
+    let image_build = carrick_guest_image_build::El1ImageBuild::new()
+        .with_allocator_test_control(allocator_test_control);
     let mut build_cmd = Command::new(&cargo);
-    build_cmd
-        .arg("build")
-        .arg("-p")
-        .arg("carrick-el1")
-        .arg("--target")
-        .arg("aarch64-unknown-none-softfloat")
-        .arg("--release")
-        .arg("--target-dir")
-        .arg(&el1_target_dir);
-
-    if std::env::var_os("CARGO_FEATURE_ALLOCATOR_TEST_CONTROL").is_some() {
-        build_cmd.arg("--features").arg("allocator-test-control");
-    }
-
-    // Remove cargo env vars that might interfere with nested cargo invocation
-    build_cmd.env_remove("CARGO_MAKEFLAGS");
-    build_cmd.env_remove("CARGO_ENCODED_RUSTFLAGS");
+    image_build.configure_command(&mut build_cmd, &el1_target_dir);
 
     let status = build_cmd
         .status()
         .expect("failed to invoke cargo build for carrick-el1");
     if !status.success() {
         panic!(
-            "failed to build carrick-el1 for aarch64-unknown-none-softfloat (exit code: {status})"
+            "failed to build carrick-el1 for {} (exit code: {status})",
+            carrick_guest_image_build::EL1_TARGET
         );
     }
 
-    let elf_path = el1_target_dir.join("aarch64-unknown-none-softfloat/release/carrick-el1");
+    let elf_path = el1_target_dir.join(image_build.elf_rel_path());
     let bin_path = Path::new(&out_dir).join("carrick-el1.bin");
 
     // Verify that no FP/SIMD instructions or register references exist in the ELF

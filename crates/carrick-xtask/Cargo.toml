@@ -32,6 +32,7 @@ proc-macro2 = "1"
 toml.workspace = true
 
 carrick-conformance = { path = "../carrick-conformance" }
+carrick-guest-image-build = { path = "../carrick-guest-image-build" }
 carrick-portable = { path = "../carrick-portable" }
 
 [dev-dependencies]
