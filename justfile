@@ -561,6 +561,10 @@ test *ARGS:
         # tests probe closed fd numbers. Stage-1 rollback tests assert reuse from
         # the process-wide root-slot pool. Keep the crate serial for these reasons.
         env RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test -p carrick-runtime --lib {{ARGS}}
+        # The VM-free HVF trap surface (capabilities, mapping plan, ESR
+        # decoders, EL1 vector layout). Its VM-booting half is the signed
+        # `just test-hvf-trap-engine`; this target must never reach hv_vm_create.
+        {{_admit}} {{_cargo}} test -p carrick-runtime --test trap_hvf {{ARGS}}
         # carrick-vmm-hvf is serial for a THIRD reason, and it is structural
         # rather than a test-hygiene lapse: the carrier is process-global by
         # design, so its alias registry, replay mappings, global-frame owner
@@ -877,6 +881,19 @@ test-embed *ARGS: build
 # Guest-running tests of carrick-vmm-hvf from SIGNED cargo test executables.
 test-hvf *ARGS:
     ./scripts/test-signed.sh carrick-vmm-hvf {{ARGS}}
+
+# HVF trap-engine tests (`crates/carrick-vmm-hvf/tests/trap_engine_hvf.rs`):
+# bring up a real VM+vCPU via `new_hvf_trap_engine` and run tiny guests through
+# the EL1 identity shim (getpid/gettid fast paths and their legacy/guard
+# controls). They moved out of carrick-runtime's `trap_hvf`, which self-skipped
+# on HV_DENIED and so "passed" unsigned without running. Every test is
+# `#[ignore]`d (a bare `cargo test` never selects it) and panics on HV_DENIED;
+# scripts/test-signed.sh signs the package's test executables, runs the
+# `trap_engine_hvf_` set with `--ignored` (each test re-execs itself in a
+# fresh process: one VM per process), then runs the package's UNENTITLED
+# negative control (`unsigned_executable_maps_hv_denied_to_entitlement`).
+test-hvf-trap-engine:
+    ./scripts/test-signed.sh carrick-vmm-hvf trap_engine_hvf_ --ignored --nocapture
 
 # Guest-running tests of carrick-conformance-next from SIGNED cargo test executables.
 test-conformance-next *ARGS: build
