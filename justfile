@@ -888,9 +888,10 @@ test-hvf *ARGS:
     ./scripts/test-signed.sh carrick-vmm-hvf {{ARGS}}
 
 # HVF trap-engine tests (`crates/carrick-vmm-hvf/tests/trap_engine_hvf.rs`):
-# bring up a real VM+vCPU via `new_hvf_trap_engine` and run tiny guests through
-# the EL1 identity shim (getpid/gettid fast paths and their legacy/guard
-# controls). They moved out of carrick-runtime's `trap_hvf`, which self-skipped
+# bring up a real VM via `new_hvf_trap_engine`, load the staged root onto a
+# live persistent-executor vCPU (production's first executor load) and run
+# tiny guests through the mailbox vectors (EL1 getpid fast path, its
+# closed-gate and no-shim controls, unseeded gettid forwarding). They moved out of carrick-runtime's `trap_hvf`, which self-skipped
 # on HV_DENIED and so "passed" unsigned without running. Every test is
 # `#[ignore]`d (a bare `cargo test` never selects it) and panics on HV_DENIED;
 # scripts/test-signed.sh signs the package's test executables, runs the
