@@ -1,6 +1,6 @@
 //! Resolve fixture inputs independently of the host workspace's crate population.
 use super::environment::{BuildEnvironment, checkout_configs};
-use super::{BUILD_SCRIPTS, ContentHash, GuestTarget, Result, fail, git, hash_source, safe_path};
+use super::{BUILD_SCRIPTS, ContentHash, Result, fail, git, hash_source, safe_path};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -91,15 +91,13 @@ fn resolved_inputs(root: &Path) -> Result<BTreeSet<String>> {
                 "missing fixture manifest or lockfile: {fixture}"
             )));
         }
-        let targets: &[GuestTarget] = if *fixture == "conformance-probes" {
-            &[GuestTarget::Musl, GuestTarget::Gnu]
-        } else {
-            &[GuestTarget::Musl]
-        };
-        for target in targets {
-            // Resolve the same default features and target as the locked build.
-            // Offline prevents validation from silently relying on registry access;
-            // a cold/incomplete Cargo cache is an explicit preparation failure.
+        // Resolve the unfiltered graph: build-dependencies and proc-macros
+        // compile for the publisher's host, which need not be the verifier's,
+        // so a target-filtered graph could omit host-only path crates. The
+        // union over every platform is a superset of any one build.
+        // Offline prevents validation from silently relying on registry access;
+        // a cold/incomplete Cargo cache is an explicit preparation failure.
+        {
             let configs = checkout_configs(&root, &directory)?;
             let mut command = Command::new("cargo");
             environment
@@ -115,8 +113,6 @@ fn resolved_inputs(root: &Path) -> Result<BTreeSet<String>> {
                     "--offline",
                     "--format-version",
                     "1",
-                    "--filter-platform",
-                    target.triple(),
                     "--manifest-path",
                 ])
                 .arg(&manifest);
@@ -198,9 +194,33 @@ fn resolved_inputs(root: &Path) -> Result<BTreeSet<String>> {
     Ok(inputs)
 }
 
-/// Compute the same scoped input inventory used by the bundle publisher.
-pub fn source_hashes(root: &Path) -> Result<BTreeMap<String, ContentHash>> {
-    let inputs = resolved_inputs(root)?;
+/// Reject a recorded compiler input that could name anything but a tracked
+/// checkout source: escapes, absolute paths and generated `target/` files.
+fn validate_compiler_input(root: &Path, relative: &str) -> Result<()> {
+    if Path::new(relative)
+        .components()
+        .any(|c| c == std::path::Component::Normal("target".as_ref()))
+    {
+        return Err(fail(format!(
+            "recorded compiler input under target/: {relative}"
+        )));
+    }
+    safe_path(root, relative)?;
+    Ok(())
+}
+
+/// Compute the scoped input inventory: the Cargo-graph closure plus the
+/// compiler-recorded inputs a bundle names. Every recorded input must be a
+/// clean, tracked regular file; a missing one is refused, never skipped.
+pub fn source_hashes(
+    root: &Path,
+    compiler_inputs: &[String],
+) -> Result<BTreeMap<String, ContentHash>> {
+    let mut inputs = resolved_inputs(root)?;
+    for relative in compiler_inputs {
+        validate_compiler_input(root, relative)?;
+        inputs.insert(relative.clone());
+    }
     let mut args = vec!["status", "--porcelain", "--untracked-files=all", "--"];
     args.extend(inputs.iter().map(String::as_str));
     if !git(root, &args)?.trim().is_empty() {
@@ -212,6 +232,13 @@ pub fn source_hashes(root: &Path) -> Result<BTreeMap<String, ContentHash>> {
     let mut sources = BTreeMap::new();
     for relative in paths.split('\0').filter(|p| !p.is_empty()) {
         sources.insert(relative.to_owned(), hash_source(root, relative)?);
+    }
+    for relative in compiler_inputs {
+        if !sources.contains_key(relative) {
+            return Err(fail(format!(
+                "recorded compiler input is not a tracked file: {relative}"
+            )));
+        }
     }
     if sources.is_empty() {
         return Err(fail("empty fixture source inventory"));
