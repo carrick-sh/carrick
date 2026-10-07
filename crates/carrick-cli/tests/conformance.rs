@@ -4573,6 +4573,14 @@ fn bless_native_probe_oracle() {
     let dir = probe_oracle_dir("amd64native", &libc);
     let mut provenance = native::ProbeProvenance::current().expect("native provenance");
     provenance.image_digest = rootfs.as_ref().map(|rootfs| rootfs.image_digest.clone());
+    let static_root = if libc == "musl" {
+        let inputs = native::static_init_inputs().expect("native static init inputs");
+        let root = native::static_probe_root(&inputs).expect("native static root");
+        provenance.static_init_inputs = Some(inputs);
+        Some(root)
+    } else {
+        None
+    };
     if dir.exists() {
         native::validate_probe_oracle_dir(&dir).expect("existing native provenance differs; refresh the entire oracle directory on the new kernel");
         let previous: native::ProbeProvenance = serde_json::from_slice(
@@ -4604,7 +4612,10 @@ fn bless_native_probe_oracle() {
             "x86_64-unknown-linux-gnu"
         })
         .join(name);
-        let result = match &rootfs {
+        let result = match rootfs
+            .as_ref()
+            .or_else(|| static_root.as_ref().map(|(_, root)| root))
+        {
             Some(rootfs) => native::run_probe_in_root(&probe, rootfs),
             None => native::run_probe(&probe),
         };

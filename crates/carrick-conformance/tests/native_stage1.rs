@@ -110,6 +110,15 @@ fn native_argv_mirrors_docker_inputs_and_uses_unshare_chroot() {
     let mut unsupported = s.clone();
     unsupported.docker_flags = vec!["--privileged".into()];
     assert!(argv::native_argv(&unsupported, &rootfs).is_err());
+    let mut bad_environment = rootfs.clone();
+    bad_environment.env = vec!["/usr/bin/true".into()];
+    assert!(argv::native_argv(&s, &bad_environment).is_err());
+    let chroot = native
+        .iter()
+        .position(|arg| arg == "/usr/sbin/chroot")
+        .unwrap();
+    assert_eq!(&native[chroot + 2..chroot + 4], ["/bin/sh", "-c"]);
+    assert!(native[chroot + 4].contains("exec 3>&-"));
 }
 
 #[test]

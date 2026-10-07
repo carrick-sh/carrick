@@ -392,6 +392,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "carrick-coordinator",
+ "carrick-kernel-arena",
  "carrick-spec",
  "clap",
  "libc",
