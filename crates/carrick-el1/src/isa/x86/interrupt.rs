@@ -279,6 +279,10 @@ pub fn rendezvous_context(context: AddressContext<RootGpa>) -> Result<ShootdownR
             continue;
         }
         while request.ack[peer].load(Ordering::Acquire) < generation {
+            let member = &table.members[peer];
+            if member.running.load(Ordering::Acquire) == 0 {
+                break;
+            }
             service_shootdowns()?;
             if read_tsc().wrapping_sub(start) > limit {
                 fatal_unacknowledged_shootdown(
