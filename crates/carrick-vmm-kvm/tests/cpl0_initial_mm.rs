@@ -147,3 +147,20 @@ fn production_extent_cannot_alias_kernel_metadata() {
         "initial extent aliases the dynamic metadata aperture"
     );
 }
+
+#[test]
+fn production_boot_binds_both_kvm_local_apics() {
+    let carrier = Cpl0Carrier::boot_production(0x20_000).expect("production KVM boot");
+    assert!(
+        carrier
+            .bootstrap_lapic_mapped()
+            .expect("bootstrap LAPIC table walk"),
+        "production CPL0 needs a writable supervisor mapping to xAPIC MMIO"
+    );
+    for slot in 0..2 {
+        let version = carrier
+            .lapic_register(slot, 0x30)
+            .expect("production vCPU needs a live local APIC");
+        assert_ne!(version & 0xff, 0, "missing LAPIC version on slot {slot}");
+    }
+}
