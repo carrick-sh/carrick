@@ -1,0 +1,723 @@
+// Native custody tests over the production shared process-owner adapter.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+use super::*;
+use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
+use carrick_sched_core::process::{LinuxSignal, TaskSerial, WaitChildClass, WaitTarget};
+use core::cell::{Cell, RefCell};
+use core::num::NonZeroU64;
+use core::time::Duration;
+use std::rc::Rc;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Uid(u32);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Transaction(u64);
+struct Failure;
+impl RegistryFailure for Failure {
+    fn fail(invariant: RegistryInvariant) -> ! {
+        panic!("{invariant:?}")
+    }
+}
+impl GuestProcessFailure for Failure {
+    fn fail_process(invariant: GuestProcessInvariant) -> ! {
+        panic!("{invariant:?}")
+    }
+}
+#[derive(Default)]
+struct Work {
+    member_visits: Cell<usize>,
+    event_reads: Cell<usize>,
+    resource_visits: Cell<usize>,
+    signal_reads: Cell<usize>,
+    revision_reads: Cell<usize>,
+}
+struct Claim(Rc<Cell<usize>>);
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+    }
+}
+#[derive(Clone)]
+struct Signals {
+    state: Rc<Cell<ExitSignalState>>,
+    order: Rc<RefCell<Vec<&'static str>>>,
+    work: Rc<Work>,
+}
+impl ExitSignalSource for Signals {
+    fn exit_signal_state(&self, signal: LinuxSignal) -> ExitSignalState {
+        assert_eq!(signal, LinuxSignal::SIGCHLD);
+        self.work.signal_reads.set(self.work.signal_reads.get() + 1);
+        self.order.borrow_mut().push("signal");
+        self.state.get()
+    }
+}
+#[derive(Clone)]
+struct Member {
+    task: TaskKey,
+    order: Rc<RefCell<Vec<&'static str>>>,
+}
+impl ExitMember for Member {
+    fn exit_task(&self) -> TaskKey {
+        self.task
+    }
+}
+impl Member {
+    fn cancel(self) {
+        self.order.borrow_mut().push("cancel");
+    }
+}
+struct Budget {
+    reserved: Cell<u64>,
+}
+struct Credit {
+    source: Rc<Budget>,
+    remaining: u64,
+}
+impl Drop for Credit {
+    fn drop(&mut self) {
+        self.source
+            .reserved
+            .set(self.source.reserved.get() - self.remaining);
+    }
+}
+struct Native {
+    task: TaskKey,
+    members: usize,
+    work: Rc<Work>,
+    budget: Rc<Budget>,
+    signals: Signals,
+    autoreap: bool,
+    own_usage: TaskRusage,
+    wake: u64,
+}
+impl NativeProcessCustody for Native {
+    type Claim = Claim;
+    type Event = ();
+    type Credit = Credit;
+    type Error = ();
+    type Transaction = Transaction;
+    type Member = Member;
+    type Resources = Rc<Work>;
+    type SignalTarget = Signals;
+    fn next_revision(&self, current: TaskRevision) -> Result<TaskRevision, ()> {
+        self.work
+            .revision_reads
+            .set(self.work.revision_reads.get() + 1);
+        current
+            .raw()
+            .checked_add(self.budget.reserved.get())
+            .and_then(|n| n.checked_add(1))
+            .ok_or(())?;
+        current.next().ok_or(())
+    }
+    fn reserve_exit_credit(&self, current: TaskRevision) -> Result<Credit, ()> {
+        self.next_revision(current)?;
+        self.budget.reserved.set(self.budget.reserved.get() + 1);
+        Ok(Credit {
+            source: self.budget.clone(),
+            remaining: 1,
+        })
+    }
+    fn consume_exit_credit(&self, credit: &mut Credit, current: TaskRevision) -> TaskRevision {
+        assert!(Rc::ptr_eq(&credit.source, &self.budget));
+        assert_eq!(credit.remaining, 1);
+        credit.remaining = 0;
+        self.budget.reserved.set(self.budget.reserved.get() - 1);
+        current.next().unwrap()
+    }
+    fn wait_event(&self, _: WaitJobControl, _: bool) -> Option<()> {
+        self.work.event_reads.set(self.work.event_reads.get() + 1);
+        None
+    }
+    fn wake_generation(&self) -> TaskWakeGeneration {
+        TaskWakeGeneration::from_task_counter(self.wake)
+    }
+    fn own_members_and_resources(&self) -> (Vec<Member>, Rc<Work>) {
+        self.work
+            .member_visits
+            .set(self.work.member_visits.get() + self.members);
+        self.work
+            .resource_visits
+            .set(self.work.resource_visits.get() + 1);
+        (
+            (0..self.members)
+                .map(|_| Member {
+                    task: self.task,
+                    order: self.signals.order.clone(),
+                })
+                .collect(),
+            self.work.clone(),
+        )
+    }
+    fn signal_target(&self) -> Signals {
+        self.signals.clone()
+    }
+    fn autoreaps_children(&self) -> bool {
+        self.autoreap
+    }
+    fn own_rusage(&self) -> TaskRusage {
+        self.own_usage
+    }
+}
+type Owner = GuestProcessOwner<(), Uid, Native, Failure>;
+type Task = GuestTask<(), Uid, Native>;
+type Published = GuestPublishedExit<(), Uid, Native>;
+fn key(id: i32, serial: u64) -> TaskKey {
+    TaskKey {
+        id: TaskId::from_abi_positive(id).unwrap(),
+        serial: TaskSerial::from_raw_u64(serial).unwrap(),
+    }
+}
+fn address(task: TaskKey) -> AddressContext<RootGpa> {
+    AddressContext {
+        root: RootGpa::page_aligned(FrameGpa::new((task.id.raw() as u64 + 1) * 4096)).unwrap(),
+        mm: MmGeneration::new(NonZeroU64::new(task.serial.raw()).unwrap()),
+        generation: ContextGeneration::new(NonZeroU64::new(1).unwrap()),
+    }
+}
+fn task(
+    task: TaskKey,
+    parent: Option<TaskKey>,
+    releases: Rc<Cell<usize>>,
+    members: usize,
+    order: Rc<RefCell<Vec<&'static str>>>,
+) -> Task {
+    let work = Rc::new(Work::default());
+    let signals = Signals {
+        state: Rc::new(Cell::new(ExitSignalState {
+            disposition: ExitSignalDisposition::Caught,
+            blocked: false,
+        })),
+        order,
+        work: work.clone(),
+    };
+    let native = Native {
+        task,
+        members,
+        work,
+        budget: Rc::new(Budget {
+            reserved: Cell::new(0),
+        }),
+        signals,
+        autoreap: false,
+        own_usage: TaskRusage {
+            user_time: Duration::from_micros(7),
+            system_time: Duration::from_micros(3),
+        },
+        wake: 11,
+    };
+    let mut frame = [0; 20];
+    frame[15] = 0x400000;
+    frame[16] = 0x23;
+    frame[17] = 0x202;
+    frame[18] = 0x800000;
+    frame[19] = 0x1b;
+    let context = ParkedContextWords::from_parts(
+        frame,
+        address(task),
+        0x9000,
+        0,
+        [0; carrick_sched_core::X86_XSAVE_BYTES],
+    );
+    GuestTask::new(
+        GuestTaskMetadata {
+            key: task,
+            container: (),
+            namespace_pid: task.id.raw() as u32,
+            identity: TaskIdentity::led_by(key(1, 1).id),
+            namespace_process_group: 1,
+            namespace_session: 1,
+            ruid: Uid(0),
+            euid: Uid(0),
+            exit_signal: ChildExitSignal::SIGCHLD,
+            diagnostic_name: "native".into(),
+        },
+        parent,
+        context,
+        native,
+        Claim(releases),
+    )
+}
+fn owner() -> Owner {
+    let mut owner = Owner::new();
+    owner
+        .seed_initial(task(
+            key(1, 1),
+            None,
+            Rc::new(Cell::new(0)),
+            1,
+            Rc::new(RefCell::new(Vec::new())),
+        ))
+        .unwrap();
+    owner
+}
+fn birth(owner: &mut Owner, parent: TaskKey, child: TaskKey, releases: Rc<Cell<usize>>) {
+    let snapshot = owner.capture_parent(parent).unwrap();
+    let child_row = task(
+        child,
+        Some(parent),
+        releases,
+        1,
+        Rc::new(RefCell::new(Vec::new())),
+    );
+    owner
+        .admit_child(
+            snapshot,
+            snapshot,
+            &child_row,
+            BirthAttachment::Parent,
+            None,
+        )
+        .unwrap()
+        .publish(child_row);
+}
+fn exit(owner: &mut Owner, task: TaskKey, adopter: Option<TaskKey>) -> Published {
+    owner
+        .prepare_exit(task, adopter)
+        .unwrap()
+        .reserve(Transaction(task.serial.raw()))
+        .unwrap()
+        .begin(LinuxWaitStatus::from_wait_encoding(5 << 8))
+        .unwrap()
+        .publish()
+}
+fn query(target: WaitTarget) -> WaitQuery {
+    WaitQuery {
+        target,
+        class: WaitChildClass::Sigchld,
+        job_control: WaitJobControl::NONE,
+    }
+}
+#[test]
+fn initial_task_preserves_exact_parked_context_and_seeds_once() {
+    let mut owner = owner();
+    assert!(
+        owner
+            .task(key(1, 1))
+            .unwrap()
+            .context()
+            .authenticates(address(key(1, 1)))
+    );
+    assert_eq!(owner.task(key(1, 1)).unwrap().parent(), None);
+    assert!(matches!(
+        owner.seed_initial(task(
+            key(2, 2),
+            None,
+            Rc::new(Cell::new(0)),
+            1,
+            Rc::new(RefCell::new(Vec::new()))
+        )),
+        Err(GuestProcessError::InitialAlreadySeeded)
+    ));
+    assert_eq!(owner.registry.tasks.len(), 1);
+}
+#[test]
+fn stale_parent_and_changed_revision_refuse_birth_without_resource_loss() {
+    let mut owner = owner();
+    let parent = key(1, 1);
+    let captured = owner.capture_parent(parent).unwrap();
+    birth(&mut owner, parent, key(2, 2), Rc::new(Cell::new(0)));
+    let releases = Rc::new(Cell::new(0));
+    let row = task(
+        key(3, 3),
+        Some(parent),
+        releases.clone(),
+        1,
+        Rc::new(RefCell::new(Vec::new())),
+    );
+    assert!(matches!(
+        owner.admit_child(captured, captured, &row, BirthAttachment::Parent, None),
+        Err(GuestProcessError::Birth(BirthError::CallerRevision))
+    ));
+    let mut stale = owner.capture_parent(parent).unwrap();
+    stale.key.serial = TaskSerial::from_raw_u64(99).unwrap();
+    assert!(matches!(
+        owner.admit_child(stale, stale, &row, BirthAttachment::Parent, None),
+        Err(GuestProcessError::Birth(BirthError::CallerGone))
+    ));
+    assert_eq!(releases.get(), 0);
+    let current = owner.capture_parent(parent).unwrap();
+    owner
+        .admit_child(current, current, &row, BirthAttachment::Parent, None)
+        .unwrap()
+        .publish(row);
+    assert_eq!(
+        owner.task(parent).unwrap().children(),
+        &BTreeSet::from([key(2, 2), key(3, 3)])
+    );
+}
+#[test]
+fn two_children_exit_before_wait_consume_once_and_keep_claims_owned() {
+    let mut owner = owner();
+    let parent = key(1, 1);
+    let first = key(2, 2);
+    let second = key(3, 3);
+    let first_releases = Rc::new(Cell::new(0));
+    let second_releases = Rc::new(Cell::new(0));
+    birth(&mut owner, parent, first, first_releases.clone());
+    birth(&mut owner, parent, second, second_releases.clone());
+    let done = exit(&mut owner, first, None);
+    done.effects.cancel_members(Member::cancel);
+    let done = exit(&mut owner, second, None);
+    done.effects.cancel_members(Member::cancel);
+    assert_eq!(first_releases.get(), 0);
+    assert!(matches!(
+        owner.precheck_wait(parent, query(WaitTarget::Any)).unwrap(),
+        WaitReadiness::Ready
+    ));
+    assert!(
+        matches!(owner.scan_wait(parent, query(WaitTarget::Exact(first))).unwrap(), WaitSelection::Exited(receipt) if receipt.key == first && receipt.status.raw() == 5 << 8)
+    );
+    assert_eq!(first_releases.get(), 0);
+    let first_result = owner
+        .consume_wait(parent, query(WaitTarget::Exact(first)))
+        .unwrap();
+    assert_eq!(
+        first_result.reaped_record.as_ref().unwrap().receipt.key,
+        first
+    );
+    assert_eq!(first_releases.get(), 0);
+    assert_eq!(
+        owner.task(parent).unwrap().children_rusage().user_time,
+        Duration::from_micros(7)
+    );
+    assert!(matches!(
+        owner
+            .consume_wait(parent, query(WaitTarget::Exact(first)))
+            .unwrap()
+            .selection,
+        WaitSelection::NoChild
+    ));
+    assert!(matches!(
+        owner.precheck_wait(parent, query(WaitTarget::Any)).unwrap(),
+        WaitReadiness::Ready
+    ));
+    let second_result = owner.consume_wait(parent, query(WaitTarget::Any)).unwrap();
+    assert_eq!(
+        second_result.reaped_record.as_ref().unwrap().receipt.key,
+        second
+    );
+    assert_eq!(
+        owner.task(parent).unwrap().children_rusage().user_time,
+        Duration::from_micros(14)
+    );
+    drop(first_result);
+    assert_eq!((first_releases.get(), second_releases.get()), (1, 0));
+    drop(second_result);
+    assert_eq!(second_releases.get(), 1);
+}
+#[test]
+fn recycled_numeric_child_does_not_authorize_stale_caller_or_wait() {
+    let mut owner = owner();
+    let parent = key(1, 1);
+    let old = key(2, 2);
+    birth(&mut owner, parent, old, Rc::new(Cell::new(0)));
+    let done = exit(&mut owner, old, None);
+    done.effects.cancel_members(Member::cancel);
+    drop(owner.consume_wait(parent, query(WaitTarget::Any)).unwrap());
+    let current = key(2, 99);
+    birth(&mut owner, parent, current, Rc::new(Cell::new(0)));
+    assert!(matches!(owner.task(old), Err(GuestProcessError::Stale(found)) if found == old));
+    assert!(
+        matches!(owner.precheck_wait(old, query(WaitTarget::Any)), Err(GuestProcessError::Stale(found)) if found == old)
+    );
+    assert_eq!(owner.task(current).unwrap().key(), current);
+}
+#[test]
+fn released_exact_members_cancel_before_parent_signal_snapshot() {
+    let mut owner = owner();
+    let parent = key(1, 1);
+    let order = Rc::new(RefCell::new(Vec::new()));
+    owner.task_mut(parent).unwrap().native_mut().signals.order = order.clone();
+    let snapshot = owner.capture_parent(parent).unwrap();
+    let row = task(
+        key(2, 2),
+        Some(parent),
+        Rc::new(Cell::new(0)),
+        2,
+        order.clone(),
+    );
+    owner
+        .admit_child(snapshot, snapshot, &row, BirthAttachment::Parent, None)
+        .unwrap()
+        .publish(row);
+    let done = exit(&mut owner, key(2, 2), None);
+    assert!(owner.registry.reservations.is_empty());
+    assert!(order.borrow().is_empty());
+    let permit = done.effects.cancel_members(Member::cancel);
+    assert_eq!(&*order.borrow(), &["cancel", "cancel"]);
+    let target = owner.select_exit_parent(&permit).unwrap();
+    let notification = target.prepare();
+    assert_eq!(notification.parent, parent);
+    assert_eq!(notification.signal, Some(LinuxSignal::SIGCHLD));
+    assert_eq!(&*order.borrow(), &["cancel", "cancel", "signal"]);
+}
+#[test]
+fn exiting_parent_reparents_live_and_zombie_children_through_shared_topology() {
+    let mut owner = owner();
+    let root = key(1, 1);
+    let parent = key(2, 2);
+    let live_child = key(3, 3);
+    let dead_child = key(4, 4);
+    birth(&mut owner, root, parent, Rc::new(Cell::new(0)));
+    birth(&mut owner, parent, live_child, Rc::new(Cell::new(0)));
+    birth(&mut owner, parent, dead_child, Rc::new(Cell::new(0)));
+    let done = exit(&mut owner, dead_child, None);
+    done.effects.cancel_members(Member::cancel);
+    let done = exit(&mut owner, parent, None);
+    done.effects.cancel_members(Member::cancel);
+    assert_eq!(owner.task(live_child).unwrap().parent(), Some(root));
+    assert_eq!(
+        owner.registry.zombies[&dead_child.id].receipt.parent,
+        Some(root)
+    );
+    assert_eq!(
+        owner.task(root).unwrap().children(),
+        &BTreeSet::from([parent, live_child, dead_child])
+    );
+    let consumed = owner
+        .consume_wait(root, query(WaitTarget::Exact(dead_child)))
+        .unwrap();
+    assert_eq!(consumed.reaped_record.unwrap().receipt.key, dead_child);
+}
+#[test]
+fn shared_explicit_subreaper_adopts_orphans_and_preserves_subtree_cpu_charge() {
+    let mut owner = owner();
+    let root = key(1, 1);
+    let subreaper = key(2, 2);
+    let exiting = key(3, 3);
+    let child = key(4, 4);
+    birth(&mut owner, root, subreaper, Rc::new(Cell::new(0)));
+    birth(&mut owner, subreaper, exiting, Rc::new(Cell::new(0)));
+    birth(&mut owner, exiting, child, Rc::new(Cell::new(0)));
+    let done = exit(&mut owner, child, None);
+    done.effects.cancel_members(Member::cancel);
+    drop(
+        owner
+            .consume_wait(exiting, query(WaitTarget::Exact(child)))
+            .unwrap(),
+    );
+    let orphan = key(5, 5);
+    birth(&mut owner, exiting, orphan, Rc::new(Cell::new(0)));
+    let done = exit(&mut owner, exiting, Some(subreaper));
+    done.effects.cancel_members(Member::cancel);
+    assert_eq!(owner.task(orphan).unwrap().parent(), Some(subreaper));
+    let consumed = owner
+        .consume_wait(subreaper, query(WaitTarget::Exact(exiting)))
+        .unwrap();
+    assert!(
+        matches!(consumed.selection, WaitSelection::Exited(receipt) if receipt.total_charge_to_reaper().user_time == Duration::from_micros(14))
+    );
+    assert_eq!(
+        owner.task(subreaper).unwrap().children_rusage().user_time,
+        Duration::from_micros(14)
+    );
+}
+#[test]
+fn autoreap_returns_owned_receipt_without_cpu_charge_or_wait_edge() {
+    let mut owner = owner();
+    let parent = key(1, 1);
+    owner.task_mut(parent).unwrap().native_mut().autoreap = true;
+    let releases = Rc::new(Cell::new(0));
+    birth(&mut owner, parent, key(2, 2), releases.clone());
+    let done = exit(&mut owner, key(2, 2), None);
+    let permit = done.effects.cancel_members(Member::cancel);
+    assert_eq!(permit.parent(), Some(parent));
+    assert!(owner.registry.zombies.is_empty());
+    assert!(owner.task(parent).unwrap().children().is_empty());
+    assert_eq!(
+        owner.task(parent).unwrap().children_rusage(),
+        TaskRusage::default()
+    );
+    assert!(matches!(
+        owner.precheck_wait(parent, query(WaitTarget::Any)).unwrap(),
+        WaitReadiness::NoChild
+    ));
+    assert_eq!(releases.get(), 0);
+    assert_eq!(
+        done.autoreaped_receipt.as_ref().unwrap().receipt.key,
+        key(2, 2)
+    );
+    drop(done.autoreaped_receipt);
+    assert_eq!(releases.get(), 1);
+}
+#[test]
+fn dropping_reserved_exit_rolls_back_exact_reservation_without_state_change() {
+    let mut owner = owner();
+    let parent = key(1, 1);
+    birth(&mut owner, parent, key(2, 2), Rc::new(Cell::new(0)));
+    birth(&mut owner, key(2, 2), key(3, 3), Rc::new(Cell::new(0)));
+    let revision = owner.capture_parent(parent).unwrap().revision;
+    {
+        let _reserved = owner
+            .prepare_exit(key(2, 2), None)
+            .unwrap()
+            .reserve(Transaction(4))
+            .unwrap();
+    }
+    assert!(owner.registry.reservations.is_empty());
+    assert_eq!(owner.capture_parent(parent).unwrap().revision, revision);
+    assert_eq!(
+        owner.task(key(2, 2)).unwrap().lifecycle(),
+        TaskLifecycle::Live
+    );
+    assert_eq!(
+        owner.task(parent).unwrap().native().budget.reserved.get(),
+        0
+    );
+    assert_eq!(
+        owner
+            .task(key(3, 3))
+            .unwrap()
+            .native()
+            .budget
+            .reserved
+            .get(),
+        0
+    );
+}
+#[test]
+fn adapter_exit_work_visits_exactly_own_members_and_no_unrelated_native_resources() {
+    for count in [0, 1, 8, 32, 128] {
+        let mut owner = owner();
+        let parent = key(1, 1);
+        let snapshot = owner.capture_parent(parent).unwrap();
+        let row = task(
+            key(2, 2),
+            Some(parent),
+            Rc::new(Cell::new(0)),
+            count,
+            Rc::new(RefCell::new(Vec::new())),
+        );
+        let work = row.native().work.clone();
+        owner
+            .admit_child(snapshot, snapshot, &row, BirthAttachment::Parent, None)
+            .unwrap()
+            .publish(row);
+        let mut unrelated = Vec::new();
+        for id in 1000..1512 {
+            let row = task(
+                key(id, id as u64),
+                None,
+                Rc::new(Cell::new(0)),
+                1,
+                Rc::new(RefCell::new(Vec::new())),
+            );
+            unrelated.push(row.native().work.clone());
+            // Test-only sole-registry population setup, never a second selector.
+            let key = row.key();
+            owner
+                .registry
+                .process_groups
+                .get_mut(&row.identity().process_group)
+                .unwrap()
+                .members
+                .insert(key);
+            owner.registry.tasks.insert(key.id, row);
+        }
+        let done = exit(&mut owner, key(2, 2), None);
+        let mut cancelled = 0;
+        done.effects.cancel_members(|member| {
+            assert_eq!(member.exit_task(), key(2, 2));
+            cancelled += 1;
+        });
+        assert_eq!(cancelled, count);
+        assert_eq!(work.member_visits.get(), count);
+        assert_eq!(work.resource_visits.get(), 1);
+        assert_eq!(work.signal_reads.get(), 0);
+        for work in unrelated {
+            assert_eq!(
+                (
+                    work.member_visits.get(),
+                    work.resource_visits.get(),
+                    work.signal_reads.get(),
+                    work.revision_reads.get()
+                ),
+                (0, 0, 0, 0)
+            );
+        }
+    }
+}
+
+#[test]
+fn wrong_exact_member_is_refused_before_begin_and_reserved_drop_rolls_back() {
+    let mut owner = owner();
+    birth(&mut owner, key(1, 1), key(2, 2), Rc::new(Cell::new(0)));
+    owner.task_mut(key(2, 2)).unwrap().native_mut().task = key(3, 3);
+    let error = {
+        let result = owner
+            .prepare_exit(key(2, 2), None)
+            .unwrap()
+            .reserve(Transaction(9))
+            .unwrap()
+            .begin(LinuxWaitStatus::from_wait_encoding(0));
+        match result {
+            Err(error) => error,
+            Ok(pending) => {
+                let _ = pending.publish();
+                panic!("shared begin accepted a member of another exact task");
+            }
+        }
+    };
+    assert!(
+        matches!(error, GuestProcessError::Exit(ExitError::Topology(found)) if found == key(2, 2).id)
+    );
+    assert!(owner.registry.reservations.is_empty());
+    assert_eq!(
+        owner.task(key(2, 2)).unwrap().lifecycle(),
+        TaskLifecycle::Live
+    );
+}
+#[test]
+fn adapter_wait_work_visits_only_own_children_with_512_unrelated_rows() {
+    for count in [1, 8, 32, 128] {
+        let mut owner = owner();
+        let parent = key(1, 1);
+        let mut own = Vec::new();
+        for id in 2..count + 2 {
+            birth(
+                &mut owner,
+                parent,
+                key(id, id as u64),
+                Rc::new(Cell::new(0)),
+            );
+            own.push(
+                owner
+                    .task(key(id, id as u64))
+                    .unwrap()
+                    .native()
+                    .work
+                    .clone(),
+            );
+        }
+        let mut unrelated = Vec::new();
+        for id in 1000..1512 {
+            let row = task(
+                key(id, id as u64),
+                None,
+                Rc::new(Cell::new(0)),
+                1,
+                Rc::new(RefCell::new(Vec::new())),
+            );
+            let key = row.key();
+            unrelated.push(row.native().work.clone());
+            owner
+                .registry
+                .process_groups
+                .get_mut(&row.identity().process_group)
+                .unwrap()
+                .members
+                .insert(key);
+            owner.registry.tasks.insert(key.id, row);
+        }
+        assert!(
+            matches!(owner.precheck_wait(parent, query(WaitTarget::Any)).unwrap(), WaitReadiness::StillRunning(token) if token.wake_generation().raw() == 11)
+        );
+        for work in own {
+            assert_eq!(work.event_reads.get(), 1);
+        }
+        for work in unrelated {
+            assert_eq!(work.event_reads.get(), 0);
+        }
+    }
+}

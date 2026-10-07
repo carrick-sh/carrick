@@ -9,5 +9,6 @@ pub mod inotify;
 pub mod ipc;
 pub mod lifecycle;
 pub mod mm_portal;
+pub mod process_owner;
 pub mod sched;
 pub mod thread_setup;

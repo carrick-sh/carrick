@@ -997,3 +997,29 @@ continuing CPU1/fork then the two-MM witness. This supersedes the temporary
 push hold above; push the committed work branch labelled with that red.
 No further attribution or arena edits are needed. Source remains frozen;
 resume the guest payload/native integration after the watchdog continuation.
+
+## Guest payload adapter continuation (2026-10-07)
+
+Inherited checkpoint 2a2ca03c0 is normally pushed with the known, separately
+owned arena host-test red labelled. Shared-kernel d355743b2 was already
+merged. The scratch payload adapter is now real source in
+`personality/process_owner.rs`, with twelve concrete sibling tests. It uses
+the sole scheduler-core registry for birth, wait and reserved exit; native
+resources, context and non-Clone numeric claims remain row payloads.
+
+First compile caught a borrow lifetime in the wrong-member negative test;
+a lexical scope releases the failed pending-exit result before inspecting
+the owner. This compile failure is not semantic red evidence. Removing the
+exact TaskKey guards gives the recycled-PID assertion failure in
+/tmp/x86-cont-payload-key-red.log. Restored custody passes twelve tests and
+all 263 EL1 lib tests in /tmp/x86-cont-payload-final-tests.log. All-target
+focused clippy passes in /tmp/x86-cont-payload-clippy-green.log, including
+the nested ARM freestanding image build; its initial type-complexity finding
+is corrected with a named selection alias. The one new host-only fail-stop
+is classified as carrier_fault el1::process_owner, preserving the existing
+freestanding fatal transport.
+
+This is payload custody only. Production ProcessNative, initial ELF/stack
+VMA and residency imports, frame-level inheritance, per-MM InitialWords,
+real COW and CPU1 execution remain to bind. No two-MM green, new ignore,
+Docker run, signed HVF result or review-ready milestone is claimed.
