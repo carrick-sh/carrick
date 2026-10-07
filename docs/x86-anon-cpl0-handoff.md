@@ -235,3 +235,33 @@ has its one inherited ARM fatal_entry_binding hvc difference. Comparison to
 710980f1c passes with zero failures, including no new ARM drift. Receipts:
 `/tmp/x86-anon-review-el1.log`, `/tmp/x86-anon-review-asm-n1.log`, and
 `/tmp/x86-anon-review-asm-milestone.log`.
+
+## Shared-kernel shootdown gate attribution (2026-10-07)
+
+Final full KVM gate on the review correction was red at
+`two_running_vcpus_drop_stale_translation_on_shootdown`: a running CPU's
+acknowledgement lagged the published generation. Preserve
+`/tmp/x86-anon-review-final-kvm.log`; do not call this gate green.
+
+The director requested fixed 50-run samples on clean pure shared-kernel
+and the review revision and authorized pushing review fixes if the pure
+branch also failed, labelled with this evidence. Separate freshly built
+artifacts, sampled sequentially with no concurrent guest workloads:
+
+- Pure `7d6daf2873ce38dc7cfecb1d8a330a97c4759f1e`: 22 failures / 50.
+- Review `8aa876fde48bd11af4364d647b0377dcae09c367`: 25 failures / 50.
+- Same failure: `running CPU must acknowledge shootdown` (pure line 1249;
+  review line 1264). Example: `/tmp/x86-shootdown-pure-fresh-50/4.log`.
+- Raw logs and fixed sample exit statuses:
+  `/tmp/x86-shootdown-pure-fresh-50/`,
+  `/tmp/x86-shootdown-review-fresh-50/`; artifact SHA256s:
+  `/tmp/x86-shootdown-fresh-artifacts.sha256`.
+
+An initial attribution attempt reused a target directory across checkouts;
+subsequent review compilation rejected stale nested CPL0 metadata. That
+attempt is excluded from the comparison. Both authoritative artifacts
+were rebuilt into separate new target directories. No retry-until-green,
+new ignore, assertion weakening, shootdown-code fix or timeout change was
+made. The director routes the shared-kernel defect to its owner. Review
+correction gates otherwise passed: EL1 249, clippy, fmt-check and clean-tree
+lint-domains. Signed HVF remains unavailable on this host.
