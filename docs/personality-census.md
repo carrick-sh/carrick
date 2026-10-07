@@ -171,7 +171,6 @@ Mixed crates contain runtime or substrate mechanisms that currently embed Linux 
 | [`crates/carrick-el1/src/memory.rs:534`](crates/carrick-el1/src/memory.rs#L534) | `fn` | `serve_delegated_anonymous` | LINUX_*/SYS_* | LINUX_*/SYS_*: ['SYS_MPROTECT', 'SYS_BRK', 'SYS_MMAP'] |
 | [`crates/carrick-el1/src/memory.rs:685`](crates/carrick-el1/src/memory.rs#L685) | `fn` | `try_serve_munmap` | LINUX_*/SYS_*, errno | LINUX_*/SYS_*: ['SYS_MUNMAP'], errno: ['ENOMEM', 'EINVAL'] |
 | [`crates/carrick-el1/src/memory.rs:744`](crates/carrick-el1/src/memory.rs#L744) | `fn` | `try_serve_mprotect` | LINUX_*/SYS_*, errno | LINUX_*/SYS_*: ['SYS_MPROTECT'], errno: ['EINVAL'] |
-| [`crates/carrick-el1/src/personality/common_entry.rs:35`](crates/carrick-el1/src/personality/common_entry.rs#L35) | `fn` | `serve_canonical` | LINUX_*/SYS_* | LINUX_*/SYS_*: ['SYS_SET_ROBUST_LIST'] |
 | [`crates/carrick-el1/src/personality/dispatch.rs:259`](crates/carrick-el1/src/personality/dispatch.rs#L259) | `fn` | `dispatch_syscall_with_lifecycle` | LINUX_*/SYS_* | LINUX_*/SYS_*: ['SYS_EPOLL_PWAIT', 'SYS_RT_SIGPROCMASK', 'SYS_WRITE'] |
 | [`crates/carrick-el1/src/personality/file.rs:12`](crates/carrick-el1/src/personality/file.rs#L12) | `const` | `EBADF` | errno | errno: ['EBADF'] |
 | [`crates/carrick-el1/src/personality/file.rs:13`](crates/carrick-el1/src/personality/file.rs#L13) | `const` | `EFAULT` | errno | errno: ['EFAULT'] |

@@ -259,6 +259,16 @@ fn production_image_rejects_fixture_syscalls() {
             .iter()
             .find(|symbol| elf.strtab.get_at(symbol.st_name) == Some(name))
     };
+    let production_entry = symbol(&production_elf, "carrick_x86_enter")
+        .expect("production entry symbol must remain linked");
+    assert!(
+        production_elf.program_headers.iter().any(|header| {
+            header.p_type == goblin::elf::program_header::PT_LOAD
+                && production_entry.st_value >= header.p_vaddr
+                && production_entry.st_value < header.p_vaddr + header.p_filesz
+        }),
+        "production entry must occupy a LOAD segment"
+    );
     for name in [
         "carrick_x86_fixture_dispatch_witness",
         "CARRICK_X86_FIXTURE_DISPATCH_WITNESSES",

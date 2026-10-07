@@ -1039,6 +1039,17 @@
     },
     {
       "file": "crates/carrick-el1/src/personality/lifecycle.rs",
+      "function": "<El1PendingFamilies<'a,F,C,U,G> as LifecycleNative<'a>>::prepare_child",
+      "ordinal_in_function": 1,
+      "fingerprint": "4f196a964b1d760152b4de23f5130a2d4fa483d3569a41527552b1a2b1d34ed0",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1::prepare_child",
+      "rationale": "Child creation was admitted with an ARM native frame, but that frame disappeared before context publication. Returning silently would leave a partially prepared child; this is carrier invariant failure.",
+      "sink": "fatal",
+      "domain": "el1::prepare_child"
+    },
+    {
+      "file": "crates/carrick-el1/src/personality/lifecycle.rs",
       "function": "<El1PendingFamilies<'a,F,C,U,G> as LifecycleNative<'a>>::run_next",
       "ordinal_in_function": 1,
       "fingerprint": "067465495ab07aa077d16acf0f5136c18f55a7fe7f9aaa12d861404b174e7632",
