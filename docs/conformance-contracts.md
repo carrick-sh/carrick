@@ -616,6 +616,17 @@ The VM-free binding is `carrick-sched-core::process::exit_tests`, plus existing
 host exit/thread-reservation tests through the same owner. Selection visits
 only the exiting task, its ancestry, its children and its affected parents;
 it does not scan the registry population. Private prepared-plan fields keep
-adopter and child-set selection in the shared owner. Terminal zombie,
-cancellation and notification publication extraction, signed ARM binding and
+adopter and child-set selection in the shared owner. Terminal zombie publication,
+exit-group member selection, reservation release and parent notification ordering
+use the same owner. Cancellation authority requires the exact opaque reservation
+incarnation; its parent permit is available only after cancelling those members.
+Notification selection authenticates the exact parent, then snapshots signal
+state outside the registry guard through the existing shared signal policy.
+
+The structural exit-effect test uses 1/8/32/128 own members and 512 unrelated
+processes: it visits each own member once, performs at most four identity reads
+for the exiting task, and performs zero unrelated identity/member reads. A full
+population-scan mutant fails this budget. An unrelated reservation is refused
+before exit begins, and a rebound reservation with the same numeric transaction
+cannot release old effects or be erased by old rollback. Signed ARM binding and
 the live CPL0 two-MM witness remain open; no runtime-ratio claim is made.

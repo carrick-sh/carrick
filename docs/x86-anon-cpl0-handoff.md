@@ -655,3 +655,47 @@ Linux host; no Docker or signed acceptance was run. No load generators
 were started; pgrep found none. No shared-kernel change was merged.
 Cancellation/notification ownership and CPL0/CPU1/two-MM binding remain
 open. This is an intermediate work-branch milestone, not review-ready.
+
+
+## Exit effects continuation (2026-10-07, host gates green)
+
+The shared owner now selects exit-group members and retains cancellation
+custody until its exact reservation release. Reservation rows, their set permit
+and the release token share one opaque incarnation: reusing a transaction
+number cannot release old effects, validate an old permit, or erase a rebound
+reservation during rollback. Exit admission also requires this plan's exact
+participant objects and every reserved ID before changing lifecycle state.
+After member cancellation, the owner issues the only parent notification
+permit, authenticates the parent's generation, and uses the existing portable
+signal policy. Host signal locks remain outside the registry guard; host ptrace,
+namespace, file retirement and vfork transport preserve their prior order.
+File-table resource capture deduplicates typed IDs while preserving first-seen
+order. `InitialWords` and the production page-fault entry are unchanged.
+
+Red-first evidence:
+- `/tmp/x86-process-exit-release-incarnation-red.log`: reused numeric transaction
+  accepts another reservation's release; 3 pass / 1 fail. Opaque incarnation
+  restores the four-test green.
+- `/tmp/x86-process-exit-effects-admission-red.log`: unrelated reservation
+  authorizes exit admission; 4 pass / 1 fail. Exact plan binding restores all
+  five tests in `/tmp/x86-process-exit-effects-admission-green.log`.
+- `/tmp/x86-process-exit-effects-budget-red.log`: deliberately scanning all
+  processes violates the targeted-work budget; restored owner passes at
+  1/8/32/128 members with 512 unrelated processes.
+
+The first host gate was deliberately cancelled for the additional admission
+check; its status 143 is retained separately and is not passing evidence.
+Final-source `just test`, `just test-kernel-semantics` and `just clippy` exited
+zero, recorded in `/tmp/x86-process-exit-effects-final-{host,semantics,clippy}.log`
+and their `.status` files. Five shared tests passed in
+`/tmp/x86-process-exit-effects-final-unit.log`. The result type alias fixes
+clippy without allowing the lint. No review-ready,
+CPU1 execution or two-live-MM green is claimed yet. No shared-kernel merge was
+performed; the independently owned shootdown red remains labelled by the
+previous receipt and its 22/50 versus 25/50 baseline observations.
+
+At the next clean boundary, merge director-authorized shared-kernel 51236d3d5.
+The director reports zero failures in 50 focused and 20 complete shootdown
+runs. Retarget its IRQ #PF header to PR #82's existing user-fault entry, remove
+its additional fault receiver, and put settlement and the fixture completion
+suffix into the single entry. Then require zero failures in the full KVM gate.

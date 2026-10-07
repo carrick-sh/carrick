@@ -97,6 +97,7 @@ name = "carrick-sched-core"
 version = "0.1.0"
 dependencies = [
  "carrick-guest-arch",
+ "carrick-signal-core",
  "carrick-syscall-abi",
  "zerocopy",
 ]

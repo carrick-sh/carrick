@@ -12,8 +12,7 @@ use carrick_fatal::carrick_fatal;
 use carrick_hal::KernelTransactionId;
 
 use super::{
-    KernelFailpoint, KernelOperationError, TaskGraphReservation, TaskSetReservation,
-    check_failpoint, next_revision,
+    KernelFailpoint, KernelOperationError, TaskSetReservation, check_failpoint, next_revision,
 };
 use crate::kernel::core::{
     FileCloseDisposition, FileCloseEvent, Kernel, KernelContext, RegistryState,
@@ -70,6 +69,59 @@ impl carrick_sched_core::process::exit::ExitLive<crate::kernel::container::Conta
         self.task
             .reserve_exit_participant_revision(self.revision)
             .ok_or(KernelOperationError::RevisionExhausted)
+    }
+}
+pub(in crate::kernel) struct HostExitMember(crate::kernel::objects::ThreadRef);
+impl carrick_sched_core::process::exit::ExitMember for HostExitMember {
+    fn exit_task(&self) -> TaskKey {
+        self.0.task_key()
+    }
+}
+impl carrick_sched_core::process::exit::ExitEffectSource<crate::kernel::container::ContainerId>
+    for TaskRecord
+{
+    type Member = HostExitMember;
+    type Resources = Vec<Arc<FileTable>>;
+    fn exit_members(&self) -> (Vec<Self::Member>, Self::Resources) {
+        let mut members = Vec::new();
+        let mut files = Vec::new();
+        let mut seen = BTreeSet::new();
+        for key in self.task.thread_keys() {
+            if let Some(thread) = self.task.thread(key.tid) {
+                let table = thread.resources().files();
+                if seen.insert(table.id()) {
+                    files.push(table);
+                }
+                members.push(HostExitMember(thread));
+            }
+        }
+        (members, files)
+    }
+    fn exit_begin(&self) -> bool {
+        self.task.begin_exit()
+    }
+}
+pub(in crate::kernel) struct HostExitParent(Arc<crate::kernel::objects::Task>);
+impl carrick_sched_core::process::exit::ExitSignalSource for HostExitParent {
+    fn exit_signal_state(
+        &self,
+        signal: crate::kernel::ids::LinuxSignal,
+    ) -> carrick_sched_core::process::exit::ExitSignalState {
+        let action = self.0.shared().sighand().action_entry(signal);
+        let blocked = self.0.threads().iter().any(|thread| {
+            let state = thread.signal_state.lock();
+            thread.blocked_mask().contains(signal.raw())
+                || state
+                    .active_wait_set()
+                    .is_some_and(|set| set.contains(signal.raw()))
+        });
+        crate::kernel::objects::signal::child_exit_signal_state(action, blocked)
+    }
+}
+impl carrick_sched_core::process::exit::ExitNotificationSource for TaskRecord {
+    type Target = HostExitParent;
+    fn exit_notification_target(&self) -> HostExitParent {
+        HostExitParent(Arc::clone(&self.task))
     }
 }
 impl carrick_sched_core::process::exit::ExitLivePublication<crate::kernel::container::ContainerId>
@@ -668,18 +720,8 @@ impl Kernel {
             namespace_session,
         );
         let result_zombie = registry_zombie.clone();
-        let task_ids: Vec<_> = topology.reserved_ids().iter().copied().collect();
-        let reservation = TaskSetReservation::acquired(self, &mut state, task_ids, transaction)?;
-        state.reservations.insert(
-            task_id,
-            TaskGraphReservation::exit_participant(transaction, topology.task_revision()),
-        );
-        for (affected_id, participant) in topology.participants() {
-            state.reservations.insert(
-                *affected_id,
-                TaskGraphReservation::exit_participant(transaction, participant.revision()),
-            );
-        }
+        let reservation =
+            TaskSetReservation::acquired_exit(self, &mut state, &topology, transaction)?;
         drop(state);
         check_failpoint(failpoint, KernelFailpoint::AfterReserve)?;
         check_failpoint(failpoint, KernelFailpoint::AfterObjects)?;
@@ -734,15 +776,16 @@ impl Kernel {
         if exiting_record.task.lifecycle() != TaskLifecycle::Live {
             return Err(KernelOperationError::ExitTopologyChanged(prepared.task.id));
         }
-        state.validate_exit_topology(prepared.task, &prepared.topology)?;
+        let own_tracer = exiting_record.task.ptrace_tracer();
+        let mut effects = state.begin_exit_effects(
+            prepared.task,
+            &prepared.topology,
+            &prepared.reservation.permit,
+        )?;
         // ptrace(2): a tracer's exit detaches every tracee it still owns, and
         // a detached stopped tracee resumes. Capture the tracer key before
         // `begin_exit` clears this task's own tracee-side record so the tracer
         // can drop its index entry and re-evaluate a wait on this task.
-        let own_tracer = exiting_record.task.ptrace_tracer();
-        if !exiting_record.task.begin_exit() {
-            return Err(KernelOperationError::AlreadyExiting(prepared.task.id));
-        }
         let mut released_tracees = Vec::new();
         for tracee_key in exiting_record.task.take_ptrace_tracees() {
             if let Some(tracee) = state
@@ -765,20 +808,7 @@ impl Kernel {
         if let Some(tracer) = &own_tracer {
             tracer.remove_ptrace_tracee(prepared.task);
         }
-        let mut exiting_threads = Vec::new();
-        let mut exiting_file_tables = Vec::new();
-        for thread_key in exiting_record.task.thread_keys() {
-            if let Some(thread) = exiting_record.task.thread(thread_key.tid) {
-                let files = thread.resources().files();
-                if !exiting_file_tables
-                    .iter()
-                    .any(|observed| Arc::ptr_eq(observed, &files))
-                {
-                    exiting_file_tables.push(files);
-                }
-                exiting_threads.push(thread);
-            }
-        }
+        let exiting_file_tables = effects.take_resources().unwrap_or_default();
 
         let record = state
             .tasks
@@ -865,7 +895,7 @@ impl Kernel {
                 drop(retiring);
                 let pending_publication = prepared.reservation.commit(&mut state)?;
                 drop(state);
-                pending_publication.publish();
+                let released = pending_publication.publish();
 
                 if let Some(parent_key) = prepared.topology.autoreap_parent() {
                     kernel.auditors().reaped(parent_key, prepared.task);
@@ -910,43 +940,31 @@ impl Kernel {
                 }
                 // Cancellation can wake a host waiter, whose callback may re-enter the
                 // registry. Never invoke it while holding the topology write lock.
-                for thread in exiting_threads {
-                    let _ = thread.cancel_kernel_owned_continuation(
+                let parent_permit = effects.after_release(released)?.cancel_members(|thread| {
+                    let _ = thread.0.cancel_kernel_owned_continuation(
                         crate::kernel::continuation::CancellationCause::ProcessExit,
                     );
-                }
+                });
                 // Queue the parent's exit notification after the exit reservation is
                 // committed. If notify_parent ran before commit, a parent that woke
                 // immediately would see TaskBusy in wait_child_matching and park in
                 // BlockedContinuation having already consumed this exit's wake edge,
                 // wedging forever.
-                if let Some(parent_key) = prepared.result_zombie.parent {
-                    let parent_task = {
-                        let state = kernel.registry().settled().read();
-                        state
-                            .tasks
-                            .get(&parent_key.id)
-                            .filter(|record| record.task.key() == parent_key)
-                            .map(|record| Arc::clone(&record.task))
-                    };
-                    if let Some(parent_task) = parent_task {
-                        let posted = match prepared.result_zombie.exit_signal {
-                            crate::kernel::ids::ChildExitSignal::Signal(signal) => {
-                                if child_exit_signal_needs_notification(&parent_task, signal) {
-                                    let siginfo = exit_siginfo_for_zombie(&prepared.result_zombie);
-                                    kernel.post_signal_to_task_key(parent_key, signal, siginfo)
-                                } else {
-                                    false
-                                }
-                            }
-                            crate::kernel::ids::ChildExitSignal::None => false,
-                        };
-                        if !posted {
-                            parent_task.wake();
-                        }
+                let parent_target = {
+                    let state = kernel.registry().settled().read();
+                    state.select_exit_parent(&parent_permit)
+                };
+                if let Some(target) = parent_target {
+                    let notification = target.prepare();
+                    let posted = notification.signal.is_some_and(|signal| {
+                        let siginfo = exit_siginfo_for_zombie(&prepared.result_zombie);
+                        kernel.post_signal_to_task_key(notification.parent, signal, siginfo)
+                    });
+                    if !posted {
+                        notification.payload.0.wake();
                     }
                 }
-                notify_parent(prepared.result_zombie.parent);
+                notify_parent(parent_permit.parent());
                 for tracee in released_tracees {
                     tracee.wake();
                 }
@@ -1071,25 +1089,6 @@ impl Kernel {
             }
         }
     }
-}
-
-fn child_exit_signal_needs_notification(
-    parent: &crate::kernel::objects::Task,
-    signal: crate::kernel::ids::LinuxSignal,
-) -> bool {
-    let action = parent.shared().sighand().action_entry(signal);
-    let any_thread_blocks = parent.threads().iter().any(|thread| {
-        let state = thread.signal_state.lock();
-        thread.blocked_mask().contains(signal.raw())
-            || state
-                .active_wait_set()
-                .is_some_and(|set| set.contains(signal.raw()))
-    });
-    crate::kernel::objects::signal::child_exit_signal_needs_notification(
-        signal,
-        action,
-        any_thread_blocks,
-    )
 }
 
 fn exit_siginfo_for_zombie(zombie: &Zombie) -> Option<carrick_abi::LinuxSiginfo> {
