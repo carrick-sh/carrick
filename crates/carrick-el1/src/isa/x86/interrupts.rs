@@ -2,6 +2,7 @@
 
 pub const TIMER_VECTOR: u8 = 0xe0;
 pub const KICK_VECTOR: u8 = 0xe1;
+pub const RESCHED_VECTOR: u8 = 0xe2;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
 pub const LAPIC_BASE: u64 = 0xfee0_0000;
 pub const LAPIC_VA: u64 = 0xffff_ffff_d000_0000;
@@ -174,7 +175,7 @@ pub mod hardware {
     /// # Safety
     /// Caller has published wake ownership first. APIC destination names a
     /// retained CPU, never a task/host PID. No interrupt-send busy polling.
-    pub unsafe fn send_wake(apic_id: ApicId) -> Result<(), IpiBusy> {
+    unsafe fn send_ipi(apic_id: ApicId, vector: u8) -> Result<(), IpiBusy> {
         // A busy command is not a delivered wake. Return owned work to the
         // caller instead of spinning with IF masked or dropping the command.
         if unsafe { core::ptr::read_volatile((LAPIC_VA + 0x300) as *const u32) } & (1 << 12) != 0 {
@@ -182,9 +183,19 @@ pub mod hardware {
         }
         unsafe {
             write(0x310, u32::from(apic_id.0) << 24);
-            write(0x300, u32::from(KICK_VECTOR));
+            write(0x300, u32::from(vector));
         }
         Ok(())
+    }
+    /// # Safety
+    /// Caller owns a published wake and names a retained APIC destination.
+    pub unsafe fn send_wake(apic_id: ApicId) -> Result<(), IpiBusy> {
+        unsafe { send_ipi(apic_id, KICK_VECTOR) }
+    }
+    /// # Safety
+    /// Caller owns a published scheduler wake for a retained CPU slot.
+    pub unsafe fn send_resched(apic_id: ApicId) -> Result<(), IpiBusy> {
+        unsafe { send_ipi(apic_id, RESCHED_VECTOR) }
     }
     /// # Safety
     /// CPL0 reads the mapped local APIC In-Service Register (ISR).
