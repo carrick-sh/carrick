@@ -213,6 +213,9 @@ impl Kernel {
         // consume. The shared owner selects and reaps under this write guard.
         let mut state = self.registry().settled().write();
         let consumed = state.consume_wait(parent_id, query).map_err(wait_error)?;
+        // Preserve host numeric-claim release under the registry write guard,
+        // before namespace effects and reaped observers can run.
+        drop(consumed.reaped_record);
         let region = consumed.reaped_parent.and_then(|_| {
             state
                 .tasks
