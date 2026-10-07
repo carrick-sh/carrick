@@ -1318,6 +1318,37 @@ mod kernel {
     }
 }
 
+// The production macro removes every fixture state access; this image seam
+// returns immediately there. Only the fixture image carries ordering holds.
+#[cfg(target_os = "none")]
+#[unsafe(no_mangle)]
+pub extern "Rust" fn carrick_fixture_hold_check(
+    _table: &carrick_el1::isa::x86::context::native::ShootdownTable,
+    _target_mode: u32,
+) -> Result<(), carrick_el1::isa::ArchError> {
+    fixture_stmt! {
+        if _table.fixture_hold_ipi.load(core::sync::atomic::Ordering::Acquire) == _target_mode {
+            // SAFETY: this fixture owns the identity-mapped control data page.
+            // Release its running reader only after the edit reached this hold.
+            unsafe { core::ptr::write_volatile(0x4_0008 as *mut u8, 1); }
+            let Some(tsc_hz) = carrick_el1::isa::x86::interrupt::tsc_frequency() else {
+                return Err(carrick_el1::isa::ArchError::Unbound);
+            };
+            let Some(limit) = tsc_hz.get().checked_mul(5) else {
+                return Err(carrick_el1::isa::ArchError::Unbound);
+            };
+            let start = carrick_el1::isa::x86::interrupt::read_tsc();
+            while _table.fixture_hold_ipi.load(core::sync::atomic::Ordering::Acquire) == _target_mode {
+                if carrick_el1::isa::x86::interrupt::read_tsc().wrapping_sub(start) > limit {
+                    return Err(carrick_el1::isa::ArchError::Busy);
+                }
+                core::hint::spin_loop();
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "none")]
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
