@@ -906,6 +906,7 @@ impl PreparedRun {
         // (`.semgrep/typed-domains.yml::no-cfg-not-platform-macos`).
         #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
         let run = if backend == ExecutionBackend::KvmX86Cpl0 {
+            let mut dispatcher = dispatcher;
             let _ = (&debug_state_path, &root, &carrier, &carrier_lease);
             let bytes = dispatcher.read_exec_file(&executable).ok_or_else(|| {
                 RuntimeError::Unsupported(format!("guest executable not found: {executable}"))
@@ -918,8 +919,49 @@ impl PreparedRun {
             let mut machine =
                 carrick_vmm_kvm::cpl0_boot::Cpl0Carrier::boot_production(extent_bytes)?;
             machine.load_guest_mm(&image, &argv, &env)?;
-            let (exit_code, traps) = machine.run_initial_process(max_traps, |fd, bytes| {
-                dispatcher.forward_stdio_bytes(fd, bytes)
+            let reporter = carrick_kernel::compat::CompatReporter::default();
+            let (exit_code, traps) = machine.run_initial_process(max_traps, |machine, frame| {
+                use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
+                use carrick_kernel::dispatch::{DispatchOutcome, SyscallRequest};
+                use carrick_vmm_kvm::cpl0_boot::InitialSyscallDisposition as Decision;
+                let syscall = carrick_guest_mem::X8664SyscallFrame {
+                    rax: frame.rax,
+                    rdi: frame.rdi,
+                    rsi: frame.rsi,
+                    rdx: frame.rdx,
+                    r10: frame.r10,
+                    r8: frame.r8,
+                    r9: frame.r9,
+                };
+                let raw = match X8664GuestArch::normalize_syscall(&syscall) {
+                    SyscallNorm::Plain(raw) => raw,
+                    SyscallNorm::ArchPrctl { code, addr } => {
+                        let value =
+                            carrick_hal::x8664_arch::service_arch_prctl(machine, code, addr)?;
+                        return Ok(Decision::Return(value));
+                    }
+                };
+                let kernel = dispatcher.capture_one_task_context().map_err(|error| {
+                    carrick_hal::TrapError::Hypervisor(format!(
+                        "capture x86 syscall context: {error}"
+                    ))
+                })?;
+                let request = SyscallRequest::from_raw(raw).with_current_guest_sp(Some(frame.rsp));
+                let outcome = dispatcher
+                    .dispatch(&kernel, request, machine, &reporter)
+                    .map_err(|error| {
+                        carrick_hal::TrapError::Hypervisor(format!("dispatch x86 syscall: {error}"))
+                    })?;
+                match outcome {
+                    DispatchOutcome::Returned { value } => Ok(Decision::Return(value)),
+                    DispatchOutcome::Errno { errno } => Ok(Decision::Return(errno.guest_retval())),
+                    DispatchOutcome::Exit { code } | DispatchOutcome::ThreadExit { code } => {
+                        Ok(Decision::Exit(code))
+                    }
+                    other => Err(carrick_hal::TrapError::Hypervisor(format!(
+                        "x86 syscall needs runtime completion: {other:?}"
+                    ))),
+                }
             })?;
             let (guest_entries, host_forwards) = machine.initial_execution_witness();
             let report = crate::compat::CompatReport {

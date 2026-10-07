@@ -12,41 +12,83 @@ use std::time::Duration;
 
 use assert_cmd::Command;
 
+const ELF_HEADER_SIZE: usize = 64;
+const ELF_PROGRAM_HEADER_SIZE: usize = 56;
+const ELF_CODE_OFFSET: usize = 0x1000;
+const ELF_LOAD_BASE: u64 = 0x400000;
+const ELF_ENTRY: u64 = ELF_LOAD_BASE + ELF_CODE_OFFSET as u64;
+const ELF_X86_64_MACHINE: u16 = 62;
+const X86_SYS_WRITE: u8 = 1;
+const X86_SYS_EXIT: u8 = 60;
+
 fn hello_elf() -> Vec<u8> {
     // _start: write(1, "hello\n", 6); exit(7). The RIP displacement points
     // at the six literal bytes after the final syscall instruction.
     let code: &[u8] = &[
-        0xb8, 1, 0, 0, 0, // mov eax, 1
-        0xbf, 1, 0, 0, 0, // mov edi, 1
-        0x48, 0x8d, 0x35, 0x13, 0, 0, 0, // lea rsi, [rip+19]
-        0xba, 6, 0, 0, 0, // mov edx, 6
-        0x0f, 0x05, // syscall
-        0xbf, 7, 0, 0, 0, // mov edi, 7
-        0xb8, 60, 0, 0, 0, // mov eax, 60
-        0x0f, 0x05, // syscall
-        b'h', b'e', b'l', b'l', b'o', b'\n',
+        0xb8,
+        X86_SYS_WRITE,
+        0,
+        0,
+        0, // mov eax, SYS_write
+        0xbf,
+        1,
+        0,
+        0,
+        0, // mov edi, 1
+        0x48,
+        0x8d,
+        0x35,
+        0x13,
+        0,
+        0,
+        0, // lea rsi, [rip+19]
+        0xba,
+        6,
+        0,
+        0,
+        0, // mov edx, 6
+        0x0f,
+        0x05, // syscall
+        0xbf,
+        7,
+        0,
+        0,
+        0, // mov edi, 7
+        0xb8,
+        X86_SYS_EXIT,
+        0,
+        0,
+        0, // mov eax, SYS_exit
+        0x0f,
+        0x05, // syscall
+        b'h',
+        b'e',
+        b'l',
+        b'l',
+        b'o',
+        b'\n',
     ];
-    let mut elf = vec![0_u8; 0x1000 + code.len()];
+    let mut elf = vec![0_u8; ELF_CODE_OFFSET + code.len()];
     elf[..4].copy_from_slice(b"\x7fELF");
     elf[4..7].copy_from_slice(&[2, 1, 1]);
     elf[16..18].copy_from_slice(&2_u16.to_le_bytes());
-    elf[18..20].copy_from_slice(&62_u16.to_le_bytes());
+    elf[18..20].copy_from_slice(&ELF_X86_64_MACHINE.to_le_bytes());
     elf[20..24].copy_from_slice(&1_u32.to_le_bytes());
-    elf[24..32].copy_from_slice(&0x401000_u64.to_le_bytes());
-    elf[32..40].copy_from_slice(&64_u64.to_le_bytes());
-    elf[52..54].copy_from_slice(&64_u16.to_le_bytes());
-    elf[54..56].copy_from_slice(&56_u16.to_le_bytes());
+    elf[24..32].copy_from_slice(&ELF_ENTRY.to_le_bytes());
+    elf[32..40].copy_from_slice(&(ELF_HEADER_SIZE as u64).to_le_bytes());
+    elf[52..54].copy_from_slice(&(ELF_HEADER_SIZE as u16).to_le_bytes());
+    elf[54..56].copy_from_slice(&(ELF_PROGRAM_HEADER_SIZE as u16).to_le_bytes());
     elf[56..58].copy_from_slice(&1_u16.to_le_bytes());
-    let ph = 64;
+    let ph = ELF_HEADER_SIZE;
     elf[ph..ph + 4].copy_from_slice(&1_u32.to_le_bytes());
     elf[ph + 4..ph + 8].copy_from_slice(&5_u32.to_le_bytes());
     elf[ph + 8..ph + 16].copy_from_slice(&0_u64.to_le_bytes());
-    elf[ph + 16..ph + 24].copy_from_slice(&0x400000_u64.to_le_bytes());
+    elf[ph + 16..ph + 24].copy_from_slice(&ELF_LOAD_BASE.to_le_bytes());
     let image_len = elf.len() as u64;
     elf[ph + 32..ph + 40].copy_from_slice(&image_len.to_le_bytes());
     elf[ph + 40..ph + 48].copy_from_slice(&image_len.to_le_bytes());
-    elf[ph + 48..ph + 56].copy_from_slice(&0x1000_u64.to_le_bytes());
-    elf[0x1000..].copy_from_slice(code);
+    elf[ph + 48..ph + 56].copy_from_slice(&(ELF_CODE_OFFSET as u64).to_le_bytes());
+    elf[ELF_CODE_OFFSET..].copy_from_slice(code);
     elf
 }
 
@@ -211,6 +253,21 @@ fn mounted_static_x86_bad_write_returns_efault_and_continues() {
 }
 
 #[test]
+fn mounted_static_x86_forwarded_getpid_uses_shared_dispatcher() {
+    compare_mounted_assembly_with_native("x86_dispatch_getpid.S", b"D\n");
+}
+
+#[test]
+fn mounted_static_x86_arch_prctl_preserves_user_tls_bases() {
+    compare_mounted_assembly_with_native("x86_dispatch_segments.S", b"T\n");
+}
+
+#[test]
+fn mounted_static_x86_dispatches_libc_startup_calls() {
+    compare_mounted_assembly_with_native("x86_dispatch_startup.S", b"S\n");
+}
+
+#[test]
 fn mounted_static_x86_memory_and_fork_wait_match_native() {
     compare_mounted_assembly_with_native("x86_memory_fork_wait.S", b"F\n");
 }
@@ -287,7 +344,8 @@ fn compare_mounted_assembly_with_native(fixture: &str, expected_stdout: &[u8]) {
     assert_eq!(
         run.stdout,
         native.stdout,
-        "Carrick stderr: {}",
+        "Carrick status: {:?}; stderr: {}",
+        run.status,
         String::from_utf8_lossy(&run.stderr)
     );
     assert_eq!(

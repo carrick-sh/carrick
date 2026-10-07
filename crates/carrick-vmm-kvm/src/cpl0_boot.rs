@@ -27,6 +27,7 @@ use carrick_el1_abi::{
 };
 use carrick_guest_arch::FrameGpa;
 use carrick_guest_arch::{AddressContext, ContextGeneration, MmGeneration, RootGpa, UserVa};
+use carrick_guest_mem::{CurrentMmMemory, GuestMemory, MemoryError};
 use carrick_hal::{
     FrameEventCapacity, FrameInventoryEvent, FrameLength, MappingGeneration, MemPerms,
 };
@@ -127,6 +128,12 @@ fn fixture_cpuid_with_tsc_hz(
         entries.push(clock);
     }
     Ok(())
+}
+
+/// The host's disposition of one Linux call forwarded by the shared guest.
+pub enum InitialSyscallDisposition {
+    Return(i64),
+    Exit(i32),
 }
 
 fn backing_identity(ids: &ObjectIdRegistry) -> Result<BackingIdentity, TrapError> {
@@ -1407,49 +1414,17 @@ impl Cpl0Carrier {
         Ok(())
     }
 
-    fn read_initial_user(
-        &self,
-        root: RootGpa,
-        start: u64,
-        len: usize,
-    ) -> Result<Vec<u8>, TrapError> {
-        // A bounded host crossing may complete a short write. An unmapped
-        // next page returns the already copied prefix, as Linux write does.
-        let limit = len.min(1024 * 1024);
-        let mut bytes = Vec::with_capacity(limit);
-        while bytes.len() < limit {
-            let Some(va) = start.checked_add(bytes.len() as u64) else {
-                break;
-            };
-            let Ok(leaf) =
-                translate_leaf(&self._vm.words(), root, UserVa::new(va), Access::Read, true)
-            else {
-                break;
-            };
-            let span = (4096 - (va & 4095)) as usize;
-            let count = span.min(limit - bytes.len());
-            bytes.extend(
-                self._vm
-                    .read(leaf.output, count)
-                    .map_err(|error| fail(error.to_string()))?,
-            );
-        }
-        Ok(bytes)
-    }
-
     /// Resume the published initial MM through the existing shared Linux
     /// personality. Only host-crossing calls leave CPL0 through FORWARD_PORT.
     pub fn run_initial_process(
         &mut self,
         max_exits: usize,
-        mut stdio: impl FnMut(i32, &[u8]) -> i64,
+        mut forward: impl FnMut(&mut Self, &NativeFrame) -> Result<InitialSyscallDisposition, TrapError>,
     ) -> Result<(i32, usize), TrapError> {
         let mm = NonZeroU64::new(INITIAL_MM_KEY).ok_or_else(|| fail("initial MM key"))?;
-        let root = self
-            ._vm
-            .root(mm)
-            .ok_or_else(|| fail("initial MM not published"))?
-            .root;
+        if self._vm.root(mm).is_none() {
+            return Err(fail("initial MM not published"));
+        }
         for exits in 1..=max_exits {
             let exit = HvVcpu::run(&mut self.cpus[0])?;
             if matches!(exit, VcpuExit::Kicked) {
@@ -1512,23 +1487,17 @@ impl Cpl0Carrier {
                 .ok_or_else(|| fail("initial syscall frame backing"))?
                 .cast::<NativeFrame>();
             // SAFETY: the stopped CPU published this exact stack-local frame.
-            let frame = unsafe { &mut *ptr };
+            // Copy it before lending the carrier to the host dispatcher, then
+            // write only the return register back before resuming the vCPU.
+            let mut frame = unsafe { *ptr };
             self.host_forwards += 1;
-            match frame.rax {
-                1 => {
-                    let fd = frame.rdi as u32 as i32;
-                    let len =
-                        usize::try_from(frame.rdx).map_err(|_| fail("initial write size range"))?;
-                    let bytes = self.read_initial_user(root, frame.rsi, len)?;
-                    frame.rax = if len != 0 && bytes.is_empty() {
-                        (-14_i64) as u64 // EFAULT before any byte was copied
-                    } else {
-                        stdio(fd, &bytes) as u64
-                    };
-                }
-                60 | 231 => return Ok(((frame.rdi & 255) as i32, exits)),
-                call => return Err(fail(format!("unported initial x86 syscall {call}"))),
+            match forward(self, &frame)? {
+                InitialSyscallDisposition::Return(value) => frame.rax = value as u64,
+                InitialSyscallDisposition::Exit(code) => return Ok((code, exits)),
             }
+            // SAFETY: `ptr` names the validated retained supervisor stack and
+            // the vCPU is stopped until the next `HvVcpu::run` above.
+            unsafe { ptr.write(frame) };
         }
         Err(fail("initial process exit budget exceeded"))
     }
@@ -2587,6 +2556,120 @@ impl Cpl0Carrier {
             }
         }
         Err(fail("CPL0 control exit budget exceeded"))
+    }
+}
+
+impl GuestMemory for Cpl0Carrier {
+    fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        let mm = NonZeroU64::new(INITIAL_MM_KEY).ok_or(MemoryError::Unsupported)?;
+        let root = self._vm.root(mm).ok_or(MemoryError::Unsupported)?.root;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|_| MemoryError::MetadataAllocation)?;
+        while bytes.len() < length {
+            let va = address
+                .checked_add(bytes.len() as u64)
+                .ok_or(MemoryError::OutOfBounds { address, length })?;
+            let leaf = translate_leaf(&self._vm.words(), root, UserVa::new(va), Access::Read, true)
+                .map_err(|_| MemoryError::OutOfBounds {
+                    address: va,
+                    length,
+                })?;
+            let count = (4096 - (va & 4095)) as usize;
+            let count = count.min(length - bytes.len());
+            bytes.extend(self._vm.read(leaf.output, count).map_err(|_| {
+                MemoryError::OutOfBounds {
+                    address: va,
+                    length,
+                }
+            })?);
+        }
+        Ok(bytes)
+    }
+
+    fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        let mm = NonZeroU64::new(INITIAL_MM_KEY).ok_or(MemoryError::Unsupported)?;
+        let root = self._vm.root(mm).ok_or(MemoryError::Unsupported)?.root;
+        let mut written = 0;
+        while written < bytes.len() {
+            let va = address
+                .checked_add(written as u64)
+                .ok_or(MemoryError::OutOfBounds {
+                    address,
+                    length: bytes.len(),
+                })?;
+            let leaf = translate_leaf(
+                &self._vm.words(),
+                root,
+                UserVa::new(va),
+                Access::Write,
+                true,
+            )
+            .map_err(|_| MemoryError::OutOfBounds {
+                address: va,
+                length: bytes.len(),
+            })?;
+            let count = ((4096 - (va & 4095)) as usize).min(bytes.len() - written);
+            self._vm
+                .write(leaf.output, &bytes[written..written + count])
+                .map_err(|_| MemoryError::OutOfBounds {
+                    address: va,
+                    length: bytes.len(),
+                })?;
+            written += count;
+        }
+        Ok(())
+    }
+}
+
+impl CurrentMmMemory for Cpl0Carrier {}
+
+impl carrick_hal::x8664_arch::SegmentBaseRegs for Cpl0Carrier {
+    fn seg_set_fs_base(&mut self, address: u64) -> Result<(), TrapError> {
+        let mut sregs = self.cpus[0]
+            .fd()
+            .get_sregs()
+            .map_err(|error| fail(format!("KVM_GET_SREGS(fs): {error}")))?;
+        sregs.fs.base = address;
+        self.cpus[0]
+            .fd()
+            .set_sregs(&sregs)
+            .map_err(|error| fail(format!("KVM_SET_SREGS(fs): {error}")))
+    }
+
+    fn seg_get_fs_base(&self) -> Result<u64, TrapError> {
+        self.cpus[0]
+            .fd()
+            .get_sregs()
+            .map(|sregs| sregs.fs.base)
+            .map_err(|error| fail(format!("KVM_GET_SREGS(fs): {error}")))
+    }
+
+    fn seg_set_gs_base(&mut self, address: u64) -> Result<(), TrapError> {
+        // FORWARD_PORT stops after SYSCALL's SWAPGS: GS is the kernel CPU
+        // binding and KERNEL_GS_BASE holds the user's value until IRET swaps
+        // them back. Never replace the live supervisor GS binding here.
+        const KERNEL_GS_BASE: u32 = 0xc000_0102;
+        let msrs = Msrs::from_entries(&[kvm_msr_entry {
+            index: KERNEL_GS_BASE,
+            data: address,
+            ..Default::default()
+        }])
+        .map_err(|error| fail(format!("KERNEL_GS_BASE entry: {error}")))?;
+        let written = self.cpus[0]
+            .fd()
+            .set_msrs(&msrs)
+            .map_err(|error| fail(format!("KVM_SET_MSRS(gs): {error}")))?;
+        if written != 1 {
+            return Err(fail("KVM_SET_MSRS(gs) refused entry"));
+        }
+        Ok(())
+    }
+
+    fn seg_get_gs_base(&self) -> Result<u64, TrapError> {
+        const KERNEL_GS_BASE: u32 = 0xc000_0102;
+        self.cpus[0].read_msr(KERNEL_GS_BASE)
     }
 }
 
