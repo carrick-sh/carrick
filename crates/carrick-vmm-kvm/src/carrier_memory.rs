@@ -469,6 +469,9 @@ impl CarrierMemory {
         let (output, identity) = match op {
             DescriptorOp::Map {
                 output, backing, ..
+            }
+            | DescriptorOp::Prepare {
+                output, backing, ..
             } => (output, backing),
             DescriptorOp::CowRepoint { new, backing, .. } => (new, backing),
             _ => return Ok(None),
