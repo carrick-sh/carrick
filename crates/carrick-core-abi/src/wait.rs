@@ -100,6 +100,7 @@ impl<'a> PortalWaitEnrollment<'a> {
             || {
                 self.source.is_live()
                     && (self.cause != SpaceWaitCause::Editor || self.source.editor_held())
+                    && (self.cause != SpaceWaitCause::Gate || self.source.gate_closed())
             },
         )
     }
@@ -184,6 +185,50 @@ mod tests {
                 Err((ObjectWaitError::Changed, _))
             ),
             "the revision can advance while the editor is held; a later park must recheck the editor"
+        );
+    }
+
+    #[test]
+    fn gate_wait_refuses_after_open_at_same_observed_revision() {
+        let ptr = unsafe { alloc::alloc::alloc_zeroed(Layout::new::<ZoneTables>()) };
+        assert!(!ptr.is_null());
+        let zone = unsafe { alloc::boxed::Box::from_raw(ptr.cast::<ZoneTables>()) };
+        let index = zone.spaces.publish_closed(77, 0x30000, 0x30000).unwrap();
+        let entry = zone.space_entry(NonZeroU64::new(77).unwrap()).unwrap();
+        let complete = |effects: OwnedObjectWakeEffects<'_>| {
+            let _ = effects.deliver_handbacks(&mut |_| {});
+        };
+        entry
+            .admit_notifications(NonZeroU64::new(1).unwrap(), &BoundedSpin(0), &complete)
+            .unwrap();
+        let access = SpaceAccess::notified(SpaceReleaseVenue {
+            zone: &zone,
+            waker: Waker::Host,
+            deliver,
+        });
+        let source = entry.notifications(NonZeroU64::new(1).unwrap()).unwrap();
+        access.open(index);
+        let revision = source.observe(SpaceWaitCause::Gate).revision();
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                tid: 77,
+                serial: 1,
+                mm: 77,
+                file_table: 1,
+                generation: 1,
+                affinity: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
+            })
+            .unwrap();
+        let operation = OperationToken::new(77, 1).unwrap();
+        let enrollment = PortalWaitEnrollment::new(source, SpaceWaitCause::Gate, revision);
+        assert!(
+            matches!(
+                enrollment.park_host(record, operation, &complete),
+                Err((ObjectWaitError::Changed, _))
+            ),
+            "the gate is open; a later park must recheck the gate"
         );
     }
 }

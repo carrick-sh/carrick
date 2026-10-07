@@ -286,13 +286,13 @@ impl Drop for SpaceEditor<'_> {
             "held admitted editor requires exact source release"
         );
         if let Some((venue, lease)) = self.release.as_ref().or(late_release.as_ref()) {
+            self.release_editor();
             let completion = |effects: crate::object_wait::OwnedObjectWakeEffects<'_>| {
                 (venue.deliver)(venue.zone, venue.waker, effects)
             };
             let receipt = lease
                 .reserve(SpaceWaitCause::Editor)
                 .advance_revision(venue.waker, &completion);
-            self.release_editor();
             receipt.publish();
         } else {
             self.release_editor();

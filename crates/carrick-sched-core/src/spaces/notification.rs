@@ -267,6 +267,18 @@ struct ResourceRelease<'a, 'z, 'c> {
     unlocked: ResourceUnlocked,
     publications: [Option<crate::object_wait::ObjectNotificationPublication<'z, 'c>>; 6],
 }
+impl<'a, 'z, 'c> ResourceRelease<'a, 'z, 'c> {
+    fn new(word: &'a AtomicU64, unlocked: ResourceUnlocked) -> Self {
+        // Unlock the resource first, ensuring no concurrent observer can sample an
+        // advanced revision while this holder still excludes the resource.
+        word.store(unlocked.word(), Ordering::SeqCst);
+        Self {
+            word,
+            unlocked,
+            publications: core::array::from_fn(|_| None),
+        }
+    }
+}
 impl Drop for ResourceRelease<'_, '_, '_> {
     fn drop(&mut self) {
         self.word.store(self.unlocked.word(), Ordering::SeqCst);
@@ -311,6 +323,10 @@ impl<'a> SpaceNotificationLease<'a> {
     /// alone cannot prove the resource is still held at enrollment.
     pub fn editor_held(&self) -> bool {
         self.zone.spaces.active_editor(self.index).is_some()
+    }
+    /// The gate word is the resource predicate for a Gate wait.
+    pub fn gate_closed(&self) -> bool {
+        self.zone.spaces.gate(self.index) != 0
     }
     pub fn identity(&self) -> SpaceNotificationIdentity {
         self.identity
@@ -364,11 +380,7 @@ impl<'a> SpaceNotificationLease<'a> {
         let completion = |effects: crate::object_wait::OwnedObjectWakeEffects<'_>| {
             (venue.deliver)(venue.zone, venue.waker, effects)
         };
-        let mut release = ResourceRelease {
-            word,
-            unlocked,
-            publications: core::array::from_fn(|_| None),
-        };
+        let mut release = ResourceRelease::new(word, unlocked);
         for (i, cause) in SpaceWaitCause::ALL.into_iter().enumerate() {
             if causes.contains(&cause) {
                 release.publications[i] = Some(
@@ -588,9 +600,6 @@ impl<'a> SpaceAccess<'a> {
             let completion = |effects: OwnedObjectWakeEffects<'_>| {
                 (venue.deliver)(venue.zone, venue.waker, effects)
             };
-            let publication = lease
-                .reserve(SpaceWaitCause::Gate)
-                .advance_revision(venue.waker, &completion);
             if opening {
                 entry.gate.fetch_and(
                     !(super::GATE_CLOSED | super::GATE_INITIAL_BIND),
@@ -599,6 +608,9 @@ impl<'a> SpaceAccess<'a> {
             } else {
                 entry.gate.fetch_sub(1, Ordering::SeqCst);
             }
+            let publication = lease
+                .reserve(SpaceWaitCause::Gate)
+                .advance_revision(venue.waker, &completion);
             publication.publish();
         } else if opening {
             self.spaces.open(index);
@@ -1247,5 +1259,54 @@ mod tests {
         assert!(!zone.record(record).has_object_operation());
         drop(queue);
         entry.retire_entry(access(&zone).venue().unwrap());
+    }
+
+    #[test]
+    fn release_resource_unlocks_before_advancing_revision() {
+        let zone = zone();
+        let entry = admitted(&zone);
+        let lease = entry.notifications(NonZeroU64::new(1).unwrap()).unwrap();
+        let word = AtomicU64::new(0);
+        let access = access(&zone);
+        let venue = access.venue().unwrap();
+
+        let stop = core::sync::atomic::AtomicBool::new(false);
+        let violations = core::sync::atomic::AtomicUsize::new(0);
+
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut last = lease.observe(SpaceWaitCause::Reservations).revision();
+                while !stop.load(Ordering::Acquire) {
+                    let snapshot = lease.observe(SpaceWaitCause::Reservations);
+                    let current = snapshot.revision();
+                    if current != last {
+                        if word.load(Ordering::SeqCst) != 0 {
+                            violations.fetch_add(1, Ordering::Relaxed);
+                        }
+                        last = current;
+                    }
+                }
+            });
+
+            for _ in 0..10_000 {
+                word.store(1, Ordering::SeqCst);
+                unsafe {
+                    lease.release_resource(
+                        venue,
+                        &word,
+                        ResourceUnlocked::Plain,
+                        &[SpaceWaitCause::Reservations],
+                    );
+                }
+            }
+            stop.store(true, Ordering::Release);
+        });
+
+        assert_eq!(
+            violations.load(Ordering::Relaxed),
+            0,
+            "an observer sampled an advanced revision while the resource was still locked"
+        );
+        entry.retire_entry(access.venue().unwrap());
     }
 }
