@@ -20,6 +20,18 @@ _start:
     syscall
     cmp $-38, %rax
     jne fail
+    sub $16, %rsp
+    movl $3, (%rsp)             # non-host descriptor 3
+    movw $4, 4(%rsp)            # POLLOUT
+    movw $0, 6(%rsp)
+    mov %rsp, %rdi
+    mov $1, %rsi                # nfds = 1
+    xor %rdx, %rdx              # timeout = 0
+    mov $7, %rax                # poll
+    syscall
+    cmp $-38, %rax              # ENOSYS
+    jne fail
+    add $16, %rsp
     mov $39, %rax               # getpid: guest-owned and served
     syscall
     test %rax, %rax
