@@ -8,8 +8,7 @@ use carrick_x86::cpl0_entry::OBSERVE_INITIAL_MM;
 use std::path::PathBuf;
 
 fn image() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/x86_64-unknown-none/release/carrick-x86-cpl0-fixture")
+    PathBuf::from(env!("CARRICK_X86_CPL0_FIXTURE_IMAGE"))
 }
 
 fn tiny_elf() -> Vec<u8> {
