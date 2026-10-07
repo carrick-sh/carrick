@@ -1,10 +1,7 @@
 //! Resolve fixture inputs independently of the host workspace's crate population.
 use super::build_code::{self, REVIEWED_BUILD_CODE, ReviewedEntry};
 use super::environment::{BuildEnvironment, checkout_configs};
-use super::{
-    BUILD_SCRIPTS, ContentHash, Result, fail, git, hash_regular_file, hash_source, linker,
-    safe_path,
-};
+use super::{BUILD_SCRIPTS, ContentHash, Result, fail, git, hash_source, linker, safe_path};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -52,7 +49,6 @@ struct Package {
 #[derive(Deserialize)]
 struct Target {
     kind: Vec<String>,
-    src_path: PathBuf,
 }
 #[derive(Deserialize)]
 struct Resolve {
@@ -152,6 +148,9 @@ fn resolve_graph(root: &Path) -> Result<(BTreeSet<String>, BTreeSet<ReviewedEntr
                 &root,
                 &metadata.workspace_root.join("Cargo.lock"),
             )?);
+            let lock = build_code::lock_checksums(&std::fs::read_to_string(
+                metadata.workspace_root.join("Cargo.lock"),
+            )?);
             let resolve = metadata
                 .resolve
                 .ok_or_else(|| fail("missing fixture Cargo resolve graph"))?;
@@ -200,40 +199,14 @@ fn resolve_graph(root: &Path) -> Result<(BTreeSet<String>, BTreeSet<ReviewedEntr
                     else {
                         continue;
                     };
-                    let package_dir = package
-                        .manifest_path
-                        .parent()
-                        .ok_or_else(|| fail("fixture package has no directory"))?;
-                    let source = target
-                        .src_path
-                        .strip_prefix(package_dir)
-                        .ok()
-                        .and_then(Path::to_str)
-                        .ok_or_else(|| {
-                            fail(format!(
-                                "build code outside its package: {}",
-                                target.src_path.display()
-                            ))
-                        })?
-                        .to_owned();
-                    let sha256 = if package.source.is_some() {
-                        hash_regular_file(&target.src_path)?
-                    } else {
-                        hash_source(&root, &relative(&root, &target.src_path)?)?
-                    };
-                    found.insert(ReviewedEntry {
-                        package: package.name.clone(),
-                        location: build_code::location(
-                            &root,
-                            &package.name,
-                            &package.version,
-                            package.source.as_deref(),
-                            &package.manifest_path,
-                        )?,
-                        kind: kind.clone(),
-                        source,
-                        sha256,
-                    });
+                    found.insert(build_code::entry(
+                        &package.name,
+                        &package.version,
+                        package.source.as_deref(),
+                        kind,
+                        &package.manifest_path,
+                        &lock,
+                    )?);
                 }
                 if package.source.is_some() {
                     continue;
