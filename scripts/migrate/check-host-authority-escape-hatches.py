@@ -82,6 +82,7 @@ ASSEMBLY_BOUNDARIES = frozenset(
         PurePosixPath("crates/carrick-x86-cpl0/src/initial_boot.rs"),
         # CPL0-only native IRQ/IRET, XSAVE, FS/GS MSRs, CR3 and IF/HLT
         # leaves. Their target_os=none guards exclude all host execution.
+        PurePosixPath("crates/carrick-x86-cpl0/src/native_irq.rs"),
         PurePosixPath("crates/carrick-x86-cpl0/src/progress.rs"),
         PurePosixPath("crates/carrick-x86/src/cpl0_scheduler.rs"),
         PurePosixPath("crates/carrick-x86/src/interrupts.rs"),

@@ -281,15 +281,16 @@ fn mounted_static_x86_guest_owned_calls_refuse_without_host_effects() {
     let report: serde_json::Value = serde_json::from_slice(envelope).unwrap();
     let witness = &report["report"]["execution_witness"];
     assert_eq!(witness["host_forwards"], 2); // write and exit_group only
-    assert_eq!(witness["portal_exits"], 4);
+    assert_eq!(witness["portal_exits"], 5);
     assert_eq!(
         witness["guest_refusal_families"],
         serde_json::json!([
             {"family": "memory", "count": 1},
-            {"family": "signal", "count": 1}
+            {"family": "signal", "count": 1},
+            {"family": "unclassified", "count": 1}
         ])
     );
-    assert_eq!(report["report"]["summary"]["distinct_partial_syscalls"], 2);
+    assert_eq!(report["report"]["summary"]["distinct_partial_syscalls"], 3);
 }
 
 #[test]

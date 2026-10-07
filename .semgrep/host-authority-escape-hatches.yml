@@ -63,6 +63,7 @@ rules:
         # Reviewed target_os=none CPL0 hardware leaves: native IRQ/IRET and
         # XSAVE, FS/GS MSRs, CR3, IF/HLT, declared fixture control port I/O.
         # No host instruction path or host semantic syscall dispatch.
+        - /crates/carrick-x86-cpl0/src/native_irq.rs
         - /crates/carrick-x86-cpl0/src/progress.rs
         - /crates/carrick-x86/src/cpl0_scheduler.rs
         - /crates/carrick-x86/src/interrupts.rs
