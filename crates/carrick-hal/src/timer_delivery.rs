@@ -289,7 +289,7 @@ mod tests {
         let generation = carrick_timer_core::itimer::arm_with_cpu_now(which, spec, false, 0);
         let fires = Arc::new(AtomicUsize::new(0));
         let fires2 = Arc::clone(&fires);
-        let sampler = MockCpuSampler(1_000_000, 1);
+        let sampler = MockCpuSampler(0, 1);
         let runner = std::thread::spawn(move || {
             run_fallback_with_sampler(which, generation, spec, Some(&sampler), move || {
                 fires2.fetch_add(1, Ordering::SeqCst);
