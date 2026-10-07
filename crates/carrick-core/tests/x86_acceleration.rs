@@ -14,7 +14,7 @@ use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
 
 fn transfer_fixture(pages: usize, unrelated: usize) {
-    let mut region = Region::new();
+    let region = Region::new();
     region.add_bank();
     let spaces = AddressSpaces::new();
     let mms = [
@@ -287,7 +287,7 @@ fn grant_fixture<B: carrick_mmu_core::owner_mmu::OwnerGrantMmu>(
         TableGrants,
     };
     use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa};
-    let mut region = Region::new();
+    let region = Region::new();
     region.add_bank();
     let spaces = AddressSpaces::new();
     let mm = admit(&region, &spaces, 11, ROOT, pages, 16);
