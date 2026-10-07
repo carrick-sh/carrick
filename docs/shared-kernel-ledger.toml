@@ -1,0 +1,6 @@
+# Shared guest-kernel defects ledger
+# Schema version 1: entries recorded when defects in shared kernel code
+# are discovered on a specific platform (x86-kvm or arm-hvf).
+
+schema_version = 1
+entries = []

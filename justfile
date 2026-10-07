@@ -121,6 +121,10 @@ build-cache:
 xtask *ARGS:
     {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- {{ARGS}}
 
+# Measure compiled guest kernel sharing between the aarch64 EL1 and x86_64 CPL0 images.
+scorecard *ARGS:
+    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- shared-kernel-scorecard {{ARGS}}
+
 # Host flock; cancels on runner death or TERM/INT/HUP; cleanup failure releases with error.
 # One five-second cleanup deadline; owner SIGKILL releases immediately.
 # Darwin cannot contain detached descendants closing every scope fd; see docs/host-lease-containment-follow-up.md.
