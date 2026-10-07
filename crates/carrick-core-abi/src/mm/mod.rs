@@ -8,8 +8,6 @@ pub mod grant;
 pub use grant::*;
 pub mod cow;
 pub use cow::*;
-pub mod fork;
-pub use fork::*;
 pub mod cow_pool;
 pub use cow_pool::*;
 pub mod grant_slot;
@@ -22,6 +20,9 @@ pub use custody::*;
 
 pub mod inventory;
 pub use inventory::*;
+
+pub mod fork;
+pub use fork::*;
 
 pub mod publication;
 pub use publication::*;

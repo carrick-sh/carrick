@@ -2695,6 +2695,13 @@ fn case_run_id() -> String {
 // Docker is absent.
 
 fn probe_oracle_dir(lane_label: &str, libc: &str) -> PathBuf {
+    let lane_label = if lane_label == "amd64"
+        && std::env::var("CARRICK_PROBE_ORACLE").as_deref() == Ok("native")
+    {
+        "amd64native"
+    } else {
+        lane_label
+    };
     repo_path(&format!(
         "crates/carrick-cli/tests/probe-oracle/{lane_label}-{libc}"
     ))
@@ -2717,9 +2724,20 @@ fn probe_src_hash(name: &str) -> String {
 /// Cached Docker-oracle output for a probe, iff present AND its source hash
 /// still matches (a stale entry — source changed since bless — reads as a miss).
 fn cached_probe_oracle(lane_label: &str, libc: &str, name: &str) -> Option<String> {
-    let raw = std::fs::read_to_string(probe_oracle_dir(lane_label, libc).join(name)).ok()?;
+    let dir = probe_oracle_dir(lane_label, libc);
+    let native = dir.file_name()?.to_str()?.starts_with("amd64native-");
+    if native {
+        carrick_conformance::native::validate_probe_oracle_dir(&dir)
+            .expect("invalid native oracle provenance");
+    }
+    let raw = std::fs::read_to_string(dir.join(name)).ok()?;
     let (hash_line, body) = raw.split_once('\n')?;
-    (hash_line == probe_src_hash(name)).then(|| normalize(body))
+    let expected = if native {
+        carrick_conformance::native::probe_source_hash(&repo_path(""), name).ok()?
+    } else {
+        probe_src_hash(name)
+    };
+    (hash_line == expected).then(|| normalize(body))
 }
 
 /// Persist a freshly-captured Docker-oracle output for a probe (the bless step).
@@ -3938,13 +3956,19 @@ fn conformance_probes() {
     // bail when Docker is absent: it falls back to the committed probe-oracle
     // cache (a deterministic probe diffs against its blessed Docker output), so
     // the gate still runs carrick-only on a Docker-less host (e.g. FreeBSD/bhyve).
-    let docker_available = Command::new("docker")
-        .arg("version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let native_probe_mode = std::env::var("CARRICK_PROBE_ORACLE").as_deref() == Ok("native");
+    assert!(
+        !native_probe_mode || cfg!(all(target_os = "linux", target_arch = "x86_64")),
+        "native probe oracle requires x86_64 Linux"
+    );
+    let docker_available = !native_probe_mode
+        && Command::new("docker")
+            .arg("version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
     if closure_mode {
         assert!(
             docker_available,
@@ -4425,6 +4449,10 @@ fn conformance_probes() {
 #[ignore = "bless step: writes the committed probe-oracle cache from live Docker"]
 fn bless_probe_oracle() {
     let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if std::env::var("CARRICK_PROBE_ORACLE").as_deref() == Ok("native") {
+        bless_native_probe_oracle();
+        return;
+    }
     use base64::Engine as _;
     let engine = base64::engine::general_purpose::STANDARD;
     let requested_lane = std::env::var("CARRICK_PROBE_LANE").ok();
@@ -4509,6 +4537,108 @@ fn bless_probe_oracle() {
         }
     }
     eprintln!("bless_probe_oracle: wrote {blessed} probe oracle(s)");
+}
+
+fn bless_native_probe_oracle() {
+    use carrick_conformance::native;
+    carrick_conformance::lane::OracleBackend::Native
+        .validate_host(
+            &carrick_conformance::lane::Lane::KvmLocal(carrick_conformance::lane::LocalKvmConfig {
+                timeout_scale: 1.0,
+            }),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        )
+        .expect("native blessing requires native x86_64 Linux");
+    let lane = std::env::var("CARRICK_PROBE_LANE").unwrap_or_else(|_| "amd64".into());
+    assert!(
+        lane == "amd64",
+        "native blessing requires CARRICK_PROBE_LANE=amd64"
+    );
+    let libc = std::env::var("CARRICK_PROBE_LIBC").unwrap_or_else(|_| "musl".into());
+    // GNU binds the loader to the exported image instead of the host libc.
+    assert!(
+        libc == "musl" || libc == "gnu",
+        "native libc must be musl or gnu"
+    );
+    let rootfs = (libc == "gnu").then(|| {
+        native::export_image(
+            &carrick_bin().expect("GNU bless needs a built carrick binary"),
+            AMD64.image,
+        )
+        .expect("native GNU image loader binding")
+    });
+    let filter = std::env::var("CARRICK_PROBE_FILTER")
+        .expect("native blessing requires an explicit probe filter");
+    let dir = probe_oracle_dir("amd64native", &libc);
+    let mut provenance = native::ProbeProvenance::current().expect("native provenance");
+    provenance.image_digest = rootfs.as_ref().map(|rootfs| rootfs.image_digest.clone());
+    let static_root = if libc == "musl" {
+        let inputs = native::static_init_inputs().expect("native static init inputs");
+        let root = native::static_probe_root(&inputs).expect("native static root");
+        provenance.static_init_inputs = Some(inputs);
+        Some(root)
+    } else {
+        None
+    };
+    if dir.exists() {
+        native::validate_probe_oracle_dir(&dir).expect("existing native provenance differs; refresh the entire oracle directory on the new kernel");
+        let previous: native::ProbeProvenance = serde_json::from_slice(
+            &std::fs::read(dir.join("PROVENANCE.json")).expect("read native provenance"),
+        )
+        .expect("parse native provenance");
+        assert!(
+            previous.image_digest == provenance.image_digest
+                || std::fs::read_dir(&dir)
+                    .expect("list native oracle directory")
+                    .count()
+                    == 1,
+            "native image changed; refresh the entire oracle directory"
+        );
+    }
+    let mut outputs = Vec::new();
+    for name in filter.split(',') {
+        assert!(
+            !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+            "invalid probe name"
+        );
+        assert!(
+            !name.starts_with("perf_"),
+            "performance output is not cacheable"
+        );
+        let probe = probes_dir(if libc == "musl" {
+            "x86_64-unknown-linux-musl"
+        } else {
+            "x86_64-unknown-linux-gnu"
+        })
+        .join(name);
+        let result = match rootfs
+            .as_ref()
+            .or_else(|| static_root.as_ref().map(|(_, root)| root))
+        {
+            Some(rootfs) => native::run_probe_in_root(&probe, rootfs),
+            None => native::run_probe(&probe),
+        };
+        let output = normalize(&result.expect("native probe execution must complete successfully"));
+        let hash = native::probe_source_hash(&repo_path(""), name).expect("probe source inputs");
+        outputs.push((name.to_string(), format!("{hash}\n{output}")));
+    }
+    // Publish only after every requested probe completed; a failed bless
+    // cannot leave a provenance file blessing half a batch.
+    std::fs::create_dir_all(&dir).expect("create native oracle directory");
+    for (name, output) in &outputs {
+        std::fs::write(dir.join(name), output).expect("write native oracle");
+        eprintln!("BLESSED amd64native:{libc}:{name}");
+    }
+    std::fs::write(
+        dir.join("PROVENANCE.json"),
+        serde_json::to_vec_pretty(&provenance).expect("serialize provenance"),
+    )
+    .expect("write native provenance");
+    eprintln!(
+        "bless_probe_oracle: wrote {} native probe oracle(s)",
+        outputs.len()
+    );
 }
 
 #[test]

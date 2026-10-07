@@ -51,7 +51,7 @@ impl OwnerForkMmu for X86Mmu {
     fn is_executable_control(word: u64) -> bool {
         word & NX == 0
     }
-    fn is_private_control(_: UserVa) -> bool {
+    fn control_needs_copy(_: UserVa, _: u64) -> bool {
         false
     }
     fn split(word: u64, level: usize, index: usize) -> Result<u64, OwnerMmuRefusal> {

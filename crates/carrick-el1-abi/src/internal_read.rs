@@ -2,10 +2,8 @@
 
 /// Fixed identity/control mapping. Its contents can change; its admitted
 /// geometry is immutable and does not describe a Linux user VMA.
-pub const CARRICK_IDENTITY_PAGE_BASE: u64 =
-    carrick_mmu_core::aarch64::owner_fork::IDENTITY_PAGE_BASE;
-pub const CARRICK_IDENTITY_PAGE_SIZE: u64 =
-    carrick_mmu_core::aarch64::owner_fork::IDENTITY_PAGE_SIZE;
+pub const CARRICK_IDENTITY_PAGE_BASE: u64 = 0x2D_001E_4000;
+pub const CARRICK_IDENTITY_PAGE_SIZE: u64 = 0x4000;
 
 /// A read capability for one named Carrick-owned window. This grants no write
 /// authority and never converts an arbitrary user range into an internal one.

@@ -2,7 +2,8 @@
 use crate::host_lease::{DEFAULT_LOCK_PATH, HostLease};
 use crate::lock_file::OwnedFileLock;
 use crate::prune_fs as at;
-use crate::remote_accept::shell_quote;
+use crate::remote_accept::{RemoteAcceptError, shell_quote};
+use crate::remote_lock::{RemoteLock, RemoteShell};
 use crate::worktree_gc::{GcError, WorktreeGcArgs};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -16,27 +17,26 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type CensusHandles = BTreeMap<i32, PathBuf>;
-struct CheckoutGuard(PathBuf);
+/// The gate checkout lock, held by a local keeper process exactly as remote
+/// drivers hold it, so a killed pruner's claim is reclaimable by liveness.
+struct CheckoutGuard {
+    _lock: RemoteLock,
+}
 impl CheckoutGuard {
     fn claim(path: &Path) -> std::io::Result<Option<Self>> {
-        match fs::create_dir(path) {
-            Ok(()) => {
-                let guard = Self(path.to_owned());
-                fs::write(
-                    path.join("run_id"),
-                    format!("target-prune-{}", std::process::id()),
-                )?;
-                Ok(Some(guard))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
-            Err(error) => Err(error),
+        let dev = path.parent().unwrap_or(Path::new("."));
+        let runs = dev.join("gate-runs");
+        let run_id = format!("target-prune-{}", std::process::id());
+        match RemoteLock::acquire(
+            RemoteShell::Local,
+            &runs.to_string_lossy(),
+            &path.to_string_lossy(),
+            &run_id,
+        ) {
+            Ok(lock) => Ok(Some(Self { _lock: lock })),
+            Err(RemoteAcceptError::LockHeld { .. }) => Ok(None),
+            Err(error) => Err(std::io::Error::other(error.to_string())),
         }
-    }
-}
-impl Drop for CheckoutGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(self.0.join("run_id"));
-        let _ = fs::remove_dir(&self.0);
     }
 }
 

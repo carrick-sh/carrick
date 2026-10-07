@@ -205,6 +205,7 @@ const _: () =
 const _: () = assert!(
     EL1_MM_PORTAL_OFFSET + core::mem::size_of::<MmPortalSlots>() as u64 <= crate::EL1_STACKS_OFFSET
 );
+
 impl carrick_core_abi::GrantSlotVenue for MmPortalSlots {
     fn carrier(&self) -> Option<core::num::NonZeroU64> {
         MmPortalSlots::carrier(self)
