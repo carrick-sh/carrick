@@ -1,15 +1,16 @@
-//! Linker inputs are invisible to dep-info. Restricted dialect: a linker
-//! script or response-file reference may appear in a fixture build input only
-//! when it names a file already in the fixture inventory; anything that
-//! cannot be resolved statically (shell expansions, absolute paths) is
-//! refused rather than chased.
+//! Linker inputs are invisible to dep-info, and a linker resolves script and
+//! response-file paths against its own search rules, which may pull in further
+//! files (`INCLUDE`, nested `@file`). Restricted dialect: fixture builds use no
+//! linker scripts or response files at all. Any reference in a builder script,
+//! an inventoried Cargo configuration or a build-script `rustc-link-arg`
+//! output is refused; nothing is resolved or authorized.
 use super::{Result, fail};
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path, PathBuf};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 /// Linker-input references in a builder script, Cargo configuration or a
 /// build-script `rustc-link-arg` value: `-T <f>`, `-T<f>`, `--script[=]<f>`,
-/// `@<response-file>` and any `*.ld`/`*.lds` token.
+/// `@<response-file>`, a linker-script `INCLUDE` and any `*.ld`/`*.lds` token.
 pub fn references(text: &str) -> Vec<String> {
     let tokens: Vec<&str> = text
         .split(|c: char| c.is_whitespace() || "\"'`,=[]()".contains(c))
@@ -23,7 +24,9 @@ pub fn references(text: &str) -> Vec<String> {
             take_next = false;
             continue;
         }
-        if token == "-T" || token == "--script" || token == "-script" {
+        if token == "INCLUDE" {
+            found.push(token.to_owned());
+        } else if token == "-T" || token == "--script" || token == "-script" {
             take_next = true;
         } else if let Some(rest) = token.strip_prefix("-T") {
             found.push(rest.to_owned());
@@ -39,45 +42,12 @@ pub fn references(text: &str) -> Vec<String> {
     found
 }
 
-fn normalize(base: &Path, reference: &str) -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
-    for component in base.join(reference).components() {
-        match component {
-            Component::Normal(name) => parts.push(name.to_str()?.to_owned()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                parts.pop()?;
-            }
-            _ => return None,
-        }
-    }
-    Some(parts.join("/"))
-}
-
-/// Refuse any linker-input reference in `text` (read from checkout-relative
-/// `origin`) that does not resolve to an inventoried source. Relative
-/// references are tried against the origin's directory, its parent (a
-/// `.cargo/` file's package) and the checkout root.
-pub fn check(origin: &str, text: &str, inventory: &BTreeSet<&str>) -> Result<()> {
-    let origin_dir = Path::new(origin).parent().unwrap_or(Path::new(""));
-    let bases: Vec<PathBuf> = vec![
-        origin_dir.to_path_buf(),
-        origin_dir.parent().unwrap_or(Path::new("")).to_path_buf(),
-        PathBuf::new(),
-    ];
-    for reference in references(text) {
-        let resolvable = !reference.is_empty()
-            && !reference.contains('$')
-            && !Path::new(&reference).is_absolute();
-        let inventoried = resolvable
-            && bases.iter().any(|base| {
-                normalize(base, &reference).is_some_and(|path| inventory.contains(path.as_str()))
-            });
-        if !inventoried {
-            return Err(fail(format!(
-                "linker input reference `{reference}` in {origin} is not an inventoried fixture input"
-            )));
-        }
+/// Refuse any linker-input reference in `text`, read from `origin`.
+pub fn check(origin: &str, text: &str) -> Result<()> {
+    if let Some(reference) = references(text).into_iter().next() {
+        return Err(fail(format!(
+            "linker input reference `{reference}` in {origin}: fixture builds may not use linker scripts or response files"
+        )));
     }
     Ok(())
 }
@@ -88,7 +58,6 @@ pub(super) fn check_inventory(
     sources: &BTreeMap<String, super::ContentHash>,
     builder_scripts: &[&str],
 ) -> Result<()> {
-    let inventory: BTreeSet<&str> = sources.keys().map(String::as_str).collect();
     for path in sources.keys() {
         let config = path == ".cargo/config"
             || path == ".cargo/config.toml"
@@ -96,7 +65,7 @@ pub(super) fn check_inventory(
             || path.ends_with("/.cargo/config.toml");
         if config || builder_scripts.contains(&path.as_str()) {
             let text = std::fs::read_to_string(super::safe_path(root, path)?)?;
-            check(path, &text, &inventory)?;
+            check(path, &text)?;
         }
     }
     Ok(())
@@ -105,11 +74,7 @@ pub(super) fn check_inventory(
 /// Publish-time scan of every build-script `output` file in the snapshot's
 /// fixture target directories: `cargo:rustc-link-arg*` values follow the same
 /// rule as checked-in configuration.
-pub fn check_build_script_outputs(
-    snapshot: &Path,
-    fixtures: &[&str],
-    inventory: &BTreeSet<&str>,
-) -> Result<()> {
+pub fn check_build_script_outputs(snapshot: &Path, fixtures: &[&str]) -> Result<()> {
     let mut pending: Vec<PathBuf> = fixtures
         .iter()
         .map(|fixture| snapshot.join(fixture).join("target"))
@@ -145,11 +110,7 @@ pub fn check_build_script_outputs(
                     continue;
                 };
                 if key.contains("link-arg") {
-                    check(
-                        &format!("build-script output {}", path.display()),
-                        value,
-                        inventory,
-                    )?;
+                    check(&format!("build-script output {}", path.display()), value)?;
                 }
             }
         }

@@ -909,11 +909,7 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
     external.push(PathBuf::from(sysroot.trim()));
     let compiler_inputs = dep_info::classify(&source, &dep_info_files, &external)?;
     let sources = source_hashes(root, &compiler_inputs)?;
-    linker::check_build_script_outputs(
-        &source,
-        inputs::FIXTURES,
-        &sources.keys().map(String::as_str).collect(),
-    )?;
+    linker::check_build_script_outputs(&source, inputs::FIXTURES)?;
     // Match the build snapshot byte-for-byte with the recorded source inputs.
     for (path, hash) in &sources {
         if &hash_source(&source, path)? != hash {

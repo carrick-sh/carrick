@@ -1,30 +1,32 @@
-//! Build scripts and proc-macros run arbitrary code at build time and may read
-//! any file without reporting it in dep-info. Restricted dialect: every one in
-//! a fixture's resolved (unfiltered, non-dev) graph must appear, with the hash
-//! of its entry source, in the committed reviewed list. Publish and admission
-//! refuse an unlisted, changed or stale entry; the list is itself an input.
-use super::{ContentHash, Result, fail};
+//! Build scripts and proc-macros run arbitrary code at build time: they may
+//! read any file without reporting it in dep-info, and an approved entry file
+//! can delegate to modules or build-dependencies. Restricted dialect:
+//! checkout packages in a fixture graph may not have build scripts or be
+//! proc-macros at all, and git/path build code is refused. Only locked
+//! registry build code is admitted, keyed by name, version, source and the
+//! `Cargo.lock` checksum that pins the entire crate, and only when listed in
+//! the committed reviewed list. Publish and admission refuse an unlisted,
+//! changed or stale entry; the list is itself an inventory input.
+use super::{Result, fail};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-/// Committed, reviewed build code. Part of every fixture input identity.
+/// Committed, reviewed registry build code. Part of every input identity.
 pub const REVIEWED_BUILD_CODE: &str = "fixtures/reviewed-build-code.json";
-const SCHEMA: &str = "carrick.fixtures.reviewed-build-code.v1";
+const SCHEMA: &str = "carrick.fixtures.reviewed-build-code.v2";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewedEntry {
     pub package: String,
-    /// `path:<checkout-relative manifest>` for checkout packages, or
-    /// `<cargo source>#<name>@<version>` for locked registry/git packages.
-    pub location: String,
+    pub version: String,
+    /// The Cargo registry source (`registry+...`).
+    pub source: String,
     /// `custom-build` or `proc-macro`.
     pub kind: String,
-    /// Entry source relative to the package directory (e.g. `build.rs`).
-    pub source: String,
-    /// Typed, length-framed digest of the entry source.
-    pub sha256: ContentHash,
+    /// `Cargo.lock` checksum of the whole crate archive.
+    pub checksum: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -34,26 +36,63 @@ pub struct ReviewedList {
     pub entries: Vec<ReviewedEntry>,
 }
 
-pub(super) fn location(
-    root: &Path,
+/// `(name, version, source) -> checksum` from a `Cargo.lock`.
+pub fn lock_checksums(text: &str) -> BTreeMap<(String, String, String), String> {
+    let mut checksums = BTreeMap::new();
+    for block in text.split("[[package]]").skip(1) {
+        let field = |key: &str| {
+            block.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix(key)
+                    .and_then(|rest| rest.trim_start().strip_prefix('='))
+                    .map(|value| value.trim().trim_matches('"').to_owned())
+            })
+        };
+        if let (Some(name), Some(version), Some(source), Some(checksum)) = (
+            field("name"),
+            field("version"),
+            field("source"),
+            field("checksum"),
+        ) {
+            checksums.insert((name, version, source), checksum);
+        }
+    }
+    checksums
+}
+
+/// The reviewed-list entry for one build-code target, or a refusal.
+pub(super) fn entry(
     name: &str,
     version: &str,
     source: Option<&str>,
+    kind: &str,
     manifest: &Path,
-) -> Result<String> {
-    Ok(match source {
-        Some(source) => format!("{source}#{name}@{version}"),
-        None => format!(
-            "path:{}",
-            manifest
-                .strip_prefix(root)
-                .ok()
-                .and_then(Path::to_str)
-                .ok_or_else(|| fail(format!(
-                    "build code package outside checkout: {}",
-                    manifest.display()
-                )))?
-        ),
+    lock: &BTreeMap<(String, String, String), String>,
+) -> Result<ReviewedEntry> {
+    let Some(source) = source else {
+        return Err(fail(format!(
+            "checkout build code is forbidden in fixture graphs: {kind} in {}",
+            manifest.display()
+        )));
+    };
+    if !source.starts_with("registry+") {
+        return Err(fail(format!(
+            "non-registry build code is forbidden in fixture graphs: {kind} {name}@{version} from {source}"
+        )));
+    }
+    let checksum = lock
+        .get(&(name.to_owned(), version.to_owned(), source.to_owned()))
+        .ok_or_else(|| {
+            fail(format!(
+                "no Cargo.lock checksum for build code {name}@{version}"
+            ))
+        })?;
+    Ok(ReviewedEntry {
+        package: name.to_owned(),
+        version: version.to_owned(),
+        source: source.to_owned(),
+        kind: kind.to_owned(),
+        checksum: checksum.clone(),
     })
 }
 
@@ -78,7 +117,7 @@ pub(super) fn check(root: &Path, found: &BTreeSet<ReviewedEntry>) -> Result<()> 
         let describe = |entries: &[&ReviewedEntry]| {
             entries
                 .iter()
-                .map(|e| format!("{} {} {} ({})", e.kind, e.location, e.source, e.sha256))
+                .map(|e| format!("{} {}@{} ({})", e.kind, e.package, e.version, e.checksum))
                 .collect::<Vec<_>>()
                 .join("; ")
         };

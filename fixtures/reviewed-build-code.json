@@ -1,26 +1,26 @@
 {
-  "schema": "carrick.fixtures.reviewed-build-code.v1",
+  "schema": "carrick.fixtures.reviewed-build-code.v2",
   "entries": [
     {
       "package": "crc32fast",
-      "location": "registry+https://github.com/rust-lang/crates.io-index#crc32fast@1.5.0",
+      "version": "1.5.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
       "kind": "custom-build",
-      "source": "build.rs",
-      "sha256": "c773f74220b2895dbd7d6cff0398bb621cba672216b86b9faedfa1b937e9f7a4"
+      "checksum": "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
     },
     {
       "package": "libc",
-      "location": "registry+https://github.com/rust-lang/crates.io-index#libc@0.2.186",
+      "version": "0.2.186",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
       "kind": "custom-build",
-      "source": "build.rs",
-      "sha256": "bbbf2d0dc012f6be46d35933eb5ec54f2fea53cd923a2ee83cd2cfd126aa00a4"
+      "checksum": "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
     },
     {
       "package": "libc",
-      "location": "registry+https://github.com/rust-lang/crates.io-index#libc@0.2.189",
+      "version": "0.2.189",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
       "kind": "custom-build",
-      "source": "build.rs",
-      "sha256": "b83a78df66fbff5be821c79d49a609059399394e6fb6f388ca0c0edb1a005dfc"
+      "checksum": "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
     }
   ]
 }
