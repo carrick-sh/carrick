@@ -279,7 +279,7 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         #[cfg(target_arch = "x86_64")]
         let mut cow = crate::fault::X86CowResolver {
             pool: carrick_el1_abi::cow_grant_pool_guest(),
-            residency: carrick_el1_abi::frame_grant_residency_guest(),
+            residency: crate::isa::frame_grant_residency_guest(),
             completion: None,
         };
         #[cfg(target_arch = "aarch64")]
@@ -294,7 +294,7 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             carrick_core::mm::transaction::SelectionVenues {
                 prepared,
                 cow: &mut cow,
-                residency: carrick_el1_abi::frame_grant_residency_guest(),
+                residency: crate::isa::frame_grant_residency_guest(),
                 slot: frame.slot as u32,
             },
         )? {
@@ -429,7 +429,7 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     if apply_grant::<NativePortalMmu, _>(
         slot,
         &words,
-        carrick_el1_abi::frame_grant_residency_guest(),
+        crate::isa::frame_grant_residency_guest(),
         target,
         || {
             #[cfg(target_arch = "aarch64")]

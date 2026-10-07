@@ -44,6 +44,25 @@ pub const fn x86_kernel_layout() -> carrick_guest_arch::KernelLayout {
     }
 }
 
+/// Native residency authority from the ISA's retained supervisor layout.
+/// The carrier maps this region before entering the image; no ARM virtual
+/// address is interpreted by an x86 guest.
+#[cfg(target_os = "none")]
+pub fn frame_grant_residency_guest() -> &'static carrick_el1_abi::FrameGrantResidencyTable {
+    #[cfg(target_arch = "aarch64")]
+    type Native = aarch64::Aarch64Backend;
+    #[cfg(target_arch = "x86_64")]
+    type Native = x86::X86Backend;
+    let layout = <Native as carrick_guest_arch::LayoutBackend>::KERNEL_LAYOUT;
+    let Some(venues) = carrick_el1_abi::KernelFaultVenues::derive(layout) else {
+        panic!("native residency venue is outside the retained kernel region");
+    };
+    // SAFETY: LayoutBackend is the image owner's typed mapping contract.
+    // derive checked alignment and region bounds; bootstrap retains this
+    // supervisor mapping until all guest CPUs stop.
+    unsafe { &*(venues.residency.raw() as *const carrick_el1_abi::FrameGrantResidencyTable) }
+}
+
 #[cfg(test)]
 mod layout_tests {
     #[test]

@@ -669,7 +669,7 @@ impl AnonymousBackingProbe for HardwareAnonymousEditor {
     }
 
     fn stock_span(&mut self, mm_key: u64, va: u64) -> Option<(u64, u64)> {
-        let page = carrick_el1_abi::frame_grant_residency_guest().lookup(mm_key, va)?;
+        let page = crate::isa::frame_grant_residency_guest().lookup(mm_key, va)?;
         Some((
             page.identity.semantic_base,
             page.identity.semantic_base + page.identity.len,
@@ -853,8 +853,7 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
             match editor.retire_and_invalidate(grant.ttbr0, start, run_len) {
                 Ok(()) => {
                     #[cfg(target_os = "none")]
-                    carrick_el1_abi::frame_grant_residency_guest()
-                        .retire_overlapping(mm_key, va, len);
+                    crate::isa::frame_grant_residency_guest().retire_overlapping(mm_key, va, len);
                     Some(slot)
                 }
                 Err(GuestRetirementError::RollbackFailed) => {
@@ -974,7 +973,7 @@ pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
     match editor.retire_and_invalidate(grant.ttbr0, address, len) {
         Ok(()) => {
             #[cfg(target_os = "none")]
-            carrick_el1_abi::frame_grant_residency_guest().retire_overlapping(mm_key, address, len);
+            crate::isa::frame_grant_residency_guest().retire_overlapping(mm_key, address, len);
             MunmapDisposition::Retired
         }
         Err(GuestRetirementError::BadRange) => MunmapDisposition::Return(-EINVAL),
