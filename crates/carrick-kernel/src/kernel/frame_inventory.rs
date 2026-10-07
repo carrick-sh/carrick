@@ -624,32 +624,6 @@ impl FrameInventoryAuthority {
             .is_some()
     }
 
-    /// Authenticate a guest copy against the exact owner generation as well
-    /// as the physical row. A stale descriptor can retain its GPA after a
-    /// mapping is republished under a new generation.
-    pub fn mapping_is_live_exact_generation(
-        &self,
-        mm: MmId,
-        mapping: MappingId,
-        frame: FrameId,
-        generation: MappingGeneration,
-        gpa: Gpa,
-        length: FrameLength,
-    ) -> bool {
-        self.state
-            .lock()
-            .mappings
-            .get(&mapping)
-            .is_some_and(|entry| {
-                entry.state == MappingState::Published
-                    && entry.mm == mm
-                    && entry.frame == frame
-                    && entry.generation == generation
-                    && entry.gpa == gpa
-                    && entry.length == length
-            })
-    }
-
     /// O(1) exact live-row authentication and its inventory revision under one
     /// lock. Existing COW replacement lanes need no new inventory publication.
     pub fn mapping_live_revision(
@@ -1302,6 +1276,34 @@ impl FrameInventoryError {
             | Self::FrameLengthMismatch { frame, .. } => Some(*frame),
             _ => None,
         }
+    }
+}
+
+impl FrameInventoryAuthority {
+    /// Authenticate a guest copy against the exact owner generation as well
+    /// as the physical row. A stale descriptor can retain its GPA after a
+    /// mapping is republished under a new generation.
+    pub fn mapping_is_live_exact_generation(
+        &self,
+        mm: MmId,
+        mapping: MappingId,
+        frame: FrameId,
+        generation: MappingGeneration,
+        gpa: Gpa,
+        length: FrameLength,
+    ) -> bool {
+        self.state
+            .lock()
+            .mappings
+            .get(&mapping)
+            .is_some_and(|entry| {
+                entry.state == MappingState::Published
+                    && entry.mm == mm
+                    && entry.frame == frame
+                    && entry.generation == generation
+                    && entry.gpa == gpa
+                    && entry.length == length
+            })
     }
 }
 
