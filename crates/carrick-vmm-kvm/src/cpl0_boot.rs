@@ -333,7 +333,10 @@ impl Cpl0Carrier {
 
     /// Inspect an invalid retained terminal after all fixture vCPUs stop.
     pub fn fixture_user_leaf_raw(&self, va: u64) -> Result<u64, TrapError> {
-        if !matches!(va, USER_CODE | 0x3_0000 | 0x3_2000 | 0x3_3000 | 0x3_4000) {
+        if !matches!(
+            va,
+            USER_CODE | 0x3_0000 | 0x3_2000 | 0x3_3000 | 0x3_4000 | 0x3_6000 | 0x3_7000
+        ) {
             return Err(fail("fixture leaf outside admitted user page"));
         }
         let mut table = LAYOUT.pml4_base;
