@@ -681,21 +681,36 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
             self.free
                 .compare_exchange(head, tag | next as u64, Ordering::AcqRel, Ordering::Relaxed)
                 .map_err(|_| Refusal::Busy)?;
+            self.node(index, banks)
+                .next_free
+                .store(1 << 63, Ordering::Release);
             return Ok(index);
         }
         self.allocated
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
                 (n < capacity).then_some(n + 1)
             })
-            .map(|n| n + 1)
+            .map(|n| {
+                let index = n + 1;
+                self.node(index, banks)
+                    .next_free
+                    .store(1 << 63, Ordering::Release);
+                index
+            })
             .map_err(|_| Refusal::MetadataRequired)
     }
 
+    #[track_caller]
     fn release(&self, index: u32, banks: Option<&dyn storage::NodeBanks>) {
         if index == 0 {
             return;
         }
         let node = self.node(index, banks);
+        assert_ne!(
+            node.next_free.load(Ordering::Acquire) & (3 << 62),
+            0,
+            "reservation node returned twice: {index}"
+        );
         // Return uses a lock-free stack. Failed CAS reflects another completed
         // return, not polling for a guest/host event while holding a worker.
         let mut head = self.free.load(Ordering::Acquire);
@@ -711,6 +726,13 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
                 Err(actual) => head = actual,
             }
         }
+    }
+
+    fn release_reserved(&self, index: u32, banks: Option<&dyn storage::NodeBanks>) {
+        self.node(index, banks)
+            .next_free
+            .store(1 << 63, Ordering::Release);
+        self.release(index, banks);
     }
 }
 
@@ -1786,12 +1808,22 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
     }
     /// Return a node: refill this root's host reserve first, then the
     /// shared pool.
+    #[track_caller]
     fn free_node(&mut self, id: u32) {
         if id == 0 {
             return;
         }
         if self.host_venue && self.state().host_reserved < HOST_RESERVE {
             let head = self.state().host_reserve_head;
+            assert_ne!(
+                self.table
+                    .node(id, self.banks)
+                    .next_free
+                    .load(Ordering::Acquire)
+                    & (3 << 62),
+                0,
+                "reservation node returned twice to host reserve: {id}"
+            );
             self.table
                 .node(id, self.banks)
                 .next_free
@@ -1820,6 +1852,10 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
             .load(Ordering::Relaxed);
         self.state_mut().host_reserve_head = next as u32;
         self.state_mut().host_reserved -= 1;
+        self.table
+            .node(head, self.banks)
+            .next_free
+            .store(1 << 63, Ordering::Release);
         Ok(head)
     }
     /// [`Self::allocate_spares`] for a host-venue commit ([`Self::host_node`]).
@@ -1884,7 +1920,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
                 .load(Ordering::Relaxed);
             self.state_mut().host_reserve_head = next as u32;
             self.state_mut().host_reserved -= 1;
-            self.table.release(head, self.banks);
+            self.table.release_reserved(head, self.banks);
         }
     }
     /// Where [`Self::mmap`] places `len` bytes, without proposing anything.
@@ -3136,6 +3172,20 @@ mod tests {
             "EL1 must complete a contended pop"
         );
         LOSE_POPS.with(|lose| lose.set(0));
+    }
+
+    #[test]
+    fn returning_one_node_twice_cannot_link_it_into_the_pool_again() {
+        let table = table();
+        let mm = ReservationMm::new(62).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let mut model = table.lock(0, mm).unwrap();
+        let node = model.pool_node().unwrap();
+        model.free_node(node);
+        let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            model.free_node(node);
+        }));
+        assert!(second.is_err(), "the same node was returned twice");
     }
 
     thread_local! {
