@@ -2517,7 +2517,7 @@ impl Cpl0Carrier {
                     if start.elapsed() > Duration::from_secs(5) {
                         return Err(fail("running reader never completed loop iteration"));
                     }
-                    std::thread::yield_now();
+                    std::hint::spin_loop();
                 }
                 for _ in 0..32 {
                     let exit =
