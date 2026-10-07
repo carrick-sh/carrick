@@ -1,15 +1,15 @@
 //! Fork census, unpublished child, undo, and receipt validation.
 
+use crate::mm::reservation::{Refusal, ReservationGeometry, ReservationPolicy, Reservations};
 use alloc::vec::Vec;
+pub use carrick_core_abi::Mapping;
 use carrick_core_abi::{
     CowGrantCompletion, El1MmHandle, PortalForkCompletion, PortalForkCustody, PortalForkRequest,
     ReservationGeneration,
 };
-pub use carrick_core_abi::Mapping;
 use carrick_guest_arch::{FrameGpa, UserVa};
 use carrick_mmu_core::aarch64::descriptor_txn::{JournalEntry, LiveDescriptorWords};
 use carrick_mmu_core::owner_mmu::{Aarch64Mmu, OwnerForkMmu};
-use crate::mm::reservation::{Refusal, ReservationGeometry, ReservationPolicy, Reservations};
 
 const SHIFTS: [u32; 4] = [39, 30, 21, 12];
 
@@ -185,7 +185,10 @@ pub trait ForkParentRoot<C: ForkChildRoot> {
     fn fork_write_authorized(&mut self, sequence: Option<core::num::NonZeroU64>) -> bool;
     fn reserve_fork_certificate(&mut self, request: PortalForkRequest) -> Result<(), ForkError>;
     fn clone_into(&mut self, child: &mut C) -> Result<(), ForkError>;
-    fn publish_fork_parent(&mut self, request: PortalForkRequest) -> Result<ReservationGeneration, ForkError>;
+    fn publish_fork_parent(
+        &mut self,
+        request: PortalForkRequest,
+    ) -> Result<ReservationGeneration, ForkError>;
     fn finish_fork_publication(
         &mut self,
         operation: carrick_core_abi::PortalOperation,
@@ -234,14 +237,16 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> ForkChildRoot
     }
 
     fn publish_fork_child(&mut self, request: PortalForkRequest) -> Result<(), ForkError> {
-        self.publish_fork_child(request).map_err(refusal_to_fork_error)
+        self.publish_fork_child(request)
+            .map_err(refusal_to_fork_error)
     }
 
     fn finish_fork_publication(
         &mut self,
         operation: carrick_core_abi::PortalOperation,
     ) -> Result<(), ForkError> {
-        self.finish_fork_publication(operation).map_err(refusal_to_fork_error)
+        self.finish_fork_publication(operation)
+            .map_err(refusal_to_fork_error)
     }
 
     fn retire(self) -> Result<(), ForkError> {
@@ -250,8 +255,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> ForkChildRoot
 }
 
 impl<'b, Policy: ReservationPolicy, Geometry: ReservationGeometry>
-    ForkParentRoot<Reservations<'b, Policy, Geometry>>
-    for Reservations<'_, Policy, Geometry>
+    ForkParentRoot<Reservations<'b, Policy, Geometry>> for Reservations<'_, Policy, Geometry>
 {
     fn incarnation(&self) -> u64 {
         self.incarnation().raw()
@@ -274,25 +278,36 @@ impl<'b, Policy: ReservationPolicy, Geometry: ReservationGeometry>
     }
 
     fn reserve_fork_certificate(&mut self, request: PortalForkRequest) -> Result<(), ForkError> {
-        self.reserve_fork_certificate(request).map_err(refusal_to_fork_error)
+        self.reserve_fork_certificate(request)
+            .map_err(refusal_to_fork_error)
     }
 
-    fn clone_into(&mut self, child: &mut Reservations<'b, Policy, Geometry>) -> Result<(), ForkError> {
+    fn clone_into(
+        &mut self,
+        child: &mut Reservations<'b, Policy, Geometry>,
+    ) -> Result<(), ForkError> {
         self.clone_into(child).map_err(refusal_to_fork_error)
     }
 
-    fn publish_fork_parent(&mut self, request: PortalForkRequest) -> Result<carrick_core_abi::ReservationGeneration, ForkError> {
-        self.publish_fork_parent(request).map_err(refusal_to_fork_error)
+    fn publish_fork_parent(
+        &mut self,
+        request: PortalForkRequest,
+    ) -> Result<carrick_core_abi::ReservationGeneration, ForkError> {
+        self.publish_fork_parent(request)
+            .map_err(refusal_to_fork_error)
     }
 
     fn finish_fork_publication(
         &mut self,
         operation: carrick_core_abi::PortalOperation,
     ) -> Result<(), ForkError> {
-        self.finish_fork_publication(operation).map_err(refusal_to_fork_error)
+        self.finish_fork_publication(operation)
+            .map_err(refusal_to_fork_error)
     }
 
-    fn commit_fork_generation(&mut self) -> Result<carrick_core_abi::ReservationGeneration, ForkError> {
+    fn commit_fork_generation(
+        &mut self,
+    ) -> Result<carrick_core_abi::ReservationGeneration, ForkError> {
         self.commit_fork_generation().map_err(refusal_to_fork_error)
     }
 }
