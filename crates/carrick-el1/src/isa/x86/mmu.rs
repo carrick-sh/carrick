@@ -353,6 +353,21 @@ pub unsafe fn execute_native_descriptor_txn(
     if words.failed_drain.get() || matches!(receipt.outcome, DescriptorOutcome::Indeterminate(_)) {
         return Err(ArchError::Busy);
     }
+    if matches!(receipt.outcome, DescriptorOutcome::Applied { stores, .. } if stores != 0) {
+        let binding = super::context::current_cpu_binding().ok_or(ArchError::Unbound)?;
+        let context = super::interrupt::current_address_owner(binding)?;
+        if context.root != txn.root || context.mm.raw() != txn.id.mm_key {
+            return Err(ArchError::Unbound);
+        }
+        // The local descriptor drain above is insufficient when another CPU
+        // still runs this exact MM. Do not return a receipt that can release
+        // old frames/tables until every running member has acknowledged, or
+        // a stopped member's reentry debt has been retained by its carrier.
+        // The returned ShootdownReceipt carries (context, generation), enabling
+        // a later producer to publish to the MM publication consumer and call
+        // `acknowledge_global_drain(mm, through)`.
+        let _drain_receipt = super::interrupt::rendezvous_context(context)?;
+    }
     Ok(receipt)
 }
 
@@ -446,13 +461,7 @@ impl MmuBackend for X86Backend {
         user_access::validate(owner, range, access)
     }
     fn install_context(&mut self, context: AddressContext<Self::Root>) -> Result<(), Self::Error> {
-        let root = context.root.address().raw();
-        live_root()?;
-        // SAFETY: the caller holds a live AddressContext and retains its
-        // supervisor mappings. PCID/PGE were ruled out by live_root, so MOV
-        // CR3 flushes local non-global translations.
-        unsafe { core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) }
-        Ok(())
+        super::interrupt::install_address_context(context)
     }
     fn request_invalidation(
         &mut self,

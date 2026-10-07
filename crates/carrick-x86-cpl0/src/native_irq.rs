@@ -92,4 +92,15 @@ extern "C" fn carrick_x86_receive_irq(vector: u32, frame: *const InterruptFrame)
         }
         crate::kernel::halt();
     }
+    if frame.cs & 3 == 3 && interrupt::check_user_return_generation().is_err() {
+        unsafe {
+            core::arch::asm!(
+                "out dx, al",
+                in("dx") carrick_el1::isa::x86::context::native::FATAL_PORT,
+                in("al") 0u8,
+                options(nostack)
+            );
+        }
+        crate::kernel::halt();
+    }
 }
