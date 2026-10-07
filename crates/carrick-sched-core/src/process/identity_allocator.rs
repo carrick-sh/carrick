@@ -18,10 +18,13 @@ impl InternalIdentity {
 
 /// Exact root namespace numbering domain, distinct from task IDs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct VisibleNamespace(NonZeroU32);
+pub struct VisibleNamespace {
+    id: NonZeroU32,
+    incarnation: NonZeroU32,
+}
 impl VisibleNamespace {
-    pub const fn new(value: NonZeroU32) -> Self {
-        Self(value)
+    pub const fn new(id: NonZeroU32, incarnation: NonZeroU32) -> Self {
+        Self { id, incarnation }
     }
 }
 /// Linux-visible PID/TID; never an internal registry key.
@@ -160,6 +163,9 @@ impl NamespaceState {
         let value = NonZeroU32::new(*next)?;
         *next += 1;
         Some(VisibleIdentity(value))
+    }
+    pub fn visible_namespace_count(&self) -> usize {
+        self.visible_next.len()
     }
     /// Exact namespace retirement discards only its visible-number cursor.
     pub fn retire_visible_namespace(&mut self, namespace: VisibleNamespace) {
@@ -312,16 +318,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reused_namespace_number_has_distinct_incarnation_custody() {
+        let mut owner = NamespaceState::new(1, 8, 1);
+        let old = VisibleNamespace::new(NonZeroU32::MIN, NonZeroU32::MIN);
+        let new = VisibleNamespace::new(NonZeroU32::MIN, NonZeroU32::new(2).unwrap());
+        assert_eq!(owner.reserve_visible(old).unwrap().get(), 2);
+        assert_eq!(owner.reserve_visible(new).unwrap().get(), 2);
+        owner.retire_visible_namespace(old);
+        assert_eq!(owner.reserve_visible(new).unwrap().get(), 3);
+        assert_eq!(owner.visible_next.len(), 1);
+    }
+
+    #[test]
     fn aborted_birth_burns_visible_number_but_recycles_internal_number() {
         let mut owner = NamespaceState::new(1, 1, 1);
-        let namespace = VisibleNamespace::new(NonZeroU32::MIN);
+        let namespace = VisibleNamespace::new(NonZeroU32::MIN, NonZeroU32::MIN);
         let internal = owner.reserve_next(ClaimKind::Task).unwrap();
         let visible = owner.reserve_visible(namespace).unwrap();
         assert_eq!(visible.get(), 2);
         owner.release(internal, ClaimKind::Task);
         assert_eq!(owner.reserve_next(ClaimKind::Task).unwrap(), internal);
         assert_eq!(owner.reserve_visible(namespace).unwrap().get(), 3);
-        let other = VisibleNamespace::new(NonZeroU32::new(2).unwrap());
+        let other = VisibleNamespace::new(NonZeroU32::new(2).unwrap(), NonZeroU32::MIN);
         assert_eq!(owner.reserve_visible(other).unwrap().get(), 2);
         owner.visible_next.insert(namespace, i32::MAX as u32 - 1);
         assert_eq!(

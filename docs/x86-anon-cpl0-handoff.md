@@ -1126,3 +1126,30 @@ an explicit lane red. Normal push checks are recorded in
 The actual real launch seed transfer, namespace visible identity/membership
 binding, native claim wrappers, MM inheritance/COW and CPU1 remain open.
 No extraction or runtime review-ready milestone is claimed.
+
+## Exact visible namespace incarnation checkpoint (2026-10-07)
+
+The visible-number key includes the live arena namespace incarnation, not
+just its wrapping numeric namespace ID. A compiling mutation that ignores
+incarnation fails with visible PID3 versus PID2 in
+/tmp/x86-cont-visible-incarnation-red.log. Restored shared tests are 166/0;
+all 20 host namespace tests pass, including stale-claim cursor reclamation.
+Focused all-target core/kernel clippy passes in
+/tmp/x86-cont-visible-incarnation-clippy.log. The earlier typed accessor
+compile failures are retained separately; they are not semantic red proof.
+
+First clean reconciliation rebound ten host-authority positions and four
+K1 operation positions, without classification/body changes. The taxonomy
+rewriter sorted 400 unchanged entries; JSON multiset equality was verified
+and that ordering-only churn was restored. Namespace incarnation changes
+require another clean positional reconciliation before the next push.
+
+The director resolved file custody: retain host files behind opaque typed
+FileTableId, never a task/PID. Forward file calls carry (FileTableId, fd).
+Fork requests copy/share according to CLONE_FILES via one typed counted
+host crossing; exit/exec close/unshare through the same venue. Required
+witnesses: child writes select its own table, and post-fork opens distinguish
+shared versus copied tables. Existing FileAuthorityRun registers its client
+and canonical root table binding; model ForkCopy/ShareTable commands do not
+import that live root table. Reuse the actual Kernel FileTable fork/descriptor
+primitives rather than treating model commands as a live authority.

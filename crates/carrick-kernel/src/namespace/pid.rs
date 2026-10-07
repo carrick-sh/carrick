@@ -242,6 +242,7 @@ impl NsSharedRegion {
         }
         let domain = carrick_sched_core::process::identity_allocator::VisibleNamespace::new(
             self.claim.ns_id,
+            std::num::NonZeroU32::new(self.claim.generation.raw())?,
         );
         let visible_id = identities.reserve_visible(domain)?.get();
         Some(PreparedNamespaceIdentity {
@@ -353,17 +354,27 @@ impl NsSharedRegion {
         }
         self.retire_members();
         if !self.arena.layout().pid_namespaces.release(self.claim) {
+            if !self.claim_is_live() {
+                self.retire_visible_cursor();
+            }
             return false;
         }
-        if let Some(owner) = self.visible_owner.get() {
+        self.retire_visible_cursor();
+        self.released.store(true, Ordering::Release);
+        true
+    }
+
+    fn retire_visible_cursor(&self) {
+        if let Some(owner) = self.visible_owner.get()
+            && let Some(incarnation) = std::num::NonZeroU32::new(self.claim.generation.raw())
+        {
             owner.retire_visible_namespace(
                 carrick_sched_core::process::identity_allocator::VisibleNamespace::new(
                     self.claim.ns_id,
+                    incarnation,
                 ),
             );
         }
-        self.released.store(true, Ordering::Release);
-        true
     }
 
     /// Strip this namespace's identity from every record it tagged and release
@@ -1714,6 +1725,18 @@ mod tests {
     // the signed build. They are gated to run serially via a fresh region per
     // test would be ideal, but the region is a process-global; so each test
     // uses the global region after init and asserts on its own pids.
+
+    #[test]
+    fn stale_namespace_claim_does_not_retain_a_dead_visible_cursor() {
+        let region = test_region();
+        let ids = crate::kernel::IdRegistry::new();
+        drop(region.reserve_identity(&ids, 42, 41).unwrap());
+        assert_eq!(ids.visible_namespace_count(), 1);
+        assert!(region.arena.layout().pid_namespaces.release(region.claim));
+        assert!(!Arc::clone(&region).retire());
+        assert_eq!(ids.visible_namespace_count(), 0);
+        assert!(region.reserve_identity(&ids, 43, 41).is_none());
+    }
 
     #[test]
     fn visible_preparation_burns_numbers_and_refuses_foreign_allocator() {
