@@ -672,7 +672,8 @@
       "allocator_capacity_bytes": 0,
       "child_exit_notification_thread_visits": 0,
       "child_exit_notification_wake_attempts": 0,
-      "child_exit_notification_wake_deliveries": 0
+      "child_exit_notification_wake_deliveries": 0,
+      "lifecycle_entry_visits": 0
     },
     "dropped_events": 0,
     "unknown_metrics": []
