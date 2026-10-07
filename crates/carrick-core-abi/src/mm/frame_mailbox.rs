@@ -353,14 +353,31 @@ impl FrameGrantMailbox {
     /// Release the exact request when the host resolved the fault through an
     /// existing path and therefore has no frame-grant response for EL1.
     pub fn cancel_request_for_fault(&self, mm_key: u64, fault_va: u64, access: u64) -> bool {
+        let matches = |request: FrameGrantRequest| {
+            request.mm_key == mm_key
+                && (request.fault_va == fault_va
+                    || request.fault_va / Self::PAGE_SIZE == fault_va / Self::PAGE_SIZE)
+                && (access == 0 || request.access == access)
+        };
+        if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_REQUESTED {
+            return false;
+        }
+        let preview = self.load_request();
+        if !matches(preview) {
+            return false;
+        }
         if self
-            .claim_request_for_fault(mm_key, fault_va, access)
-            .is_none()
+            .state
+            .compare_exchange(
+                FRAME_GRANT_MAILBOX_REQUESTED,
+                FRAME_GRANT_MAILBOX_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
         {
             return false;
         }
-        self.state
-            .store(FRAME_GRANT_MAILBOX_IDLE, Ordering::Release);
         true
     }
 
@@ -607,6 +624,24 @@ mod host_claim_tests {
             .expect("next live anonymous fault can claim the same worker");
         assert_eq!(claim.request(), second);
         drop(claim); // An early host error also owns cleanup.
+        assert_eq!(
+            mailbox.state.load(Ordering::Acquire),
+            FRAME_GRANT_MAILBOX_IDLE
+        );
+    }
+
+    #[test]
+    fn cancel_request_for_fault_covers_page_offset() {
+        let mailbox = FrameGrantMailbox::new();
+        let first = FrameGrantRequest {
+            mm_key: 7,
+            request_generation: 1,
+            fault_va: 0x6048,
+            requested_len: 4096,
+            access: 2,
+        };
+        assert!(mailbox.try_publish_request(first));
+        assert!(mailbox.cancel_request_for_fault(7, 0x6000, 0));
         assert_eq!(
             mailbox.state.load(Ordering::Acquire),
             FRAME_GRANT_MAILBOX_IDLE

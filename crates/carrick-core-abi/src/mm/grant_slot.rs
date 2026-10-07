@@ -34,14 +34,21 @@ impl PortalGrantSlot {
         request_generation: u64,
         window: PortalGrantWindow,
     ) -> bool {
-        if request_generation == 0
-            || !window.valid()
-            || self
-                .state
-                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-        {
+        if request_generation == 0 || !window.valid() {
             return false;
+        }
+        let mut current = self.state.load(Ordering::Acquire);
+        loop {
+            if current != 0 && current != 3 && current != 4 {
+                return false;
+            }
+            match self
+                .state
+                .compare_exchange_weak(current, 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
         }
         for (word, value) in self.window.iter().zip(window.words()) {
             word.store(value, Ordering::Relaxed);
@@ -54,12 +61,18 @@ impl PortalGrantSlot {
     /// A busy owner resource has a producer; carry its exact pre-probe
     /// revision across the EL1 exit instead of falling through host sparse.
     pub fn publish_fault_wait(&self, fault_va: u64, wait: PortalOwnerWait) -> bool {
-        if self
-            .state
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return false;
+        let mut current = self.state.load(Ordering::Acquire);
+        loop {
+            if current != 0 && current != 3 && current != 4 {
+                return false;
+            }
+            match self
+                .state
+                .compare_exchange_weak(current, 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
         }
         let values = [
             wait.handle().carrier().get(),
@@ -143,19 +156,51 @@ impl PortalGrantSlot {
             .compare_exchange(3, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
+    pub fn cancel_fault_for_page(&self, mm_key: u64, fault_page: u64) -> bool {
+        let state = self.state.load(Ordering::Acquire);
+        let fault_page = fault_page & !4095;
+        if state == 3 {
+            let generation = self.fault_generation.load(Ordering::Relaxed);
+            let Some(window) = self.fault_selection(mm_key, generation) else {
+                return false;
+            };
+            if window.fault_page == fault_page {
+                return self.cancel_fault_selection(window, generation);
+            }
+        } else if state == 4 {
+            let values: [u64; 6] = core::array::from_fn(|i| self.window[i].load(Ordering::Relaxed));
+            if values[1] == mm_key && values[5] == fault_page {
+                return self
+                    .state
+                    .compare_exchange(4, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok();
+            }
+        }
+        false
+    }
     /// Final-MM teardown cancels an unconsumed fault selection after its
     /// mailbox request or refusal has been withdrawn. The source MM cannot
     /// fault again, and keeping this selection blocks every later MM on the
     /// same persistent worker slot.
     pub fn withdraw_retired_mm_selection(&self, mm_key: u64) -> bool {
-        if self.state.load(Ordering::Acquire) != 3 {
-            return false;
+        let state = self.state.load(Ordering::Acquire);
+        if state == 3 {
+            let generation = self.fault_generation.load(Ordering::Relaxed);
+            let Some(window) = self.fault_selection(mm_key, generation) else {
+                return false;
+            };
+            return self.cancel_fault_selection(window, generation);
         }
-        let generation = self.fault_generation.load(Ordering::Relaxed);
-        let Some(window) = self.fault_selection(mm_key, generation) else {
-            return false;
-        };
-        self.cancel_fault_selection(window, generation)
+        if state == 4 {
+            let recorded_mm = self.window[1].load(Ordering::Relaxed);
+            if recorded_mm == mm_key {
+                return self
+                    .state
+                    .compare_exchange(4, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok();
+            }
+        }
+        false
     }
     pub fn has_outstanding_for(&self, mm_key: u64) -> bool {
         let state = self.state.load(Ordering::Acquire);
@@ -170,19 +215,21 @@ impl PortalGrantSlot {
                 .is_none_or(|window| window.operation.mm.raw() == mm_key))
     }
     pub fn submit(&self, window: PortalGrantWindow, txn: &DescriptorTxn) -> bool {
-        if !window.valid() || txn.id.mm_key.get() != window.operation.mm.raw() || {
-            let state = self.state.load(Ordering::Acquire);
-            let selected = state == 3
-                && PortalGrantWindow::decode(core::array::from_fn(|i| {
-                    self.window[i].load(Ordering::Relaxed)
-                })) == Some(window);
-            (!selected && state != 0)
-                || self
-                    .state
-                    .compare_exchange(state, 1, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-        } {
+        if !window.valid() || txn.id.mm_key.get() != window.operation.mm.raw() {
             return false;
+        }
+        let mut current = self.state.load(Ordering::Acquire);
+        loop {
+            if current != 0 && current != 3 && current != 4 {
+                return false;
+            }
+            match self
+                .state
+                .compare_exchange_weak(current, 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
         }
         if !self.descriptor.submit(txn) {
             self.state.store(0, Ordering::Release);
@@ -261,6 +308,38 @@ mod tests {
         }
     }
 
+    fn dummy_txn(mm_key: u64) -> DescriptorTxn {
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            BackingIdentity, DescriptorOp, DescriptorTxnId, PageSpan, TableGrants,
+        };
+        use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa};
+        let nz = |n| NonZeroU64::new(n).unwrap();
+        DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: nz(mm_key),
+                generation: nz(1),
+            },
+            root: SubstrateGpa(0x1000),
+            op: DescriptorOp::Prepare {
+                publication: GuestLeafPublication {
+                    va: 0x6000,
+                    ipa: 0x10000,
+                    len: 0x1000,
+                    writable: true,
+                    executable: false,
+                },
+                resident: PageSpan::new(0x6000, 4096),
+                backing: BackingIdentity {
+                    frame_id: nz(1),
+                    mapping_id: nz(2),
+                    owner_generation: nz(3),
+                    inventory_revision: nz(4),
+                },
+            },
+            tables: TableGrants::NONE,
+        }
+    }
+
     #[test]
     fn retired_mm_withdraws_mailbox_and_fault_selection_before_slot_reuse() {
         let slot = PortalGrantSlot::new();
@@ -278,5 +357,72 @@ mod tests {
         assert!(!slot.has_outstanding_for(7));
         assert!(slot.publish_fault_selection(2, window(8)));
         assert!(slot.pending_fault_selection(8, 0x6000).is_some());
+    }
+
+    #[test]
+    fn unconsumed_fault_selection_allows_subsequent_submit_on_same_slot() {
+        let slot = PortalGrantSlot::new();
+        assert!(slot.publish_fault_selection(1, window(7)));
+        let other_window = window(8);
+        let txn = dummy_txn(8);
+        assert!(slot.submit(other_window, &txn));
+    }
+
+    #[test]
+    fn unconsumed_fault_wait_allows_subsequent_submit_on_same_slot() {
+        let slot = PortalGrantSlot::new();
+        let wait = unsafe {
+            PortalOwnerWait::from_owner(
+                El1MmHandle::from_admitted_owner(
+                    NonZeroU64::new(1).unwrap(),
+                    ReservationMm::new(7).unwrap(),
+                    NonZeroU64::new(1).unwrap(),
+                ),
+                PortalWaitCause::Editor,
+                10,
+            )
+        };
+        assert!(slot.publish_fault_wait(0x6000, wait));
+        let txn = dummy_txn(8);
+        assert!(slot.submit(window(8), &txn));
+    }
+
+    #[test]
+    fn unconsumed_fault_wait_allows_new_fault_selection_on_same_slot() {
+        let slot = PortalGrantSlot::new();
+        let wait = unsafe {
+            PortalOwnerWait::from_owner(
+                El1MmHandle::from_admitted_owner(
+                    NonZeroU64::new(1).unwrap(),
+                    ReservationMm::new(7).unwrap(),
+                    NonZeroU64::new(1).unwrap(),
+                ),
+                PortalWaitCause::Editor,
+                10,
+            )
+        };
+        assert!(slot.publish_fault_wait(0x6000, wait));
+        assert!(slot.publish_fault_selection(2, window(8)));
+        assert!(slot.pending_fault_selection(8, 0x6000).is_some());
+    }
+
+    #[test]
+    fn retired_mm_withdraws_fault_wait_before_slot_reuse() {
+        let slot = PortalGrantSlot::new();
+        let wait = unsafe {
+            PortalOwnerWait::from_owner(
+                El1MmHandle::from_admitted_owner(
+                    NonZeroU64::new(1).unwrap(),
+                    ReservationMm::new(7).unwrap(),
+                    NonZeroU64::new(1).unwrap(),
+                ),
+                PortalWaitCause::Editor,
+                10,
+            )
+        };
+        assert!(slot.publish_fault_wait(0x6000, wait));
+        assert!(slot.withdraw_retired_mm_selection(7));
+        assert!(!slot.has_outstanding_for(7));
+        assert!(slot.publish_fault_selection(2, window(8)));
     }
 }

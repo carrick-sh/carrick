@@ -417,7 +417,7 @@ pub(super) fn resolve_owner_fault(
     if let Some(wait) = slot.take_fault_wait(mm_key, address) {
         return Ok(Some(carrick_hal::OwnerFaultOutcome::OwnerWait(wait)));
     }
-    let Some((generation, _window)) = slot.pending_fault_selection(mm_key, address) else {
+    let Some((generation, window)) = slot.pending_fault_selection(mm_key, address) else {
         crate::probes::hvpatch_el1_file_fault_handoff(
             address,
             carrick_el1_abi::frame_grant_mailbox_host_for_slot(index).map_or(u32::MAX, |mailbox| {
@@ -434,18 +434,37 @@ pub(super) fn resolve_owner_fault(
         mailbox.state.load(std::sync::atomic::Ordering::Acquire),
         1,
     );
-    let claim = frame_grant_access(access)
+    let claim = match frame_grant_access(access)
         .and_then(|actual| mailbox.claim_request_for_fault_owned(mm_key, address, actual))
-        .ok_or_else(|| TrapError::Hypervisor("owner fault scheduler request is stale".into()))?;
+    {
+        Some(claim) => claim,
+        None => {
+            let _ = slot.cancel_fault_selection(window, generation);
+            return Err(TrapError::Hypervisor(
+                "owner fault scheduler request is stale".into(),
+            ));
+        }
+    };
     let request = claim.request();
     if request.request_generation != generation {
+        let _ = slot.cancel_fault_selection(window, generation);
         return Err(TrapError::Hypervisor(
             "owner fault scheduler request generation is stale".into(),
         ));
     }
-    let completed = engine
-        .service_owner_fault(mm_key, generation)?
-        .ok_or_else(|| TrapError::Hypervisor("owner fault selection was displaced".into()))?;
+    let completed = match engine.service_owner_fault(mm_key, generation) {
+        Ok(Some(completed)) => completed,
+        Ok(None) => {
+            let _ = slot.cancel_fault_selection(window, generation);
+            return Err(TrapError::Hypervisor(
+                "owner fault selection was displaced".into(),
+            ));
+        }
+        Err(err) => {
+            let _ = slot.cancel_fault_selection(window, generation);
+            return Err(err);
+        }
+    };
     finish_owner_fault_response(claim, &completed)?;
     Ok(Some(completed))
 }
@@ -495,12 +514,28 @@ pub(super) fn cancel_frame_grant_request(
     address: u64,
     access: Option<carrick_mmu_core::aarch64::LeafAccess>,
 ) {
-    let Some(actual) = frame_grant_access(access) else {
-        return;
-    };
+    let actual = frame_grant_access(access).unwrap_or(0);
     if let Some(mailbox) = mailbox_slot.and_then(carrick_el1_abi::frame_grant_mailbox_host_for_slot)
     {
         let _ = mailbox.cancel_request_for_fault(mm_key, address, actual);
+    }
+}
+
+pub(super) fn cancel_portal_grant_selection(slot_index: Option<usize>, mm_key: u64, address: u64) {
+    let region = carrick_el1_abi::get_el1_region_host_ptr();
+    if region == 0 {
+        return;
+    }
+    let Some(slot_index) = slot_index else {
+        return;
+    };
+    // SAFETY: the carrier retains its EL1 portal region while running.
+    let slots = unsafe {
+        &*((region + carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+            as *const carrick_el1_abi::MmPortalSlots)
+    };
+    if let Some(slot) = slots.grant(slot_index) {
+        let _ = slot.cancel_fault_for_page(mm_key, address);
     }
 }
 
@@ -938,12 +973,10 @@ pub(super) fn withdraw_guest_descriptor_work(mm_key: u64) -> usize {
     for slot in 0..carrick_el1_abi::EL1_STACK_SLOTS as usize {
         if let Some(mailbox) = carrick_el1_abi::frame_grant_mailbox_host_for_slot(slot) {
             let _ = mailbox.withdraw_mm(mm_key);
-            if !mailbox.has_guest_work() {
-                let _ = grant_slots
-                    .and_then(|slots| slots.grant(slot))
-                    .is_some_and(|grant| grant.withdraw_retired_mm_selection(mm_key));
-            }
         }
+        let _ = grant_slots
+            .and_then(|slots| slots.grant(slot))
+            .is_some_and(|grant| grant.withdraw_retired_mm_selection(mm_key));
     }
     carrick_el1_abi::descriptor_txn_slots_host()
         .map_or(0, |slots| GUEST_GRANT_LEDGER.withdraw_mm(slots, mm_key))
