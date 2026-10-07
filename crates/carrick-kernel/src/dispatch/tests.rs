@@ -11273,6 +11273,128 @@ fn rootfs_helpers_execve_path_owner_wait_returns_owner_memory_wait_not_efault() 
 }
 
 #[test]
+fn pipe2_copyout_owner_wait_preserves_admission_before_effects() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{GuestWriteRange, MemoryPrepareError, PreparedGuestWrite};
+    use std::num::NonZeroU64;
+
+    struct Permit<'a>(&'a mut [u8; 8]);
+    impl PreparedGuestWrite for Permit<'_> {
+        fn commit(self: Box<Self>, outputs: &[&[u8]]) {
+            assert_eq!(outputs.len(), 1);
+            self.0.copy_from_slice(outputs[0]);
+        }
+    }
+    struct WaitingMemory {
+        wait: Option<PortalOwnerWait>,
+        fault: bool,
+        output: [u8; 8],
+    }
+    impl GuestMemory for WaitingMemory {
+        fn user_memory_venue(&self) -> carrick_guest_mem::UserMemoryVenue {
+            carrick_guest_mem::UserMemoryVenue::Owner
+        }
+        fn prepare_write(
+            &mut self,
+            ranges: &[GuestWriteRange],
+        ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+            assert_eq!(ranges.len(), 1);
+            assert_eq!(ranges[0].address().raw(), 0x1000);
+            assert_eq!(ranges[0].len(), 8);
+            if let Some(wait) = self.wait.take() {
+                return Err(MemoryPrepareError::OwnerWait(wait));
+            }
+            if self.fault {
+                return Err(MemoryPrepareError::Fault(MemoryError::OutOfBounds {
+                    address: 0x1000,
+                    length: 8,
+                }));
+            }
+            Ok(Box::new(Permit(&mut self.output)))
+        }
+        fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::Unsupported)
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            Err(self
+                .wait
+                .take()
+                .map_or(MemoryError::Unsupported, MemoryError::OwnerWait))
+        }
+    }
+    impl CurrentMmMemory for WaitingMemory {}
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(2).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Editor,
+            7,
+        )
+    };
+    let mut dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let reporter = CompatReporter::default();
+    let request = SyscallRequest::new(59, SyscallArgs::from([0x1000, 0, 0, 0, 0, 0]));
+    let mut memory = WaitingMemory {
+        wait: Some(wait),
+        fault: false,
+        output: [0; 8],
+    };
+    let outcome = dispatcher
+        .dispatch(&context, request, &mut memory, &reporter)
+        .unwrap();
+    assert!(
+        matches!(outcome, DispatchOutcome::OwnerMemoryWait { wait: observed, committed: 0 } if observed == wait),
+        "pipe2 flattened the exact owner wait: {outcome:?}"
+    );
+    assert_eq!(memory.output, [0; 8]);
+    let outcome = dispatcher
+        .dispatch(&context, request, &mut memory, &reporter)
+        .unwrap();
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+    assert_eq!(
+        i32::from_ne_bytes(memory.output[..4].try_into().unwrap()),
+        3
+    );
+    assert_eq!(
+        i32::from_ne_bytes(memory.output[4..].try_into().unwrap()),
+        4
+    );
+    memory.fault = true;
+    let outcome = dispatcher
+        .dispatch(&context, request, &mut memory, &reporter)
+        .unwrap();
+    assert_eq!(outcome, DispatchOutcome::errno(LINUX_EFAULT));
+    memory.fault = false;
+    let outcome = dispatcher
+        .dispatch(&context, request, &mut memory, &reporter)
+        .unwrap();
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+    assert_eq!(
+        i32::from_ne_bytes(memory.output[..4].try_into().unwrap()),
+        5
+    );
+    assert_eq!(
+        i32::from_ne_bytes(memory.output[4..].try_into().unwrap()),
+        6
+    );
+    memory.fault = true;
+    context
+        .task()
+        .replace_rlimit(carrick_abi::LinuxResource::Nofile, |_| {
+            Ok::<_, ()>(carrick_abi::LinuxRlimit::new(3, 3))
+        })
+        .unwrap();
+    let outcome = dispatcher
+        .dispatch(&context, request, &mut memory, &reporter)
+        .unwrap();
+    assert_eq!(outcome, DispatchOutcome::errno(linux_errno::EMFILE));
+}
+
+#[test]
 fn getdents64_copyout_owner_wait_witness() {
     use carrick_abi::LINUX_EFAULT;
     use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
@@ -11515,5 +11637,4 @@ fn readlinkat_copyout_owner_wait_witness() {
         "expected OwnerReadlinkCopyout, got {outcome:?}"
     );
 }
-
 
