@@ -655,10 +655,9 @@ impl Cpl0Carrier {
         cpu.fd()
             .set_regs(&regs)
             .map_err(|error| fail(error.to_string()))?;
-        let watchdog = Watchdog::start();
-        let exit = watchdog.during_guest(|| HvVcpu::run(&mut self.cpus[0]))?;
-        if watchdog.expired() {
-            return Err(fail("production initial MM deadline"));
+        let exit = HvVcpu::run(&mut self.cpus[0])?;
+        if matches!(exit, VcpuExit::Kicked) {
+            return Err(fail("production initial MM cancelled"));
         }
         if !matches!(
             exit,
@@ -855,11 +854,10 @@ impl Cpl0Carrier {
             .root(mm)
             .ok_or_else(|| fail("initial MM not published"))?
             .root;
-        let watchdog = Watchdog::start();
         for exits in 1..=max_exits {
-            let exit = watchdog.during_guest(|| HvVcpu::run(&mut self.cpus[0]))?;
-            if watchdog.expired() {
-                return Err(fail("initial process deadline"));
+            let exit = HvVcpu::run(&mut self.cpus[0])?;
+            if matches!(exit, VcpuExit::Kicked) {
+                return Err(fail("initial process cancelled"));
             }
             let VcpuExit::IoOut {
                 port: FORWARD_PORT, ..
@@ -879,7 +877,7 @@ impl Cpl0Carrier {
                         let VcpuExit::IoOut {
                             port: carrick_x86::FAULT_DOORBELL_PORT,
                             data,
-                        } = watchdog.during_guest(|| HvVcpu::run(&mut self.cpus[0]))?
+                        } = HvVcpu::run(&mut self.cpus[0])?
                         else {
                             return Err(fail("initial fault record interrupted"));
                         };
@@ -1584,6 +1582,16 @@ impl Cpl0Carrier {
             .as_slice()
             .iter()
             .any(|entry| entry.function == 1 && entry.ecx & (1 << 24) != 0))
+    }
+    /// Request a stopped fixture's next KVM_RUN to exit immediately. This
+    /// exercises the same cancellation result as a cross-thread KVM kick.
+    pub fn fixture_cancel_next_run(&mut self, index: usize) -> Result<(), TrapError> {
+        let cpu = self
+            .cpus
+            .get_mut(index)
+            .ok_or_else(|| fail("unknown CPL0 CPU slot"))?;
+        cpu.fd_mut().set_kvm_immediate_exit(1);
+        Ok(())
     }
     fn task(&self, index: usize) -> &CurrentTask {
         self.metadata(TASK_OFFSET + index as u64 * STRIDE)

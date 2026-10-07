@@ -81,6 +81,28 @@ fn initial_write_returns_prefix_or_efault_without_aborting_carrier() {
 }
 
 #[test]
+fn explicit_initial_process_cancel_stops_without_a_deadline() {
+    let elf = tiny_elf();
+    let image = prepare_static_x86_elf(&elf).expect("static ELF");
+    let extent =
+        Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("initial grant extent");
+    let mut carrier = Cpl0Carrier::boot_production(extent).expect("production KVM boot");
+    carrier
+        .load_guest_mm(&image, &[], &[])
+        .expect("shared MM owner");
+    carrier
+        .fixture_cancel_next_run(0)
+        .expect("cancel stopped vCPU");
+    let error = carrier
+        .run_initial_process(8, |_, _| 0)
+        .expect_err("cancel must interrupt KVM_RUN");
+    assert!(
+        error.to_string().contains("initial process cancelled"),
+        "{error}"
+    );
+}
+
+#[test]
 fn shared_guest_owner_loads_static_elf_and_exits_seven() {
     let elf = tiny_elf();
     let plan = prepare_static_x86_elf(&elf).expect("shared ELF parser");
