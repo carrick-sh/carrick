@@ -1,6 +1,25 @@
 # x86 anonymous CPL0 handoff (partial, 2026-10-07)
 
-## Current gate status: labelled extraction work-branch push
+## Current continuation checkpoint (2026-10-07)
+
+Pushed work/x86-process-owner through 3a81f3092. Local 64c68767f binds
+native fault/grant custody to the exact executing CPU/MM; d9adc7077 moves
+process birth admission/publication into the sole shared registry. Final
+checkpoint gates are running, with .status files as the authoritative verdicts.
+No extraction PR, two-MM green or review-ready milestone is claimed.
+The old shootdown red below is historical: the authorized shared-kernel
+single-entry settlement was merged and its foreground KVM gates passed.
+
+Exact next step: complete the frozen checkpoint gates and normal push, then
+apply the guest payload adapter over the shared birth/wait/exit owner. Scratch
+payload paths and reviewed API are in the latest section below. Next bind the
+production El1PendingFamilies process hooks, native MM fork and CPU1 execution.
+The live witness still needs initial ELF/stack VMA+residency import, retained
+frame-level fork inheritance, per-MM InitialWords windows and real stack COW.
+Keep InitialWords as the sole production descriptor editor and PR82's sole #PF.
+Do not substitute fixtures, host process policy or legacy mailboxV2 COW.
+
+## Historical registry-foundation gate status: labelled work-branch push
 
 PR102 follow-up 83364467d is pushed. The extraction registry foundation
 through 6f1fa5b87 is pushed to github/work/x86-process-owner, and no extraction review-ready or two-live-MM
@@ -858,3 +877,77 @@ the staged source and correctly refused dirty inputs. Clean re-run
 physical inventory positions only. No review verdict or rationale changes.
 Guest birth admission/claim return/payload integration and the PRIVATE two-MM
 runtime witness remain required. No review-ready claim or PR has been made.
+
+## Native grant custody and shared birth checkpoint (2026-10-07)
+
+64c68767f separates typed CPU identity from the exact bound CurrentTask in
+shared x86 fault policy. Production grant crossings carry the real CPU slot;
+physical service retains per-CPU pending custody with all four execution
+binding words and the exact native root context, authenticated with live CR3
+before submission and receipt consumption. Offered table stock leaves the
+available pool before submission; only unused stock returns after receipt.
+The host still supplies stage-2 inventory, with guest-selected windows/VMAs.
+
+CPU1 fault red /tmp/x86-process-fault-slot-red.log returns Forward rather
+than Served with one exact current task. Green /tmp/x86-process-fault-slot-green.log
+passes 251 EL1 tests. Native CPL0 build exits zero in
+/tmp/x86-process-fault-slot-cpl0-build.log. Grant custody scaffold red
+/tmp/x86-process-grant-custody-red.log accepts a foreign task and offers the
+same tables twice. Final green and focused clippy are
+/tmp/x86-process-grant-custody-{final-green,clippy}.log. Scoped read-only
+review finds no introduced defect. Service-level unused-stock/refusal tests
+remain to be bound when the native CPU1 execution bridge is runnable.
+
+d9adc7077 retains the shared registry write borrow across exact caller/parent
+admission, PID membership commit, numeric claim commit and infallible topology
+publication. It checks all live/retiring/zombie collisions, exact reservation
+incarnation and exclusive scope, payload identity/session, and selected
+parent/group/session custody. The host consumes this owner, preserving errors,
+failpoints, external-peer-root behavior and ARM-side effect order. Existing
+exit-participant thread membership rules are unchanged.
+
+Birth scaffold red /tmp/x86-process-owner-adapter-birth-red.log has eight
+failures. Genuine exit reservation red
+/tmp/x86-process-owner-adapter-birth-scope-red.log is accepted instead of Busy(1).
+Exclusive-scope fix passes all 161 sched-core tests in
+/tmp/x86-process-owner-adapter-birth-suite.log; focused clippy and host check
+pass in /tmp/x86-process-owner-adapter-birth-{clippy,host-check}.log. Birth
+visits zero of 512 unrelated identities. Review found the scope hole and
+confirmed the retained guard/PID/claim ordering otherwise.
+
+Final foreground receipts: /tmp/x86-process-birth-{host,semantics,kvm,clippy,domains}.log
+and corresponding .status files. Final committed source is frozen throughout.
+Parent ASM /tmp/x86-process-birth-asm-parent.log has zero failures; one excluded
+x86 change encodes the selected grant CPU. N1 retains the inherited single
+fatal_entry_binding ARM difference, not a green N1 verdict. No signed/HVF or
+Docker run is performed on Linux.
+
+Reconciliation correctly refused the new BirthPayloadMismatch fatal site.
+Register it as carrier_fault kernel::process_birth: payload/guard corruption
+after irreversible identity publication cannot be recovered by guest errno.
+Shift existing five fatal ordinals by one and refresh the same method
+fingerprint, preserving their verdicts/rationales and the typed-error debt
+ceiling. Remaining inventory changes only rebind source positions.
+
+Director cannot extend the running 21600-second turn and requested a pushed
+checkpoint around 21000 seconds, followed by a fresh continuation. This is a
+watchdog handoff, not a runtime milestone or a new architectural blocker.
+
+Next continuation starts by checking the final receipt status and pushed SHA,
+then releasing guest_process_payload to apply the actual payload scratch under
+/tmp/x86-process-owner-payload-draft.rs and sibling tests draft (if available).
+Its report is .superpowers/sdd/process-native-owner-plan/task-1-report.md;
+approved plan is /tmp/process-native-owner-plan.md. The native-MM read-only
+review is .superpowers/sdd/process-native-owner-plan/native-mm-integration-review.md.
+Scratch is unverified until real source red/green; preserve that distinction.
+
+Native prerequisites remain: import ELF/stack VMAs and initial residency before
+finish_import; retain exact frame-level inheritance edges (coarse share rejects
+inventoried frames); provide unopened child table custody through per-MM
+InitialWords; bind shared resolve_guest_cow through InitialWords and authenticated
+supervisor data-copy aliases. PortalGrantSlot/apply_grant deliberately refuses
+replacing live stack leaves and cannot substitute for COW. Then bind process
+fork/wait4/exit_group and CPU1 park/restore/dispatch, exact completion identity,
+and actual PRIVATE leaf witnesses per MM, no aliases and an active peer lane.
+The preserved two-MM probe in 6d4905e12 remains red on 710980f1c with fork ENOSYS
+(exit91); do not claim it is included or green in this checkpoint.

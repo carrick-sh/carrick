@@ -610,6 +610,15 @@ exercise the same owner through the public wait APIs. Signed ARM and live
 CPL0 process bindings remain required; these inner-loop checks make no
 runtime-ratio or guest-instruction claim.
 
+`kernel.process.birth-owner` covers fork publication under retained exclusive
+registry custody. Exact caller and selected-parent serial/revision, child
+population collisions, group/session membership and immutable payload identity
+must be authenticated before irreversible claim publication. A valid exit
+participant reservation cannot license new process topology; already-admitted
+thread membership remains allowed. `process::birth::tests` binds these rules,
+including dropped admission, external peer roots, a genuine exit reservation
+red-first refusal and zero identity reads across 512 unrelated tasks.
+
 `kernel.process.exit-owner` covers reserved exit topology. Linux authority is
 exit(2), wait(2), PR_SET_CHILD_SUBREAPER and SIGCHLD's SIG_IGN/SA_NOCLDWAIT
 rules. The shared registry chooses exact-generation live ancestry, reparents

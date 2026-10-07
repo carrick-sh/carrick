@@ -21876,7 +21876,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
-      "line": 996,
+      "line": 1020,
       "categories": [
         "lifecycle"
       ],
@@ -21885,7 +21885,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
-      "line": 1031,
+      "line": 1055,
       "categories": [
         "lifecycle"
       ],
@@ -21894,7 +21894,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
-      "line": 1092,
+      "line": 1116,
       "categories": [
         "lifecycle"
       ],
@@ -21903,7 +21903,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
-      "line": 1915,
+      "line": 1939,
       "categories": [
         "table_guard"
       ],
@@ -21912,7 +21912,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
-      "line": 1946,
+      "line": 1970,
       "categories": [
         "table_guard"
       ],
@@ -21921,7 +21921,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
-      "line": 2192,
+      "line": 2216,
       "categories": [
         "mapping"
       ],
@@ -21930,7 +21930,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
-      "line": 2201,
+      "line": 2225,
       "categories": [
         "mapping"
       ],
@@ -21939,7 +21939,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
-      "line": 2203,
+      "line": 2227,
       "categories": [
         "mapping"
       ],
@@ -21948,7 +21948,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
-      "line": 2235,
+      "line": 2259,
       "categories": [
         "mapping"
       ],
@@ -21957,7 +21957,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
-      "line": 2237,
+      "line": 2261,
       "categories": [
         "mapping"
       ],
