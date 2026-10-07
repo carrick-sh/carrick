@@ -487,25 +487,19 @@ impl Stage1Backing {
     }
 }
 
-/// Architecture decoding for the shared anonymous backing walk.
-/// Decoding conveys custody only; it does not authorize descriptor writes.
-pub trait AnonymousDescriptorDecode {
-    fn indices(va: u64) -> [usize; 4];
-    fn next_table(descriptor: u64, level: usize) -> Option<u64>;
-    fn private_state(descriptor: u64) -> carrick_mmu_core::aarch64::El1PrivateLeafState;
-}
+use carrick_guest_arch::{AnonymousDescriptorDecode, FrameGpa, UserVa};
 
 pub struct ArmAnonymousDecode;
 impl AnonymousDescriptorDecode for ArmAnonymousDecode {
-    fn indices(va: u64) -> [usize; 4] {
-        carrick_mmu_core::aarch64::indices(va)
+    fn indices(va: UserVa) -> [usize; 4] {
+        carrick_mmu_core::aarch64::indices(va.raw())
     }
-    fn next_table(descriptor: u64, level: usize) -> Option<u64> {
+    fn next_table(descriptor: u64, level: usize) -> Option<FrameGpa> {
         const VALID: u64 = 1;
         const TABLE: u64 = 0b11;
         const TABLE_PA: u64 = 0x0000_FFFF_FFFF_F000;
         (level < 3 && descriptor & (VALID | TABLE) == VALID | TABLE)
-            .then_some(descriptor & TABLE_PA)
+            .then_some(FrameGpa::new(descriptor & TABLE_PA))
     }
     fn private_state(descriptor: u64) -> carrick_mmu_core::aarch64::El1PrivateLeafState {
         carrick_mmu_core::aarch64::el1_private_leaf_state(descriptor)
@@ -514,13 +508,13 @@ impl AnonymousDescriptorDecode for ArmAnonymousDecode {
 
 pub struct X86AnonymousDecode;
 impl AnonymousDescriptorDecode for X86AnonymousDecode {
-    fn indices(va: u64) -> [usize; 4] {
-        [39, 30, 21, 12].map(|shift| ((va >> shift) & 511) as usize)
+    fn indices(va: UserVa) -> [usize; 4] {
+        [39, 30, 21, 12].map(|shift| ((va.raw() >> shift) & 511) as usize)
     }
-    fn next_table(descriptor: u64, level: usize) -> Option<u64> {
+    fn next_table(descriptor: u64, level: usize) -> Option<FrameGpa> {
         use carrick_mmu_core::x86::descriptor_txn::{ADDRESS, HUGE, PRESENT};
         (level < 3 && descriptor & PRESENT != 0 && descriptor & HUGE == 0)
-            .then_some(descriptor & ADDRESS)
+            .then_some(FrameGpa::new(descriptor & ADDRESS))
     }
     fn private_state(descriptor: u64) -> carrick_mmu_core::aarch64::El1PrivateLeafState {
         use carrick_mmu_core::aarch64::El1PrivateLeafState;
@@ -569,7 +563,7 @@ pub fn classify_anonymous_range<A: AnonymousDescriptorDecode>(
     let (mut private, mut resident) = (false, false);
     let mut cursor = va;
     while cursor < end {
-        let index = A::indices(cursor);
+        let index = A::indices(UserVa::new(cursor));
         let mut table = root;
         let mut level = 0;
         let descriptor = loop {
@@ -577,7 +571,7 @@ pub fn classify_anonymous_range<A: AnonymousDescriptorDecode>(
                 return malformed;
             };
             if let Some(next_table) = A::next_table(descriptor, level) {
-                table = next_table;
+                table = next_table.raw();
                 level += 1;
                 continue;
             }

@@ -628,3 +628,23 @@ mod tests {
         assert!(UserRange::checked(UserVa::new(0x1000), GuestLen::new(0)).is_some());
     }
 }
+
+/// The only EL1-private terminal states encoded by the software bits and
+/// descriptor validity. This is the authority gate for prepared backing,
+/// retirement, and host-buffer access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum El1PrivateLeafState {
+    Unowned,
+    Prepared,
+    Resident,
+    Retired,
+    Malformed,
+}
+
+/// Architecture decoding for the shared anonymous backing walk.
+/// Decoding conveys custody only; it does not authorize descriptor writes.
+pub trait AnonymousDescriptorDecode {
+    fn indices(va: UserVa) -> [usize; 4];
+    fn next_table(descriptor: u64, level: usize) -> Option<FrameGpa>;
+    fn private_state(descriptor: u64) -> El1PrivateLeafState;
+}
