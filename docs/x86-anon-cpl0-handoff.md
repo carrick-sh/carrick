@@ -18,15 +18,25 @@ the same shared owner; host NsSharedRegion retains publication only for HOST
 lanes. After seed transfer CPL0 must not mutate host arena membership.
 Guest-created nested PID namespaces must refuse with counted ENOSYS.
 
-One policy question remains before implementation: internal IdRegistry IDs
-recycle after all claims release, but visible namespace IDs are monotonic
-and burn failed preparations (the existing counter refuses i32::MAX).
-Those numbers can diverge after failed births. Asked whether to preserve
-both typed domains and policies in one NamespaceState or unify allocation
-policy, which would change host/ARM behavior. Proposed preservation is one
-shared owner with a per-root-namespace visible cursor and thin region
-adapter; no second allocator or invented identity. The new allocator test
-composes domains; it does not prove guest-created nested namespaces.
+The director resolved the allocation policy: one OWNER with both existing
+policies, not one number or policy. Keep internal recyclable IDs and visible
+monotonic PID/TID IDs as distinct types. Failed birth must burn its visible
+number while releasing its internal claim. An exploratory implementation
+and red/green test are retained in /tmp/x86-cont-visible-unlanded.patch;
+they are not landed. The shared suite was 165/0, host check and focused
+clippy passed. The exploratory full host run was cancelled, not passed.
+The proposed per-namespace cursor map still needs exact namespace lifetime
+retirement before landing, to avoid accumulating dead namespace cursors.
+
+The remaining boot-transfer question is MM serial scope. Kernel::ids and
+object_ids are kernel-owned, but MmId uses process-global CARRIER_MM_IDS
+across distinct kernels; file-description serials are process-global too.
+Moving those global sources to one VM disables unrelated kernels, while
+copying a high-water mark can duplicate MM IDs. Asked the director to choose
+a VM-qualified native identity domain or an exclusively transferred serial
+range (or identify the intended existing venue). Do not invent a new source
+or silently freeze the process-global source. Boot binding is paused on
+this scope decision; no runtime milestone or review-ready claim.
 
 Native prerequisites still include ELF/stack VMA and initial residency
 import, retained frame-level inheritance, per-MM InitialWords, real stack
