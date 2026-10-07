@@ -5,8 +5,8 @@ pub use super::thread_setup::{GuestLifecycleVenue, LifecycleVenue, guest_venue};
 use crate::file::UserCopy as ArmUserCopy;
 use carrick_el1_abi::EntryMmKey;
 use carrick_el1_abi::{
-    Claim, EntryRef, LifecycleDecline, RecordRef, SlotId, ThreadControlSlot, ThreadCtx,
-    ThreadIdentity, ThreadLifecyclePage,
+    Claim, EntryRef, LifecycleDecline, RecordRef, ThreadControlSlot, ThreadCtx, ThreadIdentity,
+    ThreadLifecyclePage,
 };
 use carrick_guest_arch::UserVa;
 use carrick_personality_linux::abi::entry::LinuxTaskState;
@@ -99,9 +99,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame
         self.counters.record_lifecycle_decline(reason);
     }
     fn has_scheduler(&self) -> bool {
-        self.frame.arm_scheduler()
-            && self.zone.is_some()
-            && SlotId::from_index(self.frame.slot_index()).is_some()
+        self.frame.arm_scheduler() && self.zone.is_some() && self.frame.slot().is_some()
     }
     fn can_prepare_child(&self, _: UserVa, _: Option<UserVa>) -> bool {
         self.frame.arm_frame_ref().is_some()
@@ -117,7 +115,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame
     }
     fn affinity(&self) -> Option<u64> {
         let zone = self.zone.as_ref()?.tables;
-        let slot = SlotId::from_index(self.frame.slot_index())?;
+        let slot = self.frame.slot()?;
         Some(match zone.slot(slot).current() {
             Some(record) => zone.record(record).identity().affinity,
             None => zone.slot(slot).affinity(),
@@ -169,7 +167,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return;
         };
-        let Some(slot) = SlotId::from_index(self.frame.slot_index()) else {
+        let Some(slot) = self.frame.slot() else {
             return;
         };
         let Some(zone) = &mut self.zone else {
@@ -182,7 +180,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame
     }
     fn exit_record(&self) -> Option<ExitRecord> {
         let zone = self.zone.as_ref()?.tables;
-        let slot = SlotId::from_index(self.frame.slot_index())?;
+        let slot = self.frame.slot()?;
         let id = zone.slot(slot).current()?;
         let record = zone.record(id);
         Some(ExitRecord {
@@ -200,7 +198,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return false;
         };
-        let Some(slot) = SlotId::from_index(self.frame.slot_index()) else {
+        let Some(slot) = self.frame.slot() else {
             return false;
         };
         let Some(zone) = &mut self.zone else {
@@ -226,7 +224,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame
         let Some(zone) = &self.zone else {
             return false;
         };
-        let Some(slot) = SlotId::from_index(self.frame.slot_index()) else {
+        let Some(slot) = self.frame.slot() else {
             return false;
         };
         if zone.tables.live(record).is_none() {
@@ -250,7 +248,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame
                 SyscallResult::new(self.frame.result().0 as i64),
             );
         };
-        let Some(slot) = SlotId::from_index(self.frame.slot_index()) else {
+        let Some(slot) = self.frame.slot() else {
             return (
                 carrick_core::Served::Idle,
                 SyscallResult::new(self.frame.result().0 as i64),
