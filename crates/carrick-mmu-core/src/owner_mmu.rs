@@ -39,6 +39,11 @@ pub trait OwnerMmu {
 /// inheritance, custody selection, admission and rollback stay in that owner.
 pub trait OwnerForkMmu: OwnerMmu {
     const ADDRESS_MASK: u64;
+    /// Root indices at or above this boundary are a retained kernel branch
+    /// shared verbatim by fork descendants. ARM keeps its current full walk.
+    fn shared_root_start() -> usize {
+        512
+    }
     /// Half-open ISA-private control window. None means no such mappings.
     fn control_window() -> Option<(UserVa, UserVa)>;
     fn is_control_alias(va: UserVa) -> bool;

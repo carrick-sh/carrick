@@ -1035,7 +1035,7 @@ impl PreparedRun {
             let reporter = carrick_kernel::compat::CompatReporter::default();
             let mut forward_families = std::collections::BTreeMap::<&'static str, u64>::new();
             let mut refusal_families = std::collections::BTreeMap::<&'static str, u64>::new();
-            let (exit_code, traps) = machine.run_initial_process(max_traps, |machine, frame| {
+            let outcome = machine.run_initial_process(max_traps, |machine, frame| {
                 use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
                 use carrick_kernel::dispatch::{DispatchOutcome, SyscallRequest};
                 use carrick_vmm_kvm::cpl0_boot::InitialSyscallDisposition as Decision;
@@ -1117,9 +1117,27 @@ impl PreparedRun {
                 host_forward_families: count_family(forward_families),
                 guest_refusal_families: count_family(refusal_families),
             });
+            let (exit_code, terminating_signal, traps) = match outcome {
+                carrick_vmm_kvm::cpl0_boot::InitialProcessExit::Exited { code, exits } => {
+                    (code, None, exits)
+                }
+                carrick_vmm_kvm::cpl0_boot::InitialProcessExit::Fault { record, exits } => {
+                    if record.cs & 3 != 3 {
+                        return Err(RuntimeError::Unsupported(format!(
+                            "CPL0 kernel fault: {record:?}"
+                        )));
+                    }
+                    let (signal, _) = record.linux_signal().ok_or_else(|| {
+                        RuntimeError::Unsupported(format!(
+                            "unclassified x86 user fault: {record:?}"
+                        ))
+                    })?;
+                    (128 + signal, Some(signal), exits)
+                }
+            };
             Ok(RunResult {
                 exit_code,
-                terminating_signal: None,
+                terminating_signal,
                 stdout: dispatcher.stdout(),
                 stderr: dispatcher.stderr(),
                 traps,

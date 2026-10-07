@@ -12,6 +12,7 @@ extern crate std;
 
 pub mod aarch64;
 pub mod descriptor_refusal;
+pub mod live_descriptor_words;
 
 mod host_backing;
 pub mod x86;

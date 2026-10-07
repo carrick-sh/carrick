@@ -13,6 +13,7 @@ carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-personality-linux = { path = "../carrick-personality-linux" }
 carrick-core = { path = "../carrick-core" }
 carrick-mmu-core = { path = "../carrick-mmu-core" }
+carrick-syscall-abi = { path = "../carrick-syscall-abi" }
 
 [[bin]]
 name = "carrick-x86-cpl0"

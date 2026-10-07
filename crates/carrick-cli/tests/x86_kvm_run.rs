@@ -7,91 +7,10 @@
 ))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::time::Duration;
 
 use assert_cmd::Command;
-
-const ELF_HEADER_SIZE: usize = 64;
-const ELF_PROGRAM_HEADER_SIZE: usize = 56;
-const ELF_CODE_OFFSET: usize = 0x1000;
-const ELF_LOAD_BASE: u64 = 0x400000;
-const ELF_ENTRY: u64 = ELF_LOAD_BASE + ELF_CODE_OFFSET as u64;
-const ELF_X86_64_MACHINE: u16 = 62;
-const X86_SYS_WRITE: u8 = 1;
-const X86_SYS_EXIT: u8 = 60;
-
-fn hello_elf() -> Vec<u8> {
-    // _start: write(1, "hello\n", 6); exit(7). The RIP displacement points
-    // at the six literal bytes after the final syscall instruction.
-    let code: &[u8] = &[
-        0xb8,
-        X86_SYS_WRITE,
-        0,
-        0,
-        0, // mov eax, SYS_write
-        0xbf,
-        1,
-        0,
-        0,
-        0, // mov edi, 1
-        0x48,
-        0x8d,
-        0x35,
-        0x13,
-        0,
-        0,
-        0, // lea rsi, [rip+19]
-        0xba,
-        6,
-        0,
-        0,
-        0, // mov edx, 6
-        0x0f,
-        0x05, // syscall
-        0xbf,
-        7,
-        0,
-        0,
-        0, // mov edi, 7
-        0xb8,
-        X86_SYS_EXIT,
-        0,
-        0,
-        0, // mov eax, SYS_exit
-        0x0f,
-        0x05, // syscall
-        b'h',
-        b'e',
-        b'l',
-        b'l',
-        b'o',
-        b'\n',
-    ];
-    let mut elf = vec![0_u8; ELF_CODE_OFFSET + code.len()];
-    elf[..4].copy_from_slice(b"\x7fELF");
-    elf[4..7].copy_from_slice(&[2, 1, 1]);
-    elf[16..18].copy_from_slice(&2_u16.to_le_bytes());
-    elf[18..20].copy_from_slice(&ELF_X86_64_MACHINE.to_le_bytes());
-    elf[20..24].copy_from_slice(&1_u32.to_le_bytes());
-    elf[24..32].copy_from_slice(&ELF_ENTRY.to_le_bytes());
-    elf[32..40].copy_from_slice(&(ELF_HEADER_SIZE as u64).to_le_bytes());
-    elf[52..54].copy_from_slice(&(ELF_HEADER_SIZE as u16).to_le_bytes());
-    elf[54..56].copy_from_slice(&(ELF_PROGRAM_HEADER_SIZE as u16).to_le_bytes());
-    elf[56..58].copy_from_slice(&1_u16.to_le_bytes());
-    let ph = ELF_HEADER_SIZE;
-    elf[ph..ph + 4].copy_from_slice(&1_u32.to_le_bytes());
-    elf[ph + 4..ph + 8].copy_from_slice(&5_u32.to_le_bytes());
-    elf[ph + 8..ph + 16].copy_from_slice(&0_u64.to_le_bytes());
-    elf[ph + 16..ph + 24].copy_from_slice(&ELF_LOAD_BASE.to_le_bytes());
-    let image_len = elf.len() as u64;
-    elf[ph + 32..ph + 40].copy_from_slice(&image_len.to_le_bytes());
-    elf[ph + 40..ph + 48].copy_from_slice(&image_len.to_le_bytes());
-    elf[ph + 48..ph + 56].copy_from_slice(&(ELF_CODE_OFFSET as u64).to_le_bytes());
-    elf[ELF_CODE_OFFSET..].copy_from_slice(code);
-    elf
-}
 
 fn append_tar(builder: &mut tar::Builder<&mut Vec<u8>>, name: &str, bytes: &[u8]) {
     let mut header = tar::Header::new_gnu();
@@ -140,8 +59,10 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
     }
     let dir = tempfile::tempdir().unwrap();
     let elf = dir.path().join("hello");
-    std::fs::write(&elf, hello_elf()).unwrap();
-    std::fs::set_permissions(&elf, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The completed compiler owns all writable ELF descriptors. A writer
+    // in this process could be inherited by a concurrent fork and make the
+    // native oracle fail ETXTBSY even after the parent closes its own fd.
+    compile_assembly("x86_hello.S", &elf);
     let native = Command::new(&elf)
         .timeout(Duration::from_secs(5))
         .output()

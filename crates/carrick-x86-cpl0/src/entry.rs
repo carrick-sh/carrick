@@ -140,6 +140,95 @@ core::arch::global_asm!(
     "ud2", // an unguarded kernel/user fault is fatal
 );
 
+// Vector 14's long-lived CPL3 path saves the full GPR and enabled xstate
+// before calling shared fault policy. The syscall-scoped kernel-copy gate
+// temporarily replaces it and restores it before returning to user mode.
+#[cfg(target_os = "none")]
+core::arch::global_asm!(
+    ".global carrick_x86_user_page_fault",
+    "carrick_x86_user_page_fault:",
+    "push rdi", "push rsi", "push rdx", "push rcx", "push rax",
+    "push r8", "push r9", "push r10", "push r11",
+    "push rbx", "push rbp", "push r12", "push r13", "push r14", "push r15",
+    "mov r12, rsp",
+    // Fifteen saved registers, then error, RIP, CS, RFLAGS, RSP and SS.
+    "test byte ptr [r12 + 136], 3",
+    "jz 7f",
+    "swapgs",
+    "2:",
+    // Claim before resetting RSP: a nested CPL0 #PF must not overwrite the
+    // outer xstate or Rust frame. XCHG supplies per-CPU atomic ownership.
+    "mov eax, 1",
+    "xchg qword ptr gs:[136], rax",
+    "test rax, rax",
+    "jnz 5f",
+    "mov qword ptr gs:[144], r12",
+    "mov rax, cr2",
+    "mov qword ptr gs:[152], rax",
+    "mov qword ptr gs:[160], 0",
+    // TSS.RSP0 is a 4 KiB fault-entry stack. Keep its hardware/GPR frame
+    // there, then run xsave and Rust on this CPU's 64 KiB syscall stack.
+    "mov rsp, gs:[0]",
+    "sub rsp, 4160",
+    "and rsp, -64",
+    // XSAVE leaves reserved header bytes untouched; XRSTOR requires zero.
+    // RAX is already in the saved frame, so clear without changing SIMD state.
+    "xor eax, eax",
+    "mov qword ptr [rsp + 512], rax",
+    "mov qword ptr [rsp + 520], rax",
+    "mov qword ptr [rsp + 528], rax",
+    "mov qword ptr [rsp + 536], rax",
+    "mov qword ptr [rsp + 544], rax",
+    "mov qword ptr [rsp + 552], rax",
+    "mov qword ptr [rsp + 560], rax",
+    "mov qword ptr [rsp + 568], rax",
+    "mov eax, 7", "xor edx, edx", "xsave64 [rsp]",
+    "mov r14, cr2",
+    "mov rdi, r12",
+    "call carrick_x86_handle_user_page_fault",
+    "mov r13, rax",
+    "test r13, r13",
+    "jnz 3f",
+    "mov eax, 7", "xor edx, edx", "xrstor64 [rsp]",
+    "mov rsp, r12",
+    "mov qword ptr gs:[136], 0",
+    "test byte ptr [rsp + 136], 3",
+    "jz 4f",
+    "swapgs",
+    "4:",
+    "pop r15", "pop r14", "pop r13", "pop r12", "pop rbp", "pop rbx",
+    "pop r11", "pop r10", "pop r9", "pop r8", "pop rax", "pop rcx",
+    "pop rdx", "pop rsi", "pop rdi",
+    "add rsp, 8", // discard the x86 page-fault error word
+    "iretq",
+    "3:",
+    "mov rdi, r12",
+    "mov rsi, r14",
+    "mov rdx, r13",
+    "call carrick_x86_unresolved_user_page_fault",
+    "7:",
+    // Nested CPL0 entry retains the claimed outer fault before terminating.
+    "cmp qword ptr gs:[136], 0",
+    "jne 5f",
+    // A non-nested CPL0 fault bypasses Linux policy and stack reuse.
+    "mov qword ptr gs:[160], 1",
+    "mov dx, 0xcc",
+    "mov eax, 1",
+    "out dx, al",
+    "jmp 6f",
+    "5:",
+    // Retain the outer frame and original CR2 in this CPU binding. Report a
+    // kernel invariant error, without calling Rust or reusing its outer stack.
+    "mov qword ptr gs:[160], 8",
+    "mov dx, 0xcc", // existing fatal transport
+    "mov eax, 8",
+    "out dx, al",
+    "6:",
+    "cli", "hlt", "jmp 6b",
+
+    "ud2",
+);
+
 #[cfg(target_os = "none")]
 mod user_fault_gate {
     use crate::interrupts;
@@ -152,6 +241,7 @@ mod user_fault_gate {
 
     unsafe extern "C" {
         fn carrick_x86_page_fault_fixup();
+        fn carrick_x86_user_page_fault();
     }
 
     pub struct GateGuard {
@@ -177,6 +267,16 @@ mod user_fault_gate {
     /// guarded user access. SYSCALL has masked IF and the IDT is retained by
     /// the image owner until this CPU retires.
     pub fn install() -> GateGuard {
+        replace(carrick_x86_page_fault_fixup as *const () as u64)
+    }
+
+    /// Retain the CPL3 #PF gate after the initial image enters userspace.
+    /// The kernel-copy guard replaces it only for one syscall and restores it.
+    pub fn install_persistent() {
+        core::mem::forget(replace(carrick_x86_user_page_fault as *const () as u64));
+    }
+
+    fn replace(entry: u64) -> GateGuard {
         // SAFETY: CPL0 owns this CPU's IF; a gate update is not atomic.
         let mask = unsafe { interrupts::hardware::mask_interrupts() };
         let mut idtr = Idtr { limit: 0, base: 0 };
@@ -187,7 +287,6 @@ mod user_fault_gate {
             // SAFETY: an undersized IDT cannot support recoverable #PF.
             unsafe { core::arch::asm!("ud2", options(noreturn)) }
         }
-        let entry = carrick_x86_page_fault_fixup as *const () as u64;
         let mut bytes = [0_u8; 16];
         bytes[0..2].copy_from_slice(&(entry as u16).to_le_bytes());
         bytes[2..4].copy_from_slice(&8_u16.to_le_bytes());
@@ -224,6 +323,7 @@ mod kernel {
     use carrick_el1_abi::{Counters, CurrentTask};
     use carrick_guest_arch::InterruptArch;
     fixture_items! { use carrick_guest_arch::EntryArch; }
+    fixture_items! { use core::sync::atomic::AtomicU64; }
     use core::sync::atomic::Ordering;
 
     // Count native exits across CPL0 CPUs for image/link and live diagnostics.
@@ -239,6 +339,149 @@ mod kernel {
             carrick_el1_abi::FrameGrantMailbox::new();
         static SHARED_COW_POOL: carrick_el1_abi::CowGrantPool =
             carrick_el1_abi::CowGrantPool::new();
+        // Retained by the stopped fixture carrier until VM retirement.
+        static FORK_RESIDENCY_ADDRESS: AtomicU64 = AtomicU64::new(0);
+        pub(super) mod process {
+            include!("process.rs");
+        }
+    }
+
+    #[repr(C)]
+    struct PageFaultStack {
+        saved_gprs: [u64; 15],
+        error: u64,
+        rip: u64,
+        cs: u64,
+        rflags: u64,
+        rsp: u64,
+        ss: u64,
+    }
+    const _: () = {
+        assert!(core::mem::offset_of!(PageFaultStack, error) == 120);
+        assert!(core::mem::offset_of!(PageFaultStack, cs) == 136);
+    };
+
+    /// Vector 14 from CPL3: classify the native error then use the same
+    /// reservation/editor/COW owner as ARM's data-abort policy.
+    #[unsafe(no_mangle)]
+    extern "C" fn carrick_x86_handle_user_page_fault(frame: &PageFaultStack) -> u64 {
+        use carrick_core::mm::transfer::resolver::NoopPreparedResolver;
+        use carrick_el1::fault::{GrantMailboxes, X86CowResolver, dispatch_x86_fault_with_prepared};
+        use carrick_el1_abi::Action;
+        let far: u64;
+        // SAFETY: CR2 is the architectural fault address for this #PF entry.
+        unsafe { core::arch::asm!("mov {}, cr2", out(reg) far, options(nomem, nostack)) };
+        let Some(fault) = decode_user_page_fault(frame.error, far, frame.cs)
+        else {
+            return 1;
+        };
+        let Some(binding) = carrick_el1::isa::x86::context::current_cpu_binding() else {
+            return 2;
+        };
+        if binding.task_address == 0 || binding.counters_address == 0 {
+            return 3;
+        }
+        // SAFETY: the active CPU binding is retained from CPL0 bootstrap and
+        // names this CPU's task and counters until its final user return.
+        let (task, counters) = unsafe {
+            (
+                &*(binding.task_address as *const CurrentTask),
+                &*(binding.counters_address as *const Counters),
+            )
+        };
+        let Some(slot) = checked_scheduler_slot(carrick_guest_arch::CpuId::new(binding.cpu_slot)) else { return 5; };
+        fixture_stmt! {
+        let serve = |zone_address: carrick_guest_arch::KernelVa,
+                     residency: &carrick_el1_abi::FrameGrantResidencyTable,
+                     pool: &dyn carrick_el1_abi::CowGrantVenue,
+                     mailbox: &carrick_el1_abi::FrameGrantMailbox| {
+            // SAFETY: the boot owner published this supervisor-only zone and
+            // retains it across the exact CPU's space-edit transaction.
+            let zone = unsafe { &*(zone_address.raw() as *const carrick_sched_core::ZoneTables) };
+            let mut cow = X86CowResolver { pool, residency, completion: None };
+            let result = dispatch_x86_fault_with_prepared(
+                0, fault, counters, core::slice::from_ref(task),
+                carrick_el1::substrate::sched::object_wait::space_access(
+                    zone, slot,
+                ),
+                GrantMailboxes::own(mailbox),
+                None::<carrick_el1::fault::PreparedFaultPath<'_, NoopPreparedResolver>>,
+                &mut cow,
+            );
+            if result == Action::Served { 0 } else { 6 }
+        };
+            let lane = binding.scheduler_witness.load(Ordering::Acquire);
+            if lane == super::lifecycle::LIFECYCLE_LANE
+                || lane == super::lifecycle::LIFECYCLE_LANE + super::lifecycle::LIFECYCLE_STRIDE
+            {
+                let address = FORK_RESIDENCY_ADDRESS.load(Ordering::Acquire);
+                if address == 0 { return 4; }
+                // SAFETY: the fixture published and retains this aligned table.
+                let residency = unsafe { &*(address as *const carrick_el1_abi::FrameGrantResidencyTable) };
+                return serve(carrick_guest_arch::KernelVa::new(super::lifecycle::LIFECYCLE_ZONE), residency,
+                    &SHARED_COW_POOL, &SHARED_FAULT_MAILBOX);
+            }
+        }
+        let layout = <carrick_el1::isa::x86::X86Backend as carrick_guest_arch::LayoutBackend>::KERNEL_LAYOUT;
+        let Some(venues) = carrick_el1_abi::KernelFaultVenues::derive(layout)
+            .and_then(carrick_el1_abi::KernelFaultVenues::require_upper_half)
+        else { return 7; };
+        // SAFETY: production KVM bootstrap maps and zero-initializes the
+        // retained x86 kernel region at this typed upper-half layout before
+        // admitting CPL3. The region owner keeps it live until CPU retirement.
+        let (residency, pool, mailboxes) = unsafe {
+            (
+                &*(venues.residency.raw() as *const carrick_el1_abi::FrameGrantResidencyTable),
+                &*(venues.cow_pool.raw() as *const carrick_el1_abi::CowGrantPool),
+                &*(venues.mailboxes.raw() as *const carrick_el1_abi::FrameGrantMailboxes),
+            )
+        };
+        let Some(mailbox) = mailboxes.slot(binding.cpu_slot as usize) else { return 5; };
+        // SAFETY: the initial image owner maps this compact zone with its
+        // actual parked-context ABI, retained for the carrier lifetime.
+        let zone = unsafe { &*(venues.zone.raw() as *const carrick_el1::memory::reservations::X86Cpl0Zone) };
+        let mut cow = X86CowResolver { pool, residency, completion: None };
+        let result = dispatch_x86_fault_with_prepared(
+            0, fault, counters, core::slice::from_ref(task),
+            carrick_core::wait::space_access(zone, slot, anonymous::initial_release),
+            GrantMailboxes::own(mailbox),
+            None::<carrick_el1::fault::PreparedFaultPath<'_, NoopPreparedResolver>>,
+            &mut cow,
+        );
+        if result == Action::Served { 0 } else { 6 }
+    }
+
+    /// Forward the original hardware fault through the existing typed x86
+    /// transport. x86 signal-handler installation is not bound in this lane;
+    /// the host applies the shared default Linux signal policy to this record.
+    #[cold]
+    #[unsafe(no_mangle)]
+    extern "C" fn carrick_x86_unresolved_user_page_fault(frame: &PageFaultStack, far: u64, reason: u64) -> ! {
+        if let Some(binding) = carrick_el1::isa::x86::context::current_cpu_binding() {
+            binding.fault_reason.store(reason, Ordering::Release);
+        }
+        fn word(value: u32) {
+            // SAFETY: this CPL0 CPU owns the existing 32-bit fault transport.
+            unsafe { core::arch::asm!("out dx, eax", in("dx") FAULT_DOORBELL_PORT,
+                in("eax") value, options(nostack, preserves_flags)); }
+        }
+        word(14);
+        for value in [frame.error, frame.rip, frame.cs, frame.rsp, frame.rflags,
+            frame.saved_gprs[10], far] {
+            word(value as u32);
+            word((value >> 32) as u32);
+        }
+        halt()
+    }
+
+    fixture_items! {
+        pub(super) fn lifecycle_invariant_error(reason: super::lifecycle::LifecycleInvariant) -> ! {
+            // SAFETY: terminal kernel custody error; report the named stage
+            // without replaying a partially committed syscall on the host.
+            unsafe { core::arch::asm!("out dx, al", in("dx") FATAL_PORT,
+                in("rax") reason as u64, options(nostack, preserves_flags)); }
+            halt()
+        }
     }
 
     // A port exit may suspend this CPU while another CPU continues. The
@@ -305,11 +548,16 @@ mod kernel {
     struct InitialWords {
         start: u64,
         end: u64,
+        edit_root: Option<carrick_guest_arch::RootGpa>,
     }
     impl InitialWords {
-        const fn fixture() -> Self { Self { start: 0xd0_0000, end: 0xd4_0000 } }
+        fn fixture() -> Self {
+            let root = carrick_el1::isa::x86::hardware_live_root()
+                .unwrap_or_else(|_| carrick_el1::isa::x86::fatal_entry_binding());
+            Self { start: 0x20_0000, end: 0xd4_0000, edit_root: Some(root) }
+        }
         const fn production(table_start: u64, table_end: u64) -> Self {
-            Self { start: table_start, end: table_end }
+            Self { start: table_start, end: table_end, edit_root: None }
         }
         fn word(
             &self,
@@ -370,9 +618,16 @@ mod kernel {
             core::sync::atomic::fence(Ordering::SeqCst);
         }
         fn invalidate_range(&self, _: u64, _: u64) {
-            // The fresh root has never been installed. Its first MOV CR3
-            // supplies the local translation boundary.
+            // Unpublished initial roots need no drain. Live fixture edits are
+            // licensed by the captured root, never by a fixed physical number.
+            if let Some(root)=self.edit_root.filter(|root|
+                carrick_el1::isa::x86::hardware_live_root().is_ok_and(|live|live==*root)) {
+                // SAFETY: this CPU owns the exact live root. With no PCID or
+                // global translations, MOV CR3 drains its old user leaves.
+                unsafe { core::arch::asm!("mov cr3, {}", in(reg) root.address().raw(), options(nostack,preserves_flags)) }
+            }
         }
+
     }
 
     struct InitialFrames {
@@ -428,7 +683,7 @@ mod kernel {
         ) -> bool {
             let dest = grant.frame.raw();
             let from = source.raw();
-            if !(0xd0_0000..0xd1_0000).contains(&dest)
+            if !((0xd0_0000..0xd1_0000).contains(&dest) || (0x40_0000..0x41_0000).contains(&dest))
                 || !(0x10_000..0x11_000).contains(&from)
                 || from + u64::from(len) > 0x11_000
                 || u64::from(offset) + u64::from(len) > 4096
@@ -454,7 +709,7 @@ mod kernel {
             bytes: &[u8],
         ) -> bool {
             let pa = grant.frame.raw();
-            if !(0xd0_0000..0xd1_0000).contains(&pa)
+            if !((0xd0_0000..0xd1_0000).contains(&pa) || (0x40_0000..0x41_0000).contains(&pa))
                 || usize::from(offset)
                     .checked_add(bytes.len())
                     .is_none_or(|end| end > 4096)
@@ -485,6 +740,9 @@ mod kernel {
             doorbell(FATAL_PORT, frame);
             halt();
         }
+        if binding.entries.load(Ordering::Acquire) == 0 {
+            super::user_fault_gate::install_persistent();
+        }
         // Both retained scheduler witness fixtures qualify XCR0 and XSAVE
         // geometry before entry. Exercise the shared native context leaf while
         // preserving the exact current task and MM authority.
@@ -511,13 +769,13 @@ mod kernel {
             use carrick_guest_arch::{EditPermissions, MmuBackend};
             // The test stages one already-parsed ET_EXEC image in its RX code
             // page. No guest ELF parser or second host descriptor author runs.
-            if frame.rdi != 0x10100 || frame.rsi != 0xc0 {
+            if frame.rdi != 0x10100 || !(0xc0..=0xf00).contains(&frame.rsi) {
                 doorbell(FATAL_PORT, frame);
                 halt();
             }
             // SAFETY: this exact RX user fixture page remains mapped under
             // the still-live source root until the new MM has copied its bytes.
-            let elf = unsafe { core::slice::from_raw_parts(frame.rdi as *const u8, 0xc0) };
+            let elf = unsafe { core::slice::from_raw_parts(frame.rdi as *const u8, frame.rsi as usize) };
             if &elf[..4] != b"\x7fELF" {
                 doorbell(FATAL_PORT, frame);
                 halt();
@@ -559,9 +817,10 @@ mod kernel {
                 doorbell(FATAL_PORT, frame);
                 halt();
             }
-            let mut frames = InitialFrames {
-                next_table: 0xd3_0000,
-                next_data: 0xd0_0000,
+            let mut frames = if frame.rdx == 1 {
+                InitialFrames { next_table: 0x30_0000, next_data: 0x40_0000 }
+            } else {
+                InitialFrames { next_table: 0xd3_0000, next_data: 0xd0_0000 }
             };
             // SAFETY: this stopped-carrier fixture owns the unpublished MM,
             // both disjoint zeroed frame ranges and the sole table editor.
@@ -592,6 +851,14 @@ mod kernel {
                 doorbell(FATAL_PORT, frame);
                 halt();
             }
+            fixture_stmt! {
+                if frame.rdx == 1
+                    && !process::admit_initial(binding, loaded.stack_pointer, loaded.address.root.address().raw())
+                {
+                    doorbell(FATAL_PORT, frame);
+                    halt();
+                }
+            }
             frame.rcx = loaded.context.frame[15];
             frame.rsp = loaded.context.frame[18];
             frame.r11 = loaded.context.frame[17];
@@ -600,7 +867,7 @@ mod kernel {
         }
         if crate::fixture_image() && frame.rax == 231
             && carrick_el1::isa::x86::hardware_live_root()
-                .is_ok_and(|root| root.address().raw() == 0xd3_0000)
+                .is_ok_and(|root| matches!(root.address().raw(), 0xd3_0000 | 0x30_0000))
         {
             // The stopped KVM fixture consumes exit_group as its terminal
             // observation; the production syscall owner is the shared kernel.
@@ -963,10 +1230,11 @@ mod kernel {
                     carrick_sched_core::SlotId::new(0),
                 ),
                 GrantMailboxes::own(&SHARED_FAULT_MAILBOX),
-                Some(PreparedFaultPath {
+                Some(PreparedFaultPath::<_> {
                     residency,
                     resolver: &mut resolver,
                     roots: None,
+                    file_slots: None,
                 }),
                 &mut NoopCowResolver,
             );

@@ -1,6 +1,19 @@
 //! Linux lifecycle policy over neutral pool transitions and native context hooks.
 use crate::abi::entry::SyscallResult;
 use crate::abi::thread::*;
+use carrick_syscall_abi::LinuxWaitOptions;
+
+/// Linux `pid_t` selector carried by wait4 (including negative selectors).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessWaitPid(i32);
+impl ProcessWaitPid {
+    pub const fn from_syscall_argument(raw: u64) -> Self {
+        Self(raw as i32)
+    }
+    pub const fn raw(self) -> i32 {
+        self.0
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LifecycleCall {
     Exit,
@@ -10,6 +23,9 @@ pub enum LifecycleCall {
     GetPid,
     GetTid,
     Clone,
+    Fork,
+    Wait4,
+    ExitGroup,
 }
 
 /// A primitive returns data, never an entry completion or a final frame write.
@@ -126,6 +142,22 @@ pub trait LifecycleNative<'a>: UserCopy {
     fn run_next(&mut self, timeout_result: SyscallResult) -> (Served, SyscallResult);
     fn result(&self) -> SyscallResult;
     fn set_result(&mut self, result: SyscallResult);
+    /// Native custody for a process fork. The shared owner selects this only
+    /// for an x86 process call with an admitted guest process venue.
+    fn process_fork(&mut self) -> Option<LifecycleOutcome> {
+        None
+    }
+    fn process_wait4(
+        &mut self,
+        _pid: ProcessWaitPid,
+        _status: UserVa,
+        _options: LinuxWaitOptions,
+    ) -> Option<LifecycleOutcome> {
+        None
+    }
+    fn process_exit_group(&mut self, _status: u8) -> Option<LifecycleOutcome> {
+        None
+    }
 }
 /// Linux aarch64 syscall numbers served here (`SYS_SET_ROBUST_LIST` is the
 /// shared canonical number from [`crate::thread`]).
@@ -235,6 +267,18 @@ pub fn invoke<'a>(
         && let Some(tid) = native.visible_tid()
     {
         return Some(returned(SyscallResult::new(i64::from(tid)), false));
+    }
+    match call {
+        LifecycleCall::Fork => return native.process_fork(),
+        LifecycleCall::Wait4 => {
+            return native.process_wait4(
+                ProcessWaitPid::from_syscall_argument(args[0]),
+                UserVa::new(args[1]),
+                LinuxWaitOptions::from_bits_retain(args[2]),
+            );
+        }
+        LifecycleCall::ExitGroup => return native.process_exit_group(args[0] as u8),
+        _ => {}
     }
     let thread = native.thread().or_else(|| {
         if call == LifecycleCall::Exit {
