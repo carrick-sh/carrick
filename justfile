@@ -654,12 +654,8 @@ test-kvm *ARGS:
         exit 1
     fi
     export CARRICK_REQUIRE_KVM=1
-    # live_vcpu_x86's M2 case runs this static musl fixture (needs the
-    # x86_64-unknown-linux-musl target; see docs/perf-results/2026-10-04-x86-kvm-lane-health.md).
-    RUSTFLAGS='-C linker=rust-lld -C linker-flavor=ld.lld -C relocation-model=static -C link-arg=--no-pie' \
-        {{_cargo}} build --release \
-        --manifest-path crates/carrick-vmm-bhyve/fixtures/hello-x86_64/Cargo.toml \
-        --target x86_64-unknown-linux-musl
+    # CPL0 images are derived and built by carrick-vmm-kvm's build script.
+    # The retired live_vcpu_x86 musl executable has no KVM-lane consumer.
     {{_admit}} {{_cargo}} test --locked -p carrick-vmm-kvm --lib --bins {{ARGS}}
     selections="$({{_admit}} {{_cargo}} run -q --locked -p carrick-xtask -- test-lanes args --lane kvm --platform-features "{{_platform_features}}")"
     red=()
