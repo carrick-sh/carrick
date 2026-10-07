@@ -1957,7 +1957,7 @@ impl Cpl0Carrier {
 
     /// Stage an exact byte in a stopped fixture's retained backing.
     pub fn fixture_write_backing_byte(&mut self, gpa: u64, value: u8) -> Result<(), TrapError> {
-        if !matches!(gpa, 0xd1_1000 | 0x4_0000) {
+        if !matches!(gpa, 0xd1_1000 | 0x4_0000 | 0x4_0008) {
             return Err(fail("fixture byte outside admitted backing"));
         }
         self._vm
@@ -2167,6 +2167,7 @@ impl Cpl0Carrier {
         cpu.fd()
             .set_guest_debug(&debug)
             .map_err(|e| fail(format!("KVM_SET_GUEST_DEBUG: {e}")))?;
+        let watchdog = Watchdog::start();
         let result = (|| {
             for _ in 0..16 {
                 let regs = cpu.fd().get_regs().map_err(|e| fail(e.to_string()))?;
@@ -2177,12 +2178,13 @@ impl Cpl0Carrier {
                 if regs.rip == rip {
                     return Ok(());
                 }
-                if !matches!(
-                    cpu.fd_mut()
-                        .run()
-                        .map_err(|e| fail(format!("KVM_RUN single-step: {e}")))?,
-                    KvmExit::Debug(_)
-                ) {
+                let exit = watchdog
+                    .during_guest(|| cpu.fd_mut().run())
+                    .map_err(|e| fail(format!("KVM_RUN single-step: {e}")))?;
+                if watchdog.expired() {
+                    return Err(fail("fixture single-step exceeded deadline"));
+                }
+                if !matches!(exit, KvmExit::Debug(_)) {
                     return Err(fail("fixture single-step exited without debug trap"));
                 }
             }
@@ -2510,7 +2512,11 @@ impl Cpl0Carrier {
         fault_va: u64,
     ) -> Result<u64, TrapError> {
         self.fixture_two_running_cpus_shootdown_fault_inner(
-            editor, reader, fault_rip, fault_va, false,
+            editor,
+            reader,
+            fault_rip,
+            fault_va,
+            carrick_x86::cpl0_entry::FIXTURE_HOLD_NONE,
         )
     }
 
@@ -2525,8 +2531,54 @@ impl Cpl0Carrier {
         fault_va: u64,
     ) -> Result<u64, TrapError> {
         self.fixture_two_running_cpus_shootdown_fault_inner(
-            editor, reader, fault_rip, fault_va, true,
+            editor,
+            reader,
+            fault_rip,
+            fault_va,
+            carrick_x86::cpl0_entry::FIXTURE_HOLD_IPI,
         )
+    }
+
+    /// Run both vCPUs concurrently with publication held until the reader has
+    /// faulted on the gated unmapped address and stopped. Forces the exact interleaving
+    /// where the peer stops before the retired generation is published, proving
+    /// that it retains its debt and settles on reentry.
+    pub fn fixture_two_running_cpus_shootdown_fault_held_publish(
+        &mut self,
+        editor: usize,
+        reader: usize,
+        fault_rip: u64,
+        fault_va: u64,
+    ) -> Result<u64, TrapError> {
+        self.fixture_two_running_cpus_shootdown_fault_inner(
+            editor,
+            reader,
+            fault_rip,
+            fault_va,
+            carrick_x86::cpl0_entry::FIXTURE_HOLD_PUBLISH,
+        )
+    }
+
+    /// Resume a stopped CPL0 CPU so its KICK handler can settle retained shootdown
+    /// debt and reload CR3 before further execution.
+    pub fn fixture_resume_stopped_cpu(&mut self, index: usize) -> Result<VcpuExit, TrapError> {
+        let watchdog = Watchdog::start();
+        let exit = watchdog.during_guest(|| self.run_cpu(index))?;
+        if watchdog.expired() {
+            return Err(fail("stopped CPU reentry exceeded deadline"));
+        }
+        if !matches!(
+            exit,
+            VcpuExit::IoOut {
+                port: CONTROL_PORT,
+                ..
+            }
+        ) {
+            return Err(fail(
+                "stopped CPU reentry did not reach completion doorbell",
+            ));
+        }
+        Ok(exit)
     }
 
     fn fixture_two_running_cpus_shootdown_fault_inner(
@@ -2535,11 +2587,12 @@ impl Cpl0Carrier {
         reader: usize,
         fault_rip: u64,
         fault_va: u64,
-        hold_ipi: bool,
+        hold_mode: u32,
     ) -> Result<u64, TrapError> {
         if editor >= 2 || reader >= 2 || editor == reader {
             return Err(fail("invalid fixture CPU slots"));
         }
+        self.fixture_write_backing_byte(0x4_0008, 0)?;
         let ram = Arc::clone(&self.ram);
         let stack_end = self.binding(editor).kernel_stack + 16;
         let table = unsafe {
@@ -2552,18 +2605,19 @@ impl Cpl0Carrier {
         let vm = &self._vm.vm().vm;
         let [a, b] = &mut self.cpus;
         let (editor_cpu, reader_cpu) = if editor == 0 { (a, b) } else { (b, a) };
-        if hold_ipi {
-            table.fixture_hold_ipi.store(true, Ordering::Release);
+        if hold_mode != carrick_x86::cpl0_entry::FIXTURE_HOLD_NONE {
+            table.fixture_hold_ipi.store(hold_mode, Ordering::Release);
         }
 
         let (editor_res, reader_res) = std::thread::scope(|scope| {
             let reader_handle = scope.spawn(|| {
                 let watchdog = Watchdog::start();
+                let start = std::time::Instant::now();
                 let mut words = Vec::with_capacity(carrick_x86::X86_FAULT_RECORD_U32_WORDS);
                 while words.len() < carrick_x86::X86_FAULT_RECORD_U32_WORDS {
                     let exit =
                         watchdog.during_guest(|| run_member(reader_cpu, table, reader, vm))?;
-                    if watchdog.expired() {
+                    if watchdog.expired() || start.elapsed() > Duration::from_secs(5) {
                         return Err(fail("running reader did not fault before deadline"));
                     }
                     if let VcpuExit::IoOut {
@@ -2571,8 +2625,11 @@ impl Cpl0Carrier {
                         data,
                     } = exit
                     {
-                        if hold_ipi {
-                            table.fixture_hold_ipi.store(false, Ordering::Release);
+                        if hold_mode == carrick_x86::cpl0_entry::FIXTURE_HOLD_IPI {
+                            table.fixture_hold_ipi.store(
+                                carrick_x86::cpl0_entry::FIXTURE_HOLD_NONE,
+                                Ordering::Release,
+                            );
                         }
                         words.push(u32::from_le_bytes(
                             data.as_slice()
@@ -2582,6 +2639,12 @@ impl Cpl0Carrier {
                     }
                 }
                 let record = carrick_x86::FaultDoorbellRecord::from_u32_words(&words)?;
+                if hold_mode == carrick_x86::cpl0_entry::FIXTURE_HOLD_PUBLISH {
+                    table.fixture_hold_ipi.store(
+                        carrick_x86::cpl0_entry::FIXTURE_HOLD_NONE,
+                        Ordering::Release,
+                    );
+                }
                 if record.vector != 14
                     || record.rip != fault_rip
                     || record.cr2 != fault_va
@@ -2595,10 +2658,10 @@ impl Cpl0Carrier {
             let editor_handle = scope.spawn(|| {
                 let watchdog = Watchdog::start();
                 let start = std::time::Instant::now();
-                if !hold_ipi {
+                {
                     while ram
                         .host_ptr(0x4_0000, 1)
-                        .map(|p| unsafe { *p })
+                        .map(|p| unsafe { (&*p.cast::<AtomicU8>()).load(Ordering::Acquire) })
                         .unwrap_or(0)
                         != 0x11
                     {
