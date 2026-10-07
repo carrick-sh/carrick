@@ -2564,9 +2564,6 @@ impl GuestMemory for Cpl0Carrier {
         let mm = NonZeroU64::new(INITIAL_MM_KEY).ok_or(MemoryError::Unsupported)?;
         let root = self._vm.root(mm).ok_or(MemoryError::Unsupported)?.root;
         let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(length)
-            .map_err(|_| MemoryError::MetadataAllocation)?;
         while bytes.len() < length {
             let va = address
                 .checked_add(bytes.len() as u64)
@@ -2578,12 +2575,19 @@ impl GuestMemory for Cpl0Carrier {
                 })?;
             let count = (4096 - (va & 4095)) as usize;
             let count = count.min(length - bytes.len());
-            bytes.extend(self._vm.read(leaf.output, count).map_err(|_| {
-                MemoryError::OutOfBounds {
+            let page = self
+                ._vm
+                .read(leaf.output, count)
+                .map_err(|_| MemoryError::OutOfBounds {
                     address: va,
                     length,
-                }
-            })?);
+                })?;
+            // A caller can request far more bytes than its live MM maps.
+            // Admit storage only as each stage-1 page proves readable.
+            bytes
+                .try_reserve(page.len())
+                .map_err(|_| MemoryError::MetadataAllocation)?;
+            bytes.extend(page);
         }
         Ok(bytes)
     }
