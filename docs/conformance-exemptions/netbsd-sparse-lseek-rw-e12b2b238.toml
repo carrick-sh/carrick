@@ -1,0 +1,6 @@
+schema = "carrick.conformance-exemption.v1"
+base = "4a902d0f118f28697f03caad6333e495e77167f2"
+head = "e12b2b23858c2e2d0952d1c52932963fb74a0dca"
+paths = ["crates/carrick-kernel/src/dispatch/fs/rw.rs"]
+contracts = ["kernel.mm.syscall-code-write"]
+rationale = "The rw.rs edit only replaces the host SEEK_DATA/SEEK_HOLE whence mapping in lseek_host_file and the host-backed File lseek arm with carrick_portable::lseek_sparse; on macOS, FreeBSD and Linux that is the same native host lseek with the same whence, and the changed semantics are owned and evidenced by kernel.fs.lseek-sparse. No read, readv, pread64, preadv or recvfrom destination path, physical backing retention, code-dependency invalidation or EFAULT handling is touched, so syscall-code-write semantics and work units are unchanged."
