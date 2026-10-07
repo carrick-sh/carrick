@@ -672,7 +672,13 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
             return Err(Refusal::Busy);
         }
         if index != 0 {
-            let next = self.node(index, banks).next_free.load(Ordering::Relaxed) as u32;
+            let link = self.node(index, banks).next_free.load(Ordering::Acquire);
+            assert_eq!(
+                link & (3 << 62),
+                0,
+                "live reservation node reached the free head: {index}"
+            );
+            let next = link as u32;
             let generation = (head >> 32)
                 .checked_add(1)
                 .filter(|v| *v <= u32::MAX as u64)
@@ -3186,6 +3192,18 @@ mod tests {
             model.free_node(node);
         }));
         assert!(second.is_err(), "the same node was returned twice");
+    }
+
+    #[test]
+    fn a_live_node_at_the_free_head_cannot_be_allocated_again() {
+        let table = table();
+        let mm = ReservationMm::new(63).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let model = table.lock(0, mm).unwrap();
+        let node = model.pool_node().unwrap();
+        table.free.store(u64::from(node), Ordering::Release);
+        let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model.pool_node()));
+        assert!(second.is_err(), "an active node was allocated twice");
     }
 
     thread_local! {
