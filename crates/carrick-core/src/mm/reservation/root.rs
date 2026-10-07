@@ -712,10 +712,26 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
             return;
         }
         let node = self.node(index, banks);
+        let marker = node.next_free.load(Ordering::Acquire);
+        #[cfg(test)]
+        if self.layout_hash.load(Ordering::Acquire) == 0 {
+            // The isolated VM-free test borrows the otherwise unused prepared
+            // sequence as a two-caller barrier while the layout is disabled.
+            self.prepared_sequence.fetch_add(1, Ordering::AcqRel);
+            while self.prepared_sequence.load(Ordering::Acquire) < 2 {
+                core::hint::spin_loop();
+            }
+        }
         assert_ne!(
-            node.next_free.load(Ordering::Acquire) & (3 << 62),
+            marker & (3 << 62),
             0,
             "reservation node returned twice: {index}"
+        );
+        assert!(
+            node.next_free
+                .compare_exchange(marker, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "reservation node return lost custody: {index}"
         );
         // Return uses a lock-free stack. Failed CAS reflects another completed
         // return, not polling for a guest/host event while holding a worker.
@@ -1821,12 +1837,13 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         }
         if self.host_venue && self.state().host_reserved < HOST_RESERVE {
             let head = self.state().host_reserve_head;
+            let marker = self
+                .table
+                .node(id, self.banks)
+                .next_free
+                .swap(0, Ordering::AcqRel);
             assert_ne!(
-                self.table
-                    .node(id, self.banks)
-                    .next_free
-                    .load(Ordering::Acquire)
-                    & (3 << 62),
+                marker & (3 << 62),
                 0,
                 "reservation node returned twice to host reserve: {id}"
             );
@@ -3204,6 +3221,37 @@ mod tests {
         table.free.store(u64::from(node), Ordering::Release);
         let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model.pool_node()));
         assert!(second.is_err(), "an active node was allocated twice");
+    }
+
+    #[test]
+    fn concurrent_returns_claim_one_node_once() {
+        let table = table();
+        let mm = ReservationMm::new(64).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let model = table.lock(0, mm).unwrap();
+        let node = model.pool_node().unwrap();
+        drop(model);
+        table.layout_hash.store(0, Ordering::Release);
+        let successes = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    table.release(node, None);
+                }))
+                .is_ok()
+            });
+            let second = scope.spawn(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    table.release(node, None);
+                }))
+                .is_ok()
+            });
+            u32::from(first.join().unwrap()) + u32::from(second.join().unwrap())
+        });
+        table
+            .layout_hash
+            .store(SharedReservations::LAYOUT_HASH, Ordering::Release);
+        table.prepared_sequence.store(0, Ordering::Release);
+        assert_eq!(successes, 1, "two returns claimed one live node");
     }
 
     thread_local! {
