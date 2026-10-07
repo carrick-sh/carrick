@@ -21,11 +21,6 @@ pub trait OwnerVenue {
         zone: &carrick_sched_core::ZoneTables,
         slot: carrick_sched_core::SlotId,
     ) -> carrick_sched_core::spaces::notification::SpaceAccess<'_>;
-    fn deliver_completion(
-        zone: &carrick_sched_core::ZoneTables,
-        slot: carrick_sched_core::SlotId,
-        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
-    );
     fn encode_error(error: MmError) -> u32;
     fn cancelled_copy_code() -> u32;
 }
@@ -62,28 +57,23 @@ pub struct MmPortal<
 
 /// Authenticated before effects, while dropping the claim can restore LIVE.
 /// Publication cannot reject a prepared settlement afterward.
-enum PreparedDelivery<'a, Venue: OwnerVenue> {
+enum PreparedDelivery<'a> {
     Standalone,
     Scheduler {
-        venue: core::marker::PhantomData<Venue>,
-        zone: &'a carrick_sched_core::ZoneTables,
+        venue: carrick_sched_core::spaces::notification::SpaceReleaseVenue<'a>,
         key: carrick_sched_core::object_wait::ObjectWaitKey,
-        waker: carrick_sched_core::SlotId,
     },
 }
-impl<Venue: OwnerVenue> PreparedDelivery<'_, Venue> {
+impl PreparedDelivery<'_> {
     fn publish(self) {
-        if let Self::Scheduler {
-            zone, key, waker, ..
-        } = self
-        {
+        if let Self::Scheduler { venue, key } = self {
             let completion = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
                 '_,
-            >| { Venue::deliver_completion(zone, waker, effects) };
+            >| { (venue.deliver)(venue.zone, venue.waker, effects) };
             // SAFETY: this capability came from the exact claimed node's
             // retained PREPARE admission, before that claim was released.
-            unsafe { zone.retained_object_notification(key) }
-                .publish(carrick_sched_core::Waker::El1 { slot: waker }, &completion);
+            unsafe { venue.zone.retained_object_notification(key) }
+                .publish(venue.waker, &completion);
         }
     }
 }
@@ -195,19 +185,19 @@ impl<
         &self,
         claim: &ClaimedPreparedCopy<'_, Policy, Geometry>,
         slot: u32,
-    ) -> Result<PreparedDelivery<'_, Venue>, MmError> {
+    ) -> Result<PreparedDelivery<'_>, MmError> {
         let Some(key) = claim.notification() else {
             return Ok(PreparedDelivery::Standalone);
         };
         let zone = self.zone.ok_or(MmError::Core)?;
-        let waker =
-            carrick_sched_core::SlotId::from_index(slot as usize).ok_or(MmError::Invalid)?;
-        Ok(PreparedDelivery::Scheduler {
-            venue: core::marker::PhantomData,
-            zone,
-            key,
-            waker,
-        })
+        let slot = carrick_sched_core::SlotId::from_index(slot as usize).ok_or(MmError::Invalid)?;
+        let venue = Venue::space_access(zone, slot)
+            .venue()
+            .ok_or(MmError::Core)?;
+        if !core::ptr::eq(venue.zone, zone) {
+            return Err(MmError::Stale);
+        }
+        Ok(PreparedDelivery::Scheduler { venue, key })
     }
     /// Release semantic custody by exact atomic identity. This does not
     /// acquire the root or descriptor editor, even while either is held.

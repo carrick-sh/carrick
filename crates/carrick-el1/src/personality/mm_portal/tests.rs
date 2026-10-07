@@ -8,6 +8,106 @@ use carrick_el1_abi::{
 use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
 use carrick_sched_core::AddressSpaces;
 use core::sync::atomic::Ordering;
+
+#[test]
+fn prepared_copy_host_venue_preserves_host_completion_authority() {
+    use carrick_core::mm::transaction::{OwnerVenue, SelectionVenues};
+    use carrick_sched_core::spaces::notification::{SpaceAccess, SpaceReleaseVenue};
+    use carrick_sched_core::{SlotId, Waker, ZoneTables};
+    struct HostVenue;
+    fn deliver(
+        _: &ZoneTables,
+        waker: Waker,
+        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+    ) {
+        let (actual, _, _) = effects.defer_handbacks();
+        assert_eq!(waker, Waker::Host);
+        assert_eq!(
+            actual,
+            Waker::Host,
+            "host completion has no guest execution slot"
+        );
+    }
+    impl OwnerVenue for HostVenue {
+        fn space_access(zone: &ZoneTables, _: SlotId) -> SpaceAccess<'_> {
+            SpaceAccess::notified(SpaceReleaseVenue {
+                zone,
+                waker: Waker::Host,
+                deliver,
+            })
+        }
+        fn encode_error(error: MmError) -> u32 {
+            error.errno()
+        }
+        fn cancelled_copy_code() -> u32 {
+            carrick_personality_linux::mm::cancelled_copy_errno()
+        }
+    }
+    for cancel in [false, true] {
+        let region = Region::new();
+        let zone = region.zone();
+        let mm = admit_notified(&region, 77, ROOT, 1, 0);
+        let view = nodes(&region);
+        let portal = carrick_core::mm::transaction::MmPortal::<
+            _,
+            carrick_personality_linux::mm::LinuxReservationPolicy,
+            crate::memory::reservations::NativeReservationGeometry,
+            HostVenue,
+        >::new(
+            NonZeroU64::new(1).unwrap(),
+            region.table(),
+            &zone.spaces,
+            &view,
+        )
+        .with_zone(zone)
+        .unwrap();
+        let tables = Tables::new(ROOT, IPA, 1);
+        let maintenance = CallerInvalidatesAsid;
+        let transfer = portal
+            .begin(
+                portal.admitted_handle(mm, 0).unwrap(),
+                GuestVa::new(VA),
+                4096,
+                TransferIntent::UserWrite,
+                0,
+            )
+            .unwrap();
+        let request = selected(
+            portal
+                .select(
+                    &transfer,
+                    &tables.live(&maintenance),
+                    SelectionVenues {
+                        prepared: &mut NoopPreparedResolver,
+                        cow: &mut NoopCowResolver,
+                        residency: &residency(),
+                        slot: 0,
+                    },
+                )
+                .unwrap(),
+        )
+        .request(TransferIntent::UserWrite, retained())
+        .unwrap();
+        let permit = prepare_transfer(&portal, request, &tables.live(&maintenance), 0)
+            .unwrap()
+            .unwrap();
+        if cancel {
+            portal.cancel_prepared(permit, request, 0).unwrap();
+        } else {
+            let wire = carrick_el1_abi::PortalTransferSlot::new();
+            let mut ticket = wire.submit_commit(request, permit, 4096).unwrap();
+            production::settle_prepared_service(&portal, wire.claim().unwrap(), permit, 0, || {
+                assert!(ticket.copy_requested(|_| true));
+            })
+            .unwrap();
+            assert_eq!(ticket.take_completion().unwrap().completed, 4096);
+        }
+        let recovered = prepare_transfer(&portal, request, &tables.live(&maintenance), 0)
+            .unwrap()
+            .unwrap();
+        portal.cancel_prepared(recovered, request, 0).unwrap();
+    }
+}
 #[test]
 fn transfer_fence_bounds_remap_to_one_chunk() {
     let region = Region::new();

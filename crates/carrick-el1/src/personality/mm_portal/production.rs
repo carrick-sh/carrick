@@ -24,13 +24,6 @@ impl carrick_core::mm::transaction::OwnerVenue for NativeOwnerVenue {
     ) -> carrick_sched_core::spaces::notification::SpaceAccess<'_> {
         crate::substrate::sched::object_wait::space_access(zone, slot)
     }
-    fn deliver_completion(
-        zone: &carrick_sched_core::ZoneTables,
-        slot: carrick_sched_core::SlotId,
-        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
-    ) {
-        crate::substrate::sched::object_wait::deliver_completion(zone, slot, effects)
-    }
     fn encode_error(error: MmError) -> u32 {
         error.errno()
     }
