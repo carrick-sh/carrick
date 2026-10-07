@@ -4,6 +4,8 @@ use carrick_syscall_abi::LinuxWaitOptions;
 use core::num::{NonZeroI32, NonZeroU64};
 use core::time::Duration;
 
+pub mod registry;
+
 macro_rules! linux_i32_id {
     ($name:ident) => {
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
