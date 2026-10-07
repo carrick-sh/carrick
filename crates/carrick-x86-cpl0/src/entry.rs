@@ -301,7 +301,7 @@ mod kernel {
         end: u64,
     }
     impl InitialWords {
-        const fn fixture() -> Self { Self { start: 0x20_0000, end: 0xc0_0000 } }
+        const fn fixture() -> Self { Self { start: 0xd0_0000, end: 0xd4_0000 } }
         const fn production(end: u64) -> Self { Self { start: 0x40_00000, end } }
         fn word(
             &self,
@@ -312,7 +312,11 @@ mod kernel {
         > {
             use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
             let in_grants = pa >= self.start && pa.checked_add(8).is_some_and(|end| end <= self.end);
-            let source_root = self.start == 0x40_00000 && (0x60_0000..0x60_1000).contains(&pa);
+            let source_root = if self.start == 0xd0_0000 {
+                (0x60_0000..0x7c_0000).contains(&pa)
+            } else {
+                self.start == 0x40_00000 && (0x60_0000..0x60_1000).contains(&pa)
+            };
             if pa & 7 != 0 || !(in_grants || source_root)
             {
                 return Err(DescriptorRefusal::TableOutsidePrimary);
@@ -377,7 +381,7 @@ mod kernel {
     impl carrick_el1::isa::x86::initial_mm::InitialFrameSource for InitialFrames {
         fn take_zeroed_table(&mut self) -> Option<carrick_guest_arch::RootGpa> {
             use carrick_guest_arch::{FrameGpa, RootGpa};
-            if self.next_table >= 0x81_0000 {
+            if self.next_table >= 0xd4_0000 {
                 return None;
             }
             let pa = self.next_table;
@@ -390,7 +394,7 @@ mod kernel {
         ) -> Option<carrick_el1::isa::x86::initial_mm::InitialDataGrant> {
             use carrick_el1::isa::x86::initial_mm::InitialDataGrant;
             use carrick_guest_arch::{EditBacking, FrameGpa};
-            if self.next_data >= 0x91_0000 {
+            if self.next_data >= 0xd1_0000 {
                 return None;
             }
             let pa = self.next_data;
@@ -416,7 +420,7 @@ mod kernel {
         ) -> bool {
             let dest = grant.frame.raw();
             let from = source.raw();
-            if !(0x90_0000..0x91_0000).contains(&dest)
+            if !(0xd0_0000..0xd1_0000).contains(&dest)
                 || !(0x10_000..0x11_000).contains(&from)
                 || from + u64::from(len) > 0x11_000
                 || u64::from(offset) + u64::from(len) > 4096
@@ -442,7 +446,7 @@ mod kernel {
             bytes: &[u8],
         ) -> bool {
             let pa = grant.frame.raw();
-            if !(0x90_0000..0x91_0000).contains(&pa)
+            if !(0xd0_0000..0xd1_0000).contains(&pa)
                 || usize::from(offset)
                     .checked_add(bytes.len())
                     .is_none_or(|end| end > 4096)
@@ -548,8 +552,8 @@ mod kernel {
                 halt();
             }
             let mut frames = InitialFrames {
-                next_table: 0x80_0000,
-                next_data: 0x90_0000,
+                next_table: 0xd3_0000,
+                next_data: 0xd0_0000,
             };
             // SAFETY: this stopped-carrier fixture owns the unpublished MM,
             // both disjoint zeroed frame ranges and the sole table editor.
@@ -588,7 +592,7 @@ mod kernel {
         }
         if crate::fixture_image() && frame.rax == 231
             && carrick_el1::isa::x86::hardware_live_root()
-                .is_ok_and(|root| root.address().raw() == 0x80_0000)
+                .is_ok_and(|root| root.address().raw() == 0xd3_0000)
         {
             // The stopped KVM fixture consumes exit_group as its terminal
             // observation; the production syscall owner is the shared kernel.
@@ -617,8 +621,8 @@ mod kernel {
             let root =
                 carrick_el1::isa::x86::hardware_live_root().map_or(0, |root| root.address().raw());
             let (Some(child), Some(parent)) = (
-                PortalForkTableArena::new(0x92_0000, 4096),
-                PortalForkTableArena::new(0x92_1000, 4096),
+                PortalForkTableArena::new(0xd2_0000, 4096),
+                PortalForkTableArena::new(0xd2_1000, 4096),
             ) else {
                 frame.rax = 0;
                 return;
@@ -629,7 +633,7 @@ mod kernel {
                 unsafe { ForkDescriptorWords::checked(root, child, parent) }.is_ok_and(|words| {
                     words.load(child.base).is_ok()
                         && words.load(parent.base).is_ok()
-                        && words.load(0x92_2000).is_err()
+                        && words.load(0xd2_2000).is_err()
                         && words.drain_succeeded()
                 }),
             );
@@ -660,7 +664,7 @@ mod kernel {
                 0x3_7000,
                 one,
                 EditOperation::Prepare {
-                    output: FrameGpa::new(0x91_1000),
+                    output: FrameGpa::new(0xd1_1000),
                     permissions: EditPermissions {
                         readable: true,
                         writable: true,
@@ -678,8 +682,8 @@ mod kernel {
                     0x3_7000,
                     one,
                     EditOperation::CowRepoint {
-                        old: FrameGpa::new(0x91_1000),
-                        new: FrameGpa::new(0x91_5000),
+                        old: FrameGpa::new(0xd1_1000),
+                        new: FrameGpa::new(0xd1_5000),
                         backing,
                         access: EditCowAccess::RecordedPrivate,
                     },
@@ -725,7 +729,7 @@ mod kernel {
                 0x3_6000,
                 one,
                 EditOperation::Prepare {
-                    output: FrameGpa::new(0x91_6000),
+                    output: FrameGpa::new(0xd1_6000),
                     permissions: EditPermissions {
                         readable: true,
                         writable: true,
@@ -988,7 +992,7 @@ mod kernel {
                 0x3_4000,
                 one,
                 EditOperation::Map {
-                    output: FrameGpa::new(0x91_1000),
+                    output: FrameGpa::new(0xd1_1000),
                     permissions: EditPermissions {
                         readable: true,
                         writable: true,
@@ -1026,8 +1030,8 @@ mod kernel {
             // SAFETY: the bootstrap direct window maps both retained frame
             // pages and this fixture excludes the sibling vCPU.
             unsafe {
-                ((DIRECT_VA + 0x91_1000) as *mut u8).write_volatile(0x5a);
-                ((DIRECT_VA + 0x91_5000) as *mut u8).write_volatile(0);
+                ((DIRECT_VA + 0xd1_1000) as *mut u8).write_volatile(0x5a);
+                ((DIRECT_VA + 0xd1_5000) as *mut u8).write_volatile(0);
             }
             // SAFETY: the lifecycle carrier keeps task and zone records live.
             let task = unsafe { &*(binding.task_address as *const CurrentTask) };
@@ -1052,7 +1056,7 @@ mod kernel {
             let Some(old_slot) = residency.publish(FrameGrantResidencyIdentity {
                 mm_key: mm,
                 semantic_base: 0x3_4000,
-                physical_ipa: 0x91_1000,
+                physical_ipa: 0xd1_1000,
                 len: 4096,
                 mapping_id: 1,
                 frame_id: 1,
@@ -1068,7 +1072,7 @@ mod kernel {
                 halt();
             };
             if !residency.record_commit(old_page)
-                || SHARED_COW_POOL.publish(mm, 0x91_4000, backing).is_none()
+                || SHARED_COW_POOL.publish(mm, 0xd1_4000, backing).is_none()
             {
                 doorbell(FATAL_PORT, frame);
                 halt();
@@ -1099,8 +1103,8 @@ mod kernel {
             );
             // SAFETY: both pages remain mapped in the supervisor direct window.
             let copied = unsafe {
-                ((DIRECT_VA + 0x91_1000) as *const u8).read_volatile() == 0x5a
-                    && ((DIRECT_VA + 0x91_5000) as *const u8).read_volatile() == 0x5a
+                ((DIRECT_VA + 0xd1_1000) as *const u8).read_volatile() == 0x5a
+                    && ((DIRECT_VA + 0xd1_5000) as *const u8).read_volatile() == 0x5a
             };
             frame.rax = u64::from(
                 action == Action::Served
