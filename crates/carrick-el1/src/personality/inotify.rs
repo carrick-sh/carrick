@@ -38,6 +38,15 @@ pub fn el1_inotify_add_watch<'a>(
     name_cache: &InotifyNameCache,
     validator: &impl MemoryValidator,
 ) -> Result<i64, Action> {
+    // A missing delegated-file authority cannot finish this call in guest.
+    // Refuse before validating or copying a guest pathname: an x86 CPL0
+    // entry can have a live file table without a published file venue.
+    if matches!(
+        access,
+        crate::substrate::file_notification::FileAccess::Unavailable
+    ) {
+        return Err(Action::Forward);
+    }
     // If mask includes unsupported modifier bits, forward to host
     if mask & UNSUPPORTED_INOTIFY_MASK_FLAGS != 0 {
         return Err(Action::Forward);

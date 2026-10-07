@@ -30,6 +30,8 @@ pub trait GuestDispatchFrame: SyscallFrame {
     fn arm_frame_ref(&self) -> Option<&TrapFrame>;
     fn arm_scheduler(&self) -> bool;
     fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64>;
+    /// Distinguish an ISA-only refusal from a family or venue refusal.
+    fn record_isa_unsupported_forward(&self) {}
 }
 
 impl GuestDispatchFrame for TrapFrame {
@@ -447,6 +449,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: Gues
     }
     fn futex(&mut self) -> FamilyCompletion {
         let Some(frame) = self.frame.arm_frame() else {
+            self.frame.record_isa_unsupported_forward();
             return FamilyCompletion::Forward;
         };
         let counters = self.counters;
@@ -474,7 +477,10 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: Gues
     }
     #[cfg(feature = "allocator-test-control")]
     fn allocator_control(&mut self) -> FamilyCompletion {
-        let frame = &mut *self.frame;
+        let Some(frame) = self.frame.arm_frame() else {
+            self.frame.record_isa_unsupported_forward();
+            return FamilyCompletion::Forward;
+        };
         let counters = self.counters;
         let zone = &mut self.zone;
         let current_tasks = self.current_tasks;
@@ -600,7 +606,10 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDis
         match memory::serve_delegated_anonymous(
             match self.frame.arm_frame() {
                 Some(frame) => frame,
-                None => return DelegatedStep::NotDelegated,
+                None => {
+                    self.frame.record_isa_unsupported_forward();
+                    return DelegatedStep::NotDelegated;
+                }
             },
             self.counters,
             task,
@@ -641,7 +650,10 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDis
         match memory::try_serve_mprotect(
             match self.frame.arm_frame() {
                 Some(frame) => frame,
-                None => return PermissionStep::Forward,
+                None => {
+                    self.frame.record_isa_unsupported_forward();
+                    return PermissionStep::Forward;
+                }
             },
             self.current_tasks,
             access,
@@ -662,7 +674,10 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDis
         match memory::try_serve_munmap(
             match self.frame.arm_frame() {
                 Some(frame) => frame,
-                None => return RetirementStep::Forward,
+                None => {
+                    self.frame.record_isa_unsupported_forward();
+                    return RetirementStep::Forward;
+                }
             },
             self.current_tasks,
             access,
@@ -704,6 +719,7 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame>
 {
     fn ipc_transfer(&mut self) -> FamilyCompletion {
         let Some(frame) = self.frame.arm_frame() else {
+            self.frame.record_isa_unsupported_forward();
             return FamilyCompletion::Forward;
         };
         let counters = self.counters;
