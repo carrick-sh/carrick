@@ -341,6 +341,13 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
         .pull_policy(PullPolicy::Missing)
         .command(command)
         .vfs_mount("/opt/carrick", Box::new(el1_sched_vfs()));
+    if std::env::var("CARRICK_SCHED_TRACE_RETURNS").as_deref() == Ok("1") {
+        // Install the existing CompatReporter probe hook. Registration alone
+        // preserves EL1 admission and enables host-return probes without
+        // printing during execution or adding another observer.
+        carrick_observability::probes::register_dtrace_probes()
+            .expect("register scheduler diagnostic return probes");
+    }
     let mut captured = None;
     if args.first() == Some(&"tlb-stale-threads")
         && (args.get(3) != Some(&"omit-first-write-ack")
