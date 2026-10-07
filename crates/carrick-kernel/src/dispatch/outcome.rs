@@ -1378,6 +1378,11 @@ mod owner_read_wait_tests {
             assert!(
                 matches!(actual, DispatchOutcome::OwnerMemoryWait { wait: got, committed: 0 } if got == wait)
             );
+            let error = super::super::read_guest_c_string(&source, 0x1000).unwrap_err();
+            assert!(
+                matches!(error, InputCopyError::Wait(carrick_guest_mem::MemoryReadWait::Owner(got)) if got == wait),
+                "expected OwnerWait for read_guest_c_string, got {error:?}"
+            );
         }
     }
 }
