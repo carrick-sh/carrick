@@ -278,10 +278,7 @@ impl SyscallDispatcher {
             if flags & !LINUX_FSOPEN_CLOEXEC != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let name = match read_guest_c_string(&*cx.memory, fs_name.0) {
-                Ok(s) => s,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-            };
+            let name = read_guest_c_string(&*cx.memory, fs_name.0)?;
             if !SUPPORTED_FS_TYPES.contains(&name.as_str()) {
                 return Ok(DispatchOutcome::errno(LINUX_ENODEV));
             }
@@ -321,19 +318,13 @@ impl SyscallDispatcher {
             }
             // (4) Copy the strings in (EFAULT on a bad pointer).
             let key_str = if key.0 != 0 {
-                match read_guest_c_string(&*cx.memory, key.0) {
-                    Ok(s) => Some(s),
-                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                }
+                Some(read_guest_c_string(&*cx.memory, key.0)?)
             } else {
                 None
             };
             let value_str = match cmd {
                 FsconfigCmd::SetString | FsconfigCmd::SetPath | FsconfigCmd::SetPathEmpty => {
-                    match read_guest_c_string(&*cx.memory, value.0) {
-                        Ok(s) => Some(s),
-                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                    }
+                    Some(read_guest_c_string(&*cx.memory, value.0)?)
                 }
                 _ => None,
             };
@@ -448,10 +439,7 @@ impl SyscallDispatcher {
             if flags & !LINUX_FSPICK_VALID_FLAGS != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let path = match read_guest_c_string(&*cx.memory, path.0) {
-                Ok(s) => s,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-            };
+            let path = read_guest_c_string(&*cx.memory, path.0)?;
             let resolved = match this.mount_api_resolve(
                 dirfd,
                 &path,
@@ -491,10 +479,7 @@ impl SyscallDispatcher {
             if flags & LINUX_AT_RECURSIVE != 0 && flags & LINUX_OPEN_TREE_CLONE == 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let path = match read_guest_c_string(&*cx.memory, path.0) {
-                Ok(s) => s,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-            };
+            let path = read_guest_c_string(&*cx.memory, path.0)?;
             let resolved = match this.mount_api_resolve(
                 dirfd,
                 &path,
@@ -537,10 +522,7 @@ impl SyscallDispatcher {
             if flags & !LINUX_MOVE_MOUNT_VALID_FLAGS != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let from_path = match read_guest_c_string(&*cx.memory, from_path.0) {
-                Ok(s) => s,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-            };
+            let from_path = read_guest_c_string(&*cx.memory, from_path.0)?;
             let from = match this.mount_api_resolve(
                 from_dirfd,
                 &from_path,
@@ -549,10 +531,7 @@ impl SyscallDispatcher {
                 Ok(p) => p,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
-            let to_path = match read_guest_c_string(&*cx.memory, to_path.0) {
-                Ok(s) => s,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-            };
+            let to_path = read_guest_c_string(&*cx.memory, to_path.0)?;
             if let Err(errno) = this.mount_api_resolve(
                 to_dirfd,
                 &to_path,
@@ -626,10 +605,7 @@ impl SyscallDispatcher {
             if attr_set == 0 && attr_clr == 0 && propagation == 0 && userns_fd == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            let path = match read_guest_c_string(&*cx.memory, path.0) {
-                Ok(s) => s,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-            };
+            let path = read_guest_c_string(&*cx.memory, path.0)?;
             if let Err(errno) = this.mount_api_resolve(
                 dirfd,
                 &path,

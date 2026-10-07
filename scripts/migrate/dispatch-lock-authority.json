@@ -112,7 +112,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/fs/directory.rs::FsView::readlinkat::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/fs/directory.rs",
-      "line": 668,
+      "line": 767,
       "item": "FsView::readlinkat",
       "category": "proc",
       "expression": ".proc.lock()",

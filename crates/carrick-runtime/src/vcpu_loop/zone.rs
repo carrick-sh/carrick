@@ -33,6 +33,18 @@ use carrick_kernel::el1_zone::HostLockWait;
 
 pub(super) enum OwnerMemoryAction {
     Syscall(carrick_hal::RawSyscall),
+    StatCopyout {
+        frame: carrick_hal::RawSyscall,
+        output: Box<carrick_kernel::dispatch::format_stat::StatCopyout>,
+    },
+    GetdentsCopyout {
+        frame: carrick_hal::RawSyscall,
+        output: Box<carrick_kernel::dispatch::fs::directory::GetdentsCopyout>,
+    },
+    ReadlinkCopyout {
+        frame: carrick_hal::RawSyscall,
+        output: Box<carrick_kernel::dispatch::fs::directory::ReadlinkCopyout>,
+    },
     CloneParentTid {
         frame: carrick_hal::RawSyscall,
         address: u64,
@@ -45,6 +57,7 @@ pub(super) enum OwnerMemoryAction {
     },
     Terminal,
     Fault,
+    SignalFrame(Box<carrick_hal::sigframe::PendingSignalFrame>),
     Ipc {
         boundary: IpcBoundary,
         token: host_ipc::OwnedIpcOperation,
@@ -697,6 +710,9 @@ where
         };
         let syscall_state = match &action {
             OwnerMemoryAction::Syscall(_)
+            | OwnerMemoryAction::StatCopyout { .. }
+            | OwnerMemoryAction::GetdentsCopyout { .. }
+            | OwnerMemoryAction::ReadlinkCopyout { .. }
             | OwnerMemoryAction::CloneParentTid { .. }
             | OwnerMemoryAction::Ipc {
                 boundary: IpcBoundary::Syscall(_),
@@ -736,7 +752,8 @@ where
             }
             OwnerMemoryAction::Terminal
             | OwnerMemoryAction::Fault
-            | OwnerMemoryAction::CloneChildTid { .. } => None,
+            | OwnerMemoryAction::CloneChildTid { .. }
+            | OwnerMemoryAction::SignalFrame(_) => None,
         };
         let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
             RuntimeError::Configuration("owner wait lost its Kernel context".to_owned())
@@ -797,6 +814,63 @@ where
                         self.phase = HvpatchProductionPhase::ResumeIpcOwner { boundary, token };
                         Ok(exit)
                     }
+                    (
+                        OwnerMemoryAction::StatCopyout { frame, output },
+                        Some((state, _, request)),
+                    ) => {
+                        let exit = self.settle_into_zone(
+                            control,
+                            continuation::quantum::ZoneSave {
+                                base: state,
+                                record: zone.record_ref(record),
+                                origin: executor::residency::ZoneResumeOrigin::HostSyscall,
+                            },
+                            seq,
+                            None,
+                            request,
+                        )?;
+                        self.phase =
+                            HvpatchProductionPhase::ResumeStatCopyoutOwner { frame, output };
+                        Ok(exit)
+                    }
+                    (
+                        OwnerMemoryAction::GetdentsCopyout { frame, output },
+                        Some((state, _, request)),
+                    ) => {
+                        let exit = self.settle_into_zone(
+                            control,
+                            continuation::quantum::ZoneSave {
+                                base: state,
+                                record: zone.record_ref(record),
+                                origin: executor::residency::ZoneResumeOrigin::HostSyscall,
+                            },
+                            seq,
+                            None,
+                            request,
+                        )?;
+                        self.phase =
+                            HvpatchProductionPhase::ResumeGetdentsCopyoutOwner { frame, output };
+                        Ok(exit)
+                    }
+                    (
+                        OwnerMemoryAction::ReadlinkCopyout { frame, output },
+                        Some((state, _, request)),
+                    ) => {
+                        let exit = self.settle_into_zone(
+                            control,
+                            continuation::quantum::ZoneSave {
+                                base: state,
+                                record: zone.record_ref(record),
+                                origin: executor::residency::ZoneResumeOrigin::HostSyscall,
+                            },
+                            seq,
+                            None,
+                            request,
+                        )?;
+                        self.phase =
+                            HvpatchProductionPhase::ResumeReadlinkCopyoutOwner { frame, output };
+                        Ok(exit)
+                    }
                     (OwnerMemoryAction::Syscall(frame), Some((state, _, request))) => {
                         let exit = self.settle_into_zone(
                             control,
@@ -851,6 +925,25 @@ where
                             wait,
                         ).map_err(|error| RuntimeError::Configuration(error.to_string()))?;
                         self.phase = HvpatchProductionPhase::ResumeCloneChildTid { address, tid };
+                        Ok(self.suspend(
+                            HvpatchLoopSuspension::BlockedContinuation,
+                            executor::ExecutorExit::BlockedContinuation {
+                                continuation: Box::new(continuation),
+                                vfork_activation: None,
+                            },
+                        ))
+                    }
+                    (OwnerMemoryAction::SignalFrame(pending), None) => {
+                        let wait = carrick_kernel::kernel::continuation::ZoneWait::new(
+                            zone.record_ref(record),
+                            seq,
+                        );
+                        let continuation = carrick_kernel::kernel::continuation::BlockedContinuation::from_signal_frame_zone_park(
+                            context,
+                            control.execution_lease_mut().map_err(RuntimeError::Trap)?,
+                            wait,
+                        ).map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+                        self.phase = HvpatchProductionPhase::ResumeSignalFrameOwner { pending };
                         Ok(self.suspend(
                             HvpatchLoopSuspension::BlockedContinuation,
                             executor::ExecutorExit::BlockedContinuation {
@@ -926,6 +1019,15 @@ where
                         )?;
                         self.service_outcome(engine, control, frame, outcome)
                     }
+                    OwnerMemoryAction::StatCopyout { frame, output } => {
+                        self.complete_stat_copyout(engine, control, frame, output)
+                    }
+                    OwnerMemoryAction::GetdentsCopyout { frame, output } => {
+                        self.complete_getdents_copyout(engine, control, frame, output)
+                    }
+                    OwnerMemoryAction::ReadlinkCopyout { frame, output } => {
+                        self.complete_readlink_copyout(engine, control, frame, output)
+                    }
                     OwnerMemoryAction::CloneParentTid {
                         frame,
                         address,
@@ -943,6 +1045,9 @@ where
                         self.complete_clone_child_tid(engine, control, address, tid)
                     }
                     OwnerMemoryAction::Fault => Ok(executor::ExecutorExit::Syscall),
+                    OwnerMemoryAction::SignalFrame(pending) => {
+                        self.resume_signal_frame(engine, control, pending)
+                    }
                     OwnerMemoryAction::Terminal => {
                         let action = self.take_terminal_memory_action()?;
                         self.drive_terminal_memory(engine, control, action)
@@ -1595,6 +1700,126 @@ where
             outcome,
             snapshots,
         )?)
+    }
+
+    pub(super) fn resume_signal_frame(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        pending: Box<carrick_hal::sigframe::PendingSignalFrame>,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let (signum, restart) = (pending.signum(), pending.restart_syscall());
+        match engine.resume_signal_frame(pending) {
+            Ok(()) => {
+                carrick_kernel::event_ring::rec_signal_inject(
+                    self.state.this_tid.raw(),
+                    signum,
+                    restart,
+                );
+                Ok(executor::ExecutorExit::Syscall)
+            }
+            Err(TrapError::SignalFrameMemory {
+                pending,
+                dependency,
+            }) => self.park_signal_frame(engine, control, pending, *dependency),
+            Err(TrapError::SignalDeliveryFault) => {
+                self.kernel.record_fatal_signal(super::FatalSignalRecord {
+                    image_generation: self.state.fatal_image_generation,
+                    tid: self
+                        .state
+                        .service_kernel_context
+                        .as_ref()
+                        .ok_or_else(|| {
+                            RuntimeError::Configuration(
+                                "signal frame fault lost context".to_owned(),
+                            )
+                        })?
+                        .thread()
+                        .key()
+                        .tid,
+                    signo: 11,
+                    code: 0,
+                    addr: 0,
+                });
+                let result = assemble_run_result(&self.kernel, 139, Some(11), self.traps, false);
+                Ok(self.enter_terminal_with_outcome(
+                    engine,
+                    VcpuLoopOutcome::ProcessExit(Box::new(result)),
+                ))
+            }
+            Err(error) => Err(RuntimeError::Trap(error).into()),
+        }
+    }
+
+    pub(super) fn park_signal_frame(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        pending: Box<carrick_hal::sigframe::PendingSignalFrame>,
+        dependency: carrick_guest_mem::MemoryPrepareError,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        use carrick_guest_mem::MemoryPrepareError;
+        match dependency {
+            MemoryPrepareError::OwnerWait(wait)
+            | MemoryPrepareError::Supply(carrick_guest_mem::MemorySupplyRequest::Metadata {
+                observed: wait,
+                ..
+            }) => self.park_owner_memory_action(
+                engine,
+                control,
+                OwnerMemoryAction::SignalFrame(pending),
+                wait,
+            ),
+            MemoryPrepareError::Supply(request) => {
+                if let Some(wait) = self.supply_owner_memory(engine, request)? {
+                    let dependency = match wait {
+                        super::binding::OwnerSupplyWait::Owner(wait) => {
+                            MemoryPrepareError::OwnerWait(wait)
+                        }
+                        super::binding::OwnerSupplyWait::Physical(wait) => {
+                            MemoryPrepareError::Physical(wait)
+                        }
+                    };
+                    self.park_signal_frame(engine, control, pending, dependency)
+                } else {
+                    self.resume_signal_frame(engine, control, pending)
+                }
+            }
+            MemoryPrepareError::Physical(wait) => {
+                let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
+                    RuntimeError::Configuration(
+                        "signal frame physical wait lost context".to_owned(),
+                    )
+                })?;
+                let runtime = self.kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
+                    RuntimeError::Configuration(
+                        "signal frame physical wait lost scheduler".to_owned(),
+                    )
+                })?;
+                let scheduler = runtime.continuation_services(context.kernel()).0;
+                let wake = registration_wake_callback(scheduler, context.thread().key(), false);
+                let (subscription, ready) = wait.0.enroll(wake);
+                if ready || wait.0.is_ready() {
+                    drop(subscription);
+                    return self.resume_signal_frame(engine, control, pending);
+                }
+                self.phase = HvpatchProductionPhase::ResumeSignalFramePhysical {
+                    pending,
+                    wait,
+                    _subscription: subscription,
+                };
+                Ok(self.suspend(
+                    HvpatchLoopSuspension::BlockedContinuation,
+                    executor::ExecutorExit::Blocked(
+                        carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                    ),
+                ))
+            }
+            other => Err(RuntimeError::Configuration(format!(
+                "signal frame has invalid memory dependency: {other:?}"
+            ))
+            .into()),
+        }
     }
 
     pub(super) fn ipc_memory_park(

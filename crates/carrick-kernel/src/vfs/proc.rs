@@ -2817,11 +2817,19 @@ fn synthetic_proc_loadavg() -> &'static [u8] {
 }
 
 fn synthetic_proc_uptime() -> String {
-    // Field 1 is seconds since (guest) boot; field 2 is cumulative idle time
-    // across all CPUs (>= field 1 on a multi-CPU box). Both 2-dp floats. The
-    // old code emitted epoch-seconds here, yielding a ~56-year "uptime".
-    let up = boot_elapsed().as_secs_f64();
-    let idle = up * crate::kernel::scheduler::guest_cpu_count().max(1) as f64;
+    format_proc_uptime(boot_elapsed(), crate::kernel::scheduler::guest_cpu_count())
+}
+
+/// Render `/proc/uptime` from an explicit boot-elapsed duration and CPU count,
+/// so the formatting contract is testable against an injected clock value
+/// instead of whatever the host's uptime happens to be.
+///
+/// Field 1 is seconds since (guest) boot; field 2 is cumulative idle time
+/// across all CPUs (>= field 1 on a multi-CPU box). Both 2-dp floats. The
+/// old code emitted epoch-seconds here, yielding a ~56-year "uptime".
+fn format_proc_uptime(boot_elapsed: Duration, cpus: usize) -> String {
+    let up = boot_elapsed.as_secs_f64();
+    let idle = up * cpus.max(1) as f64;
     format!("{up:.2} {idle:.2}\n")
 }
 
@@ -5023,15 +5031,53 @@ mod tests {
         );
     }
 
+    /// Field 1 is the boot-elapsed duration it was given, not an epoch
+    /// second (the old bug emitted ~1.78e9). Asserted against injected
+    /// values, including a host that has been up for weeks, so the verdict
+    /// does not depend on how long the test host has been running.
     #[test]
     fn uptime_is_seconds_since_boot_not_epoch() {
-        let up = synthetic_proc_uptime();
-        let first: f64 = up.split_whitespace().next().unwrap().parse().unwrap();
-        // A freshly-booted guest's uptime is small — certainly not ~1.78e9
-        // (the old epoch-seconds bug).
+        let fields = |text: &str| -> (f64, f64) {
+            let mut it = text.split_whitespace();
+            let up = it.next().expect("field 1").parse().expect("field 1 f64");
+            let idle = it.next().expect("field 2").parse().expect("field 2 f64");
+            assert!(it.next().is_none(), "exactly two fields: {text:?}");
+            (up, idle)
+        };
+
+        // Injected: a short boot, and a host up ~12.3 days (past the old
+        // 1e6 s bound). Both must round-trip verbatim.
+        for (elapsed, cpus, want_up, want_idle) in [
+            (Duration::from_millis(1_234), 4, "1.23", "4.94"),
+            (
+                Duration::from_millis(1_064_017_490),
+                4,
+                "1064017.49",
+                "4256069.96",
+            ),
+            (Duration::from_secs(7), 0, "7.00", "7.00"),
+        ] {
+            let text = format_proc_uptime(elapsed, cpus);
+            assert_eq!(text, format!("{want_up} {want_idle}\n"));
+            let (up, idle) = fields(&text);
+            assert!(idle >= up, "idle {idle} must be >= uptime {up}");
+        }
+
+        // Observed: the live file reports boot-elapsed time, and is nowhere
+        // near the realtime epoch second (the regression it guards).
+        let before = boot_elapsed().as_secs_f64();
+        let (up, _) = fields(&synthetic_proc_uptime());
+        let after = boot_elapsed().as_secs_f64();
         assert!(
-            first < 1_000_000.0,
-            "uptime field 1 should be small: {up:?}"
+            up >= before - 0.01 && up <= after + 0.01,
+            "/proc/uptime {up} must lie in boot-elapsed window [{before}, {after}]"
+        );
+        let epoch = crate::kernel::container::ClockDomain::system()
+            .realtime_now()
+            .as_secs_f64();
+        assert!(
+            (epoch - up).abs() > 1.0,
+            "/proc/uptime {up} must not be the epoch second {epoch}"
         );
     }
 

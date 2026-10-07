@@ -1,0 +1,21 @@
+schema_version = 1
+id = "kernel.time.sleep-completion-memory"
+title = "Successful sleeps leave remaining-time storage untouched"
+guest_surfaces = ["syscall:nanosleep", "syscall:clock_nanosleep"]
+semantic_authority = ["man 2 nanosleep", "man 2 clock_nanosleep"]
+fixture = "completed_sleep_preserves_remaining_output_without_memory_admission"
+scale_points = [1]
+rationale = "Remaining-time copyout belongs to an interrupted relative sleep. A successful timeout returns zero without accessing remaining-time storage, so a concurrent owner editor cannot turn that completion into a memory dependency or carrier failure. The VM-free witness checks unchanged sentinel bytes and exactly zero writes for both syscall identities. Existing interruption coverage continues to require the retained remaining-time output."
+
+[bindings]
+vm_free = "carrick-kernel::kernel::continuation::tests::{completed_sleep_preserves_remaining_output_without_memory_admission,timeout_signal_exec_exit_and_drop_cleanup_are_literal_for_every_family}"
+embed = "carrick-embed::el1_files::el1_files_exit_group_stress"
+
+[bindings.unresolved]
+docker = "Native arm64 differential promotion belongs to the integration director; this worker is prohibited from starting Docker."
+
+[[structural_budgets]]
+kind = "exact"
+metric = "guest_memory_write_bytes"
+value = 0
+rationale = "Successful completion has no remaining-time copyout, including memory admission."

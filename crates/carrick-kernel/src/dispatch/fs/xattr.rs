@@ -4,7 +4,6 @@
 //! as `impl SyscallDispatcher` methods; `self.…` resolution is type-based so
 //! the move is transparent to callers.
 use super::*;
-use crate::linux_abi::LinuxErrno;
 
 impl<'a> FsView<'a> {
     /// Resolve the first argument of an xattr syscall to the rootfs path it
@@ -15,7 +14,7 @@ impl<'a> FsView<'a> {
         &self,
         memory: &impl CurrentMmMemory,
         target: XattrTarget,
-    ) -> Result<String, LinuxErrno> {
+    ) -> Result<String, DispatchError> {
         match target {
             XattrTarget::Path {
                 path: path_ptr,
@@ -23,7 +22,7 @@ impl<'a> FsView<'a> {
             } => {
                 let path = read_guest_c_string(memory, path_ptr.0)?;
                 if path.is_empty() {
-                    return Err(LINUX_ENOENT);
+                    return Err(LINUX_ENOENT.into());
                 }
                 let resolved = self.resolve_at_path(LINUX_AT_FDCWD, &path)?;
                 // Linux resolves the path FIRST for every *xattr syscall: a path
@@ -37,7 +36,7 @@ impl<'a> FsView<'a> {
                     self.layered_lstat(&resolved)
                 };
                 if exists.is_err() {
-                    return Err(LINUX_ENOENT);
+                    return Err(LINUX_ENOENT.into());
                 }
                 Ok(resolved)
             }
@@ -55,9 +54,9 @@ impl<'a> FsView<'a> {
                         .path
                         .to_str()
                         .map(str::to_owned)
-                        .ok_or(LINUX_ENOTSUP),
+                        .ok_or_else(|| DispatchError::from(LINUX_ENOTSUP)),
                     // Pipes/sockets/etc. have no backing file → unsupported.
-                    _ => Err(LINUX_ENOTSUP),
+                    _ => Err(LINUX_ENOTSUP.into()),
                 }
             }
         }
