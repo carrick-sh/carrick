@@ -44,7 +44,9 @@ with **`HV_DENIED` (`0xfae94007`)**.
   [`scripts/test-signed.sh`](scripts/test-signed.sh) (signs via
   [`scripts/lib/post-link-sign.sh`](scripts/lib/post-link-sign.sh), serial,
   unentitled negative control). `HV_DENIED` there is a FAILURE
-  (`EmbedError::Entitlement`), never a skip — don't copy `trap_hvf.rs`'s skip.
+  (`EmbedError::Entitlement`), never a skip. Any test that boots a VM is
+  `#[ignore]`d and run only by a signed recipe (e.g. `just test-hvf-trap-engine`);
+  never skip on a failed `hv_vm_create`.
 - **Never use `lld`** — strips `__DATA,__dof_carrick` → USDT empty →
   `carrick trace` fires zero events. Keep Apple `ld64`; verify
   `otool -l target/release/carrick | grep dof`.
