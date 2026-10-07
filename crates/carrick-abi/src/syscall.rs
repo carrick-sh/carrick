@@ -318,8 +318,6 @@ macro_rules! define_aarch64_syscall_table {
                 CanonicalNr($crate::CARRICK_PRIVATE_X86_ALARM);
             pub const CARRICK_PRIVATE_X86_TIME: CanonicalNr =
                 CanonicalNr($crate::CARRICK_PRIVATE_X86_TIME);
-            pub const CARRICK_PRIVATE_X86_FORK: CanonicalNr =
-                CanonicalNr($crate::CARRICK_PRIVATE_X86_FORK);
         }
 
         const AARCH64_SYSCALLS: &[Syscall] = &[

@@ -1560,7 +1560,7 @@ impl X8664GuestArch {
         // verified spec is recorded (x86-legacy-syscall-shims workflow).
 
         let canonical = match X8664SyscallTable::remap(x86_number) {
-            SyscallRemap::Direct(c) => c,
+            SyscallRemap::Direct(c) => c.raw(),
             SyscallRemap::Private(c) => c.raw(),
             SyscallRemap::Native => x86_number,
             SyscallRemap::Unknown => carrick_abi::CARRICK_PRIVATE_X86_UNSUPPORTED,
@@ -2475,14 +2475,20 @@ mod tests {
     fn syscall_table_knows_write() {
         assert!(X8664SyscallTable::is_known(1));
         assert_eq!(X8664SyscallTable::name(1), Some("write"));
-        assert_eq!(X8664SyscallTable::remap(1), SyscallRemap::Direct(64));
+        assert_eq!(
+            X8664SyscallTable::remap(1),
+            SyscallRemap::Direct(carrick_abi::CanonicalNr(64))
+        );
     }
 
     #[test]
     fn syscall_table_knows_exit_group() {
         assert!(X8664SyscallTable::is_known(231));
         assert_eq!(X8664SyscallTable::name(231), Some("exit_group"));
-        assert_eq!(X8664SyscallTable::remap(231), SyscallRemap::Direct(94));
+        assert_eq!(
+            X8664SyscallTable::remap(231),
+            SyscallRemap::Direct(carrick_abi::CanonicalNr(94))
+        );
     }
 
     #[test]

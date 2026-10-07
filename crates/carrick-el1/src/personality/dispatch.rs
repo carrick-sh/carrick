@@ -27,6 +27,7 @@ use core::sync::atomic::Ordering;
 /// yet acquired an ISA-neutral saved-context contract.
 pub trait GuestDispatchFrame: SyscallFrame {
     fn arm_frame(&mut self) -> Option<&mut TrapFrame>;
+    fn arm_frame_ref(&self) -> Option<&TrapFrame>;
     fn arm_scheduler(&self) -> bool;
     fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64>;
 }
@@ -37,6 +38,9 @@ impl GuestDispatchFrame for TrapFrame {
     }
     fn arm_scheduler(&self) -> bool {
         true
+    }
+    fn arm_frame_ref(&self) -> Option<&TrapFrame> {
+        Some(self)
     }
     fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
         None
@@ -397,7 +401,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: Gues
     fn record_source(&self) -> Option<carrick_el1_abi::BornInZoneSource<'a>> {
         Some(carrick_el1_abi::BornInZoneSource {
             zone: self.zone.as_ref()?.tables,
-            slot: SlotId::from_index(self.frame.slot() as usize)?,
+            slot: SlotId::from_index(self.frame.slot_index())?,
         })
     }
     #[cfg(target_os = "none")]
@@ -438,7 +442,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: Gues
         &mut self,
     ) -> Option<&mut dyn carrick_personality_linux::lifecycle::LifecycleNative<'a>> {
         self.lifecycle?;
-        self.current_tasks.get(self.frame.slot() as usize)?;
+        self.current_tasks.get(self.frame.task_index())?;
         Some(self)
     }
     fn futex(&mut self) -> FamilyCompletion {
@@ -535,7 +539,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: Gues
 
     fn resumes_operation(&self) -> bool {
         self.zone.as_ref().is_some_and(|zone| {
-            SlotId::from_index(self.frame.slot() as usize)
+            SlotId::from_index(self.frame.slot_index())
                 .and_then(|slot| zone.tables.slot(slot).current())
                 .is_some_and(|record| zone.tables.record(record).has_object_operation())
         })
@@ -556,14 +560,12 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: Gues
     }
     fn anonymous_declined_for_work(&self, _ordinal: u64) {
         #[cfg(target_os = "none")]
-        if let (Some(zone), Some(task)) = (self.zone.as_ref(), self.task())
+        if let (Some(zone), Some(task), Some(slot)) =
+            (self.zone.as_ref(), self.task(), self.frame.slot())
             && memory::delegated_anonymous_root(
                 _ordinal,
                 task,
-                crate::substrate::sched::object_wait::space_access(
-                    zone.tables,
-                    SlotId::new(self.frame.slot() as u8),
-                ),
+                crate::substrate::sched::object_wait::space_access(zone.tables, slot),
                 memory::reservations::shared_guest(),
             )
             .is_some()
@@ -586,16 +588,14 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDis
         self.task().map(|task| &task.linux)
     }
     fn delegated(&mut self) -> DelegatedStep {
-        let (Some(zone), Some(task)) = (
+        let (Some(zone), Some(task), Some(slot)) = (
             self.zone.as_ref(),
-            self.current_tasks.get(self.frame.slot() as usize),
+            self.current_tasks.get(self.frame.task_index()),
+            self.frame.slot(),
         ) else {
             return DelegatedStep::NotDelegated;
         };
-        let access = crate::substrate::sched::object_wait::space_access(
-            zone.tables,
-            SlotId::new(self.frame.slot() as u8),
-        );
+        let access = crate::substrate::sched::object_wait::space_access(zone.tables, slot);
         match memory::serve_delegated_anonymous(
             match self.frame.arm_frame() {
                 Some(frame) => frame,
@@ -610,14 +610,14 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDis
             memory::DelegatedAnonymous::PreparedConflict => DelegatedStep::PreparedConflict,
             memory::DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,
             memory::DelegatedAnonymous::Served => {
-                DelegatedStep::Served(SyscallResult::new(self.frame.argument(0) as i64))
+                DelegatedStep::Served(SyscallResult::new(self.frame.result().0 as i64))
             }
             memory::DelegatedAnonymous::Forward => DelegatedStep::Forward,
         }
     }
     fn park_prepared(&mut self) -> Option<FamilyCompletion> {
-        let slot = SlotId::from_index(self.frame.slot() as usize)?;
-        let task = self.current_tasks.get(self.frame.slot() as usize)?;
+        let slot = SlotId::from_index(self.frame.slot_index())?;
+        let task = self.current_tasks.get(self.frame.task_index())?;
         let zone = self.zone.as_mut()?;
         let mut sched = native_scheduler(zone, task, self.counters, slot, &mut self.handoff);
         let served = super::mm_portal::park_prepared_edit(
@@ -628,18 +628,15 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDis
         Some(
             carrick_personality_linux::dispatch::accounted_scheduler_effect(
                 served,
-                self.frame.argument(0) as i64,
+                self.frame.result().0 as i64,
             ),
         )
     }
     fn permission(&mut self) -> PermissionStep {
-        let Some(zone) = self.zone.as_ref() else {
+        let (Some(zone), Some(slot)) = (self.zone.as_ref(), self.frame.slot()) else {
             return PermissionStep::Forward;
         };
-        let access = crate::substrate::sched::object_wait::space_access(
-            zone.tables,
-            SlotId::new(self.frame.slot() as u8),
-        );
+        let access = crate::substrate::sched::object_wait::space_access(zone.tables, slot);
         match memory::try_serve_mprotect(
             match self.frame.arm_frame() {
                 Some(frame) => frame,
@@ -657,13 +654,10 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDis
         }
     }
     fn retirement(&mut self) -> RetirementStep {
-        let Some(zone) = self.zone.as_ref() else {
+        let (Some(zone), Some(slot)) = (self.zone.as_ref(), self.frame.slot()) else {
             return RetirementStep::Forward;
         };
-        let access = crate::substrate::sched::object_wait::space_access(
-            zone.tables,
-            SlotId::new(self.frame.slot() as u8),
-        );
+        let access = crate::substrate::sched::object_wait::space_access(zone.tables, slot);
         match memory::try_serve_munmap(
             match self.frame.arm_frame() {
                 Some(frame) => frame,
@@ -738,7 +732,7 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame>
         FamilyCompletion::Forward
     }
     fn task(&self) -> Option<&CurrentTask> {
-        self.current_tasks.get(self.frame.slot() as usize)
+        self.current_tasks.get(self.frame.task_index())
     }
 }
 
@@ -824,12 +818,11 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame>
     El1PendingFamilies<'_, F, C, U, G>
 {
     fn file_access(&self) -> crate::substrate::file_notification::FileAccess<'_> {
-        match self.zone.as_ref() {
-            Some(zone) => crate::substrate::file_notification::FileAccess::notified(
-                zone.tables,
-                SlotId::new(self.frame.slot() as u8),
-            ),
-            None => {
+        match (self.zone.as_ref(), self.frame.slot()) {
+            (Some(zone), Some(slot)) => {
+                crate::substrate::file_notification::FileAccess::notified(zone.tables, slot)
+            }
+            _ => {
                 #[cfg(any(test, feature = "host-test"))]
                 {
                     crate::substrate::file_notification::FileAccess::SourceFreeModel
@@ -858,7 +851,7 @@ fn try_serve_file_syscall<'a, F, G: SyscallFrame>(
 where
     F: Fn(u32) -> *mut u8,
 {
-    let slot = frame.slot() as usize;
+    let slot = frame.task_index();
     let cur_task = current_tasks.get(slot)?;
     let file_table = cur_task.linux.file_table.load(Ordering::Acquire);
     if file_table == 0 {

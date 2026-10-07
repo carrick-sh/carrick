@@ -763,6 +763,14 @@ path = "crates/carrick-personality-linux/src/entry.rs"
 contracts = ["core.entry.completion"]
 
 [[surfaces]]
+path = "crates/carrick-syscall-abi/src/lib.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-abi/src/x86_syscall_crosscheck.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
 path = "crates/carrick-personality-linux/src/abi/entry.rs"
 contracts = ["core.entry.completion"]
 
