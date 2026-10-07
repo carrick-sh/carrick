@@ -151,3 +151,26 @@ Docker, HVF signed tests, load generators, or production traces ran here.
 Latest verified KVM gate: 120 passed, zero failed, five existing ignored.
 Log: `/tmp/x86-anon-test-kvm-final.log`. Native MMU suite: 244 passed,
 zero failed (`/tmp/x86-anon-mmu-core.log`). Final lint/asm still pending.
+
+Director milestone order (2026-10-07): finish gates and push this first-touch
+milestone honestly scoped to one boot MM. Next bind production grants to a
+second live MM: fork, both processes concurrently touch fresh anonymous
+pages, PRIVATE witnesses per MM, and no cross-MM leaf. This lane does not
+land until that witness is green. Then settle physical owed returns
+red-first, followed by the anonymous NONE/RO/munmap real-signal probes.
+
+The next production fork differential is red at this milestone: native
+prints F and exits 7; Carrick exits 99 with no stdout. Evidence:
+`/tmp/x86-anon-peer-mm-red.log`. This existing fixture does not yet supply
+the requested concurrent fresh-pages witness.
+
+Shared fault tests: 28 passed (`/tmp/x86-anon-shared-fault.log`). Final clippy
+and fmt-check pass. ARM assembly has zero new drift versus verified
+41d1a9f76 (`/tmp/x86-anon-asm-foundation.log`); against github/work/n1 the
+single inherited fatal_entry_binding hvc addition remains. Inventory
+reconciliation moved two Linux authority sites; the changed Drop abort
+fingerprint has an explicitly updated custody rationale, not a move-only
+claim. Final full lint passed on the clean tree. Receipt:
+`/tmp/x86-anon-lint-domains-final.log`. Live authority execution covered
+linux-cli and linux-runtime (569 reviewed rows); other host profiles remain
+pending as expected on this Linux host.

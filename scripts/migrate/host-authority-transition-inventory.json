@@ -6567,18 +6567,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:1575 in `Cpl0Carrier::boot`, `std::fs::read` reads only the caller-selected CPL0 bootstrap ELF, whose segments and entry are validated before the fixture registers memory or runs either vCPU; no guest syscall argument or guest identity selects this host path.",
+    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:1649 in `Cpl0Carrier::boot`, `std::fs::read` reads only the caller-selected CPL0 bootstrap ELF, whose segments and entry are validated before the fixture registers memory or runs either vCPU; no guest syscall argument or guest identity selects this host path.",
     "review_id": "HA-000752",
     "source": {
-      "byte_end": 63022,
-      "byte_start": 63009,
+      "byte_end": 65796,
+      "byte_start": 65783,
       "column": 21,
       "column_end": 34,
       "column_start": 21,
       "file": "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
-      "line": 1575,
-      "line_end": 1575,
-      "line_start": 1575
+      "line": 1649,
+      "line_end": 1649,
+      "line_start": 1649
     }
   },
   {
@@ -18232,18 +18232,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:488 in `Watchdog::start`, `std::thread::spawn` creates one bounded timeout witness for the current KVM_RUN host thread during fixture observation. Production initial MM loading and execution do not start this watchdog. Its retained KvmKickHandle targets that exact host thread; cancellation and Drop join retain its lifetime. It neither creates a guest task nor implements a guest wait, and no guest identity selects the host target.",
+    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:511 in `Watchdog::start`, `std::thread::spawn` creates one bounded timeout witness for the current KVM_RUN host thread during fixture observation. Production initial MM loading and execution do not start this watchdog. Its retained KvmKickHandle targets that exact host thread; cancellation and Drop join retain its lifetime. It neither creates a guest task nor implements a guest wait, and no guest identity selects the host target.",
     "review_id": "HA-000753",
     "source": {
-      "byte_end": 19142,
-      "byte_start": 19124,
+      "byte_end": 20017,
+      "byte_start": 19999,
       "column": 22,
       "column_end": 40,
       "column_start": 22,
       "file": "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
-      "line": 488,
-      "line_end": 488,
-      "line_start": 488
+      "line": 511,
+      "line_end": 511,
+      "line_start": 511
     }
   },
   {

@@ -480,10 +480,10 @@
       "file": "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
       "function": "<InitialInventory as Drop>::drop",
       "ordinal_in_function": 1,
-      "fingerprint": "156716491823be356a9239e5fe6078d88c720d6978dd72444185becc0ffd2113",
+      "fingerprint": "d4eb9c0ea04605a5058c94ee84059f06b1a3a409b99886b8967f0cb980b08721",
       "verdict": "carrier_fault",
       "failure_domain": "vmm_kvm::initial_inventory_rollback",
-      "rationale": "A failed rollback after a guest initial-MM publication refusal leaves frame inventory and live KVM mappings inconsistent; terminating the carrier prevents reuse of those frames.",
+      "rationale": "A failed rollback of never-submitted initial inventory can leave logical inventory and KVM mappings inconsistent, so the carrier terminates. Re-reviewed 2026-10-07: guest-exposed or submitted inventory is never rolled back by Drop without a verified retirement; custody remains until VM teardown. The unverified_guest_completion_keeps_inventory_custody_until_vm_teardown test covers both branches.",
       "sink": "raw",
       "domain": null
     },
