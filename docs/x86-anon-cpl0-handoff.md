@@ -90,6 +90,36 @@ wait, exit, CPU1 or two-live-MM PRIVATE witness can be claimed. Do not promote
 the stopped lifecycle fixture in process.rs as production policy. Preserve
 InitialWords as the only production descriptor-window authority.
 
+## Registry checkpoint push evidence
+
+Clean-tree `just lint-domains` passes after an explicit review-to-site repair:
+partial-profile ordinal reconciliation had exchanged the common execve
+argument event and the macOS-only image snapshot's PID call. The two existing
+reviews are bound to the actual `execve_argv` (7541) and
+`host_image_base_snapshot` (7587) sites, preserving operations,
+classifications and profile sets. Their rationales now describe their exact
+current-carrier diagnostic roles. The independent Linux compiler census and
+stored live macOS capture both agree; the macOS receipt was not fabricated
+or edited for this repair. Receipts:
+/tmp/x86-process-final-linux-{candidate,reconcile}.log and
+/tmp/x86-process-registry-qualified-lint.log.
+
+The retirement step's full host and separate kernel-semantics gates pass.
+Full KVM passes 128 tests with five existing ignores; clippy passes, with the
+existing Linux-only unreachable macOS libc catalog warning. Formatting is
+applied and pre-commit checks pass. Assembly against imported 6d6bcf26c has
+zero failures; N1 reports only the inherited ARM fatal_entry_binding hvc #3
+block (not new drift). Receipts:
+/tmp/x86-process-registry-{final-kvm,final-clippy,asm-n1,asm-shared}.log.
+The final post-format KVM run is recorded separately before the push.
+
+This is a reviewable registry foundation, not the completed extraction or
+PR102's two-live-MM milestone. Wait selection/consume/wake sampling, owned
+exit/reparent/SIGCHLD transactions, production CPL0 lifecycle/CPU1 binding
+and the PRIVATE/no-alias/exact-root-generation witness remain required.
+The known pre-fork defect remains separately attributed: 6/50 before versus
+5/50 after extraction. A passing single host gate is not closure of it.
+
 ## PR102 re-review follow-up
 
 Named WRITE/EXECUTE flags replace grant-publication bit literals. Shared
