@@ -11083,3 +11083,133 @@ fn pathname_resolution_owner_wait_returns_owner_memory_wait_not_efault() {
     );
 }
 
+#[test]
+fn getdents64_copyout_owner_wait_witness() {
+    use carrick_abi::LINUX_EFAULT;
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{
+        GuestMemory, GuestWriteRange, MemoryError, MemoryPrepareError, PreparedGuestWrite,
+        UserMemoryVenue,
+    };
+    use carrick_observability::compat::SyscallArgs;
+    use carrick_vfs::rootfs::{RootFsDirEntry, RootFsEntryKind, RootFsMetadata};
+    use std::num::NonZeroU64;
+
+    struct Permit<'a>(&'a mut [u8]);
+    impl PreparedGuestWrite for Permit<'_> {
+        fn commit(self: Box<Self>, outputs: &[&[u8]]) {
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(self.0.len(), outputs[0].len());
+            self.0.copy_from_slice(outputs[0]);
+        }
+    }
+
+    struct GetdentsWaitingMemory {
+        wait: Option<PortalOwnerWait>,
+        bytes: Vec<u8>,
+    }
+    impl GuestMemory for GetdentsWaitingMemory {
+        fn user_memory_venue(&self) -> UserMemoryVenue {
+            UserMemoryVenue::Owner
+        }
+        fn prepare_write(
+            &mut self,
+            ranges: &[GuestWriteRange],
+        ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+            assert_eq!(ranges.len(), 1);
+            if let Some(wait) = self.wait.take() {
+                return Err(MemoryPrepareError::OwnerWait(wait));
+            }
+            let range = ranges[0];
+            let offset = (range.address().raw() - 0x1000) as usize;
+            Ok(Box::new(Permit(
+                &mut self.bytes[offset..offset + range.len()],
+            )))
+        }
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            let offset = (address
+                .checked_sub(0x1000)
+                .ok_or(MemoryError::Unsupported)?) as usize;
+            let end = offset.checked_add(length).ok_or(MemoryError::Unsupported)?;
+            if end <= self.bytes.len() {
+                Ok(self.bytes[offset..end].to_vec())
+            } else {
+                Err(MemoryError::OutOfBounds { address, length })
+            }
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            Err(MemoryError::Unsupported)
+        }
+    }
+    impl CurrentMmMemory for GetdentsWaitingMemory {}
+
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(2).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Editor,
+            7,
+        )
+    };
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let desc = OpenDescription::Directory {
+        base: OpenDescriptionBase::new(carrick_abi::LINUX_O_RDONLY),
+        path: "/witness_dir".to_string(),
+        metadata: RootFsMetadata {
+            path: std::path::PathBuf::from("/witness_dir"),
+            kind: RootFsEntryKind::Directory,
+            mode: 0o755,
+            size: 0,
+        },
+        listing: DirListing::Loaded(vec![RootFsDirEntry {
+            name: "entry1".to_string(),
+            metadata: RootFsMetadata {
+                path: std::path::PathBuf::from("/witness_dir/entry1"),
+                kind: RootFsEntryKind::File,
+                mode: 0o644,
+                size: 100,
+            },
+            ino: 101,
+        }]),
+        offset: 0,
+        trusted_host_dir: None,
+    };
+    let outcome = dispatcher.install_fd(desc, 0);
+    let DispatchOutcome::Returned { value: fd } = outcome else {
+        panic!()
+    };
+
+    let mut memory = GetdentsWaitingMemory {
+        bytes: vec![0u8; 65536],
+        wait: Some(wait),
+    };
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let reporter = CompatReporter::default();
+    let outcome = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                carrick_abi::syscall::nr::GETDENTS64.raw(),
+                SyscallArgs::from([fd as u64, 0x1000, 4096, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+
+    assert_ne!(
+        outcome,
+        DispatchOutcome::errno(LINUX_EFAULT),
+        "getdents64 flattened owner wait to EFAULT"
+    );
+    assert!(
+        format!("{outcome:?}").starts_with("OwnerGetdentsCopyout"),
+        "expected OwnerGetdentsCopyout, got {outcome:?}"
+    );
+}
+
+
