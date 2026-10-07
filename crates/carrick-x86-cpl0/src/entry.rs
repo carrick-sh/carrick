@@ -1190,11 +1190,11 @@ mod kernel {
                 frame.rax = 0xdead;
                 return;
             }
+            frame.rbx = word1;
             doorbell(FORWARD_PORT, frame);
             let word2 = carrick_el1::isa::x86::user_access::witness(task, address, 6);
-            doorbell(FORWARD_PORT, frame);
             frame.rax = word2;
-            frame.rbx = word1;
+            doorbell(FORWARD_PORT, frame);
             return;
         }
         if crate::fixture_image()
