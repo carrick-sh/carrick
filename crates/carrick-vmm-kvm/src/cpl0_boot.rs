@@ -30,7 +30,11 @@ use carrick_mmu_core::x86::descriptor_txn::{
 };
 use carrick_x86::cpl0_entry::*;
 use carrick_x86::{BringupLayout, X86Reg, X86Vcpu};
-use kvm_bindings::{KVM_MP_STATE_RUNNABLE, Msrs, kvm_mp_state, kvm_msi, kvm_msr_entry};
+use kvm_bindings::{
+    KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP, KVM_MP_STATE_RUNNABLE, Msrs, kvm_guest_debug,
+    kvm_mp_state, kvm_msi, kvm_msr_entry,
+};
+use kvm_ioctls::VcpuExit as KvmExit;
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::ptr::NonNull;
@@ -1926,6 +1930,53 @@ impl Cpl0Carrier {
         gpa: u64,
     ) -> Result<(), TrapError> {
         self.fixture_run_until(index, FixtureStopCondition::UserByte(gpa))
+    }
+
+    /// Single-step a stopped fixture until the next instruction is the exact
+    /// requested user RIP. This does not edit guest registers or execute the
+    /// instruction at `rip`; every step is bounded and the debug control is
+    /// removed before the vCPU returns to its ordinary owner.
+    pub fn fixture_stop_before_user_rip(
+        &mut self,
+        index: usize,
+        rip: u64,
+    ) -> Result<(), TrapError> {
+        let cpu = self
+            .cpus
+            .get_mut(index)
+            .ok_or_else(|| fail("unknown CPL0 CPU slot"))?;
+        let debug = kvm_guest_debug {
+            control: KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP,
+            ..Default::default()
+        };
+        cpu.fd()
+            .set_guest_debug(&debug)
+            .map_err(|e| fail(format!("KVM_SET_GUEST_DEBUG: {e}")))?;
+        let result = (|| {
+            for _ in 0..16 {
+                let regs = cpu.fd().get_regs().map_err(|e| fail(e.to_string()))?;
+                let sregs = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
+                if sregs.cs.dpl != 3 || sregs.cs.selector & 3 != 3 {
+                    return Err(fail("fixture single-step left CPL3"));
+                }
+                if regs.rip == rip {
+                    return Ok(());
+                }
+                if !matches!(
+                    cpu.fd_mut()
+                        .run()
+                        .map_err(|e| fail(format!("KVM_RUN single-step: {e}")))?,
+                    KvmExit::Debug(_)
+                ) {
+                    return Err(fail("fixture single-step exited without debug trap"));
+                }
+            }
+            Err(fail("fixture did not stop at requested user RIP"))
+        })();
+        cpu.fd()
+            .set_guest_debug(&kvm_guest_debug::default())
+            .map_err(|e| fail(format!("KVM_SET_GUEST_DEBUG reset: {e}")))?;
+        result
     }
 
     /// Stop the resumed CPU as soon as its own native KICK gate published the
