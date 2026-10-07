@@ -265,7 +265,15 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame
         let served = native_scheduler(zone, task, self.counters, slot, &mut self.handoff).run_next(
             match self.frame.arm_frame() {
                 Some(frame) => frame,
-                None => return (carrick_core::Served::Idle, self.result()),
+                None => {
+                    #[cfg(target_os = "none")]
+                    crate::substrate::sched::hw::fatal_entry_binding();
+                    #[cfg(not(target_os = "none"))]
+                    carrick_fatal::carrick_fatal!(
+                        "el1::run_next",
+                        "scheduler admitted without an ARM native frame"
+                    )
+                }
             },
             timeout_result.raw() as u64,
         );
