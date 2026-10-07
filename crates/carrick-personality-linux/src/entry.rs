@@ -15,10 +15,14 @@ pub fn decode_x86_64(native: u64, mut args: [u64; 6], stack: u64) -> CanonicalCa
     if native == 56 {
         args.swap(3, 4);
     }
-    let canonical = carrick_syscall_abi::syscall_x86_64::canonical_x86_64(
-        carrick_syscall_abi::NativeNr(native),
-    )
-    .map_or(u64::MAX, carrick_syscall_abi::CanonicalNr::raw);
+    let canonical = if crate::abi::x86_64::lookup_native_x86_64(native).is_some() {
+        carrick_syscall_abi::CARRICK_PRIVATE_X86_ARCH_PRCTL
+    } else {
+        carrick_syscall_abi::syscall_x86_64::canonical_x86_64(
+            carrick_syscall_abi::NativeNr(native),
+        )
+        .map_or(u64::MAX, carrick_syscall_abi::CanonicalNr::raw)
+    };
     if canonical == carrick_syscall_abi::CARRICK_PRIVATE_X86_POLL {
         args = crate::abi::x86_64::poll_arguments(args);
     }
@@ -65,6 +69,7 @@ pub fn decode_aarch64(native: u64, args: [u64; 6], stack: u64) -> CanonicalCall 
         stack: UserVa::new(stack),
     }
 }
+
 /// AArch64 Linux vDSO wire identity: preserve the process half and replace
 /// the thread's visible tid only when that native vDSO binding is present.
 pub const fn aarch64_child_vdso_identity(parent: u64, visible_tid: u32) -> u64 {

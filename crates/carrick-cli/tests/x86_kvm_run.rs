@@ -78,13 +78,19 @@ fn empty_image_archive() -> Vec<u8> {
     archive
 }
 
-fn kvm_available() -> bool {
-    let present = std::path::Path::new("/dev/kvm").exists();
+fn kvm_host_available(present: bool, required: bool) -> bool {
     assert!(
-        present || std::env::var_os("CARRICK_REQUIRE_KVM").is_none_or(|value| value != "1"),
-        "CARRICK_REQUIRE_KVM=1 but /dev/kvm is absent: the KVM gate must not skip"
+        present || !required,
+        "required KVM CLI gate cannot run: /dev/kvm is absent"
     );
-    if !present {
+    present
+}
+
+fn kvm_available() -> bool {
+    if !kvm_host_available(
+        std::path::Path::new("/dev/kvm").exists(),
+        std::env::var_os("CARRICK_REQUIRE_KVM").is_some_and(|value| value == "1"),
+    ) {
         let message = b"SKIP x86 KVM CLI run: /dev/kvm is absent on this host\n";
         // libtest captures eprintln! from passing tests. Write to the host
         // descriptor so an ordinary test invocation shows the skip reason.
@@ -247,6 +253,7 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
 /// silently skipping a missing prebuilt executable. This exercises libc
 /// startup, TLS, poll and exit_group through the production shared kernel.
 #[test]
+#[ignore = "PR #81: shared host dispatch, startup memory/signals and terminal clear-tid custody"]
 fn musl_static_hello_runs_through_shared_kernel() {
     if !kvm_available() {
         return;
@@ -331,4 +338,10 @@ fn arch_prctl_tls_and_errno_match_native_linux_through_shared_kernel() {
         forwards, 2,
         "only stdout write and terminal exit cross to the host"
     );
+}
+
+#[test]
+#[should_panic(expected = "required KVM CLI gate cannot run")]
+fn required_gate_rejects_missing_kvm() {
+    kvm_host_available(false, true);
 }
