@@ -145,8 +145,11 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
                 .get()
                 .cast::<carrick_sched_core::completion_queue::CompletionQueue>()
         };
+        let Some(consumer) = queue.try_consumer_for(self.index() as u32 + 1) else {
+            return;
+        };
         while let Some(id) = unsafe {
-            queue.pop(
+            consumer.pop(
                 |id| self.prepared_link(id).load(Ordering::Acquire) as u32,
                 |id, next| {
                     self.prepared_link(id)
@@ -234,11 +237,24 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
                     .get()
                     .cast::<carrick_sched_core::completion_queue::CompletionQueue>()
             };
-            if !queue.initialize() {
+            if !queue.initialize_for(self.index() as u32 + 1) {
                 self.free_node(queue_id);
                 return Err(Refusal::Stale);
             }
             self.state_mut().prepared_head = queue_id;
+        } else {
+            let queue_id = self.state().prepared_head;
+            let queue = unsafe {
+                &*self
+                    .table
+                    .node(queue_id, self.banks)
+                    .data
+                    .get()
+                    .cast::<carrick_sched_core::completion_queue::CompletionQueue>()
+            };
+            if !queue.owned_by(self.index() as u32 + 1) {
+                return Err(Refusal::Stale);
+            }
         }
         let id = self.pool_node()?;
         let tail = match self.pool_node() {

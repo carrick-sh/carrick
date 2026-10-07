@@ -2821,6 +2821,20 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
     /// settled once every EL1-retired extent has its inventory receipt.
     pub fn retire(mut self) -> Result<(), Refusal> {
         self.reap_prepared();
+        let prepared_queue = self.state().prepared_head;
+        if prepared_queue != 0 {
+            let queue = unsafe {
+                &*self
+                    .table
+                    .node(prepared_queue, self.banks)
+                    .data
+                    .get()
+                    .cast::<carrick_sched_core::completion_queue::CompletionQueue>()
+            };
+            if !queue.owned_by(self.index() as u32 + 1) {
+                return Err(Refusal::Stale);
+            }
+        }
         if self.has_prepared_copy()
             || self.pending().is_some()
             || self.state().fork_pending
