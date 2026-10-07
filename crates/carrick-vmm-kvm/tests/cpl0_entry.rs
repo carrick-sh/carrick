@@ -249,42 +249,53 @@ fn production_image_rejects_fixture_syscalls() {
     let bytes = std::fs::read(&production).expect("production CPL0 image built");
     let fixture = PathBuf::from(env!("CARRICK_X86_CPL0_FIXTURE_IMAGE"));
     let fixture_bytes = std::fs::read(&fixture).expect("fixture CPL0 image built");
-    // The fixture-only dispatch is named in the ELF symbol table. Scanning
-    // every LOAD byte for its small negative observer ordinals confuses errno
-    // values in production read-only data with executable fixture routes.
-    let has_fixture_edit = |image: &[u8]| {
-        let elf = goblin::elf::Elf::parse(image).expect("valid CPL0 ELF symbols");
-        elf.syms.iter().any(|symbol| {
-            elf.strtab
-                .get_at(symbol.st_name)
-                .is_some_and(|name| name.contains("fixture_edit"))
-        })
+    // The fixture observer's own symbol and opaque words prove that its
+    // dispatch body is absent. Negative errno values are valid production
+    // data, so they cannot serve as fixture-dispatch witnesses.
+    let fixture_elf = goblin::elf::Elf::parse(&fixture_bytes).expect("fixture ELF symbols");
+    let production_elf = goblin::elf::Elf::parse(&bytes).expect("production ELF symbols");
+    let symbol = |elf: &goblin::elf::Elf<'_>, name: &str| {
+        elf.syms
+            .iter()
+            .find(|symbol| elf.strtab.get_at(symbol.st_name) == Some(name))
     };
-    assert!(
-        has_fixture_edit(&fixture_bytes),
-        "fixture dispatch symbol missing"
-    );
-    assert!(
-        !has_fixture_edit(&bytes),
-        "fixture dispatch linked into production"
-    );
+    for name in [
+        "carrick_x86_fixture_dispatch_witness",
+        "CARRICK_X86_FIXTURE_DISPATCH_WITNESSES",
+    ] {
+        assert!(
+            symbol(&fixture_elf, name).is_some(),
+            "fixture symbol missing: {name}"
+        );
+        assert!(
+            symbol(&production_elf, name).is_none(),
+            "fixture symbol linked: {name}"
+        );
+    }
+    let witness_symbol = symbol(&fixture_elf, "CARRICK_X86_FIXTURE_DISPATCH_WITNESSES")
+        .expect("fixture witness symbol");
+    assert_eq!(witness_symbol.st_size, 16);
+    let load = fixture_elf
+        .program_headers
+        .iter()
+        .find(|header| {
+            header.p_type == goblin::elf::program_header::PT_LOAD
+                && witness_symbol.st_value >= header.p_vaddr
+                && witness_symbol.st_value + witness_symbol.st_size
+                    <= header.p_vaddr + header.p_filesz
+        })
+        .expect("witness is in fixture LOAD bytes");
+    let offset = (load.p_offset + witness_symbol.st_value - load.p_vaddr) as usize;
     let plan =
         carrick_mem::elf::plan_elf_load_bytes_for(&bytes, 62).expect("production CPL0 load image");
-    for syscall in [
-        0xffff_ffff_ffff_ff10_u64,
-        0xffff_ffff_ffff_ff20,
-        0xffff_ffff_ffff_ff30,
-        0xffff_ffff_ffff_ff40,
-    ] {
+    for word in fixture_bytes[offset..offset + witness_symbol.st_size as usize].chunks_exact(8) {
         assert!(
             !plan.segments.iter().any(|segment| {
                 let start = segment.file_offset as usize;
                 let end = start + segment.file_size as usize;
-                bytes[start..end]
-                    .windows(8)
-                    .any(|window| window == syscall.to_le_bytes())
+                bytes[start..end].windows(8).any(|window| window == word)
             }),
-            "production image contains fixture syscall {syscall:#x}"
+            "production image contains a fixture dispatch witness"
         );
     }
     let probe = transport_program(0);

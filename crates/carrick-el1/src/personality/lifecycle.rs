@@ -23,7 +23,7 @@ impl<F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame> Us
         if let Some(user) = &mut self.lifecycle_user {
             return user.copy_in(dst, src.raw());
         }
-        let Some(task) = self.current_tasks.get(self.frame.slot() as usize) else {
+        let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return false;
         };
         crate::file::ValidatedCopy {
@@ -37,7 +37,7 @@ impl<F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame> Us
         if let Some(user) = &mut self.lifecycle_user {
             return user.copy_out(dst.raw(), src);
         }
-        let Some(task) = self.current_tasks.get(self.frame.slot() as usize) else {
+        let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return false;
         };
         crate::file::ValidatedCopy {
@@ -63,21 +63,21 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame
     }
     fn binding(&self) -> Option<carrick_el1_abi::ExecutionBinding> {
         self.current_tasks
-            .get(self.frame.slot() as usize)
+            .get(self.frame.task_index())
             .map(super::common_entry::execution_binding)
     }
     fn task_state(&self) -> Option<&'a LinuxTaskState> {
         self.current_tasks
-            .get(self.frame.slot() as usize)
+            .get(self.frame.task_index())
             .map(|task| &task.linux)
     }
     fn thread(&self) -> Option<LifecycleThread<'a>> {
         self.lifecycle?
-            .thread(self.current_tasks.get(self.frame.slot() as usize)?)
+            .thread(self.current_tasks.get(self.frame.task_index())?)
     }
     fn register_robust_list(&self, head: u64, len: u64) -> Option<SyscallResult> {
         use super::thread_setup::{RobustListHead, RobustListLen, RobustListSlot};
-        let task = self.current_tasks.get(self.frame.slot() as usize)?;
+        let task = self.current_tasks.get(self.frame.task_index())?;
         let thread = self.lifecycle?.thread(task)?;
         carrick_personality_linux::thread::set_robust_list(
             thread.page,
@@ -101,7 +101,10 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame
     fn has_scheduler(&self) -> bool {
         self.frame.arm_scheduler()
             && self.zone.is_some()
-            && SlotId::from_index(self.frame.slot() as usize).is_some()
+            && SlotId::from_index(self.frame.slot_index()).is_some()
+    }
+    fn can_prepare_child(&self, _: UserVa, _: Option<UserVa>) -> bool {
+        self.frame.arm_frame_ref().is_some()
     }
     fn user_sp(&mut self) -> Option<UserVa> {
         if let Some(sp) = self.frame.user_sp() {
@@ -114,7 +117,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame
     }
     fn affinity(&self) -> Option<u64> {
         let zone = self.zone.as_ref()?.tables;
-        let slot = SlotId::from_index(self.frame.slot() as usize)?;
+        let slot = SlotId::from_index(self.frame.slot_index())?;
         Some(match zone.slot(slot).current() {
             Some(record) => zone.record(record).identity().affinity,
             None => zone.slot(slot).affinity(),
@@ -163,10 +166,10 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame
         ctx.tpidrro_el0 = aarch64_child_vdso_identity(ctx.tpidrro_el0, context.visible_tid);
     }
     fn enqueue_born(&mut self, record: RecordRef) {
-        let Some(task) = self.current_tasks.get(self.frame.slot() as usize) else {
+        let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return;
         };
-        let Some(slot) = SlotId::from_index(self.frame.slot() as usize) else {
+        let Some(slot) = SlotId::from_index(self.frame.slot_index()) else {
             return;
         };
         let Some(zone) = &mut self.zone else {
@@ -179,7 +182,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame
     }
     fn exit_record(&self) -> Option<ExitRecord> {
         let zone = self.zone.as_ref()?.tables;
-        let slot = SlotId::from_index(self.frame.slot() as usize)?;
+        let slot = SlotId::from_index(self.frame.slot_index())?;
         let id = zone.slot(slot).current()?;
         let record = zone.record(id);
         Some(ExitRecord {
@@ -194,10 +197,10 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame
         })
     }
     fn wake_child_tid(&mut self, mm: EntryMmKey, address: UserVa) -> bool {
-        let Some(task) = self.current_tasks.get(self.frame.slot() as usize) else {
+        let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return false;
         };
-        let Some(slot) = SlotId::from_index(self.frame.slot() as usize) else {
+        let Some(slot) = SlotId::from_index(self.frame.slot_index()) else {
             return false;
         };
         let Some(zone) = &mut self.zone else {
@@ -217,13 +220,13 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame
             .is_some()
     }
     fn release_current(&mut self, record: RecordRef) -> bool {
-        let Some(task) = self.current_tasks.get(self.frame.slot() as usize) else {
+        let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return false;
         };
         let Some(zone) = &self.zone else {
             return false;
         };
-        let Some(slot) = SlotId::from_index(self.frame.slot() as usize) else {
+        let Some(slot) = SlotId::from_index(self.frame.slot_index()) else {
             return false;
         };
         if zone.tables.live(record).is_none() {
@@ -241,35 +244,35 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame
         self.handoff.is_some()
     }
     fn run_next(&mut self, timeout_result: SyscallResult) -> (carrick_core::Served, SyscallResult) {
-        let Some(task) = self.current_tasks.get(self.frame.slot() as usize) else {
+        let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return (
                 carrick_core::Served::Idle,
-                SyscallResult::new(self.frame.argument(0) as i64),
+                SyscallResult::new(self.frame.result().0 as i64),
             );
         };
-        let Some(slot) = SlotId::from_index(self.frame.slot() as usize) else {
+        let Some(slot) = SlotId::from_index(self.frame.slot_index()) else {
             return (
                 carrick_core::Served::Idle,
-                SyscallResult::new(self.frame.argument(0) as i64),
+                SyscallResult::new(self.frame.result().0 as i64),
             );
         };
         let Some(zone) = &mut self.zone else {
             return (
                 carrick_core::Served::Idle,
-                SyscallResult::new(self.frame.argument(0) as i64),
+                SyscallResult::new(self.frame.result().0 as i64),
             );
         };
         let served = native_scheduler(zone, task, self.counters, slot, &mut self.handoff).run_next(
             match self.frame.arm_frame() {
                 Some(frame) => frame,
-                None => return (carrick_core::Served::Idle, SyscallResult::new(0)),
+                None => return (carrick_core::Served::Idle, self.result()),
             },
             timeout_result.raw() as u64,
         );
-        (served, SyscallResult::new(self.frame.argument(0) as i64))
+        (served, SyscallResult::new(self.frame.result().0 as i64))
     }
     fn result(&self) -> SyscallResult {
-        SyscallResult::new(self.frame.argument(0) as i64)
+        SyscallResult::new(self.frame.result().0 as i64)
     }
     fn set_result(&mut self, result: SyscallResult) {
         self.frame
