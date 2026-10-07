@@ -1545,6 +1545,7 @@ fn next_runnable<F: PersistentExecutor>(
             .lost_adoptions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    carrick_kernel::el1_zone::hand_back_completions();
     zone.sweep_cancelled(slot);
     carrick_kernel::el1_zone::hand_back_wanted(slot);
     if registration.is_spare() {
@@ -1610,8 +1611,9 @@ fn next_runnable<F: PersistentExecutor>(
     backend.note_bound_cpu(registration.bound_cpu().map(|cpu| cpu.as_u32()));
     let waited = backend.wait_in_guest();
     kick.set_guest_idle(false);
+    carrick_kernel::el1_zone::hand_back_completions();
     match waited.map_err(|error| NextError::Fatal(error.to_string()))? {
-        GuestIdleExit::Idle => Ok(None),
+        GuestIdleExit::Idle => Ok(scheduler.try_take(registration)?),
         GuestIdleExit::Unsupported => Ok(Some(scheduler.take(registration)?)),
     }
 }
