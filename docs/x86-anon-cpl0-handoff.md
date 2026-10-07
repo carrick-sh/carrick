@@ -52,6 +52,44 @@ All seven fixture lockfiles validate. Receipts:
 and /tmp/x86-process-fixture-lock-{update,pins,check}.log. Final clean-tree
 lint and push remain to run; wait/exit/CPL0/two-live-MM remain unimplemented.
 
+## Shared registry retirement continuation
+
+The final-member group/session retirement decision now lives in the same
+scheduler-core registry as its namespace indexes. The host helper delegates
+its unchanged logic. The focused test refuses retirement by a stale task
+serial and preserves another namespace's group/session after the real last
+member retires. Both namespaces use distinct internal task keys. The missing
+shared method is red at the prior checkpoint; replacing exact TaskKey removal
+with PID-only removal is also red at the live-group assertion. Exact removal
+passes all three shared registry tests. Full `just test` and separately
+`just test-kernel-semantics` pass for the moved implementation; the final
+unit test was rerun after giving the peer namespace its distinct task key.
+The host-lease abnormal-fork negative control prints an intentional child
+failure; its containing test and the complete host gate exit zero.
+Receipts: /tmp/x86-process-group-retirement-{red,generation-red,green,
+final-unit,test,kernel-semantics}.log.
+
+Registry audit inventories retain classifications and family counts. The
+only retired K1 mapping row was Zombie documentation moved outside that
+inventory's source roots; no file-authority operation was removed. Seven
+runtime aborts retain their domains/verdicts/rationales while their owning
+function names are rebound. The guarded macOS compiler recapture for
+cfc251a07ac0 refreshed moved source spans and receipt provenance. Static
+validation agrees exactly; captured operations/profile memberships and
+review classifications are unchanged. Patch/receipt:
+target/remote-recapture/cfc251a07ac0-recapture-20261007-112329/recapture.patch;
+/tmp/x86-process-registry-recapture.log. Signed ARM runtime tests did not run.
+
+An overlapping next-step source edit caused the first post-recapture lint
+attempt to refuse dirty compiler snapshot inputs. This is not a gate pass;
+clean committed-tree lint and final push gates must run after this step.
+The process registry's population payloads remain host adapters; the full
+wait scan/consume/wake-generation and reserved exit/reparent transactions
+remain in the host kernel. They must move before any production CPL0 fork,
+wait, exit, CPU1 or two-live-MM PRIVATE witness can be claimed. Do not promote
+the stopped lifecycle fixture in process.rs as production policy. Preserve
+InitialWords as the only production descriptor-window authority.
+
 ## PR102 re-review follow-up
 
 Named WRITE/EXECUTE flags replace grant-publication bit literals. Shared
