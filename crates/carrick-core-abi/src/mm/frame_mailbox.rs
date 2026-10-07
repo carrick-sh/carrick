@@ -357,7 +357,7 @@ impl FrameGrantMailbox {
             request.mm_key == mm_key
                 && (request.fault_va == fault_va
                     || request.fault_va / Self::PAGE_SIZE == fault_va / Self::PAGE_SIZE)
-                && (access == 0 || request.access == access)
+                && request.access == access
         };
         if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_REQUESTED {
             return false;
@@ -650,7 +650,7 @@ mod host_claim_tests {
             access: 2,
         };
         assert!(mailbox.try_publish_request(first));
-        assert!(mailbox.cancel_request_for_fault(7, 0x6000, 0));
+        assert!(mailbox.cancel_request_for_fault(7, 0x6000, 2));
         assert_eq!(
             mailbox.state.load(Ordering::Acquire),
             FRAME_GRANT_MAILBOX_IDLE

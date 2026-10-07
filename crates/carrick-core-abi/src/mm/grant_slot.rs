@@ -34,21 +34,14 @@ impl PortalGrantSlot {
         request_generation: u64,
         window: PortalGrantWindow,
     ) -> bool {
-        if request_generation == 0 || !window.valid() {
-            return false;
-        }
-        let mut current = self.state.load(Ordering::Acquire);
-        loop {
-            if current != 0 && current != 3 && current != 4 {
-                return false;
-            }
-            match self
+        if request_generation == 0
+            || !window.valid()
+            || self
                 .state
-                .compare_exchange_weak(current, 1, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return false;
         }
         for (word, value) in self.window.iter().zip(window.words()) {
             word.store(value, Ordering::Relaxed);
@@ -61,18 +54,12 @@ impl PortalGrantSlot {
     /// A busy owner resource has a producer; carry its exact pre-probe
     /// revision across the EL1 exit instead of falling through host sparse.
     pub fn publish_fault_wait(&self, fault_va: u64, wait: PortalOwnerWait) -> bool {
-        let mut current = self.state.load(Ordering::Acquire);
-        loop {
-            if current != 0 && current != 3 && current != 4 {
-                return false;
-            }
-            match self
-                .state
-                .compare_exchange_weak(current, 1, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
+        if self
+            .state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
         }
         let values = [
             wait.handle().carrier().get(),
@@ -215,21 +202,19 @@ impl PortalGrantSlot {
                 .is_none_or(|window| window.operation.mm.raw() == mm_key))
     }
     pub fn submit(&self, window: PortalGrantWindow, txn: &DescriptorTxn) -> bool {
-        if !window.valid() || txn.id.mm_key.get() != window.operation.mm.raw() {
+        if !window.valid() || txn.id.mm_key.get() != window.operation.mm.raw() || {
+            let state = self.state.load(Ordering::Acquire);
+            let selected = state == 3
+                && PortalGrantWindow::decode(core::array::from_fn(|i| {
+                    self.window[i].load(Ordering::Relaxed)
+                })) == Some(window);
+            (!selected && state != 0)
+                || self
+                    .state
+                    .compare_exchange(state, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+        } {
             return false;
-        }
-        let mut current = self.state.load(Ordering::Acquire);
-        loop {
-            if current != 0 && current != 3 && current != 4 {
-                return false;
-            }
-            match self
-                .state
-                .compare_exchange_weak(current, 1, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
         }
         if !self.descriptor.submit(txn) {
             self.state.store(0, Ordering::Release);
@@ -360,16 +345,18 @@ mod tests {
     }
 
     #[test]
-    fn unconsumed_fault_selection_allows_subsequent_submit_on_same_slot() {
+    fn unconsumed_fault_selection_fails_closed_until_cancelled() {
         let slot = PortalGrantSlot::new();
         assert!(slot.publish_fault_selection(1, window(7)));
         let other_window = window(8);
         let txn = dummy_txn(8);
+        assert!(!slot.submit(other_window, &txn));
+        assert!(slot.cancel_fault_for_page(7, 0x6000));
         assert!(slot.submit(other_window, &txn));
     }
 
     #[test]
-    fn unconsumed_fault_wait_allows_subsequent_submit_on_same_slot() {
+    fn unconsumed_fault_wait_fails_closed_until_cancelled() {
         let slot = PortalGrantSlot::new();
         let wait = unsafe {
             PortalOwnerWait::from_owner(
@@ -384,11 +371,13 @@ mod tests {
         };
         assert!(slot.publish_fault_wait(0x6000, wait));
         let txn = dummy_txn(8);
+        assert!(!slot.submit(window(8), &txn));
+        assert!(slot.cancel_fault_for_page(7, 0x6000));
         assert!(slot.submit(window(8), &txn));
     }
 
     #[test]
-    fn unconsumed_fault_wait_allows_new_fault_selection_on_same_slot() {
+    fn unconsumed_fault_wait_fails_closed_until_withdrawn_or_cancelled() {
         let slot = PortalGrantSlot::new();
         let wait = unsafe {
             PortalOwnerWait::from_owner(
@@ -402,6 +391,8 @@ mod tests {
             )
         };
         assert!(slot.publish_fault_wait(0x6000, wait));
+        assert!(!slot.publish_fault_selection(2, window(8)));
+        assert!(slot.cancel_fault_for_page(7, 0x6000));
         assert!(slot.publish_fault_selection(2, window(8)));
         assert!(slot.pending_fault_selection(8, 0x6000).is_some());
     }
