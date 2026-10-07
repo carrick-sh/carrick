@@ -7508,6 +7508,33 @@
     }
   },
   {
+    "catalog_id": "HA-CATALOG-FS-READ-DIR",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "Cargo-derived local CPL0 package source directories, excluding target artifacts"
+    },
+    "expansion": null,
+    "operation": "std::fs::read_dir",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vmm-kvm/cpl0_inputs.rs:180 in `rust_files`, `std::fs::read_dir` reads only Cargo-derived local CPL0 package source directories, excluding target artifacts; this build-input census is rooted in the trusted checkout and Cargo metadata, with no guest pathname or syscall input.",
+    "review_id": "HA-000760",
+    "source": {
+      "byte_end": 6521,
+      "byte_start": 6504,
+      "column": 23,
+      "column_end": 40,
+      "column_start": 23,
+      "file": "crates/carrick-vmm-kvm/cpl0_inputs.rs",
+      "line": 180,
+      "line_end": 180,
+      "line_start": 180
+    }
+  },
+  {
     "catalog_id": "HA-CATALOG-FS-READ-LINK",
     "classification": "declared_backing",
     "evidence": {
@@ -8378,6 +8405,33 @@
       "line": 73,
       "line_end": 73,
       "line_start": 73
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-READ-TO-STRING",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "Rust source files in the Cargo-derived CPL0 build-input closure and their literal includes"
+    },
+    "expansion": null,
+    "operation": "std::fs::read_to_string",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vmm-kvm/cpl0_inputs.rs:96 in `derive`, `std::fs::read_to_string` reads only Rust source files in the Cargo-derived CPL0 build-input closure and their literal includes; this build-input census is rooted in the trusted checkout and Cargo metadata, with no guest pathname or syscall input.",
+    "review_id": "HA-000761",
+    "source": {
+      "byte_end": 3675,
+      "byte_start": 3652,
+      "column": 26,
+      "column_end": 49,
+      "column_start": 26,
+      "file": "crates/carrick-vmm-kvm/cpl0_inputs.rs",
+      "line": 96,
+      "line_end": 96,
+      "line_start": 96
     }
   },
   {
