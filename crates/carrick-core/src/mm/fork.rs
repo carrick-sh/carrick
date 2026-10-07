@@ -1,6 +1,8 @@
 //! Fork census, unpublished child, undo, and receipt validation.
 
+use crate::mm::reservation::{Refusal, ReservationGeometry, ReservationPolicy, Reservations};
 use alloc::vec::Vec;
+pub use carrick_core_abi::Mapping;
 use carrick_core_abi::{
     CowGrantCompletion, El1MmHandle, PortalForkCompletion, PortalForkCustody, PortalForkRequest,
     ReservationGeneration,
@@ -33,8 +35,6 @@ pub enum ForkError {
     OwnerRefusal(ForkOwnerRefusal),
     Core,
 }
-
-pub use carrick_core_abi::Mapping;
 
 /// All allocation occurs before borrowing either owner. Unlinked table words
 /// and parent undo storage stay owned across physical custody suspension.
@@ -196,6 +196,122 @@ pub trait ForkParentRoot<C: ForkChildRoot> {
     fn commit_fork_generation(&mut self) -> Result<ReservationGeneration, ForkError>;
 }
 
+fn refusal_to_fork_error(e: Refusal) -> ForkError {
+    match e {
+        Refusal::Stale => ForkError::Stale,
+        Refusal::Busy | Refusal::PreparedConflict => ForkError::Busy,
+        Refusal::MetadataRequired => ForkError::MetadataRequired,
+        Refusal::Invalid => ForkError::OwnerRefusal(ForkOwnerRefusal::Invalid),
+        Refusal::Collision => ForkError::OwnerRefusal(ForkOwnerRefusal::Collision),
+        Refusal::Hole => ForkError::OwnerRefusal(ForkOwnerRefusal::Hole),
+        Refusal::ForeignMapping => ForkError::OwnerRefusal(ForkOwnerRefusal::ForeignMapping),
+        Refusal::Limit => ForkError::OwnerRefusal(ForkOwnerRefusal::Limit),
+    }
+}
+
+impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> ForkChildRoot
+    for Reservations<'_, Policy, Geometry>
+{
+    fn incarnation(&self) -> u64 {
+        self.incarnation().raw()
+    }
+
+    fn is_admitted(&self) -> bool {
+        self.is_admitted()
+    }
+
+    fn fork_write_authorized(&mut self, sequence: Option<core::num::NonZeroU64>) -> bool {
+        self.fork_write_authorized(sequence)
+    }
+
+    fn authenticate_fork_origin(&mut self, request: PortalForkRequest) -> bool {
+        self.authenticate_fork_origin(request)
+    }
+
+    fn set_fork_origin(&mut self, request: PortalForkRequest) -> Result<(), ForkError> {
+        self.set_fork_origin(request).map_err(refusal_to_fork_error)
+    }
+
+    fn clear_fork_origin(&mut self) {
+        self.clear_fork_origin();
+    }
+
+    fn publish_fork_child(&mut self, request: PortalForkRequest) -> Result<(), ForkError> {
+        self.publish_fork_child(request)
+            .map_err(refusal_to_fork_error)
+    }
+
+    fn finish_fork_publication(
+        &mut self,
+        operation: carrick_core_abi::PortalOperation,
+    ) -> Result<(), ForkError> {
+        self.finish_fork_publication(operation)
+            .map_err(refusal_to_fork_error)
+    }
+
+    fn retire(self) -> Result<(), ForkError> {
+        self.retire().map_err(refusal_to_fork_error)
+    }
+}
+
+impl<'b, Policy: ReservationPolicy, Geometry: ReservationGeometry>
+    ForkParentRoot<Reservations<'b, Policy, Geometry>> for Reservations<'_, Policy, Geometry>
+{
+    fn incarnation(&self) -> u64 {
+        self.incarnation().raw()
+    }
+
+    fn generation(&self) -> carrick_core_abi::ReservationGeneration {
+        self.generation()
+    }
+
+    fn operation_sequence(&self) -> u64 {
+        self.operation_sequence()
+    }
+
+    fn fork_ready(&mut self) -> bool {
+        self.fork_ready()
+    }
+
+    fn fork_write_authorized(&mut self, sequence: Option<core::num::NonZeroU64>) -> bool {
+        self.fork_write_authorized(sequence)
+    }
+
+    fn reserve_fork_certificate(&mut self, request: PortalForkRequest) -> Result<(), ForkError> {
+        self.reserve_fork_certificate(request)
+            .map_err(refusal_to_fork_error)
+    }
+
+    fn clone_into(
+        &mut self,
+        child: &mut Reservations<'b, Policy, Geometry>,
+    ) -> Result<(), ForkError> {
+        self.clone_into(child).map_err(refusal_to_fork_error)
+    }
+
+    fn publish_fork_parent(
+        &mut self,
+        request: PortalForkRequest,
+    ) -> Result<carrick_core_abi::ReservationGeneration, ForkError> {
+        self.publish_fork_parent(request)
+            .map_err(refusal_to_fork_error)
+    }
+
+    fn finish_fork_publication(
+        &mut self,
+        operation: carrick_core_abi::PortalOperation,
+    ) -> Result<(), ForkError> {
+        self.finish_fork_publication(operation)
+            .map_err(refusal_to_fork_error)
+    }
+
+    fn commit_fork_generation(
+        &mut self,
+    ) -> Result<carrick_core_abi::ReservationGeneration, ForkError> {
+        self.commit_fork_generation().map_err(refusal_to_fork_error)
+    }
+}
+
 pub struct PreparedOwnerFork<B: OwnerForkMmu = Aarch64Mmu> {
     pub request: PortalForkRequest,
     pub parent_root: u64,
@@ -312,8 +428,19 @@ impl<B: OwnerForkMmu> PreparedOwnerFork<B> {
             rollback(words, &self.scratch.edits)?;
             return Err(error);
         }
-        let parent_generation = parent.publish_fork_parent(self.request)?;
-        child.publish_fork_child(self.request)?;
+        let parent_generation = match parent.publish_fork_parent(self.request) {
+            Ok(generation) => generation,
+            Err(error) => {
+                child.clear_fork_origin();
+                rollback(words, &self.scratch.edits)?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = child.publish_fork_child(self.request) {
+            child.clear_fork_origin();
+            rollback(words, &self.scratch.edits)?;
+            return Err(error);
+        }
         words.publish_barrier();
         words.invalidate_range(0, 1 << 48);
         Ok(UnpublishedChild::new(
@@ -657,7 +784,7 @@ pub fn census_entry<
             )?;
         }
     } else if structural {
-        if B::is_private_control(UserVa::new(va)) {
+        if B::control_needs_copy(UserVa::new(va), descriptor) {
             count.custody = count.custody.checked_add(1).ok_or(ForkError::NoMemory)?;
         }
     } else if (selected == Policy::Private || (selected == Policy::Keep && B::is_user(descriptor)))
@@ -808,7 +935,7 @@ pub fn copy_entry<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
             }
             return Ok((descriptor, (descriptor & !B::ADDRESS_MASK) | output));
         }
-        if B::is_private_control(UserVa::new(va)) {
+        if B::control_needs_copy(UserVa::new(va), descriptor) {
             let source_ipa = descriptor & B::ADDRESS_MASK;
             let destination_ipa = B::control_copy_destination(
                 UserVa::new(va),
@@ -1002,6 +1129,3 @@ pub fn validate_fork_completion(
     }
     Ok(completion)
 }
-
-mod reservation;
-pub use reservation::refusal_to_fork_error;

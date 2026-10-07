@@ -75,9 +75,6 @@ impl carrick_core::mm::fork::MappingInheritancePolicy for LinuxForkPolicy {
     }
 }
 
-#[cfg(test)]
-pub(crate) use carrick_core::mm::fork::refusal_to_fork_error;
-
 /// An unpublished memory result. Task admission chooses commit or rollback;
 /// the child gate is closed throughout, and its exact parent undo remains owned.
 pub struct UnpublishedEl1Child<B: OwnerForkMmu = NativeForkMmu> {
@@ -396,7 +393,7 @@ static PENDING_FORKS: [crate::lock::SpinLock<Option<UnpublishedEl1Child>>;
 /// both root/editor guards before requesting physical custody. Its unpublished
 /// child capsule remains owned in EL1 until the separately scheduled FINISH.
 #[cfg(target_os = "none")]
-pub(super) fn authenticate_pending_parent_write(
+pub(crate) fn authenticate_pending_parent_write(
     slot: usize,
     handle: El1MmHandle,
     sequence: NonZeroU64,
@@ -659,32 +656,4 @@ pub fn finish_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         Ok(())
     })();
     frame.x[0] = result.err().map_or(0, |error| u64::from(error.errno()));
-}
-
-#[cfg(test)]
-mod refusal_tests {
-    use super::*;
-    use crate::memory::reservations::Refusal;
-    use carrick_personality_linux::mm::MmErrorLinux;
-
-    #[test]
-    fn fork_refusals_preserve_original_mm_error_and_errno() {
-        for refusal in [
-            Refusal::Busy,
-            Refusal::PreparedConflict,
-            Refusal::Stale,
-            Refusal::Invalid,
-            Refusal::Collision,
-            Refusal::Hole,
-            Refusal::ForeignMapping,
-            Refusal::Limit,
-            Refusal::MetadataRequired,
-        ] {
-            // Before extraction these owner calls used MmError::from directly.
-            let original = MmError::from(refusal);
-            let through_core = MmError::from(refusal_to_fork_error(refusal));
-            assert_eq!(through_core, original, "{refusal:?}");
-            assert_eq!(through_core.errno(), original.errno(), "{refusal:?}");
-        }
-    }
 }

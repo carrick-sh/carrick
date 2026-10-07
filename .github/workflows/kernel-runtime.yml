@@ -14,6 +14,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Harden registry transport against intermittent network errors without retrying tests.
+  CARGO_HTTP_MULTIPLEXING: "false"   # avoid HTTP/2 framing failures against the crates.io index
+  CARGO_NET_RETRY: "10"              # transport retries for registry/download fetches only
   RUST_BACKTRACE: 1
 
 jobs:
@@ -39,7 +42,9 @@ jobs:
           tool: just
 
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
 
       - name: Publish exact-SHA fixture bundle
         run: just fixtures-publish "$GITHUB_SHA"

@@ -1,5 +1,41 @@
 # x86 anonymous CPL0 handoff (partial, 2026-10-07)
 
+## Latest process-owner continuation
+
+PR102 follow-up 83364467d is pushed. Extraction identities were rebased onto
+it as 28880ba48; b1331db4e repairs the stale neutral fault-owner assertion.
+c75bf28d7 moves live/retiring/zombie/reservation and namespace-index storage
+into scheduler core, with host resource payloads and a fatal-reporting
+adapter. The host registry and group/session records are aliases of those
+shared types, not duplicate maps. Host kernel compile-check and shared
+scope/collision tests pass. Removing the namespace collision guard makes
+its test fail; restoring it passes. Registry-step kernel-semantics passes.
+
+Full host runs before shared-kernel integration remain red at the missing
+embed-copyout input inventory; the earlier identity run also saw a pre-fork
+record failure. Director-required sequential fixed-50 A/B reproduces that
+same published-record/parent-zero assertion on pre-extraction 83364467d
+(6/50) and extraction c75bf28d7 (5/50), with separate artifacts. Receipts:
+/tmp/x86-prefork-{base,extraction}-fixed-50/{1..50}.log and status.txt;
+/tmp/x86-prefork-ab-artifacts.sha256. This is attribution, not closure.
+The director has been asked to route that defect. No arena test/code was
+changed, and no retry-until-green or new ignore was added.
+
+The director authorized merging shared-kernel 6d6bcf26c for its existing
+fixture input and shootdown fixes. Its main rebase changes ancestry; the
+71 initial conflicts resolved cleanly using previously merged 7d6daf287
+content as the three-way base. This retains our reviewed changes and that
+lane's fixes without editing its shootdown bodies. The merged host kernel
+compile-check and fmt-check pass; full post-merge gates remain required.
+
+Exact next step: finish post-merge host/kernel-semantics and push gates,
+then extract the authoritative wait scan/consume and wake-generation sample,
+followed by owned exit/reparent/SIGCHLD transactions. Registry storage alone
+does not complete the owner. Production CPL0 lifecycle/CPU1 binding and the
+two-live-MM PRIVATE witness remain open; no extraction review-ready is claimed.
+Latest receipts: /tmp/x86-process-registry-{check,unit,collision-red,test,
+kernel-semantics}.log and /tmp/x86-process-shared-{merge,check,fmt}.log.
+
 ## PR102 re-review follow-up
 
 Named WRITE/EXECUTE flags replace grant-publication bit literals. Shared

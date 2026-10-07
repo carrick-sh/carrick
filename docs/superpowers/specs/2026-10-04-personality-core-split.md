@@ -1,6 +1,8 @@
 # Personality-neutral core with Linux and NT clients
 
-Status: approved by the owner 2026-10-05 (see Owner decisions).
+Status: approved by the owner 2026-10-05 (see Owner decisions). Amended
+2026-10-06: the NT personality lives in a separate repository (see
+[Repository boundary](#repository-boundary-nt-lives-out-of-tree)).
 
 Design proposal, 2026-10-04. Documentation only; no implementation, runtime
 acceptance, or compatibility claim. Inspected Carrick `0250e7f2a834e8bd1b080780bd0f5b8e67bc30ad`.
@@ -91,7 +93,9 @@ extracted from `carrick-kernel` and `carrick-el1/src/personality`.
 suffixes. Move the signal policy into `carrick-signal-linux`; extract a small
 bitset only if the second client actually needs it, and retire
 `carrick-signal-core` after its callers move. `carrick-personality-nt` and
-`carrick-nt-abi` are new, with no dependency on Linux packages.
+`carrick-nt-abi` are new, with no dependency on Linux packages. They live in
+a separate repository, not in this tree; see
+[Repository boundary](#repository-boundary-nt-lives-out-of-tree).
 
 `carrick-kernel` remains transitional Linux integration until its portable
 owners and host bindings are relocated, then is retired without a compatibility
@@ -101,7 +105,9 @@ adapters as the Linux policy crates become `no_std`; merely renaming their
 current dependency closure cannot make them link into a guest image.
 `carrick-el1` becomes the AArch64 image composition root (core + chosen
 personality + ISA adapter); extend the existing `carrick-x86-cpl0` image for
-x86_64. A composition root may depend on a personality; a core cannot. Existing
+x86_64. A composition root may depend on a personality; a core cannot. In-tree
+composition roots compose only the Linux personality and the in-tree test
+personality; the NT composition roots live in the NT repository. Existing
 host execution venues call the same extracted owners until their privileged
 venue passes its gate. They cannot become a second model.
 
@@ -126,10 +132,15 @@ inventories; line numbers from the moving censuses are not stable IDs.
 | Linux /proc, namespaces and credentials | `carrick-kernel/src/vfs/proc.rs`, `kernel/objects/{credentials,session}.rs`, `kernel/operations/{identity,session,wait}.rs`; `carrick-vfs/src/vfs/mod.rs` synthetic proc records | Linux `src/{procfs,identity,credentials,session}.rs`. Core exports exact-generation observations, not text paths, Linux stat layouts or uid-based access decisions. NT query APIs and token/SID access checks consume its own object state. |
 | Pipes, epoll/eventfd, AF_UNIX and notifications | `carrick-pipe-core/src/lib.rs`; `carrick-el1-abi/src/ipc.rs`, `ipc/epoll.rs`; `carrick-kernel/src/kernel/objects/ipc.rs`, `dispatch/net.rs`; `carrick-inotify-core/src/lib.rs` | Clean pipe-core retains byte buffers/cursors/readiness revisions. Linux `src/ipc.rs` owns PIPE_BUF/packet policy, SIGPIPE, eventfd, epoll and AF_UNIX/SCM_RIGHTS. Core retains generic object subscriptions and pins. NT named pipes/events/IOCP are separate semantic clients, not aliases for Linux objects. |
 | Host files, namespace admission and caches | `carrick-vfs/src/fs_backend.rs`, `vfs/{dentry,rootfs,errno}.rs`; `carrick-el1/src/file.rs`, `substrate/{ipc,watches}.rs` | Retain contained host capabilities; extract neutral I/O errors, byte cache and storage identity. Linux path/stat/DAC and NT UTF-16 object paths/share modes/security remain personality policy. N4 must not declare current `VfsError = LinuxErrno` a neutral backend interface. |
-| NT handle table and Object Manager namespace | **Absent**; nearest storage donors are fd-core and kernel object registry above | New NT `src/{handle,object_manager,security}.rs`: guest HANDLE decoding, pseudo-handles, desired/granted access, duplicate/inherit rules, typed objects, named directories/symlinks and reference lifetime over core capabilities. NT namespace is not the host filesystem. |
-| NT multi-object and alertable waits, APC queues | **Absent**; nearest mechanics are sched-core `object_wait.rs` and kernel continuations | New NT `src/{wait,apc,dispatcher}.rs`: WaitAny/WaitAll, manual/auto-reset events, semaphore consumption, mutant ownership/abandonment, APC enrollment and delivery; core owns park/completion arbitration. |
-| NT sections and views; 64 KiB reservations | **Absent**; nearest range/backing owners listed above | New NT `src/{section,mm}.rs` owns section object lifetime, independent view lifetime and reservation-versus-commit transitions. Core does not equate an allocation, a view, a page or a host extent. |
-| NT SEH and syscall boundary | **Absent**; current Linux entry is `carrick-el1/src/personality/{common_entry,dispatch}.rs`, `carrick-hal/src/{trap,guest_arch,x8664_arch}.rs`, `carrick-x86/src/{engine,fault}.rs` | New NT `src/{dispatch,exception,abi_profile}.rs` plus per-ISA context encoders and a user ntdll implementation/profile. Core reports hardware faults and validates user context; personality selects exception records, user dispatch and NTSTATUS. |
+| NT handle table and Object Manager namespace | **Absent**; nearest storage donors are fd-core and kernel object registry above | New (NT repository) NT `src/{handle,object_manager,security}.rs`: guest HANDLE decoding, pseudo-handles, desired/granted access, duplicate/inherit rules, typed objects, named directories/symlinks and reference lifetime over core capabilities. NT namespace is not the host filesystem. |
+| NT multi-object and alertable waits, APC queues | **Absent**; nearest mechanics are sched-core `object_wait.rs` and kernel continuations | New (NT repository) NT `src/{wait,apc,dispatcher}.rs`: WaitAny/WaitAll, manual/auto-reset events, semaphore consumption, mutant ownership/abandonment, APC enrollment and delivery; core owns park/completion arbitration. |
+| NT sections and views; 64 KiB reservations | **Absent**; nearest range/backing owners listed above | New (NT repository) NT `src/{section,mm}.rs` owns section object lifetime, independent view lifetime and reservation-versus-commit transitions. Core does not equate an allocation, a view, a page or a host extent. |
+| NT SEH and syscall boundary | **Absent**; current Linux entry is `carrick-el1/src/personality/{common_entry,dispatch}.rs`, `carrick-hal/src/{trap,guest_arch,x8664_arch}.rs`, `carrick-x86/src/{engine,fault}.rs` | New (NT repository) NT `src/{dispatch,exception,abi_profile}.rs` plus per-ISA context encoders and a user ntdll implementation/profile. Core reports hardware faults and validates user context; personality selects exception records, user dispatch and NTSTATUS. |
+
+Every “NT `src/…`” destination in this table is a path in the NT repository.
+The neutral core capability each row needs (multi-object atomic acquisition,
+alertable notification, reserve/commit, independent views, user exception
+dispatch) is in-tree core work, specified and tested in neutral vocabulary.
 
 This inventory intentionally does not call the whole existing HAL neutral.
 Its Linux syscall normalization, fault-to-signal mapping and sigframe builders
@@ -138,6 +149,88 @@ move outward. Hardware register operations remain in HAL/guest-arch. Reuse
 replace `EntryArch::decode_syscall -> CanonicalCall` with an architectural
 entry snapshot plus personality decode. “Canonical” must stop meaning
 AArch64 Linux syscall numbering at a hardware boundary.
+
+## Repository boundary: NT lives out of tree
+
+Owner decision, 2026-10-06: the NT personality, its ABI, its clean-room
+userland and its Windows-oracle probes live in a **separate repository**
+(proposed `carrick-sh/carrick-nt`). This tree holds the personality-neutral
+core, the traits and the composition hooks. Dependencies point one way: the
+NT repository depends on Carrick crates; no crate, manifest, lockfile, gate,
+script or CI job in this tree names the NT repository.
+
+**Why.** If a rights holder objects (trademark, patent or copyright claim),
+NT must be removable without touching Linux Carrick. With NT in tree, removal
+means deleting directories while the code survives in history, or rewriting
+history, which changes every commit identity that receipts, oracle-cache keys,
+inventories and PRs depend on. A feature-gated NT in tree would also be a
+default-off dark launch, which the opt-out rule forbids, and
+`cargo metadata --all-features` would pull it into every gate. Out of tree,
+compliance means archiving or privatising one repository and dropping its
+build option. Carrick history, receipts and gates are unaffected.
+
+**What stays in this tree.**
+
+- `carrick-core`, `carrick-core-abi`, `carrick-guest-arch` and the
+  `Personality`/`CoreServices` seams above, plus every neutral capability NT
+  needs, specified in neutral vocabulary: atomic multi-object acquisition,
+  alertable notification at a user-return boundary, reserve/commit/decommit,
+  independent views over a shared backing, spawn without fork, a
+  personality-chosen per-thread TLS base register, a fixed read-only page
+  mapped into every MM, and user exception dispatch with a saved context.
+- A **non-Linux test personality** in `carrick-kernel-example` that uses each
+  of those capabilities with deliberately non-Linux semantics (opaque handles,
+  its own status encoding, wait-all, reserve/commit, one-shot guard pages). It
+  is the second in-tree client that keeps the core from becoming Linux-shaped.
+  Its contracts register under `core.*`, never `nt.*`.
+- The composition hooks: the guest-image build is a library/xtask entry point
+  that takes a composition crate, replacing the hard-coded `../carrick-el1`
+  path in `carrick-el1-image/build.rs`; host-side personality selection is a
+  registration API on the engine/CLI (for example `run_with(&[factories])`)
+  that the Linux build calls with Linux only. Personality is chosen per
+  carrier, so an NT carrier is a separate image and Linux carriers never link
+  NT code.
+- Windows host support (`carrick-vmm-whp`, `carrick-host-windows`). It uses a
+  public, documented hypervisor API like HVF and is independent of the guest
+  personality.
+- This design document. Its references are to public Microsoft
+  documentation.
+
+**What lives in the NT repository.** `carrick-personality-nt`,
+`carrick-nt-abi`, the clean-room ntdll subset and later userland, the NT
+composition roots (AArch64 and x86_64 images), the NT-enabled CLI build,
+Windows container-image layer handling, the `nt.*` contracts, the NT probes,
+the Windows-oracle cache and the provenance ledger.
+
+**Keeping the seam honest.** The extended boundary checker (P0) also rejects
+Linux types in the core's public API. The NT repository pins an exact Carrick
+commit and bumps it deliberately; core changes need no backward compatibility
+shims, but a core change that breaks NT is fixed forward in the NT
+repository. An optional downstream build job may be added to the NT
+repository's CI against Carrick `main`; Carrick's merge queue does not depend
+on the NT repository. NT work stays sequenced after the core settles
+(N1–N4), so the pin moves against a stable shape rather than daily churn.
+
+**Legal hygiene, enforced in the NT repository.** This is engineering policy,
+not legal advice; counsel review is an open owner decision below.
+
+- Names: no “Windows” or Microsoft marks in repository, crate, binary,
+  package or product names. Describe compatibility nominatively (“runs
+  Windows console programs”).
+- Never ship Microsoft binaries, DLLs, Windows SDK headers or container base
+  image content. Probes run on the licensed oracle; only our own sources and
+  observations are committed.
+- Black-box only: probes observe documented API behavior from programs we
+  write. Never disassemble, decompile, debug or trace Microsoft binaries.
+- Type and signature sources: public Microsoft documentation and Microsoft's
+  MIT-licensed `win32metadata` (and generated bindings derived from it).
+  Other header sets require a provenance audit before use; mingw-w64 is not
+  admitted until audited, because parts of it derive from excluded sources.
+- No on-disk Microsoft filesystem formats; NT file semantics map onto host
+  files. Patent-sensitive surfaces are recorded in the provenance ledger
+  before implementation.
+- Every implemented surface has a provenance ledger row naming its public
+  documents and its oracle probes.
 
 ## Core/personality seams
 
@@ -445,6 +538,10 @@ then deterministic semantic/work assertions, then live bindings. Extend the
 existing registry with `core.*` and `nt.*` authority namespaces; do not create a
 second harness or pretend Docker is an NT oracle.
 
+Milestones P0–P3 run in this tree. P4 and P5 run in the NT repository
+against a pinned Carrick commit; their gates are that repository's gates and
+never part of `just ci` here.
+
 1. **P0 — extend `check-personality-boundary` before more core moves.**
    Reclassify Linux-only packages honestly; split neutral module roots from
    mixed composition roots. Add an explicit, reviewed inventory of legacy
@@ -461,7 +558,10 @@ second harness or pretend Docker is an NT oracle.
    renamed/transitive/target/build dependency, macro, orphan-source and
    missing-metadata fail-closed behavior. Include negative fixtures for
    `Signal::KILL = 9`, POSIX timer fields and a Linux fd policy added without
-   an ABI dependency, plus a legitimate host diagnostic ID control.
+   an ABI dependency, plus a legitimate host diagnostic ID control. Also
+   reject Linux-typed items (`LinuxErrno`, `CanonicalNr`, `Signal`, `Fd`) in
+   the public API of core crates, and any manifest, lockfile or script in
+   this tree that references the NT repository.
 
    Exact gate: `cargo test -p carrick-conformance-contract --lib personality_boundary`,
    then the fresh metadata/checker commands below, then `just lint-domains`.
@@ -482,7 +582,12 @@ second harness or pretend Docker is an NT oracle.
    clients with equal visible IDs/VAs but different generations. Assert stale
    completions cannot mutate successors, absent rights cannot pin objects,
    unpublished births never run, cancellation completes once, reserve-only
-   allocations consume no data frames, and drained frames return.
+   allocations consume no data frames, and drained frames return. The
+   non-Linux test personality in `carrick-kernel-example` binds
+   `core.wait.multi-object`, `core.mm.reserve-commit-view`,
+   `core.entry.alertable-notify` and `core.fault.user-dispatch`, red-first,
+   before NT work starts; one fixture runs it beside the Linux client in one
+   process to expose global-personality scope errors.
 
    Exact gate: **new** `cargo test -p carrick-core --test personality_boundary`,
    `cargo test -p carrick-core --doc` (capability compile-fail witnesses),
@@ -525,7 +630,7 @@ second harness or pretend Docker is an NT oracle.
    lane; WHP support cannot be claimed until its Windows-native build and
    host-file/completion suite exist. ARM64 and x64 WHP need separate receipts.
 
-5. **P4 — NT semantic core and native-service PE slice.**
+5. **P4 — NT semantic core and native-service PE slice (NT repository).**
    Build the clean-room ntdll subset, NT ABI/profile, PE startup and the NT
    objects above. **New** `carrick-personality-nt/tests/native_contracts.rs`
    binds `nt.handle.lifetime`, `nt.wait.multiple-apc`,
@@ -540,15 +645,16 @@ second harness or pretend Docker is an NT oracle.
    numeric statuses and buffers with committed source-hash-qualified native
    Windows observations. Model success alone does not claim executable support.
 
-6. **P5 — production NT bindings and workload acceptance.**
-   Extend `carrick-conformance-next` with a platform-neutral **new**
-   `nt_native` target that runs the P4 PE fixtures through `carrick-embed` and
+6. **P5 — production NT bindings and workload acceptance (NT repository).**
+   Add a platform-neutral **new** `nt_native` target in the NT repository,
+   reusing `carrick-conformance-next` and `carrick-embed` as pinned
+   dependencies, that runs the P4 PE fixtures through `carrick-embed` and
    the clean-room ntdll on both native guest ISAs. Exact host gate:
    `cargo test -p carrick-conformance-next --no-default-features --features platform-<host> --test nt_native`
-   using the same explicit platform substitutions as P3; macOS executes that
-   test binary through
-   `scripts/test-signed.sh carrick-conformance-next nt_native` (new test
-   function names must carry the `nt_native` prefix). Register a Windows-oracle
+   run in the NT repository's workspace, using the same explicit platform
+   substitutions as P3; macOS signs and executes that test binary with the
+   same post-link signing as `scripts/test-signed.sh` (new test function
+   names must carry the `nt_native` prefix). Register a Windows-oracle
    capture binding in the same framework and require complete matched
    observations for every P4 contract before claiming NT support. The gate
    must reject missing profiles, oracle rows or runtime bindings.
@@ -578,6 +684,13 @@ HVF adds CDHash, LC_UUID, entitlement and DOF. Rebuild after integration.
   Docker oracle. Use the licensed Windows oracle machine (willow VM 106 is the
   existing Windows host; never touch other protected VMs). No Wine, ever
   (already settled).
+- Repository boundary (2026-10-06): NT lives in a SEPARATE REPOSITORY;
+  dependencies point only from NT to Carrick; this tree keeps the neutral
+  core, the composition hooks, the non-Linux test personality and WHP host
+  support. Open, owner's call: whether to run an automated similarity scan of
+  NT diffs against excluded corpora (a tool, not a person, reads them), given
+  that most code is model-generated; and whether to obtain IP counsel review
+  before the first public NT commit.
 - Remaining items (ntdll export/workload denominator and direct-syscall support
   boundary; x86/WHP scheduling relative to N1-N4 without diluting Linux
   acceptance; NT namespace/security/filesystem scope; the NT timing denominator
@@ -586,7 +699,8 @@ HVF adds CDHash, LC_UUID, entitlement and DOF. Rebuild after integration.
 
 ## Verification of this design change
 
-Only this file is added. It changes no guest behavior, artifact or contract
+Only this file is added (and, on 2026-10-06, amended with the repository
+boundary). It changes no guest behavior, artifact or contract
 budget; the documentation exemption applies to the task/MM/wait/signal and
 file-contract families discussed here. Required document checks are
 `test -s docs/superpowers/specs/2026-10-04-personality-core-split.md && just fmt-check`.

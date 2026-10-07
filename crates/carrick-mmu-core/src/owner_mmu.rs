@@ -63,8 +63,7 @@ pub trait OwnerForkMmu: OwnerMmu {
     fn is_owned_resident(word: u64) -> bool;
     fn is_writable_user(word: u64) -> bool;
     fn is_executable_control(word: u64) -> bool;
-    /// Per-MM control data needs private custody; carrier mappings remain shared.
-    fn is_private_control(va: UserVa) -> bool;
+    fn control_needs_copy(va: UserVa, word: u64) -> bool;
     fn split(word: u64, level: usize, index: usize) -> Result<u64, OwnerMmuRefusal>;
     fn arm_private(word: u64, level: usize, va: UserVa) -> Result<u64, OwnerMmuRefusal>;
     fn needs_break_before_make(before: u64, after: u64, level: usize) -> bool;

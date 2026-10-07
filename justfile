@@ -245,6 +245,11 @@ lint-domains-source:
     # before the offline personality-boundary graph check on fresh runners.
     {{_admit}} {{_cargo}} fetch --locked
     {{_admit}} {{_cargo}} metadata --locked --offline --all-features --format-version 1 > target/cargo-metadata.json
+    # Nested fixture workspaces (fixtures/*/Cargo.lock) sit outside the root
+    # workspace, so the --locked gates above never resolve them; without this
+    # step lock drift surfaced only at `just fixtures-publish`. No compile, so it
+    # costs a lock resolution per fixture.
+    ./scripts/check-fixture-lockfiles.sh
     {{_admit}} {{_cargo}} run -p carrick-conformance-contract --bin check-personality-boundary -- --root . --metadata-file target/cargo-metadata.json
     python3 -m unittest scripts/tests/test_check_contract_change.py
     python3 scripts/migrate/check-runtime-global-state.py --check
@@ -489,15 +494,16 @@ test-kernel-semantics *ARGS:
 
 # Host unit/integration tests that do NOT need the HVF runtime or Docker.
 test-mm-owner *ARGS:
-    {{_admit}} {{_cargo}} test --locked -p carrick-core -p carrick-core-abi --lib
-    {{_admit}} {{_cargo}} test --locked -p carrick-core --doc
-    {{_admit}} {{_cargo}} test --locked -p carrick-core --test x86_acceleration {{ARGS}}
+    cargo test --locked -p carrick-core -p carrick-core-abi --lib
+    cargo test --locked -p carrick-core --doc
+    cargo test --locked -p carrick-core --test x86_acceleration {{ARGS}}
 
 test *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     python3 -c 'import fcntl, os; [fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK) for fd in (0, 1, 2)]' 2>/dev/null || true
-    {{_admit}} {{_cargo}} test -p carrick-el1 --doc mm_portal
+    ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
+    cargo test -p carrick-el1 --doc mm_portal
     # Shared owner witnesses and X1 use host-owned descriptors; no VM/Docker.
     just --justfile {{justfile()}} test-mm-owner {{ARGS}}
     if [ "{{os()}}" = "macos" ]; then
@@ -579,6 +585,10 @@ test *ARGS:
         # tests probe closed fd numbers. Stage-1 rollback tests assert reuse from
         # the process-wide root-slot pool. Keep the crate serial for these reasons.
         env RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test -p carrick-runtime --lib {{ARGS}}
+        # The VM-free HVF trap surface (capabilities, mapping plan, ESR
+        # decoders, EL1 vector layout). Its VM-booting half is the signed
+        # `just test-hvf-trap-engine`; this target must never reach hv_vm_create.
+        {{_admit}} {{_cargo}} test -p carrick-runtime --test trap_hvf {{ARGS}}
         # carrick-vmm-hvf is serial for a THIRD reason, and it is structural
         # rather than a test-hygiene lapse: the carrier is process-global by
         # design, so its alias registry, replay mappings, global-frame owner
@@ -944,6 +954,20 @@ test-embed *ARGS: build
 test-hvf *ARGS:
     ./scripts/test-signed.sh carrick-vmm-hvf {{ARGS}}
 
+# HVF trap-engine tests (`crates/carrick-vmm-hvf/tests/trap_engine_hvf.rs`):
+# bring up a real VM via `new_hvf_trap_engine`, load the staged root onto a
+# live persistent-executor vCPU (production's first executor load) and run
+# tiny guests through the mailbox vectors (EL1 getpid fast path, its
+# closed-gate and no-shim controls, unseeded gettid forwarding). They moved out of carrick-runtime's `trap_hvf`, which self-skipped
+# on HV_DENIED and so "passed" unsigned without running. Every test is
+# `#[ignore]`d (a bare `cargo test` never selects it) and panics on HV_DENIED;
+# scripts/test-signed.sh signs the package's test executables, runs the
+# `trap_engine_hvf_` set with `--ignored` (each test re-execs itself in a
+# fresh process: one VM per process), then runs the package's UNENTITLED
+# negative control (`unsigned_executable_maps_hv_denied_to_entitlement`).
+test-hvf-trap-engine:
+    ./scripts/test-signed.sh carrick-vmm-hvf trap_engine_hvf_ --ignored --nocapture
+
 # Guest-running tests of carrick-conformance-next from SIGNED cargo test executables.
 test-conformance-next *ARGS: build
     ./scripts/test-signed.sh carrick-conformance-next {{ARGS}}
@@ -971,6 +995,20 @@ build-fixture:
 # Build the static x86_64 musl M2 fixture (Mac-native: rustup + rust-lld, no C/Docker).
 build-x86-fixture:
     ./crates/carrick-vmm-bhyve/fixtures/hello-x86_64/build.sh
+
+# Build the freestanding CPL0 kernel image for x86_64 KVM tests.
+build-cpl0:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "$(uname -s):$(uname -m)" in
+        Linux:x86_64|Linux:amd64)
+            cargo build -p carrick-x86-cpl0 --release --target x86_64-unknown-none
+            ;;
+    esac
+
+# Run KVM VMM unit and integration tests, building the CPL0 image on x86_64 first.
+kvm-tests *ARGS: build-cpl0
+    cargo test -p carrick-vmm-kvm {{ARGS}}
 
 # L1 cross-check: our owned crates compile for aarch64-linux AND the
 # platform-linux closure links no HVF/applevisor (the C4-decouple proof).

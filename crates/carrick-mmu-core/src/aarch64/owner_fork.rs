@@ -7,7 +7,6 @@ use carrick_guest_arch::{FrameGpa, UserVa};
 pub const STAGE1_TABLES_ALIAS_BASE: u64 = 0x2D_0002_0000;
 /// Bytes available through the primary stage-1 table alias.
 pub const STAGE1_TABLES_PRIMARY_SIZE: u64 = 0x1C_0000;
-/// Per-MM identity/control mapping inside the structural bootstrap window.
 pub const IDENTITY_PAGE_BASE: u64 = 0x2D_001E_4000;
 pub const IDENTITY_PAGE_SIZE: u64 = 0x4000;
 const CONTROL_BASE: u64 = STAGE1_TABLES_ALIAS_BASE - 0x2_0000;
@@ -75,7 +74,7 @@ impl OwnerForkMmu for Aarch64Mmu {
     fn is_executable_control(word: u64) -> bool {
         word & (1 << 53) == 0
     }
-    fn is_private_control(va: UserVa) -> bool {
+    fn control_needs_copy(va: UserVa, _word: u64) -> bool {
         (IDENTITY_PAGE_BASE..IDENTITY_PAGE_BASE + IDENTITY_PAGE_SIZE).contains(&va.raw())
     }
     fn split(word: u64, level: usize, index: usize) -> Result<u64, OwnerMmuRefusal> {

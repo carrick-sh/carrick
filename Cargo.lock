@@ -347,6 +347,7 @@ dependencies = [
  "base64 0.22.1",
  "bollard",
  "camino",
+ "carrick-conformance",
  "carrick-conformance-contract",
  "carrick-el1-abi",
  "carrick-embed",
@@ -394,12 +395,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "carrick-coordinator",
+ "carrick-kernel-arena",
+ "carrick-spec",
  "clap",
  "libc",
  "regex",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "toml",
 ]
 
@@ -423,6 +427,7 @@ name = "carrick-conformance-next"
 version = "0.1.0"
 dependencies = [
  "carrick-abi",
+ "carrick-conformance",
  "carrick-conformance-contract",
  "carrick-embed",
  "carrick-guest-mem",

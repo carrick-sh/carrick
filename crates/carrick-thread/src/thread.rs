@@ -1218,6 +1218,13 @@ impl Drop for FutexRedirectCleanup<'_> {
     }
 }
 
+/// Halt-poll time and the observation point after park registration.
+/// `before_sleep` obeys parking_lot's callback contract: no parking or panics.
+struct FutexParkHooks<N, P> {
+    poll_now: N,
+    before_sleep: P,
+}
+
 const FUTEX_WAKE_TOKEN: usize = 1;
 const FUTEX_SIGNAL_TOKEN: usize = 2;
 
@@ -1656,6 +1663,29 @@ impl FutexTable {
         park_token: ParkToken,
         interrupted: &dyn Fn() -> bool,
     ) -> FutexWaitOutcome {
+        self.wait_prepared_with_poll_clock(
+            wait,
+            timeout,
+            park_token,
+            interrupted,
+            FutexParkHooks {
+                poll_now: std::time::Instant::now,
+                before_sleep: &|| {},
+            },
+        )
+    }
+
+    // Keep the halt-poll clock separate from parking_lot's real timeout clock.
+    // The callbacks let tests advance the poll window and observe registration
+    // synchronously; production uses Instant::now and a no-op park observer.
+    fn wait_prepared_with_poll_clock(
+        &self,
+        wait: FutexWait,
+        timeout: Option<std::time::Duration>,
+        park_token: ParkToken,
+        interrupted: &dyn Fn() -> bool,
+        mut hooks: FutexParkHooks<impl FnMut() -> std::time::Instant, impl Fn()>,
+    ) -> FutexWaitOutcome {
         use std::cell::Cell;
         use std::time::Instant;
 
@@ -1690,8 +1720,8 @@ impl FutexTable {
 
             let poll_ns = futex_halt_poll_ns();
             if poll_ns != 0 {
-                let poll_deadline = Instant::now() + std::time::Duration::from_nanos(poll_ns);
-                while Instant::now() < poll_deadline {
+                let poll_deadline = (hooks.poll_now)() + std::time::Duration::from_nanos(poll_ns);
+                while (hooks.poll_now)() < poll_deadline {
                     if bucket.generation.load(Ordering::Acquire) != generation {
                         return FutexWaitOutcome::Woken;
                     }
@@ -1734,7 +1764,7 @@ impl FutexTable {
                         bucket.waiters.fetch_add(1, Ordering::AcqRel);
                         true
                     },
-                    || {},
+                    &hooks.before_sleep,
                     |_, _| {
                         bucket.waiters.fetch_sub(1, Ordering::AcqRel);
                     },
@@ -2810,39 +2840,58 @@ mod tests {
 
     #[test]
     fn futex_halt_poll_nonzero_delays_parking_until_window_expires() {
+        use std::cell::Cell;
+        use std::time::Instant;
+
+        let window = Duration::from_nanos(50_000_000);
         let _env = EnvGuard::set(FUTEX_HALT_POLL_ENV, Some("50000000"));
-        let table = Arc::new(FutexTable::new());
-        let waiter_table = Arc::clone(&table);
+        let table = FutexTable::new();
         let addr = 0xf00d_1000_u64;
-        let entered = Arc::new(AtomicBool::new(false));
-        let waiter_entered = Arc::clone(&entered);
+        let wait = table.prepare_wait(addr);
+        let start = Instant::now();
+        let clock_reads = Cell::new(0);
+        let parks = Cell::new(0);
+        let registration = Cell::new(None);
 
-        let waiter = std::thread::spawn(move || {
-            let wait = waiter_table.prepare_wait(addr);
-            waiter_entered.store(true, Ordering::SeqCst);
-            waiter_table.wait_prepared(wait, Some(Duration::from_secs(1)), &|| false)
-        });
-        while !entered.load(Ordering::SeqCst) {
-            std::thread::yield_now();
-        }
-
-        let deadline = std::time::Instant::now() + Duration::from_millis(20);
-        let mut observed_park = false;
-        while std::time::Instant::now() < deadline {
-            if table.waiter_count(addr) != 0 {
-                observed_park = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-
-        let woke = table.wake(addr, 1);
-        let outcome = waiter.join().unwrap();
-        assert!(
-            !observed_park,
-            "nonzero halt-poll window should avoid parking before the deadline"
+        let outcome = table.wait_prepared_with_poll_clock(
+            wait,
+            None,
+            ParkToken(0),
+            &|| false,
+            FutexParkHooks {
+                poll_now: || {
+                    assert_eq!(parks.get(), 0, "must not park before poll expiry");
+                    assert_eq!(table.waiter_count(addr), 0);
+                    let read = clock_reads.get();
+                    clock_reads.set(read + 1);
+                    match read {
+                        0 | 1 => start,
+                        2 => start + window - Duration::from_nanos(1),
+                        3 => start + window,
+                        _ => panic!("unexpected poll clock read"),
+                    }
+                },
+                before_sleep: &|| {
+                    // Record without assertions: parking_lot forbids panicking
+                    // in this callback. This table has no other users, so its
+                    // locks cannot park us. Waking consumes the registration
+                    // without a host sleep, after parking_lot's queue unlocks.
+                    parks.set(parks.get() + 1);
+                    registration.set(Some((
+                        clock_reads.get(),
+                        table.waiter_count(addr),
+                        table.wake(addr, 1),
+                    )));
+                },
+            },
         );
-        assert_eq!(woke, 0, "waker should find no parking-lot waiter yet");
+
+        let (reads, waiters, woke) = registration.get().expect("must observe park registration");
+        assert_eq!(reads, 4, "must reach the exact deadline");
+        assert_eq!(parks.get(), 1, "must register exactly once");
+        assert_eq!(waiters, 1);
+        assert_eq!(woke, 1);
+        assert_eq!(table.waiter_count(addr), 0);
         assert_eq!(outcome, FutexWaitOutcome::Woken);
     }
 
