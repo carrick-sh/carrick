@@ -17,6 +17,7 @@ core::arch::global_asm!(
     ".quad carrick_x86_kick_irq",
     ".quad carrick_x86_resched_irq",
     ".quad carrick_x86_shootdown_irq",
+    ".quad carrick_x86_user_page_fault",
     ".section .text.irq, \"ax\"",
     ".global carrick_x86_timer_irq",
     "carrick_x86_timer_irq:",
@@ -104,3 +105,4 @@ extern "C" fn carrick_x86_receive_irq(vector: u32, frame: *const InterruptFrame)
         crate::kernel::halt();
     }
 }
+

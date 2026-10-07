@@ -368,6 +368,11 @@ mod kernel {
         use carrick_el1::fault::{NoopCowResolver, dispatch_x86_fault_with_prepared};
         fixture_items! { use carrick_el1::fault::X86CowResolver; }
         use carrick_el1_abi::Action;
+        // This is the single production user #PF entry. Settle published
+        // translation debt before handling or reporting this fault.
+        if carrick_el1::isa::x86::interrupt::service_shootdowns().is_err() {
+            carrick_el1::isa::x86::fatal_entry_binding();
+        }
         let far: u64;
         // SAFETY: CR2 is the architectural fault address for this #PF entry.
         unsafe { core::arch::asm!("mov {}, cr2", out(reg) far, options(nomem, nostack)) };
@@ -424,6 +429,8 @@ mod kernel {
                     &SHARED_COW_POOL, &SHARED_FAULT_MAILBOX);
             }
         }
+        let mm_key = task.mm.key.load(Ordering::Acquire);
+        let Some(words) = anonymous::live_words(match carrick_el1_abi::ReservationMm::new(mm_key) { Some(mm) => mm, None => return 9 }) else { return 9; };
         let layout = <carrick_el1::isa::x86::X86Backend as carrick_guest_arch::LayoutBackend>::KERNEL_LAYOUT;
         let Some(venues) = carrick_el1_abi::KernelFaultVenues::derive(layout)
             .and_then(carrick_el1_abi::KernelFaultVenues::require_upper_half)
@@ -439,8 +446,6 @@ mod kernel {
         };
         // SAFETY: the boot owner retains the compact zone and its parked ABI.
         let zone = unsafe { &*(venues.zone.raw() as *const carrick_el1::memory::reservations::X86Cpl0Zone) };
-        let mm_key = task.mm.key.load(Ordering::Acquire);
-        let Some(words) = anonymous::live_words(match carrick_el1_abi::ReservationMm::new(mm_key) { Some(mm) => mm, None => return 9 }) else { return 9; };
         let roots = carrick_el1::memory::reservations::shared_x86_cpl0_guest();
         let spaces = carrick_core::wait::space_access(zone, slot, anonymous::initial_release);
         let supply = carrick_el1::fault::OwnerFaultSupply::new(portal);
@@ -507,6 +512,14 @@ mod kernel {
             frame.saved_gprs[10], far] {
             word(value as u32);
             word((value >> 32) as u32);
+        }
+        fixture_stmt! {
+            // The terminal fixture fault can resume solely to witness queued
+            // KICK settlement and its bounded completion doorbell.
+            unsafe {
+                core::arch::asm!("sti", "nop", "out dx, al",
+                    in("dx") CONTROL_PORT, in("al") 0u8, options(nostack));
+            }
         }
         halt()
     }
@@ -1657,6 +1670,37 @@ mod kernel {
             unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) };
         }
     }
+}
+
+// The production macro removes every fixture state access; this image seam
+// returns immediately there. Only the fixture image carries ordering holds.
+#[cfg(target_os = "none")]
+#[unsafe(no_mangle)]
+pub extern "Rust" fn carrick_fixture_hold_check(
+    _table: &carrick_el1::isa::x86::context::native::ShootdownTable,
+    _target_mode: u32,
+) -> Result<(), carrick_el1::isa::ArchError> {
+    fixture_stmt! {
+        if _table.fixture_hold_ipi.load(core::sync::atomic::Ordering::Acquire) == _target_mode {
+            // SAFETY: this fixture owns the identity-mapped control data page.
+            // Release its running reader only after the edit reached this hold.
+            unsafe { core::ptr::write_volatile(0x4_0008 as *mut u8, 1); }
+            let Some(tsc_hz) = carrick_el1::isa::x86::interrupt::tsc_frequency() else {
+                return Err(carrick_el1::isa::ArchError::Unbound);
+            };
+            let Some(limit) = tsc_hz.get().checked_mul(5) else {
+                return Err(carrick_el1::isa::ArchError::Unbound);
+            };
+            let start = carrick_el1::isa::x86::interrupt::read_tsc();
+            while _table.fixture_hold_ipi.load(core::sync::atomic::Ordering::Acquire) == _target_mode {
+                if carrick_el1::isa::x86::interrupt::read_tsc().wrapping_sub(start) > limit {
+                    return Err(carrick_el1::isa::ArchError::Busy);
+                }
+                core::hint::spin_loop();
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "none")]
