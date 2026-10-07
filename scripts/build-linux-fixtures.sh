@@ -24,6 +24,9 @@ mkdir -p "$out_dir"
 tmp_dir="$(mktemp -d "$out_dir/carrick-linux-aarch64-fixtures.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 
+# Each build also writes `<name>.d` dep-info beside the executable: the fixture
+# publisher records every checkout file rustc read (including `#[path]` modules
+# and `include_*!` targets) as a fixture input.
 build_fixture() {
   local source="$1"
   local name="$2"
@@ -36,8 +39,7 @@ build_fixture() {
     --edition 2024 \
     -C panic=abort \
     -C opt-level=z \
-    --emit=obj \
-    -o "$object"
+    --emit=obj="$object",dep-info="$out_dir/$name.d"
 
   "$lld" -flavor gnu \
     -static \
@@ -63,8 +65,7 @@ build_pie_fixture() {
     -C panic=abort \
     -C opt-level=z \
     -C relocation-model=pic \
-    --emit=obj \
-    -o "$object"
+    --emit=obj="$object",dep-info="$out_dir/$name.d"
 
   # Produce a static-PIE ELF: ET_DYN with no PT_INTERP, so the loader sees
   # the same shape as Alpine's busybox without needing a dynamic linker.

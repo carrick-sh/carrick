@@ -12,13 +12,14 @@ use thiserror::Error;
 use crate::{command, probe_inventory, provision};
 
 pub mod archive;
+pub mod dep_info;
 mod environment;
 mod inputs;
 use environment::BuildEnvironment;
 pub use environment::BuildPolicy;
 pub use inputs::source_hashes;
 
-const SCHEMA: &str = "carrick.fixtures.v2";
+const SCHEMA: &str = "carrick.fixtures.v3";
 pub const INSTALLED_MANIFEST: &str = "target/fixtures/installed.json";
 /// Shell builders run by the publisher; their bytes are fixture inputs.
 const BUILD_SCRIPTS: &[&str] = &[
@@ -217,6 +218,10 @@ pub struct Toolchain {
 pub struct Manifest {
     pub schema: String,
     pub source_head: CommitSha,
+    /// Checkout files the compiler reported reading (dep-info) when the
+    /// publisher built these executables, sorted. Admission hashes them in
+    /// addition to the Cargo-graph closure.
+    pub compiler_inputs: Vec<String>,
     pub sources: BTreeMap<String, ContentHash>,
     pub build_policy: BuildPolicy,
     pub toolchain: Toolchain,
@@ -224,18 +229,25 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    /// SHA-256 over the scoped source inventory and build policy. The compiler
-    /// pin is a source input; the toolchain record is checked against it.
+    /// SHA-256 over the scoped source inventory, recorded compiler inputs and
+    /// build policy. The compiler pin is a source input; the toolchain record
+    /// is checked against it. Canonical JSON frames every path and digest
+    /// (quoted, escaped strings), so entries cannot run together.
     pub fn input_identity(&self) -> Result<ContentHash> {
-        input_identity(&self.sources, &self.build_policy)
+        input_identity(&self.sources, &self.compiler_inputs, &self.build_policy)
     }
 }
 
 fn input_identity(
     sources: &BTreeMap<String, ContentHash>,
+    compiler_inputs: &[String],
     policy: &BuildPolicy,
 ) -> Result<ContentHash> {
-    Ok(hash_bytes(&serde_json::to_vec(&(sources, policy))?))
+    Ok(hash_bytes(&serde_json::to_vec(&(
+        sources,
+        compiler_inputs,
+        policy,
+    ))?))
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -326,9 +338,14 @@ fn hash_file(path: &Path) -> Result<ContentHash> {
     Ok(ContentHash(provision::compute_sha256(path)?))
 }
 
-fn hash_source(root: &Path, relative: &str) -> Result<ContentHash> {
-    // Git tracks a symlink declaration rather than its referent. Hash source
-    // link bytes without following them; executable paths reject all links.
+/// Domain of a source entry digest: the entry's type and its length-prefixed
+/// bytes. Only regular files are source inputs.
+const SOURCE_DOMAIN: &[u8] = b"carrick.fixtures.source.v1\0regular\0";
+
+/// Hash one source input as a typed, length-framed regular file. A symlink
+/// is refused rather than hashed: its link text could equal a regular file's
+/// bytes, and its referent could be anything.
+pub fn hash_source(root: &Path, relative: &str) -> Result<ContentHash> {
     let relative_path = Path::new(relative);
     let parent = match relative_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         Some(parent) => safe_path(root, &parent.to_string_lossy())?,
@@ -338,13 +355,19 @@ fn hash_source(root: &Path, relative: &str) -> Result<ContentHash> {
         .file_name()
         .ok_or_else(|| fail("empty source path"))?;
     let path = parent.join(name);
-    if fs::symlink_metadata(&path)?.file_type().is_symlink() {
-        Ok(hash_bytes(
-            fs::read_link(path)?.as_os_str().as_encoded_bytes(),
-        ))
-    } else {
-        hash_file(&path)
+    let file_type = fs::symlink_metadata(&path)?.file_type();
+    if !file_type.is_file() {
+        return Err(fail(format!(
+            "fixture source input is not a regular file (symlinks are refused): {relative}"
+        )));
     }
+    let bytes = fs::read(&path)?;
+    let length = u64::try_from(bytes.len()).map_err(|e| fail(e.to_string()))?;
+    let mut digest = Sha256::new();
+    digest.update(SOURCE_DOMAIN);
+    digest.update(length.to_be_bytes());
+    digest.update(&bytes);
+    Ok(ContentHash(format!("{:x}", digest.finalize())))
 }
 fn fail(message: impl Into<String>) -> FixturesError {
     FixturesError::Invalid(message.into())
@@ -507,7 +530,13 @@ fn validate_manifest(root: &Path, manifest: &Manifest) -> Result<()> {
     if manifest.build_policy != BuildPolicy::default() {
         return Err(fail("fixture build policy mismatch"));
     }
-    let current = source_hashes(root)?;
+    let mut sorted = manifest.compiler_inputs.clone();
+    sorted.sort();
+    sorted.dedup();
+    if sorted != manifest.compiler_inputs {
+        return Err(fail("noncanonical fixture compiler input list"));
+    }
+    let current = source_hashes(root, &manifest.compiler_inputs)?;
     if manifest.sources != current {
         let changed: Vec<_> = manifest
             .sources
@@ -523,7 +552,7 @@ fn validate_manifest(root: &Path, manifest: &Manifest) -> Result<()> {
             "fixture input identity mismatch (source hashes or inventory mismatch): bundle {} built at {}, checkout {}; differing inputs include {}",
             manifest.input_identity()?,
             manifest.source_head.0,
-            input_identity(&current, &BuildPolicy::default())?,
+            input_identity(&current, &manifest.compiler_inputs, &BuildPolicy::default())?,
             changed.join(", ")
         )));
     }
@@ -633,7 +662,13 @@ pub fn resolve_bundle(root: &Path, sha: &str, explicit: Option<&Path>) -> Result
     };
     let mut manifests = manifests_in(&store.join(&expected.0))?;
     if manifests.is_empty() && expected_head(root, Some(sha)).is_ok() {
-        let current = input_identity(&source_hashes(root)?, &BuildPolicy::default())?;
+        // Each bundle names its own compiler inputs, so the checkout's
+        // identity is computed per candidate. Any error is a non-match.
+        let matches = |manifest: &Manifest| {
+            manifest.build_policy == BuildPolicy::default()
+                && source_hashes(root, &manifest.compiler_inputs)
+                    .is_ok_and(|current| current == manifest.sources)
+        };
         if store.is_dir() {
             let mut directories: Vec<_> = fs::read_dir(&store)?
                 .map(|entry| entry.map(|e| e.path()))
@@ -641,7 +676,7 @@ pub fn resolve_bundle(root: &Path, sha: &str, explicit: Option<&Path>) -> Result
             directories.sort();
             for directory in directories {
                 for path in manifests_in(&directory)? {
-                    if read_bundle_manifest(&path)?.input_identity()? == current {
+                    if matches(&read_bundle_manifest(&path)?) {
                         manifests.push(path);
                     }
                 }
@@ -765,7 +800,7 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
         return Err(fail("fixtures build requires Linux; restore on cloudmac"));
     }
     let expected = expected_head(root, Some(sha))?;
-    source_hashes(root)?;
+    source_hashes(root, &[])?;
     let environment = BuildEnvironment::new(root)?;
     let snapshot = tempfile::tempdir_in(environment.scratch_root())?;
     let archive = snapshot.path().join("source.tar");
@@ -855,7 +890,15 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
     if expected_head(root, Some(sha))? != expected {
         return Err(fail("checkout changed during fixture build"));
     }
-    let sources = source_hashes(root)?;
+    // Record what the compiler actually read: every executable's dep-info.
+    let mut dep_info_files = Vec::new();
+    for path in executable_inventory(&source)?.keys() {
+        dep_info_files.push(source.join(dep_info::dep_info_path(path, EMBED)?));
+    }
+    let mut external = environment.cargo_cache_roots();
+    external.push(PathBuf::from(sysroot.trim()));
+    let compiler_inputs = dep_info::classify(&source, &dep_info_files, &external)?;
+    let sources = source_hashes(root, &compiler_inputs)?;
     // Match the build snapshot byte-for-byte with the recorded source inputs.
     for (path, hash) in &sources {
         if &hash_source(&source, path)? != hash {
@@ -875,6 +918,7 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
     let manifest = Manifest {
         schema: SCHEMA.into(),
         source_head: expected.clone(),
+        compiler_inputs,
         sources,
         build_policy: BuildPolicy::default(),
         toolchain,
