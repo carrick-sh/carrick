@@ -582,3 +582,23 @@ capture, clear, wake and terminal publication. `terminal_clear_loom` models
 clear/wake ordering and graph refusal. The signed anonymous and fork-COW
 comparison fixtures bind the terminal runtime path; broader pthread and exec
 acceptance remains open.
+
+`kernel.process.wait-owner` covers selection and consumption of a process's
+children by wait4/waitid. Linux authority is wait(2)'s clone-child partition,
+WNOWAIT observation, and consuming reap; wait4(2) supplies subtree CPU charging.
+The shared registry must authenticate exact task serials, preserve live and
+retiring children in a blocking wait, and sample the parent's wake generation
+in the scan that found no event. Revision or topology admission failure must
+leave the zombie, child edge and CPU ledger unchanged.
+
+The VM-free binding is `carrick-sched-core::process::wait_tests`, exercised by
+`just test`. It covers two children, stale serials, observe/consume, ptrace
+stops outside the child class, reservations and revision exhaustion. At 1, 8,
+32 and 128 live children, with 512 unrelated processes present, unrelated
+identity/event reads are exactly zero. Child identity reads are bounded by
+`2*n`, and event reads by `n`, per scan; registry lookups follow only parent
+edges. Consuming read prechecks accept a non-Clone UID receipt, making receipt
+cloning unnecessary until the write admission. Host kernel-semantics suites
+exercise the same owner through the public wait APIs. Signed ARM and live
+CPL0 process bindings remain required; these inner-loop checks make no
+runtime-ratio or guest-instruction claim.
