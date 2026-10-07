@@ -163,6 +163,12 @@ pub fn service_shootdowns() -> Result<(), ArchError> {
     Ok(())
 }
 
+/// Settle outstanding shootdown debt before touching user memory in CPL0.
+/// Any active debt for this root reloads CR3 and records acknowledgement.
+pub fn sync_user_memory_generation() -> Result<(), ArchError> {
+    service_shootdowns()
+}
+
 /// Completed x86 shootdown drain receipt. A producer passes this to the MM
 /// publication layer to settle global drain debt with `acknowledge_global_drain`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
