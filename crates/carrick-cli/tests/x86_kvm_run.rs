@@ -268,15 +268,46 @@ fn mounted_static_x86_dispatches_libc_startup_calls() {
 }
 
 #[test]
+fn mounted_static_x86_musl_hello_matches_native() {
+    if skip_without_kvm() {
+        return;
+    }
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../carrick-vmm-bhyve/fixtures/hello-x86_64");
+    // The fixture's .cargo/config.toml chooses the musl target and ET_EXEC
+    // link flags. Run Cargo from that directory so those settings take effect.
+    let build = Command::new("cargo")
+        .timeout(Duration::from_secs(60))
+        .current_dir(&fixture)
+        .args(["build", "--offline", "--release"])
+        .output()
+        .expect("build x86 musl fixture");
+    assert!(
+        build.status.success(),
+        "musl build stderr: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let elf = fixture.join("target/x86_64-unknown-linux-musl/release/carrick-hello-x86_64");
+    compare_mounted_binary_with_native(&elf, b"hello, x86_64 world\n", 0, "musl-hello");
+}
+
+#[test]
 fn mounted_static_x86_memory_and_fork_wait_match_native() {
     compare_mounted_assembly_with_native("x86_memory_fork_wait.S", b"F\n");
 }
 
-fn compare_mounted_assembly_with_native(fixture: &str, expected_stdout: &[u8]) {
+fn skip_without_kvm() -> bool {
     if !std::path::Path::new("/dev/kvm").exists() {
-        let message = b"SKIP x86 KVM assembly run: /dev/kvm is absent on this host\n";
+        let message = b"SKIP x86 KVM CLI run: /dev/kvm is absent on this host\n";
         // SAFETY: fixed diagnostic bytes to the test process stderr.
         unsafe { libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len()) };
+        return true;
+    }
+    false
+}
+
+fn compare_mounted_assembly_with_native(fixture: &str, expected_stdout: &[u8]) {
+    if skip_without_kvm() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -302,14 +333,24 @@ fn compare_mounted_assembly_with_native(fixture: &str, expected_stdout: &[u8]) {
         "cc stderr: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    let native = Command::new(&elf)
+    compare_mounted_binary_with_native(&elf, expected_stdout, 7, fixture);
+}
+
+fn compare_mounted_binary_with_native(
+    elf: &std::path::Path,
+    expected_stdout: &[u8],
+    expected_exit: i32,
+    run_id: &str,
+) {
+    let native = Command::new(elf)
         .timeout(Duration::from_secs(5))
         .output()
-        .expect("run native x86 assembly oracle");
+        .expect("run native x86 Linux oracle");
     assert_eq!(native.stdout, expected_stdout);
     assert!(native.stderr.is_empty());
-    assert_eq!(native.status.code(), Some(7));
+    assert_eq!(native.status.code(), Some(expected_exit));
 
+    let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("image.tar");
     std::fs::write(&archive, empty_image_archive()).unwrap();
     let cli = assert_cmd::cargo::cargo_bin("carrick");
@@ -328,7 +369,7 @@ fn compare_mounted_assembly_with_native(fixture: &str, expected_stdout: &[u8]) {
     let run = Command::new(&cli)
         .timeout(Duration::from_secs(5))
         .env("CARRICK_HOME", &home)
-        .env("CARRICK_RUN_ID", format!("x86-kvm-{fixture}-test"))
+        .env("CARRICK_RUN_ID", format!("x86-kvm-{run_id}-test"))
         .args([
             "run",
             "--platform",
@@ -340,7 +381,7 @@ fn compare_mounted_assembly_with_native(fixture: &str, expected_stdout: &[u8]) {
             "x86-kvm-hello:latest",
         ])
         .output()
-        .expect("run mounted assembly oracle through carrick");
+        .expect("run mounted x86 Linux oracle through carrick");
     assert_eq!(
         run.stdout,
         native.stdout,
