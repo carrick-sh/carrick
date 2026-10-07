@@ -75,7 +75,6 @@ impl carrick_core::mm::fork::MappingInheritancePolicy for LinuxForkPolicy {
     }
 }
 
-
 /// An unpublished memory result. Task admission chooses commit or rollback;
 /// the child gate is closed throughout, and its exact parent undo remains owned.
 pub struct UnpublishedEl1Child<B: OwnerForkMmu = NativeForkMmu> {
