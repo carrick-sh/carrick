@@ -6,7 +6,152 @@ use carrick_guest_arch::{
     InterruptReason, WakeToken,
 };
 use core::num::NonZeroU64;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{Ordering, fence};
+
+fn shootdown_table(
+    binding: &super::context::native::CpuBinding,
+) -> Result<&'static super::context::native::ShootdownTable, ArchError> {
+    if binding.shootdown_table_address == 0 {
+        return Err(ArchError::Unbound);
+    }
+    // SAFETY: stopped KVM bootstrap initialized the supervisor-only table
+    // before either vCPU ran and retains it until both vCPUs retire.
+    Ok(unsafe {
+        &*(binding.shootdown_table_address as *const super::context::native::ShootdownTable)
+    })
+}
+
+/// Service all published sender generations on this CPU. This is also called
+/// from a sender's wait loop, so two CPUs invalidating each other cannot deadlock
+/// with IF masked. A context install always MOV CR3, closing a switch race.
+pub fn service_shootdowns() -> Result<(), ArchError> {
+    let binding = super::context::current_cpu_binding().ok_or(ArchError::Unbound)?;
+    let slot = binding.cpu_slot as usize;
+    let table = shootdown_table(binding)?;
+    if slot >= table.requests.len() {
+        return Err(ArchError::Unbound);
+    }
+    for request in &table.requests {
+        let generation = request.generation.load(Ordering::Acquire);
+        if generation == 0 || request.ack[slot].load(Ordering::Acquire) >= generation {
+            continue;
+        }
+        let root = request.root.load(Ordering::Relaxed);
+        if root == 0 {
+            return Err(ArchError::Unbound);
+        }
+        let live = super::mmu::hardware_live_root()?.address().raw();
+        if live == root {
+            // SAFETY: PCID/PGE are rejected by hardware_live_root. Reloading
+            // the same CR3 drains every local non-global translation before
+            // the release acknowledgement becomes visible to the editor.
+            unsafe {
+                core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags))
+            }
+        }
+        request.ack[slot].store(generation, Ordering::Release);
+    }
+    Ok(())
+}
+
+/// Wait for every retained peer to drain a published root generation. Each
+/// caller owns only its own request cell and services inbound requests while
+/// waiting. A missing peer fails closed after five seconds of qualified TSC.
+pub fn rendezvous_root(root: u64) -> Result<u64, ArchError> {
+    let binding = super::context::current_cpu_binding().ok_or(ArchError::Unbound)?;
+    let slot = binding.cpu_slot as usize;
+    let table = shootdown_table(binding)?;
+    let request = table.requests.get(slot).ok_or(ArchError::Unbound)?;
+    if super::mmu::hardware_live_root()?.address().raw() != root {
+        return Err(ArchError::Unbound);
+    }
+    let generation = table
+        .next_generation
+        .fetch_add(1, Ordering::AcqRel)
+        .checked_add(1)
+        .filter(|generation| *generation != 0)
+        .ok_or(ArchError::Unbound)?;
+    request.root.store(root, Ordering::Relaxed);
+    request.generation.store(generation, Ordering::Release);
+    service_shootdowns()?;
+    fence(Ordering::SeqCst);
+    for peer in 0..table.requests.len() {
+        if peer == slot {
+            continue;
+        }
+        let apic = bound_apic_id(CpuId::new(peer as u32))?;
+        // SAFETY: the retained request is published before this native IPI.
+        unsafe { interrupts::hardware::send_shootdown(apic) }.map_err(|_| ArchError::Busy)?;
+    }
+    let tsc_hz = tsc_frequency().ok_or(ArchError::Unbound)?.get();
+    let limit = tsc_hz.checked_mul(5).ok_or(ArchError::Unbound)?;
+    let start = read_tsc();
+    for peer in 0..table.requests.len() {
+        if peer == slot {
+            continue;
+        }
+        while request.ack[peer].load(Ordering::Acquire) < generation {
+            service_shootdowns()?;
+            if read_tsc().wrapping_sub(start) > limit {
+                return Err(ArchError::Busy);
+            }
+            core::hint::spin_loop();
+        }
+    }
+    Ok(generation)
+}
+
+fn read_tsc() -> u64 {
+    let (lo, hi): (u32, u32);
+    // SAFETY: RDTSC reads this admitted CPU's monotonic counter only.
+    unsafe {
+        core::arch::asm!(
+            "rdtsc", out("eax") lo, out("edx") hi,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    (u64::from(hi) << 32) | u64::from(lo)
+}
+
+fn witness_mutual_rendezvous() -> Result<u64, ArchError> {
+    let binding = super::context::current_cpu_binding().ok_or(ArchError::Unbound)?;
+    let slot = binding.cpu_slot as usize;
+    let table = shootdown_table(binding)?;
+    if slot >= table.requests.len() {
+        return Err(ArchError::Unbound);
+    }
+    let limit = tsc_frequency()
+        .ok_or(ArchError::Unbound)?
+        .get()
+        .checked_mul(5)
+        .ok_or(ArchError::Unbound)?;
+    let start = read_tsc();
+    table.fixture_arrived.fetch_or(1 << slot, Ordering::AcqRel);
+    while table.fixture_arrived.load(Ordering::Acquire) != 0b11 {
+        if read_tsc().wrapping_sub(start) > limit {
+            return Err(ArchError::Busy);
+        }
+        core::hint::spin_loop();
+    }
+    let root = super::mmu::hardware_live_root()?.address().raw();
+    let generation = rendezvous_root(root)?;
+    let peer = 1 - slot;
+    // Hold this fixture CPU live until it has serviced the peer's request.
+    // Without this, a completed vCPU can leave KVM_RUN before the peer sends.
+    loop {
+        service_shootdowns()?;
+        let peer_request = &table.requests[peer];
+        let peer_generation = peer_request.generation.load(Ordering::Acquire);
+        if peer_generation != 0 && peer_request.ack[slot].load(Ordering::Acquire) >= peer_generation
+        {
+            return Ok(generation);
+        }
+        if read_tsc().wrapping_sub(start) > limit {
+            return Err(ArchError::Busy);
+        }
+        core::hint::spin_loop();
+    }
+}
 
 /// Native interrupt identity. These are xAPIC vectors, never ARM GIC INTIDs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +192,9 @@ pub fn capture_irq(vector: u8) -> Result<NativeIrq, ArchError> {
     // the interrupt gate throughout publication and EOI.
     if unsafe { interrupts::hardware::highest_in_service_vector() } != Some(vector) {
         return Err(ArchError::InvalidFrame);
+    }
+    if irq == NativeIrq::Shootdown {
+        service_shootdowns()?;
     }
     binding
         .pending_irqs
@@ -341,6 +489,7 @@ pub fn witness(op: u64, arg: u64) -> u64 {
             use crate::substrate::sched::ThreadCpu;
             u64::from(crate::substrate::sched::hw::HardwareCpu.ack_irq())
         }
+        6 => witness_mutual_rendezvous().unwrap_or(u64::MAX),
         _ => u64::MAX,
     }
 }
