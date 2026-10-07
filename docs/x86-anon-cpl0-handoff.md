@@ -742,3 +742,30 @@ finished zero: /tmp/x86-process-owner-single-pf-kvm.log. The formerly
 separately owned shootdown red is closed on this merged artifact. Both
 read-only reviewers found no blocking current-consumer defect; the exact-key
 API finding above is fixed and the extra IRQ source EOF blank is removed.
+
+
+## Reviewed exit checkpoint push receipts (2026-10-07)
+
+Exit cancellation/notification: 7993539f3; line-position reconciliation:
+fcf245ed5; authorized single-entry shootdown merge: 7af53d561; reviewed
+exact-key follow-up: c161561b9. A read-only follow-up review confirms the
+empty-member stale-serial finding is closed before any irreversible effect.
+
+All foreground gates finished zero on the reviewed source:
+- just test: /tmp/x86-process-exit-review-host.log and .status
+- just test-kernel-semantics: /tmp/x86-process-exit-review-semantics.log
+- just clippy: /tmp/x86-process-exit-review-clippy.log
+- just fmt-check: /tmp/x86-process-exit-review-fmt.log
+- just lint-domains: /tmp/x86-process-exit-review-domains.log
+- CARRICK_REQUIRE_KVM=1 just test-kvm:
+  /tmp/x86-process-exit-review-kvm.log and .status
+- clean inventory reconciliation: /tmp/x86-process-exit-review-reconcile.log
+
+Assembly comparison uses explicit --head HEAD. github/work/n1 retains its
+previously recorded fatal_entry_binding hvc #3 difference (one failure),
+/tmp/x86-process-exit-review-asm-n1.log. The pushed parent 1bbb69019 versus
+reviewed source reports zero failures, /tmp/x86-process-exit-review-asm-parent.log;
+there is no new ARM assembly drift. Linux compiler authority captures pass
+572 reviewed rows; non-Linux profiles remain pending. Signed ARM/HVF gates
+cannot run here, and no Docker was used. The two-live-MM PRIVATE witness is
+still red (fork ENOSYS); production process binding is the next step.
