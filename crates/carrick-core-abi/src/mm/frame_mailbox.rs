@@ -370,7 +370,7 @@ impl FrameGrantMailbox {
             .state
             .compare_exchange(
                 FRAME_GRANT_MAILBOX_REQUESTED,
-                FRAME_GRANT_MAILBOX_IDLE,
+                FRAME_GRANT_MAILBOX_HOST_WORKING,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -378,7 +378,16 @@ impl FrameGrantMailbox {
         {
             return false;
         }
-        true
+        let current = self.load_request();
+        if matches(current) && current.request_generation == preview.request_generation {
+            self.state
+                .store(FRAME_GRANT_MAILBOX_IDLE, Ordering::Release);
+            true
+        } else {
+            self.state
+                .store(FRAME_GRANT_MAILBOX_REQUESTED, Ordering::Release);
+            false
+        }
     }
 
     /// Publish the full extent before disarming first touch or releasing this
@@ -646,6 +655,43 @@ mod host_claim_tests {
             mailbox.state.load(Ordering::Acquire),
             FRAME_GRANT_MAILBOX_IDLE
         );
+    }
+
+    #[test]
+    fn late_completion_from_old_generation_is_refused_after_reclaim_and_reissue() {
+        let mailbox = FrameGrantMailbox::new();
+        let first = FrameGrantRequest {
+            mm_key: 7,
+            request_generation: 1,
+            fault_va: 0x6000,
+            requested_len: 4096,
+            access: 2,
+        };
+        assert!(mailbox.try_publish_request(first));
+        assert!(mailbox.cancel_request_for_fault(7, 0x6000, 2));
+        assert_eq!(
+            mailbox.state.load(Ordering::Acquire),
+            FRAME_GRANT_MAILBOX_IDLE
+        );
+
+        // Reissue on the same mailbox for generation 2
+        let second = FrameGrantRequest {
+            mm_key: 7,
+            request_generation: 2,
+            fault_va: 0x7000,
+            requested_len: 4096,
+            access: 2,
+        };
+        assert!(mailbox.try_publish_request(second));
+
+        // Late completion from generation 1 must be refused
+        assert!(!mailbox.cancel_request_for_fault(7, 0x6000, 2));
+        assert!(!mailbox.complete_resolved_owner_fault(first));
+        assert!(mailbox.claim_response(7, 1).is_none());
+        assert!(!mailbox.finish_response(7, 1));
+
+        // The current generation 2 request remains intact
+        assert_eq!(mailbox.claim_request_for_fault(7, 0x7000, 2), Some(second));
     }
 }
 
