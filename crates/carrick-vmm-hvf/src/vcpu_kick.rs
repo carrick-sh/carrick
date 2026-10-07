@@ -733,7 +733,7 @@ fn spawn_signal_pump_inner(
                                 which,
                                 ident,
                                 event.udata_u64(),
-                                &crate::itimer::HvfCpuSampler,
+                                &carrick_hal::timer_delivery::GuestCpuSampler,
                                 |signum| {
                                     crate::probes::itimer_fire(signum, 0);
                                     crate::host_signal::publish_process_signal(signum);

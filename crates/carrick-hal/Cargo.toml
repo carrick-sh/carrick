@@ -33,6 +33,12 @@ carrick-sched-core = { path = "../carrick-sched-core" }
 # trait so backends name one set of types. No cycle: timer-core depends only on
 # carrick-abi/portable/host (none of which depend on carrick-hal).
 carrick-timer-core = { path = "../carrick-timer-core" }
+# Guest CPU time for CPU-clock timers (`ITIMER_VIRTUAL`/`ITIMER_PROF`, CPU
+# POSIX clocks): `guest_cpu` is the per-vCPU-run accounting every shared engine
+# (`carrick-aarch64`, `carrick-x86`) feeds through `timed_run`, so the kick
+# lanes' fallback threads sample the same counters HVF does. No cycle:
+# carrick-host depends only on carrick-fatal/kernel-arena/guest-mem.
+carrick-host = { path = "../carrick-host" }
 # The shared async host-signal PUMP (`signal_pump`) needs the neutral pending
 # store + child-watch + the `HostSignalGlue` seam. No cycle: carrick-signal-linux
 # depends only on libc (not carrick-hal).

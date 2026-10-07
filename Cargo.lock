@@ -572,6 +572,7 @@ dependencies = [
  "carrick-fatal",
  "carrick-guest-arch",
  "carrick-guest-mem",
+ "carrick-host",
  "carrick-mem",
  "carrick-mmu-core",
  "carrick-observability",
