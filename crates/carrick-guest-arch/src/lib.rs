@@ -36,6 +36,20 @@ ordinal!(
     FatalCode
 );
 
+/// Native address-space register bits, including ARM ASID or x86 control
+/// bits. This is distinct from a physical root and conveys no MM authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct AddressSpaceRegister(u64);
+impl AddressSpaceRegister {
+    pub const fn from_register(raw: u64) -> Self {
+        Self(raw)
+    }
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 /// Supervisor addresses selected by the image ISA. Offsets within the kernel
 /// region retain the shared ABI; a guest cannot use another ISA's base here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

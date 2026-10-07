@@ -3646,6 +3646,61 @@ mod initial_reply_tests {
     use super::*;
 
     #[test]
+    fn initial_inventory_refuses_a_receipt_from_another_mm() {
+        let authority = Arc::new(FrameInventoryAuthority::new());
+        let ids = ObjectIdRegistry::new();
+        let (mut inventory, _) = InitialInventory::stage(
+            Arc::clone(&authority),
+            &ids,
+            [FrameGpa::new(0x2_0000_0000)],
+            0,
+            4096,
+            NonZeroU64::MIN,
+        )
+        .expect("initial MM inventory");
+        inventory.rollback().expect("original custody rollback");
+        let mut reservation = authority
+            .reserve(&ids, 1, 1, FrameEventCapacity::for_event_count(2).unwrap())
+            .expect("foreign MM transaction");
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation = MappingGeneration::from_backend_counter(NonZeroU64::MIN);
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa: carrick_guest_mem::Gpa(0x2_0000_1000),
+                length: inventory.length,
+                permissions: MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        let (_, foreign) = authority
+            .apply_with_receipt(
+                MmId::from_raw_u64(INITIAL_MM_KEY + 1).unwrap(),
+                reservation.commit(()),
+            )
+            .expect("foreign MM receipt");
+        // Settle the original unpublished receipt independently, then replace
+        // only the receipt. The MM refusal must precede frame authentication.
+        inventory.receipt = Some(foreign);
+        assert_eq!(inventory.publish().unwrap_err().0, "inventory MM mismatch");
+    }
+
+    #[test]
     fn initial_inventory_refuses_a_grant_with_a_different_gpa() {
         let (mut inventory, _) = InitialInventory::stage(
             Arc::new(FrameInventoryAuthority::new()),

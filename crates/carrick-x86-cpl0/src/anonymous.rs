@@ -123,17 +123,23 @@ impl carrick_el1::memory::AnonymousBackingProbe for X86AnonymousEditor {
     fn bind_operation(&mut self, sequence: carrick_el1_abi::ReservationSequence) {
         self.sequence = Some(sequence);
     }
-    fn backing(&mut self, root: u64, va: u64, len: u64) -> carrick_el1::memory::Stage1Backing {
+    fn backing(&mut self, root: carrick_guest_arch::AddressSpaceRegister, va: carrick_guest_arch::UserVa, len: carrick_guest_arch::GuestLen) -> carrick_el1::memory::Stage1Backing {
+        let root = root.raw();
+        let va = va.raw();
+        let len = len.raw();
         classify_anonymous_range::<X86AnonymousDecode>(&|pa| self.words.load(pa).ok(), root, va, len)
     }
-    fn stock_span(&mut self, mm: u64, va: u64) -> Option<(u64, u64)> {
+    fn stock_span(&mut self, mm: carrick_el1_abi::ReservationMm, va: carrick_guest_arch::UserVa) -> Option<carrick_guest_arch::UserRange> {
+        let mm = mm.raw();
+        let va = va.raw();
         let page = carrick_el1::isa::frame_grant_residency_guest().lookup(mm, va)?;
-        Some((page.identity.semantic_base, page.identity.semantic_base + page.identity.len))
+        UserRange::checked(UserVa::new(page.identity.semantic_base), GuestLen::new(page.identity.len))
     }
 }
 impl carrick_el1::memory::AnonymousPermissionEditor for X86AnonymousEditor {
-    fn protect_and_invalidate(&mut self, root: u64, edit: carrick_mmu_core::aarch64::GuestPermissionEdit)
+    fn protect_and_invalidate(&mut self, root: carrick_guest_arch::AddressSpaceRegister, edit: carrick_mmu_core::aarch64::GuestPermissionEdit)
         -> Result<(), carrick_mmu_core::aarch64::GuestPermissionEditError> {
+        let root = root.raw();
         self.edit(
             RootGpa::page_aligned(FrameGpa::new(root)).ok_or(carrick_mmu_core::aarch64::GuestPermissionEditError::NotPrivateAnonymous)?,
             UserRange::checked(UserVa::new(edit.va), GuestLen::new(edit.len)).ok_or(carrick_mmu_core::aarch64::GuestPermissionEditError::NotPrivateAnonymous)?,
@@ -146,8 +152,11 @@ impl carrick_el1::memory::AnonymousPermissionEditor for X86AnonymousEditor {
     }
 }
 impl carrick_el1::memory::AnonymousRetirementEditor for X86AnonymousEditor {
-    fn retire_and_invalidate(&mut self, root: u64, va: u64, len: u64)
+    fn retire_and_invalidate(&mut self, root: carrick_guest_arch::AddressSpaceRegister, va: carrick_guest_arch::UserVa, len: carrick_guest_arch::GuestLen)
         -> Result<(), carrick_mmu_core::aarch64::GuestRetirementError> {
+        let root = root.raw();
+        let va = va.raw();
+        let len = len.raw();
         self.edit(
             RootGpa::page_aligned(FrameGpa::new(root)).ok_or(carrick_mmu_core::aarch64::GuestRetirementError::NotPrivateAnonymous)?,
             UserRange::checked(UserVa::new(va), GuestLen::new(len)).ok_or(carrick_mmu_core::aarch64::GuestRetirementError::NotPrivateAnonymous)?,

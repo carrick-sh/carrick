@@ -313,7 +313,7 @@ pub enum MunmapDisposition {
 pub trait AnonymousPermissionEditor {
     fn protect_and_invalidate(
         &mut self,
-        ttbr0: u64,
+        ttbr0: carrick_guest_arch::AddressSpaceRegister,
         edit: GuestPermissionEdit,
     ) -> Result<(), GuestPermissionEditError>;
 }
@@ -322,9 +322,9 @@ pub trait AnonymousPermissionEditor {
 pub trait AnonymousRetirementEditor {
     fn retire_and_invalidate(
         &mut self,
-        ttbr0: u64,
-        address: u64,
-        len: u64,
+        ttbr0: carrick_guest_arch::AddressSpaceRegister,
+        address: carrick_guest_arch::UserVa,
+        len: carrick_guest_arch::GuestLen,
     ) -> Result<(), GuestRetirementError>;
 }
 
@@ -335,9 +335,10 @@ pub struct HardwareAnonymousPermissionEditor;
 impl AnonymousPermissionEditor for HardwareAnonymousPermissionEditor {
     fn protect_and_invalidate(
         &mut self,
-        ttbr0: u64,
+        ttbr0: carrick_guest_arch::AddressSpaceRegister,
         edit: GuestPermissionEdit,
     ) -> Result<(), GuestPermissionEditError> {
+        let ttbr0 = ttbr0.raw();
         const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
         let physical_base = ttbr0 & TTBR_BADDR_MASK;
         let words =
@@ -365,10 +366,13 @@ pub struct HardwareAnonymousRetirementEditor;
 impl AnonymousRetirementEditor for HardwareAnonymousRetirementEditor {
     fn retire_and_invalidate(
         &mut self,
-        ttbr0: u64,
-        address: u64,
-        len: u64,
+        ttbr0: carrick_guest_arch::AddressSpaceRegister,
+        address: carrick_guest_arch::UserVa,
+        len: carrick_guest_arch::GuestLen,
     ) -> Result<(), GuestRetirementError> {
+        let ttbr0 = ttbr0.raw();
+        let address = address.raw();
+        let len = len.raw();
         const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
         let physical_base = ttbr0 & TTBR_BADDR_MASK;
         let words =
@@ -616,13 +620,30 @@ pub fn classify_anonymous_range<A: AnonymousDescriptorDecode>(
 }
 
 /// Exact-MM read of the live stage-1 graph behind the syscall policy.
+///
+/// A raw integer is not an authenticated root register or a user range.
+/// ```compile_fail
+/// use carrick_el1::memory::AnonymousBackingProbe;
+/// fn untyped<E: AnonymousBackingProbe>(editor: &mut E) {
+///     editor.backing(0_u64, 0_u64, 4096_u64);
+/// }
+/// ```
 pub trait AnonymousBackingProbe {
     /// Bind the reservation owner's unique operation identity before edits.
     fn bind_operation(&mut self, _sequence: carrick_el1_abi::ReservationSequence) {}
-    fn backing(&mut self, ttbr0: u64, va: u64, len: u64) -> Stage1Backing;
+    fn backing(
+        &mut self,
+        ttbr0: carrick_guest_arch::AddressSpaceRegister,
+        va: carrick_guest_arch::UserVa,
+        len: carrick_guest_arch::GuestLen,
+    ) -> Stage1Backing;
     /// `[start, end)` of the live first-touch grant of exactly `mm_key`
     /// that prepared `va`, if any: stock this MM may hand to a new mapping.
-    fn stock_span(&mut self, mm_key: u64, va: u64) -> Option<(u64, u64)>;
+    fn stock_span(
+        &mut self,
+        mm_key: carrick_el1_abi::ReservationMm,
+        va: carrick_guest_arch::UserVa,
+    ) -> Option<carrick_guest_arch::UserRange>;
 }
 
 /// Every descriptor step of a delegated anonymous transaction.
@@ -641,7 +662,15 @@ pub struct HardwareAnonymousEditor;
 
 #[cfg(target_os = "none")]
 impl AnonymousBackingProbe for HardwareAnonymousEditor {
-    fn backing(&mut self, ttbr0: u64, va: u64, len: u64) -> Stage1Backing {
+    fn backing(
+        &mut self,
+        ttbr0: carrick_guest_arch::AddressSpaceRegister,
+        va: carrick_guest_arch::UserVa,
+        len: carrick_guest_arch::GuestLen,
+    ) -> Stage1Backing {
+        let ttbr0 = ttbr0.raw();
+        let va = va.raw();
+        let len = len.raw();
         const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
         let root = ttbr0 & TTBR_BADDR_MASK;
         let primary = carrick_mmu_core::aarch64::descriptor_txn::TableWindow {
@@ -670,12 +699,18 @@ impl AnonymousBackingProbe for HardwareAnonymousEditor {
         classify_stage1_range(&read, root, va, len)
     }
 
-    fn stock_span(&mut self, mm_key: u64, va: u64) -> Option<(u64, u64)> {
+    fn stock_span(
+        &mut self,
+        mm_key: carrick_el1_abi::ReservationMm,
+        va: carrick_guest_arch::UserVa,
+    ) -> Option<carrick_guest_arch::UserRange> {
+        let mm_key = mm_key.raw();
+        let va = va.raw();
         let page = crate::isa::frame_grant_residency_guest().lookup(mm_key, va)?;
-        Some((
-            page.identity.semantic_base,
-            page.identity.semantic_base + page.identity.len,
-        ))
+        carrick_guest_arch::UserRange::checked(
+            carrick_guest_arch::UserVa::new(page.identity.semantic_base),
+            carrick_guest_arch::GuestLen::new(page.identity.len),
+        )
     }
 }
 
@@ -683,7 +718,7 @@ impl AnonymousBackingProbe for HardwareAnonymousEditor {
 impl AnonymousPermissionEditor for HardwareAnonymousEditor {
     fn protect_and_invalidate(
         &mut self,
-        ttbr0: u64,
+        ttbr0: carrick_guest_arch::AddressSpaceRegister,
         edit: GuestPermissionEdit,
     ) -> Result<(), GuestPermissionEditError> {
         HardwareAnonymousPermissionEditor.protect_and_invalidate(ttbr0, edit)
@@ -694,9 +729,9 @@ impl AnonymousPermissionEditor for HardwareAnonymousEditor {
 impl AnonymousRetirementEditor for HardwareAnonymousEditor {
     fn retire_and_invalidate(
         &mut self,
-        ttbr0: u64,
-        address: u64,
-        len: u64,
+        ttbr0: carrick_guest_arch::AddressSpaceRegister,
+        address: carrick_guest_arch::UserVa,
+        len: carrick_guest_arch::GuestLen,
     ) -> Result<(), GuestRetirementError> {
         HardwareAnonymousRetirementEditor.retire_and_invalidate(ttbr0, address, len)
     }
@@ -782,7 +817,11 @@ pub fn serve_delegated_anonymous<
     if request.operation == carrick_el1_abi::ReservationOperation::Move {
         return refuse(pending, &mut model, Leave::RootDeclined);
     }
-    let backing = editor.backing(grant.ttbr0, va, len);
+    let backing = editor.backing(
+        carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
+        carrick_guest_arch::UserVa::new(va),
+        carrick_guest_arch::GuestLen::new(len),
+    );
     // One editor call is one all-or-nothing step: a range whose backing is
     // split into several runs by holes goes to the host.
     let run = match backing.runs() {
@@ -800,8 +839,11 @@ pub fn serve_delegated_anonymous<
         && backing.summary == RangeBacking::Prepared
         && run.is_some_and(|(start, run_len)| {
             editor
-                .stock_span(mm_key, start)
-                .is_some_and(|(base, end)| base <= start && start + run_len <= end)
+                .stock_span(mm, carrick_guest_arch::UserVa::new(start))
+                .is_some_and(|span| {
+                    span.start().raw() <= start
+                        && start + run_len <= span.start().raw() + span.len().raw()
+                })
         })
         && {
             let mut nodes = 0usize;
@@ -837,7 +879,10 @@ pub fn serve_delegated_anonymous<
                 writable: request.protection.bits() & PROT_WRITE != 0,
                 executable: request.protection.bits() & PROT_EXEC != 0,
             };
-            match editor.protect_and_invalidate(grant.ttbr0, edit) {
+            match editor.protect_and_invalidate(
+                carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
+                edit,
+            ) {
                 Ok(()) => None,
                 Err(GuestPermissionEditError::RollbackFailed) => {
                     panic!("EL1 anonymous permission rollback failed")
@@ -856,7 +901,11 @@ pub fn serve_delegated_anonymous<
             let Ok(slot) = model.reserve_return(request.range) else {
                 return refuse(pending, &mut model, Leave::JournalFull);
             };
-            match editor.retire_and_invalidate(grant.ttbr0, start, run_len) {
+            match editor.retire_and_invalidate(
+                carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
+                carrick_guest_arch::UserVa::new(start),
+                carrick_guest_arch::GuestLen::new(run_len),
+            ) {
                 Ok(()) => {
                     #[cfg(target_os = "none")]
                     crate::isa::frame_grant_residency_guest().retire_overlapping(mm_key, va, len);
@@ -979,7 +1028,11 @@ pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
     let Some(_guard) = spaces.try_begin_edit(index, mm_key, owner) else {
         return MunmapDisposition::Forward;
     };
-    match editor.retire_and_invalidate(grant.ttbr0, address, len) {
+    match editor.retire_and_invalidate(
+        carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
+        carrick_guest_arch::UserVa::new(address),
+        carrick_guest_arch::GuestLen::new(len),
+    ) {
         Ok(()) => {
             #[cfg(target_os = "none")]
             crate::isa::frame_grant_residency_guest().retire_overlapping(mm_key, address, len);
@@ -1052,7 +1105,10 @@ pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
         writable: prot & PROT_WRITE != 0,
         executable: prot & PROT_EXEC != 0,
     };
-    match editor.protect_and_invalidate(grant.ttbr0, edit) {
+    match editor.protect_and_invalidate(
+        carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
+        edit,
+    ) {
         Ok(()) if journal_room => {
             // The host applies this, in order, before it next reads the
             // MM's VMA rows; no exit now.
@@ -1127,9 +1183,10 @@ mod tests {
     impl AnonymousPermissionEditor for RecordingEditor {
         fn protect_and_invalidate(
             &mut self,
-            ttbr0: u64,
+            ttbr0: carrick_guest_arch::AddressSpaceRegister,
             edit: GuestPermissionEdit,
         ) -> Result<(), GuestPermissionEditError> {
+            let ttbr0 = ttbr0.raw();
             self.calls.push((ttbr0, edit));
             self.result.map_or(Ok(()), Err)
         }
@@ -1312,10 +1369,13 @@ mod tests {
     impl AnonymousRetirementEditor for RecordingRetirementEditor {
         fn retire_and_invalidate(
             &mut self,
-            ttbr0: u64,
-            address: u64,
-            len: u64,
+            ttbr0: carrick_guest_arch::AddressSpaceRegister,
+            address: carrick_guest_arch::UserVa,
+            len: carrick_guest_arch::GuestLen,
         ) -> Result<(), GuestRetirementError> {
+            let ttbr0 = ttbr0.raw();
+            let address = address.raw();
+            let len = len.raw();
             self.calls.push((ttbr0, address, len));
             self.result.map_or(Ok(()), Err)
         }
@@ -1485,7 +1545,15 @@ mod tests {
             fn bind_operation(&mut self, sequence: ReservationSequence) {
                 self.sequences.push(sequence);
             }
-            fn backing(&mut self, ttbr0: u64, va: u64, len: u64) -> Stage1Backing {
+            fn backing(
+                &mut self,
+                ttbr0: carrick_guest_arch::AddressSpaceRegister,
+                va: carrick_guest_arch::UserVa,
+                len: carrick_guest_arch::GuestLen,
+            ) -> Stage1Backing {
+                let ttbr0 = ttbr0.raw();
+                let va = va.raw();
+                let len = len.raw();
                 self.calls.push(Call::Probe(ttbr0, va, len));
                 match self.runs {
                     Some(runs) => Stage1Backing::with_runs(self.backing, runs),
@@ -1499,18 +1567,32 @@ mod tests {
                     None => Stage1Backing::of(self.backing),
                 }
             }
-            fn stock_span(&mut self, mm_key: u64, va: u64) -> Option<(u64, u64)> {
-                self.stock
+            fn stock_span(
+                &mut self,
+                mm_key: carrick_el1_abi::ReservationMm,
+                va: carrick_guest_arch::UserVa,
+            ) -> Option<carrick_guest_arch::UserRange> {
+                let mm_key = mm_key.raw();
+                let va = va.raw();
+                let raw_span = self
+                    .stock
                     .filter(|&(mm, start, end)| mm == mm_key && start <= va && va < end)
-                    .map(|(_, start, end)| (start, end))
+                    .map(|(_, start, end)| (start, end));
+                raw_span.and_then(|(start, end)| {
+                    carrick_guest_arch::UserRange::checked(
+                        carrick_guest_arch::UserVa::new(start),
+                        carrick_guest_arch::GuestLen::new(end.checked_sub(start)?),
+                    )
+                })
             }
         }
         impl AnonymousPermissionEditor for Editor {
             fn protect_and_invalidate(
                 &mut self,
-                ttbr0: u64,
+                ttbr0: carrick_guest_arch::AddressSpaceRegister,
                 edit: GuestPermissionEdit,
             ) -> Result<(), GuestPermissionEditError> {
+                let ttbr0 = ttbr0.raw();
                 self.calls.push(Call::Protect(ttbr0, edit));
                 self.protect.map_or(Ok(()), Err)
             }
@@ -1518,10 +1600,13 @@ mod tests {
         impl AnonymousRetirementEditor for Editor {
             fn retire_and_invalidate(
                 &mut self,
-                ttbr0: u64,
-                address: u64,
-                len: u64,
+                ttbr0: carrick_guest_arch::AddressSpaceRegister,
+                address: carrick_guest_arch::UserVa,
+                len: carrick_guest_arch::GuestLen,
             ) -> Result<(), GuestRetirementError> {
+                let ttbr0 = ttbr0.raw();
+                let address = address.raw();
+                let len = len.raw();
                 self.calls.push(Call::Retire(ttbr0, address, len));
                 Ok(())
             }
