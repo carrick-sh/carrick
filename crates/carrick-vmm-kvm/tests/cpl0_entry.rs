@@ -1247,6 +1247,64 @@ fn two_running_vcpus_drop_stale_translation_on_shootdown() {
     assert_ne!(generation, 0, "retirement must publish a generation");
     assert!(
         ack[1] >= generation,
+        "running CPU must acknowledge shootdown: ack[1]={}, generation={}",
+        ack[1],
+        generation
+    );
+    assert_eq!(carrier.fixture_shootdown_served(0, 1).unwrap(), generation);
+    assert_eq!(
+        carrier.fixture_kick_generation_checks(1).unwrap(),
+        checks_before,
+        "running CPU served shootdown via IPI, not KICK"
+    );
+}
+
+#[test]
+fn two_running_vcpus_fault_before_shootdown_ipi_acknowledges_in_guest() {
+    let mut editor = Vec::new();
+    for phase in [2_u64, 3] {
+        editor.extend_from_slice(&[0x48, 0xbf]); // mov rdi, phase
+        editor.extend_from_slice(&phase.to_le_bytes());
+        editor.extend_from_slice(&[0x48, 0xb8]); // mov rax, fixture edit
+        editor.extend_from_slice(&OBSERVE_RETIRE_REPOINT.to_le_bytes());
+        editor.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+        editor.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+        editor.extend_from_slice(&[0x0f, 0x05]);
+    }
+    editor.extend_from_slice(&[0x0f, 0x0b]);
+    let mut reader = vec![0xa0]; // mov al, [0x37000]
+    reader.extend_from_slice(&0x3_7000_u64.to_le_bytes());
+    reader.push(0xa2); // mov [0x40000], al
+    reader.extend_from_slice(&0x4_0000_u64.to_le_bytes());
+    reader.extend_from_slice(&[0xeb, 0xec]); // repeat the 20-byte load/store loop
+
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&editor, &reader])
+        .expect("two native KVM CPUs with one retained page-table root");
+    carrier.fixture_share_root(1, 0).expect("same MM root");
+    carrier.fixture_write_backing_byte(0xd1_1000, 0x11).unwrap();
+    assert_eq!(carrier.observe(0).expect("prepare old page").result, 1);
+    carrier
+        .fixture_stop_after_user_value(1, 0x4_0000, 0x11)
+        .expect("reader warmed its old translation");
+    carrier
+        .fixture_stop_before_user_rip(1, carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000)
+        .expect("reader stopped before user rip");
+    let checks_before = carrier.fixture_kick_generation_checks(1).unwrap();
+    carrier.fixture_write_backing_byte(0x4_0000, 0).unwrap();
+    let result = carrier
+        .fixture_two_running_cpus_shootdown_fault_held_ipi(
+            0,
+            1,
+            carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000,
+            0x3_7000,
+        )
+        .expect("concurrent shootdown and user fault with held IPI");
+    assert_eq!(result, 1, "editor completed retirement");
+    let [(root, generation, ack), _] = carrier.fixture_shootdown_state();
+    assert_eq!(root, 0x60_0000, "retirement must name the shared root");
+    assert_ne!(generation, 0, "retirement must publish a generation");
+    assert!(
+        ack[1] >= generation,
         "running CPU must acknowledge shootdown"
     );
     assert_eq!(carrier.fixture_shootdown_served(0, 1).unwrap(), generation);
