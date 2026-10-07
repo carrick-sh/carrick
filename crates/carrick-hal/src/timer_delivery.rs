@@ -2,8 +2,7 @@
 //! mechanism behind the neutral `carrick-timer-core` slot/registry bookkeeping.
 //! HVF arms an `EVFILT_TIMER` on its kqueue signal pump (so a busy vCPU is
 //! kicked on expiry); KVM has no pump, so `arm_itimer` returns `false` and the
-//! caller spawns the shared wall-clock fallback thread
-//! (`carrick_timer_core::itimer::run_fallback`). The trait PERMITS divergence:
+//! caller spawns the shared fallback thread ([`run_fallback`]). The trait PERMITS divergence:
 //! the slot/spec/remaining math is shared verbatim (timer-core), only the
 //! delivery glue differs.
 //!
@@ -17,6 +16,39 @@ use crate::threaded::VcpuRegistry;
 pub use crate::posix_timer::PosixTimerSpec;
 pub use carrick_timer_core::TimerSpecNs;
 pub use carrick_timer_core::itimer::TimerArm;
+
+/// The guest CPU clock every vCPU lane shares: per-vCPU guest run time the
+/// shared engines (`carrick-aarch64`, `carrick-x86`; HVF's trap loop) commit
+/// through `carrick_host::guest_cpu::timed_run`, plus runs still in flight.
+/// The sampler CPU-clock timers (`ITIMER_VIRTUAL`/`ITIMER_PROF`, CPU POSIX
+/// clocks) measure on the process-per-host-process lanes. (HVPatch keys CPU
+/// timers on its exact task instead; see the kernel's process timer delivery.)
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GuestCpuSampler;
+
+impl carrick_timer_core::CpuSampler for GuestCpuSampler {
+    fn total_cpu_ns(&self) -> u64 {
+        carrick_host::guest_cpu::total_ns_including_active()
+    }
+
+    fn active_vcpus(&self) -> u64 {
+        carrick_host::guest_cpu::active_count() as u64
+    }
+}
+
+/// The CPU clock a POSIX timer of `clock_kind` measures on a
+/// process-per-host-process lane: `None` for a wall clock, else the
+/// process guest CPU total ([`GuestCpuSampler`]). Per-thread CPU clocks are
+/// measured against the process total here, as HVF always has.
+pub fn posix_cpu_clock(
+    clock_kind: carrick_timer_core::ClockKind,
+) -> Option<Arc<dyn Fn() -> Option<u64> + Send + Sync>> {
+    use carrick_timer_core::CpuSampler;
+    clock_kind.is_cpu().then(|| {
+        Arc::new(|| Some(GuestCpuSampler.total_cpu_ns()))
+            as Arc<dyn Fn() -> Option<u64> + Send + Sync>
+    })
+}
 
 /// Arm a POSIX per-process timer using the shared fallback firing thread.
 ///
@@ -39,10 +71,13 @@ pub fn arm_fallback_posix_timer(
             carrick_signal_linux::publish_process_signal(signum);
             kicker.kick_all();
         };
+        let cpu_clock = posix_cpu_clock(slot.clock_kind);
         let _ = std::thread::Builder::new()
             .name(format!("carrick-ptimer-{id}"))
             .spawn(move || {
-                crate::posix_timer::run_fallback(slot, generation, spec, on_fire);
+                crate::posix_timer::run_fallback_with_cpu(
+                    slot, generation, spec, cpu_clock, on_fire,
+                );
             });
     }
     Some(armed.old)
@@ -59,12 +94,10 @@ pub fn disarm_fallback_posix_timer(id: i32) {
     let _ = crate::posix_timer::arm(id, TimerSpecNs::DISARM);
 }
 
-/// Shared fallback-timer timing loop body for interval timers.
-pub fn run_fallback(which: usize, generation: u64, spec: TimerSpecNs, on_fire: impl Fn()) {
-    run_fallback_with_sampler(which, generation, spec, None, on_fire);
-}
-
-/// Shared fallback-timer timing loop body with an optional CPU sampler.
+/// Shared fallback-timer timing loop body for interval timers. CPU timers
+/// (`ITIMER_VIRTUAL`/`ITIMER_PROF`) measure `cpu_sampler`; there is no
+/// sampler-less form, because a CPU timer polled against a constant 0 never
+/// comes due.
 ///
 /// Every delivery goes through `carrick_timer_core::itimer::fire_*_if_current`,
 /// which checks this worker's `generation`, decides expiry and runs `on_fire`
@@ -72,11 +105,11 @@ pub fn run_fallback(which: usize, generation: u64, spec: TimerSpecNs, on_fire: i
 /// worker (if superseded) can neither deliver nor touch the slot again.
 /// `on_fire` runs under that gate, so it must not call back into
 /// `carrick_timer_core::itimer` for the same `which`.
-pub fn run_fallback_with_sampler(
+pub fn run_fallback(
     which: usize,
     generation: u64,
     spec: TimerSpecNs,
-    cpu_sampler: Option<&dyn carrick_timer_core::CpuSampler>,
+    cpu_sampler: &dyn carrick_timer_core::CpuSampler,
     on_fire: impl Fn(),
 ) {
     if carrick_timer_core::itimer::is_cpu_timer(which) {
@@ -95,15 +128,15 @@ pub fn run_fallback_with_sampler(
 pub fn run_fallback_cpu(
     which: usize,
     generation: u64,
-    cpu_sampler: Option<&dyn carrick_timer_core::CpuSampler>,
+    cpu_sampler: &dyn carrick_timer_core::CpuSampler,
     on_fire: &impl Fn(),
 ) {
     use carrick_timer_core::FireOutcome;
     loop {
         // Sample OUTSIDE the slot gate (the sampler reads host CPU counters);
         // the expiry decision against the live arm happens under it.
-        let now_ns = cpu_sampler.map_or(0, |s| s.total_cpu_ns());
-        let active_vcpus = cpu_sampler.map_or(0, |s| s.active_vcpus());
+        let now_ns = cpu_sampler.total_cpu_ns();
+        let active_vcpus = cpu_sampler.active_vcpus();
         match carrick_timer_core::itimer::fire_cpu_if_current(
             which,
             generation,
@@ -265,7 +298,7 @@ mod tests {
         let sampler = MockCpuSampler(10_000, 1);
         let fires = Arc::new(AtomicUsize::new(0));
         let fires2 = Arc::clone(&fires);
-        run_fallback_with_sampler(which, generation, spec, Some(&sampler), move || {
+        run_fallback(which, generation, spec, &sampler, move || {
             fires2.fetch_add(1, Ordering::SeqCst);
         });
         assert_eq!(
@@ -333,7 +366,7 @@ mod tests {
         let fires = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fires2 = Arc::clone(&fires);
         let runner = std::thread::spawn(move || {
-            run_fallback_with_sampler(which, generation, spec, Some(&sampler), move || {
+            run_fallback(which, generation, spec, &sampler, move || {
                 fires2.fetch_add(1, Ordering::SeqCst);
             });
         });
@@ -423,7 +456,7 @@ mod tests {
         // retired generation must not deliver.
         carrick_timer_core::itimer::disarm(which);
         let fires = AtomicUsize::new(0);
-        run_fallback(which, generation, spec, || {
+        run_fallback(which, generation, spec, &MockCpuSampler::default(), || {
             fires.fetch_add(1, Ordering::SeqCst);
         });
         assert_eq!(fires.load(Ordering::SeqCst), 0);

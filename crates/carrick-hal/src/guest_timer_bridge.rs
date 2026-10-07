@@ -223,15 +223,13 @@ pub trait TimerFiring: 'static {
     /// The backend [`TimerDelivery`] the run loop registered, if any.
     fn delivery() -> Option<Arc<dyn TimerDelivery>>;
 
-    /// Read the current guest CPU runtime in nanoseconds, if supported by the lane.
-    fn sample_cpu_now() -> Option<u64> {
-        None
-    }
+    /// Read the current guest CPU runtime in nanoseconds, if supported by the
+    /// lane. A CPU itimer arms its due point against this, so a firing that
+    /// delivers CPU timers must return its real clock.
+    fn sample_cpu_now() -> Option<u64>;
 
     /// Read the active guest vCPU count, if supported by the lane.
-    fn active_vcpus() -> u64 {
-        0
-    }
+    fn active_vcpus() -> u64;
 }
 
 /// A [`GuestTimerBridge`] over the neutral `carrick-timer-core` registry —
@@ -378,21 +376,28 @@ pub struct KickerTimerFiring;
 
 impl TimerFiring for KickerTimerFiring {
     /// Spawn the fallback timer thread for `which`. The timing-loop body is
-    /// shared (`carrick_timer_core::itimer::run_fallback`); the per-fire
-    /// action delivers via [`deliver`]. For wall-time `ITIMER_REAL` the shared
-    /// loop sleeps to the deadline; for CPU-time `ITIMER_VIRTUAL`/`ITIMER_PROF`
-    /// it POLLS the core's `cpu_timer_decision` against the live aggregate
-    /// guest CPU total — so CPU itimers fire off real guest CPU time and never
-    /// while the guest is idle. At most one thread per `which` is live — a
-    /// disarm/re-arm bumps the generation so the old thread exits.
+    /// shared (`timer_delivery::run_fallback`); the per-fire action delivers
+    /// via [`deliver`]. For wall-time `ITIMER_REAL` the shared loop sleeps to
+    /// the deadline; for CPU-time `ITIMER_VIRTUAL`/`ITIMER_PROF` it polls the
+    /// gated CPU expiry decision against the guest CPU total the shared
+    /// engines commit (`timer_delivery::GuestCpuSampler`) -- so CPU itimers
+    /// fire off real guest CPU time and never while the guest is idle. At most
+    /// one thread per `which` is live -- a disarm/re-arm bumps the generation
+    /// so the old thread exits.
     fn spawn_itimer_fallback(which: usize, generation: u64, spec: TimerSpecNs) {
         let signum = itimer_signum_for(which);
         let _ = std::thread::Builder::new()
             .name(format!("carrick-itimer-{which}"))
             .spawn(move || {
-                crate::timer_delivery::run_fallback(which, generation, spec, || {
-                    deliver(signum);
-                });
+                crate::timer_delivery::run_fallback(
+                    which,
+                    generation,
+                    spec,
+                    &crate::timer_delivery::GuestCpuSampler,
+                    || {
+                        deliver(signum);
+                    },
+                );
             });
     }
 
@@ -409,10 +414,13 @@ impl TimerFiring for KickerTimerFiring {
         let on_fire = move || {
             deliver(signum);
         };
+        let cpu_clock = crate::timer_delivery::posix_cpu_clock(slot.clock_kind);
         let _ = std::thread::Builder::new()
             .name(format!("carrick-ptimer-{id}"))
             .spawn(move || {
-                crate::posix_timer::run_fallback(slot, generation, spec, on_fire);
+                crate::posix_timer::run_fallback_with_cpu(
+                    slot, generation, spec, cpu_clock, on_fire,
+                );
             });
     }
 
@@ -422,6 +430,16 @@ impl TimerFiring for KickerTimerFiring {
 
     fn delivery() -> Option<Arc<dyn TimerDelivery>> {
         delivery()
+    }
+
+    fn sample_cpu_now() -> Option<u64> {
+        use carrick_timer_core::CpuSampler;
+        Some(crate::timer_delivery::GuestCpuSampler.total_cpu_ns())
+    }
+
+    fn active_vcpus() -> u64 {
+        use carrick_timer_core::CpuSampler;
+        crate::timer_delivery::GuestCpuSampler.active_vcpus()
     }
 }
 
@@ -451,6 +469,14 @@ impl TimerFiring for NullTimerFiring {
 
     fn delivery() -> Option<Arc<dyn TimerDelivery>> {
         None
+    }
+
+    fn sample_cpu_now() -> Option<u64> {
+        None
+    }
+
+    fn active_vcpus() -> u64 {
+        0
     }
 }
 
@@ -515,5 +541,103 @@ mod tests {
         );
         assert!(bridge.posix_delete(id));
         assert!(!bridge.posix_exists(id));
+    }
+
+    /// Guest CPU the kick lanes' engines would have committed through
+    /// `guest_cpu::timed_run`, advanced from the test thread.
+    fn burn_guest_cpu(ns: u64) {
+        carrick_host::guest_cpu::add(ns);
+    }
+
+    /// Wait (bounded) until `signum` is pending process-wide.
+    fn signal_pends_within(signum: i32, bound: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + bound;
+        loop {
+            let pending = carrick_signal_linux::take_process_pending();
+            if pending == signum {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn register_test_kicker() {
+        let registry: Arc<dyn VcpuRegistry> = Arc::new(crate::GenericVcpuRegistry::new());
+        register_kicker(
+            registry,
+            ThreadId::synthetic_for_tests(0x17e7),
+            Box::new(|| {}),
+        );
+    }
+
+    #[test]
+    fn kicker_itimer_virtual_fires_once_guest_cpu_crosses_due() {
+        let _serial = TIMER_REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        carrick_timer_core::itimer::clear();
+        carrick_signal_linux::clear_proc_pending();
+        register_test_kicker();
+        let bridge = KickerGuestTimers::default();
+        let which = 1; // ITIMER_VIRTUAL
+        let spec = TimerSpecNs {
+            value: 2_000_000,
+            interval: 0,
+        };
+        let generation = bridge.itimer_arm(which, spec, false);
+        bridge.itimer_spawn_fallback_timer(which, generation, spec);
+        // Not due: no guest CPU has run since the arm.
+        assert!(!signal_pends_within(
+            carrick_abi::LINUX_SIGVTALRM,
+            std::time::Duration::from_millis(20)
+        ));
+        burn_guest_cpu(3_000_000);
+        assert!(
+            signal_pends_within(
+                carrick_abi::LINUX_SIGVTALRM,
+                std::time::Duration::from_secs(5)
+            ),
+            "ITIMER_VIRTUAL never fired on a kick lane after guest CPU crossed its due time"
+        );
+        assert!(!carrick_timer_core::itimer::is_armed(which));
+        carrick_signal_linux::clear_proc_pending();
+    }
+
+    #[test]
+    fn kicker_cpu_posix_timer_fires_once_guest_cpu_crosses_due() {
+        let _serial = TIMER_REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        carrick_signal_linux::clear_proc_pending();
+        let kicker: Arc<dyn VcpuRegistry> = Arc::new(crate::GenericVcpuRegistry::new());
+        let id = crate::posix_timer::create_with_clock_kind(
+            carrick_abi::LINUX_CLOCK_PROCESS_CPUTIME_ID as i32,
+            carrick_timer_core::ClockKind::ProcessCpu,
+            carrick_abi::LINUX_SIGPROF,
+            None,
+            0,
+        );
+        let spec = TimerSpecNs {
+            value: 2_000_000,
+            interval: 0,
+        };
+        crate::timer_delivery::arm_fallback_posix_timer(id, spec, &kicker).expect("known id");
+        assert!(!signal_pends_within(
+            carrick_abi::LINUX_SIGPROF,
+            std::time::Duration::from_millis(20)
+        ));
+        burn_guest_cpu(3_000_000);
+        assert!(
+            signal_pends_within(
+                carrick_abi::LINUX_SIGPROF,
+                std::time::Duration::from_secs(5)
+            ),
+            "a CLOCK_PROCESS_CPUTIME_ID timer never fired on a kick lane after guest CPU crossed its due time"
+        );
+        assert!(crate::posix_timer::delete(id));
+        carrick_signal_linux::clear_proc_pending();
     }
 }

@@ -251,17 +251,9 @@ pub fn seed_overrun(id: i32, count: u32) {
 }
 
 /// Drive a POSIX per-process timer's expiries on a backend firing thread.
-pub fn run_fallback(
-    slot: std::sync::Arc<PosixTimerSlot>,
-    generation: u64,
-    spec: TimerSpecNs,
-    on_fire: impl Fn(),
-) {
-    run_fallback_with_cpu(slot, generation, spec, None, on_fire);
-}
-
-/// Drive a POSIX per-process timer's expiries on a backend firing thread, optionally
-/// using a custom CPU-time sampler (`cpu_now`) for CPU-time clocks.
+/// `cpu_now` samples the timer's CPU clock and must be `Some` for a CPU-clock
+/// timer (`slot.clock_kind.is_cpu()`); a `None` or vanished sample ends the
+/// timer. Wall-clock timers ignore it.
 pub fn run_fallback_with_cpu(
     slot: std::sync::Arc<PosixTimerSlot>,
     generation: u64,
