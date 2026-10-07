@@ -487,20 +487,79 @@ impl Stage1Backing {
     }
 }
 
-/// Classify `[va, va + len)` by walking the live graph rooted at `root`.
-/// `read` loads the descriptor word at a table PA, `None` outside the
-/// primary arena. Absent tables skip their whole span, so the walk is
-/// proportional to the populated terminals, not to `len`.
+/// Architecture decoding for the shared anonymous backing walk.
+/// Decoding conveys custody only; it does not authorize descriptor writes.
+pub trait AnonymousDescriptorDecode {
+    fn indices(va: u64) -> [usize; 4];
+    fn next_table(descriptor: u64, level: usize) -> Option<u64>;
+    fn private_state(descriptor: u64) -> carrick_mmu_core::aarch64::El1PrivateLeafState;
+}
+
+pub struct ArmAnonymousDecode;
+impl AnonymousDescriptorDecode for ArmAnonymousDecode {
+    fn indices(va: u64) -> [usize; 4] {
+        carrick_mmu_core::aarch64::indices(va)
+    }
+    fn next_table(descriptor: u64, level: usize) -> Option<u64> {
+        const VALID: u64 = 1;
+        const TABLE: u64 = 0b11;
+        const TABLE_PA: u64 = 0x0000_FFFF_FFFF_F000;
+        (level < 3 && descriptor & (VALID | TABLE) == VALID | TABLE)
+            .then_some(descriptor & TABLE_PA)
+    }
+    fn private_state(descriptor: u64) -> carrick_mmu_core::aarch64::El1PrivateLeafState {
+        carrick_mmu_core::aarch64::el1_private_leaf_state(descriptor)
+    }
+}
+
+pub struct X86AnonymousDecode;
+impl AnonymousDescriptorDecode for X86AnonymousDecode {
+    fn indices(va: u64) -> [usize; 4] {
+        [39, 30, 21, 12].map(|shift| ((va >> shift) & 511) as usize)
+    }
+    fn next_table(descriptor: u64, level: usize) -> Option<u64> {
+        use carrick_mmu_core::x86::descriptor_txn::{ADDRESS, HUGE, PRESENT};
+        (level < 3 && descriptor & PRESENT != 0 && descriptor & HUGE == 0)
+            .then_some(descriptor & ADDRESS)
+    }
+    fn private_state(descriptor: u64) -> carrick_mmu_core::aarch64::El1PrivateLeafState {
+        use carrick_mmu_core::aarch64::El1PrivateLeafState;
+        use carrick_mmu_core::x86::descriptor_txn::{ADDRESS, PREPARED, PRESENT, PRIVATE, RETIRED};
+        if descriptor & PRIVATE == 0 {
+            El1PrivateLeafState::Unowned
+        } else if descriptor & PRESENT != 0 {
+            El1PrivateLeafState::Resident
+        } else if descriptor & RETIRED != 0 {
+            El1PrivateLeafState::Retired
+        } else if descriptor & PREPARED != 0 && descriptor & ADDRESS != 0 {
+            El1PrivateLeafState::Prepared
+        } else {
+            El1PrivateLeafState::Malformed
+        }
+    }
+}
+
+/// ARM binding retained for existing callers of the shared classifier.
 pub fn classify_stage1_range(
     read: &dyn Fn(u64) -> Option<u64>,
     root: u64,
     va: u64,
     len: u64,
 ) -> Stage1Backing {
-    use carrick_mmu_core::aarch64::{El1PrivateLeafState, el1_private_leaf_state, indices};
-    const VALID: u64 = 1;
-    const TABLE: u64 = 0b11;
-    const TABLE_PA: u64 = 0x0000_FFFF_FFFF_F000;
+    classify_anonymous_range::<ArmAnonymousDecode>(read, root, va, len)
+}
+
+/// Classify `[va, va + len)` by walking the live graph rooted at `root`.
+/// `read` loads the descriptor word at a table PA, `None` outside the
+/// primary arena. Absent tables skip their whole span, so the walk is
+/// proportional to the populated terminals, not to `len`.
+pub fn classify_anonymous_range<A: AnonymousDescriptorDecode>(
+    read: &dyn Fn(u64) -> Option<u64>,
+    root: u64,
+    va: u64,
+    len: u64,
+) -> Stage1Backing {
+    use carrick_mmu_core::aarch64::El1PrivateLeafState;
     const SPANS: [u64; 4] = [1 << 39, 1 << 30, 1 << 21, PAGE_SIZE];
     let malformed = Stage1Backing::foreign(ForeignBacking::Malformed);
     let Some(end) = va.checked_add(len) else {
@@ -510,15 +569,15 @@ pub fn classify_stage1_range(
     let (mut private, mut resident) = (false, false);
     let mut cursor = va;
     while cursor < end {
-        let index = indices(cursor);
+        let index = A::indices(cursor);
         let mut table = root;
         let mut level = 0;
         let descriptor = loop {
             let Some(descriptor) = read(table + index[level] as u64 * 8) else {
                 return malformed;
             };
-            if level < 3 && descriptor & (VALID | TABLE) == VALID | TABLE {
-                table = descriptor & TABLE_PA;
+            if let Some(next_table) = A::next_table(descriptor, level) {
+                table = next_table;
                 level += 1;
                 continue;
             }
@@ -527,7 +586,7 @@ pub fn classify_stage1_range(
         let span = SPANS[level];
         let next = (cursor & !(span - 1)).saturating_add(span);
         if descriptor != 0 {
-            match el1_private_leaf_state(descriptor) {
+            match A::private_state(descriptor) {
                 El1PrivateLeafState::Prepared => private = true,
                 El1PrivateLeafState::Resident => {
                     private = true;
@@ -1016,6 +1075,45 @@ pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn x86_private_classifier_regression() {
+        use carrick_mmu_core::x86::descriptor_txn::{PREPARED, PRESENT, PRIVATE, RETIRED};
+        let root = 0x1000;
+        for (leaf, expected) in [
+            (0x5000 | PRIVATE | PRESENT, RangeBacking::Private),
+            (0x5000 | PRIVATE | PREPARED, RangeBacking::Prepared),
+            (0x5000 | PRIVATE | RETIRED, RangeBacking::Retired),
+            (0x5000 | PRESENT, RangeBacking::Foreign),
+            (PRIVATE, RangeBacking::Foreign),
+            (0, RangeBacking::Empty),
+        ] {
+            let read = |pa| match pa {
+                0x1000 => Some(0x2000 | 7),
+                0x2000 => Some(0x3000 | 7),
+                0x3000 => Some(0x4000 | 7),
+                0x4000 => Some(leaf),
+                _ => None,
+            };
+            assert_eq!(
+                classify_anonymous_range::<X86AnonymousDecode>(&read, root, 0, 4096).summary,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn x86_classifier_skips_absent_subtrees() {
+        use core::cell::Cell;
+        let reads = Cell::new(0);
+        let read = |pa| {
+            reads.set(reads.get() + 1);
+            (pa == 0x1000).then_some(0)
+        };
+        let backing = classify_anonymous_range::<X86AnonymousDecode>(&read, 0x1000, 0, 1 << 39);
+        assert_eq!(backing.summary, RangeBacking::Empty);
+        assert_eq!(reads.get(), 1);
+    }
+
     use super::*;
 
     #[derive(Default)]
