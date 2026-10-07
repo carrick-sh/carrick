@@ -516,6 +516,17 @@ pub enum DispatchOutcome {
     /// Backend: complete the syscall with `errno.guest_retval()` (the negative
     /// errno), service pending signals, and resume the task.
     Errno { errno: LinuxErrno },
+    /// A stat result was already captured from its fd or pathname. Retain
+    /// that immutable record and complete only its copyout after this exact
+    /// owner dependency settles; repeating the lookup can observe a reused fd.
+    /// Backend: enroll the dependency, release execution capacity, and resume
+    /// `output` under the same task binding before completing the syscall.
+    OwnerStatCopyout {
+        #[serde(skip_serializing)]
+        output: Box<super::format_stat::StatCopyout>,
+        #[serde(skip_serializing)]
+        dependency: carrick_guest_mem::MemoryPrepareError,
+    },
     /// An admitted EL1 owner declined memory preparation before the host
     /// source was consumed. The runtime enrolls this exact owner/cause/revision
     /// in the zone, releases the executor, and retries the saved syscall only

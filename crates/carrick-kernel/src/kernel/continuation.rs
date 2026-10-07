@@ -1480,6 +1480,7 @@ impl BlockedContinuation {
             DispatchOutcome::Returned { .. }
             | DispatchOutcome::SchedulerYield
             | DispatchOutcome::Errno { .. }
+            | DispatchOutcome::OwnerStatCopyout { .. }
             | DispatchOutcome::OwnerMemoryWait { .. }
             | DispatchOutcome::OwnerMemorySupply { .. }
             | DispatchOutcome::OwnerPhysicalWait { .. }
