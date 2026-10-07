@@ -306,6 +306,12 @@ impl<'a> SpaceNotificationLease<'a> {
             && self.source.retirement.load(Ordering::Acquire) == 0
             && self.zone.spaces.key(self.index) == self.identity.mm.get()
     }
+    /// The editor word is the resource predicate for an Editor wait. Its
+    /// revision advances before the editor unlocks, so revision equality
+    /// alone cannot prove the resource is still held at enrollment.
+    pub fn editor_held(&self) -> bool {
+        self.zone.spaces.active_editor(self.index).is_some()
+    }
     pub fn identity(&self) -> SpaceNotificationIdentity {
         self.identity
     }
