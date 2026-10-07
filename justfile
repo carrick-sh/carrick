@@ -242,6 +242,11 @@ lint-domains-source:
     # before the offline personality-boundary graph check on fresh runners.
     {{_admit}} {{_cargo}} fetch --locked
     {{_admit}} {{_cargo}} metadata --locked --offline --all-features --format-version 1 > target/cargo-metadata.json
+    # Nested fixture workspaces (fixtures/*/Cargo.lock) sit outside the root
+    # workspace, so the --locked gates above never resolve them; without this
+    # step lock drift surfaced only at `just fixtures-publish`. No compile, so it
+    # costs a lock resolution per fixture.
+    ./scripts/check-fixture-lockfiles.sh
     {{_admit}} {{_cargo}} run -p carrick-conformance-contract --bin check-personality-boundary -- --root . --metadata-file target/cargo-metadata.json
     python3 -m unittest scripts/tests/test_check_contract_change.py
     python3 scripts/migrate/check-runtime-global-state.py --check
