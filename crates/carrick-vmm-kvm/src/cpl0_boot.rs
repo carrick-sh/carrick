@@ -161,6 +161,7 @@ fn fixture_cpuid_with_tsc_hz(
             ..Default::default()
         };
         selected[leaf0].eax = selected[leaf0].eax.max(0x15);
+        *entries = selected;
         return Ok(());
     }
     let clock = kvm_bindings::kvm_cpuid_entry2 {
@@ -185,6 +186,19 @@ pub enum InitialSyscallDisposition {
     Return(i64),
     Refused(carrick_abi::LinuxErrno),
     Exit(GuestExitStatus),
+}
+
+/// Physical services carry no guest Linux policy or host dispatch authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalCrossingFamily {
+    OwnerGrant,
+}
+impl PhysicalCrossingFamily {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnerGrant => "owner_grant",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -333,6 +347,7 @@ struct InitialInventory {
     authority: Arc<FrameInventoryAuthority>,
     receipt: Option<carrick_hal::FrameInventoryApplyReceipt>,
     frames: Vec<(FrameGpa, BackingIdentity)>,
+    length: FrameLength,
     expected: usize,
     committed: usize,
     guest_exposed: bool,
@@ -434,6 +449,7 @@ impl InitialInventory {
                 authority,
                 receipt: Some(receipt),
                 frames,
+                length,
                 expected: 0,
                 committed: 0,
                 guest_exposed: false,
@@ -455,10 +471,26 @@ impl InventoryTransaction for InitialInventory {
         let receipt = self.receipt.as_ref().ok_or_else(|| {
             crate::carrier_memory::MemoryError("initial inventory receipt absent".into())
         })?;
-        for &(_, identity) in &self.frames {
+        let mm = MmId::from_raw_u64(INITIAL_MM_KEY).ok_or_else(|| {
+            crate::carrier_memory::MemoryError("initial inventory MM absent".into())
+        })?;
+        if receipt.mm().get() != mm.raw() {
+            return Err(crate::carrier_memory::MemoryError(
+                "inventory MM mismatch".into(),
+            ));
+        }
+        for &(gpa, identity) in &self.frames {
             let mapping = MappingId::from_kernel_allocation(identity.mapping_id);
             let frame = FrameId::from_kernel_allocation(identity.frame_id);
-            if !receipt.authorizes(mapping, frame) {
+            if !receipt.authorizes(mapping, frame)
+                || !self.authority.mapping_is_live_exact(
+                    mm,
+                    mapping,
+                    frame,
+                    carrick_guest_mem::Gpa(gpa.raw()),
+                    self.length,
+                )
+            {
                 return Err(crate::carrier_memory::MemoryError(
                     "inventory frame missing".into(),
                 ));
@@ -804,9 +836,10 @@ pub struct Cpl0Carrier {
     object_ids: Arc<ObjectIdRegistry>,
     initial_inventory: Option<InitialInventory>,
     grant_tables: Vec<RootGpa>,
-    anonymous_next_gpa: u64,
+    anonymous_next_gpa: FrameGpa,
     anonymous_pending: Option<anonymous_owner::PendingGrant>,
     anonymous_private_pages: u64,
+    owner_grant_crossings: u64,
     metadata_base: NonNull<u8>,
     host_forwards: u64,
     host_yields: u64,
@@ -1669,6 +1702,7 @@ impl Cpl0Carrier {
                     ..
                 }
             ) {
+                self.record_physical_crossing(PhysicalCrossingFamily::OwnerGrant)?;
                 self.service_anonymous_grant()?;
                 continue;
             }
@@ -1777,6 +1811,26 @@ impl Cpl0Carrier {
     /// checked at the stopped guest's applied owner-grant completion.
     pub fn anonymous_private_pages(&self) -> u64 {
         self.anonymous_private_pages
+    }
+
+    fn record_physical_crossing(
+        &mut self,
+        family: PhysicalCrossingFamily,
+    ) -> Result<(), TrapError> {
+        let count = match family {
+            PhysicalCrossingFamily::OwnerGrant => &mut self.owner_grant_crossings,
+        };
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| fail("physical crossing counter exhausted"))?;
+        Ok(())
+    }
+
+    pub fn physical_crossing_counts(&self) -> [(PhysicalCrossingFamily, u64); 1] {
+        [(
+            PhysicalCrossingFamily::OwnerGrant,
+            self.owner_grant_crossings,
+        )]
     }
 
     pub(crate) fn boot_inner(
@@ -2416,9 +2470,10 @@ impl Cpl0Carrier {
             object_ids,
             initial_inventory: None,
             grant_tables: Vec::new(),
-            anonymous_next_gpa: 0x2_0000_0000,
+            anonymous_next_gpa: FrameGpa::new(0x2_0000_0000),
             anonymous_pending: None,
             anonymous_private_pages: 0,
+            owner_grant_crossings: 0,
             metadata_base,
             host_forwards: 0,
             host_yields: 0,
@@ -3589,6 +3644,24 @@ mod watchdog_tests {
 #[cfg(test)]
 mod initial_reply_tests {
     use super::*;
+
+    #[test]
+    fn initial_inventory_refuses_a_grant_with_a_different_gpa() {
+        let (mut inventory, _) = InitialInventory::stage(
+            Arc::new(FrameInventoryAuthority::new()),
+            &ObjectIdRegistry::new(),
+            [FrameGpa::new(0x2_0000_0000)],
+            0,
+            4096,
+            NonZeroU64::MIN,
+        )
+        .expect("fresh exact inventory grant");
+        inventory.frames[0].0 = FrameGpa::new(0x2_0000_1000);
+        assert!(
+            inventory.publish().is_err(),
+            "a mapping/frame pair does not authorize another GPA"
+        );
+    }
 
     #[test]
     fn unverified_guest_completion_keeps_inventory_custody_until_vm_teardown() {

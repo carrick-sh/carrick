@@ -96,14 +96,12 @@ pub fn select_fault_window<
 >(
     root: &mut crate::mm::reservation::Reservations<'_, Policy, Geometry, Context>,
     carrier: NonZeroU64,
-    va: u64,
-    max_len: u64,
-    access: u64,
+    va: carrick_guest_arch::UserVa,
+    max_len: carrick_guest_arch::GuestLen,
+    protection: carrick_core_abi::ReservationProtection,
 ) -> Result<carrick_core_abi::PortalGrantWindow, crate::mm::reservation::Refusal> {
     use crate::mm::reservation::Refusal;
-    let protection =
-        carrick_core_abi::ReservationProtection::from_bits(access).ok_or(Refusal::Invalid)?;
-    let plan = root.transfer_fault_plan(va & !4095, max_len, protection)?;
+    let plan = root.transfer_fault_plan(va.raw() & !4095, max_len.raw(), protection)?;
     let mapping = root.mapping(plan.range.start()).ok_or(Refusal::Stale)?;
     let host_backing = match mapping.host_backing {
         Some(source) => Some(
@@ -169,8 +167,14 @@ impl<
                 .ok()?;
             root.mapping(va)?.host_backing?;
             owner_source.set(true);
-            let window =
-                select_fault_window(&mut root, self.slots.carrier()?, va, 4096, access).ok()?;
+            let window = select_fault_window(
+                &mut root,
+                self.slots.carrier()?,
+                carrick_guest_arch::UserVa::new(va),
+                carrick_guest_arch::GuestLen::new(4096),
+                carrick_core_abi::ReservationProtection::from_bits(access)?,
+            )
+            .ok()?;
             drop(root);
             let slot = self.slots.grant(self.worker as usize)?;
             let generation = next_frame_grant_generation();

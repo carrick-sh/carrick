@@ -188,6 +188,12 @@ fn mounted_static_x86_elf_matches_native_anonymous_memory() {
     let witness = &report["report"]["execution_witness"];
     assert_eq!(witness["anonymous_private_pages"], 1);
     assert_eq!(
+        witness["physical_crossing_families"],
+        serde_json::json!([
+            { "family": "owner_grant", "count": 2 }
+        ])
+    );
+    assert_eq!(
         witness["host_forwards"], 2,
         "only write and exit cross host dispatch"
     );
@@ -196,6 +202,36 @@ fn mounted_static_x86_elf_matches_native_anonymous_memory() {
             .as_array()
             .is_none_or(|rows| rows.is_empty())
     );
+}
+
+#[test]
+fn mounted_static_x86_adjacent_anonymous_memory_keeps_existing_leaf() {
+    compare_mounted_assembly_with_native("x86_adjacent_memory.S", b"A\n");
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("adjacent-counted");
+    compile_assembly("x86_adjacent_memory.S", &elf);
+    let observed = run_mounted_binary(&elf, "x86-adjacent-counted", true);
+    assert_eq!(observed.status.code(), Some(7));
+    let report: serde_json::Value = serde_json::from_slice(
+        observed
+            .stdout
+            .strip_prefix(b"A\n")
+            .expect("adjacent output"),
+    )
+    .unwrap();
+    let witness = &report["report"]["execution_witness"];
+    assert_eq!(witness["anonymous_private_pages"], 2);
+    assert_eq!(
+        witness["physical_crossing_families"],
+        serde_json::json!([
+            { "family": "owner_grant", "count": 4 }
+        ])
+    );
+    assert_eq!(witness["host_forwards"], 2);
+    assert_eq!(witness["portal_exits"], 6);
 }
 
 #[test]

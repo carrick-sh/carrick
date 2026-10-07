@@ -96,12 +96,13 @@ impl Cpl0Carrier {
         if self.cpus[0].get_gpr(X86Reg::Cr3)? != root.address().raw() {
             return Err(fail("owner grant inactive root"));
         }
-        let gpa = FrameGpa::new(self.anonymous_next_gpa);
+        let gpa = self.anonymous_next_gpa;
         let len = window.range.len();
-        self.anonymous_next_gpa = gpa
-            .raw()
-            .checked_add(len)
-            .ok_or_else(|| fail("owner grant GPA exhausted"))?;
+        self.anonymous_next_gpa = FrameGpa::new(
+            gpa.raw()
+                .checked_add(len)
+                .ok_or_else(|| fail("owner grant GPA exhausted"))?,
+        );
         let (mut inventory, grants) = InitialInventory::stage(
             Arc::clone(&self.frame_inventory),
             &self.object_ids,
@@ -148,8 +149,12 @@ impl Cpl0Carrier {
                     va: window.range.start(),
                     ipa: grant.gpa,
                     len,
-                    writable: window.protection.bits() & 2 != 0,
-                    executable: window.protection.bits() & 4 != 0,
+                    writable: window
+                        .protection
+                        .permits(carrick_el1_abi::ReservationProtection::WRITE),
+                    executable: window
+                        .protection
+                        .permits(carrick_el1_abi::ReservationProtection::EXECUTE),
                 },
                 resident: PageSpan::new(window.fault_page, 4096),
                 backing: identity,

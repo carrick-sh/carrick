@@ -6,7 +6,7 @@ use carrick_el1::memory::reservations::{X86Cpl0Zone, shared_x86_cpl0_guest};
 use carrick_el1_abi::{
     CurrentTask, TrapFrame,
 };
-use carrick_guest_arch::RootGpa;
+use carrick_guest_arch::{RootGpa, FrameGpa, UserRange, UserVa, GuestLen};
 use carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords;
 use carrick_personality_linux::dispatch::FamilyCompletion;
 use carrick_personality_linux::entry::{CanonicalCall, SyscallResult};
@@ -20,9 +20,9 @@ static TABLE_START: AtomicU64 = AtomicU64::new(0);
 static TABLE_END: AtomicU64 = AtomicU64::new(0);
 
 static LIVE_CONTEXT: carrick_el1::lock::SpinLock<Option<carrick_guest_arch::AddressContext<RootGpa>>> = carrick_el1::lock::SpinLock::new(None);
-pub(super) fn live_words(mm: u64) -> Option<InitialWords> {
+pub(super) fn live_words(mm: carrick_el1_abi::ReservationMm) -> Option<InitialWords> {
     let context = (*LIVE_CONTEXT.lock())?;
-    if context.mm.raw().get() != mm
+    if context.mm.raw().get() != mm.raw()
         || carrick_el1::isa::x86::hardware_live_root().ok()? != context.root { return None; }
     let end = TABLE_END.load(Ordering::Acquire);
     let start = TABLE_START.load(Ordering::Relaxed);
@@ -58,7 +58,8 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
         Some(&self.task.linux)
     }
     fn delegated(&mut self) -> DelegatedStep {
-        let mm = self.task.mm.key.load(Ordering::Acquire);
+        let Some(mm) = carrick_el1_abi::ReservationMm::new(self.task.mm.key.load(Ordering::Acquire))
+            else { return DelegatedStep::Forward; };
         let Some(words) = live_words(mm) else { return DelegatedStep::Forward; };
         let zone_address = carrick_el1::isa::x86_kernel_layout().zone.raw();
         // SAFETY: boot retains the compact zone throughout this MM's execution.
@@ -71,7 +72,7 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
         };
         // SAFETY: this CPU's binding retains its initialized atomic counters.
         let counters = unsafe { &*(binding.counters_address as *const carrick_el1_abi::Counters) };
-        let mut editor = X86AnonymousEditor { words };
+        let mut editor = X86AnonymousEditor { words, sequence: None };
         match carrick_el1::memory::serve_delegated_anonymous(
             &mut self.frame, counters, self.task,
             carrick_core::wait::space_access(zone, slot, initial_release),
@@ -91,20 +92,23 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
     }
 }
 
-struct X86AnonymousEditor { words: InitialWords }
+struct X86AnonymousEditor {
+    words: InitialWords,
+    sequence: Option<carrick_el1_abi::ReservationSequence>,
+}
 impl X86AnonymousEditor {
-    fn edit(&self, register: u64, va: u64, len: u64, operation: carrick_guest_arch::EditOperation)
+    fn edit(&self, register: RootGpa, range: UserRange, operation: carrick_guest_arch::EditOperation)
         -> Result<(), carrick_mmu_core::descriptor_refusal::DescriptorRefusal> {
-        use carrick_guest_arch::{EditIntent, EditOwner, GuestLen, UserRange, UserVa};
+        use carrick_guest_arch::{EditIntent, EditOwner};
         use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
         use carrick_mmu_core::x86::descriptor_txn::{DescriptorOutcome, DescriptorTxn, InlineJournal, execute_descriptor_txn};
         let context = self.words.context.ok_or(DescriptorRefusal::StaleRoot)?;
-        if context.root.address().raw() != register { return Err(DescriptorRefusal::StaleRoot); }
-        let range = UserRange::checked(UserVa::new(va), GuestLen::new(len))
-            .ok_or(DescriptorRefusal::BadRange)?;
+        if context.root != register { return Err(DescriptorRefusal::StaleRoot); }
         // SAFETY: serve_delegated_anonymous holds the exact MM editor and root
         // across this operation; InitialWords retains its authenticated context.
-        let owner = unsafe { EditOwner::issue(context.root, context.mm.raw(), context.generation.raw()) };
+        let sequence = self.sequence.and_then(|sequence| core::num::NonZeroU64::new(sequence.raw()))
+            .ok_or(DescriptorRefusal::BadEncoding)?;
+        let owner = unsafe { EditOwner::issue(context.root, context.mm.raw(), sequence) };
         let intent = EditIntent::checked(owner, range, operation, &[])
             .ok_or(DescriptorRefusal::BadRange)?;
         let txn = DescriptorTxn::from_intent(&intent)?;
@@ -116,6 +120,9 @@ impl X86AnonymousEditor {
     }
 }
 impl carrick_el1::memory::AnonymousBackingProbe for X86AnonymousEditor {
+    fn bind_operation(&mut self, sequence: carrick_el1_abi::ReservationSequence) {
+        self.sequence = Some(sequence);
+    }
     fn backing(&mut self, root: u64, va: u64, len: u64) -> carrick_el1::memory::Stage1Backing {
         classify_anonymous_range::<X86AnonymousDecode>(&|pa| self.words.load(pa).ok(), root, va, len)
     }
@@ -127,7 +134,10 @@ impl carrick_el1::memory::AnonymousBackingProbe for X86AnonymousEditor {
 impl carrick_el1::memory::AnonymousPermissionEditor for X86AnonymousEditor {
     fn protect_and_invalidate(&mut self, root: u64, edit: carrick_mmu_core::aarch64::GuestPermissionEdit)
         -> Result<(), carrick_mmu_core::aarch64::GuestPermissionEditError> {
-        self.edit(root, edit.va, edit.len, carrick_guest_arch::EditOperation::Protect {
+        self.edit(
+            RootGpa::page_aligned(FrameGpa::new(root)).ok_or(carrick_mmu_core::aarch64::GuestPermissionEditError::NotPrivateAnonymous)?,
+            UserRange::checked(UserVa::new(edit.va), GuestLen::new(edit.len)).ok_or(carrick_mmu_core::aarch64::GuestPermissionEditError::NotPrivateAnonymous)?,
+            carrick_guest_arch::EditOperation::Protect {
             permissions: carrick_guest_arch::EditPermissions {
                 readable: edit.readable, writable: edit.writable, executable: edit.executable,
                 user: edit.readable || edit.writable || edit.executable,
@@ -138,7 +148,10 @@ impl carrick_el1::memory::AnonymousPermissionEditor for X86AnonymousEditor {
 impl carrick_el1::memory::AnonymousRetirementEditor for X86AnonymousEditor {
     fn retire_and_invalidate(&mut self, root: u64, va: u64, len: u64)
         -> Result<(), carrick_mmu_core::aarch64::GuestRetirementError> {
-        self.edit(root, va, len, carrick_guest_arch::EditOperation::Unmap)
+        self.edit(
+            RootGpa::page_aligned(FrameGpa::new(root)).ok_or(carrick_mmu_core::aarch64::GuestRetirementError::NotPrivateAnonymous)?,
+            UserRange::checked(UserVa::new(va), GuestLen::new(len)).ok_or(carrick_mmu_core::aarch64::GuestRetirementError::NotPrivateAnonymous)?,
+            carrick_guest_arch::EditOperation::Unmap)
             .map_err(|_| carrick_mmu_core::aarch64::GuestRetirementError::NotPrivateAnonymous)
     }
 }
