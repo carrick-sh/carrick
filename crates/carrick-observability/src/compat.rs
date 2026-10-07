@@ -536,6 +536,9 @@ pub struct ExecutionWitness {
     #[serde(default)]
     pub portal_exits: u64,
     pub host_forwards: u64,
+    /// PRIVATE pages authenticated against live CPL0 descriptors at grant settlement.
+    #[serde(default)]
+    pub anonymous_private_pages: u64,
     /// Temporary host semantic scaffolding, counted by crossing family.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_forward_families: Vec<ExecutionFamilyCount>,

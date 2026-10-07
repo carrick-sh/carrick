@@ -18,7 +18,7 @@ pub fn panic_publication_detail() -> u64 {
     0
 }
 
-pub use carrick_core::mm::fault::{request_lazy_frames, root_admits_commit};
+pub use carrick_core::mm::fault::{request_lazy_frames, root_fault_admission};
 
 /// Decode an EL0 translation fault that can be satisfied by publishing fresh
 /// anonymous backing. Permission faults name an already-mapped page and must
@@ -62,6 +62,7 @@ enum FaultClass {
         grant_access: u64,
     },
     WritePermission,
+    Protection(LeafAccess),
     Other,
 }
 
@@ -85,7 +86,8 @@ fn x86_fault_class(fault: carrick_guest_arch::FaultInfo) -> FaultClass {
     }
     match (fault.present, fault.access) {
         (true, Access::Write) => FaultClass::WritePermission,
-        (true, _) => FaultClass::Other,
+        (true, Access::Read) => FaultClass::Protection(LeafAccess::Read),
+        (true, Access::Execute) => FaultClass::Protection(LeafAccess::Execute),
         (false, Access::Read) => FaultClass::Translation {
             access: LeafAccess::Read,
             grant_access: 1,
@@ -228,36 +230,29 @@ impl PreparedPageResolver for HardwarePreparedResolver {
 /// CPL0 publication of a host-backed prepared leaf while the shared fault
 /// dispatcher holds this MM's exact guest editor.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub struct X86PreparedResolver {
+pub struct X86PreparedResolver<'a, W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords> {
     mm_key: NonZeroU64,
-    table_alias: carrick_guest_arch::KernelVa,
-    table_bytes: carrick_guest_arch::GuestLen,
+    words: &'a W,
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 static X86_EDIT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-impl X86PreparedResolver {
+impl<'a, W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords> X86PreparedResolver<'a, W> {
     /// # Safety
-    /// Use this resolver only inside `dispatch_x86_fault_with_prepared`, whose
-    /// exact-MM editor spans `commit_prepared` and receipt settlement. The
-    /// alias must retain writable supervisor mappings of the target arena.
-    pub unsafe fn under_editor(
-        mm_key: NonZeroU64,
-        table_alias: carrick_guest_arch::KernelVa,
-        table_bytes: carrick_guest_arch::GuestLen,
-    ) -> Self {
-        Self {
-            mm_key,
-            table_alias,
-            table_bytes,
-        }
+    /// The shared fault dispatcher must retain this MM's exact editor across
+    /// each operation. words retains the owner-admitted table window and
+    /// performs checked invalidation for its actual live address context.
+    pub unsafe fn under_editor(mm_key: NonZeroU64, words: &'a W) -> Self {
+        Self { mm_key, words }
     }
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-impl PreparedPageResolver for X86PreparedResolver {
+impl<W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords> PreparedPageResolver
+    for X86PreparedResolver<'_, W>
+{
     fn commit_prepared(
         &mut self,
         root_pa: u64,
@@ -266,22 +261,25 @@ impl PreparedPageResolver for X86PreparedResolver {
         access: LeafAccess,
     ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
         use carrick_guest_arch::{
-            Access, EditIntent, EditOperation, EditOwner, FrameGpa, GuestLen, MmuEditArch, RootGpa,
-            TableWindow, UserRange, UserVa,
+            EditIntent, EditOperation, EditOwner, FrameGpa, GuestLen, RootGpa, UserRange, UserVa,
         };
         use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
-        use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
-
+        use carrick_mmu_core::x86::descriptor_txn::{
+            Access, DescriptorOutcome, DescriptorTxn, InlineJournal, execute_descriptor_txn,
+            translate_leaf,
+        };
         let root = RootGpa::page_aligned(FrameGpa::new(root_pa))
             .ok_or(GuestPreparedCommitError::BadAddress)?;
-        let address = UserVa::new(va);
-        let range = UserRange::checked(address, GuestLen::new(4096))
+        if crate::isa::x86::hardware_live_root() != Ok(root) {
+            return Err(GuestPreparedCommitError::BadAddress);
+        }
+        let range = UserRange::checked(UserVa::new(va), GuestLen::new(4096))
             .ok_or(GuestPreparedCommitError::BadAddress)?;
         let expected = FrameGpa::new(expected_pa);
-        let fault_access = match access {
-            LeafAccess::Read => Access::Read,
-            LeafAccess::Write => Access::Write,
-            LeafAccess::Execute => Access::Execute,
+        let (fault_access, native_access) = match access {
+            LeafAccess::Read => (carrick_guest_arch::Access::Read, Access::Read),
+            LeafAccess::Write => (carrick_guest_arch::Access::Write, Access::Write),
+            LeafAccess::Execute => (carrick_guest_arch::Access::Execute, Access::Execute),
         };
         let sequence = X86_EDIT_SEQUENCE
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
@@ -290,14 +288,8 @@ impl PreparedPageResolver for X86PreparedResolver {
             .ok()
             .and_then(NonZeroU64::new)
             .ok_or(GuestPreparedCommitError::BadAddress)?;
-        // SAFETY: the constructor requires a retained supervisor alias; this
-        // resolver is invoked only while the shared dispatcher holds the
-        // exact editor of the authenticated root.
-        let tables =
-            unsafe { TableWindow::issue(root.address(), self.table_alias, self.table_bytes) }
-                .ok_or(GuestPreparedCommitError::TableOutsidePrimary)?;
-        // SAFETY: `under_editor` requires this resolver to run only under the
-        // exact-MM editor; the caller's grant names the current MM root.
+        // SAFETY: constructor and shared dispatch retain the exact editor;
+        // live_root above authenticates the executing hardware context.
         let owner = unsafe { EditOwner::issue(root, self.mm_key, sequence) };
         let intent = EditIntent::checked(
             owner,
@@ -309,56 +301,34 @@ impl PreparedPageResolver for X86PreparedResolver {
             &[],
         )
         .ok_or(GuestPreparedCommitError::BadAddress)?;
-        let mut arch = crate::isa::x86::Kernel::new(crate::isa::x86::X86Backend);
-        // SAFETY: exact editor and retained supervisor table alias are held
-        // through descriptor publication and the local drain receipt.
-        let receipt = unsafe { arch.execute_edit(intent, tables) };
-        match receipt {
-            Ok(receipt) => match receipt.outcome {
-                DescriptorOutcome::Applied { .. } => Ok(GuestPreparedCommit::Committed),
-                DescriptorOutcome::Refused(DescriptorRefusal::NotPrepared) => {
-                    // SAFETY: the same exact editor and table alias remain
-                    // held; the read-only walk authenticates the existing
-                    // user leaf before declaring the retry resident.
-                    let tables = unsafe {
-                        TableWindow::issue(root.address(), self.table_alias, self.table_bytes)
-                    }
-                    .ok_or(GuestPreparedCommitError::TableOutsidePrimary)?;
-                    if unsafe {
-                        crate::isa::x86::resident_leaf_matches(
-                            root,
-                            &tables,
-                            address,
-                            expected,
-                            fault_access,
-                        )
-                    }
-                    .unwrap_or(false)
-                    {
-                        Ok(GuestPreparedCommit::AlreadyResident)
-                    } else {
-                        Err(GuestPreparedCommitError::NotPrepared)
-                    }
+        let txn = DescriptorTxn::from_intent(&intent)
+            .map_err(|_| GuestPreparedCommitError::BadAddress)?;
+        let receipt = execute_descriptor_txn(self.words, &txn, root, &mut InlineJournal::new());
+        match receipt.outcome {
+            DescriptorOutcome::Applied { .. } => Ok(GuestPreparedCommit::Committed),
+            DescriptorOutcome::Refused(DescriptorRefusal::NotPrepared) => {
+                if translate_leaf(self.words, root, UserVa::new(va), native_access, true)
+                    .is_ok_and(|leaf| leaf.output == expected)
+                {
+                    Ok(GuestPreparedCommit::AlreadyResident)
+                } else {
+                    Err(GuestPreparedCommitError::NotPrepared)
                 }
-                DescriptorOutcome::Refused(DescriptorRefusal::WrongBacking) => {
-                    Err(GuestPreparedCommitError::WrongBacking)
-                }
-                DescriptorOutcome::Refused(DescriptorRefusal::PermissionDenied) => {
-                    Err(GuestPreparedCommitError::PermissionDenied)
-                }
-                DescriptorOutcome::Refused(DescriptorRefusal::MissingTable) => {
-                    Err(GuestPreparedCommitError::MissingTable)
-                }
-                DescriptorOutcome::Refused(DescriptorRefusal::TableOutsidePrimary) => {
-                    Err(GuestPreparedCommitError::TableOutsidePrimary)
-                }
-                DescriptorOutcome::Indeterminate(_) => {
-                    Err(GuestPreparedCommitError::RollbackFailed)
-                }
-                _ => Err(GuestPreparedCommitError::NotPrepared),
-            },
-            Err(crate::isa::ArchError::Busy) => Err(GuestPreparedCommitError::RollbackFailed),
-            Err(_) => Err(GuestPreparedCommitError::BadAddress),
+            }
+            DescriptorOutcome::Refused(DescriptorRefusal::WrongBacking) => {
+                Err(GuestPreparedCommitError::WrongBacking)
+            }
+            DescriptorOutcome::Refused(DescriptorRefusal::PermissionDenied) => {
+                Err(GuestPreparedCommitError::PermissionDenied)
+            }
+            DescriptorOutcome::Refused(DescriptorRefusal::MissingTable) => {
+                Err(GuestPreparedCommitError::MissingTable)
+            }
+            DescriptorOutcome::Refused(DescriptorRefusal::TableOutsidePrimary) => {
+                Err(GuestPreparedCommitError::TableOutsidePrimary)
+            }
+            DescriptorOutcome::Indeterminate(_) => Err(GuestPreparedCommitError::RollbackFailed),
+            _ => Err(GuestPreparedCommitError::NotPrepared),
         }
     }
 }
@@ -1166,6 +1136,47 @@ impl<'a> GrantMailboxes<'a> {
     }
 }
 
+/// A CPL0 fault can request physical supply without delegating leaf publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnerFaultSupplyOutcome {
+    Unavailable,
+    PolicyDeclined,
+    Selected,
+}
+
+pub struct OwnerFaultSupply<'a> {
+    pub slots: &'a carrick_el1_abi::MmPortalSlots,
+    outcome: core::cell::Cell<OwnerFaultSupplyOutcome>,
+}
+impl<'a> OwnerFaultSupply<'a> {
+    pub fn new(slots: &'a carrick_el1_abi::MmPortalSlots) -> Self {
+        Self {
+            slots,
+            outcome: core::cell::Cell::new(OwnerFaultSupplyOutcome::Unavailable),
+        }
+    }
+    pub fn outcome(&self) -> OwnerFaultSupplyOutcome {
+        self.outcome.get()
+    }
+}
+#[derive(Clone, Copy)]
+pub enum FaultSupply<'a> {
+    Mailbox(GrantMailboxes<'a>),
+    Owner(&'a OwnerFaultSupply<'a>),
+}
+impl<'a> From<GrantMailboxes<'a>> for FaultSupply<'a> {
+    fn from(mailboxes: GrantMailboxes<'a>) -> Self {
+        Self::Mailbox(mailboxes)
+    }
+}
+impl FaultSupply<'_> {
+    fn decline(self) {
+        if let Self::Owner(owner) = self {
+            owner.outcome.set(OwnerFaultSupplyOutcome::PolicyDeclined);
+        }
+    }
+}
+
 /// Fault dispatch with explicitly supplied shared regions and COW resolver.
 /// A refusal is consumed and forwarded once through the host fault path.
 /// Successful publication and first-touch commit both happen on the host.
@@ -1253,7 +1264,7 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         counters,
         current_tasks,
         spaces,
-        mailboxes,
+        mailboxes.into(),
         prepared,
         cow_resolver,
     )
@@ -1263,6 +1274,7 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
 /// The entry backend must have checked the fault's user origin before calling.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_x86_fault_with_prepared<
+    'supply,
     P: PreparedPageResolver,
     C: CowResolver,
     G: carrick_core::mm::reservation::ReservationGeometry,
@@ -1273,7 +1285,7 @@ pub fn dispatch_x86_fault_with_prepared<
     counters: &Counters,
     current_tasks: &[CurrentTask],
     spaces: SpaceAccess<'_, Context>,
-    mailboxes: GrantMailboxes<'_>,
+    supply: impl Into<FaultSupply<'supply>>,
     prepared: Option<PreparedFaultPath<'_, P, G>>,
     cow_resolver: &mut C,
 ) -> Action {
@@ -1284,7 +1296,7 @@ pub fn dispatch_x86_fault_with_prepared<
         counters,
         current_tasks,
         spaces,
-        mailboxes,
+        supply.into(),
         prepared,
         cow_resolver,
     )
@@ -1303,11 +1315,11 @@ fn dispatch_classified_fault<
     counters: &Counters,
     current_tasks: &[CurrentTask],
     spaces: SpaceAccess<'_, Context>,
-    mailboxes: GrantMailboxes<'_>,
+    supply: FaultSupply<'_>,
     mut prepared: Option<PreparedFaultPath<'_, P, G>>,
     cow_resolver: &mut C,
 ) -> Action {
-    let mailbox = mailboxes.own;
+    use carrick_core::mm::fault::RootFaultAdmission;
     counters.fault_taken.fetch_add(1, Ordering::Relaxed);
     if fault == FaultClass::WritePermission {
         let Some(task) = current_tasks.get(slot as usize) else {
@@ -1323,6 +1335,23 @@ fn dispatch_classified_fault<
         let Some(owner) = NonZeroU64::new(slot + 1) else {
             return Action::Forward;
         };
+        if let FaultSupply::Owner(_) = supply {
+            match root_fault_admission(
+                prepared.as_ref().and_then(|path| path.roots),
+                spaces,
+                slot as u32,
+                mm_key,
+                far & !4095,
+                LeafAccess::Write,
+            ) {
+                RootFaultAdmission::Allowed => {}
+                RootFaultAdmission::Declined => {
+                    supply.decline();
+                    return Action::Forward;
+                }
+                _ => return Action::Forward,
+            }
+        }
         // A closed gate (host pause or retirement) or another EL1 editor:
         // the host resolves this fault.
         // Sibling threads fault on the same forked MM together; each COW
@@ -1347,6 +1376,22 @@ fn dispatch_classified_fault<
         return Action::Forward;
     }
 
+    if let FaultClass::Protection(access) = fault {
+        if let FaultSupply::Owner(_) = supply
+            && let Some(task) = current_tasks.get(slot as usize)
+            && root_fault_admission(
+                prepared.as_ref().and_then(|path| path.roots),
+                spaces,
+                slot as u32,
+                task.mm.key.load(Ordering::Acquire),
+                far & !4095,
+                access,
+            ) == RootFaultAdmission::Declined
+        {
+            supply.decline();
+        }
+        return Action::Forward;
+    }
     let FaultClass::Translation {
         access: prepared_access,
         grant_access: access,
@@ -1369,16 +1414,20 @@ fn dispatch_classified_fault<
         // First-touch stock over a root hole is backing, not a mapping: the
         // host answers a touch the root does not map (SIGSEGV), and asks
         // for no grant.
-        if root_admits_commit(
+        match root_fault_admission(
             prepared.as_ref().and_then(|path| path.roots),
             spaces,
             slot as u32,
             mm_key,
             far & !4095,
             prepared_access,
-        ) == Some(false)
-        {
-            return Action::Forward;
+        ) {
+            RootFaultAdmission::Declined => {
+                supply.decline();
+                return Action::Forward;
+            }
+            RootFaultAdmission::Unavailable => return Action::Forward,
+            _ => {}
         }
         let Some(index) = spaces.find(mm_key) else {
             return Action::Forward;
@@ -1401,20 +1450,64 @@ fn dispatch_classified_fault<
         ) {
             Ok(GuestPreparedCommit::Committed) => {
                 assert!(path.residency.record_commit(page));
-                consume_served_refusals(mailboxes, mm_key, far, access);
+                if let FaultSupply::Mailbox(mailboxes) = supply {
+                    consume_served_refusals(mailboxes, mm_key, far, access);
+                }
                 return Action::Served;
             }
             Ok(GuestPreparedCommit::AlreadyResident) => {
-                consume_served_refusals(mailboxes, mm_key, far, access);
+                if let FaultSupply::Mailbox(mailboxes) = supply {
+                    consume_served_refusals(mailboxes, mm_key, far, access);
+                }
                 return Action::Served;
             }
             Err(GuestPreparedCommitError::RollbackFailed) => {
                 panic!("EL1 prepared-page commit rollback failed")
             }
+            Err(_) if matches!(supply, FaultSupply::Owner(_)) => return Action::Forward,
             Err(_) => {}
         }
     }
 
+    if let FaultSupply::Owner(owner) = supply {
+        let selected = (|| {
+            let roots = prepared.as_ref()?.roots?;
+            let mm = carrick_el1_abi::ReservationMm::new(mm_key)?;
+            let index = spaces.find(mm_key)?;
+            let mut root = roots.lock_in(spaces, index.index(), mm, slot as u32).ok()?;
+            let window = match carrick_core::mm::fault::select_fault_window(
+                &mut root,
+                owner.slots.carrier()?,
+                far,
+                carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE,
+                access,
+            ) {
+                Ok(window) => window,
+                Err(
+                    crate::memory::reservations::Refusal::Hole
+                    | crate::memory::reservations::Refusal::Limit,
+                ) => {
+                    owner.outcome.set(OwnerFaultSupplyOutcome::PolicyDeclined);
+                    return None;
+                }
+                Err(_) => return None,
+            };
+            if window.host_backing.is_some() {
+                return None;
+            }
+            let slot = owner.slots.grant(slot as usize)?;
+            slot.publish_fault_selection(window.operation.sequence.get(), window)
+                .then_some(())
+        })();
+        if selected.is_some() {
+            owner.outcome.set(OwnerFaultSupplyOutcome::Selected);
+        }
+        return Action::Forward;
+    }
+    let FaultSupply::Mailbox(mailboxes) = supply else {
+        return Action::Forward;
+    };
+    let mailbox = mailboxes.own;
     // Only refusals cross back to EL1. Successful grants have already
     // published and released their slot on the host, even after migration.
     if consume_refusal(mailboxes, mm_key, far, access) {

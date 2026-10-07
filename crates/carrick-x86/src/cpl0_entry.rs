@@ -108,6 +108,8 @@ pub const RETURN_KICK_PORT: u16 = 0xca;
 pub const WORK_PORT: u16 = 0xcb;
 pub const FATAL_PORT: u16 = 0xcc;
 pub const YIELD_PORT: u16 = 0xd0;
+/// Physical owner-grant submission/receipt boundary; Linux policy stays in CPL0.
+pub const OWNER_GRANT_PORT: u16 = 0xd1;
 /// Fixture observation only, outside Linux semantic serving.
 pub const OBSERVE_NATIVE: u64 = u64::MAX;
 /// Fixture observation of the shared kernel's active MMU root.

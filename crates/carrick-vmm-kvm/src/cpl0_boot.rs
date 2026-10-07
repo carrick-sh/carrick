@@ -44,7 +44,7 @@ use carrick_sched_core::{SlotId, Waker};
 use carrick_x86::cpl0_entry::*;
 use carrick_x86::{BringupLayout, X86Reg, X86Vcpu};
 use kvm_bindings::{KVM_MP_STATE_RUNNABLE, Msrs, kvm_mp_state, kvm_msr_entry};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::ptr::NonNull;
@@ -113,7 +113,34 @@ fn fixture_cpuid_with_tsc_hz(
         .ok_or(FixtureCpuidError::MissingLeafZero)?;
     let existing = entries.iter().position(|entry| entry.function == 0x15);
     if existing.is_none() && entries.len() >= kvm_bindings::KVM_MAX_CPUID_ENTRIES {
-        return Err(FixtureCpuidError::FullTable);
+        // This fixture owns its synthetic CPUID model. A retained all-zero
+        // duplicate of leaf zero is unused storage, not an architectural
+        // feature: carrick-vm returns 64 populated rows and 192 such rows.
+        // Reuse only an exact zero duplicate, preserving every real leaf.
+        let vacant = entries.iter().enumerate().find_map(|(index, entry)| {
+            (index != leaf0
+                && entry.function == 0
+                && entry.index == 0
+                && entry.flags == 0
+                && entry.eax == 0
+                && entry.ebx == 0
+                && entry.ecx == 0
+                && entry.edx == 0
+                && entry.padding == [0; 3])
+                .then_some(index)
+        });
+        let Some(vacant) = vacant else {
+            return Err(FixtureCpuidError::FullTable);
+        };
+        entries[vacant] = kvm_bindings::kvm_cpuid_entry2 {
+            function: 0x15,
+            eax: 1,
+            ebx: 1,
+            ecx: hz,
+            ..Default::default()
+        };
+        entries[leaf0].eax = entries[leaf0].eax.max(0x15);
+        return Ok(());
     }
     let clock = kvm_bindings::kvm_cpuid_entry2 {
         function: 0x15,
@@ -286,6 +313,7 @@ struct InitialInventory {
     frames: Vec<(FrameGpa, BackingIdentity)>,
     expected: usize,
     committed: usize,
+    guest_exposed: bool,
 }
 impl InitialInventory {
     fn stage(
@@ -293,9 +321,11 @@ impl InitialInventory {
         ids: &ObjectIdRegistry,
         gpas: impl IntoIterator<Item = FrameGpa>,
         table_grants: usize,
+        frame_len: u64,
+        owner_generation: NonZeroU64,
     ) -> Result<(Self, Vec<X86InitialBootGrant>), TrapError> {
         let gpas: Vec<_> = gpas.into_iter().collect();
-        if table_grants == 0 || table_grants >= gpas.len() {
+        if table_grants >= gpas.len() {
             return Err(fail("initial inventory grant partition"));
         }
         let capacity = FrameEventCapacity::for_event_count(
@@ -308,9 +338,9 @@ impl InitialInventory {
             .reserve(ids, gpas.len(), gpas.len(), capacity)
             .map_err(|error| fail(format!("initial inventory reserve: {error}")))?;
         let transaction = reservation.transaction();
-        let generation = MappingGeneration::from_backend_counter(NonZeroU64::MIN);
+        let generation = MappingGeneration::from_backend_counter(owner_generation);
         let length = FrameLength::from_mapping_extent(
-            NonZeroU64::new(4096).ok_or_else(|| fail("initial frame length"))?,
+            NonZeroU64::new(frame_len).ok_or_else(|| fail("initial frame length"))?,
         );
         let mut rows = Vec::with_capacity(gpas.len());
         for (index, gpa) in gpas.into_iter().enumerate() {
@@ -361,7 +391,7 @@ impl InitialInventory {
                     .ok_or_else(|| fail("initial frame identity"))?,
                 mapping_id: NonZeroU64::new(mapping.raw())
                     .ok_or_else(|| fail("initial mapping identity"))?,
-                owner_generation: NonZeroU64::MIN,
+                owner_generation,
                 inventory_revision: NonZeroU64::new(receipt.revision())
                     .ok_or_else(|| fail("initial inventory revision"))?,
             };
@@ -384,6 +414,7 @@ impl InitialInventory {
                 frames,
                 expected: 0,
                 committed: 0,
+                guest_exposed: false,
             },
             grants,
         ))
@@ -402,26 +433,12 @@ impl InventoryTransaction for InitialInventory {
         let receipt = self.receipt.as_ref().ok_or_else(|| {
             crate::carrier_memory::MemoryError("initial inventory receipt absent".into())
         })?;
-        let snapshot = self.authority.snapshot();
-        if snapshot.revision != receipt.revision() || snapshot.mappings.len() != self.frames.len() {
-            return Err(crate::carrier_memory::MemoryError(
-                "initial inventory publication mismatch".into(),
-            ));
-        }
-        let rows: BTreeMap<_, _> = snapshot
-            .mappings
-            .iter()
-            .map(|row| (row.gpa.0, row))
-            .collect();
-        for &(gpa, identity) in &self.frames {
-            let found = rows.get(&gpa.raw()).is_some_and(|row| {
-                row.frame.raw() == identity.frame_id.get()
-                    && row.mapping.raw() == identity.mapping_id.get()
-                    && row.mm.raw() == INITIAL_MM_KEY
-            });
-            if !found {
+        for &(_, identity) in &self.frames {
+            let mapping = MappingId::from_kernel_allocation(identity.mapping_id);
+            let frame = FrameId::from_kernel_allocation(identity.frame_id);
+            if !receipt.authorizes(mapping, frame) {
                 return Err(crate::carrier_memory::MemoryError(
-                    "initial inventory frame missing".into(),
+                    "inventory frame missing".into(),
                 ));
             }
         }
@@ -437,9 +454,15 @@ impl InventoryTransaction for InitialInventory {
             ));
         }
         self.committed += 1;
+        self.guest_exposed = true;
         Ok(())
     }
     fn rollback(&mut self) -> Result<(), crate::carrier_memory::MemoryError> {
+        if self.guest_exposed {
+            return Err(crate::carrier_memory::MemoryError(
+                "cannot roll back guest-exposed inventory without retirement".into(),
+            ));
+        }
         if let Some(receipt) = self.receipt.take() {
             self.authority
                 .rollback_unpublished_apply(&receipt)
@@ -455,7 +478,7 @@ impl InventoryTransaction for InitialInventory {
 }
 impl Drop for InitialInventory {
     fn drop(&mut self) {
-        if self.receipt.is_some() && self.rollback().is_err() {
+        if self.receipt.is_some() && !self.guest_exposed && self.rollback().is_err() {
             std::process::abort();
         }
     }
@@ -539,6 +562,22 @@ impl Drop for Watchdog {
 #[cfg(test)]
 mod fixture_cpuid_tests {
     use super::*;
+
+    #[test]
+    fn full_cpuid_fixture_reuses_only_an_exact_zero_duplicate_of_leaf_zero() {
+        let mut entries =
+            vec![kvm_bindings::kvm_cpuid_entry2::default(); kvm_bindings::KVM_MAX_CPUID_ENTRIES];
+        entries[0].eax = 0x10;
+        entries[1].function = 7;
+        entries[1].ebx = (1 << 7) | (1 << 20);
+        let features = entries[1];
+        fixture_cpuid_with_tsc_hz(&mut entries, 2_000_000_000).expect("vacant duplicate reused");
+        assert_eq!(entries.len(), kvm_bindings::KVM_MAX_CPUID_ENTRIES);
+        assert_eq!(entries[0].eax, 0x15);
+        assert_eq!(entries[1].ebx, features.ebx);
+        assert_eq!(entries[2].function, 0x15);
+        assert_eq!(entries[2].ecx, 2_000_000_000);
+    }
 
     #[test]
     fn full_kvm_cpuid_table_refuses_a_new_tsc_leaf_without_mutation() {
@@ -627,6 +666,9 @@ pub struct EntryState {
 
 /// The vCPUs drop before the VM, and its registered backing drops last.
 /// No run handle or host pointer escapes this fixture owner.
+#[path = "cpl0_anonymous.rs"]
+mod anonymous_owner;
+
 pub struct Cpl0Carrier {
     pub(crate) cpus: [KvmVcpu; 2],
     pub(crate) _vm: CarrierMemory,
@@ -636,6 +678,10 @@ pub struct Cpl0Carrier {
     frame_inventory: Arc<FrameInventoryAuthority>,
     object_ids: Arc<ObjectIdRegistry>,
     initial_inventory: Option<InitialInventory>,
+    grant_tables: Vec<RootGpa>,
+    anonymous_next_gpa: u64,
+    anonymous_pending: Option<anonymous_owner::PendingGrant>,
+    anonymous_private_pages: u64,
     metadata_base: NonNull<u8>,
     host_forwards: u64,
     host_yields: u64,
@@ -1015,6 +1061,8 @@ impl Cpl0Carrier {
                 FrameGpa::new(INITIAL_EXTENT_GPA + (frame_offset + index * 4096) as u64)
             }),
             table_grants,
+            4096,
+            NonZeroU64::MIN,
         )?;
         inventory
             .publish()
@@ -1332,6 +1380,16 @@ impl Cpl0Carrier {
             limits,
         )?;
         inventory.finish()?;
+        self.bind_grant_portal()?;
+        for grant in grants
+            .get(reply.result_table_used as usize..table_grants)
+            .ok_or_else(|| fail("initial unused table grants"))?
+        {
+            self.grant_tables.push(
+                RootGpa::page_aligned(FrameGpa::new(grant.gpa))
+                    .ok_or_else(|| fail("initial unused table alignment"))?,
+            );
+        }
         self.initial_inventory = Some(inventory);
         Ok(())
     }
@@ -1463,6 +1521,16 @@ impl Cpl0Carrier {
             if matches!(exit, VcpuExit::Kicked) {
                 return Err(fail("initial process cancelled"));
             }
+            if matches!(
+                exit,
+                VcpuExit::IoOut {
+                    port: OWNER_GRANT_PORT,
+                    ..
+                }
+            ) {
+                self.service_anonymous_grant()?;
+                continue;
+            }
             let VcpuExit::IoOut {
                 port: FORWARD_PORT, ..
             } = exit
@@ -1562,6 +1630,12 @@ impl Cpl0Carrier {
             self.binding(0).entries.load(Ordering::Acquire),
             self.host_forwards,
         )
+    }
+
+    /// Pages whose PRIVATE native descriptors and physical custody were
+    /// checked at the stopped guest's applied owner-grant completion.
+    pub fn anonymous_private_pages(&self) -> u64 {
+        self.anonymous_private_pages
     }
 
     pub(crate) fn boot_inner(
@@ -2005,6 +2079,11 @@ impl Cpl0Carrier {
         } else {
             None
         };
+        if kernel_region.is_some() {
+            memory
+                .initialize_fault_records(FrameGpa::new(KERNEL_REGION_GPA))
+                .map_err(|error| fail(error.to_string()))?;
+        }
         let machine = CarrierMachine::from_memory(memory, 2).map_err(|e| fail(e.to_string()))?;
         let (cpus, vm) = machine.into_parts();
         let [mut a, mut b]: [KvmVcpu; 2] =
@@ -2177,6 +2256,10 @@ impl Cpl0Carrier {
             frame_inventory,
             object_ids,
             initial_inventory: None,
+            grant_tables: Vec::new(),
+            anonymous_next_gpa: 0x2_0000_0000,
+            anonymous_pending: None,
+            anonymous_private_pages: 0,
             metadata_base,
             host_forwards: 0,
             host_yields: 0,
@@ -2838,6 +2921,31 @@ mod initial_reply_tests {
     use super::*;
 
     #[test]
+    fn unverified_guest_completion_keeps_inventory_custody_until_vm_teardown() {
+        for exposed in [false, true] {
+            let authority = Arc::new(FrameInventoryAuthority::new());
+            let (mut inventory, _) = InitialInventory::stage(
+                Arc::clone(&authority),
+                &ObjectIdRegistry::new(),
+                [FrameGpa::new(0x2_0000_0000)],
+                0,
+                4096,
+                NonZeroU64::MIN,
+            )
+            .expect("fresh physical grant");
+            inventory.guest_exposed = exposed;
+            if exposed {
+                assert!(
+                    inventory.rollback().is_err(),
+                    "unverified completion cannot authorize rollback"
+                );
+            }
+            drop(inventory);
+            assert_eq!(authority.snapshot().mappings.len(), usize::from(exposed));
+        }
+    }
+
+    #[test]
     fn initial_inventory_publishes_data_frames_without_table_grants() {
         let base = INITIAL_EXTENT_GPA + 0x20_000;
         let (inventory, grants) = InitialInventory::stage(
@@ -2845,6 +2953,8 @@ mod initial_reply_tests {
             &ObjectIdRegistry::new(),
             (0..4).map(|index| FrameGpa::new(base + index * 4096)),
             2,
+            4096,
+            NonZeroU64::MIN,
         )
         .expect("staged exact grants");
         assert_eq!(grants.len(), 4);

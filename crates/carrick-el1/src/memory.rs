@@ -723,12 +723,16 @@ pub enum DelegatedAnonymous {
 /// retirement's frames are journaled as an owed return for the host's bulk
 /// receipt at its next boundary. Everything else refuses the proposal and
 /// forwards. The Linux entry owner publishes the completion/refusal counter.
-pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
+pub fn serve_delegated_anonymous<
+    E: AnonymousDescriptorEditor,
+    G: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
     frame: &mut TrapFrame,
     counters: &carrick_el1_abi::Counters,
     current: &CurrentTask,
-    spaces: SpaceAccess<'_>,
-    table: &reservations::SharedReservations,
+    spaces: SpaceAccess<'_, C>,
+    table: &carrick_core::mm::reservation::SharedReservations<LinuxReservationPolicy, G>,
     editor: &mut E,
 ) -> DelegatedAnonymous {
     let nr = frame.x[8];
@@ -758,13 +762,12 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
         ReservationDisposition::Work(pending) => pending,
     };
     let request = pending.request();
-    let refuse = |pending: PendingReservationSyscall,
-                  model: &mut reservations::Reservations<'_>,
-                  why: Leave| {
-        // The proposal is this guard's own; refusing it cannot be stale.
-        let _ = pending.cancel(model);
-        forward(why)
-    };
+    let refuse =
+        |pending: PendingReservationSyscall, model: &mut ReservationModel<'_, G, C>, why: Leave| {
+            // The proposal is this guard's own; refusing it cannot be stale.
+            let _ = pending.cancel(model);
+            forward(why)
+        };
     let (Some(grant), Some(owner)) = (spaces.grant(index, mm_key), NonZeroU64::new(frame.slot + 1))
     else {
         return refuse(pending, &mut model, Leave::NoGrant);
@@ -909,11 +912,14 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
 /// The admitted root that owns syscall `nr` when it is a delegated MM's
 /// anonymous `brk`/`mmap`/`munmap`/`mprotect` (`None`: the MM keeps the
 /// paths it had before admission).
-pub fn delegated_anonymous_root(
+pub fn delegated_anonymous_root<
+    G: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
     nr: u64,
     current: &CurrentTask,
-    spaces: SpaceAccess<'_>,
-    table: &reservations::SharedReservations,
+    spaces: SpaceAccess<'_, C>,
+    table: &carrick_core::mm::reservation::SharedReservations<LinuxReservationPolicy, G>,
 ) -> Option<(
     carrick_el1_abi::ReservationMm,
     carrick_sched_core::spaces::SpaceIndex,

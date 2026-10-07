@@ -1,14 +1,10 @@
-// CPL0 binding of the shared Linux anonymous reservation owner. Fresh
-// descriptor holes complete in the guest root; backed edits still forward
-// until the x86 descriptor/backing service is bound.
+// CPL0 binding of the shared Linux anonymous reservation owner and native
+// descriptor editor. Physical returns remain journaled for owner settlement.
 use super::InitialWords;
-use carrick_el1::memory::{
-    RangeBacking, ReservationDisposition, X86AnonymousDecode, classify_anonymous_range,
-    decide_anonymous_syscall,
-};
+use carrick_el1::memory::{X86AnonymousDecode, classify_anonymous_range};
 use carrick_el1::memory::reservations::{X86Cpl0Zone, shared_x86_cpl0_guest};
 use carrick_el1_abi::{
-    CurrentTask, ReservationBackingReceipt, ReservationCompletion, ReservationMm, TrapFrame,
+    CurrentTask, TrapFrame,
 };
 use carrick_guest_arch::RootGpa;
 use carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords;
@@ -23,7 +19,18 @@ use core::sync::atomic::{AtomicU64, Ordering};
 static TABLE_START: AtomicU64 = AtomicU64::new(0);
 static TABLE_END: AtomicU64 = AtomicU64::new(0);
 
-pub(super) fn admit_tables(start: u64, end: u64) {
+static LIVE_CONTEXT: carrick_el1::lock::SpinLock<Option<carrick_guest_arch::AddressContext<RootGpa>>> = carrick_el1::lock::SpinLock::new(None);
+pub(super) fn live_words(mm: u64) -> Option<InitialWords> {
+    let context = (*LIVE_CONTEXT.lock())?;
+    if context.mm.raw().get() != mm
+        || carrick_el1::isa::x86::hardware_live_root().ok()? != context.root { return None; }
+    let end = TABLE_END.load(Ordering::Acquire);
+    let start = TABLE_START.load(Ordering::Relaxed);
+    (start != 0 && end > start).then(|| InitialWords::live(start, end, context))
+}
+
+pub(super) fn admit_tables(start: u64, end: u64, context: carrick_guest_arch::AddressContext<RootGpa>) {
+    *LIVE_CONTEXT.lock() = Some(context);
     TABLE_START.store(start, Ordering::Relaxed);
     TABLE_END.store(end, Ordering::Release);
 }
@@ -45,93 +52,35 @@ impl<'a> X86AnonymousVenue<'a> {
     }
 }
 
-/// Test whether this span has no descriptor authority at any level. An absent
-/// ancestor skips its whole subtree, so large untouched reservations do not
-/// cost one four-level walk per page.
-fn empty_stage1(root: RootGpa, start: u64, end: u64, table_start: u64, table_end: u64) -> Option<bool> {
-    if start >= end || end > 0x8000_0000_0000 {
-        return None;
-    }
-    let words = InitialWords::production(table_start, table_end);
-    let read = |pa| words.load(pa).ok();
-    Some(
-        classify_anonymous_range::<X86AnonymousDecode>(
-            &read, root.address().raw(), start, end - start,
-        ).summary == RangeBacking::Empty,
-    )
-}
-
 impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
     fn original_argument0(&self) -> u64 { self.frame.x[0] }
     fn task_state(&self) -> Option<&carrick_personality_linux::abi::entry::LinuxTaskState> {
         Some(&self.task.linux)
     }
     fn delegated(&mut self) -> DelegatedStep {
-        let table_end = TABLE_END.load(Ordering::Acquire);
-        let table_start = TABLE_START.load(Ordering::Relaxed);
-        if table_start == 0 || table_end <= table_start { return DelegatedStep::Forward; }
+        let mm = self.task.mm.key.load(Ordering::Acquire);
+        let Some(words) = live_words(mm) else { return DelegatedStep::Forward; };
         let zone_address = carrick_el1::isa::x86_kernel_layout().zone.raw();
-        // SAFETY: the carrier retains and maps the aligned zone with the
-        // reservation store throughout this initial MM's execution.
+        // SAFETY: boot retains the compact zone throughout this MM's execution.
         let zone = unsafe { &*(zone_address as *const X86Cpl0Zone) };
-        let Some(mm) = ReservationMm::new(self.task.mm.key.load(Ordering::Acquire)) else {
-            return DelegatedStep::Forward;
-        };
-        let Some(index) = zone.spaces.find(mm.raw()) else { return DelegatedStep::Forward; };
-        let table = shared_x86_cpl0_guest();
-        if !table.admitted(index.index(), mm) { return DelegatedStep::NotDelegated; }
         let Some(slot) = SlotId::from_index(self.frame.slot as usize) else {
             return DelegatedStep::Forward;
         };
-        let access = carrick_core::wait::space_access(zone, slot, initial_release);
-        let Some(grant) = access.grant(index, mm.raw()) else { return DelegatedStep::Forward; };
-        let Some(root) = RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(grant.ttbr0)) else {
+        let Some(binding) = carrick_el1::isa::x86::context::current_cpu_binding() else {
             return DelegatedStep::Forward;
         };
-        if !carrick_el1::isa::x86::hardware_live_root()
-            .is_ok_and(|live| live.address() == root.address()) {
-            return DelegatedStep::Forward;
-        }
-        let Ok(mut model) = table.lock_in(access, index.index(), mm, self.frame.slot as u32) else {
-            return DelegatedStep::Forward;
-        };
-        match decide_anonymous_syscall(&self.frame, self.task, &mut model) {
-            ReservationDisposition::Return(value) => {
-                DelegatedStep::Served(SyscallResult::new(value))
-            }
-            ReservationDisposition::Work(mut pending) => {
-                let request = pending.request();
-                if empty_stage1(root, request.range.start(), request.range.end(), table_start, table_end)
-                    != Some(true)
-                {
-                    if pending.cancel(&mut model).is_err() { fatal_reservation(); }
-                    return DelegatedStep::Forward;
-                }
-                // SAFETY: the exact MM root and editor are held. This range
-                // has no descriptor at any level, so no stage-1, backing or
-                // inventory change is owed before the reservation commit.
-                let completion = unsafe {
-                    ReservationCompletion::after_descriptor_and_backing_commit(
-                        request,
-                        ReservationBackingReceipt {
-                            receipt: request.sequence.raw(),
-                            granted_bytes: 0,
-                            returned_bytes: 0,
-                        },
-                    )
-                };
-                if completion.is_some_and(|completion| {
-                    pending.complete(&mut self.frame, self.task, &mut model, completion).is_ok()
-                }) {
-                    DelegatedStep::Served(SyscallResult::new(self.frame.x[0] as i64))
-                } else {
-                    if pending.cancel(&mut model).is_err() { fatal_reservation(); }
-                    DelegatedStep::Forward
-                }
-            }
-            ReservationDisposition::Forward | ReservationDisposition::Unavailable(_) => {
-                DelegatedStep::Forward
-            }
+        // SAFETY: this CPU's binding retains its initialized atomic counters.
+        let counters = unsafe { &*(binding.counters_address as *const carrick_el1_abi::Counters) };
+        let mut editor = X86AnonymousEditor { words };
+        match carrick_el1::memory::serve_delegated_anonymous(
+            &mut self.frame, counters, self.task,
+            carrick_core::wait::space_access(zone, slot, initial_release),
+            shared_x86_cpl0_guest(), &mut editor,
+        ) {
+            carrick_el1::memory::DelegatedAnonymous::Served =>
+                DelegatedStep::Served(SyscallResult::new(self.frame.x[0] as i64)),
+            carrick_el1::memory::DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,
+            _ => DelegatedStep::Forward,
         }
     }
     fn park_prepared(&mut self) -> Option<FamilyCompletion> { None }
@@ -139,6 +88,58 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
     fn retirement(&mut self) -> RetirementStep { RetirementStep::Forward }
     fn install_result(&mut self, result: SyscallResult) {
         self.frame.x[0] = result.raw() as u64;
+    }
+}
+
+struct X86AnonymousEditor { words: InitialWords }
+impl X86AnonymousEditor {
+    fn edit(&self, register: u64, va: u64, len: u64, operation: carrick_guest_arch::EditOperation)
+        -> Result<(), carrick_mmu_core::descriptor_refusal::DescriptorRefusal> {
+        use carrick_guest_arch::{EditIntent, EditOwner, GuestLen, UserRange, UserVa};
+        use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+        use carrick_mmu_core::x86::descriptor_txn::{DescriptorOutcome, DescriptorTxn, InlineJournal, execute_descriptor_txn};
+        let context = self.words.context.ok_or(DescriptorRefusal::StaleRoot)?;
+        if context.root.address().raw() != register { return Err(DescriptorRefusal::StaleRoot); }
+        let range = UserRange::checked(UserVa::new(va), GuestLen::new(len))
+            .ok_or(DescriptorRefusal::BadRange)?;
+        // SAFETY: serve_delegated_anonymous holds the exact MM editor and root
+        // across this operation; InitialWords retains its authenticated context.
+        let owner = unsafe { EditOwner::issue(context.root, context.mm.raw(), context.generation.raw()) };
+        let intent = EditIntent::checked(owner, range, operation, &[])
+            .ok_or(DescriptorRefusal::BadRange)?;
+        let txn = DescriptorTxn::from_intent(&intent)?;
+        match execute_descriptor_txn(&self.words, &txn, context.root, &mut InlineJournal::new()).outcome {
+            DescriptorOutcome::Applied { .. } => Ok(()),
+            DescriptorOutcome::Refused(reason) | DescriptorOutcome::RolledBack(reason) => Err(reason),
+            DescriptorOutcome::Indeterminate(_) => fatal_reservation(),
+        }
+    }
+}
+impl carrick_el1::memory::AnonymousBackingProbe for X86AnonymousEditor {
+    fn backing(&mut self, root: u64, va: u64, len: u64) -> carrick_el1::memory::Stage1Backing {
+        classify_anonymous_range::<X86AnonymousDecode>(&|pa| self.words.load(pa).ok(), root, va, len)
+    }
+    fn stock_span(&mut self, mm: u64, va: u64) -> Option<(u64, u64)> {
+        let page = carrick_el1::isa::frame_grant_residency_guest().lookup(mm, va)?;
+        Some((page.identity.semantic_base, page.identity.semantic_base + page.identity.len))
+    }
+}
+impl carrick_el1::memory::AnonymousPermissionEditor for X86AnonymousEditor {
+    fn protect_and_invalidate(&mut self, root: u64, edit: carrick_mmu_core::aarch64::GuestPermissionEdit)
+        -> Result<(), carrick_mmu_core::aarch64::GuestPermissionEditError> {
+        self.edit(root, edit.va, edit.len, carrick_guest_arch::EditOperation::Protect {
+            permissions: carrick_guest_arch::EditPermissions {
+                readable: edit.readable, writable: edit.writable, executable: edit.executable,
+                user: edit.readable || edit.writable || edit.executable,
+            },
+        }).map_err(|_| carrick_mmu_core::aarch64::GuestPermissionEditError::NotPrivateAnonymous)
+    }
+}
+impl carrick_el1::memory::AnonymousRetirementEditor for X86AnonymousEditor {
+    fn retire_and_invalidate(&mut self, root: u64, va: u64, len: u64)
+        -> Result<(), carrick_mmu_core::aarch64::GuestRetirementError> {
+        self.edit(root, va, len, carrick_guest_arch::EditOperation::Unmap)
+            .map_err(|_| carrick_mmu_core::aarch64::GuestRetirementError::NotPrivateAnonymous)
     }
 }
 

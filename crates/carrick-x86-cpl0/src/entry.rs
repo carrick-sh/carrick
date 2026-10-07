@@ -365,8 +365,7 @@ mod kernel {
     /// reservation/editor/COW owner as ARM's data-abort policy.
     #[unsafe(no_mangle)]
     extern "C" fn carrick_x86_handle_user_page_fault(frame: &PageFaultStack) -> u64 {
-        use carrick_core::mm::transfer::resolver::NoopPreparedResolver;
-        use carrick_el1::fault::{GrantMailboxes, X86CowResolver, dispatch_x86_fault_with_prepared};
+        use carrick_el1::fault::{X86CowResolver, dispatch_x86_fault_with_prepared};
         use carrick_el1_abi::Action;
         let far: u64;
         // SAFETY: CR2 is the architectural fault address for this #PF entry.
@@ -391,6 +390,8 @@ mod kernel {
         };
         let Some(slot) = checked_scheduler_slot(carrick_guest_arch::CpuId::new(binding.cpu_slot)) else { return 5; };
         fixture_stmt! {
+        use carrick_core::mm::transfer::resolver::NoopPreparedResolver;
+        use carrick_el1::fault::GrantMailboxes;
         let serve = |zone_address: carrick_guest_arch::KernelVa,
                      residency: &carrick_el1_abi::FrameGrantResidencyTable,
                      pool: &dyn carrick_el1_abi::CowGrantVenue,
@@ -429,26 +430,61 @@ mod kernel {
         // SAFETY: production KVM bootstrap maps and zero-initializes the
         // retained x86 kernel region at this typed upper-half layout before
         // admitting CPL3. The region owner keeps it live until CPU retirement.
-        let (residency, pool, mailboxes) = unsafe {
+        let (residency, pool, portal) = unsafe {
             (
                 &*(venues.residency.raw() as *const carrick_el1_abi::FrameGrantResidencyTable),
                 &*(venues.cow_pool.raw() as *const carrick_el1_abi::CowGrantPool),
-                &*(venues.mailboxes.raw() as *const carrick_el1_abi::FrameGrantMailboxes),
+                &*(layout.portal.raw() as *const carrick_el1_abi::MmPortalSlots),
             )
         };
-        let Some(mailbox) = mailboxes.slot(binding.cpu_slot as usize) else { return 5; };
-        // SAFETY: the initial image owner maps this compact zone with its
-        // actual parked-context ABI, retained for the carrier lifetime.
+        // SAFETY: the boot owner retains the compact zone and its parked ABI.
         let zone = unsafe { &*(venues.zone.raw() as *const carrick_el1::memory::reservations::X86Cpl0Zone) };
+        let mm_key = task.mm.key.load(Ordering::Acquire);
+        let Some(words) = anonymous::live_words(mm_key) else { return 9; };
+        let roots = carrick_el1::memory::reservations::shared_x86_cpl0_guest();
+        let spaces = carrick_core::wait::space_access(zone, slot, anonymous::initial_release);
+        let supply = carrick_el1::fault::OwnerFaultSupply::new(portal);
+        // SAFETY: the shared fault owner acquires the exact-MM editor before
+        // every prepared commit; InitialWords retains its native context.
+        let Some(prepared_mm) = core::num::NonZeroU64::new(mm_key) else { return 9; };
+        let mut prepared = unsafe { carrick_el1::fault::X86PreparedResolver::under_editor(prepared_mm, &words) };
         let mut cow = X86CowResolver { pool, residency, completion: None };
         let result = dispatch_x86_fault_with_prepared(
-            0, fault, counters, core::slice::from_ref(task),
-            carrick_core::wait::space_access(zone, slot, anonymous::initial_release),
-            GrantMailboxes::own(mailbox),
-            None::<carrick_el1::fault::PreparedFaultPath<'_, NoopPreparedResolver>>,
-            &mut cow,
+            0, fault, counters, core::slice::from_ref(task), spaces,
+            carrick_el1::fault::FaultSupply::Owner(&supply),
+            Some(carrick_el1::fault::PreparedFaultPath { residency, resolver: &mut prepared,
+                roots: Some(roots), file_slots: None }), &mut cow,
         );
-        if result == Action::Served { 0 } else { 6 }
+        if result == Action::Served { return 0; }
+        use carrick_el1::fault::OwnerFaultSupplyOutcome;
+        match supply.outcome() {
+            OwnerFaultSupplyOutcome::PolicyDeclined => 6,
+            OwnerFaultSupplyOutcome::Unavailable => 9,
+            OwnerFaultSupplyOutcome::Selected => {
+                fn cross() {
+                    // SAFETY: this CPL0 CPU owns the physical grant service.
+                    unsafe { core::arch::asm!("out dx, eax", in("dx") OWNER_GRANT_PORT, in("eax") 0u32, options(nostack)) };
+                }
+                cross();
+                let Some(grant_slot) = portal.grant(0) else { return 9; };
+                let Some(window) = grant_slot.window() else { return 9; };
+                let Some(index) = spaces.find(mm_key) else { return 9; };
+                let Ok(mut root) = roots.lock_in(spaces, index.index(), window.operation.mm, 0) else { return 9; };
+                let Ok(target) = carrick_core::mm::frames::grant_target_in(
+                    window.operation.carrier, window, spaces, 0, &mut root) else { return 9; };
+                let receipt = carrick_core::mm::frames::apply_grant::<carrick_mmu_core::x86::owner_mmu::X86Mmu, _>(
+                    grant_slot, &words, residency, target,
+                    // The ISA executor already completed InitialWords' checked
+                    // context drain before producing its Applied outcome.
+                    || {},
+                );
+                drop(root);
+                let applied = receipt.is_some_and(|receipt| matches!(receipt.outcome,
+                    carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)));
+                cross();
+                if applied { 0 } else { 9 }
+            }
+        }
     }
 
     /// Forward the original hardware fault through the existing typed x86
@@ -549,15 +585,20 @@ mod kernel {
         start: u64,
         end: u64,
         edit_root: Option<carrick_guest_arch::RootGpa>,
+        context: Option<carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>>,
     }
     impl InitialWords {
         fn fixture() -> Self {
             let root = carrick_el1::isa::x86::hardware_live_root()
                 .unwrap_or_else(|_| carrick_el1::isa::x86::fatal_entry_binding());
-            Self { start: 0x20_0000, end: 0xd4_0000, edit_root: Some(root) }
+            Self { start: 0x20_0000, end: 0xd4_0000, edit_root: Some(root), context: None }
         }
         const fn production(table_start: u64, table_end: u64) -> Self {
-            Self { start: table_start, end: table_end, edit_root: None }
+            Self { start: table_start, end: table_end, edit_root: None, context: None }
+        }
+        fn live(table_start: u64, table_end: u64,
+            context: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>) -> Self {
+            Self { start: table_start, end: table_end, edit_root: None, context: Some(context) }
         }
         fn word(
             &self,
@@ -617,7 +658,34 @@ mod kernel {
         fn publish_barrier(&self) {
             core::sync::atomic::fence(Ordering::SeqCst);
         }
-        fn invalidate_range(&self, _: u64, _: u64) {
+        fn invalidate_range(&self, _va: u64, _len: u64) {
+            if let Some(context) = self.context {
+                use carrick_guest_arch::{GuestLen, MmuBackend, UserRange, UserVa};
+                let binding = carrick_el1::isa::x86::context::current_cpu_binding()
+                    .unwrap_or_else(|| carrick_el1::isa::x86::fatal_entry_binding());
+                let zone_address = carrick_el1::isa::x86_kernel_layout().zone.raw();
+                // SAFETY: the carrier retains this compact supervisor zone;
+                // its occupancy authority selects every executing MM.
+                let zone = unsafe { &*(zone_address as *const carrick_el1::memory::reservations::X86Cpl0Zone) };
+                let peer_live = (0..super::adapter::CPL0_CPU_COUNT).any(|cpu| cpu != binding.cpu_slot as usize
+                    && carrick_sched_core::SlotId::from_index(cpu)
+                        .is_some_and(|slot| zone.installed_space(slot) == context.mm.raw().get()));
+                if peer_live {
+                    if carrick_el1::isa::x86::interrupt::rendezvous_root(context.root.address().raw()).is_err() {
+                        carrick_el1::isa::x86::fatal_entry_binding();
+                    }
+                } else {
+                    let range = UserRange::checked(UserVa::new(_va), GuestLen::new(_len))
+                        .unwrap_or_else(|| carrick_el1::isa::x86::fatal_entry_binding());
+                    let mut backend = carrick_el1::isa::x86::X86Backend;
+                    let ticket = backend.request_invalidation(context, range)
+                        .unwrap_or_else(|_| carrick_el1::isa::x86::fatal_entry_binding());
+                    let receipt = backend.ack_drain(ticket)
+                        .unwrap_or_else(|_| carrick_el1::isa::x86::fatal_entry_binding());
+                    if receipt.context() != context { carrick_el1::isa::x86::fatal_entry_binding(); }
+                }
+                return;
+            }
             // Unpublished initial roots need no drain. Live fixture edits are
             // licensed by the captured root, never by a fixed physical number.
             if let Some(root)=self.edit_root.filter(|root|
@@ -1049,8 +1117,7 @@ mod kernel {
         if crate::fixture_image() && frame.rax == OBSERVE_DESCRIPTOR_PREPARE_PUBLISH {
             use carrick_core::mm::transfer::resolver::PreparedPageResolver;
             use carrick_guest_arch::{
-                EditBacking, EditLeafSize, EditOperation, EditPermissions, FrameGpa, GuestLen,
-                KernelVa,
+                EditBacking, EditLeafSize, EditOperation, EditPermissions, FrameGpa,
             };
             use carrick_mmu_core::aarch64::{GuestPreparedCommit, LeafAccess};
             use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
@@ -1090,12 +1157,9 @@ mod kernel {
             }
             // SAFETY: one fixture vCPU owns the MM and its retained table
             // alias throughout both the publication and the retry check.
+            let words = InitialWords::fixture();
             let mut resolver = unsafe {
-                carrick_el1::fault::X86PreparedResolver::under_editor(
-                    one,
-                    KernelVa::new(DIRECT_VA + 0x60_0000),
-                    GuestLen::new(FIXTURE_PML4_CAPACITY),
-                )
+                carrick_el1::fault::X86PreparedResolver::under_editor(one, &words)
             };
             let published =
                 resolver.commit_prepared(0x60_0000, 0x3_2000, 0x9_0000, LeafAccess::Read);
@@ -1130,7 +1194,7 @@ mod kernel {
             use carrick_el1_abi::{Action, FrameGrantResidencyIdentity};
             use carrick_guest_arch::{
                 Access, EditBacking, EditLeafSize, EditOperation, EditPermissions, FaultInfo,
-                FrameGpa, GuestLen, KernelVa, UserVa,
+                FrameGpa, UserVa,
             };
             use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
 
@@ -1207,13 +1271,8 @@ mod kernel {
             // SAFETY: the shared dispatcher acquires this MM's exact editor
             // before invoking the resolver, and the upper direct table window lives
             // for the whole KVM fixture.
-            let mut resolver = unsafe {
-                X86PreparedResolver::under_editor(
-                    mm_key,
-                    KernelVa::new(DIRECT_VA + 0x60_0000),
-                    GuestLen::new(FIXTURE_PML4_CAPACITY),
-                )
-            };
+            let words = InitialWords::fixture();
+            let mut resolver = unsafe { X86PreparedResolver::under_editor(mm_key, &words) };
             // SAFETY: KVM retains this counter record for the bound vCPU.
             let counters = unsafe { &*(binding.counters_address as *const Counters) };
             let action = dispatch_x86_fault_with_prepared(
