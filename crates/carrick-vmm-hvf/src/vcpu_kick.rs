@@ -816,11 +816,6 @@ mod tests {
         (registry, kicks, futex)
     }
 
-    /// Serialises the pump timer-event tests over the process-global
-    /// `carrick-timer-core` interval-timer slots.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    static ITIMER_SLOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// A CPU sampler that parks the pump on its sample -- after the timer
     /// event's generation was observed, before the expiry decision -- until
     /// the test has run `setitimer`, then reports `now_ns` guest CPU.
@@ -890,9 +885,9 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn pump_cpu_itimer_does_not_publish_after_disarm_returns() {
-        let _g = ITIMER_SLOT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The pump-state lock also serialises the process-global
+        // interval-timer slots these pump timer-event tests drive.
+        let _g = crate::host_signal::pump_state_test_guard();
         carrick_timer_core::itimer::clear();
         let which = 1;
         let spec = carrick_timer_core::TimerSpecNs {
@@ -912,9 +907,9 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn pump_cpu_itimer_stale_event_leaves_replacement_arm_alone() {
-        let _g = ITIMER_SLOT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The pump-state lock also serialises the process-global
+        // interval-timer slots these pump timer-event tests drive.
+        let _g = crate::host_signal::pump_state_test_guard();
         carrick_timer_core::itimer::clear();
         let which = 1;
         let spec = carrick_timer_core::TimerSpecNs {
