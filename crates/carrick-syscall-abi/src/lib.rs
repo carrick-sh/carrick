@@ -80,6 +80,7 @@ enum PrivateX86Ordinal {
     Alarm,
     Time,
     Fork,
+    ArchPrctl,
 }
 
 /// The private numbers grow DOWN from `u64::MAX - 0x20`, far outside any real
@@ -186,6 +187,10 @@ pub const CARRICK_PRIVATE_X86_ALARM: u64 = private_x86_number(PrivateX86Ordinal:
 pub const CARRICK_PRIVATE_X86_TIME: u64 = private_x86_number(PrivateX86Ordinal::Time);
 /// Canonical guest-kernel route for x86 `fork`, which asm-generic lacks.
 pub const CARRICK_PRIVATE_X86_FORK: u64 = private_x86_number(PrivateX86Ordinal::Fork);
+
+/// Guest-native TLS/CPUID operation admitted by the shared Linux entry owner.
+/// This is not a host-forward request: the personality supplies the ISA leaf.
+pub const CARRICK_PRIVATE_X86_ARCH_PRCTL: u64 = private_x86_number(PrivateX86Ordinal::ArchPrctl);
 
 // Every CARRICK_PRIVATE_X86_* number must be UNIQUE: a collision silently
 // routes one syscall through another's handler (alarm(2) briefly shared

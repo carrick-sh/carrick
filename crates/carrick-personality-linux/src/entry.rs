@@ -19,6 +19,9 @@ pub fn decode_x86_64(native: u64, mut args: [u64; 6], stack: u64) -> CanonicalCa
         }
         SyscallRemap::Direct(ordinal) => ordinal,
         SyscallRemap::Private(ordinal) => ordinal.raw(),
+        SyscallRemap::Native if crate::abi::x86_64::lookup_native_x86_64(native).is_some() => {
+            carrick_syscall_abi::CARRICK_PRIVATE_X86_ARCH_PRCTL
+        }
         SyscallRemap::Native | SyscallRemap::Unknown => u64::MAX,
     });
     if canonical == carrick_syscall_abi::CARRICK_PRIVATE_X86_POLL {
@@ -82,6 +85,14 @@ pub trait LinuxEntryVenue {
     fn set_tid_address(&self, _: UserVa) -> Option<SyscallResult> {
         None
     }
+    #[cfg(target_arch = "x86_64")]
+    fn arch_prctl(
+        &self,
+        _: Option<crate::abi::x86_64::ArchPrctlOperation>,
+        _: UserVa,
+    ) -> Option<SyscallResult> {
+        None
+    }
     fn task_state(&self) -> &crate::abi::entry::LinuxTaskState;
     fn record_forwarded(&self, ordinal: usize);
     fn record_served(&self, ordinal: usize);
@@ -94,6 +105,9 @@ pub struct SharedVenue<'a, B, R, T> {
     pub counters: crate::dispatch::EntryCounters<'a>,
     pub robust_list: R,
     pub tid_address: T,
+    #[cfg(target_arch = "x86_64")]
+    pub arch_prctl:
+        &'a dyn Fn(Option<crate::abi::x86_64::ArchPrctlOperation>, UserVa) -> Option<SyscallResult>,
 }
 impl<
     B: Fn() -> ExecutionBinding,
@@ -112,6 +126,14 @@ impl<
     }
     fn set_tid_address(&self, address: UserVa) -> Option<SyscallResult> {
         (self.tid_address)(address)
+    }
+    #[cfg(target_arch = "x86_64")]
+    fn arch_prctl(
+        &self,
+        operation: Option<crate::abi::x86_64::ArchPrctlOperation>,
+        address: UserVa,
+    ) -> Option<SyscallResult> {
+        (self.arch_prctl)(operation, address)
     }
     fn record_forwarded(&self, ordinal: usize) {
         self.counters.forwarded(ordinal as u64);
@@ -148,14 +170,36 @@ impl<'a> crate::dispatch::PendingFamilies<'a> for CommonFamilies<'a> {
     fn host_work(&self) -> bool {
         self.venue.task_state().has_pending_host_work()
     }
+    #[cfg(target_arch = "x86_64")]
+    fn arch_prctl(&mut self) -> Option<SyscallResult> {
+        self.venue.arch_prctl(
+            crate::abi::x86_64::ArchPrctlOperation::decode(self.args[0]),
+            UserVa::new(self.args[1]),
+        )
+    }
     fn record_served(&self, ordinal: u64) {
+        #[cfg(target_arch = "x86_64")]
+        let ordinal = native_diagnostic_ordinal(ordinal);
         self.venue.record_served(ordinal as usize);
     }
     fn record_forwarded(&self, ordinal: u64) {
+        #[cfg(target_arch = "x86_64")]
+        let ordinal = native_diagnostic_ordinal(ordinal);
         self.venue.record_forwarded(ordinal as usize);
     }
     fn publish_work(&self, _: bool) {
         self.venue.task_state().record_completed_with_work();
+    }
+}
+
+// Native operations have no asm-generic index. Their diagnostic slot uses the
+// native ordinal; semantic routing always retains the private canonical tag.
+#[cfg(target_arch = "x86_64")]
+fn native_diagnostic_ordinal(ordinal: u64) -> u64 {
+    if ordinal == carrick_syscall_abi::CARRICK_PRIVATE_X86_ARCH_PRCTL {
+        crate::abi::x86_64::ARCH_PRCTL_X86_NR
+    } else {
+        ordinal
     }
 }
 

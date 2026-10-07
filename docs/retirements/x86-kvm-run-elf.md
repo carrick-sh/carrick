@@ -4,8 +4,7 @@ The production x86 Linux CLI lane uses the shared `carrick-el1` kernel at
 CPL0, with receipt backend `kvm-x86-cpl0`. The former per-process `KvmVmm`
 and its host `Pml4Manager` editor are removed. KVM register ioctl marshalling
 moves unchanged into `vcpu_x86`; this adapter owns no RAM or page tables.
-The bhyve/NVMM engines and their shared `carrick-x86` implementation remain
-unchanged.
+The bhyve/NVMM engines and their shared `carrick-x86` behavior are retained.
 
 The applicable production contract is `x86.carrier.cli-run`. Native Linux
 execution of each exact ELF supplies output and exit-status authority. The
@@ -123,9 +122,28 @@ completion. The x86 setup call now routes through the same shared dispatcher
 admission/completion owner, counts once and retains its original argument when
 host work is pending; ARM's ordinal routing stays unchanged.
 
-The migrated musl CLI test remains red at native `poll` (7). Production
-shared host-dispatch binding and real scheduler/futex exit custody are tracked
-dependencies on [PR #81's x86-run follow-up](https://github.com/carrick-sh/carrick/pull/81).
-The initial host exit refuses a registered clear-tid pointer until that
-custody exists; it never reports successful exit while omitting the clear.
-This retained test has no ignore, retry, timeout increase or reduced concurrency.
+The migrated musl CLI test is explicitly ignored with a PR #81 dependency
+reason; it remains a nonblocking tracked red, and the pre-translation receipt
+records the first refusal at native `poll` (7). Poll now selects the canonical
+ppoll handler with an integer-timeout shape tag and shared conversion; this
+alone cannot make musl run before the production host dispatcher is bound.
+
+The complete lost standalone startup/service surface belongs to
+[PR #81 and the x86-run follow-up](https://github.com/carrick-sh/carrick/pull/81):
+read, writev, close; brk; anonymous mmap, munmap and mprotect; rt_sigaction,
+rt_sigprocmask and sigaltstack; poll/ppoll; tkill (the former abort path exits
+134); vDSO publication and `AT_SYSINFO_EHDR`; and terminal clear-tid custody.
+Rust/std musl startup also reaches rt_sigaction(13), mmap(9), mprotect(10)
+and sigaltstack. It always registers set_tid_address, so initial host exit
+currently refuses rather than pretending to clear/wake a pointer without
+scheduler/futex custody. These shared families are not implemented here.
+
+`decode_x86_64` must retain argument and output shapes when dispatch is bound:
+x86 `epoll_event` is packed into 12 bytes, unlike ARM's layout; poll(7) carries
+signed integer milliseconds, unlike ppoll(271)'s timespec pointer. A direct
+poll-to-ppoll number mapping is invalid. The remaining legacy shape audit is
+[x86-legacy-syscall-audit.md](x86-legacy-syscall-audit.md).
+
+The required `just test-kvm` gate runs CLI hello and TLS, refuses a missing or
+inaccessible `/dev/kvm`, and is wired into linux-portable acceptance and both
+KVM workflows. The musl ignore is deliberate and names PR #81.

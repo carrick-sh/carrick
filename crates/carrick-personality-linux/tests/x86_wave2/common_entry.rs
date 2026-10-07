@@ -368,3 +368,70 @@ pub(super) fn x4_linux_common_entry() {
         }
     }
 }
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn arch_prctl_uses_shared_admission_and_completion_with_pending_work() {
+    use carrick_personality_linux::abi::x86_64::ArchPrctlOperation;
+    use carrick_personality_linux::entry::{LinuxEntryVenue, SyscallResult};
+    struct NativeVenue<'a> {
+        world: &'a World,
+        calls: core::cell::Cell<u64>,
+    }
+    impl LinuxEntryVenue for NativeVenue<'_> {
+        fn binding(&self) -> carrick_core_abi::ExecutionBinding {
+            execution_binding(&self.world.tasks[1])
+        }
+        fn set_robust_list(&self, _: u64, _: u64) -> Option<i64> {
+            None
+        }
+        fn task_state(&self) -> &carrick_personality_linux::abi::entry::LinuxTaskState {
+            &self.world.tasks[1].linux
+        }
+        fn arch_prctl(
+            &self,
+            operation: Option<ArchPrctlOperation>,
+            address: UserVa,
+        ) -> Option<SyscallResult> {
+            assert_eq!(operation, Some(ArchPrctlOperation::SetFs));
+            assert_eq!(address.raw(), 0x7000);
+            self.calls.set(self.calls.get() + 1);
+            Some(SyscallResult::new(0))
+        }
+        fn record_served(&self, ordinal: usize) {
+            self.world.counters.served[ordinal].fetch_add(1, Ordering::Relaxed);
+        }
+        fn record_forwarded(&self, ordinal: usize) {
+            if let Some(counter) = self.world.counters.forwarded.get(ordinal) {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    let w = World::new(LifecycleHatches::ON);
+    let venue = NativeVenue {
+        world: &w,
+        calls: core::cell::Cell::new(0),
+    };
+    w.tasks[1].linux.mark_pending_host_work();
+    let call =
+        carrick_personality_linux::entry::decode_x86_64(158, [0x1002, 0x7000, 0, 0, 0, 0], 0x9000);
+    assert!(
+        matches!(carrick_personality_linux::entry::serve(&call, &venue), EntryOutcome::ServedWithWork { result } if result.raw() == 0)
+    );
+    assert_eq!(venue.calls.get(), 1);
+    assert_eq!(w.counters.served[158].load(Ordering::Relaxed), 1);
+    assert_eq!(w.tasks[1].linux.served_with_work.load(Ordering::Relaxed), 1);
+    assert_eq!(w.tasks[0].linux.served_with_work.load(Ordering::Relaxed), 0);
+    assert_eq!(w.tasks[1].linux.orig_arg0.load(Ordering::Relaxed), 0x1002);
+    w.tasks[1].execution.generation.store(0, Ordering::Release);
+    assert_eq!(
+        carrick_personality_linux::entry::serve(&call, &venue),
+        EntryOutcome::Forward
+    );
+    assert_eq!(
+        venue.calls.get(),
+        1,
+        "unadmitted native effects are forbidden"
+    );
+    assert_eq!(w.counters.served[158].load(Ordering::Relaxed), 1);
+}

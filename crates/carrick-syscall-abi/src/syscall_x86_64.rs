@@ -73,7 +73,10 @@ pub enum NativeX86Call {
 /// Classification comes from the same table used by the host dispatcher.
 pub fn lookup_native_x86_64(number: u64) -> Option<NativeX86Call> {
     let entry = lookup_x86_64(number)?;
-    (entry.remap == SyscallRemap::Native).then_some(NativeX86Call::ArchPrctl)
+    match (number, entry.remap) {
+        (ARCH_PRCTL_X86_NR, SyscallRemap::Native) => Some(NativeX86Call::ArchPrctl),
+        _ => None,
+    }
 }
 
 /// FS/GS and CPUID operations from arch_prctl(2). The syscall's operation
@@ -1119,6 +1122,20 @@ mod tests {
 
     #[test]
     fn arch_prctl_is_native() {
+        let mut native_rows = X86_64_SYSCALLS
+            .iter()
+            .filter(|entry| entry.remap == SyscallRemap::Native);
+        assert_eq!(
+            native_rows.next().map(|entry| entry.number),
+            Some(ARCH_PRCTL_X86_NR)
+        );
+        assert_eq!(native_rows.next(), None);
+        assert_eq!(
+            lookup_native_x86_64(ARCH_PRCTL_X86_NR),
+            Some(NativeX86Call::ArchPrctl)
+        );
+        assert_eq!(lookup_native_x86_64(0), None);
+
         let e = lookup_x86_64(158).expect("arch_prctl must be in the table");
         assert_eq!(e.name, "arch_prctl");
         assert_eq!(e.remap, SyscallRemap::Native);

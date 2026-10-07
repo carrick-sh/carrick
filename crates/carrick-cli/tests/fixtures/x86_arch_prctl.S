@@ -54,6 +54,25 @@ _start:
     mov %fs:0, %rax
     cmpq $0x12345678, %rax
     jne fail
+    /* Linux's reserved final lower-half page is not a legal TLS base. */
+    mov $NR_ARCH_PRCTL, %eax
+    mov $SET_FS, %edi
+    movabs $0x7ffffffff000, %rsi
+    syscall
+    cmp $-1, %rax
+    jne fail
+    mov %fs:0, %rax
+    cmpq $0x12345678, %rax
+    jne fail
+    mov $NR_ARCH_PRCTL, %eax
+    mov $SET_GS, %edi
+    movabs $0x7ffffffff000, %rsi
+    syscall
+    cmp $-1, %rax
+    jne fail
+    mov %gs:0, %rax
+    cmpq $0x12345678, %rax
+    jne fail
     mov $NR_ARCH_PRCTL, %eax
     mov $0xffff, %edi
     xor %esi, %esi

@@ -18,6 +18,8 @@ pub enum Family {
     Write,
     EpollWait,
     Lifecycle(LifecycleCall),
+    #[cfg(target_arch = "x86_64")]
+    ArchPrctl,
     Futex,
     InotifyAdd,
     InotifyRemove,
@@ -158,6 +160,10 @@ impl EntryCounters<'_> {
 /// different family and never publish entry completion.
 pub trait PendingFamilies<'a> {
     fn take_handoff_receipt(&mut self) -> Option<carrick_core_abi::EntryHandoffReceipt> {
+        None
+    }
+    #[cfg(target_arch = "x86_64")]
+    fn arch_prctl(&mut self) -> Option<SyscallResult> {
         None
     }
     fn binding(&self) -> Option<carrick_core_abi::ExecutionBinding>;
@@ -308,6 +314,16 @@ pub trait PendingFamilies<'a> {
 
 /// The sole ordinal routing decision and family completion owner.
 fn serve_family(family: Family, ordinal: u64, pending: &mut dyn PendingFamilies<'_>) -> FamilyRun {
+    #[cfg(target_arch = "x86_64")]
+    if family == Family::ArchPrctl {
+        let original = pending.original_argument0();
+        return pending
+            .arch_prctl()
+            .map_or(FamilyCompletion::Forward.into(), |result| FamilyRun {
+                completion: FamilyCompletion::Complete(result.raw()),
+                returned: Some((result, original)),
+            });
+    }
     if let Family::Lifecycle(call) = family {
         let original = pending.original_argument0();
         return pending
@@ -330,6 +346,8 @@ fn serve_family(family: Family, ordinal: u64, pending: &mut dyn PendingFamilies<
         Family::Write => pending.write(),
         Family::EpollWait => pending.epoll_wait(),
         Family::Lifecycle(_) => FamilyCompletion::Forward,
+        #[cfg(target_arch = "x86_64")]
+        Family::ArchPrctl => FamilyCompletion::Forward,
         Family::Futex => pending.futex(),
         Family::InotifyAdd => pending.inotify_add(),
         Family::InotifyRemove => pending.inotify_remove(),
@@ -502,6 +520,10 @@ pub fn dispatch_x86<'a>(
     control: u64,
     pending: &mut dyn PendingFamilies<'a>,
 ) -> CompletionRoute {
+    #[cfg(target_arch = "x86_64")]
+    if ordinal == carrick_syscall_abi::CARRICK_PRIVATE_X86_ARCH_PRCTL {
+        return dispatch_family(ordinal, Family::ArchPrctl, pending);
+    }
     let family = if ordinal == crate::abi::x86_64::SYS_SET_TID_ADDRESS {
         Family::Lifecycle(LifecycleCall::SetTidAddress)
     } else {
@@ -540,6 +562,8 @@ fn dispatch_family<'a>(
     let setup = pending.lifecycle_available()
         && matches!(family, Family::Lifecycle(_))
         && matches!(ordinal, 96 | 99 | 132 | 135);
+    #[cfg(target_arch = "x86_64")]
+    let setup = setup || family == Family::ArchPrctl;
     let transfer = pending.ipc_available()
         && matches!(family, Family::Read | Family::Write | Family::EpollWait);
     if pending.host_work() && !pending.resumes_operation() && !transfer && !setup {
