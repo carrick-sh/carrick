@@ -2,8 +2,8 @@
 
 use super::{ArchError, X86Backend, interrupts};
 use carrick_guest_arch::{
-    CounterFrequency, CounterTick, CpuId, CpuTarget, Deadline, InterruptAck, InterruptBackend,
-    InterruptReason, WakeToken,
+    AddressContext, ContextGeneration, CounterFrequency, CounterTick, CpuId, CpuTarget, Deadline,
+    InterruptAck, InterruptBackend, InterruptReason, MmGeneration, RootGpa, WakeToken,
 };
 use core::num::NonZeroU64;
 use core::sync::atomic::{Ordering, fence};
@@ -21,6 +21,106 @@ fn shootdown_table(
     })
 }
 
+pub(crate) fn current_address_owner(
+    binding: &super::context::native::CpuBinding,
+) -> Result<AddressContext<RootGpa>, ArchError> {
+    let root = super::mmu::hardware_live_root()?;
+    if binding.task_address == 0 {
+        return Err(ArchError::Unbound);
+    }
+    // SAFETY: the admitted binding retains its exact task record until the
+    // host stops this vCPU; the MM key is atomically published before entry.
+    let task = unsafe { &*(binding.task_address as *const carrick_el1_abi::CurrentTask) };
+    let mm = NonZeroU64::new(task.mm.key.load(Ordering::Acquire)).ok_or(ArchError::Unbound)?;
+    let generation = NonZeroU64::new(binding.mm_owner_generation.load(Ordering::Acquire))
+        .ok_or(ArchError::Unbound)?;
+    Ok(AddressContext {
+        root,
+        mm: MmGeneration::new(mm),
+        generation: ContextGeneration::new(generation),
+    })
+}
+
+/// Install a new x86 address owner and publish its exact member identity as
+/// one transition. Senders treat an odd revision as potentially matching.
+pub(crate) fn install_address_context(context: AddressContext<RootGpa>) -> Result<(), ArchError> {
+    super::mmu::hardware_live_root()?;
+    let binding = super::context::current_cpu_binding().ok_or(ArchError::Unbound)?;
+    let table = shootdown_table(binding)?;
+    let member = table
+        .members
+        .get(binding.cpu_slot as usize)
+        .ok_or(ArchError::Unbound)?;
+    if binding.task_address == 0 {
+        return Err(ArchError::Unbound);
+    }
+    // SAFETY: this CPU's stopped-host binding retains the current task.
+    // Update the task's active MM identity to match the installed context.
+    let task = unsafe { &*(binding.task_address as *const carrick_el1_abi::CurrentTask) };
+    task.mm.key.store(context.mm.raw().get(), Ordering::Release);
+    member.revision.fetch_add(1, Ordering::AcqRel);
+    // SAFETY: the authenticated context owns a retained supervisor mapping;
+    // PCID/PGE were rejected above, so MOV CR3 flushes local translations.
+    unsafe {
+        core::arch::asm!(
+            "mov cr3, {}",
+            in(reg) context.root.address().raw(),
+            options(nostack, preserves_flags)
+        )
+    };
+    binding
+        .mm_owner_generation
+        .store(context.generation.raw().get(), Ordering::Release);
+    let mut current_gen = 0;
+    for request in &table.requests {
+        if request.root.load(Ordering::Acquire) == context.root.address().raw()
+            && request.mm_key.load(Ordering::Acquire) == context.mm.raw().get()
+            && request.owner_generation.load(Ordering::Acquire) == context.generation.raw().get()
+        {
+            current_gen = current_gen.max(request.generation.load(Ordering::Acquire));
+        }
+    }
+    binding
+        .last_seen_generation
+        .store(current_gen, Ordering::Release);
+    member
+        .root
+        .store(context.root.address().raw(), Ordering::Relaxed);
+    member
+        .mm_key
+        .store(context.mm.raw().get(), Ordering::Relaxed);
+    member
+        .owner_generation
+        .store(context.generation.raw().get(), Ordering::Relaxed);
+    member.revision.fetch_add(1, Ordering::Release);
+    Ok(())
+}
+
+fn publish_root_request(
+    context: AddressContext<RootGpa>,
+    table: &super::context::native::ShootdownTable,
+    slot: usize,
+) -> Result<u64, ArchError> {
+    let request = table.requests.get(slot).ok_or(ArchError::Unbound)?;
+    let generation = table
+        .next_generation
+        .fetch_add(1, Ordering::AcqRel)
+        .checked_add(1)
+        .filter(|generation| *generation != 0)
+        .ok_or(ArchError::Unbound)?;
+    request
+        .root
+        .store(context.root.address().raw(), Ordering::Relaxed);
+    request
+        .mm_key
+        .store(context.mm.raw().get(), Ordering::Relaxed);
+    request
+        .owner_generation
+        .store(context.generation.raw().get(), Ordering::Relaxed);
+    request.generation.store(generation, Ordering::Release);
+    Ok(generation)
+}
+
 /// Service all published sender generations on this CPU. This is also called
 /// from a sender's wait loop, so two CPUs invalidating each other cannot deadlock
 /// with IF masked. A context install always MOV CR3, closing a switch race.
@@ -33,52 +133,140 @@ pub fn service_shootdowns() -> Result<(), ArchError> {
     }
     for request in &table.requests {
         let generation = request.generation.load(Ordering::Acquire);
-        if generation == 0 || request.ack[slot].load(Ordering::Acquire) >= generation {
+        if generation == 0 || request.served[slot].load(Ordering::Acquire) >= generation {
             continue;
         }
         let root = request.root.load(Ordering::Relaxed);
-        if root == 0 {
+        let mm_key = request.mm_key.load(Ordering::Relaxed);
+        let owner_generation = request.owner_generation.load(Ordering::Relaxed);
+        if root == 0 || mm_key == 0 || owner_generation == 0 {
             return Err(ArchError::Unbound);
         }
-        let live = super::mmu::hardware_live_root()?.address().raw();
-        if live == root {
+        let live = current_address_owner(binding)?;
+        if live.root.address().raw() == root
+            && live.mm.raw().get() == mm_key
+            && live.generation.raw().get() == owner_generation
+        {
             // SAFETY: PCID/PGE are rejected by hardware_live_root. Reloading
             // the same CR3 drains every local non-global translation before
             // the release acknowledgement becomes visible to the editor.
             unsafe {
                 core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags))
             }
+            binding
+                .last_seen_generation
+                .fetch_max(generation, Ordering::Release);
         }
+        request.served[slot].store(generation, Ordering::Release);
         request.ack[slot].store(generation, Ordering::Release);
     }
     Ok(())
 }
 
-/// Wait for every retained peer to drain a published root generation. Each
-/// caller owns only its own request cell and services inbound requests while
-/// waiting. A missing peer fails closed after five seconds of qualified TSC.
-pub fn rendezvous_root(root: u64) -> Result<u64, ArchError> {
+/// Completed x86 shootdown drain receipt. A producer passes this to the MM
+/// publication layer to settle global drain debt with `acknowledge_global_drain`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShootdownReceipt {
+    pub context: AddressContext<RootGpa>,
+    pub generation: u64,
+}
+
+impl ShootdownReceipt {
+    pub const fn new(context: AddressContext<RootGpa>, generation: u64) -> Self {
+        Self {
+            context,
+            generation,
+        }
+    }
+
+    pub const fn mm_key(&self) -> NonZeroU64 {
+        self.context.mm.raw()
+    }
+
+    pub const fn owner_generation(&self) -> NonZeroU64 {
+        self.context.generation.raw()
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+#[cold]
+#[inline(never)]
+pub fn fatal_unacknowledged_shootdown(cpu: u32, root: u64, generation: u64) -> ! {
+    #[cfg(target_os = "none")]
+    unsafe {
+        core::arch::asm!(
+            "out dx, al",
+            "2: hlt",
+            "jmp 2b",
+            in("dx") super::context::native::FATAL_PORT,
+            in("rax") carrick_el1_abi::PANIC_SENTINEL,
+            in("rsi") (u64::from(cpu) << 32) | (generation & 0xffff_ffff),
+            in("rdi") root,
+            options(noreturn)
+        );
+    }
+    #[cfg(not(target_os = "none"))]
+    panic!("fatal: shootdown ack never arrived for cpu {cpu}, root {root:#x}, gen {generation}");
+}
+
+/// Publish the exact edited root/MM generation and wait only for matching
+/// CPUs that were running when the request became visible. A stopped CPU
+/// settles its retained generation through KICK before its next user access.
+pub fn rendezvous_context(context: AddressContext<RootGpa>) -> Result<ShootdownReceipt, ArchError> {
     let binding = super::context::current_cpu_binding().ok_or(ArchError::Unbound)?;
     let slot = binding.cpu_slot as usize;
     let table = shootdown_table(binding)?;
-    let request = table.requests.get(slot).ok_or(ArchError::Unbound)?;
-    if super::mmu::hardware_live_root()?.address().raw() != root {
+    if current_address_owner(binding)? != context {
         return Err(ArchError::Unbound);
     }
-    let generation = table
-        .next_generation
-        .fetch_add(1, Ordering::AcqRel)
-        .checked_add(1)
-        .filter(|generation| *generation != 0)
-        .ok_or(ArchError::Unbound)?;
-    request.root.store(root, Ordering::Relaxed);
-    request.generation.store(generation, Ordering::Release);
-    service_shootdowns()?;
-    fence(Ordering::SeqCst);
+    // Check if any peer currently has this root active (or changing).
+    let mut any_peer_active = false;
     for peer in 0..table.requests.len() {
         if peer == slot {
             continue;
         }
+        let member = &table.members[peer];
+        if member.matches_or_changing(
+            context.root.address().raw(),
+            context.mm.raw().get(),
+            context.generation.raw().get(),
+        ) {
+            any_peer_active = true;
+            break;
+        }
+    }
+    if !any_peer_active {
+        // No other CPU has this root active: local INVLPG (executed during the
+        // descriptor edit transaction) is sufficient.
+        let seen_gen = binding.last_seen_generation.load(Ordering::Acquire);
+        return Ok(ShootdownReceipt::new(context, seen_gen));
+    }
+    let generation = publish_root_request(context, table, slot)?;
+    let request = table.requests.get(slot).ok_or(ArchError::Unbound)?;
+    binding
+        .last_seen_generation
+        .fetch_max(generation, Ordering::Release);
+    service_shootdowns()?;
+    fence(Ordering::SeqCst);
+    let mut awaited = [false; super::context::native::CPL0_CPU_COUNT];
+    for (peer, awaited_peer) in awaited.iter_mut().enumerate().take(table.requests.len()) {
+        if peer == slot {
+            continue;
+        }
+        let member = &table.members[peer];
+        if member.running.load(Ordering::Acquire) == 0
+            || !member.matches_or_changing(
+                context.root.address().raw(),
+                context.mm.raw().get(),
+                context.generation.raw().get(),
+            )
+        {
+            continue;
+        }
+        *awaited_peer = true;
         let apic = bound_apic_id(CpuId::new(peer as u32))?;
         // SAFETY: the retained request is published before this native IPI.
         unsafe { interrupts::hardware::send_shootdown(apic) }.map_err(|_| ArchError::Busy)?;
@@ -86,19 +274,64 @@ pub fn rendezvous_root(root: u64) -> Result<u64, ArchError> {
     let tsc_hz = tsc_frequency().ok_or(ArchError::Unbound)?.get();
     let limit = tsc_hz.checked_mul(5).ok_or(ArchError::Unbound)?;
     let start = read_tsc();
-    for peer in 0..table.requests.len() {
-        if peer == slot {
+    for (peer, &awaited_peer) in awaited.iter().enumerate().take(table.requests.len()) {
+        if !awaited_peer {
             continue;
         }
         while request.ack[peer].load(Ordering::Acquire) < generation {
             service_shootdowns()?;
             if read_tsc().wrapping_sub(start) > limit {
-                return Err(ArchError::Busy);
+                fatal_unacknowledged_shootdown(
+                    peer as u32,
+                    context.root.address().raw(),
+                    generation,
+                );
             }
             core::hint::spin_loop();
         }
     }
-    Ok(generation)
+    Ok(ShootdownReceipt::new(context, generation))
+}
+
+/// Validate this CPU's invalidation generation before returning to user mode.
+/// A CPU whose seen generation is behind does a full CR3 reload.
+pub fn check_user_return_generation() -> Result<(), ArchError> {
+    service_shootdowns()?;
+    let binding = super::context::current_cpu_binding().ok_or(ArchError::Unbound)?;
+    let table = shootdown_table(binding)?;
+    let live = current_address_owner(binding)?;
+    let mut latest_gen = binding.last_seen_generation.load(Ordering::Acquire);
+    let mut behind = false;
+    for request in &table.requests {
+        let generation = request.generation.load(Ordering::Acquire);
+        if generation > latest_gen
+            && request.root.load(Ordering::Acquire) == live.root.address().raw()
+            && request.mm_key.load(Ordering::Acquire) == live.mm.raw().get()
+            && request.owner_generation.load(Ordering::Acquire) == live.generation.raw().get()
+        {
+            latest_gen = generation;
+            behind = true;
+        }
+    }
+    if behind {
+        let root = live.root.address().raw();
+        // SAFETY: PCID/PGE are rejected. Reloading CR3 drains stale translations before user mode.
+        unsafe { core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) }
+        binding
+            .last_seen_generation
+            .fetch_max(latest_gen, Ordering::Release);
+    }
+    Ok(())
+}
+
+/// Native two-sender fixture entry; normal MM edits pass the typed owner.
+pub fn rendezvous_root(root: u64) -> Result<u64, ArchError> {
+    let binding = super::context::current_cpu_binding().ok_or(ArchError::Unbound)?;
+    let context = current_address_owner(binding)?;
+    if context.root.address().raw() != root {
+        return Err(ArchError::Unbound);
+    }
+    rendezvous_context(context).map(|receipt| receipt.generation)
 }
 
 fn read_tsc() -> u64 {
@@ -193,8 +426,16 @@ pub fn capture_irq(vector: u8) -> Result<NativeIrq, ArchError> {
     if unsafe { interrupts::hardware::highest_in_service_vector() } != Some(vector) {
         return Err(ArchError::InvalidFrame);
     }
-    if irq == NativeIrq::Shootdown {
+    if matches!(irq, NativeIrq::Shootdown | NativeIrq::Kick) {
         service_shootdowns()?;
+    }
+    if irq == NativeIrq::Kick {
+        let table = shootdown_table(binding)?;
+        table
+            .kick_checks
+            .get(binding.cpu_slot as usize)
+            .ok_or(ArchError::Unbound)?
+            .fetch_add(1, Ordering::Release);
     }
     binding
         .pending_irqs

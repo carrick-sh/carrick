@@ -272,9 +272,19 @@ mod kernel {
         };
         let root = RootGpa::page_aligned(FrameGpa::new(0x60_0000))
             .ok_or(carrick_el1::isa::ArchError::Unbound)?;
+        let mm_key = carrick_el1::isa::x86::context::current_cpu_binding()
+            .and_then(|binding| {
+                if binding.task_address == 0 {
+                    None
+                } else {
+                    let task = unsafe { &*(binding.task_address as *const carrick_el1_abi::CurrentTask) };
+                    core::num::NonZeroU64::new(task.mm.key.load(core::sync::atomic::Ordering::Acquire))
+                }
+            })
+            .unwrap_or(core::num::NonZeroU64::MIN);
         // SAFETY: this fixture runs one vCPU at a time with the retained
         // root, so each sequential native descriptor edit is exclusive.
-        let owner = unsafe { EditOwner::issue(root, core::num::NonZeroU64::MIN, sequence) };
+        let owner = unsafe { EditOwner::issue(root, mm_key, sequence) };
         let range = UserRange::checked(UserVa::new(va), GuestLen::new(4096))
             .ok_or(carrick_el1::isa::ArchError::Unbound)?;
         let intent = EditIntent::checked(owner, range, operation, &[])
@@ -662,6 +672,15 @@ mod kernel {
                 frame.rax = 0;
                 return;
             };
+            if !matches!(frame.rdi, 0 | 2 | 3) {
+                frame.rax = 0;
+                return;
+            }
+            if frame.rdi == 3 {
+                let retired = applied(fixture_edit(0x3_7000, one, EditOperation::Unmap));
+                frame.rax = u64::from(retired);
+                return;
+            }
             let mapped = fixture_edit(
                 0x3_7000,
                 one,
@@ -677,6 +696,10 @@ mod kernel {
                     backing,
                 },
             );
+            if frame.rdi == 2 {
+                frame.rax = u64::from(applied(mapped));
+                return;
+            }
             let retired =
                 applied(mapped) && applied(fixture_edit(0x3_7000, one, EditOperation::Unmap));
             let repointed = retired
@@ -1262,6 +1285,10 @@ mod kernel {
     #[unsafe(no_mangle)]
     extern "C" fn carrick_x86_validate_return(frame: &mut NativeFrame) {
         if !frame.valid_user_return() {
+            doorbell(FATAL_PORT, frame);
+            halt();
+        }
+        if carrick_el1::isa::x86::interrupt::check_user_return_generation().is_err() {
             doorbell(FATAL_PORT, frame);
             halt();
         }
