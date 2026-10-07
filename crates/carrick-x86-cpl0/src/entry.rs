@@ -250,7 +250,7 @@ mod kernel {
 
     impl SyscallFrame for NativeDispatch<'_> {
         fn canonical_ordinal(&self) -> CanonicalNr { self.call.canonical }
-        fn argument(&self, index: usize) -> u64 { self.call.args[index] }
+        fn argument(&self, index: usize) -> Option<u64> { self.call.args.get(index).copied() }
         fn result(&self) -> NativeReturnWord { NativeReturnWord(self.frame.rax) }
         fn set_result(&mut self, result: NativeReturnWord) { self.frame.rax = result.0; }
         fn slot(&self) -> Option<carrick_guest_arch::SlotId> { self.slot }
