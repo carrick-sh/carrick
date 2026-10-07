@@ -16,8 +16,11 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod gate;
 pub mod itimer;
 pub mod posix;
+
+pub use gate::{FireOutcome, GateHold, TransitionGate};
 
 use core::time::Duration;
 
