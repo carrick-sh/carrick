@@ -7,7 +7,7 @@
     "description_backing": 26,
     "epoll": 522,
     "stream": 176,
-    "mapping": 1645,
+    "mapping": 1650,
     "lifecycle": 34
   },
   "production_counts": {
@@ -16,7 +16,7 @@
     "description_backing": 10,
     "epoll": 223,
     "stream": 120,
-    "mapping": 1034,
+    "mapping": 1037,
     "lifecycle": 16
   },
   "files": {
@@ -2211,7 +2211,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/rw.rs",
-      "line": 3009,
+      "line": 3015,
       "categories": [
         "description_guard"
       ],
@@ -2220,7 +2220,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/rw.rs",
-      "line": 3558,
+      "line": 3564,
       "categories": [
         "description_guard"
       ],
@@ -2229,7 +2229,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/rw.rs",
-      "line": 3619,
+      "line": 3625,
       "categories": [
         "description_guard"
       ],
@@ -2238,7 +2238,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/rw.rs",
-      "line": 3827,
+      "line": 3833,
       "categories": [
         "description_guard"
       ],
@@ -18221,7 +18221,16 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 632,
+      "line": 629,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// mapping is republished under a new generation.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 633,
       "categories": [
         "mapping"
       ],
@@ -18230,20 +18239,11 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 640,
+      "line": 642,
       "categories": [
         "mapping"
       ],
       "text": ".get(&mapping)",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 653,
-      "categories": [
-        "mapping"
-      ],
-      "text": "/// makes the proof stale even if the mapping row itself is unchanged.",
       "scope_kind": "production_callsite"
     },
     {
@@ -18257,7 +18257,34 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 663,
+      "line": 666,
+      "categories": [
+        "mapping"
+      ],
+      "text": ".get(&mapping)",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 679,
+      "categories": [
+        "mapping"
+      ],
+      "text": "/// makes the proof stale even if the mapping row itself is unchanged.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 684,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping: MappingId,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 689,
       "categories": [
         "mapping"
       ],
@@ -18266,7 +18293,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 779,
+      "line": 805,
       "categories": [
         "mapping"
       ],
@@ -18275,7 +18302,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 789,
+      "line": 815,
       "categories": [
         "mapping"
       ],
@@ -18284,7 +18311,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 795,
+      "line": 821,
       "categories": [
         "mapping"
       ],
@@ -18293,7 +18320,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 796,
+      "line": 822,
       "categories": [
         "mapping"
       ],
@@ -18302,7 +18329,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 803,
+      "line": 829,
       "categories": [
         "mapping"
       ],
@@ -18311,7 +18338,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 808,
+      "line": 834,
       "categories": [
         "mapping"
       ],
@@ -18320,7 +18347,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 811,
+      "line": 837,
       "categories": [
         "mapping"
       ],
@@ -18329,7 +18356,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 816,
+      "line": 842,
       "categories": [
         "mapping"
       ],
@@ -18338,7 +18365,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 849,
+      "line": 875,
       "categories": [
         "mapping"
       ],
@@ -18347,7 +18374,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 862,
+      "line": 888,
       "categories": [
         "mapping"
       ],
@@ -18356,7 +18383,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 867,
+      "line": 893,
       "categories": [
         "mapping"
       ],
@@ -18365,7 +18392,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 868,
+      "line": 894,
       "categories": [
         "mapping"
       ],
@@ -18374,61 +18401,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 871,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping,",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 877,
-      "categories": [
-        "mapping"
-      ],
-      "text": "return Err(generation_error(mapping, entry.generation, generation));",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 880,
-      "categories": [
-        "mapping"
-      ],
-      "text": "return Err(FrameInventoryError::InvalidOrdering(mapping));",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 885,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping,",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 890,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let entry = live_mapping_mut(state, mm, mapping)?;",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 891,
-      "categories": [
-        "mapping"
-      ],
-      "text": "require_next_generation(mapping, entry.generation, generation)?;",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 896,
+      "line": 897,
       "categories": [
         "mapping"
       ],
@@ -18441,12 +18414,30 @@
       "categories": [
         "mapping"
       ],
-      "text": "?mapping,",
+      "text": "return Err(generation_error(mapping, entry.generation, generation));",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 908,
+      "line": 906,
+      "categories": [
+        "mapping"
+      ],
+      "text": "return Err(FrameInventoryError::InvalidOrdering(mapping));",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 911,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 916,
       "categories": [
         "mapping"
       ],
@@ -18455,7 +18446,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 909,
+      "line": 917,
       "categories": [
         "mapping"
       ],
@@ -18464,7 +18455,43 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 919,
+      "line": 922,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 929,
+      "categories": [
+        "mapping"
+      ],
+      "text": "?mapping,",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 934,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let entry = live_mapping_mut(state, mm, mapping)?;",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 935,
+      "categories": [
+        "mapping"
+      ],
+      "text": "require_next_generation(mapping, entry.generation, generation)?;",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 945,
       "categories": [
         "mapping"
       ],
@@ -18473,7 +18500,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1022,
+      "line": 1048,
       "categories": [
         "mapping"
       ],
@@ -18482,7 +18509,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1025,
+      "line": 1051,
       "categories": [
         "mapping"
       ],
@@ -18491,7 +18518,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1026,
+      "line": 1052,
       "categories": [
         "mapping"
       ],
@@ -18500,7 +18527,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1029,
+      "line": 1055,
       "categories": [
         "mapping"
       ],
@@ -18509,7 +18536,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1035,
+      "line": 1061,
       "categories": [
         "mapping"
       ],
@@ -18518,7 +18545,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1041,
+      "line": 1067,
       "categories": [
         "mapping"
       ],
@@ -18527,7 +18554,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1047,
+      "line": 1073,
       "categories": [
         "mapping"
       ],
@@ -18536,7 +18563,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1064,
+      "line": 1090,
       "categories": [
         "mapping"
       ],
@@ -18545,7 +18572,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1069,
+      "line": 1095,
       "categories": [
         "mapping"
       ],
@@ -18554,7 +18581,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1087,
+      "line": 1113,
       "categories": [
         "mapping"
       ],
@@ -18563,7 +18590,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1092,
+      "line": 1118,
       "categories": [
         "mapping"
       ],
@@ -18572,7 +18599,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1101,
+      "line": 1127,
       "categories": [
         "mapping"
       ],
@@ -18581,7 +18608,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1153,
+      "line": 1179,
       "categories": [
         "mapping"
       ],
@@ -18590,7 +18617,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1154,
+      "line": 1180,
       "categories": [
         "mapping"
       ],
@@ -18599,7 +18626,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1155,
+      "line": 1181,
       "categories": [
         "mapping"
       ],
@@ -18608,7 +18635,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1194,
+      "line": 1220,
       "categories": [
         "mapping"
       ],
@@ -18617,7 +18644,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1198,
+      "line": 1224,
       "categories": [
         "mapping"
       ],
@@ -18626,7 +18653,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1200,
+      "line": 1226,
       "categories": [
         "mapping"
       ],
@@ -18635,7 +18662,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1202,
+      "line": 1228,
       "categories": [
         "mapping"
       ],
@@ -18644,7 +18671,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1206,
+      "line": 1232,
       "categories": [
         "mapping"
       ],
@@ -18653,7 +18680,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1208,
+      "line": 1234,
       "categories": [
         "mapping"
       ],
@@ -18662,7 +18689,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1210,
+      "line": 1236,
       "categories": [
         "mapping"
       ],
@@ -18671,7 +18698,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1213,
+      "line": 1239,
       "categories": [
         "mapping"
       ],
@@ -18680,7 +18707,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1215,
+      "line": 1241,
       "categories": [
         "mapping"
       ],
@@ -18689,7 +18716,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1217,
+      "line": 1243,
       "categories": [
         "mapping"
       ],
@@ -18698,56 +18725,11 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1219,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping: MappingId,",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1229,
-      "categories": [
-        "mapping"
-      ],
-      "text": "#[error(\"mapping extent at {gpa:?} with length {length:?} overflows the GPA domain\")]",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1243,
-      "categories": [
-        "mapping"
-      ],
-      "text": "#[error(\"batch leaves a prepared mapping unpublished\")]",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
       "line": 1245,
       "categories": [
         "mapping"
       ],
-      "text": "#[error(\"mapping generation space exhausted\")]",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1247,
-      "categories": [
-        "mapping"
-      ],
-      "text": "#[error(\"frame {0:?} mapping count exhausted\")]",
-      "scope_kind": "production_callsite"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1249,
-      "categories": [
-        "mapping"
-      ],
-      "text": "#[error(\"frame {0:?} mapping count underflowed\")]",
+      "text": "mapping: MappingId,",
       "scope_kind": "production_callsite"
     },
     {
@@ -18756,12 +18738,57 @@
       "categories": [
         "mapping"
       ],
+      "text": "#[error(\"mapping extent at {gpa:?} with length {length:?} overflows the GPA domain\")]",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1269,
+      "categories": [
+        "mapping"
+      ],
+      "text": "#[error(\"batch leaves a prepared mapping unpublished\")]",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1271,
+      "categories": [
+        "mapping"
+      ],
+      "text": "#[error(\"mapping generation space exhausted\")]",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1273,
+      "categories": [
+        "mapping"
+      ],
+      "text": "#[error(\"frame {0:?} mapping count exhausted\")]",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1275,
+      "categories": [
+        "mapping"
+      ],
+      "text": "#[error(\"frame {0:?} mapping count underflowed\")]",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1281,
+      "categories": [
+        "mapping"
+      ],
       "text": "#[error(\"unpublished frame inventory rollback receipt duplicates mapping {0:?}\")]",
       "scope_kind": "production_callsite"
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1257,
+      "line": 1283,
       "categories": [
         "mapping"
       ],
@@ -18770,7 +18797,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1259,
+      "line": 1285,
       "categories": [
         "mapping"
       ],
@@ -18779,7 +18806,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1401,
+      "line": 1427,
       "categories": [
         "mapping"
       ],
@@ -18788,7 +18815,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1409,
+      "line": 1435,
       "categories": [
         "mapping"
       ],
@@ -18797,83 +18824,11 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1419,
+      "line": 1445,
       "categories": [
         "mapping"
       ],
       "text": "mapping,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1463,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let mapping = reservation.claim_mapping().unwrap();",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1464,
-      "categories": [
-        "mapping"
-      ],
-      "text": "expected = Some((mapping, frame));",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1465,
-      "categories": [
-        "mapping"
-      ],
-      "text": "prepare_publish(reservation, transaction, frame, mapping, 0x8000, 0x4000);",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1467,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let (mapping, frame) = expected.unwrap();",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1469,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1478,
-      "categories": [
-        "mapping"
-      ],
-      "text": "assert!(receipt.authorizes(mapping, frame));",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1483,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let mapping = reservation.claim_mapping().unwrap();",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1484,
-      "categories": [
-        "mapping"
-      ],
-      "text": "prepare_publish(reservation, transaction, frame, mapping, 0x10_0000, 0x4000);",
       "scope_kind": "test_or_definition"
     },
     {
@@ -18882,75 +18837,12 @@
       "categories": [
         "mapping"
       ],
-      "text": "mapping,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1501,
-      "categories": [
-        "mapping"
-      ],
       "text": "let mapping = reservation.claim_mapping().unwrap();",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1502,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mismatched = Some((mapping, frame));",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1503,
-      "categories": [
-        "mapping"
-      ],
-      "text": "prepare_publish(reservation, transaction, frame, mapping, 0x20_0000, 0x4000);",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1505,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let (mapping, frame) = mismatched.unwrap();",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1507,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1514,
-      "categories": [
-        "mapping"
-      ],
-      "text": "Err(FrameInventoryError::GrantRowMismatch(refused)) if refused == mapping",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1525,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let mapping = reservation.claim_mapping().unwrap();",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1526,
+      "line": 1490,
       "categories": [
         "mapping"
       ],
@@ -18959,16 +18851,16 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1527,
+      "line": 1491,
       "categories": [
         "mapping"
       ],
-      "text": "prepare_publish(reservation, transaction, frame, mapping, 0x4000, 0x4000);",
+      "text": "prepare_publish(reservation, transaction, frame, mapping, 0x8000, 0x4000);",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1534,
+      "line": 1493,
       "categories": [
         "mapping"
       ],
@@ -18977,7 +18869,16 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1535,
+      "line": 1495,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1504,
       "categories": [
         "mapping"
       ],
@@ -18986,25 +18887,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1543,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1560,
-      "categories": [
-        "mapping"
-      ],
-      "text": "assert!(retirement_receipt.authorizes(mapping, frame));",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1574,
+      "line": 1509,
       "categories": [
         "mapping"
       ],
@@ -19013,11 +18896,119 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1575,
+      "line": 1510,
       "categories": [
         "mapping"
       ],
-      "text": "first_pair = Some((mapping, frame));",
+      "text": "prepare_publish(reservation, transaction, frame, mapping, 0x10_0000, 0x4000);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1515,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1522,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1530,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1543,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let mapping = reservation.claim_mapping().unwrap();",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1544,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mismatched = Some((mapping, frame));",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1545,
+      "categories": [
+        "mapping"
+      ],
+      "text": "prepare_publish(reservation, transaction, frame, mapping, 0x20_0000, 0x4000);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1547,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let (mapping, frame) = mismatched.unwrap();",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1549,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1556,
+      "categories": [
+        "mapping"
+      ],
+      "text": "Err(FrameInventoryError::GrantRowMismatch(refused)) if refused == mapping",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1567,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let mapping = reservation.claim_mapping().unwrap();",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1568,
+      "categories": [
+        "mapping"
+      ],
+      "text": "expected = Some((mapping, frame));",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1569,
+      "categories": [
+        "mapping"
+      ],
+      "text": "prepare_publish(reservation, transaction, frame, mapping, 0x4000, 0x4000);",
       "scope_kind": "test_or_definition"
     },
     {
@@ -19026,12 +19017,39 @@
       "categories": [
         "mapping"
       ],
-      "text": "prepare_publish(reservation, transaction, frame, mapping, 0x4000, 0x4000);",
+      "text": "let (mapping, frame) = expected.unwrap();",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1586,
+      "line": 1577,
+      "categories": [
+        "mapping"
+      ],
+      "text": "assert!(receipt.authorizes(mapping, frame));",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1585,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1602,
+      "categories": [
+        "mapping"
+      ],
+      "text": "assert!(retirement_receipt.authorizes(mapping, frame));",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1616,
       "categories": [
         "mapping"
       ],
@@ -19040,7 +19058,34 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1587,
+      "line": 1617,
+      "categories": [
+        "mapping"
+      ],
+      "text": "first_pair = Some((mapping, frame));",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1618,
+      "categories": [
+        "mapping"
+      ],
+      "text": "prepare_publish(reservation, transaction, frame, mapping, 0x4000, 0x4000);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1628,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let mapping = reservation.claim_mapping().unwrap();",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1629,
       "categories": [
         "mapping"
       ],
@@ -19049,7 +19094,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1588,
+      "line": 1630,
       "categories": [
         "mapping"
       ],
@@ -19058,7 +19103,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1620,
+      "line": 1662,
       "categories": [
         "mapping"
       ],
@@ -19067,7 +19112,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1625,
+      "line": 1667,
       "categories": [
         "mapping"
       ],
@@ -19076,7 +19121,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1651,
+      "line": 1693,
       "categories": [
         "mapping"
       ],
@@ -19085,7 +19130,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1652,
+      "line": 1694,
       "categories": [
         "mapping"
       ],
@@ -19094,7 +19139,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1657,
+      "line": 1699,
       "categories": [
         "mapping"
       ],
@@ -19103,7 +19148,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1672,
+      "line": 1714,
       "categories": [
         "mapping"
       ],
@@ -19112,7 +19157,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1677,
+      "line": 1719,
       "categories": [
         "mapping"
       ],
@@ -19121,7 +19166,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1699,
+      "line": 1741,
       "categories": [
         "mapping"
       ],
@@ -19130,7 +19175,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1700,
+      "line": 1742,
       "categories": [
         "mapping"
       ],
@@ -19139,7 +19184,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1701,
+      "line": 1743,
       "categories": [
         "mapping"
       ],
@@ -19148,7 +19193,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1722,
+      "line": 1764,
       "categories": [
         "mapping"
       ],
@@ -19157,7 +19202,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1725,
+      "line": 1767,
       "categories": [
         "mapping"
       ],
@@ -19166,7 +19211,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1730,
+      "line": 1772,
       "categories": [
         "mapping"
       ],
@@ -19175,7 +19220,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1746,
+      "line": 1788,
       "categories": [
         "mapping"
       ],
@@ -19184,7 +19229,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1749,
+      "line": 1791,
       "categories": [
         "mapping"
       ],
@@ -19193,7 +19238,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1750,
+      "line": 1792,
       "categories": [
         "mapping"
       ],
@@ -19202,7 +19247,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1765,
+      "line": 1807,
       "categories": [
         "mapping"
       ],
@@ -19211,7 +19256,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1777,
+      "line": 1819,
       "categories": [
         "mapping"
       ],
@@ -19220,7 +19265,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1778,
+      "line": 1820,
       "categories": [
         "mapping"
       ],
@@ -19229,74 +19274,11 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1779,
+      "line": 1821,
       "categories": [
         "mapping"
       ],
       "text": "prepare_publish(reservation, transaction, frame, mapping, 0x4000, 0x4000);",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1789,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let mapping = reservation.claim_mapping().expect(\"mapping\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1790,
-      "categories": [
-        "mapping"
-      ],
-      "text": "prepare_publish(reservation, transaction, frame, mapping, 0x8000, 0x4000);",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1798,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let first_mapping = first_mapping.expect(\"first mapping\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1803,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping: first_mapping,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1806,
-      "categories": [
-        "mapping"
-      ],
-      "text": ".expect(\"unmap mm1's only mapping\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1812,
-      "categories": [
-        "mapping"
-      ],
-      "text": "assert_counts_agree(\"unmap mm1's only mapping\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1830,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let mapping = reservation.claim_mapping().expect(\"mapping\");",
       "scope_kind": "test_or_definition"
     },
     {
@@ -19305,7 +19287,7 @@
       "categories": [
         "mapping"
       ],
-      "text": "shared = Some((frame, mapping));",
+      "text": "let mapping = reservation.claim_mapping().expect(\"mapping\");",
       "scope_kind": "test_or_definition"
     },
     {
@@ -19314,39 +19296,21 @@
       "categories": [
         "mapping"
       ],
-      "text": "prepare_publish(reservation, transaction, frame, mapping, 0x4000, 0x4000);",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1841,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let mapping = reservation.claim_mapping().expect(\"mapping\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1842,
-      "categories": [
-        "mapping"
-      ],
-      "text": "second_mapping = Some(mapping);",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1843,
-      "categories": [
-        "mapping"
-      ],
       "text": "prepare_publish(reservation, transaction, frame, mapping, 0x8000, 0x4000);",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1868,
+      "line": 1840,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let first_mapping = first_mapping.expect(\"first mapping\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1845,
       "categories": [
         "mapping"
       ],
@@ -19355,7 +19319,88 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1886,
+      "line": 1848,
+      "categories": [
+        "mapping"
+      ],
+      "text": ".expect(\"unmap mm1's only mapping\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1854,
+      "categories": [
+        "mapping"
+      ],
+      "text": "assert_counts_agree(\"unmap mm1's only mapping\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1872,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let mapping = reservation.claim_mapping().expect(\"mapping\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1873,
+      "categories": [
+        "mapping"
+      ],
+      "text": "shared = Some((frame, mapping));",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1874,
+      "categories": [
+        "mapping"
+      ],
+      "text": "prepare_publish(reservation, transaction, frame, mapping, 0x4000, 0x4000);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1883,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let mapping = reservation.claim_mapping().expect(\"mapping\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1884,
+      "categories": [
+        "mapping"
+      ],
+      "text": "second_mapping = Some(mapping);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1885,
+      "categories": [
+        "mapping"
+      ],
+      "text": "prepare_publish(reservation, transaction, frame, mapping, 0x8000, 0x4000);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1910,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping: first_mapping,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 1928,
       "categories": [
         "mapping"
       ],
@@ -19364,7 +19409,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1891,
+      "line": 1933,
       "categories": [
         "mapping"
       ],
@@ -19373,7 +19418,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1932,
+      "line": 1974,
       "categories": [
         "mapping"
       ],
@@ -19382,7 +19427,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1933,
+      "line": 1975,
       "categories": [
         "mapping"
       ],
@@ -19391,7 +19436,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1934,
+      "line": 1976,
       "categories": [
         "mapping"
       ],
@@ -19400,7 +19445,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1940,
+      "line": 1982,
       "categories": [
         "mapping"
       ],
@@ -19409,7 +19454,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1941,
+      "line": 1983,
       "categories": [
         "mapping"
       ],
@@ -19418,7 +19463,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1942,
+      "line": 1984,
       "categories": [
         "mapping"
       ],
@@ -19427,7 +19472,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1945,
+      "line": 1987,
       "categories": [
         "mapping"
       ],
@@ -19436,7 +19481,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1947,
+      "line": 1989,
       "categories": [
         "mapping"
       ],
@@ -19445,7 +19490,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1952,
+      "line": 1994,
       "categories": [
         "mapping"
       ],
@@ -19454,7 +19499,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2021,
+      "line": 2063,
       "categories": [
         "mapping"
       ],
@@ -19463,7 +19508,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2022,
+      "line": 2064,
       "categories": [
         "mapping"
       ],
@@ -19472,7 +19517,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2023,
+      "line": 2065,
       "categories": [
         "mapping"
       ],
@@ -19481,7 +19526,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2029,
+      "line": 2071,
       "categories": [
         "mapping"
       ],
@@ -19490,7 +19535,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2030,
+      "line": 2072,
       "categories": [
         "mapping"
       ],
@@ -19499,7 +19544,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2031,
+      "line": 2073,
       "categories": [
         "mapping"
       ],
@@ -19508,7 +19553,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2041,
+      "line": 2083,
       "categories": [
         "mapping"
       ],
@@ -19517,7 +19562,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2058,
+      "line": 2100,
       "categories": [
         "mapping"
       ],
@@ -19526,7 +19571,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2059,
+      "line": 2101,
       "categories": [
         "mapping"
       ],
@@ -19535,7 +19580,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2069,
+      "line": 2111,
       "categories": [
         "mapping"
       ],
@@ -19544,7 +19589,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2084,
+      "line": 2126,
       "categories": [
         "mapping"
       ],
@@ -19553,7 +19598,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2088,
+      "line": 2130,
       "categories": [
         "mapping"
       ],
@@ -19562,7 +19607,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2089,
+      "line": 2131,
       "categories": [
         "mapping"
       ],
@@ -19571,7 +19616,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2090,
+      "line": 2132,
       "categories": [
         "mapping"
       ],
@@ -19580,7 +19625,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2102,
+      "line": 2144,
       "categories": [
         "mapping"
       ],
@@ -19589,7 +19634,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2118,
+      "line": 2160,
       "categories": [
         "mapping"
       ],
@@ -19598,7 +19643,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2145,
+      "line": 2187,
       "categories": [
         "mapping"
       ],
@@ -19607,38 +19652,11 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2146,
+      "line": 2188,
       "categories": [
         "mapping"
       ],
       "text": "ids = Some((frame, mapping));",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2147,
-      "categories": [
-        "mapping"
-      ],
-      "text": "prepare_publish(reservation, transaction, frame, mapping, 0x4000, 0x4000);",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2169,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let (frame, mapping) = ids.expect(\"IDs\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2175,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping,",
       "scope_kind": "test_or_definition"
     },
     {
@@ -19647,57 +19665,12 @@
       "categories": [
         "mapping"
       ],
-      "text": "mapping,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2212,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping: unknown,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2229,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let mapping = reservation.claim_mapping().expect(\"mapping\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2230,
-      "categories": [
-        "mapping"
-      ],
-      "text": "ids = Some((frame, mapping));",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2231,
-      "categories": [
-        "mapping"
-      ],
       "text": "prepare_publish(reservation, transaction, frame, mapping, 0x4000, 0x4000);",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2236,
-      "categories": [
-        "mapping"
-      ],
-      "text": ".expect(\"initial mapping\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2237,
+      "line": 2211,
       "categories": [
         "mapping"
       ],
@@ -19706,25 +19679,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2241,
-      "categories": [
-        "mapping"
-      ],
-      "text": "prepare_publish(reservation, transaction, frame, mapping, 0x8000, 0x4000);",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2245,
-      "categories": [
-        "mapping"
-      ],
-      "text": "Err(FrameInventoryError::UnreservedMapping(mapping))",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2253,
+      "line": 2217,
       "categories": [
         "mapping"
       ],
@@ -19733,34 +19688,25 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2260,
+      "line": 2231,
       "categories": [
         "mapping"
       ],
-      "text": "Err(FrameInventoryError::InvalidOrdering(mapping))",
+      "text": "mapping,",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2290,
+      "line": 2254,
       "categories": [
         "mapping"
       ],
-      "text": "let claimed_mapping = abandoned.claim_mapping().expect(\"mapping\");",
+      "text": "mapping: unknown,",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2299,
-      "categories": [
-        "mapping"
-      ],
-      "text": "assert!(replacement.claim_mapping().expect(\"new mapping\").raw() > claimed_mapping.raw());",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2307,
+      "line": 2271,
       "categories": [
         "mapping"
       ],
@@ -19769,79 +19715,16 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2308,
+      "line": 2272,
       "categories": [
         "mapping"
       ],
-      "text": "prepare_publish(reservation, transaction, forged, mapping, 0x4000, 0x4000);",
+      "text": "ids = Some((frame, mapping));",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2327,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let mapping = legitimate.claim_mapping().expect(\"mapping\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2328,
-      "categories": [
-        "mapping"
-      ],
-      "text": "prepare_publish(&mut legitimate, transaction, frame, mapping, 0x4000, 0x4000);",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2336,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2346,
-      "categories": [
-        "mapping"
-      ],
-      "text": "mapping,",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2354,
-      "categories": [
-        "mapping"
-      ],
-      "text": "vec![mapping],",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2374,
-      "categories": [
-        "mapping"
-      ],
-      "text": "let mapping = reservation.claim_mapping().expect(\"mapping\");",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2375,
-      "categories": [
-        "mapping"
-      ],
-      "text": "duplicate = Some(mapping);",
-      "scope_kind": "test_or_definition"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2376,
+      "line": 2273,
       "categories": [
         "mapping"
       ],
@@ -19850,7 +19733,43 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2381,
+      "line": 2278,
+      "categories": [
+        "mapping"
+      ],
+      "text": ".expect(\"initial mapping\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 2279,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let (frame, mapping) = ids.expect(\"IDs\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 2283,
+      "categories": [
+        "mapping"
+      ],
+      "text": "prepare_publish(reservation, transaction, frame, mapping, 0x8000, 0x4000);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 2287,
+      "categories": [
+        "mapping"
+      ],
+      "text": "Err(FrameInventoryError::UnreservedMapping(mapping))",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 2295,
       "categories": [
         "mapping"
       ],
@@ -19859,25 +19778,34 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2389,
+      "line": 2302,
       "categories": [
         "mapping"
       ],
-      "text": "let mapping = duplicate.expect(\"mapping ID\");",
+      "text": "Err(FrameInventoryError::InvalidOrdering(mapping))",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2392,
+      "line": 2332,
       "categories": [
         "mapping"
       ],
-      "text": "Err(FrameInventoryError::DuplicateMapping(mapping))",
+      "text": "let claimed_mapping = abandoned.claim_mapping().expect(\"mapping\");",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2403,
+      "line": 2341,
+      "categories": [
+        "mapping"
+      ],
+      "text": "assert!(replacement.claim_mapping().expect(\"new mapping\").raw() > claimed_mapping.raw());",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 2349,
       "categories": [
         "mapping"
       ],
@@ -19886,29 +19814,65 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2404,
+      "line": 2350,
       "categories": [
         "mapping"
       ],
-      "text": "original = Some((frame, mapping));",
+      "text": "prepare_publish(reservation, transaction, forged, mapping, 0x4000, 0x4000);",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2405,
+      "line": 2369,
       "categories": [
         "mapping"
       ],
-      "text": "prepare_publish(reservation, transaction, frame, mapping, 0x10000, 0x10000);",
+      "text": "let mapping = legitimate.claim_mapping().expect(\"mapping\");",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2411,
+      "line": 2370,
       "categories": [
         "mapping"
       ],
-      "text": "let (frame, mapping) = original.expect(\"original IDs\");",
+      "text": "prepare_publish(&mut legitimate, transaction, frame, mapping, 0x4000, 0x4000);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 2378,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 2388,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 2396,
+      "categories": [
+        "mapping"
+      ],
+      "text": "vec![mapping],",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 2416,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let mapping = reservation.claim_mapping().expect(\"mapping\");",
       "scope_kind": "test_or_definition"
     },
     {
@@ -19917,30 +19881,48 @@
       "categories": [
         "mapping"
       ],
+      "text": "duplicate = Some(mapping);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 2418,
+      "categories": [
+        "mapping"
+      ],
+      "text": "prepare_publish(reservation, transaction, frame, mapping, 0x4000, 0x4000);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 2423,
+      "categories": [
+        "mapping"
+      ],
       "text": "mapping,",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2422,
+      "line": 2431,
       "categories": [
         "mapping"
       ],
-      "text": "let fragment = reservation.claim_mapping().expect(\"fragment mapping\");",
+      "text": "let mapping = duplicate.expect(\"mapping ID\");",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2440,
+      "line": 2434,
       "categories": [
         "mapping"
       ],
-      "text": ".map(|mapping| (mapping.gpa.0, mapping.length.raw()))",
+      "text": "Err(FrameInventoryError::DuplicateMapping(mapping))",
       "scope_kind": "test_or_definition"
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2453,
+      "line": 2445,
       "categories": [
         "mapping"
       ],
@@ -19949,11 +19931,29 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2454,
+      "line": 2446,
       "categories": [
         "mapping"
       ],
-      "text": "ids = Some((frame, mapping));",
+      "text": "original = Some((frame, mapping));",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 2447,
+      "categories": [
+        "mapping"
+      ],
+      "text": "prepare_publish(reservation, transaction, frame, mapping, 0x10000, 0x10000);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 2453,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let (frame, mapping) = original.expect(\"original IDs\");",
       "scope_kind": "test_or_definition"
     },
     {
@@ -19967,7 +19967,52 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2468,
+      "line": 2464,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let fragment = reservation.claim_mapping().expect(\"fragment mapping\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 2482,
+      "categories": [
+        "mapping"
+      ],
+      "text": ".map(|mapping| (mapping.gpa.0, mapping.length.raw()))",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 2495,
+      "categories": [
+        "mapping"
+      ],
+      "text": "let mapping = reservation.claim_mapping().expect(\"mapping\");",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 2496,
+      "categories": [
+        "mapping"
+      ],
+      "text": "ids = Some((frame, mapping));",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 2501,
+      "categories": [
+        "mapping"
+      ],
+      "text": "mapping,",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
+      "line": 2510,
       "categories": [
         "mapping"
       ],
@@ -19976,7 +20021,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2473,
+      "line": 2515,
       "categories": [
         "mapping"
       ],
@@ -19985,7 +20030,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2506,
+      "line": 2548,
       "categories": [
         "mapping"
       ],
@@ -19994,7 +20039,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2507,
+      "line": 2549,
       "categories": [
         "mapping"
       ],
@@ -20003,7 +20048,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2511,
+      "line": 2553,
       "categories": [
         "mapping"
       ],
@@ -20012,7 +20057,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2534,
+      "line": 2576,
       "categories": [
         "mapping"
       ],
@@ -20021,7 +20066,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 2539,
+      "line": 2581,
       "categories": [
         "mapping"
       ],
@@ -23649,7 +23694,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/prepare.rs",
-      "line": 604,
+      "line": 713,
       "categories": [
         "mapping"
       ],
