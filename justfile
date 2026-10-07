@@ -148,7 +148,7 @@ fixtures-publish SHA:
 fixtures-restore BUNDLE:
     {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- fixtures restore --bundle {{quote(BUNDLE)}}
 
-# Verify the exact-SHA fixture archive before restoration on the gate host.
+# Verify a fixture archive by input identity before restoration on the gate host.
 fixtures-verify BUNDLE:
     {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- fixtures verify --bundle {{quote(BUNDLE)}}
 

@@ -218,12 +218,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Guest fixtures come from the exact-SHA Linux bundle. Rebuilding here would
+# Guest fixtures come from a Linux-published bundle. Rebuilding here would
 # replace the proven executable identity and require toolchains on cloudmac.
 # Also verify on direct test-embed/conformance-next invocations, before signing
 # or executing any test. The inherited lease covers this verification too.
-# Unrelated dirty sources are allowed: evidence records input_identity and
-# checkout dirtiness, while the bundle must still belong to checkout HEAD.
+# The bundle is admitted by fixture input identity: unrelated commits and dirty
+# sources keep it valid, any fixture input change refuses it. Evidence records
+# HEAD, the working tree, dirtiness and the input identity.
 case "$pkg" in
     carrick-embed|carrick-conformance-next)
         fixture_receipt="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-fixtures.XXXXXX")"

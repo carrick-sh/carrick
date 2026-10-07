@@ -1,6 +1,6 @@
 //! Resolve fixture inputs independently of the host workspace's crate population.
 use super::environment::{BuildEnvironment, checkout_configs};
-use super::{ContentHash, GuestTarget, Result, fail, git, hash_source, safe_path};
+use super::{BUILD_SCRIPTS, ContentHash, GuestTarget, Result, fail, git, hash_source, safe_path};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -14,17 +14,12 @@ const FIXTURES: &[&str] = &[
     "fixtures/embed-icache-reuse",
     "fixtures/embed-el1-sched",
 ];
+/// Inputs outside the Cargo graph. Workspace manifests, lockfiles and Cargo
+/// configuration are derived from each fixture's resolved graph below.
 const BUILD_INPUTS: &[&str] = &[
-    // Path crates inherit workspace package/dependency declarations and lints.
-    "Cargo.toml",
-    "Cargo.lock",
+    // Read by the controlled build environment to select the compiler.
     "rust-toolchain.toml",
     ".cargo",
-    "scripts/build-linux-fixtures.sh",
-    "scripts/build-embed-interceptor-probe.sh",
-    "scripts/build-embed-zone-readers.sh",
-    "scripts/build-embed-icache-reuse.sh",
-    "scripts/build-embed-el1-sched.sh",
     // The publisher itself constructs the Cargo commands and probe selection.
     "crates/carrick-xtask/src/fixtures.rs",
     "crates/carrick-xtask/src/fixtures/inputs.rs",
@@ -83,7 +78,11 @@ fn relative(root: &Path, path: &Path) -> Result<String> {
 fn resolved_inputs(root: &Path) -> Result<BTreeSet<String>> {
     let root = root.canonicalize()?;
     let environment = BuildEnvironment::new(&root)?;
-    let mut inputs: BTreeSet<_> = BUILD_INPUTS.iter().map(|s| (*s).to_owned()).collect();
+    let mut inputs: BTreeSet<_> = BUILD_INPUTS
+        .iter()
+        .chain(BUILD_SCRIPTS)
+        .map(|s| (*s).to_owned())
+        .collect();
     for fixture in FIXTURES {
         let directory = safe_path(&root, fixture)?;
         let manifest = directory.join("Cargo.toml");
@@ -182,8 +181,11 @@ fn resolved_inputs(root: &Path) -> Result<BTreeSet<String>> {
                 inputs.insert(relative(&root, directory)?);
                 // Cargo config and inherited workspace declarations can live above
                 // a path package, outside its source tree. Include those as well.
+                // Only the fixture workspace's own lockfile (added above from
+                // `workspace_root`) pins its graph: an enclosing host workspace
+                // lockfile is never read when building a fixture workspace.
                 for ancestor in directory.ancestors().take_while(|p| p.starts_with(&root)) {
-                    for name in ["Cargo.toml", "Cargo.lock", ".cargo"] {
+                    for name in ["Cargo.toml", ".cargo"] {
                         let path = ancestor.join(name);
                         if path.exists() {
                             inputs.insert(relative(&root, &path)?);

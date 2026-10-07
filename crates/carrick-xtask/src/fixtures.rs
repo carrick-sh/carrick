@@ -20,6 +20,14 @@ pub use inputs::source_hashes;
 
 const SCHEMA: &str = "carrick.fixtures.v2";
 pub const INSTALLED_MANIFEST: &str = "target/fixtures/installed.json";
+/// Shell builders run by the publisher; their bytes are fixture inputs.
+const BUILD_SCRIPTS: &[&str] = &[
+    "scripts/build-linux-fixtures.sh",
+    "scripts/build-embed-interceptor-probe.sh",
+    "scripts/build-embed-zone-readers.sh",
+    "scripts/build-embed-icache-reuse.sh",
+    "scripts/build-embed-el1-sched.sh",
+];
 const EMBED: &[(&str, &str)] = &[
     ("embed-interceptor-probe", "interceptor-probe"),
     ("embed-zone-readers", "zone-readers"),
@@ -111,6 +119,12 @@ pub struct CommitSha(String);
 #[serde(try_from = "String", into = "String")]
 pub struct ContentHash(String);
 
+/// Git tree object naming the checkout's working state (tracked and
+/// untracked, gitignored outputs excluded) when evidence was produced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct GitTreeId(String);
+
 fn hex_identity(value: &str, len: usize) -> Result<()> {
     if value.len() != len
         || !value
@@ -148,6 +162,23 @@ impl From<ContentHash> for String {
         value.0
     }
 }
+impl TryFrom<String> for GitTreeId {
+    type Error = FixturesError;
+    fn try_from(value: String) -> Result<Self> {
+        hex_identity(&value, 40)?;
+        Ok(Self(value))
+    }
+}
+impl From<GitTreeId> for String {
+    fn from(value: GitTreeId) -> Self {
+        value.0
+    }
+}
+impl std::fmt::Display for ContentHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GuestTarget {
@@ -179,6 +210,8 @@ pub struct Toolchain {
     pub cargo: String,
     pub gnu_linker: String,
 }
+/// A bundle is admitted by its fixture input identity, never by commit:
+/// `source_head` is the publisher's provenance, not an admission key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -188,6 +221,21 @@ pub struct Manifest {
     pub build_policy: BuildPolicy,
     pub toolchain: Toolchain,
     pub executables: Vec<Executable>,
+}
+
+impl Manifest {
+    /// SHA-256 over the scoped source inventory and build policy. The compiler
+    /// pin is a source input; the toolchain record is checked against it.
+    pub fn input_identity(&self) -> Result<ContentHash> {
+        input_identity(&self.sources, &self.build_policy)
+    }
+}
+
+fn input_identity(
+    sources: &BTreeMap<String, ContentHash>,
+    policy: &BuildPolicy,
+) -> Result<ContentHash> {
+    Ok(hash_bytes(&serde_json::to_vec(&(sources, policy))?))
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -203,9 +251,11 @@ struct Installed {
 pub struct ValidationReceipt {
     pub validation_method: ValidationMethod,
     pub checkout_head: CommitSha,
+    pub checkout_tree: GitTreeId,
     pub bundle_source_head: CommitSha,
     pub checkout_dirty: bool,
     pub manifest_sha256: ContentHash,
+    /// Fixture input identity shared by the bundle and this checkout.
     pub inputs_sha256: ContentHash,
 }
 
@@ -218,17 +268,50 @@ pub enum ValidationMethod {
 fn validation_receipt(root: &Path, manifest: &Manifest) -> Result<ValidationReceipt> {
     Ok(ValidationReceipt {
         validation_method: ValidationMethod::InputIdentity,
-        checkout_head: expected_head(root, Some(&manifest.source_head.0))?,
+        checkout_head: expected_head(root, None)?,
+        checkout_tree: working_tree(root)?,
         bundle_source_head: manifest.source_head.clone(),
         checkout_dirty: !git(root, &["status", "--porcelain", "--untracked-files=all"])?
             .trim()
             .is_empty(),
         manifest_sha256: hash_bytes(&manifest_bytes(manifest)?),
-        inputs_sha256: hash_bytes(&serde_json::to_vec(&(
-            &manifest.sources,
-            &manifest.build_policy,
-        ))?),
+        inputs_sha256: manifest.input_identity()?,
     })
+}
+
+/// Name the exact working state without touching the real index: stage the
+/// worktree into a private copy of the index and write its tree object.
+fn working_tree(root: &Path) -> Result<GitTreeId> {
+    let index = PathBuf::from(
+        git(
+            root,
+            &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        )?
+        .trim(),
+    );
+    let scratch = tempfile::tempdir()?;
+    let private = scratch.path().join("index");
+    if index.is_file() {
+        // The copy keeps Git's stat cache, so only changed files are rehashed.
+        fs::copy(&index, &private)?;
+    }
+    let run = |args: &[&str]| -> Result<String> {
+        let output = Command::new("git")
+            .current_dir(root)
+            .env("GIT_INDEX_FILE", &private)
+            .args(args)
+            .output()?;
+        if !output.status.success() {
+            return Err(fail(format!(
+                "working tree identity: git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        String::from_utf8(output.stdout).map_err(|e| fail(e.to_string()))
+    };
+    run(&["add", "--all", "--", "."])?;
+    GitTreeId::try_from(run(&["write-tree"])?.trim().to_owned())
 }
 
 /// Revalidate all installed bytes before generating evidence for this invocation.
@@ -415,21 +498,34 @@ fn validate_executable(path: &Path, executable: &Executable) -> Result<()> {
     Ok(())
 }
 
-fn validate_manifest(root: &Path, manifest: &Manifest, expected: &CommitSha) -> Result<()> {
+/// Admission is exact on fixture inputs and independent of unrelated files:
+/// the bundle's input identity must equal the checkout's current one.
+fn validate_manifest(root: &Path, manifest: &Manifest) -> Result<()> {
     if manifest.schema != SCHEMA {
         return Err(fail("unknown fixture manifest schema"));
-    }
-    if &manifest.source_head != expected {
-        return Err(fail(format!(
-            "wrong SHA: manifest {}, expected {}",
-            manifest.source_head.0, expected.0
-        )));
     }
     if manifest.build_policy != BuildPolicy::default() {
         return Err(fail("fixture build policy mismatch"));
     }
-    if manifest.sources != source_hashes(root)? {
-        return Err(fail("fixture source hashes or inventory mismatch"));
+    let current = source_hashes(root)?;
+    if manifest.sources != current {
+        let changed: Vec<_> = manifest
+            .sources
+            .keys()
+            .chain(current.keys())
+            .filter(|path| manifest.sources.get(*path) != current.get(*path))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .take(8)
+            .cloned()
+            .collect();
+        return Err(fail(format!(
+            "fixture input identity mismatch (source hashes or inventory mismatch): bundle {} built at {}, checkout {}; differing inputs include {}",
+            manifest.input_identity()?,
+            manifest.source_head.0,
+            input_identity(&current, &BuildPolicy::default())?,
+            changed.join(", ")
+        )));
     }
     let pin = fs::read_to_string(root.join("rust-toolchain.toml"))?;
     let release = manifest
@@ -464,7 +560,7 @@ fn manifest_bytes(manifest: &Manifest) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec_pretty(manifest)?)
 }
 
-fn read_bundle_manifest(path: &Path, expected: Option<&CommitSha>) -> Result<Manifest> {
+fn read_bundle_manifest(path: &Path) -> Result<Manifest> {
     let bytes = fs::read(path)?;
     let parent = path
         .parent()
@@ -476,8 +572,8 @@ fn read_bundle_manifest(path: &Path, expected: Option<&CommitSha>) -> Result<Man
     if manifest_bytes(&manifest)? != bytes {
         return Err(fail("noncanonical fixture manifest"));
     }
-    if manifest.schema != SCHEMA || expected.is_some_and(|sha| sha != &manifest.source_head) {
-        return Err(fail("unknown fixture schema or wrong SHA"));
+    if manifest.schema != SCHEMA {
+        return Err(fail("unknown fixture manifest schema"));
     }
     Ok(manifest)
 }
@@ -495,27 +591,34 @@ fn check_bundle_objects(path: &Path, manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
-fn inspect_bundle(path: &Path, expected: Option<&CommitSha>) -> Result<Manifest> {
-    let manifest = read_bundle_manifest(path, expected)?;
+fn inspect_bundle(path: &Path) -> Result<Manifest> {
+    let manifest = read_bundle_manifest(path)?;
     check_bundle_objects(path, &manifest)?;
     Ok(manifest)
 }
 
+/// `sha`, when given, asserts the checkout's HEAD; the bundle itself is
+/// admitted by input identity whichever commit published it.
 pub fn verify_bundle(root: &Path, path: &Path, sha: Option<&str>) -> Result<Manifest> {
-    let expected = expected_head(root, sha)?;
-    let manifest = read_bundle_manifest(path, Some(&expected))?;
-    validate_manifest(root, &manifest, &expected)?;
+    expected_head(root, sha)?;
+    let manifest = read_bundle_manifest(path)?;
+    validate_manifest(root, &manifest)?;
     check_bundle_objects(path, &manifest)?;
     Ok(manifest)
 }
 
-/// Select only an unambiguous exact-commit bundle, never mutable probe caches.
+/// Select one unambiguous bundle for `sha`, never mutable probe caches.
+/// A bundle published from `sha` itself wins. Otherwise, when the local
+/// checkout is at `sha`, select by its current fixture input identity so an
+/// unrelated commit reuses the previous bundle. The receiver re-verifies.
 pub fn resolve_bundle(root: &Path, sha: &str, explicit: Option<&Path>) -> Result<PathBuf> {
     let expected = CommitSha::try_from(sha.to_owned())?;
-    let path = if let Some(path) = explicit {
-        path.to_path_buf()
-    } else {
-        let directory = root.join("target/fixtures/bundles").join(&expected.0);
+    if let Some(path) = explicit {
+        inspect_bundle(path)?;
+        return Ok(path.to_path_buf());
+    }
+    let store = root.join("target/fixtures/bundles");
+    let manifests_in = |directory: &Path| -> Result<Vec<PathBuf>> {
         let mut manifests = Vec::new();
         if directory.is_dir() {
             for entry in fs::read_dir(directory)? {
@@ -525,26 +628,45 @@ pub fn resolve_bundle(root: &Path, sha: &str, explicit: Option<&Path>) -> Result
                 }
             }
         }
-        if manifests.len() != 1 {
-            return Err(fail(format!(
-                "expected one exact-SHA fixture bundle, found {}; publish it on Linux or supply --fixture-manifest",
-                manifests.len()
-            )));
-        }
-        manifests.remove(0)
+        manifests.sort();
+        Ok(manifests)
     };
-    inspect_bundle(&path, Some(&expected))?;
+    let mut manifests = manifests_in(&store.join(&expected.0))?;
+    if manifests.is_empty() && expected_head(root, Some(sha)).is_ok() {
+        let current = input_identity(&source_hashes(root)?, &BuildPolicy::default())?;
+        if store.is_dir() {
+            let mut directories: Vec<_> = fs::read_dir(&store)?
+                .map(|entry| entry.map(|e| e.path()))
+                .collect::<io::Result<_>>()?;
+            directories.sort();
+            for directory in directories {
+                for path in manifests_in(&directory)? {
+                    if read_bundle_manifest(&path)?.input_identity()? == current {
+                        manifests.push(path);
+                    }
+                }
+            }
+        }
+    }
+    if manifests.len() != 1 {
+        return Err(fail(format!(
+            "expected one fixture bundle for {} or its fixture input identity, found {}; publish it on Linux or supply --fixture-manifest",
+            expected.0,
+            manifests.len()
+        )));
+    }
+    let path = manifests.remove(0);
+    inspect_bundle(&path)?;
     Ok(path)
 }
 
 pub fn verify_installed(root: &Path) -> Result<Manifest> {
-    let expected = expected_head(root, None)?;
     let installed: Installed =
         serde_json::from_slice(&fs::read(safe_path(root, INSTALLED_MANIFEST)?)?)?;
     if hash_bytes(&manifest_bytes(&installed.manifest)?) != installed.manifest_sha256 {
         return Err(fail("installed manifest hash mismatch"));
     }
-    validate_manifest(root, &installed.manifest, &expected)?;
+    validate_manifest(root, &installed.manifest)?;
     for executable in &installed.manifest.executables {
         validate_executable(&safe_path(root, &executable.path)?, executable)?;
     }
@@ -723,13 +845,7 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
         }
         run_build(&mut command)?;
     }
-    for script in [
-        "scripts/build-linux-fixtures.sh",
-        "scripts/build-embed-interceptor-probe.sh",
-        "scripts/build-embed-zone-readers.sh",
-        "scripts/build-embed-icache-reuse.sh",
-        "scripts/build-embed-el1-sched.sh",
-    ] {
+    for script in BUILD_SCRIPTS {
         run_build(
             environment
                 .configure(Command::new("bash").current_dir(&source).arg(script))
@@ -764,7 +880,7 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
         toolchain,
         executables,
     };
-    validate_manifest(root, &manifest, &expected)?;
+    validate_manifest(root, &manifest)?;
     let bytes = manifest_bytes(&manifest)?;
     let store = output
         .map(Path::to_path_buf)
@@ -848,7 +964,7 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
                 let archive_sha256 = provision::compute_sha256(&bundle_path)?;
                 writeln!(
                     writer,
-                    "fixtures: verified {} executables for {}; identity={} archive_sha256={}",
+                    "fixtures: verified {} executables built at {}; identity={} archive_sha256={}",
                     manifest.executables.len(),
                     manifest.source_head.0,
                     identity,
@@ -869,8 +985,10 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
             }
             writeln!(
                 writer,
-                "fixtures: verified {} executables for {} by input_identity",
+                "fixtures: verified {} executables for {} by input_identity {} (bundle built at {})",
                 manifest.executables.len(),
+                expected.0,
+                manifest.input_identity()?,
                 manifest.source_head.0
             )?;
         }

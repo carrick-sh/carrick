@@ -475,11 +475,17 @@ fn missing_object_is_rejected_before_any_install() {
     f.rejected("No such file");
 }
 #[test]
-fn wrong_sha_is_rejected_even_with_valid_content_address() {
+fn bundle_source_head_is_provenance_not_an_admission_key() {
     let mut f = Fixture::new();
     f.manifest.source_head = "a".repeat(40).try_into().unwrap();
     f.republish();
-    f.rejected("wrong SHA");
+    fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+    let validation = fixtures::verify_installed_receipt(f.repo.path()).unwrap();
+    assert_eq!(String::from(validation.bundle_source_head), "a".repeat(40));
+    assert_eq!(
+        String::from(validation.checkout_head),
+        git(f.repo.path(), &["rev-parse", "HEAD"])
+    );
 }
 #[test]
 fn expected_sha_must_match_checkout() {
@@ -708,6 +714,25 @@ fn unrelated_workspace_edits_preserve_fixture_identity() {
         validation["checkout_head"],
         validation["bundle_source_head"]
     );
+    // The tree names the dirty working state; the real index is untouched.
+    let tree = validation["checkout_tree"].as_str().unwrap();
+    assert_ne!(tree, git(f.repo.path(), &["rev-parse", "HEAD^{tree}"]));
+    assert_eq!(
+        git(
+            f.repo.path(),
+            &[
+                "ls-tree",
+                "--name-only",
+                tree,
+                "crates/carrick-runtime/src/"
+            ]
+        ),
+        "crates/carrick-runtime/src/diagnostic.rs\ncrates/carrick-runtime/src/lib.rs"
+    );
+    assert!(
+        git(f.repo.path(), &["status", "--porcelain"])
+            .contains("?? crates/carrick-runtime/src/diagnostic.rs")
+    );
     assert_eq!(
         validation["inputs_sha256"],
         String::from(hash(
@@ -772,6 +797,183 @@ fn transitive_fixture_dependency_edits_are_rejected() {
         b"// changed builder\n",
     );
     assert!(fixtures::verify_installed(f.repo.path()).is_err());
+}
+
+fn commit(root: &Path, path: &str, bytes: &[u8], message: &str) -> String {
+    write(root, path, bytes);
+    git(root, &["add", "--", path]);
+    git(root, &["commit", "-qm", message]);
+    git(root, &["rev-parse", "HEAD"])
+}
+
+fn input_identity(manifest: &Manifest) -> ContentHash {
+    hash(&serde_json::to_vec(&(&manifest.sources, &manifest.build_policy)).unwrap())
+}
+
+fn assert_identity_refusal(f: &Fixture, case: &str) {
+    for error in [
+        fixtures::verify_installed(f.repo.path()).unwrap_err(),
+        fixtures::verify_bundle(f.repo.path(), &f.path, None).unwrap_err(),
+    ] {
+        let error = error.to_string();
+        assert!(error.contains("input identity mismatch"), "{case}: {error}");
+    }
+    assert!(
+        carrick_xtask::accept::verify_signed_fixtures(f.repo.path()).is_err(),
+        "{case}: acceptance admitted changed fixture inputs"
+    );
+}
+
+#[test]
+fn committed_unrelated_edit_keeps_bundle_admissible_by_input_identity() {
+    let f = Fixture::new();
+    let root = f.repo.path();
+    let built_at = git(root, &["rev-parse", "HEAD"]);
+    let head = commit(
+        root,
+        "crates/carrick-runtime/src/lib.rs",
+        b"// unrelated runtime change\n",
+        "unrelated runtime change",
+    );
+    assert_ne!(head, built_at);
+    fixtures::verify_bundle(root, &f.path, Some(&head)).unwrap();
+    fixtures::restore(root, &f.path, Some(&head)).unwrap();
+    // Acceptance admission: clean checkout, matching input identity.
+    let validation = carrick_xtask::accept::verify_signed_fixtures(root).unwrap();
+    assert_eq!(String::from(validation.checkout_head), head);
+    assert_eq!(String::from(validation.bundle_source_head), built_at);
+    assert!(!validation.checkout_dirty);
+    assert_eq!(validation.inputs_sha256, input_identity(&f.manifest));
+    assert_eq!(
+        String::from(validation.checkout_tree),
+        git(root, &["rev-parse", "HEAD^{tree}"])
+    );
+}
+
+#[test]
+fn workspace_lockfile_is_not_a_fixture_input() {
+    // Fixture workspaces carry their own Cargo.lock; the host workspace lock
+    // cannot change fixture bytes and churns with every host dependency.
+    let f = Fixture::new();
+    let root = f.repo.path();
+    fixtures::restore(root, &f.path, None).unwrap();
+    write(root, "Cargo.lock", b"# host workspace lock\nversion = 4\n");
+    fixtures::verify_installed(root).unwrap();
+    commit(
+        root,
+        "Cargo.lock",
+        b"# host workspace lock, new host dependency\nversion = 4\n",
+        "host dependency bump",
+    );
+    fixtures::verify_installed(root).unwrap();
+    carrick_xtask::accept::verify_signed_fixtures(root).unwrap();
+}
+
+#[test]
+fn committed_fixture_input_edits_refuse_by_input_identity() {
+    for path in [
+        // Fixture source.
+        "conformance-probes/src/bin/hello.rs",
+        // Direct, transitive and build-dependency path closure members.
+        "crates/carrick-el1-abi/src/lib.rs",
+        "crates/fixture-transitive/src/lib.rs",
+        "crates/fixture-builder/src/lib.rs",
+    ] {
+        let f = Fixture::new();
+        fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+        commit(
+            f.repo.path(),
+            path,
+            b"// changed fixture input\n",
+            "fixture input change",
+        );
+        assert_identity_refusal(&f, path);
+    }
+}
+
+#[test]
+fn fixture_lockfile_change_refuses_by_input_identity() {
+    let f = Fixture::new();
+    let root = f.repo.path();
+    fixtures::restore(root, &f.path, None).unwrap();
+    let path = "fixtures/embed-el1-sched/Cargo.lock";
+    let lock = fs::read_to_string(root.join(path)).unwrap();
+    // A still-valid `--locked` lockfile with different bytes.
+    let changed = lock.replace("\nversion = 4\n", "\nversion = 3\n");
+    assert_ne!(changed, lock);
+    commit(root, path, changed.as_bytes(), "fixture lockfile change");
+    assert_identity_refusal(&f, path);
+}
+
+#[test]
+fn toolchain_pin_change_refuses() {
+    let f = Fixture::new();
+    let root = f.repo.path();
+    fixtures::restore(root, &f.path, None).unwrap();
+    commit(
+        root,
+        "rust-toolchain.toml",
+        b"[toolchain]\nchannel = \"1.96.0\"\ntargets = [\"aarch64-unknown-linux-musl\"]\n",
+        "toolchain pin declaration change",
+    );
+    assert_identity_refusal(&f, "rust-toolchain.toml declaration");
+    let f = Fixture::new();
+    let root = f.repo.path();
+    fixtures::restore(root, &f.path, None).unwrap();
+    commit(
+        root,
+        "rust-toolchain.toml",
+        b"[toolchain]\nchannel = \"1.97.0\"\n",
+        "toolchain channel bump",
+    );
+    // An uninstalled channel may fail before hashing; either way it refuses.
+    assert!(fixtures::verify_installed(root).is_err());
+    assert!(fixtures::verify_bundle(root, &f.path, None).is_err());
+    assert!(carrick_xtask::accept::verify_signed_fixtures(root).is_err());
+}
+
+fn copy_bundle(from: &Path, to: &Path) {
+    fs::create_dir_all(to.join("objects")).unwrap();
+    fs::copy(from.join("manifest.json"), to.join("manifest.json")).unwrap();
+    for entry in fs::read_dir(from.join("objects")).unwrap() {
+        let entry = entry.unwrap();
+        let destination = to.join("objects").join(entry.file_name());
+        fs::copy(entry.path(), &destination).unwrap();
+        fs::set_permissions(destination, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+#[test]
+fn bundle_selection_follows_fixture_input_identity_across_commits() {
+    let f = Fixture::new();
+    let root = f.repo.path();
+    let built_at = git(root, &["rev-parse", "HEAD"]);
+    let bundle = f.path.parent().unwrap();
+    let stored = root
+        .join("target/fixtures/bundles")
+        .join(&built_at)
+        .join(bundle.file_name().unwrap());
+    copy_bundle(bundle, &stored);
+    let head = commit(
+        root,
+        "crates/carrick-runtime/src/lib.rs",
+        b"// unrelated\n",
+        "unrelated change",
+    );
+    assert_eq!(
+        fixtures::resolve_bundle(root, &head, None).unwrap(),
+        stored.join("manifest.json")
+    );
+    let head = commit(
+        root,
+        "crates/fixture-transitive/src/lib.rs",
+        b"// fixture input\n",
+        "fixture input change",
+    );
+    let error = fixtures::resolve_bundle(root, &head, None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("found 0"), "{error}");
 }
 
 #[test]
@@ -1093,20 +1295,45 @@ fn remote_preparation_restores_raw_fixtures_after_same_sha_cleanup() {
 }
 
 #[test]
-fn remote_preparation_rejects_stale_sha_before_acceptance() {
+fn remote_preparation_admits_new_commit_with_same_fixture_inputs() {
     let f = Fixture::new();
     let p = Preparation::new(&f);
-    write(
+    let built_at = git(f.repo.path(), &["rev-parse", "HEAD"]);
+    commit(
         f.repo.path(),
         "README.md",
         b"a new commit with the same fixture sources\n",
+        "next commit",
     );
-    git(f.repo.path(), &["add", "README.md"]);
-    git(f.repo.path(), &["commit", "-qm", "next commit"]);
+    p.setup(&f);
+    let (exit, log) = p.remote_job();
+    assert_eq!(exit, "0", "same-input bundle refused:\n{log}");
+    assert!(p.scratch.path().join("accepted").exists());
+    let validation = carrick_xtask::accept::verify_signed_fixtures(&p.checkout).unwrap();
+    assert_eq!(String::from(validation.bundle_source_head), built_at);
+    assert_eq!(
+        String::from(validation.checkout_head),
+        git(&p.checkout, &["rev-parse", "HEAD"])
+    );
+}
+
+#[test]
+fn remote_preparation_rejects_changed_fixture_inputs_before_acceptance() {
+    let f = Fixture::new();
+    let p = Preparation::new(&f);
+    commit(
+        f.repo.path(),
+        "conformance-probes/src/bin/hello.rs",
+        b"changed probe source\n",
+        "fixture input change",
+    );
     p.setup(&f);
     let (exit, log) = p.remote_job();
     assert_ne!(exit, "0");
-    assert!(log.contains("wrong SHA"), "wrong rejection reason: {log}");
+    assert!(
+        log.contains("input identity mismatch"),
+        "wrong rejection reason: {log}"
+    );
     assert!(!p.scratch.path().join("accepted").exists());
     assert!(carrick_xtask::accept::verify_signed_fixtures(&p.checkout).is_err());
 }
@@ -1396,14 +1623,18 @@ esac
         "failed cleanup must fail the signed workflow"
     );
     fs::write(&cleanup_script, cleanup_bytes).unwrap();
-    // A new checkout cannot consume the previous SHA's downloaded artifact.
-    write(&p.checkout, "README.md", b"next workflow commit\n");
-    git(&p.checkout, &["add", "README.md"]);
-    git(&p.checkout, &["commit", "-qm", "next workflow commit"]);
+    // A new checkout cannot consume an artifact built from different fixture
+    // inputs; admission is by input identity, not by commit.
+    commit(
+        &p.checkout,
+        "conformance-probes/src/bin/hello.rs",
+        b"next workflow fixture input\n",
+        "next workflow commit",
+    );
     let before = fs::read(&executions).unwrap();
     let out = run(signed["run"].as_str().unwrap());
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("wrong SHA"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("input identity mismatch"));
     assert_eq!(fs::read(&executions).unwrap(), before);
 }
 
@@ -1703,7 +1934,13 @@ fn remote_bundle_selection_rejects_missing_ambiguous_and_wrong_sha_inputs() {
     let f = Fixture::new();
     let sha = git(f.repo.path(), &["rev-parse", "HEAD"]);
     assert!(fixtures::resolve_bundle(f.repo.path(), &sha, None).is_err());
-    assert!(fixtures::resolve_bundle(f.repo.path(), &"a".repeat(40), Some(&f.path)).is_err());
+    assert!(fixtures::resolve_bundle(f.repo.path(), "HEAD", Some(&f.path)).is_err());
+    // An explicit bundle is selected as given; the receiver admits it by
+    // input identity against its own exact checkout.
+    assert_eq!(
+        fixtures::resolve_bundle(f.repo.path(), &"a".repeat(40), Some(&f.path)).unwrap(),
+        f.path
+    );
     assert_eq!(
         fixtures::resolve_bundle(f.repo.path(), &sha, Some(&f.path)).unwrap(),
         f.path
