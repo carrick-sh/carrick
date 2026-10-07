@@ -78,7 +78,7 @@ impl SlotId {
 /// implement this directly; no ISA-shaped substitute frame is constructed.
 pub trait SyscallFrame {
     fn canonical_ordinal(&self) -> CanonicalNr;
-    fn argument(&self, index: usize) -> u64;
+    fn argument(&self, index: usize) -> Option<u64>;
     fn result(&self) -> NativeReturnWord;
     fn set_result(&mut self, result: NativeReturnWord);
     fn slot(&self) -> Option<SlotId>;
