@@ -36,6 +36,22 @@ two-live-MM PRIVATE witness remain open; no extraction review-ready is claimed.
 Latest receipts: /tmp/x86-process-registry-{check,unit,collision-red,test,
 kernel-semantics}.log and /tmp/x86-process-shared-{merge,check,fmt}.log.
 
+Post-merge integration verification: just test and just test-kernel-semantics
+pass; full required KVM passes 128 tests with five existing ignores (none
+added). Clippy passes. The imported shared-kernel shootdown fix owns that
+change; no new shootdown implementation was authored here. The director
+accepted and routed the pre-existing pre-fork failure using the fixed-50
+6/50-before and 5/50-after evidence above; a passing single host gate is not
+closure of that defect. Assembly comparison against imported 6d6bcf26c has
+zero failures/no new ARM drift; N1 retains its known inherited ARM block.
+Domain lint initially caught an automatic merge duplicate signal-core
+package in the scheduler fixture lockfile; the duplicate was removed and
+Cargo refreshed its path closure, retaining root-locked dependency versions.
+All seven fixture lockfiles validate. Receipts:
+/tmp/x86-process-shared-{test,kernel-semantics,kvm,clippy,asm-n1,asm-import}.log
+and /tmp/x86-process-fixture-lock-{update,pins,check}.log. Final clean-tree
+lint and push remain to run; wait/exit/CPL0/two-live-MM remain unimplemented.
+
 ## PR102 re-review follow-up
 
 Named WRITE/EXECUTE flags replace grant-publication bit literals. Shared
