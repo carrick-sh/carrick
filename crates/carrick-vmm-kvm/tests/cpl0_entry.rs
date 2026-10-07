@@ -1113,12 +1113,16 @@ fn stopped_cpl3_cpu_receives_a_queued_host_kick() {
         0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x04, 0x00, // mov rax, [0x40000]
         0xeb, 0xf6, // jmp to the load
     ]);
+    let load_rip = carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000 + program.len() as u64 - 10;
     let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&program, &program])
         .expect("real KVM CPU with native interrupt gates");
     assert_eq!(carrier.observe(1).expect("first user syscall").result, 0);
     carrier
         .fixture_stop_after_user_byte(1, 0x4_0000)
         .expect("stop CPU 1 while its user loop runs");
+    carrier
+        .fixture_stop_before_user_rip(1, load_rip)
+        .expect("next user instruction is the loop load");
     assert_eq!(carrier.fixture_pending_irqs(1).unwrap(), 0);
     carrier
         .queue_resume_kick(1)
