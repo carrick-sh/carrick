@@ -298,6 +298,31 @@ impl MemoryWitness {
         };
         self.edit(index, op)
     }
+    /// Publish a private anonymous owner grant with a resident data page.
+    /// Protect and Retire require this provenance; a host Map is distinct.
+    pub fn prepare_private(
+        &mut self,
+        index: usize,
+        va: u64,
+        handle: BackingHandle,
+    ) -> Result<(), MemoryError> {
+        let record = self.memory.record(handle)?;
+        let span = PageSpan::new(va, PAGE);
+        self.edit(
+            index,
+            DescriptorOp::Prepare {
+                span,
+                output: record.backing.extent.base,
+                permissions: Permissions {
+                    writable: true,
+                    executable: false,
+                    user: true,
+                },
+                resident: span,
+                backing: record.backing.identity,
+            },
+        )
+    }
     pub fn edit(&mut self, index: usize, op: DescriptorOp) -> Result<(), MemoryError> {
         let context = *self
             .contexts
