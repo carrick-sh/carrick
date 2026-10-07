@@ -23,24 +23,25 @@ contract at the runtime boundary.
 
 ## Current Platform Matrix
 
-| Feature | Host | VMM crate | Host crate | Guest ISA status | Notes |
+| Target OS | Host | VMM crate | Host crate | Guest ISA status | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `platform-macos` | macOS / Apple Silicon | `carrick-vmm-hvf` | `carrick-host`, `carrick-host-bsd` | AArch64 mature; amd64 via Rosetta path | Default feature; release path; requires codesign entitlement. |
-| `platform-linux` | Linux | `carrick-vmm-kvm` | `carrick-host-linux` | AArch64 KVM path; x86_64 active lane | Build with `--no-default-features --features platform-linux`. |
-| `platform-freebsd` | FreeBSD | `carrick-vmm-bhyve` | `carrick-host-bsd` | x86_64 active lane | Requires `vmm.ko` / `/dev/vmm`; target-host cleanup matters. |
-| `platform-netbsd` | NetBSD | `carrick-vmm-nvmm` | `carrick-host-bsd` | x86_64 bring-up lane | Nested NVMM host behavior is a known blocker without target preparation. |
+| `macos` | macOS / Apple Silicon | `carrick-vmm-hvf` | `carrick-host`, `carrick-host-bsd` | AArch64 mature; amd64 via Rosetta path | Release path; requires codesign entitlement. |
+| `linux` | Linux | `carrick-vmm-kvm` | `carrick-host-linux` | AArch64 KVM path; x86_64 active lane | |
+| `freebsd` | FreeBSD | `carrick-vmm-bhyve` (x86_64 only) | `carrick-host-bsd` | x86_64 active lane | Requires `vmm.ko` / `/dev/vmm`; target-host cleanup matters. |
+| `netbsd` | NetBSD | `carrick-vmm-nvmm` (x86_64 only) | `carrick-host-bsd` | x86_64 bring-up lane | Nested NVMM host behavior is a known blocker without target preparation. |
 
-Each non-macOS build selects exactly one platform feature:
+The build target selects the backend; there is no `platform-*` feature. The
+VMM and host crates are `[target.'cfg(target_os = ...)'.dependencies]` of
+`carrick-runtime` and `carrick-cli`, and the code gates on the same
+predicates, so the same command builds the right backend on every host:
 
 ```sh
-cargo build -p carrick-cli --no-default-features --features platform-linux
-cargo build -p carrick-cli --no-default-features --features platform-freebsd
-cargo build -p carrick-cli --no-default-features --features platform-netbsd
+cargo build -p carrick-cli                     # this host's backend
+cargo check -p carrick-cli --target x86_64-unknown-freebsd   # a cross-check
 ```
 
-The default `platform-macos` feature pulls `carrick-vmm-hvf` and Apple
-Hypervisor.framework bindings, so it is intentionally not used for non-macOS
-target builds.
+`carrick-vmm-hvf` and the Apple Hypervisor.framework bindings are reachable
+only from a macOS target.
 
 ---
 
@@ -136,23 +137,24 @@ The product path remains:
 carrick-cli -> carrick-engine -> { carrick-image, carrick-runtime -> carrick-kernel -> carrick-vfs } -> carrick-spec
 ```
 
-Platform code is selected below `carrick-runtime` and `carrick-cli`:
+Platform code is selected below `carrick-runtime` and `carrick-cli`, by the
+build target:
 
 ```text
-platform-macos
+target_os = "macos"
   -> carrick-vmm-hvf
   -> carrick-host + carrick-host-bsd
 
-platform-linux
+target_os = "linux"
   -> carrick-vmm-kvm
   -> carrick-host-linux
 
-platform-freebsd
-  -> carrick-vmm-bhyve
+target_os = "freebsd"
+  -> carrick-vmm-bhyve (x86_64 only)
   -> carrick-host-bsd
 
-platform-netbsd
-  -> carrick-vmm-nvmm
+target_os = "netbsd"
+  -> carrick-vmm-nvmm (x86_64 only)
   -> carrick-host-bsd
 ```
 
@@ -259,9 +261,9 @@ The conformance harness is platform-neutral: it shells out to a built `carrick`
 binary and compares against Docker oracle results or cached oracle verdicts.
 
 - Local macOS/HVF is the default lane.
-- `--lane kvm-local` runs a platform-linux binary on Linux with `/dev/kvm`.
-- `--lane bhyve-local` runs a platform-freebsd binary on FreeBSD with bhyve.
-- `--lane nvmm-local` runs a platform-netbsd binary on NetBSD with NVMM.
+- `--lane kvm-local` runs a Linux-built binary on Linux with `/dev/kvm`.
+- `--lane bhyve-local` runs a FreeBSD-built binary on FreeBSD with bhyve.
+- `--lane nvmm-local` runs a NetBSD-built binary on NetBSD with NVMM.
 
 The local x86 lanes inject `--platform linux/amd64` and need the platform binary
 built on the target host. x86-lane expected gaps belong in backend-specific

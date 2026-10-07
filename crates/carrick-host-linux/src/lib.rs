@@ -8,7 +8,7 @@
 //! All code is `cfg(target_os = "linux")`; on any other host this crate is
 //! intentionally empty. It depends only on the trait crate `carrick-hal` (no
 //! VMM-backend dependency) — the KVM backend (`carrick-vmm-kvm`) and this host
-//! layer are integrated by `carrick-runtime` under the `platform-linux` feature.
+//! layer are integrated by `carrick-runtime` on a Linux build target.
 #![cfg(target_os = "linux")]
 
 pub mod epoll_mux;

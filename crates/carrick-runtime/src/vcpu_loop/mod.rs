@@ -80,7 +80,7 @@ const SIGNAL_WAIT_SLICE: Duration = Duration::from_millis(50);
 pub(crate) mod memory;
 #[cfg(test)]
 pub(crate) mod native_probe;
-#[cfg(feature = "platform-macos")]
+#[cfg(target_os = "macos")]
 pub(crate) use memory::apply_image_proc_state;
 pub(crate) use memory::{
     KernelFrameCowAuthority, RefuseAliasInstallSpec, apply_alias_frame_inventory,
@@ -105,11 +105,11 @@ pub(crate) use memory::{
 // `unreachable!()`. Only `load_execve_image` (HVF image builder) and
 // `hardware_tso_for_debug` (Apple TSO) remain macOS-only stubs.
 // ---------------------------------------------------------------------------
-#[cfg(feature = "platform-macos")]
+#[cfg(target_os = "macos")]
 use crate::runtime::exec::{
     forked_child_die_by_signal, load_execve_image, stop_after_traced_exec, stop_by_signal,
 };
-#[cfg(feature = "platform-macos")]
+#[cfg(target_os = "macos")]
 use crate::runtime::hardware_tso_for_debug;
 
 /// Attach the architecture-appropriate VMM vDSO after sealing the live
@@ -117,12 +117,7 @@ use crate::runtime::hardware_tso_for_debug;
 /// image yet, so the fail-closed x86 choice is to omit AT_SYSINFO_EHDR and the
 /// mapping entirely; libc then uses ordinary syscalls. AArch64 retains the
 /// existing no-fastpaths image because it still provides rt_sigreturn.
-#[cfg(any(
-    test,
-    feature = "platform-linux",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(test, target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
 fn with_vmm_vdso_for_dispatcher<A: carrick_hal::GuestArch>(
     image: AddressSpace,
     dispatcher: &SyscallDispatcher,
@@ -153,16 +148,8 @@ fn with_vmm_vdso_for_dispatcher<A: carrick_hal::GuestArch>(
 // `load_execve_image` (HVF AddressSpace builder) and `hardware_tso_for_debug`
 // (Apple TSO) stay genuinely macOS-only stubs — the KVM execve path builds its
 // own image (Task 7d) and KVM has no Rosetta TSO toggle.
-#[cfg(any(
-    test,
-    feature = "platform-linux",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
-#[cfg_attr(
-    all(test, feature = "platform-macos"),
-    allow(dead_code, unused_imports)
-)]
+#[cfg(any(test, target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
+#[cfg_attr(all(test, target_os = "macos"), allow(dead_code, unused_imports))]
 #[allow(unused_variables, clippy::needless_pass_by_value)]
 mod macos_helper_stubs {
     use super::{AddressSpace, SyscallDispatcher};
@@ -300,7 +287,7 @@ mod macos_helper_stubs {
         // `run_elf_real_dispatch`. Per-ISA vDSO bytes come from the engine's
         // GuestArch; the x86_64 lanes now materialize the shared x86 clock vDSO
         // as well, so execve children do not fall back to real clock syscalls.
-        #[cfg(all(feature = "platform-linux", target_arch = "aarch64"))]
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
         let image = {
             type KvmArch = <carrick_vmm_kvm::KvmTrapEngine as carrick_hal::ThreadedEngine>::Arch;
             let linux_page_size = dispatcher.linux_page_size();
@@ -336,7 +323,7 @@ mod macos_helper_stubs {
             };
         #[cfg(all(
             not(target_arch = "x86_64"),
-            not(all(feature = "platform-linux", target_arch = "aarch64"))
+            not(all(target_os = "linux", target_arch = "aarch64"))
         ))]
         let image = raw
             .with_vdso_auxv(false)
@@ -357,11 +344,7 @@ mod macos_helper_stubs {
         unreachable!("Apple-Silicon hardware TSO toggle is HVF-only; KVM has no Rosetta TSO")
     }
 }
-#[cfg(any(
-    feature = "platform-linux",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
 use macos_helper_stubs::{
     forked_child_die_by_signal, hardware_tso_for_debug, stop_after_traced_exec, stop_by_signal,
 };
@@ -394,7 +377,7 @@ use signal::{
     SignalRestartContext, deliver_fault_signal, deliver_pending_signal_with_restart,
     deliver_reserved_signal_with_restart, lower_el0_fault,
 };
-#[cfg(feature = "platform-macos")]
+#[cfg(target_os = "macos")]
 pub(crate) use signal::{
     deliver_pending_signal, partial_write_interrupt_outcome, raise_sigpipe_for_blocking_write,
     signal_wait_expired, signal_wait_slice,

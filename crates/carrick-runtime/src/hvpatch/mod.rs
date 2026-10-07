@@ -8,41 +8,33 @@
 
 //! HVF execution with static text patched to enter in-guest syscall islands.
 
-#[cfg(all(
-    feature = "platform-macos",
-    target_os = "macos",
-    target_arch = "aarch64"
-))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
 
 use carrick_fatal::carrick_fatal;
 
-#[cfg(any(test, feature = "platform-macos"))]
+#[cfg(any(test, target_os = "macos"))]
 use crate::memory::{AddressSpace, AddressSpaceError};
 use carrick_hal::{SysReg, ThreadedEngine};
 use carrick_kernel::dispatch::SyscallDispatcher;
 use carrick_kernel::kernel::CarrierProcess;
-#[cfg(all(
-    feature = "platform-macos",
-    target_os = "macos",
-    target_arch = "aarch64"
-))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use carrick_kernel::run_result::RunResult;
 use carrick_kernel::run_result::RuntimeError;
-#[cfg(any(test, feature = "platform-macos"))]
+#[cfg(any(test, target_os = "macos"))]
 use carrick_mem::elf::SegmentPerms;
-#[cfg(any(test, feature = "platform-macos"))]
+#[cfg(any(test, target_os = "macos"))]
 use island::passthrough_island_bytes;
-#[cfg(any(test, feature = "platform-macos"))]
+#[cfg(any(test, target_os = "macos"))]
 use patcher::{ISLAND_STUB_SIZE, PatchError, PatchSite, patch_svc_zero};
 
 mod asid;
-#[cfg(any(test, feature = "platform-macos"))]
+#[cfg(any(test, target_os = "macos"))]
 mod island;
 mod mm_resources;
-#[cfg(any(test, feature = "platform-macos"))]
+#[cfg(any(test, target_os = "macos"))]
 mod patcher;
 mod stage1_mm;
 
@@ -1231,15 +1223,15 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
     }))
 }
 
-#[cfg(any(test, feature = "platform-macos"))]
+#[cfg(any(test, target_os = "macos"))]
 const PAGE_SIZE: u64 = 4096;
-#[cfg(any(test, feature = "platform-macos"))]
+#[cfg(any(test, target_os = "macos"))]
 const STAGE2_PAGE_SIZE: u64 = crate::trap::HVF_PAGE_SIZE;
-#[cfg(any(test, feature = "platform-macos"))]
+#[cfg(any(test, target_os = "macos"))]
 const SVC_ZERO: u32 = 0xd400_0001;
 
 #[derive(Debug)]
-#[cfg(any(test, feature = "platform-macos"))]
+#[cfg(any(test, target_os = "macos"))]
 struct PreparedImage {
     image: AddressSpace,
     manifest: Vec<PatchSite>,
@@ -1247,7 +1239,7 @@ struct PreparedImage {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[cfg(any(test, feature = "platform-macos"))]
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) enum PrepareError {
     #[error(transparent)]
     AddressSpace(#[from] AddressSpaceError),
@@ -1259,14 +1251,14 @@ pub(crate) enum PrepareError {
     MissingRegion(usize),
 }
 
-#[cfg(any(test, feature = "platform-macos"))]
+#[cfg(any(test, target_os = "macos"))]
 fn align_up_stage2(value: u64) -> Option<u64> {
     value
         .checked_add(STAGE2_PAGE_SIZE - 1)
         .map(|v| v & !(STAGE2_PAGE_SIZE - 1))
 }
 
-#[cfg(any(test, feature = "platform-macos"))]
+#[cfg(any(test, target_os = "macos"))]
 fn span_is_free(base: u64, size: u64, ranges: &[(u64, u64)]) -> bool {
     let Some(end) = base.checked_add(size) else {
         return false;
@@ -1276,7 +1268,7 @@ fn span_is_free(base: u64, size: u64, ranges: &[(u64, u64)]) -> bool {
         .all(|&(occupied_start, occupied_end)| end <= occupied_start || base >= occupied_end)
 }
 
-#[cfg(any(test, feature = "platform-macos"))]
+#[cfg(any(test, target_os = "macos"))]
 fn find_island_base(
     region_start: u64,
     region_end: u64,
@@ -1354,7 +1346,7 @@ fn find_island_base(
     })
 }
 
-#[cfg(any(test, feature = "platform-macos"))]
+#[cfg(any(test, target_os = "macos"))]
 fn prepare_image(mut image: AddressSpace) -> Result<PreparedImage, PrepareError> {
     let mut occupied: Vec<(u64, u64)> = Vec::with_capacity(image.regions().len() + 1);
     for region in image.regions() {
@@ -1421,7 +1413,7 @@ fn prepare_image(mut image: AddressSpace) -> Result<PreparedImage, PrepareError>
 
 /// Patch an `execve` replacement image before the runtime adds its own
 /// executable trampoline/vector pages.
-#[cfg(any(test, feature = "platform-macos"))]
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn prepare_exec_image_for_dispatcher(
     image: AddressSpace,
     dispatcher: &SyscallDispatcher,
@@ -1430,11 +1422,7 @@ pub(crate) fn prepare_exec_image_for_dispatcher(
     Ok(prepare_image(image)?.image)
 }
 
-#[cfg(all(
-    feature = "platform-macos",
-    target_os = "macos",
-    target_arch = "aarch64"
-))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn finish_hvpatch_image(
     image: AddressSpace,
     dispatcher: SyscallDispatcher,
@@ -1444,11 +1432,7 @@ pub(crate) fn finish_hvpatch_image(
     finish_hvpatch_image_owned(image, dispatcher, max_traps, debug_state_path, None)
 }
 
-#[cfg(all(
-    feature = "platform-macos",
-    target_os = "macos",
-    target_arch = "aarch64"
-))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn finish_hvpatch_image_on(
     image: AddressSpace,
     dispatcher: SyscallDispatcher,
@@ -1466,11 +1450,7 @@ pub(crate) fn finish_hvpatch_image_on(
     )
 }
 
-#[cfg(all(
-    feature = "platform-macos",
-    target_os = "macos",
-    target_arch = "aarch64"
-))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn finish_hvpatch_image_owned(
     image: AddressSpace,
     dispatcher: SyscallDispatcher,
@@ -1508,11 +1488,7 @@ fn finish_hvpatch_image_owned(
     }
 }
 
-#[cfg(all(
-    feature = "platform-macos",
-    target_os = "macos",
-    target_arch = "aarch64"
-))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn run_static_hvpatch<A, E>(
     path: &Path,
     dispatcher: SyscallDispatcher,

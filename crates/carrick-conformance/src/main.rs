@@ -71,9 +71,9 @@ struct Args {
     /// WHERE the carrick side runs — not which backend it uses; carrick has one
     /// (HVPatch) and no lane selects it. `hvf` (the local signed binary on this
     /// mac, the default, and the owner of the shared baseline), `kvm` (carrick
-    /// in the lima guest), `kvm-local` (direct platform-linux carrick on this
-    /// host), `bhyve-local` (direct platform-freebsd carrick on this host), or
-    /// `nvmm-local` (direct platform-netbsd carrick on this host).
+    /// in the lima guest), `kvm-local` (direct linux carrick on this
+    /// host), `bhyve-local` (direct freebsd carrick on this host), or
+    /// `nvmm-local` (direct netbsd carrick on this host).
     #[arg(long, default_value = "hvf")]
     lane: String,
     /// lima VM name for `--lane kvm`.
@@ -2405,14 +2405,14 @@ fn preflight(bin: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Local Linux/KVM preflight: the binary is built for platform-linux and runs
+/// Local Linux/KVM preflight: the binary is built for linux and runs
 /// on this host, so macOS codesign is irrelevant. Validate only the local
 /// executable and `/dev/kvm` before the suite fan-out starts.
 fn preflight_kvm_local(bin: &Path) -> anyhow::Result<()> {
     let meta = match std::fs::metadata(bin) {
         Ok(m) => m,
         Err(_) => anyhow::bail!(
-            "{} is missing — build carrick-cli with `--no-default-features --features platform-linux` first",
+            "{} is missing — build carrick-cli on this host (`just build`) first",
             bin.display()
         ),
     };
@@ -2434,21 +2434,21 @@ fn preflight_kvm_local(bin: &Path) -> anyhow::Result<()> {
     {
         eprintln!(
             "WARNING: {} looks STALE (older than a runtime-crate source) — \
-             rebuild the platform-linux carrick binary to be sure you are testing HEAD. Continuing.",
+             rebuild the linux carrick binary to be sure you are testing HEAD. Continuing.",
             bin.display()
         );
     }
     Ok(())
 }
 
-/// Local FreeBSD/bhyve preflight: the binary is built for platform-freebsd and
+/// Local FreeBSD/bhyve preflight: the binary is built for freebsd and
 /// runs on this host, so macOS codesign is irrelevant. Validate only the local
 /// executable and bhyve device before the suite fan-out starts.
 fn preflight_bhyve_local(bin: &Path) -> anyhow::Result<()> {
     let meta = match std::fs::metadata(bin) {
         Ok(m) => m,
         Err(_) => anyhow::bail!(
-            "{} is missing — build carrick-cli with `--no-default-features --features platform-freebsd` first",
+            "{} is missing — build carrick-cli on this host (`just build`) first",
             bin.display()
         ),
     };
@@ -2470,7 +2470,7 @@ fn preflight_bhyve_local(bin: &Path) -> anyhow::Result<()> {
     {
         eprintln!(
             "WARNING: {} looks STALE (older than a runtime-crate source) — \
-             rebuild the platform-freebsd carrick binary to be sure you are testing HEAD. Continuing.",
+             rebuild the freebsd carrick binary to be sure you are testing HEAD. Continuing.",
             bin.display()
         );
     }
@@ -2481,14 +2481,14 @@ fn bhyve_device_available(vmm_dir: &Path, vmmctl: &Path) -> bool {
     vmm_dir.exists() || vmmctl.exists()
 }
 
-/// Local NetBSD/NVMM preflight: the binary is built for platform-netbsd and runs
+/// Local NetBSD/NVMM preflight: the binary is built for netbsd and runs
 /// on this host, so macOS codesign is irrelevant. Validate only the local
 /// executable and NVMM device before the suite fan-out starts.
 fn preflight_nvmm_local(bin: &Path) -> anyhow::Result<()> {
     let meta = match std::fs::metadata(bin) {
         Ok(m) => m,
         Err(_) => anyhow::bail!(
-            "{} is missing — build carrick-cli with `--no-default-features --features platform-netbsd` first",
+            "{} is missing — build carrick-cli on this host (`just build`) first",
             bin.display()
         ),
     };
@@ -2510,7 +2510,7 @@ fn preflight_nvmm_local(bin: &Path) -> anyhow::Result<()> {
     {
         eprintln!(
             "WARNING: {} looks STALE (older than a runtime-crate source) — \
-             rebuild the platform-netbsd carrick binary to be sure you are testing HEAD. Continuing.",
+             rebuild the netbsd carrick binary to be sure you are testing HEAD. Continuing.",
             bin.display()
         );
     }

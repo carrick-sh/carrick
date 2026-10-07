@@ -178,9 +178,9 @@ AMBIENT_BUILD_AUTHORITY = {
 }
 
 for host, features in (
-    ("linux", "syscall-shim,platform-linux"),
-    ("freebsd", "platform-freebsd"),
-    ("netbsd", "platform-netbsd"),
+    ("linux", ["--features", "syscall-shim"]),
+    ("freebsd", ["--no-default-features"]),
+    ("netbsd", ["--no-default-features"]),
 ):
     for target, package, target_args in (
         ("cli", "carrick-cli", ["--bin", "carrick"]),
@@ -191,9 +191,7 @@ for host, features in (
             "clippy",
             "-p",
             package,
-            "--no-default-features",
-            "--features",
-            features,
+            *features,
             "--target",
             HOST_TRIPLES[host],
             *target_args,

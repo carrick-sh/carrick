@@ -43,11 +43,10 @@ schedule-hooks = []
 # Bounded protocol models; no synchronization substitutions in product code.
 loom = []
 
-# NOTE: no `platform-*` features. This crate selects no VMM and no host
-# backend: the host-OS glue it needs (the kqueue/epoll readiness multiplexer,
+# NOTE: this crate selects no VMM and no host backend: the host-OS glue it needs (the kqueue/epoll readiness multiplexer,
 # the host errno table) arrives through carrick-host-bsd / carrick-host-linux
 # in the `cfg(target_os)` tables at the bottom, exactly as in carrick-vfs. The
-# backend selection stays above, in carrick-runtime.
+# backend selection stays above, in carrick-runtime's target tables.
 
 [dependencies]
 carrick-fatal.workspace = true
@@ -92,8 +91,7 @@ zerocopy.workspace = true
 
 # `host_to_linux_errno` and the readiness multiplexer are the two host-OS edges
 # below the kernel: the BSD tables on macOS/FreeBSD/NetBSD, the Linux ones on
-# Linux. Gated on `target_os` rather than a `platform-*` feature because this
-# crate has no backend selection — the host errno space and the host event
+# Linux. Gated on `target_os` because the host errno space and the host event
 # backend are properties of the host it is compiled for.
 [target.'cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))'.dependencies]
 carrick-host-bsd = { path = "../carrick-host-bsd" }

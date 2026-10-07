@@ -57,21 +57,22 @@ rules:
           - pattern: libc::XATTR_CREATE
           - pattern: libc::XATTR_REPLACE
 
-  - id: no-cfg-not-platform-macos
+  - id: no-platform-feature-cfg
     languages: [generic]
     severity: ERROR
     message: >
-      `not(feature = "platform-macos")` conflates the host-OS and
-      hypervisor-backend axes and silently captures every non-macOS host
-      (FreeBSD today; NetBSD/OpenBSD/illumos tomorrow). Use an explicit positive
-      predicate instead: `feature = "platform-linux"` for Linux-lane (KVM) code,
-      or `any(feature = "platform-linux", feature = "platform-freebsd")` for
-      shared non-macOS infrastructure. ABI-shape branches that are not yet behind
-      carrick-portable may use the build.rs `carrick_bsd`/`carrick_linux` cfgs.
+      The VMM/host backend is selected by the build TARGET, not a Cargo
+      feature: carrick-runtime and carrick-cli scope every backend crate to a
+      `[target.'cfg(target_os = ...)'.dependencies]` table. A
+      `feature = "platform-*"` gate reintroduces a second selection axis that
+      can disagree with the target (and that every off-macOS caller must
+      remember to pass). Gate backend code on `target_os` (plus `target_arch`
+      where the backend is arch-scoped, e.g. bhyve/NVMM on x86_64), with an
+      explicit positive predicate for the hosts that have that arm. ABI-shape
+      branches that are not yet behind carrick-portable may use the build.rs
+      `carrick_bsd`/`carrick_linux` cfgs.
     paths:
       include:
         - crates/
-      exclude:
-        - crates/*/tests/
     patterns:
-      - pattern-regex: 'not\(feature\s*=\s*"platform-macos"\)'
+      - pattern-regex: 'feature\s*=\s*"platform-'

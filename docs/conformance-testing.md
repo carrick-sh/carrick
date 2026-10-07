@@ -44,7 +44,7 @@ is rejected before any steps run. It runs `just test-kernel`, native Cargo tests
 for the neutral cores/ABI/EL1, kernel example, x86/AArch64 engines, Linux host
 primitives, contract registry and xtask, plus a separate KVM test step; the
 `carrick-guest-arch` crate is absent (guest architecture types live in `carrick-hal`).
-It also runs clippy for the CLI's `platform-linux,syscall-shim` closure and worker
+It also runs clippy for the CLI's Linux-target (KVM, default `syscall-shim`) closure and worker
 harnesses with `-D warnings`, fmt-check, and the shared `lint-domains-source` checks. A separate authority compiler
 step executes Linux profiles; live macOS/FreeBSD/NetBSD profiles require those
 hosts and are explicitly recorded in the receipt's skipped steps. Source checks
@@ -213,8 +213,8 @@ cargo run -p carrick-conformance -- --lane bhyve-local --tier smoke
 cargo run -p carrick-conformance -- --lane nvmm-local --tier smoke
 ```
 
-Those lanes expect a platform-native `carrick` binary built with the matching
-`platform-*` feature and inject `--platform linux/amd64` (they run x86_64
+Those lanes expect a `carrick` binary built on that host (`just build`; the
+build target selects the backend) and inject `--platform linux/amd64` (they run x86_64
 guests). That platform flag is the ONLY thing a lane adds to the suite argv.
 Lane-specific expected gaps belong in that lane's overlay
 (`scripts/conformance/baseline.<key>.jsonl`), not in the shared `hvf` baseline —

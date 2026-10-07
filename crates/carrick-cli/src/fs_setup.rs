@@ -61,7 +61,7 @@ use carrick_vfs::fs_backend::{FsBackend, HostFsBackend};
 /// On a `--fs host` failure, fall back to the in-memory backend when the
 /// `fs-memory` feature is compiled in, or hard-error with an actionable message
 /// when it isn't (the "host, then error" rule).
-// Only the `platform-macos` `RunElf` arm installs an fs backend, so on the
+// Only the macOS `RunElf` arm installs an fs backend, so on the
 // non-macOS build these helpers have no caller; they are live on macOS.
 #[cfg(feature = "fs-memory")]
 #[allow(dead_code)]
@@ -90,7 +90,7 @@ fn host_failure_fallback(reason: &str) -> Result<(Box<dyn FsBackend>, FsBackendK
 /// `fs-memory` feature we fall back to the in-memory backend with a
 /// warning; without it (the default) we fail with an actionable error
 /// ("host, then error").
-// Called only from the `platform-macos` `RunElf` command arm; dead on non-macOS.
+// Called only from the macOS `RunElf` command arm; dead on non-macOS.
 #[allow(dead_code)]
 pub(crate) fn install_fs_backend(
     dispatcher: &mut SyscallDispatcher,
@@ -142,7 +142,7 @@ pub(crate) fn install_fs_backend(
 /// no OCI rootfs to supply `/tmp`, passwd/group databases, or resolver files;
 /// enough real software assumes those paths exist that Carrick seeds them for
 /// both memory and host backends.
-// Reachable only via `install_fs_backend` (the `platform-macos` `RunElf` arm),
+// Reachable only via `install_fs_backend` (the macOS `RunElf` arm),
 // so it is dead on the non-macOS build and live on macOS.
 #[allow(dead_code)]
 fn seed_guest_baseline(backend: &mut dyn FsBackend) {

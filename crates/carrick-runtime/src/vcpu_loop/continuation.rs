@@ -7,7 +7,7 @@ pub mod quantum;
 #[cfg(test)]
 mod tests;
 
-#[cfg(any(test, feature = "platform-macos"))]
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) use self::quantum::HvpatchTaskQuantum;
 pub(crate) use self::quantum::{
     ExecutorFailureSettlement, HvpatchTaskBinding, PersistentQuantumJob,

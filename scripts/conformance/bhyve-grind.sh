@@ -36,7 +36,7 @@ REG="${BHYVE_REG:-localhost:5050}"
 IMG="${BHYVE_IMG:-localhost:5050/ltp:arm64}"
 SSH="ssh -o ConnectTimeout=15 -o ServerAliveInterval=20 -o ServerAliveCountMax=400 -o BatchMode=yes"
 ENVV="CARRICK_INSECURE_REGISTRIES=$REG"
-BUILD="cargo build --release -j4 -p carrick-cli --no-default-features --features platform-freebsd,syscall-shim"
+BUILD="cargo build --release -j4 -p carrick-cli"
 # The harness is a SECOND explicit build, and it is not optional: the root
 # manifest's `default-members` is `crates/carrick-cli`, and carrick-conformance
 # is a bin-only crate outside that closure, so no carrick build of any shape

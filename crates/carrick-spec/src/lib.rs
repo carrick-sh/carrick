@@ -738,7 +738,7 @@ impl HostOs {
 /// `Platform`.
 ///
 /// The VMM backend (HVF/KVM/bhyve/NVMM) is a fourth dimension the audit names,
-/// but today it is fixed by the compile-time `platform-*` feature and fully
+/// but today it is fixed at compile time by the build target and fully
 /// implied by `host_os`, so it is not carried here yet — it joins this descriptor
 /// when the per-VMM runtime-platform descriptor lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

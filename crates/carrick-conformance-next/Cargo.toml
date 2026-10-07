@@ -13,13 +13,10 @@ path = "src/lib.rs"
 workspace = true
 
 [features]
-# Matches carrick-embed: forward platform features and syscall-shim.
-default = ["platform-macos", "syscall-shim"]
+# Matches carrick-embed: forward syscall-shim (the host backend follows the
+# build target).
+default = ["syscall-shim"]
 syscall-shim = ["carrick-embed/syscall-shim"]
-platform-macos = ["carrick-embed/platform-macos"]
-platform-linux = ["carrick-embed/platform-linux"]
-platform-freebsd = ["carrick-embed/platform-freebsd"]
-platform-netbsd = ["carrick-embed/platform-netbsd"]
 fs-memory = ["carrick-embed/fs-memory"]
 
 [dependencies]

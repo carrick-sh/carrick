@@ -434,7 +434,7 @@ pub(crate) enum Commands {
     },
     /// `run-elf` drives a freestanding ELF straight through the HVF run loop
     /// (`run_static_elf_with_hvf_…`), macOS-only.
-    #[cfg(feature = "platform-macos")]
+    #[cfg(target_os = "macos")]
     RunElf {
         #[clap(flatten)]
         run_args: RunArgs,

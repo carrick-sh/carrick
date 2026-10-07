@@ -4,9 +4,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 // This suite drives the macOS HVF syscall loop with scripted AArch64 frames
 // (run_syscall_loop / SyscallTrap / Aarch64SyscallFrame), which
-// carrick_runtime::runtime only exposes under platform-macos. Gate the whole
+// carrick_runtime::runtime only exposes on macOS. Gate the whole
 // file so the non-macOS cross-checks (which build --all-targets) skip it.
-#![cfg(feature = "platform-macos")]
+#![cfg(target_os = "macos")]
 
 #[path = "../../carrick-kernel/tests/integration/common/syscall_support.rs"]
 mod support;
