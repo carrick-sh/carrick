@@ -734,6 +734,12 @@ pub use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 #[repr(transparent)]
 pub struct El1TaskId(u64);
 
+impl From<carrick_sched_core::process::TaskId> for El1TaskId {
+    fn from(id: carrick_sched_core::process::TaskId) -> Self {
+        Self::from_linux_tid(id.raw())
+    }
+}
+
 impl El1TaskId {
     /// No task bound to the slot.
     pub const NONE: Self = Self(0);

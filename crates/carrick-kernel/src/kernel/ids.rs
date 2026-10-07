@@ -1,3 +1,7 @@
+pub use carrick_sched_core::process::{
+    ChildExitSignal, InvalidLinuxId, InvalidLinuxSignal, LinuxSignal, ProcessGroupId, SessionId,
+    TaskId, TaskSerial,
+};
 use std::num::{NonZeroI32, NonZeroU64};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -57,10 +61,7 @@ macro_rules! serial_id {
     };
 }
 
-linux_i32_id!(TaskId);
 linux_i32_id!(LinuxTid);
-linux_i32_id!(ProcessGroupId);
-linux_i32_id!(SessionId);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
@@ -79,87 +80,6 @@ impl FileSlotNumber {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[repr(transparent)]
-pub struct LinuxSignal(NonZeroI32);
-
-impl LinuxSignal {
-    pub fn for_signal_number(raw: i32) -> Result<Self, InvalidLinuxSignal> {
-        let value = NonZeroI32::new(raw).ok_or(InvalidLinuxSignal::OutOfRange(raw))?;
-        if !(1..=64).contains(&raw) {
-            return Err(InvalidLinuxSignal::OutOfRange(raw));
-        }
-        Ok(Self(value))
-    }
-
-    pub const fn raw(self) -> i32 {
-        self.0.get()
-    }
-
-    /// Whether this is a POSIX realtime signal (`SIGRTMIN..=SIGRTMAX`, 32..=64
-    /// on Linux/aarch64).
-    ///
-    /// The distinction is not cosmetic: realtime signals QUEUE — every send is
-    /// delivered, with its own siginfo, in send order — while a standard signal
-    /// collapses to one pending bit no matter how many times it is sent. The
-    /// pending queue picks `enqueue_realtime` vs `enqueue_standard` from this,
-    /// so a wrong answer silently drops or duplicates deliveries.
-    ///
-    /// This is THE authority for the question; callers holding a raw signum go
-    /// through [`Self::for_signal_number`] rather than re-testing the range.
-    pub const fn is_realtime(self) -> bool {
-        self.0.get() >= 32
-    }
-
-    /// `SIGCHLD` (17 on Linux/aarch64): the exit signal an ordinary `fork`
-    /// child delivers, and the one `wait(2)` selects by default.
-    pub const SIGCHLD: Self = Self(NonZeroI32::new(17).unwrap());
-}
-
-/// The signal a task delivers to its parent when it terminates -- the
-/// `CSIGNAL` byte of `clone(2)` flags or `clone3(2)`'s `exit_signal`.
-///
-/// This is task state because Linux `wait(2)` partitions children on it: a
-/// child whose exit signal is anything other than `SIGCHLD` -- a different
-/// signal or none at all -- is a "clone child", visible only to a wait that
-/// passes `__WCLONE` or `__WALL`. A plain `waitpid` on such a child is
-/// `ECHILD`, not a reap (wait(2), "__WCLONE").
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ChildExitSignal {
-    /// Exit signal 0: the parent is not signalled at all.
-    None,
-    Signal(LinuxSignal),
-}
-
-impl ChildExitSignal {
-    pub const SIGCHLD: Self = Self::Signal(LinuxSignal::SIGCHLD);
-
-    /// The exit signal a clone request carries. The dispatch layer has
-    /// already lowered an out-of-range `CSIGNAL` byte to 0, so anything
-    /// other than a valid signal number means "no signal".
-    pub fn for_clone_request(raw: u32) -> Self {
-        i32::try_from(raw)
-            .ok()
-            .and_then(|raw| LinuxSignal::for_signal_number(raw).ok())
-            .map_or(Self::None, Self::Signal)
-    }
-
-    /// Whether `wait(2)` treats this child as a "clone child".
-    pub fn is_clone_child(self) -> bool {
-        self != Self::SIGCHLD
-    }
-
-    /// The raw signal number, 0 for none -- the value `clone3`'s
-    /// `exit_signal` field carries.
-    pub fn raw(self) -> i32 {
-        match self {
-            Self::None => 0,
-            Self::Signal(signal) => signal.raw(),
-        }
-    }
-}
-
-serial_id!(TaskSerial);
 serial_id!(ThreadSerial);
 serial_id!(MmId);
 serial_id!(FileTableId);
@@ -174,16 +94,6 @@ impl MmId {
     }
 }
 
-impl TaskId {
-    pub(crate) const fn from_registry_allocation(raw: NonZeroI32) -> Self {
-        Self(raw)
-    }
-
-    pub fn for_root_bootstrap(raw: i32) -> Result<Self, InvalidLinuxId> {
-        Self::from_abi_positive(raw)
-    }
-}
-
 impl LinuxTid {
     pub(crate) const fn from_registry_allocation(raw: NonZeroI32) -> Self {
         Self(raw)
@@ -192,34 +102,8 @@ impl LinuxTid {
     /// The initial thread of a thread group has the same numeric identity as
     /// its task/TGID, but remains a distinct semantic domain.
     pub const fn for_task_leader(task: TaskId) -> Self {
-        Self(task.0)
+        Self(task.nonzero())
     }
-}
-
-impl ProcessGroupId {
-    pub fn from_leader(leader: TaskId) -> Self {
-        Self(leader.0)
-    }
-}
-
-impl SessionId {
-    pub fn from_leader(leader: TaskId) -> Self {
-        Self(leader.0)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum InvalidLinuxId {
-    #[error("Linux identity zero is reserved")]
-    Zero,
-    #[error("Linux identity {0} is negative")]
-    Negative(i32),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum InvalidLinuxSignal {
-    #[error("Linux signal number {0} is outside 1..=64")]
-    OutOfRange(i32),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
