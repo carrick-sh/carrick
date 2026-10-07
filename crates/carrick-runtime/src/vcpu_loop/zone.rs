@@ -33,6 +33,10 @@ use carrick_kernel::el1_zone::HostLockWait;
 
 pub(super) enum OwnerMemoryAction {
     Syscall(carrick_hal::RawSyscall),
+    StatCopyout {
+        frame: carrick_hal::RawSyscall,
+        output: Box<carrick_kernel::dispatch::format_stat::StatCopyout>,
+    },
     CloneParentTid {
         frame: carrick_hal::RawSyscall,
         address: u64,
@@ -697,6 +701,7 @@ where
         };
         let syscall_state = match &action {
             OwnerMemoryAction::Syscall(_)
+            | OwnerMemoryAction::StatCopyout { .. }
             | OwnerMemoryAction::CloneParentTid { .. }
             | OwnerMemoryAction::Ipc {
                 boundary: IpcBoundary::Syscall(_),
@@ -795,6 +800,25 @@ where
                             request,
                         )?;
                         self.phase = HvpatchProductionPhase::ResumeIpcOwner { boundary, token };
+                        Ok(exit)
+                    }
+                    (
+                        OwnerMemoryAction::StatCopyout { frame, output },
+                        Some((state, _, request)),
+                    ) => {
+                        let exit = self.settle_into_zone(
+                            control,
+                            continuation::quantum::ZoneSave {
+                                base: state,
+                                record: zone.record_ref(record),
+                                origin: executor::residency::ZoneResumeOrigin::HostSyscall,
+                            },
+                            seq,
+                            None,
+                            request,
+                        )?;
+                        self.phase =
+                            HvpatchProductionPhase::ResumeStatCopyoutOwner { frame, output };
                         Ok(exit)
                     }
                     (OwnerMemoryAction::Syscall(frame), Some((state, _, request))) => {
@@ -925,6 +949,9 @@ where
                             control.submission.host_wait_context(),
                         )?;
                         self.service_outcome(engine, control, frame, outcome)
+                    }
+                    OwnerMemoryAction::StatCopyout { frame, output } => {
+                        self.complete_stat_copyout(engine, control, frame, output)
                     }
                     OwnerMemoryAction::CloneParentTid {
                         frame,

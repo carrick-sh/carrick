@@ -223,7 +223,7 @@ pub(super) enum HvpatchProductionPhase {
         internal_tid: i32,
         tid: i32,
     },
-    ResumeClonePhysical {
+    ResumeMemoryCompletionPhysical {
         action: zone::OwnerMemoryAction,
         wait: carrick_guest_mem::OwnedMemoryWait,
         _subscription: Box<dyn std::fmt::Debug + Send + Sync>,
@@ -270,6 +270,10 @@ pub(super) enum HvpatchProductionPhase {
     /// syscall still owns completion; a wake re-enters its exact dispatch.
     ResumeOwnerZone {
         frame: carrick_hal::RawSyscall,
+    },
+    ResumeStatCopyoutOwner {
+        frame: carrick_hal::RawSyscall,
+        output: Box<carrick_kernel::dispatch::format_stat::StatCopyout>,
     },
     ResumeTerminalOwner {
         action: Box<TerminalMemoryAction>,
@@ -472,7 +476,8 @@ impl HvpatchProductionPhase {
             Self::ResumeIpcPhysical { .. } => 25,
             Self::ResumeCloneChildTid { .. } => 26,
             Self::ResumeCloneParentTid { .. } => 27,
-            Self::ResumeClonePhysical { .. } => 28,
+            Self::ResumeMemoryCompletionPhysical { .. } => 28,
+            Self::ResumeStatCopyoutOwner { .. } => 29,
         }
     }
 }
@@ -2873,7 +2878,7 @@ where
                 },
                 wait,
             ),
-            Err(error) => self.wait_for_clone_tid_memory(
+            Err(error) => self.wait_for_memory_completion(
                 engine,
                 control,
                 zone::OwnerMemoryAction::CloneParentTid {
@@ -2907,7 +2912,7 @@ where
                 zone::OwnerMemoryAction::CloneChildTid { address, tid },
                 wait,
             ),
-            Err(error) => self.wait_for_clone_tid_memory(
+            Err(error) => self.wait_for_memory_completion(
                 engine,
                 control,
                 zone::OwnerMemoryAction::CloneChildTid { address, tid },
@@ -2916,13 +2921,27 @@ where
         }
     }
 
-    fn drive_clone_tid_action(
+    pub(super) fn complete_stat_copyout(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        frame: carrick_hal::RawSyscall,
+        output: Box<carrick_kernel::dispatch::format_stat::StatCopyout>,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let outcome = (*output).resume(engine);
+        self.service_outcome(engine, control, frame, outcome)
+    }
+
+    fn drive_memory_completion_action(
         &mut self,
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         action: zone::OwnerMemoryAction,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         match action {
+            zone::OwnerMemoryAction::StatCopyout { frame, output } => {
+                self.complete_stat_copyout(engine, control, frame, output)
+            }
             zone::OwnerMemoryAction::CloneParentTid {
                 frame,
                 address,
@@ -2933,13 +2952,13 @@ where
                 self.complete_clone_child_tid(engine, control, address, tid)
             }
             _ => Err(RuntimeError::Configuration(
-                "non-clone action in clone TID continuation".to_owned(),
+                "invalid action in owned memory completion".to_owned(),
             )
             .into()),
         }
     }
 
-    fn wait_for_clone_tid_memory(
+    fn wait_for_memory_completion(
         &mut self,
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
@@ -2957,27 +2976,27 @@ where
             }) => self.park_owner_memory_action(engine, control, action, observed),
             MemoryPrepareError::Supply(request) => {
                 match self.supply_owner_memory(engine, request)? {
-                    Some(OwnerSupplyWait::Owner(wait)) => self.wait_for_clone_tid_memory(
+                    Some(OwnerSupplyWait::Owner(wait)) => self.wait_for_memory_completion(
                         engine,
                         control,
                         action,
                         MemoryPrepareError::OwnerWait(wait),
                     ),
-                    Some(OwnerSupplyWait::Physical(wait)) => self.wait_for_clone_tid_memory(
+                    Some(OwnerSupplyWait::Physical(wait)) => self.wait_for_memory_completion(
                         engine,
                         control,
                         action,
                         MemoryPrepareError::Physical(wait),
                     ),
-                    None => self.drive_clone_tid_action(engine, control, action),
+                    None => self.drive_memory_completion_action(engine, control, action),
                 }
             }
             MemoryPrepareError::Physical(wait) => {
                 let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
-                    RuntimeError::Configuration("clone TID wait lost context".to_owned())
+                    RuntimeError::Configuration("owned memory completion lost context".to_owned())
                 })?;
                 let runtime = self.kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
-                    RuntimeError::Configuration("clone TID wait lost runtime".to_owned())
+                    RuntimeError::Configuration("owned memory completion lost runtime".to_owned())
                 })?;
                 let scheduler = runtime.continuation_services(context.kernel()).0;
                 let (subscription, ready) = wait.0.enroll(registration_wake_callback(
@@ -2987,9 +3006,9 @@ where
                 ));
                 if ready || wait.0.is_ready() {
                     drop(subscription);
-                    return self.drive_clone_tid_action(engine, control, action);
+                    return self.drive_memory_completion_action(engine, control, action);
                 }
-                self.phase = HvpatchProductionPhase::ResumeClonePhysical {
+                self.phase = HvpatchProductionPhase::ResumeMemoryCompletionPhysical {
                     action,
                     wait,
                     _subscription: subscription,
@@ -3002,7 +3021,7 @@ where
                 ))
             }
             other => Err(RuntimeError::Configuration(format!(
-                "clone TID output preparation: {other:?}"
+                "owned memory completion output preparation: {other:?}"
             ))
             .into()),
         }
@@ -3244,6 +3263,14 @@ where
         frame: carrick_hal::RawSyscall,
         outcome: DispatchOutcome,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        if let DispatchOutcome::OwnerStatCopyout { output, dependency } = outcome {
+            return self.wait_for_memory_completion(
+                engine,
+                control,
+                zone::OwnerMemoryAction::StatCopyout { frame, output },
+                dependency,
+            );
+        }
         if let DispatchOutcome::OwnerMemorySupply { request, committed } = outcome {
             self.state.owner_read_progress = self
                 .state
@@ -4331,6 +4358,18 @@ where
                 HvpatchProductionPhase::ResumeOwnerZone { frame } => {
                     return self.resume_owner_zone(engine, control, frame);
                 }
+                HvpatchProductionPhase::ResumeStatCopyoutOwner { frame, output } => {
+                    let mut result = self.consume_owner_zone(control)?;
+                    self.state.reserved_signal = self
+                        .state
+                        .reserved_signal
+                        .take()
+                        .or(result.take_reserved_signal());
+                    // Lookup already succeeded. Complete its captured copyout
+                    // before servicing a reserved signal, without re-dispatch.
+                    self.state.continuation_restart = None;
+                    return self.complete_stat_copyout(engine, control, frame, output);
+                }
                 HvpatchProductionPhase::ResumeFaultOwner => {
                     return self.resume_owner_fault_zone(engine, control);
                 }
@@ -4454,13 +4493,13 @@ where
                         tid,
                     );
                 }
-                HvpatchProductionPhase::ResumeClonePhysical {
+                HvpatchProductionPhase::ResumeMemoryCompletionPhysical {
                     action,
                     wait,
                     _subscription,
                 } => {
                     if !wait.0.is_ready() {
-                        self.phase = HvpatchProductionPhase::ResumeClonePhysical {
+                        self.phase = HvpatchProductionPhase::ResumeMemoryCompletionPhysical {
                             action,
                             wait,
                             _subscription,
@@ -4473,7 +4512,7 @@ where
                         ));
                     }
                     drop(_subscription);
-                    return self.drive_clone_tid_action(engine, control, action);
+                    return self.drive_memory_completion_action(engine, control, action);
                 }
                 HvpatchProductionPhase::ResumeForkQuiesce { _subscription } => {
                     drop(_subscription);
