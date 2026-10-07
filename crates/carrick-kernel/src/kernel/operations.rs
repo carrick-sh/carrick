@@ -563,6 +563,31 @@ impl ForkReservation {
     }
 }
 
+impl carrick_sched_core::process::birth::BirthLive for TaskRecord {
+    type Error = KernelOperationError;
+
+    fn birth_lifecycle(&self) -> carrick_sched_core::process::TaskLifecycle {
+        self.task.lifecycle()
+    }
+
+    fn birth_revision(&self) -> TaskRevision {
+        self.revision
+    }
+
+    fn birth_session(&self) -> super::ids::SessionId {
+        self.task.session()
+    }
+
+    fn birth_prepare_parent_revision(&self) -> Result<TaskRevision, Self::Error> {
+        next_revision(&self.task, self.revision)
+    }
+
+    fn birth_publish_child(&mut self, child: TaskKey, revision: TaskRevision) {
+        self.task.add_child(child);
+        self.revision = revision;
+    }
+}
+
 #[derive(Debug)]
 pub struct PreparedFork {
     reservation: ForkReservation,
@@ -702,33 +727,46 @@ impl PreparedFork {
         {
             let mut state = kernel.registry().settled().write();
             operation.validate(&state)?;
-            let Some(caller_record) = state.tasks.get(&caller_task.key().id) else {
-                return Err(KernelOperationError::ParentExited);
-            };
-            if caller_record.task.key() != caller_task.key() {
-                return Err(KernelOperationError::ParentExited);
-            }
-            if caller_record.revision != caller_revision {
-                return Err(KernelOperationError::StaleContext);
-            }
-            let Some(child_parent_record) = state.tasks.get(&child_parent_task.key().id) else {
-                return Err(KernelOperationError::ForkParentExited);
-            };
-            if child_parent_record.task.key() != child_parent_task.key() {
-                return Err(KernelOperationError::ForkParentExited);
-            }
-            if child_parent_record.revision != child_parent_revision {
-                return Err(KernelOperationError::ForkParentChanged);
-            }
-            let next_child_parent_revision =
-                next_revision(&child_parent_record.task, child_parent_record.revision)?;
-            let process_group = child.process_group();
-            let session = child.session();
-            if !state.process_groups.contains_key(&process_group)
-                || !state.sessions.contains_key(&session)
-            {
-                return Err(KernelOperationError::IdentityObjectMissing);
-            }
+            use carrick_sched_core::process::birth::{BirthAttachment, BirthError, BirthSnapshot};
+            use carrick_sched_core::process::wait::WaitIdentity;
+            let admission = state
+                .admit_process_birth(
+                    BirthSnapshot {
+                        key: caller_task.key(),
+                        revision: caller_revision,
+                    },
+                    BirthSnapshot {
+                        key: child_parent_task.key(),
+                        revision: child_parent_revision,
+                    },
+                    WaitIdentity {
+                        key: child_key,
+                        parent: child.parent(),
+                        tracer: child.ptrace_tracer(),
+                        group: child.process_group(),
+                        exit_signal: child.exit_signal(),
+                    },
+                    child.session(),
+                    if external_peer_root {
+                        BirthAttachment::ExternalPeerRoot
+                    } else {
+                        BirthAttachment::Parent
+                    },
+                    Some(&operation.permit),
+                )
+                .map_err(|error| match error {
+                    BirthError::CallerGone => KernelOperationError::ParentExited,
+                    BirthError::CallerRevision => KernelOperationError::StaleContext,
+                    BirthError::ParentGone => KernelOperationError::ForkParentExited,
+                    BirthError::ParentRevision | BirthError::ParentMismatch => {
+                        KernelOperationError::ForkParentChanged
+                    }
+                    BirthError::IdentityMissing => KernelOperationError::IdentityObjectMissing,
+                    BirthError::Reservation => KernelOperationError::StaleReservation,
+                    BirthError::Busy(id) => KernelOperationError::TaskBusy(id),
+                    BirthError::Collision(_) => KernelOperationError::TaskChangedBeforeCommit,
+                    BirthError::Resource(error) => error,
+                })?;
             check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
 
             if pid_identity.is_some_and(|identity| !identity.commit()) {
@@ -736,26 +774,17 @@ impl PreparedFork {
             }
 
             let task_claim = task_reservation.commit();
-            if !external_peer_root {
-                child_parent_task.add_child(child_key);
-            }
-            if let Some(group) = state.process_groups.get_mut(&process_group) {
-                group.members.insert(child_key);
-            }
-            state.tasks.insert(
-                child_id,
-                TaskRecord {
-                    task: Arc::clone(&child),
-                    revision: TaskRevision::INITIAL,
-                    task_claim,
-                    thread_claims: std::collections::BTreeMap::from([(leader_tid, leader_claim)]),
-                    dead_leader: None,
-                    vfork_release,
-                    has_execed: false,
-                    diagnostic_name,
-                    thread_pool: Default::default(),
-                },
-            );
+            admission.publish(TaskRecord {
+                task: Arc::clone(&child),
+                revision: TaskRevision::INITIAL,
+                task_claim,
+                thread_claims: std::collections::BTreeMap::from([(leader_tid, leader_claim)]),
+                dead_leader: None,
+                vfork_release,
+                has_execed: false,
+                diagnostic_name,
+                thread_pool: Default::default(),
+            });
             kernel.observe_task_publication(
                 &child,
                 &leader,
@@ -767,11 +796,6 @@ impl PreparedFork {
                 kernel
                     .exit_subscribers
                     .register_erased(child_key, &subscriber.0);
-            }
-            if !external_peer_root
-                && let Some(parent_record) = state.tasks.get_mut(&child_parent_task.key().id)
-            {
-                parent_record.revision = next_child_parent_revision;
             }
             operation.commit(&mut state)?
         }

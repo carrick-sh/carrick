@@ -4,6 +4,7 @@ use carrick_syscall_abi::LinuxWaitOptions;
 use core::num::{NonZeroI32, NonZeroU64};
 use core::time::Duration;
 
+pub mod birth;
 pub mod exit;
 pub mod registry;
 pub mod wait;
