@@ -1,8 +1,9 @@
 //! Live KVM x86_64 integration tests: M0/M1 (ring-3 SYSCALL doorbell) + M2
 //! (static musl ELF hello-world).
 //!
-//! These tests require `/dev/kvm` and are skipped silently when absent (e.g.
-//! on the macOS dev machine or a lima aarch64 VM).  They are LIVE: they
+//! These tests require `/dev/kvm` and are skipped when absent (e.g. on a
+//! KVM-less Linux x86_64 host). Under `CARRICK_REQUIRE_KVM=1`, which the KVM
+//! gate (`just test-kvm`) sets, a missing device or fixture FAILS instead.  They are LIVE: they
 //! actually create a KVM VM, run a vCPU, and observe the guest's stdout.
 //!
 //! Run on an x86_64 Linux host with /dev/kvm (e.g. Ubuntu 24.04):
@@ -18,8 +19,17 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+fn kvm_required() -> bool {
+    std::env::var_os("CARRICK_REQUIRE_KVM").is_some_and(|value| value == "1")
+}
+
 fn kvm_available() -> bool {
-    Path::new("/dev/kvm").exists()
+    let present = Path::new("/dev/kvm").exists();
+    assert!(
+        present || !kvm_required(),
+        "CARRICK_REQUIRE_KVM=1 but /dev/kvm is absent: the KVM gate must not skip"
+    );
+    present
 }
 
 /// Locate the `carrick-vmm-kvm` binary relative to the test executable.
@@ -244,6 +254,11 @@ fn test_m2_musl_static_hello() {
     let fixture = root.join(
         "crates/carrick-vmm-bhyve/fixtures/hello-x86_64/\
          target/x86_64-unknown-linux-musl/release/carrick-hello-x86_64",
+    );
+    assert!(
+        fixture.exists() || !kvm_required(),
+        "CARRICK_REQUIRE_KVM=1 but the musl hello fixture is not built: {}",
+        fixture.display()
     );
     if !fixture.exists() {
         eprintln!(

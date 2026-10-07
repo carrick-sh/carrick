@@ -55,9 +55,15 @@ mod execve_tests {
     const TARGET_ELF: &[u8] = include_bytes!("../fixtures/exec-target-exit0/exec-target-exit0");
 
     /// True when `/dev/kvm` is usable; tests SKIP (return early) otherwise so the
-    /// suite is green on KVM-less hosts.
+    /// suite is green on KVM-less hosts. The KVM gate (`just test-kvm`) sets
+    /// `CARRICK_REQUIRE_KVM=1`, under which a missing device FAILS.
     fn kvm_available() -> bool {
-        std::path::Path::new("/dev/kvm").exists()
+        let present = std::path::Path::new("/dev/kvm").exists();
+        assert!(
+            present || std::env::var_os("CARRICK_REQUIRE_KVM").is_none_or(|value| value != "1"),
+            "CARRICK_REQUIRE_KVM=1 but /dev/kvm is absent: the KVM gate must not skip"
+        );
+        present
     }
 
     fn engine_for(bytes: &[u8]) -> KvmTrapEngine {

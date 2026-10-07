@@ -46,8 +46,7 @@ struct FpControls {
 }
 
 fn progress(boundary: KickBoundary) {
-    let image = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/x86_64-unknown-none/release/carrick-x86-cpl0-fixture");
+    let image = PathBuf::from(env!("CARRICK_X86_CPL0_FIXTURE_IMAGE"));
     let mut first = Vec::new();
     // A real common-kernel entry before the syscall-free compute loop.
     for (opcode, value) in [
