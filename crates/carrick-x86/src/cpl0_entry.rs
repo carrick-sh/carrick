@@ -185,6 +185,9 @@ pub struct CpuBinding {
     pub wake_routes_address: u64,
     /// Measured xAPIC timer hertz when TSC-deadline mode is unavailable.
     pub apic_timer_hz: AtomicU64,
+    /// Coalesced native interrupt reasons awaiting the shared scheduler.
+    /// The IRQ entry publishes here before completing the xAPIC ISR.
+    pub pending_irqs: AtomicU32,
 }
 const _: () = {
     assert!(core::mem::offset_of!(CpuBinding, kernel_stack) == 0);
