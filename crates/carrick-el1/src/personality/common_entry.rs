@@ -46,6 +46,10 @@ fn serve_canonical_inner(
     let shared = SharedVenue {
         binding: || execution_binding(task),
         state: &task.linux,
+        process_pid: task.visible_pid(),
+        visible_tid: venue
+            .thread(task)
+            .and_then(|thread| thread.slot.visible_tid()),
         counters: EntryCounters {
             served: &counters.served,
             forwarded: &counters.forwarded,

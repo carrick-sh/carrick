@@ -756,7 +756,7 @@ pub struct CurrentTask {
     pub linux: LinuxTaskState,
     pub mm: ExecutionMm,
     pub metadata: LinuxTaskMetadata,
-    _stride_padding: [u64; 6],
+    _stride_padding: [u64; 5],
 }
 
 pub const CURRENT_TASK_STRIDE_SHIFT: u32 = 7;
@@ -775,6 +775,7 @@ const _: () = {
     assert!(core::mem::offset_of!(CurrentTask, mm.thread_generation) == 56);
     assert!(core::mem::offset_of!(CurrentTask, metadata.lifecycle_page) == 64);
     assert!(core::mem::offset_of!(CurrentTask, metadata.control_slot) == 72);
+    assert!(core::mem::offset_of!(CurrentTask, metadata.visible_pid) == 80);
 };
 
 impl CurrentTask {
@@ -784,7 +785,7 @@ impl CurrentTask {
             linux: LinuxTaskState::new(),
             mm: ExecutionMm::new(),
             metadata: LinuxTaskMetadata::new(),
-            _stride_padding: [0; 6],
+            _stride_padding: [0; 5],
         }
     }
 
@@ -835,6 +836,17 @@ impl CurrentTask {
         self.metadata.lifecycle_page.store(page, Ordering::Release);
     }
 
+    /// The process leader's namespace PID, shared by every thread in its
+    /// process and cleared before a task slot is reused.
+    pub fn publish_visible_pid(&self, pid: u32) {
+        self.metadata.visible_pid.store(pid, Ordering::Release);
+    }
+
+    pub fn visible_pid(&self) -> Option<u32> {
+        let pid = self.metadata.visible_pid.load(Ordering::Acquire);
+        (pid != 0).then_some(pid)
+    }
+
     #[inline]
     pub fn clear(&self) {
         self.linux.file_table.store(0, Ordering::Release);
@@ -847,6 +859,7 @@ impl CurrentTask {
         self.mm.key.store(0, Ordering::Release);
         self.mm.thread_generation.store(0, Ordering::Release);
         self.publish_lifecycle(0, 0);
+        self.publish_visible_pid(0);
     }
 
     #[inline]

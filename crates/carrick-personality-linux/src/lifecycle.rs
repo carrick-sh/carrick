@@ -7,6 +7,7 @@ pub enum LifecycleCall {
     SigAltStack,
     SigProcMask,
     SetRobustList,
+    GetPid,
     GetTid,
     Clone,
 }
@@ -81,6 +82,12 @@ pub trait LifecycleNative<'a>: UserCopy {
     fn arguments(&self) -> [u64; 6];
     fn binding(&self) -> Option<ExecutionBinding>;
     fn task_state(&self) -> Option<&'a crate::abi::entry::LinuxTaskState>;
+    fn process_pid(&self) -> Option<u32> {
+        None
+    }
+    fn visible_tid(&self) -> Option<u32> {
+        None
+    }
     fn register_robust_list(&self, head: u64, len: u64) -> Option<SyscallResult> {
         let thread = self.thread()?;
         set_robust_list(
@@ -126,6 +133,7 @@ pub const SYS_EXIT: usize = 93;
 pub const SYS_SIGALTSTACK: usize = 132;
 pub const SYS_RT_SIGPROCMASK: usize = 135;
 pub const SYS_GETTID: usize = 178;
+pub const SYS_GETPID: usize = 172;
 pub const SYS_CLONE: usize = 220;
 
 // clone(2) flags.
@@ -198,6 +206,7 @@ pub const fn is_lifecycle_syscall(nr: usize) -> bool {
             | SYS_SIGALTSTACK
             | SYS_RT_SIGPROCMASK
             | SYS_GETTID
+            | SYS_GETPID
             | SYS_CLONE
     )
 }
@@ -215,6 +224,17 @@ pub fn invoke<'a>(
             native.register_robust_list(args[0], args[1])?,
             false,
         ));
+    }
+    if call == LifecycleCall::GetPid {
+        return Some(returned(
+            SyscallResult::new(i64::from(native.process_pid()?)),
+            false,
+        ));
+    }
+    if call == LifecycleCall::GetTid
+        && let Some(tid) = native.visible_tid()
+    {
+        return Some(returned(SyscallResult::new(i64::from(tid)), false));
     }
     let thread = native.thread().or_else(|| {
         if call == LifecycleCall::Exit {

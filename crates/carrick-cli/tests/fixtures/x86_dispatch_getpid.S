@@ -1,4 +1,4 @@
-# Native x86 Linux oracle for a syscall forwarded from the shared guest.
+# Native x86 Linux oracle for one task identity across shared guest calls.
 # Expected stdout: D\n; expected exit: 7.
 .global _start
 .text
@@ -7,6 +7,11 @@ _start:
     syscall
     test %rax, %rax
     jle fail
+    mov %rax, %r12
+    mov $186, %rax
+    syscall
+    cmp %r12, %rax
+    jne fail
     mov $1, %rax
     mov $1, %rdi
     lea ok(%rip), %rsi
