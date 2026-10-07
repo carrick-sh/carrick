@@ -189,3 +189,16 @@ closed, with no shell removal fallback. Low-disk recovery needs no Cargo run,
 build or gate checkout mutation. A busy lock, unavailable root lsof or helper,
 or insufficient reclaimed space preserves the 40 GiB refusal. The helper
 honors the existing `CARRICK_HOST_LEASE_PATH` environment plumbing.
+
+## Shared guest-kernel scorecard
+
+`just scorecard` (invoking `carrick-xtask shared-kernel-scorecard [--json] [--base <rev>]`)
+measures compiled source sharing between the aarch64 EL1 guest image and the x86_64 CPL0
+guest image. Rather than estimating sharing from path conventions, it builds both images,
+inspects the compiler-emitted dep-info (`.d`) files, and counts non-blank, non-comment lines
+of repo-local Rust source compiled into both images versus image-specific lines. It reports
+overall sharing percentages, per-crate breakdowns, internal `cfg(target_arch ...)` forks in
+shared files, and platform defect counts recorded in `docs/shared-kernel-ledger.toml`. When
+`--base <rev>` is provided, the command creates a temporary detached worktree at the given
+revision, measures base sharing metrics, and prints comparative deltas before cleanly removing
+the worktree.

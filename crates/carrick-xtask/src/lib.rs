@@ -18,6 +18,7 @@ mod prune_fs;
 pub mod remote_accept;
 pub mod remote_lock;
 pub mod remote_recapture;
+pub mod shared_kernel_scorecard;
 mod target_prune;
 pub mod test_lanes;
 pub mod worktree_admission;

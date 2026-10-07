@@ -98,6 +98,12 @@ pub enum Commands {
         about = "Derive each test target's gate lane from Cargo metadata and check coverage"
     )]
     TestLanes(crate::test_lanes::TestLanesArgs),
+
+    #[command(
+        name = "shared-kernel-scorecard",
+        about = "Measure shared guest kernel code between EL1 and CPL0 images"
+    )]
+    SharedKernelScorecard(crate::shared_kernel_scorecard::ScorecardArgs),
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -193,6 +199,8 @@ pub enum CliError {
     RemoteRecapture(#[from] crate::remote_recapture::RecaptureError),
     #[error("test lanes: {0}")]
     TestLanes(#[from] crate::test_lanes::TestLanesError),
+    #[error("shared-kernel-scorecard: {0}")]
+    SharedKernelScorecard(#[from] crate::shared_kernel_scorecard::ScorecardError),
 }
 
 pub fn resolve_repo_info(root: Option<&Path>) -> Result<RepoInfo, CliError> {
@@ -432,6 +440,11 @@ where
         Commands::TestLanes(args) => {
             let info = resolve_repo_info(cli.root.as_deref())?;
             crate::test_lanes::run(&info.repository_root, args, writer)?;
+            Ok(())
+        }
+        Commands::SharedKernelScorecard(args) => {
+            let info = resolve_repo_info(cli.root.as_deref())?;
+            crate::shared_kernel_scorecard::run(&info.repository_root, args, writer)?;
             Ok(())
         }
     }
