@@ -1232,6 +1232,7 @@ fn two_running_vcpus_drop_stale_translation_on_shootdown() {
         .fixture_stop_before_user_rip(1, carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000)
         .expect("reader stopped before user rip");
     let checks_before = carrier.fixture_kick_generation_checks(1).unwrap();
+    carrier.fixture_write_backing_byte(0x4_0000, 0).unwrap();
     let result = carrier
         .fixture_two_running_cpus_shootdown_fault(
             0,
