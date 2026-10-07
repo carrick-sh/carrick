@@ -1204,6 +1204,43 @@ impl Cpl0Carrier {
                     .map_err(|e| fail(e.to_string()))?;
             }
         }
+        if hardware_interrupts {
+            use carrick_x86::interrupts::{
+                IRQ_HEADER_GPA, IRQ_HEADER_MAGIC, KICK_VECTOR, RESCHED_VECTOR, SHOOTDOWN_VECTOR,
+                TIMER_VECTOR,
+            };
+            let header = ram
+                .read(IRQ_HEADER_GPA, 5 * size_of::<u64>())
+                .map_err(|error| fail(format!("native IRQ header: {error}")))?;
+            let mut words = [0_u64; 5];
+            for (word, bytes) in words.iter_mut().zip(header.chunks_exact(8)) {
+                *word = u64::from_le_bytes(
+                    bytes
+                        .try_into()
+                        .map_err(|_| fail("native IRQ header width"))?,
+                );
+            }
+            if words[0] != IRQ_HEADER_MAGIC
+                || words[1..]
+                    .iter()
+                    .any(|pc| !(IMAGE_VA..IMAGE_VA + 0x10_0000).contains(pc))
+            {
+                return Err(fail("native IRQ header or entry outside image"));
+            }
+            for index in 0..2 {
+                let idt = carrick_x86::fault_slot_gpa(carrick_x86::fault_idt_base(LAYOUT), index)?;
+                for (vector, entry) in [TIMER_VECTOR, KICK_VECTOR, RESCHED_VECTOR, SHOOTDOWN_VECTOR]
+                    .into_iter()
+                    .zip(words[1..].iter().copied())
+                {
+                    ram.write_gpa(
+                        idt + u64::from(vector) * 16,
+                        &carrick_x86::interrupts::interrupt_gate(entry),
+                    )
+                    .map_err(|error| fail(error.to_string()))?;
+                }
+            }
+        }
         // SAFETY: private zeroed backing; typed objects fit and are aligned.
         // They are initialized before registration or any guest execution.
         unsafe {
@@ -1282,6 +1319,7 @@ impl Cpl0Carrier {
                     tsc_hz: AtomicU64::new(0),
                     wake_routes_address: METADATA_VA + ROUTES_OFFSET,
                     apic_timer_hz: AtomicU64::new(0),
+                    pending_irqs: AtomicU32::new(0),
                 });
             }
         }
@@ -1584,6 +1622,33 @@ impl Cpl0Carrier {
             bytes[2] as u8,
             bytes[3] as u8,
         ]))
+    }
+    /// Inject a fixture interrupt into a stopped production vCPU. The IRQ is
+    /// delivered only after the guest next runs with IF enabled.
+    pub fn fixture_inject_irq(&self, index: usize, vector: u8) -> Result<(), TrapError> {
+        let apic = self.lapic_register(index, 0x20)? >> 24;
+        let apic = u8::try_from(apic).map_err(|_| fail("xAPIC destination width"))?;
+        let routed = self
+            ._vm
+            .vm()
+            .vm
+            .signal_msi(kvm_bindings::kvm_msi {
+                address_lo: carrick_x86::interrupts::LAPIC_BASE as u32 | (u32::from(apic) << 12),
+                data: u32::from(vector),
+                ..Default::default()
+            })
+            .map_err(|error| fail(format!("KVM_SIGNAL_MSI: {error}")))?;
+        if routed != 1 {
+            return Err(fail("fixture interrupt not routed"));
+        }
+        Ok(())
+    }
+    /// Read the retained native IRQ mailbox after the guest exits.
+    pub fn fixture_pending_irqs(&self, index: usize) -> Result<u32, TrapError> {
+        if index >= self.cpus.len() {
+            return Err(fail("unknown CPL0 CPU slot"));
+        }
+        Ok(self.binding(index).pending_irqs.load(Ordering::Acquire))
     }
     /// The installed KVM CPUID capability for the stopped fixture vCPU.
     pub fn has_tsc_deadline(&self, index: usize) -> Result<bool, TrapError> {
