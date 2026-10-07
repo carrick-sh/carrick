@@ -6,7 +6,7 @@ use carrick_guest_arch::{RootGpa, UserVa};
 use carrick_mmu_core::aarch64::LeafAccess;
 use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
 use carrick_mmu_core::owner_mmu::OwnerForkMmu;
-use carrick_sched_core::spaces::notification::SpaceAccess;
+use carrick_sched_core::spaces::notification::{SpaceAccess, SpaceWaitCause};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_FRAME_GRANT_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -196,16 +196,49 @@ impl<
                 return None;
             }
             owner_admitted.set(true);
-            let _editor = self.spaces.try_begin_edit(
+            let source = self.spaces.current_notification(index, mm_key);
+            let editor_wait = source
+                .as_ref()
+                .map(|source| source.observe(SpaceWaitCause::Editor));
+            let Some(_editor) = self.spaces.try_begin_edit(
                 index,
                 mm_key,
                 NonZeroU64::new(u64::from(self.worker) + 1)?,
-            )?;
+            ) else {
+                if let Some(snapshot) = editor_wait {
+                    let _ = self.publish_wait(
+                        source.as_ref()?,
+                        mm,
+                        va,
+                        carrick_core_abi::PortalWaitCause::Editor,
+                        snapshot.revision(),
+                    );
+                }
+                return Some(true);
+            };
             let grant = self.spaces.table().grant(index, mm_key)?;
-            let mut root = self
+            let reservation_wait = source
+                .as_ref()
+                .map(|source| source.observe(SpaceWaitCause::Reservations));
+            let mut root = match self
                 .roots
                 .lock_in(self.spaces, index.index(), mm, self.worker)
-                .ok()?;
+            {
+                Ok(root) => root,
+                Err(crate::mm::reservation::Refusal::Busy) => {
+                    if let (Some(source), Some(snapshot)) = (source.as_ref(), reservation_wait) {
+                        let _ = self.publish_wait(
+                            source,
+                            mm,
+                            va,
+                            carrick_core_abi::PortalWaitCause::Reservations,
+                            snapshot.revision(),
+                        );
+                    }
+                    return Some(true);
+                }
+                Err(_) => return Some(true),
+            };
             let protection = carrick_core_abi::ReservationProtection::from_bits(access)?;
             let plan = owner_fault_plan::<_, _, B, _>(
                 &mut root,
@@ -259,6 +292,39 @@ impl<
             Some(true)
         };
         run().unwrap_or(owner_admitted.get())
+    }
+    fn publish_wait(
+        &self,
+        source: &carrick_sched_core::spaces::notification::SpaceNotificationLease<'_>,
+        mm: carrick_core_abi::ReservationMm,
+        va: u64,
+        cause: carrick_core_abi::PortalWaitCause,
+        revision: u64,
+    ) -> bool {
+        let Some(carrier) = self.slots.carrier() else {
+            return false;
+        };
+        let Some(slot) = self.slots.grant(self.worker as usize) else {
+            return false;
+        };
+        let identity = source.identity();
+        if identity.mm.get() != mm.raw() {
+            return false;
+        }
+        // SAFETY: caller sampled this exact admitted owner's live cause
+        // source before probing the editor or reservation root.
+        let wait = unsafe {
+            carrick_core_abi::PortalOwnerWait::from_owner(
+                carrick_core_abi::El1MmHandle::from_admitted_owner(
+                    carrier,
+                    mm,
+                    identity.incarnation,
+                ),
+                cause,
+                revision,
+            )
+        };
+        slot.publish_fault_wait(va, wait)
     }
 }
 

@@ -412,6 +412,9 @@ pub(super) fn resolve_owner_fault(
     let Some(slot) = slots.grant(index) else {
         return Ok(None);
     };
+    if let Some(wait) = slot.take_fault_wait(mm_key, address) {
+        return Ok(Some(carrick_hal::OwnerFaultOutcome::OwnerWait(wait)));
+    }
     let Some((generation, _window)) = slot.pending_fault_selection(mm_key, address) else {
         crate::probes::hvpatch_el1_file_fault_handoff(
             address,
@@ -949,9 +952,23 @@ static GUEST_GRANT_LEDGER: GuestGrantLedger = GuestGrantLedger::new();
 /// that vCPU slot, whichever MM it next runs. Returns the descriptor entries
 /// released.
 pub(super) fn withdraw_guest_descriptor_work(mm_key: u64) -> usize {
+    let region = carrick_el1_abi::get_el1_region_host_ptr();
+    let grant_slots = (region != 0).then(|| {
+        // SAFETY: the carrier retains its EL1 portal region until final MM
+        // teardown has withdrawn all of this MM's outstanding work.
+        unsafe {
+            &*((region + carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+                as *const carrick_el1_abi::MmPortalSlots)
+        }
+    });
     for slot in 0..carrick_el1_abi::EL1_STACK_SLOTS as usize {
         if let Some(mailbox) = carrick_el1_abi::frame_grant_mailbox_host_for_slot(slot) {
             let _ = mailbox.withdraw_mm(mm_key);
+            if !mailbox.has_guest_work() {
+                let _ = grant_slots
+                    .and_then(|slots| slots.grant(slot))
+                    .is_some_and(|grant| grant.withdraw_retired_mm_selection(mm_key));
+            }
         }
     }
     carrick_el1_abi::descriptor_txn_slots_host()

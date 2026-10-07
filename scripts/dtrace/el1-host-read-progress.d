@@ -274,6 +274,17 @@ proc:::exit
     exit(0);
 }
 
+tick-1s
+{
+    seconds++;
+}
+
+tick-1s
+/seconds >= 10/
+{
+    exit(0);
+}
+
 END
 {
     printa("EL1HOSTREAD1|class=%d|detail=%d|count=%@d\n", @classes);
