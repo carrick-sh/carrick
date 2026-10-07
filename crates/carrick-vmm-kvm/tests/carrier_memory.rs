@@ -49,6 +49,10 @@ fn two_live_mms_map_identical_vas_to_private_bytes_and_share_only_explicit_edges
         w.map(1, shared_va, shared, true).is_err(),
         "sharing requires the issued frame edge"
     );
+    assert!(
+        w.prepare_private(1, shared_va, shared).is_err(),
+        "a private prepare also requires the issued frame edge"
+    );
     w.share_with(1, shared).unwrap();
     w.map(1, shared_va, shared, true).unwrap();
     byte(&mut w, 0, 0x41);
@@ -112,7 +116,7 @@ fn nx_and_readonly_violations_report_user_instruction_and_write_faults() {
     let a = w.private_extent(0x41).unwrap();
     let b = w.private_extent(0x42).unwrap();
     w.map(0, DATA_VA, a, true).unwrap();
-    w.map(1, DATA_VA, b, true).unwrap();
+    w.prepare_private(1, DATA_VA, b).unwrap();
     w.edit(
         1,
         DescriptorOp::Protect {
@@ -163,7 +167,7 @@ fn retired_guest_leaf_keeps_old_frame_until_owner_settlement() {
     let program = code(&[(DATA_VA, None)]);
     let mut w = MemoryWitness::boot([&program, &program]).unwrap();
     let old = w.private_extent(0x41).unwrap();
-    w.map(0, DATA_VA, old, true).unwrap();
+    w.prepare_private(0, DATA_VA, old).unwrap();
     w.edit(0, DescriptorOp::Retire(PageSpan::new(DATA_VA, PAGE)))
         .unwrap();
     fault(&mut w, 0, 4);
