@@ -1080,12 +1080,10 @@ ci-install-semgrep:
     echo "$RUNNER_TEMP/semgrep/bin" >> "${GITHUB_PATH:?}"
 
 ci-install-linux-cross:
-    sudo apt-get update
-    sudo apt-get install -y gcc-aarch64-linux-gnu
+    timeout 600 sh -c 'sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30 update && sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30 install -y gcc-aarch64-linux-gnu'
 
 ci-install-freebsd-cross:
-    sudo apt-get update
-    sudo apt-get install -y clang llvm
+    timeout 600 sh -c 'sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30 update && sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30 install -y clang llvm'
 
 # Keep the permanent archive: release mirrors eventually remove old sysroots.
 ci-freebsd-sysroot:
