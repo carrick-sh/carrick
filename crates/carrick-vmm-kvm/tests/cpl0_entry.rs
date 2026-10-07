@@ -48,8 +48,8 @@ fn assert_opaque_registrations(calls: [&[(u64, u64)]; 2]) {
     let mut entries = [0; 2];
     let mut publications = [0; 2];
     for round in 0..calls[0].len() {
-        for task in 0..2 {
-            let (head, len) = calls[task][round];
+        for (task, task_calls) in calls.iter().enumerate() {
+            let (head, len) = task_calls[round];
             let observation = carrier.observe(task).expect("bounded native entry/return");
             if len == 24 {
                 heads[task] = (head, 24);
