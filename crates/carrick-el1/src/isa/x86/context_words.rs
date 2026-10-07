@@ -130,6 +130,112 @@ mod tests {
     }
 
     #[test]
+    fn x86_parked_context_roots_clone_through_shared_fork_owner() {
+        use crate::memory::reservations::{
+            LinuxReservationLayout, NoRootWait, X86Cpl0Reservations, X86Cpl0RootReleaseVenue,
+        };
+        use carrick_core::mm::fork::{ForkChildRoot, ForkParentRoot};
+        use carrick_el1_abi::{
+            PortalForkRequest, PortalForkTableArena, PortalOperation, ReservationMm,
+            ReservationProtection, ReservationRange,
+        };
+        const _: () = {
+            assert!(
+                core::mem::align_of::<carrick_test_support::TestEl1Region>()
+                    >= core::mem::align_of::<X86Cpl0Reservations>()
+            );
+            assert!(
+                core::mem::align_of::<carrick_test_support::TestEl1Region>()
+                    >= core::mem::align_of::<ZoneTables<ParkedContextWords>>()
+            );
+        };
+        let region = carrick_test_support::TestEl1Region::zeroed();
+        // SAFETY: this aligned region retains both zeroed ABI records at
+        // their CPL0 offsets through every root guard and notification lease.
+        let (table, zone) = unsafe {
+            (
+                &*region
+                    .as_ptr()
+                    .add(carrick_el1_abi::X86_CPL0_RESERVATIONS_OFFSET as usize)
+                    .cast::<X86Cpl0Reservations>(),
+                &*region
+                    .as_ptr()
+                    .add(carrick_el1_abi::X86_CPL0_ZONE_OFFSET as usize)
+                    .cast::<ZoneTables<ParkedContextWords>>(),
+            )
+        };
+        let parent_mm = ReservationMm::new(11).unwrap();
+        let child_mm = ReservationMm::new(12).unwrap();
+        let parent_slot = zone
+            .spaces
+            .publish_closed(parent_mm.raw(), 0x6000, 0)
+            .unwrap();
+        let child_slot = zone
+            .spaces
+            .publish_closed(child_mm.raw(), 0x7000, 0)
+            .unwrap();
+        let layout = LinuxReservationLayout {
+            heap: ReservationRange::new(0x200000, 0x300000).unwrap(),
+            arena: ReservationRange::new(0x400000, 0x800000).unwrap(),
+            brk: 0x200000,
+            address_limit: u64::MAX,
+            data_limit: u64::MAX,
+            external_address_bytes: 0,
+            external_data_bytes: 0,
+        };
+        table
+            .publish(parent_slot.index(), parent_mm, layout)
+            .unwrap();
+        table.publish(child_slot.index(), child_mm, layout).unwrap();
+        let venue = X86Cpl0RootReleaseVenue::new(
+            table,
+            SpaceReleaseVenue {
+                zone,
+                waker: Waker::Host,
+                deliver: deliver_x86_notification,
+            },
+        )
+        .unwrap();
+        let mut parent = venue
+            .lock(parent_slot.index(), parent_mm, &NoRootWait)
+            .unwrap();
+        let range = ReservationRange::new(0x100000, 0x101000).unwrap();
+        parent
+            .import(range, ReservationProtection::READ_WRITE, true)
+            .unwrap();
+        parent.finish_import().unwrap();
+        let mut child = venue
+            .lock(child_slot.index(), child_mm, &NoRootWait)
+            .unwrap();
+        let request = PortalForkRequest {
+            operation: PortalOperation {
+                carrier: NonZeroU64::MIN,
+                mm: parent_mm,
+                incarnation: NonZeroU64::new(parent.incarnation().raw()).unwrap(),
+                sequence: parent.next_transfer_sequence().unwrap(),
+            },
+            parent_generation: parent.generation(),
+            child_mm,
+            child_tables: PortalForkTableArena::new(0x200000, 4096).unwrap(),
+            parent_tables: PortalForkTableArena::new(0x300000, 4096).unwrap(),
+            kernel_control_ipa: 0xa00000,
+        };
+        ForkParentRoot::reserve_fork_certificate(&mut parent, request).unwrap();
+        ForkChildRoot::set_fork_origin(&mut child, request).unwrap();
+        ForkParentRoot::clone_into(&mut parent, &mut child).unwrap();
+        assert!(ForkChildRoot::is_admitted(&child));
+        let mut inherited = std::vec::Vec::new();
+        child
+            .observe_mappings(&mut |mapping| inherited.push(mapping))
+            .unwrap();
+        assert_eq!(inherited.len(), 1);
+        assert_eq!(inherited[0].range, range);
+        assert!(inherited[0].anonymous);
+        assert_eq!(child.mm(), child_mm);
+        assert_eq!(parent.mm(), parent_mm);
+    }
+
+    #[test]
     fn x86_zone_owns_exact_space_notification_custody() {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: the scheduler table and x86 context words are zero-valid;

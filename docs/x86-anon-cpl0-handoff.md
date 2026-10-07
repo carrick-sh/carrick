@@ -769,3 +769,30 @@ there is no new ARM assembly drift. Linux compiler authority captures pass
 572 reviewed rows; non-Linux profiles remain pending. Signed ARM/HVF gates
 cannot run here, and no Docker was used. The two-live-MM PRIVATE witness is
 still red (fork ENOSYS); production process binding is the next step.
+
+
+## Process entry and fork-context bridge (2026-10-07)
+
+The existing El1PendingFamilies process hooks now take exact native process
+custody through a ProcessNative venue. The shared entry completion path is
+retained. Every ARM caller passes None, preserving its previous behavior.
+All four execution-binding components authenticate before native effects.
+Red /tmp/x86-process-hooks-red.log fails the exactly-bound call before the
+hooks delegate; green /tmp/x86-process-hooks-green.log passes 22 lifecycle tests.
+The initial scaffold import error is separate and is not semantic red evidence.
+
+The shared fork root traits previously forced ARM ThreadCtx. They now accept
+the same parked-context parameter as Reservations, with no new fork owner.
+The corrected TestEl1Region fixture fails against old core at 2565e74a9 with
+expected ThreadCtx/found ParkedContextWords, in
+/tmp/x86-process-fork-context-final-red.log. Generic custody clones the real
+anonymous reservation in /tmp/x86-process-fork-context-green.log. The initial
+separate-allocation fixture correctly failed same-region authentication;
+the corrected fixture uses aligned records at the CPL0 offsets.
+
+Focused verification: 97 core tests in /tmp/x86-process-hooks-core.log;
+250 EL1 plus two creation-owner tests in /tmp/x86-process-hooks-final-el1.log;
+22 wave-2 tests in /tmp/x86-process-hooks-wave2.log. Focused clippy is zero in
+/tmp/x86-process-hooks-focused-clippy-green.log after removing an unnecessary
+explicit drop from the new test. Production ProcessNative is not yet bound;
+shared guest registry, CPU1, per-execution grants and two-MM green are next.

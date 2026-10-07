@@ -1,7 +1,7 @@
 //! Linux lifecycle policy over neutral pool transitions and native context hooks.
 use crate::abi::entry::SyscallResult;
 use crate::abi::thread::*;
-use carrick_syscall_abi::LinuxWaitOptions;
+pub use carrick_syscall_abi::LinuxWaitOptions;
 
 /// Linux `pid_t` selector carried by wait4 (including negative selectors).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,6 +68,20 @@ use carrick_core_abi::ExecutionBinding;
 use carrick_guest_arch::UserVa;
 use carrick_sched_core::{RecordRef, ThreadIdentity};
 use core::sync::atomic::Ordering;
+
+/// Native process custody supplied by the execution lane. Registry decisions
+/// remain in the shared scheduler owner; this adapter retains machine context.
+pub trait ProcessNative {
+    fn binding(&self) -> ExecutionBinding;
+    fn fork(&mut self) -> LifecycleOutcome;
+    fn wait4(
+        &mut self,
+        pid: ProcessWaitPid,
+        status: UserVa,
+        options: LinuxWaitOptions,
+    ) -> LifecycleOutcome;
+    fn exit_group(&mut self, status: u8) -> LifecycleOutcome;
+}
 
 pub trait UserCopy {
     fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool;

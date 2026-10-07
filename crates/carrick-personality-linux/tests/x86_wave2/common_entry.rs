@@ -376,6 +376,7 @@ pub(super) fn x4_linux_common_entry() {
                         None::<dispatch::Zone<'_, super::NoCpu, sched::HardwareUserWord>>,
                         None,
                         Some(&*w.venue),
+                        None,
                         |_| core::ptr::null_mut()
                     ),
                     carrick_el1_abi::Action::ServedWithWork
