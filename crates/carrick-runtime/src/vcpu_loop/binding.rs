@@ -5035,6 +5035,7 @@ where
                             far,
                             fault_access,
                         );
+                        signal::cancel_portal_grant_selection(engine.mailbox_slot(), mm_key, far);
                     }
                     self.state
                         .note_cow_resolution(far, syndrome, translation, arm_generation)?;
@@ -5204,6 +5205,19 @@ where
                         })?
                         .map_err(RuntimeError::Trap)?
                 {
+                    if let Some(mm_key) = self.state.zone_mm {
+                        signal::cancel_frame_grant_request(
+                            engine.mailbox_slot(),
+                            mm_key,
+                            si_addr,
+                            fault_access,
+                        );
+                        signal::cancel_portal_grant_selection(
+                            engine.mailbox_slot(),
+                            mm_key,
+                            si_addr,
+                        );
+                    }
                     return Ok(executor::ExecutorExit::Syscall);
                 }
                 if let Some(mm_key) = self.state.zone_mm {
@@ -5213,6 +5227,7 @@ where
                         si_addr,
                         fault_access,
                     );
+                    signal::cancel_portal_grant_selection(engine.mailbox_slot(), mm_key, si_addr);
                 }
                 // Captured only now: a first touch resolved above never
                 // delivers a signal, and this capture is an `RwLock` read plus

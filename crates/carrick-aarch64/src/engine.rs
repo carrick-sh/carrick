@@ -5564,6 +5564,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             return Ok(None);
         };
         if mm_key != self.mm_generation {
+            let _ = slot.cancel_fault_selection(window, request_generation);
             return Err(TrapError::Hypervisor(
                 "owner fault selection names another MM".into(),
             ));
@@ -5591,7 +5592,11 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 }
                 return Ok(Some(carrick_hal::OwnerFaultOutcome::BusFault));
             }
-            other => other?,
+            Err(err) => {
+                let _ = slot.cancel_fault_selection(window, request_generation);
+                return Err(err);
+            }
+            Ok(prep) => prep,
         };
         let grant = match prepared {
             crate::user_transfer::TransferPreparation::Grant(grant) => grant,
@@ -5631,6 +5636,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             }
         };
         if !slot.submit(window, grant.transaction()) {
+            let _ = slot.cancel_fault_selection(window, request_generation);
             return Err(TrapError::Hypervisor(
                 "owner fault grant selection was displaced".into(),
             ));
