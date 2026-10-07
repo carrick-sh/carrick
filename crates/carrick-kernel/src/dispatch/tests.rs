@@ -11638,3 +11638,258 @@ fn readlinkat_copyout_owner_wait_witness() {
     );
 }
 
+
+#[test]
+fn serial_host_ipc_vector_owner_wait_preserves_unconsumed_operation() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{
+        GuestWriteRange, MemoryPrepareError, PreparedGuestWrite, UserMemoryVenue,
+    };
+    use std::cell::Cell;
+    use std::num::NonZeroU64;
+
+    struct Permit<'a> {
+        memory: &'a mut LinearMemory,
+        ranges: Vec<GuestWriteRange>,
+    }
+    impl PreparedGuestWrite for Permit<'_> {
+        fn commit(self: Box<Self>, outputs: &[&[u8]]) {
+            assert_eq!(outputs.len(), self.ranges.len());
+            for (range, bytes) in self.ranges.iter().zip(outputs) {
+                assert!(bytes.len() <= range.len());
+                self.memory
+                    .write_bytes(range.address().raw(), bytes)
+                    .unwrap();
+            }
+        }
+    }
+    struct WaitingMemory {
+        memory: LinearMemory,
+        read_wait: Cell<Option<PortalOwnerWait>>,
+        write_wait: Option<PortalOwnerWait>,
+        wait_at: u64,
+    }
+    impl GuestMemory for WaitingMemory {
+        fn user_memory_venue(&self) -> UserMemoryVenue {
+            UserMemoryVenue::Owner
+        }
+        fn prepare_write(
+            &mut self,
+            ranges: &[GuestWriteRange],
+        ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+            assert!(ranges.iter().map(|r| r.len()).sum::<usize>() <= 4096);
+            if ranges
+                .iter()
+                .any(|range| range.address().raw() == self.wait_at)
+                && let Some(wait) = self.write_wait.take()
+            {
+                return Err(MemoryPrepareError::OwnerWait(wait));
+            }
+            Ok(Box::new(Permit {
+                memory: &mut self.memory,
+                ranges: ranges.to_vec(),
+            }))
+        }
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            if address == 0x4100
+                && let Some(wait) = self.read_wait.take()
+            {
+                return Err(MemoryError::OwnerWait(wait));
+            }
+            self.memory.read_bytes(address, length)
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            Err(self
+                .write_wait
+                .take()
+                .map_or(MemoryError::Unsupported, MemoryError::OwnerWait))
+        }
+    }
+    impl CurrentMmMemory for WaitingMemory {}
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(2).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Editor,
+            7,
+        )
+    };
+    for eventfd in [false, true] {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 8192]);
+        let (reader, writer) = if eventfd {
+            let outcome = dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(19, SyscallArgs([0, 2048, 0, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap();
+            let DispatchOutcome::Returned { value } = outcome else {
+                panic!("{outcome:?}");
+            };
+            (value as u64, value as u64)
+        } else {
+            assert_eq!(
+                dispatcher
+                    .dispatch(
+                        &context,
+                        SyscallRequest::new(59, SyscallArgs([0x4300, 0, 0, 0, 0, 0])),
+                        &mut memory,
+                        &reporter
+                    )
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 0 }
+            );
+            let pair = memory.read_bytes(0x4300, 8).unwrap();
+            (
+                i32::from_ne_bytes(pair[..4].try_into().unwrap()) as u64,
+                i32::from_ne_bytes(pair[4..].try_into().unwrap()) as u64,
+            )
+        };
+        memory
+            .write_bytes(0x4000, carrick_abi::LinuxIovec::new(0x4100, 8).as_bytes())
+            .unwrap();
+        memory.write_bytes(0x4100, &42u64.to_ne_bytes()).unwrap();
+        let mut memory = WaitingMemory {
+            memory,
+            read_wait: Cell::new(Some(wait)),
+            write_wait: Some(wait),
+            wait_at: 0x4100,
+        };
+        let write = SyscallRequest::new(66, SyscallArgs([writer, 0x4000, 1, 0, 0, 0]));
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, write, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+            "writev eventfd={eventfd}"
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, write, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::Returned { value: 8 }
+        );
+        let read = SyscallRequest::new(65, SyscallArgs([reader, 0x4000, 1, 0, 0, 0]));
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, read, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+            "readv eventfd={eventfd}"
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, read, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::Returned { value: 8 }
+        );
+        assert_eq!(
+            memory.memory.read_bytes(0x4100, 8).unwrap(),
+            42u64.to_ne_bytes()
+        );
+        // A pipe may report an already delivered prefix; an eventfd must
+        // retain the entire scalar counter until all destinations are ready.
+        memory
+            .memory
+            .write_bytes(0x4000, carrick_abi::LinuxIovec::new(0x4100, 4).as_bytes())
+            .unwrap();
+        memory
+            .memory
+            .write_bytes(0x4010, carrick_abi::LinuxIovec::new(0x4104, 4).as_bytes())
+            .unwrap();
+        let fill = SyscallRequest::new(64, SyscallArgs([writer, 0x4100, 8, 0, 0, 0]));
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, fill, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::Returned { value: 8 }
+        );
+        memory.write_wait = Some(wait);
+        memory.wait_at = 0x4104;
+        let scatter = SyscallRequest::new(65, SyscallArgs([reader, 0x4000, 2, 0, 0, 0]));
+        let outcome = dispatcher
+            .dispatch(&context, scatter, &mut memory, &reporter)
+            .unwrap();
+        if eventfd {
+            assert_eq!(
+                outcome,
+                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+            );
+            assert_eq!(
+                dispatcher
+                    .dispatch(&context, scatter, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 8 }
+            );
+        } else {
+            assert_eq!(outcome, DispatchOutcome::Returned { value: 4 });
+            let tail = SyscallRequest::new(63, SyscallArgs([reader, 0x4104, 4, 0, 0, 0]));
+            assert_eq!(
+                dispatcher
+                    .dispatch(&context, tail, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 4 }
+            );
+            assert_eq!(
+                dispatcher
+                    .dispatch(&context, fill, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 8 }
+            );
+            memory
+                .memory
+                .write_bytes(0x4000, carrick_abi::LinuxIovec::new(u64::MAX, 8).as_bytes())
+                .unwrap();
+            assert_eq!(
+                dispatcher
+                    .dispatch(&context, read, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::errno(LINUX_EFAULT)
+            );
+            memory
+                .memory
+                .write_bytes(0x4000, carrick_abi::LinuxIovec::new(0x4100, 8).as_bytes())
+                .unwrap();
+            assert_eq!(
+                dispatcher
+                    .dispatch(&context, read, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 8 }
+            );
+
+            // More than one owner step must complete without inventing a
+            // short read at the 4 KiB boundary when the pipe has all bytes.
+            let payload: Vec<u8> = (0..5000).map(|index| (index % 251) as u8).collect();
+            memory.memory.write_bytes(0x4500, &payload).unwrap();
+            memory
+                .memory
+                .write_bytes(
+                    0x4000,
+                    carrick_abi::LinuxIovec::new(0x4500, 5000).as_bytes(),
+                )
+                .unwrap();
+            assert_eq!(
+                dispatcher
+                    .dispatch(&context, write, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 5000 }
+            );
+            memory.memory.write_bytes(0x4500, &vec![0; 5000]).unwrap();
+            assert_eq!(
+                dispatcher
+                    .dispatch(&context, read, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 5000 }
+            );
+            assert_eq!(memory.memory.read_bytes(0x4500, 5000).unwrap(), payload);
+        }
+    }
+}

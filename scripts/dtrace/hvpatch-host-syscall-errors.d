@@ -10,7 +10,9 @@
  * Live-qualified on the corrected 0d154a9a4-based pipe artifact: return and
  * bind controls fired, errors=0, bounded=0; the consumer reported no drops.
  * The preparation arm reports VA, length, phase and detail; phase 4/detail 2
- * was live-qualified as an Editor wait on the pre-fix pipe2 error capture.
+ * was live-qualified as a Reservations wait on the pre-fix pipe2 capture.
+ * The mixed-vector capture qualified phase 4/detail 1 as an Editor wait;
+ * these cause values are PortalWaitCause encodings, not inferred labels.
  * Perturbation: one aggregate per host return, output only on errors; this
  * is diagnostic mechanism evidence, never a runtime measurement.
  * Ends on target exit; the 30-second diagnostic bound fails closed.
