@@ -207,14 +207,14 @@ fn cpl0_supervisor_stub_is_rx_while_tables_and_idt_are_rw_nx() {
 #[test]
 fn cpl0_forward_port_returns_host_result_through_shared_entry() {
     let mut program = vec![0x48, 0xb8];
-    program.extend_from_slice(&39u64.to_le_bytes()); // getpid, forwarded
+    program.extend_from_slice(&8u64.to_le_bytes()); // lseek, forwarded
     program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
     program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
     let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
     let result = carrier
         .observe_with_forward(0, |frame| {
-            assert_eq!(frame.rax, 39);
+            assert_eq!(frame.rax, 8);
             frame.rax = 42;
             Ok(())
         })
@@ -227,7 +227,7 @@ fn cpl0_forward_port_returns_host_result_through_shared_entry() {
 #[test]
 fn cpl0_rechecks_host_modified_return_frame_before_iret() {
     let mut program = vec![0x48, 0xb8];
-    program.extend_from_slice(&39_u64.to_le_bytes()); // forwarded getpid
+    program.extend_from_slice(&8_u64.to_le_bytes()); // forwarded lseek
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
     let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
     let failure = carrier
@@ -315,8 +315,8 @@ fn production_image_rejects_fixture_syscalls() {
         .observe(0)
         .expect_err("synthetic syscall must not dispatch");
     assert!(
-        err.to_string().contains("unported CPL0 native call"),
-        "{err}"
+        carrier.refusal_overflow_count() >= 1,
+        "synthetic syscall must be counted in refusal overflow bucket: {err}"
     );
 }
 
@@ -328,10 +328,10 @@ fn production_interrupt_boot_serves_an_ordinary_syscall() {
         Cpl0Carrier::boot_with_interrupts(&production, [&first, &first]).expect("KVM image");
     let err = carrier
         .observe(0)
-        .expect_err("production observer call must forward after the ordinary syscall");
+        .expect_err("production observer call is not handled in production image");
     assert!(
-        err.to_string().contains("unported CPL0 native call"),
-        "{err}"
+        carrier.refusal_overflow_count() >= 1,
+        "observer call must be counted in refusal overflow bucket: {err}"
     );
     assert_eq!(carrier.robust_list_head(0).expect("task head"), 0x2345);
 }
@@ -739,7 +739,15 @@ fn x4_linux_common_entry() {
         }
     }
     // Native numbers are not canonical ARM ordinals. Refusals never call a
-    // family or receive a synthetic host result; inspect the stopped owner.
+    // family or receive a synthetic host result; they return -ENOSYS from CPL0
+    // and bump the refusal counter. getpid(39) will be served in CPL0 later by
+    // the x86 process lane. Inspect the stopped owner.
+    let binding = ExecutionBinding {
+        task: EntryTaskKey::from_raw(41),
+        generation: EntryGeneration::from_raw(100),
+        mm: EntryMmKey::from_raw(77),
+        thread_generation: EntryThreadGeneration::from_raw(101),
+    };
     for native in [39_u32, 99, 273] {
         let mut code = program(&[(0xdead, 24)]);
         let needle = [0xb8, 0x11, 0x01, 0, 0, 0x0f, 0x05];
@@ -750,20 +758,38 @@ fn x4_linux_common_entry() {
         code[offset + 1..offset + 5].copy_from_slice(&native.to_le_bytes());
         let peer = program(&[(0xbeef, 24)]);
         let mut carrier = Cpl0Carrier::boot(&image(), [&code, &peer]).unwrap();
+        carrier.bind_execution(0, binding).unwrap();
         if native == 273 {
             carrier.unload_execution(0).unwrap();
+            let err = carrier
+                .observe(0)
+                .expect_err("unloaded execution must fail closed");
+            assert!(err.to_string().contains("CPL0 fatal exit"), "{err}");
+            let stopped = carrier.entry_state();
+            assert_eq!(stopped.entries, [1, 0]);
+            assert_eq!(stopped.publications, [0, 0]);
+            assert_eq!(stopped.completions, [1, 0]);
+            assert_eq!(stopped.heads, [(0, 0); 2]);
+            assert_eq!(stopped.served, 0);
+            assert_eq!(stopped.host_forwards, 0);
+            assert_eq!(carrier.refusal_count(273), 1);
+            continue;
         }
-        assert!(carrier.observe(0).is_err());
+        let observed = carrier
+            .observe(0)
+            .expect("refusal returns -ENOSYS to guest");
+        assert_eq!(observed.result, -38);
         let stopped = carrier.entry_state();
         assert_eq!(stopped.entries, [1, 0]);
         assert_eq!(stopped.publications, [0, 0]);
-        assert_eq!(stopped.completions, [0, 0]);
+        assert_eq!(stopped.completions, [1, 0]);
         assert_eq!(stopped.heads, [(0, 0); 2]);
         assert_eq!(stopped.served, 0);
         assert_eq!(
-            stopped.host_forwards, 1,
-            "one explicit refusal, no host emulation"
+            stopped.host_forwards, 0,
+            "refusal is served directly in CPL0 with ENOSYS, no host forward"
         );
+        assert_eq!(carrier.refusal_count(native as u64), 1);
     }
 }
 
@@ -813,7 +839,7 @@ fn forwarded_call_completes_before_pending_kick_work_exit() {
         .windows(native_robust_list.len())
         .position(|bytes| bytes == native_robust_list)
         .expect("native syscall in fixture");
-    code[offset + 1..offset + 5].copy_from_slice(&39_u32.to_le_bytes()); // getpid forwards
+    code[offset + 1..offset + 5].copy_from_slice(&8_u32.to_le_bytes()); // lseek forwards
     let peer = program(&[(0xbeef, 24)]);
     let mut carrier = Cpl0Carrier::boot(&image(), [&code, &peer]).expect("real KVM image");
     carrier

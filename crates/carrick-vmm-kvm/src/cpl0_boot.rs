@@ -1195,6 +1195,22 @@ impl Cpl0Carrier {
         )
     }
 
+    /// Read the per-ordinal CPL0 refusal counter for a native syscall ordinal.
+    /// Ordinals >= 512 are read from the overflow bucket.
+    pub fn refusal_count(&self, nr: u64) -> u64 {
+        let counters: &Counters = self.metadata(COUNTERS_OFFSET);
+        if let Ok(index @ 0..=511) = usize::try_from(nr) {
+            return counters.refused[index].load(Ordering::Acquire);
+        }
+        counters.refused[512].load(Ordering::Acquire)
+    }
+
+    /// Read the CPL0 refusal counter overflow bucket (unknown/unmapped/out-of-range ordinals).
+    pub fn refusal_overflow_count(&self) -> u64 {
+        let counters: &Counters = self.metadata(COUNTERS_OFFSET);
+        counters.refused[512].load(Ordering::Acquire)
+    }
+
     pub(crate) fn boot_inner(
         image: &Path,
         programs: [&[u8]; 2],
