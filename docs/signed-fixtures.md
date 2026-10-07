@@ -43,8 +43,9 @@ it cannot authorize signed acceptance.
 ## Input identity
 
 A bundle's **input identity** is the SHA-256 of its canonical source
-inventory and build policy (`Manifest::input_identity`, recorded as
-`inputs_sha256`). Restore and verification admit a bundle when its input
+inventory, its recorded compiler inputs and its build policy
+(`Manifest::input_identity`, recorded as `inputs_sha256`). Canonical JSON
+frames every path and digest as a quoted, escaped string. Restore and verification admit a bundle when its input
 identity equals the checkout's current identity, whichever commit published
 it: `source_head` is publisher provenance, not an admission key. An unrelated
 commit, or unrelated dirty or untracked files, therefore keep the bundle
@@ -57,6 +58,33 @@ refused before hashing. There is no hand-maintained crate list; the closure is
 re-derived from `cargo metadata` on every check, so a new path dependency is
 an input as soon as a fixture depends on it.
 
+The source inventory is the union of two derivations:
+
+- **Cargo graph closure**, re-derived on every check (below). It is resolved
+  **unfiltered** by platform: build-dependencies and proc-macros compile for
+  the publisher's host, which need not match the verifier's, so a guest- or
+  host-filtered graph could omit a `cfg(target_arch = ...)` build helper.
+- **Compiler-recorded inputs** (manifest v3 `compiler_inputs`). After
+  building, the publisher reads every executable's dep-info (Cargo's
+  `<bin>.d`; the raw builder emits `<name>.d` with `--emit dep-info`) and
+  records each checkout file the compiler read: `#[path]` modules,
+  `include_str!`/`include_bytes!` targets, build scripts and their
+  `rerun-if-changed` files, wherever they live. Files in the locked
+  registry/git cache and the pinned sysroot are identified by `Cargo.lock`
+  checksums and the compiler pin instead. A generated file under any
+  `target/` directory, a relative path, any other file outside the checkout,
+  or an executable without dep-info fails the publish. Admission hashes every
+  recorded input from the checkout; one that is missing, untracked, dirty or
+  under `target/` is refused.
+
+Each source entry digest is SHA-256 over a domain naming the entry type
+(`carrick.fixtures.source.v1\0regular\0`), the big-endian u64 length and
+the bytes. Only regular files are inputs: a symlink anywhere in the inventory
+is refused, so link text can never stand in for file contents. Linker
+arguments live in tracked Cargo configuration or the builder scripts, which
+are inputs; dep-info does not name files a linker reads, so a fixture must
+not reference an untracked linker script.
+
 ## Bundle and restore
 
 Build requires the full current HEAD SHA and clean fixture source inputs. It
@@ -64,14 +92,13 @@ builds in a fresh `git archive` snapshot: an old executable or Cargo target
 cache cannot stand in for a fresh output. Cargo locks, Cargo configuration,
 fixture sources, probe inventory, build scripts, and compiler pin are hashed.
 For each fixture manifest, the source inventory runs `cargo metadata --locked
---offline --format-version 1 --filter-platform <guest-triple>` against the
-fixture manifest and follows its resolved dependency graph. Metadata runs in
+--offline --format-version 1` (no platform filter) against the fixture
+manifest and follows its resolved dependency graph. Metadata runs in
 an isolated directory with the checkout's tracked Cargo configs passed
 explicitly in Cargo precedence order. It hashes the
 tracked source trees of reachable local path packages, including transitive
 and build dependencies; dev-only edges are excluded because these binaries
-are built without tests. The probe crate resolves both musl and GNU targets;
-the remaining fixtures resolve musl. The inventory also includes each fixture
+are built without tests. The inventory also includes each fixture
 workspace's own `Cargo.lock`, ancestor Cargo manifests and configuration of
 every reachable path package, the compiler pin, the shell builders and the
 Rust publisher's build and probe-selection sources. Unrelated workspace crate
@@ -86,8 +113,8 @@ going offline. No cross compiler or guest target installation is needed just
 to resolve metadata. Missing manifests/locks, failed resolution, or path
 packages outside the checkout fail closed; there is no whole-workspace or
 incomplete-inventory fallback.
-Tracked source symlinks are hashed as their Git link declarations without
-following them; executable objects and destination paths reject symlinks.
+Source symlinks are refused; executable objects and destination paths
+reject symlinks too.
 The manifest also records `rustc -vV`, Cargo, GNU linker identity, target triple
 per executable, and SHA-256 of every executable. Builds check that the
 checkout and snapshot still agree before publishing.
@@ -153,8 +180,8 @@ again.
 
 ## Controlled fixture build policy
 
-The v2 manifest records `build_policy`, and `inputs_sha256` hashes both the
-source inventory and that policy. Earlier manifests must be rebuilt; editing
+The manifest records `build_policy`, and `inputs_sha256` hashes the
+source inventory, recorded compiler inputs and that policy. Earlier manifests must be rebuilt; editing
 a manifest cannot supply evidence that its executables followed the policy.
 Verification requires the recorded policy to equal the current publisher's
 policy and refuses ambient `CARGO_PROFILE_*`, `CARGO_BUILD_*`, target linker
@@ -261,7 +288,7 @@ directory. Verification, SHA-256 hashing and restoration use only this
 capture. Archive verification reads the gzip stream through EOF, validating
 all member trailers and rejecting trailing garbage for local uploads too.
 It then invokes the same checkout-aware verifier as manifest restoration:
-v2 schema, input identity (scoped source closure), current build policy,
+v3 schema, input identity (scoped source closure), current build policy,
 toolchain and executable inventory must all match before run provenance is
 published.
 Ambient build overrides are rejected here as well as during restore.
@@ -358,3 +385,15 @@ source, direct, transitive and build-dependency path crates),
 `toolchain_pin_change_refuses` were refused only by commit, never by input
 identity; they now refuse with `fixture input identity mismatch`, as do the
 remote-preparation and Actions workflow bindings.
+
+A review of the first input-identity revision found three holes that exact-SHA
+admission had masked; each was closed red-first. Against that revision,
+`compiler_input_outside_package_directories_refuses` (a committed change to
+an `include_str!`ed repo-root file), `symlink_with_identical_link_text_refuses`
+(a regular file holding `actual.txt` replaced by a symlink to `actual.txt`)
+and `target_cfg_build_dependency_is_a_fixture_input` (a committed change to an
+x86_64-only build-dependency) each kept the stale bundle admitted. They now
+refuse. `cargo_dep_info_records_out_of_package_compiler_inputs` runs a real
+Cargo build and checks the recorded `#[path]`, `include_str!`, build-script
+and `rerun-if-changed` inputs; `dep_info_classification_fails_closed` and
+`recorded_compiler_inputs_must_be_tracked_sources` cover the refusals.
