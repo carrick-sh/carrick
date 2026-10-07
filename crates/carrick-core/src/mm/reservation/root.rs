@@ -3076,6 +3076,23 @@ mod tests {
         LOSE_POPS.with(|lose| lose.set(0));
     }
 
+    #[test]
+    fn repeated_node_return_must_not_allocate_one_id_to_two_roots() {
+        let table = table();
+        let first_mm = ReservationMm::new(62).unwrap();
+        let second_mm = ReservationMm::new(63).unwrap();
+        table.publish(0, first_mm, layout()).unwrap();
+        table.publish(1, second_mm, layout()).unwrap();
+        let mut first = table.lock(0, first_mm).unwrap();
+        let second = table.lock(1, second_mm).unwrap();
+        let id = first.pool_node().unwrap();
+        first.free_node(id);
+        first.free_node(id);
+        let first_owner = first.pool_node().unwrap();
+        let second_owner = second.pool_node().unwrap();
+        assert_ne!(first_owner, second_owner, "two roots acquired node {id}");
+    }
+
     thread_local! {
         static LOSE_POPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
