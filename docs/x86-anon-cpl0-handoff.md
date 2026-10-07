@@ -4,9 +4,17 @@
 
 Guest payload adapter d5157d2c2 and the exactly restored two-MM witness
 d37570d90 are pushed to github/work/x86-process-owner. Shared numeric/serial
-allocation extraction is committed at 89aefd595; checkpoint gate
-receipts are appended below. The two-MM witness remains red at fork ENOSYS
-(exit91), with native Q/exit7. No CPU1, two-MM green or review-ready claim.
+allocation extraction is committed at 89aefd595. Visible PID extraction
+7b141f762, exact namespace incarnation 55e8e9200, reviewed inventory positions
+5958fabca, physical VM capability scope b4f9454dd, and guarded macOS recapture
+777b8c1fa are also pushed. Clean lint-domains passes after the recapture;
+ARM assembly has 115/115 blocks and zero new drift against 3063858a0.
+
+The latest CARRICK_REQUIRE_KVM=1 just test-kvm has 134 passes, one failure,
+and five existing ignored tests. Its sole failure is the original two-MM
+witness at fork ENOSYS (exit91), with native Q/exit7. No CPU1, two-MM green,
+full latest host/semantics gate, or review-ready claim. Next root ownership
+scope question is pending with the director (details appended below).
 
 The director confirmed two next-step authority choices: pure PID collision/
 claim and serial allocation belong in sched-core with thin native/host
@@ -1181,3 +1189,46 @@ capture checks fail, and independent receipt tests additionally report the
 reviewed projection differs from the old macOS capture. Rerun clean after
 pushing and obtain a guarded remote recapture for the moved source spans;
 never rewrite the compiler receipt by hand.
+
+## Real-launch root scope question and latest gates (2026-10-07)
+
+The x86 production branch in prepare.rs:1017 explicitly ignores carrier and
+carrier_lease. Its dispatcher still has the mandatory one-task adapter from
+kernel_context.rs:46, whose Kernel::bootstrap_root uses
+Container::for_reference_model rather than the actual prepared Container.
+set_container (dispatcher.rs:272) installs only the dispatcher field.
+The prepared Container's PID namespace is established separately at
+prepare.rs:839. Copying the adapter metadata would therefore export the
+wrong namespace instead of the required real namespace PID1/group/session.
+
+Existing RuntimeCarrier::boot_kernel_root_prepared (carrier.rs:620) shares
+one Kernel across later container roots, and also constructs an
+HvpatchRuntimeDirectory. Exporting that entire allocator/population would
+change the scope of other live roots. The director question asks whether to
+bootstrap one fresh per-CPL0-VM Kernel over the actual prepared Container
+(recommended), adopt the actual launch resources, and export it once, or
+use the RuntimeCarrier shared Kernel and split only this container's
+population. Do not invent metadata or freeze unrelated roots while this
+question is unresolved. The applicable allocator algorithms remain shared
+sched-core algorithms in either case; no process-policy copying is allowed.
+
+Latest committed evidence:
+- /tmp/x86-cont-vm-scope-green.log: ten carrier-memory tests pass with KVM
+  required; red-first foreign-VM authentication is in
+  /tmp/x86-cont-vm-scope-red-filter.log.
+- /tmp/x86-cont-vm-scope-clippy.log: focused KVM all-target clippy exits zero;
+  normal push hooks also run workspace all-target clippy successfully.
+- /tmp/x86-cont-visible-domains-recaptured.log: clean just lint-domains exits
+  zero; Linux CLI/runtime 572 reviewed rows are checked live, macOS receipt
+  is independently recaptured. Other platform live checks remain pending.
+- /tmp/x86-cont-vm-scope-asm.log: 115/115 ARM blocks unchanged.
+- /tmp/x86-cont-visible-scope-kvm.log: full required-KVM lane selection runs
+  to completion with 134 passes, one two-MM exit91 failure, five existing
+  ignored tests. This is not a green gate and no ignores were added.
+- target/remote-recapture/b4f9454dd078-recapture-20261007-233605/recapture.patch:
+  guarded macOS position-only receipt patch. Classifications/catalogs and
+  profile slices unchanged. Remote static authority checks all 619 rows.
+
+No Docker, no signed/HVF tests, no load generator, no draft PR, and no
+accept/remote-accept full gate were run. The separately owned arena prefork
+red is still pre-existing; this checkpoint does not close it.
