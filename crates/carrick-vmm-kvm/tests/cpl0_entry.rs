@@ -9,6 +9,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::needless_range_loop)]
 
 use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
+use carrick_mmu_core::x86::descriptor_txn::Access;
 use carrick_sched_core::{ParkedContextWords, SlotId, ThreadIdentity, ZoneTables};
 use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
 use carrick_x86::cpl0_entry::{
@@ -162,6 +163,45 @@ fn production_cpl0_boot_requires_smep_and_smap_on_both_cpus() {
     for slot in 0..2 {
         let cr4 = carrier.supervisor_cr4(slot).expect("stopped CPU state");
         assert_eq!(cr4 & ((1 << 20) | (1 << 21)), (1 << 20) | (1 << 21));
+    }
+}
+
+#[test]
+fn cpl0_supervisor_stub_is_rx_while_tables_and_idt_are_rw_nx() {
+    let layout = carrick_x86::BringupLayout {
+        trampoline_base: 0x10_0000,
+        gdt_base: 0x50_0000,
+        pml4_base: 0x60_0000,
+    };
+    for carrier in [
+        Cpl0Carrier::boot(&image(), [&[], &[]]).expect("fixture KVM boot"),
+        Cpl0Carrier::boot_production(0x20_000).expect("production KVM boot"),
+    ] {
+        let idt = carrick_x86::fault_idt_base(layout);
+        let stub = carrick_x86::fault_stub_base(layout);
+        let tss = carrick_x86::fault_tss_base(layout);
+        for data in [layout.pml4_base, idt, tss] {
+            assert!(
+                carrier
+                    .bootstrap_supervisor_access(data, Access::Write)
+                    .expect("data page")
+            );
+            assert!(
+                !carrier
+                    .bootstrap_supervisor_access(data, Access::Execute)
+                    .expect("NX data")
+            );
+        }
+        assert!(
+            carrier
+                .bootstrap_supervisor_access(stub, Access::Execute)
+                .expect("stub code")
+        );
+        assert!(
+            !carrier
+                .bootstrap_supervisor_access(stub, Access::Write)
+                .expect("RX stub")
+        );
     }
 }
 
@@ -420,7 +460,7 @@ fn shared_kernel_x86_cow_copies_and_repoints_through_intent() {
     assert_ne!(leaf & 1, 0);
     assert_ne!(leaf & 2, 0, "replacement is writable");
     assert_eq!(leaf & (1 << 10), 0, "COW flag is cleared");
-    assert_eq!(leaf & 0x000f_ffff_ffff_f000, 0x91_5000);
+    assert_eq!(leaf & 0x000f_ffff_ffff_f000, 0xd1_5000);
 }
 
 #[test]
@@ -460,7 +500,7 @@ fn shared_kernel_retired_page_repoints_without_user_publication() {
     let leaf = carrier
         .fixture_user_leaf_raw(0x3_7000)
         .expect("retired leaf");
-    assert_eq!(leaf & 0x000f_ffff_ffff_f000, 0x91_5000);
+    assert_eq!(leaf & 0x000f_ffff_ffff_f000, 0xd1_5000);
     assert_eq!(leaf & ((1 << 0) | (1 << 9)), 0, "still inaccessible");
     assert_ne!(leaf & (1 << 8), 0, "retired predecessor preserved");
 }

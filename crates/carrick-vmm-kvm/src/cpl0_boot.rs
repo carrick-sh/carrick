@@ -361,6 +361,23 @@ impl Cpl0Carrier {
         Err(fail("fixture leaf walk incomplete"))
     }
 
+    /// Inspect the stopped bootstrap's supervisor direct-window permissions.
+    pub fn bootstrap_supervisor_access(&self, gpa: u64, access: Access) -> Result<bool, TrapError> {
+        if !(0x20_0000..0xc0_0000).contains(&gpa) {
+            return Err(fail("supervisor access outside bootstrap window"));
+        }
+        let root = RootGpa::page_aligned(FrameGpa::new(LAYOUT.pml4_base))
+            .ok_or_else(|| fail("bootstrap root alignment"))?;
+        Ok(translate_leaf(
+            &self._vm.words(),
+            root,
+            UserVa::new(DIRECT_VA + gpa),
+            access,
+            false,
+        )
+        .is_ok())
+    }
+
     pub fn boot(image: &Path, programs: [&[u8]; 2]) -> Result<Self, TrapError> {
         Self::boot_inner(image, programs, false)
     }
@@ -952,14 +969,28 @@ impl Cpl0Carrier {
         }
         // Existing x86 descriptor/TSS/IDT machinery, including private stacks
         // and exception stubs, remains the hardware authority.
-        maps.push(Pml4MapSpec {
-            va: DIRECT_VA + 0x20_0000,
-            gpa: 0x20_0000,
-            len: 0xa0_0000,
-            user: false,
-            write: true,
-            exec: true,
-        });
+        let stub_start = carrick_x86::fault_stub_base(LAYOUT);
+        let stub_end = carrick_x86::fault_tss_base(LAYOUT);
+        if !(0x20_0000 < stub_start && stub_start < stub_end && stub_end < 0xc0_0000) {
+            return Err(fail("CPL0 stub outside direct window"));
+        }
+        // Retained exception stubs execute from their supervisor alias. The
+        // page tables, private IDTs, TSS, stacks and records need write access
+        // but must never be executable in that alias.
+        for (start, end, write, exec) in [
+            (0x20_0000, stub_start, true, false),
+            (stub_start, stub_end, false, true),
+            (stub_end, 0xc0_0000, true, false),
+        ] {
+            maps.push(Pml4MapSpec {
+                va: DIRECT_VA + start,
+                gpa: start,
+                len: end - start,
+                user: false,
+                write,
+                exec,
+            });
+        }
         maps.push(Pml4MapSpec {
             va: DIRECT_VA + 0xc0_0000,
             gpa: 0xc0_0000,
