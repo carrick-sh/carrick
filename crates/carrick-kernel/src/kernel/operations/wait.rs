@@ -4,86 +4,24 @@
 //! child exit-signal classification, and lost-wake prevention across the
 //! child wait precheck.
 
-use carrick_abi::{LinuxWaitOptions, NsUid};
+#[cfg(test)]
+use carrick_abi::LinuxWaitOptions;
+use carrick_abi::NsUid;
 use carrick_fatal::carrick_fatal;
 
 use super::session::remove_group_member;
 use super::{KernelOperationError, ensure_task_unreserved, next_revision};
 use crate::kernel::core::{Kernel, RegistryState};
-use crate::kernel::ids::{ChildExitSignal, LinuxSignal, ProcessGroupId, TaskId};
+use crate::kernel::ids::{LinuxSignal, ProcessGroupId, TaskId};
 use crate::kernel::objects::{TaskJobControlEvent, TaskKey, Zombie};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WaitMode {
-    Observe,
-    Consume,
-}
-
-/// Which children a `wait(2)` call can see, by the child's exit signal.
-///
-/// Linux partitions a parent's children into ordinary ones (exit signal
-/// `SIGCHLD`) and "clone children" (any other exit signal, or none). A plain
-/// wait sees only the former; `__WCLONE` selects only the latter and
-/// `__WALL` both (wait(2)). The partition applies to real children in every
-/// arm of the wait -- the zombie scan, job-control state changes, and the
-/// `ECHILD`/block decision -- but not to ptrace tracees a tracer waits on
-/// without being their parent.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WaitChildClass {
-    /// The default: children whose exit signal is `SIGCHLD`.
-    Sigchld,
-    /// `__WCLONE`: only clone children.
-    Clone,
-    /// `__WALL`: every child regardless of exit signal.
-    All,
-}
-
-impl WaitChildClass {
-    pub fn from_wait_options(options: LinuxWaitOptions) -> Self {
-        if options.contains(LinuxWaitOptions::WALL) {
-            Self::All
-        } else if options.contains(LinuxWaitOptions::WCLONE) {
-            Self::Clone
-        } else {
-            Self::Sigchld
-        }
-    }
-
-    pub fn admits(self, exit_signal: ChildExitSignal) -> bool {
-        match self {
-            Self::Sigchld => !exit_signal.is_clone_child(),
-            Self::Clone => exit_signal.is_clone_child(),
-            Self::All => true,
-        }
-    }
-}
+use carrick_sched_core::process::WaitTarget;
+pub use carrick_sched_core::process::{WaitChildClass, WaitMode};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct WaitJobControl {
     stopped: bool,
     continued: bool,
-}
-
-/// Which children one wait call may reap: the `pid` argument of
-/// `wait4`/`waitid` lowered to a single typed selector, so a pid, an exact
-/// generation and a process group can never be combined inconsistently.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WaitTarget {
-    Any,
-    Pid(TaskId),
-    Exact(TaskKey),
-    ProcessGroup(ProcessGroupId),
-}
-
-impl WaitTarget {
-    fn admits(self, child: TaskKey, process_group: ProcessGroupId) -> bool {
-        match self {
-            Self::Any => true,
-            Self::Pid(target) => target == child.id,
-            Self::Exact(target) => target == child,
-            Self::ProcessGroup(group) => group == process_group,
-        }
-    }
 }
 
 impl WaitJobControl {

@@ -832,7 +832,7 @@ impl Kernel {
             .filter(|session| session.container == task.container().id())
             .map(|session| session.namespace_id)
             .ok_or(KernelOperationError::ExitTopologyChanged(task_id))?;
-        let registry_zombie = Zombie::from_task(
+        let registry_zombie = crate::kernel::objects::process::capture_zombie(
             &task,
             status,
             diagnostic_name,

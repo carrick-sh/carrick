@@ -285,3 +285,105 @@ new ignore, assertion weakening, shootdown-code fix or timeout change was
 made. The director routes the shared-kernel defect to its owner. Review
 correction gates otherwise passed: EL1 249, clippy, fmt-check and clean-tree
 lint-domains. Signed HVF remains unavailable on this host.
+## process owner extraction
+
+Director-approved scope: this lane moves the authoritative process/wait
+graph into `carrick-sched-core`, then makes both host `carrick-kernel` and
+CPL0 consumers. The crate already owns exact task/thread execution and
+object-wait notification; the process topology and its wait producer belong
+beside that notification authority. It remains `no_std` with `alloc`.
+`carrick-core` continues to own MM fork commit/abort/publication and COW.
+No fixture lifecycle, host syscall forwarding, or second process table is
+part of the implementation.
+
+Move the process-only state and transitions, preserving existing typed
+identities: `TaskId`/`TaskKey`, leader/tgid identity, `ChildExitSignal`,
+parent/child links, live/retiring/zombie membership, `LinuxWaitStatus`,
+CPU/children-rusage receipt, job-control/tracee wait selectors, and the
+numeric claim retained until reap. Split host resource payloads from that
+state; MM/files/credentials/namespace handles and subscriptions stay host
+payloads keyed by the same process generation. They must not retain their
+own parent/child or zombie authority. Namespace uid/pid rendering crosses
+through typed adapter values, not host process identity.
+
+Move `operations/wait.rs`'s `WaitMode`, `WaitChildClass`, `WaitTarget`,
+`WaitJobControl`, `ChildWaitPrecheck`, `WaitOutcome`, the selection body of
+`wait_child_matching`, and `sample_precheck`. Preserve consume-under-write
+atomicity, clone-child partitioning, ptrace/job-control observations,
+WNOWAIT/WNOHANG behavior, accumulated child CPU charging, and the wake
+generation sampled by the scan. Wait4/waitid wire rendering remains in the
+Linux personality, using the shared typed status and identity receipt.
+
+Move process topology preparation/publication from `operations/exit.rs`'s
+`prepare_task_exit_key_with_adopter`, `retire_task_exit_notifying`, and
+zombie publication/reaping into owned shared transactions. Preserve reserved
+topology versus live thread membership, subreaper/reparent selection,
+autoreap (SIG_IGN/SA_NOCLDWAIT), exit_group membership cancellation, and
+SIGCHLD producer ordering after committed exit. Host file/MM retirement and
+ptrace/namespace transport remain adapter effects with preadmitted receipts;
+the shared owner decides each effect and its exact target. No host adapter
+may independently decide which child or zombie a wait sees.
+
+Host call sites to change: `kernel/core.rs::RegistryState`, `TaskRecord` and
+`ZombieRecord`; `objects/task.rs` parent/children/lifecycle/job-control and
+identity accessors; `objects/process.rs` zombie/status/rusage capture;
+`operations/{clone,exit,wait,session}.rs` and identity/ptrace mutations;
+`dispatch/{wait,wait_source,wait_authority,wait_plan}.rs` and continuations;
+`kernel/process_lifecycle.rs` public outcomes. Public host APIs delegate to
+the shared owner so existing callers exercise the moved body. Host locks
+and resource lifetimes adapt one graph, never mirror it. Inventory each
+direct topology reader/writer before deleting the old authority.
+
+CPL0 then binds `El1PendingFamilies::{process_fork,process_wait4,
+process_exit_group}` to the same owner, generic over the existing parked
+context. Save/load/CR3/trap projection stays in guest-arch adapters. Import
+initial ELF/stack VMAs, admit the exact child MM through shared core fork,
+publish child custody before CPU1 execution, and park waits through the
+shared notification. Keep `InitialWords` as the sole descriptor window;
+each borrow authenticates the selected MM, root incarnation and generation.
+Stage-2 grant inventory is a counted physical crossing, never a VMA or
+process decision. CPU0/CPU1 completion slots and pending grants are scoped
+to exact execution identities.
+
+Evidence before push: preserve `/tmp/x86-anon-two-mm-red.log` (710 fork
+ENOSYS); shared VM-free red/green tests cover two children, stale/recycled
+identity, observe/consume, WNOHANG, exit-before-enrollment, autoreap,
+reparent and concurrent membership during exit. Run `just test`,
+`just test-kernel-semantics`, EL1 lib tests, full required KVM, clippy,
+fmt-check, clean-tree lint, and assembly comparison for no new ARM drift.
+The director runs the signed ARM gate. The two-live-MM KVM receipt must
+prove PRIVATE leaves per MM, no cross-MM alias and an active peer lane;
+native output alone cannot close this extraction or make PR102 landable.
+
+## Process extraction resumed after review push
+
+Review correction `e9f18354532739575b88056d9b4d63518b997bd5` is pushed on
+work/x86-anon-cpl0, draft PR102; review-ready was posted for that correction
+only. The authorized shared-kernel shootdown exception is documented above.
+
+Current local work is work/x86-process-owner-resume, based on that pushed
+revision. The earlier extraction checkpoint was cherry-picked: canonical
+process identities, lifecycle/wait status, zombie data and parent/child
+storage now live in no_std carrick-sched-core; host callers consume them.
+The final zombie move compile-check passed on the resumed tree. No guest
+process graph, production fork/wait/exit binding, second-MM descriptor
+window, or peer-MM green has been added. This branch is not push-ready.
+
+Exact next step: move the authoritative live/retiring/zombie registry and
+wait selection/consume body (including the wake generation sampled by that
+scan), then the reserved exit/reparent/SIGCHLD transaction into the shared
+owner. Keep host resource payloads and namespace rendering as adapters.
+Do not leave a duplicate host graph or promote the fixture lifecycle.
+After that move, run the planned host/kernel-semantics/EL1 gates, bind the
+CPL0 consumer and import ELF/stack VMAs before attempting the preserved
+red two-MM KVM probe. The earlier red test remains in 6d4905e12 on
+work/x86-anon-step2-checkpoint; bring it into the implementation branch
+when its production dependency is actually being closed, without ignores.
+
+Resumed extraction preliminary checks: host kernel lib compile-check passed;
+scheduler-core 136 tests passed; host wait suite 11 tests passed after fixing
+a test-only import exposed by the zombie move. Receipts:
+`/tmp/x86-anon-process-resume-check.log`,
+`/tmp/x86-anon-process-resume-sched.log`, and
+`/tmp/x86-anon-process-resume-wait.log`. These are preliminary movement
+checks, not full host, signed, Linux-conformance or second-MM acceptance.

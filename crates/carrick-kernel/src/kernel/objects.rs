@@ -122,17 +122,7 @@ impl std::fmt::Debug for ObjectRevision {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct TaskKey {
-    pub id: TaskId,
-    pub serial: TaskSerial,
-}
-
-impl std::fmt::Display for TaskKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "task#{}:{}", self.id.raw(), self.serial.raw())
-    }
-}
+pub use carrick_sched_core::process::TaskKey;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileDescriptionBackingKind {

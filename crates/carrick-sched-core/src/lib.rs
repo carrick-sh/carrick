@@ -80,8 +80,12 @@
 
 #![no_std]
 
+extern crate alloc;
+
 #[cfg(test)]
 extern crate std;
+
+pub mod process;
 
 pub mod completion_queue;
 pub mod object_wait;
