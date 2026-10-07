@@ -13,9 +13,24 @@ use core::num::NonZeroU64;
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering;
 
-/// The host now owns frame-grant publication; EL1 has no publication error.
+#[cfg(target_os = "none")]
+static PANIC_RETIREMENT_DETAIL: AtomicU64 = AtomicU64::new(0);
+
+/// Diagnostic detail carried by the EL1 panic sentinel.
 pub fn panic_publication_detail() -> u64 {
+    #[cfg(target_os = "none")]
+    {
+        PANIC_RETIREMENT_DETAIL.load(Ordering::Relaxed)
+    }
+    #[cfg(not(target_os = "none"))]
     0
+}
+
+pub fn set_panic_retirement_detail(detail: u64) {
+    #[cfg(target_os = "none")]
+    PANIC_RETIREMENT_DETAIL.store(detail, Ordering::Relaxed);
+    #[cfg(not(target_os = "none"))]
+    let _ = detail;
 }
 
 pub use carrick_core::mm::fault::{request_lazy_frames, root_admits_commit};

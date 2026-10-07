@@ -2391,6 +2391,39 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         }
         Ok(result)
     }
+    /// Diagnostic classification after a refused retirement commit. Read-only:
+    /// the caller must not treat this observation as permission to retry an
+    /// already applied descriptor edit.
+    pub fn retirement_failure_detail(&mut self, completion: ReservationCompletion) -> u64 {
+        let Some(pending) = self.state().pending else {
+            return 1;
+        };
+        let request = pending.request;
+        if !matches!(
+            request.operation,
+            ReservationOperation::Retire | ReservationOperation::Prepare
+        ) {
+            return 2;
+        }
+        if !completion.authenticates(request)
+            || request.mm != self.mm
+            || request.generation != self.generation()
+        {
+            return 3;
+        }
+        if ReservationNodeFlags::from_bits(pending.flags).is_none() {
+            return 4;
+        }
+        let needed = request
+            .source
+            .map_or(0, |source| self.splits_needed(source))
+            + self.splits_needed(request.range)
+            + usize::from(request.operation != ReservationOperation::Retire);
+        if Spares(pending.nodes).available() < needed {
+            return 5;
+        }
+        6 // A later tree edit or generation commit refused the proposal.
+    }
     pub fn refuse(&mut self, request: ReservationRequest) -> Result<(), Refusal> {
         let pending = self.state().pending.ok_or(Refusal::Stale)?;
         if pending.request != request {

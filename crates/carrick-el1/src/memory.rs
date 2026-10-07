@@ -839,6 +839,11 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
         )
     };
     let retired = owed_return.is_some();
+    let retirement_detail = if retired {
+        completion.map_or(7, |value| model.retirement_failure_detail(value))
+    } else {
+        0
+    };
     let completed = match (completion, owed_return) {
         (Some(completion), Some(slot)) => pending
             .complete_deferring_return(frame, current, counters, &mut model, completion, slot),
@@ -856,6 +861,7 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
         Ok(()) => DelegatedAnonymous::Served,
         // The descriptor edit is live but the root refused to commit it.
         Err(refusal) if retired => {
+            crate::fault::set_panic_retirement_detail(retirement_detail);
             panic!("EL1 anonymous retirement commit refused: {refusal:?}")
         }
         Err(_) => refuse(pending, &mut model, Leave::RootUnavailable),
