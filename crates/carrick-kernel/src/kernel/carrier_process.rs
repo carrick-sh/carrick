@@ -413,45 +413,108 @@ impl ProcessTimerTarget {
     }
 }
 
-struct ProcessItimerSlot {
-    generation: std::sync::atomic::AtomicU64,
-    spec: parking_lot::Mutex<Option<carrick_hal::TimerSpecNs>>,
+/// One HVPatch Linux process's interval timers. HVPatch multiplexes many
+/// Linux processes in one carrier, so each owns its own
+/// [`carrick_timer_core::itimer::ItimerTable`] instead of the carrier-global
+/// one, but it arms, disarms and delivers through the SAME gated table
+/// methods as every other lane: the generation check, the expiry decision,
+/// the delivery and a one-shot's retirement happen in one slot-gate hold, so
+/// once `setitimer` (or teardown) returns, no driver of the superseded arm
+/// delivers.
+struct ProcessItimers {
+    table: carrick_timer_core::itimer::ItimerTable,
 }
 
-impl ProcessItimerSlot {
+impl ProcessItimers {
     fn new() -> Self {
         Self {
-            generation: std::sync::atomic::AtomicU64::new(0),
-            spec: parking_lot::Mutex::new(None),
+            table: carrick_timer_core::itimer::ItimerTable::new(),
         }
     }
 
-    fn replace(&self, spec: Option<carrick_hal::TimerSpecNs>) -> u64 {
-        use std::sync::atomic::Ordering;
-        let mut current = self.spec.lock();
-        let generation = self
-            .generation
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1);
-        *current = spec;
-        generation
+    /// Arm `which`, anchoring a CPU timer's due point at guest CPU total
+    /// `cpu_now_ns`. `None` for an out-of-range `which`.
+    fn arm(&self, which: usize, spec: carrick_hal::TimerSpecNs, cpu_now_ns: u64) -> Option<u64> {
+        if which >= carrick_timer_core::itimer::ITIMER_COUNT {
+            return None;
+        }
+        Some(self.table.arm_with_cpu_now(which, spec, false, cpu_now_ns))
     }
 
-    fn generation_matches(&self, generation: u64) -> bool {
-        self.generation.load(std::sync::atomic::Ordering::Acquire) == generation
+    fn disarm(&self, which: usize) {
+        self.table.disarm(which);
     }
 
-    fn retire_one_shot(&self, generation: u64) {
-        let mut current = self.spec.lock();
-        if self.generation_matches(generation) {
-            *current = None;
+    fn clear(&self) {
+        self.table.clear();
+    }
+
+    #[cfg(test)]
+    fn is_armed(&self, which: usize) -> bool {
+        self.table.is_armed(which)
+    }
+
+    #[cfg(test)]
+    fn generation(&self, which: usize) -> u64 {
+        self.table.generation(which)
+    }
+
+    /// Drive the expiries of arm `generation` of `which` until it is retired,
+    /// superseded, disarmed, or its process is gone (`sample_cpu` returns
+    /// `None` or `deliver` returns `false`). `sample_cpu` reads THIS process's
+    /// guest CPU total for ITIMER_VIRTUAL/PROF and is unused for ITIMER_REAL.
+    /// `deliver` runs under the slot gate: it must stay bounded and must not
+    /// re-enter this table.
+    fn drive(
+        &self,
+        which: usize,
+        generation: u64,
+        spec: carrick_hal::TimerSpecNs,
+        mut sample_cpu: impl FnMut() -> Option<u64>,
+        mut deliver: impl FnMut() -> bool,
+    ) {
+        use carrick_timer_core::FireOutcome;
+
+        if carrick_timer_core::itimer::is_cpu_timer(which) {
+            loop {
+                // Sampled outside the gate; the decision against the LIVE arm
+                // happens inside it, so a sample taken before a disarm or
+                // re-arm can never be charged to the replacement.
+                let Some(now_ns) = sample_cpu() else {
+                    return;
+                };
+                let mut delivered = true;
+                match self
+                    .table
+                    .fire_cpu_if_current(which, generation, now_ns, 1, || {
+                        delivered = deliver();
+                    }) {
+                    FireOutcome::Wait { delay_ns } => {
+                        std::thread::sleep(std::time::Duration::from_nanos(delay_ns.raw()));
+                    }
+                    FireOutcome::Fired if delivered => {}
+                    FireOutcome::Fired | FireOutcome::Retired => return,
+                }
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_nanos(spec.value));
+        loop {
+            let mut delivered = true;
+            let outcome = self.table.fire_wall_if_current(which, generation, || {
+                delivered = deliver();
+            });
+            if outcome != FireOutcome::Fired || !delivered {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_nanos(spec.interval));
         }
     }
 }
 
 pub struct ProcessTimerDelivery {
     target: ProcessTimerTarget,
-    slots: [std::sync::Arc<ProcessItimerSlot>; carrick_timer_core::itimer::ITIMER_COUNT],
+    itimers: std::sync::Arc<ProcessItimers>,
 }
 
 impl ProcessTimerDelivery {
@@ -464,83 +527,14 @@ impl ProcessTimerDelivery {
                 kernel: std::sync::Arc::downgrade(kernel),
                 task,
             },
-            slots: std::array::from_fn(|_| std::sync::Arc::new(ProcessItimerSlot::new())),
-        }
-    }
-
-    fn drive_itimer(
-        target: ProcessTimerTarget,
-        slot: std::sync::Arc<ProcessItimerSlot>,
-        which: usize,
-        generation: u64,
-        spec: carrick_hal::TimerSpecNs,
-        signum: i32,
-    ) {
-        if carrick_timer_core::itimer::is_cpu_timer(which) {
-            // ITIMER_VIRTUAL/PROF measure THIS process's CPU. Under HVPatch
-            // every guest process shares the carrier, so the carrier-wide
-            // counters would charge siblings' CPU to this timer; read the
-            // task's own threads instead. A vanished task ends the timer.
-            let cpu_now = || {
-                target
-                    .task()
-                    .map(|task| task.self_cpu_ns_including_active())
-            };
-            let Some(start_ns) = cpu_now() else {
-                return;
-            };
-            let mut cpu_due_ns = start_ns.saturating_add(spec.value);
-            loop {
-                if !slot.generation_matches(generation) {
-                    return;
-                }
-                let Some(now_ns) = cpu_now() else {
-                    return;
-                };
-                if now_ns >= cpu_due_ns {
-                    let siginfo = crate::linux_abi::LinuxSiginfo::kernel(signum);
-                    if !target.deliver(signum, Some(siginfo)) {
-                        return;
-                    }
-                    if spec.interval == 0 {
-                        slot.retire_one_shot(generation);
-                        return;
-                    }
-                    cpu_due_ns = now_ns.saturating_add(spec.interval);
-                } else {
-                    let diff = cpu_due_ns - now_ns;
-                    let delay_ns = carrick_timer_core::itimer::cpu_timer_recheck_delay_ns(
-                        carrick_timer_core::CpuNs(diff),
-                    );
-                    std::thread::sleep(std::time::Duration::from_nanos(delay_ns.raw()));
-                }
-            }
-        }
-
-        std::thread::sleep(std::time::Duration::from_nanos(spec.value));
-
-        loop {
-            if !slot.generation_matches(generation) {
-                return;
-            }
-            let siginfo = crate::linux_abi::LinuxSiginfo::kernel(signum);
-            if !target.deliver(signum, Some(siginfo)) {
-                return;
-            }
-            if spec.interval == 0 {
-                slot.retire_one_shot(generation);
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_nanos(spec.interval));
+            itimers: std::sync::Arc::new(ProcessItimers::new()),
         }
     }
 }
 
 impl Drop for ProcessTimerDelivery {
     fn drop(&mut self) {
-        for slot in &self.slots {
-            slot.replace(None);
-        }
+        self.itimers.clear();
     }
 }
 
@@ -556,24 +550,50 @@ impl carrick_hal::TimerDelivery for ProcessTimerDelivery {
         _needs_periodic: bool,
         signum: i32,
     ) -> bool {
-        let Some(slot) = self.slots.get(which).cloned() else {
+        if which >= carrick_timer_core::itimer::ITIMER_COUNT {
+            return false;
+        }
+        // ITIMER_VIRTUAL/PROF measure THIS process's CPU. Under HVPatch every
+        // guest process shares the carrier, so the carrier-wide counters would
+        // charge siblings' CPU to this timer; read the task's own threads
+        // instead. The due point is anchored at the setitimer call. A
+        // vanished task ends the timer; this delivery still owns the arm
+        // (returning false would hand it to the carrier-global fallback).
+        let target = self.target.clone();
+        let sample_cpu = move || {
+            target
+                .task()
+                .map(|task| task.self_cpu_ns_including_active())
+        };
+        let cpu_now_ns = if carrick_timer_core::itimer::is_cpu_timer(which) {
+            let Some(now_ns) = sample_cpu() else {
+                self.itimers.disarm(which);
+                return true;
+            };
+            now_ns
+        } else {
+            0
+        };
+        let Some(generation) = self.itimers.arm(which, spec, cpu_now_ns) else {
             return false;
         };
-        let generation = slot.replace(Some(spec));
+        let itimers = std::sync::Arc::clone(&self.itimers);
         let target = self.target.clone();
         let pid = self.target.task.id.raw();
         let _ = std::thread::Builder::new()
             .name(format!("carrick-hvpatch-itimer-{pid}-{which}"))
             .spawn(move || {
-                Self::drive_itimer(target, slot, which, generation, spec, signum);
+                let deliver = || {
+                    let siginfo = crate::linux_abi::LinuxSiginfo::kernel(signum);
+                    target.deliver(signum, Some(siginfo))
+                };
+                itimers.drive(which, generation, spec, sample_cpu, deliver);
             });
         true
     }
 
     fn disarm_itimer(&self, which: usize) {
-        if let Some(slot) = self.slots.get(which) {
-            slot.replace(None);
-        }
+        self.itimers.disarm(which);
     }
 
     fn arm_posix(
@@ -1006,6 +1026,149 @@ pub mod test_support {
 pub use test_support::{
     TestCarrierProcess, TestMmBackend, TestStage1MmProjection, test_mm_binding,
 };
+
+/// Linearizability of HVPatch's per-process interval timers against
+/// `setitimer` and process teardown. Each test parks the delivery driver INSIDE
+/// its CPU sampler -- after the driver has committed to the arm generation it
+/// was spawned for and before its expiry decision -- performs the transition,
+/// then releases a sample that is due. No expiry of the superseded setting may
+/// be delivered once the transition has returned.
+#[cfg(test)]
+mod itimer_linearizability_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+
+    use super::ProcessItimers;
+
+    const ITIMER_VIRTUAL: usize = carrick_abi::LINUX_ITIMER_VIRTUAL as usize;
+    const ONE_SHOT: carrick_hal::TimerSpecNs = carrick_hal::TimerSpecNs {
+        value: 100,
+        interval: 0,
+    };
+
+    /// Spawn the driver for `generation` with a sampler that reports zero CPU
+    /// once (not due), then parks on its second sample until released, and
+    /// reports a CPU total far past the due point. Returns the delivery count,
+    /// the parked signal and the release handle.
+    fn park_driver_in_sampler(
+        itimers: &Arc<ProcessItimers>,
+        generation: u64,
+    ) -> (
+        Arc<AtomicUsize>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let fires = Arc::new(AtomicUsize::new(0));
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let itimers = Arc::clone(itimers);
+        let driver_fires = Arc::clone(&fires);
+        let driver = std::thread::spawn(move || {
+            let mut samples = 0_u32;
+            let sample_cpu = move || {
+                samples += 1;
+                match samples {
+                    1 => Some(0),
+                    2 => {
+                        parked_tx.send(()).expect("test waits for the park");
+                        release_rx.recv().expect("test releases the driver");
+                        Some(1_000_000)
+                    }
+                    _ => None,
+                }
+            };
+            let deliver = || {
+                driver_fires.fetch_add(1, Ordering::SeqCst);
+                true
+            };
+            itimers.drive(ITIMER_VIRTUAL, generation, ONE_SHOT, sample_cpu, deliver);
+        });
+        (fires, parked_rx, release_tx, driver)
+    }
+
+    #[test]
+    fn setitimer_disarm_while_driver_is_parked_delivers_nothing() {
+        let itimers = Arc::new(ProcessItimers::new());
+        let generation = itimers
+            .arm(ITIMER_VIRTUAL, ONE_SHOT, 0)
+            .expect("ITIMER_VIRTUAL arms");
+        let (fires, parked, release, driver) = park_driver_in_sampler(&itimers, generation);
+        parked.recv().expect("driver parks in its sampler");
+
+        itimers.disarm(ITIMER_VIRTUAL);
+        release.send(()).expect("driver is parked");
+        driver.join().expect("driver exits");
+
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            0,
+            "an expiry of a timer disarmed before it was due must not be delivered"
+        );
+        assert!(!itimers.is_armed(ITIMER_VIRTUAL));
+    }
+
+    #[test]
+    fn setitimer_rearm_while_driver_is_parked_leaves_the_replacement_untouched() {
+        let itimers = Arc::new(ProcessItimers::new());
+        let stale = itimers
+            .arm(ITIMER_VIRTUAL, ONE_SHOT, 0)
+            .expect("ITIMER_VIRTUAL arms");
+        let (fires, parked, release, driver) = park_driver_in_sampler(&itimers, stale);
+        parked.recv().expect("driver parks in its sampler");
+
+        let replacement_spec = carrick_hal::TimerSpecNs {
+            value: 10_000_000,
+            interval: 0,
+        };
+        let replacement = itimers
+            .arm(ITIMER_VIRTUAL, replacement_spec, 0)
+            .expect("ITIMER_VIRTUAL re-arms");
+        release.send(()).expect("driver is parked");
+        driver.join().expect("driver exits");
+
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            0,
+            "the superseded arm's driver must not deliver after the re-arm returned"
+        );
+        assert!(itimers.is_armed(ITIMER_VIRTUAL));
+        assert_eq!(itimers.generation(ITIMER_VIRTUAL), replacement);
+        // The stale driver's due sample must not have consumed or moved the
+        // replacement's due point: at the same CPU total it is still pending.
+        let mut replacement_fires = 0;
+        let outcome =
+            itimers
+                .table
+                .fire_cpu_if_current(ITIMER_VIRTUAL, replacement, 1_000_000, 1, || {
+                    replacement_fires += 1
+                });
+        assert!(
+            matches!(outcome, carrick_timer_core::FireOutcome::Wait { .. }),
+            "replacement must still be pending, got {outcome:?}"
+        );
+        assert_eq!(replacement_fires, 0);
+    }
+
+    #[test]
+    fn teardown_while_driver_is_parked_delivers_nothing() {
+        let itimers = Arc::new(ProcessItimers::new());
+        let generation = itimers
+            .arm(ITIMER_VIRTUAL, ONE_SHOT, 0)
+            .expect("ITIMER_VIRTUAL arms");
+        let (fires, parked, release, driver) = park_driver_in_sampler(&itimers, generation);
+        parked.recv().expect("driver parks in its sampler");
+
+        // What `Drop for ProcessTimerDelivery` runs at exec/exit teardown.
+        itimers.clear();
+        release.send(()).expect("driver is parked");
+        driver.join().expect("driver exits");
+
+        assert_eq!(fires.load(Ordering::SeqCst), 0);
+        assert!(!itimers.is_armed(ITIMER_VIRTUAL));
+    }
+}
 
 #[cfg(test)]
 mod tests {
