@@ -15,6 +15,7 @@ pub mod probe_inventory;
 pub mod provision;
 mod prune_fs;
 pub mod remote_accept;
+pub mod remote_lock;
 pub mod remote_recapture;
 mod target_prune;
 pub mod worktree_admission;
