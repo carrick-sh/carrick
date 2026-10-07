@@ -734,7 +734,7 @@ pub use outcome::{
 };
 #[allow(unused_imports)]
 pub(crate) use outcome::{
-    BlockingRecordLockStep, lower_handler_result, try_drive_blocking_record_lock,
+    BlockingRecordLockStep, InputCopyError, lower_handler_result, try_drive_blocking_record_lock,
 };
 #[allow(unused_imports)]
 pub use outcome::{BlockingWriteStep, drive_blocking_record_lock, drive_blocking_write};
@@ -2668,7 +2668,7 @@ fn write_kernel_struct_raw<T: KernelAbi>(
 pub(crate) fn read_kernel_struct<T>(
     memory: &impl CurrentMmMemory,
     address: u64,
-) -> Result<T, LinuxErrno>
+) -> Result<T, InputCopyError>
 where
     T: KernelAbi + FromBytes,
 {
@@ -2682,16 +2682,16 @@ fn read_kernel_prefix<T>(
     memory: &impl CurrentMmMemory,
     address: u64,
     length: usize,
-) -> Result<T, LinuxErrno>
+) -> Result<T, InputCopyError>
 where
     T: KernelAbi + FromBytes,
 {
     if address == 0 || length > T::ABI_SIZE {
-        return Err(LINUX_EFAULT);
+        return Err(LINUX_EFAULT.into());
     }
     let bytes = memory
         .read_bytes(address, length)
-        .map_err(|_| LINUX_EFAULT)?;
+        .map_err(DispatchError::input_copy)?;
     let mut value = <T as zerocopy::FromZeros>::new_zeroed();
     value.as_mut_bytes()[..length].copy_from_slice(&bytes);
     Ok(value)

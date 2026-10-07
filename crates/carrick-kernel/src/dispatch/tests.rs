@@ -3617,11 +3617,11 @@ mod overlay_dispatch_tests {
 
         assert_eq!(
             read_kernel_struct::<LinuxTimespec>(&memory, 0),
-            Err(LINUX_EFAULT)
+            Err(InputCopyError::Errno(LINUX_EFAULT))
         );
         assert_eq!(
             read_kernel_struct::<LinuxTimespec>(&memory, MEM_BASE + MEM_LEN as u64 - 1),
-            Err(LINUX_EFAULT)
+            Err(InputCopyError::Errno(LINUX_EFAULT))
         );
     }
 
@@ -3644,7 +3644,7 @@ mod overlay_dispatch_tests {
                 address,
                 <LinuxCloneArgs as KernelAbi>::ABI_SIZE + 1,
             ),
-            Err(LINUX_EFAULT)
+            Err(InputCopyError::Errno(LINUX_EFAULT))
         );
     }
 
@@ -3954,7 +3954,10 @@ mod overlay_dispatch_tests {
         // No shared mapping -> EFAULT propagates unchanged (no regression for
         // a genuinely bad private/anon address).
         let lin = LinearMemory::new(0x1000, vec![0u8; 8]);
-        assert_eq!(read_futex_word(&lin, 0x9_9999_9999), Err(LINUX_EFAULT));
+        assert_eq!(
+            read_futex_word(&lin, 0x9_9999_9999),
+            Err(InputCopyError::Errno(LINUX_EFAULT))
+        );
     }
 
     struct CountingMemory {

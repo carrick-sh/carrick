@@ -2847,7 +2847,7 @@ impl<'a> IpcView<'a> {
             } else {
                 match read_timespec(&*cx.memory, timeout.0) {
                     Ok(ts) => Some(ts),
-                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    Err(error) => return Ok(error.outcome()),
                 }
             };
             this.sysv_semop(cx, semid as i32, sops.0, nsops as usize, to)

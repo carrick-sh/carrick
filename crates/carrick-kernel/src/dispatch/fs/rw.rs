@@ -54,6 +54,14 @@ impl WriteSource<'_> {
     }
 }
 
+/// A write has not consumed its source while it is copying the guest buffer.
+/// Owner reads may suspend on a real publication dependency; redispatching the
+/// saved syscall after that dependency wakes is safe at this boundary because
+/// no destination byte has been written yet.
+fn write_source_read_error(error: carrick_guest_mem::MemoryError) -> DispatchOutcome {
+    DispatchError::input_copy(error).outcome()
+}
+
 fn retained_executable_bytes(
     executable: &crate::dispatch::executable_authority::CurrentExecutable,
     offset: usize,
@@ -2284,8 +2292,8 @@ impl<'a> FsView<'a> {
             } else {
                 match (*cx.memory).read_bytes(address, length) {
                     Ok(b) => b,
-                    Err(_) => {
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    Err(error) => {
+                        return Ok(write_source_read_error(error));
                     }
                 }
             };
@@ -2963,7 +2971,7 @@ impl<'a> FsView<'a> {
             } else if length <= STACK_WRITE_LIMIT {
                 match (*cx.memory).read_into(address, &mut stack_buf[..length]) {
                     Ok(()) => &stack_buf[..length],
-                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                    Err(error) => return Ok(write_source_read_error(error)),
                 }
             } else {
                 match (*cx.memory).read_bytes(address, length) {
@@ -2971,7 +2979,7 @@ impl<'a> FsView<'a> {
                         heap_buf = v;
                         &heap_buf
                     }
-                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                    Err(error) => return Ok(write_source_read_error(error)),
                 }
             };
 
