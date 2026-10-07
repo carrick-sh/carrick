@@ -41,6 +41,21 @@ pub fn serve_canonical(
                     .linux_result()
                 })
             },
+            #[cfg(target_arch = "x86_64")]
+            arch_prctl: &|operation, address| {
+                #[cfg(target_os = "none")]
+                {
+                    Some(
+                        super::x86_native::arch_prctl(task, operation, address)
+                            .unwrap_or_else(|_| crate::isa::x86::fatal_entry_binding()),
+                    )
+                }
+                #[cfg(not(target_os = "none"))]
+                {
+                    let _ = (operation, address);
+                    None
+                }
+            },
             tid_address: |address| {
                 venue.thread(task).and_then(|thread| {
                     carrick_personality_linux::thread::set_tid_address(

@@ -28,12 +28,16 @@ jobs:
             grep -m1 -o '\bsvm\b' /proc/cpuinfo
             /usr/local/bin/carrick-xtask ci-scaler verify-kvm
           } 2>&1 | tee pilot-logs/capability.log
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
       - name: Build the CPL0 image and execute KVM entry tests
         shell: bash
         run: |
           set -euo pipefail
           cargo build --locked --release -p carrick-x86-cpl0 --target x86_64-unknown-none 2>&1 | tee pilot-logs/image-build.log
-          cargo test --locked -p carrick-vmm-kvm --test cpl0_entry -- --nocapture 2>&1 | tee pilot-logs/cpl0-entry.log
+          just test-kvm 2>&1 | tee pilot-logs/kvm-tests.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
