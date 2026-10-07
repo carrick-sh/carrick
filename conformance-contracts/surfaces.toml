@@ -392,7 +392,7 @@ contracts = ["kernel.mm.syscall-code-write", "kernel.mm.backing-maintenance-look
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/fs/rw.rs"
-contracts = ["kernel.mm.syscall-code-write"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.fs.lseek-sparse"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/fs/tests.rs"
