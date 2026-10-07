@@ -718,6 +718,9 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame>
     El1PendingFamilies<'_, F, C, U, G>
 {
     fn ipc_transfer(&mut self) -> FamilyCompletion {
+        let Some(venue) = &self.ipc else {
+            return FamilyCompletion::Forward;
+        };
         let Some(frame) = self.frame.arm_frame() else {
             self.frame.record_isa_unsupported_forward();
             return FamilyCompletion::Forward;
@@ -725,11 +728,10 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame>
         let counters = self.counters;
         let zone = &mut self.zone;
         let current_tasks = self.current_tasks;
-        let ipc = &self.ipc;
         let slot = frame.slot as usize;
         let cur_task = current_tasks.get(slot);
-        if let (Some(venue), Some(zone), Some(task), Some(zslot)) =
-            (ipc, zone.as_mut(), cur_task, SlotId::from_index(slot))
+        if let (Some(zone), Some(task), Some(zslot)) =
+            (zone.as_mut(), cur_task, SlotId::from_index(slot))
         {
             let orig_x0 = frame.x[0];
             let mut sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
