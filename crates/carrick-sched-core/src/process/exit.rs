@@ -741,6 +741,9 @@ impl<
         plan: &PreparedExitTopology<L::Credit>,
         permit: &ReservedTaskSet<Transaction>,
     ) -> ExitEffectAdmission<C, L, Transaction> {
+        if task != plan.task_revision.task {
+            return Err(ExitError::Topology(task.id));
+        }
         self.validate_task_set(permit)
             .map_err(|_| ExitError::Topology(task.id))?;
         if plan

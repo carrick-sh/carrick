@@ -443,7 +443,7 @@ fn exit_effect_work_visits_only_own_members_at_all_scales() {
     }
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct Transaction(u32);
-    for n in [1, 8, 32, 128] {
+    for n in [0, 1, 8, 32, 128] {
         let task = key(1);
         let mut owner: ProcessRegistry<
             (),
@@ -495,6 +495,10 @@ fn exit_effect_work_visits_only_own_members_at_all_scales() {
         }
         let plan = owner.prepare_exit_topology(task, None).unwrap();
         let permit = owner.reserve_exit_task_set(&plan, Transaction(1)).unwrap();
+        assert!(
+            owner.begin_exit_effects(key(2), &plan, &permit).is_err(),
+            "a stale task serial must be refused even with no members"
+        );
         let effects = owner.begin_exit_effects(task, &plan, &permit).unwrap();
         let release = owner.release_task_set(&permit).unwrap();
         let mut cancelled = 0;
