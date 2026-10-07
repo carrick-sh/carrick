@@ -407,7 +407,7 @@ mod kernel {
             let zone = unsafe { &*(zone_address.raw() as *const carrick_sched_core::ZoneTables) };
             let mut cow = X86CowResolver { pool, residency, completion: None };
             let result = dispatch_x86_fault_with_prepared(
-                0, fault, counters, core::slice::from_ref(task),
+                carrick_guest_arch::CpuId::new(0), fault, counters, task,
                 carrick_el1::substrate::sched::object_wait::space_access(
                     zone, slot,
                 ),
@@ -455,7 +455,7 @@ mod kernel {
         let mut prepared = unsafe { carrick_el1::fault::X86PreparedResolver::under_editor(prepared_mm, &words) };
         let mut cow = NoopCowResolver;
         let result = dispatch_x86_fault_with_prepared(
-            0, fault, counters, core::slice::from_ref(task), spaces,
+            carrick_guest_arch::CpuId::new(binding.cpu_slot), fault, counters, task, spaces,
             carrick_el1::fault::FaultSupply::Owner(&supply),
             Some(carrick_el1::fault::PreparedFaultPath { residency, resolver: &mut prepared,
                 roots: Some(roots), file_slots: None }), &mut cow,
@@ -466,18 +466,18 @@ mod kernel {
             OwnerFaultSupplyOutcome::PolicyDeclined => 6,
             OwnerFaultSupplyOutcome::Unavailable => 9,
             OwnerFaultSupplyOutcome::Selected => {
-                fn cross() {
+                fn cross(slot: u32) {
                     // SAFETY: this CPL0 CPU owns the physical grant service.
-                    unsafe { core::arch::asm!("out dx, eax", in("dx") OWNER_GRANT_PORT, in("eax") 0u32, options(nostack)) };
+                    unsafe { core::arch::asm!("out dx, eax", in("dx") OWNER_GRANT_PORT, in("eax") slot, options(nostack)) };
                 }
-                cross();
-                let Some(grant_slot) = portal.grant(0) else { return 9; };
+                cross(binding.cpu_slot);
+                let Some(grant_slot) = portal.grant(binding.cpu_slot as usize) else { return 9; };
                 let Some(window) = grant_slot.window() else { return 9; };
                 let Some(index) = spaces.find(mm_key) else { return 9; };
-                let Ok(mut root) = roots.lock_in(spaces, index.index(), window.operation.mm, 0) else { return 9; };
+                let Ok(mut root) = roots.lock_in(spaces, index.index(), window.operation.mm, binding.cpu_slot) else { return 9; };
                 let Ok(target) = carrick_core::mm::frames::grant_target_in(
                     match portal.carrier() { Some(carrier) => carrier, None => return 9 },
-                    window, spaces, 0, &mut root) else { return 9; };
+                    window, spaces, binding.cpu_slot, &mut root) else { return 9; };
                 let receipt = carrick_core::mm::frames::apply_grant::<carrick_mmu_core::x86::owner_mmu::X86Mmu, _>(
                     grant_slot, &words, residency, target,
                     // The ISA executor already completed InitialWords' checked
@@ -487,7 +487,7 @@ mod kernel {
                 drop(root);
                 let applied = receipt.is_some_and(|receipt| matches!(receipt.outcome,
                     carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)));
-                cross();
+                cross(binding.cpu_slot);
                 if applied { 0 } else { 9 }
             }
         }
@@ -1313,14 +1313,14 @@ mod kernel {
             // SAFETY: KVM retains this counter record for the bound vCPU.
             let counters = unsafe { &*(binding.counters_address as *const Counters) };
             let action = dispatch_x86_fault_with_prepared(
-                0,
+                carrick_guest_arch::CpuId::new(0),
                 FaultInfo {
                     address: UserVa::new(0x3_3000),
                     access: Access::Read,
                     present: false,
                 },
                 counters,
-                core::slice::from_ref(task),
+                task,
                 carrick_el1::substrate::sched::object_wait::space_access(
                     zone,
                     carrick_sched_core::SlotId::new(0),
@@ -1457,14 +1457,14 @@ mod kernel {
             // SAFETY: this bound vCPU owns the counter record for its lifetime.
             let counters = unsafe { &*(binding.counters_address as *const Counters) };
             let action = dispatch_x86_fault_with_prepared(
-                0,
+                carrick_guest_arch::CpuId::new(0),
                 FaultInfo {
                     address: UserVa::new(0x3_4000),
                     access: Access::Write,
                     present: true,
                 },
                 counters,
-                core::slice::from_ref(task),
+                task,
                 carrick_el1::substrate::sched::object_wait::space_access(
                     zone,
                     carrick_sched_core::SlotId::new(0),
