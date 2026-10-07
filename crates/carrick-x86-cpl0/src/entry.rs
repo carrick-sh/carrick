@@ -30,6 +30,21 @@ fixture_items! {
 }
 fixture_items! {
     #[cfg(target_os = "none")]
+    #[unsafe(no_mangle)]
+    static CARRICK_X86_FIXTURE_DISPATCH_WITNESSES: [u64; 2] =
+        [0x7bd6_8a91_c4e2_5f03, 0xa239_4c7d_8e15_b6f0];
+
+    #[cfg(target_os = "none")]
+    #[unsafe(no_mangle)]
+    #[inline(never)]
+    fn carrick_x86_fixture_dispatch_witness() -> bool {
+        // A volatile read keeps the fixture-only witness in the linked image.
+        (unsafe { core::ptr::read_volatile(core::ptr::addr_of!(CARRICK_X86_FIXTURE_DISPATCH_WITNESSES).cast::<u64>()) })
+            == 0x7bd6_8a91_c4e2_5f03
+    }
+}
+fixture_items! {
+    #[cfg(target_os = "none")]
     mod cpl0_scheduler {
         pub(crate) use super::scheduler::*;
     }
@@ -218,7 +233,7 @@ mod kernel {
     use carrick_el1::personality::thread_setup::GuestLifecycleVenue;
     use carrick_el1::personality::{dispatch, sched};
     use carrick_el1_abi::{Action, Counters, CurrentTask, InotifyNameCache};
-    use carrick_guest_arch::{CanonicalSyscall, InterruptArch, LayoutBackend, NativeReturnWord, SyscallFrame, UserVa};
+    use carrick_guest_arch::{CanonicalNr, InterruptArch, LayoutBackend, NativeReturnWord, SyscallFrame, UserVa};
     fixture_items! { use carrick_guest_arch::EntryArch; }
     use core::sync::atomic::Ordering;
 
@@ -226,20 +241,23 @@ mod kernel {
         frame: &'a mut NativeFrame,
         call: carrick_personality_linux::entry::CanonicalCall,
         publications: &'a core::sync::atomic::AtomicU64,
+        slot: Option<carrick_guest_arch::SlotId>,
     }
 
     impl SyscallFrame for NativeDispatch<'_> {
-        fn canonical_ordinal(&self) -> CanonicalSyscall { CanonicalSyscall::new(self.call.canonical.raw()) }
+        fn canonical_ordinal(&self) -> CanonicalNr { self.call.canonical }
         fn argument(&self, index: usize) -> u64 { self.call.args[index] }
+        fn result(&self) -> NativeReturnWord { NativeReturnWord(self.frame.rax) }
         fn set_result(&mut self, result: NativeReturnWord) { self.frame.rax = result.0; }
-        // The CPU binding owns one exact task. Its table slice is projected
-        // with that task at local index zero, independently of the CPU id.
-        fn slot(&self) -> u64 { 0 }
-        fn user_pc(&self) -> UserVa { UserVa::new(self.frame.rcx) }
+        fn slot(&self) -> Option<carrick_guest_arch::SlotId> { self.slot }
+        // The retained metadata stores task records at an ISA-specific stride;
+        // this call projects only the authenticated current task as a slice.
+        fn task_index(&self) -> usize { if self.slot.is_some() { 0 } else { usize::MAX } }
         fn user_sp(&self) -> Option<UserVa> { Some(self.call.stack) }
     }
     impl dispatch::GuestDispatchFrame for NativeDispatch<'_> {
         fn arm_frame(&mut self) -> Option<&mut carrick_el1_abi::TrapFrame> { None }
+        fn arm_frame_ref(&self) -> Option<&carrick_el1_abi::TrapFrame> { None }
         fn arm_scheduler(&self) -> bool { false }
         fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
             Some(self.publications)
@@ -528,11 +546,11 @@ mod kernel {
                 halt();
             }
         } }
-        if crate::fixture_image() && frame.rax == OBSERVE_NATIVE {
+        fixture_stmt! { if frame.rax == OBSERVE_NATIVE && crate::carrick_x86_fixture_dispatch_witness() {
             doorbell(CONTROL_PORT, frame);
             frame.rax = 0;
             return;
-        }
+        } }
         if crate::fixture_image() && frame.rax == OBSERVE_INITIAL_MM {
             use carrick_el1::isa::x86::initial_mm::{
                 InitialImageRegion, InitialImageSpec, InitialSourceRange, InitialStackSpec,
@@ -1296,6 +1314,7 @@ mod kernel {
                 frame,
                 call,
                 publications: &binding.publications,
+                slot: carrick_guest_arch::SlotId::from_index(binding.cpu_slot as usize),
             };
             match dispatch::dispatch_syscall_with_lifecycle(
                 &mut native,

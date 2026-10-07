@@ -712,20 +712,22 @@ pub struct TrapFrame {
     pub far: u64,
 }
 impl carrick_guest_arch::SyscallFrame for TrapFrame {
-    fn canonical_ordinal(&self) -> carrick_guest_arch::CanonicalSyscall {
-        carrick_guest_arch::CanonicalSyscall::new(self.x[8])
+    fn canonical_ordinal(&self) -> carrick_guest_arch::CanonicalNr {
+        carrick_guest_arch::CanonicalNr::new(self.x[8])
     }
     fn argument(&self, index: usize) -> u64 {
         self.x[index]
     }
+    fn result(&self) -> carrick_guest_arch::NativeReturnWord {
+        carrick_guest_arch::NativeReturnWord(self.x[0])
+    }
     fn set_result(&mut self, result: carrick_guest_arch::NativeReturnWord) {
         self.x[0] = result.0;
     }
-    fn slot(&self) -> u64 {
-        self.slot
-    }
-    fn user_pc(&self) -> carrick_guest_arch::UserVa {
-        carrick_guest_arch::UserVa::new(self.elr)
+    fn slot(&self) -> Option<carrick_guest_arch::SlotId> {
+        usize::try_from(self.slot)
+            .ok()
+            .and_then(carrick_guest_arch::SlotId::from_index)
     }
     fn user_sp(&self) -> Option<carrick_guest_arch::UserVa> {
         None
