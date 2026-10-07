@@ -1030,7 +1030,11 @@ fi
             carrick_xtask::accept::AcceptPhase::Signed,
             log.to_str().unwrap(),
             exit.to_str().unwrap(),
-            self.lock.to_str().unwrap(),
+            &carrick_xtask::remote_lock::LockClaim {
+                lock_dir: self.lock.to_string_lossy().into_owned(),
+                run_id: "fixture-run".to_owned(),
+                keeper_pid: std::process::id(),
+            },
             bundle,
         )
         .unwrap();
@@ -1474,6 +1478,7 @@ fn check_remote_accept_cli(remote_bundle: bool, invalid_receipt: bool) {
     p.lock = remote.join("gate-worktree.lock");
     // Only the SSH network boundary is replaced. Real Git and rsync servers
     // execute in scratch; detached acceptance is joined to avoid test polling.
+    // The checkout lock's keeper runs through this fake session too.
     write(
         &p.bin,
         "ssh",
@@ -1492,8 +1497,9 @@ case "$script" in
     'df -Pk '*)
         printf '%s\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on' 'fixture-volume 104857600 0 104857600 0% /fixture-test'
         exit 0 ;;
-    *nohup*) script="$script
-wait" ;;
+    # The detached job inherits fd 9 (this fake session's stdout), so the
+    # driver's capture joins it instead of polling for the exit file.
+    *nohup*) exec 9>&1 ;;
 esac
 exec sh -c "$script"
 "#,
@@ -1728,7 +1734,11 @@ fn signed_preparation_requires_a_bundle_and_checkout_admission() {
                 phase,
                 "/log",
                 "/exit",
-                "/lock",
+                &carrick_xtask::remote_lock::LockClaim {
+                    lock_dir: "/lock".to_owned(),
+                    run_id: "fixture-run".to_owned(),
+                    keeper_pid: std::process::id(),
+                },
                 None,
             )
             .is_err()

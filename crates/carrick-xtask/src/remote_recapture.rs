@@ -9,6 +9,7 @@ use thiserror::Error;
 
 use crate::command::{self, CommandError};
 use crate::remote_accept::{self as remote, RemoteAcceptError, shell_quote};
+use crate::remote_lock::{LockClaim, RemoteLock, RemoteShell, build_join_cmd};
 
 const CAPTURE: &str = "scripts/migrate/host-authority-macos-capture.json";
 const INVENTORY: &str = "scripts/migrate/host-authority-transition-inventory.json";
@@ -242,16 +243,32 @@ fn build_recapture_script(worktree: &str, sha: &str, run_dir: &str) -> String {
     )
 }
 
-fn build_launch_command(remote_root: &str, worktree: &str, run_dir: &str, script: &str) -> String {
+fn build_launch_command(
+    remote_root: &str,
+    worktree: &str,
+    run_dir: &str,
+    script: &str,
+    lock: &LockClaim,
+) -> String {
     let env = shell_quote(&format!("{remote_root}/env.sh"));
     let exit = shell_quote(&format!("{run_dir}/exit"));
     let exit_tmp = shell_quote(&format!("{run_dir}/exit.tmp"));
     let completion =
         format!("rc=$?; echo \"$rc\" > {exit_tmp} && mv {exit_tmp} {exit}; exit \"$rc\"");
+    // This shell runs the recapture to completion even when the ssh session
+    // drops, so it joins the checkout lock as a holder (sponsor: the keeper)
+    // before any work; a dead driver's lock is then held exactly as long as
+    // this shell lives.
+    let join = build_join_cmd(
+        &lock.lock_dir,
+        &lock.run_id,
+        &lock.keeper_pid.to_string(),
+        "\"$$\"",
+    );
     // Invoke the lease CLI directly: just's variadic CMD interpolation joins
     // shell text and loses the single argv boundary around a multiline script.
     format!(
-        "set -eu; mkdir {}; trap {} EXIT; [ ! -f {env} ] || . {env}; cd {}; cargo run --locked -p carrick-xtask -- host-lease --mode gate -- sh -c {} > {} 2>&1",
+        "set -eu; {join}; mkdir {}; trap {} EXIT; [ ! -f {env} ] || . {env}; cd {}; cargo run --locked -p carrick-xtask -- host-lease --mode gate -- sh -c {} > {} 2>&1",
         shell_quote(run_dir),
         shell_quote(&completion),
         shell_quote(worktree),
@@ -292,8 +309,8 @@ pub fn run(root: Option<&Path>, args: RemoteRecaptureArgs) -> Result<PathBuf, Re
     let lock_dir = remote::remote_lock_dir(Path::new(&remote_root))
         .to_string_lossy()
         .into_owned();
-    remote::acquire_remote_lock(&host, &remote_root, &lock_dir, &run_id)?;
-    let mut guard = remote::RemoteLockGuard::new(&host, lock_dir);
+    let runs_dir = format!("{remote_root}/gate-runs");
+    let mut lock = RemoteLock::acquire(RemoteShell::ssh(&host), &runs_dir, &lock_dir, &run_id)?;
     let worktree = remote::prepare_remote_worktree(
         &root,
         &host,
@@ -306,13 +323,13 @@ pub fn run(root: Option<&Path>, args: RemoteRecaptureArgs) -> Result<PathBuf, Re
         .into_owned();
     let script = build_recapture_script(&worktree, &sha, &run_dir);
     // Checkout lock -> host lease -> compiler work, just like remote-accept.
-    let launch = build_launch_command(&remote_root, &worktree, &run_dir, &script);
+    let launch = build_launch_command(&remote_root, &worktree, &run_dir, &script, lock.claim());
     println!("Recapturing {sha} on {host}; remote log: {run_dir}/recapture.log");
     if let Err(error) = remote::run_ssh_command(&host, &launch) {
         // A transport failure does not prove the remote compiler stopped.
-        // Retain the checkout lock; remote-accept's stale-lock recovery can
-        // reclaim it only after the remote completion trap publishes `exit`.
-        guard.disarm();
+        // Retain the checkout lock: the launch shell joined it as a holder,
+        // so it becomes reclaimable exactly when no holder process is alive.
+        lock.hand_off();
         return Err(error.into());
     }
     // Fetch failures propagate before touching any local output. Never read an
@@ -632,11 +649,23 @@ mod tests {
                 "set -eu\nprintf '%s' \"$CARRICK_RECAPTURE_FIXTURE\" > {}\n",
                 shell_quote(&witness.to_string_lossy())
             );
+            let lock_dir = root
+                .join("gate-worktree.lock")
+                .to_string_lossy()
+                .into_owned();
+            let lock = RemoteLock::acquire(
+                RemoteShell::Local,
+                &root.join("gate-runs").to_string_lossy(),
+                &lock_dir,
+                "run-recapture",
+            )
+            .unwrap();
             let launch = build_launch_command(
                 &root.to_string_lossy(),
                 &worktree.to_string_lossy(),
                 &run_dir.to_string_lossy(),
                 &script,
+                lock.claim(),
             );
             let output = Command::new("sh")
                 .args(["-c", &launch])
@@ -652,6 +681,44 @@ mod tests {
             if !reject {
                 assert_eq!(fs::read_to_string(&witness).unwrap(), "quoted-value");
             }
+            drop(lock);
+            assert!(!Path::new(&lock_dir).exists());
         }
+    }
+
+    #[test]
+    fn launch_refuses_without_a_live_keeper() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let lock_dir = root
+            .join("gate-worktree.lock")
+            .to_string_lossy()
+            .into_owned();
+        let run_dir = root.join("run");
+        let mut claim = None;
+        {
+            let lock = RemoteLock::acquire(
+                RemoteShell::Local,
+                &root.join("gate-runs").to_string_lossy(),
+                &lock_dir,
+                "run-recapture",
+            )
+            .unwrap();
+            claim.replace(lock.claim().clone());
+        }
+        // The released lock cannot be joined: no work, no run directory.
+        let launch = build_launch_command(
+            &root.to_string_lossy(),
+            &root.to_string_lossy(),
+            &run_dir.to_string_lossy(),
+            "exit 0",
+            &claim.unwrap(),
+        );
+        let output = Command::new("sh").args(["-c", &launch]).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(crate::remote_lock::LOCK_LOST_STATUS)
+        );
+        assert!(!run_dir.exists());
     }
 }

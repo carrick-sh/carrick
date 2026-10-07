@@ -76,8 +76,19 @@ evidence, profile, operation or rationale prose change. Only source coordinates
 and the matching leading rationale location can move. Generated files on the
 Mac are restored before the checkout lock is released. Transfer failures never
 publish a validated patch. If the execution SSH connection fails, the checkout
-lock stays held until the remote completion marker permits the shared stale-lock
-recovery to reclaim it; a disconnect cannot prove compiler work stopped.
+lock stays held: the remote launch shell joined it as a holder, and a disconnect
+cannot prove compiler work stopped.
+
+The checkout lock (`gate-worktree.lock`) records each gate-host process holding
+it in `holders/<pid>` with that process's start time. The acquiring SSH session
+keeps a remote keeper process alive until the driver releases or dies; work
+that outlives the driver (the detached accept job, the recapture shell) joins
+as a holder while a live holder sponsors it. A later acquirer reclaims the lock
+only when every recorded holder process is gone and the holder set did not
+change while it looked, and appends the recovered run-id to
+`gate-worktree.lock.recoveries`. A lock without holder records is reclaimed
+only through its run's published `exit` file; otherwise it is reported and
+left for a human.
 Recapture is inventory maintenance, not an acceptance
 receipt; run the acceptance gates on the resulting commit.
 
