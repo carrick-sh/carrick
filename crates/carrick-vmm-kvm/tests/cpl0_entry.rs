@@ -1258,6 +1258,74 @@ fn two_running_vcpus_drop_stale_translation_on_shootdown() {
 }
 
 #[test]
+fn stopped_cpl0_cpu_drops_stale_translation_before_cpl0_access() {
+    let mut editor = Vec::new();
+    for phase in [2_u64, 3] {
+        editor.extend_from_slice(&[0x48, 0xbf]); // mov rdi, phase
+        editor.extend_from_slice(&phase.to_le_bytes());
+        editor.extend_from_slice(&[0x48, 0xb8]); // mov rax, fixture edit
+        editor.extend_from_slice(&OBSERVE_RETIRE_REPOINT.to_le_bytes());
+        editor.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+        editor.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+        editor.extend_from_slice(&[0x0f, 0x05]);
+    }
+    editor.extend_from_slice(&[0x0f, 0x0b]);
+
+    let mut reader = vec![0x48, 0xbf]; // mov rdi, 0x3_7000
+    reader.extend_from_slice(&0x3_7000_u64.to_le_bytes());
+    reader.extend_from_slice(&[0x48, 0xb8]); // mov rax, OBSERVE_CPL0_UACCESS_SHOOTDOWN
+    reader
+        .extend_from_slice(&carrick_x86::cpl0_entry::OBSERVE_CPL0_UACCESS_SHOOTDOWN.to_le_bytes());
+    reader.extend_from_slice(&[0x0f, 0x05]); // syscall -> warms TLB, stops on FORWARD_PORT, resumes, reads again, stops on second FORWARD_PORT
+    reader.extend_from_slice(&[0x48, 0x89, 0xc7, 0x48, 0xb8]); // mov rdi, rax; mov rax, OBSERVE_NATIVE
+    reader.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    reader.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&editor, &reader])
+        .expect("two native KVM CPUs with one retained page-table root");
+    carrier.fixture_share_root(1, 0).expect("same MM root");
+    carrier.fixture_write_backing_byte(0xd1_1000, 0x11).unwrap();
+    assert_eq!(carrier.observe(0).expect("prepare old page").result, 1);
+
+    carrier
+        .fixture_run_until_forward(1)
+        .expect("reader stopped on FORWARD_PORT in CPL0");
+    assert_eq!(carrier.observe(0).expect("retire old page").result, 1);
+    let [(root, generation, ack), _] = carrier.fixture_shootdown_state();
+    assert_eq!(root, 0x60_0000);
+    assert_ne!(generation, 0);
+    assert!(
+        ack[1] < generation,
+        "stopped CPU in CPL0 must not prematurely acknowledge"
+    );
+    assert!(
+        carrier.fixture_shootdown_served(0, 1).unwrap() < generation,
+        "stopped CPU in CPL0 must still owe its drain"
+    );
+    carrier.fixture_write_backing_byte(0xd1_1000, 0x22).unwrap();
+
+    carrier
+        .fixture_run_until_forward(1)
+        .expect("resumed CPL0 user access stopped on second FORWARD_PORT");
+    assert_eq!(
+        carrier.fixture_shootdown_served(0, 1).unwrap(),
+        generation,
+        "shootdown must be served after CPL0 settlement"
+    );
+    let [(_, generation, ack), _] = carrier.fixture_shootdown_state();
+    assert!(
+        ack[1] >= generation,
+        "shootdown must be acknowledged after CPL0 settlement"
+    );
+
+    let result = carrier.observe(1).expect("read result");
+    assert_eq!(
+        result.result, -14,
+        "resumed CPL0 user access must fault on unmapped page, not read stale TLB"
+    );
+}
+
+#[test]
 fn shared_kernel_scheduler_routes_reschedule_to_peer_apic() {
     const INTERRUPT_WITNESS: u64 = 0xffff_ffff_ffff_ff40;
     let mut sender = vec![0x48, 0xbe]; // mov rsi, peer scheduler slot
