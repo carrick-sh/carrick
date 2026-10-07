@@ -141,6 +141,7 @@ fn measured_sample_backing_is_fixed_across_short_and_long_runs() {
 }
 
 fn carrier_or_fail() -> Carrier {
+    common::arm_fatal_debugger_hold();
     for _ in 0..50 {
         match Carrier::new() {
             Ok(carrier) => return carrier,

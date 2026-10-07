@@ -517,6 +517,7 @@ dependencies = [
  "carrick-el1-abi",
  "carrick-el1-image",
  "carrick-engine",
+ "carrick-fatal",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",
