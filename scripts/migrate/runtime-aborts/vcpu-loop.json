@@ -1665,28 +1665,6 @@
       "domain": "hvpatch::guest_fork_arm"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "function": "publish_frame_grant_refusal",
-      "ordinal_in_function": 1,
-      "fingerprint": "979097e0f33623d6a6549b8edd384222238b160bfd60042f41681ca5d83806ef",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::el1_frame_grant",
-      "rationale": "Claimed frame-grant request could not publish backend refusal status to the guest mailbox.",
-      "sink": "fatal",
-      "domain": "hvpatch::el1_frame_grant"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "function": "finish_owner_fault_response",
-      "ordinal_in_function": 1,
-      "fingerprint": "817ab7be47d08e02895cfb712a055ce791828d4abb9b382a05e056e500eff262",
-      "sink": "fatal",
-      "domain": "hvpatch::owner_fault",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::owner_fault",
-      "rationale": "The owner resolved the fault or retained its exact pending continuation, but the generation-bound mailbox claim was lost before completion. The existing assertion moved from resolve_owner_fault into its shared completion helper; continuing would split owner state from scheduler completion authority."
-    },
-    {
       "file": "crates/carrick-runtime/src/vcpu_loop/terminal.rs",
       "function": "<CloneAdmissionPermit as Drop>::drop",
       "ordinal_in_function": 1,
