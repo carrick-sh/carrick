@@ -242,10 +242,10 @@ mod fork_cow {
         ReservationGeneration, ReservationMm, ReservationNodeFlags, ReservationProtection,
         ReservationRange,
     };
+    use carrick_guest_arch::{FrameGpa, RootGpa, UserVa};
     use carrick_mmu_core::aarch64::descriptor_txn::{
         BackingIdentity, DescriptorRefusal, LiveDescriptorWords,
     };
-    use carrick_guest_arch::{FrameGpa, RootGpa, UserVa};
     use carrick_mmu_core::owner_mmu::{Aarch64Mmu, OwnerMmuRefusal, OwnerTranslation};
     use carrick_mmu_core::x86::descriptor_txn::{
         COW, HUGE, MAY_WRITE, NX, PREPARED, PRESENT, USER, WRITE,
@@ -303,9 +303,12 @@ mod fork_cow {
             self.origin = None;
         }
         fn publish_fork_child(&mut self, _request: PortalForkRequest) -> Result<(), ForkError> {
-        Ok(())
-    }
-        fn finish_fork_publication(&mut self, _operation: PortalOperation) -> Result<(), ForkError> {
+            Ok(())
+        }
+        fn finish_fork_publication(
+            &mut self,
+            _operation: PortalOperation,
+        ) -> Result<(), ForkError> {
             self.finished = true;
             Ok(())
         }
@@ -341,16 +344,25 @@ mod fork_cow {
         fn fork_write_authorized(&mut self, _sequence: Option<NonZeroU64>) -> bool {
             self.authorized
         }
-        fn reserve_fork_certificate(&mut self, _request: PortalForkRequest) -> Result<(), ForkError> {
+        fn reserve_fork_certificate(
+            &mut self,
+            _request: PortalForkRequest,
+        ) -> Result<(), ForkError> {
             Ok(())
         }
         fn clone_into(&mut self, _child: &mut TestChildRoot) -> Result<(), ForkError> {
             Ok(())
         }
-        fn publish_fork_parent(&mut self, _request: PortalForkRequest) -> Result<ReservationGeneration, ForkError> {
+        fn publish_fork_parent(
+            &mut self,
+            _request: PortalForkRequest,
+        ) -> Result<ReservationGeneration, ForkError> {
             Ok(self.generation)
         }
-        fn finish_fork_publication(&mut self, _operation: PortalOperation) -> Result<(), ForkError> {
+        fn finish_fork_publication(
+            &mut self,
+            _operation: PortalOperation,
+        ) -> Result<(), ForkError> {
             self.finished = true;
             Ok(())
         }
@@ -777,7 +789,8 @@ mod fork_cow {
         // L1 entry: points to leaf
         perms_mem.store(l1_pa, leaf_pa | PRESENT | WRITE | USER);
 
-        let mut perms_scratch = ForkScratch::bounded(req, 1, 512 * 8, 512 * 8, 512 * 8, 512).unwrap();
+        let mut perms_scratch =
+            ForkScratch::bounded(req, 1, 512 * 8, 512 * 8, 512 * 8, 512).unwrap();
         perms_scratch.mappings = vec![Mapping {
             range: ReservationRange::new(0, 0x0000_8000_0000_0000).unwrap(),
             protection: ReservationProtection::READ_WRITE,
@@ -869,7 +882,8 @@ mod fork_cow {
         let huge_leaf = huge_leaf_2m_pa | PRESENT | WRITE | USER | HUGE | NX;
         huge_mem.store(l2_pa, huge_leaf);
 
-        let mut huge_scratch = ForkScratch::bounded(req, 1, 512 * 8, 512 * 8, 512 * 8, 512).unwrap();
+        let mut huge_scratch =
+            ForkScratch::bounded(req, 1, 512 * 8, 512 * 8, 512 * 8, 512).unwrap();
         // [0..1 MiB): PRIVATE
         // [1..2 MiB): DONTFORK
         huge_scratch.mappings = vec![

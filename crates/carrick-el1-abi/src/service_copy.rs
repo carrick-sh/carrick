@@ -131,7 +131,6 @@ impl carrick_core_abi::ServiceCopyWindowLease for ServiceCopyLease<'_> {
     }
 }
 
-
 impl Drop for ServiceCopyLease<'_> {
     fn drop(&mut self) {
         let index = usize::from(self.slot.raw());
