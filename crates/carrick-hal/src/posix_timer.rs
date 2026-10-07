@@ -5,6 +5,14 @@
 //! counter so a disarm or re-arm cleanly retires the previous thread without a
 //! kqueue dependency. This sidesteps allocating a unique EVFILT_TIMER ident per
 //! dynamic timer and keeps the pump side untouched.
+//!
+//! Every arm (`timer_settime`, including a disarm) and `timer_delete` runs
+//! under the slot's [`TransitionGate`], and a firing thread delivers only
+//! through `fire_if_current`, which checks its generation, charges any
+//! overrun and runs the delivery callback inside ONE gate hold. Once an arm or
+//! delete returns, no firing thread of a superseded generation delivers or
+//! touches the slot (Linux: no expiry of the old setting generates a signal
+//! after `timer_settime`/`timer_delete` returns).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -12,7 +20,7 @@ use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 pub use carrick_timer_core::posix::{OVERRUN_MAX, PosixTimerSpec};
-use carrick_timer_core::{ClockKind, CpuNs, TimerSpecNs, WallNs};
+use carrick_timer_core::{ClockKind, CpuNs, FireOutcome, TimerSpecNs, TransitionGate, WallNs};
 
 pub struct PosixTimerSlot {
     pub clock_id: i32,
@@ -31,6 +39,9 @@ pub struct PosixTimerSlot {
     pub generation: AtomicU64,
     /// Overrun count since the last successful expiry observation.
     pub overruns: AtomicU32,
+    /// Serializes arm/disarm/delete with firing-thread delivery; see the
+    /// module docs.
+    gate: TransitionGate,
 }
 
 impl PosixTimerSlot {
@@ -53,6 +64,7 @@ impl PosixTimerSlot {
             armed_at_ns: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             overruns: AtomicU32::new(0),
+            gate: TransitionGate::new(),
         }
     }
 }
@@ -145,12 +157,16 @@ pub struct PosixArm {
 /// Replace the slot's spec and bump its generation. Returns `None` for an
 /// unknown id. On a non-disarm arm (`spec.value != 0`) records the arm
 /// timestamp; the caller is responsible for spawning the firing thread.
+///
+/// Returns only after any in-flight delivery of the previous setting has
+/// finished; no firing thread of the previous generation delivers afterwards.
 pub fn arm(id: i32, spec: TimerSpecNs) -> Option<PosixArm> {
     let slot = {
         let mut guard = registry();
         let map = ensure_registry(&mut guard);
         map.get(&id).cloned()
     }?;
+    let gate = slot.gate.hold();
     let old = {
         let mut cur = slot.spec.lock().unwrap_or_else(|e| e.into_inner());
         let old = *cur;
@@ -167,6 +183,7 @@ pub fn arm(id: i32, spec: TimerSpecNs) -> Option<PosixArm> {
     } else {
         slot.armed_at_ns.store(now_ns(), Ordering::SeqCst);
     }
+    drop(gate);
     Some(PosixArm {
         old,
         generation: new_gen,
@@ -178,8 +195,39 @@ pub fn arm(id: i32, spec: TimerSpecNs) -> Option<PosixArm> {
 }
 
 /// Whether the firing thread for `slot`/`generation` is still the live arm.
+/// A snapshot only: delivery must go through `fire_if_current`.
 pub fn generation_matches(slot: &PosixTimerSlot, generation: u64) -> bool {
     slot.generation.load(Ordering::SeqCst) == generation
+}
+
+/// Deliver one expiry for the firing thread of arm `generation`: if that arm
+/// is still live, charge `overrun` (a periodic expiry after the first) and
+/// run `on_fire`, all under the slot gate, so an arm or delete that returned
+/// before this call is never followed by a delivery or an overrun charge for
+/// the superseded setting. Returns [`FireOutcome::Retired`] when the arm is
+/// gone or `spec` was a one-shot (just delivered), else
+/// [`FireOutcome::Fired`]. `on_fire` must not re-enter `arm`/`delete` for this
+/// timer.
+fn fire_if_current(
+    slot: &PosixTimerSlot,
+    generation: u64,
+    spec: TimerSpecNs,
+    overrun: bool,
+    on_fire: &impl Fn(),
+) -> FireOutcome {
+    let _gate = slot.gate.hold();
+    if !generation_matches(slot, generation) {
+        return FireOutcome::Retired;
+    }
+    if overrun {
+        record_overrun(slot);
+    }
+    on_fire();
+    if spec.interval == 0 {
+        FireOutcome::Retired
+    } else {
+        FireOutcome::Fired
+    }
 }
 
 /// Bump a slot's overrun counter (a periodic expiry the backend's firing thread
@@ -226,20 +274,10 @@ pub fn run_fallback_with_cpu(
         return;
     }
     std::thread::sleep(Duration::from_nanos(spec.value));
-    if !generation_matches(&slot, generation) {
-        return;
-    }
-    on_fire();
-    if spec.interval == 0 {
-        return;
-    }
-    loop {
+    let mut overrun = false;
+    while fire_if_current(&slot, generation, spec, overrun, &on_fire) == FireOutcome::Fired {
+        overrun = true;
         std::thread::sleep(Duration::from_nanos(spec.interval));
-        if !generation_matches(&slot, generation) {
-            return;
-        }
-        record_overrun(&slot);
-        on_fire();
     }
 }
 
@@ -280,14 +318,12 @@ fn run_fallback_cpu(
             std::thread::sleep(Duration::from_nanos(delay.raw()));
             continue;
         }
-        if fired {
-            record_overrun(slot);
-        }
-        on_fire();
-        fired = true;
-        if spec.interval == 0 {
+        // The sample above ran outside the gate; the generation check, the
+        // overrun charge and the delivery happen in one gate hold.
+        if fire_if_current(slot, generation, spec, fired, on_fire) != FireOutcome::Fired {
             return;
         }
+        fired = true;
         due = now.saturating_add(spec.interval);
     }
 }
@@ -309,15 +345,24 @@ pub fn remaining(id: i32) -> Option<TimerSpecNs> {
 }
 
 /// Remove a timer. Returns whether the id existed.
+///
+/// Returns only after any in-flight delivery has finished; no firing thread
+/// of the deleted timer delivers afterwards.
 pub fn delete(id: i32) -> bool {
-    let mut guard = registry();
-    let map = ensure_registry(&mut guard);
-    if let Some(slot) = map.remove(&id) {
-        slot.generation.fetch_add(1, Ordering::SeqCst);
-        true
-    } else {
-        false
-    }
+    let removed = {
+        let mut guard = registry();
+        let map = ensure_registry(&mut guard);
+        map.remove(&id)
+    };
+    // Retire under the slot gate, outside the registry lock: a firing thread
+    // holds the gate across its delivery callback, which must not be able to
+    // stall unrelated registry operations.
+    let Some(slot) = removed else {
+        return false;
+    };
+    let _gate = slot.gate.hold();
+    slot.generation.fetch_add(1, Ordering::SeqCst);
+    true
 }
 
 /// Does a timer with `id` exist in the registry?
@@ -430,5 +475,168 @@ mod tests {
         .expect("arm");
         assert_eq!(armed.slot.clock_kind, ClockKind::ProcessCpu);
         delete(id);
+    }
+
+    /// A CPU-clock sampler for the fallback worker that replays `script`
+    /// (one value per sample) and PARKS on sample `park_at` -- after the
+    /// worker's generation check, before its expiry decision -- until the test
+    /// has deleted or re-armed the timer. Forces the arm/delete-vs-fire
+    /// interleaving deterministically instead of racing a spawned thread.
+    struct ScriptedCpu {
+        script: Vec<u64>,
+        park_at: usize,
+        next: std::sync::atomic::AtomicUsize,
+        parked: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        resume: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    const PARK_BOUND: Duration = Duration::from_secs(5);
+
+    impl ScriptedCpu {
+        fn sample(&self) -> Option<u64> {
+            let index = self.next.fetch_add(1, Ordering::SeqCst);
+            if index == self.park_at {
+                let parked = self
+                    .parked
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                let resume = self
+                    .resume
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let (Some(parked), Some(resume)) = (parked, resume) {
+                    parked.send(()).expect("test observes the parked worker");
+                    resume
+                        .recv_timeout(PARK_BOUND)
+                        .expect("test resumes the parked worker");
+                }
+            }
+            self.script.get(index).or(self.script.last()).copied()
+        }
+    }
+
+    /// Spawn a CPU-clock fallback worker for `armed` whose sample `park_at`
+    /// parks; returns once it is parked, with the fire counter, the resume
+    /// sender and the worker handle.
+    fn spawn_parked_cpu_worker(
+        armed: &PosixArm,
+        spec: TimerSpecNs,
+        script: Vec<u64>,
+        park_at: usize,
+    ) -> (
+        std::sync::Arc<AtomicU32>,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let sampler = std::sync::Arc::new(ScriptedCpu {
+            script,
+            park_at,
+            next: std::sync::atomic::AtomicUsize::new(0),
+            parked: Mutex::new(Some(parked_tx)),
+            resume: Mutex::new(Some(resume_rx)),
+        });
+        let cpu_now: std::sync::Arc<dyn Fn() -> Option<u64> + Send + Sync> =
+            std::sync::Arc::new(move || sampler.sample());
+        let fires = std::sync::Arc::new(AtomicU32::new(0));
+        let counted = std::sync::Arc::clone(&fires);
+        let slot = armed.slot.clone();
+        let generation = armed.generation;
+        let runner = std::thread::spawn(move || {
+            run_fallback_with_cpu(slot, generation, spec, Some(cpu_now), move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+            });
+        });
+        parked_rx
+            .recv_timeout(PARK_BOUND)
+            .expect("fallback worker reaches its parking CPU sample");
+        (fires, resume_tx, runner)
+    }
+
+    /// Arm a one-shot process-CPU timer, park its worker at the expiry
+    /// decision with the due point reached, run `retire`, resume, and return
+    /// how many expiries the worker delivered.
+    fn cpu_one_shot_fires_after(retire: impl FnOnce(i32)) -> u32 {
+        let id = create_with_clock_kind(2, ClockKind::ProcessCpu, 27, None, 0);
+        let spec = TimerSpecNs {
+            value: 1_000,
+            interval: 0,
+        };
+        let armed = arm(id, spec).expect("arm");
+        // Sample 0 is the arm's start point; sample 1 (parked) reports the
+        // CPU total exactly at the due point.
+        let (fires, resume, runner) = spawn_parked_cpu_worker(&armed, spec, vec![0, 1_000], 1);
+        retire(id);
+        resume.send(()).expect("worker still parked");
+        runner.join().expect("fallback worker terminates");
+        let _ = delete(id);
+        fires.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn cpu_fallback_does_not_fire_after_timer_delete_returns() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let fires = cpu_one_shot_fires_after(|id| {
+            assert!(delete(id));
+        });
+        assert_eq!(fires, 0, "a POSIX timer fired after timer_delete returned");
+    }
+
+    #[test]
+    fn cpu_fallback_does_not_fire_after_disarming_settime_returns() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let fires = cpu_one_shot_fires_after(|id| {
+            let _ = arm(id, TimerSpecNs::DISARM).expect("disarm");
+        });
+        assert_eq!(
+            fires, 0,
+            "a POSIX timer fired after a disarming timer_settime returned"
+        );
+    }
+
+    #[test]
+    fn cpu_fallback_stale_worker_leaves_replacement_arm_alone() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let id = create_with_clock_kind(2, ClockKind::ProcessCpu, 27, None, 0);
+        let spec = TimerSpecNs {
+            value: 1_000,
+            interval: 1_000,
+        };
+        let armed = arm(id, spec).expect("arm");
+        // Sample 0 = start, sample 1 = first expiry (delivered), sample 2
+        // parks with the next periodic expiry already reached.
+        let (fires, resume, runner) =
+            spawn_parked_cpu_worker(&armed, spec, vec![0, 1_000, 5_000], 2);
+        // timer_settime replaces the arm. The stale worker must neither
+        // deliver the old setting's next expiry nor charge an overrun to the
+        // replacement (whose own worker is not spawned here).
+        let replacement = arm(
+            id,
+            TimerSpecNs {
+                value: 1_000_000_000,
+                interval: 1_000_000_000,
+            },
+        )
+        .expect("re-arm");
+        resume.send(()).expect("worker still parked");
+        runner.join().expect("fallback worker terminates");
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            1,
+            "a stale POSIX-timer worker delivered after timer_settime replaced its arm"
+        );
+        assert_eq!(
+            getoverrun(id),
+            Some(0),
+            "a stale POSIX-timer worker charged an overrun to the replacement arm"
+        );
+        assert!(generation_matches(
+            &replacement.slot,
+            replacement.generation
+        ));
+        let _ = delete(id);
     }
 }

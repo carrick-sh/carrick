@@ -50,8 +50,11 @@ pub fn arm_fallback_posix_timer(
 
 /// Disarm a POSIX timer driven by [`arm_fallback_posix_timer`].
 ///
-/// `TimerSpecNs::DISARM` bumps the timer-core generation, causing any in-flight
-/// fallback thread to retire before it can publish another signal.
+/// `TimerSpecNs::DISARM` bumps the slot generation under the slot's transition
+/// gate, and fallback threads deliver only through the same gate after
+/// re-checking their generation: once this returns, no fallback thread of the
+/// disarmed setting publishes another signal. A delivery that won the gate
+/// first has completed (its signal stays pending, as on Linux).
 pub fn disarm_fallback_posix_timer(id: i32) {
     let _ = crate::posix_timer::arm(id, TimerSpecNs::DISARM);
 }
@@ -82,7 +85,7 @@ pub fn run_fallback_with_sampler(
     }
     std::thread::sleep(std::time::Duration::from_nanos(spec.value));
     while carrick_timer_core::itimer::fire_wall_if_current(which, generation, &on_fire)
-        == carrick_timer_core::itimer::FireOutcome::Fired
+        == carrick_timer_core::FireOutcome::Fired
     {
         std::thread::sleep(std::time::Duration::from_nanos(spec.interval));
     }
@@ -95,7 +98,7 @@ pub fn run_fallback_cpu(
     cpu_sampler: Option<&dyn carrick_timer_core::CpuSampler>,
     on_fire: &impl Fn(),
 ) {
-    use carrick_timer_core::itimer::FireOutcome;
+    use carrick_timer_core::FireOutcome;
     loop {
         // Sample OUTSIDE the slot gate (the sampler reads host CPU counters);
         // the expiry decision against the live arm happens under it.

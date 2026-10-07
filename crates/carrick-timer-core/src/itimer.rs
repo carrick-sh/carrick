@@ -33,6 +33,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use crate::gate::{FireOutcome, GateHold, TransitionGate};
 use crate::{CpuNs, CpuSampler, TimerSpecNs, WallNs};
 
 /// The 3 itimer `which` values (REAL=0, VIRTUAL=1, PROF=2).
@@ -84,7 +85,7 @@ struct ItimerSlot {
     live_ident: AtomicUsize,
     /// Serializes every transition of this slot with fallback-thread delivery.
     /// See [`SlotGate`].
-    gate: AtomicBool,
+    gate: TransitionGate,
 }
 
 impl ItimerSlot {
@@ -97,7 +98,7 @@ impl ItimerSlot {
             needs_periodic: AtomicBool::new(false),
             cpu_due_ns: AtomicU64::new(0),
             live_ident: AtomicUsize::new(0),
-            gate: AtomicBool::new(false),
+            gate: TransitionGate::new(),
         }
     }
 
@@ -106,14 +107,10 @@ impl ItimerSlot {
     /// signal + wake), which must never call back into this module for the
     /// same slot.
     fn gate(&self) -> SlotGate<'_> {
-        while self
-            .gate
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
+        SlotGate {
+            _hold: self.gate.hold(),
+            slot: self,
         }
-        SlotGate { slot: self }
     }
 }
 
@@ -125,13 +122,8 @@ impl ItimerSlot {
 /// read a later disarm's zeroed `cpu_due_ns` as "due", deliver a signal for a
 /// timer disarmed before expiry, and `complete_fire` a replacement arm away.
 struct SlotGate<'a> {
+    _hold: GateHold<'a>,
     slot: &'a ItimerSlot,
-}
-
-impl Drop for SlotGate<'_> {
-    fn drop(&mut self) {
-        self.slot.gate.store(false, Ordering::Release);
-    }
 }
 
 impl SlotGate<'_> {
@@ -365,18 +357,6 @@ pub fn complete_fire(which: usize) -> bool {
         .is_some_and(|slot| slot.gate().complete_fire())
 }
 
-/// Outcome of one fallback-thread delivery attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FireOutcome {
-    /// The expiry was delivered and the periodic arm stays live.
-    Fired,
-    /// A CPU timer is not due yet; re-check after this WALL-CLOCK delay.
-    Wait { delay_ns: WallNs },
-    /// The worker's arm is gone: superseded or disarmed before this attempt,
-    /// or a one-shot this attempt just delivered and retired. The worker exits.
-    Retired,
-}
-
 /// Deliver a wall-clock (`ITIMER_REAL`) expiry for the fallback thread of arm
 /// `generation`: if that arm is still live, run `on_fire` and retire a
 /// one-shot, all under the slot gate, so an arm/disarm that returns before
@@ -519,7 +499,7 @@ pub fn clear() {
 /// sole thread.
 pub fn reset_after_fork() {
     for slot in &SLOTS {
-        slot.gate.store(false, Ordering::Release);
+        slot.gate.release_after_fork();
         slot.gate().disarm();
     }
 }
@@ -604,10 +584,10 @@ mod tests {
         arm(0, spec, false);
         // Model a fork taken while a parent fallback thread held the gate:
         // the holder never runs in the child, so nothing will release it.
-        SLOTS[0].gate.store(true, Ordering::Release);
+        core::mem::forget(SLOTS[0].gate.hold());
         reset_after_fork();
         assert!(!is_armed(0), "a fork child starts with no interval timers");
-        assert!(!SLOTS[0].gate.load(Ordering::Acquire));
+        assert!(!SLOTS[0].gate.is_held());
         let generation = arm(0, spec, false);
         assert!(is_armed(0));
         assert_eq!(super::generation(0), generation);
