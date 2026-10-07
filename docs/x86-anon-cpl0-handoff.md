@@ -3,7 +3,7 @@
 ## Current gate status: labelled extraction work-branch push
 
 PR102 follow-up 83364467d is pushed. The extraction registry foundation
-through 7f25ac48f is ready for the authorized work-branch push, and no extraction review-ready or two-live-MM
+through 6f1fa5b87 is pushed to github/work/x86-process-owner, and no extraction review-ready or two-live-MM
 milestone is claimed. Full host, separate kernel-semantics, clippy and clean
 Linux domain lint pass. N1's inherited ARM hvc #3 difference is unchanged;
 comparison against imported shared-kernel 6d6bcf26c has zero failures.
@@ -30,6 +30,52 @@ transactions and production CPL0/CPU1 binding. The shared-lane shootdown
 owner must close its gate; do not patch it here. The two-live-MM PRIVATE,
 no-cross-MM-alias and exact-root-incarnation/generation witness remains red
 at its pre-fix checkpoint and must go green before claiming the milestone.
+
+## Shared wait transaction milestone
+
+50cdc3aac moves the production wait selector and consuming reap into the
+same scheduler-core registry. Host wait APIs delegate child/tracee matching,
+clone classes, live/retiring population, wake sampling, zombie removal,
+group retirement and subtree CPU charging. Host code retains primitive
+resource access, wire rendering, namespace retirement and audit effects.
+A consuming read precheck returns readiness without cloning a zombie;
+write admission rescans and checks parent/child reservations and revision
+capacity before any reap. Wake generation crosses the adapter as a named
+type. Host serialized precheck/outcome wrappers do not select a population.
+
+Red evidence: the shared API is absent before the extraction; PID-only
+matching fails the stale-serial assertion. An isolated global-population
+scan fails the unrelated-read budget at 1 versus 0. Its exact sources/base
+and hashes are retained in /tmp/x86-process-wait-budget-red-source; the
+scratch worktree was removed. Seven shared tests pass, covering two
+children, observe/consume, exact serials, live retirement, clone versus
+non-child tracee stops, admission failure, one CPU charge, non-Clone UID
+prechecks and 1/8/32/128 children with 512 unrelated live processes.
+
+Step verification: full just test and separate just test-kernel-semantics
+pass. Full clippy, formatting and clean Linux domain lint pass. The two
+existing child-reaping abort fingerprints were rebound, preserving their
+classifications/domains/rationales. N1 comparison retains its inherited
+ARM hvc #3 difference; comparison with 6f1fa5b87 is 114/114 blocks with
+zero changes/failures. Required foreground KVM is 127 passed, one failed,
+five existing ignores; its sole red is the separately owned shootdown
+acknowledgement failure, covered by the director's work-branch push
+permission and the 22/50 versus 25/50 attribution above. No retry, new
+ignore, shootdown edit or second #PF entry was added.
+
+Receipts: /tmp/x86-process-wait-{red,generation-red,budget-red,
+final-style-unit,frozen-test,kernel-semantics,final-clippy,final-domains,
+asm-n1,asm-parent,kvm,aborts}.log. The first development host run caught
+one missing typed-wake-to-wire conversion; it was fixed before the frozen
+host gate. Clippy's result-type/conditional findings were fixed without
+allow attributes, and the focused tests and full clippy were rerun.
+Signed HVF is unavailable here. Reserved exit/reparent transactions and
+production CPL0 lifecycle/CPU1 binding remain next; the two-live-MM PRIVATE
+witness is not green, and no PR or review-ready is claimed.
+
+The fetched shared-kernel ab1655fcc adds another #PF in native_irq.rs.
+The director was notified; merge its reworked single-production-entry fix
+when available, without authoring shootdown changes in this lane.
 
 ## Latest process-owner continuation
 
