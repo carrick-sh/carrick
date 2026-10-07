@@ -78,6 +78,40 @@ fn fail(message: impl Into<String>) -> TrapError {
     TrapError::Hypervisor(message.into())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FixtureCpuidError {
+    MissingLeafZero,
+    FullTable,
+}
+
+fn fixture_cpuid_with_tsc_hz(
+    entries: &mut Vec<kvm_bindings::kvm_cpuid_entry2>,
+    hz: u32,
+) -> Result<(), FixtureCpuidError> {
+    let leaf0 = entries
+        .iter()
+        .position(|entry| entry.function == 0)
+        .ok_or(FixtureCpuidError::MissingLeafZero)?;
+    let existing = entries.iter().position(|entry| entry.function == 0x15);
+    if existing.is_none() && entries.len() >= kvm_bindings::KVM_MAX_CPUID_ENTRIES {
+        return Err(FixtureCpuidError::FullTable);
+    }
+    let clock = kvm_bindings::kvm_cpuid_entry2 {
+        function: 0x15,
+        eax: 1,
+        ebx: 1,
+        ecx: hz,
+        ..Default::default()
+    };
+    entries[leaf0].eax = entries[leaf0].eax.max(0x15);
+    if let Some(existing) = existing {
+        entries[existing] = clock;
+    } else {
+        entries.push(clock);
+    }
+    Ok(())
+}
+
 fn record_bytes<T: Copy>(record: &T) -> &[u8] {
     // SAFETY: every caller passes a fully initialized fixed-layout ABI
     // record; its storage remains live for the returned borrow.
@@ -192,6 +226,64 @@ impl Drop for Watchdog {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod fixture_cpuid_tests {
+    use super::*;
+
+    #[test]
+    fn full_kvm_cpuid_table_refuses_a_new_tsc_leaf_without_mutation() {
+        let mut entries = vec![kvm_bindings::kvm_cpuid_entry2 {
+            function: 0,
+            eax: 7,
+            ..Default::default()
+        }];
+        entries.extend((1..kvm_bindings::KVM_MAX_CPUID_ENTRIES).map(|index| {
+            kvm_bindings::kvm_cpuid_entry2 {
+                function: 0x100 + index as u32,
+                ..Default::default()
+            }
+        }));
+        let before = entries.clone();
+        assert_eq!(
+            fixture_cpuid_with_tsc_hz(&mut entries, 2_000_000_000),
+            Err(FixtureCpuidError::FullTable)
+        );
+        assert_eq!(entries.len(), before.len());
+        assert_eq!(entries[0].eax, before[0].eax);
+    }
+
+    #[test]
+    fn full_kvm_cpuid_table_reuses_its_existing_tsc_leaf() {
+        let mut entries = vec![kvm_bindings::kvm_cpuid_entry2 {
+            function: 0,
+            eax: 7,
+            ..Default::default()
+        }];
+        entries.extend((1..kvm_bindings::KVM_MAX_CPUID_ENTRIES).map(|index| {
+            kvm_bindings::kvm_cpuid_entry2 {
+                function: if index == 17 {
+                    0x15
+                } else {
+                    0x100 + index as u32
+                },
+                ..Default::default()
+            }
+        }));
+        assert_eq!(
+            fixture_cpuid_with_tsc_hz(&mut entries, 2_000_000_000),
+            Ok(())
+        );
+        assert_eq!(entries.len(), kvm_bindings::KVM_MAX_CPUID_ENTRIES);
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.function == 0x15)
+                .map(|entry| entry.ecx),
+            Some(2_000_000_000)
+        );
     }
 }
 
@@ -1591,19 +1683,8 @@ impl Cpl0Carrier {
             .get_cpuid2(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
             .map_err(|e| fail(format!("KVM_GET_CPUID2: {e}")))?;
         let mut entries = cpuid.as_slice().to_vec();
-        let leaf0 = entries
-            .iter_mut()
-            .find(|entry| entry.function == 0)
-            .ok_or_else(|| fail("missing CPUID leaf zero"))?;
-        leaf0.eax = leaf0.eax.max(0x15);
-        entries.retain(|entry| entry.function != 0x15);
-        entries.push(kvm_bindings::kvm_cpuid_entry2 {
-            function: 0x15,
-            eax: 1,
-            ebx: 1,
-            ecx: hz,
-            ..Default::default()
-        });
+        fixture_cpuid_with_tsc_hz(&mut entries, hz)
+            .map_err(|error| fail(format!("fixture CPUID clock: {error:?}")))?;
         let cpuid = kvm_bindings::CpuId::from_entries(&entries)
             .map_err(|e| fail(format!("fixture CPUID entries: {e}")))?;
         cpu.fd()
