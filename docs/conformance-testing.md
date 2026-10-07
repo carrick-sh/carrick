@@ -599,10 +599,12 @@ cargo run -p carrick-conformance -- --lane kvm-local --oracle native \
 
 Native execution requires passwordless `sudo`, util-linux `unshare`, GNU
 `chroot`/`cp`, and mount permissions. Each command runs in fresh mount, PID,
-UTS and IPC namespaces, with a waiting PID-1 shell, a chroot, private procfs,
+UTS and IPC namespaces, with a waiting PID-1 shell inside the chroot, private procfs,
 devpts and shared-memory tmpfs, and only the standard null/zero/random devices.
-Namespace exit kills orphaned descendants; timeout cleanup targets only the
-spawned process group. Each invocation copies the immutable root with
+Init owns a fresh session with positive namespace pgrp/sid. Timeout cleanup
+authenticates init by host PID and start ticks, kills only init, and lets
+unshare/sudo reap it before reaping the direct child; namespace exit kills
+remaining descendants. Each invocation copies the immutable root with
 `cp -a --reflink=auto`; workloads cannot mutate the cached lower.
 
 `carrick rootfs export IMAGE --platform linux/amd64` materializes an image
@@ -611,6 +613,9 @@ image environment, command, entrypoint and working directory as JSON. It uses
 the VFS's contained OCI layer merger with native numeric ownership, modes, archive mtimes and
 special-node publication, rather than the carrier-readable metadata projection.
 Extraction fails on unsupported extended metadata or denied node creation.
+The image must provide `/bin/sh` and its loader for the PID-1 init. Admission
+uses a host-side descriptor acknowledgement that is closed before the workload;
+a missing init is refused instead of being cached as a Linux command failure.
 Stage 1 rejects non-root image users, bind mounts, Docker privilege/capability
 flags, tty options and unsupported security options. These are explicit
 unsupported envelopes, never substituted or cached as Linux results.
@@ -636,7 +641,9 @@ The identical ELF executes under the native namespace/chroot envelope; musl
 requires no image. GNU blessing resolves the amd64 probe image and uses its
 loader, not host libc. Native outputs live in `probe-oracle/amd64native-{musl,gnu}`
 with `PROVENANCE.json` recording full kernel release, distro, namespace flags,
-extractor policy and source-hash scheme. Native source hashes include the probe,
+extractor policy, init policy and source-hash scheme. Static roots include the
+host shell and loader closure, whose file hashes are recorded and checked;
+the tested static ELF does not link against those libraries. Native source hashes include the probe,
 shared helper library, Cargo manifest and lockfile. Both probe-cache readers
 reject a different full kernel release. Partial re-blessing across a kernel
 change is refused so untouched entries cannot inherit new provenance.

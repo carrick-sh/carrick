@@ -20,5 +20,11 @@
     "special-nodes",
     "contained-symlinks",
     "reject-unsupported-pax-metadata"
-  ]
+  ],
+  "init_policy": "chroot-shell-pid1-v1",
+  "static_init_inputs": {
+    "/bin/sh": "a6f559e00b69a4aa4d8cb607be18d9386c5aee55c509e2c075549dcf00e00fc7",
+    "/lib/x86_64-linux-gnu/libc.so.6": "9792e3cbb541c8f44c7acf5f14f4022ea62998ecc787d326bed4d8b6547dfd92",
+    "/lib64/ld-linux-x86-64.so.2": "c8438e4fde1934e61c88311633f00949ff645d5c04cdb8671fa3d78164d2f307"
+  }
 }

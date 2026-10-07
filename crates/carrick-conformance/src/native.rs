@@ -14,6 +14,58 @@ pub const UNSHARE_FLAGS: &[&str] = &[
     "--kill-child=KILL",
 ];
 pub const SOURCE_HASH_SCHEME: &str = "sha256-bin-lib-cargo-manifest-lock-v1";
+pub const INIT_POLICY: &str = "chroot-shell-pid1-v1";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeStartTicks(u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeInitIdentity {
+    pid: carrick_kernel_arena::domains::HostPid,
+    start: NativeStartTicks,
+}
+
+impl NativeInitIdentity {
+    fn from_stat(stat: &str) -> anyhow::Result<Self> {
+        let (pid, _) = stat
+            .split_once(' ')
+            .ok_or_else(|| anyhow::anyhow!("init stat missing pid"))?;
+        let (_, fields) = stat
+            .rsplit_once(')')
+            .ok_or_else(|| anyhow::anyhow!("init stat missing comm"))?;
+        let fields: Vec<_> = fields.split_whitespace().collect();
+        let pid: u32 = pid.parse()?;
+        anyhow::ensure!(pid > 1, "native init must belong to a child namespace");
+        let start = fields
+            .get(19)
+            .ok_or_else(|| anyhow::anyhow!("init stat missing start time"))?
+            .parse()?;
+        Ok(Self {
+            pid: carrick_kernel_arena::domains::HostPid::new(pid),
+            start: NativeStartTicks(start),
+        })
+    }
+}
+
+/// Kill only namespace init. Unshare and sudo stay alive to reap it, and the
+/// harness then reaps its direct child. A group kill creates orphaned zombies.
+pub(crate) fn kill_init(record: &Path) -> anyhow::Result<()> {
+    let recorded = NativeInitIdentity::from_stat(&std::fs::read_to_string(record)?)?;
+    let current = match std::fs::read_to_string(format!("/proc/{}/stat", recorded.pid.raw())) {
+        Ok(stat) => NativeInitIdentity::from_stat(&stat)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        recorded == current,
+        "refusing to signal a recycled native init pid"
+    );
+    let status = Command::new("sudo")
+        .args(["-n", "kill", "-KILL", "--", &recorded.pid.raw().to_string()])
+        .status()?;
+    anyhow::ensure!(status.success(), "native namespace init cleanup failed");
+    Ok(())
+}
 
 pub fn kernel_release() -> anyhow::Result<String> {
     anyhow::ensure!(cfg!(target_os = "linux"), "native oracle requires Linux");
@@ -45,6 +97,9 @@ pub struct ProbeProvenance {
     pub source_hash_scheme: String,
     pub rootfs_extractor: String,
     pub rootfs_flags: Vec<String>,
+    pub init_policy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_init_inputs: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_digest: Option<String>,
 }
@@ -63,6 +118,8 @@ impl ProbeProvenance {
                 .map(|flag| (*flag).into())
                 .collect(),
             image_digest: None,
+            init_policy: INIT_POLICY.into(),
+            static_init_inputs: None,
         }
     }
     pub fn current() -> anyhow::Result<Self> {
@@ -80,6 +137,7 @@ pub fn validate_probe_provenance(provenance: &ProbeProvenance, kernel: &str) -> 
         || provenance.unshare_flags != UNSHARE_FLAGS
         || provenance.rootfs_extractor != carrick_spec::OCI_NATIVE_EXTRACTOR_ID
         || provenance.rootfs_flags != carrick_spec::OCI_NATIVE_EXTRACTOR_FLAGS
+        || provenance.init_policy != INIT_POLICY
     {
         return Err(format!(
             "native probe oracle provenance mismatch: recorded kernel {:?}, host {:?}; re-bless on this native host",
@@ -94,7 +152,16 @@ pub fn validate_probe_oracle_dir(dir: &Path) -> Result<(), String> {
         &std::fs::read(dir.join("PROVENANCE.json")).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    validate_probe_provenance(&provenance, &kernel_release().map_err(|e| e.to_string())?)
+    validate_probe_provenance(&provenance, &kernel_release().map_err(|e| e.to_string())?)?;
+    if let Some(inputs) = &provenance.static_init_inputs {
+        let current = static_init_inputs().map_err(|e| e.to_string())?;
+        if inputs != &current {
+            return Err(
+                "native static init inputs changed; re-bless the entire oracle directory".into(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// JSON emitted by `carrick rootfs export`. The lower is immutable; every
@@ -136,14 +203,67 @@ pub fn export_image(carrick: &Path, image: &str) -> anyhow::Result<NativeRootfs>
 }
 
 /// Identical static ELF, in a fresh chroot with the suite oracle's namespace
-/// and device envelope. No guest runtime, Docker client, or dynamic loader.
+/// and device envelope. The tested ELF remains static; only its init shell
+/// uses a loader. No guest runtime or Docker client is involved.
 pub fn run_probe(probe: &Path) -> anyhow::Result<String> {
+    let inputs = static_init_inputs()?;
+    let (_root, lower) = static_probe_root(&inputs)?;
+    run_probe_in_root(probe, &lower)
+}
+
+/// The static ELF needs no guest libc; the waiting PID-1 shell still needs its
+/// own loader closure. These host inputs are fingerprinted in probe provenance.
+pub fn static_init_inputs() -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let out = Command::new("ldd").arg("/bin/sh").output()?;
+    anyhow::ensure!(
+        out.status.success(),
+        "cannot resolve native init shell loader closure"
+    );
+    let text = String::from_utf8(out.stdout)?;
+    anyhow::ensure!(
+        !text.contains("not found"),
+        "native init loader library missing"
+    );
+    let mut paths = std::collections::BTreeSet::from(["/bin/sh".to_string()]);
+    for line in text.lines() {
+        if let Some(path) = line.split_whitespace().find(|part| part.starts_with('/')) {
+            paths.insert(path.into());
+        }
+    }
+    paths
+        .into_iter()
+        .map(|path| {
+            let hash = crate::shard::hash(&std::fs::read(&path)?);
+            Ok((path, hash))
+        })
+        .collect()
+}
+
+pub fn static_probe_root(
+    inputs: &std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<(tempfile::TempDir, NativeRootfs)> {
     let root = tempfile::tempdir()?;
+    for (source, expected_hash) in inputs {
+        let relative = source
+            .strip_prefix('/')
+            .ok_or_else(|| anyhow::anyhow!("init path must be absolute"))?;
+        let destination = root.path().join(relative);
+        std::fs::create_dir_all(
+            destination
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("init path missing parent"))?,
+        )?;
+        std::fs::copy(source, &destination)?;
+        anyhow::ensure!(
+            crate::shard::hash(&std::fs::read(destination)?) == *expected_hash,
+            "native init input changed while copying"
+        );
+    }
     let lower = NativeRootfs {
         root: root.path().into(),
         ..Default::default()
     };
-    run_probe_in_root(probe, &lower)
+    Ok((root, lower))
 }
 
 /// GNU helpers use an OCI rootfs loader, never the host's accidental libc.
@@ -221,4 +341,28 @@ pub fn probe_source_hash(repo: &Path, name: &str) -> anyhow::Result<String> {
         hash.update(bytes);
     }
     Ok(format!("{:x}", hash.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_identity_binds_pid_and_start_ticks() -> anyhow::Result<()> {
+        let mut fields = vec!["0"; 20];
+        fields[0] = "S";
+        fields[19] = "12345";
+        let original =
+            NativeInitIdentity::from_stat(&format!("42 (init with spaces) {}", fields.join(" ")))?;
+        assert_eq!(original.pid.raw(), 42);
+        fields[19] = "12346";
+        let reused =
+            NativeInitIdentity::from_stat(&format!("42 (different init) {}", fields.join(" ")))?;
+        assert_ne!(original, reused);
+        assert!(
+            NativeInitIdentity::from_stat(&format!("1 (host init) {}", fields.join(" "))).is_err()
+        );
+        assert!(NativeInitIdentity::from_stat("42 (truncated) S").is_err());
+        Ok(())
+    }
 }
