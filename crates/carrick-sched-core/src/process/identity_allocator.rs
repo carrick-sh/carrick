@@ -1,8 +1,37 @@
 //! Pure identity allocation shared by host and native process consumers.
 //! Consumers provide exclusion and own role-preserving claim lifetimes.
 use alloc::collections::BTreeMap;
-use core::num::{NonZeroI32, NonZeroU64};
+use core::num::{NonZeroI32, NonZeroU32, NonZeroU64};
 use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Internal collision-domain number; not a visible PID/TID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InternalIdentity(NonZeroI32);
+impl InternalIdentity {
+    pub const fn get(self) -> i32 {
+        self.0.get()
+    }
+    pub const fn nonzero(self) -> NonZeroI32 {
+        self.0
+    }
+}
+
+/// Exact root namespace numbering domain, distinct from task IDs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct VisibleNamespace(NonZeroU32);
+impl VisibleNamespace {
+    pub const fn new(value: NonZeroU32) -> Self {
+        Self(value)
+    }
+}
+/// Linux-visible PID/TID; never an internal registry key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VisibleIdentity(NonZeroU32);
+impl VisibleIdentity {
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
 
 #[derive(Debug)]
 pub struct NamespaceState {
@@ -10,6 +39,7 @@ pub struct NamespaceState {
     last: i32,
     next: i32,
     claims: BTreeMap<i32, ClaimCounts>,
+    visible_next: BTreeMap<VisibleNamespace, u32>,
 }
 
 impl NamespaceState {
@@ -21,7 +51,7 @@ impl NamespaceState {
         };
     }
 
-    pub fn release(&mut self, raw: NonZeroI32, kind: ClaimKind) {
+    pub fn release(&mut self, raw: InternalIdentity, kind: ClaimKind) {
         let key = raw.get();
         let remove = {
             let Some(claims) = self.claims.get_mut(&key) else {
@@ -117,7 +147,23 @@ impl NamespaceState {
             last,
             next,
             claims: BTreeMap::new(),
+            visible_next: BTreeMap::new(),
         }
+    }
+    /// Preparation burns its visible number even when birth rolls back.
+    /// PID1 is reserved for the root seed, not allocated here.
+    pub fn reserve_visible(&mut self, namespace: VisibleNamespace) -> Option<VisibleIdentity> {
+        let next = self.visible_next.entry(namespace).or_insert(2);
+        if *next >= i32::MAX as u32 {
+            return None;
+        }
+        let value = NonZeroU32::new(*next)?;
+        *next += 1;
+        Some(VisibleIdentity(value))
+    }
+    /// Exact namespace retirement discards only its visible-number cursor.
+    pub fn retire_visible_namespace(&mut self, namespace: VisibleNamespace) {
+        self.visible_next.remove(&namespace);
     }
     pub fn set_next(&mut self, raw: i32) {
         assert!((self.first..=self.last).contains(&raw));
@@ -138,7 +184,7 @@ impl NamespaceState {
                 counts
             })
     }
-    pub fn reserve_next(&mut self, kind: ClaimKind) -> Result<NonZeroI32, IdError> {
+    pub fn reserve_next(&mut self, kind: ClaimKind) -> Result<InternalIdentity, IdError> {
         let start = self.next;
         loop {
             let candidate = self.next;
@@ -155,14 +201,18 @@ impl NamespaceState {
                 if !incremented {
                     return Err(IdError::ClaimCountExhausted(candidate.get()));
                 }
-                return Ok(candidate);
+                return Ok(InternalIdentity(candidate));
             }
             if self.next == start {
                 return Err(IdError::Exhausted);
             }
         }
     }
-    pub fn reserve_exact(&mut self, raw: i32, kind: ClaimKind) -> Result<NonZeroI32, IdError> {
+    pub fn reserve_exact(
+        &mut self,
+        raw: i32,
+        kind: ClaimKind,
+    ) -> Result<InternalIdentity, IdError> {
         if raw < self.first || raw > self.last {
             return Err(IdError::OutOfRange(raw));
         }
@@ -175,9 +225,13 @@ impl NamespaceState {
         if !self.claims.entry(raw.get()).or_default().increment(kind) {
             return Err(IdError::ClaimCountExhausted(raw.get()));
         }
-        Ok(raw)
+        Ok(InternalIdentity(raw))
     }
-    pub fn claim_related(&mut self, raw: i32, kind: ClaimKind) -> Result<NonZeroI32, IdError> {
+    pub fn claim_related(
+        &mut self,
+        raw: i32,
+        kind: ClaimKind,
+    ) -> Result<InternalIdentity, IdError> {
         let Some(nonzero) = NonZeroI32::new(raw) else {
             return Err(IdError::OutOfRange(raw));
         };
@@ -187,7 +241,7 @@ impl NamespaceState {
         if !claims.increment(kind) {
             return Err(IdError::ClaimCountExhausted(raw));
         }
-        Ok(nonzero)
+        Ok(InternalIdentity(nonzero))
     }
 }
 
@@ -256,6 +310,29 @@ impl SerialAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aborted_birth_burns_visible_number_but_recycles_internal_number() {
+        let mut owner = NamespaceState::new(1, 1, 1);
+        let namespace = VisibleNamespace::new(NonZeroU32::MIN);
+        let internal = owner.reserve_next(ClaimKind::Task).unwrap();
+        let visible = owner.reserve_visible(namespace).unwrap();
+        assert_eq!(visible.get(), 2);
+        owner.release(internal, ClaimKind::Task);
+        assert_eq!(owner.reserve_next(ClaimKind::Task).unwrap(), internal);
+        assert_eq!(owner.reserve_visible(namespace).unwrap().get(), 3);
+        let other = VisibleNamespace::new(NonZeroU32::new(2).unwrap());
+        assert_eq!(owner.reserve_visible(other).unwrap().get(), 2);
+        owner.visible_next.insert(namespace, i32::MAX as u32 - 1);
+        assert_eq!(
+            owner.reserve_visible(namespace).unwrap().get(),
+            i32::MAX as u32 - 1
+        );
+        assert_eq!(owner.reserve_visible(namespace), None);
+        owner.retire_visible_namespace(namespace);
+        assert_eq!(owner.visible_next.len(), 1);
+        assert_eq!(owner.reserve_visible(other).unwrap().get(), 3);
+    }
 
     #[test]
     fn nested_domains_keep_ancestor_collisions_and_child_numbers_distinct() {

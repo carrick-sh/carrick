@@ -18,25 +18,31 @@ the same shared owner; host NsSharedRegion retains publication only for HOST
 lanes. After seed transfer CPL0 must not mutate host arena membership.
 Guest-created nested PID namespaces must refuse with counted ENOSYS.
 
-The director resolved the allocation policy: one OWNER with both existing
-policies, not one number or policy. Keep internal recyclable IDs and visible
-monotonic PID/TID IDs as distinct types. Failed birth must burn its visible
-number while releasing its internal claim. An exploratory implementation
-and red/green test are retained in /tmp/x86-cont-visible-unlanded.patch;
-they are not landed. The shared suite was 165/0, host check and focused
-clippy passed. The exploratory full host run was cancelled, not passed.
-The proposed per-namespace cursor map still needs exact namespace lifetime
-retirement before landing, to avoid accumulating dead namespace cursors.
+The director resolved allocation policy: one OWNER with both existing
+policies. Internal collision-domain IDs recycle only after all roles release;
+visible PID/TID IDs remain monotonic and burn aborted preparations. The
+shared API uses distinct InternalIdentity and VisibleIdentity types.
+The visible extraction now delegates to that owner: region adapters retain the exact
+shared owner, refuse foreign allocators, and remove their cursor on exact
+namespace retirement. The original missing-selection red is /tmp/x86-cont-visible-red.log.
+The typed shared suite passes 165/0 in /tmp/x86-cont-visible-typed-green.log;
+the exact host adapter test passes in /tmp/x86-cont-visible-const-adapter.log.
+Typed accessors preserve the host wrappers' const API. Its first compile
+failure is retained in /tmp/x86-cont-visible-typed-adapter.log; it is not
+semantic evidence. Focused clippy and committed domain checks follow.
 
-The remaining boot-transfer question is MM serial scope. Kernel::ids and
-object_ids are kernel-owned, but MmId uses process-global CARRIER_MM_IDS
-across distinct kernels; file-description serials are process-global too.
-Moving those global sources to one VM disables unrelated kernels, while
-copying a high-water mark can duplicate MM IDs. Asked the director to choose
-a VM-qualified native identity domain or an exclusively transferred serial
-range (or identify the intended existing venue). Do not invent a new source
-or silently freeze the process-global source. Boot binding is paused on
-this scope decision; no runtime milestone or review-ready claim.
+The MM scope decision is also resolved. CPL0 MM/object serials are VM-local;
+any crossing into a host table shared by multiple VMs must use a typed
+(VM instance, local identity) key. Leave process-global CARRIER_MM_IDS and
+file-description serial counters untouched for ARM/HVPatch and other kernels.
+Never clone a high-water mark or freeze those global allocators.
+Current production boundaries: CarrierMemory owns one KvmVm plus private
+roots, aliases and memslot maps; Cpl0Carrier constructs its own separate
+FrameInventoryAuthority. These tables are not process-global. Audit public
+physical capabilities (BackingHandle/SharedFrameEdge) and any future shared
+inventory boundary for exact VM origin before permitting inherited frames.
+Add two live/simulated VM scopes issuing the same local MM without collision.
+Boot binding and the production two-MM witness remain open.
 
 Native prerequisites still include ELF/stack VMA and initial residency
 import, retained frame-level inheritance, per-MM InitialWords, real stack
