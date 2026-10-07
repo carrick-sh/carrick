@@ -1600,6 +1600,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir().expect("create private artifact directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make artifact directory private");
         let path = directory.path().join("ledger.json");
         publish_artifact_bytes(&path, b"receipt\n").expect("publish artifact");
         assert_eq!(std::fs::read(&path).expect("read artifact"), b"receipt\n");
