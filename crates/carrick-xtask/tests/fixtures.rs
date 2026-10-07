@@ -290,6 +290,7 @@ impl Fixture {
             "fixtures/embed-interceptor-probe",
             "fixtures/embed-zone-readers",
             "fixtures/embed-icache-reuse",
+            "fixtures/embed-copyout",
             "fixtures/embed-el1-sched",
         ] {
             let name = directory.rsplit('/').next().unwrap();
