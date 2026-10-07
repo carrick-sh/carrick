@@ -298,8 +298,10 @@ pub const LINUX_PORTABLE_STEPS: &[StepSpec] = &[
     },
     StepSpec {
         name: "kvm-tests",
-        program: "cargo",
-        args: &["test", "-p", "carrick-vmm-kvm"],
+        // Every `kvm`-lane test target (derived from Cargo metadata), with
+        // CARRICK_REQUIRE_KVM=1 so a missing /dev/kvm or fixture fails.
+        program: "just",
+        args: &["test-kvm"],
         env: &[],
         log_name: "03-kvm-tests.log",
     },
