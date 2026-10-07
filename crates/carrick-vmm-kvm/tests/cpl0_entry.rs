@@ -186,6 +186,25 @@ fn cpl0_forward_port_returns_host_result_through_shared_entry() {
 }
 
 #[test]
+fn cpl0_rechecks_host_modified_return_frame_before_iret() {
+    let mut program = vec![0x48, 0xb8];
+    program.extend_from_slice(&39_u64.to_le_bytes()); // forwarded getpid
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    let failure = carrier
+        .observe_with_forward(0, |frame| {
+            frame.rcx = 0x8000_0000_0000_0000; // noncanonical user RIP
+            frame.rax = 42;
+            Ok(())
+        })
+        .expect_err("invalid host-modified return must fail closed");
+    assert!(
+        format!("{failure:?}").contains("CPL0 fatal exit"),
+        "invalid return requires a typed fatal exit: {failure:?}"
+    );
+}
+
+#[test]
 fn production_image_rejects_fixture_syscalls() {
     let production = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/x86_64-unknown-none/release/carrick-x86-cpl0");

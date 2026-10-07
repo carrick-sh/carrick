@@ -85,6 +85,10 @@ core::arch::global_asm!(
     "mov rdi, rsp",
     "mov rsi, gs:[16]",
     "call carrick_x86_enter",
+    // A host forward may alter the retained frame after the entry check.
+    // Validate once more after every early return and before SWAPGS/IRETQ.
+    "mov rdi, rsp",
+    "call carrick_x86_validate_return",
     "pop r15",
     "pop r14",
     "pop r13",
@@ -1246,6 +1250,14 @@ mod kernel {
         if task.linux.has_pending_host_work() {
             task.linux.record_completed_with_work();
             doorbell(WORK_PORT, frame);
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn carrick_x86_validate_return(frame: &mut NativeFrame) {
+        if !frame.valid_user_return() {
+            doorbell(FATAL_PORT, frame);
+            halt();
         }
     }
 
