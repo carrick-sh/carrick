@@ -255,55 +255,14 @@ impl Drop for PublishedFork {
 
 /// The transaction owns either all task mutations or an exit participant's
 /// topology with separately admitted thread membership publications.
-#[derive(Debug)]
-pub(super) struct TaskGraphReservation {
-    transaction: KernelTransactionId,
-    scope: TaskReservationScope,
-}
+pub(super) type TaskGraphReservation =
+    carrick_sched_core::process::exit::TaskGraphReservation<KernelTransactionId>;
 
-#[derive(Debug)]
-enum TaskReservationScope {
-    Exclusive,
-    ExitParticipant(Arc<exit::ExitParticipantRevision>),
-}
-
-impl TaskGraphReservation {
-    pub(super) fn exclusive(transaction: KernelTransactionId) -> Self {
-        Self {
-            transaction,
-            scope: TaskReservationScope::Exclusive,
-        }
-    }
-
-    pub(super) fn transaction(&self) -> KernelTransactionId {
-        self.transaction
-    }
-
-    fn exit_participant(
-        transaction: KernelTransactionId,
-        revision: Arc<exit::ExitParticipantRevision>,
-    ) -> Self {
-        Self {
-            transaction,
-            scope: TaskReservationScope::ExitParticipant(revision),
-        }
-    }
-
-    pub(super) fn permits_nonfinal_thread_exit(&self) -> bool {
-        matches!(self.scope, TaskReservationScope::ExitParticipant(_))
-    }
-
-    fn prepare_membership_revision(
-        &self,
-        task: TaskKey,
-        current: TaskRevision,
-        next: TaskRevision,
-    ) -> Result<Option<exit::PreparedExitMembershipRevision>, KernelOperationError> {
-        match &self.scope {
-            TaskReservationScope::Exclusive => Ok(None),
-            TaskReservationScope::ExitParticipant(revision) => {
-                revision.prepare_membership(task, current, next).map(Some)
-            }
+impl From<carrick_sched_core::process::exit::TaskSetError> for KernelOperationError {
+    fn from(error: carrick_sched_core::process::exit::TaskSetError) -> Self {
+        match error {
+            carrick_sched_core::process::exit::TaskSetError::Busy(id) => Self::TaskBusy(id),
+            carrick_sched_core::process::exit::TaskSetError::Stale => Self::StaleReservation,
         }
     }
 }
@@ -313,7 +272,7 @@ impl TaskGraphReservation {
 #[derive(Debug)]
 pub(super) struct TaskSetReservation {
     kernel: Arc<Kernel>,
-    task_ids: Vec<TaskId>,
+    permit: carrick_sched_core::process::exit::ReservedTaskSet<KernelTransactionId>,
     transaction: KernelTransactionId,
     active: bool,
     birth_admission: Option<super::thread_ledger::BirthAdmissionGuard>,
@@ -323,22 +282,13 @@ impl TaskSetReservation {
     pub(super) fn acquired(
         kernel: &Arc<Kernel>,
         state: &mut RegistryState,
-        mut task_ids: Vec<TaskId>,
+        task_ids: Vec<TaskId>,
         transaction: KernelTransactionId,
     ) -> Result<Self, KernelOperationError> {
-        task_ids.sort_unstable();
-        task_ids.dedup();
-        for task_id in &task_ids {
-            ensure_task_unreserved(state, *task_id)?;
-        }
-        for task_id in &task_ids {
-            state
-                .reservations
-                .insert(*task_id, TaskGraphReservation::exclusive(transaction));
-        }
+        let permit = state.reserve_task_set(task_ids, transaction)?;
         Ok(Self {
             kernel: Arc::clone(kernel),
-            task_ids,
+            permit,
             transaction,
             active: true,
             birth_admission: None,
@@ -346,27 +296,14 @@ impl TaskSetReservation {
     }
 
     pub(super) fn validate(&self, state: &RegistryState) -> Result<(), KernelOperationError> {
-        if self.task_ids.iter().all(|task_id| {
-            state
-                .reservations
-                .get(task_id)
-                .map(TaskGraphReservation::transaction)
-                == Some(self.transaction)
-        }) {
-            Ok(())
-        } else {
-            Err(KernelOperationError::StaleReservation)
-        }
+        state.validate_task_set(&self.permit).map_err(Into::into)
     }
 
     pub(super) fn commit(
         &mut self,
         state: &mut RegistryState,
     ) -> Result<PendingReservationPublication, KernelOperationError> {
-        self.validate(state)?;
-        for task_id in &self.task_ids {
-            state.reservations.remove(task_id);
-        }
+        state.release_task_set(&self.permit)?;
         self.active = false;
         // Conflicting authority is committed. Release birth custody before
         // reservation subscribers can attempt their next host operation.
@@ -407,18 +344,7 @@ impl Drop for TaskSetReservation {
             return;
         }
         let mut state = self.kernel.registry().settled().write();
-        let mut changed = false;
-        for task_id in &self.task_ids {
-            if state
-                .reservations
-                .get(task_id)
-                .map(TaskGraphReservation::transaction)
-                == Some(self.transaction)
-            {
-                state.reservations.remove(task_id);
-                changed = true;
-            }
-        }
+        let changed = state.rollback_task_set(&self.permit);
         drop(state);
         drop(self.birth_admission.take());
         if changed {

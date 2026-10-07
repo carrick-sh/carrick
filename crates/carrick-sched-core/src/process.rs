@@ -4,8 +4,12 @@ use carrick_syscall_abi::LinuxWaitOptions;
 use core::num::{NonZeroI32, NonZeroU64};
 use core::time::Duration;
 
+pub mod exit;
 pub mod registry;
 pub mod wait;
+
+#[cfg(test)]
+mod exit_tests;
 
 macro_rules! linux_i32_id {
     ($name:ident) => {

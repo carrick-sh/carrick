@@ -584,3 +584,44 @@ a test-only import exposed by the zombie move. Receipts:
 `/tmp/x86-anon-process-resume-sched.log`, and
 `/tmp/x86-anon-process-resume-wait.log`. These are preliminary movement
 checks, not full host, signed, Linux-conformance or second-MM acceptance.
+
+## Reserved exit topology extraction in progress
+
+The shared owner now holds `TaskRevision`, participant membership admission,
+owned topology revision credits, and exact adopter/autoreap selection,
+validation and child-set publication. The host consumes a private-field
+`PreparedExitTopology` over its actual registry payloads. Live and zombie
+children are reparented by the shared owner; no mirrored graph was introduced.
+Host revision-capacity, namespace, ptrace and terminal resource effects remain
+consumer primitives. Zombie publication, membership cancellation and SIGCHLD
+ordering extraction are the next part of this step; CPL0 is still unbound.
+
+First API reds: `/tmp/x86-process-exit-red.log`,
+`/tmp/x86-process-exit-credit-red.log`,
+`/tmp/x86-process-exit-topology-red.log`,
+`/tmp/x86-process-exit-publication-red.log`. A PID-only participant mutant
+fails the exact-incarnation assertion in
+`/tmp/x86-process-exit-incarnation-red.log` (3 passed, 1 failed); it was
+restored before `/tmp/x86-process-exit-frozen-unit.log` (4 passed).
+Do not treat these lower-layer receipts as the two-MM live green.
+
+Reservation-set admission, validation, release and exact-transaction rollback
+now delegate to the shared registry as well. Terminal zombie versus autoreap
+publication authenticates the exact retiring key in that owner. The host
+retains an autoreaped numeric claim until the end of terminal publication,
+matching the original lifetime; namespace and transport remain effects.
+
+A frozen host gate exposed an unchanged snapshot fixture race:
+`mem_authority_snapshot_honors_deadline_contention` returned `Ok` instead of
+`TimedOut` after its 40-ms lock holder released before a delayed test thread
+started the operation. Pure b8d240335 with a controlled 50-ms pre-call delay
+reproduces twice (2/2 red):
+`/tmp/x86-process-exit-deadline-baseline-red{,-2}.log`.
+The same baseline production with completion-coordinated lock release passes
+with that delay: `/tmp/x86-process-exit-deadline-baseline-owned-green-final.log`.
+The source patch, HEAD and source SHA256 are saved beside that receipt; the
+scratch worktree was removed. The first exploratory owned-green receipt had
+overlapping fixture edits and is not authoritative. The committed fixture
+keeps the operation's 5-ms deadline and bounds both coordination waits; it
+adds no retry or timeout increase. Current focused green:
+`/tmp/x86-process-exit-deadline-owned-green.log`.
