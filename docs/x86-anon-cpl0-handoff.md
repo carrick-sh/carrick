@@ -625,3 +625,33 @@ overlapping fixture edits and is not authoritative. The committed fixture
 keeps the operation's 5-ms deadline and bounds both coordination waits; it
 adds no retry or timeout increase. Current focused green:
 `/tmp/x86-process-exit-deadline-owned-green.log`.
+
+### Reserved topology checkpoint gates
+
+Commits: snapshot fixture repair `98055b22d`, shared exit topology/receipt
+extraction `32d5311f6`, position-only inventory rebind `949da8fbd`.
+`just test`, `just test-kernel-semantics`, `just clippy` and clean-tree
+`just lint-domains` all exit zero. Linux compiler census: 572 reviewed rows;
+other host profiles remain pending, with their stored/static reviews intact.
+Receipts: `/tmp/x86-process-exit-final-{unit,host,semantics,clippy,domains}.log`.
+Reconciliation: `/tmp/x86-process-exit-reconcile.log` (zero host-authority
+rebinds, 68 K1 operation positions, three taxonomy positions and three
+unchanged-domain/rationale exit identity fingerprints).
+
+Required full KVM: 127 passed, one failed, five existing ignores, no new
+ignores. The only failure is the separately owned
+`two_running_vcpus_drop_stale_translation_on_shootdown`, at cpl0_entry.rs:1264
+("running CPU must acknowledge shootdown"). No retry or code change here.
+The existing A/B attribution remains 22/50 on pure 7d6daf287, with the
+independent review's 25/50; this run does not replace that attribution.
+Receipt: `/tmp/x86-process-exit-final-kvm.log`, with
+`CARRICK_REQUIRE_KVM=1 CARRICK_RUN_ID=x86-process-exit-owner-kvm`.
+
+Assembly against github/work/n1 has the single inherited ARM
+fatal_entry_binding hvc #3 difference. Against b8d240335, all 114 blocks
+match, with zero drift/failures. Receipts:
+`/tmp/x86-process-exit-asm-{n1,parent}.log`. Signed HVF cannot run on this
+Linux host; no Docker or signed acceptance was run. No load generators
+were started; pgrep found none. No shared-kernel change was merged.
+Cancellation/notification ownership and CPL0/CPU1/two-MM binding remain
+open. This is an intermediate work-branch milestone, not review-ready.
