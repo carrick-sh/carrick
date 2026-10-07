@@ -90,14 +90,28 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         if queue == 0 {
             0
         } else {
-            unsafe { (*self.table.node(queue, self.banks).data.get()).words[2] as u32 }
+            let queue = unsafe {
+                &*self
+                    .table
+                    .node(queue, self.banks)
+                    .data
+                    .get()
+                    .cast::<carrick_sched_core::completion_queue::CompletionQueue>()
+            };
+            queue.live_head()
         }
     }
     fn set_prepared_live_head(&mut self, id: u32) {
         let queue = self.state().prepared_head;
-        unsafe {
-            (*self.table.node(queue, self.banks).data.get()).words[2] = u64::from(id);
-        }
+        let queue = unsafe {
+            &*self
+                .table
+                .node(queue, self.banks)
+                .data
+                .get()
+                .cast::<carrick_sched_core::completion_queue::CompletionQueue>()
+        };
+        queue.set_live_head(id);
     }
     pub fn has_prepared_copy(&self) -> bool {
         self.prepared_live_head() != 0

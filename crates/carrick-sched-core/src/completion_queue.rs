@@ -1,6 +1,6 @@
 //! Intrusive MPSC custody queue. Producers publish with one exchange and one
 //! link store; a single owner drains ready links without waiting for producers.
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 const STUB: u32 = u32::MAX;
 
 #[repr(C)]
@@ -9,6 +9,7 @@ pub struct CompletionQueue {
     head: AtomicU32,
     tail: AtomicU32,
     stub_next: AtomicU32,
+    live_head: AtomicU64,
     owner: AtomicU32,
     consumer: AtomicU32,
 }
@@ -41,6 +42,7 @@ impl CompletionQueue {
                 self.head.store(STUB, Ordering::Relaxed);
                 self.tail.store(STUB, Ordering::Relaxed);
                 self.stub_next.store(0, Ordering::Relaxed);
+                self.live_head.store(0, Ordering::Relaxed);
                 self.owner.store(owner, Ordering::Relaxed);
                 self.consumer.store(0, Ordering::Relaxed);
                 self.initialized.store(2, Ordering::Release);
@@ -51,6 +53,14 @@ impl CompletionQueue {
     }
     pub fn owned_by(&self, owner: u32) -> bool {
         self.initialized.load(Ordering::Acquire) == 2 && self.owner.load(Ordering::Acquire) == owner
+    }
+    /// Root-guarded live prepared records; separate from the MPSC links.
+    pub fn live_head(&self) -> u32 {
+        self.live_head.load(Ordering::Relaxed) as u32
+    }
+    /// The caller holds the reservation root's editor authority.
+    pub fn set_live_head(&self, id: u32) {
+        self.live_head.store(u64::from(id), Ordering::Relaxed);
     }
     pub fn try_consumer_for(&self, owner: u32) -> Option<CompletionConsumer<'_>> {
         if !self.owned_by(owner) {
@@ -238,5 +248,18 @@ mod tests {
                 "a second consumer duplicated the same record"
             );
         });
+    }
+
+    #[test]
+    fn owner_claim_preserves_reserved_live_head_word() {
+        let queue: CompletionQueue = unsafe { core::mem::zeroed() };
+        assert!(queue.initialize_for(7));
+        // Reservation metadata places its guarded live-list head at word 2.
+        let words = (&queue as *const CompletionQueue).cast::<core::sync::atomic::AtomicU64>();
+        unsafe { (*words.add(2)).store(123, Ordering::Release) };
+        let consumer = queue.try_consumer_for(7).expect("owned queue");
+        assert_eq!(unsafe { (*words.add(2)).load(Ordering::Acquire) }, 123);
+        drop(consumer);
+        assert_eq!(unsafe { (*words.add(2)).load(Ordering::Acquire) }, 123);
     }
 }

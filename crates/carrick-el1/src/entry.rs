@@ -104,12 +104,6 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     let (line, column) = info.location().map_or((0, 0), |location| {
         (u64::from(location.line()), u64::from(location.column()))
     });
-    let mut file_hash = 0xcbf29ce484222325u64;
-    if let Some(location) = info.location() {
-        for byte in location.file().as_bytes() {
-            file_hash = (file_hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
-        }
-    }
     let detail = carrick_el1::fault::panic_publication_detail();
     unsafe {
         core::arch::asm!(
@@ -117,7 +111,6 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
             in("x0") carrick_el1_abi::PANIC_SENTINEL,
             in("x1") line,
             in("x2") column,
-            in("x4") file_hash,
             in("x3") detail,
         );
     }
