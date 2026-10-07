@@ -425,4 +425,51 @@ mod tests {
         assert!(!slot.has_outstanding_for(7));
         assert!(slot.publish_fault_selection(2, window(8)));
     }
+
+    #[test]
+    fn late_completion_from_old_generation_is_refused_after_reclaim_and_reissue() {
+        let slot = PortalGrantSlot::new();
+        let win1 = window(7);
+        let mut txn1 = dummy_txn(7);
+        txn1.id.generation = NonZeroU64::new(1).unwrap();
+        assert!(slot.submit(win1, &txn1));
+
+        // Reclaim / withdraw the slot for generation 1
+        assert!(slot.withdraw(win1, &txn1));
+
+        // Reissue on the same slot for generation 2
+        let mut win2 = window(7);
+        win2.generation = ReservationGeneration::new(2).unwrap();
+        let mut txn2 = dummy_txn(7);
+        txn2.id.generation = NonZeroU64::new(2).unwrap();
+        assert!(slot.submit(win2, &txn2));
+
+        // A late completion from the old generation 1 must be refused
+        assert!(slot.take_receipt(win1, &txn1).is_none());
+        assert!(!slot.withdraw(win1, &txn1));
+
+        // The current generation 2 window remains intact
+        assert_eq!(slot.window(), Some(win2));
+    }
+
+    #[test]
+    fn late_fault_cancellation_from_old_generation_is_refused_after_reissue() {
+        let slot = PortalGrantSlot::new();
+        let win1 = window(7);
+        assert!(slot.publish_fault_selection(1, win1));
+
+        // Cancel generation 1
+        assert!(slot.cancel_fault_selection(win1, 1));
+
+        // Reissue on the same slot for generation 2
+        let mut win2 = window(7);
+        win2.generation = ReservationGeneration::new(2).unwrap();
+        assert!(slot.publish_fault_selection(2, win2));
+
+        // Late cancellation from old generation 1 must be refused
+        assert!(!slot.cancel_fault_selection(win1, 1));
+
+        // Slot must still hold generation 2
+        assert_eq!(slot.fault_selection(7, 2), Some(win2));
+    }
 }
