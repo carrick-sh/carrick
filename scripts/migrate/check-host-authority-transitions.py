@@ -298,11 +298,11 @@ def _expected_profile_commands() -> dict[str, tuple[str, ...]]:
     # The build target selects the VMM/host backend; the per-host arguments
     # only carry each lane's syscall-shim selection (the justfile's
     # `_host_shim_features`): Linux forces the shim on, the BSD lanes build the
-    # legacy trap-only path.
+    # crates' defaults (shim on).
     for host, features in (
         ("linux", ("--features", "syscall-shim")),
-        ("freebsd", ("--no-default-features",)),
-        ("netbsd", ("--no-default-features",)),
+        ("freebsd", ()),
+        ("netbsd", ()),
     ):
         for target, package, target_args in (
             ("cli", "carrick-cli", ("--bin", "carrick")),

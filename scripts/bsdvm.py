@@ -122,10 +122,10 @@ STAGES: dict[str, Stage] = {
         # V12), so its red list would be pure artifact. `-p carrick-cli`
         # measures what the campaign actually needs: the CLI, engine and
         # runtime, whose host backend the BSD build target selects.
-        # `--no-default-features` keeps the BSD lanes' historical shim-off
-        # build (the justfile's `_host_shim_features`).
+        # Default features: the syscall shim is on for BSD lanes too (the
+        # justfile's `_host_shim_features`).
         cmds=[
-            "cd /root/carrick && cargo build -p carrick-cli --no-default-features"
+            "cd /root/carrick && cargo build -p carrick-cli"
         ],
         report_only=True,  # red list IS the bring-up worklist (spec)
         available=True,

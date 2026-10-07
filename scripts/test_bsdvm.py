@@ -1379,7 +1379,7 @@ class GateTests(unittest.TestCase):
         self.assertNotIn("platform-", s1.cmds[0])
         self.assertEqual(
             s1.cmds[0],
-            "cd /root/carrick && cargo build -p carrick-cli --no-default-features",
+            "cd /root/carrick && cargo build -p carrick-cli",
         )
         self.assertFalse(BSDVM.STAGES["stage2"].available)
         self.assertIn("NativeLane", BSDVM.STAGES["stage2"].note)

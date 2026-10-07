@@ -29,12 +29,12 @@ _admit := _cargo + " run --locked -p carrick-xtask -- worktree-run --"
 # lane's historical shim configuration: macOS builds the crates' defaults (the
 # CLI/embed default enables the shim; a lone `-p carrick-runtime` test does not),
 # Linux also forces the shim onto lone runtime/engine test builds, and the
-# FreeBSD/NetBSD lanes have always built the legacy trap-only path
-# (`--no-default-features`, the shim's documented hatch).
+# FreeBSD/NetBSD lanes build the crates' defaults with the shim ON (owner,
+# 2026-10-06); `--no-default-features` remains the shim's documented hatch.
 _host_shim_features := if os() == "macos" { "" \
 } else if os() == "linux" { "--features syscall-shim" \
-} else if os() == "freebsd" { "--no-default-features" \
-} else if os() == "netbsd" { "--no-default-features" \
+} else if os() == "freebsd" { "" \
+} else if os() == "netbsd" { "" \
 } else { "UNSUPPORTED-HOST" }
 
 # Show the recipe list (default).
@@ -945,10 +945,10 @@ check-linux:
 # CFLAGS_x86_64_unknown_freebsd="--target=x86_64-unknown-freebsdN --sysroot=<base.txz extract>".
 # CI (.github/workflows/ci.yml) fetches the sysroot + sets these. `cargo check`
 # does NOT link, so no FreeBSD linker is needed — only the cross C compiler.
-# `--no-default-features` keeps the FreeBSD lane's historical shim-off build
-# (see `_host_shim_features`); the target alone selects bhyve.
+# Builds the crates' defaults (syscall shim on, see `_host_shim_features`);
+# the target alone selects bhyve.
 check-freebsd:
-    {{_admit}} {{_cargo}} check --target x86_64-unknown-freebsd --no-default-features --all-targets -p carrick-cli -p carrick-runtime
+    {{_admit}} {{_cargo}} check --target x86_64-unknown-freebsd --all-targets -p carrick-cli -p carrick-runtime
 
 # Cross-check the NetBSD/NVMM backend closure for x86_64-unknown-netbsd. NVMM's
 # crate (carrick-vmm-nvmm) depends only on the shared backend/host crates — NOT
