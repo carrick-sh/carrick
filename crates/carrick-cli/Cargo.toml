@@ -133,3 +133,13 @@ carrick-vmm-bhyve = { path = "../carrick-vmm-bhyve", optional = true }
 
 [target.'cfg(all(target_os = "netbsd", target_arch = "x86_64"))'.dependencies]
 carrick-vmm-nvmm = { path = "../carrick-vmm-nvmm", optional = true }
+
+# Test gate lanes (`just xtask test-lanes check`; carrick-xtask src/test_lanes.rs).
+[package.metadata.carrick.test-lanes]
+cli = "integration"
+fs_backend_flag = "integration"
+trace_profile = "integration"
+conformance = "signed-cli"
+conformance_cli_contract = "signed-cli"
+perf_runner = "signed-cli"
+x86_kvm_run = "kvm"
