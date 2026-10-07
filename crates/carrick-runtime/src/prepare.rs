@@ -34,13 +34,13 @@ use crate::execute::{
     HostRootLayout, cached_lower_enabled, detached_stable_scratch_path, effective_guest_hostname,
     install_rosetta_mounts, prepare_host_root, record_detached_scratch, seed_guest_baseline,
 };
-#[cfg(any(test, feature = "platform-macos"))]
+#[cfg(any(test, target_os = "macos"))]
 use crate::execute::{
     entrypoint_not_executable_result, entrypoint_not_found_result, is_entrypoint_not_executable,
     is_entrypoint_not_found,
 };
 use crate::interactive_supervisor::InteractiveSession;
-#[cfg(feature = "platform-macos")]
+#[cfg(target_os = "macos")]
 use crate::runtime::{RunElfExecutionOptions, run_elf_from_dispatcher_debug_on};
 use carrick_kernel::dispatch::{StdioSink, SyscallDispatcher};
 use carrick_kernel::kernel::container::LaunchContext;
@@ -810,7 +810,7 @@ fn prepare_with_lease(
 /// runc/shell exit conventions for a failed entrypoint load: 127 for "not
 /// found", 126 for "found but not executable"; a configuration-time refusal
 /// passes through unwrapped so it surfaces labeled as what it is.
-#[cfg(any(test, feature = "platform-macos"))]
+#[cfg(any(test, target_os = "macos"))]
 fn classify_run_outcome(
     run: Result<RunResult, RuntimeError>,
     label: &str,
@@ -859,7 +859,7 @@ impl PreparedRun {
             carrier,
             carrier_lease,
         } = self;
-        #[cfg(feature = "platform-macos")]
+        #[cfg(target_os = "macos")]
         let run = match root {
             RootBacking::Host => classify_run_outcome(
                 run_elf_from_dispatcher_debug_on(
@@ -894,15 +894,11 @@ impl PreparedRun {
                 "failed to run rootfs ELF",
             ),
         };
-        // Explicit positive predicate, not `not(platform-macos)`: the host-OS
-        // and hypervisor-backend axes are distinct, and a negation silently
-        // captures every future non-macOS host as well
-        // (`.semgrep/typed-domains.yml::no-cfg-not-platform-macos`).
-        #[cfg(any(
-            feature = "platform-linux",
-            feature = "platform-freebsd",
-            feature = "platform-netbsd"
-        ))]
+        // Explicit positive predicate, not `not(target_os = "macos")`: each
+        // listed host has its own backend arm, and a negation would silently
+        // capture every future non-macOS host as well (which has no backend
+        // and must fail at carrick-cli's unsupported-host guard instead).
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
         let run = {
             let _ = (
                 executable,

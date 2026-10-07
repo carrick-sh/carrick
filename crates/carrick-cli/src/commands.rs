@@ -60,10 +60,10 @@ use carrick_vfs::rootfs::RootFs;
 // HVF-only diagnostics — the `run-elf`, `trap-capabilities`, and full
 // `syscalls`-table subcommands are macOS-only for now; per-number
 // `syscalls <n>` works across supported hosts.
-#[cfg(feature = "platform-macos")]
+#[cfg(target_os = "macos")]
 use carrick_runtime::syscall::aarch64_table;
 use carrick_runtime::syscall::lookup_aarch64;
-#[cfg(feature = "platform-macos")]
+#[cfg(target_os = "macos")]
 use carrick_runtime::trap::hvf_capabilities;
 
 use crate::args::{
@@ -72,13 +72,9 @@ use crate::args::{
 };
 // Only the non-HVF `Commands::Debug` arm below matches on `DebugCommand`
 // variants directly; the macOS arm just forwards `command` into `run_debug`.
-#[cfg(any(
-    feature = "platform-linux",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
 use crate::args::DebugCommand;
-#[cfg(feature = "platform-macos")]
+#[cfg(target_os = "macos")]
 use crate::debug::run_debug;
 #[cfg(target_os = "macos")]
 use crate::hvpatch_carrier_cpu_attribution_profile::HvpatchCarrierCpuAttributionSummary;
@@ -257,7 +253,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 }))?
             );
         }
-        #[cfg(feature = "platform-macos")]
+        #[cfg(target_os = "macos")]
         Commands::RunElf {
             path,
             rootfs_layers,
@@ -830,35 +826,23 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             } else {
                 // The full-table dump comes from the HVF syscall table; macOS-only.
                 // The per-number lookup above works on both backends.
-                #[cfg(feature = "platform-macos")]
+                #[cfg(target_os = "macos")]
                 println!("{}", serde_json::to_string_pretty(aarch64_table())?);
-                #[cfg(any(
-                    feature = "platform-linux",
-                    feature = "platform-freebsd",
-                    feature = "platform-netbsd"
-                ))]
+                #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
                 bail!(
                     "the full syscall-table dump is HVF-only on this build; pass a syscall number"
                 );
             }
         }
         Commands::TrapCapabilities => {
-            #[cfg(feature = "platform-macos")]
+            #[cfg(target_os = "macos")]
             println!("{}", serde_json::to_string_pretty(&hvf_capabilities())?);
-            #[cfg(any(
-                feature = "platform-linux",
-                feature = "platform-freebsd",
-                feature = "platform-netbsd"
-            ))]
+            #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
             bail!("trap-capabilities is HVF-only; not available on this backend");
         }
-        #[cfg(feature = "platform-macos")]
+        #[cfg(target_os = "macos")]
         Commands::Debug { command } => run_debug(command, store.clone())?,
-        #[cfg(any(
-            feature = "platform-linux",
-            feature = "platform-freebsd",
-            feature = "platform-netbsd"
-        ))]
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
         Commands::Debug { command } => match command {
             // Parses a file only, so it is available wherever the binary is.
             DebugCommand::Core { core } => crate::debug_core::run_debug_core(&core)?,

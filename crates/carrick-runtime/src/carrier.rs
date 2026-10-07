@@ -1424,16 +1424,12 @@ pub(crate) fn retire_leased_container(
     Ok(receipt)
 }
 
-#[cfg(feature = "platform-macos")]
+#[cfg(target_os = "macos")]
 fn destroy_vm() -> Result<(), RuntimeError> {
     crate::trap::destroy_persistent_vm_at_carrier_exit().map_err(RuntimeError::from)
 }
 
-#[cfg(any(
-    feature = "platform-linux",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
 fn destroy_vm() -> Result<(), RuntimeError> {
     Ok(())
 }

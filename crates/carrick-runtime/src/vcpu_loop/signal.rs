@@ -34,7 +34,7 @@ pub(crate) fn signal_wait_expired(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|target| Instant::now() >= target)
 }
 
-#[cfg(any(test, feature = "platform-macos"))]
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) use carrick_kernel::kernel::continuation::raise_sigpipe_for_blocking_write;
 
 pub(crate) fn partial_write_interrupt_outcome(

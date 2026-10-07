@@ -19,14 +19,9 @@
 //! CARRICK_NVMM_EXECVE=/root/fixtures/execve \
 //! CARRICK_NVMM_SIGSEGV=/root/fixtures/nvmm-sigsegv \
 //! CARRICK_NVMM_SIGSEGV_DEFAULT=/root/fixtures/nvmm-sigsegv-default \
-//!   cargo test -p carrick-runtime --no-default-features --features platform-netbsd \
-//!   --test live_nvmm_x86 -- --nocapture
+//!   cargo test -p carrick-runtime --test live_nvmm_x86 -- --nocapture
 //! ```
-#![cfg(all(
-    target_os = "netbsd",
-    target_arch = "x86_64",
-    feature = "platform-netbsd"
-))]
+#![cfg(all(target_os = "netbsd", target_arch = "x86_64"))]
 // Integration tests legitimately fail fast on missing test infra.
 #![allow(clippy::expect_used)]
 

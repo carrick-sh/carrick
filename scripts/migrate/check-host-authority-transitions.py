@@ -295,10 +295,14 @@ def _expected_profile_commands() -> dict[str, tuple[str, ...]]:
             CLIPPY_CODE,
         ),
     }
+    # The build target selects the VMM/host backend; the per-host arguments
+    # only carry each lane's syscall-shim selection (the justfile's
+    # `_host_shim_features`): Linux forces the shim on, the BSD lanes build the
+    # legacy trap-only path.
     for host, features in (
-        ("linux", "syscall-shim,platform-linux"),
-        ("freebsd", "platform-freebsd"),
-        ("netbsd", "platform-netbsd"),
+        ("linux", ("--features", "syscall-shim")),
+        ("freebsd", ("--no-default-features",)),
+        ("netbsd", ("--no-default-features",)),
     ):
         for target, package, target_args in (
             ("cli", "carrick-cli", ("--bin", "carrick")),
@@ -309,9 +313,7 @@ def _expected_profile_commands() -> dict[str, tuple[str, ...]]:
                 "clippy",
                 "-p",
                 package,
-                "--no-default-features",
-                "--features",
-                features,
+                *features,
                 "--target",
                 HOST_TRIPLES[host],
                 *target_args,

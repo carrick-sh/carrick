@@ -86,33 +86,21 @@
 //! [`runtime_util`] (the fork-safe async bridge + docker-format helpers), and
 //! the `debug` module (ESR / lldb tooling).
 
-// ── Exactly-one-platform invariant (enforced, not assumed) ──────────────────
-// `carrick-cli` links exactly one VMM + host backend via a single `platform-*`
-// feature (see Cargo.toml). Selecting none — or more than one — otherwise fails
-// late with opaque duplicate-symbol / missing-dependency errors; these guards
-// turn that into a clear diagnostic at the front door. The matching
-// `platform-* ⇔ target_os` invariant is asserted in `build.rs`.
+// ── Host backend selection (derived from the target, not chosen) ───────────
+// `carrick-cli` links exactly one VMM + host backend, and the build TARGET picks
+// it: each backend crate is a `[target.'cfg(target_os = ...)'.dependencies]`
+// edge (see Cargo.toml), so there is no feature to forget or to mismatch with
+// the target. A target with no Carrick backend fails here, at the front door,
+// rather than late with opaque missing-dependency errors.
 #[cfg(not(any(
-    feature = "platform-macos",
-    feature = "platform-linux",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd",
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "netbsd",
 )))]
 compile_error!(
-    "no platform selected: enable exactly one of \
-     platform-macos / platform-linux / platform-freebsd / platform-netbsd"
-);
-#[cfg(any(
-    all(feature = "platform-macos", feature = "platform-linux"),
-    all(feature = "platform-macos", feature = "platform-freebsd"),
-    all(feature = "platform-macos", feature = "platform-netbsd"),
-    all(feature = "platform-linux", feature = "platform-freebsd"),
-    all(feature = "platform-linux", feature = "platform-netbsd"),
-    all(feature = "platform-freebsd", feature = "platform-netbsd"),
-))]
-compile_error!(
-    "multiple platforms selected: enable exactly one platform-* feature \
-     (each pulls a mutually-exclusive host VMM backend)"
+    "unsupported host: carrick-cli has a VMM/host backend only for \
+     macOS (HVF), Linux (KVM), FreeBSD (bhyve/native) and NetBSD (NVMM/native)"
 );
 // The AMP1 reader only parses a text stream and hashes the bundled D program,
 // so — like the census modules below — it is declared on every platform even
@@ -124,7 +112,7 @@ mod args;
 mod commands;
 // `debug` (guest address-space snapshot for the lldb plugin) reads the macOS-only
 // `runtime::DebugStateSnapshot`; HVF-only.
-#[cfg(feature = "platform-macos")]
+#[cfg(target_os = "macos")]
 mod debug;
 mod debug_amplification;
 mod debug_core;
@@ -260,7 +248,7 @@ fn main() -> anyhow::Result<()> {
     supervisor_perf::record_top_level_pid();
     configure_process_environment();
     register_dtrace_probes();
-    #[cfg(feature = "platform-macos")]
+    #[cfg(target_os = "macos")]
     carrick_runtime::probes::dsr_cache_lifecycle(
         unsafe { libc::getpid() },
         carrick_runtime::probes::DsrCacheLifecyclePhase::HostSelfReexecProbesReady,

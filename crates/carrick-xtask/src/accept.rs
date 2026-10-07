@@ -316,9 +316,8 @@ pub const LINUX_PORTABLE_STEPS: &[StepSpec] = &[
             "carrick-el1",
             "-p",
             "carrick-kernel-example",
-            "--no-default-features",
-            "--features",
-            "carrick-cli/platform-linux,carrick-cli/syscall-shim",
+            // No feature selection: the Linux target selects the KVM backend,
+            // and carrick-cli's default enables the syscall shim.
             "--all-targets",
             "--keep-going",
             "--",
@@ -1812,12 +1811,10 @@ mod tests {
             .iter()
             .find(|step| step.name == "clippy-linux")
             .unwrap();
-        assert!(clippy.args.contains(&"--no-default-features"));
-        assert!(
-            clippy
-                .args
-                .contains(&"carrick-cli/platform-linux,carrick-cli/syscall-shim")
-        );
+        // The target selects the backend; the step must not re-select it (or
+        // drop carrick-cli's default syscall shim).
+        assert!(!clippy.args.contains(&"--no-default-features"));
+        assert!(!clippy.args.contains(&"--features"));
         assert!(clippy.args.ends_with(&["--", "-D", "warnings"]));
     }
 

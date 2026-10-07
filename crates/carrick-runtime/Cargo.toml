@@ -12,7 +12,6 @@ path = "src/lib.rs"
 workspace = true
 
 [features]
-default = ["platform-macos"]
 # Guest-side syscall shim (docs/syscall-shim-design.md). NO default here on
 # purpose: the binary (carrick-cli) is the single control point. carrick-cli's
 # default enables it for normal builds; dependents that use carrick-runtime as a
@@ -28,7 +27,7 @@ trace-traps = []
 watchpoint = ["carrick-kernel/watchpoint"]
 event-ring-dump = ["carrick-kernel/event-ring-dump"]
 trace-hvf = ["carrick-vmm-hvf/trace-hvf"]
-trace-syscalls = ["carrick-vmm-hvf?/trace-syscalls", "carrick-observability/trace-syscalls"]
+trace-syscalls = ["carrick-vmm-hvf/trace-syscalls", "carrick-observability/trace-syscalls"]
 debug-stats = ["carrick-vmm-hvf/debug-stats"]
 trace-elf = ["carrick-mem/trace-elf"]
 # The bridge-less test surface: carrick-hal's Null host-signal / guest-timer
@@ -40,27 +39,6 @@ trace-elf = ["carrick-mem/trace-elf"]
 test-support = ["carrick-hal/test-support", "carrick-kernel/test-support"]
 conformance-metrics = ["carrick-kernel/conformance-metrics", "carrick-observability/conformance-metrics"]
 
-# Platform backend selection (exactly one active at a time). carrick-cli's
-# `default` enables `platform-macos`; a `platform-linux` build links NO HVF.
-# The `dep:` syntax keeps the optional crates from auto-becoming implicit
-# features, so the only way to pull in carrick-vmm-hvf is via `platform-macos`.
-platform-macos = ["dep:carrick-vmm-hvf", "dep:carrick-host-bsd"]
-platform-linux = ["dep:carrick-vmm-kvm"]
-# FreeBSD/bhyve backend (scaffolding; aarch64 FreeBSD host needed for L2).
-# Mirrors platform-linux.
-# Pulls in carrick-host-bsd for the FreeBSD kqueue EventMultiplexer (shared with macOS).
-#
-# The two `dep:carrick-vmm-*` edges below resolve against ARCH-SCOPED
-# `[target.'cfg(...)'.dependencies]` tables further down, not the plain
-# `[dependencies]` table: bhyve and NVMM virtualize the HOST ISA, so both are
-# x86_64-only, while `platform-freebsd`/`platform-netbsd` mean "the FreeBSD /
-# NetBSD host backend" on every arch. A `dep:` reference to an optional
-# dependency whose target table does not match is accepted by cargo and
-# activates nothing (a genuinely undeclared name still errors at manifest
-# parse), so the SAME feature name selects bhyve+native on amd64 and
-# native-only on arm64 — no parallel `platform-*-native` universe.
-platform-freebsd = ["dep:carrick-vmm-bhyve", "dep:carrick-host-bsd"]
-platform-netbsd = ["dep:carrick-vmm-nvmm", "dep:carrick-host-bsd"]
 [dependencies]
 carrick-fatal.workspace = true
 carrick-abi = { path = "../carrick-abi" }
@@ -71,14 +49,14 @@ carrick-kernel = { path = "../carrick-kernel" }
 carrick-portable = { path = "../carrick-portable" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-thread = { path = "../carrick-thread" }
-carrick-vmm-hvf = { path = "../carrick-vmm-hvf", optional = true }
-carrick-host-bsd = { path = "../carrick-host-bsd", optional = true }
-carrick-vmm-kvm = { path = "../carrick-vmm-kvm", optional = true }
-# carrick-vmm-bhyve / carrick-vmm-nvmm are NOT declared here: they are
-# x86_64-only and live in arch-scoped target tables below. carrick-host-linux
-# is not declared either — the Linux host-OS layer (epoll EventMultiplexer,
-# errno identity) is below the kernel, so carrick-kernel depends on it under
-# `cfg(target_os = "linux")` and the carrier names it nowhere.
+# The VMM/host backend crates are NOT declared here. The build target selects
+# the backend: each lives in a `[target.'cfg(...)'.dependencies]` table below,
+# so a plain `cargo build` on any supported host links that host's backend and
+# no other (there is no `platform-*` feature to forget, or to mismatch with the
+# target). carrick-host-linux is not declared either — the Linux host-OS layer
+# (epoll EventMultiplexer, errno identity) is below the kernel, so
+# carrick-kernel depends on it under `cfg(target_os = "linux")` and the carrier
+# names it nowhere.
 carrick-aarch64 = { path = "../carrick-aarch64" }
 carrick-host = { path = "../carrick-host" }
 carrick-kernel-arena = { path = "../carrick-kernel-arena" }
@@ -122,22 +100,34 @@ carrick-spec = { path = "../carrick-spec" }
 carrick-vfs = { path = "../carrick-vfs" }
 
 
-# The FreeBSD/bhyve VMM backend, pulled in by `platform-freebsd`. Arch-scoped,
-# not just OS-scoped: bhyve virtualizes the host ISA, so this crate is
-# x86_64-only. Its own crate-level gate keys on `target_os`, which matches on
-# FreeBSD/aarch64 too, so an OS-only dependency edge would compile libvmmapi
-# and the x86 engine into an aarch64 build that has no VMM lane at all.
-# NOTE: because `dep:carrick-vmm-bhyve` in `[features]` is silently inert on a
-# non-matching target (cargo emits no diagnostic that the feature enabled
-# nothing), this comment is the only signal — keep it.
+# ── Host backend, selected by the build target ──────────────────────────────
+# macOS: the HVF VMM. Linux: KVM. FreeBSD / NetBSD: the kqueue host layer plus,
+# on x86_64 only, the bhyve / NVMM VMM (an aarch64 BSD build is the native
+# lane). The source gates on the same `target_os` / `target_arch` predicates,
+# so the manifest and the code cannot disagree about which backend is linked.
+[target.'cfg(target_os = "macos")'.dependencies]
+carrick-vmm-hvf = { path = "../carrick-vmm-hvf" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+carrick-vmm-kvm = { path = "../carrick-vmm-kvm" }
+
+# The kqueue EventMultiplexer shared by macOS and the BSDs.
+[target.'cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))'.dependencies]
+carrick-host-bsd = { path = "../carrick-host-bsd" }
+
+# The FreeBSD/bhyve VMM backend. Arch-scoped, not just OS-scoped: bhyve
+# virtualizes the host ISA, so this crate is x86_64-only. Its own crate-level
+# gate keys on `target_os`, which matches on FreeBSD/aarch64 too, so an OS-only
+# dependency edge would compile libvmmapi and the x86 engine into an aarch64
+# build that has no VMM lane at all.
 [target.'cfg(all(target_os = "freebsd", target_arch = "x86_64"))'.dependencies]
-carrick-vmm-bhyve = { path = "../carrick-vmm-bhyve", optional = true }
+carrick-vmm-bhyve = { path = "../carrick-vmm-bhyve" }
 
 # The NetBSD/NVMM VMM backend, arch-scoped for the same reason. NVMM is an
 # x86-only NetBSD subsystem and there is no `/usr/lib/libnvmm.so` on arm64, so
 # the manifest is what keeps `-lnvmm` off a NetBSD/aarch64 link line.
 [target.'cfg(all(target_os = "netbsd", target_arch = "x86_64"))'.dependencies]
-carrick-vmm-nvmm = { path = "../carrick-vmm-nvmm", optional = true }
+carrick-vmm-nvmm = { path = "../carrick-vmm-nvmm" }
 
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
@@ -151,10 +141,7 @@ carrick-sched-core = { path = "../carrick-sched-core" }
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 # Self dev-dependency: enables `test-support` on this crate's own lib when it
 # is built for an integration test (`tests/`), which sees no `cfg(test)`.
-# `default-features = false` so it adds ONLY that feature: with the default
-# on, a `--no-default-features --features platform-<other>` cross-check would
-# get `platform-macos` (and carrick-vmm-hvf) re-enabled through this edge.
-carrick-runtime = { path = ".", default-features = false, features = ["test-support"] }
+carrick-runtime = { path = ".", features = ["test-support"] }
 carrick-test-support = { path = "../carrick-test-support" }
 # The host-open/stat/xattr amplification counters live on carrick-vfs's hot
 # path and are compiled out of a normal build; the fs tests here assert on them.

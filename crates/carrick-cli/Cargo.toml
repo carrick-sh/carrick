@@ -16,8 +16,9 @@ workspace = true
 # (getpid, answered guest-side from the identity page)
 # is default ON. (Clock syscalls are served via the vDSO and dispatch, not
 # the EL1 shim.) Build with `--no-default-features` for the legacy trap-only
-# vector path.
-default        = ["syscall-shim", "platform-macos"]
+# vector path. The VMM/host backend is NOT a feature: the build target selects
+# it (see the target-scoped dependency tables at the bottom of this file).
+default        = ["syscall-shim"]
 # Heap-allocation census (diagnostic, like carrick-runtime's `debug-stats`).
 # Installs `dhat` as the global allocator so every allocation is attributed to
 # a call stack, and writes one `dhat-<pid>.json` per process. Answers "what
@@ -29,18 +30,6 @@ default        = ["syscall-shim", "platform-macos"]
 # binary much slower, so it is a measurement build, never a shipping one.
 alloc-census   = ["dep:dhat"]
 syscall-shim   = ["carrick-runtime/syscall-shim", "carrick-embed/syscall-shim"]
-# Exactly one platform-* is active at a time; `default` keeps macOS building
-# exactly as today. `platform-linux` links NO HVF.
-platform-macos = ["dep:carrick-vmm-hvf", "dep:carrick-host-bsd", "carrick-runtime/platform-macos", "carrick-engine/platform-macos", "carrick-embed/platform-macos"]
-platform-linux = ["dep:carrick-vmm-kvm", "carrick-runtime/platform-linux", "carrick-engine/platform-linux", "carrick-embed/platform-linux"]
-# `dep:carrick-vmm-bhyve` / `dep:carrick-vmm-nvmm` resolve against the
-# ARCH-SCOPED target tables at the bottom of this file: both VMMs are
-# x86_64-only, while the platform feature names the HOST backend on every arch.
-# On a non-matching target cargo accepts the `dep:` reference and activates
-# nothing, so one feature name covers both arches (see carrick-runtime's
-# Cargo.toml for the full rationale).
-platform-freebsd = ["dep:carrick-vmm-bhyve", "dep:carrick-host-bsd", "carrick-runtime/platform-freebsd", "carrick-engine/platform-freebsd", "carrick-embed/platform-freebsd"]
-platform-netbsd = ["dep:carrick-vmm-nvmm", "dep:carrick-host-bsd", "carrick-runtime/platform-netbsd", "carrick-engine/platform-netbsd", "carrick-embed/platform-netbsd"]
 # In-memory fs backend selection (`--fs memory`). Default OFF on purpose; opt in
 # with `cargo build -p carrick-cli --features fs-memory`.
 fs-memory = ["carrick-spec/fs-memory", "carrick-engine/fs-memory", "carrick-runtime/fs-memory"]
@@ -78,11 +67,8 @@ carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-vfs = { path = "../carrick-vfs" }
 carrick-fatal.workspace = true
 dhat = { version = "0.3", optional = true }
-carrick-vmm-hvf = { path = "../carrick-vmm-hvf", optional = true }
-carrick-host-bsd = { path = "../carrick-host-bsd", optional = true }
-carrick-vmm-kvm = { path = "../carrick-vmm-kvm", optional = true }
-# carrick-vmm-bhyve / carrick-vmm-nvmm are NOT declared here: they are
-# x86_64-only and live in arch-scoped target tables at the bottom of this file.
+# The VMM/host backend crates live in target-scoped tables at the bottom of
+# this file: the build target, not a feature, selects the backend.
 carrick-spec = { path = "../carrick-spec", features = ["clap"] }
 carrick-image = { path = "../carrick-image" }
 carrick-engine = { path = "../carrick-engine", default-features = false }
@@ -122,13 +108,24 @@ tokio.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-# Arch-scoped for the same reason as carrick-runtime's copies: bhyve and NVMM
-# are x86_64-only VMMs whose own crate-level gates key on `target_os` alone, so
-# an OS-only dependency edge would drag libvmmapi / -lnvmm and the x86 engine
-# into an aarch64 BSD build that has no VMM lane. `platform-freebsd` /
-# `platform-netbsd` still name the host backend on both arches.
+# ── Host backend, selected by the build target ──────────────────────────────
+# Mirrors carrick-runtime's tables: macOS -> HVF, Linux -> KVM, FreeBSD/NetBSD
+# -> the kqueue host layer plus, on x86_64 only, bhyve / NVMM. Arch-scoped for
+# the same reason as carrick-runtime's copies: bhyve and NVMM are x86_64-only
+# VMMs whose own crate-level gates key on `target_os` alone, so an OS-only
+# dependency edge would drag libvmmapi / -lnvmm and the x86 engine into an
+# aarch64 BSD build that has no VMM lane.
+[target.'cfg(target_os = "macos")'.dependencies]
+carrick-vmm-hvf = { path = "../carrick-vmm-hvf" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+carrick-vmm-kvm = { path = "../carrick-vmm-kvm" }
+
+[target.'cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))'.dependencies]
+carrick-host-bsd = { path = "../carrick-host-bsd" }
+
 [target.'cfg(all(target_os = "freebsd", target_arch = "x86_64"))'.dependencies]
-carrick-vmm-bhyve = { path = "../carrick-vmm-bhyve", optional = true }
+carrick-vmm-bhyve = { path = "../carrick-vmm-bhyve" }
 
 [target.'cfg(all(target_os = "netbsd", target_arch = "x86_64"))'.dependencies]
-carrick-vmm-nvmm = { path = "../carrick-vmm-nvmm", optional = true }
+carrick-vmm-nvmm = { path = "../carrick-vmm-nvmm" }

@@ -131,7 +131,7 @@ pub use carrick_host::{guest_cpu, host_facts, host_mapping, host_proc, ulock};
 // syscall metadata (`syscall`). None depend on dispatch/VFS. Re-exported under
 // their original `crate::trap::…` / `crate::thread::…` / … paths so every call
 // site across the runtime is unchanged.
-#[cfg(feature = "platform-macos")]
+#[cfg(target_os = "macos")]
 pub use carrick_vmm_hvf::{fork_coord, signal_arrival, threaded_impl, trap, vcpu_kick};
 // The host-signal and guest-timer seams are NOT re-exported: dispatch and the
 // kernel reach them only through the carrier's `CarrierBridges`
@@ -170,16 +170,12 @@ pub use carrick_mem::shared_aperture;
 // thread (ThreadRegistry/FutexTable) + fork_quiesce barriers are
 // hypervisor-agnostic; both backends use the real carrick-thread impls.
 pub use carrick_thread::{fork_quiesce, thread};
-// Under platform-linux there is no carrick-vmm-hvf to re-export `trap` from; the
+// Off macOS there is no carrick-vmm-hvf to re-export `trap` from; the
 // SyscallTrap/TrapError contract lives in carrick-hal (section
 // HAL). Re-export a `trap` shim so `crate::trap::{SyscallTrap, …}` resolves on
 // both platforms. The concrete engine (HvfTrapEngine / KvmTrapEngine) is
 // selected by the run-loop, which is itself platform-gated.
-#[cfg(any(
-    feature = "platform-linux",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
 pub mod trap {
     pub use carrick_hal::{RawSyscall, SyscallTrap, TrapError};
     // Portable helpers the native (DSR) backend shares with the HVF trap
@@ -217,7 +213,7 @@ pub mod debug_state;
 pub mod execute;
 pub(crate) mod hvpatch;
 pub mod prepare;
-#[cfg(feature = "platform-macos")]
+#[cfg(target_os = "macos")]
 pub mod runtime;
 pub use prepare::{
     ExecutionPlan, PreparedRun, Runtime, RuntimeExtensions, prepare_on, resolve_plan,
@@ -463,11 +459,7 @@ pub fn rosetta_available() -> bool {
     }
 }
 
-#[cfg(any(
-    feature = "platform-linux",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
 pub mod runtime {
     pub use crate::debug_state::{DebugRegionSnapshot, DebugStateSnapshot, maybe_dump_debug_state};
     // Private: `RunResult`/`RuntimeError` are kernel types and the carrier does

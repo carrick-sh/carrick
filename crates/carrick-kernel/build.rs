@@ -1,8 +1,8 @@
 //! OS-family `cfg` emitter for `carrick-kernel`.
 //!
 //! Residual ABI-shape branches that don't (yet) live behind `carrick-portable`
-//! key on these instead of the banned macOS-negation feature gate (a
-//! `not(platform-macos)` cfg used as a synonym for "Linux"):
+//! key on these instead of a macOS negation (a `not(target_os = "macos")`
+//! cfg used as a synonym for "Linux"):
 //!   * `carrick_bsd`   — kqueue / `extattr` / `sockaddr_dl` family (Darwin + the BSDs + illumos)
 //!   * `carrick_linux` — Linux ABI shapes (`sockaddr_ll`, …)
 //!

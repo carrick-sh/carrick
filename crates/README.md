@@ -13,9 +13,11 @@ budgets, time control, network interposition, and shared buffers; the CLI
 reaches the runtime only through the engine. Tty sessions and concurrent
 containers in one host process are not yet public embed features.
 
-Platform code is selected by Cargo features. The default feature is
-`platform-macos`; non-macOS builds use `--no-default-features` plus exactly one
-`platform-*` feature.
+Platform code is selected by the build target, not by Cargo features:
+`carrick-runtime` and `carrick-cli` scope each VMM/host backend crate to a
+`[target.'cfg(target_os = ...)'.dependencies]` table and gate the code on the
+same `target_os`/`target_arch` predicates. A plain `cargo build -p carrick-cli`
+on any supported host links that host's backend; cross-checks pass `--target`.
 
 ## Product and Runtime
 
@@ -85,20 +87,22 @@ lifecycle semantics.
 
 ## Feature Closure Rules
 
-- `platform-macos` pulls `carrick-vmm-hvf`, `carrick-host`, and
+- A macOS target pulls `carrick-vmm-hvf`, `carrick-host`, and
   `carrick-host-bsd`; it needs macOS codesigning before running guests.
-- `platform-linux` pulls `carrick-vmm-kvm` and `carrick-host-linux`; it must not
+- A Linux target pulls `carrick-vmm-kvm` and `carrick-host-linux`; it must not
   pull HVF/applevisor.
-- `platform-freebsd` pulls `carrick-vmm-bhyve` and `carrick-host-bsd`; it must
-  not pull HVF/applevisor.
-- `platform-netbsd` pulls `carrick-vmm-nvmm` and `carrick-host-bsd`; it must not
-  pull HVF/applevisor.
-- `carrick-embed` and `carrick-conformance-next` forward `platform-*` and
-  `syscall-shim` (default `["platform-macos", "syscall-shim"]`), so an embedded
-  guest runs with the same EL1 shim as the shipped binary. `scripts/closure-assert-no-hvf.sh`
-  walks `carrick-cli` only; check the embed closure with
-  `cargo tree -p carrick-embed --no-default-features --features platform-linux
-  --target aarch64-unknown-linux-gnu --edges normal | grep -Ei
+- A FreeBSD target pulls `carrick-host-bsd` and, on x86_64 only,
+  `carrick-vmm-bhyve` (aarch64 is the native lane); it must not pull
+  HVF/applevisor.
+- A NetBSD target pulls `carrick-host-bsd` and, on x86_64 only,
+  `carrick-vmm-nvmm`; it must not pull HVF/applevisor.
+- No `platform-*` feature exists; `.semgrep/portability.yaml`
+  (`no-platform-feature-cfg`) rejects reintroducing one.
+- `carrick-embed` and `carrick-conformance-next` forward `syscall-shim`
+  (default ON), so an embedded guest runs with the same EL1 shim as the
+  shipped binary. `scripts/closure-assert-no-hvf.sh` walks `carrick-cli` only;
+  check the embed closure with `cargo tree -p carrick-embed --target
+  aarch64-unknown-linux-gnu --edges normal | grep -Ei
   'carrick-vmm-hvf|applevisor'` (expect no output).
 
 Use `cargo metadata --no-deps` and `scripts/closure-assert-no-hvf.sh` when

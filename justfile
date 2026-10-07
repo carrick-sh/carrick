@@ -1,8 +1,9 @@
 # Carrick task runner.
 #
 # The build/run recipes are CROSS-PLATFORM (macOS/HVF, Linux/KVM, FreeBSD/bhyve,
-# NetBSD/NVMM): `_platform_features` selects the right backend feature set per host,
-# and on macOS the build is codesigned (a bare `cargo build` strips the
+# NetBSD/NVMM): the build TARGET selects the VMM/host backend (target-scoped
+# dependency tables in carrick-runtime / carrick-cli; there is no `platform-*`
+# feature), and on macOS the build is codesigned (a bare `cargo build` strips the
 # `com.apple.security.hypervisor` entitlement → every run fails HV_DENIED
 # 0xfae94007; scripts/build-signed.sh re-signs it). Run `just --list` for all recipes.
 
@@ -23,12 +24,17 @@ export CARRICK_SCCACHE_SEARCH_PATH := replace_regex(_build_env, _build_env_field
 _cargo := "cargo --config " + quote(CARRICK_CARGO_CACHE_CONFIG)
 _admit := _cargo + " run --locked -p carrick-xtask -- worktree-run --"
 
-# Per-host backend feature flags for `cargo build`/`cargo test` of carrick-cli.
-# macOS uses the default features (+ codesign via build-signed.sh), so it is empty.
-_platform_features := if os() == "macos" { "" \
-} else if os() == "linux" { "--no-default-features --features syscall-shim,platform-linux" \
-} else if os() == "freebsd" { "--no-default-features --features platform-freebsd" \
-} else if os() == "netbsd" { "--no-default-features --features platform-netbsd" \
+# Per-host `syscall-shim` selection for `cargo build`/`cargo test` of carrick-cli.
+# It names NO backend: the build target selects that. It only preserves each
+# lane's historical shim configuration: macOS builds the crates' defaults (the
+# CLI/embed default enables the shim; a lone `-p carrick-runtime` test does not),
+# Linux also forces the shim onto lone runtime/engine test builds, and the
+# FreeBSD/NetBSD lanes have always built the legacy trap-only path
+# (`--no-default-features`, the shim's documented hatch).
+_host_shim_features := if os() == "macos" { "" \
+} else if os() == "linux" { "--features syscall-shim" \
+} else if os() == "freebsd" { "--no-default-features" \
+} else if os() == "netbsd" { "--no-default-features" \
 } else { "UNSUPPORTED-HOST" }
 
 # Show the recipe list (default).
@@ -40,15 +46,15 @@ default:
 # carrick-x86/carrick-aarch64 engines, and the host's VMM backend: bhyve/kvm/nvmm),
 # but NOT carrick-vmm-hvf (macOS-only; its build script needs cc/applevisor). The
 # gate recipes below feed this list to `cargo {test,doc}` off-macOS so the
-# platform's OWN crates are exercised without `--workspace` dragging in HVF or the
-# macos-default features (a virtual workspace also rejects a root `--features`).
+# platform's OWN crates are exercised without `--workspace` dragging in HVF's
+# macOS-only build script (a virtual workspace also rejects a root `--features`).
 # Derived from `cargo tree` so it self-updates as crates are added/removed.
 [private]
 _platform_crates:
-    @{{_admit}} {{_cargo}} tree -p carrick-cli {{_platform_features}} --prefix none 2>/dev/null | grep -oE '^carrick-[a-z0-9-]+' | sort -u | sed 's/^/-p /' | tr '\n' ' '
+    @{{_admit}} {{_cargo}} tree -p carrick-cli {{_host_shim_features}} --prefix none 2>/dev/null | grep -oE '^carrick-[a-z0-9-]+' | sort -u | sed 's/^/-p /' | tr '\n' ' '
 
 # Build the runnable release binary for the host (args go to cargo). macOS codesigns
-# the HVF entitlement; Linux/FreeBSD/NetBSD do a plain build with the backend features.
+# the HVF entitlement; Linux/FreeBSD/NetBSD do a plain build (the target picks the backend).
 build *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -56,7 +62,7 @@ build *ARGS:
     if [ "{{os()}}" = "macos" ]; then
         exec ./scripts/build-signed.sh {{ARGS}}
     fi
-    exec {{_admit}} {{_cargo}} build --release -p carrick-cli {{_platform_features}} {{ARGS}}
+    exec {{_admit}} {{_cargo}} build --release -p carrick-cli {{_host_shim_features}} {{ARGS}}
 
 # Build the runnable RELEASE binary with debug entitlements (get-task-allow) for
 # lldb attaching. NOTE: this is an optimized release build that is merely
@@ -69,7 +75,7 @@ build-debug *ARGS:
     if [ "{{os()}}" = "macos" ]; then
         exec ./scripts/build-signed.sh --debug {{ARGS}}
     fi
-    exec {{_admit}} {{_cargo}} build -p carrick-cli {{_platform_features}} {{ARGS}}
+    exec {{_admit}} {{_cargo}} build -p carrick-cli {{_host_shim_features}} {{ARGS}}
 
 # Build + sign the DEBUG PROFILE so `debug_assert!` is live in a guest run.
 #
@@ -86,7 +92,7 @@ build-debug-profile *ARGS:
 _build-debug-profile *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
-    {{_admit}} {{_cargo}} build -p carrick-cli {{_platform_features}} {{ARGS}}
+    {{_admit}} {{_cargo}} build -p carrick-cli {{_host_shim_features}} {{ARGS}}
     if [ "{{os()}}" = "macos" ]; then
         codesign -f -s - --entitlements scripts/entitlements-debug.plist target/debug/carrick
         codesign -d --entitlements - target/debug/carrick 2>&1 | grep -q hypervisor \
@@ -164,7 +170,7 @@ land-provision *ARGS:
 
 # Fast unsigned debug build (cannot run a guest — for compile-checking only).
 check *ARGS:
-    {{_admit}} {{_cargo}} build -p carrick-cli {{_platform_features}} {{ARGS}}
+    {{_admit}} {{_cargo}} build -p carrick-cli {{_host_shim_features}} {{ARGS}}
 
 # Compile-check the fuzz harness (a separate `[workspace]` excluded from the main
 # build, so a bit-rotted target / a changed carrick-runtime ABI-decode entry
@@ -189,11 +195,11 @@ clippy *ARGS:
         exec {{_admit}} {{_cargo}} clippy --workspace --all-targets --keep-going {{ARGS}} -- -D warnings
     fi
     # Off-macOS: lint carrick-cli + its platform dep-closure (carrick-runtime, the
-    # shared x86/aarch64 engines, this host's VMM backend) under the backend feature
-    # set, so the kvm/bhyve/nvmm code the macOS gate never sees is linted too. Scoping
-    # to -p carrick-cli {{_platform_features}} keeps HVF/macos-defaults out (a root
-    # --workspace --features is rejected on a virtual workspace).
-    exec {{_admit}} {{_cargo}} clippy -p carrick-cli {{_platform_features}} --all-targets --keep-going {{ARGS}} -- -D warnings
+    # shared x86/aarch64 engines, this host's VMM backend, all selected by the
+    # target), so the kvm/bhyve/nvmm code the macOS gate never sees is linted too.
+    # Scoping to -p carrick-cli keeps the macOS-only carrick-vmm-hvf crate out (a
+    # root --workspace --features is also rejected on a virtual workspace).
+    exec {{_admit}} {{_cargo}} clippy -p carrick-cli {{_host_shim_features}} --all-targets --keep-going {{ARGS}} -- -D warnings
 
 # Typed-domain semgrep gate: blocks the bug SHAPES the newtypes exist to kill
 # (raw wait-set complements, bit=signum masks, host pids in NsPid, hand-numbered
@@ -578,21 +584,21 @@ test *ARGS:
         exit 0
     fi
     # Off-macOS: run the lib tests of THIS host's own crates only (-p list from
-    # _platform_crates) under the backend feature set — `--workspace --lib` would
-    # pull in carrick-vmm-hvf + the macos-default features and fail to compile.
+    # _platform_crates) — `--workspace --lib` would pull in the macOS-only
+    # carrick-vmm-hvf crate and fail to compile.
     # CLI/runtime/host have the same process-global state on every host; keep
     # their complete test processes serial, as above. The remaining package
     # selection still comes from the platform closure, including all its bins.
     pkgs="$(just --justfile {{justfile()}} _platform_crates | sed -E 's/-p carrick-(cli|runtime|host) //g')"
     # Runtime's self dev-dependency previously enabled these test doubles for
     # the whole selection. Keep them explicit when its test target is separate.
-    {{_admit}} {{_cargo}} test $pkgs {{_platform_features}} --features carrick-kernel/test-support,carrick-vfs/test-support --lib --bins {{ARGS}} -- --skip serial_host
-    env RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test $pkgs {{_platform_features}} --features carrick-kernel/test-support,carrick-vfs/test-support --lib --bins {{ARGS}} serial_host
-    env RUST_MIN_STACK=8388608 RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test -p carrick-cli {{_platform_features}} --bin carrick {{ARGS}}
+    {{_admit}} {{_cargo}} test $pkgs {{_host_shim_features}} --features carrick-kernel/test-support,carrick-vfs/test-support --lib --bins {{ARGS}} -- --skip serial_host
+    env RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test $pkgs {{_host_shim_features}} --features carrick-kernel/test-support,carrick-vfs/test-support --lib --bins {{ARGS}} serial_host
+    env RUST_MIN_STACK=8388608 RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test -p carrick-cli {{_host_shim_features}} --bin carrick {{ARGS}}
     env RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test -p carrick-host --lib {{ARGS}}
     # Runtime still has process-wide carrier lifecycle, root-slot pool, env and
     # host-fork tests; fixture-owned injections alone do not make it parallel-safe.
-    env RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test -p carrick-runtime {{_platform_features}} --lib {{ARGS}}
+    env RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test -p carrick-runtime {{_host_shim_features}} --lib {{ARGS}}
     {{_admit}} {{_cargo}} test -p carrick-conformance-contract --tests {{ARGS}}
     {{_admit}} {{_cargo}} test -p carrick-xtask --test probe_coverage {{ARGS}}
 
@@ -605,17 +611,17 @@ doc *ARGS:
         exec env RUSTDOCFLAGS="-D warnings" {{_admit}} {{_cargo}} doc --workspace --no-deps --document-private-items {{ARGS}}
     fi
     # Off-macOS: document THIS host's own crates explicitly (-p list from
-    # _platform_crates) under the backend feature set. The explicit -p list is
+    # _platform_crates). The explicit -p list is
     # load-bearing: with only `-p carrick-cli … --no-deps`, rustdoc checks but does
     # NOT run on the backend crates, so broken intra-doc links in carrick-vmm-kvm/
     # bhyve/nvmm (cfg'd-empty on macOS, so the macOS gate never sees them) slip
     # through. --no-deps still keeps -D warnings off EXTERNAL crates.
     pkgs="$(just --justfile {{justfile()}} _platform_crates)"
-    exec env RUSTDOCFLAGS="-D warnings" {{_admit}} {{_cargo}} doc $pkgs {{_platform_features}} --no-deps --document-private-items {{ARGS}}
+    exec env RUSTDOCFLAGS="-D warnings" {{_admit}} {{_cargo}} doc $pkgs {{_host_shim_features}} --no-deps --document-private-items {{ARGS}}
 
 # Host integration suites (no HVF/Docker); syscall_process is its own binary (matches CI).
-# carrick-runtime and carrick-engine default to platform-macos (→ HVF), so off-macOS
-# they need {{_platform_features}}; carrick-image has no platform features (left bare).
+# The backend follows the target on every host; {{_host_shim_features}} only keeps
+# each lane's historical syscall-shim selection. carrick-image has no features.
 test-integration:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -655,29 +661,28 @@ test-integration:
             -- --skip generic_probe_shard_ --skip case_
         exit 0
     fi
-    # Off-macOS: same suites, but with the backend feature set on the crates that
-    # default to platform-macos. (The `integration` suite has some macOS-only test
+    # Off-macOS: same suites, with this lane's shim selection. (The `integration` suite has some macOS-only test
     # bodies that aren't cfg-gated and a couple of cases that need a prebuilt
     # fixtures/linux-aarch64-hello image — those fail/skip ENVIRONMENTALLY off-macOS,
     # not because of feature wiring.)
-    {{_admit}} {{_cargo}} test -p carrick-runtime {{_platform_features}} --test integration
-    # carrick-kernel takes no `platform-*` feature: its host-OS edges are
+    {{_admit}} {{_cargo}} test -p carrick-runtime {{_host_shim_features}} --test integration
+    # carrick-kernel takes no shim selection here: its host-OS edges are
     # `cfg(target_os)` dependency tables, so the same invocation is correct on
     # every host.
     {{_admit}} {{_cargo}} test -p carrick-kernel --test integration
     {{_admit}} {{_cargo}} test -p carrick-kernel --test io_blocking_guard
-    {{_admit}} {{_cargo}} test -p carrick-runtime {{_platform_features}} --test syscall_process
-    {{_admit}} {{_cargo}} test -p carrick-cli {{_platform_features}} --test trace_profile
-    {{_admit}} {{_cargo}} test -p carrick-cli {{_platform_features}} --test fs_backend_flag
-    {{_admit}} {{_cargo}} test -p carrick-cli {{_platform_features}} --test cli
+    {{_admit}} {{_cargo}} test -p carrick-runtime {{_host_shim_features}} --test syscall_process
+    {{_admit}} {{_cargo}} test -p carrick-cli {{_host_shim_features}} --test trace_profile
+    {{_admit}} {{_cargo}} test -p carrick-cli {{_host_shim_features}} --test fs_backend_flag
+    {{_admit}} {{_cargo}} test -p carrick-cli {{_host_shim_features}} --test cli
     # syscall-shim belongs to the runtime dependency, not the engine API.
-    {{_admit}} {{_cargo}} test -p carrick-engine {{replace(_platform_features, "syscall-shim", "carrick-runtime/syscall-shim")}}
+    {{_admit}} {{_cargo}} test -p carrick-engine {{replace(_host_shim_features, "syscall-shim", "carrick-runtime/syscall-shim")}}
     {{_admit}} {{_cargo}} test -p carrick-image
 
 # Run the full host CI gate locally (fmt · clippy · build · docs · tests) — the source of truth CI calls.
 # Composes the now-OS-aware leaf recipes. The only OS difference is the `check` arg:
 # on macOS `check --workspace` compiles every crate (HVF included); off-macOS a bare
-# `check` (= `cargo build -p carrick-cli {{_platform_features}}`) is the right scope —
+# `check` (= `cargo build -p carrick-cli`) is the right scope —
 # `--workspace` there would drag in carrick-vmm-hvf (cc/applevisor) and fail.
 ci:
     #!/usr/bin/env bash
@@ -715,7 +720,7 @@ conformance TIER="full" *ARGS: build
 conformance-quick *ARGS: build
     {{_admit}} {{_cargo}} run -p carrick-conformance -- --tier smoke {{ARGS}}
 
-# KVM/lima Docker-parity gate (Phase 5). Builds carrick IN-GUEST for platform-linux,
+# KVM/lima Docker-parity gate (Phase 5). Builds carrick IN-GUEST for Linux/KVM,
 # then runs the smoke tier on the KVM lane vs the (backend-independent) docker oracles,
 # consulting the layered KVM baseline overlay. Needs: `just lima-up` + Docker Desktop.
 conformance-kvm *ARGS:
@@ -817,9 +822,9 @@ conformance-probes: build
           conformance_default_run_contract -- --exact --nocapture
         retained_filter="$(paste -sd, scripts/conformance/retained-generic-probes.txt)"
         CARRICK_PROBE_LANE=arm64 CARRICK_PROBE_FILTER="$retained_filter" \
-          {{_admit}} {{_cargo}} test -p carrick-cli --test conformance {{_platform_features}} -- --nocapture
+          {{_admit}} {{_cargo}} test -p carrick-cli --test conformance {{_host_shim_features}} -- --nocapture
     else
-        {{_admit}} {{_cargo}} test -p carrick-cli --test conformance {{_platform_features}} -- --nocapture
+        {{_admit}} {{_cargo}} test -p carrick-cli --test conformance {{_host_shim_features}} -- --nocapture
     fi
 
 # Verify the frozen 2,127-suite discovery surface against the current clean
@@ -921,7 +926,7 @@ kvm-tests *ARGS: build-cpl0
     cargo test -p carrick-vmm-kvm {{ARGS}}
 
 # L1 cross-check: our owned crates compile for aarch64-linux AND the
-# platform-linux closure links no HVF/applevisor (the C4-decouple proof).
+# Linux-target carrick-cli closure links no HVF/applevisor (the C4-decouple proof).
 # Runs on the Mac (no nested VM needed) — matches the CI cross-check job.
 # `carrick-host-linux` (native-epoll host glue) is in the closure so an
 # aarch64-linux compile break is caught here; its native unit tests run on the
@@ -932,7 +937,7 @@ check-linux:
 
 # Cross-check the FULL carrick-cli + carrick-runtime closure for
 # x86_64-unknown-freebsd — including the C deps (ring via oci-client), so the
-# whole platform-freebsd binary is covered, not just the no-HVF backend crates.
+# whole FreeBSD-target binary is covered, not just the no-HVF backend crates.
 # `--all-targets` so the crates' #[test] modules compile too (a test-only break
 # is still a break). The CALLER must export the FreeBSD cross C toolchain so
 # ring's build.rs targets freebsd: CC_x86_64_unknown_freebsd /
@@ -940,8 +945,10 @@ check-linux:
 # CFLAGS_x86_64_unknown_freebsd="--target=x86_64-unknown-freebsdN --sysroot=<base.txz extract>".
 # CI (.github/workflows/ci.yml) fetches the sysroot + sets these. `cargo check`
 # does NOT link, so no FreeBSD linker is needed — only the cross C compiler.
+# `--no-default-features` keeps the FreeBSD lane's historical shim-off build
+# (see `_host_shim_features`); the target alone selects bhyve.
 check-freebsd:
-    {{_admit}} {{_cargo}} check --target x86_64-unknown-freebsd --no-default-features --features platform-freebsd --all-targets -p carrick-cli -p carrick-runtime
+    {{_admit}} {{_cargo}} check --target x86_64-unknown-freebsd --no-default-features --all-targets -p carrick-cli -p carrick-runtime
 
 # Cross-check the NetBSD/NVMM backend closure for x86_64-unknown-netbsd. NVMM's
 # crate (carrick-vmm-nvmm) depends only on the shared backend/host crates — NOT
@@ -952,7 +959,7 @@ check-freebsd:
 check-netbsd:
     {{_admit}} {{_cargo}} check --target x86_64-unknown-netbsd --all-targets -p carrick-vmm-nvmm
 
-# Verify that no macOS/HVF dependencies exist in the platform-linux closure (L1 closure assertion).
+# Verify that no macOS/HVF dependencies exist in the Linux-target closure (L1 closure assertion).
 closure-linux:
     ./scripts/closure-assert-no-hvf.sh
 

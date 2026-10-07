@@ -9,9 +9,9 @@
 //! The remaining lanes are the cross-platform bring-up lanes. `Kvm` wraps the
 //! SAME carrick argv as `limactl shell <vm> -- env … <carrick-in-guest> run …`,
 //! rewriting the `localhost` conformance-registry host to the lima gateway so
-//! the guest can pull from the mac registry. `KvmLocal` runs a platform-linux
+//! the guest can pull from the mac registry. `KvmLocal` runs a Linux-target
 //! carrick binary directly on a Linux host with `/dev/kvm`. `BhyveLocal` and
-//! `NvmmLocal` do the same for platform-freebsd/platform-netbsd carrick binaries
+//! `NvmmLocal` do the same for FreeBSD- and NetBSD-target carrick binaries
 //! on hosts with `/dev/vmm` or `/dev/nvmm`. Those three run x86_64 guests and so
 //! request `--platform linux/amd64`.
 

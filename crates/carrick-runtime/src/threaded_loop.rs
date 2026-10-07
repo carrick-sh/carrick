@@ -104,17 +104,13 @@ pub trait HostBackend: Send + Sync + 'static {
         main_tid: crate::thread::ThreadId,
         container: carrick_kernel::kernel::ContainerId,
     ) {
-        #[cfg(any(
-            feature = "platform-linux",
-            feature = "platform-freebsd",
-            feature = "platform-netbsd"
-        ))]
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
         carrick_hal::guest_timer_bridge::register_kicker(
             std::sync::Arc::clone(kicker),
             main_tid,
             Box::new(move || crate::thread::notify_container_futex_signal_pending(container)),
         );
-        #[cfg(feature = "platform-macos")]
+        #[cfg(target_os = "macos")]
         {
             let _ = (kicker, main_tid, container);
         }

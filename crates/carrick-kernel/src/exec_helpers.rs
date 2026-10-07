@@ -90,7 +90,7 @@ pub fn resolve_shebang(
 //
 // The OCI/entrypoint run path is live on macOS (HVF) and aarch64-KVM (`run_oci`)
 // but not yet wired on x86_64-KVM, where `run_oci` is a stub until OCI-x86 lands
-// — so this is legitimately unused ONLY on the x86_64 platform-linux build.
+// — so this is legitimately unused ONLY on the x86_64 Linux build.
 #[cfg_attr(all(target_os = "linux", target_arch = "x86_64"), allow(dead_code))]
 pub fn resolve_entrypoint_path(
     path: &str,

@@ -9,7 +9,7 @@
 //! The Linux host-OS glue that used to live here (the native epoll
 //! `EventMultiplexer` and the `host_to_linux_errno` identity hook) was split
 //! out into the VMM-agnostic `carrick-host-linux` crate; carrick-runtime wires
-//! both together under the `platform-linux` feature.
+//! both together on a Linux build target.
 #![cfg(target_os = "linux")]
 
 pub mod guest_setup;

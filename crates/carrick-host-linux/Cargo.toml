@@ -19,7 +19,7 @@ workspace = true
 # compiles to an empty crate, so the default macOS workspace build stays green.
 # Depends only on the trait crate `carrick-hal` (NO VMM backend dependency); the
 # KVM backend (carrick-vmm-kvm) and this host layer are wired together by
-# carrick-runtime under the `platform-linux` feature.
+# carrick-runtime's `cfg(target_os = "linux")` dependency table.
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
 carrick-hal = { path = "../carrick-hal" }

@@ -15,9 +15,9 @@ use std::sync::Arc;
 // re-export here would be a transitional path for a type that moved.
 use carrick_kernel::dispatch::CarrierBridges;
 
-#[cfg(feature = "platform-macos")]
+#[cfg(target_os = "macos")]
 type ActiveHostSignal = carrick_vmm_hvf::host_signal::HvfHostSignal;
-#[cfg(feature = "platform-macos")]
+#[cfg(target_os = "macos")]
 type ActiveGuestTimers = carrick_vmm_hvf::timer_delivery::HvfGuestTimers;
 
 // UNLIKE the VMM entry points, the kick+futex glue cannot simply be arch-gated
@@ -27,23 +27,19 @@ type ActiveGuestTimers = carrick_vmm_hvf::timer_delivery::HvfGuestTimers;
 // glue, and a BSD build with no VMM crate (aarch64) resolves to
 // `carrick_host_bsd::native_glue::BsdNativeGlue`, which expresses the same
 // per-OS policy from the same single-source `carrick_host_bsd::signum` table.
-#[cfg(feature = "platform-linux")]
+#[cfg(target_os = "linux")]
 type ActiveHostSignal = carrick_vmm_kvm::KvmHostSignal;
-#[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
+#[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
 type ActiveHostSignal = carrick_hal::GenericHostSignalBridge<carrick_vmm_bhyve::BhyveGlue>;
-#[cfg(all(feature = "platform-netbsd", target_arch = "x86_64"))]
+#[cfg(all(target_os = "netbsd", target_arch = "x86_64"))]
 type ActiveHostSignal = carrick_hal::GenericHostSignalBridge<carrick_vmm_nvmm::NvmmGlue>;
 #[cfg(all(
-    any(feature = "platform-freebsd", feature = "platform-netbsd"),
+    any(target_os = "freebsd", target_os = "netbsd"),
     not(target_arch = "x86_64")
 ))]
 type ActiveHostSignal =
     carrick_hal::GenericHostSignalBridge<carrick_host_bsd::native_glue::BsdNativeGlue>;
-#[cfg(any(
-    feature = "platform-linux",
-    feature = "platform-freebsd",
-    feature = "platform-netbsd"
-))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
 type ActiveGuestTimers = carrick_hal::KickerGuestTimers;
 
 /// The bridges every product carrier hands its dispatchers.

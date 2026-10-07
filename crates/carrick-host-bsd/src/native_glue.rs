@@ -10,7 +10,7 @@
 //!
 //! On **FreeBSD/aarch64 and NetBSD/aarch64 there is no VMM crate at all**:
 //! bhyve and NVMM virtualize the host ISA and are x86_64-only, so
-//! `platform-freebsd` / `platform-netbsd` on arm64 select the native (DSR)
+//! a FreeBSD / NetBSD arm64 build target selects the native (DSR)
 //! backend alone. `ActiveGlue` still has to resolve, and it has to resolve to
 //! the REAL BSD signal policy — an identity-translating placeholder would
 //! silently mis-target every divergent signal (a guest SIGUSR1 = Linux 10 sent

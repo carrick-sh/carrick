@@ -42,10 +42,6 @@ class VmConfig:
     # `PathExportShapeTests` covers the shape.
     remote_env_prefix: str = ""
     pinned_sha512: str | None = None
-    # The `carrick-runtime`/`carrick-cli` platform feature that selects this
-    # guest's host backend. Substituted into a stage command as
-    # `{platform_feature}` -- see STAGES["stage1"].
-    platform_feature: str = ""
 
 
 @dataclass(frozen=True)
@@ -65,7 +61,6 @@ VMS: dict[str, VmConfig] = {
         name="freebsd-arm64",
         ssh_port=2201,
         remote="fbsd-arm",
-        platform_feature="platform-freebsd",
         image_candidates=[
             # Preferred: cloud-init capable image (provision goes NoCloud).
             f"{_FB_BASE}/FreeBSD-15.1-RELEASE-arm64-aarch64-BASIC-CLOUDINIT-ufs.qcow2.xz",
@@ -89,7 +84,6 @@ VMS: dict[str, VmConfig] = {
         name="netbsd-arm64",
         ssh_port=2202,
         remote="nbsd-arm",
-        platform_feature="platform-netbsd",
         image_candidates=[f"{_NB_BASE}/arm64.img.gz"],
         checksum_url=f"{_NB_BASE}/SHA512",
         image_format="img.gz",
@@ -123,18 +117,15 @@ STAGES: dict[str, Stage] = {
     "stage1": Stage(
         # The ACCEPTANCE-PATH compile, not `--workspace`.
         #
-        # `cargo build --workspace` builds every member with DEFAULT features,
-        # which on a BSD means `carrick-runtime`'s `default = ["platform-macos"]`
-        # -- so it drags in `carrick-vmm-hvf` (a macOS crate with no crate-level
-        # `#![cfg]`) and then fails `carrick-cli`'s own build.rs assertion that
-        # platform-macos requires `target_os = "macos"`. That red list is pure
-        # artifact: neither crate is on the aarch64 BSD acceptance path (scout
-        # spec V12). Selecting the guest's real platform feature measures what
-        # the campaign actually needs -- the CLI, engine and runtime built
-        # against this host's backend.
+        # `cargo build --workspace` also builds `carrick-vmm-hvf`, a macOS
+        # crate that is not on the aarch64 BSD acceptance path (scout spec
+        # V12), so its red list would be pure artifact. `-p carrick-cli`
+        # measures what the campaign actually needs: the CLI, engine and
+        # runtime, whose host backend the BSD build target selects.
+        # `--no-default-features` keeps the BSD lanes' historical shim-off
+        # build (the justfile's `_host_shim_features`).
         cmds=[
-            "cd /root/carrick && cargo build -p carrick-cli "
-            "--no-default-features --features {platform_feature}"
+            "cd /root/carrick && cargo build -p carrick-cli --no-default-features"
         ],
         report_only=True,  # red list IS the bring-up worklist (spec)
         available=True,
@@ -1457,12 +1448,7 @@ def run_gate(vm: VmConfig, stage_name: str, boot_retries: int = 0) -> dict:
                 raise
             head = push_head(vm)
             rustc = ssh_run(vm, "rustc --version", timeout_s=30).stdout.strip()
-            # Plain substitution, not `str.format`: a stage command is a shell
-            # line and may legitimately contain braces.
-            remaining = [
-                cmd.replace("{platform_feature}", vm.platform_feature)
-                for cmd in stage.cmds
-            ]
+            remaining = list(stage.cmds)
             while remaining:
                 cmd = remaining.pop(0)
                 try:
