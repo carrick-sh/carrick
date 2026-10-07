@@ -471,6 +471,28 @@ mod tests {
     }
 
     #[test]
+    fn aarch64_sigframe_owner_wait_does_not_force_sigsegv_witness() {
+        use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+        let mut e = empty_engine();
+        e.sp = 0x20_0000;
+        e.elr_el1 = 0xDEAD_BEE0;
+        let handle = unsafe {
+            El1MmHandle::from_admitted_owner(
+                core::num::NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(7).unwrap(),
+                core::num::NonZeroU64::new(1).unwrap(),
+            )
+        };
+        let wait = unsafe { PortalOwnerWait::from_owner(handle, PortalWaitCause::Editor, 84) };
+        e.prepare_refusal = Some(carrick_guest_mem::MemoryError::OwnerWait(wait));
+        let result = Aarch64GuestArch::build_sigframe(&mut e, inject_params(0));
+        assert!(
+            !matches!(result, Err(crate::TrapError::SignalDeliveryFault)),
+            "owner wait must not force SignalDeliveryFault (SIGSEGV)"
+        );
+    }
+
+    #[test]
     fn aarch64_signal_frame_invalid_stack_still_forces_sigsegv() {
         let mut e = empty_engine();
         e.sp = 0x20_0000;
