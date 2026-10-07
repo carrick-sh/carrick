@@ -1,5 +1,25 @@
 # x86 anonymous CPL0 handoff (partial, 2026-10-07)
 
+## PR102 re-review follow-up
+
+Named WRITE/EXECUTE flags replace grant-publication bit literals. Shared
+anonymous editor boundaries now take AddressSpaceRegister, UserVa, GuestLen,
+ReservationMm and UserRange; the register preserves ARM ASID bits. The
+hardware COW busy callback accesses its pool only on ARM, refusing the x86
+unbound venue without a pool read. InitialInventory has a foreign-MM test:
+removing its MM guard yields "inventory frame missing" instead of the
+required "inventory MM mismatch"; restoring it passes.
+
+Receipts: /tmp/x86-anon-followup-mm-{red,green}.log and
+/tmp/x86-anon-followup-doc.log (raw editor arguments rejected). The normal
+worktree-target KVM gate reports 127 passed, one known shared-kernel
+shootdown acknowledgement failure, and five existing ignores, none added:
+/tmp/x86-anon-followup-worktree-kvm.log. The earlier external-target run
+also failed its fixture lookup under /tmp/crates; the normal-target run
+passes that fixture. Shootdown code is unchanged and belongs to another
+lane. Clippy and fmt-check pass in /tmp/x86-anon-followup-final-{clippy,fmt}.log.
+Production process-owner extraction and the two-live-MM green remain open.
+
 Read the carrick-vm continuation at the end first; the original WIP
 section below records the relocated checkpoint, not the current verdict.
 

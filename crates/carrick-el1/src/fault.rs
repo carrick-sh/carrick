@@ -402,6 +402,7 @@ impl CowResolver for HardwareCowResolver {
     }
 
     fn editor_busy(&mut self) {
+        #[cfg(target_arch = "aarch64")]
         carrick_el1_abi::cow_grant_pool_guest()
             .note_declined(carrick_el1_abi::CowDecline::EditorBusy);
     }

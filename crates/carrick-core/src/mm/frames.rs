@@ -197,8 +197,14 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
         };
         if publication.va != window.range.start()
             || publication.len != window.range.len()
-            || publication.writable != (window.protection.bits() & 2 != 0)
-            || publication.executable != (window.protection.bits() & 4 != 0)
+            || publication.writable
+                != window
+                    .protection
+                    .permits(carrick_core_abi::mm::ReservationProtection::WRITE)
+            || publication.executable
+                != window
+                    .protection
+                    .permits(carrick_core_abi::mm::ReservationProtection::EXECUTE)
             || resident.va != window.fault_page
             || resident.len != 4096
         {
