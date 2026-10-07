@@ -2518,6 +2518,7 @@ fn every_executable_has_a_declared_dep_info_location() {
         ("embed-interceptor-probe", "interceptor-probe"),
         ("embed-zone-readers", "zone-readers"),
         ("embed-icache-reuse", "icache-reuse"),
+        ("embed-copyout", "copyout"),
         ("embed-el1-sched", "el1-sched"),
     ];
     for path in fixtures::executable_inventory(f.repo.path())
