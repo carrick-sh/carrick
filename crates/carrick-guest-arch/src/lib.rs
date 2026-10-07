@@ -41,6 +41,7 @@ ordinal!(
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[repr(transparent)]
 pub struct SlotId(u8);
+const _: () = assert!(core::mem::size_of::<SlotId>() == 1);
 
 impl SlotId {
     pub const fn new(raw: u8) -> Self {
