@@ -325,7 +325,7 @@ pub fn witness(
     let mut control_exits = 0;
     let mut injected = false;
     for _ in 0..3 {
-        let exit = HvVcpu::run(&mut carrier.cpus[0])?;
+        let exit = watchdog.during_guest(|| HvVcpu::run(&mut carrier.cpus[0]))?;
         if watchdog.expired.load(Ordering::Acquire) {
             return Err(fail("CPL0 progress deadline expired"));
         }
