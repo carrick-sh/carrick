@@ -22,6 +22,8 @@ use carrick_el1::isa::x86::context::native as adapter;
 
 #[cfg(target_os = "none")]
 use carrick_el1::isa::x86::interrupts;
+#[cfg(target_os = "none")]
+mod native_irq;
 fixture_items! {
     #[cfg(target_os = "none")]
     mod progress;

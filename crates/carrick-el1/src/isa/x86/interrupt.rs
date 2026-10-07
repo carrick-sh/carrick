@@ -8,6 +8,55 @@ use carrick_guest_arch::{
 use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
 
+/// Native interrupt identity. These are xAPIC vectors, never ARM GIC INTIDs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeIrq {
+    Timer,
+    Kick,
+    Resched,
+    Shootdown,
+}
+
+impl NativeIrq {
+    pub const fn from_vector(vector: u8) -> Option<Self> {
+        match vector {
+            interrupts::TIMER_VECTOR => Some(Self::Timer),
+            interrupts::KICK_VECTOR => Some(Self::Kick),
+            interrupts::RESCHED_VECTOR => Some(Self::Resched),
+            interrupts::SHOOTDOWN_VECTOR => Some(Self::Shootdown),
+            _ => None,
+        }
+    }
+
+    pub const fn pending_bit(self) -> u32 {
+        match self {
+            Self::Timer => 1,
+            Self::Kick => 2,
+            Self::Resched => 4,
+            Self::Shootdown => 8,
+        }
+    }
+}
+
+/// Retain the accepted native IRQ until the shared scheduler drains it.
+/// The interrupt gate masks IF; the accepted xAPIC ISR must match its gate.
+pub fn capture_irq(vector: u8) -> Result<NativeIrq, ArchError> {
+    let irq = NativeIrq::from_vector(vector).ok_or(ArchError::InvalidFrame)?;
+    let binding = super::context::current_cpu_binding().ok_or(ArchError::Unbound)?;
+    // SAFETY: this CPL0 CPU owns the mapped xAPIC ISR and IF is masked by
+    // the interrupt gate throughout publication and EOI.
+    if unsafe { interrupts::hardware::highest_in_service_vector() } != Some(vector) {
+        return Err(ArchError::InvalidFrame);
+    }
+    binding
+        .pending_irqs
+        .fetch_or(irq.pending_bit(), Ordering::Release);
+    // SAFETY: the matching vector was confirmed in service above; EOI does
+    // not consume the pending mailbox bit or a shootdown generation receipt.
+    unsafe { interrupts::hardware::end_interrupt() };
+    Ok(irq)
+}
+
 fn bound_apic_id(slot: CpuId) -> Result<interrupts::ApicId, ArchError> {
     let binding = super::context::current_cpu_binding().ok_or(ArchError::Unbound)?;
     if binding.wake_routes_address == 0 {
