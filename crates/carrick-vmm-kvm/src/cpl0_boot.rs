@@ -223,9 +223,13 @@ fn run_member(
     // A sender that observes this release either targets the live vCPU or
     // races this pre-run scan, which queues its durable MSI before KVM_RUN.
     member.running.store(1, Ordering::Release);
-    if table.requests.iter().any(|request| {
-        request.generation.load(Ordering::Acquire) > request.served[slot].load(Ordering::Acquire)
-    }) {
+    let sregs = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
+    if sregs.cs.dpl == 3
+        && table.requests.iter().any(|request| {
+            request.generation.load(Ordering::Acquire)
+                > request.served[slot].load(Ordering::Acquire)
+        })
+    {
         if !stopped_at_interruptible_user(cpu)? {
             return Err(fail("shootdown debt requires interruptible CPL3 reentry"));
         }
@@ -249,14 +253,12 @@ fn run_member(
     }
     let result = HvVcpu::run(cpu)?;
     member.running.store(0, Ordering::Release);
-    if stopped_at_interruptible_user(cpu)? {
-        // The host may release a sender after this vCPU has stopped, but
-        // leaves `served` behind until native KICK settles debt on reentry.
-        for request in &table.requests {
-            let generation = request.generation.load(Ordering::Acquire);
-            if generation != 0 {
-                request.ack[slot].store(generation, Ordering::Release);
-            }
+    // The host may release a sender after this vCPU has stopped, but
+    // leaves `served` behind until native KICK settles debt on reentry.
+    for request in &table.requests {
+        let generation = request.generation.load(Ordering::Acquire);
+        if generation != 0 {
+            request.ack[slot].store(generation, Ordering::Release);
         }
     }
     Ok(result)
@@ -2470,7 +2472,7 @@ impl Cpl0Carrier {
         let [a, b] = &mut self.cpus;
         let (editor_cpu, reader_cpu) = if editor == 0 { (a, b) } else { (b, a) };
 
-        std::thread::scope(|scope| {
+        let (editor_res, reader_res) = std::thread::scope(|scope| {
             let reader_handle = scope.spawn(|| {
                 let watchdog = Watchdog::start();
                 let mut words = Vec::with_capacity(carrick_x86::X86_FAULT_RECORD_U32_WORDS);
@@ -2505,6 +2507,18 @@ impl Cpl0Carrier {
 
             let editor_handle = scope.spawn(|| {
                 let watchdog = Watchdog::start();
+                let start = std::time::Instant::now();
+                while ram
+                    .host_ptr(0x4_0000, 1)
+                    .map(|p| unsafe { *p })
+                    .unwrap_or(0)
+                    != 0x11
+                {
+                    if start.elapsed() > Duration::from_secs(5) {
+                        return Err(fail("running reader never completed loop iteration"));
+                    }
+                    std::thread::yield_now();
+                }
                 for _ in 0..32 {
                     let exit =
                         watchdog.during_guest(|| run_member(editor_cpu, table, editor, vm))?;
@@ -2545,14 +2559,19 @@ impl Cpl0Carrier {
                 Err(fail("editor fixture exit budget"))
             });
 
-            let editor_res = editor_handle
-                .join()
-                .map_err(|_| fail("editor thread panic"))??;
-            reader_handle
-                .join()
-                .map_err(|_| fail("reader thread panic"))??;
-            Ok(editor_res)
-        })
+            let editor_res = match editor_handle.join() {
+                Ok(res) => res,
+                Err(_) => Err(fail("editor thread panic")),
+            };
+            let reader_res = match reader_handle.join() {
+                Ok(res) => res,
+                Err(_) => Err(fail("reader thread panic")),
+            };
+            (editor_res, reader_res)
+        });
+        let editor_res = editor_res?;
+        reader_res?;
+        Ok(editor_res)
     }
 
     /// Resume a stopped native entry after its host service has completed.
