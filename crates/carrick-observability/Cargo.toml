@@ -36,10 +36,14 @@ thiserror.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2.workspace = true
 
-# usdt is scoped to EXACTLY the target set that compiles `probes::real` — see
-# the matching `#[cfg]` at the top of src/probes.rs. Everything else links
-# `probes::stub`, which fires nothing and (since `register_dtrace_probes` now
-# returns the crate-local `ProbeRegistrationError`) names no `usdt` type at all.
+# usdt is scoped to EXACTLY the target set that CAN compile `probes::real`;
+# build.rs emits `carrick_usdt_probes` for this same set (keep them in step),
+# minus cross builds whose host would make the usdt proc-macro emit the wrong
+# backend/registers (those link the stub and leave this edge unused, which is
+# harmless: the runtime `usdt` crate itself builds for these targets).
+# Everything else links `probes::stub`, which fires nothing and (since
+# `register_dtrace_probes` now returns the crate-local
+# `ProbeRegistrationError`) names no `usdt` type at all.
 #
 # This is not cosmetic scoping: `usdt-impl` 0.6.0 DOES NOT COMPILE on
 # aarch64-unknown-freebsd. Its build.rs picks the `Standard` (illumos/FreeBSD)
