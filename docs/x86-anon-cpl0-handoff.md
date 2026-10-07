@@ -989,3 +989,11 @@ adapter and twelve tests outside the tracked tree; only rustfmt parsing ran.
 They have not compiled or passed tests. Read its appended task-1-report.md
 assumptions, run genuine red-first binding tests, review, commit and continue
 native MM fork/COW/CPU1 integration. The two-MM PRIVATE witness remains open.
+
+Director correction at watchdog boundary: this arena red is already known and
+routed to a separate task, with earlier baseline/extraction counts 6/50 and
+5/50. The director instructed recording the known pre-existing red and
+continuing CPU1/fork then the two-MM witness. This supersedes the temporary
+push hold above; push the committed work branch labelled with that red.
+No further attribution or arena edits are needed. Source remains frozen;
+resume the guest payload/native integration after the watchdog continuation.
