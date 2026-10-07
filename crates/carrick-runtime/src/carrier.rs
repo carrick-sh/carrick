@@ -2519,6 +2519,12 @@ mod tests {
     fn concurrent_public_shutdown_publishes_one_artifact_and_returns_equal_results() {
         let _serial = TEST_LOCK.lock();
         let directory = tempfile::tempdir().expect("private artifact directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("make artifact directory private");
+        }
         let artifact = directory.path().join("lifecycle.json");
         let _environment = ArtifactEnvGuard::install(&artifact);
         let carrier = process_carrier().expect("implicit carrier");
