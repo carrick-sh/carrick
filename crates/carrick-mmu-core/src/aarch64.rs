@@ -216,17 +216,7 @@ const SW_EL1_MAY_WRITE: u64 = 1 << 57;
 /// EL1 execute ceiling.
 const SW_EL1_MAY_EXEC: u64 = 1 << 58;
 
-/// The only EL1-private terminal states encoded by the software bits and
-/// descriptor validity. This is the authority gate for prepared backing,
-/// retirement, and host-buffer access.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum El1PrivateLeafState {
-    Unowned,
-    Prepared,
-    Resident,
-    Retired,
-    Malformed,
-}
+pub use carrick_guest_arch::El1PrivateLeafState;
 
 pub fn el1_private_leaf_state(descriptor: u64) -> El1PrivateLeafState {
     if descriptor & SW_EL1_PRIVATE == 0 {
