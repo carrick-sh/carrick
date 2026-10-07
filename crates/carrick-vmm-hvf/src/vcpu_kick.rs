@@ -462,6 +462,69 @@ fn retry_durable_signal_kicks(kicker: &dyn carrick_hal::VcpuRegistry) -> bool {
     kicked
 }
 
+/// Handle one fired `EVFILT_TIMER` for interval timer `which`, registered on
+/// the pump kqueue as `ident` with arm `generation` in its `udata`.
+///
+/// The generation check, CPU-timer expiry decision, `publish`, one-shot
+/// retirement and any follow-up kevent registration run in ONE slot-gate hold
+/// (`itimer::fire_kqueue_if_current`), so the pump is linearizable with
+/// `setitimer`: once an arm or disarm returns, an event of the superseded arm
+/// can neither publish nor retire the replacement, and a disarm's `EV_DELETE`
+/// (issued after its gate hold) always follows any re-registration made here.
+/// Only the CPU sample is taken outside the gate.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn handle_itimer_kevent(
+    kq: &crate::darwin_kqueue::Kqueue,
+    which: usize,
+    ident: usize,
+    generation: u64,
+    sampler: &dyn carrick_timer_core::CpuSampler,
+    publish: impl FnOnce(i32),
+) {
+    let (now_ns, active_vcpus) = if crate::itimer::is_cpu_timer(which) {
+        (sampler.total_cpu_ns(), sampler.active_vcpus())
+    } else {
+        (0, 0)
+    };
+    let mut published = false;
+    let outcome = crate::itimer::fire_kqueue_if_current(
+        which,
+        generation,
+        now_ns,
+        active_vcpus,
+        || {
+            published = true;
+            publish(crate::itimer::signum_for(which));
+        },
+        |rearm| {
+            let (flags, data_ns) = match rearm {
+                crate::itimer::KqueueRearm::OneShot { delay_ns } => {
+                    (libc::EV_ADD | libc::EV_ONESHOT, delay_ns.raw().max(1))
+                }
+                crate::itimer::KqueueRearm::Periodic { interval_ns } => {
+                    (libc::EV_ADD, interval_ns.raw())
+                }
+            };
+            let _ = kq.apply(&[crate::darwin_kqueue::Kevent::timer(
+                ident,
+                flags,
+                i64::try_from(data_ns).unwrap_or(i64::MAX),
+            )
+            .with_udata_u64(generation)]);
+        },
+    );
+    if outcome == carrick_timer_core::FireOutcome::Retired && !published {
+        // A stale late fire from a superseded arm (disarmed, or re-armed onto
+        // a fresh ident): delete the dead knote. A one-shot that just
+        // delivered was already removed by EV_ONESHOT.
+        let _ = kq.apply(&[crate::darwin_kqueue::Kevent::timer(
+            ident,
+            libc::EV_DELETE,
+            0,
+        )]);
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn spawn_signal_pump_inner(
     kicker: std::sync::Arc<dyn carrick_hal::VcpuRegistry>,
@@ -665,76 +728,17 @@ fn spawn_signal_pump_inner(
                     }
                     if let Some(ident) = event.timer_ident() {
                         if let Some(which) = crate::itimer::which_for_ident(ident) {
-                            // Invariant check: the fire's `udata` carries the arm
-                            // generation it was registered with. If it no longer
-                            // matches the slot's live generation, this is a stale
-                            // late fire from a superseded arm (disarmed, or
-                            // re-armed onto a fresh ident) — drop it and delete the
-                            // dead knote. Guards against an extra/duplicate signal.
-                            if !crate::itimer::is_armed(which)
-                                || event.udata_u64() != crate::itimer::generation(which)
-                            {
-                                let _ = kq.apply(&[crate::darwin_kqueue::Kevent::timer(
-                                    ident,
-                                    libc::EV_DELETE,
-                                    0,
-                                )]);
-                                continue;
-                            }
-                            let cpu_timer = crate::itimer::is_cpu_timer(which);
-                            if cpu_timer
-                                && let Some(crate::itimer::CpuTimerDecision::Wait { delay_ns }) =
-                                    crate::itimer::cpu_timer_decision(which)
-                            {
-                                let _ = kq.apply(&[crate::darwin_kqueue::Kevent::timer(
-                                    ident,
-                                    libc::EV_ADD | libc::EV_ONESHOT,
-                                    i64::try_from(delay_ns.raw().max(1)).unwrap_or(i64::MAX),
-                                )
-                                .with_udata_u64(crate::itimer::generation(which))]);
-                                continue;
-                            }
-                            let signum = crate::itimer::signum_for(which);
-                            crate::probes::itimer_fire(signum, 0);
-                            crate::host_signal::publish_process_signal(signum);
-                            if cpu_timer {
-                                // The repeat interval of a CPU timer is a guest
-                                // CPU budget, converted to a wall-clock recheck.
-                                let interval = crate::itimer::interval_ns(which);
-                                if interval > 0 {
-                                    let delay_ns = crate::itimer::cpu_timer_recheck_delay_ns(
-                                        carrick_timer_core::CpuNs(interval),
-                                    );
-                                    let _ = kq.apply(&[crate::darwin_kqueue::Kevent::timer(
-                                        ident,
-                                        libc::EV_ADD | libc::EV_ONESHOT,
-                                        i64::try_from(delay_ns.raw()).unwrap_or(i64::MAX),
-                                    )
-                                    .with_udata_u64(crate::itimer::generation(which))]);
-                                } else {
-                                    crate::itimer::complete_fire(which);
-                                }
-                                continue;
-                            }
-                            // A two-phase timer (it_value != it_interval) is armed
-                            // as a one-shot for it_value; on that first fire we arm
-                            // the periodic timer exactly once. take_needs_periodic
-                            // clears the flag so later periodic fires don't re-arm
-                            // (which would reset the period and accumulate drift).
-                            // Pure-periodic and one-shot timers never re-arm here.
-                            if crate::itimer::take_needs_periodic(which) {
-                                let interval = crate::itimer::interval_ns(which);
-                                if interval > 0 {
-                                    let _ = kq.apply(&[crate::darwin_kqueue::Kevent::timer(
-                                        ident,
-                                        libc::EV_ADD,
-                                        interval as i64,
-                                    )
-                                    .with_udata_u64(crate::itimer::generation(which))]);
-                                }
-                            } else {
-                                crate::itimer::complete_fire(which);
-                            }
+                            handle_itimer_kevent(
+                                &kq,
+                                which,
+                                ident,
+                                event.udata_u64(),
+                                &crate::itimer::HvfCpuSampler,
+                                |signum| {
+                                    crate::probes::itimer_fire(signum, 0);
+                                    crate::host_signal::publish_process_signal(signum);
+                                },
+                            );
                         }
                         continue;
                     }
@@ -810,6 +814,139 @@ mod tests {
                 carrick_thread::platform_futex::SharedFutexTable::new(),
             ));
         (registry, kicks, futex)
+    }
+
+    /// Serialises the pump timer-event tests over the process-global
+    /// `carrick-timer-core` interval-timer slots.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    static ITIMER_SLOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A CPU sampler that parks the pump on its sample -- after the timer
+    /// event's generation was observed, before the expiry decision -- until
+    /// the test has run `setitimer`, then reports `now_ns` guest CPU.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    struct ParkingCpuSampler {
+        now_ns: u64,
+        park:
+            std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    impl carrick_timer_core::CpuSampler for ParkingCpuSampler {
+        fn total_cpu_ns(&self) -> u64 {
+            let park = self
+                .park
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some((parked, resume)) = park {
+                parked.send(()).expect("test observes the parked pump");
+                resume
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("test resumes the parked pump");
+            }
+            self.now_ns
+        }
+
+        fn active_vcpus(&self) -> u64 {
+            1
+        }
+    }
+
+    /// Deliver a fired CPU-itimer kevent for arm `generation` on a pump-like
+    /// thread whose CPU sample parks; run `setitimer` while it is parked,
+    /// resume, and return how many signals the event published.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn cpu_itimer_kevent_publishes_after(
+        which: usize,
+        now_ns: u64,
+        setitimer: impl FnOnce(),
+    ) -> usize {
+        let generation = carrick_timer_core::itimer::generation(which);
+        let ident = carrick_timer_core::itimer::live_ident(which);
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let sampler = ParkingCpuSampler {
+            now_ns,
+            park: std::sync::Mutex::new(Some((parked_tx, resume_rx))),
+        };
+        let published = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&published);
+        let pump = std::thread::spawn(move || {
+            let kq = crate::darwin_kqueue::Kqueue::new_internal().expect("kqueue");
+            handle_itimer_kevent(&kq, which, ident, generation, &sampler, |_| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            });
+        });
+        parked_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("pump reaches its CPU sample");
+        setitimer();
+        resume_tx.send(()).expect("pump still parked");
+        pump.join().expect("pump timer handling terminates");
+        published.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn pump_cpu_itimer_does_not_publish_after_disarm_returns() {
+        let _g = ITIMER_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        carrick_timer_core::itimer::clear();
+        let which = 1;
+        let spec = carrick_timer_core::TimerSpecNs {
+            value: 1_000_000,
+            interval: 1_000_000,
+        };
+        carrick_timer_core::itimer::arm_with_cpu_now(which, spec, false, 0);
+        let published = cpu_itimer_kevent_publishes_after(which, 1_000_000, || {
+            carrick_timer_core::itimer::disarm(which);
+        });
+        assert_eq!(
+            published, 0,
+            "the pump published SIGVTALRM for an itimer disarmed before its expiry decision"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn pump_cpu_itimer_stale_event_leaves_replacement_arm_alone() {
+        let _g = ITIMER_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        carrick_timer_core::itimer::clear();
+        let which = 1;
+        let spec = carrick_timer_core::TimerSpecNs {
+            value: 1_000_000,
+            interval: 1_000_000,
+        };
+        carrick_timer_core::itimer::arm_with_cpu_now(which, spec, false, 0);
+        let mut replacement = 0;
+        let published = cpu_itimer_kevent_publishes_after(which, 1_000_000, || {
+            // A one-shot replacement that is already due: its own kevent owns
+            // that expiry; the stale event must neither publish it nor retire
+            // the replacement slot.
+            replacement = carrick_timer_core::itimer::arm_with_cpu_now(
+                which,
+                carrick_timer_core::TimerSpecNs {
+                    value: 500,
+                    interval: 0,
+                },
+                false,
+                0,
+            );
+        });
+        assert_eq!(
+            published, 0,
+            "a stale pump timer event published the replacement arm's expiry"
+        );
+        assert!(
+            carrick_timer_core::itimer::is_armed(which),
+            "a stale pump timer event retired the replacement arm"
+        );
+        assert_eq!(carrick_timer_core::itimer::generation(which), replacement);
+        carrick_timer_core::itimer::disarm(which);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

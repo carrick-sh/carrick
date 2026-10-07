@@ -34,7 +34,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::gate::{FireOutcome, GateHold, TransitionGate};
-use crate::{CpuNs, CpuSampler, TimerSpecNs, WallNs};
+use crate::{CpuNs, TimerSpecNs, WallNs};
 
 /// The 3 itimer `which` values (REAL=0, VIRTUAL=1, PROF=2).
 pub const ITIMER_COUNT: usize = 3;
@@ -224,7 +224,7 @@ pub fn is_cpu_timer(which: usize) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CpuTimerDecision {
+enum CpuTimerDecision {
     Fire,
     /// Not enough guest CPU has elapsed yet; re-check after this WALL-CLOCK
     /// sleep delay (already converted from the remaining CPU quantity by
@@ -346,17 +346,6 @@ pub fn interval_ns(which: usize) -> u64 {
         .map_or(0, |slot| slot.interval_ns.load(Ordering::SeqCst))
 }
 
-/// Mark a delivered expiry complete. One-shot timers are spent after that
-/// delivery, so retire their neutral armed slot. Periodic/two-phase timers stay
-/// armed for their next interval.
-///
-/// Returns `true` when this call retired a one-shot.
-pub fn complete_fire(which: usize) -> bool {
-    SLOTS
-        .get(which)
-        .is_some_and(|slot| slot.gate().complete_fire())
-}
-
 /// Deliver a wall-clock (`ITIMER_REAL`) expiry for the fallback thread of arm
 /// `generation`: if that arm is still live, run `on_fire` and retire a
 /// one-shot, all under the slot gate, so an arm/disarm that returns before
@@ -400,26 +389,70 @@ pub fn fire_cpu_if_current(
     }
 }
 
-/// For CPU timers, decide whether enough guest CPU has elapsed for this timer
-/// to fire given current guest CPU time `now_ns` and `active_vcpus`.
-pub fn cpu_timer_decision(
-    which: usize,
-    now_ns: u64,
-    active_vcpus: u64,
-) -> Option<CpuTimerDecision> {
-    if !is_cpu_timer(which) {
-        return None;
-    }
-    let slot = SLOTS.get(which)?;
-    Some(slot.gate().cpu_decision(now_ns, active_vcpus))
+/// What a kqueue-driven deliverer (the HVF signal pump) must register for the
+/// live arm after a gated timer event. Applied by the `rearm` callback of
+/// [`fire_kqueue_if_current`] while the slot gate is still held, so a
+/// `setitimer` that returns afterwards always sees (and can `EV_DELETE`) it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KqueueRearm {
+    /// One-shot after this wall delay: a CPU timer's next recheck (not due
+    /// yet, or the next period of a periodic CPU timer).
+    OneShot { delay_ns: WallNs },
+    /// The periodic timer a two-phase wall timer (`it_value != it_interval`)
+    /// switches to after its first expiry.
+    Periodic { interval_ns: WallNs },
 }
 
-/// Decide CPU timer expiry using a [`CpuSampler`].
-pub fn cpu_timer_decision_with_sampler<S: CpuSampler>(
+/// Handle one fired kqueue timer event of `which` registered for arm
+/// `generation`: check the arm is still live, decide CPU-timer expiry
+/// against the sampled guest CPU total `now_ns`, deliver via `on_fire`,
+/// retire a spent one-shot and request any follow-up registration via
+/// `rearm`, ALL in one slot-gate hold. A superseded or disarmed arm returns
+/// [`FireOutcome::Retired`] without delivering; a not-yet-due CPU timer
+/// requests its recheck and returns [`FireOutcome::Wait`]. `now_ns` and
+/// `active_vcpus` are ignored for `ITIMER_REAL`. Neither callback may
+/// re-enter this module for the same `which`.
+pub fn fire_kqueue_if_current(
     which: usize,
-    sampler: &S,
-) -> Option<CpuTimerDecision> {
-    cpu_timer_decision(which, sampler.total_cpu_ns(), sampler.active_vcpus())
+    generation: u64,
+    now_ns: u64,
+    active_vcpus: u64,
+    on_fire: impl FnOnce(),
+    rearm: impl FnOnce(KqueueRearm),
+) -> FireOutcome {
+    let Some(slot) = SLOTS.get(which) else {
+        return FireOutcome::Retired;
+    };
+    let gate = slot.gate();
+    if !gate.is_current(generation) {
+        return FireOutcome::Retired;
+    }
+    let cpu_timer = is_cpu_timer(which);
+    if cpu_timer
+        && let CpuTimerDecision::Wait { delay_ns } = gate.cpu_decision(now_ns, active_vcpus)
+    {
+        rearm(KqueueRearm::OneShot { delay_ns });
+        return FireOutcome::Wait { delay_ns };
+    }
+    if gate.fire(on_fire) == FireOutcome::Retired {
+        return FireOutcome::Retired;
+    }
+    let interval_ns = slot.interval_ns.load(Ordering::SeqCst);
+    if cpu_timer {
+        // The repeat interval of a CPU timer is a guest-CPU budget, converted
+        // to a wall-clock recheck.
+        rearm(KqueueRearm::OneShot {
+            delay_ns: cpu_timer_recheck_delay_ns(CpuNs(interval_ns)),
+        });
+    } else if slot.needs_periodic.swap(false, Ordering::SeqCst) {
+        // Two-phase: the first expiry was a one-shot; switch to the periodic
+        // timer exactly once (later periodic fires must not re-arm, which
+        // would reset the period and accumulate drift).
+        rearm(KqueueRearm::Periodic {
+            interval_ns: WallNs(interval_ns),
+        });
+    }
+    FireOutcome::Fired
 }
 
 /// Convert remaining aggregate guest CPU time into a wall-clock delay for the
@@ -473,15 +506,6 @@ pub fn current_arm(which: usize) -> Option<TimerArm> {
 
 pub fn current_arms() -> impl Iterator<Item = TimerArm> {
     (0..WHICH_COUNT).filter_map(current_arm)
-}
-
-/// Atomically take the `needs_periodic` flag for `which`, returning whether the
-/// pump should arm the periodic timer now (and clearing it so later periodic
-/// fires don't re-arm).
-pub fn take_needs_periodic(which: usize) -> bool {
-    SLOTS
-        .get(which)
-        .is_some_and(|slot| slot.needs_periodic.swap(false, Ordering::SeqCst))
 }
 
 /// Disarm every `which`.
@@ -542,19 +566,22 @@ mod tests {
     fn cpu_due_decision_fires_when_due() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         clear();
-        arm(1, TimerSpecNs::DISARM, false);
-        match cpu_timer_decision(1, 0, 1) {
-            Some(CpuTimerDecision::Fire) => {}
-            other => panic!("expected Fire, got {other:?}"),
-        }
-        disarm(1);
+        let spec = TimerSpecNs {
+            value: 1_000,
+            interval: 0,
+        };
+        let generation = arm_with_cpu_now(1, spec, false, 0);
+        let mut fires = 0;
+        let outcome = fire_cpu_if_current(1, generation, 1_000, 1, || fires += 1);
+        assert_eq!((outcome, fires), (FireOutcome::Retired, 1));
+        assert!(!is_armed(1), "a delivered CPU one-shot retires its slot");
     }
 
     #[test]
     fn cpu_due_decision_waits_when_not_due() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         clear();
-        arm_with_cpu_now(
+        let generation = arm_with_cpu_now(
             1,
             TimerSpecNs {
                 value: 10_000,
@@ -563,13 +590,14 @@ mod tests {
             false,
             1_000,
         );
-        match cpu_timer_decision(1, 5_000, 2) {
-            Some(CpuTimerDecision::Wait { delay_ns }) => {
-                // (11_000 - 5_000) / 2 = 3_000
-                assert_eq!(delay_ns.raw(), 3_000);
+        // (11_000 - 5_000) / 2 = 3_000
+        let outcome = fire_cpu_if_current(1, generation, 5_000, 2, || panic!("not due"));
+        assert_eq!(
+            outcome,
+            FireOutcome::Wait {
+                delay_ns: WallNs(3_000)
             }
-            other => panic!("expected Wait, got {other:?}"),
-        }
+        );
         disarm(1);
     }
 
@@ -595,10 +623,102 @@ mod tests {
     }
 
     #[test]
+    fn kqueue_fire_drops_superseded_generation() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        clear();
+        let spec = TimerSpecNs {
+            value: 1_000,
+            interval: 0,
+        };
+        let stale = arm(0, spec, false);
+        let live = arm(0, spec, false);
+        let mut fired = 0;
+        let outcome = fire_kqueue_if_current(0, stale, 0, 0, || fired += 1, |_| panic!());
+        assert_eq!((outcome, fired), (FireOutcome::Retired, 0));
+        assert!(is_armed(0));
+        assert_eq!(generation(0), live);
+        let outcome = fire_kqueue_if_current(0, live, 0, 0, || fired += 1, |_| panic!());
+        assert_eq!((outcome, fired), (FireOutcome::Retired, 1));
+        assert!(!is_armed(0), "a delivered one-shot retires its slot");
+    }
+
+    #[test]
+    fn kqueue_fire_two_phase_wall_timer_switches_to_periodic_once() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        clear();
+        let generation = arm(
+            0,
+            TimerSpecNs {
+                value: 5_000,
+                interval: 2_000,
+            },
+            true,
+        );
+        let mut rearms = [None, None];
+        for rearm in &mut rearms {
+            let outcome = fire_kqueue_if_current(0, generation, 0, 0, || {}, |r| *rearm = Some(r));
+            assert_eq!(outcome, FireOutcome::Fired);
+        }
+        assert_eq!(
+            rearms,
+            [
+                Some(KqueueRearm::Periodic {
+                    interval_ns: WallNs(2_000)
+                }),
+                None
+            ]
+        );
+        disarm(0);
+    }
+
+    #[test]
+    fn kqueue_fire_cpu_timer_waits_then_fires_and_rechecks() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        clear();
+        let generation = arm_with_cpu_now(
+            1,
+            TimerSpecNs {
+                value: 4_000,
+                interval: 3_000,
+            },
+            false,
+            1_000,
+        );
+        let mut fired = 0;
+        let mut rearm = None;
+        let outcome =
+            fire_kqueue_if_current(1, generation, 2_000, 1, || fired += 1, |r| rearm = Some(r));
+        assert_eq!(
+            outcome,
+            FireOutcome::Wait {
+                delay_ns: WallNs(3_000)
+            }
+        );
+        assert_eq!(
+            rearm,
+            Some(KqueueRearm::OneShot {
+                delay_ns: WallNs(3_000)
+            })
+        );
+        assert_eq!(fired, 0);
+        let outcome =
+            fire_kqueue_if_current(1, generation, 5_000, 1, || fired += 1, |r| rearm = Some(r));
+        assert_eq!(outcome, FireOutcome::Fired);
+        assert_eq!(fired, 1);
+        assert_eq!(
+            rearm,
+            Some(KqueueRearm::OneShot {
+                delay_ns: WallNs(3_000)
+            })
+        );
+        disarm(1);
+    }
+
+    #[test]
     fn one_shot_fire_retires_armed_slot() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         clear();
-        arm(
+        let generation = arm(
             0,
             TimerSpecNs {
                 value: 1_000_000,
@@ -607,7 +727,10 @@ mod tests {
             false,
         );
 
-        assert!(complete_fire(0));
+        assert_eq!(
+            fire_wall_if_current(0, generation, || {}),
+            FireOutcome::Retired
+        );
         assert!(!is_armed(0));
     }
 
@@ -615,7 +738,7 @@ mod tests {
     fn periodic_fire_keeps_armed_slot() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         clear();
-        arm(
+        let generation = arm(
             0,
             TimerSpecNs {
                 value: 1_000_000,
@@ -624,7 +747,10 @@ mod tests {
             false,
         );
 
-        assert!(!complete_fire(0));
+        assert_eq!(
+            fire_wall_if_current(0, generation, || {}),
+            FireOutcome::Fired
+        );
         assert!(is_armed(0));
     }
 
@@ -728,13 +854,12 @@ mod tests {
         );
         assert!(is_armed(which));
         assert_eq!(interval_ns(which), 5_000);
-        assert!(take_needs_periodic(which));
-        assert!(!take_needs_periodic(which));
+        assert!(SLOTS[which].needs_periodic.load(Ordering::SeqCst));
 
         disarm(which);
         assert!(!is_armed(which));
         assert_eq!(interval_ns(which), 0);
-        assert!(!take_needs_periodic(which));
+        assert!(!SLOTS[which].needs_periodic.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -752,7 +877,7 @@ mod tests {
         );
         assert!(is_armed(which));
         assert_eq!(interval_ns(which), 0);
-        assert!(!take_needs_periodic(which));
+        assert!(!SLOTS[which].needs_periodic.load(Ordering::SeqCst));
         disarm(which);
     }
 
