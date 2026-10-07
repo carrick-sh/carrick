@@ -77,6 +77,10 @@ impl IdRegistry {
     pub(crate) fn reserve_visible(&self, namespace: VisibleNamespace) -> Option<VisibleIdentity> {
         self.state.lock().reserve_visible(namespace)
     }
+    #[cfg(test)]
+    pub(crate) fn visible_namespace_count(&self) -> usize {
+        self.state.lock().visible_namespace_count()
+    }
     pub(crate) fn same_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.state, &other.state)
     }

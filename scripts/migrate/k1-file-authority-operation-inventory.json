@@ -22839,7 +22839,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 502,
+      "line": 511,
       "categories": [
         "mapping"
       ],
@@ -22848,7 +22848,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 533,
+      "line": 542,
       "categories": [
         "mapping"
       ],
@@ -22857,7 +22857,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 841,
+      "line": 850,
       "categories": [
         "mapping"
       ],
@@ -22866,7 +22866,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 1703,
+      "line": 1712,
       "categories": [
         "mapping"
       ],
