@@ -218,7 +218,7 @@ pub(crate) fn is_structural_namespace_mutation(canonical_nr: u64) -> bool {
 mod access;
 mod attr;
 mod close_dup;
-mod directory;
+pub mod directory;
 pub(in crate::dispatch) mod fd_helpers;
 pub(crate) mod ioctl;
 #[cfg(test)]

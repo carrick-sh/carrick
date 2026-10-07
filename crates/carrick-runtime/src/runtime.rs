@@ -1142,6 +1142,8 @@ where
         match outcome {
             DispatchOutcome::OwnerMemoryWait { .. }
             | DispatchOutcome::OwnerStatCopyout { .. }
+            | DispatchOutcome::OwnerGetdentsCopyout { .. }
+            | DispatchOutcome::OwnerReadlinkCopyout { .. }
             | DispatchOutcome::OwnerMemorySupply { .. }
             | DispatchOutcome::OwnerPhysicalWait { .. } => {
                 return Err(RuntimeError::Configuration(

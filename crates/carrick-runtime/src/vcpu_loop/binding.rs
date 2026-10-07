@@ -275,6 +275,14 @@ pub(super) enum HvpatchProductionPhase {
         frame: carrick_hal::RawSyscall,
         output: Box<carrick_kernel::dispatch::format_stat::StatCopyout>,
     },
+    ResumeGetdentsCopyoutOwner {
+        frame: carrick_hal::RawSyscall,
+        output: Box<carrick_kernel::dispatch::fs::directory::GetdentsCopyout>,
+    },
+    ResumeReadlinkCopyoutOwner {
+        frame: carrick_hal::RawSyscall,
+        output: Box<carrick_kernel::dispatch::fs::directory::ReadlinkCopyout>,
+    },
     ResumeTerminalOwner {
         action: Box<TerminalMemoryAction>,
     },
@@ -478,6 +486,8 @@ impl HvpatchProductionPhase {
             Self::ResumeCloneParentTid { .. } => 27,
             Self::ResumeMemoryCompletionPhysical { .. } => 28,
             Self::ResumeStatCopyoutOwner { .. } => 29,
+            Self::ResumeGetdentsCopyoutOwner { .. } => 30,
+            Self::ResumeReadlinkCopyoutOwner { .. } => 31,
         }
     }
 }
@@ -2932,6 +2942,30 @@ where
         self.service_outcome(engine, control, frame, outcome)
     }
 
+    #[allow(clippy::boxed_local)]
+    pub(super) fn complete_getdents_copyout(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        frame: carrick_hal::RawSyscall,
+        output: Box<carrick_kernel::dispatch::fs::directory::GetdentsCopyout>,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let outcome = (*output).resume(engine);
+        self.service_outcome(engine, control, frame, outcome)
+    }
+
+    #[allow(clippy::boxed_local)]
+    pub(super) fn complete_readlink_copyout(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        frame: carrick_hal::RawSyscall,
+        output: Box<carrick_kernel::dispatch::fs::directory::ReadlinkCopyout>,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let outcome = (*output).resume(engine);
+        self.service_outcome(engine, control, frame, outcome)
+    }
+
     fn drive_memory_completion_action(
         &mut self,
         engine: &mut E,
@@ -2941,6 +2975,12 @@ where
         match action {
             zone::OwnerMemoryAction::StatCopyout { frame, output } => {
                 self.complete_stat_copyout(engine, control, frame, output)
+            }
+            zone::OwnerMemoryAction::GetdentsCopyout { frame, output } => {
+                self.complete_getdents_copyout(engine, control, frame, output)
+            }
+            zone::OwnerMemoryAction::ReadlinkCopyout { frame, output } => {
+                self.complete_readlink_copyout(engine, control, frame, output)
             }
             zone::OwnerMemoryAction::CloneParentTid {
                 frame,
@@ -3268,6 +3308,22 @@ where
                 engine,
                 control,
                 zone::OwnerMemoryAction::StatCopyout { frame, output },
+                dependency,
+            );
+        }
+        if let DispatchOutcome::OwnerGetdentsCopyout { output, dependency } = outcome {
+            return self.wait_for_memory_completion(
+                engine,
+                control,
+                zone::OwnerMemoryAction::GetdentsCopyout { frame, output },
+                dependency,
+            );
+        }
+        if let DispatchOutcome::OwnerReadlinkCopyout { output, dependency } = outcome {
+            return self.wait_for_memory_completion(
+                engine,
+                control,
+                zone::OwnerMemoryAction::ReadlinkCopyout { frame, output },
                 dependency,
             );
         }
@@ -4369,6 +4425,26 @@ where
                     // before servicing a reserved signal, without re-dispatch.
                     self.state.continuation_restart = None;
                     return self.complete_stat_copyout(engine, control, frame, output);
+                }
+                HvpatchProductionPhase::ResumeGetdentsCopyoutOwner { frame, output } => {
+                    let mut result = self.consume_owner_zone(control)?;
+                    self.state.reserved_signal = self
+                        .state
+                        .reserved_signal
+                        .take()
+                        .or(result.take_reserved_signal());
+                    self.state.continuation_restart = None;
+                    return self.complete_getdents_copyout(engine, control, frame, output);
+                }
+                HvpatchProductionPhase::ResumeReadlinkCopyoutOwner { frame, output } => {
+                    let mut result = self.consume_owner_zone(control)?;
+                    self.state.reserved_signal = self
+                        .state
+                        .reserved_signal
+                        .take()
+                        .or(result.take_reserved_signal());
+                    self.state.continuation_restart = None;
+                    return self.complete_readlink_copyout(engine, control, frame, output);
                 }
                 HvpatchProductionPhase::ResumeFaultOwner => {
                     return self.resume_owner_fault_zone(engine, control);
