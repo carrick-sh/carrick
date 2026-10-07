@@ -298,3 +298,46 @@ fn ring_rejects_invalid_geometry() {
     assert!(PublicationRing::<0>::new(1).is_none());
     assert!(PublicationRing::<3>::new(1).is_none());
 }
+
+#[test]
+fn drain_is_bounded_by_one_head_snapshot() {
+    let mut ring = PublicationRing::<4>::new(4).unwrap();
+    let records: [MmPublication; 2] =
+        core::array::from_fn(|i| MmPublication::encode(&map_view(i as u64 + 1)));
+    let (mut producer, mut consumer) = ring.split();
+    for record in &records {
+        producer.push(record).unwrap();
+    }
+    // The producer refills one slot after every pop; the drain still ends
+    // after the two records visible at its snapshot.
+    let mut drained = Vec::new();
+    let mut refills = 0;
+    let count = consumer
+        .drain_with(&mut drained, |_| {
+            // Bounded so the unbounded (old) drain terminates and fails.
+            if refills < 8 {
+                refills += 1;
+                producer.push(&records[0]).unwrap();
+            }
+        })
+        .unwrap();
+    assert_eq!((count, refills), (2, 2));
+    assert_eq!(drained, records.to_vec());
+    assert_eq!(consumer.pop(), Ok(Some(records[0])));
+}
+
+#[test]
+fn executable_protect_names_a_prior() {
+    let protect = PublicationShape {
+        permissions: EditPermissions {
+            executable: true,
+            ..RO
+        },
+        table_grants: TableGrantCount(0),
+        ..shape(PublicationKind::Protect)
+    };
+    assert_eq!(
+        PublicationView::checked(protect, identity(1), span(0x40_0000, 0x1000), None, None),
+        Err(PublicationDecodeError::Prior)
+    );
+}
