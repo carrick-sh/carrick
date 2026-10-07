@@ -232,10 +232,10 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
 - **Red-first:** `git checkout <pre-fix> -- <file>`, rebuild signed, DIFF;
   restore, MATCH; record false lines in the commit. Passing immediately proves
   nothing. Fixture bundles are admitted by **input identity** (fixture sources,
-  their resolved Cargo path-dependency closure and lockfiles, compiler pin,
-  builders), not by commit: unrelated commits and dirty host sources keep a
-  restored bundle valid for scoped `just test-embed <filter>` / `test-signed.sh`
-  runs. Changed fixture inputs refuse it and need their own committed variant
+  their unfiltered Cargo path-dependency closure and lockfiles, every checkout
+  file the compiler's dep-info recorded, compiler pin, builders), not by
+  commit: unrelated commits and dirty host sources keep a restored bundle
+  valid for scoped `just test-embed <filter>` / `test-signed.sh` runs. Changed fixture inputs refuse it and need their own committed variant
   and rebuilt bundle. Acceptance independently requires no tracked or
   untracked changes (gitignored outputs excluded); receipts bind exact HEAD,
   the working tree and the input identity; see [`docs/signed-fixtures.md`](docs/signed-fixtures.md#input-identity).
