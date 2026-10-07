@@ -5,8 +5,8 @@ use carrick_core::lifecycle::Lifecycle;
 use carrick_el1::personality::thread_setup::{LifecycleThread, LifecycleVenue};
 use carrick_el1::personality::{common_entry::execution_binding, dispatch, sched};
 use carrick_el1_abi::{
-    Action, Counters, CurrentTask, EntryRef, InotifyNameCache, LifecycleHatches, ThreadControlSlot,
-    ThreadLifecyclePage, TrapFrame,
+    Action, BlockedMask, Counters, CurrentTask, EntryRef, InotifyNameCache, LifecycleHatches,
+    PendingSignals, ThreadControlSlot, ThreadLifecyclePage, TrapFrame,
 };
 use carrick_guest_arch::{CanonicalNr, GuestIsa, NativeReturnWord, SyscallFrame, UserVa};
 use carrick_personality_linux::entry::decode_x86_snapshot;
@@ -191,6 +191,35 @@ fn two_tasks_publish_only_their_own_robust_heads() {
     assert_eq!(w.served(), 8);
     assert_eq!(w.publications.load(Ordering::Relaxed), 8);
     assert_eq!(w.forwarded(), 0);
+}
+
+#[test]
+fn x86_block_pending_unblock_owes_work_before_return() {
+    const SIGUSR1_BIT: u64 = 1 << 9;
+    let w = World::new(LifecycleHatches::ON);
+    let set = Box::new(SIGUSR1_BIT);
+    let sigprocmask = |how| NativeFrame {
+        rax: 14,
+        rdi: how,
+        rsi: (&*set as *const u64) as u64,
+        r10: 8,
+        rsp: 0x7fff_0000,
+        ..Default::default()
+    };
+    let (blocked, frame) = w.call(0, sigprocmask(0));
+    assert_eq!((blocked, frame.rax), (Action::Served, 0));
+    let slot = &w.venue.slots[0];
+    assert_eq!(slot.blocked(), BlockedMask(SIGUSR1_BIT));
+
+    // The forwarded kill(self) has posted a signal while it was blocked.
+    let seen = slot
+        .pending()
+        .post_then_read_blocked(PendingSignals(SIGUSR1_BIT), slot);
+    assert_ne!(seen.0 & SIGUSR1_BIT, 0);
+    let (unblocked, frame) = w.call(0, sigprocmask(1));
+    assert_eq!((unblocked, frame.rax), (Action::ServedWithWork, 0));
+    assert_eq!(slot.blocked(), BlockedMask(0));
+    assert_eq!(w.tasks[0].linux.served_with_work.load(Ordering::Acquire), 1);
 }
 
 #[test]

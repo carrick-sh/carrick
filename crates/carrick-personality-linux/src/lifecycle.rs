@@ -108,9 +108,7 @@ pub trait LifecycleNative<'a>: UserCopy {
     ) -> Result<RecordRef, carrick_sched_core::Exhausted>;
     fn free_record(&mut self, record: RecordRef);
     /// ISA-only context availability, checked before any output or pool claim.
-    fn can_prepare_child(&self, _: UserVa, _: Option<UserVa>) -> bool {
-        true
-    }
+    fn can_prepare_child(&self, stack: UserVa, tls: Option<UserVa>) -> bool;
     fn prepare_child(&mut self, record: RecordRef, context: ChildContext);
     fn enqueue_born(&mut self, record: RecordRef);
     fn exit_record(&self) -> Option<ExitRecord>;
