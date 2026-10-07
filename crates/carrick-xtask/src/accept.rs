@@ -310,6 +310,10 @@ pub const LINUX_PORTABLE_STEPS: &[StepSpec] = &[
             "clippy",
             "-p",
             "carrick-cli",
+            // Selected explicitly so its unit-test target is linted under the
+            // Linux feature closure; as a mere dependency only its lib is.
+            "-p",
+            "carrick-runtime",
             "-p",
             "carrick-xtask",
             "-p",
@@ -1813,6 +1817,12 @@ mod tests {
             .find(|step| step.name == "clippy-linux")
             .unwrap();
         assert!(clippy.args.contains(&"--no-default-features"));
+        assert!(
+            clippy
+                .args
+                .windows(2)
+                .any(|pair| pair == ["-p", "carrick-runtime"])
+        );
         assert!(
             clippy
                 .args
