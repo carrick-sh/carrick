@@ -209,6 +209,19 @@ impl BuildEnvironment {
         Ok(environment)
     }
 
+    /// Registry/git caches in the isolated Cargo home. Sources under them
+    /// are pinned by each fixture's `Cargo.lock` checksums.
+    pub(super) fn cargo_cache_roots(&self) -> Vec<PathBuf> {
+        let Some(home) = self.variables.get(&OsString::from("CARGO_HOME")) else {
+            return Vec::new();
+        };
+        ["registry", "git"]
+            .iter()
+            .map(|cache| Path::new(home).join(cache))
+            .filter(|path| path.exists())
+            .collect()
+    }
+
     pub(super) fn scratch_root(&self) -> &Path {
         self._directory.path()
     }

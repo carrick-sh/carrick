@@ -12,14 +12,26 @@ use thiserror::Error;
 use crate::{command, probe_inventory, provision};
 
 pub mod archive;
+pub mod build_code;
+pub mod dep_info;
 mod environment;
 mod inputs;
+pub mod linker;
 use environment::BuildEnvironment;
 pub use environment::BuildPolicy;
-pub use inputs::source_hashes;
+pub use inputs::{current_build_code, source_hashes};
 
-const SCHEMA: &str = "carrick.fixtures.v2";
+const SCHEMA: &str = "carrick.fixtures.v3";
 pub const INSTALLED_MANIFEST: &str = "target/fixtures/installed.json";
+/// Shell builders run by the publisher; their bytes are fixture inputs.
+const BUILD_SCRIPTS: &[&str] = &[
+    "scripts/build-linux-fixtures.sh",
+    "scripts/build-embed-interceptor-probe.sh",
+    "scripts/build-embed-zone-readers.sh",
+    "scripts/build-embed-icache-reuse.sh",
+    "scripts/build-embed-copyout.sh",
+    "scripts/build-embed-el1-sched.sh",
+];
 const EMBED: &[(&str, &str)] = &[
     ("embed-interceptor-probe", "interceptor-probe"),
     ("embed-zone-readers", "zone-readers"),
@@ -70,6 +82,9 @@ pub enum FixturesAction {
         #[arg(long, value_enum)]
         source: crate::remote_accept::FixtureBundleSource,
     },
+    /// Print the build scripts and proc-macros in the fixture graphs in the
+    /// reviewed-list format, for review before updating the committed list.
+    BuildCode,
     /// Check a bundle or, by default, every installed signed-tier fixture.
     Verify {
         #[arg(long, conflicts_with = "bundle")]
@@ -108,9 +123,15 @@ type Result<T> = std::result::Result<T, FixturesError>;
 #[serde(try_from = "String", into = "String")]
 pub struct CommitSha(String);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ContentHash(String);
+
+/// Git tree object naming the checkout's working state (tracked and
+/// untracked, gitignored outputs excluded) when evidence was produced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct GitTreeId(String);
 
 fn hex_identity(value: &str, len: usize) -> Result<()> {
     if value.len() != len
@@ -149,6 +170,23 @@ impl From<ContentHash> for String {
         value.0
     }
 }
+impl TryFrom<String> for GitTreeId {
+    type Error = FixturesError;
+    fn try_from(value: String) -> Result<Self> {
+        hex_identity(&value, 40)?;
+        Ok(Self(value))
+    }
+}
+impl From<GitTreeId> for String {
+    fn from(value: GitTreeId) -> Self {
+        value.0
+    }
+}
+impl std::fmt::Display for ContentHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GuestTarget {
@@ -180,15 +218,43 @@ pub struct Toolchain {
     pub cargo: String,
     pub gnu_linker: String,
 }
+/// A bundle is admitted by its fixture input identity, never by commit:
+/// `source_head` is the publisher's provenance, not an admission key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub schema: String,
     pub source_head: CommitSha,
+    /// Checkout files the compiler reported reading (dep-info) when the
+    /// publisher built these executables, sorted. Admission hashes them in
+    /// addition to the Cargo-graph closure.
+    pub compiler_inputs: Vec<String>,
     pub sources: BTreeMap<String, ContentHash>,
     pub build_policy: BuildPolicy,
     pub toolchain: Toolchain,
     pub executables: Vec<Executable>,
+}
+
+impl Manifest {
+    /// SHA-256 over the scoped source inventory, recorded compiler inputs and
+    /// build policy. The compiler pin is a source input; the toolchain record
+    /// is checked against it. Canonical JSON frames every path and digest
+    /// (quoted, escaped strings), so entries cannot run together.
+    pub fn input_identity(&self) -> Result<ContentHash> {
+        input_identity(&self.sources, &self.compiler_inputs, &self.build_policy)
+    }
+}
+
+fn input_identity(
+    sources: &BTreeMap<String, ContentHash>,
+    compiler_inputs: &[String],
+    policy: &BuildPolicy,
+) -> Result<ContentHash> {
+    Ok(hash_bytes(&serde_json::to_vec(&(
+        sources,
+        compiler_inputs,
+        policy,
+    ))?))
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -204,9 +270,11 @@ struct Installed {
 pub struct ValidationReceipt {
     pub validation_method: ValidationMethod,
     pub checkout_head: CommitSha,
+    pub checkout_tree: GitTreeId,
     pub bundle_source_head: CommitSha,
     pub checkout_dirty: bool,
     pub manifest_sha256: ContentHash,
+    /// Fixture input identity shared by the bundle and this checkout.
     pub inputs_sha256: ContentHash,
 }
 
@@ -219,17 +287,50 @@ pub enum ValidationMethod {
 fn validation_receipt(root: &Path, manifest: &Manifest) -> Result<ValidationReceipt> {
     Ok(ValidationReceipt {
         validation_method: ValidationMethod::InputIdentity,
-        checkout_head: expected_head(root, Some(&manifest.source_head.0))?,
+        checkout_head: expected_head(root, None)?,
+        checkout_tree: working_tree(root)?,
         bundle_source_head: manifest.source_head.clone(),
         checkout_dirty: !git(root, &["status", "--porcelain", "--untracked-files=all"])?
             .trim()
             .is_empty(),
         manifest_sha256: hash_bytes(&manifest_bytes(manifest)?),
-        inputs_sha256: hash_bytes(&serde_json::to_vec(&(
-            &manifest.sources,
-            &manifest.build_policy,
-        ))?),
+        inputs_sha256: manifest.input_identity()?,
     })
+}
+
+/// Name the exact working state without touching the real index: stage the
+/// worktree into a private copy of the index and write its tree object.
+fn working_tree(root: &Path) -> Result<GitTreeId> {
+    let index = PathBuf::from(
+        git(
+            root,
+            &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        )?
+        .trim(),
+    );
+    let scratch = tempfile::tempdir()?;
+    let private = scratch.path().join("index");
+    if index.is_file() {
+        // The copy keeps Git's stat cache, so only changed files are rehashed.
+        fs::copy(&index, &private)?;
+    }
+    let run = |args: &[&str]| -> Result<String> {
+        let output = Command::new("git")
+            .current_dir(root)
+            .env("GIT_INDEX_FILE", &private)
+            .args(args)
+            .output()?;
+        if !output.status.success() {
+            return Err(fail(format!(
+                "working tree identity: git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        String::from_utf8(output.stdout).map_err(|e| fail(e.to_string()))
+    };
+    run(&["add", "--all", "--", "."])?;
+    GitTreeId::try_from(run(&["write-tree"])?.trim().to_owned())
 }
 
 /// Revalidate all installed bytes before generating evidence for this invocation.
@@ -244,9 +345,14 @@ fn hash_file(path: &Path) -> Result<ContentHash> {
     Ok(ContentHash(provision::compute_sha256(path)?))
 }
 
-fn hash_source(root: &Path, relative: &str) -> Result<ContentHash> {
-    // Git tracks a symlink declaration rather than its referent. Hash source
-    // link bytes without following them; executable paths reject all links.
+/// Domain of a source entry digest: the entry's type and its length-prefixed
+/// bytes. Only regular files are source inputs.
+const SOURCE_DOMAIN: &[u8] = b"carrick.fixtures.source.v1\0regular\0";
+
+/// Hash one source input as a typed, length-framed regular file. A symlink
+/// is refused rather than hashed: its link text could equal a regular file's
+/// bytes, and its referent could be anything.
+pub fn hash_source(root: &Path, relative: &str) -> Result<ContentHash> {
     let relative_path = Path::new(relative);
     let parent = match relative_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         Some(parent) => safe_path(root, &parent.to_string_lossy())?,
@@ -255,14 +361,25 @@ fn hash_source(root: &Path, relative: &str) -> Result<ContentHash> {
     let name = relative_path
         .file_name()
         .ok_or_else(|| fail("empty source path"))?;
-    let path = parent.join(name);
-    if fs::symlink_metadata(&path)?.file_type().is_symlink() {
-        Ok(hash_bytes(
-            fs::read_link(path)?.as_os_str().as_encoded_bytes(),
-        ))
-    } else {
-        hash_file(&path)
+    hash_regular_file(&parent.join(name))
+}
+
+/// The typed, length-framed digest of one regular file; links are refused.
+fn hash_regular_file(path: &Path) -> Result<ContentHash> {
+    let file_type = fs::symlink_metadata(path)?.file_type();
+    if !file_type.is_file() {
+        return Err(fail(format!(
+            "fixture source input is not a regular file (symlinks are refused): {}",
+            path.display()
+        )));
     }
+    let bytes = fs::read(path)?;
+    let length = u64::try_from(bytes.len()).map_err(|e| fail(e.to_string()))?;
+    let mut digest = Sha256::new();
+    digest.update(SOURCE_DOMAIN);
+    digest.update(length.to_be_bytes());
+    digest.update(&bytes);
+    Ok(ContentHash(format!("{:x}", digest.finalize())))
 }
 fn fail(message: impl Into<String>) -> FixturesError {
     FixturesError::Invalid(message.into())
@@ -416,21 +533,40 @@ fn validate_executable(path: &Path, executable: &Executable) -> Result<()> {
     Ok(())
 }
 
-fn validate_manifest(root: &Path, manifest: &Manifest, expected: &CommitSha) -> Result<()> {
+/// Admission is exact on fixture inputs and independent of unrelated files:
+/// the bundle's input identity must equal the checkout's current one.
+fn validate_manifest(root: &Path, manifest: &Manifest) -> Result<()> {
     if manifest.schema != SCHEMA {
         return Err(fail("unknown fixture manifest schema"));
-    }
-    if &manifest.source_head != expected {
-        return Err(fail(format!(
-            "wrong SHA: manifest {}, expected {}",
-            manifest.source_head.0, expected.0
-        )));
     }
     if manifest.build_policy != BuildPolicy::default() {
         return Err(fail("fixture build policy mismatch"));
     }
-    if manifest.sources != source_hashes(root)? {
-        return Err(fail("fixture source hashes or inventory mismatch"));
+    let mut sorted = manifest.compiler_inputs.clone();
+    sorted.sort();
+    sorted.dedup();
+    if sorted != manifest.compiler_inputs {
+        return Err(fail("noncanonical fixture compiler input list"));
+    }
+    let current = source_hashes(root, &manifest.compiler_inputs)?;
+    if manifest.sources != current {
+        let changed: Vec<_> = manifest
+            .sources
+            .keys()
+            .chain(current.keys())
+            .filter(|path| manifest.sources.get(*path) != current.get(*path))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .take(8)
+            .cloned()
+            .collect();
+        return Err(fail(format!(
+            "fixture input identity mismatch (source hashes or inventory mismatch): bundle {} built at {}, checkout {}; differing inputs include {}",
+            manifest.input_identity()?,
+            manifest.source_head.0,
+            input_identity(&current, &manifest.compiler_inputs, &BuildPolicy::default())?,
+            changed.join(", ")
+        )));
     }
     let pin = fs::read_to_string(root.join("rust-toolchain.toml"))?;
     let release = manifest
@@ -465,7 +601,7 @@ fn manifest_bytes(manifest: &Manifest) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec_pretty(manifest)?)
 }
 
-fn read_bundle_manifest(path: &Path, expected: Option<&CommitSha>) -> Result<Manifest> {
+fn read_bundle_manifest(path: &Path) -> Result<Manifest> {
     let bytes = fs::read(path)?;
     let parent = path
         .parent()
@@ -477,8 +613,8 @@ fn read_bundle_manifest(path: &Path, expected: Option<&CommitSha>) -> Result<Man
     if manifest_bytes(&manifest)? != bytes {
         return Err(fail("noncanonical fixture manifest"));
     }
-    if manifest.schema != SCHEMA || expected.is_some_and(|sha| sha != &manifest.source_head) {
-        return Err(fail("unknown fixture schema or wrong SHA"));
+    if manifest.schema != SCHEMA {
+        return Err(fail("unknown fixture manifest schema"));
     }
     Ok(manifest)
 }
@@ -496,27 +632,34 @@ fn check_bundle_objects(path: &Path, manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
-fn inspect_bundle(path: &Path, expected: Option<&CommitSha>) -> Result<Manifest> {
-    let manifest = read_bundle_manifest(path, expected)?;
+fn inspect_bundle(path: &Path) -> Result<Manifest> {
+    let manifest = read_bundle_manifest(path)?;
     check_bundle_objects(path, &manifest)?;
     Ok(manifest)
 }
 
+/// `sha`, when given, asserts the checkout's HEAD; the bundle itself is
+/// admitted by input identity whichever commit published it.
 pub fn verify_bundle(root: &Path, path: &Path, sha: Option<&str>) -> Result<Manifest> {
-    let expected = expected_head(root, sha)?;
-    let manifest = read_bundle_manifest(path, Some(&expected))?;
-    validate_manifest(root, &manifest, &expected)?;
+    expected_head(root, sha)?;
+    let manifest = read_bundle_manifest(path)?;
+    validate_manifest(root, &manifest)?;
     check_bundle_objects(path, &manifest)?;
     Ok(manifest)
 }
 
-/// Select only an unambiguous exact-commit bundle, never mutable probe caches.
+/// Select one unambiguous bundle for `sha`, never mutable probe caches.
+/// A bundle published from `sha` itself wins. Otherwise, when the local
+/// checkout is at `sha`, select by its current fixture input identity so an
+/// unrelated commit reuses the previous bundle. The receiver re-verifies.
 pub fn resolve_bundle(root: &Path, sha: &str, explicit: Option<&Path>) -> Result<PathBuf> {
     let expected = CommitSha::try_from(sha.to_owned())?;
-    let path = if let Some(path) = explicit {
-        path.to_path_buf()
-    } else {
-        let directory = root.join("target/fixtures/bundles").join(&expected.0);
+    if let Some(path) = explicit {
+        inspect_bundle(path)?;
+        return Ok(path.to_path_buf());
+    }
+    let store = root.join("target/fixtures/bundles");
+    let manifests_in = |directory: &Path| -> Result<Vec<PathBuf>> {
         let mut manifests = Vec::new();
         if directory.is_dir() {
             for entry in fs::read_dir(directory)? {
@@ -526,26 +669,51 @@ pub fn resolve_bundle(root: &Path, sha: &str, explicit: Option<&Path>) -> Result
                 }
             }
         }
-        if manifests.len() != 1 {
-            return Err(fail(format!(
-                "expected one exact-SHA fixture bundle, found {}; publish it on Linux or supply --fixture-manifest",
-                manifests.len()
-            )));
-        }
-        manifests.remove(0)
+        manifests.sort();
+        Ok(manifests)
     };
-    inspect_bundle(&path, Some(&expected))?;
+    let mut manifests = manifests_in(&store.join(&expected.0))?;
+    if manifests.is_empty() && expected_head(root, Some(sha)).is_ok() {
+        // Each bundle names its own compiler inputs, so the checkout's
+        // identity is computed per candidate. Any error is a non-match.
+        let matches = |manifest: &Manifest| {
+            manifest.build_policy == BuildPolicy::default()
+                && source_hashes(root, &manifest.compiler_inputs)
+                    .is_ok_and(|current| current == manifest.sources)
+        };
+        if store.is_dir() {
+            let mut directories: Vec<_> = fs::read_dir(&store)?
+                .map(|entry| entry.map(|e| e.path()))
+                .collect::<io::Result<_>>()?;
+            directories.sort();
+            for directory in directories {
+                for path in manifests_in(&directory)? {
+                    if matches(&read_bundle_manifest(&path)?) {
+                        manifests.push(path);
+                    }
+                }
+            }
+        }
+    }
+    if manifests.len() != 1 {
+        return Err(fail(format!(
+            "expected one fixture bundle for {} or its fixture input identity, found {}; publish it on Linux or supply --fixture-manifest",
+            expected.0,
+            manifests.len()
+        )));
+    }
+    let path = manifests.remove(0);
+    inspect_bundle(&path)?;
     Ok(path)
 }
 
 pub fn verify_installed(root: &Path) -> Result<Manifest> {
-    let expected = expected_head(root, None)?;
     let installed: Installed =
         serde_json::from_slice(&fs::read(safe_path(root, INSTALLED_MANIFEST)?)?)?;
     if hash_bytes(&manifest_bytes(&installed.manifest)?) != installed.manifest_sha256 {
         return Err(fail("installed manifest hash mismatch"));
     }
-    validate_manifest(root, &installed.manifest, &expected)?;
+    validate_manifest(root, &installed.manifest)?;
     for executable in &installed.manifest.executables {
         validate_executable(&safe_path(root, &executable.path)?, executable)?;
     }
@@ -644,7 +812,7 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
         return Err(fail("fixtures build requires Linux; restore on cloudmac"));
     }
     let expected = expected_head(root, Some(sha))?;
-    source_hashes(root)?;
+    source_hashes(root, &[])?;
     let environment = BuildEnvironment::new(root)?;
     let snapshot = tempfile::tempdir_in(environment.scratch_root())?;
     let archive = snapshot.path().join("source.tar");
@@ -724,14 +892,7 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
         }
         run_build(&mut command)?;
     }
-    for script in [
-        "scripts/build-linux-fixtures.sh",
-        "scripts/build-embed-interceptor-probe.sh",
-        "scripts/build-embed-zone-readers.sh",
-        "scripts/build-embed-icache-reuse.sh",
-        "scripts/build-embed-copyout.sh",
-        "scripts/build-embed-el1-sched.sh",
-    ] {
+    for script in BUILD_SCRIPTS {
         run_build(
             environment
                 .configure(Command::new("bash").current_dir(&source).arg(script))
@@ -741,7 +902,16 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
     if expected_head(root, Some(sha))? != expected {
         return Err(fail("checkout changed during fixture build"));
     }
-    let sources = source_hashes(root)?;
+    // Record what the compiler actually read: every executable's dep-info.
+    let mut dep_info_files = Vec::new();
+    for path in executable_inventory(&source)?.keys() {
+        dep_info_files.push(source.join(dep_info::dep_info_path(path, EMBED)?));
+    }
+    let mut external = environment.cargo_cache_roots();
+    external.push(PathBuf::from(sysroot.trim()));
+    let compiler_inputs = dep_info::classify(&source, &dep_info_files, &external)?;
+    let sources = source_hashes(root, &compiler_inputs)?;
+    linker::check_build_script_outputs(&source, inputs::FIXTURES)?;
     // Match the build snapshot byte-for-byte with the recorded source inputs.
     for (path, hash) in &sources {
         if &hash_source(&source, path)? != hash {
@@ -761,12 +931,13 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
     let manifest = Manifest {
         schema: SCHEMA.into(),
         source_head: expected.clone(),
+        compiler_inputs,
         sources,
         build_policy: BuildPolicy::default(),
         toolchain,
         executables,
     };
-    validate_manifest(root, &manifest, &expected)?;
+    validate_manifest(root, &manifest)?;
     let bytes = manifest_bytes(&manifest)?;
     let store = output
         .map(Path::to_path_buf)
@@ -838,6 +1009,13 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
             )?;
             archive::restore(root, Path::new(&provenance.captured_path), None)?;
         }
+        FixturesAction::BuildCode => {
+            write!(
+                writer,
+                "{}",
+                build_code::render(&current_build_code(root)?)?
+            )?;
+        }
         FixturesAction::Verify {
             manifest,
             bundle,
@@ -850,7 +1028,7 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
                 let archive_sha256 = provision::compute_sha256(&bundle_path)?;
                 writeln!(
                     writer,
-                    "fixtures: verified {} executables for {}; identity={} archive_sha256={}",
+                    "fixtures: verified {} executables built at {}; identity={} archive_sha256={}",
                     manifest.executables.len(),
                     manifest.source_head.0,
                     identity,
@@ -871,8 +1049,10 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
             }
             writeln!(
                 writer,
-                "fixtures: verified {} executables for {} by input_identity",
+                "fixtures: verified {} executables for {} by input_identity {} (bundle built at {})",
                 manifest.executables.len(),
+                expected.0,
+                manifest.input_identity()?,
                 manifest.source_head.0
             )?;
         }
