@@ -1,5 +1,5 @@
 #![cfg_attr(
-    all(not(target_os = "macos"), not(test)),
+    not(target_os = "macos"),
     expect(
         dead_code,
         reason = "bound by the KVM carrier at M5: docs/superpowers/plans/2026-10-04-kvm-hvpatch-carrier.md"
@@ -790,16 +790,26 @@ pub(crate) fn bootstrap_hvpatch_process_child_tid(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use super::super::binding::*;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use super::super::tests::*;
     use super::super::*;
     use super::*;
-    use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use crate::thread::ThreadId;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use crate::thread::{FutexTable, ThreadRegistry};
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use crate::vcpu_loop::executor::TaskBindingResolver;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use crate::vcpu_loop::memory::fixed_frame_cow_owner_inventory_for_test;
     use carrick_guest_mem::GuestMemory;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use parking_lot::Mutex;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use std::cell::RefCell;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use std::sync::Arc;
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1425,8 +1435,10 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[derive(Default)]
     pub(crate) struct Memory(pub(crate) std::collections::BTreeMap<u64, Vec<u8>>);
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     impl carrick_guest_mem::GuestMemory for Memory {
         fn read_bytes_raw(
             &self,
@@ -1450,8 +1462,10 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     impl CurrentMmMemory for Memory {}
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     impl threads::CloneTidMemory for Memory {
         fn read_clone_tid_bytes(
             &self,
@@ -1657,7 +1671,9 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(super) struct NoopPlatformFutex;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     impl PlatformFutex for NoopPlatformFutex {
         fn private_wait(
             &self,
@@ -1698,6 +1714,7 @@ pub(crate) mod tests {
         fn notify_signal_pending_for(&self, _tid: ThreadId) {}
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     macro_rules! test_carrier_graph_with_dispatcher {
         ($pid:expr, $dispatcher:expr) => {{
             let (process, root) = crate::hvpatch::process_context_for_tests($pid);

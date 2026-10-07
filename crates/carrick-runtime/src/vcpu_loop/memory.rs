@@ -889,32 +889,42 @@ mod tests {
     // the kernel's `mm_access` test fixtures and mocks, imported below.
     // ------------------------------------------------------------------
     use std::num::NonZeroU64;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use carrick_abi::LinuxCloneFlags;
     use carrick_guest_mem::{Gpa, GuestVa};
     use carrick_hal::{
         ForeignCowReceipt, ForeignMmReadLease, ForeignMmReadReceipt, ForeignMmSnapshot,
-        ForeignMmTransport, ForeignMmTransportError, ThreadId, VcpuKickDyn, VcpuRegistry,
+        ForeignMmTransport, ForeignMmTransportError, ThreadId,
     };
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use carrick_hal::{VcpuKickDyn, VcpuRegistry};
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use carrick_kernel::kernel::mm_access::ProjectedForeignMmSnapshot;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use carrick_kernel::kernel::mm_access::test_support::fixture_backend;
     use carrick_kernel::kernel::mm_access::test_support::{
         MockCowCounters, MockCowFault, MockCowReceipt, MockCowTransport, bootstrap, cow_fixture,
-        execution_lease, fixture_backend, foreign_mm, fork_with_backend, publish_cow_mapping,
-        with_foreign_mutation,
+        execution_lease, foreign_mm, fork_with_backend, publish_cow_mapping, with_foreign_mutation,
     };
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use carrick_kernel::kernel::{
-        ClonePlan, Kernel, KernelContext, LinuxWaitStatus, MmAccessError, MmBackend, MmId,
-        MmRelation, SnapshotError, VmaAccess,
+        ClonePlan, LinuxWaitStatus, MmRelation, SnapshotError, VmaAccess,
     };
+    use carrick_kernel::kernel::{Kernel, KernelContext, MmAccessError, MmBackend, MmId};
 
     /// A kick that only asks the target's own thread to leave the guest, as
     /// a real vCPU exit does: the thread observes it and runs its entry
     /// boundary itself, so a pause cannot begin and end behind its back.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     struct RequestExitOnKick(Arc<std::sync::atomic::AtomicBool>);
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     impl VcpuKickDyn for RequestExitOnKick {
         fn kick(&self) {
             self.0.store(true, Ordering::SeqCst);
@@ -1532,6 +1542,7 @@ mod tests {
         ));
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn native_carrier_elf(words: &[u32], data_va: u64) -> Vec<u8> {
         let mut bytes = vec![0u8; 0x3000];
         bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
