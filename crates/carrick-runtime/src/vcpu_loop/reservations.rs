@@ -105,6 +105,8 @@ impl HostReservationProvider for CarrierReservations {
             .and_then(|pin| table.provision_metadata(&pin, generation));
         if result.is_err() {
             let _ = mapping.try_retire();
+        } else {
+            wake_metadata_waiters(&self.access);
         }
         result
     }
@@ -173,4 +175,35 @@ impl PreparedHostReservations for PreparedView {
             &carrick_el1::memory::reservations::NoRootWait,
         )
     }
+}
+
+fn wake_metadata_waiters(access: &CarrierMetadataAccess) {
+    let Ok(region) = access.region() else {
+        return;
+    };
+    // SAFETY: access owns the complete aligned carrier region; ZoneTables fits the ABI region bounds.
+    let zone = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+            .cast::<carrick_el1_abi::ZoneTables>()
+    };
+    fn deliver(
+        zone: &carrick_sched_core::ZoneTables,
+        _: carrick_sched_core::Waker,
+        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+    ) {
+        carrick_sched_core::LockWait::complete_object_wake(
+            &carrick_kernel::el1_zone::HostLockWait,
+            zone,
+            effects,
+        );
+    }
+    let venue = carrick_sched_core::spaces::notification::SpaceReleaseVenue {
+        zone,
+        waker: carrick_sched_core::Waker::Host,
+        deliver,
+    };
+    let access = carrick_sched_core::spaces::notification::SpaceAccess::notified(venue);
+    access.publish_metadata_all();
 }

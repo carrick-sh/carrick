@@ -3981,6 +3981,17 @@ fn owner_wait_enrollment_follows_only_its_real_release(
     } else {
         None
     };
+    let mut permits = Vec::new();
+    if cause == PortalWaitCause::Metadata {
+        let mut root = portal.root(mm, 1).unwrap();
+        loop {
+            match unsafe { root.prepare_copy_for_fixture(request, None) } {
+                Ok(permit) => permits.push(permit),
+                Err(crate::memory::reservations::Refusal::MetadataRequired) => break,
+                other => panic!("unexpected admission {other:?}"),
+            }
+        }
+    }
     let wire = carrick_el1_abi::PortalTransferSlot::new();
     let mut ticket = wire.submit_prepare(request).unwrap();
     if cause == PortalWaitCause::Gate {
@@ -4035,6 +4046,9 @@ fn owner_wait_enrollment_follows_only_its_real_release(
         if let Some(request) = pending {
             portal.root(mm, 1).unwrap().refuse(request).unwrap();
         }
+        if cause == PortalWaitCause::Metadata {
+            access.publish_metadata(entry.index());
+        }
     };
     if before {
         release(&mut editor, &mut root);
@@ -4071,6 +4085,9 @@ fn owner_wait_enrollment_follows_only_its_real_release(
         zone.take_completion_handbacks(&BoundedSpin(0), &mut |_| panic!("duplicate completion"));
     }
     zone.free_record(record);
+    for permit in permits {
+        portal.cancel_prepared(permit, request, 0).unwrap();
+    }
     if cause == PortalWaitCause::Gate {
         // Resume the original selection and operation after the real producer
         // released it; no host byte has been consumed while parked.
@@ -4095,15 +4112,114 @@ fn owner_wait_enrollment_follows_only_its_real_release(
 #[test]
 fn owner_wait_release_before_enrollment_never_parks_a_lost_edge() {
     use carrick_el1_abi::PortalWaitCause::*;
-    for cause in [Editor, Reservations, Gate, PendingEdit] {
+    for cause in [Editor, Reservations, Gate, PendingEdit, Metadata] {
         owner_wait_enrollment_follows_only_its_real_release(cause, true);
     }
 }
 #[test]
 fn owner_wait_unrelated_release_cannot_reschedule_and_real_release_delivers_once() {
     use carrick_el1_abi::PortalWaitCause::*;
-    for cause in [Editor, Reservations, Gate, PendingEdit] {
+    for cause in [Editor, Reservations, Gate, PendingEdit, Metadata] {
         owner_wait_enrollment_follows_only_its_real_release(cause, false);
+    }
+}
+
+#[test]
+fn owner_wait_metadata_provisioning_wakes_parked_waiter_and_resumes_prepare() {
+    use carrick_el1_abi::{PortalPrepareSuspension, PortalWaitCause};
+    use carrick_sched_core::object_wait::{OperationToken, OwnedObjectWakeEffects};
+    use carrick_sched_core::{BoundedSpin, Claim, ThreadIdentity};
+
+    let region = Region::new();
+    let zone = region.zone();
+    let mm = admit_notified(&region, 77, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(
+        NonZeroU64::new(1).unwrap(),
+        region.table(),
+        &zone.spaces,
+        &view,
+    )
+    .with_zone(zone)
+    .unwrap();
+    let tables = Tables::new(ROOT, IPA, 1);
+    let handle = portal.admitted_handle(mm, 0).unwrap();
+    let transfer = portal
+        .begin(handle, GuestVa::new(VA), 4096, TransferIntent::UserWrite, 0)
+        .unwrap();
+    let request = selected(select(&portal, &transfer, &tables))
+        .request(TransferIntent::UserWrite, retained())
+        .unwrap();
+
+    let mut permits = Vec::new();
+    {
+        let mut root = portal.root(mm, 1).unwrap();
+        loop {
+            match unsafe { root.prepare_copy_for_fixture(request, None) } {
+                Ok(permit) => permits.push(permit),
+                Err(crate::memory::reservations::Refusal::MetadataRequired) => break,
+                other => panic!("unexpected admission {other:?}"),
+            }
+        }
+    }
+
+    let wire = carrick_el1_abi::PortalTransferSlot::new();
+    let mut ticket = wire.submit_prepare(request).unwrap();
+    serve_transfer(
+        &portal,
+        wire.claim().unwrap(),
+        &tables.live(&CallerInvalidatesAsid),
+        0,
+        || panic!("no consuming effect"),
+    )
+    .unwrap();
+
+    let Some(PortalPrepareSuspension::Owner(receipt)) = ticket.take_prepare_suspension() else {
+        panic!("exact owner wait required");
+    };
+    assert_eq!(receipt.cause(), PortalWaitCause::Metadata);
+
+    let slots = region.portal_slots();
+    assert!(slots.bind_carrier(handle.carrier()));
+    let enrollment = slots.authenticate_wait(zone, receipt).unwrap();
+
+    let record = zone
+        .alloc_record(ThreadIdentity {
+            tid: 101,
+            serial: 1001,
+            mm: mm.raw(),
+            file_table: 1,
+            generation: 1,
+            affinity: 0,
+            lifecycle_page: 0,
+            control_slot: 0,
+        })
+        .unwrap();
+    let operation = OperationToken::new(701, 11).unwrap();
+    let complete = |owned: OwnedObjectWakeEffects<'_>| {
+        let _ = owned.defer_handbacks();
+    };
+
+    enrollment.park_host(record, operation, &complete).unwrap();
+    assert!(matches!(zone.record(record).claim(), Claim::Parked { .. }));
+
+    // Provision new metadata capacity via add_bank.
+    region.add_bank();
+
+    let mut delivered = Vec::new();
+    zone.take_completion_handbacks(&BoundedSpin(0), &mut |record| delivered.push(record));
+    assert_eq!(delivered, [zone.record_ref(record)]);
+    assert!(zone.record(record).object_host_continuation());
+    assert_eq!(
+        unsafe { zone.record(record).take_object_operation() }
+            .unwrap()
+            .index(),
+        701
+    );
+    zone.free_record(record);
+
+    for permit in permits {
+        portal.cancel_prepared(permit, request, 0).unwrap();
     }
 }
 

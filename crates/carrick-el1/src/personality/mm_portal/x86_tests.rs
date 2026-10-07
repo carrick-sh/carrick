@@ -8,7 +8,7 @@ use carrick_sched_core::AddressSpaces;
 use core::sync::atomic::Ordering;
 
 fn transfer_fixture(pages: usize, unrelated: usize) {
-    let mut region = Region::new();
+    let region = Region::new();
     region.add_bank();
     let spaces = AddressSpaces::new();
     let mms = [

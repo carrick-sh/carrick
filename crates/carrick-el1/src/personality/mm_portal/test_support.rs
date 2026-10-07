@@ -19,7 +19,7 @@ pub const RW: u64 = 3 | (1 << 6) | (1 << 10) | (1 << 54);
 pub struct Region {
     pub ptr: NonNull<u8>,
     pub layout: std::alloc::Layout,
-    pub bank: Option<std::sync::Arc<Bank>>,
+    pub bank: std::sync::Mutex<Option<std::sync::Arc<Bank>>>,
 }
 impl Default for Region {
     fn default() -> Self {
@@ -36,7 +36,7 @@ impl Region {
         Self {
             ptr,
             layout,
-            bank: None,
+            bank: std::sync::Mutex::new(None),
         }
     }
     pub fn portal_slots(&self) -> &carrick_el1_abi::MmPortalSlots {
@@ -106,6 +106,8 @@ impl MetadataExtentResolver for NoResolver<'_> {
         let pin = NoPin(
             self.0
                 .bank
+                .lock()
+                .unwrap()
                 .as_ref()
                 .ok_or(MetadataResolutionError::StaleOwner)?
                 .clone(),
@@ -117,7 +119,24 @@ impl MetadataExtentResolver for NoResolver<'_> {
     }
 }
 impl Region {
-    pub fn add_bank(&mut self) {
+    pub fn publish_metadata(&self) {
+        fn deliver(
+            _: &carrick_sched_core::ZoneTables,
+            _: carrick_sched_core::Waker,
+            effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+        ) {
+            let _ = effects.defer_handbacks();
+        }
+        let venue = carrick_sched_core::spaces::notification::SpaceReleaseVenue {
+            zone: self.zone(),
+            waker: carrick_sched_core::Waker::Host,
+            deliver,
+        };
+        let access = carrick_sched_core::spaces::notification::SpaceAccess::notified(venue);
+        access.publish_metadata_all();
+    }
+
+    pub fn add_bank(&self) {
         let layout = std::alloc::Layout::from_size_align(4 * 1024 * 1024, 64).unwrap();
         let bank = std::sync::Arc::new(Bank {
             ptr: NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }).unwrap(),
@@ -126,7 +145,8 @@ impl Region {
         self.table()
             .provision_metadata(&NoPin(bank.clone()), self.table().storage_generation())
             .unwrap();
-        self.bank = Some(bank);
+        *self.bank.lock().unwrap() = Some(bank);
+        self.publish_metadata();
     }
 }
 pub struct CountWords<'a, W> {
@@ -368,7 +388,7 @@ pub fn native_owner_matrix(mut make: impl FnMut() -> Box<dyn PhysicalTransferFix
             let mut physical = make();
             physical.provision(IPA, pages * 4096);
             physical.provision(IPA + 0x100_000, pages * 4096);
-            let mut region = Region::new();
+            let region = Region::new();
             region.add_bank();
             let zone = region.zone();
             let spaces =
