@@ -84,16 +84,32 @@ enum FixtureCpuidError {
     FullTable,
 }
 
+// The fixture uses CPUID only for the native CPU features admitted at boot,
+// APIC topology, XSAVE x87/SSE/AVX, and the optional clock source. KVM hosts
+// may return a completely full supported-CPUID table, so carrying unrelated
+// cache, trace, and brand leaves into KVM_SET_CPUID2 cannot reserve 0x15.
+fn fixture_cpuid_leaf(entry: &kvm_bindings::kvm_cpuid_entry2) -> bool {
+    match entry.function {
+        0 | 1 | 0x8000_0000 | 0x8000_0001 | 0x8000_0007 | 0x8000_0008 => true,
+        0x15 => entry.index == 0,
+        7 => entry.index == 0, // SMEP, SMAP and native feature admission.
+        0xb | 0x1f => entry.index <= 2, // APIC topology for the two CPUs.
+        0xd => entry.index <= 2, // XCR0=x87|SSE|AVX, including XSAVE size.
+        _ => false,
+    }
+}
+
 fn fixture_cpuid_with_tsc_hz(
     entries: &mut Vec<kvm_bindings::kvm_cpuid_entry2>,
     hz: u32,
 ) -> Result<(), FixtureCpuidError> {
-    let leaf0 = entries
+    let mut selected: Vec<_> = entries.iter().copied().filter(fixture_cpuid_leaf).collect();
+    let leaf0 = selected
         .iter()
         .position(|entry| entry.function == 0)
         .ok_or(FixtureCpuidError::MissingLeafZero)?;
-    let existing = entries.iter().position(|entry| entry.function == 0x15);
-    if existing.is_none() && entries.len() >= kvm_bindings::KVM_MAX_CPUID_ENTRIES {
+    let existing = selected.iter().position(|entry| entry.function == 0x15);
+    if existing.is_none() && selected.len() >= kvm_bindings::KVM_MAX_CPUID_ENTRIES {
         return Err(FixtureCpuidError::FullTable);
     }
     let clock = kvm_bindings::kvm_cpuid_entry2 {
@@ -103,12 +119,13 @@ fn fixture_cpuid_with_tsc_hz(
         ecx: hz,
         ..Default::default()
     };
-    entries[leaf0].eax = entries[leaf0].eax.max(0x15);
+    selected[leaf0].eax = selected[leaf0].eax.max(0x15);
     if let Some(existing) = existing {
-        entries[existing] = clock;
+        selected[existing] = clock;
     } else {
-        entries.push(clock);
+        selected.push(clock);
     }
+    *entries = selected;
     Ok(())
 }
 
@@ -234,25 +251,52 @@ mod fixture_cpuid_tests {
     use super::*;
 
     #[test]
-    fn full_kvm_cpuid_table_refuses_a_new_tsc_leaf_without_mutation() {
+    fn eighty_supported_leaves_leave_room_for_fixture_tsc() {
         let mut entries = vec![kvm_bindings::kvm_cpuid_entry2 {
             function: 0,
-            eax: 7,
+            eax: 0x16,
             ..Default::default()
         }];
-        entries.extend((1..kvm_bindings::KVM_MAX_CPUID_ENTRIES).map(|index| {
-            kvm_bindings::kvm_cpuid_entry2 {
+        entries.extend(
+            [1, 7, 0xd, 0x8000_0000, 0x8000_0001, 0x8000_0008].map(|function| {
+                kvm_bindings::kvm_cpuid_entry2 {
+                    function,
+                    ..Default::default()
+                }
+            }),
+        );
+        entries.extend(
+            (entries.len()..80).map(|index| kvm_bindings::kvm_cpuid_entry2 {
                 function: 0x100 + index as u32,
                 ..Default::default()
-            }
-        }));
+            }),
+        );
+        assert_eq!(entries.len(), 80);
+        fixture_cpuid_with_tsc_hz(&mut entries, 2_000_000_000).unwrap();
+        assert!(entries.len() < 80, "unused host leaves must be removed");
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.function == 0x15 && entry.ecx == 2_000_000_000)
+        );
+        assert!(entries.iter().any(|entry| entry.function == 7));
+        assert!(entries.iter().any(|entry| entry.function == 0xd));
+    }
+
+    #[test]
+    fn missing_base_leaf_refuses_without_mutation() {
+        let mut entries = (0..kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .map(|index| kvm_bindings::kvm_cpuid_entry2 {
+                function: 0x100 + index as u32,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
         let before = entries.clone();
         assert_eq!(
             fixture_cpuid_with_tsc_hz(&mut entries, 2_000_000_000),
-            Err(FixtureCpuidError::FullTable)
+            Err(FixtureCpuidError::MissingLeafZero)
         );
-        assert_eq!(entries.len(), before.len());
-        assert_eq!(entries[0].eax, before[0].eax);
+        assert_eq!(entries, before);
     }
 
     #[test]
@@ -276,7 +320,7 @@ mod fixture_cpuid_tests {
             fixture_cpuid_with_tsc_hz(&mut entries, 2_000_000_000),
             Ok(())
         );
-        assert_eq!(entries.len(), kvm_bindings::KVM_MAX_CPUID_ENTRIES);
+        assert_eq!(entries.len(), 2);
         assert_eq!(
             entries
                 .iter()
