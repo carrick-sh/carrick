@@ -164,3 +164,29 @@ fn production_boot_binds_both_kvm_local_apics() {
         assert_ne!(version & 0xff, 0, "missing LAPIC version on slot {slot}");
     }
 }
+
+#[test]
+fn production_irq_entry_retains_each_native_vector_from_live_user_mode() {
+    for (vector, bit) in [(0xe0, 1), (0xe1, 2), (0xe2, 4), (0xe3, 8)] {
+        let elf = tiny_elf();
+        let image = prepare_static_x86_elf(&elf).expect("static ELF");
+        let extent =
+            Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("initial grant extent");
+        let mut carrier = Cpl0Carrier::boot_production(extent).expect("production KVM boot");
+        carrier
+            .load_guest_mm(&image, &[], &[])
+            .expect("shared MM owner");
+        carrier
+            .fixture_inject_irq(0, vector)
+            .expect("native IRQ edge into stopped vCPU");
+        let (status, _) = carrier
+            .run_initial_process(8, |_, _| 0)
+            .expect("user task returns after native IRQ");
+        assert_eq!(status, 7, "vector {vector:#x}");
+        assert_eq!(
+            carrier.fixture_pending_irqs(0).expect("IRQ mailbox") & bit,
+            bit,
+            "vector {vector:#x}"
+        );
+    }
+}
