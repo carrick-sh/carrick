@@ -406,7 +406,8 @@ impl PublicationView {
     /// - output (and its ticket) present exactly for output kinds, aligned to
     ///   its leaf, with the span starting on that leaf boundary (parent-block
     ///   alignment for `Block2M`/`Block1G` and `Coalesce`);
-    /// - prior present for `CowRepoint`/`Unmap` and for a writable `Protect`,
+    /// - prior present for `CowRepoint`/`Unmap` and for a `Protect` granting
+    ///   write or execute,
     ///   aligned to its own leaf, and covering exactly the span when it
     ///   replaces or removes one alias;
     /// - drain claim valid for the ISA; a refused edit claims no drain;
@@ -459,8 +460,9 @@ impl PublicationView {
         if output.is_none() && table_grants.0 != 0 {
             return Err(E::TableGrants);
         }
-        let prior_required =
-            kind.requires_prior() || (kind == PublicationKind::Protect && permissions.writable);
+        let prior_required = kind.requires_prior()
+            || (kind == PublicationKind::Protect
+                && (permissions.writable || permissions.executable));
         let prior_allowed = prior_required || kind == PublicationKind::Protect;
         if (prior_required && prior.is_none()) || (!prior_allowed && prior.is_some()) {
             return Err(E::Prior);
@@ -866,15 +868,38 @@ impl<const N: usize> RingConsumer<'_, N> {
         Ok(Some(record))
     }
 
-    /// Pop every visible record, in ring order.
+    /// Pop the records visible at one head snapshot, in ring order. A
+    /// producer that keeps refilling cannot extend the drain: the work is
+    /// bounded by the snapshot occupancy, at most `N`.
     pub fn drain_into(
         &mut self,
         out: &mut alloc::vec::Vec<MmPublication>,
     ) -> Result<usize, RingCorrupt> {
+        self.drain_with(out, |_| {})
+    }
+
+    fn drain_with(
+        &mut self,
+        out: &mut alloc::vec::Vec<MmPublication>,
+        mut after_pop: impl FnMut(&mut Self),
+    ) -> Result<usize, RingCorrupt> {
+        let ring = self.ring;
+        let tail = ring.tail.0.load(Ordering::Relaxed);
+        let head = ring.head.0.load(Ordering::Acquire);
+        let used = head.wrapping_sub(tail);
+        if used > PublicationRing::<N>::CAPACITY {
+            return Err(RingCorrupt);
+        }
+        let snapshot = usize::try_from(used).map_err(|_| RingCorrupt)?;
+        out.try_reserve(snapshot).map_err(|_| RingCorrupt)?;
         let mut count = 0;
-        while let Some(record) = self.pop()? {
+        while count < snapshot {
+            let Some(record) = self.pop()? else {
+                return Err(RingCorrupt);
+            };
             out.push(record);
             count += 1;
+            after_pop(self);
         }
         Ok(count)
     }
