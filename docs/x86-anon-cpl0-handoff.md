@@ -1,5 +1,33 @@
 # x86 anonymous CPL0 handoff (partial, 2026-10-07)
 
+## Current gate status: extraction push held
+
+PR102 follow-up 83364467d is pushed. The extraction registry foundation
+through 09df94f4e is local, and no extraction review-ready or two-live-MM
+milestone is claimed. Full host, separate kernel-semantics, clippy and clean
+Linux domain lint pass. N1's inherited ARM hvc #3 difference is unchanged;
+comparison against imported shared-kernel 6d6bcf26c has zero failures.
+
+The committed post-format KVM build first failed before VM execution because
+nested Cargo build-script outputs retained linker script paths into deleted
+/tmp/wt-x86-review-attribution. Targeted cargo clean of carrick-el1 and
+carrick-x86-cpl0 in the three affected nested image target directories
+removed those stale outputs (285.5 MiB). No source shim or fake linker script
+was added. The fresh-image full KVM run then reports 127 passed, one failed,
+and five existing ignores. The sole failure is the separately owned known
+shootdown test: two_running_vcpus_drop_stale_translation_on_shootdown,
+cpl0_entry.rs:1264, "running CPU must acknowledge shootdown". The earlier
+same-code gate reported 128/0/5. This is not retry-until-green; the fresh
+red gate is authoritative and the extraction push is held. Shootdown code
+was not edited. The director was notified with ref 09df94f4e.
+Receipts: /tmp/x86-process-registry-{committed-kvm,clean-image-kvm}.log.
+
+Continue the wait scan/consume/wake-generation extraction, then owned exit
+transactions and production CPL0/CPU1 binding. The shared-lane shootdown
+owner must close its gate; do not patch it here. The two-live-MM PRIVATE,
+no-cross-MM-alias and exact-root-incarnation/generation witness remains red
+at its pre-fix checkpoint and must go green before claiming the milestone.
+
 ## Latest process-owner continuation
 
 PR102 follow-up 83364467d is pushed. Extraction identities were rebased onto
