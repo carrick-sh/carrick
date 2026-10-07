@@ -43,13 +43,18 @@ use carrick_sched_core::spaces::notification::{SpaceAccess, SpaceReleaseVenue};
 use carrick_sched_core::{SlotId, Waker};
 use carrick_x86::cpl0_entry::*;
 use carrick_x86::{BringupLayout, X86Reg, X86Vcpu};
-use kvm_bindings::{KVM_MP_STATE_RUNNABLE, Msrs, kvm_mp_state, kvm_msr_entry};
+use kvm_bindings::{
+    KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP, KVM_MP_STATE_RUNNABLE, Msrs, kvm_guest_debug,
+    kvm_mp_state, kvm_msi, kvm_msr_entry,
+};
+use kvm_ioctls::VcpuExit as KvmExit;
+use kvm_ioctls::VmFd;
 use std::collections::VecDeque;
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -103,21 +108,37 @@ enum FixtureCpuidError {
     FullTable,
 }
 
+// The fixture uses CPUID only for the native CPU features admitted at boot,
+// APIC topology, XSAVE x87/SSE/AVX, and the optional clock source. KVM hosts
+// may return a completely full supported-CPUID table, so carrying unrelated
+// cache, trace, and brand leaves into KVM_SET_CPUID2 cannot reserve 0x15.
+fn fixture_cpuid_leaf(entry: &kvm_bindings::kvm_cpuid_entry2) -> bool {
+    match entry.function {
+        0 | 1 | 0x8000_0000 | 0x8000_0001 | 0x8000_0007 | 0x8000_0008 => true,
+        0x15 => entry.index == 0,
+        7 => entry.index == 0, // SMEP, SMAP and native feature admission.
+        0xb | 0x1f => entry.index <= 2, // APIC topology for the two CPUs.
+        0xd => entry.index <= 2, // XCR0=x87|SSE|AVX, including XSAVE size.
+        _ => false,
+    }
+}
+
 fn fixture_cpuid_with_tsc_hz(
     entries: &mut Vec<kvm_bindings::kvm_cpuid_entry2>,
     hz: u32,
 ) -> Result<(), FixtureCpuidError> {
-    let leaf0 = entries
+    let mut selected: Vec<_> = entries.iter().copied().filter(fixture_cpuid_leaf).collect();
+    let leaf0 = selected
         .iter()
         .position(|entry| entry.function == 0)
         .ok_or(FixtureCpuidError::MissingLeafZero)?;
-    let existing = entries.iter().position(|entry| entry.function == 0x15);
-    if existing.is_none() && entries.len() >= kvm_bindings::KVM_MAX_CPUID_ENTRIES {
+    let existing = selected.iter().position(|entry| entry.function == 0x15);
+    if existing.is_none() && selected.len() >= kvm_bindings::KVM_MAX_CPUID_ENTRIES {
         // This fixture owns its synthetic CPUID model. A retained all-zero
         // duplicate of leaf zero is unused storage, not an architectural
         // feature: carrick-vm returns 64 populated rows and 192 such rows.
         // Reuse only an exact zero duplicate, preserving every real leaf.
-        let vacant = entries.iter().enumerate().find_map(|(index, entry)| {
+        let vacant = selected.iter().enumerate().find_map(|(index, entry)| {
             (index != leaf0
                 && entry.function == 0
                 && entry.index == 0
@@ -132,14 +153,14 @@ fn fixture_cpuid_with_tsc_hz(
         let Some(vacant) = vacant else {
             return Err(FixtureCpuidError::FullTable);
         };
-        entries[vacant] = kvm_bindings::kvm_cpuid_entry2 {
+        selected[vacant] = kvm_bindings::kvm_cpuid_entry2 {
             function: 0x15,
             eax: 1,
             ebx: 1,
             ecx: hz,
             ..Default::default()
         };
-        entries[leaf0].eax = entries[leaf0].eax.max(0x15);
+        selected[leaf0].eax = selected[leaf0].eax.max(0x15);
         return Ok(());
     }
     let clock = kvm_bindings::kvm_cpuid_entry2 {
@@ -149,12 +170,13 @@ fn fixture_cpuid_with_tsc_hz(
         ecx: hz,
         ..Default::default()
     };
-    entries[leaf0].eax = entries[leaf0].eax.max(0x15);
+    selected[leaf0].eax = selected[leaf0].eax.max(0x15);
     if let Some(existing) = existing {
-        entries[existing] = clock;
+        selected[existing] = clock;
     } else {
-        entries.push(clock);
+        selected.push(clock);
     }
+    *entries = selected;
     Ok(())
 }
 
@@ -497,6 +519,82 @@ enum WatchdogControl {
     Pause,
     Cancel,
 }
+
+#[derive(Clone, Copy)]
+enum FixtureStopCondition {
+    UserByte(u64, u8),
+    PendingKick(usize),
+}
+
+fn stopped_at_interruptible_user(cpu: &KvmVcpu) -> Result<bool, TrapError> {
+    let sregs = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
+    let regs = cpu.fd().get_regs().map_err(|e| fail(e.to_string()))?;
+    let events = cpu
+        .fd()
+        .get_vcpu_events()
+        .map_err(|e| fail(e.to_string()))?;
+    Ok(sregs.cs.dpl == 3
+        && sregs.cs.selector & 3 == 3
+        && regs.rflags & (1 << 9) != 0
+        && events.interrupt.shadow == 0
+        && events.interrupt.injected == 0)
+}
+
+fn run_member(
+    cpu: &mut KvmVcpu,
+    table: &ShootdownTable,
+    slot: usize,
+    vm: &VmFd,
+) -> Result<VcpuExit, TrapError> {
+    let member = table
+        .members
+        .get(slot)
+        .ok_or_else(|| fail("unknown CPL0 CPU slot"))?;
+    // A sender that observes this release either targets the live vCPU or
+    // races this pre-run scan, which queues its durable MSI before KVM_RUN.
+    member.running.store(1, Ordering::Release);
+    let sregs = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
+    let has_debt = table.requests.iter().any(|request| {
+        request.generation.load(Ordering::Acquire) > request.served[slot].load(Ordering::Acquire)
+    });
+    if has_debt {
+        if sregs.cs.dpl == 3 && !stopped_at_interruptible_user(cpu)? {
+            return Err(fail("shootdown debt requires interruptible CPL3 reentry"));
+        } else if sregs.cs.dpl != 0 && sregs.cs.dpl != 3 {
+            return Err(fail("shootdown debt on unsupported CPL reentry"));
+        }
+        let lapic = cpu.fd().get_lapic().map_err(|e| fail(e.to_string()))?;
+        let apic_id = u32::from_le_bytes([
+            lapic.regs[0x20] as u8,
+            lapic.regs[0x21] as u8,
+            lapic.regs[0x22] as u8,
+            lapic.regs[0x23] as u8,
+        ]) >> 24;
+        let delivered = vm
+            .signal_msi(kvm_msi {
+                address_lo: 0xfee0_0000 | (apic_id << 12),
+                data: u32::from(carrick_x86::interrupts::KICK_VECTOR),
+                ..Default::default()
+            })
+            .map_err(|e| fail(format!("KVM_SIGNAL_MSI reentry: {e}")))?;
+        if delivered <= 0 {
+            return Err(fail("reentry shootdown MSI was blocked"));
+        }
+    }
+    let result = HvVcpu::run(cpu)?;
+    member.running.store(0, Ordering::Release);
+    if stopped_at_interruptible_user(cpu)? {
+        // The host may release a sender after this vCPU has stopped, but
+        // leaves `served` behind until native KICK settles debt on reentry.
+        for request in &table.requests {
+            let generation = request.generation.load(Ordering::Acquire);
+            if generation != 0 {
+                request.ack[slot].store(generation, Ordering::Release);
+            }
+        }
+    }
+    Ok(result)
+}
 impl Watchdog {
     pub(crate) fn start() -> Self {
         Self::start_with_timeout(Duration::from_secs(5))
@@ -580,25 +678,52 @@ mod fixture_cpuid_tests {
     }
 
     #[test]
-    fn full_kvm_cpuid_table_refuses_a_new_tsc_leaf_without_mutation() {
+    fn eighty_supported_leaves_leave_room_for_fixture_tsc() {
         let mut entries = vec![kvm_bindings::kvm_cpuid_entry2 {
             function: 0,
-            eax: 7,
+            eax: 0x16,
             ..Default::default()
         }];
-        entries.extend((1..kvm_bindings::KVM_MAX_CPUID_ENTRIES).map(|index| {
-            kvm_bindings::kvm_cpuid_entry2 {
+        entries.extend(
+            [1, 7, 0xd, 0x8000_0000, 0x8000_0001, 0x8000_0008].map(|function| {
+                kvm_bindings::kvm_cpuid_entry2 {
+                    function,
+                    ..Default::default()
+                }
+            }),
+        );
+        entries.extend(
+            (entries.len()..80).map(|index| kvm_bindings::kvm_cpuid_entry2 {
                 function: 0x100 + index as u32,
                 ..Default::default()
-            }
-        }));
+            }),
+        );
+        assert_eq!(entries.len(), 80);
+        fixture_cpuid_with_tsc_hz(&mut entries, 2_000_000_000).unwrap();
+        assert!(entries.len() < 80, "unused host leaves must be removed");
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.function == 0x15 && entry.ecx == 2_000_000_000)
+        );
+        assert!(entries.iter().any(|entry| entry.function == 7));
+        assert!(entries.iter().any(|entry| entry.function == 0xd));
+    }
+
+    #[test]
+    fn missing_base_leaf_refuses_without_mutation() {
+        let mut entries = (0..kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .map(|index| kvm_bindings::kvm_cpuid_entry2 {
+                function: 0x100 + index as u32,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
         let before = entries.clone();
         assert_eq!(
             fixture_cpuid_with_tsc_hz(&mut entries, 2_000_000_000),
-            Err(FixtureCpuidError::FullTable)
+            Err(FixtureCpuidError::MissingLeafZero)
         );
-        assert_eq!(entries.len(), before.len());
-        assert_eq!(entries[0].eax, before[0].eax);
+        assert_eq!(entries, before);
     }
 
     #[test]
@@ -622,7 +747,7 @@ mod fixture_cpuid_tests {
             fixture_cpuid_with_tsc_hz(&mut entries, 2_000_000_000),
             Ok(())
         );
-        assert_eq!(entries.len(), kvm_bindings::KVM_MAX_CPUID_ENTRIES);
+        assert_eq!(entries.len(), 2);
         assert_eq!(
             entries
                 .iter()
@@ -690,6 +815,22 @@ pub struct Cpl0Carrier {
 }
 
 impl Cpl0Carrier {
+    fn run_cpu(&mut self, index: usize) -> Result<VcpuExit, TrapError> {
+        if index >= self.cpus.len() {
+            return Err(fail("unknown CPL0 CPU slot"));
+        }
+        // SAFETY: `metadata_base` owns this aligned table until every vCPU
+        // and scoped guest-run thread has stopped. The table and vCPU fields
+        // are disjoint even while this method borrows the vCPU mutably.
+        let table = unsafe {
+            &*self
+                .metadata_base
+                .as_ptr()
+                .add(SHOOTDOWN_OFFSET as usize)
+                .cast::<ShootdownTable>()
+        };
+        run_member(&mut self.cpus[index], table, index, &self._vm.vm().vm)
+    }
     /// Size one private retained aperture for the host-staged PT_LOAD bytes,
     /// the boot record, and guest-owned table/data grants. Capacity follows
     /// the submitted image rather than reserving a carrier-wide RAM pool.
@@ -1196,7 +1337,7 @@ impl Cpl0Carrier {
         cpu.fd()
             .set_regs(&regs)
             .map_err(|error| fail(error.to_string()))?;
-        let exit = HvVcpu::run(&mut self.cpus[0])?;
+        let exit = self.run_cpu(0)?;
         if matches!(exit, VcpuExit::Kicked) {
             return Err(fail("production initial MM cancelled"));
         }
@@ -1517,7 +1658,7 @@ impl Cpl0Carrier {
         }
         let mut recent_forwards = VecDeque::with_capacity(8);
         for exits in 1..=max_exits {
-            let exit = HvVcpu::run(&mut self.cpus[0])?;
+            let exit = self.run_cpu(0)?;
             if matches!(exit, VcpuExit::Kicked) {
                 return Err(fail("initial process cancelled"));
             }
@@ -1549,7 +1690,7 @@ impl Cpl0Carrier {
                         let VcpuExit::IoOut {
                             port: carrick_x86::FAULT_DOORBELL_PORT,
                             data,
-                        } = HvVcpu::run(&mut self.cpus[0])?
+                        } = self.run_cpu(0)?
                         else {
                             return Err(fail("initial fault record interrupted"));
                         };
@@ -2001,6 +2142,15 @@ impl Cpl0Carrier {
                     .thread_generation
                     .store(101 + index as u64, Ordering::Release);
                 (*task).mm.key.store(201 + index as u64, Ordering::Release);
+                (*shootdown).members[index].publish(
+                    if interrupts && index == 1 {
+                        crate::carrier_interrupts::SECOND_ROOT
+                    } else {
+                        LAYOUT.pml4_base
+                    },
+                    201 + index as u64,
+                    1,
+                );
                 (*task).publish_lifecycle(METADATA_VA, METADATA_VA + CONTROL_OFFSET + offset);
                 let binding = ram
                     .host_ptr(META_GPA + BINDING_OFFSET + offset, size_of::<CpuBinding>())
@@ -2035,6 +2185,8 @@ impl Cpl0Carrier {
                     fault_frame: AtomicU64::new(0),
                     fault_address: AtomicU64::new(0),
                     fault_reason: AtomicU64::new(0),
+                    mm_owner_generation: AtomicU64::new(1),
+                    last_seen_generation: AtomicU64::new(0),
                 });
             }
         }
@@ -2097,6 +2249,13 @@ impl Cpl0Carrier {
                 USER_CODE + index as u64 * 4096,
                 0x3_1ff0 + index as u64 * 0x1_0000,
             )?;
+            if hardware_interrupts && initial_extent_bytes.is_none() {
+                // This fixture enters CPL3 directly. Unlike the production
+                // initial-MM IRET frame, the generic x86 bootstrap flags
+                // still have IF clear for CPL0 bringup. Admit native APIC
+                // interrupts before the first fixture user instruction.
+                cpu.set_gpr(X86Reg::Rflags, boot.rflags | (1 << 9))?;
+            }
             carrick_x86::program_fault_segments(cpu, LAYOUT, index as u64)?;
             let mut system = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
             if initial_extent_bytes.is_some() {
@@ -2357,6 +2516,346 @@ impl Cpl0Carrier {
         }
         Ok(self.binding(index).pending_irqs.load(Ordering::Acquire))
     }
+
+    /// Bind a stopped fixture reader to the editor's exact page-table root.
+    /// Both retained tasks then name the same MM generation for this witness.
+    pub fn fixture_share_root(&mut self, reader: usize, editor: usize) -> Result<(), TrapError> {
+        if reader == editor || reader >= self.cpus.len() || editor >= self.cpus.len() {
+            return Err(fail("invalid fixture root sharing slots"));
+        }
+        let root = self.cpus[editor]
+            .fd()
+            .get_sregs()
+            .map_err(|e| fail(e.to_string()))?
+            .cr3;
+        let mut reader_sregs = self.cpus[reader]
+            .fd()
+            .get_sregs()
+            .map_err(|e| fail(e.to_string()))?;
+        reader_sregs.cr3 = root;
+        self.cpus[reader]
+            .fd()
+            .set_sregs(&reader_sregs)
+            .map_err(|e| fail(e.to_string()))?;
+        // The fixed 0x600000 descriptor fixture issues MM key 1. Bind both
+        // tasks to that exact owner before either enters the shared root.
+        self.task(editor).mm.key.store(1, Ordering::Release);
+        self.task(reader).mm.key.store(1, Ordering::Release);
+        let table: &ShootdownTable = self.metadata(SHOOTDOWN_OFFSET);
+        table.members[editor].publish(root, 1, 1);
+        table.members[reader].publish(root, 1, 1);
+        Ok(())
+    }
+
+    /// Bind one stopped descriptor fixture to its fixed MM editor identity.
+    /// The fixture's EditOwner names MM key 1 for the 0x600000 root.
+    pub fn fixture_bind_descriptor_owner(&mut self, index: usize) -> Result<(), TrapError> {
+        if index >= self.cpus.len() {
+            return Err(fail("unknown CPL0 CPU slot"));
+        }
+        let root = self.cpus[index]
+            .fd()
+            .get_sregs()
+            .map_err(|e| fail(e.to_string()))?
+            .cr3;
+        if root != LAYOUT.pml4_base {
+            return Err(fail("descriptor fixture requires first root"));
+        }
+        self.task(index).mm.key.store(1, Ordering::Release);
+        let table: &ShootdownTable = self.metadata(SHOOTDOWN_OFFSET);
+        table.members[index].publish(root, 1, 1);
+        Ok(())
+    }
+
+    /// Stage an exact byte in a stopped fixture's retained backing.
+    pub fn fixture_write_backing_byte(&mut self, gpa: u64, value: u8) -> Result<(), TrapError> {
+        if !matches!(gpa, 0xd1_1000 | 0x4_0000) {
+            return Err(fail("fixture byte outside admitted backing"));
+        }
+        self._vm
+            .write(FrameGpa::new(gpa), &[value])
+            .map_err(|e| fail(e.to_string()))
+    }
+
+    /// Queue the native KICK on a stopped CPL3 vCPU before its next KVM_RUN.
+    /// KVM_INTERRUPT rejects an in-kernel IRQ chip; the retained APIC ID
+    /// addresses an MSI directly to this CPU's local APIC instead.
+    pub fn queue_resume_kick(&mut self, index: usize) -> Result<(), TrapError> {
+        let cpu = self
+            .cpus
+            .get(index)
+            .ok_or_else(|| fail("unknown CPL0 CPU slot"))?;
+        let sregs = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
+        let regs = cpu.fd().get_regs().map_err(|e| fail(e.to_string()))?;
+        if sregs.cs.dpl != 3 || sregs.cs.selector & 3 != 3 || regs.rflags & (1 << 9) == 0 {
+            return Err(fail(format!(
+                "resume kick requires CPL3 with IF set: cs={:#x} dpl={} rip={:#x} rflags={:#x}",
+                sregs.cs.selector, sregs.cs.dpl, regs.rip, regs.rflags
+            )));
+        }
+        let events = cpu
+            .fd()
+            .get_vcpu_events()
+            .map_err(|e| fail(e.to_string()))?;
+        if events.interrupt.shadow != 0 || events.interrupt.injected != 0 {
+            return Err(fail(
+                "resume kick has an interrupt shadow or injected vector",
+            ));
+        }
+        let apic_id = self.lapic_register(index, 0x20)? >> 24;
+        let msi = kvm_msi {
+            address_lo: 0xfee0_0000 | (apic_id << 12),
+            data: u32::from(carrick_x86::interrupts::KICK_VECTOR),
+            ..Default::default()
+        };
+        if self
+            ._vm
+            .vm()
+            .vm
+            .signal_msi(msi)
+            .map_err(|e| fail(format!("KVM_SIGNAL_MSI: {e}")))?
+            <= 0
+        {
+            return Err(fail("resume kick MSI was blocked"));
+        }
+        Ok(())
+    }
+
+    fn fixture_run_until(
+        &mut self,
+        index: usize,
+        condition: FixtureStopCondition,
+    ) -> Result<(), TrapError> {
+        if index >= self.cpus.len() {
+            return Err(fail("unknown CPL0 CPU slot"));
+        }
+        let (address, pending) = match condition {
+            FixtureStopCondition::UserByte(gpa, _) => {
+                let pointer = self
+                    .ram
+                    .host_ptr(gpa, 1)
+                    .ok_or_else(|| fail("fixture user flag outside backing"))?;
+                (pointer as usize, false)
+            }
+            FixtureStopCondition::PendingKick(slot) => {
+                let offset = BINDING_OFFSET + slot as u64 * STRIDE;
+                let pointer = self
+                    .ram
+                    .host_ptr(META_GPA + offset, size_of::<CpuBinding>())
+                    .ok_or_else(|| fail("fixture IRQ binding outside backing"))?
+                    .cast::<CpuBinding>();
+                // SAFETY: the retained metadata page contains this initialized
+                // per-CPU binding through both the watcher and stopped vCPU.
+                let pending = unsafe { &(*pointer).pending_irqs };
+                (pending as *const AtomicU32 as usize, true)
+            }
+        };
+        let retained_ram = Arc::clone(&self.ram);
+        let stopped = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let kick = KvmKickHandle::for_current_thread();
+            let stopped_ref = &stopped;
+            let watcher = scope.spawn(move || {
+                let _retained_ram = retained_ram;
+                let start = std::time::Instant::now();
+                loop {
+                    // SAFETY: the retained GuestRam owns the backing; the
+                    // guest writes the byte atomically and the binding field
+                    // is AtomicU32. The watcher never mutates either record.
+                    let reached = unsafe {
+                        if pending {
+                            (&*(address as *const AtomicU32)).load(Ordering::Acquire) & 2 != 0
+                        } else {
+                            let FixtureStopCondition::UserByte(_, expected) = condition else {
+                                return false;
+                            };
+                            (&*(address as *const AtomicU8)).load(Ordering::Acquire) == expected
+                        }
+                    };
+                    if reached {
+                        kick.kick();
+                        return true;
+                    }
+                    if stopped_ref.load(Ordering::Acquire) {
+                        return false;
+                    }
+                    if start.elapsed() >= Duration::from_secs(5) {
+                        kick.kick();
+                        return false;
+                    }
+                    std::hint::spin_loop();
+                }
+            });
+            let exit = self.run_cpu(index);
+            stopped.store(true, Ordering::Release);
+            let reached = watcher
+                .join()
+                .map_err(|_| fail("fixture stop watcher panicked"))?;
+            if !reached {
+                return Err(fail("fixture stop condition was not reached"));
+            }
+            if !matches!(exit?, VcpuExit::Kicked) {
+                return Err(fail("fixture stop did not interrupt KVM_RUN"));
+            }
+            Ok(())
+        })
+    }
+
+    /// Stop a running CPL3 loop only after its first user byte store reached
+    /// retained host backing. This leaves the exact guest registers stopped.
+    pub fn fixture_stop_after_user_byte(
+        &mut self,
+        index: usize,
+        gpa: u64,
+    ) -> Result<(), TrapError> {
+        self.fixture_run_until(index, FixtureStopCondition::UserByte(gpa, 1))
+    }
+
+    pub fn fixture_stop_after_user_value(
+        &mut self,
+        index: usize,
+        gpa: u64,
+        value: u8,
+    ) -> Result<(), TrapError> {
+        self.fixture_run_until(index, FixtureStopCondition::UserByte(gpa, value))
+    }
+
+    /// Observe the actual #PF record after resuming a stopped CPL3 load.
+    /// A stale TLB entry instead keeps the user loop alive until the watchdog
+    /// cancels KVM_RUN; that is a failed witness, not an accepted timeout.
+    pub fn fixture_run_until_user_fault(
+        &mut self,
+        index: usize,
+        rip: u64,
+        va: u64,
+    ) -> Result<(), TrapError> {
+        if index >= self.cpus.len() {
+            return Err(fail("unknown CPL0 CPU slot"));
+        }
+        let watchdog = Watchdog::start();
+        let mut words = Vec::with_capacity(carrick_x86::X86_FAULT_RECORD_U32_WORDS);
+        while words.len() < carrick_x86::X86_FAULT_RECORD_U32_WORDS {
+            let exit = watchdog.during_guest(|| self.run_cpu(index))?;
+            if watchdog.expired() {
+                return Err(fail("stopped user load did not fault before deadline"));
+            }
+            let VcpuExit::IoOut {
+                port: carrick_x86::FAULT_DOORBELL_PORT,
+                data,
+            } = exit
+            else {
+                return Err(fail("stopped user load exited without fault record"));
+            };
+            words.push(u32::from_le_bytes(
+                data.as_slice()
+                    .try_into()
+                    .map_err(|_| fail("fixture fault word width"))?,
+            ));
+        }
+        let record = carrick_x86::FaultDoorbellRecord::from_u32_words(&words)?;
+        if record.vector != 14 || record.rip != rip || record.cr2 != va || record.cs & 3 != 3 {
+            return Err(fail(format!("unexpected stopped user fault: {record:?}")));
+        }
+        Ok(())
+    }
+
+    /// Single-step a stopped fixture until the next instruction is the exact
+    /// requested user RIP. This does not edit guest registers or execute the
+    /// instruction at `rip`; every step is bounded and the debug control is
+    /// removed before the vCPU returns to its ordinary owner.
+    pub fn fixture_stop_before_user_rip(
+        &mut self,
+        index: usize,
+        rip: u64,
+    ) -> Result<(), TrapError> {
+        let cpu = self
+            .cpus
+            .get_mut(index)
+            .ok_or_else(|| fail("unknown CPL0 CPU slot"))?;
+        let debug = kvm_guest_debug {
+            control: KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP,
+            ..Default::default()
+        };
+        cpu.fd()
+            .set_guest_debug(&debug)
+            .map_err(|e| fail(format!("KVM_SET_GUEST_DEBUG: {e}")))?;
+        let result = (|| {
+            for _ in 0..16 {
+                let regs = cpu.fd().get_regs().map_err(|e| fail(e.to_string()))?;
+                let sregs = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
+                if sregs.cs.dpl != 3 || sregs.cs.selector & 3 != 3 {
+                    return Err(fail("fixture single-step left CPL3"));
+                }
+                if regs.rip == rip {
+                    return Ok(());
+                }
+                if !matches!(
+                    cpu.fd_mut()
+                        .run()
+                        .map_err(|e| fail(format!("KVM_RUN single-step: {e}")))?,
+                    KvmExit::Debug(_)
+                ) {
+                    return Err(fail("fixture single-step exited without debug trap"));
+                }
+            }
+            Err(fail("fixture did not stop at requested user RIP"))
+        })();
+        cpu.fd()
+            .set_guest_debug(&kvm_guest_debug::default())
+            .map_err(|e| fail(format!("KVM_SET_GUEST_DEBUG reset: {e}")))?;
+        result
+    }
+
+    /// Stop the resumed CPU as soon as its own native KICK gate published the
+    /// pending mailbox bit, before another fixture operation changes state.
+    pub fn fixture_run_until_pending_kick(&mut self, index: usize) -> Result<(), TrapError> {
+        self.fixture_run_until(index, FixtureStopCondition::PendingKick(index))
+    }
+
+    /// Run the vCPU until it stops on FORWARD_PORT in CPL0, returning the saved
+    /// control frame and setting its frame result to zero so it can resume transparently.
+    pub fn fixture_run_until_forward(&mut self, index: usize) -> Result<NativeFrame, TrapError> {
+        let exit = self.run_cpu(index)?;
+        let VcpuExit::IoOut {
+            port: FORWARD_PORT, ..
+        } = exit
+        else {
+            return Err(fail("expected FORWARD_PORT exit"));
+        };
+        self.host_forwards += 1;
+        let address = self.cpus[index].get_gpr(X86Reg::Rax)?;
+        let stack_end = self.binding(index).kernel_stack + 16;
+        if address & 7 != 0
+            || address < stack_end - 0x1_0000
+            || address
+                .checked_add(size_of::<NativeFrame>() as u64)
+                .is_none_or(|end| end > stack_end)
+        {
+            return Err(fail(
+                "CPL0 control frame outside its private supervisor stack",
+            ));
+        }
+        let ptr = self
+            .ram
+            .host_ptr(address - DIRECT_VA, size_of::<NativeFrame>())
+            .ok_or_else(|| fail("CPL0 control frame outside backing"))?
+            .cast::<NativeFrame>();
+        let frame = unsafe { *ptr };
+        unsafe { (*ptr).rax = 0 };
+        Ok(frame)
+    }
+
+    /// Read a CPU's last seen shootdown generation recorded by its CR3 reload path.
+    pub fn fixture_last_seen_generation(&self, index: usize) -> Result<u64, TrapError> {
+        if index >= self.cpus.len() {
+            return Err(fail("unknown CPL0 CPU slot"));
+        }
+        Ok(self
+            .binding(index)
+            .last_seen_generation
+            .load(Ordering::Acquire))
+    }
+
     /// Exact retained generations and acknowledgements for a stopped fixture.
     pub fn fixture_shootdown_state(&self) -> [(u64, u64, [u64; 2]); 2] {
         let table: &ShootdownTable = self.metadata(SHOOTDOWN_OFFSET);
@@ -2368,6 +2867,37 @@ impl Cpl0Carrier {
                 core::array::from_fn(|peer| request.ack[peer].load(Ordering::Acquire)),
             )
         })
+    }
+    pub fn fixture_shootdown_owner(&self, sender: usize) -> Result<(u64, u64), TrapError> {
+        let table: &ShootdownTable = self.metadata(SHOOTDOWN_OFFSET);
+        let request = table
+            .requests
+            .get(sender)
+            .ok_or_else(|| fail("unknown shootdown sender"))?;
+        Ok((
+            request.mm_key.load(Ordering::Acquire),
+            request.owner_generation.load(Ordering::Acquire),
+        ))
+    }
+    pub fn fixture_kick_generation_checks(&self, slot: usize) -> Result<u64, TrapError> {
+        let table: &ShootdownTable = self.metadata(SHOOTDOWN_OFFSET);
+        Ok(table
+            .kick_checks
+            .get(slot)
+            .ok_or_else(|| fail("unknown shootdown CPU"))?
+            .load(Ordering::Acquire))
+    }
+    pub fn fixture_shootdown_served(&self, sender: usize, slot: usize) -> Result<u64, TrapError> {
+        let table: &ShootdownTable = self.metadata(SHOOTDOWN_OFFSET);
+        let request = table
+            .requests
+            .get(sender)
+            .ok_or_else(|| fail("unknown shootdown sender"))?;
+        let served = request
+            .served
+            .get(slot)
+            .ok_or_else(|| fail("unknown shootdown CPU"))?;
+        Ok(served.load(Ordering::Acquire))
     }
     /// The installed KVM CPUID capability for the stopped fixture vCPU.
     pub fn has_tsc_deadline(&self, index: usize) -> Result<bool, TrapError> {
@@ -2505,10 +3035,13 @@ impl Cpl0Carrier {
             cpu: &mut KvmVcpu,
             ram: &GuestRam,
             stack_end: u64,
+            table: &ShootdownTable,
+            slot: usize,
+            vm: &VmFd,
         ) -> Result<u64, TrapError> {
             let watchdog = Watchdog::start();
             for _ in 0..32 {
-                let exit = watchdog.during_guest(|| HvVcpu::run(cpu))?;
+                let exit = watchdog.during_guest(|| run_member(cpu, table, slot, vm))?;
                 if watchdog.expired() {
                     return Err(fail("paired fixture guest interval deadline"));
                 }
@@ -2557,16 +3090,153 @@ impl Cpl0Carrier {
             self.binding(0).kernel_stack + 16,
             self.binding(1).kernel_stack + 16,
         ];
+        // SAFETY: the retained table outlives both scoped guest-run threads.
+        let table = unsafe {
+            &*self
+                .metadata_base
+                .as_ptr()
+                .add(SHOOTDOWN_OFFSET as usize)
+                .cast::<ShootdownTable>()
+        };
+        let vm = &self._vm.vm().vm;
         let [a, b] = &mut self.cpus;
         std::thread::scope(|scope| {
-            let left = scope.spawn(|| first_result(a, &ram, stacks[0]));
-            let right = scope.spawn(|| first_result(b, &ram, stacks[1]));
+            let left = scope.spawn(|| first_result(a, &ram, stacks[0], table, 0, vm));
+            let right = scope.spawn(|| first_result(b, &ram, stacks[1], table, 1, vm));
             let a = left.join().map_err(|_| fail("paired CPU 0 host panic"))??;
             let b = right
                 .join()
                 .map_err(|_| fail("paired CPU 1 host panic"))??;
             Ok([a, b])
         })
+    }
+
+    /// Run both vCPUs concurrently: the editor retires a page while the reader
+    /// is actively executing in user mode. Proves that the live cross-CPU shootdown
+    /// IPI invalidates the translation and causes the reader's next load to fault.
+    pub fn fixture_two_running_cpus_shootdown_fault(
+        &mut self,
+        editor: usize,
+        reader: usize,
+        fault_rip: u64,
+        fault_va: u64,
+    ) -> Result<u64, TrapError> {
+        if editor >= 2 || reader >= 2 || editor == reader {
+            return Err(fail("invalid fixture CPU slots"));
+        }
+        let ram = Arc::clone(&self.ram);
+        let stack_end = self.binding(editor).kernel_stack + 16;
+        let table = unsafe {
+            &*self
+                .metadata_base
+                .as_ptr()
+                .add(SHOOTDOWN_OFFSET as usize)
+                .cast::<ShootdownTable>()
+        };
+        let vm = &self._vm.vm().vm;
+        let [a, b] = &mut self.cpus;
+        let (editor_cpu, reader_cpu) = if editor == 0 { (a, b) } else { (b, a) };
+
+        let (editor_res, reader_res) = std::thread::scope(|scope| {
+            let reader_handle = scope.spawn(|| {
+                let watchdog = Watchdog::start();
+                let mut words = Vec::with_capacity(carrick_x86::X86_FAULT_RECORD_U32_WORDS);
+                while words.len() < carrick_x86::X86_FAULT_RECORD_U32_WORDS {
+                    let exit =
+                        watchdog.during_guest(|| run_member(reader_cpu, table, reader, vm))?;
+                    if watchdog.expired() {
+                        return Err(fail("running reader did not fault before deadline"));
+                    }
+                    if let VcpuExit::IoOut {
+                        port: carrick_x86::FAULT_DOORBELL_PORT,
+                        data,
+                    } = exit
+                    {
+                        words.push(u32::from_le_bytes(
+                            data.as_slice()
+                                .try_into()
+                                .map_err(|_| fail("fixture fault word width"))?,
+                        ));
+                    }
+                }
+                let record = carrick_x86::FaultDoorbellRecord::from_u32_words(&words)?;
+                if record.vector != 14
+                    || record.rip != fault_rip
+                    || record.cr2 != fault_va
+                    || record.cs & 3 != 3
+                {
+                    return Err(fail(format!("unexpected running user fault: {record:?}")));
+                }
+                Ok(())
+            });
+
+            let editor_handle = scope.spawn(|| {
+                let watchdog = Watchdog::start();
+                let start = std::time::Instant::now();
+                while ram
+                    .host_ptr(0x4_0000, 1)
+                    .map(|p| unsafe { *p })
+                    .unwrap_or(0)
+                    != 0x11
+                {
+                    if start.elapsed() > Duration::from_secs(5) {
+                        return Err(fail("running reader never completed loop iteration"));
+                    }
+                    std::hint::spin_loop();
+                }
+                for _ in 0..32 {
+                    let exit =
+                        watchdog.during_guest(|| run_member(editor_cpu, table, editor, vm))?;
+                    if watchdog.expired() {
+                        return Err(fail("running editor deadline"));
+                    }
+                    match exit {
+                        VcpuExit::IoOut {
+                            port: CONTROL_PORT, ..
+                        } => {
+                            let address = editor_cpu.get_gpr(X86Reg::Rax)?;
+                            if address & 7 != 0
+                                || address < stack_end - 0x1_0000
+                                || address
+                                    .checked_add(size_of::<NativeFrame>() as u64)
+                                    .is_none_or(|end| end > stack_end)
+                            {
+                                return Err(fail("editor control frame outside private stack"));
+                            }
+                            let ptr = ram
+                                .host_ptr(address - DIRECT_VA, size_of::<NativeFrame>())
+                                .ok_or_else(|| fail("editor control frame outside backing"))?
+                                .cast::<NativeFrame>();
+                            return Ok(unsafe { (*ptr).rdi });
+                        }
+                        VcpuExit::IoOut {
+                            port: FATAL_PORT, ..
+                        } => {
+                            return Err(fail("editor fixture fatal exit"));
+                        }
+                        VcpuExit::IoOut {
+                            port: ENTRY_KICK_PORT | RETURN_KICK_PORT,
+                            ..
+                        } => {}
+                        _ => return Err(fail("editor fixture non-control exit")),
+                    }
+                }
+                Err(fail("editor fixture exit budget"))
+            });
+
+            let editor_res = match editor_handle.join() {
+                Ok(res) => res,
+                Err(_) => Err(fail("editor thread panic")),
+            };
+            let reader_res = match reader_handle.join() {
+                Ok(res) => res,
+                Err(_) => Err(fail("reader thread panic")),
+            };
+            (editor_res, reader_res)
+        });
+        let editor_res = editor_res?;
+        reader_res?;
+        Ok(editor_res)
     }
 
     /// Resume a stopped native entry after its host service has completed.
@@ -2582,7 +3252,7 @@ impl Cpl0Carrier {
         let watchdog = Watchdog::start();
         for _ in 0..32 {
             let exit = watchdog
-                .during_guest(|| HvVcpu::run(&mut self.cpus[index]))
+                .during_guest(|| self.run_cpu(index))
                 .map_err(|e| fail(e.to_string()))?;
             if watchdog.expired.load(Ordering::Acquire) {
                 let mut detail = "CPL0 fixture deadline".to_owned();
@@ -2672,7 +3342,7 @@ impl Cpl0Carrier {
                 ENTRY_KICK_PORT | RETURN_KICK_PORT => {
                     self.task(index).linux.mark_pending_host_work();
                     self.cpus[index].fd_mut().set_kvm_immediate_exit(1);
-                    let kicked = HvVcpu::run(&mut self.cpus[index]);
+                    let kicked = self.run_cpu(index);
                     self.cpus[index].fd_mut().set_kvm_immediate_exit(0);
                     if !matches!(kicked, Ok(VcpuExit::Kicked)) {
                         return Err(fail("boundary kick did not interrupt KVM_RUN"));

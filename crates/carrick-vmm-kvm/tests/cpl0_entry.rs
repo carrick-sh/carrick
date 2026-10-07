@@ -405,6 +405,7 @@ fn shared_kernel_x86_descriptor_protects_a_user_page() {
     program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
     let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    carrier.fixture_bind_descriptor_owner(0).unwrap();
     assert_eq!(
         carrier
             .observe(0)
@@ -428,6 +429,7 @@ fn shared_kernel_x86_prepares_then_publishes_a_user_page() {
     program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
     let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    carrier.fixture_bind_descriptor_owner(0).unwrap();
     assert_eq!(
         carrier.observe(0).expect("descriptor publication").result,
         1
@@ -508,6 +510,7 @@ fn shared_kernel_retired_page_repoints_without_user_publication() {
     program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
     let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    carrier.fixture_bind_descriptor_owner(0).unwrap();
     assert_eq!(carrier.observe(0).expect("owner retirement").result, 1);
     let leaf = carrier
         .fixture_user_leaf_raw(0x3_7000)
@@ -1120,6 +1123,237 @@ fn shared_kernel_peer_apic_queues_wake_for_runnable_cpu() {
 }
 
 #[test]
+fn stopped_cpl3_cpu_receives_a_queued_host_kick() {
+    let mut program = vec![0x31, 0xff, 0x48, 0xb8]; // zero result; mov rax, OBSERVE_NATIVE
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05]); // first syscall stops on CONTROL_PORT
+    program.extend_from_slice(&[
+        0xc6, 0x04, 0x25, 0x00, 0x00, 0x04, 0x00, 0x01, // mov byte [0x40000], 1
+        0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x04, 0x00, // mov rax, [0x40000]
+        0xeb, 0xf6, // jmp to the load
+    ]);
+    let load_rip = carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000 + program.len() as u64 - 10;
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&program, &program])
+        .expect("real KVM CPU with native interrupt gates");
+    assert_eq!(carrier.observe(1).expect("first user syscall").result, 0);
+    carrier
+        .fixture_stop_after_user_byte(1, 0x4_0000)
+        .expect("stop CPU 1 while its user loop runs");
+    carrier
+        .fixture_stop_before_user_rip(1, load_rip)
+        .expect("next user instruction is the loop load");
+    assert_eq!(carrier.fixture_pending_irqs(1).unwrap(), 0);
+    carrier
+        .queue_resume_kick(1)
+        .expect("queue KICK on stopped CPL3 CPU");
+    carrier
+        .fixture_run_until_pending_kick(1)
+        .expect("guest KICK handler before continued user loop");
+    assert_ne!(
+        carrier
+            .fixture_pending_irqs(1)
+            .expect("retained IRQ reason")
+            & 2,
+        0,
+        "guest KICK handler must run before the first syscall result"
+    );
+}
+
+#[test]
+fn stopped_cpl3_cpu_drops_a_retired_translation_before_its_next_load() {
+    let mut editor = Vec::new();
+    for phase in [2_u64, 3] {
+        editor.extend_from_slice(&[0x48, 0xbf]); // mov rdi, phase
+        editor.extend_from_slice(&phase.to_le_bytes());
+        editor.extend_from_slice(&[0x48, 0xb8]); // mov rax, fixture edit
+        editor.extend_from_slice(&OBSERVE_RETIRE_REPOINT.to_le_bytes());
+        editor.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+        editor.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+        editor.extend_from_slice(&[0x0f, 0x05]);
+    }
+    editor.extend_from_slice(&[0x0f, 0x0b]);
+    let mut reader = vec![0xa0]; // mov al, [0x37000]
+    reader.extend_from_slice(&0x3_7000_u64.to_le_bytes());
+    reader.push(0xa2); // mov [0x40000], al
+    reader.extend_from_slice(&0x4_0000_u64.to_le_bytes());
+    reader.extend_from_slice(&[0xeb, 0xec]); // repeat the 20-byte load/store loop
+
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&editor, &reader])
+        .expect("two native KVM CPUs with one retained page-table root");
+    carrier.fixture_share_root(1, 0).expect("same MM root");
+    carrier.fixture_write_backing_byte(0xd1_1000, 0x11).unwrap();
+    assert_eq!(carrier.observe(0).expect("prepare old page").result, 1);
+    carrier
+        .fixture_stop_after_user_value(1, 0x4_0000, 0x11)
+        .expect("reader warmed its old translation");
+    carrier
+        .fixture_stop_before_user_rip(1, carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000)
+        .expect("next user instruction is the stale-page load");
+    let checks_before = carrier.fixture_kick_generation_checks(1).unwrap();
+    carrier.fixture_write_backing_byte(0x4_0000, 0).unwrap();
+    assert_eq!(carrier.observe(0).expect("retire old page").result, 1);
+    let [(root, generation, ack), _] = carrier.fixture_shootdown_state();
+    assert_eq!(root, 0x60_0000, "retirement must name the shared root");
+    assert_eq!(carrier.fixture_shootdown_owner(0).unwrap(), (1, 1));
+    assert_ne!(generation, 0, "retirement must publish a generation");
+    assert!(ack[1] < generation, "stopped CPU must still owe its drain");
+    assert!(carrier.fixture_shootdown_served(0, 1).unwrap() < generation);
+    assert_eq!(
+        carrier.fixture_kick_generation_checks(1).unwrap(),
+        checks_before
+    );
+    carrier
+        .fixture_run_until_user_fault(1, carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000, 0x3_7000)
+        .expect("first resumed load faults on the retired page");
+    assert_ne!(carrier.fixture_pending_irqs(1).unwrap() & 2, 0);
+    assert!(
+        carrier.fixture_shootdown_state()[0].2[1] >= generation,
+        "KICK must acknowledge the retirement before the first user load"
+    );
+    assert_eq!(carrier.fixture_shootdown_served(0, 1).unwrap(), generation);
+    assert_eq!(
+        carrier.fixture_kick_generation_checks(1).unwrap(),
+        checks_before + 1
+    );
+}
+
+#[test]
+fn two_running_vcpus_drop_stale_translation_on_shootdown() {
+    let mut editor = Vec::new();
+    for phase in [2_u64, 3] {
+        editor.extend_from_slice(&[0x48, 0xbf]); // mov rdi, phase
+        editor.extend_from_slice(&phase.to_le_bytes());
+        editor.extend_from_slice(&[0x48, 0xb8]); // mov rax, fixture edit
+        editor.extend_from_slice(&OBSERVE_RETIRE_REPOINT.to_le_bytes());
+        editor.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+        editor.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+        editor.extend_from_slice(&[0x0f, 0x05]);
+    }
+    editor.extend_from_slice(&[0x0f, 0x0b]);
+    let mut reader = vec![0xa0]; // mov al, [0x37000]
+    reader.extend_from_slice(&0x3_7000_u64.to_le_bytes());
+    reader.push(0xa2); // mov [0x40000], al
+    reader.extend_from_slice(&0x4_0000_u64.to_le_bytes());
+    reader.extend_from_slice(&[0xeb, 0xec]); // repeat the 20-byte load/store loop
+
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&editor, &reader])
+        .expect("two native KVM CPUs with one retained page-table root");
+    carrier.fixture_share_root(1, 0).expect("same MM root");
+    carrier.fixture_write_backing_byte(0xd1_1000, 0x11).unwrap();
+    assert_eq!(carrier.observe(0).expect("prepare old page").result, 1);
+    carrier
+        .fixture_stop_after_user_value(1, 0x4_0000, 0x11)
+        .expect("reader warmed its old translation");
+    carrier
+        .fixture_stop_before_user_rip(1, carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000)
+        .expect("reader stopped before user rip");
+    let checks_before = carrier.fixture_kick_generation_checks(1).unwrap();
+    carrier.fixture_write_backing_byte(0x4_0000, 0).unwrap();
+    let result = carrier
+        .fixture_two_running_cpus_shootdown_fault(
+            0,
+            1,
+            carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000,
+            0x3_7000,
+        )
+        .expect("concurrent shootdown and user fault");
+    assert_eq!(result, 1, "editor completed retirement");
+    let [(root, generation, ack), _] = carrier.fixture_shootdown_state();
+    assert_eq!(root, 0x60_0000, "retirement must name the shared root");
+    assert_ne!(generation, 0, "retirement must publish a generation");
+    assert!(
+        ack[1] >= generation,
+        "running CPU must acknowledge shootdown"
+    );
+    assert_eq!(carrier.fixture_shootdown_served(0, 1).unwrap(), generation);
+    assert_eq!(
+        carrier.fixture_kick_generation_checks(1).unwrap(),
+        checks_before,
+        "running CPU served shootdown via IPI, not KICK"
+    );
+}
+
+#[test]
+fn stopped_cpl0_cpu_drops_stale_translation_before_cpl0_access() {
+    let mut editor = Vec::new();
+    for phase in [2_u64, 3] {
+        editor.extend_from_slice(&[0x48, 0xbf]); // mov rdi, phase
+        editor.extend_from_slice(&phase.to_le_bytes());
+        editor.extend_from_slice(&[0x48, 0xb8]); // mov rax, fixture edit
+        editor.extend_from_slice(&OBSERVE_RETIRE_REPOINT.to_le_bytes());
+        editor.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+        editor.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+        editor.extend_from_slice(&[0x0f, 0x05]);
+    }
+    editor.extend_from_slice(&[0x0f, 0x0b]);
+
+    let mut reader = vec![0x48, 0xbf]; // mov rdi, 0x3_7000
+    reader.extend_from_slice(&0x3_7000_u64.to_le_bytes());
+    reader.extend_from_slice(&[0x48, 0xb8]); // mov rax, OBSERVE_CPL0_UACCESS_SHOOTDOWN
+    reader
+        .extend_from_slice(&carrick_x86::cpl0_entry::OBSERVE_CPL0_UACCESS_SHOOTDOWN.to_le_bytes());
+    reader.extend_from_slice(&[0x0f, 0x05]); // syscall -> warms TLB, stops on FORWARD_PORT, resumes, reads again, stops on second FORWARD_PORT
+    reader.extend_from_slice(&[0x48, 0x89, 0xc7, 0x48, 0xb8]); // mov rdi, rax; mov rax, OBSERVE_NATIVE
+    reader.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    reader.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&editor, &reader])
+        .expect("two native KVM CPUs with one retained page-table root");
+    carrier.fixture_share_root(1, 0).expect("same MM root");
+    carrier.fixture_write_backing_byte(0xd1_1000, 0x11).unwrap();
+    assert_eq!(carrier.observe(0).expect("prepare old page").result, 1);
+
+    let frame1 = carrier
+        .fixture_run_until_forward(1)
+        .expect("reader stopped on first FORWARD_PORT in CPL0");
+    assert_eq!(
+        frame1.rbx, 0x11,
+        "reader must hold proven warm translation reading 0x11 before stop"
+    );
+
+    assert_eq!(carrier.observe(0).expect("retire old page").result, 1);
+    let [(root, generation, ack), _] = carrier.fixture_shootdown_state();
+    assert_eq!(root, 0x60_0000);
+    assert_ne!(generation, 0);
+    assert!(
+        ack[1] < generation,
+        "stopped CPU in CPL0 must not prematurely acknowledge"
+    );
+    assert!(
+        carrier.fixture_shootdown_served(0, 1).unwrap() < generation,
+        "stopped CPU in CPL0 must still owe its drain"
+    );
+    assert!(
+        carrier.fixture_last_seen_generation(1).unwrap() < generation,
+        "stopped CPU in CPL0 must not have reloaded CR3 for new generation yet"
+    );
+    carrier.fixture_write_backing_byte(0xd1_1000, 0x22).unwrap();
+
+    let frame2 = carrier
+        .fixture_run_until_forward(1)
+        .expect("resumed CPL0 user access stopped on second FORWARD_PORT");
+    assert_eq!(
+        frame2.rax as i64, -14,
+        "resumed CPL0 user access must fault on unmapped page, not read stale TLB"
+    );
+    let [(_, generation, ack), _] = carrier.fixture_shootdown_state();
+    assert!(
+        ack[1] >= generation,
+        "shootdown must be acknowledged after CPL0 settlement"
+    );
+    assert_eq!(
+        carrier.fixture_shootdown_served(0, 1).unwrap(),
+        generation,
+        "shootdown must be served after CPL0 settlement"
+    );
+    assert_eq!(
+        carrier.fixture_last_seen_generation(1).unwrap(),
+        generation,
+        "CR3 must be reloaded after CPL0 settlement"
+    );
+}
+
+#[test]
 fn shared_kernel_scheduler_routes_reschedule_to_peer_apic() {
     const INTERRUPT_WITNESS: u64 = 0xffff_ffff_ffff_ff40;
     let mut sender = vec![0x48, 0xbe]; // mov rsi, peer scheduler slot
@@ -1164,6 +1398,7 @@ fn two_live_cpus_complete_mutual_root_shootdowns() {
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
     let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&program, &program])
         .expect("two live KVM CPUs");
+    carrier.fixture_share_root(1, 0).expect("same MM root");
     let generations = carrier.fixture_observe_pair().unwrap_or_else(|error| {
         panic!(
             "mutual rendezvous: {error}; state={:?}",
