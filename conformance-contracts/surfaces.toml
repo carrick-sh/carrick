@@ -773,9 +773,6 @@ path = "crates/carrick-vmm-hvf/src/vcpu_kick.rs"
 contracts = ["kernel.timer.delivery-gate"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/native_ownership_tests.rs"
-
-[[surfaces]]
 path = "crates/carrick-el1/src/personality/native_ownership_tests.rs"
 contracts = ["kernel.el1.mm-exclusive-owner"]
 
