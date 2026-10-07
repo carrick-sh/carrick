@@ -434,7 +434,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: Gues
         self.ipc_transfer()
     }
     fn original_argument0(&self) -> u64 {
-        self.frame.argument(0)
+        self.frame.argument(0).unwrap_or(0)
     }
     fn install_result(&mut self, result: SyscallResult) {
         self.frame
@@ -589,7 +589,7 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDis
     for El1PendingFamilies<'_, F, C, U, G>
 {
     fn original_argument0(&self) -> u64 {
-        self.frame.argument(0)
+        self.frame.argument(0).unwrap_or(0)
     }
     fn task_state(&self) -> Option<&LinuxTaskState> {
         self.task().map(|task| &task.linux)
@@ -762,12 +762,15 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDis
         self.frame.canonical_ordinal().raw()
     }
     fn inotify_add(&mut self) -> Option<i64> {
+        let fd = self.frame.argument(0)? as i32;
+        let wd = self.frame.argument(1)?;
+        let mask = self.frame.argument(2)? as u32;
         self.task().and_then(|task| {
             inotify::el1_inotify_add_watch(
                 self.file_access(),
-                self.frame.argument(0) as i32,
-                self.frame.argument(1),
-                self.frame.argument(2) as u32,
+                fd,
+                wd,
+                mask,
                 task,
                 self.fd_map,
                 self.object_table,
@@ -779,11 +782,13 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDis
         })
     }
     fn inotify_remove(&mut self) -> Option<i64> {
+        let fd = self.frame.argument(0)? as i32;
+        let wd = self.frame.argument(1)? as i32;
         self.task().and_then(|task| {
             inotify::el1_inotify_rm_watch(
                 self.file_access(),
-                self.frame.argument(0) as i32,
-                self.frame.argument(1) as i32,
+                fd,
+                wd,
                 task,
                 self.fd_map,
                 self.object_table,
@@ -793,7 +798,7 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDis
         })
     }
     fn original_argument0(&self) -> u64 {
-        self.frame.argument(0)
+        self.frame.argument(0).unwrap_or(0)
     }
     fn task_state(&self) -> Option<&LinuxTaskState> {
         self.task().map(|task| &task.linux)
@@ -812,10 +817,13 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDis
         )
     }
     fn inotify_read(&mut self) -> Option<i64> {
+        let fd = self.frame.argument(0)? as i32;
+        let buf = self.frame.argument(1)?;
+        let len = self.frame.argument(2)? as usize;
         inotify::el1_inotify_read(
-            self.frame.argument(0) as i32,
-            self.frame.argument(1),
-            self.frame.argument(2) as usize,
+            fd,
+            buf,
+            len,
             self.task()?,
             self.fd_map,
             self.inotify_table,
@@ -876,7 +884,7 @@ where
     if file_table == 0 {
         return None;
     }
-    let fd = frame.argument(0) as i32;
+    let fd = frame.argument(0)? as i32;
     // fd -> open file (this description's offset and flags) -> inode (bytes).
     let (handle, slot_idx) = fd_map_lookup(fd_map, file_table, fd)?;
     if handle == 0 || handle as usize > MAX_ZONE_OPEN_FILES {
@@ -913,7 +921,7 @@ where
         task: cur_task,
         validator: &file::HardwareValidator,
     };
-    let args = [frame.argument(1), frame.argument(2), frame.argument(3)];
+    let args = [frame.argument(1)?, frame.argument(2)?, frame.argument(3)?];
     let zone_file = file::ZoneFile { inode: file, open };
     // SAFETY: the inode is locked and revalidated; `cache_ptr` is its slot.
     let outcome = unsafe {

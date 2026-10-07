@@ -715,8 +715,8 @@ impl carrick_guest_arch::SyscallFrame for TrapFrame {
     fn canonical_ordinal(&self) -> carrick_guest_arch::CanonicalNr {
         carrick_guest_arch::CanonicalNr::new(self.x[8])
     }
-    fn argument(&self, index: usize) -> u64 {
-        self.x[index]
+    fn argument(&self, index: usize) -> Option<u64> {
+        self.x.get(index).copied()
     }
     fn result(&self) -> carrick_guest_arch::NativeReturnWord {
         carrick_guest_arch::NativeReturnWord(self.x[0])
