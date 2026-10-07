@@ -3716,7 +3716,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/xattr.rs",
-      "line": 46,
+      "line": 45,
       "categories": [
         "description_guard"
       ],
@@ -11853,7 +11853,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mount_api.rs",
-      "line": 351,
+      "line": 342,
       "categories": [
         "description_guard"
       ],
@@ -11862,7 +11862,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mount_api.rs",
-      "line": 430,
+      "line": 421,
       "categories": [
         "description_guard"
       ],
@@ -11970,7 +11970,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 967,
+      "line": 961,
       "categories": [
         "table_guard"
       ],
@@ -11979,7 +11979,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 1074,
+      "line": 1068,
       "categories": [
         "table_guard"
       ],
@@ -11988,7 +11988,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 1874,
+      "line": 1868,
       "categories": [
         "description_guard"
       ],
@@ -11997,7 +11997,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 1911,
+      "line": 1905,
       "categories": [
         "table_guard"
       ],
@@ -12006,7 +12006,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 1916,
+      "line": 1910,
       "categories": [
         "table_guard"
       ],
@@ -12015,7 +12015,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 1927,
+      "line": 1921,
       "categories": [
         "table_guard"
       ],
@@ -12024,7 +12024,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 2593,
+      "line": 2587,
       "categories": [
         "table_guard"
       ],
@@ -12033,7 +12033,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 2754,
+      "line": 2748,
       "categories": [
         "table_guard"
       ],
