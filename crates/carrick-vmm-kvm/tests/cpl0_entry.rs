@@ -727,7 +727,9 @@ fn x4_linux_common_entry() {
                 assert_eq!(observed.forwarded, 0);
                 assert_eq!(observed.semantic_host_exits, 0, "no host Linux serving");
                 assert_eq!(observed.kicks, 2 * (entries[0] + entries[1]));
-                assert_eq!(observed.work_exits, entries[0] + entries[1]);
+                // Entry work is published by shared dispatch before the
+                // return kick requests a second, separately recorded exit.
+                assert_eq!(observed.work_exits, 2 * (entries[0] + entries[1]));
                 assert_eq!(observed.captured_stack, 0x3_1fe8 + task as u64 * 0x1_0000);
                 assert_eq!(observed.returned_stack, observed.captured_stack);
                 assert_eq!(observed.preserved_rbx, calls[task][round as usize].0);
@@ -793,13 +795,40 @@ fn entry_and_return_kicks_never_republish_or_recomplete() {
             );
             assert_eq!(observation.returned_stack, observation.captured_stack);
             assert_eq!(observation.kicks, (entries[0] + entries[1]) * 2);
-            assert_eq!(observation.work_exits, entries[0] + entries[1]);
+            assert_eq!(observation.work_exits, 2 * (entries[0] + entries[1]));
             forwards = observation.forwarded + observation.semantic_host_exits;
         }
     }
     let observation_count = entries[0] + entries[1];
     assert_eq!(observation_count, 4);
     assert_eq!(forwards, 0, "kicks cannot forward a served call");
+}
+
+#[test]
+fn forwarded_call_completes_before_pending_kick_work_exit() {
+    let mut code = program(&[(0xdead, 24)]);
+    let native_robust_list = [0xb8, 0x11, 0x01, 0, 0, 0x0f, 0x05];
+    let offset = code
+        .windows(native_robust_list.len())
+        .position(|bytes| bytes == native_robust_list)
+        .expect("native syscall in fixture");
+    code[offset + 1..offset + 5].copy_from_slice(&39_u32.to_le_bytes()); // getpid forwards
+    let peer = program(&[(0xbeef, 24)]);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&code, &peer]).expect("real KVM image");
+    carrier
+        .inject_boundary_kicks(0)
+        .expect("entry and return kicks");
+    let observed = carrier
+        .observe_with_forward(0, |frame| {
+            frame.rax = 4321;
+            Ok(())
+        })
+        .expect("forward, completion, and pending work exit");
+    assert_eq!(observed.result, 4321);
+    assert_eq!(carrier.entry_state().host_forwards, 1);
+    assert_eq!(observed.kicks, 2);
+    assert_eq!(observed.work_exits, 1);
+    assert_eq!(observed.completions, [1, 0]);
 }
 
 #[test]
