@@ -1340,6 +1340,7 @@ pub(crate) mod tests {
                     kicker,
                     carrick_hal::InGuestFlag::for_guest_thread(),
                     1_000,
+                    carrick_kernel::kernel::TrapTrace::Off,
                 );
             state.service_kernel_context = Some(root.retain_exact());
             let syscall_request = SyscallRequest::new(
@@ -1840,6 +1841,7 @@ pub(crate) mod tests {
                     kicker,
                     carrick_hal::InGuestFlag::for_guest_thread(),
                     1_000,
+                    carrick_kernel::kernel::TrapTrace::Off,
                 );
             state.service_kernel_context = Some(root.retain_exact());
             let clone_flags = if phase.is_none() {
@@ -1988,6 +1990,7 @@ pub(crate) mod tests {
                 kicker,
                 carrick_hal::InGuestFlag::for_guest_thread(),
                 1_000,
+                carrick_kernel::kernel::TrapTrace::Off,
             );
         state.service_kernel_context = Some(root.retain_exact());
         let mut memory = Memory::default();
@@ -2069,6 +2072,7 @@ pub(crate) mod tests {
                 kicker,
                 carrick_hal::InGuestFlag::for_guest_thread(),
                 1_000,
+                carrick_kernel::kernel::TrapTrace::Off,
             );
         state.service_kernel_context = Some(root.retain_exact());
         let mut memory = Memory::default();

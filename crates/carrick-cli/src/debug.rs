@@ -1205,12 +1205,12 @@ fn run_container_gate(
             carrick_runtime::Runtime::execute_on(
                 &carrier,
                 &alpha.spec,
-                carrick_kernel::kernel::LaunchContext::from_process_env()?,
+                crate::runtime_util::launch_context_from_process_env()?,
             ),
             carrick_runtime::Runtime::execute_on(
                 &carrier,
                 &beta.spec,
-                carrick_kernel::kernel::LaunchContext::from_process_env()?,
+                crate::runtime_util::launch_context_from_process_env()?,
             ),
         ),
         ContainerGateMode::Concurrent => {
@@ -1218,7 +1218,7 @@ fn run_container_gate(
             let alpha_thread = thread::Builder::new()
                 .name("gate-alpha".into())
                 .spawn(move || {
-                    let launch = carrick_kernel::kernel::LaunchContext::from_process_env()?;
+                    let launch = crate::runtime_util::launch_context_from_process_env()?;
                     carrick_runtime::Runtime::execute_on(&alpha_carrier, &alpha.spec, launch)
                 })
                 .context("spawn alpha container thread")?;
@@ -1226,7 +1226,7 @@ fn run_container_gate(
             let beta_thread = thread::Builder::new()
                 .name("gate-beta".into())
                 .spawn(move || {
-                    let launch = carrick_kernel::kernel::LaunchContext::from_process_env()?;
+                    let launch = crate::runtime_util::launch_context_from_process_env()?;
                     carrick_runtime::Runtime::execute_on(&beta_carrier, &beta.spec, launch)
                 })
                 .context("spawn beta container thread")?;

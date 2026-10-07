@@ -5553,6 +5553,7 @@ where
             kicker,
             in_guest,
             max_traps,
+            kernel.dispatcher.container().launch().trap_trace,
         );
         state.execution_lease = execution_lease;
         state.service_kernel_context = Some(context.retain_exact());
@@ -5885,6 +5886,7 @@ mod tests {
             kicker,
             carrick_hal::InGuestFlag::for_guest_thread(),
             1_000,
+            carrick_kernel::kernel::TrapTrace::Off,
         );
         state.service_kernel_context = Some(root.retain_exact());
         let mut job =
@@ -6443,6 +6445,7 @@ mod tests {
             kicker,
             carrick_hal::InGuestFlag::for_guest_thread(),
             1_000,
+            carrick_kernel::kernel::TrapTrace::Off,
         );
         state.service_kernel_context = Some(root.retain_exact());
         let production = ProductionHvpatchLoopJob {
@@ -6845,6 +6848,7 @@ mod tests {
             Arc::new(carrick_hal::GenericVcpuRegistry::new()),
             carrick_hal::InGuestFlag::for_guest_thread(),
             1_000,
+            carrick_kernel::kernel::TrapTrace::Off,
         );
         state.service_kernel_context = Some(root.retain_exact());
         let mut job =

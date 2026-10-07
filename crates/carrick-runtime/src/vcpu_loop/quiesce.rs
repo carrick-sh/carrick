@@ -1638,6 +1638,7 @@ where
             Arc::clone(&child_kicker),
             carrick_hal::InGuestFlag::for_guest_thread(),
             self.max_traps,
+            self.trace,
         );
         child_state.execution_lease = execution_lease;
         child_state.service_kernel_context = Some(child_context.retain_exact());

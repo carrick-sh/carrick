@@ -175,6 +175,7 @@ pub(super) struct ProcessThreadAdoptionFactory<E: ThreadedEngine> {
     threads: VcpuThreadRegistry,
     kicker: Arc<dyn VcpuRegistry>,
     max_traps: usize,
+    trap_trace: carrick_kernel::kernel::TrapTrace,
     engine: std::marker::PhantomData<fn() -> E>,
 }
 
@@ -289,6 +290,7 @@ where
             threads: state.threads.clone(),
             kicker: state.kicker.clone(),
             max_traps: state.max_traps,
+            trap_trace: state.trace,
             engine: std::marker::PhantomData,
         })
     }
@@ -426,6 +428,7 @@ where
             self.kicker.clone(),
             carrick_hal::InGuestFlag::for_guest_thread(),
             self.max_traps,
+            self.trap_trace,
         );
         reserved.execution_lease = execution_lease;
         state.push(reserved);
@@ -671,6 +674,7 @@ mod tests {
             Arc::new(carrick_hal::GenericVcpuRegistry::new()),
             carrick_hal::InGuestFlag::for_guest_thread(),
             max_traps,
+            carrick_kernel::kernel::TrapTrace::Off,
         )
     }
 
@@ -855,7 +859,9 @@ mod tests {
             test_carrier_graph_with_dispatcher!(72_491, SyscallDispatcher::new());
         let (_, peer_scheduler, peer_kernel, peer, _, _) =
             test_carrier_graph_with_dispatcher!(72_492, SyscallDispatcher::new());
-        let owner_state = state(&owner_kernel, &owner, 1_001);
+        let mut owner_state = state(&owner_kernel, &owner, 1_001);
+        // The launch's trap log travels with the owning process, not the peer.
+        owner_state.trace = carrick_kernel::kernel::TrapTrace::Stderr;
         let peer_state = state(&peer_kernel, &peer, 2_002);
         let factory = ProcessThreadAdoptionFactory::capture(&owner_kernel, &owner_state).unwrap();
         let reservation = factory.reserve(owner.thread().key()).unwrap();
@@ -867,6 +873,11 @@ mod tests {
         assert!(!Arc::ptr_eq(&adopted.state.registry, &peer_state.registry));
         assert!(!Arc::ptr_eq(&adopted.state.futex, &peer_state.futex));
         assert_eq!(adopted.state.max_traps, 1_001);
+        assert_eq!(
+            adopted.state.trace,
+            carrick_kernel::kernel::TrapTrace::Stderr
+        );
+        assert_eq!(peer_state.trace, carrick_kernel::kernel::TrapTrace::Off);
         assert_eq!(
             adopted.state.kernel_thread.as_ref().unwrap().key(),
             owner.thread().key()

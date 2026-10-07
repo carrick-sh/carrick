@@ -631,7 +631,7 @@ fn run_detached_carrier(
             std::process::exit(1);
         }
     };
-    let launch = match carrick_kernel::kernel::LaunchContext::from_process_env() {
+    let launch = match crate::runtime_util::launch_context_from_process_env() {
         Ok(launch) => launch,
         Err(_) => {
             container::mark_exited(id, 1);
