@@ -3859,18 +3859,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/build.rs:53 in `main`, `std::fs::copy` copies only the Cargo-built production CPL0 image into this build script OUT_DIR; no guest path or identity selects either host file.",
+    "rationale": "At crates/carrick-vmm-kvm/build.rs:65 in `main`, `std::fs::copy` copies only the Cargo-built production CPL0 image into this build script OUT_DIR; no guest path or identity selects either host file.",
     "review_id": "HA-000759",
     "source": {
-      "byte_end": 1623,
-      "byte_start": 1610,
-      "column": 5,
-      "column_end": 18,
-      "column_start": 5,
+      "byte_end": 2582,
+      "byte_start": 2569,
+      "column": 9,
+      "column_end": 22,
+      "column_start": 9,
       "file": "crates/carrick-vmm-kvm/build.rs",
-      "line": 53,
-      "line_end": 53,
-      "line_start": 53
+      "line": 65,
+      "line_end": 65,
+      "line_start": 65
     }
   },
   {
@@ -6567,18 +6567,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:1371 in `Cpl0Carrier::boot`, `std::fs::read` reads only the caller-selected CPL0 bootstrap ELF, whose segments and entry are validated before the fixture registers memory or runs either vCPU; no guest syscall argument or guest identity selects this host path.",
+    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:1566 in `Cpl0Carrier::boot`, `std::fs::read` reads only the caller-selected CPL0 bootstrap ELF, whose segments and entry are validated before the fixture registers memory or runs either vCPU; no guest syscall argument or guest identity selects this host path.",
     "review_id": "HA-000752",
     "source": {
-      "byte_end": 55975,
-      "byte_start": 55962,
+      "byte_end": 62679,
+      "byte_start": 62666,
       "column": 21,
       "column_end": 34,
       "column_start": 21,
       "file": "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
-      "line": 1371,
-      "line_end": 1371,
-      "line_start": 1371
+      "line": 1566,
+      "line_end": 1566,
+      "line_start": 1566
     }
   },
   {
@@ -14208,18 +14208,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/frame_inventory.rs:1142 in `prepare_reservation`, `std::process::id` identifies only the calling host process so the authority discards cached entropy after a host fork; it neither supplies a guest identity nor selects a host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/frame_inventory.rs:1168 in `prepare_reservation`, `std::process::id` identifies only the calling host process so the authority discards cached entropy after a host fork; it neither supplies a guest identity nor selects a host target.",
     "review_id": "HA-000649",
     "source": {
-      "byte_end": 42137,
-      "byte_start": 42121,
+      "byte_end": 42998,
+      "byte_start": 42982,
       "column": 48,
       "column_end": 64,
       "column_start": 48,
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1142,
-      "line_end": 1142,
-      "line_start": 1142
+      "line": 1168,
+      "line_end": 1168,
+      "line_start": 1168
     }
   },
   {
@@ -18232,18 +18232,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:412 in `Watchdog::start`, `std::thread::spawn` creates one bounded timeout witness for the current KVM_RUN host thread during fixture observation. Production initial MM loading and execution do not start this watchdog. Its retained KvmKickHandle targets that exact host thread; cancellation and Drop join retain its lifetime. It neither creates a guest task nor implements a guest wait, and no guest identity selects the host target.",
+    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:488 in `Watchdog::start`, `std::thread::spawn` creates one bounded timeout witness for the current KVM_RUN host thread during fixture observation. Production initial MM loading and execution do not start this watchdog. Its retained KvmKickHandle targets that exact host thread; cancellation and Drop join retain its lifetime. It neither creates a guest task nor implements a guest wait, and no guest identity selects the host target.",
     "review_id": "HA-000753",
     "source": {
-      "byte_end": 16909,
-      "byte_start": 16891,
+      "byte_end": 19142,
+      "byte_start": 19124,
       "column": 22,
       "column_end": 40,
       "column_start": 22,
       "file": "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
-      "line": 412,
-      "line_end": 412,
-      "line_start": 412
+      "line": 488,
+      "line_end": 488,
+      "line_start": 488
     }
   },
   {
