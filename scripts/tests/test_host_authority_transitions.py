@@ -179,8 +179,8 @@ AMBIENT_BUILD_AUTHORITY = {
 
 for host, features in (
     ("linux", ["--features", "syscall-shim"]),
-    ("freebsd", ["--no-default-features"]),
-    ("netbsd", ["--no-default-features"]),
+    ("freebsd", []),
+    ("netbsd", []),
 ):
     for target, package, target_args in (
         ("cli", "carrick-cli", ["--bin", "carrick"]),
