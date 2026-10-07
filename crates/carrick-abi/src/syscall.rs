@@ -700,6 +700,19 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn canonical_syscalls_leave_private_diagnostic_slots_free() {
+        let first_private = carrick_syscall_abi::private_x86_counter_slot(
+            carrick_syscall_abi::CanonicalNr(carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2),
+        )
+        .unwrap();
+        assert!(
+            super::AARCH64_SYSCALLS
+                .iter()
+                .all(|call| (call.number as usize) < first_private)
+        );
+    }
+
     use super::*;
 
     #[test]

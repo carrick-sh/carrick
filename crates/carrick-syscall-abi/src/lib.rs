@@ -89,6 +89,22 @@ const fn private_x86_number(ordinal: PrivateX86Ordinal) -> u64 {
     u64::MAX - 0x20 - ordinal as u64
 }
 
+/// Dedicated diagnostic counter slots for private x86 operations. Slots
+/// 480..511 are outside the current asm-generic table; 511 remains the panic
+/// sentinel. Derive the slots from the same enum as the private call numbers
+/// so they cannot collide with each other or with native/canonical number 158.
+/// This uses spare slots in the existing 512-counter ABI without changing it.
+pub const fn private_x86_counter_slot(number: CanonicalNr) -> Option<usize> {
+    let first = private_x86_number(PrivateX86Ordinal::Dup2);
+    let last = private_x86_number(PrivateX86Ordinal::ArchPrctl);
+    if number.raw() >= last && number.raw() <= first {
+        Some(480 + (first - number.raw()) as usize)
+    } else {
+        None
+    }
+}
+const _: () = assert!(480 + (PrivateX86Ordinal::ArchPrctl as usize) < 511);
+
 /// Carrick-internal normalized syscall number for x86_64 `dup2(2)`.
 ///
 /// The asm-generic/canonical table has `dup3(2)` but no `dup2(2)`, and using

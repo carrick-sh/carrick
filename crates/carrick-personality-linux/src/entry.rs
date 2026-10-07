@@ -192,15 +192,12 @@ impl<'a> crate::dispatch::PendingFamilies<'a> for CommonFamilies<'a> {
     }
 }
 
-// Native operations have no asm-generic index. Their diagnostic slot uses the
-// native ordinal; semantic routing always retains the private canonical tag.
+// Private semantic tags retain private counter slots; a native ordinal
+// could name an unrelated call in the asm-generic-indexed counter arrays.
 #[cfg(target_arch = "x86_64")]
-fn native_diagnostic_ordinal(ordinal: u64) -> u64 {
-    if ordinal == carrick_syscall_abi::CARRICK_PRIVATE_X86_ARCH_PRCTL {
-        crate::abi::x86_64::ARCH_PRCTL_X86_NR
-    } else {
-        ordinal
-    }
+pub(crate) fn native_diagnostic_ordinal(ordinal: u64) -> u64 {
+    carrick_syscall_abi::private_x86_counter_slot(carrick_syscall_abi::CanonicalNr(ordinal))
+        .map_or(ordinal, |slot| slot as u64)
 }
 
 pub fn serve(call: &CanonicalCall, venue: &dyn LinuxEntryVenue) -> EntryOutcome {
