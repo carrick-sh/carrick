@@ -3,10 +3,6 @@
 //! via KVM_GET/SET_ONE_REG. On x86_64: bare KVM_CREATE_VCPU (no ARM init);
 //! registers via KVM_GET/SET_REGS/SREGS from guest_setup_x86 (Tasks 2–3).
 //! Guest RAM via KVM_SET_USER_MEMORY_REGION over a host mmap; run via KVM_RUN.
-// On x86_64, the aarch64-specific functions in this module are dead until
-// Tasks 2–4 wire the x86 paths.  Suppress dead_code warnings on non-aarch64
-// targets to keep `cargo clippy -- -D warnings` clean on container-104.
-#![cfg_attr(not(target_arch = "aarch64"), allow(dead_code, unused_imports))]
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
@@ -81,12 +77,19 @@ pub(crate) enum KvmStat {
     ExitDebug,
     ExitInternal,
     ExitOther,
+    #[cfg(target_arch = "x86_64")]
     GetRegs,
+    #[cfg(target_arch = "x86_64")]
     SetRegs,
+    #[cfg(target_arch = "x86_64")]
     GetSregs,
+    #[cfg(target_arch = "x86_64")]
     SetSregs,
+    #[cfg(target_arch = "x86_64")]
     GetFpu,
+    #[cfg(target_arch = "x86_64")]
     SetFpu,
+    #[cfg(target_arch = "x86_64")]
     SetMsrs,
 }
 
@@ -151,12 +154,19 @@ pub(crate) fn record_kvm_stat(stat: KvmStat) {
         KvmStat::ExitDebug => &KVM_EXIT_DEBUG,
         KvmStat::ExitInternal => &KVM_EXIT_INTERNAL,
         KvmStat::ExitOther => &KVM_EXIT_OTHER,
+        #[cfg(target_arch = "x86_64")]
         KvmStat::GetRegs => &KVM_GET_REGS,
+        #[cfg(target_arch = "x86_64")]
         KvmStat::SetRegs => &KVM_SET_REGS,
+        #[cfg(target_arch = "x86_64")]
         KvmStat::GetSregs => &KVM_GET_SREGS,
+        #[cfg(target_arch = "x86_64")]
         KvmStat::SetSregs => &KVM_SET_SREGS,
+        #[cfg(target_arch = "x86_64")]
         KvmStat::GetFpu => &KVM_GET_FPU,
+        #[cfg(target_arch = "x86_64")]
         KvmStat::SetFpu => &KVM_SET_FPU,
+        #[cfg(target_arch = "x86_64")]
         KvmStat::SetMsrs => &KVM_SET_MSRS,
     }
     .fetch_add(1, Ordering::Relaxed);
@@ -687,6 +697,7 @@ impl KvmVcpu {
     /// within a live VM. `execve(2)` replaces the whole VM on the x86 backend, so
     /// parking the old vCPU into the old VM's pool would keep obsolete KVM fds
     /// alive past image replacement.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn close_on_drop(&mut self) {
         self.recycle = None;
     }
@@ -1183,10 +1194,9 @@ impl KvmVm {
         // the id space is spent) unless vcpus are recycled. The vcpu_init below
         // fully resets a recycled vcpu — same UNPROGRAMMED contract either way.
         let parked = self.vcpu_pool.lock().ok().and_then(|mut p| p.pop());
-        let fd: VcpuFd;
         #[cfg(target_arch = "x86_64")]
         let fault_slot: u64;
-        match parked {
+        let fd: VcpuFd = match parked {
             Some(mut parked) => {
                 #[cfg(target_arch = "x86_64")]
                 {
@@ -1216,7 +1226,7 @@ impl KvmVm {
                 parked.fd.set_kvm_immediate_exit(1);
                 let _ = parked.fd.run(); // -EINTR; consumes any stale MMIO completion
                 parked.fd.set_kvm_immediate_exit(0);
-                fd = parked.fd;
+                parked.fd
             }
             None => {
                 // Draw a UNIQUE vcpu_id from the shared allocator. The owning
@@ -1245,9 +1255,9 @@ impl KvmVm {
                     .map_err(|e| os_err("KVM_CREATE_VCPU", e))?;
                 #[cfg(target_arch = "x86_64")]
                 self.install_x86_cpuid(&new_fd)?;
-                fd = new_fd;
+                new_fd
             }
-        }
+        };
         #[cfg(target_arch = "x86_64")]
         {
             // Enable AVX state on EVERY x86 vCPU: XCR0 = x87(0)|SSE(1)|AVX(2) so
@@ -1361,6 +1371,7 @@ impl KvmVm {
     ///
     /// Does NOT touch `next_slot`; the execve path unmaps all old slots, then
     /// [`Self::reset_slot_counter`]s and re-registers the new windows from slot 0.
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn unmap_memory_slot(&mut self, slot: u32) -> Result<(), OsError> {
         let region = kvm_userspace_memory_region {
             slot,
@@ -1394,6 +1405,7 @@ impl KvmVm {
     /// re-register from slot 0. Called by `execve_into` after unmapping every
     /// old slot, so the new image's windows reuse the same slot ids/order the
     /// fresh VM would have used.
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn reset_slot_counter(&mut self) {
         self.next_slot.store(0, Ordering::SeqCst);
     }
@@ -1405,6 +1417,7 @@ impl KvmVm {
     /// process can live on with a hole). `unmap_memory_slot` treats deleting a
     /// nonexistent slot as idempotent success, so execve's `0..slot_count()`
     /// teardown sweep is safe across holes.
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn slot_count(&self) -> u32 {
         self.next_slot.load(Ordering::SeqCst)
     }
