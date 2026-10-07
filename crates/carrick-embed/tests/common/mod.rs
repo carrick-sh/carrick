@@ -19,6 +19,19 @@ pub const SMOKE_IMAGE: &str = "docker.io/library/ubuntu:24.04";
 
 static GUEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// Use the CLI's existing terminal-fatal hold for live embed diagnostics.
+/// This does not change workload deadlines or successful execution. Holding
+/// one failing executor lets other executors advance until LLDB attaches;
+/// that observer effect must be retained with the capture, not called a gate.
+pub fn arm_fatal_debugger_hold() {
+    if let Ok(value) = std::env::var("CARRICK_FATAL_HOLD_SECS")
+        && let Ok(secs) = value.trim().parse::<u32>()
+        && secs > 0
+    {
+        carrick_fatal::arm_debugger_hold(secs);
+    }
+}
+
 /// Serialize guest-running tests inside one process: HVF allows one VM per
 /// process, and the Inherit case redirects the process's own fd 1. The recipe
 /// sets `RUST_TEST_THREADS=1`; this is the in-file belt for a filtered run.
