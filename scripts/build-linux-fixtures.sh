@@ -26,7 +26,11 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 # Each build also writes `<name>.d` dep-info beside the executable: the fixture
 # publisher records every checkout file rustc read (including `#[path]` modules
-# and `include_*!` targets) as a fixture input.
+# and `include_*!` targets) as a fixture input. `--out-dir` keeps rustc's
+# intermediate objects in this run's private `$tmp_dir`: with `--emit=obj=PATH`
+# and no `-o`, rustc stages them in the working directory, so two concurrent
+# builds (parallel integration tests) raced on the same `<crate>-cgu.0.rcgu.o`.
+# Every output is written privately and moved into place.
 build_fixture() {
   local source="$1"
   local name="$2"
@@ -39,7 +43,8 @@ build_fixture() {
     --edition 2024 \
     -C panic=abort \
     -C opt-level=z \
-    --emit=obj="$object",dep-info="$out_dir/$name.d"
+    --out-dir "$tmp_dir" \
+    --emit=obj="$object",dep-info="$tmp_dir/$name.d"
 
   "$lld" -flavor gnu \
     -static \
@@ -49,6 +54,7 @@ build_fixture() {
     "$object"
 
   mv -f "$artifact_tmp" "$artifact"
+  mv -f "$tmp_dir/$name.d" "$out_dir/$name.d"
   file "$artifact"
 }
 
@@ -65,7 +71,8 @@ build_pie_fixture() {
     -C panic=abort \
     -C opt-level=z \
     -C relocation-model=pic \
-    --emit=obj="$object",dep-info="$out_dir/$name.d"
+    --out-dir "$tmp_dir" \
+    --emit=obj="$object",dep-info="$tmp_dir/$name.d"
 
   # Produce a static-PIE ELF: ET_DYN with no PT_INTERP, so the loader sees
   # the same shape as Alpine's busybox without needing a dynamic linker.
@@ -79,6 +86,7 @@ build_pie_fixture() {
     "$object"
 
   mv -f "$artifact_tmp" "$artifact"
+  mv -f "$tmp_dir/$name.d" "$out_dir/$name.d"
   file "$artifact"
 }
 
