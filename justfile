@@ -679,12 +679,16 @@ test-integration:
 # on macOS `check --workspace` compiles every crate (HVF included); off-macOS a bare
 # `check` (= `cargo build -p carrick-cli {{_platform_features}}`) is the right scope —
 # `--workspace` there would drag in carrick-vmm-hvf (cc/applevisor) and fail.
+check-fixture-locks:
+    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- check-fixture-locks
+
 ci:
     #!/usr/bin/env bash
     set -euo pipefail
     j() { just --justfile {{justfile()}} "$@"; }
     j check-disk
     j check-frame-pointers
+    j check-fixture-locks
     j fmt-check
     j clippy
     j lint-domains

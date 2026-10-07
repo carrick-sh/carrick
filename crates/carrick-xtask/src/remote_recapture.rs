@@ -246,8 +246,19 @@ fn build_launch_command(remote_root: &str, worktree: &str, run_dir: &str, script
     let env = shell_quote(&format!("{remote_root}/env.sh"));
     let exit = shell_quote(&format!("{run_dir}/exit"));
     let exit_tmp = shell_quote(&format!("{run_dir}/exit.tmp"));
-    let completion =
-        format!("rc=$?; echo \"$rc\" > {exit_tmp} && mv {exit_tmp} {exit}; exit \"$rc\"");
+    let completion = format!(
+        "rc=$?; {}/target/debug/carrick-xtask gate-cleanup --owned-root {} --run-id {} >> {} 2>&1 || {{ [ \"$rc\" != 0 ] || rc=1; }}; echo \"$rc\" > {exit_tmp} && mv {exit_tmp} {exit}; exit \"$rc\"",
+        shell_quote(worktree),
+        shell_quote(worktree),
+        shell_quote(
+            Path::new(run_dir)
+                .file_name()
+                .unwrap_or_default()
+                .to_str()
+                .unwrap_or_default()
+        ),
+        shell_quote(&format!("{run_dir}/recapture.log"))
+    );
     // Invoke the lease CLI directly: just's variadic CMD interpolation joins
     // shell text and loses the single argv boundary around a multiline script.
     format!(
@@ -627,6 +638,10 @@ mod tests {
             };
             fs::write(&cargo, stub).unwrap();
             fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+            let helper = worktree.join("target/debug/carrick-xtask");
+            fs::create_dir_all(helper.parent().unwrap()).unwrap();
+            fs::write(&helper, "#!/bin/sh\n[ \"$1\" = gate-cleanup ] && [ \"$2\" = --owned-root ] && [ \"$3\" = \"$PWD\" ]\n").unwrap();
+            fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
             let witness = worktree.join("executed");
             let script = format!(
                 "set -eu\nprintf '%s' \"$CARRICK_RECAPTURE_FIXTURE\" > {}\n",
