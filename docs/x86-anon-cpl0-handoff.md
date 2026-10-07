@@ -833,3 +833,28 @@ inventory tests, including two simultaneously retained MM transactions with
 different GPA and mapping identities and the existing wrong-MM refusal.
 This is physical custody proof only: production CPU1, process hooks, exact
 per-execution pending grants and the two-MM PRIVATE live witness remain open.
+
+## Owned consuming reap custody (2026-10-07)
+
+5c80ffd1b extends the existing shared consume_wait result with the removed,
+non-cloneable consumer zombie payload. No extra scan or shadow numeric claim
+is needed. Host drops that payload under the existing registry write guard,
+before reaped observers and namespace effects. Group/session cleanup and
+parent CPU charging remain the same shared consuming body.
+
+Red /tmp/x86-process-owner-adapter-reap-red.log observes a selected numeric
+claim dropped before result release (one release, expected zero). Green
+/tmp/x86-process-owner-adapter-reap-green.log passes all 152 sched-core tests;
+focused clippy exits zero in /tmp/x86-process-owner-adapter-reap-clippy.log.
+A read-only scoped review approves spec and quality with no findings.
+Kernel semantics, KVM and workspace clippy exit zero in
+/tmp/x86-process-owned-reap-{semantics,kvm,clippy}.log. Full just test is still
+running at this documentation checkpoint; its final .status is authoritative.
+N1 ASM retains the recorded single difference, parent comparison is zero.
+
+The first reconciliation attempt started while the pre-commit hook still held
+the staged source and correctly refused dirty inputs. Clean re-run
+/tmp/x86-process-owned-reap-reconcile-clean.log exits zero and rebinds two
+physical inventory positions only. No review verdict or rationale changes.
+Guest birth admission/claim return/payload integration and the PRIVATE two-MM
+runtime witness remain required. No review-ready claim or PR has been made.
