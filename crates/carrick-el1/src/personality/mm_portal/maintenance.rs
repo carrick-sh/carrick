@@ -367,7 +367,7 @@ fn with_x86_backing_venue<R>(
         words,
         root,
         pool: carrick_el1_abi::cow_grant_pool_guest(),
-        residency: carrick_el1_abi::frame_grant_residency_guest(),
+        residency: crate::isa::frame_grant_residency_guest(),
         copy_window: carrick_core::mm::cow::CowCopyWindow::target(words, root),
     };
     Ok(run(&venue))

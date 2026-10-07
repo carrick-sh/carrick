@@ -843,7 +843,7 @@ pub(crate) fn with_hardware_cow_venue<R>(
         words: &words,
         root: carrick_mmu_core::aarch64::SubstrateGpa(ttbr0 & TTBR_BADDR_MASK),
         pool: carrick_el1_abi::cow_grant_pool_guest(),
-        residency: carrick_el1_abi::frame_grant_residency_guest(),
+        residency: crate::isa::frame_grant_residency_guest(),
         copy_window,
     }))
 }
@@ -1121,7 +1121,7 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 peers: Some(carrick_el1_abi::frame_grant_mailboxes_guest()),
             },
             Some(PreparedFaultPath::<_> {
-                residency: carrick_el1_abi::frame_grant_residency_guest(),
+                residency: crate::isa::frame_grant_residency_guest(),
                 resolver: &mut HardwarePreparedResolver,
                 roots: Some(crate::memory::reservations::shared_guest()),
                 file_slots: Some(unsafe {

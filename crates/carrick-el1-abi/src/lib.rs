@@ -2207,12 +2207,6 @@ pub fn frame_grant_residency_host() -> Option<&'static FrameGrantResidencyTable>
     })
 }
 
-#[cfg(target_os = "none")]
-pub fn frame_grant_residency_guest() -> &'static FrameGrantResidencyTable {
-    // SAFETY: the kernel-only EL1 region is installed before fault entry.
-    unsafe { &*(EL1_FRAME_GRANT_RESIDENCY_BASE as *const FrameGrantResidencyTable) }
-}
-
 /// Guest view of the shared metadata mailbox. Call only while executing in
 /// the installed Carrick EL1 image.
 #[cfg(target_os = "none")]
