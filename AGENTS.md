@@ -177,8 +177,8 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
   ask the user for a native x86 box.
 - **Cross-platform lanes:** `--lane kvm-local|bhyve-local|nvmm-local` (inject
   `--platform linux/amd64`, set `CARRICK_INSECURE_REGISTRIES`). Build off macOS
-  with `cargo build -p carrick-cli --no-default-features --features platform-<linux|freebsd|netbsd>`
-  (`platform-macos` → E0433; `build-signed.sh` is macOS-only). x86 excuses go
+  with `just build` / `cargo build -p carrick-cli`: the build target selects the
+  backend (no `platform-*` features; `build-signed.sh` is macOS-only). x86 excuses go
   in `baseline.kvm.jsonl`. No registry: `ssh -R 5005:<registry-host>:5005 <box>`.
   **Shared tree:** sync only your files, `md5`-verify deps — no blanket
   `rsync crates/`.
