@@ -93,10 +93,13 @@ pub enum WaitReadiness {
 }
 
 #[derive(Debug)]
-pub struct ConsumedWait<Z, E> {
+pub struct ConsumedWait<Z, E, OwnedZombie> {
     pub selection: WaitSelection<Z, E>,
     /// Exact parent to which the consumer delivers the post-reap effects.
     pub reaped_parent: Option<TaskKey>,
+    /// The removed payload retains the consumer's numeric/resource custody
+    /// until the caller releases it. Observing a receipt never clones custody.
+    pub reaped_record: Option<OwnedZombie>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WaitError<E> {
@@ -107,8 +110,10 @@ pub enum WaitError<E> {
 
 pub type ObservedWait<C, U, L> =
     Result<WaitSelection<Zombie<C, U>, <L as WaitLive>::Event>, WaitError<<L as WaitLive>::Error>>;
-pub type ConsumingWait<C, U, L> =
-    Result<ConsumedWait<Zombie<C, U>, <L as WaitLive>::Event>, WaitError<<L as WaitLive>::Error>>;
+pub type ConsumingWait<C, U, L, Z> = Result<
+    ConsumedWait<Zombie<C, U>, <L as WaitLive>::Event, Z>,
+    WaitError<<L as WaitLive>::Error>,
+>;
 
 impl<
     C: Copy + Ord,
@@ -182,7 +187,7 @@ impl<
         &mut self,
         parent_id: TaskId,
         query: WaitQuery,
-    ) -> ConsumingWait<C, U, L>
+    ) -> ConsumingWait<C, U, L, Z>
     where
         Z: WaitZombie<C, U>,
     {
@@ -190,6 +195,7 @@ impl<
         let selected = self.select_wait(parent_id, query, true)?;
         let selection = self.wait_receipt(selected)?;
         let mut reaped_parent = None;
+        let mut reaped_record = None;
         if let WaitSelection::Exited(zombie) = &selection {
             self.admit_wait(zombie.key.id)?;
             let parent = self
@@ -198,7 +204,7 @@ impl<
                 .ok_or(WaitError::UnknownTask(parent_id))?;
             let revision = parent.prepare_reap().map_err(WaitError::Revision)?;
             reaped_parent = Some(parent.wait_identity().key);
-            self.zombies.remove(&zombie.key.id);
+            reaped_record = self.zombies.remove(&zombie.key.id);
             self.remove_group_member(zombie.process_group, zombie.session, zombie.key);
             // No fallible operation follows removal. The same write guard
             // owns the parent entry that was admitted above.
@@ -209,6 +215,7 @@ impl<
         Ok(ConsumedWait {
             selection,
             reaped_parent,
+            reaped_record,
         })
     }
 

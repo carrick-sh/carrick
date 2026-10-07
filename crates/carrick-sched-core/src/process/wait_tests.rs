@@ -382,3 +382,67 @@ fn shared_wait_consuming_precheck_does_not_require_cloning_receipts() {
     assert!(owner.zombies.contains_key(&child.id));
     assert_eq!(owner.tasks[&parent.id].charge, TaskRusage::default());
 }
+
+#[test]
+fn consuming_wait_retains_only_selected_owned_claim_until_result_release() {
+    struct OwnedZombie {
+        receipt: Zombie<u32, u32>,
+        releases: alloc::rc::Rc<Cell<usize>>,
+    }
+    impl WaitZombie<u32, u32> for OwnedZombie {
+        fn wait_zombie(&self) -> &Zombie<u32, u32> {
+            &self.receipt
+        }
+    }
+    impl Drop for OwnedZombie {
+        fn drop(&mut self) {
+            self.releases.set(self.releases.get() + 1);
+        }
+    }
+    let mut owner = empty_registry::<OwnedZombie>();
+    let parent = key(1, 1);
+    let first = key(2, 2);
+    let second = key(3, 3);
+    let mut p = live(parent, None);
+    p.children = alloc::vec![first, second];
+    owner.tasks.insert(parent.id, p);
+    let first_releases = alloc::rc::Rc::new(Cell::new(0));
+    let second_releases = alloc::rc::Rc::new(Cell::new(0));
+    for (child, releases) in [(first, &first_releases), (second, &second_releases)] {
+        owner.zombies.insert(
+            child.id,
+            OwnedZombie {
+                receipt: zombie(child, parent),
+                releases: releases.clone(),
+            },
+        );
+    }
+    let mut first_query = query();
+    first_query.target = WaitTarget::Exact(first);
+    let consumed_first = owner.consume_wait(parent.id, first_query).unwrap();
+    assert!(
+        matches!(consumed_first.selection, WaitSelection::Exited(ref receipt) if receipt.key == first)
+    );
+    assert_eq!(
+        first_releases.get(),
+        0,
+        "reap must return owned numeric custody"
+    );
+    assert_eq!(second_releases.get(), 0);
+    assert!(!owner.zombies.contains_key(&first.id));
+    assert!(owner.zombies.contains_key(&second.id));
+    let consumed_second = owner.consume_wait(parent.id, query()).unwrap();
+    assert!(
+        matches!(consumed_second.selection, WaitSelection::Exited(ref receipt) if receipt.key == second)
+    );
+    assert_eq!(second_releases.get(), 0);
+    assert!(matches!(
+        owner.consume_wait(parent.id, query()).unwrap().selection,
+        WaitSelection::NoChild
+    ));
+    drop(consumed_first);
+    assert_eq!(first_releases.get(), 1);
+    assert_eq!(second_releases.get(), 0);
+    drop(consumed_second);
+    assert_eq!(second_releases.get(), 1);
+}
