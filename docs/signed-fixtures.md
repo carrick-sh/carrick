@@ -40,6 +40,23 @@ containers on macOS. Embed and raw fixtures already cross-built locally, but
 from its inventory. It remains a separate developer provisioning command;
 it cannot authorize signed acceptance.
 
+## Input identity
+
+A bundle's **input identity** is the SHA-256 of its canonical source
+inventory and build policy (`Manifest::input_identity`, recorded as
+`inputs_sha256`). Restore and verification admit a bundle when its input
+identity equals the checkout's current identity, whichever commit published
+it: `source_head` is publisher provenance, not an admission key. An unrelated
+commit, or unrelated dirty or untracked files, therefore keep the bundle
+valid. Any change to a fixture input refuses it with `fixture input identity
+mismatch`, naming both identities, the build commit and the differing inputs:
+fixture sources, a crate in a fixture's path-dependency closure, a fixture
+`Cargo.lock`, tracked Cargo configuration, the compiler pin, a builder script
+or the publisher's own build code. A dirty or untracked fixture input is
+refused before hashing. There is no hand-maintained crate list; the closure is
+re-derived from `cargo metadata` on every check, so a new path dependency is
+an input as soon as a fixture depends on it.
+
 ## Bundle and restore
 
 Build requires the full current HEAD SHA and clean fixture source inputs. It
@@ -54,10 +71,13 @@ explicitly in Cargo precedence order. It hashes the
 tracked source trees of reachable local path packages, including transitive
 and build dependencies; dev-only edges are excluded because these binaries
 are built without tests. The probe crate resolves both musl and GNU targets;
-the remaining fixtures resolve musl. The inventory also includes root and
-ancestor Cargo manifests/locks/configuration and the Rust publisher's build
-and probe-selection sources. Unrelated workspace crate sources, such as
-`carrick-runtime`, are outside this inventory.
+the remaining fixtures resolve musl. The inventory also includes each fixture
+workspace's own `Cargo.lock`, ancestor Cargo manifests and configuration of
+every reachable path package, the compiler pin, the shell builders and the
+Rust publisher's build and probe-selection sources. Unrelated workspace crate
+sources, such as `carrick-runtime`, are outside this inventory, and so is the
+host workspace `Cargo.lock`: Cargo builds each fixture workspace from its own
+lockfile and never reads an enclosing workspace's lock.
 
 Build, restore, and verification need Cargo and cached registry metadata/source
 packages for these locked graphs. Prepare a cold cache with `cargo fetch
@@ -85,7 +105,7 @@ These hashes provide integrity and freshness, not publisher authentication:
 transport bundles from the trusted build publisher.
 
 Transfer the entire content-address directory, preserving executable modes.
-On a checkout at the same exact SHA:
+On any checkout whose fixture input identity matches:
 
 ```sh
 just xtask fixtures restore --manifest /scratch/bundle/<manifest-sha256>/manifest.json
@@ -99,7 +119,7 @@ An inherited gate lease is reused; an inherited shared lease is rejected
 without attempting an upgrade. Standalone manifest and archive restores
 therefore cannot replace fixtures used by a live signed gate.
 
-Restore verifies the address, commit, full source and executable inventories,
+Restore verifies the address, input identity, full source and executable inventories,
 all hashes, executable permissions, AArch64 ELF architecture, static musl
 shape, GNU loader, and compiler pin before writing any destination. Paths
 outside the declared inventory and symlink components fail closed. It captures
@@ -120,11 +140,16 @@ fails before signing or guest execution if it cannot verify the installed
 receipt and every fixture. `test-signed.sh` verifies again for embed and
 conformance-next invocations; it consumes the restored bytes without building
 guest fixtures. Both the installed receipt and fresh verification evidence
-record `validation_method: "input_identity"`, bundle and checkout commit IDs,
-manifest and input-inventory SHA-256 digests, and checkout dirtiness. Acceptance
-includes this evidence as `fixture_validation`; signed-test JSONL includes a
-`fixture_validation` record. These fields describe fixture input equality,
-not full-tree SHA equality or acceptance of a dirty host build.
+record `validation_method: "input_identity"`, the checkout's exact HEAD
+(`checkout_head`), the Git tree of its working state (`checkout_tree`:
+tracked and untracked files, gitignored outputs excluded, written from a
+private copy of the index), the bundle's build commit (`bundle_source_head`),
+checkout dirtiness, and the manifest and input-identity SHA-256 digests.
+Acceptance includes this evidence as `fixture_validation`; signed-test JSONL
+includes a `fixture_validation` record. These fields describe fixture input
+equality, not full-tree SHA equality or acceptance of a dirty host build.
+Receipts installed before `checkout_tree` existed no longer parse; restore
+again.
 
 ## Controlled fixture build policy
 
@@ -155,9 +180,10 @@ not a sandbox for untrusted build scripts or a claim of bit reproducibility.
 
 ## Scoped tests and red-first work
 
-An exact-HEAD bundle remains valid when unrelated checkout sources are dirty.
-For a runtime red-first test on macOS, restore the bundle for current HEAD
-once, then:
+A bundle stays valid across commits and dirty edits that do not touch fixture
+inputs. Restore once, then commit, rebase or edit host sources freely; rebuild
+and publish only when the input identity changes. For a runtime red-first test
+on macOS:
 
 ```sh
 git checkout <pre-fix> -- crates/carrick-runtime/src/<file>.rs
@@ -173,15 +199,15 @@ uncommitted work before replacing a file. The same fixture validation applies
 to direct `scripts/test-signed.sh carrick-conformance-next <filter>` runs.
 A modified or untracked input inside a fixture or its resolved dependency
 closure still rejects the bundle. If the test changes such inputs, commit
-that variant, build and restore its exact-SHA bundle, and test that artifact.
-Restore a new exact-SHA bundle after changing HEAD, even if only unrelated
-sources changed. `just accept --phase signed` and `remote-accept` retain their
-fully clean-checkout and exact-SHA admission rules. Acceptance checks tracked
-and untracked files independently of fixture validation, overriding Git's
-untracked-file display preference; only gitignored outputs are excluded. It
-checks again before signed work and before issuing a PASS receipt. Focused
-dirty-tree receipts do
-not confer acceptance or carry signed executable identity across rebuilds.
+that variant, build and restore its bundle, and test that artifact.
+`just accept --phase signed` and `remote-accept` additionally require a
+fully clean checkout. Acceptance checks tracked and untracked files
+independently of fixture validation, overriding Git's untracked-file display
+preference; only gitignored outputs are excluded. It checks again before
+signed work and before issuing a PASS receipt. Its receipt binds the exact
+HEAD, `checkout_tree` and the bundle's input identity. Focused dirty-tree
+receipts do not confer acceptance or carry signed executable identity across
+rebuilds.
 
 ## Remote acceptance and Actions entry points
 
@@ -209,18 +235,22 @@ just lease gate sh -c 'just fixtures-restore "$1" && just accept --phase signed'
 declared directories into private staging, rejects links, traversal, duplicate
 entries and multiple roots, then uses the same complete manifest verifier and
 receipt-last restore as `--manifest`. Missing, changed or non-executable
-objects and a previous-SHA bundle fail before acceptance. `just lease`
+objects and a bundle built from different fixture inputs fail before
+acceptance. `just lease`
 preserves command argument boundaries and accept inherits its existing gate
 descriptor, without reacquiring or upgrading a shared lease. Upload the
 fixture artifact separately from acceptance logs and receipts.
 
 `just remote-accept --ref <sha> --phase signed` selects the unique local
 `target/fixtures/bundles/<sha>/<digest>/manifest.json`, packages and transfers
-it to that run's directory, and restores it after checkout cleanup. Supply
-`--fixture-manifest <path>` when the bundle is elsewhere or multiple publishers
-produced distinct valid bundles for one SHA. Selection requires the requested
-commit's identity; there is no fallback to mutable local or remote probe
-directories. Host-only acceptance needs no guest fixtures.
+it to that run's directory, and restores it after checkout cleanup. With no
+bundle published from `<sha>` itself and the local checkout at `<sha>`, it
+selects the unique stored bundle (under any build commit) whose input identity
+matches the checkout. Supply `--fixture-manifest <path>` when the bundle is
+elsewhere, the checkout is at another commit, or several stored bundles
+match. There is no fallback to mutable local or remote probe directories, and
+the gate host re-verifies input identity against its own exact checkout.
+Host-only acceptance needs no guest fixtures.
 
 Use `--remote-bundle /absolute/gate-host/path/bundle.tar.gz` to consume a
 published archive already on the gate host instead of uploading a local
@@ -231,8 +261,9 @@ directory. Verification, SHA-256 hashing and restoration use only this
 capture. Archive verification reads the gzip stream through EOF, validating
 all member trailers and rejecting trailing garbage for local uploads too.
 It then invokes the same checkout-aware verifier as manifest restoration:
-exact HEAD, v2 schema, scoped source closure, current build policy, toolchain
-and executable inventory must all match before run provenance is published.
+v2 schema, input identity (scoped source closure), current build policy,
+toolchain and executable inventory must all match before run provenance is
+published.
 Ambient build overrides are rejected here as well as during restore.
 `fixtures verify --bundle <path> --receipt <path>` writes fresh input-identity
 evidence atomically. Receipt annotation and attach preserve acceptance's
@@ -268,8 +299,9 @@ native ARM Linux and passes the same-run, exact-SHA archive to its dependent
 HVF job. After checkout and artifact download, one exclusive host lease
 covers restore, signing, embedded tests, cached probes and scoped cleanup.
 Its VM-free regression executes that workflow preparation on an empty
-checkout, repeats it after same-SHA raw-fixture removal, and rejects a
-previous-SHA artifact before either signed test command can execute.
+checkout, repeats it after same-SHA raw-fixture removal, and rejects an
+artifact built from different fixture inputs before either signed test
+command can execute.
 
 PR #2's merge-queue worker will replace `land-provision` with these publisher
 and restore entry points after this PR lands, per director coordination. Its
@@ -283,8 +315,8 @@ This is host-only acceptance/provisioning code outside guest execution. The
 applicable invariant is exact source and executable identity for every signed
 fixture, with work linear in input and executable bytes. No guest ABI, guest
 scheduler, or guest-operation budget changes. The VM-free xtask tests cover
-roundtrip installation, tampered/missing objects, manifest tamper, wrong SHA,
-source drift, acceptance refusal of untracked host tests, controlled build
+roundtrip installation, tampered/missing objects, manifest tamper, a checkout
+HEAD differing from `--sha`, source drift, acceptance refusal of untracked host tests, controlled build
 environment/config isolation and policy mismatch, unrelated dirty workspace
 edits, direct/transitive path dependency
 drift, failed metadata resolution, missing lockfiles, input-identity receipt
@@ -314,3 +346,15 @@ inventory restored, it printed `clean restore succeeded before unrelated edit`,
 then `introduced only crates/carrick-runtime/src/lib.rs edit`, and failed with
 `dirty fixture source inputs`. Thus the red reaches the edit after proving
 clean installation; independent-inventory tests separately verify the new scope.
+
+The input-identity witnesses were added red-first against the exact-SHA
+admitter: `committed_unrelated_edit_keeps_bundle_admissible_by_input_identity`
+failed with `unknown fixture schema or wrong SHA`,
+`workspace_lockfile_is_not_a_fixture_input` with `dirty fixture source inputs`,
+and `bundle_selection_follows_fixture_input_identity_across_commits` with
+`found 0`. `committed_fixture_input_edits_refuse_by_input_identity` (fixture
+source, direct, transitive and build-dependency path crates),
+`fixture_lockfile_change_refuses_by_input_identity` and
+`toolchain_pin_change_refuses` were refused only by commit, never by input
+identity; they now refuse with `fixture input identity mismatch`, as do the
+remote-preparation and Actions workflow bindings.
