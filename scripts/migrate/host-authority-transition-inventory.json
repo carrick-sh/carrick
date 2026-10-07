@@ -13348,18 +13348,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/mqueue.rs:1199 in `deliver_notify`, the host result from `std::process::id` determines the legacy host-fallback message-queue thread recipient used by `deliver_notify`.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/mqueue.rs:1193 in `deliver_notify`, the host result from `std::process::id` determines the legacy host-fallback message-queue thread recipient used by `deliver_notify`.",
     "review_id": "HA-000501",
     "source": {
-      "byte_end": 45519,
-      "byte_start": 45503,
+      "byte_end": 45277,
+      "byte_start": 45261,
       "column": 40,
       "column_end": 56,
       "column_start": 40,
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 1199,
-      "line_end": 1199,
-      "line_start": 1199
+      "line": 1193,
+      "line_end": 1193,
+      "line_start": 1193
     }
   },
   {
@@ -13377,18 +13377,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/mqueue.rs:1227 in `deliver_notify`, the host result from `std::process::id` determines the legacy host-fallback message-queue signal recipient used by `deliver_notify`.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/mqueue.rs:1221 in `deliver_notify`, the host result from `std::process::id` determines the legacy host-fallback message-queue signal recipient used by `deliver_notify`.",
     "review_id": "HA-000502",
     "source": {
-      "byte_end": 46783,
-      "byte_start": 46767,
+      "byte_end": 46541,
+      "byte_start": 46525,
       "column": 40,
       "column_end": 56,
       "column_start": 40,
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 1227,
-      "line_end": 1227,
-      "line_start": 1227
+      "line": 1221,
+      "line_end": 1221,
+      "line_start": 1221
     }
   },
   {
