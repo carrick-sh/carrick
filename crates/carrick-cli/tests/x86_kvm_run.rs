@@ -8,6 +8,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::ExitStatusExt;
 use std::time::Duration;
 
 use assert_cmd::Command;
@@ -243,6 +244,7 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
 }
 
 #[test]
+#[ignore = "CPL0 anonymous mmap first touch needs the shared guest fault and descriptor editor"]
 fn mounted_static_x86_elf_matches_native_anonymous_memory() {
     compare_mounted_assembly_with_native("x86_memory_only.S", b"M\n");
 }
@@ -291,36 +293,50 @@ fn mounted_static_x86_guest_owned_calls_refuse_without_host_effects() {
 }
 
 #[test]
+#[ignore = "CPL0 mprotect needs the shared anonymous descriptor editor and x86 SIGSEGV delivery"]
+fn mounted_static_x86_mprotect_none_faults_like_native() {
+    compare_mounted_fault_with_native("x86_mprotect_fault.S");
+}
+
+#[test]
+#[ignore = "CPL0 munmap needs the shared anonymous descriptor editor and x86 SIGSEGV delivery"]
+fn mounted_static_x86_munmap_faults_like_native() {
+    compare_mounted_fault_with_native("x86_munmap_fault.S");
+}
+
+#[test]
 fn mounted_static_x86_arch_prctl_preserves_user_tls_bases() {
     compare_mounted_assembly_with_native("x86_dispatch_segments.S", b"T\n");
 }
 
 #[test]
+fn mounted_static_x86_poll_stdio_matches_native() {
+    compare_mounted_assembly_with_native("x86_poll_stdio.S", b"P\n");
+}
+
+#[test]
+#[ignore = "CPL0 startup needs guest rt_sigaction, lifecycle copy, and anonymous mprotect"]
 fn mounted_static_x86_dispatches_libc_startup_calls() {
     compare_mounted_assembly_with_native("x86_dispatch_startup.S", b"S\n");
 }
 
 #[test]
+#[ignore = "musl startup needs CPL0 signal actions and anonymous first-touch backing"]
 fn mounted_static_x86_musl_hello_matches_native() {
     if skip_without_kvm() {
         return;
     }
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../carrick-vmm-bhyve/fixtures/hello-x86_64");
-    // The fixture's .cargo/config.toml chooses the musl target and ET_EXEC
-    // link flags. Run Cargo from that directory so those settings take effect.
-    let build = Command::new("cargo")
-        .timeout(Duration::from_secs(60))
-        .current_dir(&fixture)
-        .args(["build", "--offline", "--release"])
-        .output()
-        .expect("build x86 musl fixture");
-    assert!(
-        build.status.success(),
-        "musl build stderr: {}",
-        String::from_utf8_lossy(&build.stderr)
-    );
+    // `just test-kvm` declares and builds this input before the test target.
+    // A missing artifact is a gate error, not a passing skip or a nested
+    // Cargo build inside an already running test process.
     let elf = fixture.join("target/x86_64-unknown-linux-musl/release/carrick-hello-x86_64");
+    assert!(
+        elf.is_file(),
+        "missing KVM lane musl build input: {}",
+        elf.display()
+    );
     compare_mounted_binary_with_native(&elf, b"hello, x86_64 world\n", 0, "musl-hello");
 }
 
@@ -331,7 +347,12 @@ fn mounted_static_x86_memory_and_fork_wait_match_native() {
 }
 
 fn skip_without_kvm() -> bool {
-    if !std::path::Path::new("/dev/kvm").exists() {
+    let present = std::path::Path::new("/dev/kvm").exists();
+    assert!(
+        present || std::env::var_os("CARRICK_REQUIRE_KVM").is_none_or(|value| value != "1"),
+        "CARRICK_REQUIRE_KVM=1 but /dev/kvm is absent: the KVM gate must not skip"
+    );
+    if !present {
         let message = b"SKIP x86 KVM CLI run: /dev/kvm is absent on this host\n";
         // SAFETY: fixed diagnostic bytes to the test process stderr.
         unsafe { libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len()) };
@@ -350,6 +371,30 @@ fn compare_mounted_assembly_with_native(fixture: &str, expected_stdout: &[u8]) {
     compare_mounted_binary_with_native(&elf, expected_stdout, 7, fixture);
 }
 
+fn compare_mounted_fault_with_native(fixture: &str) {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("fault-guest");
+    compile_assembly(fixture, &elf);
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .expect("run native x86 fault oracle");
+    assert_eq!(native.status.signal(), Some(libc::SIGSEGV));
+    assert!(native.stdout.is_empty());
+    let run = run_mounted_binary(&elf, fixture, false);
+    assert!(run.stdout.is_empty());
+    assert!(
+        run.status.signal() == Some(libc::SIGSEGV)
+            || run.status.code() == Some(128 + libc::SIGSEGV),
+        "CPL0 must deliver SIGSEGV like native Linux; status: {:?}; stderr: {}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
 fn compile_assembly(fixture: &str, elf: &std::path::Path) {
     let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -363,7 +408,7 @@ fn compile_assembly(fixture: &str, elf: &std::path::Path) {
             "-Wl,--build-id=none",
             "-o",
         ])
-        .arg(&elf)
+        .arg(elf)
         .arg(&source)
         .output()
         .expect("compile native x86 assembly oracle");

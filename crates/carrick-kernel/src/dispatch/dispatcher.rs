@@ -2312,6 +2312,15 @@ impl<'a> MemView<'a> {
 }
 
 impl SyscallDispatcher {
+    /// Initial limits transferred to the in-guest reservation owner before
+    /// the first task runs. Guest updates require their own owner publication.
+    pub fn launch_resource_limit(
+        &self,
+        resource: carrick_abi::LinuxResource,
+    ) -> carrick_abi::LinuxRlimit {
+        self.effective_resource_limit(resource.index() as u64)
+    }
+
     #[inline]
     pub fn fs_view(&self) -> FsView<'_> {
         FsView {

@@ -13,7 +13,7 @@ _start:
     cmp $-38, %rax              # ENOSYS
     jne fail
     mov $10, %rdi               # SIGUSR1
-    lea handler(%rip), %rsi
+    lea action(%rip), %rsi
     xor %rdx, %rdx
     mov $8, %r10
     mov $13, %rax               # rt_sigaction
@@ -39,5 +39,12 @@ exit:
     ud2
 handler:
     ret
+.data
+.balign 8
+action:
+    .quad handler                 # sa_handler
+    .quad 0                       # sa_flags
+    .quad 0                       # sa_restorer
+    .quad 0                       # sa_mask (x86_64 kernel sigset size 8)
 .section .rodata
 ok: .ascii "R\n"

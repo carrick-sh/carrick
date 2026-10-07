@@ -2282,7 +2282,7 @@ impl<'a> FsView<'a> {
             let bytes = if length == 0 {
                 Vec::new()
             } else {
-                match (*cx.memory).read_bytes(address, length) {
+                match (*cx.memory).read_bytes_prefix(address, length) {
                     Ok(b) => b,
                     Err(_) => {
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
@@ -2963,10 +2963,16 @@ impl<'a> FsView<'a> {
             } else if length <= STACK_WRITE_LIMIT {
                 match (*cx.memory).read_into(address, &mut stack_buf[..length]) {
                     Ok(()) => &stack_buf[..length],
-                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                    Err(_) => match (*cx.memory).read_bytes_prefix(address, length) {
+                        Ok(prefix) if !prefix.is_empty() => {
+                            heap_buf = prefix;
+                            &heap_buf
+                        }
+                        _ => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                    },
                 }
             } else {
-                match (*cx.memory).read_bytes(address, length) {
+                match (*cx.memory).read_bytes_prefix(address, length) {
                     Ok(v) => {
                         heap_buf = v;
                         &heap_buf
