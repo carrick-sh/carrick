@@ -3833,7 +3833,7 @@
       "rationale": "The publication token lost its exact staged task incarnation after signal retirement; continuing could publish completion for a reused identity.",
       "failure_domain": "kernel::task_exit_publication",
       "domain": "kernel::task_exit_publication",
-      "fingerprint": "c0bd6597988b6d3e13d67089e15098dc3f28ae60966be8f4612851d5bf784bcd",
+      "fingerprint": "316e391fda47d5d23f1de8de54594dc637f29417d5c1cece0dc726b7e426ee09",
       "sink": "fatal"
     },
     {

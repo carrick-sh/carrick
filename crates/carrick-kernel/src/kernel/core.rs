@@ -308,24 +308,7 @@ impl KernelTaskBinding {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-#[repr(transparent)]
-pub struct TaskRevision(u64);
-
-impl TaskRevision {
-    pub const INITIAL: Self = Self(1);
-
-    pub const fn next(self) -> Option<Self> {
-        match self.0.checked_add(1) {
-            Some(next) => Some(Self(next)),
-            None => None,
-        }
-    }
-
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-}
+pub use carrick_sched_core::process::exit::TaskRevision;
 
 pub struct RootBootstrap {
     task_id: TaskId,

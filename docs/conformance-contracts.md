@@ -602,3 +602,20 @@ cloning unnecessary until the write admission. Host kernel-semantics suites
 exercise the same owner through the public wait APIs. Signed ARM and live
 CPL0 process bindings remain required; these inner-loop checks make no
 runtime-ratio or guest-instruction claim.
+
+`kernel.process.exit-owner` covers reserved exit topology. Linux authority is
+exit(2), wait(2), PR_SET_CHILD_SUBREAPER and SIGCHLD's SIG_IGN/SA_NOCLDWAIT
+rules. The shared registry chooses exact-generation live ancestry, reparents
+both live and zombie children, and removes the exiting child edge for autoreap.
+Topology reservations retain one publication credit per live participant;
+admitted thread births and nonfinal exits may advance their revisions without
+closing those participants' membership gates. Dropping admission leaves their
+revision unchanged; publishing topology advances the current revision.
+
+The VM-free binding is `carrick-sched-core::process::exit_tests`, plus existing
+host exit/thread-reservation tests through the same owner. Selection visits
+only the exiting task, its ancestry, its children and its affected parents;
+it does not scan the registry population. Private prepared-plan fields keep
+adopter and child-set selection in the shared owner. Terminal zombie,
+cancellation and notification publication extraction, signed ARM binding and
+the live CPL0 two-MM witness remain open; no runtime-ratio claim is made.
