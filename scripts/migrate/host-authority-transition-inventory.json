@@ -3886,18 +3886,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/build.rs:65 in `main`, `std::fs::copy` copies only the Cargo-built production CPL0 image into this build script OUT_DIR; no guest path or identity selects either host file.",
+    "rationale": "At crates/carrick-vmm-kvm/build.rs:58 in `main`, `std::fs::copy` copies only the Cargo-built production CPL0 image into this build script OUT_DIR; no guest path or identity selects either host file.",
     "review_id": "HA-000759",
     "source": {
-      "byte_end": 2582,
-      "byte_start": 2569,
+      "byte_end": 2436,
+      "byte_start": 2423,
       "column": 9,
       "column_end": 22,
       "column_start": 9,
       "file": "crates/carrick-vmm-kvm/build.rs",
-      "line": 65,
-      "line_end": 65,
-      "line_start": 65
+      "line": 58,
+      "line_end": 58,
+      "line_start": 58
     }
   },
   {

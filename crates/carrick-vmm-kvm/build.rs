@@ -31,25 +31,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=cpl0_inputs.rs");
     let out = PathBuf::from(std::env::var("OUT_DIR")?);
     let target_dir = out.join("cpl0-target");
-    let status = Command::new(cargo)
-        .args([
-            "build",
-            "--locked",
-            "--release",
-            "-p",
-            "carrick-x86-cpl0",
-            "--bin",
-            "carrick-x86-cpl0",
-            "--bin",
-            "carrick-x86-cpl0-fixture",
-            "--target",
-            "x86_64-unknown-none",
-            "--target-dir",
-        ])
-        .arg(&target_dir)
-        .env_remove("CARGO_MAKEFLAGS")
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        .status()?;
+    let image_build = carrick_guest_image_build::Cpl0ImageBuild::new()
+        .with_locked(true)
+        .with_fixture(true);
+    let mut cmd = Command::new(cargo);
+    image_build.configure_command(&mut cmd, &target_dir);
+    let status = cmd.status()?;
     if !status.success() {
         return Err(format!("CPL0 image build failed: {status}").into());
     }
@@ -58,14 +45,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // separate (possibly stale) `cargo build` populated. The fixture keeps its
     // file name: the carrier recognises the fixture image by it.
     for (bin, variable) in [
-        ("carrick-x86-cpl0", "CARRICK_X86_CPL0_IMAGE"),
-        ("carrick-x86-cpl0-fixture", "CARRICK_X86_CPL0_FIXTURE_IMAGE"),
+        (
+            carrick_guest_image_build::CPL0_BIN_PRODUCTION,
+            "CARRICK_X86_CPL0_IMAGE",
+        ),
+        (
+            carrick_guest_image_build::CPL0_BIN_FIXTURE,
+            "CARRICK_X86_CPL0_FIXTURE_IMAGE",
+        ),
     ] {
         let image = out.join(bin);
-        std::fs::copy(
-            target_dir.join("x86_64-unknown-none/release").join(bin),
-            &image,
-        )?;
+        std::fs::copy(target_dir.join(image_build.bin_rel_path(bin)), &image)?;
         println!("cargo:rustc-env={variable}={}", image.display());
     }
     Ok(())

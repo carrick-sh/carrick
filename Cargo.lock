@@ -514,6 +514,7 @@ name = "carrick-el1-image"
 version = "0.1.0"
 dependencies = [
  "carrick-el1-abi",
+ "carrick-guest-image-build",
 ]
 
 [[package]]
@@ -590,6 +591,10 @@ version = "0.1.0"
 dependencies = [
  "zerocopy",
 ]
+
+[[package]]
+name = "carrick-guest-image-build"
+version = "0.1.0"
 
 [[package]]
 name = "carrick-guest-mem"
@@ -1088,6 +1093,7 @@ dependencies = [
  "carrick-el1-abi",
  "carrick-fatal",
  "carrick-guest-arch",
+ "carrick-guest-image-build",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",
@@ -1163,6 +1169,7 @@ name = "carrick-xtask"
 version = "0.1.0"
 dependencies = [
  "carrick-conformance",
+ "carrick-guest-image-build",
  "carrick-portable",
  "clap",
  "flate2",

@@ -12,3 +12,6 @@ carrick-el1-abi = { path = "../carrick-el1-abi" }
 default = []
 # Only signed embed verification builds expose the private allocator control.
 allocator-test-control = []
+
+[build-dependencies]
+carrick-guest-image-build = { path = "../carrick-guest-image-build" }

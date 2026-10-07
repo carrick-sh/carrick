@@ -135,8 +135,8 @@ impl GuestImage {
 
     pub fn target(self) -> &'static str {
         match self {
-            GuestImage::El1 => "aarch64-unknown-none-softfloat",
-            GuestImage::Cpl0 => "x86_64-unknown-none",
+            GuestImage::El1 => carrick_guest_image_build::EL1_TARGET,
+            GuestImage::Cpl0 => carrick_guest_image_build::CPL0_TARGET,
         }
     }
 }
@@ -554,45 +554,23 @@ fn run_image_build(
 ) -> Result<(), ScorecardError> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut cmd = Command::new(&cargo);
-    cmd.current_dir(repo_root);
-    cmd.env_remove("CARGO_MAKEFLAGS");
-    cmd.env_remove("CARGO_ENCODED_RUSTFLAGS");
-
-    // Exact invocation matching crates/carrick-el1-image/build.rs and
-    // crates/carrick-vmm-kvm/build.rs (same target, features, profile and RUSTFLAGS).
     match image {
         GuestImage::El1 => {
-            cmd.args([
-                "build",
-                "--locked",
-                "-p",
-                "carrick-el1",
-                "--target",
-                image.target(),
-                "--release",
-                "--target-dir",
-            ]);
-            cmd.arg(target_dir);
-            if std::env::var_os("CARGO_FEATURE_ALLOCATOR_TEST_CONTROL").is_some() {
-                cmd.arg("--features").arg("allocator-test-control");
-            }
+            // Production EL1 image is built without allocator-test-control
+            carrick_guest_image_build::El1ImageBuild::new()
+                .with_allocator_test_control(false)
+                .configure_command(&mut cmd, target_dir);
         }
         GuestImage::Cpl0 => {
-            cmd.args([
-                "build",
-                "--locked",
-                "--release",
-                "-p",
-                "carrick-x86-cpl0",
-                "--bin",
-                "carrick-x86-cpl0",
-                "--target",
-                image.target(),
-                "--target-dir",
-            ]);
-            cmd.arg(target_dir);
+            let has_fixture = repo_root
+                .join("crates/carrick-x86-cpl0/src/fixture.rs")
+                .exists();
+            carrick_guest_image_build::Cpl0ImageBuild::new()
+                .with_fixture(has_fixture)
+                .configure_command(&mut cmd, target_dir);
         }
     }
+    cmd.current_dir(repo_root);
 
     let output = cmd.output()?;
     if !output.status.success() {
@@ -820,12 +798,34 @@ impl WorktreeGuard {
 
 impl Drop for WorktreeGuard {
     fn drop(&mut self) {
-        let _ = Command::new("git")
+        match Command::new("git")
             .current_dir(&self.repo_root)
             .args(["worktree", "remove", "--force"])
             .arg(&self.worktree_path)
-            .status();
-        let _ = std::fs::remove_dir_all(&self.worktree_path);
+            .status()
+        {
+            Ok(status) if !status.success() => {
+                eprintln!(
+                    "shared-kernel-scorecard: failed to remove git worktree at {}: exit status {status}",
+                    self.worktree_path.display()
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "shared-kernel-scorecard: failed to run git worktree remove for {}: {err}",
+                    self.worktree_path.display()
+                );
+            }
+            _ => {}
+        }
+        if self.worktree_path.exists()
+            && let Err(err) = std::fs::remove_dir_all(&self.worktree_path)
+        {
+            eprintln!(
+                "shared-kernel-scorecard: failed to remove directory {}: {err}",
+                self.worktree_path.display()
+            );
+        }
     }
 }
 
