@@ -1105,6 +1105,39 @@ fn shared_kernel_peer_apic_queues_wake_for_runnable_cpu() {
 }
 
 #[test]
+fn stopped_cpl3_cpu_receives_a_queued_host_kick() {
+    let mut program = vec![0x31, 0xff, 0x48, 0xb8]; // zero result; mov rax, OBSERVE_NATIVE
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05]); // first syscall stops on CONTROL_PORT
+    program.extend_from_slice(&[
+        0xc6, 0x04, 0x25, 0x00, 0x00, 0x04, 0x00, 0x01, // mov byte [0x40000], 1
+        0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x04, 0x00, // mov rax, [0x40000]
+        0xeb, 0xf6, // jmp to the load
+    ]);
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&program, &program])
+        .expect("real KVM CPU with native interrupt gates");
+    assert_eq!(carrier.observe(1).expect("first user syscall").result, 0);
+    carrier
+        .fixture_stop_after_user_byte(1, 0x4_0000)
+        .expect("stop CPU 1 while its user loop runs");
+    assert_eq!(carrier.fixture_pending_irqs(1).unwrap(), 0);
+    carrier
+        .queue_resume_kick(1)
+        .expect("queue KICK on stopped CPL3 CPU");
+    carrier
+        .fixture_run_until_pending_kick(1)
+        .expect("guest KICK handler before continued user loop");
+    assert_ne!(
+        carrier
+            .fixture_pending_irqs(1)
+            .expect("retained IRQ reason")
+            & 2,
+        0,
+        "guest KICK handler must run before the first syscall result"
+    );
+}
+
+#[test]
 fn shared_kernel_scheduler_routes_reschedule_to_peer_apic() {
     const INTERRUPT_WITNESS: u64 = 0xffff_ffff_ffff_ff40;
     let mut sender = vec![0x48, 0xbe]; // mov rsi, peer scheduler slot
