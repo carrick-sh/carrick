@@ -410,3 +410,45 @@ fn drain_failure_retains_slot_and_retirement_failure_reinstalls_same_generation(
     assert_eq!(replacement.slot, handle.slot);
     assert_ne!(replacement.generation, handle.generation);
 }
+
+#[test]
+fn two_live_vms_reject_each_others_local_mm_backing_capabilities() {
+    let mut first = CarrierMemory::create().unwrap();
+    let mut second = CarrierMemory::create().unwrap();
+    let first_handle = first.install(&[backing(0x1000, PAGE as usize, 1)]).unwrap()[0];
+    let second_handle = second
+        .install(&[backing(0x1000, PAGE as usize, 1)])
+        .unwrap()[0];
+    assert_eq!(first_handle.slot_index(), second_handle.slot_index());
+    assert_eq!(first_handle.generation(), second_handle.generation());
+    let context = AddressContext {
+        root: root(0x1000),
+        mm: MmGeneration::new(nz(1)),
+        generation: ContextGeneration::new(nz(1)),
+    };
+    first.install_root(nz(1), context).unwrap();
+    second.install_root(nz(1), context).unwrap();
+    assert_eq!(first.root(nz(1)), second.root(nz(1)));
+    assert!(
+        first.record(second_handle).is_err(),
+        "foreign VM handle authenticated as local backing"
+    );
+    assert!(second.record(first_handle).is_err());
+    let edge = first.share(first_handle).unwrap();
+    assert!(second.attach_shared(nz(1), &edge).is_err());
+    assert!(
+        second
+            .bind_frame_identities(
+                first_handle,
+                &[(
+                    FrameGpa::new(0x1000),
+                    backing(0x2000, PAGE as usize, 2).identity
+                )]
+            )
+            .is_err()
+    );
+    first.write(FrameGpa::new(0x1000), b"A").unwrap();
+    second.write(FrameGpa::new(0x1000), b"B").unwrap();
+    assert_eq!(first.read(FrameGpa::new(0x1000), 1).unwrap(), b"A");
+    assert_eq!(second.read(FrameGpa::new(0x1000), 1).unwrap(), b"B");
+}
