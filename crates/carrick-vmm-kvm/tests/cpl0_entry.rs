@@ -982,3 +982,41 @@ fn shared_kernel_interrupt_leaves() {
     let obs_unknown = carrier.observe(0).expect("unknown-slot wake observation");
     assert_eq!(obs_unknown.result, -1, "unknown CPU slot must be refused");
 }
+
+#[test]
+fn shared_kernel_peer_apic_queues_wake_for_runnable_cpu() {
+    const INTERRUPT_WITNESS: u64 = 0xffff_ffff_ffff_ff40;
+    let mut sender = vec![0x48, 0xbe]; // mov rsi, target scheduler slot
+    sender.extend_from_slice(&1_u64.to_le_bytes());
+    sender.extend_from_slice(&[0x48, 0xbf]); // mov rdi, send-wake witness operation
+    sender.extend_from_slice(&2_u64.to_le_bytes());
+    sender.extend_from_slice(&[0x48, 0xb8]);
+    sender.extend_from_slice(&INTERRUPT_WITNESS.to_le_bytes());
+    sender.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    sender.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    sender.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let receiver = program(&[(0xaced, 24), (0xbeef, 24)]);
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&sender, &receiver])
+        .expect("two real KVM CPUs and shared CPL0 kernel");
+    assert_eq!(
+        carrier.observe(1).expect("peer baseline completion").result,
+        0
+    );
+    assert_eq!(carrier.observe(0).expect("sender completion").result, 0);
+    assert_ne!(
+        carrier.lapic_register(1, 0x270).expect("peer IRR") & (1 << 1),
+        0,
+        "the peer APIC must queue the native wake vector: sender ICR low={:#x} high={:#x}, peer ISR={:#x}, peer SVR={:#x}",
+        carrier.lapic_register(0, 0x300).expect("sender ICR low"),
+        carrier.lapic_register(0, 0x310).expect("sender ICR high"),
+        carrier.lapic_register(1, 0x170).expect("peer ISR"),
+        carrier.lapic_register(1, 0xf0).expect("peer SVR")
+    );
+    assert_eq!(
+        carrier
+            .observe(1)
+            .expect("peer must run after reschedule IPI")
+            .result,
+        0
+    );
+}
