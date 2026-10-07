@@ -1182,6 +1182,22 @@ mod kernel {
             return;
         }
         if crate::fixture_image()
+            && frame.rax == OBSERVE_CPL0_UACCESS_SHOOTDOWN
+        {
+            let address = frame.rdi;
+            let word1 = carrick_el1::isa::x86::user_access::witness(task, address, 6);
+            if word1 as i64 == -14 {
+                frame.rax = 0xdead;
+                return;
+            }
+            doorbell(FORWARD_PORT, frame);
+            let word2 = carrick_el1::isa::x86::user_access::witness(task, address, 6);
+            doorbell(FORWARD_PORT, frame);
+            frame.rax = word2;
+            frame.rbx = word1;
+            return;
+        }
+        if crate::fixture_image()
             && frame.rax == carrick_el1::isa::x86::transport::TRANSPORT_WITNESS {
             frame.rax = carrick_el1::isa::x86::transport::witness(frame.rdi);
             return;

@@ -224,41 +224,59 @@ fn run_member(
     // races this pre-run scan, which queues its durable MSI before KVM_RUN.
     member.running.store(1, Ordering::Release);
     let sregs = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
-    if sregs.cs.dpl == 3
-        && table.requests.iter().any(|request| {
-            request.generation.load(Ordering::Acquire)
-                > request.served[slot].load(Ordering::Acquire)
-        })
-    {
-        if !stopped_at_interruptible_user(cpu)? {
-            return Err(fail("shootdown debt requires interruptible CPL3 reentry"));
-        }
-        let lapic = cpu.fd().get_lapic().map_err(|e| fail(e.to_string()))?;
-        let apic_id = u32::from_le_bytes([
-            lapic.regs[0x20] as u8,
-            lapic.regs[0x21] as u8,
-            lapic.regs[0x22] as u8,
-            lapic.regs[0x23] as u8,
-        ]) >> 24;
-        let delivered = vm
-            .signal_msi(kvm_msi {
-                address_lo: 0xfee0_0000 | (apic_id << 12),
-                data: u32::from(carrick_x86::interrupts::KICK_VECTOR),
-                ..Default::default()
-            })
-            .map_err(|e| fail(format!("KVM_SIGNAL_MSI reentry: {e}")))?;
-        if delivered <= 0 {
-            return Err(fail("reentry shootdown MSI was blocked"));
+    let has_debt = table.requests.iter().any(|request| {
+        request.generation.load(Ordering::Acquire) > request.served[slot].load(Ordering::Acquire)
+    });
+    if has_debt {
+        if sregs.cs.dpl == 3 {
+            if !stopped_at_interruptible_user(cpu)? {
+                return Err(fail("shootdown debt requires interruptible CPL3 reentry"));
+            }
+            let lapic = cpu.fd().get_lapic().map_err(|e| fail(e.to_string()))?;
+            let apic_id = u32::from_le_bytes([
+                lapic.regs[0x20] as u8,
+                lapic.regs[0x21] as u8,
+                lapic.regs[0x22] as u8,
+                lapic.regs[0x23] as u8,
+            ]) >> 24;
+            let delivered = vm
+                .signal_msi(kvm_msi {
+                    address_lo: 0xfee0_0000 | (apic_id << 12),
+                    data: u32::from(carrick_x86::interrupts::KICK_VECTOR),
+                    ..Default::default()
+                })
+                .map_err(|e| fail(format!("KVM_SIGNAL_MSI reentry: {e}")))?;
+            if delivered <= 0 {
+                return Err(fail("reentry shootdown MSI was blocked"));
+            }
+        } else if sregs.cs.dpl == 0 {
+            // Settle shootdown debt for stopped CPL0 vCPU before KVM_RUN:
+            // Rewriting sregs via KVM_SET_SREGS forces KVM to reload CR3 and
+            // flush guest non-global TLB translations before resuming CPL0 execution.
+            cpu.fd()
+                .set_sregs(&sregs)
+                .map_err(|e| fail(e.to_string()))?;
+            for request in &table.requests {
+                let generation = request.generation.load(Ordering::Acquire);
+                if generation > request.served[slot].load(Ordering::Acquire) {
+                    request.served[slot].store(generation, Ordering::Release);
+                    request.ack[slot].store(generation, Ordering::Release);
+                }
+            }
+        } else {
+            return Err(fail("shootdown debt on unsupported CPL reentry"));
         }
     }
     let result = HvVcpu::run(cpu)?;
     member.running.store(0, Ordering::Release);
-    // The host may release a sender after this vCPU has stopped, but
-    // leaves `served` behind until native KICK settles debt on reentry.
-    for request in &table.requests {
-        let generation = request.generation.load(Ordering::Acquire);
-        if generation != 0 {
-            request.ack[slot].store(generation, Ordering::Release);
+    if stopped_at_interruptible_user(cpu)? {
+        // The host may release a sender after this vCPU has stopped, but
+        // leaves `served` behind until native KICK settles debt on reentry.
+        for request in &table.requests {
+            let generation = request.generation.load(Ordering::Acquire);
+            if generation != 0 {
+                request.ack[slot].store(generation, Ordering::Release);
+            }
         }
     }
     Ok(result)
@@ -2191,6 +2209,39 @@ impl Cpl0Carrier {
     pub fn fixture_run_until_pending_kick(&mut self, index: usize) -> Result<(), TrapError> {
         self.fixture_run_until(index, FixtureStopCondition::PendingKick(index))
     }
+
+    /// Run the vCPU until it stops on FORWARD_PORT in CPL0, setting its frame
+    /// result to zero so it can resume transparently.
+    pub fn fixture_run_until_forward(&mut self, index: usize) -> Result<(), TrapError> {
+        let exit = self.run_cpu(index)?;
+        let VcpuExit::IoOut {
+            port: FORWARD_PORT, ..
+        } = exit
+        else {
+            return Err(fail("expected FORWARD_PORT exit"));
+        };
+        self.host_forwards += 1;
+        let address = self.cpus[index].get_gpr(X86Reg::Rax)?;
+        let stack_end = self.binding(index).kernel_stack + 16;
+        if address & 7 != 0
+            || address < stack_end - 0x1_0000
+            || address
+                .checked_add(size_of::<NativeFrame>() as u64)
+                .is_none_or(|end| end > stack_end)
+        {
+            return Err(fail(
+                "CPL0 control frame outside its private supervisor stack",
+            ));
+        }
+        let ptr = self
+            .ram
+            .host_ptr(address - DIRECT_VA, size_of::<NativeFrame>())
+            .ok_or_else(|| fail("CPL0 control frame outside backing"))?
+            .cast::<NativeFrame>();
+        unsafe { (*ptr).rax = 0 };
+        Ok(())
+    }
+
     /// Exact retained generations and acknowledgements for a stopped fixture.
     pub fn fixture_shootdown_state(&self) -> [(u64, u64, [u64; 2]); 2] {
         let table: &ShootdownTable = self.metadata(SHOOTDOWN_OFFSET);
