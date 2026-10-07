@@ -1811,7 +1811,7 @@ fn event_after_destination_load_before_resume_kicks_exact_generation_once() {
     .expect("consume exact continuation once");
     assert!(matches!(
         resumed.completion,
-        ContinuationCompletion::ReturnWithGuestWrites(0, _)
+        ContinuationCompletion::Return(0)
     ));
     assert_eq!(
         resume_continuation(
@@ -1897,7 +1897,7 @@ fn continuation_carried_through_unconsumed_lease_resumes_on_next_claim() {
     .expect("a continuation held across an unconsumed lease resumes on the next claim");
     assert!(matches!(
         result.completion,
-        ContinuationCompletion::ReturnWithGuestWrites(0, _)
+        ContinuationCompletion::Return(0)
     ));
     fixture.scheduler.settle_exited(resumed).expect("exit");
 }
@@ -1970,10 +1970,7 @@ fn timeout_signal_exec_exit_and_drop_cleanup_are_literal_for_every_family() {
                 ContinuationFamily::WaitOnFdsSelect,
                 ContinuationCompletion::ReturnWithGuestWrites(0, writes),
             ) => assert_eq!(writes.len(), 2),
-            (
-                ContinuationFamily::WaitOnSleep,
-                ContinuationCompletion::ReturnWithGuestWrites(0, writes),
-            ) => assert_eq!(writes.len(), 1),
+            (ContinuationFamily::WaitOnSleep, ContinuationCompletion::Return(0)) => {}
             other => panic!("unexpected timeout result: {other:?}"),
         }
         let interrupted = make()
@@ -2008,6 +2005,61 @@ fn timeout_signal_exec_exit_and_drop_cleanup_are_literal_for_every_family() {
             6,
             "{family:?} cleans once per terminal path"
         );
+    }
+}
+
+#[test]
+fn completed_sleep_preserves_remaining_output_without_memory_admission() {
+    struct RemainingMemory {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+    impl GuestMemory for RemainingMemory {
+        fn read_bytes_raw(&self, _address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            Ok(self.bytes[..length].to_vec())
+        }
+        fn write_bytes_raw(&mut self, _address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            self.writes += 1;
+            self.bytes[..bytes.len()].copy_from_slice(bytes);
+            Ok(())
+        }
+    }
+    impl CurrentMmMemory for RemainingMemory {}
+
+    let (_kernel, context) = bootstrap(15_209);
+    let generation = publish(&context, 0x501);
+    let dispatcher = crate::dispatch::SyscallDispatcher::new();
+    for nr in [
+        carrick_abi::syscall::nr::NANOSLEEP,
+        carrick_abi::syscall::nr::CLOCK_NANOSLEEP,
+    ] {
+        let capture =
+            ContinuationCapture::new(&context, generation, request(nr.raw()), RestartClass::Never)
+                .unwrap();
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnSleep {
+                duration: Duration::from_millis(10),
+                remaining: Some(crate::dispatch::GuestPtr(0x9000)),
+            },
+            capture,
+        )
+        .unwrap();
+        let result = continuation
+            .resume(ContinuationEvent::Timeout, &context)
+            .unwrap();
+        let mut memory = RemainingMemory {
+            writes: 0,
+            bytes: vec![0xa5; std::mem::size_of::<libc::timespec>()],
+        };
+        assert!(matches!(
+            fold_continuation_completion(result.completion, &dispatcher, &context, &mut memory),
+            Ok(Some(DispatchOutcome::Returned { value: 0 }))
+        ));
+        assert_eq!(
+            memory.writes, 0,
+            "successful sleep must not admit rem copyout"
+        );
+        assert!(memory.bytes.iter().all(|byte| *byte == 0xa5));
     }
 }
 
@@ -7350,6 +7402,55 @@ fn terminal_zone_capture_rejects_another_threads_execution_lease() {
         BlockedContinuation::from_terminal_zone_park(&other, &lease, wait),
         Err(ContinuationBuildError::StaleExecutionAuthority),
     ));
+}
+
+#[test]
+fn signal_frame_zone_capture_retains_delivery_and_only_reserves_sigkill() {
+    let (_kernel, context) = bootstrap(15_412);
+    publish(&context, 0x704);
+    let executor =
+        crate::kernel::objects::ExecutorId::for_transitional_thread(context.thread().registry_id())
+            .unwrap();
+    let lease = context.thread().claim_runnable(executor).unwrap();
+    let wait = ZoneWait::new(carrick_el1_abi::RecordRef::PLACEHOLDER, 1);
+    wait.mark_consumed();
+    let continuation =
+        BlockedContinuation::from_signal_frame_zone_park(&context, &lease, wait).unwrap();
+    assert_eq!(continuation.authority().syscall(), None);
+    assert_eq!(continuation.authority().mm(), context.shared().mm().id());
+    assert_eq!(
+        continuation.authority().restart_class(),
+        RestartClass::Never
+    );
+    assert!(!continuation.accepts_generic_scheduler_wake());
+    let signal = crate::kernel::LinuxSignal::for_signal_number(12).unwrap();
+    context
+        .signal_authority()
+        .enqueue_thread_standard(signal, None);
+    let probe = SignalReadinessProbe::from_continuation(&continuation);
+    assert!(
+        probe.event().is_none(),
+        "another handler cannot replace an admitted frame"
+    );
+    assert!(context.signal_authority().thread_pending().contains(12));
+    let kill = crate::kernel::LinuxSignal::for_signal_number(9).unwrap();
+    context
+        .signal_authority()
+        .enqueue_thread_standard(kill, None);
+    let event = probe
+        .event()
+        .expect("SIGKILL cancels the retained delivery");
+    assert_eq!(event.reserved_signal().unwrap().signum(), 9);
+    let result = continuation.resume(event, &context).unwrap();
+    assert_eq!(result.completion, ContinuationCompletion::ResumeSignalFrame);
+    assert_eq!(result.restart(), RestartDecision::NoRestart);
+    assert_eq!(result.reserved_signal().unwrap().signum(), 9);
+    assert!(context.signal_authority().thread_pending().contains(12));
+    drop(result);
+    assert!(
+        context.signal_authority().thread_pending().contains(9),
+        "dropped reservation requeues through its exact owner"
+    );
 }
 
 #[test]

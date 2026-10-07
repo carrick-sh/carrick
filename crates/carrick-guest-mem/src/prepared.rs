@@ -134,7 +134,7 @@ pub enum MemorySupplyRequest {
         observed: PortalOwnerWait,
     },
 }
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum MemoryPrepareError {
     /// The caller must split a stream before source consumption. This is not
     /// an invalid guest address and must not be lowered to EFAULT.

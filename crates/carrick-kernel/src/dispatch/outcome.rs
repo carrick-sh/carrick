@@ -516,6 +516,36 @@ pub enum DispatchOutcome {
     /// Backend: complete the syscall with `errno.guest_retval()` (the negative
     /// errno), service pending signals, and resume the task.
     Errno { errno: LinuxErrno },
+    /// A stat result was already captured from its fd or pathname. Retain
+    /// that immutable record and complete only its copyout after this exact
+    /// owner dependency settles; repeating the lookup can observe a reused fd.
+    /// Backend: enroll the dependency, release execution capacity, and resume
+    /// `output` under the same task binding before completing the syscall.
+    OwnerStatCopyout {
+        #[serde(skip_serializing)]
+        output: Box<super::format_stat::StatCopyout>,
+        #[serde(skip_serializing)]
+        dependency: carrick_guest_mem::MemoryPrepareError,
+    },
+    /// A getdents64 batch was already generated from the directory description
+    /// and its offset cursor was advanced. Retain the formatted records and
+    /// complete only the copyout after this exact owner dependency settles,
+    /// so the cursor does not skip or repeat entries.
+    OwnerGetdentsCopyout {
+        #[serde(skip_serializing)]
+        output: Box<super::fs::directory::GetdentsCopyout>,
+        #[serde(skip_serializing)]
+        dependency: carrick_guest_mem::MemoryPrepareError,
+    },
+    /// A readlinkat target was already captured and decoded. Retain the
+    /// target bytes and complete only the copyout after this exact owner
+    /// dependency settles.
+    OwnerReadlinkCopyout {
+        #[serde(skip_serializing)]
+        output: Box<super::fs::directory::ReadlinkCopyout>,
+        #[serde(skip_serializing)]
+        dependency: carrick_guest_mem::MemoryPrepareError,
+    },
     /// An admitted EL1 owner declined memory preparation before the host
     /// source was consumed. The runtime enrolls this exact owner/cause/revision
     /// in the zone, releases the executor, and retries the saved syscall only
@@ -1366,6 +1396,11 @@ mod owner_read_wait_tests {
                 .outcome();
             assert!(
                 matches!(actual, DispatchOutcome::OwnerMemoryWait { wait: got, committed: 0 } if got == wait)
+            );
+            let error = super::super::read_guest_c_string(&source, 0x1000).unwrap_err();
+            assert!(
+                matches!(error, InputCopyError::Wait(carrick_guest_mem::MemoryReadWait::Owner(got)) if got == wait),
+                "expected OwnerWait for read_guest_c_string, got {error:?}"
             );
         }
     }

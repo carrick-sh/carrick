@@ -11024,3 +11024,496 @@ fn exec_image_cache_single_flights_one_key() {
     });
     assert_eq!(builds.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
+
+#[test]
+fn xattr_getxattr_path_owner_wait_returns_owner_memory_wait_not_efault() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{GuestMemory, MemoryError};
+    use carrick_observability::compat::SyscallArgs;
+    use std::num::NonZeroU64;
+
+    struct WaitingMemory(PortalOwnerWait);
+    impl GuestMemory for WaitingMemory {
+        fn read_bytes_raw(&self, _address: u64, _length: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::OwnerWait(self.0))
+        }
+        fn write_bytes_raw(&mut self, _address: u64, _bytes: &[u8]) -> Result<(), MemoryError> {
+            Ok(())
+        }
+    }
+    impl CurrentMmMemory for WaitingMemory {}
+
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(2).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Editor,
+            7,
+        )
+    };
+    let mut memory = WaitingMemory(wait);
+    let dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let reporter = CompatReporter::default();
+
+    // SYS_GETXATTR: getxattr(path, name, value, size)
+    let outcome = lower_handler_result(
+        dispatcher
+            .dispatch_normalized(
+                &context,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::GETXATTR.raw(),
+                    SyscallArgs::from([0x1000, 0x2000, 0x3000, 64, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+                None,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome,
+        DispatchOutcome::OwnerMemoryWait {
+            wait,
+            committed: 0,
+        },
+        "getxattr path owner wait must return OwnerMemoryWait, not EFAULT"
+    );
+}
+
+#[test]
+fn mount_api_fspick_path_owner_wait_returns_owner_memory_wait_not_efault() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{GuestMemory, MemoryError};
+    use carrick_observability::compat::SyscallArgs;
+    use std::num::NonZeroU64;
+
+    struct WaitingMemory(PortalOwnerWait);
+    impl GuestMemory for WaitingMemory {
+        fn read_bytes_raw(&self, _address: u64, _length: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::OwnerWait(self.0))
+        }
+        fn write_bytes_raw(&mut self, _address: u64, _bytes: &[u8]) -> Result<(), MemoryError> {
+            Ok(())
+        }
+    }
+    impl CurrentMmMemory for WaitingMemory {}
+
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(2).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Editor,
+            7,
+        )
+    };
+    let mut memory = WaitingMemory(wait);
+    let dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    context
+        .task()
+        .with_caps(|caps| *caps = crate::namespace::process::CapabilitySet::full());
+    let reporter = CompatReporter::default();
+
+    // SYS_FSPICK: fspick(dirfd, path, flags)
+    let outcome = lower_handler_result(
+        dispatcher
+            .dispatch_normalized(
+                &context,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::FSPICK.raw(),
+                    SyscallArgs::from([carrick_abi::LINUX_AT_FDCWD as u64, 0x1000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+                None,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome,
+        DispatchOutcome::OwnerMemoryWait {
+            wait,
+            committed: 0,
+        },
+        "fspick path owner wait must return OwnerMemoryWait, not EFAULT"
+    );
+}
+
+#[test]
+fn mqueue_mq_open_name_owner_wait_returns_owner_memory_wait_not_efault() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{GuestMemory, MemoryError};
+    use carrick_observability::compat::SyscallArgs;
+    use std::num::NonZeroU64;
+
+    struct WaitingMemory(PortalOwnerWait);
+    impl GuestMemory for WaitingMemory {
+        fn read_bytes_raw(&self, _address: u64, _length: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::OwnerWait(self.0))
+        }
+        fn write_bytes_raw(&mut self, _address: u64, _bytes: &[u8]) -> Result<(), MemoryError> {
+            Ok(())
+        }
+    }
+    impl CurrentMmMemory for WaitingMemory {}
+
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(2).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Editor,
+            7,
+        )
+    };
+    let mut memory = WaitingMemory(wait);
+    let dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let reporter = CompatReporter::default();
+
+    // SYS_MQ_OPEN: mq_open(name, oflag, mode, attr)
+    let outcome = lower_handler_result(
+        dispatcher
+            .dispatch_normalized(
+                &context,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::MQ_OPEN.raw(),
+                    SyscallArgs::from([0x1000, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+                None,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome,
+        DispatchOutcome::OwnerMemoryWait {
+            wait,
+            committed: 0,
+        },
+        "mq_open name owner wait must return OwnerMemoryWait, not EFAULT"
+    );
+}
+
+#[test]
+fn rootfs_helpers_execve_path_owner_wait_returns_owner_memory_wait_not_efault() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{GuestMemory, MemoryError};
+    use carrick_observability::compat::SyscallArgs;
+    use std::num::NonZeroU64;
+
+    struct WaitingMemory(PortalOwnerWait);
+    impl GuestMemory for WaitingMemory {
+        fn read_bytes_raw(&self, _address: u64, _length: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::OwnerWait(self.0))
+        }
+        fn write_bytes_raw(&mut self, _address: u64, _bytes: &[u8]) -> Result<(), MemoryError> {
+            Ok(())
+        }
+    }
+    impl CurrentMmMemory for WaitingMemory {}
+
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(2).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Editor,
+            7,
+        )
+    };
+    let mut memory = WaitingMemory(wait);
+    let dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let reporter = CompatReporter::default();
+
+    // SYS_EXECVE: execve(pathname, argv, envp)
+    let outcome = lower_handler_result(
+        dispatcher
+            .dispatch_normalized(
+                &context,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::EXECVE.raw(),
+                    SyscallArgs::from([0x1000, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+                None,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome,
+        DispatchOutcome::OwnerMemoryWait {
+            wait,
+            committed: 0,
+        },
+        "execve pathname owner wait must return OwnerMemoryWait, not EFAULT"
+    );
+}
+
+#[test]
+fn getdents64_copyout_owner_wait_witness() {
+    use carrick_abi::LINUX_EFAULT;
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{
+        GuestMemory, GuestWriteRange, MemoryError, MemoryPrepareError, PreparedGuestWrite,
+        UserMemoryVenue,
+    };
+    use carrick_observability::compat::SyscallArgs;
+    use carrick_vfs::rootfs::{RootFsDirEntry, RootFsEntryKind, RootFsMetadata};
+    use std::num::NonZeroU64;
+
+    struct Permit<'a>(&'a mut [u8]);
+    impl PreparedGuestWrite for Permit<'_> {
+        fn commit(self: Box<Self>, outputs: &[&[u8]]) {
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(self.0.len(), outputs[0].len());
+            self.0.copy_from_slice(outputs[0]);
+        }
+    }
+
+    struct GetdentsWaitingMemory {
+        wait: Option<PortalOwnerWait>,
+        bytes: Vec<u8>,
+    }
+    impl GuestMemory for GetdentsWaitingMemory {
+        fn user_memory_venue(&self) -> UserMemoryVenue {
+            UserMemoryVenue::Owner
+        }
+        fn prepare_write(
+            &mut self,
+            ranges: &[GuestWriteRange],
+        ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+            assert_eq!(ranges.len(), 1);
+            if let Some(wait) = self.wait.take() {
+                return Err(MemoryPrepareError::OwnerWait(wait));
+            }
+            let range = ranges[0];
+            let offset = (range.address().raw() - 0x1000) as usize;
+            Ok(Box::new(Permit(
+                &mut self.bytes[offset..offset + range.len()],
+            )))
+        }
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            let offset = (address
+                .checked_sub(0x1000)
+                .ok_or(MemoryError::Unsupported)?) as usize;
+            let end = offset.checked_add(length).ok_or(MemoryError::Unsupported)?;
+            if end <= self.bytes.len() {
+                Ok(self.bytes[offset..end].to_vec())
+            } else {
+                Err(MemoryError::OutOfBounds { address, length })
+            }
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            Err(MemoryError::Unsupported)
+        }
+    }
+    impl CurrentMmMemory for GetdentsWaitingMemory {}
+
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(2).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Editor,
+            7,
+        )
+    };
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let desc = OpenDescription::Directory {
+        base: OpenDescriptionBase::new(carrick_abi::LINUX_O_RDONLY),
+        path: "/witness_dir".to_string(),
+        metadata: RootFsMetadata {
+            path: std::path::PathBuf::from("/witness_dir"),
+            kind: RootFsEntryKind::Directory,
+            mode: 0o755,
+            size: 0,
+        },
+        listing: DirListing::Loaded(vec![RootFsDirEntry {
+            name: "entry1".to_string(),
+            metadata: RootFsMetadata {
+                path: std::path::PathBuf::from("/witness_dir/entry1"),
+                kind: RootFsEntryKind::File,
+                mode: 0o644,
+                size: 100,
+            },
+            ino: 101,
+        }]),
+        offset: 0,
+        trusted_host_dir: None,
+    };
+    let outcome = dispatcher.install_fd(desc, 0);
+    let DispatchOutcome::Returned { value: fd } = outcome else {
+        panic!()
+    };
+
+    let mut memory = GetdentsWaitingMemory {
+        bytes: vec![0u8; 65536],
+        wait: Some(wait),
+    };
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let reporter = CompatReporter::default();
+    let outcome = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                carrick_abi::syscall::nr::GETDENTS64.raw(),
+                SyscallArgs::from([fd as u64, 0x1000, 4096, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+
+    assert_ne!(
+        outcome,
+        DispatchOutcome::errno(LINUX_EFAULT),
+        "getdents64 flattened owner wait to EFAULT"
+    );
+    assert!(
+        format!("{outcome:?}").starts_with("OwnerGetdentsCopyout"),
+        "expected OwnerGetdentsCopyout, got {outcome:?}"
+    );
+}
+
+#[test]
+fn readlinkat_copyout_owner_wait_witness() {
+    use carrick_abi::LINUX_EFAULT;
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{
+        GuestMemory, GuestWriteRange, MemoryError, MemoryPrepareError, PreparedGuestWrite,
+        UserMemoryVenue,
+    };
+    use carrick_observability::compat::SyscallArgs;
+    use std::num::NonZeroU64;
+
+    struct Permit<'a>(&'a mut [u8]);
+    impl PreparedGuestWrite for Permit<'_> {
+        fn commit(self: Box<Self>, outputs: &[&[u8]]) {
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(self.0.len(), outputs[0].len());
+            self.0.copy_from_slice(outputs[0]);
+        }
+    }
+
+    struct ReadlinkWaitingMemory {
+        wait: Option<PortalOwnerWait>,
+        bytes: Vec<u8>,
+    }
+    impl GuestMemory for ReadlinkWaitingMemory {
+        fn user_memory_venue(&self) -> UserMemoryVenue {
+            UserMemoryVenue::Owner
+        }
+        fn prepare_write(
+            &mut self,
+            ranges: &[GuestWriteRange],
+        ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+            assert_eq!(ranges.len(), 1);
+            if let Some(wait) = self.wait.take() {
+                return Err(MemoryPrepareError::OwnerWait(wait));
+            }
+            let range = ranges[0];
+            let offset = (range.address().raw() - 0x2000) as usize;
+            Ok(Box::new(Permit(
+                &mut self.bytes[offset..offset + range.len()],
+            )))
+        }
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            if address == 0x1000 {
+                let path = b"/proc/self/cwd\0";
+                let mut out = vec![0u8; length];
+                let copy_len = path.len().min(length);
+                out[..copy_len].copy_from_slice(&path[..copy_len]);
+                return Ok(out);
+            }
+            let offset = (address
+                .checked_sub(0x2000)
+                .ok_or(MemoryError::Unsupported)?) as usize;
+            let end = offset.checked_add(length).ok_or(MemoryError::Unsupported)?;
+            if end <= self.bytes.len() {
+                Ok(self.bytes[offset..end].to_vec())
+            } else {
+                Err(MemoryError::OutOfBounds { address, length })
+            }
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            Err(MemoryError::Unsupported)
+        }
+    }
+    impl CurrentMmMemory for ReadlinkWaitingMemory {}
+
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(2).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Gate,
+            7,
+        )
+    };
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let mut memory = ReadlinkWaitingMemory {
+        bytes: vec![0u8; 65536],
+        wait: Some(wait),
+    };
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let reporter = CompatReporter::default();
+    let outcome = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                carrick_abi::syscall::nr::READLINKAT.raw(),
+                SyscallArgs::from([
+                    carrick_abi::LINUX_AT_FDCWD as u64,
+                    0x1000,
+                    0x2000,
+                    1024,
+                    0,
+                    0,
+                ]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+
+    assert_ne!(
+        outcome,
+        DispatchOutcome::errno(LINUX_EFAULT),
+        "readlinkat flattened owner wait to EFAULT"
+    );
+    assert!(
+        format!("{outcome:?}").starts_with("OwnerReadlinkCopyout"),
+        "expected OwnerReadlinkCopyout, got {outcome:?}"
+    );
+}
+
+
