@@ -1,6 +1,7 @@
 use super::*;
-use alloc::collections::BTreeSet;
-use carrick_core_abi::{EditSequence, PublicationIdentity, PublicationShape, PublishedOutput};
+use carrick_core_abi::{
+    EditSequence, PublicationIdentity, PublicationShape, PublishedOutput, PublishedPrior,
+};
 use carrick_guest_arch::{FrameGpa, UserRange};
 use core::cell::Cell;
 
@@ -11,6 +12,7 @@ const A_ROOT: u64 = 0x10_0000;
 const B_ROOT: u64 = 0x20_0000;
 const A_FRAME: u64 = 0x100_0000;
 const B_FRAME: u64 = 0x200_0000;
+const EXTENT: u64 = 1024 * PAGE;
 const VA: u64 = 0x40_0000;
 const GEN: u64 = 5;
 
@@ -45,28 +47,24 @@ fn root(raw: u64) -> RootGpa {
 fn owner_gen(raw: u64) -> OwnerGeneration {
     OwnerGeneration::new(nz(raw))
 }
-fn ticket_id(raw: u64) -> TicketId {
-    TicketId::new(nz(raw))
-}
 fn ring(raw: u64) -> RingId {
     RingId(nz(raw))
 }
+fn ipa(raw: u64) -> Stage1Ipa {
+    Stage1Ipa::new(raw)
+}
+fn len(raw: u64) -> GuestLen {
+    GuestLen::new(raw)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Fault {
-    NoTicket,
-    NoAlias,
-}
+enum Fault {}
 
 #[derive(Default)]
 struct TestLedger {
+    book: PublicationBook,
     mms: BTreeMap<PublicationMm, LedgerMm>,
-    states: BTreeMap<MmIncarnationKey, MmPublicationState>,
-    quarantined: BTreeSet<MmIncarnationKey>,
     extents: BTreeMap<u64, (u64, ExtentCustody)>,
-    tickets: BTreeMap<(MmIncarnationKey, TicketId), AdmissionTicket>,
-    held: BTreeSet<(MmIncarnationKey, TicketId)>,
-    aliases: BTreeMap<(MmIncarnationKey, u64), LedgerAlias>,
     released: Vec<(MmIncarnationKey, DeferredRelease)>,
     tables: u64,
     /// Ledger entries examined by lookups, independent of the consumer.
@@ -83,11 +81,11 @@ impl TestLedger {
                 isa,
             },
         );
-        self.states.insert(key, MmPublicationState::new());
+        self.book.register_mm(key);
     }
-    fn add_extent(&mut self, base: u64, len: u64, owner: MmIncarnationKey) {
+    fn add_extent(&mut self, base: u64, bytes: u64, owner: MmIncarnationKey) {
         self.extents
-            .insert(base, (len, ExtentCustody::new(owner, owner_gen(GEN))));
+            .insert(base, (bytes, ExtentCustody::new(owner, owner_gen(GEN))));
     }
     fn custody_at(&mut self, base: u64) -> &mut ExtentCustody {
         &mut self.extents.get_mut(&base).unwrap().1
@@ -96,170 +94,113 @@ impl TestLedger {
         // SAFETY: the test plays the host share path.
         unsafe { self.custody_at(base).mint_shared_edge(to) }.unwrap()
     }
-    fn cow_share(&mut self, base: u64, to: MmIncarnationKey) -> EdgeGeneration {
-        let custody = self.custody_at(base);
-        let proof = custody.begin_cow().unwrap();
-        // SAFETY: the test plays fork custody.
-        unsafe { custody.mint_cow_edge(to, proof) }.unwrap()
+    fn begin_cow(&self, base: u64) -> Result<CowTransition, CowBlocked> {
+        self.book.begin_cow(ipa(base), len(self.extents[&base].0))
     }
-    fn issue_with(
+    fn cow_share(&mut self, base: u64, to: MmIncarnationKey) -> Result<EdgeGeneration, CowBlocked> {
+        let proof = self.begin_cow(base)?;
+        let custody = &mut self.extents.get_mut(&base).unwrap().1;
+        // SAFETY: the test plays fork custody for exactly this extent.
+        unsafe { self.book.mint_cow_edge(custody, to, proof) }
+    }
+    fn issue_spec(
         &mut self,
         mm: MmIncarnationKey,
-        id: u64,
         output: u64,
+        bytes: u64,
         access: ExtentAccess,
         max_permissions: EditPermissions,
-    ) -> PublishedOutput {
-        let ticket = AdmissionTicket {
-            output: Stage1Ipa::new(output),
+    ) -> Result<PublishedOutput, AdmissionBlocked> {
+        let spec = AdmissionTicket {
+            output: ipa(output),
             leaf: EditLeafSize::Page,
-            len: GuestLen::new(PAGE),
+            len: len(bytes),
             owner_generation: owner_gen(GEN),
             access,
             inventory_revision: InventoryRevision::new(nz(1)),
             max_permissions,
             table_grants: TableGrantCount(2),
         };
-        self.tickets.insert((mm, ticket_id(id)), ticket);
-        PublishedOutput {
-            address: ticket.output,
-            leaf: ticket.leaf,
-            ticket: ticket_id(id),
-            owner_generation: ticket.owner_generation,
+        let slot = self.book.admission_permitted(mm)?;
+        let ticket = self.book.issue_ticket(slot, spec)?;
+        Ok(PublishedOutput {
+            address: spec.output,
+            leaf: spec.leaf,
+            ticket,
+            owner_generation: spec.owner_generation,
             access,
-            inventory_revision: ticket.inventory_revision,
-        }
+            inventory_revision: spec.inventory_revision,
+        })
     }
     fn issue(
         &mut self,
         mm: MmIncarnationKey,
-        id: u64,
         output: u64,
         access: ExtentAccess,
     ) -> PublishedOutput {
-        self.issue_with(mm, id, output, access, RW)
+        self.issue_spec(mm, output, PAGE, access, RW).unwrap()
     }
-    /// A live alias published earlier, at `VA`.
+    /// A live alias published earlier at `va`.
     fn add_alias(
         &mut self,
         mm: MmIncarnationKey,
+        va: u64,
         frame: u64,
         access: ExtentAccess,
         permissions: EditPermissions,
     ) {
-        if permissions.writable {
-            self.custody_at(frame).writable_published().unwrap();
-        }
-        self.aliases.insert(
-            (mm, frame),
-            LedgerAlias {
-                va: UserVa::new(VA),
-                len: GuestLen::new(PAGE),
+        let generation = AliasGeneration(nz(self.book.seq().unwrap()));
+        new_alias(
+            &mut self.book,
+            mm,
+            UserVa::new(va),
+            Alias {
+                frame: ipa(frame),
+                len: len(PAGE),
+                leaf: EditLeafSize::Page,
                 owner_generation: owner_gen(GEN),
                 access,
                 permissions,
-                max_permissions: RW,
+                ceiling: RW,
+                present: true,
+                generation,
+                use_seq: 0,
             },
-        );
+        )
+        .unwrap();
     }
     fn state(&self, mm: MmIncarnationKey) -> &MmPublicationState {
-        &self.states[&mm]
+        self.book.state(mm).unwrap()
+    }
+    fn quarantined(&self, mm: MmIncarnationKey) -> bool {
+        self.book.quarantined(mm)
+    }
+    fn reusable(&self, frame: u64) -> bool {
+        self.book.frame_reusable(ipa(frame), len(PAGE))
     }
 }
 
 impl PhysicalLedger for TestLedger {
     type Fault = Fault;
-    fn mm_quarantined(&self, mm: MmIncarnationKey) -> bool {
-        self.quarantined.contains(&mm)
+    fn book(&self) -> &PublicationBook {
+        &self.book
     }
-    fn quarantine_mm(&mut self, mm: MmIncarnationKey) {
-        self.quarantined.insert(mm);
+    fn book_mut(&mut self) -> &mut PublicationBook {
+        &mut self.book
     }
     fn mm(&self, mm: PublicationMm) -> Option<LedgerMm> {
         self.mms.get(&mm).copied()
     }
-    fn publication_state(&mut self, mm: MmIncarnationKey) -> Option<&mut MmPublicationState> {
-        self.states.get_mut(&mm)
-    }
-    fn ticket(&self, mm: MmIncarnationKey, ticket: TicketId) -> Option<AdmissionTicket> {
+    fn custody(&self, address: Stage1Ipa, bytes: GuestLen) -> Option<&ExtentCustody> {
+        let (&base, (extent, custody)) = self.extents.range(..=address.raw()).next_back()?;
         self.examined.set(self.examined.get() + 1);
-        self.tickets.get(&(mm, ticket)).copied()
-    }
-    fn outstanding_tickets(&self, mm: MmIncarnationKey) -> usize {
-        self.tickets
-            .keys()
-            .filter(|(owner, _)| *owner == mm)
-            .count()
-    }
-    fn custody(&self, address: Stage1Ipa) -> Option<&ExtentCustody> {
-        let (&base, (len, custody)) = self.extents.range(..=address.raw()).next_back()?;
-        self.examined.set(self.examined.get() + 1);
-        (address.raw() < base + len).then_some(custody)
-    }
-    fn custody_mut(&mut self, address: Stage1Ipa) -> Option<&mut ExtentCustody> {
-        let (&base, (len, custody)) = self.extents.range_mut(..=address.raw()).next_back()?;
-        (address.raw() < base + *len).then_some(custody)
-    }
-    fn alias(&self, mm: MmIncarnationKey, address: Stage1Ipa) -> Option<LedgerAlias> {
-        self.examined.set(self.examined.get() + 1);
-        self.aliases.get(&(mm, address.raw())).copied()
+        (address.raw().checked_add(bytes.raw())? <= base + extent).then_some(custody)
     }
     fn apply(&mut self, record: &AuthenticatedPublication) -> Result<(), Fault> {
-        let view = record.view();
-        let key = view.key();
-        if let Some(prior) = view.prior() {
-            match view.kind() {
-                PublicationKind::CowRepoint | PublicationKind::Unmap => {
-                    self.aliases
-                        .remove(&(key, prior.address.raw()))
-                        .ok_or(Fault::NoAlias)?;
-                }
-                PublicationKind::Protect => {
-                    self.aliases
-                        .get_mut(&(key, prior.address.raw()))
-                        .ok_or(Fault::NoAlias)?
-                        .permissions = view.permissions();
-                }
-                _ => {}
-            }
-        }
-        if let Some(out) = view.output() {
-            let ticket = self
-                .tickets
-                .remove(&(key, out.ticket))
-                .ok_or(Fault::NoTicket)?;
-            self.aliases.insert(
-                (key, out.address.raw()),
-                LedgerAlias {
-                    va: view.span().start(),
-                    len: ticket.len,
-                    owner_generation: ticket.owner_generation,
-                    access: ticket.access,
-                    permissions: view.permissions(),
-                    max_permissions: ticket.max_permissions,
-                },
-            );
-            self.tables += u64::from(view.table_grants().0);
-        }
-        Ok(())
-    }
-    fn hold_ticket(&mut self, mm: MmIncarnationKey, ticket: TicketId) -> Result<(), Fault> {
-        self.tickets.remove(&(mm, ticket)).ok_or(Fault::NoTicket)?;
-        self.held.insert((mm, ticket));
+        self.tables += u64::from(record.view().table_grants().0);
         Ok(())
     }
     fn release(&mut self, mm: MmIncarnationKey, release: DeferredRelease) -> Result<(), Fault> {
-        match release {
-            DeferredRelease::Ticket(id) => {
-                self.tickets.remove(&(mm, id)).ok_or(Fault::NoTicket)?;
-            }
-            DeferredRelease::HeldOutput(id) => {
-                if !self.held.remove(&(mm, id)) {
-                    return Err(Fault::NoTicket);
-                }
-            }
-            DeferredRelease::Prior(_) => {}
-        }
         self.released.push((mm, release));
         Ok(())
     }
@@ -272,6 +213,7 @@ struct Edit {
     counter: u64,
     root: RootGpa,
     va: u64,
+    bytes: u64,
     output: Option<PublishedOutput>,
     prior: Option<PublishedPrior>,
 }
@@ -291,6 +233,7 @@ impl Edit {
             counter,
             root: root(root_raw),
             va: VA,
+            bytes: PAGE,
             output: None,
             prior: None,
         }
@@ -307,7 +250,7 @@ impl Edit {
     }
     fn prior(mut self, address: u64) -> Self {
         self.prior = Some(PublishedPrior {
-            address: Stage1Ipa::new(address),
+            address: ipa(address),
             leaf: EditLeafSize::Page,
             owner_generation: owner_gen(GEN),
         });
@@ -329,6 +272,9 @@ impl Edit {
         self.shape.drain = drain;
         self
     }
+    fn local(self) -> Self {
+        self.drain(GuestIsa::Aarch64, PublicationDrain::Local)
+    }
     fn permissions(mut self, permissions: EditPermissions) -> Self {
         self.shape.permissions = permissions;
         self
@@ -341,13 +287,24 @@ impl Edit {
         self.va = va;
         self
     }
-    fn protect_ro(counter: u64) -> Self {
+    fn bytes(mut self, bytes: u64) -> Self {
+        self.bytes = bytes;
+        self
+    }
+    fn unmap(counter: u64, frame: u64) -> Self {
         Self::a(counter)
-            .kind(PublicationKind::Protect)
+            .kind(PublicationKind::Unmap)
+            .prior(frame)
             .permissions(RO)
     }
-    fn record(&self) -> MmPublication {
-        let view = PublicationView::checked(
+    fn protect(counter: u64, frame: u64, permissions: EditPermissions) -> Self {
+        Self::a(counter)
+            .kind(PublicationKind::Protect)
+            .prior(frame)
+            .permissions(permissions)
+    }
+    fn view(&self) -> Result<PublicationView, PublicationDecodeError> {
+        PublicationView::checked(
             self.shape,
             PublicationIdentity {
                 mm: self.mm.mm,
@@ -356,26 +313,28 @@ impl Edit {
                 edit_sequence: EditSequence::new(nz(self.counter + 1000)),
                 root: self.root,
             },
-            UserRange::checked(UserVa::new(self.va), GuestLen::new(PAGE)).unwrap(),
+            UserRange::checked(UserVa::new(self.va), len(self.bytes)).unwrap(),
             self.output,
             self.prior,
         )
-        .unwrap();
-        MmPublication::encode(&view)
+    }
+    fn record(&self) -> MmPublication {
+        MmPublication::encode(&self.view().unwrap())
     }
 }
 
-/// Two live ARM MMs, each owning a 16-page extent.
+/// Two live ARM MMs, each owning one extent; A also has an RO alias of its
+/// first frame at `VA` when `with_alias`.
 fn two_mms() -> TestLedger {
     let mut ledger = TestLedger::default();
     ledger.add_mm(key(A, 1), root(A_ROOT), GuestIsa::Aarch64);
     ledger.add_mm(key(B, 1), root(B_ROOT), GuestIsa::Aarch64);
-    ledger.add_extent(A_FRAME, 16 * PAGE, key(A, 1));
-    ledger.add_extent(B_FRAME, 16 * PAGE, key(B, 1));
+    ledger.add_extent(A_FRAME, EXTENT, key(A, 1));
+    ledger.add_extent(B_FRAME, EXTENT, key(B, 1));
     ledger
 }
 
-/// Each edit travels on its own MM's ring (ring id = mm key).
+/// Each edit travels on its own MM's ring.
 fn consume_edits(
     ledger: &mut TestLedger,
     edits: &[Edit],
@@ -405,58 +364,472 @@ fn only_cause(report: &ConsumeReport<Fault>) -> QuarantineCause<Fault> {
     report.quarantined[0].cause
 }
 
-fn a_map(ledger: &mut TestLedger, counter: u64, id: u64, frame: u64) -> Edit {
-    let out = ledger.issue(key(A, 1), id, frame, ExtentAccess::Owner);
+fn a_map(ledger: &mut TestLedger, counter: u64, frame: u64) -> Edit {
+    let out = ledger.issue(key(A, 1), frame, ExtentAccess::Owner);
     Edit::a(counter).output(out)
 }
 
-fn retire_ready(ledger: &mut TestLedger, mm: MmIncarnationKey, through: u64) {
-    close_admission(ledger, mm, Some(counter(through))).unwrap();
+fn clean(report: &ConsumeReport<Fault>) {
+    assert!(report.quarantined.is_empty(), "{report:?}");
+}
+
+// Round 4: aliases keyed by (mm, incarnation, VA).
+
+#[test]
+fn same_frame_at_two_vas_keeps_both_aliases() {
+    let mut ledger = two_mms();
+    let x = a_map(&mut ledger, 1, A_FRAME);
+    let out = ledger.issue(key(A, 1), A_FRAME, ExtentAccess::Owner);
+    let y = Edit::a(2).output(out).at(VA + 0x10_0000);
+    let report = run(&mut ledger, &[x, y]);
+    clean(&report);
+    assert_eq!(report.applied, 2);
+    assert_eq!(ledger.book.alias_count(), 2);
+    let report = run(&mut ledger, &[Edit::unmap(3, A_FRAME)]);
+    clean(&report);
+    // The alias at Y still maps F: F is neither released for reuse nor
+    // forgotten.
+    assert!(
+        ledger
+            .book
+            .alias(key(A, 1), UserVa::new(VA + 0x10_0000))
+            .is_some()
+    );
+    assert!(!ledger.reusable(A_FRAME));
+    run(&mut ledger, &[Edit::unmap(4, A_FRAME).at(VA + 0x10_0000)]);
+    assert!(ledger.reusable(A_FRAME));
 }
 
 #[test]
-fn two_mms_apply_independently() {
+fn fresh_map_over_a_live_alias_quarantines() {
     let mut ledger = two_mms();
-    let a = a_map(&mut ledger, 1, 1, A_FRAME);
-    let out = ledger.issue(key(B, 1), 1, B_FRAME, ExtentAccess::Owner);
-    let report = run(&mut ledger, &[a, Edit::b(1).output(out)]);
-    assert_eq!((report.applied, report.quarantined.len()), (2, 0));
-    assert!(ledger.aliases.contains_key(&(key(A, 1), A_FRAME)));
-    assert!(ledger.aliases.contains_key(&(key(B, 1), B_FRAME)));
+    ledger.add_alias(key(A, 1), VA, A_FRAME, ExtentAccess::Owner, RO);
+    let map = a_map(&mut ledger, 1, A_FRAME + PAGE);
+    assert_eq!(
+        only_cause(&run(&mut ledger, &[map])),
+        QuarantineCause::VaOccupied
+    );
 }
 
-// Round 3 item 1: ISA and drain authority come from the producer.
+#[test]
+fn multi_leaf_map_is_one_alias_removed_by_one_unmap() {
+    let mut ledger = two_mms();
+    let out = ledger
+        .issue_spec(key(A, 1), A_FRAME, 2 * PAGE, ExtentAccess::Owner, RW)
+        .unwrap();
+    let map = Edit::a(1).output(out).bytes(2 * PAGE);
+    let unmap = Edit::unmap(2, A_FRAME).bytes(2 * PAGE);
+    let report = run(&mut ledger, &[map, unmap]);
+    clean(&report);
+    assert_eq!(report.applied, 2);
+    assert_eq!(ledger.book.alias_count(), 0);
+    assert!(ledger.book.frame_reusable(ipa(A_FRAME), len(2 * PAGE)));
+}
+
+#[test]
+fn prior_must_name_the_alias_at_its_va() {
+    // Another MM's frame named at a VA where this MM has a different alias.
+    let mut ledger = two_mms();
+    ledger.add_alias(key(A, 1), VA, A_FRAME, ExtentAccess::Owner, RO);
+    ledger.add_alias(key(B, 1), VA, B_FRAME, ExtentAccess::Owner, RO);
+    assert_eq!(
+        only_cause(&run(&mut ledger, &[Edit::unmap(1, B_FRAME)])),
+        QuarantineCause::PriorFrameMismatch
+    );
+    assert!(ledger.book.alias(key(B, 1), UserVa::new(VA)).is_some());
+    assert!(ledger.released.is_empty());
+
+    // No alias of this MM at that VA.
+    let mut ledger = two_mms();
+    ledger.add_alias(key(B, 1), VA, B_FRAME, ExtentAccess::Owner, RO);
+    let out = ledger.issue(key(A, 1), A_FRAME, ExtentAccess::Owner);
+    let repoint = Edit::unmap(1, B_FRAME)
+        .kind(PublicationKind::CowRepoint)
+        .output(out);
+    assert_eq!(
+        only_cause(&run(&mut ledger, &[repoint])),
+        QuarantineCause::NoPriorAlias
+    );
+
+    // The span must be the alias's whole span.
+    let mut ledger = two_mms();
+    ledger.add_alias(key(A, 1), VA, A_FRAME, ExtentAccess::Owner, RO);
+    assert_eq!(
+        only_cause(&run(
+            &mut ledger,
+            &[Edit::unmap(1, A_FRAME).bytes(2 * PAGE)]
+        )),
+        QuarantineCause::SpanMismatch
+    );
+}
+
+#[test]
+fn prior_generation_must_match() {
+    let mut ledger = two_mms();
+    ledger.add_alias(key(A, 1), VA, A_FRAME, ExtentAccess::Owner, RO);
+    ledger
+        .book
+        .aliases
+        .get_mut(&(key(A, 1), VA))
+        .unwrap()
+        .owner_generation = owner_gen(GEN + 1);
+    assert_eq!(
+        only_cause(&run(&mut ledger, &[Edit::unmap(1, A_FRAME)])),
+        QuarantineCause::StalePriorGeneration
+    );
+}
+
+// Round 4: writable reachability is derived.
+
+#[test]
+fn rolled_back_protect_to_rw_blocks_cow_until_drained() {
+    let mut ledger = two_mms();
+    ledger.add_alias(key(A, 1), VA, A_FRAME, ExtentAccess::Owner, RO);
+    assert!(ledger.begin_cow(A_FRAME).is_ok());
+    let rolled = Edit::protect(1, A_FRAME, RW)
+        .outcome(PublicationOutcome::RolledBack)
+        .local();
+    clean(&run(&mut ledger, &[rolled]));
+    assert_eq!(
+        ledger.begin_cow(A_FRAME),
+        Err(CowBlocked::PendingWritable(key(A, 1), counter(1)))
+    );
+    acknowledge_global_drain(&mut ledger, key(A, 1), counter(1)).unwrap();
+    assert!(ledger.begin_cow(A_FRAME).is_ok());
+}
+
+#[test]
+fn writable_alias_needs_a_named_drained_downgrade_before_cow() {
+    let mut ledger = two_mms();
+    let map = a_map(&mut ledger, 1, A_FRAME);
+    run(&mut ledger, &[map]);
+    assert_eq!(
+        ledger.begin_cow(A_FRAME),
+        Err(CowBlocked::WritableAlias(key(A, 1), UserVa::new(VA)))
+    );
+    // A priorless downgrade or COW arming cannot even be expressed.
+    for kind in [PublicationKind::Protect, PublicationKind::ArmCow] {
+        let priorless = Edit::a(2).kind(kind).permissions(RO);
+        assert_eq!(priorless.view(), Err(PublicationDecodeError::Prior));
+    }
+    assert!(ledger.begin_cow(A_FRAME).is_err());
+    // The named downgrade with a Local drain still leaves a possibly-cached
+    // writable translation.
+    run(&mut ledger, &[Edit::protect(2, A_FRAME, RO).local()]);
+    assert_eq!(
+        ledger.begin_cow(A_FRAME),
+        Err(CowBlocked::PendingWritable(key(A, 1), counter(2)))
+    );
+    acknowledge_global_drain(&mut ledger, key(A, 1), counter(2)).unwrap();
+    assert!(ledger.cow_share(A_FRAME, key(B, 1)).is_ok());
+}
+
+#[test]
+fn outstanding_writable_ticket_blocks_cow() {
+    let mut ledger = two_mms();
+    ledger
+        .issue_spec(key(A, 1), A_FRAME, PAGE, ExtentAccess::Owner, RO)
+        .unwrap();
+    assert!(ledger.begin_cow(A_FRAME).is_ok());
+    let out = ledger.issue(key(A, 1), A_FRAME + PAGE, ExtentAccess::Owner);
+    assert_eq!(
+        ledger.begin_cow(A_FRAME),
+        Err(CowBlocked::WritableTicket(key(A, 1), out.ticket))
+    );
+}
+
+#[test]
+fn cow_proof_is_rederived_at_mint() {
+    let mut ledger = two_mms();
+    let proof = ledger.begin_cow(A_FRAME).unwrap();
+    ledger.issue(key(A, 1), A_FRAME, ExtentAccess::Owner);
+    let custody = &mut ledger.extents.get_mut(&A_FRAME).unwrap().1;
+    // SAFETY: the test plays fork custody for exactly this extent.
+    let minted = unsafe { ledger.book.mint_cow_edge(custody, key(B, 1), proof) };
+    assert!(matches!(minted, Err(CowBlocked::WritableTicket(..))));
+}
+
+// Round 4: settlements reference the alias, and frames wait for them.
+
+#[test]
+fn release_waits_behind_earlier_settlements_of_the_alias() {
+    let mut ledger = two_mms();
+    ledger.add_alias(key(A, 1), VA, A_FRAME, ExtentAccess::Owner, RW);
+    let downgrade = Edit::protect(1, A_FRAME, RO).local();
+    let unmap =
+        Edit::unmap(2, A_FRAME).drain(GuestIsa::Aarch64, PublicationDrain::ArmBroadcastSpan);
+    clean(&run(&mut ledger, &[downgrade, unmap]));
+    // The frame is neither released nor reusable by B: the downgrade's
+    // possibly-cached writable translation still names it.
+    assert!(ledger.released.is_empty());
+    assert!(!ledger.reusable(A_FRAME));
+    assert!(ledger.begin_cow(A_FRAME).is_err());
+    assert_eq!(
+        acknowledge_global_drain(&mut ledger, key(A, 1), counter(2)),
+        Ok(1)
+    );
+    assert!(matches!(
+        ledger.released[..],
+        [(_, DeferredRelease::Prior { frame, .. })] if frame == ipa(A_FRAME)
+    ));
+    assert!(ledger.reusable(A_FRAME));
+}
 
 #[test]
 fn x86_producer_cannot_settle_debt_with_an_arm_claim() {
     let mut ledger = two_mms();
     ledger.mms.get_mut(&key(A, 1).mm).unwrap().isa = GuestIsa::X86_64;
-    ledger.add_alias(key(A, 1), A_FRAME, ExtentAccess::Owner, RO);
-    let unmap = Edit::a(1)
-        .kind(PublicationKind::Unmap)
-        .prior(A_FRAME)
-        .drain(GuestIsa::X86_64, PublicationDrain::Local);
-    let forged = Edit::protect_ro(2).drain(GuestIsa::Aarch64, PublicationDrain::ArmBroadcastAsid);
+    ledger.add_alias(key(A, 1), VA, A_FRAME, ExtentAccess::Owner, RO);
+    ledger.add_alias(
+        key(A, 1),
+        VA + PAGE,
+        A_FRAME + PAGE,
+        ExtentAccess::Owner,
+        RO,
+    );
+    let unmap = Edit::unmap(1, A_FRAME).drain(GuestIsa::X86_64, PublicationDrain::Local);
+    let forged = Edit::protect(2, A_FRAME + PAGE, RO)
+        .at(VA + PAGE)
+        .drain(GuestIsa::Aarch64, PublicationDrain::ArmBroadcastAsid);
     let report = run(&mut ledger, &[unmap, forged]);
     assert_eq!(only_cause(&report), QuarantineCause::IsaMismatch);
-    assert_eq!(report.quarantined[0].mm, key(A, 1));
     assert!(ledger.released.is_empty(), "frame freed under x86 debt");
 }
 
-// Round 3 item 2: attribution to the ring's bound producer.
+#[test]
+fn x86_shootdown_claim_never_clears_debt() {
+    let mut ledger = two_mms();
+    ledger.mms.get_mut(&key(A, 1).mm).unwrap().isa = GuestIsa::X86_64;
+    ledger.add_alias(key(A, 1), VA, A_FRAME, ExtentAccess::Owner, RO);
+    ledger.add_alias(
+        key(A, 1),
+        VA + PAGE,
+        A_FRAME + PAGE,
+        ExtentAccess::Owner,
+        RO,
+    );
+    let local = Edit::unmap(1, A_FRAME).drain(GuestIsa::X86_64, PublicationDrain::Local);
+    let claim = Edit::protect(2, A_FRAME + PAGE, RO)
+        .at(VA + PAGE)
+        .drain(GuestIsa::X86_64, PublicationDrain::X86ShootdownClaim);
+    clean(&run(&mut ledger, &[local, claim]));
+    assert!(ledger.released.is_empty());
+    assert_eq!(
+        acknowledge_global_drain(&mut ledger, key(A, 1), counter(3)),
+        Err(DrainAckError::Unconsumed)
+    );
+    assert_eq!(
+        acknowledge_global_drain(&mut ledger, key(A, 1), counter(1)),
+        Ok(1)
+    );
+    assert_eq!(
+        ledger.state(key(A, 1)).oldest_drain_debt(),
+        Some(counter(2))
+    );
+}
+
+#[test]
+fn arm_span_broadcast_does_not_clear_other_spans() {
+    let mut ledger = two_mms();
+    ledger.add_alias(key(A, 1), VA, A_FRAME, ExtentAccess::Owner, RO);
+    ledger.add_alias(
+        key(A, 1),
+        VA + PAGE,
+        A_FRAME + PAGE,
+        ExtentAccess::Owner,
+        RO,
+    );
+    let local = Edit::unmap(1, A_FRAME).local();
+    let span = Edit::unmap(2, A_FRAME + PAGE)
+        .at(VA + PAGE)
+        .drain(GuestIsa::Aarch64, PublicationDrain::ArmBroadcastSpan);
+    clean(&run(&mut ledger, &[local, span]));
+    assert!(matches!(
+        ledger.released[..],
+        [(_, DeferredRelease::Prior { frame, .. })] if frame == ipa(A_FRAME + PAGE)
+    ));
+    assert_eq!(
+        ledger.state(key(A, 1)).oldest_drain_debt(),
+        Some(counter(1))
+    );
+    ledger.add_alias(
+        key(A, 1),
+        VA + 2 * PAGE,
+        A_FRAME + 2 * PAGE,
+        ExtentAccess::Owner,
+        RO,
+    );
+    run(
+        &mut ledger,
+        &[Edit::protect(3, A_FRAME + 2 * PAGE, RO).at(VA + 2 * PAGE)],
+    );
+    assert_eq!(ledger.released.len(), 2);
+    assert_eq!(ledger.state(key(A, 1)).oldest_drain_debt(), None);
+}
+
+#[test]
+fn cow_repoint_moves_alias_and_holds_prior_until_drain() {
+    let mut ledger = two_mms();
+    let map = a_map(&mut ledger, 1, A_FRAME);
+    let out = ledger.issue(key(A, 1), A_FRAME + PAGE, ExtentAccess::Owner);
+    let repoint = Edit::unmap(2, A_FRAME)
+        .kind(PublicationKind::CowRepoint)
+        .output(out)
+        .local();
+    clean(&run(&mut ledger, &[map, repoint]));
+    let alias = ledger.book.alias(key(A, 1), UserVa::new(VA)).unwrap();
+    assert_eq!(alias.frame, ipa(A_FRAME + PAGE));
+    assert!(ledger.released.is_empty());
+    assert!(matches!(
+        ledger.begin_cow(A_FRAME),
+        Err(CowBlocked::PendingWritable(..))
+    ));
+    acknowledge_global_drain(&mut ledger, key(A, 1), counter(2)).unwrap();
+    assert_eq!(ledger.released.len(), 1);
+    assert!(ledger.reusable(A_FRAME));
+}
+
+// Round 4: admission is a reservation; all held settlements count.
+
+#[test]
+fn rolled_back_tickets_are_bounded_by_admission() {
+    let mut ledger = two_mms();
+    let mut outs = Vec::new();
+    for i in 0..MAX_HELD_PER_MM as u64 {
+        outs.push(
+            ledger
+                .issue_spec(key(A, 1), A_FRAME + i * PAGE, PAGE, ExtentAccess::Owner, RW)
+                .unwrap(),
+        );
+    }
+    // The 257th admission is refused.
+    assert_eq!(
+        ledger.book.admission_permitted(key(A, 1)),
+        Err(AdmissionBlocked::Backpressure)
+    );
+    let rolled: Vec<Edit> = outs
+        .iter()
+        .enumerate()
+        .map(|(i, out)| {
+            Edit::a(i as u64 + 1)
+                .output(*out)
+                .at(VA + i as u64 * PAGE)
+                .outcome(PublicationOutcome::RolledBack)
+                .local()
+        })
+        .collect();
+    clean(&run(&mut ledger, &rolled));
+    assert_eq!(ledger.state(key(A, 1)).held_settlements(), MAX_HELD_PER_MM);
+    assert_eq!(
+        ledger.book.admission_permitted(key(A, 1)),
+        Err(AdmissionBlocked::Backpressure)
+    );
+    acknowledge_global_drain(&mut ledger, key(A, 1), counter(MAX_HELD_PER_MM as u64)).unwrap();
+    assert!(ledger.book.admission_permitted(key(A, 1)).is_ok());
+}
+
+#[test]
+fn untracked_held_settlements_backpressure_the_producer() {
+    let mut ledger = two_mms();
+    let total = MAX_HELD_PER_MM as u64 + 10;
+    let mut unmaps = Vec::new();
+    for i in 0..total {
+        ledger.add_alias(
+            key(A, 1),
+            VA + i * PAGE,
+            A_FRAME + i * PAGE,
+            ExtentAccess::Owner,
+            RO,
+        );
+        unmaps.push(
+            Edit::unmap(i + 1, A_FRAME + i * PAGE)
+                .at(VA + i * PAGE)
+                .local(),
+        );
+    }
+    let report = consume_edits(&mut ledger, &unmaps, &[(key(A, 1), counter(total))]);
+    clean(&report);
+    assert_eq!(
+        (report.applied, report.backpressured),
+        (MAX_HELD_PER_MM, 10)
+    );
+    acknowledge_global_drain(&mut ledger, key(A, 1), counter(MAX_HELD_PER_MM as u64)).unwrap();
+    let report = consume(
+        &mut ledger,
+        &[RingBatch {
+            ring: ring(A),
+            bound: key(A, 1),
+            records: &[],
+        }],
+        &[(key(A, 1), counter(total))],
+    );
+    clean(&report);
+    assert_eq!(report.applied, 10);
+}
+
+#[test]
+fn debt_without_custody_is_compacted() {
+    let mut ledger = two_mms();
+    ledger.add_alias(key(A, 1), VA, A_FRAME, ExtentAccess::Owner, RO);
+    let edits: Vec<Edit> = (1..=1000)
+        .map(|c| Edit::protect(c, A_FRAME, RO).local())
+        .collect();
+    clean(&run(&mut ledger, &edits));
+    let state = ledger.state(key(A, 1));
+    assert_eq!(state.held_settlements(), 0);
+    assert_eq!(state.oldest_drain_debt(), Some(counter(1)));
+    acknowledge_global_drain(&mut ledger, key(A, 1), counter(999)).unwrap();
+    assert_eq!(
+        ledger.state(key(A, 1)).oldest_drain_debt(),
+        Some(counter(1000))
+    );
+}
+
+#[test]
+fn retirement_requires_the_host_barrier() {
+    let mut ledger = two_mms();
+    let out = ledger.issue(key(A, 1), A_FRAME, ExtentAccess::Owner);
+    assert_eq!(
+        retirement_permitted(&ledger.book, key(A, 1)),
+        Err(RetirementBlocked::AdmissionOpen)
+    );
+    close_admission(&mut ledger.book, key(A, 1), Some(counter(2))).unwrap();
+    assert_eq!(
+        ledger.book.admission_permitted(key(A, 1)),
+        Err(AdmissionBlocked::Closed)
+    );
+    assert_eq!(
+        retirement_permitted(&ledger.book, key(A, 1)),
+        Err(RetirementBlocked::OpenTickets(1))
+    );
+    run(&mut ledger, &[Edit::a(1).output(out).local()]);
+    assert_eq!(
+        retirement_permitted(&ledger.book, key(A, 1)),
+        Err(RetirementBlocked::UnconsumedRecords)
+    );
+    run(&mut ledger, &[Edit::protect(2, A_FRAME, RO).local()]);
+    assert_eq!(
+        retirement_permitted(&ledger.book, key(A, 1)),
+        Err(RetirementBlocked::DrainDebt(counter(1)))
+    );
+    acknowledge_global_drain(&mut ledger, key(A, 1), counter(2)).unwrap();
+    assert_eq!(retirement_permitted(&ledger.book, key(A, 1)), Ok(()));
+}
+
+// Producer attribution.
 
 #[test]
 fn forged_identity_quarantines_producer_not_victim() {
     let mut ledger = two_mms();
-    run(
-        &mut ledger,
-        &[Edit::b(1).kind(PublicationKind::Protect).permissions(RO)],
-    );
-    // Ring 1 is bound to A but carries a duplicate of B's counter 1.
-    let forged = [Edit::b(1)
-        .kind(PublicationKind::Protect)
-        .permissions(RO)
-        .record()];
+    ledger.add_alias(key(B, 1), VA, B_FRAME, ExtentAccess::Owner, RO);
+    let b = Edit::protect(1, B_FRAME, RO);
+    let b = Edit {
+        mm: key(B, 1),
+        root: root(B_ROOT),
+        ..b
+    };
+    run(&mut ledger, &[b]);
+    let forged = [b.record()];
     let report = consume(
         &mut ledger,
         &[RingBatch {
@@ -468,14 +841,17 @@ fn forged_identity_quarantines_producer_not_victim() {
     );
     assert_eq!(only_cause(&report), QuarantineCause::ProducerMismatch);
     assert_eq!(report.quarantined[0].mm, key(A, 1));
-    assert_eq!(report.quarantined[0].ring, Some(ring(1)));
-    assert!(!ledger.mm_quarantined(key(B, 1)));
+    assert!(!ledger.quarantined(key(B, 1)));
 }
 
 #[test]
 fn malformed_record_quarantines_only_its_producer() {
     let mut ledger = two_mms();
-    let mut record = Edit::protect_ro(1).record();
+    ledger.add_alias(key(B, 1), VA, B_FRAME, ExtentAccess::Owner, RO);
+    let mut record = Edit::a(1)
+        .kind(PublicationKind::Protect)
+        .prior(A_FRAME)
+        .record();
     // SAFETY: test-only corruption of a plain `repr(C)` Copy record; decode
     // must reject it.
     let bytes = unsafe {
@@ -485,10 +861,13 @@ fn malformed_record_quarantines_only_its_producer() {
         )
     };
     bytes[40] ^= 1;
-    let b = [Edit::b(1)
-        .kind(PublicationKind::Protect)
-        .permissions(RO)
-        .record()];
+    let b = Edit::protect(1, B_FRAME, RO);
+    let b = [Edit {
+        mm: key(B, 1),
+        root: root(B_ROOT),
+        ..b
+    }
+    .record()];
     let report = consume(
         &mut ledger,
         &[
@@ -512,448 +891,70 @@ fn malformed_record_quarantines_only_its_producer() {
     assert_eq!(report.applied, 1);
 }
 
-// Round 3 item 3: rolled-back tickets cannot be spent again.
+// Tickets.
 
 #[test]
 fn rolled_back_then_refused_same_ticket_does_not_free_early() {
     let mut ledger = two_mms();
-    let out = ledger.issue(key(A, 1), 1, A_FRAME, ExtentAccess::Owner);
+    let out = ledger.issue(key(A, 1), A_FRAME, ExtentAccess::Owner);
     let rolled = Edit::a(1)
         .output(out)
         .outcome(PublicationOutcome::RolledBack)
-        .drain(GuestIsa::Aarch64, PublicationDrain::Local);
+        .local();
     let refused = Edit::a(2).output(out).outcome(PublicationOutcome::Refused);
-    let report = run(&mut ledger, &[rolled, refused]);
-    assert_eq!(only_cause(&report), QuarantineCause::NoTicket);
+    assert_eq!(
+        only_cause(&run(&mut ledger, &[rolled, refused])),
+        QuarantineCause::NoTicket
+    );
     assert!(ledger.released.is_empty());
-    assert!(ledger.held.contains(&(key(A, 1), ticket_id(1))));
+    assert!(!ledger.reusable(A_FRAME));
 }
 
 #[test]
 fn rolled_back_local_holds_ticket_until_host_ack() {
     let mut ledger = two_mms();
-    let out = ledger.issue(key(A, 1), 1, A_FRAME, ExtentAccess::Owner);
+    let out = ledger.issue(key(A, 1), A_FRAME, ExtentAccess::Owner);
     let edit = Edit::a(1)
         .output(out)
         .outcome(PublicationOutcome::RolledBack)
-        .drain(GuestIsa::Aarch64, PublicationDrain::Local);
-    run(&mut ledger, &[edit]);
+        .local();
+    clean(&run(&mut ledger, &[edit]));
     assert!(ledger.released.is_empty());
-    assert_eq!(ledger.outstanding_tickets(key(A, 1)), 0);
+    assert!(matches!(
+        ledger.begin_cow(A_FRAME),
+        Err(CowBlocked::WritableTicket(..))
+    ));
     assert_eq!(
         acknowledge_global_drain(&mut ledger, key(A, 1), counter(1)),
         Ok(1)
     );
     assert_eq!(
         ledger.released,
-        [(key(A, 1), DeferredRelease::HeldOutput(ticket_id(1)))]
+        [(key(A, 1), DeferredRelease::HeldOutput(out.ticket))]
     );
+    assert!(ledger.reusable(A_FRAME));
 }
-
-// Round 3 item 4: aliases keep their permission ceiling.
-
-#[test]
-fn read_only_ticket_cannot_be_protected_writable() {
-    let mut ledger = two_mms();
-    let out = ledger.issue_with(key(A, 1), 1, A_FRAME, ExtentAccess::Owner, RO);
-    let map = Edit::a(1).output(out).permissions(RO);
-    let protect = Edit::a(2).kind(PublicationKind::Protect).prior(A_FRAME);
-    let report = run(&mut ledger, &[map, protect]);
-    assert_eq!(only_cause(&report), QuarantineCause::PermissionEscalation);
-    assert_eq!(report.applied, 1);
-}
-
-#[test]
-fn records_without_output_or_prior_cannot_grant_write() {
-    for kind in [PublicationKind::Publish, PublicationKind::ArmCow] {
-        let mut ledger = two_mms();
-        let report = run(&mut ledger, &[Edit::a(1).kind(kind)]);
-        assert_eq!(
-            only_cause(&report),
-            QuarantineCause::PermissionEscalation,
-            "{kind:?}"
-        );
-    }
-}
-
-// Round 3 item 5: span must be the prior alias's VA span.
-
-#[test]
-fn prior_span_must_match_alias_va() {
-    for kind in [PublicationKind::Unmap, PublicationKind::Protect] {
-        let mut ledger = two_mms();
-        ledger.add_alias(key(A, 1), A_FRAME, ExtentAccess::Owner, RW);
-        let edit = Edit::a(1)
-            .kind(kind)
-            .prior(A_FRAME)
-            .permissions(RO)
-            .at(VA + PAGE);
-        let report = run(&mut ledger, &[edit]);
-        assert_eq!(
-            only_cause(&report),
-            QuarantineCause::SpanMismatch,
-            "{kind:?}"
-        );
-    }
-}
-
-// Round 3 item 6: bounded work.
-
-#[test]
-fn contiguous_batch_beyond_deferral_bound_applies() {
-    let mut ledger = two_mms();
-    let edits: Vec<Edit> = (1..=257).map(Edit::protect_ro).collect();
-    let report = consume_edits(&mut ledger, &edits, &[(key(A, 1), counter(257))]);
-    assert_eq!((report.applied, report.quarantined.len()), (257, 0));
-}
-
-#[test]
-fn record_closing_the_gap_is_always_accepted() {
-    let mut ledger = two_mms();
-    let later: Vec<Edit> = (2..=257).map(Edit::protect_ro).collect();
-    let report = run(&mut ledger, &later);
-    assert_eq!((report.deferred, report.quarantined.len()), (256, 0));
-    let report = consume_edits(
-        &mut ledger,
-        &[Edit::protect_ro(1)],
-        &[(key(A, 1), counter(257))],
-    );
-    assert_eq!((report.applied, report.quarantined.len()), (257, 0));
-    assert_eq!(ledger.state(key(A, 1)).deferred_records(), 0);
-}
-
-#[test]
-fn deferral_beyond_bound_quarantines() {
-    let mut ledger = two_mms();
-    let later: Vec<Edit> = (2..=258).map(Edit::protect_ro).collect();
-    assert_eq!(
-        only_cause(&run(&mut ledger, &later)),
-        QuarantineCause::DeferralOverflow
-    );
-}
-
-#[test]
-fn debt_without_custody_is_compacted() {
-    let mut ledger = two_mms();
-    let edits: Vec<Edit> = (1..=1000)
-        .map(|c| Edit::protect_ro(c).drain(GuestIsa::Aarch64, PublicationDrain::Local))
-        .collect();
-    run(&mut ledger, &edits);
-    let state = ledger.state(key(A, 1));
-    assert_eq!(state.held_settlements(), 0);
-    assert_eq!(state.oldest_drain_debt(), Some(counter(1)));
-    acknowledge_global_drain(&mut ledger, key(A, 1), counter(999)).unwrap();
-    assert_eq!(
-        ledger.state(key(A, 1)).oldest_drain_debt(),
-        Some(counter(1000))
-    );
-}
-
-#[test]
-fn held_custody_applies_admission_backpressure() {
-    let mut ledger = two_mms();
-    let frames = MAX_HELD_SETTLEMENTS_PER_MM as u64;
-    ledger.add_extent(0x1000_0000, frames * PAGE, key(A, 1));
-    let mut edits = Vec::new();
-    for i in 0..frames {
-        let frame = 0x1000_0000 + i * PAGE;
-        let va = VA + i * PAGE;
-        ledger.add_alias(key(A, 1), frame, ExtentAccess::Owner, RO);
-        ledger.aliases.get_mut(&(key(A, 1), frame)).unwrap().va = UserVa::new(va);
-        edits.push(
-            Edit::a(i + 1)
-                .kind(PublicationKind::Unmap)
-                .prior(frame)
-                .at(va)
-                .drain(GuestIsa::Aarch64, PublicationDrain::Local),
-        );
-    }
-    assert_eq!(admission_permitted(&mut ledger, key(A, 1)), Ok(()));
-    run(&mut ledger, &edits);
-    assert_eq!(
-        admission_permitted(&mut ledger, key(A, 1)),
-        Err(AdmissionBlocked::Backpressure)
-    );
-    acknowledge_global_drain(&mut ledger, key(A, 1), counter(frames)).unwrap();
-    assert_eq!(admission_permitted(&mut ledger, key(A, 1)), Ok(()));
-}
-
-// Round 3 item 7: retirement barrier.
-
-#[test]
-fn retirement_requires_the_host_barrier() {
-    let mut ledger = two_mms();
-    let out = ledger.issue(key(A, 1), 1, A_FRAME, ExtentAccess::Owner);
-    assert_eq!(
-        retirement_permitted(&mut ledger, key(A, 1)),
-        Err(RetirementBlocked::AdmissionOpen)
-    );
-    retire_ready(&mut ledger, key(A, 1), 2);
-    assert_eq!(
-        admission_permitted(&mut ledger, key(A, 1)),
-        Err(AdmissionBlocked::Closed)
-    );
-    assert_eq!(
-        retirement_permitted(&mut ledger, key(A, 1)),
-        Err(RetirementBlocked::OutstandingTickets(1))
-    );
-    let map = Edit::a(1)
-        .output(out)
-        .drain(GuestIsa::Aarch64, PublicationDrain::Local);
-    run(&mut ledger, &[map]);
-    assert_eq!(
-        retirement_permitted(&mut ledger, key(A, 1)),
-        Err(RetirementBlocked::UnconsumedRecords)
-    );
-    run(
-        &mut ledger,
-        &[Edit::protect_ro(2).drain(GuestIsa::Aarch64, PublicationDrain::Local)],
-    );
-    assert_eq!(
-        retirement_permitted(&mut ledger, key(A, 1)),
-        Err(RetirementBlocked::DrainDebt(counter(1)))
-    );
-    acknowledge_global_drain(&mut ledger, key(A, 1), counter(2)).unwrap();
-    assert_eq!(retirement_permitted(&mut ledger, key(A, 1)), Ok(()));
-}
-
-// Round 3 item 8: COW edges need a write-downgrade transition.
-
-#[test]
-fn cow_edge_requires_drained_write_downgrade() {
-    let mut ledger = two_mms();
-    let map = a_map(&mut ledger, 1, 1, A_FRAME);
-    run(&mut ledger, &[map]);
-    assert_eq!(
-        ledger.custody_at(A_FRAME).begin_cow(),
-        Err(CowTransitionError::WritableAliasesLive(1))
-    );
-    let downgrade = Edit::a(2)
-        .kind(PublicationKind::Protect)
-        .prior(A_FRAME)
-        .permissions(RO)
-        .drain(GuestIsa::Aarch64, PublicationDrain::Local);
-    run(&mut ledger, &[downgrade]);
-    // Downgraded but not drained: a remote CPU may still write.
-    assert!(ledger.custody_at(A_FRAME).begin_cow().is_err());
-    acknowledge_global_drain(&mut ledger, key(A, 1), counter(2)).unwrap();
-    let proof = ledger.custody_at(A_FRAME).begin_cow().unwrap();
-    // A writable alias published after the proof makes it stale.
-    let map = a_map(&mut ledger, 3, 2, A_FRAME + PAGE).at(VA + PAGE);
-    run(&mut ledger, &[map]);
-    // SAFETY: the test plays fork custody.
-    let minted = unsafe { ledger.custody_at(A_FRAME).mint_cow_edge(key(B, 1), proof) };
-    assert_eq!(minted, Err(CowTransitionError::Stale));
-}
-
-// Shared frames.
-
-#[test]
-fn foreign_output_without_edge_quarantines() {
-    let mut ledger = two_mms();
-    let out = ledger.issue(key(A, 1), 1, B_FRAME, ExtentAccess::Owner);
-    let report = run(&mut ledger, &[Edit::a(1).output(out)]);
-    assert_eq!(only_cause(&report), QuarantineCause::ForeignOutput);
-    assert!(!ledger.mm_quarantined(key(B, 1)));
-}
-
-#[test]
-fn foreign_output_with_exact_edge_applies() {
-    let mut ledger = two_mms();
-    let edge = ledger.share(B_FRAME, key(A, 1));
-    let out = ledger.issue(key(A, 1), 1, B_FRAME, ExtentAccess::Edge(edge));
-    let report = run(&mut ledger, &[Edit::a(1).output(out)]);
-    assert_eq!((report.applied, report.quarantined.len()), (1, 0));
-}
-
-#[test]
-fn stale_edge_generation_quarantines() {
-    let mut ledger = two_mms();
-    let old = ledger.share(B_FRAME, key(A, 1));
-    let out = ledger.issue(key(A, 1), 1, B_FRAME, ExtentAccess::Edge(old));
-    ledger.custody_at(B_FRAME).revoke_edge(key(A, 1));
-    ledger.share(B_FRAME, key(A, 1));
-    let report = run(&mut ledger, &[Edit::a(1).output(out)]);
-    assert_eq!(only_cause(&report), QuarantineCause::StaleEdge);
-}
-
-#[test]
-fn owner_death_leaves_edge_only_custody() {
-    let mut ledger = two_mms();
-    let edge = ledger.share(B_FRAME, key(A, 1));
-    assert_eq!(
-        ledger.custody_at(B_FRAME).retire_owner(),
-        OwnerRetired::EdgeOnly { edges: 1 }
-    );
-    let out = ledger.issue(key(A, 1), 1, B_FRAME, ExtentAccess::Edge(edge));
-    assert_eq!(run(&mut ledger, &[Edit::a(1).output(out)]).applied, 1);
-    let custody = ledger.custody_at(B_FRAME);
-    assert_eq!(
-        custody.admits(key(B, 1), ExtentAccess::Owner),
-        Err(AccessDenied::Foreign)
-    );
-    custody.revoke_edge(key(A, 1));
-    assert_eq!(custody.retire_owner(), OwnerRetired::Reclaimable);
-}
-
-#[test]
-fn cow_edge_forbids_writable_mapping() {
-    let mut ledger = two_mms();
-    let edge = ledger.cow_share(B_FRAME, key(A, 1));
-    let out = ledger.issue(key(A, 1), 1, B_FRAME, ExtentAccess::Edge(edge));
-    assert_eq!(
-        only_cause(&run(&mut ledger, &[Edit::a(1).output(out)])),
-        QuarantineCause::CowWritable
-    );
-
-    let mut ledger = two_mms();
-    let edge = ledger.cow_share(B_FRAME, key(A, 1));
-    let out = ledger.issue(key(A, 1), 1, B_FRAME, ExtentAccess::Edge(edge));
-    let report = run(&mut ledger, &[Edit::a(1).output(out).permissions(RO)]);
-    assert_eq!(report.applied, 1);
-    let out = ledger.issue(key(B, 1), 1, B_FRAME, ExtentAccess::Owner);
-    assert_eq!(
-        only_cause(&run(&mut ledger, &[Edit::b(1).output(out)])),
-        QuarantineCause::CowWritable
-    );
-}
-
-#[test]
-fn writable_protect_of_cow_shared_frame_quarantines() {
-    let mut ledger = two_mms();
-    ledger.cow_share(A_FRAME, key(B, 1));
-    ledger.add_alias(key(A, 1), A_FRAME, ExtentAccess::Owner, RO);
-    let protect = Edit::a(1).kind(PublicationKind::Protect).prior(A_FRAME);
-    assert_eq!(
-        only_cause(&run(&mut ledger, &[protect])),
-        QuarantineCause::CowWritable
-    );
-}
-
-// Prior output.
-
-#[test]
-fn prior_of_another_mm_quarantines() {
-    for kind in [PublicationKind::CowRepoint, PublicationKind::Unmap] {
-        let mut ledger = two_mms();
-        ledger.add_alias(key(B, 1), B_FRAME, ExtentAccess::Owner, RO);
-        let mut edit = Edit::a(1).kind(kind).prior(B_FRAME).permissions(RO);
-        if kind == PublicationKind::CowRepoint {
-            let out = ledger.issue(key(A, 1), 1, A_FRAME, ExtentAccess::Owner);
-            edit = edit.output(out);
-        }
-        let report = run(&mut ledger, &[edit]);
-        assert_eq!(
-            only_cause(&report),
-            QuarantineCause::ForeignPrior,
-            "{kind:?}"
-        );
-        assert!(ledger.aliases.contains_key(&(key(B, 1), B_FRAME)));
-        assert!(ledger.released.is_empty());
-    }
-}
-
-#[test]
-fn prior_length_and_generation_must_match() {
-    let unmap = Edit::a(1).kind(PublicationKind::Unmap).prior(A_FRAME);
-    let mut ledger = two_mms();
-    ledger.add_alias(key(A, 1), A_FRAME, ExtentAccess::Owner, RO);
-    ledger.aliases.get_mut(&(key(A, 1), A_FRAME)).unwrap().len = GuestLen::new(2 * PAGE);
-    assert_eq!(
-        only_cause(&run(&mut ledger, &[unmap])),
-        QuarantineCause::PriorLength
-    );
-
-    let mut ledger = two_mms();
-    ledger.add_alias(key(A, 1), A_FRAME, ExtentAccess::Owner, RO);
-    ledger
-        .aliases
-        .get_mut(&(key(A, 1), A_FRAME))
-        .unwrap()
-        .owner_generation = owner_gen(GEN + 1);
-    assert_eq!(
-        only_cause(&run(&mut ledger, &[unmap])),
-        QuarantineCause::StalePriorGeneration
-    );
-}
-
-// Identity.
-
-#[test]
-fn stale_incarnation_quarantines() {
-    let mut ledger = two_mms();
-    let edit = Edit::new(key(A, 2), 1, A_ROOT)
-        .kind(PublicationKind::Protect)
-        .permissions(RO);
-    assert_eq!(
-        only_cause(&run(&mut ledger, &[edit])),
-        QuarantineCause::StaleIncarnation
-    );
-    assert!(!ledger.mm_quarantined(key(A, 1)));
-}
-
-#[test]
-fn root_of_another_mm_quarantines() {
-    let mut ledger = two_mms();
-    let edit = Edit::new(key(A, 1), 1, B_ROOT)
-        .kind(PublicationKind::Protect)
-        .permissions(RO);
-    assert_eq!(
-        only_cause(&run(&mut ledger, &[edit])),
-        QuarantineCause::RootMismatch
-    );
-}
-
-#[test]
-fn stale_owner_generation_quarantines() {
-    let mut ledger = two_mms();
-    let out = ledger.issue(key(A, 1), 1, A_FRAME, ExtentAccess::Owner);
-    ledger.custody_at(A_FRAME).owner_generation = owner_gen(GEN + 1);
-    assert_eq!(
-        only_cause(&run(&mut ledger, &[Edit::a(1).output(out)])),
-        QuarantineCause::StaleOwnerGeneration
-    );
-}
-
-#[test]
-fn recycled_slot_rejects_predecessor_records() {
-    let mut ledger = two_mms();
-    let out = ledger.issue(key(A, 1), 1, A_FRAME, ExtentAccess::Owner);
-    ledger.states.remove(&key(A, 1));
-    ledger.add_mm(key(A, 2), root(A_ROOT), GuestIsa::Aarch64);
-    assert_eq!(
-        only_cause(&run(&mut ledger, &[Edit::a(1).output(out)])),
-        QuarantineCause::StaleIncarnation
-    );
-    let stale = Edit::new(key(A, 2), 1, A_ROOT).output(out);
-    assert_eq!(
-        only_cause(&run(&mut ledger, &[stale])),
-        QuarantineCause::NoTicket
-    );
-}
-
-// Admission.
 
 #[test]
 fn applied_needs_an_outstanding_matching_ticket() {
     let mut ledger = two_mms();
-    let out = ledger.issue(key(A, 1), 1, A_FRAME, ExtentAccess::Owner);
-    ledger.tickets.clear();
+    let mut out = ledger.issue(key(A, 1), A_FRAME, ExtentAccess::Owner);
+    out.ticket = TicketId::new(nz(999));
     assert_eq!(
         only_cause(&run(&mut ledger, &[Edit::a(1).output(out)])),
         QuarantineCause::NoTicket
     );
 
     let mut ledger = two_mms();
-    let mut out = ledger.issue(key(A, 1), 1, A_FRAME, ExtentAccess::Owner);
-    out.address = Stage1Ipa::new(A_FRAME + PAGE);
+    let mut out = ledger.issue(key(A, 1), A_FRAME, ExtentAccess::Owner);
+    out.address = ipa(A_FRAME + PAGE);
     assert_eq!(
         only_cause(&run(&mut ledger, &[Edit::a(1).output(out)])),
         QuarantineCause::TicketMismatch
     );
 
     let mut ledger = two_mms();
-    let out = ledger.issue(key(A, 1), 1, A_FRAME, ExtentAccess::Owner);
+    let out = ledger.issue(key(A, 1), A_FRAME, ExtentAccess::Owner);
     let exec = EditPermissions {
         executable: true,
         ..RW
@@ -967,7 +968,7 @@ fn applied_needs_an_outstanding_matching_ticket() {
     );
 
     let mut ledger = two_mms();
-    let out = ledger.issue(key(A, 1), 1, A_FRAME, ExtentAccess::Owner);
+    let out = ledger.issue(key(A, 1), A_FRAME, ExtentAccess::Owner);
     assert_eq!(
         only_cause(&run(&mut ledger, &[Edit::a(1).output(out).grants(3)])),
         QuarantineCause::TableGrantOverrun
@@ -975,35 +976,46 @@ fn applied_needs_an_outstanding_matching_ticket() {
 }
 
 #[test]
+fn read_only_ticket_cannot_be_protected_writable() {
+    let mut ledger = two_mms();
+    let out = ledger
+        .issue_spec(key(A, 1), A_FRAME, PAGE, ExtentAccess::Owner, RO)
+        .unwrap();
+    let map = Edit::a(1).output(out).permissions(RO);
+    let report = run(&mut ledger, &[map, Edit::protect(2, A_FRAME, RW)]);
+    assert_eq!(only_cause(&report), QuarantineCause::PermissionEscalation);
+    assert_eq!(report.applied, 1);
+}
+
+#[test]
 fn applied_accounts_table_grants_and_consumes_ticket() {
     let mut ledger = two_mms();
-    let out = ledger.issue(key(A, 1), 1, A_FRAME, ExtentAccess::Owner);
+    let out = ledger.issue(key(A, 1), A_FRAME, ExtentAccess::Owner);
     let report = run(&mut ledger, &[Edit::a(1).output(out).grants(2)]);
     assert_eq!(report.applied, 1);
     assert_eq!(ledger.tables, 2);
-    assert!(ledger.tickets.is_empty());
-    assert_eq!(ledger.custody_at(A_FRAME).writable_aliases(), 1);
+    assert_eq!(ledger.state(key(A, 1)).open_tickets(), 0);
 }
 
 #[test]
 fn refused_releases_its_own_ticket_only() {
     let mut ledger = two_mms();
-    let mine = ledger.issue(key(A, 1), 1, A_FRAME, ExtentAccess::Owner);
-    ledger.issue(key(A, 1), 2, A_FRAME + PAGE, ExtentAccess::Owner);
+    let mine = ledger.issue(key(A, 1), A_FRAME, ExtentAccess::Owner);
+    ledger.issue(key(A, 1), A_FRAME + PAGE, ExtentAccess::Owner);
     let edit = Edit::a(1).output(mine).outcome(PublicationOutcome::Refused);
     let report = run(&mut ledger, &[edit]);
     assert_eq!((report.applied, report.released), (0, 1));
     assert_eq!(
         ledger.released,
-        [(key(A, 1), DeferredRelease::Ticket(ticket_id(1)))]
+        [(key(A, 1), DeferredRelease::Ticket(mine.ticket))]
     );
-    assert!(ledger.tickets.contains_key(&(key(A, 1), ticket_id(2))));
+    assert_eq!(ledger.state(key(A, 1)).open_tickets(), 1);
 }
 
 #[test]
 fn refused_with_stale_owner_cannot_release_custody() {
     let mut ledger = two_mms();
-    let mut out = ledger.issue(key(A, 1), 1, A_FRAME, ExtentAccess::Owner);
+    let mut out = ledger.issue(key(A, 1), A_FRAME, ExtentAccess::Owner);
     out.owner_generation = owner_gen(GEN - 1);
     let edit = Edit::a(1).output(out).outcome(PublicationOutcome::Refused);
     assert_eq!(
@@ -1013,80 +1025,157 @@ fn refused_with_stale_owner_cannot_release_custody() {
     assert!(ledger.released.is_empty());
 }
 
-// Drains.
+// Shared frames.
 
 #[test]
-fn x86_shootdown_claim_never_clears_debt() {
+fn foreign_output_without_edge_quarantines() {
     let mut ledger = two_mms();
-    ledger.mms.get_mut(&key(A, 1).mm).unwrap().isa = GuestIsa::X86_64;
-    ledger.add_alias(key(A, 1), A_FRAME, ExtentAccess::Owner, RO);
-    let local = Edit::a(1)
-        .kind(PublicationKind::Unmap)
-        .prior(A_FRAME)
-        .drain(GuestIsa::X86_64, PublicationDrain::Local);
-    let claim = Edit::protect_ro(2).drain(GuestIsa::X86_64, PublicationDrain::X86ShootdownClaim);
-    run(&mut ledger, &[local, claim]);
-    assert!(ledger.released.is_empty());
+    let out = ledger.issue(key(A, 1), B_FRAME, ExtentAccess::Owner);
     assert_eq!(
-        acknowledge_global_drain(&mut ledger, key(A, 1), counter(3)),
-        Err(DrainAckError::Unconsumed)
+        only_cause(&run(&mut ledger, &[Edit::a(1).output(out)])),
+        QuarantineCause::ForeignOutput
     );
+    assert!(!ledger.quarantined(key(B, 1)));
+}
+
+#[test]
+fn foreign_output_with_exact_edge_applies() {
+    let mut ledger = two_mms();
+    let edge = ledger.share(B_FRAME, key(A, 1));
+    let out = ledger.issue(key(A, 1), B_FRAME, ExtentAccess::Edge(edge));
+    let report = run(&mut ledger, &[Edit::a(1).output(out)]);
+    clean(&report);
+    assert_eq!(report.applied, 1);
+}
+
+#[test]
+fn stale_edge_generation_quarantines() {
+    let mut ledger = two_mms();
+    let old = ledger.share(B_FRAME, key(A, 1));
+    let out = ledger.issue(key(A, 1), B_FRAME, ExtentAccess::Edge(old));
+    ledger.custody_at(B_FRAME).revoke_edge(key(A, 1));
+    ledger.share(B_FRAME, key(A, 1));
     assert_eq!(
-        acknowledge_global_drain(&mut ledger, key(A, 1), counter(1)),
-        Ok(1)
-    );
-    assert_eq!(
-        ledger.state(key(A, 1)).oldest_drain_debt(),
-        Some(counter(2))
+        only_cause(&run(&mut ledger, &[Edit::a(1).output(out)])),
+        QuarantineCause::StaleEdge
     );
 }
 
 #[test]
-fn arm_span_broadcast_does_not_clear_other_spans() {
+fn owner_death_leaves_edge_only_custody() {
     let mut ledger = two_mms();
-    ledger.add_alias(key(A, 1), A_FRAME, ExtentAccess::Owner, RO);
-    ledger.add_alias(key(A, 1), A_FRAME + PAGE, ExtentAccess::Owner, RO);
-    let local = Edit::a(1)
-        .kind(PublicationKind::Unmap)
-        .prior(A_FRAME)
-        .drain(GuestIsa::Aarch64, PublicationDrain::Local);
-    let span = Edit::a(2)
-        .kind(PublicationKind::Unmap)
-        .prior(A_FRAME + PAGE)
-        .drain(GuestIsa::Aarch64, PublicationDrain::ArmBroadcastSpan);
-    run(&mut ledger, &[local, span]);
-    assert!(matches!(
-        ledger.released[..],
-        [(_, DeferredRelease::Prior(PublishedPrior { address, .. }))] if address.raw() == A_FRAME + PAGE
-    ));
+    let edge = ledger.share(B_FRAME, key(A, 1));
     assert_eq!(
-        ledger.state(key(A, 1)).oldest_drain_debt(),
-        Some(counter(1))
+        ledger.custody_at(B_FRAME).retire_owner(),
+        OwnerRetired::EdgeOnly { edges: 1 }
     );
-    run(&mut ledger, &[Edit::protect_ro(3)]);
-    assert_eq!(ledger.released.len(), 2);
-    assert_eq!(ledger.state(key(A, 1)).oldest_drain_debt(), None);
+    let out = ledger.issue(key(A, 1), B_FRAME, ExtentAccess::Edge(edge));
+    assert_eq!(run(&mut ledger, &[Edit::a(1).output(out)]).applied, 1);
+    let custody = ledger.custody_at(B_FRAME);
+    assert_eq!(
+        custody.admits(key(B, 1), ExtentAccess::Owner),
+        Err(AccessDenied::Foreign)
+    );
+    custody.revoke_edge(key(A, 1));
+    assert_eq!(custody.retire_owner(), OwnerRetired::Reclaimable);
 }
 
 #[test]
-fn cow_repoint_moves_alias_and_holds_prior_until_drain() {
+fn cow_edge_forbids_writable_mapping() {
     let mut ledger = two_mms();
-    let map = a_map(&mut ledger, 1, 1, A_FRAME);
-    let out = ledger.issue(key(A, 1), 2, A_FRAME + PAGE, ExtentAccess::Owner);
-    let repoint = Edit::a(2)
-        .kind(PublicationKind::CowRepoint)
-        .output(out)
+    let edge = ledger.cow_share(B_FRAME, key(A, 1)).unwrap();
+    let out = ledger
+        .issue_spec(key(A, 1), B_FRAME, PAGE, ExtentAccess::Edge(edge), RW)
+        .unwrap();
+    assert_eq!(
+        only_cause(&run(&mut ledger, &[Edit::a(1).output(out)])),
+        QuarantineCause::CowWritable
+    );
+
+    let mut ledger = two_mms();
+    let edge = ledger.cow_share(B_FRAME, key(A, 1)).unwrap();
+    let out = ledger
+        .issue_spec(key(A, 1), B_FRAME, PAGE, ExtentAccess::Edge(edge), RO)
+        .unwrap();
+    assert_eq!(
+        run(&mut ledger, &[Edit::a(1).output(out).permissions(RO)]).applied,
+        1
+    );
+    let out = ledger
+        .issue_spec(key(B, 1), B_FRAME + PAGE, PAGE, ExtentAccess::Owner, RW)
+        .unwrap();
+    assert_eq!(
+        only_cause(&run(&mut ledger, &[Edit::b(1).output(out)])),
+        QuarantineCause::CowWritable
+    );
+}
+
+#[test]
+fn writable_protect_of_cow_shared_frame_quarantines() {
+    let mut ledger = two_mms();
+    ledger.add_alias(key(A, 1), VA, A_FRAME, ExtentAccess::Owner, RO);
+    ledger.cow_share(A_FRAME, key(B, 1)).unwrap();
+    assert_eq!(
+        only_cause(&run(&mut ledger, &[Edit::protect(1, A_FRAME, RW)])),
+        QuarantineCause::CowWritable
+    );
+}
+
+// Identity.
+
+#[test]
+fn stale_incarnation_quarantines() {
+    let mut ledger = two_mms();
+    let edit = Edit::new(key(A, 2), 1, A_ROOT)
+        .kind(PublicationKind::Protect)
         .prior(A_FRAME)
-        .drain(GuestIsa::Aarch64, PublicationDrain::Local);
-    run(&mut ledger, &[map, repoint]);
-    assert!(!ledger.aliases.contains_key(&(key(A, 1), A_FRAME)));
-    assert!(ledger.aliases.contains_key(&(key(A, 1), A_FRAME + PAGE)));
-    assert!(ledger.released.is_empty());
-    // The old writable alias is still live until the drain settles.
-    assert_eq!(ledger.custody_at(A_FRAME).writable_aliases(), 2);
-    acknowledge_global_drain(&mut ledger, key(A, 1), counter(2)).unwrap();
-    assert_eq!(ledger.released.len(), 1);
-    assert_eq!(ledger.custody_at(A_FRAME).writable_aliases(), 1);
+        .permissions(RO);
+    assert_eq!(
+        only_cause(&run(&mut ledger, &[edit])),
+        QuarantineCause::StaleIncarnation
+    );
+    assert!(!ledger.quarantined(key(A, 1)));
+}
+
+#[test]
+fn root_of_another_mm_quarantines() {
+    let mut ledger = two_mms();
+    ledger.add_alias(key(A, 1), VA, A_FRAME, ExtentAccess::Owner, RO);
+    let edit = Edit {
+        root: root(B_ROOT),
+        ..Edit::protect(1, A_FRAME, RO)
+    };
+    assert_eq!(
+        only_cause(&run(&mut ledger, &[edit])),
+        QuarantineCause::RootMismatch
+    );
+}
+
+#[test]
+fn stale_owner_generation_quarantines() {
+    let mut ledger = two_mms();
+    let out = ledger.issue(key(A, 1), A_FRAME, ExtentAccess::Owner);
+    ledger.custody_at(A_FRAME).owner_generation = owner_gen(GEN + 1);
+    assert_eq!(
+        only_cause(&run(&mut ledger, &[Edit::a(1).output(out)])),
+        QuarantineCause::StaleOwnerGeneration
+    );
+}
+
+#[test]
+fn recycled_slot_rejects_predecessor_records() {
+    let mut ledger = two_mms();
+    let out = ledger.issue(key(A, 1), A_FRAME, ExtentAccess::Owner);
+    ledger.add_mm(key(A, 2), root(A_ROOT), GuestIsa::Aarch64);
+    assert_eq!(
+        only_cause(&run(&mut ledger, &[Edit::a(1).output(out)])),
+        QuarantineCause::StaleIncarnation
+    );
+    let stale = Edit::new(key(A, 2), 1, A_ROOT).output(out);
+    assert_eq!(
+        only_cause(&run(&mut ledger, &[stale])),
+        QuarantineCause::NoTicket
+    );
 }
 
 // Ordering.
@@ -1094,12 +1183,9 @@ fn cow_repoint_moves_alias_and_holds_prior_until_drain() {
 #[test]
 fn counters_order_records_across_rings() {
     let mut ledger = two_mms();
-    let first = a_map(&mut ledger, 1, 1, A_FRAME);
-    let second = Edit::a(2)
-        .kind(PublicationKind::Unmap)
-        .prior(A_FRAME)
-        .permissions(RO)
-        .drain(GuestIsa::Aarch64, PublicationDrain::ArmBroadcastSpan);
+    let first = a_map(&mut ledger, 1, A_FRAME);
+    let second =
+        Edit::unmap(2, A_FRAME).drain(GuestIsa::Aarch64, PublicationDrain::ArmBroadcastSpan);
     let ring_one = [second.record()];
     let ring_two = [first.record()];
     let report = consume(
@@ -1118,17 +1204,62 @@ fn counters_order_records_across_rings() {
         ],
         &[(key(A, 1), counter(2))],
     );
-    assert_eq!((report.applied, report.quarantined.len()), (2, 0));
-    assert!(ledger.aliases.is_empty());
+    clean(&report);
+    assert_eq!(report.applied, 2);
+    assert_eq!(ledger.book.alias_count(), 0);
+}
+
+#[test]
+fn contiguous_batch_beyond_deferral_bound_applies() {
+    let mut ledger = two_mms();
+    ledger.add_alias(key(A, 1), VA, A_FRAME, ExtentAccess::Owner, RO);
+    let edits: Vec<Edit> = (1..=257).map(|c| Edit::protect(c, A_FRAME, RO)).collect();
+    let report = consume_edits(&mut ledger, &edits, &[(key(A, 1), counter(257))]);
+    clean(&report);
+    assert_eq!(report.applied, 257);
+}
+
+#[test]
+fn record_closing_the_gap_is_always_accepted() {
+    let mut ledger = two_mms();
+    ledger.add_alias(key(A, 1), VA, A_FRAME, ExtentAccess::Owner, RO);
+    let later: Vec<Edit> = (2..=257).map(|c| Edit::protect(c, A_FRAME, RO)).collect();
+    let report = run(&mut ledger, &later);
+    clean(&report);
+    assert_eq!(report.deferred, 256);
+    let report = consume_edits(
+        &mut ledger,
+        &[Edit::protect(1, A_FRAME, RO)],
+        &[(key(A, 1), counter(257))],
+    );
+    clean(&report);
+    assert_eq!(report.applied, 257);
+}
+
+#[test]
+fn deferral_beyond_bound_quarantines() {
+    let mut ledger = two_mms();
+    ledger.add_alias(key(A, 1), VA, A_FRAME, ExtentAccess::Owner, RO);
+    let later: Vec<Edit> = (2..=258).map(|c| Edit::protect(c, A_FRAME, RO)).collect();
+    assert_eq!(
+        only_cause(&run(&mut ledger, &later)),
+        QuarantineCause::DeferralOverflow
+    );
 }
 
 #[test]
 fn lost_record_quarantines_only_that_mm() {
     let mut ledger = two_mms();
-    let b = Edit::b(1).kind(PublicationKind::Protect).permissions(RO);
+    ledger.add_alias(key(A, 1), VA, A_FRAME, ExtentAccess::Owner, RO);
+    ledger.add_alias(key(B, 1), VA, B_FRAME, ExtentAccess::Owner, RO);
+    let b = Edit {
+        mm: key(B, 1),
+        root: root(B_ROOT),
+        ..Edit::protect(1, B_FRAME, RO)
+    };
     let report = consume_edits(
         &mut ledger,
-        &[Edit::protect_ro(2), b],
+        &[Edit::protect(2, A_FRAME, RO), b],
         &[(key(A, 1), counter(2)), (key(B, 1), counter(1))],
     );
     assert_eq!(only_cause(&report), QuarantineCause::LostRecord);
@@ -1139,9 +1270,10 @@ fn lost_record_quarantines_only_that_mm() {
 #[test]
 fn duplicate_counter_quarantines() {
     let mut ledger = two_mms();
-    run(&mut ledger, &[Edit::protect_ro(1)]);
+    ledger.add_alias(key(A, 1), VA, A_FRAME, ExtentAccess::Owner, RO);
+    run(&mut ledger, &[Edit::protect(1, A_FRAME, RO)]);
     assert_eq!(
-        only_cause(&run(&mut ledger, &[Edit::protect_ro(1)])),
+        only_cause(&run(&mut ledger, &[Edit::protect(1, A_FRAME, RO)])),
         QuarantineCause::DuplicateCounter
     );
 }
@@ -1149,31 +1281,37 @@ fn duplicate_counter_quarantines() {
 #[test]
 fn quarantine_is_per_mm_and_sticky() {
     let mut ledger = two_mms();
-    let bad = Edit::new(key(A, 1), 1, B_ROOT)
-        .kind(PublicationKind::Protect)
-        .permissions(RO);
-    let b = Edit::b(1).kind(PublicationKind::Protect).permissions(RO);
+    ledger.add_alias(key(A, 1), VA, A_FRAME, ExtentAccess::Owner, RO);
+    ledger.add_alias(key(B, 1), VA, B_FRAME, ExtentAccess::Owner, RO);
+    let bad = Edit {
+        root: root(B_ROOT),
+        ..Edit::protect(1, A_FRAME, RO)
+    };
+    let b = Edit {
+        mm: key(B, 1),
+        root: root(B_ROOT),
+        ..Edit::protect(1, B_FRAME, RO)
+    };
     let report = run(&mut ledger, &[bad, b]);
     assert_eq!(only_cause(&report), QuarantineCause::RootMismatch);
     assert_eq!(report.applied, 1);
-    let report = run(&mut ledger, &[Edit::protect_ro(2)]);
+    let report = run(&mut ledger, &[Edit::protect(2, A_FRAME, RO)]);
     assert_eq!((report.applied, report.quarantined.len()), (0, 0));
     assert_eq!(
-        retirement_permitted(&mut ledger, key(A, 1)),
+        retirement_permitted(&ledger.book, key(A, 1)),
         Err(RetirementBlocked::Quarantined)
     );
 }
 
 /// Adversarial population: many unrelated extents, aliases, tickets and MMs
-/// must not change how many ledger entries the consumer touches.
+/// must not change how many entries the consumer touches.
 fn visits_with_population(unrelated: u64) -> (usize, usize) {
     let mut ledger = two_mms();
     for i in 0..unrelated {
         let base = 0x1000_0000 + i * PAGE;
         let owner = if i % 2 == 0 { key(B, 1) } else { key(A, 1) };
         ledger.add_extent(base, PAGE, owner);
-        ledger.add_alias(owner, base, ExtentAccess::Owner, RO);
-        ledger.issue(owner, 1000 + i, base, ExtentAccess::Owner);
+        ledger.add_alias(owner, 0x8000_0000 + i * PAGE, base, ExtentAccess::Owner, RO);
     }
     for i in 0..unrelated / 4 {
         ledger.add_mm(
@@ -1182,28 +1320,22 @@ fn visits_with_population(unrelated: u64) -> (usize, usize) {
             GuestIsa::Aarch64,
         );
     }
-    let map = a_map(&mut ledger, 1, 1, A_FRAME);
-    let out = ledger.issue(key(A, 1), 2, A_FRAME + PAGE, ExtentAccess::Owner);
-    let refused = ledger.issue(key(B, 1), 3, B_FRAME, ExtentAccess::Owner);
+    let map = a_map(&mut ledger, 1, A_FRAME);
+    let out = ledger.issue(key(A, 1), A_FRAME + PAGE, ExtentAccess::Owner);
+    let refused = ledger.issue(key(B, 1), B_FRAME, ExtentAccess::Owner);
     let edits = [
         map,
-        Edit::a(2)
+        Edit::unmap(2, A_FRAME)
             .kind(PublicationKind::CowRepoint)
-            .output(out)
-            .prior(A_FRAME)
-            .permissions(RO),
+            .output(out),
         Edit::b(1)
             .output(refused)
             .outcome(PublicationOutcome::Refused),
-        Edit::a(3)
-            .kind(PublicationKind::Unmap)
-            .prior(A_FRAME + PAGE)
-            .permissions(RO)
-            .drain(GuestIsa::Aarch64, PublicationDrain::Local),
+        Edit::unmap(3, A_FRAME + PAGE).local(),
     ];
     ledger.examined.set(0);
     let report = consume_edits(&mut ledger, &edits, &[(key(A, 1), counter(3))]);
-    assert!(report.quarantined.is_empty(), "{report:?}");
+    clean(&report);
     (report.ledger_visits, ledger.examined.get())
 }
 
@@ -1212,6 +1344,7 @@ fn visits_bounded_by_records_and_touched_edges() {
     let small = visits_with_population(8);
     let large = visits_with_population(8192);
     assert_eq!(small, large);
-    // 2 batches + 3 tickets + 3 custodies + 2 priors.
-    assert_eq!(small.0, 10);
+    // 2 batches; map: ticket, custody, VA check; repoint: ticket, custody,
+    // prior; refused: ticket, custody; unmap: prior.
+    assert_eq!(small.0, 11);
 }
