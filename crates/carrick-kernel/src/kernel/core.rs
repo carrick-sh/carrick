@@ -1443,6 +1443,7 @@ impl Kernel {
         };
         let registry = Registry::new(
             RegistryState {
+                failure: core::marker::PhantomData,
                 epoch: 1,
                 container_inits: BTreeMap::from([(container.id(), task_key)]),
                 tasks: BTreeMap::from([(bootstrap.task_id, task_record)]),
@@ -2802,19 +2803,46 @@ pub(super) struct RetiringTaskRecord {
     pub(super) observation: Zombie,
 }
 
+pub(super) type RegistryState = carrick_sched_core::process::registry::ProcessRegistry<
+    ContainerId,
+    TaskRecord,
+    ZombieRecord,
+    RetiringTaskRecord,
+    super::operations::TaskGraphReservation,
+    super::thread_retirement::RetiredThreads,
+    Arc<ProcessGroup>,
+    Arc<Session>,
+    HostRegistryFailure,
+>;
+
 #[derive(Debug)]
-pub(super) struct RegistryState {
-    pub(super) epoch: u64,
-    pub(super) container_inits: BTreeMap<ContainerId, TaskKey>,
-    pub(super) tasks: BTreeMap<TaskId, TaskRecord>,
-    pub(super) zombies: BTreeMap<TaskId, ZombieRecord>,
-    pub(super) retiring_tasks: BTreeMap<TaskId, RetiringTaskRecord>,
-    pub(super) process_groups: BTreeMap<ProcessGroupId, ProcessGroupRecord>,
-    pub(super) process_group_by_namespace: BTreeMap<(ContainerId, u32), ProcessGroupId>,
-    pub(super) reservations: BTreeMap<TaskId, super::operations::TaskGraphReservation>,
-    pub(super) retired_threads: super::thread_retirement::RetiredThreads,
-    pub(super) sessions: BTreeMap<SessionId, SessionRecord>,
-    pub(super) session_by_namespace: BTreeMap<(ContainerId, u32), SessionId>,
+pub(super) struct HostRegistryFailure;
+impl carrick_sched_core::process::registry::RegistryFailure for HostRegistryFailure {
+    fn fail(invariant: carrick_sched_core::process::registry::RegistryInvariant) -> ! {
+        use carrick_sched_core::process::registry::RegistryInvariant;
+        match invariant {
+            RegistryInvariant::EpochExhausted => carrick_fatal!(
+                "kernel::registry_epoch",
+                "Kernel RegistryState epoch counter overflow"
+            ),
+            RegistryInvariant::ProcessGroupCollision => carrick_fatal!(
+                "kernel::process_group_index",
+                "process-group publication collided in internal or container namespace index"
+            ),
+            RegistryInvariant::ProcessGroupIndexLost => carrick_fatal!(
+                "kernel::process_group_index",
+                "removing process-group did not remove matching container namespace index edge"
+            ),
+            RegistryInvariant::SessionCollision => carrick_fatal!(
+                "kernel::session_index",
+                "session publication collided in internal or container namespace index"
+            ),
+            RegistryInvariant::SessionIndexLost => carrick_fatal!(
+                "kernel::session_index",
+                "removing session did not remove matching container namespace index edge"
+            ),
+        }
+    }
 }
 
 fn fail_container_root(
@@ -2825,78 +2853,6 @@ fn fail_container_root(
         Err(KernelError::InjectedContainerRootFailure(boundary))
     } else {
         Ok(())
-    }
-}
-
-impl RegistryState {
-    pub(super) fn publish_epoch(&mut self) {
-        let Some(next) = self.epoch.checked_add(1) else {
-            carrick_fatal!(
-                "kernel::registry_epoch",
-                "Kernel RegistryState epoch counter overflow"
-            );
-        };
-        self.epoch = next;
-    }
-
-    pub(super) fn publish_process_group(&mut self, id: ProcessGroupId, record: ProcessGroupRecord) {
-        let namespace_key = (record.container, record.namespace_id);
-        if self.process_groups.contains_key(&id)
-            || self.process_group_by_namespace.contains_key(&namespace_key)
-        {
-            carrick_fatal!(
-                "kernel::process_group_index",
-                "process-group publication collided in internal or container namespace index"
-            );
-        }
-        self.process_group_by_namespace.insert(namespace_key, id);
-        self.process_groups.insert(id, record);
-    }
-
-    pub(super) fn remove_process_group(
-        &mut self,
-        id: ProcessGroupId,
-    ) -> Option<ProcessGroupRecord> {
-        let record = self.process_groups.remove(&id)?;
-        if self
-            .process_group_by_namespace
-            .remove(&(record.container, record.namespace_id))
-            != Some(id)
-        {
-            carrick_fatal!(
-                "kernel::process_group_index",
-                "removing process-group did not remove matching container namespace index edge"
-            );
-        }
-        Some(record)
-    }
-
-    pub(super) fn publish_session(&mut self, id: SessionId, record: SessionRecord) {
-        let namespace_key = (record.container, record.namespace_id);
-        if self.sessions.contains_key(&id) || self.session_by_namespace.contains_key(&namespace_key)
-        {
-            carrick_fatal!(
-                "kernel::session_index",
-                "session publication collided in internal or container namespace index"
-            );
-        }
-        self.session_by_namespace.insert(namespace_key, id);
-        self.sessions.insert(id, record);
-    }
-
-    pub(super) fn remove_session(&mut self, id: SessionId) -> Option<SessionRecord> {
-        let record = self.sessions.remove(&id)?;
-        if self
-            .session_by_namespace
-            .remove(&(record.container, record.namespace_id))
-            != Some(id)
-        {
-            carrick_fatal!(
-                "kernel::session_index",
-                "removing session did not remove matching container namespace index edge"
-            );
-        }
-        Some(record)
     }
 }
 
@@ -2930,25 +2886,10 @@ pub(super) struct RetiredThreadRecord {
     pub(super) _claim: ThreadClaim,
 }
 
-#[derive(Debug)]
-pub(super) struct ProcessGroupRecord {
-    pub(super) object: Arc<ProcessGroup>,
-    pub(super) members: BTreeSet<TaskKey>,
-    /// Namespace that owns this group name. Internal `ProcessGroupId` remains
-    /// the scheduler/kernel key; this pair is the guest-facing authority.
-    pub(super) container: ContainerId,
-    pub(super) namespace_id: u32,
-}
-
-#[derive(Debug)]
-pub(super) struct SessionRecord {
-    pub(super) object: Arc<Session>,
-    pub(super) process_groups: BTreeSet<ProcessGroupId>,
-    /// Namespace that owns this session name. Its lifetime is exactly this
-    /// record's lifetime, independent of the leader's task slot.
-    pub(super) container: ContainerId,
-    pub(super) namespace_id: u32,
-}
+pub(super) type ProcessGroupRecord =
+    carrick_sched_core::process::registry::ProcessGroupRecord<Arc<ProcessGroup>, ContainerId>;
+pub(super) type SessionRecord =
+    carrick_sched_core::process::registry::SessionRecord<Arc<Session>, ContainerId>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum KernelError {
