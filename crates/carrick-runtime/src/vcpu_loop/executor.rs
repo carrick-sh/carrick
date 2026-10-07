@@ -1611,9 +1611,8 @@ fn next_runnable<F: PersistentExecutor>(
     backend.note_bound_cpu(registration.bound_cpu().map(|cpu| cpu.as_u32()));
     let waited = backend.wait_in_guest();
     kick.set_guest_idle(false);
-    carrick_kernel::el1_zone::hand_back_completions();
     match waited.map_err(|error| NextError::Fatal(error.to_string()))? {
-        GuestIdleExit::Idle => Ok(scheduler.try_take(registration)?),
+        GuestIdleExit::Idle => Ok(None),
         GuestIdleExit::Unsupported => Ok(Some(scheduler.take(registration)?)),
     }
 }
