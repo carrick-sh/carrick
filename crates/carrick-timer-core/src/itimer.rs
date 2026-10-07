@@ -21,7 +21,8 @@
 //! at most one spurious fire instead of leaving a runaway periodic timer.
 //!
 //! Every slot transition (arm, disarm, expiry decision, one-shot retirement)
-//! runs under the slot's [`SlotGate`], and the fallback threads deliver through
+//! runs under the slot's private transition gate (`SlotGate`), and the
+//! fallback threads deliver through
 //! [`fire_wall_if_current`] / [`fire_cpu_if_current`], which check the arm
 //! generation, decide expiry, run the delivery callback and retire a one-shot
 //! inside ONE gate hold. That makes delivery linearizable with `setitimer`:
