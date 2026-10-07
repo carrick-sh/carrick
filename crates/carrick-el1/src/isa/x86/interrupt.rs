@@ -8,6 +8,31 @@ use carrick_guest_arch::{
 use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
 
+fn bound_apic_id(slot: CpuId) -> Result<interrupts::ApicId, ArchError> {
+    let binding = super::context::current_cpu_binding().ok_or(ArchError::Unbound)?;
+    if binding.wake_routes_address == 0 {
+        return Err(ArchError::Unbound);
+    }
+    // SAFETY: stopped-host bootstrap mapped and initialized this exact table
+    // before any vCPU ran; it remains live until every vCPU retires.
+    let routes = unsafe {
+        &*(binding.wake_routes_address as *const super::context::native::PublishedApicIds)
+    };
+    routes
+        .destination(slot)
+        .map(|route| interrupts::ApicId(route.0))
+        .ok_or(ArchError::Unbound)
+}
+
+/// Send a scheduler reschedule using a slot-indexed published APIC route.
+pub fn send_resched(slot: carrick_sched_core::SlotId) -> Result<(), ArchError> {
+    let apic = bound_apic_id(CpuId::new(u32::from(slot.raw())))?;
+    core::sync::atomic::fence(Ordering::SeqCst);
+    // SAFETY: scheduler published the target work before sending this IPI;
+    // the stopped bootstrap retains the destination APIC until retirement.
+    unsafe { interrupts::hardware::send_resched(apic) }.map_err(|_| ArchError::Busy)
+}
+
 /// Query the TSC frequency from architectural CPUID or the exact KVM binding.
 pub fn tsc_frequency() -> Option<NonZeroU64> {
     let max_leaf: u32;
@@ -143,19 +168,10 @@ impl InterruptBackend for X86Backend {
         Ok(())
     }
     fn send_wake(&mut self, target: CpuTarget, _token: WakeToken) -> Result<(), Self::Error> {
-        let binding = super::context::current_cpu_binding().ok_or(ArchError::Unbound)?;
-        if binding.wake_routes_address == 0 {
-            return Err(ArchError::Unbound);
-        }
-        // SAFETY: stopped-host bootstrap mapped and initialized this exact
-        // table before any vCPU ran; it remains live until every vCPU retires.
-        let routes = unsafe {
-            &*(binding.wake_routes_address as *const super::context::native::PublishedApicIds)
-        };
-        let apic_id = routes.destination(target.cpu).ok_or(ArchError::Unbound)?.0;
+        let apic_id = bound_apic_id(target.cpu)?;
+        core::sync::atomic::fence(Ordering::SeqCst);
         // SAFETY: caller published wake ownership first; target CPU is bound.
-        unsafe { interrupts::hardware::send_wake(interrupts::ApicId(apic_id)) }
-            .map_err(|_| ArchError::Busy)?;
+        unsafe { interrupts::hardware::send_wake(apic_id) }.map_err(|_| ArchError::Busy)?;
         Ok(())
     }
     fn ack_interrupt(
@@ -256,6 +272,22 @@ pub fn witness(op: u64, arg: u64) -> u64 {
             Ok(None) => 0,
             Err(_) => u64::MAX,
         },
+        4 => {
+            // Exercise the scheduler's current reschedule path, including
+            // its stored route and interrupt identity, on two real vCPUs.
+            use crate::substrate::sched::ThreadCpu;
+            let Ok(slot) = u8::try_from(arg) else {
+                return u64::MAX;
+            };
+            let route = arg + 1;
+            crate::substrate::sched::hw::HardwareCpu
+                .send_resched(carrick_sched_core::SlotId::new(slot), route);
+            0
+        }
+        5 => {
+            use crate::substrate::sched::ThreadCpu;
+            u64::from(crate::substrate::sched::hw::HardwareCpu.ack_irq())
+        }
         _ => u64::MAX,
     }
 }
