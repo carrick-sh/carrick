@@ -1995,7 +1995,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
-      "line": 991,
+      "line": 1025,
       "categories": [
         "table_guard"
       ],
