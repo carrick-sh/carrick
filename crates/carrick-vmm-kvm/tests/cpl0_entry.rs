@@ -138,14 +138,23 @@ fn image() -> PathBuf {
 
 #[test]
 fn production_cpl0_boot_retains_separate_supervisor_and_initial_extents() {
+    let metadata_bytes = (carrick_el1_abi::X86_CPL0_ZONE_OFFSET as usize
+        + std::mem::size_of::<carrick_el1::memory::reservations::X86Cpl0Zone>()
+        + 4095)
+        & !4095;
     for initial_bytes in [0x20_000, 0x40_000, 0x80_000] {
         let carrier = Cpl0Carrier::boot_production(initial_bytes)
             .expect("production image on one KVM carrier VM");
-        // Bootstrap RAM, allocator metadata, supervisor region, initial MM.
-        assert_eq!(carrier.physical_slot_count(), 4);
+        // Bootstrap RAM, dynamic metadata, allocator, supervisor region,
+        // and the exact requested initial MM extent each retain one slot.
+        assert_eq!(carrier.physical_slot_count(), 5);
         assert_eq!(
             carrier.retained_bytes(),
-            16 * 1024 * 1024 + 0x90_0000 + 64 * 1024 * 1024 + initial_bytes
+            0xc0_0000
+                + metadata_bytes
+                + carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE as usize
+                + carrick_el1_abi::EL1_REGION_SIZE as usize
+                + initial_bytes
         );
         assert!(
             carrier
