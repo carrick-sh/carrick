@@ -7,7 +7,7 @@ use carrick_mmu_core::aarch64::descriptor_txn::{
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use super::PortalGrantWindow;
+use super::{El1MmHandle, PortalGrantWindow, PortalOwnerWait, PortalWaitCause, ReservationMm};
 #[repr(C, align(64))]
 pub struct PortalGrantSlot {
     state: AtomicU64,
@@ -51,6 +51,59 @@ impl PortalGrantSlot {
         self.state.store(3, Ordering::Release);
         true
     }
+    /// A busy owner resource has a producer; carry its exact pre-probe
+    /// revision across the EL1 exit instead of falling through host sparse.
+    pub fn publish_fault_wait(&self, fault_va: u64, wait: PortalOwnerWait) -> bool {
+        if self
+            .state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        let values = [
+            wait.handle().carrier().get(),
+            wait.handle().mm().raw(),
+            wait.handle().incarnation().get(),
+            wait.cause().encode(),
+            wait.revision(),
+            fault_va & !4095,
+        ];
+        for (word, value) in self.window.iter().zip(values) {
+            word.store(value, Ordering::Relaxed);
+        }
+        self.state.store(4, Ordering::Release);
+        true
+    }
+    pub fn take_fault_wait(&self, mm_key: u64, fault_va: u64) -> Option<PortalOwnerWait> {
+        if self.state.load(Ordering::Acquire) != 4 {
+            return None;
+        }
+        let values: [u64; 6] = core::array::from_fn(|i| self.window[i].load(Ordering::Relaxed));
+        if values[1] != mm_key || values[5] != fault_va & !4095 {
+            return None;
+        }
+        let carrier = core::num::NonZeroU64::new(values[0])?;
+        let mm = ReservationMm::new(values[1])?;
+        let incarnation = core::num::NonZeroU64::new(values[2])?;
+        let cause = PortalWaitCause::decode(values[3])?;
+        if self
+            .state
+            .compare_exchange(4, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
+        // SAFETY: publication accepts an owner-issued wait sampled from the
+        // exact live source before its failed resource probe.
+        Some(unsafe {
+            PortalOwnerWait::from_owner(
+                El1MmHandle::from_admitted_owner(carrier, mm, incarnation),
+                cause,
+                values[4],
+            )
+        })
+    }
     pub fn fault_selection(
         &self,
         mm_key: u64,
@@ -90,8 +143,25 @@ impl PortalGrantSlot {
             .compare_exchange(3, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
+    /// Final-MM teardown cancels an unconsumed fault selection after its
+    /// mailbox request or refusal has been withdrawn. The source MM cannot
+    /// fault again, and keeping this selection blocks every later MM on the
+    /// same persistent worker slot.
+    pub fn withdraw_retired_mm_selection(&self, mm_key: u64) -> bool {
+        if self.state.load(Ordering::Acquire) != 3 {
+            return false;
+        }
+        let generation = self.fault_generation.load(Ordering::Relaxed);
+        let Some(window) = self.fault_selection(mm_key, generation) else {
+            return false;
+        };
+        self.cancel_fault_selection(window, generation)
+    }
     pub fn has_outstanding_for(&self, mm_key: u64) -> bool {
         let state = self.state.load(Ordering::Acquire);
+        if state == 4 {
+            return self.window[1].load(Ordering::Relaxed) == mm_key;
+        }
         state != 0
             && (state == 1
                 || PortalGrantWindow::decode(core::array::from_fn(|i| {
@@ -162,4 +232,51 @@ impl PortalGrantSlot {
 pub trait GrantSlotVenue {
     fn carrier(&self) -> Option<core::num::NonZeroU64>;
     fn grant(&self, slot: usize) -> Option<&PortalGrantSlot>;
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::{
+        FrameGrantMailbox, FrameGrantRequest, PortalOperation, ReservationGeneration,
+        ReservationProtection, ReservationRange,
+    };
+    use core::num::NonZeroU64;
+
+    fn window(mm_key: u64) -> PortalGrantWindow {
+        PortalGrantWindow {
+            operation: PortalOperation {
+                carrier: NonZeroU64::new(1).unwrap(),
+                mm: ReservationMm::new(mm_key).unwrap(),
+                incarnation: NonZeroU64::new(1).unwrap(),
+                sequence: NonZeroU64::new(1).unwrap(),
+            },
+            generation: ReservationGeneration::new(1).unwrap(),
+            range: ReservationRange::new(0x6000, 0x7000).unwrap(),
+            protection: ReservationProtection::from_bits(3).unwrap(),
+            fault_page: 0x6000,
+            host_backing: None,
+            fork_sequence: None,
+        }
+    }
+
+    #[test]
+    fn retired_mm_withdraws_mailbox_and_fault_selection_before_slot_reuse() {
+        let slot = PortalGrantSlot::new();
+        let mailbox = FrameGrantMailbox::new();
+        assert!(slot.publish_fault_selection(1, window(7)));
+        assert!(mailbox.try_publish_request(FrameGrantRequest {
+            mm_key: 7,
+            request_generation: 1,
+            fault_va: 0x6000,
+            requested_len: 4096,
+            access: 2,
+        }));
+        assert!(mailbox.withdraw_mm(7));
+        assert!(slot.withdraw_retired_mm_selection(7));
+        assert!(!slot.has_outstanding_for(7));
+        assert!(slot.publish_fault_selection(2, window(8)));
+        assert!(slot.pending_fault_selection(8, 0x6000).is_some());
+    }
 }

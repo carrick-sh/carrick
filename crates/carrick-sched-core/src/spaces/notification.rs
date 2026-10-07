@@ -545,6 +545,15 @@ impl<'a> SpaceAccess<'a> {
     pub fn table(self) -> &'a super::AddressSpaces {
         self.spaces
     }
+    /// Borrow the exact live source before probing an owner resource. Its
+    /// revision can then name the release that makes a failed probe ready.
+    pub fn current_notification(
+        self,
+        index: SpaceIndex,
+        mm: u64,
+    ) -> Option<SpaceNotificationLease<'a>> {
+        self.venue?.zone.editor_notification(index, mm)
+    }
     /// Preserve the nested host pause count; the release revision precedes
     /// the atomic decrement, and delivery follows it.
     pub fn lower(self, index: SpaceIndex) {
