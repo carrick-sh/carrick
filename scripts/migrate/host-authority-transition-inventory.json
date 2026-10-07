@@ -15446,17 +15446,19 @@
     "classification": "declared_substrate",
     "evidence": {
       "authority": "authenticated_carrier",
-      "resource": "current carrier USDT diagnostic event used by `host_image_base`"
+      "resource": "current carrier USDT execve argument diagnostic event used by `execve_argv`"
     },
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:7541 in `host_image_base`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_image_base`; no guest identity selects its host target.",
-    "review_id": "HA-000467",
+    "rationale": "At crates/carrick-observability/src/probes.rs:7541 in `execve_argv`, `std::process::id` supplies the current carrier identity for its USDT execve argument diagnostic event; the opaque guest path/arguments are trace payload and do not select the host process target.",
+    "review_id": "HA-000466",
     "source": {
       "byte_end": 291654,
       "byte_start": 291638,
@@ -15474,19 +15476,17 @@
     "classification": "declared_substrate",
     "evidence": {
       "authority": "authenticated_carrier",
-      "resource": "current carrier USDT diagnostic event used by `host_image_base_snapshot`"
+      "resource": "current carrier image identity used by `host_image_base_snapshot`"
     },
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
-      "linux-cli",
-      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:7587 in `host_image_base_snapshot`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_image_base_snapshot`; no guest identity selects its host target.",
-    "review_id": "HA-000466",
+    "rationale": "At crates/carrick-observability/src/probes.rs:7587 in `host_image_base_snapshot`, `std::process::id` identifies the current carrier image whose dyld base, slide and path are collected for offline symbolication; no guest identity selects its host process target.",
+    "review_id": "HA-000467",
     "source": {
       "byte_end": 293974,
       "byte_start": 293958,
