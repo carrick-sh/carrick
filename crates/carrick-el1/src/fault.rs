@@ -147,13 +147,17 @@ pub(crate) fn handle_cow_outcome(
     }
 }
 
-pub struct PreparedFaultPath<'a, P: PreparedPageResolver> {
+pub struct PreparedFaultPath<
+    'a, P: PreparedPageResolver,
+    G: carrick_core::mm::reservation::ReservationGeometry = crate::memory::reservations::NativeReservationGeometry,
+> {
     pub residency: &'a carrick_el1_abi::FrameGrantResidencyTable,
     pub resolver: &'a mut P,
     /// The shared reservation roots. A delegated MM's prepared backing may
     /// include first-touch stock over root holes: it is committed only where
     /// the root holds a node that permits the access.
-    pub roots: Option<&'a crate::memory::reservations::SharedReservations>,
+    pub roots: Option<&'a carrick_core::mm::reservation::SharedReservations<carrick_personality_linux::mm::LinuxReservationPolicy, G>>,
+    pub file_slots: Option<&'a carrick_el1_abi::MmPortalSlots>,
 }
 
 #[cfg(target_os = "none")]
@@ -1116,10 +1120,13 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 own: mailbox,
                 peers: Some(carrick_el1_abi::frame_grant_mailboxes_guest()),
             },
-            Some(PreparedFaultPath {
+            Some(PreparedFaultPath::<_> {
                 residency: carrick_el1_abi::frame_grant_residency_guest(),
                 resolver: &mut HardwarePreparedResolver,
                 roots: Some(crate::memory::reservations::shared_guest()),
+                file_slots: Some(unsafe {
+                    &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
+                }),
             }),
             &mut HardwareCowResolver {
                 service_slot: None,
@@ -1255,14 +1262,19 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
 /// Execute the same guest fault policy for a decoded CPL3 x86 page fault.
 /// The entry backend must have checked the fault's user origin before calling.
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_x86_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
+pub fn dispatch_x86_fault_with_prepared<
+    P: PreparedPageResolver,
+    C: CowResolver,
+    G: carrick_core::mm::reservation::ReservationGeometry,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
+>(
     slot: u64,
     fault: carrick_guest_arch::FaultInfo,
     counters: &Counters,
     current_tasks: &[CurrentTask],
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, Context>,
     mailboxes: GrantMailboxes<'_>,
-    prepared: Option<PreparedFaultPath<'_, P>>,
+    prepared: Option<PreparedFaultPath<'_, P, G>>,
     cow_resolver: &mut C,
 ) -> Action {
     dispatch_classified_fault(
@@ -1279,15 +1291,20 @@ pub fn dispatch_x86_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch_classified_fault<P: PreparedPageResolver, C: CowResolver>(
+fn dispatch_classified_fault<
+    P: PreparedPageResolver,
+    C: CowResolver,
+    G: carrick_core::mm::reservation::ReservationGeometry,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
+>(
     slot: u64,
     far: u64,
     fault: FaultClass,
     counters: &Counters,
     current_tasks: &[CurrentTask],
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, Context>,
     mailboxes: GrantMailboxes<'_>,
-    mut prepared: Option<PreparedFaultPath<'_, P>>,
+    mut prepared: Option<PreparedFaultPath<'_, P, G>>,
     cow_resolver: &mut C,
 ) -> Action {
     let mailbox = mailboxes.own;
@@ -1405,11 +1422,9 @@ fn dispatch_classified_fault<P: PreparedPageResolver, C: CowResolver>(
     }
 
     #[cfg(target_os = "none")]
-    if let Some(roots) = prepared.as_ref().and_then(|path| path.roots) {
-        let slots = unsafe {
-            &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
-        };
-        if (FileFaultVenue {
+    if let Some(roots) = prepared.as_ref().and_then(|path| path.roots)
+        && let Some(slots) = prepared.as_ref().and_then(|path| path.file_slots)
+        && (carrick_core::mm::fault::FileFaultVenue {
             roots,
             spaces,
             slots,
@@ -1417,9 +1432,8 @@ fn dispatch_classified_fault<P: PreparedPageResolver, C: CowResolver>(
             mailbox,
         })
         .publish(mm_key, far, access)
-        {
-            return Action::Forward;
-        }
+    {
+        return Action::Forward;
     }
     let _ = request_lazy_frames(mailbox, mm_key, far, access);
     Action::Forward
@@ -1509,10 +1523,11 @@ mod tests {
                 &tasks,
                 carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                 GrantMailboxes::own(&mailbox),
-                Some(PreparedFaultPath {
+                Some(PreparedFaultPath::<_> {
                     residency: &table,
                     resolver: &mut prepared,
                     roots: None,
+                    file_slots: None,
                 }),
                 &mut NoopCowResolver,
             ),
@@ -1560,10 +1575,11 @@ mod tests {
                 &tasks,
                 carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                 GrantMailboxes::own(&mailbox),
-                Some(PreparedFaultPath {
+                Some(PreparedFaultPath::<_> {
                     residency: &residency,
                     resolver: &mut prepared,
                     roots: None,
+                    file_slots: None,
                 }),
                 &mut NoopCowResolver,
             ),
@@ -1700,10 +1716,11 @@ mod tests {
                 &tasks,
                 carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                 GrantMailboxes::own(&mailbox),
-                Some(PreparedFaultPath {
+                Some(PreparedFaultPath::<_> {
                     residency: &residency,
                     resolver: &mut prepared,
                     roots: Some(&roots),
+                    file_slots: None,
                 }),
                 &mut NoopCowResolver,
             );
@@ -1750,10 +1767,11 @@ mod tests {
                     &published_space(mm, 0x8800_0000)
                 ),
                 GrantMailboxes::own(&FrameGrantMailbox::new()),
-                Some(PreparedFaultPath {
+                Some(PreparedFaultPath::<_> {
                     residency: &table,
                     resolver: &mut RecordingPreparedResolver::default(),
                     roots: None,
+                    file_slots: None,
                 }),
                 &mut NoopCowResolver,
             ),
@@ -2028,10 +2046,11 @@ mod tests {
                         own: origin,
                         peers: Some(&boxes),
                     },
-                    Some(PreparedFaultPath {
+                    Some(PreparedFaultPath::<_> {
                         residency: &table,
                         resolver: &mut RecordingPreparedResolver::default(),
                         roots: None,
+                        file_slots: None,
                     }),
                     &mut NoopCowResolver,
                 ),
@@ -2065,10 +2084,11 @@ mod tests {
                         own,
                         peers: Some(&boxes),
                     },
-                    Some(PreparedFaultPath {
+                    Some(PreparedFaultPath::<_> {
                         residency: &table,
                         resolver: &mut RecordingPreparedResolver::default(),
                         roots: None,
+                        file_slots: None,
                     }),
                     &mut NoopCowResolver,
                 ),
@@ -2090,10 +2110,11 @@ mod tests {
                         own: origin,
                         peers: Some(&boxes),
                     },
-                    Some(PreparedFaultPath {
+                    Some(PreparedFaultPath::<_> {
                         residency: &table,
                         resolver: &mut RecordingPreparedResolver::default(),
                         roots: None,
+                        file_slots: None,
                     }),
                     &mut NoopCowResolver,
                 ),

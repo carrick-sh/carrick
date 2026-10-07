@@ -4,7 +4,7 @@ use crate::bringup_fns::BringupLayout;
 use crate::vmm::{WindowRegion, X86_PML4_CAPACITY, X86Exit, X86FaultKind, X86Reg, X86Seg, X86Vcpu};
 
 pub const FP_STUB_DOORBELL_PORT: u16 = 0xC6;
-pub const FAULT_DOORBELL_PORT: u16 = 0xC7;
+pub use crate::cpl0_entry::FAULT_DOORBELL_PORT;
 
 pub const X86_FAULT_SLOTS: u64 = 256;
 pub const X86_IDT_ENTRIES: usize = 256;
@@ -141,6 +141,11 @@ impl FaultDoorbellRecord {
             saved_rax: qword(11),
             cr2: qword(13),
         })
+    }
+
+    /// Linux signal policy shared with the ordinary x86 trap engine.
+    pub fn linux_signal(self) -> Option<(i32, i32)> {
+        crate::engine::x86_fault_signal(self.kind(), self.error_code)
     }
 
     pub fn kind(self) -> X86FaultKind {

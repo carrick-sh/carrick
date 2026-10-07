@@ -142,7 +142,7 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
     }
 }
 
-fn initial_release(
+pub(super) fn initial_release(
     _: &X86Cpl0Zone,
     _: carrick_sched_core::Waker,
     owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, carrick_sched_core::ParkedContextWords>,

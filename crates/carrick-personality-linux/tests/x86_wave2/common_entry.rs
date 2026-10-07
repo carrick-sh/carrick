@@ -13,6 +13,7 @@ use carrick_guest_arch::{GuestIsa, NativeOrdinal, UserVa};
 use carrick_personality_linux::dispatch::FamilyCompletion;
 use carrick_personality_linux::entry::CanonicalOrdinal;
 use carrick_personality_linux::entry::SyscallResult;
+use carrick_personality_linux::entry::decode_aarch64;
 use carrick_personality_linux::entry::{CanonicalCall, decode_x86_snapshot};
 use carrick_personality_linux::pending_anonymous::{
     DelegatedStep, PendingAnonymousVenue, PermissionStep, RetirementStep,
@@ -184,6 +185,24 @@ fn x86_brk_enters_the_common_linux_anonymous_route() {
     );
     assert_eq!(world.counters.served[214].load(Ordering::Relaxed), 1);
     assert_eq!(world.counters.forwarded[214].load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn arm_process_calls_still_forward_without_native_hooks() {
+    let world = World::new(LifecycleHatches::ON);
+    for number in [94, 260] {
+        let call = decode_aarch64(number, [0; 6], 0x7000);
+        assert_eq!(
+            serve_canonical(
+                &call,
+                &world.counters,
+                &world.tasks[0],
+                &*world.venue,
+                Some(&world.publications),
+            ),
+            EntryOutcome::Forward,
+        );
+    }
 }
 
 #[test]

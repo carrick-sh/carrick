@@ -522,6 +522,9 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
         mm: MmGeneration::new(mm_key),
         generation: ContextGeneration::new(generation),
     };
+    #[cfg(target_os = "none")]
+    super::x86::mmu::register_shared_supervisor_tables(words, source_root)
+        .map_err(|_| InitialMmError::DescriptorRefused)?;
     let mut frame = [0; 20];
     frame[15] = image.stack.entry;
     frame[16] = 0x23; // user 64-bit code selector in the CPL0 GDT

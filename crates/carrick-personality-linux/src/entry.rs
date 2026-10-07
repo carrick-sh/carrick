@@ -28,6 +28,10 @@ pub fn decode_x86_64(native: u64, mut args: [u64; 6], stack: u64) -> CanonicalCa
         14 => 135,
         131 => 132,
         202 => 98,
+        57 | 61 | 231 => carrick_syscall_abi::syscall_x86_64::canonical_x86_64(
+            carrick_syscall_abi::NativeNr(native),
+        )
+        .map_or(u64::MAX, carrick_syscall_abi::CanonicalNr::raw),
         _ => u64::MAX,
     };
     CanonicalCall {

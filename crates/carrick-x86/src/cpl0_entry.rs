@@ -100,6 +100,7 @@ impl PublishedApicIds {
     }
 }
 
+pub const FAULT_DOORBELL_PORT: u16 = 0xc7;
 pub const FORWARD_PORT: u16 = 0xc5;
 pub const CONTROL_PORT: u16 = 0xc8;
 pub const ENTRY_KICK_PORT: u16 = 0xc9;
@@ -124,6 +125,34 @@ pub const OBSERVE_PORTAL_WINDOW: u64 = u64::MAX - 8;
 pub const OBSERVE_FORK_TABLE_WINDOW: u64 = u64::MAX - 9;
 pub const OBSERVE_RETIRE_REPOINT: u64 = u64::MAX - 10;
 pub const OBSERVE_INITIAL_MM: u64 = u64::MAX - 11;
+
+/// Decode vector 14 only after the hardware frame proves CPL3 origin. A
+/// reserved-bit fault cannot be repaired by mapping or COW policy.
+pub fn decode_user_page_fault(
+    error: u64,
+    address: u64,
+    cs: u64,
+) -> Option<carrick_guest_arch::FaultInfo> {
+    use carrick_guest_arch::{Access, FaultInfo, UserVa};
+    if cs & 3 != 3
+        || error & 4 == 0
+        || error & (8 | (1 << 5) | (1 << 15)) != 0
+        || address >= (1 << 47)
+    {
+        return None;
+    }
+    Some(FaultInfo {
+        address: UserVa::new(address),
+        access: if error & 16 != 0 {
+            Access::Execute
+        } else if error & 2 != 0 {
+            Access::Write
+        } else {
+            Access::Read
+        },
+        present: error & 1 != 0,
+    })
+}
 /// Supervisor direct-window base mapping low physical RAM into the upper half.
 pub const DIRECT_VA: u64 = carrick_el1_abi::X86_CPL0_DIRECT_VA;
 /// Retained KVM fixture page-table window; the root is its first page.
@@ -209,6 +238,13 @@ impl X86Registers for NativeFrame {
     }
 }
 
+/// Convert the issued CPU domain to the bounded scheduler slot domain.
+pub fn checked_scheduler_slot(cpu: CpuId) -> Option<carrick_sched_core::SlotId> {
+    Some(carrick_sched_core::SlotId::new(
+        u8::try_from(cpu.raw()).ok()?,
+    ))
+}
+
 /// Per-vCPU supervisor binding, private to this entry/bootstrap (not a change
 /// to the common ABI). SWAPGS accesses only its first three words.
 #[repr(C)]
@@ -240,17 +276,59 @@ pub struct CpuBinding {
     pub pending_irqs: AtomicU32,
     /// Retained per-sender shootdown table, published before any vCPU runs.
     pub shootdown_table_address: u64,
+    /// Per-CPU fault custody. The outer frame stays on its TSS entry stack.
+    pub fault_active: AtomicU64,
+    pub fault_frame: AtomicU64,
+    pub fault_address: AtomicU64,
+    pub fault_reason: AtomicU64,
 }
 const _: () = {
     assert!(core::mem::offset_of!(CpuBinding, kernel_stack) == 0);
     assert!(core::mem::offset_of!(CpuBinding, user_stack) == 8);
     assert!(core::mem::offset_of!(CpuBinding, self_address) == 16);
     assert!(core::mem::offset_of!(CpuBinding, cpu_slot) == 88);
+    assert!(core::mem::offset_of!(CpuBinding, fault_active) == 136);
+    assert!(core::mem::offset_of!(CpuBinding, fault_frame) == 144);
+    assert!(core::mem::offset_of!(CpuBinding, fault_address) == 152);
+    assert!(core::mem::offset_of!(CpuBinding, fault_reason) == 160);
 };
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+    #[test]
+    fn scheduler_slot_conversion_rejects_unissued_high_bits() {
+        use super::checked_scheduler_slot;
+        use carrick_guest_arch::CpuId;
+        assert_eq!(
+            checked_scheduler_slot(CpuId::new(0)).map(|slot| slot.raw()),
+            Some(0)
+        );
+        assert_eq!(
+            checked_scheduler_slot(CpuId::new(255)).map(|slot| slot.raw()),
+            Some(255)
+        );
+        assert!(checked_scheduler_slot(CpuId::new(256)).is_none());
+        assert!(checked_scheduler_slot(CpuId::new(u32::MAX)).is_none());
+    }
+    #[test]
+    fn user_page_fault_decodes_only_cpl3_access_with_valid_error_bits() {
+        use carrick_guest_arch::{Access, UserVa};
+        let write = super::decode_user_page_fault(0b111, 0x7fff_e000, 0x1b).unwrap();
+        assert_eq!(write.address, UserVa::new(0x7fff_e000));
+        assert_eq!(write.access, Access::Write);
+        assert!(write.present);
+        let execute = super::decode_user_page_fault(0b10100, 0x400000, 0x1b).unwrap();
+        assert_eq!(execute.access, Access::Execute);
+        assert!(!execute.present);
+        assert!(super::decode_user_page_fault(0b111, 0x7fff_e000, 8).is_none());
+        assert!(super::decode_user_page_fault(0b011, 0x7fff_e000, 0x1b).is_none());
+        assert!(super::decode_user_page_fault(0b1111, 0x7fff_e000, 0x1b).is_none());
+        assert!(super::decode_user_page_fault(7 | (1 << 5), 0x400000, 0x1b).is_none());
+        assert!(super::decode_user_page_fault(7 | (1 << 15), 0x400000, 0x1b).is_none());
+        assert!(super::decode_user_page_fault(0b111, 1 << 47, 0x1b).is_none());
+    }
+
     use super::*;
     #[test]
     fn apic_routes_cover_every_issued_carrier_slot() {

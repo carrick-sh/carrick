@@ -1452,7 +1452,7 @@ impl Cpl0Carrier {
         &mut self,
         max_exits: usize,
         mut forward: impl FnMut(&mut Self, &NativeFrame) -> Result<InitialSyscallDisposition, TrapError>,
-    ) -> Result<(i32, usize), TrapError> {
+    ) -> Result<InitialProcessExit, TrapError> {
         let mm = NonZeroU64::new(INITIAL_MM_KEY).ok_or_else(|| fail("initial MM key"))?;
         if self._vm.root(mm).is_none() {
             return Err(fail("initial MM not published"));
@@ -1492,9 +1492,13 @@ impl Cpl0Carrier {
                         ));
                     }
                     let record = carrick_x86::FaultDoorbellRecord::from_u32_words(&words)?;
-                    return Err(fail(format!(
-                        "initial process fault: {record:?}; recent forwarded (nr, args[0..3], return): {recent_forwards:?}"
-                    )));
+                    let reason = self.binding(0).fault_reason.load(Ordering::Acquire);
+                    if reason != 6 {
+                        return Err(fail(format!(
+                            "kernel fault policy refused: reason {reason}, {record:?}"
+                        )));
+                    }
+                    return Ok(InitialProcessExit::Fault { record, exits });
                 }
                 let mut detail = match exit {
                     VcpuExit::IoOut { port, .. } => {
@@ -1533,7 +1537,12 @@ impl Cpl0Carrier {
                 InitialSyscallDisposition::Refused(errno) => {
                     frame.rax = errno.guest_retval() as u64;
                 }
-                InitialSyscallDisposition::Exit(code) => return Ok((code.code(), exits)),
+                InitialSyscallDisposition::Exit(code) => {
+                    return Ok(InitialProcessExit::Exited {
+                        code: code.code(),
+                        exits,
+                    });
+                }
             }
             if recent_forwards.len() == 8 {
                 recent_forwards.pop_front();
@@ -1948,6 +1957,10 @@ impl Cpl0Carrier {
                     apic_timer_hz: AtomicU64::new(0),
                     pending_irqs: AtomicU32::new(0),
                     shootdown_table_address: METADATA_VA + SHOOTDOWN_OFFSET,
+                    fault_active: AtomicU64::new(0),
+                    fault_frame: AtomicU64::new(0),
+                    fault_address: AtomicU64::new(0),
+                    fault_reason: AtomicU64::new(0),
                 });
             }
         }
@@ -2514,7 +2527,10 @@ impl Cpl0Carrier {
             }
             if port == FATAL_PORT {
                 let payload = self.cpus[index].get_gpr(X86Reg::Rax)?;
-                return Err(fail(format!("CPL0 fatal exit: payload {payload:#x}")));
+                let fault = self.user_fault_state(index)?;
+                let mut detail = format!("CPL0 fatal exit: payload {payload:#x}, fault {fault:?}");
+                self.cpus[index].append_debug_state(&mut detail);
+                return Err(fail(detail));
             }
             if port == YIELD_PORT {
                 self.host_yields += 1;
@@ -2917,6 +2933,7 @@ pub struct LifecycleObservation {
     pub served: [u64; 3],
     pub forwards: u64,
     pub words: [u64; 8],
+    pub parked_parent_result: u64,
 }
 impl Cpl0Carrier {
     /// The same KVM carrier, with one fixed native context sidecar per process.
@@ -2990,6 +3007,8 @@ impl Cpl0Carrier {
                     control_slot: controls_address,
                 },
                 slot,
+                maintenance_root: RootGpa::page_aligned(FrameGpa::new(root))
+                    .ok_or_else(|| fail("maintenance root"))?,
                 data_start: LIFECYCLE_DATA,
                 data_end: LIFECYCLE_DATA + 4096,
                 wakes: 0,
@@ -3124,6 +3143,204 @@ impl Cpl0Carrier {
             served: [220, 98, 93].map(|nr| counters.served[nr].load(Ordering::Acquire)),
             forwards: self.host_forwards,
             words,
+            parked_parent_result: lane.contexts[0].frame.rax,
         })
     }
+}
+
+impl Cpl0Carrier {
+    /// Fill the shared fixture MM census while both CPUs are stopped.
+    pub fn exhaust_fork_address_spaces(&mut self) -> Result<(), TrapError> {
+        use carrick_sched_core::ZoneTables;
+        // SAFETY: boot_lifecycle owns initialized aligned retained zone RAM.
+        let zone = unsafe {
+            &*self
+                .ram
+                .host_ptr(0x100_0000, size_of::<ZoneTables>())
+                .ok_or_else(|| fail("lifecycle zone"))?
+                .cast::<ZoneTables>()
+        };
+        let mut key = 1000;
+        while zone.spaces.publish_closed(key, 0x1000, 0).is_some() {
+            key += 1;
+        }
+        Ok(())
+    }
+
+    /// Exhaust record or wait-entry capacity in the stopped scheduler fixture.
+    pub fn exhaust_lifecycle_capacity(&mut self, entries: bool) -> Result<(), TrapError> {
+        use carrick_sched_core::{BoundedSpin, ThreadIdentity, ZoneTables};
+        // SAFETY: the fixture owns initialized aligned zone storage; CPUs stopped.
+        let zone = unsafe {
+            &*self
+                .ram
+                .host_ptr(0x100_0000, size_of::<ZoneTables>())
+                .ok_or_else(|| fail("lifecycle zone"))?
+                .cast::<ZoneTables>()
+        };
+        let identity = ThreadIdentity {
+            tid: 1000,
+            serial: 1,
+            mm: 1000,
+            file_table: 1,
+            generation: 1,
+            affinity: 1,
+            lifecycle_page: 0,
+            control_slot: 0,
+        };
+        if entries {
+            let record = zone
+                .alloc_record(identity)
+                .map_err(|_| fail("capacity record"))?;
+            let key = 0x70000;
+            let guard = zone
+                .lock(ZoneTables::bucket_of(identity.mm, key), &BoundedSpin(1024))
+                .ok_or_else(|| fail("capacity bucket"))?;
+            while zone
+                .enqueue(
+                    &guard,
+                    record,
+                    zone.next_seq(record),
+                    identity.mm,
+                    key,
+                    u32::MAX,
+                    0,
+                )
+                .is_ok()
+            {}
+        } else {
+            while zone.alloc_record(identity).is_ok() {}
+        }
+        Ok(())
+    }
+
+    /// Measure remaining record capacity using owned allocations while stopped.
+    /// Every temporary record is returned before guest execution resumes.
+    pub fn lifecycle_record_capacity(&self) -> Result<usize, TrapError> {
+        use carrick_sched_core::{ThreadIdentity, ZoneTables};
+        // SAFETY: boot_lifecycle owns initialized aligned retained zone RAM;
+        // all guest CPUs are stopped during this diagnostic.
+        let zone = unsafe {
+            &*self
+                .ram
+                .host_ptr(0x100_0000, size_of::<ZoneTables>())
+                .ok_or_else(|| fail("lifecycle zone"))?
+                .cast::<ZoneTables>()
+        };
+        let identity = ThreadIdentity {
+            tid: 1001,
+            serial: 1,
+            mm: 1001,
+            file_table: 1,
+            generation: 1,
+            affinity: 1,
+            lifecycle_page: 0,
+            control_slot: 0,
+        };
+        let mut records = Vec::new();
+        while let Ok(record) = zone.alloc_record(identity) {
+            records.push(record);
+        }
+        let capacity = records.len();
+        for record in records {
+            zone.free_record(record);
+        }
+        Ok(capacity)
+    }
+
+    /// Break only the stopped fault-policy counters venue to force a nested
+    /// supervisor #PF after the next user fault acquired per-CPU custody.
+    pub fn invalidate_user_fault_counters_venue(&mut self) -> Result<(), TrapError> {
+        let address =
+            META_GPA + BINDING_OFFSET + core::mem::offset_of!(CpuBinding, counters_address) as u64;
+        self._vm
+            .write(
+                FrameGpa::new(address),
+                &0xffff_dead_0000_0000_u64.to_le_bytes(),
+            )
+            .map_err(|error| fail(error.to_string()))
+    }
+
+    /// Stopped hardware diagnostics, retained independently of the syscall frame.
+    pub fn user_fault_state(&self, index: usize) -> Result<(u64, u64, u64, u64, u64), TrapError> {
+        if index >= 2 {
+            return Err(fail("unknown CPL0 task"));
+        }
+        let binding = self.binding(index);
+        let frame = binding.fault_frame.load(Ordering::Acquire);
+        let (error, pc) = if frame == 0 {
+            (0, 0)
+        } else {
+            let bytes = self
+                ._vm
+                .read(FrameGpa::new(frame - DIRECT_VA + 120), 16)
+                .map_err(|error| fail(error.to_string()))?;
+            (
+                u64::from_le_bytes(
+                    bytes[..8]
+                        .try_into()
+                        .map_err(|_| fail("fault error width"))?,
+                ),
+                u64::from_le_bytes(bytes[8..].try_into().map_err(|_| fail("fault PC width"))?),
+            )
+        };
+        Ok((
+            binding.fault_active.load(Ordering::Acquire),
+            binding.fault_address.load(Ordering::Acquire),
+            error,
+            pc,
+            binding.fault_reason.load(Ordering::Acquire),
+        ))
+    }
+
+    /// Poison reserved XSAVE header words while the faulting vCPU is stopped.
+    pub fn poison_user_fault_xsave_header(&mut self, index: usize) -> Result<(), TrapError> {
+        if index >= 2 {
+            return Err(fail("unknown CPL0 task"));
+        }
+        let xsave = (self.binding(index).kernel_stack - 4160) & !63;
+        self._vm
+            .write(FrameGpa::new(xsave - DIRECT_VA + 520), &[0xa5; 16])
+            .map_err(|e| fail(e.to_string()))
+    }
+
+    /// Guard the 64 bytes each vCPU's old xsave frame would overwrite below
+    /// its 4 KiB #PF entry stack. The vCPU1 guard is below vCPU0's saved
+    /// hardware/GPR frame, so both faults may run before inspection.
+    pub fn arm_user_fault_stack_canary(&mut self) -> Result<(), TrapError> {
+        let first = carrick_x86::fault_stack_base(LAYOUT);
+        for address in [first - 64, first + 4096 - 256] {
+            self._vm
+                .write(FrameGpa::new(address), &[0xa5; 64])
+                .map_err(|e| fail(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub fn user_fault_stack_canary_intact(&self) -> Result<bool, TrapError> {
+        let first = carrick_x86::fault_stack_base(LAYOUT);
+        for address in [first - 64, first + 4096 - 256] {
+            let bytes = self
+                ._vm
+                .read(FrameGpa::new(address), 64)
+                .map_err(|e| fail(e.to_string()))?;
+            if bytes != [0xa5; 64] {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// A guest exception is an owned process outcome, separate from carrier failure.
+#[derive(Debug)]
+pub enum InitialProcessExit {
+    Exited {
+        code: i32,
+        exits: usize,
+    },
+    Fault {
+        record: carrick_x86::FaultDoorbellRecord,
+        exits: usize,
+    },
 }

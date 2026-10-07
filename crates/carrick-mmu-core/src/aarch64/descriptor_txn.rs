@@ -1041,22 +1041,7 @@ impl VerifiedDescriptorReceipt {
 /// Hardware access to one live stage-1 table graph, by table physical
 /// address. EL1 implements it over the primary-table alias; tests implement
 /// it over host memory and can inject failures.
-pub trait LiveDescriptorWords {
-    /// Load one descriptor. Addresses outside the reachable primary arena
-    /// are [`DescriptorRefusal::TableOutsidePrimary`].
-    fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal>;
-    /// Replace exactly `current` by `new`. `Ok(false)` means the word no
-    /// longer holds the validated value: editor exclusion was violated.
-    fn compare_exchange(&self, pa: u64, current: u64, new: u64) -> Result<bool, DescriptorRefusal>;
-    /// Store into a granted table page that no walker can reach yet.
-    fn store_unlinked(&self, pa: u64, value: u64) -> Result<(), DescriptorRefusal>;
-    /// Make every earlier store visible to hardware table walkers before a
-    /// following link store (`DSB ISHST` on AArch64).
-    fn publish_barrier(&self);
-    /// Complete break-before-make for `[va, va + len)` in this MM's ASID
-    /// (`DSB ISH; TLBI VAE1IS...; DSB ISH`).
-    fn invalidate_range(&self, va: u64, len: u64);
-}
+pub use crate::live_descriptor_words::LiveDescriptorWords;
 
 /// One journaled live store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]

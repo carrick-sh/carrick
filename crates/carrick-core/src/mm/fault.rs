@@ -36,9 +36,10 @@ pub fn request_lazy_frames(mailbox: &FrameGrantMailbox, mm_key: u64, va: u64, ac
 pub fn root_admits_commit<
     Policy: crate::mm::reservation::ReservationPolicy,
     Geometry: crate::mm::reservation::ReservationGeometry,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
 >(
     roots: Option<&crate::mm::reservation::SharedReservations<Policy, Geometry>>,
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, Context>,
     slot: u32,
     mm_key: u64,
     page: u64,
@@ -72,9 +73,10 @@ pub struct FileFaultVenue<
     Policy: crate::mm::reservation::ReservationPolicy,
     Geometry: crate::mm::reservation::ReservationGeometry,
     Slots: carrick_core_abi::GrantSlotVenue,
+    Context: Copy + Send + Sync + zerocopy::FromZeros = carrick_sched_core::ThreadCtx,
 > {
     pub roots: &'a crate::mm::reservation::SharedReservations<Policy, Geometry>,
-    pub spaces: SpaceAccess<'a>,
+    pub spaces: SpaceAccess<'a, Context>,
     pub slots: &'a Slots,
     pub worker: u32,
     pub mailbox: &'a FrameGrantMailbox,
@@ -83,7 +85,8 @@ impl<
     Policy: crate::mm::reservation::ReservationPolicy,
     Geometry: crate::mm::reservation::ReservationGeometry,
     Slots: carrick_core_abi::GrantSlotVenue,
-> FileFaultVenue<'_, Policy, Geometry, Slots>
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
+> FileFaultVenue<'_, Policy, Geometry, Slots, Context>
 {
     pub fn publish(&self, mm_key: u64, va: u64, access: u64) -> bool {
         let owner_source = core::cell::Cell::new(false);
