@@ -2,7 +2,10 @@
 // descriptor holes complete in the guest root; backed edits still forward
 // until the x86 descriptor/backing service is bound.
 use super::InitialWords;
-use carrick_el1::memory::{ReservationDisposition, decide_anonymous_syscall};
+use carrick_el1::memory::{
+    RangeBacking, ReservationDisposition, X86AnonymousDecode, classify_anonymous_range,
+    decide_anonymous_syscall,
+};
 use carrick_el1::memory::reservations::{X86Cpl0Zone, shared_x86_cpl0_guest};
 use carrick_el1_abi::{
     CurrentTask, ReservationBackingReceipt, ReservationCompletion, ReservationMm, TrapFrame,
@@ -50,31 +53,12 @@ fn empty_stage1(root: RootGpa, start: u64, end: u64, table_start: u64, table_end
         return None;
     }
     let words = InitialWords::production(table_start, table_end);
-    let mut cursor = start;
-    while cursor < end {
-        let mut table = root.address().raw();
-        let mut advanced = false;
-        for shift in [39_u32, 30, 21, 12] {
-            let word = words.load(table + ((cursor >> shift) & 511) * 8).ok()?;
-            if word == 0 {
-                let next = ((cursor >> shift) + 1).checked_shl(shift)?;
-                cursor = next.min(end);
-                advanced = true;
-                break;
-            }
-            if word & 1 == 0 || (shift == 30 || shift == 21) && word & (1 << 7) != 0 {
-                return Some(false);
-            }
-            if shift == 12 {
-                return Some(false);
-            }
-            table = word & 0x000f_ffff_ffff_f000;
-        }
-        if !advanced {
-            return Some(false);
-        }
-    }
-    Some(true)
+    let read = |pa| words.load(pa).ok();
+    Some(
+        classify_anonymous_range::<X86AnonymousDecode>(
+            &read, root.address().raw(), start, end - start,
+        ).summary == RangeBacking::Empty,
+    )
 }
 
 impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
