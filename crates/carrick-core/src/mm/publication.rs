@@ -1,43 +1,68 @@
 //! Neutral host consumer for MMU publication v2 records.
 //!
+//! Threat model: the EL1/CPL0 kernel that edits descriptors and publishes
+//! records is Carrick's own code. This consumer is a fail-closed *checker*
+//! against kernel bugs and against anything guest user code can influence;
+//! it is not a hardened boundary against a malicious kernel, and Carrick
+//! makes no adversarial security claim.
+//!
 //! The guest plans and executes every descriptor edit and publishes one
-//! [`MmPublication`] per settled edit. The host's part is:
+//! [`MmPublication`] per settled edit into a ring the host bound to exactly
+//! one producer MM. The host's part is:
 //!
-//! 1. **Admission, before any store**: the ledger issues an
-//!    [`AdmissionTicket`] naming the output, its leaf, the exact extent access
-//!    (owner or one share edge), the maximum permissions and table grants.
-//! 2. **Consumption**: [`consume`] orders records per (mm, incarnation) by
-//!    their dense [`PublicationCounter`], authenticates each against the
-//!    ticket, the extent's live custody and the publisher's exact prior alias,
-//!    then applies it or releases this edit's own ticket.
-//! 3. **Drain settlement**: custody that a remote CPU may still translate to
-//!    (a replaced prior, a rolled-back output) is held as drain debt until a
-//!    drain the host trusts covers it.
+//! 1. **Admission, before any store**: while [`admission_permitted`] holds,
+//!    the ledger issues an [`AdmissionTicket`] naming the output, its leaf,
+//!    the exact extent access (owner or one share edge), the permission
+//!    ceiling and table grants.
+//! 2. **Consumption**: [`consume`] attributes every record to its ring's
+//!    bound MM, takes ISA and drain authority from host-owned identity,
+//!    orders records by their dense [`PublicationCounter`], authenticates
+//!    each against the ticket, the extent's live custody and the publisher's
+//!    exact prior alias (frame, VA span, length, owner generation, permission
+//!    ceiling), then applies it or moves its custody.
+//! 3. **Drain settlement**: custody a remote CPU may still translate to (a
+//!    replaced prior, a rolled-back output, a write permission being
+//!    revoked) is held until a drain the host trusts covers it.
 //!
-//! The consumer never plans, walks or undoes a descriptor and never resolves
-//! the informational user span. Any mismatch quarantines the publishing MM
-//! (a malformed, unattributable record quarantines the carrier): the host has
-//! no authority to author a corrective edit.
+//! Remaining trust assumption: the host does not re-walk guest descriptors.
+//! It checks that every named frame, span and permission is one it
+//! authorized, and relies on stage-2 confinement for the rest: guest stores
+//! can only name frames stage-2 exposes to the VM, each exposed frame is
+//! under a ticket or an authenticated alias, and a kernel bug that stores a
+//! descriptor without publishing it is outside what this checker can see.
+//!
+//! Any mismatch quarantines the producer's bound MM, never an MM a record
+//! merely names. The host never authors a corrective edit.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use carrick_core_abi::{
-    EdgeGeneration, ExtentAccess, InventoryRevision, MmIncarnationKey, MmPublication,
-    OwnerGeneration, PublicationCounter, PublicationDecodeError, PublicationDrain, PublicationKind,
-    PublicationMm, PublicationOutcome, PublicationView, PublishedPrior, Stage1Ipa, TableGrantCount,
-    TicketId, leaf_bytes,
+    EdgeGeneration, ExtentAccess, InventoryRevision, MmIncarnation, MmIncarnationKey,
+    MmPublication, OwnerGeneration, PublicationCounter, PublicationDecodeError, PublicationDrain,
+    PublicationKind, PublicationMm, PublicationOutcome, PublicationView, PublishedPrior, Stage1Ipa,
+    TableGrantCount, TicketId, leaf_bytes,
 };
-use carrick_guest_arch::{EditLeafSize, EditPermissions, GuestIsa, GuestLen, RootGpa};
+use carrick_guest_arch::{EditLeafSize, EditPermissions, GuestIsa, GuestLen, RootGpa, UserVa};
+use core::num::NonZeroU64;
 
-/// Out-of-order records held per MM while an earlier counter is in flight on
-/// another ring. Exceeding it means the producer is not draining in order.
+/// Out-of-order records held per MM after the contiguous prefix has been
+/// consumed. Exceeding it means the producer is not draining in order.
 pub const MAX_DEFERRED_PER_MM: usize = 256;
 
-/// Ledger facts for one live MM slot.
+/// Held custody (replaced priors, rolled-back outputs) per MM before
+/// [`admission_permitted`] applies backpressure to new tickets.
+pub const MAX_HELD_SETTLEMENTS_PER_MM: usize = 256;
+
+/// Host-assigned identity of one publication ring.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RingId(pub NonZeroU64);
+
+/// Ledger facts for one live MM slot, including the ISA its kernel runs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LedgerMm {
-    pub incarnation: carrick_core_abi::MmIncarnation,
+    pub incarnation: MmIncarnation,
     pub root: RootGpa,
+    pub isa: GuestIsa,
 }
 
 /// Host admission for one prepared output, issued before the guest may store
@@ -54,12 +79,17 @@ pub struct AdmissionTicket {
     pub table_grants: TableGrantCount,
 }
 
-/// One live alias the ledger recorded for an exact (mm, incarnation).
+/// One live alias the ledger recorded for an exact (mm, incarnation): its
+/// user VA span, frame identity, current permissions and the ceiling its
+/// ticket authorized.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LedgerAlias {
+    pub va: UserVa,
     pub len: GuestLen,
     pub owner_generation: OwnerGeneration,
     pub access: ExtentAccess,
+    pub permissions: EditPermissions,
+    pub max_permissions: EditPermissions,
 }
 
 /// Why a share edge exists. Shared edges carry MAP_SHARED / attach_shared
@@ -94,8 +124,27 @@ pub enum OwnerRetired {
     Reclaimable,
 }
 
+/// Proof that no writable alias of an extent was live (published and not yet
+/// drained away) when it was taken. Only [`ExtentCustody::begin_cow`] creates
+/// one, and [`ExtentCustody::mint_cow_edge`] rejects it if a writable alias
+/// has appeared since.
+#[derive(Debug, Eq, PartialEq)]
+pub struct CowTransition {
+    writable_epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CowTransitionError {
+    /// Writable aliases are live or their downgrade has not drained.
+    WritableAliasesLive(u32),
+    /// A writable alias was published after the transition began.
+    Stale,
+    Exhausted,
+}
+
 /// Owner plus host-minted share edges for one physical extent, keyed by the
-/// exact (mm, incarnation) and edge generation. Every ledger embeds this, so
+/// exact (mm, incarnation) and edge generation, and a count of live writable
+/// aliases that only the consumer maintains. Every ledger embeds this, so
 /// owner-or-edge authentication has one implementation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExtentCustody {
@@ -104,6 +153,8 @@ pub struct ExtentCustody {
     edges: BTreeMap<MmIncarnationKey, ShareEdge>,
     cow_edges: usize,
     next_edge: u64,
+    writable_aliases: u32,
+    writable_epoch: u64,
 }
 
 impl ExtentCustody {
@@ -114,6 +165,8 @@ impl ExtentCustody {
             edges: BTreeMap::new(),
             cow_edges: 0,
             next_edge: 0,
+            writable_aliases: 0,
+            writable_epoch: 0,
         }
     }
     pub const fn owner(&self) -> Option<MmIncarnationKey> {
@@ -128,20 +181,14 @@ impl ExtentCustody {
     pub fn edge(&self, mm: MmIncarnationKey) -> Option<ShareEdge> {
         self.edges.get(&mm).copied()
     }
+    /// Writable aliases published and not yet drained away.
+    pub const fn writable_aliases(&self) -> u32 {
+        self.writable_aliases
+    }
 
-    /// Mint a fresh edge for `mm`, replacing any older edge it held.
-    ///
-    /// # Safety
-    /// Only the host share/attach_shared path or fork custody may call this,
-    /// after it has itself authorized `mm` to reach this extent. A guest
-    /// record never mints an edge.
-    pub unsafe fn mint_edge(
-        &mut self,
-        mm: MmIncarnationKey,
-        kind: EdgeKind,
-    ) -> Option<EdgeGeneration> {
+    fn mint(&mut self, mm: MmIncarnationKey, kind: EdgeKind) -> Option<EdgeGeneration> {
         self.next_edge = self.next_edge.checked_add(1)?;
-        let generation = EdgeGeneration::new(core::num::NonZeroU64::new(self.next_edge)?);
+        let generation = EdgeGeneration::new(NonZeroU64::new(self.next_edge)?);
         if kind == EdgeKind::CowInherited {
             self.cow_edges = self.cow_edges.checked_add(1)?;
         }
@@ -151,6 +198,47 @@ impl ExtentCustody {
             self.cow_edges = self.cow_edges.saturating_sub(1);
         }
         Some(generation)
+    }
+
+    /// Mint a fresh shared (MAP_SHARED / attach_shared) edge for `mm`.
+    ///
+    /// # Safety
+    /// Only the host share/attach_shared path may call this, after it has
+    /// itself authorized `mm` to reach this extent. A guest record never
+    /// mints an edge.
+    pub unsafe fn mint_shared_edge(&mut self, mm: MmIncarnationKey) -> Option<EdgeGeneration> {
+        self.mint(mm, EdgeKind::Shared)
+    }
+
+    /// Begin a fork-custody transition: succeeds only when no writable alias
+    /// is live, i.e. every one was downgraded or removed and that drain
+    /// settled.
+    pub fn begin_cow(&self) -> Result<CowTransition, CowTransitionError> {
+        if self.writable_aliases != 0 {
+            return Err(CowTransitionError::WritableAliasesLive(
+                self.writable_aliases,
+            ));
+        }
+        Ok(CowTransition {
+            writable_epoch: self.writable_epoch,
+        })
+    }
+
+    /// Mint a fork-custody (COW) edge for `mm` under a transition proof.
+    ///
+    /// # Safety
+    /// Only fork custody may call this, after it has itself authorized `mm`
+    /// to inherit this extent.
+    pub unsafe fn mint_cow_edge(
+        &mut self,
+        mm: MmIncarnationKey,
+        proof: CowTransition,
+    ) -> Result<EdgeGeneration, CowTransitionError> {
+        if proof.writable_epoch != self.writable_epoch || self.writable_aliases != 0 {
+            return Err(CowTransitionError::Stale);
+        }
+        self.mint(mm, EdgeKind::CowInherited)
+            .ok_or(CowTransitionError::Exhausted)
     }
 
     pub fn revoke_edge(&mut self, mm: MmIncarnationKey) -> Option<ShareEdge> {
@@ -195,15 +283,50 @@ impl ExtentCustody {
                     .is_some_and(|edge| edge.kind == EdgeKind::Shared),
             }
     }
+
+    fn writable_published(&mut self) -> Option<()> {
+        self.writable_aliases = self.writable_aliases.checked_add(1)?;
+        self.writable_epoch = self.writable_epoch.checked_add(1)?;
+        Some(())
+    }
+
+    fn writable_drained(&mut self) -> Option<()> {
+        self.writable_aliases = self.writable_aliases.checked_sub(1)?;
+        Some(())
+    }
 }
 
-/// Custody a ledger may return only after the drain covering it settles.
+/// Custody returned to the ledger, after the drain covering it if any.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeferredRelease {
+    /// A refused edit's own outstanding ticket (no store happened).
+    Ticket(TicketId),
+    /// A rolled-back edit's ticket, already moved out of Outstanding by
+    /// [`PhysicalLedger::hold_ticket`]; it can no longer be spent.
+    HeldOutput(TicketId),
     /// A replaced or removed prior alias's frame.
     Prior(PublishedPrior),
-    /// A rolled-back edit's own prepared ticket.
-    Ticket(TicketId),
+}
+
+/// Everything one record leaves held until its drain settles.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Settlement {
+    release: Option<DeferredRelease>,
+    /// A writable alias of this frame stops being live once drained.
+    writable_drop: Option<Stage1Ipa>,
+}
+impl Settlement {
+    const fn is_empty(&self) -> bool {
+        self.release.is_none() && self.writable_drop.is_none()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Admission {
+    Open,
+    Closed {
+        final_through: Option<PublicationCounter>,
+    },
 }
 
 /// Publication bookkeeping for one (mm, incarnation). The ledger stores it
@@ -211,8 +334,11 @@ pub enum DeferredRelease {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MmPublicationState {
     next: PublicationCounter,
-    pending: BTreeMap<PublicationCounter, Option<DeferredRelease>>,
     deferred: BTreeMap<PublicationCounter, PublicationView>,
+    /// Records with stores but nothing held, compacted to one range.
+    uncovered: Option<(PublicationCounter, PublicationCounter)>,
+    held: BTreeMap<PublicationCounter, Settlement>,
+    admission: Admission,
 }
 
 impl Default for MmPublicationState {
@@ -225,8 +351,10 @@ impl MmPublicationState {
     pub const fn new() -> Self {
         Self {
             next: PublicationCounter::FIRST,
-            pending: BTreeMap::new(),
             deferred: BTreeMap::new(),
+            uncovered: None,
+            held: BTreeMap::new(),
+            admission: Admission::Open,
         }
     }
     /// The next counter this MM must publish.
@@ -235,7 +363,47 @@ impl MmPublicationState {
     }
     /// Oldest record with stores not yet covered by a trusted drain.
     pub fn oldest_drain_debt(&self) -> Option<PublicationCounter> {
-        self.pending.keys().next().copied()
+        let held = self.held.keys().next().copied();
+        let uncovered = self.uncovered.map(|(first, _)| first);
+        match (held, uncovered) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+    /// Records that still hold custody until a drain settles.
+    pub fn held_settlements(&self) -> usize {
+        self.held.len()
+    }
+    pub fn deferred_records(&self) -> usize {
+        self.deferred.len()
+    }
+    fn settle_through(&mut self, through: PublicationCounter) -> Vec<Settlement> {
+        if let Some((first, last)) = self.uncovered {
+            self.uncovered = if last <= through {
+                None
+            } else if first <= through {
+                through.next().map(|after| (after, last))
+            } else {
+                Some((first, last))
+            };
+        }
+        let later = match through.next() {
+            Some(after) => self.held.split_off(&after),
+            None => BTreeMap::new(),
+        };
+        core::mem::replace(&mut self.held, later)
+            .into_values()
+            .collect()
+    }
+    fn hold(&mut self, counter: PublicationCounter, settlement: Settlement) {
+        if settlement.is_empty() {
+            self.uncovered = Some(match self.uncovered {
+                Some((first, _)) => (first, counter),
+                None => (counter, counter),
+            });
+        } else {
+            self.held.insert(counter, settlement);
+        }
     }
 }
 
@@ -261,44 +429,38 @@ impl AuthenticatedPublication {
 }
 
 /// The host's physical ledger, as seen by the neutral consumer. Every lookup
-/// is by stage-1 IPA or exact identity; none takes a user VA.
+/// is by stage-1 IPA or exact identity; none resolves a user VA.
 pub trait PhysicalLedger {
     type Fault: Copy + core::fmt::Debug;
 
-    /// Carrier-wide quarantine, for records that cannot be attributed.
-    fn carrier_quarantined(&self) -> bool;
-    fn quarantine_carrier(&mut self);
     /// Per-MM quarantine: sticky; other MMs keep running.
     fn mm_quarantined(&self, mm: MmIncarnationKey) -> bool;
     fn quarantine_mm(&mut self, mm: MmIncarnationKey);
 
-    /// Live incarnation and root of `mm`'s slot.
+    /// Live incarnation, root and ISA of `mm`'s slot.
     fn mm(&self, mm: PublicationMm) -> Option<LedgerMm>;
     fn publication_state(&mut self, mm: MmIncarnationKey) -> Option<&mut MmPublicationState>;
 
-    /// An outstanding ticket issued to exactly `mm`.
+    /// An *outstanding* ticket issued to exactly `mm`; held tickets are not
+    /// returned.
     fn ticket(&self, mm: MmIncarnationKey, ticket: TicketId) -> Option<AdmissionTicket>;
+    fn outstanding_tickets(&self, mm: MmIncarnationKey) -> usize;
     /// Live custody of the extent containing `address`.
     fn custody(&self, address: Stage1Ipa) -> Option<&ExtentCustody>;
+    fn custody_mut(&mut self, address: Stage1Ipa) -> Option<&mut ExtentCustody>;
     /// The live alias `mm` holds at stage-1 output `address`.
     fn alias(&self, mm: MmIncarnationKey, address: Stage1Ipa) -> Option<LedgerAlias>;
 
-    /// Bounded postcondition over the settled record (Applied/RolledBack).
-    /// A ledger that does not read guest descriptors returns `Ok`; then
-    /// safety rests on stage-2 confinement: guest stores can only name frames
-    /// the stage-2 tables expose to that VM, and every exposed frame is under
-    /// a ticket or a ledger alias authenticated here.
-    fn postcondition(&self, record: &AuthenticatedPublication) -> Result<(), Self::Fault> {
-        let _ = record;
-        Ok(())
-    }
-
-    /// Commit an Applied record all-or-nothing: consume its ticket, publish
-    /// the output alias and its table grants, drop the prior alias. Prior
-    /// custody is not returned here; see [`PhysicalLedger::release`].
+    /// Commit an Applied record all-or-nothing: consume its ticket and publish
+    /// the output alias (VA = span start, ceiling = ticket ceiling) with its
+    /// table grants; update a protected alias's permissions; drop a replaced
+    /// or removed prior alias. Prior custody is not returned here.
     fn apply(&mut self, record: &AuthenticatedPublication) -> Result<(), Self::Fault>;
-    /// Return custody: a refused/rolled-back edit's own ticket, or a replaced
-    /// prior frame once its drain has settled.
+    /// Move a rolled-back edit's ticket out of Outstanding into held
+    /// custody, atomically: from now on it cannot be spent or released by
+    /// any record, only by [`DeferredRelease::HeldOutput`].
+    fn hold_ticket(&mut self, mm: MmIncarnationKey, ticket: TicketId) -> Result<(), Self::Fault>;
+    /// Return custody to capacity.
     fn release(
         &mut self,
         mm: MmIncarnationKey,
@@ -310,6 +472,11 @@ pub trait PhysicalLedger {
 pub enum QuarantineCause<F> {
     UnknownMm,
     StaleIncarnation,
+    Malformed(PublicationDecodeError),
+    /// The record names an MM other than its ring's bound producer.
+    ProducerMismatch,
+    /// The record's ISA disagrees with the producer's host-owned ISA.
+    IsaMismatch,
     RootMismatch,
     DuplicateCounter,
     LostRecord,
@@ -326,26 +493,28 @@ pub enum QuarantineCause<F> {
     ForeignPrior,
     PriorLength,
     StalePriorGeneration,
-    Postcondition(F),
+    /// The record's span is not the VA span of its authenticated prior.
+    SpanMismatch,
+    CustodyAccounting,
     Ledger(F),
 }
 
-/// One MM quarantined by this batch.
+/// One producer quarantined by this batch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Quarantine<F> {
+    pub ring: Option<RingId>,
     pub mm: MmIncarnationKey,
     pub counter: Option<PublicationCounter>,
     pub cause: QuarantineCause<F>,
 }
 
-/// The whole batch was refused and the carrier quarantined.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CarrierQuarantine {
-    AlreadyQuarantined,
-    Malformed {
-        index: usize,
-        reason: PublicationDecodeError,
-    },
+/// Records drained from one ring, attributed to the producer MM the host
+/// bound to that ring.
+#[derive(Clone, Copy, Debug)]
+pub struct RingBatch<'a> {
+    pub ring: RingId,
+    pub bound: MmIncarnationKey,
+    pub records: &'a [MmPublication],
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -353,29 +522,42 @@ pub struct ConsumeReport<F> {
     pub applied: usize,
     pub released: usize,
     pub deferred: usize,
-    /// Ledger lookups made by the consumer: a constant per record, never a
-    /// function of unrelated extents, aliases or MMs.
+    /// Ledger lookups made by the consumer: a constant per record and per
+    /// batch, never a function of unrelated extents, aliases or MMs.
     pub ledger_visits: usize,
     pub quarantined: Vec<Quarantine<F>>,
 }
 
+const fn permissions_within(asked: EditPermissions, allowed: EditPermissions) -> bool {
+    (!asked.readable || allowed.readable)
+        && (!asked.writable || allowed.writable)
+        && (!asked.executable || allowed.executable)
+        && (!asked.user || allowed.user)
+}
+
+/// Ceiling for a record that names neither an output nor a prior alias
+/// (Publish, ArmCow, a downgrade-only Protect): never write or execute.
+const NO_GRANT_CEILING: EditPermissions = EditPermissions {
+    readable: true,
+    writable: false,
+    executable: false,
+    user: true,
+};
+
 fn authenticate<L: PhysicalLedger>(
     ledger: &L,
+    live: LedgerMm,
     view: PublicationView,
     visits: &mut usize,
 ) -> Result<AuthenticatedPublication, QuarantineCause<L::Fault>> {
     use QuarantineCause as Q;
     let key = view.key();
-    *visits += 1;
-    let live = ledger.mm(key.mm).ok_or(Q::UnknownMm)?;
-    if live.incarnation != key.incarnation {
-        return Err(Q::StaleIncarnation);
-    }
     if live.root != view.root() {
         return Err(Q::RootMismatch);
     }
-    let len = view.span().len();
+    let span = view.span();
     let mut ticket = None;
+    let mut ceiling = NO_GRANT_CEILING;
     if let Some(out) = view.output() {
         *visits += 1;
         let issued = ledger.ticket(key, out.ticket).ok_or(Q::NoTicket)?;
@@ -384,14 +566,11 @@ fn authenticate<L: PhysicalLedger>(
         }
         if issued.output != out.address
             || issued.leaf != out.leaf
-            || issued.len != len
+            || issued.len != span.len()
             || issued.access != out.access
             || issued.inventory_revision != out.inventory_revision
         {
             return Err(Q::TicketMismatch);
-        }
-        if !permissions_within(view.permissions(), issued.max_permissions) {
-            return Err(Q::PermissionEscalation);
         }
         if view.table_grants() > issued.table_grants {
             return Err(Q::TableGrantOverrun);
@@ -410,6 +589,7 @@ fn authenticate<L: PhysicalLedger>(
         if view.permissions().writable && !custody.writable_allowed(key, out.access) {
             return Err(Q::CowWritable);
         }
+        ceiling = issued.max_permissions;
         ticket = Some(issued);
     }
     let mut prior_alias = None;
@@ -424,6 +604,14 @@ fn authenticate<L: PhysicalLedger>(
         if alias.owner_generation != prior.owner_generation {
             return Err(Q::StalePriorGeneration);
         }
+        // Postcondition the host can check without walking descriptors: the
+        // edit's span is exactly the VA span of the alias it names.
+        if alias.va != span.start() || alias.len != span.len() {
+            return Err(Q::SpanMismatch);
+        }
+        if view.output().is_none() {
+            ceiling = alias.max_permissions;
+        }
         if view.kind() == PublicationKind::Protect && view.permissions().writable {
             *visits += 1;
             let custody = ledger.custody(prior.address).ok_or(Q::ForeignPrior)?;
@@ -433,25 +621,20 @@ fn authenticate<L: PhysicalLedger>(
         }
         prior_alias = Some(alias);
     }
-    let record = AuthenticatedPublication {
+    if view.outcome() != PublicationOutcome::Refused
+        && !permissions_within(view.permissions(), ceiling)
+    {
+        return Err(Q::PermissionEscalation);
+    }
+    Ok(AuthenticatedPublication {
         view,
         ticket,
         prior: prior_alias,
-    };
-    if view.outcome() != PublicationOutcome::Refused {
-        ledger.postcondition(&record).map_err(Q::Postcondition)?;
-    }
-    Ok(record)
+    })
 }
 
-const fn permissions_within(asked: EditPermissions, allowed: EditPermissions) -> bool {
-    (!asked.readable || allowed.readable)
-        && (!asked.writable || allowed.writable)
-        && (!asked.executable || allowed.executable)
-        && (!asked.user || allowed.user)
-}
-
-/// How much of the guest's drain claim the host trusts.
+/// How much of the guest's drain claim the host trusts, given the
+/// producer's host-owned ISA.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TrustedDrain {
     /// Remote CPUs may still translate this record's span.
@@ -462,70 +645,119 @@ enum TrustedDrain {
     WholeMm,
 }
 
-const fn trusted_drain(isa: GuestIsa, drain: PublicationDrain) -> TrustedDrain {
-    match (isa, drain) {
+const fn trusted_drain(producer_isa: GuestIsa, drain: PublicationDrain) -> TrustedDrain {
+    match (producer_isa, drain) {
         (GuestIsa::Aarch64, PublicationDrain::ArmBroadcastAsid) => TrustedDrain::WholeMm,
         (GuestIsa::Aarch64, PublicationDrain::ArmBroadcastSpan) => TrustedDrain::OwnSpan,
-        // x86 shootdown claims are guest assertions; only the host's own
-        // `acknowledge_global_drain` clears x86 debt.
+        // x86 shootdown claims are kernel assertions the host does not
+        // observe; only the host's own `acknowledge_global_drain` clears x86
+        // debt.
         _ => TrustedDrain::None,
+    }
+}
+
+fn custody_step<L: PhysicalLedger>(
+    ledger: &mut L,
+    address: Stage1Ipa,
+    step: fn(&mut ExtentCustody) -> Option<()>,
+) -> Result<(), QuarantineCause<L::Fault>> {
+    ledger
+        .custody_mut(address)
+        .and_then(step)
+        .ok_or(QuarantineCause::CustodyAccounting)
+}
+
+fn complete<L: PhysicalLedger>(
+    ledger: &mut L,
+    key: MmIncarnationKey,
+    settlement: Settlement,
+) -> Result<usize, QuarantineCause<L::Fault>> {
+    if let Some(frame) = settlement.writable_drop {
+        custody_step(ledger, frame, ExtentCustody::writable_drained)?;
+    }
+    match settlement.release {
+        Some(release) => {
+            ledger
+                .release(key, release)
+                .map_err(QuarantineCause::Ledger)?;
+            Ok(1)
+        }
+        None => Ok(0),
     }
 }
 
 fn settle<L: PhysicalLedger>(
     ledger: &mut L,
+    producer_isa: GuestIsa,
     record: &AuthenticatedPublication,
     report: &mut ConsumeReport<L::Fault>,
 ) -> Result<(), QuarantineCause<L::Fault>> {
     let view = record.view;
     let key = view.key();
-    let release = match view.outcome() {
+    let writable = view.permissions().writable;
+    let mut settlement = Settlement::default();
+    match view.outcome() {
         PublicationOutcome::Refused => {
-            // No store happened: this edit's own ticket returns now.
+            // No store happened: this edit's own outstanding ticket returns.
             if let Some(out) = view.output() {
                 ledger
                     .release(key, DeferredRelease::Ticket(out.ticket))
                     .map_err(QuarantineCause::Ledger)?;
                 report.released += 1;
             }
-            None
+            return Ok(());
         }
-        PublicationOutcome::RolledBack => view.output().map(|o| DeferredRelease::Ticket(o.ticket)),
+        PublicationOutcome::RolledBack => {
+            if let Some(out) = view.output() {
+                ledger
+                    .hold_ticket(key, out.ticket)
+                    .map_err(QuarantineCause::Ledger)?;
+                settlement.release = Some(DeferredRelease::HeldOutput(out.ticket));
+            }
+        }
         PublicationOutcome::Applied => {
             ledger.apply(record).map_err(QuarantineCause::Ledger)?;
             report.applied += 1;
-            match view.kind() {
-                PublicationKind::CowRepoint | PublicationKind::Unmap => {
-                    view.prior().map(DeferredRelease::Prior)
+            if let Some(out) = view.output()
+                && writable
+            {
+                custody_step(ledger, out.address, ExtentCustody::writable_published)?;
+            }
+            if let (Some(prior), Some(alias)) = (view.prior(), record.prior) {
+                match view.kind() {
+                    PublicationKind::CowRepoint | PublicationKind::Unmap => {
+                        settlement.release = Some(DeferredRelease::Prior(prior));
+                        if alias.permissions.writable {
+                            settlement.writable_drop = Some(prior.address);
+                        }
+                    }
+                    PublicationKind::Protect if alias.permissions.writable && !writable => {
+                        settlement.writable_drop = Some(prior.address);
+                    }
+                    PublicationKind::Protect if !alias.permissions.writable && writable => {
+                        custody_step(ledger, prior.address, ExtentCustody::writable_published)?;
+                    }
+                    _ => {}
                 }
-                _ => None,
             }
         }
-    };
-    if view.outcome() == PublicationOutcome::Refused {
-        return Ok(());
     }
     let mut settled = Vec::new();
     {
         let state = ledger
             .publication_state(key)
             .ok_or(QuarantineCause::UnknownMm)?;
-        match trusted_drain(view.isa(), view.drain()) {
-            TrustedDrain::None => {
-                state.pending.insert(view.counter(), release);
-            }
-            TrustedDrain::OwnSpan => settled.extend(release),
+        match trusted_drain(producer_isa, view.drain()) {
+            TrustedDrain::None => state.hold(view.counter(), settlement),
+            TrustedDrain::OwnSpan => settled.push(settlement),
             TrustedDrain::WholeMm => {
-                settled.extend(core::mem::take(&mut state.pending).into_values().flatten());
-                settled.extend(release);
+                settled.extend(state.settle_through(view.counter()));
+                settled.push(settlement);
             }
         }
     }
-    for release in settled {
-        ledger
-            .release(key, release)
-            .map_err(QuarantineCause::Ledger)?;
-        report.released += 1;
+    for settlement in settled {
+        report.released += complete(ledger, key, settlement)?;
     }
     Ok(())
 }
@@ -533,6 +765,7 @@ fn settle<L: PhysicalLedger>(
 fn quarantine_mm<L: PhysicalLedger>(
     ledger: &mut L,
     report: &mut ConsumeReport<L::Fault>,
+    ring: Option<RingId>,
     mm: MmIncarnationKey,
     counter: Option<PublicationCounter>,
     cause: QuarantineCause<L::Fault>,
@@ -541,38 +774,28 @@ fn quarantine_mm<L: PhysicalLedger>(
     if let Some(state) = ledger.publication_state(mm) {
         state.deferred.clear();
     }
-    report.quarantined.push(Quarantine { mm, counter, cause });
+    report.quarantined.push(Quarantine {
+        ring,
+        mm,
+        counter,
+        cause,
+    });
 }
 
-/// Consume one batch drained from every ring at a common point.
+/// Consume one round drained from every ring at a common point.
 ///
-/// `published` holds per-MM published-through counters the caller read
-/// (acquire) *before* snapshotting the rings: every record at or below that
-/// counter is visible in this batch or an earlier one, so a missing one is
-/// lost and quarantines its MM. Records beyond a gap are held, in order,
-/// until the gap fills.
-pub fn consume<L, I>(
+/// Each record is attributed to its ring's bound MM; a record naming any
+/// other identity, or an ISA other than the producer's, quarantines the
+/// producer. `published` holds per-MM published-through counters the caller
+/// read (acquire) *before* snapshotting the rings: every record at or below
+/// that counter is visible in this round or an earlier one, so a missing one
+/// is lost and quarantines its MM. The contiguous prefix is consumed first;
+/// only records still beyond a gap count against [`MAX_DEFERRED_PER_MM`].
+pub fn consume<L: PhysicalLedger>(
     ledger: &mut L,
-    records: I,
+    batches: &[RingBatch<'_>],
     published: &[(MmIncarnationKey, PublicationCounter)],
-) -> Result<ConsumeReport<L::Fault>, CarrierQuarantine>
-where
-    L: PhysicalLedger,
-    I: IntoIterator<Item = MmPublication>,
-{
-    if ledger.carrier_quarantined() {
-        return Err(CarrierQuarantine::AlreadyQuarantined);
-    }
-    let mut views = Vec::new();
-    for (index, record) in records.into_iter().enumerate() {
-        match record.decode() {
-            Ok(view) => views.push(view),
-            Err(reason) => {
-                ledger.quarantine_carrier();
-                return Err(CarrierQuarantine::Malformed { index, reason });
-            }
-        }
-    }
+) -> ConsumeReport<L::Fault> {
     let mut report = ConsumeReport {
         applied: 0,
         released: 0,
@@ -580,38 +803,95 @@ where
         ledger_visits: 0,
         quarantined: Vec::new(),
     };
-    let mut touched = BTreeSet::new();
-    for view in views {
-        let key = view.key();
-        if ledger.mm_quarantined(key) {
+    let mut groups: BTreeMap<
+        MmIncarnationKey,
+        (LedgerMm, BTreeMap<PublicationCounter, PublicationView>),
+    > = BTreeMap::new();
+    let mut ring_of: BTreeMap<MmIncarnationKey, RingId> = BTreeMap::new();
+    for batch in batches {
+        let bound = batch.bound;
+        let ring = Some(batch.ring);
+        if ledger.mm_quarantined(bound) {
             continue;
         }
-        let live = ledger.mm(key.mm);
-        let Some(state) = ledger.publication_state(key) else {
-            let cause = match live {
-                Some(live) if live.incarnation != key.incarnation => {
-                    QuarantineCause::StaleIncarnation
+        report.ledger_visits += 1;
+        let live = match ledger.mm(bound.mm) {
+            Some(live) if live.incarnation == bound.incarnation => live,
+            Some(_) => {
+                quarantine_mm(
+                    ledger,
+                    &mut report,
+                    ring,
+                    bound,
+                    None,
+                    QuarantineCause::StaleIncarnation,
+                );
+                continue;
+            }
+            None => {
+                quarantine_mm(
+                    ledger,
+                    &mut report,
+                    ring,
+                    bound,
+                    None,
+                    QuarantineCause::UnknownMm,
+                );
+                continue;
+            }
+        };
+        ring_of.insert(bound, batch.ring);
+        for record in batch.records {
+            if ledger.mm_quarantined(bound) {
+                break;
+            }
+            let view = match record.decode() {
+                Ok(view) => view,
+                Err(reason) => {
+                    quarantine_mm(
+                        ledger,
+                        &mut report,
+                        ring,
+                        bound,
+                        None,
+                        QuarantineCause::Malformed(reason),
+                    );
+                    break;
                 }
-                _ => QuarantineCause::UnknownMm,
             };
-            quarantine_mm(ledger, &mut report, key, Some(view.counter()), cause);
-            continue;
-        };
-        let duplicate = view.counter() < state.next || state.deferred.contains_key(&view.counter());
-        let overflow = state.deferred.len() >= MAX_DEFERRED_PER_MM;
-        if !duplicate && !overflow {
-            state.deferred.insert(view.counter(), view);
-            touched.insert(key);
-            continue;
+            let counter = Some(view.counter());
+            let cause = if view.key() != bound {
+                Some(QuarantineCause::ProducerMismatch)
+            } else if view.isa() != live.isa {
+                Some(QuarantineCause::IsaMismatch)
+            } else {
+                let group = groups
+                    .entry(bound)
+                    .or_insert_with(|| (live, BTreeMap::new()));
+                let Some(state) = ledger.publication_state(bound) else {
+                    quarantine_mm(
+                        ledger,
+                        &mut report,
+                        ring,
+                        bound,
+                        counter,
+                        QuarantineCause::UnknownMm,
+                    );
+                    break;
+                };
+                let duplicate = view.counter() < state.next
+                    || state.deferred.contains_key(&view.counter())
+                    || group.1.insert(view.counter(), view).is_some();
+                duplicate.then_some(QuarantineCause::DuplicateCounter)
+            };
+            if let Some(cause) = cause {
+                quarantine_mm(ledger, &mut report, ring, bound, counter, cause);
+                break;
+            }
         }
-        let cause = if duplicate {
-            QuarantineCause::DuplicateCounter
-        } else {
-            QuarantineCause::DeferralOverflow
-        };
-        quarantine_mm(ledger, &mut report, key, Some(view.counter()), cause);
     }
-    for key in touched {
+    for (key, (live, mut incoming)) in groups {
+        let ring = ring_of.get(&key).copied();
         loop {
             if ledger.mm_quarantined(key) {
                 break;
@@ -620,13 +900,17 @@ where
                 break;
             };
             let next = state.next;
-            let Some(view) = state.deferred.remove(&next) else {
+            let Some(view) = incoming
+                .remove(&next)
+                .or_else(|| state.deferred.remove(&next))
+            else {
                 break;
             };
             let Some(successor) = next.next() else {
                 quarantine_mm(
                     ledger,
                     &mut report,
+                    ring,
                     key,
                     Some(next),
                     QuarantineCause::LostRecord,
@@ -634,14 +918,31 @@ where
                 break;
             };
             state.next = successor;
-            let outcome = authenticate(ledger, view, &mut report.ledger_visits)
-                .and_then(|record| settle(ledger, &record, &mut report));
+            let outcome = authenticate(ledger, live, view, &mut report.ledger_visits)
+                .and_then(|record| settle(ledger, live.isa, &record, &mut report));
             if let Err(cause) = outcome {
-                quarantine_mm(ledger, &mut report, key, Some(next), cause);
+                quarantine_mm(ledger, &mut report, ring, key, Some(next), cause);
             }
         }
-        if let Some(state) = ledger.publication_state(key) {
-            report.deferred += state.deferred.len();
+        if ledger.mm_quarantined(key) {
+            continue;
+        }
+        let Some(state) = ledger.publication_state(key) else {
+            continue;
+        };
+        state.deferred.append(&mut incoming);
+        let deferred = state.deferred.len();
+        if deferred > MAX_DEFERRED_PER_MM {
+            quarantine_mm(
+                ledger,
+                &mut report,
+                ring,
+                key,
+                None,
+                QuarantineCause::DeferralOverflow,
+            );
+        } else {
+            report.deferred += deferred;
         }
     }
     for &(key, through) in published {
@@ -653,16 +954,18 @@ where
         };
         let next = state.next;
         if next <= through {
+            let ring = ring_of.get(&key).copied();
             quarantine_mm(
                 ledger,
                 &mut report,
+                ring,
                 key,
                 Some(next),
                 QuarantineCause::LostRecord,
             );
         }
     }
-    Ok(report)
+    report
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -671,7 +974,7 @@ pub enum DrainAckError<F> {
     Quarantined,
     /// The acknowledgement names a counter not yet consumed.
     Unconsumed,
-    Ledger(F),
+    Settlement(QuarantineCause<F>),
 }
 
 /// Record a drain the host itself performed over `mm`, covering every edit
@@ -682,7 +985,7 @@ pub fn acknowledge_global_drain<L: PhysicalLedger>(
     mm: MmIncarnationKey,
     through: PublicationCounter,
 ) -> Result<usize, DrainAckError<L::Fault>> {
-    if ledger.carrier_quarantined() || ledger.mm_quarantined(mm) {
+    if ledger.mm_quarantined(mm) {
         return Err(DrainAckError::Quarantined);
     }
     let state = ledger
@@ -691,50 +994,106 @@ pub fn acknowledge_global_drain<L: PhysicalLedger>(
     if through >= state.next {
         return Err(DrainAckError::Unconsumed);
     }
-    let later = match through.next() {
-        Some(after) => state.pending.split_off(&after),
-        None => BTreeMap::new(),
-    };
-    let settled = core::mem::replace(&mut state.pending, later);
+    let settled = state.settle_through(through);
     let mut released = 0;
-    for release in settled.into_values().flatten() {
-        if let Err(fault) = ledger.release(mm, release) {
-            ledger.quarantine_mm(mm);
-            return Err(DrainAckError::Ledger(fault));
+    for settlement in settled {
+        match complete(ledger, mm, settlement) {
+            Ok(count) => released += count,
+            Err(cause) => {
+                ledger.quarantine_mm(mm);
+                return Err(DrainAckError::Settlement(cause));
+            }
         }
-        released += 1;
     }
     Ok(released)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionBlocked {
+    UnknownMm,
+    Quarantined,
+    Closed,
+    /// Held custody awaiting drains has reached its bound.
+    Backpressure,
+}
+
+/// Whether the ledger may issue a new ticket to `mm`. Ledgers call this
+/// before every admission, which bounds release-bearing drain debt.
+pub fn admission_permitted<L: PhysicalLedger>(
+    ledger: &mut L,
+    mm: MmIncarnationKey,
+) -> Result<(), AdmissionBlocked> {
+    if ledger.mm_quarantined(mm) {
+        return Err(AdmissionBlocked::Quarantined);
+    }
+    let state = ledger
+        .publication_state(mm)
+        .ok_or(AdmissionBlocked::UnknownMm)?;
+    if state.admission != Admission::Open {
+        return Err(AdmissionBlocked::Closed);
+    }
+    if state.held.len() >= MAX_HELD_SETTLEMENTS_PER_MM {
+        return Err(AdmissionBlocked::Backpressure);
+    }
+    Ok(())
+}
+
+/// Host retirement barrier, step one: close admission and record the final
+/// published-through counter, read after the producer stopped.
+pub fn close_admission<L: PhysicalLedger>(
+    ledger: &mut L,
+    mm: MmIncarnationKey,
+    final_through: Option<PublicationCounter>,
+) -> Result<(), AdmissionBlocked> {
+    let state = ledger
+        .publication_state(mm)
+        .ok_or(AdmissionBlocked::UnknownMm)?;
+    state.admission = Admission::Closed { final_through };
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RetirementBlocked {
     UnknownMm,
     Quarantined,
-    /// A record with stores is not yet covered by a trusted drain.
-    DrainDebt(PublicationCounter),
+    AdmissionOpen,
+    OutstandingTickets(usize),
+    /// The final published-through counter has not been consumed.
+    UnconsumedRecords,
     /// Out-of-order records are still waiting for an earlier counter.
     UnsettledRecords,
+    /// A record with stores is not yet covered by a trusted drain.
+    DrainDebt(PublicationCounter),
 }
 
-/// Gate for MM retirement and capacity return: a remote CPU may still
-/// translate to this MM's frames until a trusted drain covers every record
-/// with stores.
+/// Gate for MM retirement and capacity return: admission closed, no
+/// outstanding tickets, the final published-through counter consumed, and
+/// every held custody and drain debt settled.
 pub fn retirement_permitted<L: PhysicalLedger>(
     ledger: &mut L,
     mm: MmIncarnationKey,
 ) -> Result<(), RetirementBlocked> {
-    if ledger.carrier_quarantined() || ledger.mm_quarantined(mm) {
+    if ledger.mm_quarantined(mm) {
         return Err(RetirementBlocked::Quarantined);
     }
+    let outstanding = ledger.outstanding_tickets(mm);
     let state = ledger
         .publication_state(mm)
         .ok_or(RetirementBlocked::UnknownMm)?;
-    if let Some(debt) = state.oldest_drain_debt() {
-        return Err(RetirementBlocked::DrainDebt(debt));
+    let Admission::Closed { final_through } = state.admission else {
+        return Err(RetirementBlocked::AdmissionOpen);
+    };
+    if outstanding != 0 {
+        return Err(RetirementBlocked::OutstandingTickets(outstanding));
+    }
+    if final_through.is_some_and(|through| state.next <= through) {
+        return Err(RetirementBlocked::UnconsumedRecords);
     }
     if !state.deferred.is_empty() {
         return Err(RetirementBlocked::UnsettledRecords);
+    }
+    if let Some(debt) = state.oldest_drain_debt() {
+        return Err(RetirementBlocked::DrainDebt(debt));
     }
     Ok(())
 }
