@@ -82,13 +82,10 @@ pub trait SyscallFrame {
     fn result(&self) -> NativeReturnWord;
     fn set_result(&mut self, result: NativeReturnWord);
     fn slot(&self) -> Option<SlotId>;
-    fn slot_index(&self) -> usize {
-        self.slot().map_or(usize::MAX, SlotId::index)
-    }
     /// Index within the supplied task slice. A projected one-task x86 slice
     /// uses index zero while retaining its real CPU slot in `slot()`.
     fn task_index(&self) -> usize {
-        self.slot_index()
+        self.slot().map_or(usize::MAX, SlotId::index)
     }
     fn user_sp(&self) -> Option<UserVa>;
 }

@@ -401,7 +401,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: Gues
     fn record_source(&self) -> Option<carrick_el1_abi::BornInZoneSource<'a>> {
         Some(carrick_el1_abi::BornInZoneSource {
             zone: self.zone.as_ref()?.tables,
-            slot: SlotId::from_index(self.frame.slot_index())?,
+            slot: self.frame.slot()?,
         })
     }
     #[cfg(target_os = "none")]
@@ -539,7 +539,8 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: Gues
 
     fn resumes_operation(&self) -> bool {
         self.zone.as_ref().is_some_and(|zone| {
-            SlotId::from_index(self.frame.slot_index())
+            self.frame
+                .slot()
                 .and_then(|slot| zone.tables.slot(slot).current())
                 .is_some_and(|record| zone.tables.record(record).has_object_operation())
         })
@@ -616,7 +617,7 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDis
         }
     }
     fn park_prepared(&mut self) -> Option<FamilyCompletion> {
-        let slot = SlotId::from_index(self.frame.slot_index())?;
+        let slot = self.frame.slot()?;
         let task = self.current_tasks.get(self.frame.task_index())?;
         let zone = self.zone.as_mut()?;
         let mut sched = native_scheduler(zone, task, self.counters, slot, &mut self.handoff);
