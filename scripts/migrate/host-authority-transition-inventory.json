@@ -39,18 +39,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:1047 in `run_cli`, `libc::geteuid` acts only on the current CLI trace privilege state used by `run_cli`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:1071 in `run_cli`, `libc::geteuid` acts only on the current CLI trace privilege state used by `run_cli`; no guest identity selects its host target.",
     "review_id": "HA-000003",
     "source": {
-      "byte_end": 47235,
-      "byte_start": 47222,
+      "byte_end": 48135,
+      "byte_start": 48122,
       "column": 29,
       "column_end": 42,
       "column_start": 29,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 1047,
-      "line_end": 1047,
-      "line_start": 1047
+      "line": 1071,
+      "line_end": 1071,
+      "line_start": 1071
     }
   },
   {
@@ -1461,18 +1461,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:1082 in `run_cli`, `libc::getuid` acts only on the CLI trace credential handoff used by `run_cli`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:1106 in `run_cli`, `libc::getuid` acts only on the CLI trace credential handoff used by `run_cli`; no guest identity selects its host target.",
     "review_id": "HA-000062",
     "source": {
-      "byte_end": 49392,
-      "byte_start": 49380,
+      "byte_end": 50292,
+      "byte_start": 50280,
       "column": 39,
       "column_end": 51,
       "column_start": 39,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 1082,
-      "line_end": 1082,
-      "line_start": 1082
+      "line": 1106,
+      "line_end": 1106,
+      "line_start": 1106
     }
   },
   {
@@ -7656,18 +7656,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:1105 in `run_cli`, `std::fs::read_to_string` accesses only the user-selected DTrace script.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:1129 in `run_cli`, `std::fs::read_to_string` accesses only the user-selected DTrace script.",
     "review_id": "HA-000276",
     "source": {
-      "byte_end": 50569,
-      "byte_start": 50546,
+      "byte_end": 51469,
+      "byte_start": 51446,
       "column": 30,
       "column_end": 53,
       "column_start": 30,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 1105,
-      "line_end": 1105,
-      "line_start": 1105
+      "line": 1129,
+      "line_end": 1129,
+      "line_start": 1129
     }
   },
   {
@@ -7682,18 +7682,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:1353 in `run_cli`, `std::fs::read_to_string` acts only on operator-selected namespace census capture or executable, hashed and checked by the trace diagnostic; it does not delegate Linux namespace or process authority to the host.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:1377 in `run_cli`, `std::fs::read_to_string` acts only on operator-selected namespace census capture or executable, hashed and checked by the trace diagnostic; it does not delegate Linux namespace or process authority to the host.",
     "review_id": "HA-000711",
     "source": {
-      "byte_end": 64500,
-      "byte_start": 64477,
+      "byte_end": 65400,
+      "byte_start": 65377,
       "column": 39,
       "column_end": 62,
       "column_start": 39,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 1353,
-      "line_end": 1353,
-      "line_start": 1353
+      "line": 1377,
+      "line_end": 1377,
+      "line_start": 1377
     }
   },
   {
@@ -7708,18 +7708,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:1409 in `run_cli`, `std::fs::read_to_string` accesses only the user-selected completed inotify09 population capture.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:1433 in `run_cli`, `std::fs::read_to_string` accesses only the user-selected completed inotify09 population capture.",
     "review_id": "HA-000670",
     "source": {
-      "byte_end": 68299,
-      "byte_start": 68276,
+      "byte_end": 69199,
+      "byte_start": 69176,
       "column": 39,
       "column_end": 62,
       "column_start": 39,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 1409,
-      "line_end": 1409,
-      "line_start": 1409
+      "line": 1433,
+      "line_end": 1433,
+      "line_start": 1433
     }
   },
   {
@@ -11340,18 +11340,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:1547 in `run_cli`, `std::fs::write` accesses only the operator-selected `--summary-jsonl` path, publishing the HVPatch carrier CPU attribution profile's parsed summary as JSON.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:1571 in `run_cli`, `std::fs::write` accesses only the operator-selected `--summary-jsonl` path, publishing the HVPatch carrier CPU attribution profile's parsed summary as JSON.",
     "review_id": "HA-000690",
     "source": {
-      "byte_end": 74987,
-      "byte_start": 74973,
+      "byte_end": 75887,
+      "byte_start": 75873,
       "column": 5,
       "column_end": 19,
       "column_start": 5,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 1547,
-      "line_end": 1547,
-      "line_start": 1547
+      "line": 1571,
+      "line_end": 1571,
+      "line_start": 1571
     }
   },
   {
