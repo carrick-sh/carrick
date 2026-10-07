@@ -240,6 +240,51 @@ fn mounted_static_x86_bad_write_returns_efault_and_continues() {
 }
 
 #[test]
+fn mounted_static_x86_two_live_mms_have_private_anonymous_leaves() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("two-mm-private");
+    compile_assembly("x86_two_mm_private.S", &elf);
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .expect("native two-MM oracle");
+    assert_eq!(native.status.code(), Some(7));
+    assert_eq!(native.stdout, b"Q\n");
+    let observed = run_mounted_binary(&elf, "x86-two-mm-private", true);
+    assert_eq!(
+        observed.status.code(),
+        Some(7),
+        "91 = fork refusal; 93 = mmap refusal; 94 = cross-MM/zero leaf; 95 = wait failure; stderr: {}",
+        String::from_utf8_lossy(&observed.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(observed.stdout.strip_prefix(b"Q\n").expect("two-MM stdout"))
+            .unwrap();
+    let witness = &report["report"]["execution_witness"];
+    assert_eq!(witness["anonymous_private_pages"], 32);
+    let owners = witness["anonymous_private_mms"]
+        .as_array()
+        .expect("live-authenticated per-MM PRIVATE witnesses");
+    assert_eq!(owners.len(), 2);
+    assert_ne!(owners[0]["mm"], owners[1]["mm"]);
+    assert_ne!(owners[0]["root"], owners[1]["root"]);
+    for owner in owners {
+        assert_eq!(owner["private_pages"], 16);
+        assert!(owner["incarnation"].as_u64().is_some_and(|n| n > 0));
+        assert!(owner["generation"].as_u64().is_some_and(|n| n > 0));
+    }
+    assert_eq!(witness["cross_mm_private_aliases"], 0);
+    assert!(
+        witness["peer_active_private_grants"]
+            .as_u64()
+            .is_some_and(|n| n > 0)
+    );
+}
+
+#[test]
 fn mounted_static_x86_getpid_matches_guest_gettid() {
     compare_mounted_assembly_with_native("x86_dispatch_getpid.S", b"D\n");
 }
