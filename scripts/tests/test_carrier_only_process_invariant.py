@@ -21,6 +21,34 @@ def finding(path: str, item: str, kind: str):
 
 
 class CarrierOnlyProcessInvariantTest(unittest.TestCase):
+    def test_native_rootfs_operator_does_not_license_guest_process_creation(self):
+        path = "crates/carrick-cli/src/commands.rs"
+        self.assertEqual(
+            GATE.classify(finding(path, "export_native_rootfs", "process_command")),
+            "operator_tool",
+        )
+        for item in ("run_cli", "new_native_helper"):
+            self.assertEqual(
+                GATE.classify(finding(path, item, "process_command")),
+                "forbidden_product_process_creation",
+            )
+        self.assertEqual(
+            GATE.classify(finding(path, "export_native_rootfs", "fork")),
+            "forbidden_product_process_creation",
+        )
+
+    def test_native_rootfs_operator_cannot_add_another_spawn(self):
+        operation = finding(
+            "crates/carrick-cli/src/commands.rs",
+            "export_native_rootfs",
+            "process_command",
+        )
+        with mock.patch.object(GATE, "scan", return_value=[operation] * 4):
+            failures = GATE.failures(ROOT)
+        expansions = [line for line in failures if "forbidden_exception_expansion" in line]
+        self.assertEqual(len(expansions), 1)
+        self.assertIn("export_native_rootfs exceeds the reviewed carrier-only limit 3", expansions[0])
+
     def test_exact_carrier_birth_is_separate_from_other_lifecycle_calls(self):
         self.assertEqual(
             GATE.classify(
