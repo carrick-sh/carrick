@@ -7111,6 +7111,77 @@ fn blocking_eventfd_read_wakes_on_producer_write_before_enroll() {
 }
 
 #[test]
+fn poll_stop_continue_retains_deadline_and_caught_handler_does_not_restart() {
+    let poll_nr = carrick_abi::CARRICK_PRIVATE_X86_POLL;
+    assert!(!is_restartable_syscall(poll_nr));
+    for (index, milliseconds) in [-1_i32, 60_000].into_iter().enumerate() {
+        let (kernel, root) = bootstrap(153_810 + index as i32);
+        let plan = crate::kernel::ClonePlan::from_flags(
+            LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+        )
+        .expect("thread plan");
+        let context = kernel
+            .clone_thread(
+                &root,
+                plan,
+                ThreadId::synthetic_for_tests(153_850 + index as i32),
+                None,
+            )
+            .expect("poll sibling");
+        let generation = publish(&context, 0x810 + index as u64);
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnFds {
+                fds: WaitFds::empty(),
+                timeout: carrick_abi::syscall_x86_64::PollTimeout::from_register(
+                    milliseconds as u32 as u64,
+                )
+                .duration(),
+                sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
+            },
+            ContinuationCapture::new(&context, generation, request(poll_nr), RestartClass::Never)
+                .expect("poll capture"),
+        )
+        .expect("poll continuation");
+        let admitted_deadline = continuation.deadline();
+        assert_eq!(admitted_deadline.is_none(), milliseconds < 0);
+        let probe = SignalReadinessProbe::from_continuation(&continuation);
+        let stop =
+            crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGSTOP).unwrap();
+        let cont =
+            crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGCONT).unwrap();
+        for _ in 0..2 {
+            assert!(kernel.stop_task_for_job_control(root.task().key().id, stop, None));
+            assert!(kernel.post_signal_to_task(root.task().key().id, cont, None));
+            assert!(
+                probe.event().is_none(),
+                "stop/continue preserves the admitted poll"
+            );
+            assert_eq!(
+                continuation.deadline(),
+                admitted_deadline,
+                "stop time counts against the original deadline, never a new timeout"
+            );
+        }
+        let usr1 = crate::kernel::LinuxSignal::for_signal_number(10).unwrap();
+        let mut action = carrick_abi::LinuxSigaction::empty();
+        action.sa_handler = 0x1234;
+        action.sa_flags = carrick_abi::LINUX_SA_RESTART;
+        let authority = context.signal_authority();
+        authority.install_action(usr1, action);
+        authority.enqueue_thread_standard(usr1, None);
+        let result = continuation
+            .resume(ContinuationEvent::Signal, &context)
+            .unwrap();
+        assert_eq!(
+            result.completion,
+            ContinuationCompletion::Errno(LINUX_EINTR)
+        );
+        assert_eq!(result.restart(), RestartDecision::NoRestart);
+    }
+}
+
+#[test]
 fn group_stop_interrupts_epoll_sibling_but_preserves_pipe_wait() {
     let (kernel, root) = bootstrap(153_799);
     let plan = crate::kernel::ClonePlan::from_flags(

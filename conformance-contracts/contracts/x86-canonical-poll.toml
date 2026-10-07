@@ -1,0 +1,29 @@
+schema_version = 1
+id = "x86.canonical.poll"
+title = "Shared x86 poll translation retains timeout shape and deadline"
+guest_surfaces = ["syscall:poll", "syscall:ppoll", "vmm:kvm"]
+semantic_authority = [
+  "https://man7.org/linux/man-pages/man2/poll.2.html: signed int milliseconds, every negative value is infinite, zero is non-blocking; NULL mask leaves the caller mask unchanged",
+  "https://man7.org/linux/man-pages/man2/restart_syscall.2.html: poll stop/continue restart deducts elapsed time, including stopped time; caught handlers produce EINTR rather than SA_RESTART replay",
+]
+fixture = "carrick-syscall-abi::syscall_x86_64::tests; carrick-personality-linux::x86_wave2::poll_decode_preserves_integer_timeout_and_has_no_sigmask; carrick-kernel::kernel::continuation::tests::poll_stop_continue_retains_deadline_and_caught_handler_does_not_restart"
+scale_points = [1, 2, 4]
+structural_budgets = []
+rationale = """
+One shared table selects the existing ppoll handler with a private integer-
+timeout shape tag. The no_std const conversion does fixed arithmetic, without
+allocation, guest memory access, or a synthetic guest timespec reservation.
+Both HAL and guest personality use the same three-argument projection.
+The same ppoll wait assembly, descriptor authority and continuation owner
+perform readiness and copyout. Stop/continue retains the original absolute
+deadline; caught handlers return EINTR even with SA_RESTART. No relative-
+timeout replay, retry, extra host wait or x86-only readiness implementation
+is introduced. The direct-number cross-check has no poll exception anymore.
+"""
+
+[bindings]
+vm_free = "carrick-syscall-abi::syscall_x86_64::tests; carrick-personality-linux::x86_wave2::poll_decode_preserves_integer_timeout_and_has_no_sigmask; carrick-kernel::kernel::continuation::tests::poll_stop_continue_retains_deadline_and_caught_handler_does_not_restart"
+
+[bindings.unresolved]
+embed_structural = "Production KVM host dispatch and scheduler/lifecycle custody are PR #81 dependencies; the musl startup failure is not closed by a translation-only pass."
+docker = "Director-owned; no Docker or signed HVF execution on this Linux worker."

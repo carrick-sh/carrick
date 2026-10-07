@@ -21,6 +21,9 @@ pub fn decode_x86_64(native: u64, mut args: [u64; 6], stack: u64) -> CanonicalCa
         SyscallRemap::Private(ordinal) => ordinal.raw(),
         SyscallRemap::Native | SyscallRemap::Unknown => u64::MAX,
     });
+    if canonical == carrick_syscall_abi::CARRICK_PRIVATE_X86_POLL {
+        args = crate::abi::x86_64::poll_arguments(args);
+    }
     CanonicalCall {
         isa: GuestIsa::X86_64,
         canonical: CanonicalOrdinal::new(canonical),

@@ -3208,10 +3208,12 @@ impl<'a> NetView<'a> {
             // to a `struct timespec { i64 tv_sec; i64 tv_nsec; }`. We translate
             // to milliseconds for libc::poll (-1 = forever, 0 = immediate).
             let timeout_ms: i32 = if is_poll {
-                // poll: arg2 IS the int timeout_ms (-1 = block forever, 0 = return
-                // now, N = N ms). The raw register value is sign-correct in its
-                // low 32 bits.
-                timeout_address as i32
+                // The shared guest-safe translator distinguishes infinite from
+                // zero and converts the low signed 32 bits exactly. Its finite
+                // duration is bounded by INT_MAX milliseconds.
+                carrick_abi::syscall_x86_64::PollTimeout::from_register(timeout_address)
+                    .duration()
+                    .map_or(-1, |duration| duration.as_millis() as i32)
             } else if timeout_address == 0 {
                 -1
             } else {
