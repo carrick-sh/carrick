@@ -4,7 +4,7 @@
 
 Guest payload adapter d5157d2c2 and the exactly restored two-MM witness
 d37570d90 are pushed to github/work/x86-process-owner. Shared numeric/serial
-allocation extraction is committed locally at 89aefd595; checkpoint gate
+allocation extraction is committed at 89aefd595; checkpoint gate
 receipts are appended below. The two-MM witness remains red at fork ENOSYS
 (exit91), with native Q/exit7. No CPU1, two-MM green or review-ready claim.
 
@@ -13,14 +13,20 @@ claim and serial allocation belong in sched-core with thin native/host
 wrappers; the initial task/namespace/group/session/claims transfer from the
 real host launch once via a typed, counted boot crossing. Then host identity
 mutation for that VM refuses. Delete task41/generation11/thread101/PID41.
-Before binding that seed, resolve the additional namespace boundary question:
-NsSharedRegion::reserve_identity owns a separate visible PID/TID counter and
-host arena membership. Do not copy that policy into native code or mutate
-host guest-identity state after transfer. The director was asked to identify
-an existing shared venue or confirm moving its policy/storage behind the
-shared owner. The new allocator test composes domains; it does not prove
-unsupported guest-created nested namespaces (current namespace code models
-only the root namespace).
+The director subsequently confirmed moving visible PID/TID selection into
+the same shared owner; host NsSharedRegion retains publication only for HOST
+lanes. After seed transfer CPL0 must not mutate host arena membership.
+Guest-created nested PID namespaces must refuse with counted ENOSYS.
+
+One policy question remains before implementation: internal IdRegistry IDs
+recycle after all claims release, but visible namespace IDs are monotonic
+and burn failed preparations (the existing counter refuses i32::MAX).
+Those numbers can diverge after failed births. Asked whether to preserve
+both typed domains and policies in one NamespaceState or unify allocation
+policy, which would change host/ARM behavior. Proposed preservation is one
+shared owner with a per-root-namespace visible cursor and thin region
+adapter; no second allocator or invented identity. The new allocator test
+composes domains; it does not prove guest-created nested namespaces.
 
 Native prerequisites still include ELF/stack VMA and initial residency
 import, retained frame-level inheritance, per-MM InitialWords, real stack
@@ -1095,7 +1101,12 @@ rather than being copied. /tmp/x86-cont-allocator-globals.log exits zero.
 The initial reconciler's exit one is retained in
 /tmp/x86-cont-allocator-reconcile.log, not called a pass.
 
-Clean domain and normal push checks follow this documentation checkpoint.
+Clean `just lint-domains` finishes zero in
+/tmp/x86-cont-allocator-domains.log. Required fresh KVM finishes one in
+/tmp/x86-cont-allocator-kvm.log: 133 passed, one failed, five existing ignores.
+The sole failure is the restored two-MM witness at fork exit91; it remains
+an explicit lane red. Normal push checks are recorded in
+/tmp/x86-cont-allocator-push.log.
 The actual real launch seed transfer, namespace visible identity/membership
 binding, native claim wrappers, MM inheritance/COW and CPU1 remain open.
 No extraction or runtime review-ready milestone is claimed.
