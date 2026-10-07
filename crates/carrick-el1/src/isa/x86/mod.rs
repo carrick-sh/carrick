@@ -3,7 +3,7 @@
 use super::ArchError;
 
 pub mod context;
-pub mod initial_mm;
+pub use super::x86_initial_mm as initial_mm;
 pub mod interrupt;
 mod mmu;
 pub mod transport;

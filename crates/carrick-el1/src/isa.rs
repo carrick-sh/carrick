@@ -68,8 +68,8 @@ pub mod arm_edit;
 pub mod aarch64;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod x86;
-// The carrier uses the same pure stack builder as CPL0 to issue exactly the
-// frames the initial image will publish. Native hardware leaves stay gated.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+// The carrier and CPL0 share one pure initial-MM module. Host tests exercise
+// that same module on every host; native hardware leaves stay gated.
+#[cfg(any(target_arch = "x86_64", test))]
 #[path = "isa/x86/initial_mm.rs"]
 pub mod x86_initial_mm;
