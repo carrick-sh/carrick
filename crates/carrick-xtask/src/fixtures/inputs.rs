@@ -1,12 +1,16 @@
 //! Resolve fixture inputs independently of the host workspace's crate population.
+use super::build_code::{self, REVIEWED_BUILD_CODE, ReviewedEntry};
 use super::environment::{BuildEnvironment, checkout_configs};
-use super::{BUILD_SCRIPTS, ContentHash, Result, fail, git, hash_source, safe_path};
+use super::{
+    BUILD_SCRIPTS, ContentHash, Result, fail, git, hash_regular_file, hash_source, linker,
+    safe_path,
+};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const FIXTURES: &[&str] = &[
+pub(super) const FIXTURES: &[&str] = &[
     "conformance-probes",
     "fixtures/linux-aarch64-hello",
     "fixtures/embed-interceptor-probe",
@@ -20,6 +24,8 @@ const BUILD_INPUTS: &[&str] = &[
     // Read by the controlled build environment to select the compiler.
     "rust-toolchain.toml",
     ".cargo",
+    // Reviewed build scripts and proc-macros: the review is an input too.
+    REVIEWED_BUILD_CODE,
     // The publisher itself constructs the Cargo commands and probe selection.
     "crates/carrick-xtask/src/fixtures.rs",
     "crates/carrick-xtask/src/fixtures/inputs.rs",
@@ -37,8 +43,16 @@ struct Metadata {
 #[derive(Deserialize)]
 struct Package {
     id: String,
+    name: String,
+    version: String,
     source: Option<String>,
     manifest_path: PathBuf,
+    targets: Vec<Target>,
+}
+#[derive(Deserialize)]
+struct Target {
+    kind: Vec<String>,
+    src_path: PathBuf,
 }
 #[derive(Deserialize)]
 struct Resolve {
@@ -76,7 +90,19 @@ fn relative(root: &Path, path: &Path) -> Result<String> {
 }
 
 fn resolved_inputs(root: &Path) -> Result<BTreeSet<String>> {
+    let (inputs, found) = resolve_graph(root)?;
+    build_code::check(root, &found)?;
+    Ok(inputs)
+}
+
+/// Build scripts and proc-macros in the fixture graphs, as reviewed entries.
+pub fn current_build_code(root: &Path) -> Result<BTreeSet<ReviewedEntry>> {
+    Ok(resolve_graph(root)?.1)
+}
+
+fn resolve_graph(root: &Path) -> Result<(BTreeSet<String>, BTreeSet<ReviewedEntry>)> {
     let root = root.canonicalize()?;
+    let mut found = BTreeSet::new();
     let environment = BuildEnvironment::new(&root)?;
     let mut inputs: BTreeSet<_> = BUILD_INPUTS
         .iter()
@@ -166,6 +192,49 @@ fn resolved_inputs(root: &Path) -> Result<BTreeSet<String>> {
                         pending.push(dependency.pkg.clone());
                     }
                 }
+                for target in &package.targets {
+                    let Some(kind) = target
+                        .kind
+                        .iter()
+                        .find(|k| *k == "custom-build" || *k == "proc-macro")
+                    else {
+                        continue;
+                    };
+                    let package_dir = package
+                        .manifest_path
+                        .parent()
+                        .ok_or_else(|| fail("fixture package has no directory"))?;
+                    let source = target
+                        .src_path
+                        .strip_prefix(package_dir)
+                        .ok()
+                        .and_then(Path::to_str)
+                        .ok_or_else(|| {
+                            fail(format!(
+                                "build code outside its package: {}",
+                                target.src_path.display()
+                            ))
+                        })?
+                        .to_owned();
+                    let sha256 = if package.source.is_some() {
+                        hash_regular_file(&target.src_path)?
+                    } else {
+                        hash_source(&root, &relative(&root, &target.src_path)?)?
+                    };
+                    found.insert(ReviewedEntry {
+                        package: package.name.clone(),
+                        location: build_code::location(
+                            &root,
+                            &package.name,
+                            &package.version,
+                            package.source.as_deref(),
+                            &package.manifest_path,
+                        )?,
+                        kind: kind.clone(),
+                        source,
+                        sha256,
+                    });
+                }
                 if package.source.is_some() {
                     continue;
                 }
@@ -191,7 +260,7 @@ fn resolved_inputs(root: &Path) -> Result<BTreeSet<String>> {
             }
         }
     }
-    Ok(inputs)
+    Ok((inputs, found))
 }
 
 /// Reject a recorded compiler input that could name anything but a tracked
@@ -243,5 +312,6 @@ pub fn source_hashes(
     if sources.is_empty() {
         return Err(fail("empty fixture source inventory"));
     }
+    linker::check_inventory(root, &sources, BUILD_SCRIPTS)?;
     Ok(sources)
 }

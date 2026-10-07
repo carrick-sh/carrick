@@ -86,6 +86,7 @@ pub fn classify(
     dep_info_files: &[PathBuf],
     external: &[PathBuf],
 ) -> Result<Vec<String>> {
+    let given = snapshot.to_path_buf();
     let snapshot = snapshot.canonicalize()?;
     let external: Vec<PathBuf> = external
         .iter()
@@ -114,6 +115,14 @@ pub fn classify(
                     prerequisite.display()
                 )));
             }
+            let lexical = prerequisite
+                .strip_prefix(&snapshot)
+                .or_else(|_| prerequisite.strip_prefix(&given));
+            if let Ok(relative) = lexical {
+                let relative = walk_without_symlinks(&snapshot, relative)?;
+                recorded.insert(relative);
+                continue;
+            }
             let path = prerequisite.canonicalize().map_err(|error| {
                 fail(format!(
                     "compiler input {} from {}: {error}",
@@ -121,21 +130,13 @@ pub fn classify(
                     file.display()
                 ))
             })?;
-            if let Ok(relative) = path.strip_prefix(&snapshot) {
-                if relative
-                    .components()
-                    .any(|c| c == Component::Normal("target".as_ref()))
-                {
-                    return Err(fail(format!(
-                        "generated compiler input under target/ is not a source input: {}",
-                        relative.display()
-                    )));
-                }
-                let relative = relative.to_str().ok_or_else(|| {
-                    fail(format!("non-UTF8 compiler input: {}", relative.display()))
-                })?;
-                recorded.insert(relative.to_owned());
-            } else if !external.iter().any(|root| path.starts_with(root)) {
+            if path.starts_with(&snapshot) {
+                return Err(fail(format!(
+                    "compiler input reaches the checkout through a symlink: {}",
+                    prerequisite.display()
+                )));
+            }
+            if !external.iter().any(|root| path.starts_with(root)) {
                 return Err(fail(format!(
                     "compiler input outside the checkout and locked caches: {}",
                     path.display()
@@ -144,4 +145,56 @@ pub fn classify(
         }
     }
     Ok(recorded.into_iter().collect())
+}
+
+/// Resolve a compiler-reported checkout path exactly as written, refusing a
+/// symlink at any component: canonicalizing first would record a link's
+/// current referent, so retargeting the link would keep the identity.
+fn walk_without_symlinks(snapshot: &Path, relative: &Path) -> Result<String> {
+    let mut parts: Vec<&std::ffi::OsStr> = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(name) => {
+                parts.push(name);
+                let path = parts.iter().fold(snapshot.to_path_buf(), |p, n| p.join(n));
+                let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                    fail(format!("compiler input {}: {error}", relative.display()))
+                })?;
+                if metadata.file_type().is_symlink() {
+                    return Err(fail(format!(
+                        "compiler input passes through a symlink: {}",
+                        relative.display()
+                    )));
+                }
+            }
+            Component::CurDir => {}
+            // Each popped component was verified to be a real directory.
+            Component::ParentDir if parts.pop().is_some() => {}
+            _ => {
+                return Err(fail(format!(
+                    "compiler input escapes the checkout: {}",
+                    relative.display()
+                )));
+            }
+        }
+    }
+    let path: PathBuf = parts.iter().collect();
+    if path
+        .components()
+        .any(|c| c == Component::Normal("target".as_ref()))
+    {
+        return Err(fail(format!(
+            "generated compiler input under target/ is not a source input: {}",
+            path.display()
+        )));
+    }
+    if !fs::symlink_metadata(snapshot.join(&path))?.is_file() {
+        return Err(fail(format!(
+            "compiler input is not a regular file: {}",
+            path.display()
+        )));
+    }
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| fail(format!("non-UTF8 compiler input: {}", path.display())))
 }

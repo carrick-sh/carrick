@@ -163,6 +163,28 @@ fn write(root: &Path, path: &str, bytes: &[u8]) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, bytes).unwrap();
 }
+/// The reviewed build-code list: the fixture graph's one build script
+/// (`embed-el1-sched/build.rs`, `fn main() {}`) plus `extra` entries.
+fn write_reviewed_build_code(root: &Path, extra: &[serde_json::Value]) {
+    let mut entries = vec![serde_json::json!({
+        "package": "embed-el1-sched",
+        "location": "path:fixtures/embed-el1-sched/Cargo.toml",
+        "kind": "custom-build",
+        "source": "build.rs",
+        "sha256": String::from(source_hash(b"fn main() {}\n")),
+    })];
+    entries.extend(extra.iter().cloned());
+    entries.sort_by_key(|e| e.to_string());
+    write(
+        root,
+        "fixtures/reviewed-build-code.json",
+        &serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "carrick.fixtures.reviewed-build-code.v1",
+            "entries": entries,
+        }))
+        .unwrap(),
+    );
+}
 fn hash(bytes: &[u8]) -> ContentHash {
     format!("{:x}", Sha256::digest(bytes)).try_into().unwrap()
 }
@@ -284,6 +306,7 @@ impl Fixture {
             b"[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\n",
         );
         write(root, "shared/banner.txt", b"fixture banner\n");
+        write_reviewed_build_code(root, &[]);
         // Same bytes as a symlink to `actual.txt` would hash under link text.
         write(root, "conformance-probes/actual.txt", b"actual\n");
         write(root, "conformance-probes/alias.txt", b"actual.txt");
@@ -2584,4 +2607,259 @@ fn unfiltered_graph_includes_host_only_build_dependencies() {
     // The include_str! target is not in the Cargo closure; only dep-info
     // (the manifest's compiler_inputs) brings it in.
     assert!(!sources.contains_key("shared/banner.txt"));
+}
+
+#[test]
+fn dep_info_refuses_compiler_inputs_reached_through_symlinks() {
+    // `shared/current.txt -> a.txt`: recording only the canonical `a.txt`
+    // would let a retarget to `b.txt` keep the identity.
+    let snapshot = CanonicalTempDir::new();
+    let root = snapshot.path();
+    write(root, "src/main.rs", b"");
+    write(root, "shared/a.txt", b"a\n");
+    write(root, "shared/b.txt", b"b\n");
+    std::os::unix::fs::symlink("a.txt", root.join("shared/current.txt")).unwrap();
+    std::os::unix::fs::symlink("shared", root.join("linked-dir")).unwrap();
+    for reported in ["shared/current.txt", "linked-dir/a.txt"] {
+        write(
+            root,
+            "dep/main.d",
+            format!(
+                "out: {} {}\n",
+                root.join("src/main.rs").display(),
+                root.join(reported).display()
+            )
+            .as_bytes(),
+        );
+        let result = fixtures::dep_info::classify(root, &[root.join("dep/main.d")], &[]);
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("symlink")),
+            "{reported}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn unreviewed_build_script_refuses_publish_and_admission() {
+    // A build script can read any file without telling dep-info.
+    let f = Fixture::new();
+    let root = f.repo.path();
+    commit(
+        root,
+        "fixtures/embed-zone-readers/build.rs",
+        b"fn main() { let b = std::fs::read_to_string(\"../../shared/banner.txt\").unwrap(); println!(\"cargo:rustc-env=BANNER={}\", b.trim()); }\n",
+        "new build script reading an outside file",
+    );
+    let result = fixtures::source_hashes(root, &f.manifest.compiler_inputs);
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("unreviewed build code")),
+        "{result:?}"
+    );
+    // Reviewing it (recording its hash) admits it; the list is an input.
+    let build_rs = fs::read(root.join("fixtures/embed-zone-readers/build.rs")).unwrap();
+    let reviewed = serde_json::json!({
+        "package": "embed-zone-readers",
+        "location": "path:fixtures/embed-zone-readers/Cargo.toml",
+        "kind": "custom-build",
+        "source": "build.rs",
+        "sha256": String::from(source_hash(&build_rs)),
+    });
+    write_reviewed_build_code(root, std::slice::from_ref(&reviewed));
+    git(root, &["commit", "-qam", "review the build script"]);
+    let sources = fixtures::source_hashes(root, &f.manifest.compiler_inputs).unwrap();
+    assert!(sources.contains_key("fixtures/reviewed-build-code.json"));
+    // Changing the reviewed script refuses until it is reviewed again.
+    commit(
+        root,
+        "fixtures/embed-zone-readers/build.rs",
+        b"fn main() {}\n",
+        "edit reviewed build script",
+    );
+    assert!(
+        fixtures::source_hashes(root, &f.manifest.compiler_inputs)
+            .unwrap_err()
+            .to_string()
+            .contains("unreviewed build code")
+    );
+    // A stale entry (reviewed code no longer in the graph) also refuses.
+    fs::remove_file(root.join("fixtures/embed-zone-readers/build.rs")).unwrap();
+    git(root, &["commit", "-qam", "drop the build script"]);
+    assert!(
+        fixtures::source_hashes(root, &f.manifest.compiler_inputs)
+            .unwrap_err()
+            .to_string()
+            .contains("stale reviewed entries: [custom-build path:fixtures/embed-zone-readers")
+    );
+}
+
+#[test]
+fn unreviewed_proc_macro_refuses() {
+    let f = Fixture::new();
+    let root = f.repo.path();
+    write(
+        root,
+        "crates/fixture-macro/Cargo.toml",
+        b"[package]\nname = \"fixture-macro\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[lib]\nproc-macro = true\n",
+    );
+    write(root, "crates/fixture-macro/src/lib.rs", b"// macro\n");
+    let manifest = "fixtures/embed-icache-reuse/Cargo.toml";
+    let mut text = fs::read_to_string(root.join(manifest)).unwrap();
+    text.push_str("[dependencies]\nfixture-macro = { path = \"../../crates/fixture-macro\" }\n");
+    write(root, manifest, text.as_bytes());
+    let output = Command::new("cargo")
+        .current_dir(root)
+        .args([
+            "generate-lockfile",
+            "--offline",
+            "--manifest-path",
+            manifest,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "proc-macro dependency"]);
+    let error = fixtures::source_hashes(root, &f.manifest.compiler_inputs)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("proc-macro path:crates/fixture-macro/Cargo.toml src/lib.rs"),
+        "{error}"
+    );
+}
+
+#[test]
+fn linker_references_resolve_only_to_inventoried_inputs() {
+    let inventory: std::collections::BTreeSet<&str> =
+        ["conformance-probes/link.ld", "scripts/link.ld"].into();
+    let check = |origin: &str, text: &str| fixtures::linker::check(origin, text, &inventory);
+    // Inside an inventoried package directory: admitted.
+    check(
+        "conformance-probes/.cargo/config.toml",
+        "rustflags = [\"-C\", \"link-arg=-Tlink.ld\"]",
+    )
+    .unwrap();
+    check(
+        "scripts/build-x.sh",
+        "\"$lld\" -flavor gnu -T link.ld -o out obj.o",
+    )
+    .unwrap();
+    for (origin, text) in [
+        ("scripts/build-x.sh", "\"$lld\" -T \"$repo_root/other.ld\""),
+        ("scripts/build-x.sh", "cc -Wl,-T,/abs/link.ld"),
+        ("scripts/build-x.sh", "cc -Wl,--script=missing.ld"),
+        ("scripts/build-x.sh", "cc -Wl,@response.txt"),
+        ("scripts/build-x.sh", "cc foo.lds"),
+        ("scripts/build-x.sh", "ld -T"),
+    ] {
+        assert!(
+            check(origin, text)
+                .unwrap_err()
+                .to_string()
+                .contains("linker input reference"),
+            "{text}"
+        );
+    }
+    // The real builder scripts and Cargo configuration carry no reference.
+    let real = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for path in [
+        ".cargo/config.toml",
+        "scripts/build-linux-fixtures.sh",
+        "scripts/build-embed-interceptor-probe.sh",
+        "scripts/build-embed-zone-readers.sh",
+        "scripts/build-embed-icache-reuse.sh",
+        "scripts/build-embed-el1-sched.sh",
+    ] {
+        let text = fs::read_to_string(real.join(path)).unwrap();
+        assert_eq!(
+            fixtures::linker::references(&text),
+            Vec::<String>::new(),
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn inventoried_linker_script_change_refuses_by_identity() {
+    let f = Fixture::new();
+    let root = f.repo.path();
+    write(root, "conformance-probes/link.ld", b"SECTIONS {}\n");
+    write(
+        root,
+        "conformance-probes/.cargo/config.toml",
+        b"[target.aarch64-unknown-linux-musl]\nrustflags = [\"-C\", \"link-arg=-Tlink.ld\"]\n",
+    );
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "package linker script"]);
+    let before = fixtures::source_hashes(root, &f.manifest.compiler_inputs).unwrap();
+    commit(
+        root,
+        "conformance-probes/link.ld",
+        b"SECTIONS { . = 0x1000; }\n",
+        "change linker script",
+    );
+    let after = fixtures::source_hashes(root, &f.manifest.compiler_inputs).unwrap();
+    assert_ne!(
+        before["conformance-probes/link.ld"],
+        after["conformance-probes/link.ld"]
+    );
+}
+
+#[test]
+fn linker_script_reference_must_be_an_inventoried_input() {
+    // A repo-root linker script named by tracked Cargo configuration is read
+    // by the linker, which dep-info does not report.
+    let f = Fixture::new();
+    let root = f.repo.path();
+    write(root, "link.ld", b"SECTIONS {}\n");
+    write(
+        root,
+        "conformance-probes/.cargo/config.toml",
+        b"[target.aarch64-unknown-linux-musl]\nrustflags = [\"-C\", \"link-arg=-T../link.ld\"]\n",
+    );
+    git(
+        root,
+        &["add", "link.ld", "conformance-probes/.cargo/config.toml"],
+    );
+    git(root, &["commit", "-qm", "repo-root linker script"]);
+    let result = fixtures::source_hashes(root, &f.manifest.compiler_inputs);
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("linker input")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn build_script_link_arg_outputs_follow_the_linker_rule() {
+    let snapshot = CanonicalTempDir::new();
+    let root = snapshot.path();
+    let output = "fixtures/embed-x/target/aarch64-unknown-linux-musl/release/build/x-0123/output";
+    write(
+        root,
+        output,
+        b"cargo:rustc-cfg=foo\ncargo:rerun-if-changed=build.rs\n",
+    );
+    let inventory = std::collections::BTreeSet::new();
+    fixtures::linker::check_build_script_outputs(root, &["fixtures/embed-x"], &inventory).unwrap();
+    write(
+        root,
+        output,
+        b"cargo:rustc-link-arg-bins=-T../../shared/link.ld\n",
+    );
+    assert!(
+        fixtures::linker::check_build_script_outputs(root, &["fixtures/embed-x"], &inventory)
+            .unwrap_err()
+            .to_string()
+            .contains("linker input reference")
+    );
 }
