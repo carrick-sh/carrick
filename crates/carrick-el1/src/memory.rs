@@ -562,79 +562,6 @@ pub fn classify_stage1_range(
     backing
 }
 
-/// Classify `[va, va + len)` by walking the live x86-64 stage-1 graph rooted at `root`.
-/// `read` loads the descriptor word at a table PA, `None` outside the
-/// table arena. Absent tables skip their whole span, so the walk is
-/// proportional to the populated terminals, not to `len`.
-pub fn classify_x86_stage1_range(
-    read: &dyn Fn(u64) -> Option<u64>,
-    root: u64,
-    va: u64,
-    len: u64,
-) -> Stage1Backing {
-    use carrick_mmu_core::aarch64::El1PrivateLeafState;
-    use carrick_mmu_core::x86::descriptor_txn::{ADDRESS, HUGE, PRESENT, x86_private_leaf_state};
-    const SPANS: [u64; 4] = [1 << 39, 1 << 30, 1 << 21, PAGE_SIZE];
-    let malformed = Stage1Backing::foreign(ForeignBacking::Malformed);
-    let Some(end) = va.checked_add(len) else {
-        return malformed;
-    };
-    let mut backing = Stage1Backing::of(RangeBacking::Empty);
-    let (mut private, mut resident) = (false, false);
-    let mut cursor = va;
-    while cursor < end {
-        let mut table = root;
-        let mut level = 0;
-        let descriptor = loop {
-            let slot = table + ((cursor >> (39 - level * 9)) & 511) * 8;
-            let Some(descriptor) = read(slot) else {
-                return malformed;
-            };
-            if level < 3 && descriptor & PRESENT != 0 && descriptor & HUGE == 0 {
-                table = descriptor & ADDRESS;
-                level += 1;
-                continue;
-            }
-            break descriptor;
-        };
-        let span = SPANS[level];
-        let next = (cursor & !(span - 1)).saturating_add(span);
-        if descriptor != 0 {
-            match x86_private_leaf_state(descriptor) {
-                El1PrivateLeafState::Prepared => private = true,
-                El1PrivateLeafState::Resident => {
-                    private = true;
-                    resident = true;
-                }
-                El1PrivateLeafState::Retired => {
-                    return Stage1Backing::of(RangeBacking::Retired);
-                }
-                El1PrivateLeafState::Unowned if level < 3 => {
-                    return Stage1Backing::foreign(ForeignBacking::Block);
-                }
-                El1PrivateLeafState::Unowned => {
-                    return Stage1Backing::foreign(ForeignBacking::HostOwnedLeaf);
-                }
-                El1PrivateLeafState::Malformed => return malformed,
-            }
-            backing.push(cursor, next.min(end));
-            if backing.summary == RangeBacking::Foreign {
-                return Stage1Backing::foreign(ForeignBacking::TooManyRuns);
-            }
-        }
-        if next <= cursor {
-            break;
-        }
-        cursor = next;
-    }
-    backing.summary = match (private, resident) {
-        (true, true) => RangeBacking::Private,
-        (true, false) => RangeBacking::Prepared,
-        _ => RangeBacking::Empty,
-    };
-    backing
-}
-
 /// Exact-MM read of the live stage-1 graph behind the syscall policy.
 pub trait AnonymousBackingProbe {
     fn backing(&mut self, ttbr0: u64, va: u64, len: u64) -> Stage1Backing;
@@ -743,16 +670,12 @@ pub enum DelegatedAnonymous {
 /// retirement's frames are journaled as an owed return for the host's bulk
 /// receipt at its next boundary. Everything else refuses the proposal and
 /// forwards. The Linux entry owner publishes the completion/refusal counter.
-pub fn serve_delegated_anonymous<
-    G: ReservationGeometry,
-    C: Copy + Send + Sync + zerocopy::FromZeros,
-    E: AnonymousDescriptorEditor,
->(
+pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
     frame: &mut TrapFrame,
     counters: &carrick_el1_abi::Counters,
     current: &CurrentTask,
-    spaces: SpaceAccess<'_, C>,
-    table: &carrick_core::mm::reservation::SharedReservations<LinuxReservationPolicy, G>,
+    spaces: SpaceAccess<'_>,
+    table: &reservations::SharedReservations,
     editor: &mut E,
 ) -> DelegatedAnonymous {
     let nr = frame.x[8];
@@ -782,12 +705,13 @@ pub fn serve_delegated_anonymous<
         ReservationDisposition::Work(pending) => pending,
     };
     let request = pending.request();
-    let refuse =
-        |pending: PendingReservationSyscall, model: &mut ReservationModel<'_, G, C>, why: Leave| {
-            // The proposal is this guard's own; refusing it cannot be stale.
-            let _ = pending.cancel(model);
-            forward(why)
-        };
+    let refuse = |pending: PendingReservationSyscall,
+                  model: &mut reservations::Reservations<'_>,
+                  why: Leave| {
+        // The proposal is this guard's own; refusing it cannot be stale.
+        let _ = pending.cancel(model);
+        forward(why)
+    };
     let (Some(grant), Some(owner)) = (spaces.grant(index, mm_key), NonZeroU64::new(frame.slot + 1))
     else {
         return refuse(pending, &mut model, Leave::NoGrant);
@@ -933,14 +857,11 @@ pub fn serve_delegated_anonymous<
 /// The admitted root that owns syscall `nr` when it is a delegated MM's
 /// anonymous `brk`/`mmap`/`munmap`/`mprotect` (`None`: the MM keeps the
 /// paths it had before admission).
-pub fn delegated_anonymous_root<
-    G: ReservationGeometry,
-    C: Copy + Send + Sync + zerocopy::FromZeros,
->(
+pub fn delegated_anonymous_root(
     nr: u64,
     current: &CurrentTask,
-    spaces: SpaceAccess<'_, C>,
-    table: &carrick_core::mm::reservation::SharedReservations<LinuxReservationPolicy, G>,
+    spaces: SpaceAccess<'_>,
+    table: &reservations::SharedReservations,
 ) -> Option<(
     carrick_el1_abi::ReservationMm,
     carrick_sched_core::spaces::SpaceIndex,
@@ -2229,87 +2150,6 @@ mod tests {
             for page in 0..9 {
                 words[leaf(16 + 2 * page)] =
                     (0x9001_0000 + page as u64 * 0x2000) | PRIVATE | VALID | TABLE;
-            }
-            assert_eq!(
-                cause(&words, va + 0x10000, 0x12000),
-                ForeignBacking::TooManyRuns
-            );
-        }
-
-        #[test]
-        fn x86_stage1_classification() {
-            use carrick_mmu_core::x86::descriptor_txn::{
-                HUGE, PREPARED, PRESENT, PRIVATE, RETIRED, USER, WRITE,
-            };
-            let root = 0x8000_0000u64;
-            // Four table pages: PML4 (L0), PDPT (L1), PD (L2), PT (L3).
-            let mut words = vec![0u64; 4 * 512];
-            let va = 0x4000_0000u64; // PML4[0], PDPT[1], PD[0]
-            words[0] = (root + 0x1000) | PRESENT | USER | WRITE;
-            words[512 + 1] = (root + 0x2000) | PRESENT | USER | WRITE;
-            words[1024] = (root + 0x3000) | PRESENT | USER | WRITE;
-            let leaf = |page: usize| 1536 + page;
-            words[leaf(0)] = 0x9000_0000 | PRIVATE | PRESENT | USER | WRITE; // resident
-            words[leaf(1)] = 0x9000_1000 | PRIVATE | PREPARED | USER | WRITE; // prepared (invalid)
-            words[leaf(3)] = 0x9000_3000 | PRESENT | USER | WRITE; // host-owned (no PRIVATE)
-            words[leaf(4)] = 0x9000_4000 | PRIVATE | RETIRED | USER; // retired (invalid)
-            let classify = |words: &Vec<u64>, va: u64, len: u64| {
-                let read = |pa: u64| {
-                    let offset = pa.checked_sub(root)?;
-                    words.get((offset / 8) as usize).copied()
-                };
-                classify_x86_stage1_range(&read, root, va, len).summary
-            };
-            let runs = |words: &Vec<u64>, va: u64, len: u64| {
-                let read = |pa: u64| {
-                    let offset = pa.checked_sub(root)?;
-                    words.get((offset / 8) as usize).copied()
-                };
-                classify_x86_stage1_range(&read, root, va, len)
-                    .runs()
-                    .to_vec()
-            };
-            assert_eq!(classify(&words, va, 0x2000), RangeBacking::Private);
-            assert_eq!(
-                classify(&words, va + 0x1000, 0x1000),
-                RangeBacking::Prepared
-            );
-            assert_eq!(classify(&words, va + 0x2000, 0x1000), RangeBacking::Empty);
-            // A hole beside backed pages: the backed run alone is the step.
-            assert_eq!(classify(&words, va, 0x3000), RangeBacking::Private);
-            assert_eq!(runs(&words, va, 0x3000), vec![(va, va + 0x2000)]);
-            assert_eq!(
-                runs(&words, va + 0x1000, 0x2000),
-                vec![(va + 0x1000, va + 0x2000)]
-            );
-            assert_eq!(classify(&words, va + 0x3000, 0x1000), RangeBacking::Foreign);
-            assert_eq!(classify(&words, va + 0x4000, 0x1000), RangeBacking::Retired);
-            // An absent L2 table is one empty span.
-            assert_eq!(
-                classify(&words, va + (1 << 21), 1 << 30),
-                RangeBacking::Empty
-            );
-            // Each foreign range names its cause.
-            let cause = |words: &Vec<u64>, va: u64, len: u64| {
-                let read = |pa: u64| {
-                    let offset = pa.checked_sub(root)?;
-                    words.get((offset / 8) as usize).copied()
-                };
-                let backing = classify_x86_stage1_range(&read, root, va, len);
-                assert_eq!(backing.summary, RangeBacking::Foreign);
-                backing.foreign
-            };
-            assert_eq!(
-                cause(&words, va + 0x3000, 0x1000),
-                ForeignBacking::HostOwnedLeaf
-            );
-            // An L2 block (HUGE) without EL1 tags.
-            words[1024 + 2] = 0x9040_0000 | PRESENT | HUGE;
-            assert_eq!(cause(&words, va + (2 << 21), 0x1000), ForeignBacking::Block);
-            // More than 8 private runs separated by holes.
-            for page in 0..9 {
-                words[leaf(16 + 2 * page)] =
-                    (0x9001_0000 + page as u64 * 0x2000) | PRIVATE | PRESENT | USER;
             }
             assert_eq!(
                 cause(&words, va + 0x10000, 0x12000),
