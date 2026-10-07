@@ -20,17 +20,76 @@ pub const CPL0_CPU_COUNT: usize = 2;
 
 pub struct ShootdownRequest {
     pub root: AtomicU64,
+    /// Exact MM incarnation that owns `root`; a reused root is a new owner.
+    pub mm_key: AtomicU64,
+    pub owner_generation: AtomicU64,
     pub generation: AtomicU64,
     pub ack: [AtomicU64; CPL0_CPU_COUNT],
+    /// Guest-confirmed drains. Host offline acknowledgement never advances it.
+    pub served: [AtomicU64; CPL0_CPU_COUNT],
 }
 
 impl ShootdownRequest {
     pub const fn new() -> Self {
         Self {
             root: AtomicU64::new(0),
+            mm_key: AtomicU64::new(0),
+            owner_generation: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             ack: [const { AtomicU64::new(0) }; CPL0_CPU_COUNT],
+            served: [const { AtomicU64::new(0) }; CPL0_CPU_COUNT],
         }
+    }
+}
+
+/// One CPU's live address owner. Odd `revision` means a context switch is in
+/// progress; a sender conservatively treats that state as a matching member.
+pub struct ShootdownMember {
+    pub revision: AtomicU64,
+    pub root: AtomicU64,
+    pub mm_key: AtomicU64,
+    pub owner_generation: AtomicU64,
+    /// Published by the host before KVM_RUN, cleared only after a safe CPL3
+    /// exit. A stopped member's debt is drained on its next admitted entry.
+    pub running: AtomicU32,
+}
+
+impl ShootdownMember {
+    pub const fn new() -> Self {
+        Self {
+            revision: AtomicU64::new(0),
+            root: AtomicU64::new(0),
+            mm_key: AtomicU64::new(0),
+            owner_generation: AtomicU64::new(0),
+            running: AtomicU32::new(0),
+        }
+    }
+
+    pub fn publish(&self, root: u64, mm_key: u64, owner_generation: u64) {
+        self.revision
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        self.root.store(root, core::sync::atomic::Ordering::Relaxed);
+        self.mm_key
+            .store(mm_key, core::sync::atomic::Ordering::Relaxed);
+        self.owner_generation
+            .store(owner_generation, core::sync::atomic::Ordering::Relaxed);
+        self.revision
+            .fetch_add(1, core::sync::atomic::Ordering::Release);
+    }
+
+    pub fn matches_or_changing(&self, root: u64, mm_key: u64, owner_generation: u64) -> bool {
+        let first = self.revision.load(core::sync::atomic::Ordering::Acquire);
+        if first & 1 != 0 {
+            return true;
+        }
+        let observed = (
+            self.root.load(core::sync::atomic::Ordering::Relaxed),
+            self.mm_key.load(core::sync::atomic::Ordering::Relaxed),
+            self.owner_generation
+                .load(core::sync::atomic::Ordering::Relaxed),
+        );
+        let last = self.revision.load(core::sync::atomic::Ordering::Acquire);
+        first != last || observed == (root, mm_key, owner_generation)
     }
 }
 
@@ -40,20 +99,32 @@ impl Default for ShootdownRequest {
     }
 }
 
+impl Default for ShootdownMember {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Retained publication shared by the exact CPU bindings in one carrier.
 pub struct ShootdownTable {
     pub next_generation: AtomicU64,
+    /// KICK-entry generation checks; fixture can prove this happened before
+    /// the stopped CPU executes its next user instruction.
+    pub kick_checks: [AtomicU64; CPL0_CPU_COUNT],
     /// Fixture-only two-live-CPU start barrier; production ignores it.
     pub fixture_arrived: AtomicU32,
     pub requests: [ShootdownRequest; CPL0_CPU_COUNT],
+    pub members: [ShootdownMember; CPL0_CPU_COUNT],
 }
 
 impl ShootdownTable {
     pub const fn new() -> Self {
         Self {
             next_generation: AtomicU64::new(0),
+            kick_checks: [const { AtomicU64::new(0) }; CPL0_CPU_COUNT],
             fixture_arrived: AtomicU32::new(0),
             requests: [const { ShootdownRequest::new() }; CPL0_CPU_COUNT],
+            members: [const { ShootdownMember::new() }; CPL0_CPU_COUNT],
         }
     }
 }
@@ -155,6 +226,7 @@ pub fn decode_user_page_fault(
         present: error & 1 != 0,
     })
 }
+pub const OBSERVE_CPL0_UACCESS_SHOOTDOWN: u64 = u64::MAX - 12;
 /// Supervisor direct-window base mapping low physical RAM into the upper half.
 pub const DIRECT_VA: u64 = carrick_el1_abi::X86_CPL0_DIRECT_VA;
 /// Retained KVM fixture page-table window; the root is its first page.
@@ -283,6 +355,11 @@ pub struct CpuBinding {
     pub fault_frame: AtomicU64,
     pub fault_address: AtomicU64,
     pub fault_reason: AtomicU64,
+    /// Exact MM owner generation of this CPU's active root, published on
+    /// every context install. Zero refuses shootdown authentication.
+    pub mm_owner_generation: AtomicU64,
+    /// Last invalidation generation drained by this CPU for its active root.
+    pub last_seen_generation: AtomicU64,
 }
 const _: () = {
     assert!(core::mem::offset_of!(CpuBinding, kernel_stack) == 0);

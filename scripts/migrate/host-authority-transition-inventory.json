@@ -6567,18 +6567,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:1649 in `Cpl0Carrier::boot`, `std::fs::read` reads only the caller-selected CPL0 bootstrap ELF, whose segments and entry are validated before the fixture registers memory or runs either vCPU; no guest syscall argument or guest identity selects this host path.",
+    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:1206 in `Cpl0Carrier::boot`, `std::fs::read` reads only the caller-selected CPL0 bootstrap ELF, whose segments and entry are validated before the fixture registers memory or runs either vCPU; no guest syscall argument or guest identity selects this host path.",
     "review_id": "HA-000752",
     "source": {
-      "byte_end": 65796,
-      "byte_start": 65783,
+      "byte_end": 47554,
+      "byte_start": 47541,
       "column": 21,
       "column_end": 34,
       "column_start": 21,
       "file": "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
-      "line": 1649,
-      "line_end": 1649,
-      "line_start": 1649
+      "line": 1206,
+      "line_end": 1206,
+      "line_start": 1206
     }
   },
   {
@@ -7459,7 +7459,7 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
-      "resource": "cargo-metadata workspace dependency tree inspected by CPL0 image input derivation"
+      "resource": "Cargo-derived local CPL0 package source directories, excluding target artifacts"
     },
     "expansion": null,
     "operation": "std::fs::read_dir",
@@ -7467,7 +7467,7 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/cpl0_inputs.rs:180 in `rust_files`, `std::fs::read_dir` inspects package directories in the repository workspace to enumerate Rust sources for CPL0 image build watching.",
+    "rationale": "At crates/carrick-vmm-kvm/cpl0_inputs.rs:180 in `rust_files`, `std::fs::read_dir` reads only Cargo-derived local CPL0 package source directories, excluding target artifacts; this build-input census is rooted in the trusted checkout and Cargo metadata, with no guest pathname or syscall input.",
     "review_id": "HA-000760",
     "source": {
       "byte_end": 6521,
@@ -8359,7 +8359,7 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
-      "resource": "cargo-metadata workspace dependency source file inspected by CPL0 image input derivation"
+      "resource": "Rust source files in the Cargo-derived CPL0 build-input closure and their literal includes"
     },
     "expansion": null,
     "operation": "std::fs::read_to_string",
@@ -8367,7 +8367,7 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/cpl0_inputs.rs:96 in `derive`, `std::fs::read_to_string` reads a discovered Rust source file to parse include statements for CPL0 image build watching.",
+    "rationale": "At crates/carrick-vmm-kvm/cpl0_inputs.rs:96 in `derive`, `std::fs::read_to_string` reads only Rust source files in the Cargo-derived CPL0 build-input closure and their literal includes; this build-input census is rooted in the trusted checkout and Cargo metadata, with no guest pathname or syscall input.",
     "review_id": "HA-000761",
     "source": {
       "byte_end": 3675,
@@ -18232,18 +18232,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:511 in `Watchdog::start`, `std::thread::spawn` creates one bounded timeout witness for the current KVM_RUN host thread during fixture observation. Production initial MM loading and execution do not start this watchdog. Its retained KvmKickHandle targets that exact host thread; cancellation and Drop join retain its lifetime. It neither creates a guest task nor implements a guest wait, and no guest identity selects the host target.",
+    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:279 in `Watchdog::start`, `std::thread::spawn` creates one bounded timeout witness for the current KVM_RUN host thread in fixture and production entry. Its retained KvmKickHandle targets that exact host thread; cancellation and Drop join retain its lifetime. It neither creates a guest task nor implements a guest wait, and no guest identity selects the host target.",
     "review_id": "HA-000753",
     "source": {
-      "byte_end": 20017,
-      "byte_start": 19999,
+      "byte_end": 10677,
+      "byte_start": 10659,
       "column": 22,
       "column_end": 40,
       "column_start": 22,
       "file": "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
-      "line": 511,
-      "line_end": 511,
-      "line_start": 511
+      "line": 279,
+      "line_end": 279,
+      "line_start": 279
     }
   },
   {
