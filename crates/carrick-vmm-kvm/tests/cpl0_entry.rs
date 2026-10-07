@@ -1141,6 +1141,34 @@ fn shared_kernel_scheduler_routes_reschedule_to_peer_apic() {
 }
 
 #[test]
+fn two_live_cpus_complete_mutual_root_shootdowns() {
+    const INTERRUPT_WITNESS: u64 = 0xffff_ffff_ffff_ff40;
+    let mut program = vec![0x48, 0xbf]; // mov rdi, rendezvous witness op
+    program.extend_from_slice(&6_u64.to_le_bytes());
+    program.extend_from_slice(&[0x48, 0xb8]); // mov rax, INTERRUPT_WITNESS
+    program.extend_from_slice(&INTERRUPT_WITNESS.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&program, &program])
+        .expect("two live KVM CPUs");
+    let generations = carrier.fixture_observe_pair().unwrap_or_else(|error| {
+        panic!(
+            "mutual rendezvous: {error}; state={:?}",
+            carrier.fixture_shootdown_state()
+        )
+    });
+    assert!(
+        generations
+            .into_iter()
+            .all(|generation| generation > 0 && generation < 100),
+        "generations={generations:?}; state={:?}",
+        carrier.fixture_shootdown_state()
+    );
+    assert_ne!(generations[0], generations[1]);
+}
+
+#[test]
 fn shared_kernel_scheduler_ack_uses_spurious_sentinel() {
     const INTERRUPT_WITNESS: u64 = 0xffff_ffff_ffff_ff40;
     let mut program = vec![0x48, 0xbf]; // mov rdi, scheduler ack witness
