@@ -29,7 +29,8 @@ use carrick_guest_arch::FrameGpa;
 use carrick_guest_arch::{AddressContext, ContextGeneration, MmGeneration, RootGpa, UserVa};
 use carrick_guest_mem::{CurrentMmMemory, GuestMemory, MemoryError};
 use carrick_hal::{
-    FrameEventCapacity, FrameInventoryEvent, FrameLength, MappingGeneration, MemPerms,
+    FrameEventCapacity, FrameId, FrameInventoryEvent, FrameLength, MappingGeneration, MappingId,
+    MemPerms,
 };
 use carrick_hal::{HvVcpu, TrapError, VcpuExit, VcpuKick};
 use carrick_kernel::kernel::{FrameInventoryAuthority, MmId, ObjectIdRegistry};
@@ -43,7 +44,7 @@ use carrick_sched_core::{SlotId, Waker};
 use carrick_x86::cpl0_entry::*;
 use carrick_x86::{BringupLayout, X86Reg, X86Vcpu};
 use kvm_bindings::{KVM_MP_STATE_RUNNABLE, Msrs, kvm_mp_state, kvm_msr_entry};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::ptr::NonNull;
@@ -135,6 +136,19 @@ pub enum InitialSyscallDisposition {
     Return(i64),
     Refused(carrick_abi::LinuxErrno),
     Exit(GuestExitStatus),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct InitialReservationLimits {
+    pub address: carrick_abi::LinuxRlimit,
+    pub data: carrick_abi::LinuxRlimit,
+}
+
+impl InitialReservationLimits {
+    pub const UNLIMITED: Self = Self {
+        address: carrick_abi::LinuxRlimit::new(u64::MAX, u64::MAX),
+        data: carrick_abi::LinuxRlimit::new(u64::MAX, u64::MAX),
+    };
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -362,6 +376,7 @@ impl InitialInventory {
                 inventory_revision: receipt.revision(),
             });
         }
+        frames.sort_unstable_by_key(|(gpa, _)| gpa.raw());
         Ok((
             Self {
                 authority,
@@ -910,6 +925,7 @@ impl Cpl0Carrier {
         image: &carrick_mem::x86_initial_image::X86InitialImage<'_>,
         argv: &[String],
         env: &[String],
+        limits: InitialReservationLimits,
     ) -> Result<(), TrapError> {
         let (_, extent_len) = self
             .initial_extent
@@ -1313,6 +1329,7 @@ impl Cpl0Carrier {
             root,
             reply.result_initial_break,
             reply.stack_top,
+            limits,
         )?;
         inventory.finish()?;
         self.initial_inventory = Some(inventory);
@@ -1325,6 +1342,7 @@ impl Cpl0Carrier {
         root: RootGpa,
         initial_break: u64,
         stack_top: u64,
+        limits: InitialReservationLimits,
     ) -> Result<(), TrapError> {
         const ARENA_START: u64 = 0x4000_0000;
         let heap = ReservationRange::new(initial_break, ARENA_START)
@@ -1363,8 +1381,8 @@ impl Cpl0Carrier {
                     heap,
                     arena,
                     brk: initial_break,
-                    address_limit: u64::MAX,
-                    data_limit: u64::MAX,
+                    address_limit: limits.address.rlim_cur,
+                    data_limit: limits.data.rlim_cur,
                     external_address_bytes: 0,
                     external_data_bytes: 0,
                 },
@@ -1439,6 +1457,7 @@ impl Cpl0Carrier {
         if self._vm.root(mm).is_none() {
             return Err(fail("initial MM not published"));
         }
+        let mut recent_forwards = VecDeque::with_capacity(8);
         for exits in 1..=max_exits {
             let exit = HvVcpu::run(&mut self.cpus[0])?;
             if matches!(exit, VcpuExit::Kicked) {
@@ -1473,7 +1492,9 @@ impl Cpl0Carrier {
                         ));
                     }
                     let record = carrick_x86::FaultDoorbellRecord::from_u32_words(&words)?;
-                    return Err(fail(format!("initial process fault: {record:?}")));
+                    return Err(fail(format!(
+                        "initial process fault: {record:?}; recent forwarded (nr, args[0..3], return): {recent_forwards:?}"
+                    )));
                 }
                 let mut detail = match exit {
                     VcpuExit::IoOut { port, .. } => {
@@ -1504,6 +1525,8 @@ impl Cpl0Carrier {
             // Copy it before lending the carrier to the host dispatcher, then
             // write only the return register back before resuming the vCPU.
             let mut frame = unsafe { *ptr };
+            let native_nr = frame.rax;
+            let native_args = [frame.rdi, frame.rsi, frame.rdx];
             self.host_forwards += 1;
             match forward(self, &frame)? {
                 InitialSyscallDisposition::Return(value) => frame.rax = value as u64,
@@ -1512,6 +1535,10 @@ impl Cpl0Carrier {
                 }
                 InitialSyscallDisposition::Exit(code) => return Ok((code.code(), exits)),
             }
+            if recent_forwards.len() == 8 {
+                recent_forwards.pop_front();
+            }
+            recent_forwards.push_back((native_nr, native_args, frame.rax as i64));
             // SAFETY: `ptr` names the validated retained supervisor stack and
             // the vCPU is stopped until the next `HvVcpu::run` above.
             unsafe { ptr.write(frame) };
@@ -2576,9 +2603,75 @@ impl Cpl0Carrier {
     }
 }
 
+impl Cpl0Carrier {
+    fn authenticate_initial_copy_page(
+        &self,
+        output: FrameGpa,
+        address: u64,
+    ) -> Result<(), MemoryError> {
+        let page = output.raw() & !4095;
+        let inventory = self
+            .initial_inventory
+            .as_ref()
+            .ok_or(MemoryError::Unsupported)?;
+        let index = inventory
+            .frames
+            .binary_search_by_key(&page, |(gpa, _)| gpa.raw())
+            .map_err(|_| MemoryError::OutOfBounds { address, length: 1 })?;
+        let identity = inventory.frames[index].1;
+        let mm_key = self.task(0).mm.key.load(Ordering::Acquire);
+        let mm = MmId::from_raw_u64(mm_key).ok_or(MemoryError::Unsupported)?;
+        let length = FrameLength::from_mapping_extent(
+            NonZeroU64::new(4096).ok_or(MemoryError::Unsupported)?,
+        );
+        if !self.frame_inventory.mapping_is_live_exact_generation(
+            mm,
+            MappingId::from_kernel_allocation(identity.mapping_id),
+            FrameId::from_kernel_allocation(identity.frame_id),
+            MappingGeneration::from_backend_counter(identity.owner_generation),
+            carrick_guest_mem::Gpa(page),
+            length,
+        ) {
+            return Err(MemoryError::OutOfBounds { address, length: 1 });
+        }
+        Ok(())
+    }
+}
+
 impl GuestMemory for Cpl0Carrier {
+    fn read_bytes_prefix(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        // This bounded crossing copy has one frame of host storage at a time.
+        // A later inaccessible page leaves Linux the already readable prefix.
+        let limit = length.min(1024 * 1024);
+        let mut bytes = Vec::new();
+        while bytes.len() < limit {
+            let Some(va) = address.checked_add(bytes.len() as u64) else {
+                break;
+            };
+            let count = ((4096 - (va & 4095)) as usize).min(limit - bytes.len());
+            match self.read_bytes_raw(va, count) {
+                Ok(page) => bytes.extend(page),
+                Err(error) if bytes.is_empty() => return Err(error),
+                Err(_) => break,
+            }
+        }
+        Ok(bytes)
+    }
+
     fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
-        let mm = NonZeroU64::new(INITIAL_MM_KEY).ok_or(MemoryError::Unsupported)?;
+        let ceiling =
+            carrick_hal::guest_arch::UserVaCeiling::for_abi(carrick_abi::LinuxGuestAbi::X86_64)
+                .exclusive_end();
+        if length != 0
+            && (address >= ceiling
+                || address
+                    .checked_add(length as u64)
+                    .is_none_or(|end| end > ceiling))
+        {
+            return Err(MemoryError::OutOfBounds { address, length });
+        }
+        let mm = NonZeroU64::new(self.task(0).mm.key.load(Ordering::Acquire))
+            .ok_or(MemoryError::Unsupported)?;
         let root = self._vm.root(mm).ok_or(MemoryError::Unsupported)?.root;
         let mut bytes = Vec::new();
         while bytes.len() < length {
@@ -2590,6 +2683,7 @@ impl GuestMemory for Cpl0Carrier {
                     address: va,
                     length,
                 })?;
+            self.authenticate_initial_copy_page(leaf.output, va)?;
             let count = (4096 - (va & 4095)) as usize;
             let count = count.min(length - bytes.len());
             let page = self
@@ -2610,7 +2704,22 @@ impl GuestMemory for Cpl0Carrier {
     }
 
     fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
-        let mm = NonZeroU64::new(INITIAL_MM_KEY).ok_or(MemoryError::Unsupported)?;
+        let ceiling =
+            carrick_hal::guest_arch::UserVaCeiling::for_abi(carrick_abi::LinuxGuestAbi::X86_64)
+                .exclusive_end();
+        if !bytes.is_empty()
+            && (address >= ceiling
+                || address
+                    .checked_add(bytes.len() as u64)
+                    .is_none_or(|end| end > ceiling))
+        {
+            return Err(MemoryError::OutOfBounds {
+                address,
+                length: bytes.len(),
+            });
+        }
+        let mm = NonZeroU64::new(self.task(0).mm.key.load(Ordering::Acquire))
+            .ok_or(MemoryError::Unsupported)?;
         let root = self._vm.root(mm).ok_or(MemoryError::Unsupported)?.root;
         let mut written = 0;
         while written < bytes.len() {
@@ -2631,6 +2740,7 @@ impl GuestMemory for Cpl0Carrier {
                 address: va,
                 length: bytes.len(),
             })?;
+            self.authenticate_initial_copy_page(leaf.output, va)?;
             let count = ((4096 - (va & 4095)) as usize).min(bytes.len() - written);
             self._vm
                 .write(leaf.output, &bytes[written..written + count])

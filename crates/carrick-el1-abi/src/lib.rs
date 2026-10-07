@@ -4475,8 +4475,8 @@ mod layout_manifest {
         field!(CurrentTask, execution, ExecutionIdentity, 0, 16, 8);
         field!(CurrentTask, linux, LinuxTaskState, 16, 32, 8);
         field!(CurrentTask, mm, ExecutionMm, 48, 16, 8);
-        field!(CurrentTask, metadata, LinuxTaskMetadata, 64, 16, 8);
-        field!(CurrentTask, _stride_padding, [u64; 6], 80, 48, 8);
+        field!(CurrentTask, metadata, LinuxTaskMetadata, 64, 24, 8);
+        field!(CurrentTask, _stride_padding, [u64; 5], 88, 40, 8);
     }
 
     #[test]

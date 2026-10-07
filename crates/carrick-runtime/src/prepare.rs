@@ -73,6 +73,7 @@ impl InitialForwardClass {
 fn classify_initial_x86_forward(
     native: carrick_abi::NativeNr,
     args: [u64; 6],
+    poll_host_fds: bool,
 ) -> InitialForwardClass {
     use InitialForwardClass::{Host, Refuse};
     // x86_64 Linux UAPI ordinals. The native-number type prevents a
@@ -81,7 +82,7 @@ fn classify_initial_x86_forward(
         0 if args[0] == 0 => Host("terminal"), // read(stdin)
         1 | 20 if args[0] == 1 || args[0] == 2 => Host("terminal"), // write/writev
         3 if args[0] <= 2 => Host("terminal"), // close(stdio)
-        7 if args[1] == 0 => Host("clock"),    // poll with no descriptors
+        7 if poll_host_fds => Host("terminal"), // bounded host-backed pollfds
         60 | 231 => Host("exit"),
         63 => Host("system_query"), // uname
         96 | 228 => Host("clock"),  // gettimeofday/clock_gettime
@@ -95,6 +96,37 @@ fn classify_initial_x86_forward(
     }
 }
 
+/// Poll may cross only for the CLI's host-backed descriptors. The kernel's
+/// in-zone descriptor namespace has no authority in the host dispatcher.
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+fn initial_poll_has_only_host_fds(
+    machine: &carrick_vmm_kvm::cpl0_boot::Cpl0Carrier,
+    args: [u64; 6],
+) -> bool {
+    use zerocopy::FromBytes;
+    let Ok(nfds) = usize::try_from(args[1]) else {
+        return false;
+    };
+    if nfds > 64 {
+        return false;
+    }
+    if nfds == 0 {
+        return true;
+    }
+    let Some(length) = nfds.checked_mul(core::mem::size_of::<carrick_abi::LinuxPollFd>()) else {
+        return false;
+    };
+    let Ok(bytes) = carrick_guest_mem::GuestMemory::read_bytes(machine, args[0], length) else {
+        return false;
+    };
+    bytes
+        .chunks_exact(core::mem::size_of::<carrick_abi::LinuxPollFd>())
+        .all(|chunk| {
+            carrick_abi::LinuxPollFd::read_from_bytes(chunk)
+                .is_ok_and(|entry| entry.fd < 0 || entry.fd <= 2)
+        })
+}
+
 #[cfg(all(test, feature = "platform-linux", target_arch = "x86_64"))]
 mod initial_x86_forward_tests {
     use super::{InitialForwardClass, classify_initial_x86_forward};
@@ -102,7 +134,8 @@ mod initial_x86_forward_tests {
 
     #[test]
     fn only_explicit_host_crossings_reach_host_semantics() {
-        let classify = |nr, fd| classify_initial_x86_forward(NativeNr(nr), [fd, 0, 0, 0, 0, 0]);
+        let classify =
+            |nr, fd| classify_initial_x86_forward(NativeNr(nr), [fd, 0, 0, 0, 0, 0], true);
         assert_eq!(classify(1, 1), InitialForwardClass::Host("terminal"));
         assert_eq!(classify(1, 2), InitialForwardClass::Host("terminal"));
         assert_eq!(classify(1, 3), InitialForwardClass::Refuse("unclassified"));
@@ -111,6 +144,11 @@ mod initial_x86_forward_tests {
         assert_eq!(classify(11, 0), InitialForwardClass::Refuse("memory"));
         assert_eq!(classify(39, 0), InitialForwardClass::Refuse("identity"));
         assert_eq!(classify(13, 0), InitialForwardClass::Refuse("signal"));
+        assert_eq!(classify(7, 0), InitialForwardClass::Host("terminal"));
+        assert_eq!(
+            classify_initial_x86_forward(NativeNr(7), [0, 3, 0, 0, 0, 0], false),
+            InitialForwardClass::Refuse("unclassified")
+        );
         assert_eq!(classify(62, 0), InitialForwardClass::Refuse("signal"));
         assert_eq!(classify(57, 0), InitialForwardClass::Refuse("task_wait"));
         assert_eq!(classify(160, 0), InitialForwardClass::Refuse("limits"));
@@ -989,7 +1027,11 @@ impl PreparedRun {
             )?;
             let mut machine =
                 carrick_vmm_kvm::cpl0_boot::Cpl0Carrier::boot_production(extent_bytes)?;
-            machine.load_guest_mm(&image, &argv, &env)?;
+            let limits = carrick_vmm_kvm::cpl0_boot::InitialReservationLimits {
+                address: dispatcher.launch_resource_limit(carrick_abi::LinuxResource::As),
+                data: dispatcher.launch_resource_limit(carrick_abi::LinuxResource::Data),
+            };
+            machine.load_guest_mm(&image, &argv, &env, limits)?;
             let reporter = carrick_kernel::compat::CompatReporter::default();
             let mut forward_families = std::collections::BTreeMap::<&'static str, u64>::new();
             let mut refusal_families = std::collections::BTreeMap::<&'static str, u64>::new();
@@ -1014,7 +1056,9 @@ impl PreparedRun {
                         return Ok(Decision::Return(value));
                     }
                 };
-                match classify_initial_x86_forward(raw.native_number, raw.args) {
+                let poll_host_fds =
+                    raw.native_number.0 == 7 && initial_poll_has_only_host_fds(machine, raw.args);
+                match classify_initial_x86_forward(raw.native_number, raw.args, poll_host_fds) {
                     InitialForwardClass::Host(family) => {
                         *forward_families.entry(family).or_default() += 1;
                     }

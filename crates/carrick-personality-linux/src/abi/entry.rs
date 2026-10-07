@@ -189,14 +189,16 @@ mod layout_manifest {
                 size_of::<LinuxTaskMetadata>(),
                 align_of::<LinuxTaskMetadata>()
             ),
-            (16, 8)
+            (24, 8)
         );
         // Exhaustive pattern makes newly added fields require a manifest entry.
         let _ = |LinuxTaskMetadata {
                      lifecycle_page: _,
                      control_slot: _,
+                     visible_pid: _,
                  }: LinuxTaskMetadata| {};
         field!(LinuxTaskMetadata, lifecycle_page, AtomicU64, 0, 8, 8);
         field!(LinuxTaskMetadata, control_slot, AtomicU64, 8, 8, 8);
+        field!(LinuxTaskMetadata, visible_pid, AtomicU32, 16, 4, 4);
     }
 }
