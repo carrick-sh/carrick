@@ -201,6 +201,11 @@ pub mod hardware {
         unsafe { send_ipi(apic_id, RESCHED_VECTOR) }
     }
     /// # Safety
+    /// A retained generation request was published before this IPI.
+    pub unsafe fn send_shootdown(apic_id: ApicId) -> Result<(), IpiBusy> {
+        unsafe { send_ipi(apic_id, SHOOTDOWN_VECTOR) }
+    }
+    /// # Safety
     /// CPL0 reads the mapped local APIC In-Service Register (ISR).
     pub unsafe fn highest_in_service_vector() -> Option<u8> {
         for reg_idx in (0..8).rev() {
