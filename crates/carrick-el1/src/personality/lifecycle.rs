@@ -102,7 +102,12 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame
         self.frame.arm_scheduler() && self.zone.is_some() && self.frame.slot().is_some()
     }
     fn can_prepare_child(&self, _: UserVa, _: Option<UserVa>) -> bool {
-        self.frame.arm_frame_ref().is_some()
+        if self.frame.arm_frame_ref().is_some() {
+            true
+        } else {
+            self.frame.record_isa_unsupported_forward();
+            false
+        }
     }
     fn user_sp(&mut self) -> Option<UserVa> {
         if let Some(sp) = self.frame.user_sp() {
@@ -153,7 +158,13 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame
         // SAFETY: this exact new record is unpublished and exclusively owned by this birth.
         let ctx = unsafe { record.ctx_mut() };
         let Some(frame) = self.frame.arm_frame() else {
-            return;
+            #[cfg(target_os = "none")]
+            crate::substrate::sched::hw::fatal_entry_binding();
+            #[cfg(not(target_os = "none"))]
+            carrick_fatal::carrick_fatal!(
+                "el1::prepare_child",
+                "child preparation admitted without an ARM native frame"
+            );
         };
         zone.cpu.save(frame, ctx);
         ctx.x[0] = context.result.raw() as u64;
