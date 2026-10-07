@@ -1287,6 +1287,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         let exit =
             carrick_vmm_hvf::hvf_aarch64_engine::run_worker_idle_entry(lifecycle, vcpu, frame);
         zone.leave_guest(slot, &carrick_kernel::el1_zone::HostLockWait);
+        carrick_kernel::el1_zone::hand_back_completions();
         match exit? {
             carrick_aarch64::Aarch64Exit::Halt => Ok(GuestIdleExit::Idle),
             other => Err(TrapError::Hypervisor(format!(

@@ -3230,6 +3230,7 @@ where
                         .to_owned(),
                 ));
             }
+            carrick_kernel::el1_zone::hand_back_completions();
             Ok(None)
         })();
         self.state.guest_execution = Some(executor);
