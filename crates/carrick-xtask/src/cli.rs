@@ -92,6 +92,12 @@ pub enum Commands {
         about = "Recapture moved host-authority positions on the gate Mac and return a patch"
     )]
     RemoteRecapture(crate::remote_recapture::RemoteRecaptureArgs),
+
+    #[command(
+        name = "test-lanes",
+        about = "Derive each test target's gate lane from Cargo metadata and check coverage"
+    )]
+    TestLanes(crate::test_lanes::TestLanesArgs),
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -185,6 +191,8 @@ pub enum CliError {
     RemoteAccept(#[from] crate::remote_accept::RemoteAcceptError),
     #[error("remote recapture error: {0}")]
     RemoteRecapture(#[from] crate::remote_recapture::RecaptureError),
+    #[error("test lanes: {0}")]
+    TestLanes(#[from] crate::test_lanes::TestLanesError),
 }
 
 pub fn resolve_repo_info(root: Option<&Path>) -> Result<RepoInfo, CliError> {
@@ -419,6 +427,11 @@ where
         }
         Commands::RemoteRecapture(args) => {
             crate::remote_recapture::run(cli.root.as_deref(), args)?;
+            Ok(())
+        }
+        Commands::TestLanes(args) => {
+            let info = resolve_repo_info(cli.root.as_deref())?;
+            crate::test_lanes::run(&info.repository_root, args, writer)?;
             Ok(())
         }
     }

@@ -81,7 +81,12 @@ fn empty_image_archive() -> Vec<u8> {
 
 #[test]
 fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
-    if !std::path::Path::new("/dev/kvm").exists() {
+    let present = std::path::Path::new("/dev/kvm").exists();
+    assert!(
+        present || std::env::var_os("CARRICK_REQUIRE_KVM").is_none_or(|value| value != "1"),
+        "CARRICK_REQUIRE_KVM=1 but /dev/kvm is absent: the KVM gate must not skip"
+    );
+    if !present {
         let message = b"SKIP x86 KVM CLI run: /dev/kvm is absent on this host\n";
         // libtest captures eprintln! from passing tests. Write to the host
         // descriptor so an ordinary test invocation shows the skip reason.
