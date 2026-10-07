@@ -1981,9 +1981,9 @@
       "kind": "static",
       "file": "crates/carrick-kernel/src/kernel/ids.rs",
       "symbol": "NEXT_FILE_DESCRIPTION_ID",
-      "fingerprint": "e5de473ba863b6f4206b47d69226d2dbe46e9f2b22d11a52622aea523cfa8623",
+      "fingerprint": "8cca60a42fc31e55686c65db09fae450edb82d8598588e1997729dc9874d6bcb",
       "classification": "monotonic_allocator",
-      "rationale": "Carrier-wide monotonic allocator NEXT_FILE_DESCRIPTION_ID in crates/carrick-runtime/src/kernel/ids.rs generating unique IDs across the host process."
+      "rationale": "Process-wide monotonic NEXT_FILE_DESCRIPTION_ID source in crates/carrick-kernel/src/kernel/ids.rs delegates the unchanged non-reusing atomic allocation and restored-ID high-water mark to the shared SerialAllocator. Its single process-global scope and monotonic_allocator classification are retained; it is not a per-task or namespace allocator."
     },
     {
       "kind": "static",

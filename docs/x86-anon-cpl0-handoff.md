@@ -2,23 +2,33 @@
 
 ## Current continuation checkpoint (2026-10-07)
 
-Pushed work/x86-process-owner through 3a81f3092. Local 64c68767f binds
-native fault/grant custody to the exact executing CPU/MM; d9adc7077 moves
-process birth admission/publication into the sole shared registry. Final
-checkpoint host gate is red; other required gates passed except the inherited
-N1 difference. The latest attribution section below is authoritative.
-No extraction PR, two-MM green or review-ready milestone is claimed.
-The old shootdown red below is historical: the authorized shared-kernel
-single-entry settlement was merged and its foreground KVM gates passed.
+Guest payload adapter d5157d2c2 and the exactly restored two-MM witness
+d37570d90 are pushed to github/work/x86-process-owner. Shared numeric/serial
+allocation extraction is committed locally at 89aefd595; checkpoint gate
+receipts are appended below. The two-MM witness remains red at fork ENOSYS
+(exit91), with native Q/exit7. No CPU1, two-MM green or review-ready claim.
 
-Exact next step: complete the frozen checkpoint gates and normal push, then
-apply the guest payload adapter over the shared birth/wait/exit owner. Scratch
-payload paths and reviewed API are in the latest section below. Next bind the
-production El1PendingFamilies process hooks, native MM fork and CPU1 execution.
-The live witness still needs initial ELF/stack VMA+residency import, retained
-frame-level fork inheritance, per-MM InitialWords windows and real stack COW.
-Keep InitialWords as the sole production descriptor editor and PR82's sole #PF.
-Do not substitute fixtures, host process policy or legacy mailboxV2 COW.
+The director confirmed two next-step authority choices: pure PID collision/
+claim and serial allocation belong in sched-core with thin native/host
+wrappers; the initial task/namespace/group/session/claims transfer from the
+real host launch once via a typed, counted boot crossing. Then host identity
+mutation for that VM refuses. Delete task41/generation11/thread101/PID41.
+Before binding that seed, resolve the additional namespace boundary question:
+NsSharedRegion::reserve_identity owns a separate visible PID/TID counter and
+host arena membership. Do not copy that policy into native code or mutate
+host guest-identity state after transfer. The director was asked to identify
+an existing shared venue or confirm moving its policy/storage behind the
+shared owner. The new allocator test composes domains; it does not prove
+unsupported guest-created nested namespaces (current namespace code models
+only the root namespace).
+
+Native prerequisites still include ELF/stack VMA and initial residency
+import, retained frame-level inheritance, per-MM InitialWords, real stack
+COW and production ProcessNative/CPU1 execution. Keep InitialWords as the
+sole descriptor editor and PR82's sole #PF. Do not substitute fixtures,
+host process policy, invented claim custody or legacy mailboxV2 COW.
+The arena prefork test remains a known pre-existing red, separately routed;
+a passing host gate here does not close it. No Docker or signed/HVF run.
 
 ## Historical registry-foundation gate status: labelled work-branch push
 
@@ -1062,3 +1072,30 @@ post-handoff host allocation must refuse. Delete fixed task41/generation11/
 thread101/PID41. Required red-first seed tests: namespace PID1 and requested
 session/group match, plus host post-boot allocation refusal. This binding
 and native MM/fork/COW/CPU1 remain open; no runtime milestone is claimed.
+
+## Shared allocation checkpoint gate receipts (2026-10-07)
+
+89aefd595 moves the pure allocation bodies; host parking_lot/RAII wrappers
+retain role custody and existing identity/serial scopes. Full `just test`
+and separate `just test-kernel-semantics` finish zero in
+/tmp/x86-cont-allocator-{test,semantics}.log. Focused all-target core/kernel
+clippy finishes zero in /tmp/x86-cont-allocator-clippy.log. Parent ARM ASM
+is 115/115 with no differences in /tmp/x86-cont-allocator-asm-parent.log.
+The host compile check and the shared 164-test suite are zero; raw abort
+ledger remains 97/97 carrier faults with no new abort or debt.
+
+Reconciliation rebinds no host-authority positions or abort fingerprints.
+Its taxonomy rewriter only sorted 400 unchanged records (JSON multiset
+equality); that unrelated ordering churn was restored. The global-state
+gate correctly flags NEXT_FILE_DESCRIPTION_ID's changed initializer type.
+Explicit review preserves its monotonic_allocator verdict and process-wide
+scope, rebinding the actual shared SerialAllocator fingerprint and rationale.
+The exact monotonic atomic allocation and restored high-water mark moved,
+rather than being copied. /tmp/x86-cont-allocator-globals.log exits zero.
+The initial reconciler's exit one is retained in
+/tmp/x86-cont-allocator-reconcile.log, not called a pass.
+
+Clean domain and normal push checks follow this documentation checkpoint.
+The actual real launch seed transfer, namespace visible identity/membership
+binding, native claim wrappers, MM inheritance/COW and CPU1 remain open.
+No extraction or runtime review-ready milestone is claimed.
