@@ -984,6 +984,32 @@ fn shared_kernel_interrupt_leaves() {
 }
 
 #[test]
+fn shared_kernel_frequency_uses_published_kvm_binding() {
+    const INTERRUPT_WITNESS: u64 = 0xffff_ffff_ffff_ff40;
+    const PUBLISHED_HZ: u64 = 1_234_567_890;
+    let mut program = vec![0x48, 0xbf]; // mov rdi, frequency operation
+    program.extend_from_slice(&0_u64.to_le_bytes());
+    program.extend_from_slice(&[0x48, 0xb8]); // mov rax, interrupt witness
+    program.extend_from_slice(&INTERRUPT_WITNESS.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&program, &program])
+        .expect("real KVM + CPL0 image with interrupts");
+    carrier
+        .fixture_publish_tsc_hz(0, PUBLISHED_HZ)
+        .expect("published CPU binding");
+    carrier
+        .fixture_publish_cpuid_tsc_hz(0, 2_000_000_000)
+        .expect("distinct architectural CPUID clock");
+    assert_eq!(
+        carrier.observe(0).expect("shared kernel frequency").result,
+        PUBLISHED_HZ as i64,
+        "the exact carrier-published KVM binding is authoritative"
+    );
+}
+
+#[test]
 fn shared_kernel_peer_apic_queues_wake_for_runnable_cpu() {
     const INTERRUPT_WITNESS: u64 = 0xffff_ffff_ffff_ff40;
     let mut sender = vec![0x48, 0xbe]; // mov rsi, target scheduler slot
