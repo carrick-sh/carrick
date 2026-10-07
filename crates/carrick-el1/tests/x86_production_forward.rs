@@ -152,7 +152,7 @@ fn production_x86_family_absences_forward_without_touching_user_memory() {
         assert_eq!(frame.rax, 0xfeed, "{family} must not install a result");
         assert_eq!(
             isa_unsupported.load(Ordering::Relaxed) - before_isa,
-            u64::from(matches!(native, 0 | 1 | 281 | 202)),
+            u64::from(matches!(native, 202)),
             "{family} must distinguish ISA refusal from semantic forwarding"
         );
         assert_eq!(
