@@ -185,9 +185,10 @@ impl PublicationKind {
             Self::Prepare | Self::Map | Self::CowRepoint | Self::Coalesce
         )
     }
-    /// Kinds that remove (or replace) one exact prior alias.
+    /// Kinds that change an existing alias. Each must name it: no record
+    /// changes an alias's state without naming its frame and span.
     pub const fn requires_prior(self) -> bool {
-        matches!(self, Self::CowRepoint | Self::Unmap)
+        !matches!(self, Self::Prepare | Self::Map)
     }
 }
 
@@ -406,10 +407,11 @@ impl PublicationView {
     /// - output (and its ticket) present exactly for output kinds, aligned to
     ///   its leaf, with the span starting on that leaf boundary (parent-block
     ///   alignment for `Block2M`/`Block1G` and `Coalesce`);
-    /// - prior present for `CowRepoint`/`Unmap` and for a `Protect` granting
-    ///   write or execute,
-    ///   aligned to its own leaf, and covering exactly the span when it
-    ///   replaces or removes one alias;
+    /// - a prior for every kind that changes an existing alias (all but
+    ///   `Prepare`/`Map`), aligned to its own leaf and covering exactly the
+    ///   span as a whole number of its leaves (the alias's actual extent);
+    ///   `Coalesce` keeps the prior's frame and only grows its leaf;
+    /// - `ArmCow` never grants write;
     /// - drain claim valid for the ISA; a refused edit claims no drain;
     /// - table grants only under an output ticket.
     pub fn checked(
@@ -460,21 +462,25 @@ impl PublicationView {
         if output.is_none() && table_grants.0 != 0 {
             return Err(E::TableGrants);
         }
-        let prior_required = kind.requires_prior()
-            || (kind == PublicationKind::Protect
-                && (permissions.writable || permissions.executable));
-        let prior_allowed = prior_required || kind == PublicationKind::Protect;
-        if (prior_required && prior.is_none()) || (!prior_allowed && prior.is_some()) {
+        if kind.requires_prior() != prior.is_some() {
             return Err(E::Prior);
         }
         if let Some(p) = prior {
             let bytes = leaf_bytes(p.leaf);
             if !aligned(p.address.raw(), bytes)
-                || p.address.raw().checked_add(bytes).is_none()
-                || len != bytes
+                || !aligned(len, bytes)
+                || p.address.raw().checked_add(len).is_none()
             {
                 return Err(E::Prior);
             }
+            if kind == PublicationKind::Coalesce
+                && output.is_none_or(|o| o.address != p.address || leaf_bytes(o.leaf) <= bytes)
+            {
+                return Err(E::Prior);
+            }
+        }
+        if kind == PublicationKind::ArmCow && permissions.writable {
+            return Err(E::Permissions);
         }
         Ok(Self {
             kind,
