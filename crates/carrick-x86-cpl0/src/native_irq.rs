@@ -175,6 +175,15 @@ extern "C" fn carrick_x86_receive_page_fault(
         send_fault_qword(saved_rax);
         send_fault_qword(cr2);
     }
+    fixture_stmt! {
+        // The terminal fixture fault can be reentered solely to witness the
+        // queued KICK before a bounded completion exit. STI's shadow ends at NOP.
+        unsafe {
+            core::arch::asm!("sti", "nop", "out dx, al",
+                in("dx") carrick_el1::isa::x86::context::native::CONTROL_PORT,
+                in("al") 0u8, options(nostack));
+        }
+    }
     crate::kernel::halt();
 }
 
