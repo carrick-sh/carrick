@@ -179,39 +179,98 @@ fn drain_claim_must_match_isa() {
 }
 
 #[test]
-fn unmap_requires_prior_and_writable_protect_names_one() {
+fn every_alias_change_names_its_prior() {
+    let quiet = |kind| PublicationShape {
+        permissions: RO,
+        table_grants: TableGrantCount(0),
+        ..shape(kind)
+    };
+    // Downgrades and COW arming change an alias too: no priorless edits.
+    for kind in [
+        PublicationKind::Unmap,
+        PublicationKind::Protect,
+        PublicationKind::ArmCow,
+        PublicationKind::Publish,
+    ] {
+        assert_eq!(
+            PublicationView::checked(
+                quiet(kind),
+                identity(1),
+                span(0x40_0000, 0x1000),
+                None,
+                None
+            ),
+            Err(PublicationDecodeError::Prior),
+            "{kind:?}"
+        );
+        assert!(
+            PublicationView::checked(
+                quiet(kind),
+                identity(1),
+                span(0x40_0000, 0x1000),
+                None,
+                Some(prior(0x9000_0000)),
+            )
+            .is_ok(),
+            "{kind:?}"
+        );
+    }
+    // A fresh mapping never names a prior.
+    assert_eq!(
+        PublicationView::checked(
+            shape(PublicationKind::Map),
+            identity(1),
+            span(0x40_0000, 0x1000),
+            Some(output(0x8000_0000, EditLeafSize::Page, ExtentAccess::Owner)),
+            Some(prior(0x9000_0000)),
+        ),
+        Err(PublicationDecodeError::Prior)
+    );
+    // ArmCow never grants write.
+    assert_eq!(
+        PublicationView::checked(
+            PublicationShape {
+                permissions: RW,
+                ..quiet(PublicationKind::ArmCow)
+            },
+            identity(1),
+            span(0x40_0000, 0x1000),
+            None,
+            Some(prior(0x9000_0000)),
+        ),
+        Err(PublicationDecodeError::Permissions)
+    );
+}
+
+#[test]
+fn multi_leaf_prior_covers_the_whole_alias() {
     let unmap = PublicationShape {
+        permissions: RO,
         table_grants: TableGrantCount(0),
         ..shape(PublicationKind::Unmap)
     };
-    assert_eq!(
-        PublicationView::checked(unmap, identity(1), span(0x40_0000, 0x1000), None, None),
-        Err(PublicationDecodeError::Prior)
-    );
-    let protect = PublicationShape {
-        table_grants: TableGrantCount(0),
-        ..shape(PublicationKind::Protect)
+    // An 8192-byte alias of two pages is removed by one record.
+    let view = PublicationView::checked(
+        unmap,
+        identity(1),
+        span(0x40_0000, 0x2000),
+        None,
+        Some(prior(0x9000_0000)),
+    )
+    .unwrap();
+    assert_eq!(MmPublication::encode(&view).decode(), Ok(view));
+    // A span that is not a whole number of the prior's leaves is refused.
+    let block = PublishedPrior {
+        leaf: EditLeafSize::Block2M,
+        ..prior(0x8000_0000)
     };
-    assert_eq!(
-        PublicationView::checked(protect, identity(1), span(0x40_0000, 0x1000), None, None),
-        Err(PublicationDecodeError::Prior)
-    );
-    let read_only = PublicationShape {
-        permissions: RO,
-        ..protect
-    };
-    assert!(
-        PublicationView::checked(read_only, identity(1), span(0x40_0000, 0x1000), None, None)
-            .is_ok()
-    );
-    // A prior names exactly one alias covering the span.
     assert_eq!(
         PublicationView::checked(
-            protect,
+            unmap,
             identity(1),
-            span(0x40_0000, 0x2000),
+            span(0x4000_0000, 0x1000),
             None,
-            Some(prior(0x9000_0000)),
+            Some(block)
         ),
         Err(PublicationDecodeError::Prior)
     );
@@ -248,6 +307,22 @@ fn block_and_coalesce_need_parent_alignment() {
         ),
         Err(PublicationDecodeError::Output)
     );
+    // Coalesce keeps the children's frame and grows only the leaf.
+    let coalesce = |prior_address: u64| {
+        PublicationView::checked(
+            shape(PublicationKind::Coalesce),
+            identity(1),
+            span(0x4000_0000, two_m),
+            Some(output(
+                0x8000_0000,
+                EditLeafSize::Block2M,
+                ExtentAccess::Owner,
+            )),
+            Some(prior(prior_address)),
+        )
+    };
+    assert!(coalesce(0x8000_0000).is_ok());
+    assert_eq!(coalesce(0x9000_0000), Err(PublicationDecodeError::Prior));
 }
 
 #[test]
@@ -324,20 +399,4 @@ fn drain_is_bounded_by_one_head_snapshot() {
     assert_eq!((count, refills), (2, 2));
     assert_eq!(drained, records.to_vec());
     assert_eq!(consumer.pop(), Ok(Some(records[0])));
-}
-
-#[test]
-fn executable_protect_names_a_prior() {
-    let protect = PublicationShape {
-        permissions: EditPermissions {
-            executable: true,
-            ..RO
-        },
-        table_grants: TableGrantCount(0),
-        ..shape(PublicationKind::Protect)
-    };
-    assert_eq!(
-        PublicationView::checked(protect, identity(1), span(0x40_0000, 0x1000), None, None),
-        Err(PublicationDecodeError::Prior)
-    );
 }
