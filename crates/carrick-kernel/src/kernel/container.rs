@@ -158,6 +158,31 @@ impl LaunchAuthorization {
     }
 }
 
+/// Whether every guest thread of a launch prints each syscall trap and its
+/// result to stderr (`CARRICK_TRACE_TRAPS`, the non-root, non-DTrace trap log
+/// `scripts/ltp-reduce.py` parses). The CLI resolves the variable into
+/// [`LaunchContext::trap_trace`]; the runtime never reads it.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum TrapTrace {
+    /// No per-trap log (the default for every launch).
+    #[default]
+    Off,
+    /// Log every syscall trap and its return to stderr.
+    Stderr,
+}
+
+impl TrapTrace {
+    /// The CLI's spelling: any presence of `CARRICK_TRACE_TRAPS` (even empty)
+    /// turns the log on, exactly as the former runtime env read did.
+    pub fn from_env_presence(present: bool) -> Self {
+        if present { Self::Stderr } else { Self::Off }
+    }
+
+    pub fn is_enabled(self) -> bool {
+        matches!(self, Self::Stderr)
+    }
+}
+
 /// Everything the runtime used to read from the process environment to know
 /// WHICH container it is running, as one typed value the CLI builds and the
 /// runtime consumes. An embedding host application builds it with
@@ -181,6 +206,11 @@ pub struct LaunchContext {
     /// The lifecycle-registry entry this run is the carrier of
     /// (`CARRICK_CONTAINER_ID`); `None` for a foreground run.
     pub registry_id: Option<RegistryContainerId>,
+    /// The per-trap stderr log every guest thread of this launch inherits.
+    /// Resolved by the CLI from `CARRICK_TRACE_TRAPS` (see
+    /// [`LaunchContext::with_trap_trace`]); every constructor here leaves it
+    /// [`TrapTrace::Off`].
+    pub trap_trace: TrapTrace,
 }
 
 impl LaunchContext {
@@ -197,7 +227,16 @@ impl LaunchContext {
             exec_overlay: None,
             launch_authorization: None,
             registry_id: None,
+            trap_trace: TrapTrace::Off,
         }
+    }
+
+    /// Set the launch's per-trap log. The CLI is the one caller that derives
+    /// it from the process environment.
+    #[must_use]
+    pub fn with_trap_trace(mut self, trap_trace: TrapTrace) -> Self {
+        self.trap_trace = trap_trace;
+        self
     }
 
     /// Build an unmanaged launch at the process-identity boundary, preserving
@@ -267,6 +306,7 @@ impl LaunchContext {
             exec_overlay,
             launch_authorization,
             registry_id,
+            trap_trace: TrapTrace::Off,
         })
     }
 }
@@ -1521,6 +1561,17 @@ mod tests {
         let b = ContainerId::allocate();
         assert_ne!(a, b);
         assert!(b.raw() > a.raw());
+    }
+
+    #[test]
+    fn trap_trace_is_launch_owned_and_off_unless_the_cli_sets_it() {
+        let launch = LaunchContext::unmanaged(RunId::new("trap-trace"));
+        assert_eq!(launch.trap_trace, TrapTrace::Off);
+        assert!(!launch.trap_trace.is_enabled());
+        let traced = launch.with_trap_trace(TrapTrace::from_env_presence(true));
+        assert_eq!(traced.trap_trace, TrapTrace::Stderr);
+        assert!(traced.trap_trace.is_enabled());
+        assert_eq!(TrapTrace::from_env_presence(false), TrapTrace::Off);
     }
 
     #[test]

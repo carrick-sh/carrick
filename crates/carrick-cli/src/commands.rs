@@ -322,7 +322,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     std::process::exit(125);
                 }
             };
-            let launch = match carrick_kernel::kernel::LaunchContext::from_process_env() {
+            let launch = match crate::runtime_util::launch_context_from_process_env() {
                 Ok(launch) => launch,
                 Err(e) => {
                     eprintln!("carrick: {e:#}");
@@ -621,7 +621,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     std::process::exit(125);
                 }
             };
-            let launch = match carrick_kernel::kernel::LaunchContext::from_process_env() {
+            let launch = match crate::runtime_util::launch_context_from_process_env() {
                 Ok(launch) => launch,
                 Err(e) => {
                     eprintln!("carrick: {e:#}");
@@ -2266,7 +2266,7 @@ pub(crate) fn run_build(args: BuildArgs<'_>) -> anyhow::Result<()> {
     crate::runtime_util::emit_resolve_warnings(&resolved.warnings);
     let carrier =
         carrick_runtime::CarrierRuntime::new_explicit().context("create kaniko build carrier")?;
-    let launch = carrick_kernel::kernel::LaunchContext::from_process_env()
+    let launch = crate::runtime_util::launch_context_from_process_env()
         .context("resolve kaniko launch identity")?;
     let result = carrick_runtime::Runtime::execute_on(&carrier, &resolved.spec, launch)
         .context("run kaniko build carrier")?;

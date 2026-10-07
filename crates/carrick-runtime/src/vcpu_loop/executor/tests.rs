@@ -7292,6 +7292,7 @@ fn run_production_exec_failure_pool_case(boundary: InjectedExecFailureBoundary, 
         Arc::clone(&kicker),
         carrick_hal::InGuestFlag::for_guest_thread(),
         1_000,
+        carrick_kernel::kernel::TrapTrace::Off,
     );
     state.execution_lease = execution_lease_cell;
     state.service_kernel_context = Some(context.retain_exact());

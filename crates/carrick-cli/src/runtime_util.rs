@@ -48,6 +48,19 @@ pub(crate) fn host_env_snapshot() -> Vec<(String, String)> {
     std::env::vars().collect()
 }
 
+/// The launch context for a run this CLI process carries: the identity
+/// `LaunchContext::from_process_env` resolves, plus the CLI-owned debug
+/// switches the runtime must not read from the environment itself.
+/// `CARRICK_TRACE_TRAPS` (any value, even empty) turns on the per-trap stderr
+/// log every guest thread of the launch inherits.
+pub(crate) fn launch_context_from_process_env()
+-> Result<carrick_kernel::kernel::LaunchContext, carrick_kernel::run_result::RuntimeError> {
+    let trap_trace = carrick_kernel::kernel::TrapTrace::from_env_presence(
+        std::env::var_os("CARRICK_TRACE_TRAPS").is_some(),
+    );
+    Ok(carrick_kernel::kernel::LaunchContext::from_process_env()?.with_trap_trace(trap_trace))
+}
+
 /// The network-namespace id an unnamed bridge container falls back to:
 /// `anon-<pid>` of this carrier process, minted once here so every guest fork
 /// child inherits the same id. Passed to the engine explicitly; it never
