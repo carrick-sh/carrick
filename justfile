@@ -148,7 +148,7 @@ fixtures-publish SHA:
 fixtures-restore BUNDLE:
     {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- fixtures restore --bundle {{quote(BUNDLE)}}
 
-# Verify the exact-SHA fixture archive before restoration on the gate host.
+# Verify a fixture archive by input identity before restoration on the gate host.
 fixtures-verify BUNDLE:
     {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- fixtures verify --bundle {{quote(BUNDLE)}}
 
@@ -1196,8 +1196,16 @@ ci-changes:
             done < "$paths"
         fi
     fi
+    # Draft PRs defer the hosted macOS jobs: the macOS runner pool is small and
+    # shared with the merge queue. Marking the PR ready reruns them; merge_group
+    # and push runs always include them.
+    macos=true
+    if [[ "${CI_EVENT}" == pull_request && "${CI_DRAFT:-false}" == true ]]; then
+        macos=false
+    fi
     echo "heavy=$heavy" >> "${GITHUB_OUTPUT:?}"
-    echo "Run hosted checks: $heavy"
+    echo "macos=$macos" >> "${GITHUB_OUTPUT:?}"
+    echo "Run hosted checks: $heavy (macOS: $macos)"
 
 # Fail closed: GitHub considers skipped required jobs successful on their own.
 # ci-ok depends on every job; only the filter can license a docs-only PR skip.
@@ -1207,8 +1215,12 @@ ci-results:
     jq -e --arg event "${CI_EVENT:?}" '
       .changes.result == "success" and
       (length > 1) and
-      (if .changes.outputs.heavy == "true" then
+      (if .changes.outputs.heavy == "true" and .changes.outputs.macos == "true" then
          del(.changes) | all(.[]; .result == "success")
+       elif .changes.outputs.heavy == "true" and .changes.outputs.macos == "false" and $event == "pull_request" then
+         del(.changes)
+         | (with_entries(select(.key | startswith("macos-"))) | all(.[]; .result == "skipped"))
+           and (with_entries(select(.key | startswith("macos-") | not)) | all(.[]; .result == "success"))
        elif .changes.outputs.heavy == "false" and $event == "pull_request" then
          del(.changes) | all(.[]; .result == "skipped")
        else false end)
