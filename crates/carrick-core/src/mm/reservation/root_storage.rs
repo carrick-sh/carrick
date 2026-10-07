@@ -346,9 +346,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         )
     }
 
-    #[track_caller]
     pub(super) fn node<'a>(&'a self, id: u32, banks: Option<&'a dyn NodeBanks>) -> &'a Node {
-        assert_ne!(id, 0, "reservation node lookup requires a live ID");
         let index = id as usize - 1;
         if index < NODES {
             return &self.nodes[index];

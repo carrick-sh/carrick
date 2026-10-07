@@ -8244,12 +8244,11 @@ impl HvfInner {
                     let source_line = vcpu.get_reg(Reg::X1).unwrap_or(0);
                     let source_column = vcpu.get_reg(Reg::X2).unwrap_or(0);
                     let publication_detail = vcpu.get_reg(Reg::X3).unwrap_or(0);
-                    let panic_file_hash = vcpu.get_reg(Reg::X4).unwrap_or(0);
                     carrick_fatal!(
                         "el1",
                         "EL1 panic handler invoked: panic sentinel {x0:#x} at elr_el1={elr_el1:#x}; \
                          source_line={source_line} source_column={source_column} \
-                         frame_grant_publication_detail={publication_detail} panic_file_hash={panic_file_hash:#x}"
+                         frame_grant_publication_detail={publication_detail}"
                     );
                 }
                 if is_stage1_cow_write_fault(esr_el1) {
