@@ -35,15 +35,19 @@ pub(crate) fn supervisor_maps() -> [Pml4MapSpec; 2] {
             write: true,
             exec: false,
         },
-        Pml4MapSpec {
-            va: carrick_x86::interrupts::LAPIC_VA,
-            gpa: LAPIC_BASE,
-            len: 4096,
-            user: false,
-            write: true,
-            exec: false,
-        },
+        lapic_map(),
     ]
+}
+
+pub(crate) fn lapic_map() -> Pml4MapSpec {
+    Pml4MapSpec {
+        va: carrick_x86::interrupts::LAPIC_VA,
+        gpa: LAPIC_BASE,
+        len: 4096,
+        user: false,
+        write: true,
+        exec: false,
+    }
 }
 pub(crate) fn data_map(index: u64) -> Pml4MapSpec {
     Pml4MapSpec {

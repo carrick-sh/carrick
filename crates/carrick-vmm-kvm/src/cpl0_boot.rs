@@ -415,6 +415,20 @@ impl Cpl0Carrier {
         .is_ok())
     }
 
+    /// Inspect the stopped bootstrap root's native xAPIC MMIO mapping.
+    pub fn bootstrap_lapic_mapped(&self) -> Result<bool, TrapError> {
+        let root = RootGpa::page_aligned(FrameGpa::new(LAYOUT.pml4_base))
+            .ok_or_else(|| fail("bootstrap root alignment"))?;
+        Ok(translate_leaf(
+            &self._vm.words(),
+            root,
+            UserVa::new(carrick_x86::interrupts::LAPIC_VA),
+            Access::Write,
+            false,
+        )
+        .is_ok_and(|leaf| leaf.output.raw() == carrick_x86::interrupts::LAPIC_BASE))
+    }
+
     pub fn boot(image: &Path, programs: [&[u8]; 2]) -> Result<Self, TrapError> {
         Self::boot_inner(image, programs, false)
     }
@@ -965,6 +979,7 @@ impl Cpl0Carrier {
         initial_extent_bytes: Option<usize>,
         fixture_image: bool,
     ) -> Result<Self, TrapError> {
+        let hardware_interrupts = interrupts || initial_extent_bytes.is_some();
         let plan = carrick_mem::elf::plan_elf_load_bytes_for(bytes, 62)
             .map_err(|e| fail(format!("CPL0 ELF: {e}")))?;
         if !(IMAGE_VA..IMAGE_VA + 0x10_0000).contains(&plan.entry) {
@@ -1108,6 +1123,8 @@ impl Cpl0Carrier {
         if interrupts {
             maps.extend(crate::carrier_interrupts::supervisor_maps());
             maps.push(crate::carrier_interrupts::data_map(0));
+        } else if hardware_interrupts {
+            maps.push(crate::carrier_interrupts::lapic_map());
         }
         // CPL0 ordinary loads/copies can race a page-table publication after
         // preflight. Keep every bootstrap supervisor leaf outside the user
@@ -1270,7 +1287,7 @@ impl Cpl0Carrier {
         }
         let ram = Arc::new(ram);
         let mut memory = CarrierMemory::create().map_err(|e| fail(e.to_string()))?;
-        if interrupts {
+        if hardware_interrupts {
             crate::carrier_interrupts::create_irqchip(memory.vm())?;
         }
         memory
@@ -1355,7 +1372,7 @@ impl Cpl0Carrier {
                 + carrick_x86::fault_slot_gpa(carrick_x86::fault_idt_base(LAYOUT), index as u64)?;
             system.tr.base = DIRECT_VA
                 + carrick_x86::fault_slot_gpa(carrick_x86::fault_tss_base(LAYOUT), index as u64)?;
-            if interrupts {
+            if hardware_interrupts {
                 system.apic_base = carrick_x86::interrupts::LAPIC_BASE
                     | 0x800
                     | if index == 0 { 0x100 } else { 0 };
@@ -1368,7 +1385,7 @@ impl Cpl0Carrier {
                 boot.star,
                 boot.sfmask | (1 << 10) | (1 << 8) | (1 << 18),
             )?;
-            if interrupts {
+            if hardware_interrupts {
                 // KVM_CREATE_IRQCHIP leaves the secondary vCPU awaiting SIPI.
                 // Both native CPL0 entry states were installed while stopped;
                 // admit each CPU before exposing the carrier to its owner.
@@ -1429,7 +1446,7 @@ impl Cpl0Carrier {
             // SAFETY: both vCPUs are stopped and the retained binding was
             // initialized above; atomic publication precedes guest entry.
             unsafe { (*binding).tsc_hz.store(hz, Ordering::Release) };
-            if interrupts {
+            if hardware_interrupts {
                 let mut lapic = cpu
                     .fd()
                     .get_lapic()
@@ -1454,7 +1471,7 @@ impl Cpl0Carrier {
                     .map_err(|e| fail(format!("KVM_SET_LAPIC: {e}")))?;
             }
         }
-        if interrupts {
+        if hardware_interrupts {
             if apic_ids[0] == apic_ids[1] {
                 return Err(fail("duplicate KVM xAPIC destination"));
             }
