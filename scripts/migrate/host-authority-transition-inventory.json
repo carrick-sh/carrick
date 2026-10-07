@@ -353,18 +353,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:279 in `set_init`, the host result from `libc::getpgrp` determines the guest PID-namespace identity mapping used by `set_init`.",
+    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:280 in `set_init`, the host result from `libc::getpgrp` determines the guest PID-namespace identity mapping used by `set_init`.",
     "review_id": "HA-000013",
     "source": {
-      "byte_end": 10607,
-      "byte_start": 10594,
+      "byte_end": 10676,
+      "byte_start": 10663,
       "column": 39,
       "column_end": 52,
       "column_start": 39,
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 279,
-      "line_end": 279,
-      "line_start": 279
+      "line": 280,
+      "line_end": 280,
+      "line_start": 280
     }
   },
   {
@@ -382,18 +382,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:518 in `refresh_init_host_pgid`, the host result from `libc::getpgrp` determines the guest PID-namespace identity mapping used by `refresh_init_host_pgid`.",
+    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:529 in `refresh_init_host_pgid`, the host result from `libc::getpgrp` determines the guest PID-namespace identity mapping used by `refresh_init_host_pgid`.",
     "review_id": "HA-000014",
     "source": {
-      "byte_end": 20046,
-      "byte_start": 20033,
+      "byte_end": 20432,
+      "byte_start": 20419,
       "column": 25,
       "column_end": 38,
       "column_start": 25,
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 518,
-      "line_end": 518,
-      "line_start": 518
+      "line": 529,
+      "line_end": 529,
+      "line_start": 529
     }
   },
   {
@@ -1175,18 +1175,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:630 in `self_ns_ppid`, the host result from `libc::getppid` determines the guest PID-namespace identity mapping used by `self_ns_ppid`.",
+    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:641 in `self_ns_ppid`, the host result from `libc::getppid` determines the guest PID-namespace identity mapping used by `self_ns_ppid`.",
     "review_id": "HA-000052",
     "source": {
-      "byte_end": 25181,
-      "byte_start": 25168,
+      "byte_end": 25567,
+      "byte_start": 25554,
       "column": 25,
       "column_end": 38,
       "column_start": 25,
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 630,
-      "line_end": 630,
-      "line_start": 630
+      "line": 641,
+      "line_end": 641,
+      "line_start": 641
     }
   },
   {
@@ -1204,18 +1204,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:649 in `self_ns_ppid`, the host result from `libc::getppid` determines the guest PID-namespace identity mapping used by `self_ns_ppid`.",
+    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:660 in `self_ns_ppid`, the host result from `libc::getppid` determines the guest PID-namespace identity mapping used by `self_ns_ppid`.",
     "review_id": "HA-000053",
     "source": {
-      "byte_end": 25829,
-      "byte_start": 25816,
+      "byte_end": 26215,
+      "byte_start": 26202,
       "column": 30,
       "column_end": 43,
       "column_start": 30,
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 649,
-      "line_end": 649,
-      "line_start": 649
+      "line": 660,
+      "line_end": 660,
+      "line_start": 660
     }
   },
   {
@@ -1435,18 +1435,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:285 in `set_init`, the host result from `libc::getsid` determines the guest PID-namespace session identity used by `set_init`.",
+    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:286 in `set_init`, the host result from `libc::getsid` determines the guest PID-namespace session identity used by `set_init`.",
     "review_id": "HA-000061",
     "source": {
-      "byte_end": 10822,
-      "byte_start": 10810,
+      "byte_end": 10891,
+      "byte_start": 10879,
       "column": 38,
       "column_end": 50,
       "column_start": 38,
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 285,
-      "line_end": 285,
-      "line_start": 285
+      "line": 286,
+      "line_end": 286,
+      "line_start": 286
     }
   },
   {
@@ -14316,18 +14316,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:587 in `self_ns_pid`, the host result from `std::process::id` determines the guest PID-namespace self identity used by `self_ns_pid`.",
+    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:598 in `self_ns_pid`, the host result from `std::process::id` determines the guest PID-namespace self identity used by `self_ns_pid`.",
     "review_id": "HA-000534",
     "source": {
-      "byte_end": 23293,
-      "byte_start": 23277,
+      "byte_end": 23679,
+      "byte_start": 23663,
       "column": 16,
       "column_end": 32,
       "column_start": 16,
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 587,
-      "line_end": 587,
-      "line_start": 587
+      "line": 598,
+      "line_end": 598,
+      "line_start": 598
     }
   },
   {
@@ -14345,18 +14345,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:632 in `self_ns_ppid`, the host result from `std::process::id` determines the guest PID-namespace parent identity used by `self_ns_ppid`.",
+    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:643 in `self_ns_ppid`, the host result from `std::process::id` determines the guest PID-namespace parent identity used by `self_ns_ppid`.",
     "review_id": "HA-000535",
     "source": {
-      "byte_end": 25236,
-      "byte_start": 25220,
+      "byte_end": 25622,
+      "byte_start": 25606,
       "column": 21,
       "column_end": 37,
       "column_start": 21,
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 632,
-      "line_end": 632,
-      "line_start": 632
+      "line": 643,
+      "line_end": 643,
+      "line_start": 643
     }
   },
   {
@@ -14374,18 +14374,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:963 in `is_execed_child_of_current`, the host result from `std::process::id` determines the guest exec-child ancestry result used by `is_execed_child_of_current`.",
+    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:974 in `is_execed_child_of_current`, the host result from `std::process::id` determines the guest exec-child ancestry result used by `is_execed_child_of_current`.",
     "review_id": "HA-000537",
     "source": {
-      "byte_end": 39209,
-      "byte_start": 39193,
+      "byte_end": 39595,
+      "byte_start": 39579,
       "column": 43,
       "column_end": 59,
       "column_start": 43,
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 963,
-      "line_end": 963,
-      "line_start": 963
+      "line": 974,
+      "line_end": 974,
+      "line_start": 974
     }
   },
   {
@@ -18721,18 +18721,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:1085 in `PidNamespace::register`, `std::thread::yield_now` schedules only the current carrier worker while kernel namespace-record ownership settles; no host identity supplies the namespace membership answer.",
+    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:1096 in `PidNamespace::register`, `std::thread::yield_now` schedules only the current carrier worker while kernel namespace-record ownership settles; no host identity supplies the namespace membership answer.",
     "review_id": "HA-000634",
     "source": {
-      "byte_end": 43284,
-      "byte_start": 43262,
+      "byte_end": 43670,
+      "byte_start": 43648,
       "column": 13,
       "column_end": 35,
       "column_start": 13,
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 1085,
-      "line_end": 1085,
-      "line_start": 1085
+      "line": 1096,
+      "line_end": 1096,
+      "line_start": 1096
     }
   },
   {
@@ -18750,18 +18750,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:1455 in `PidNamespace::unregister_reaped_ref`, `std::thread::yield_now` schedules only the current carrier worker while an exact kernel record transition settles; no host identity supplies the retirement answer.",
+    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:1466 in `PidNamespace::unregister_reaped_ref`, `std::thread::yield_now` schedules only the current carrier worker while an exact kernel record transition settles; no host identity supplies the retirement answer.",
     "review_id": "HA-000635",
     "source": {
-      "byte_end": 56728,
-      "byte_start": 56706,
+      "byte_end": 57114,
+      "byte_start": 57092,
       "column": 21,
       "column_end": 43,
       "column_start": 21,
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 1455,
-      "line_end": 1455,
-      "line_start": 1455
+      "line": 1466,
+      "line_end": 1466,
+      "line_start": 1466
     }
   },
   {
