@@ -228,43 +228,27 @@ fn run_member(
         request.generation.load(Ordering::Acquire) > request.served[slot].load(Ordering::Acquire)
     });
     if has_debt {
-        if sregs.cs.dpl == 3 {
-            if !stopped_at_interruptible_user(cpu)? {
-                return Err(fail("shootdown debt requires interruptible CPL3 reentry"));
-            }
-            let lapic = cpu.fd().get_lapic().map_err(|e| fail(e.to_string()))?;
-            let apic_id = u32::from_le_bytes([
-                lapic.regs[0x20] as u8,
-                lapic.regs[0x21] as u8,
-                lapic.regs[0x22] as u8,
-                lapic.regs[0x23] as u8,
-            ]) >> 24;
-            let delivered = vm
-                .signal_msi(kvm_msi {
-                    address_lo: 0xfee0_0000 | (apic_id << 12),
-                    data: u32::from(carrick_x86::interrupts::KICK_VECTOR),
-                    ..Default::default()
-                })
-                .map_err(|e| fail(format!("KVM_SIGNAL_MSI reentry: {e}")))?;
-            if delivered <= 0 {
-                return Err(fail("reentry shootdown MSI was blocked"));
-            }
-        } else if sregs.cs.dpl == 0 {
-            // Settle shootdown debt for stopped CPL0 vCPU before KVM_RUN:
-            // Rewriting sregs via KVM_SET_SREGS forces KVM to reload CR3 and
-            // flush guest non-global TLB translations before resuming CPL0 execution.
-            cpu.fd()
-                .set_sregs(&sregs)
-                .map_err(|e| fail(e.to_string()))?;
-            for request in &table.requests {
-                let generation = request.generation.load(Ordering::Acquire);
-                if generation > request.served[slot].load(Ordering::Acquire) {
-                    request.served[slot].store(generation, Ordering::Release);
-                    request.ack[slot].store(generation, Ordering::Release);
-                }
-            }
-        } else {
+        if sregs.cs.dpl == 3 && !stopped_at_interruptible_user(cpu)? {
+            return Err(fail("shootdown debt requires interruptible CPL3 reentry"));
+        } else if sregs.cs.dpl != 0 && sregs.cs.dpl != 3 {
             return Err(fail("shootdown debt on unsupported CPL reentry"));
+        }
+        let lapic = cpu.fd().get_lapic().map_err(|e| fail(e.to_string()))?;
+        let apic_id = u32::from_le_bytes([
+            lapic.regs[0x20] as u8,
+            lapic.regs[0x21] as u8,
+            lapic.regs[0x22] as u8,
+            lapic.regs[0x23] as u8,
+        ]) >> 24;
+        let delivered = vm
+            .signal_msi(kvm_msi {
+                address_lo: 0xfee0_0000 | (apic_id << 12),
+                data: u32::from(carrick_x86::interrupts::KICK_VECTOR),
+                ..Default::default()
+            })
+            .map_err(|e| fail(format!("KVM_SIGNAL_MSI reentry: {e}")))?;
+        if delivered <= 0 {
+            return Err(fail("reentry shootdown MSI was blocked"));
         }
     }
     let result = HvVcpu::run(cpu)?;
@@ -2210,9 +2194,9 @@ impl Cpl0Carrier {
         self.fixture_run_until(index, FixtureStopCondition::PendingKick(index))
     }
 
-    /// Run the vCPU until it stops on FORWARD_PORT in CPL0, setting its frame
-    /// result to zero so it can resume transparently.
-    pub fn fixture_run_until_forward(&mut self, index: usize) -> Result<(), TrapError> {
+    /// Run the vCPU until it stops on FORWARD_PORT in CPL0, returning the saved
+    /// control frame and setting its frame result to zero so it can resume transparently.
+    pub fn fixture_run_until_forward(&mut self, index: usize) -> Result<NativeFrame, TrapError> {
         let exit = self.run_cpu(index)?;
         let VcpuExit::IoOut {
             port: FORWARD_PORT, ..
@@ -2238,8 +2222,20 @@ impl Cpl0Carrier {
             .host_ptr(address - DIRECT_VA, size_of::<NativeFrame>())
             .ok_or_else(|| fail("CPL0 control frame outside backing"))?
             .cast::<NativeFrame>();
+        let frame = unsafe { *ptr };
         unsafe { (*ptr).rax = 0 };
-        Ok(())
+        Ok(frame)
+    }
+
+    /// Read a CPU's last seen shootdown generation recorded by its CR3 reload path.
+    pub fn fixture_last_seen_generation(&self, index: usize) -> Result<u64, TrapError> {
+        if index >= self.cpus.len() {
+            return Err(fail("unknown CPL0 CPU slot"));
+        }
+        Ok(self
+            .binding(index)
+            .last_seen_generation
+            .load(Ordering::Acquire))
     }
 
     /// Exact retained generations and acknowledgements for a stopped fixture.

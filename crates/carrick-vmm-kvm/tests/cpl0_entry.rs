@@ -1288,9 +1288,14 @@ fn stopped_cpl0_cpu_drops_stale_translation_before_cpl0_access() {
     carrier.fixture_write_backing_byte(0xd1_1000, 0x11).unwrap();
     assert_eq!(carrier.observe(0).expect("prepare old page").result, 1);
 
-    carrier
+    let frame1 = carrier
         .fixture_run_until_forward(1)
-        .expect("reader stopped on FORWARD_PORT in CPL0");
+        .expect("reader stopped on first FORWARD_PORT in CPL0");
+    assert_eq!(
+        frame1.rbx, 0x11,
+        "reader must hold proven warm translation reading 0x11 before stop"
+    );
+
     assert_eq!(carrier.observe(0).expect("retire old page").result, 1);
     let [(root, generation, ack), _] = carrier.fixture_shootdown_state();
     assert_eq!(root, 0x60_0000);
@@ -1303,26 +1308,33 @@ fn stopped_cpl0_cpu_drops_stale_translation_before_cpl0_access() {
         carrier.fixture_shootdown_served(0, 1).unwrap() < generation,
         "stopped CPU in CPL0 must still owe its drain"
     );
+    assert!(
+        carrier.fixture_last_seen_generation(1).unwrap() < generation,
+        "stopped CPU in CPL0 must not have reloaded CR3 for new generation yet"
+    );
     carrier.fixture_write_backing_byte(0xd1_1000, 0x22).unwrap();
 
-    carrier
+    let frame2 = carrier
         .fixture_run_until_forward(1)
         .expect("resumed CPL0 user access stopped on second FORWARD_PORT");
     assert_eq!(
-        carrier.fixture_shootdown_served(0, 1).unwrap(),
-        generation,
-        "shootdown must be served after CPL0 settlement"
+        frame2.rax as i64, -14,
+        "resumed CPL0 user access must fault on unmapped page, not read stale TLB"
     );
     let [(_, generation, ack), _] = carrier.fixture_shootdown_state();
     assert!(
         ack[1] >= generation,
         "shootdown must be acknowledged after CPL0 settlement"
     );
-
-    let result = carrier.observe(1).expect("read result");
     assert_eq!(
-        result.result, -14,
-        "resumed CPL0 user access must fault on unmapped page, not read stale TLB"
+        carrier.fixture_shootdown_served(0, 1).unwrap(),
+        generation,
+        "shootdown must be served after CPL0 settlement"
+    );
+    assert_eq!(
+        carrier.fixture_last_seen_generation(1).unwrap(),
+        generation,
+        "CR3 must be reloaded after CPL0 settlement"
     );
 }
 
