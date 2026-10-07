@@ -35,6 +35,11 @@ pub fn send_resched(slot: carrick_sched_core::SlotId) -> Result<(), ArchError> {
 
 /// Query the TSC frequency from architectural CPUID or the exact KVM binding.
 pub fn tsc_frequency() -> Option<NonZeroU64> {
+    if let Some(hz) = super::context::current_cpu_binding()
+        .and_then(|binding| NonZeroU64::new(binding.tsc_hz.load(Ordering::Acquire)))
+    {
+        return Some(hz);
+    }
     let max_leaf: u32;
     // SAFETY: CPUID leaf 0 returns max basic leaf without side effects.
     unsafe {
@@ -97,8 +102,7 @@ pub fn tsc_frequency() -> Option<NonZeroU64> {
             return Some(hz);
         }
     }
-    super::context::current_cpu_binding()
-        .and_then(|binding| NonZeroU64::new(binding.tsc_hz.load(Ordering::Acquire)))
+    None
 }
 
 fn has_tsc_deadline() -> bool {
