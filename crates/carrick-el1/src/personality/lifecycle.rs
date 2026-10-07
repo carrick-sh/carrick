@@ -15,6 +15,14 @@ use carrick_personality_linux::entry::aarch64_child_vdso_identity;
 pub use carrick_personality_linux::lifecycle::*;
 pub use carrick_personality_linux::thread::{LifecycleThread, SYS_SET_ROBUST_LIST};
 
+impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord> El1PendingFamilies<'a, F, C, U> {
+    fn process_venue(&mut self) -> Option<&mut (dyn ProcessNative + 'a)> {
+        let binding = LifecycleNative::binding(self)?;
+        let venue = self.process.as_deref_mut()?;
+        (venue.binding() == binding).then_some(venue)
+    }
+}
+
 impl<F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord> UserCopy
     for El1PendingFamilies<'_, F, C, U>
 {
@@ -51,6 +59,20 @@ impl<F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord> UserCopy
 impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord> LifecycleNative<'a>
     for El1PendingFamilies<'a, F, C, U>
 {
+    fn process_fork(&mut self) -> Option<LifecycleOutcome> {
+        Some(self.process_venue()?.fork())
+    }
+    fn process_wait4(
+        &mut self,
+        pid: ProcessWaitPid,
+        status: UserVa,
+        options: LinuxWaitOptions,
+    ) -> Option<LifecycleOutcome> {
+        Some(self.process_venue()?.wait4(pid, status, options))
+    }
+    fn process_exit_group(&mut self, status: u8) -> Option<LifecycleOutcome> {
+        Some(self.process_venue()?.exit_group(status))
+    }
     fn arguments(&self) -> [u64; 6] {
         [
             self.frame.x[0],

@@ -494,6 +494,7 @@ dependencies = [
  "carrick-mmu-core",
  "carrick-personality-linux",
  "carrick-sched-core",
+ "carrick-test-support",
  "zerocopy",
 ]
 

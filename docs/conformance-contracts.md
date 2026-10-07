@@ -623,7 +623,7 @@ incarnation; its parent permit is available only after cancelling those members.
 Notification selection authenticates the exact parent, then snapshots signal
 state outside the registry guard through the existing shared signal policy.
 
-The structural exit-effect test uses 1/8/32/128 own members and 512 unrelated
+The structural exit-effect test uses 0/1/8/32/128 own members and 512 unrelated
 processes: it visits each own member once, performs at most four identity reads
 for the exiting task, and performs zero unrelated identity/member reads. A full
 population-scan mutant fails this budget. An unrelated reservation is refused
@@ -660,3 +660,23 @@ The terminal fixture fault suffix emits one completion exit after unmasking
 KICK; production keeps its terminal halt and contains no fixture hold polling.
 No VM-free runner can witness real TLB contents. HVF signed execution and Docker
 are outside this x86 KVM binding; this lane uses `CARRICK_REQUIRE_KVM=1`.
+
+
+## Process entry native custody (`kernel.process.entry-owner`)
+
+CPL0 process calls use the existing Linux lifecycle dispatcher and completion
+owner. Before invoking native fork, wait4 or exit_group custody, the pending
+family must authenticate task, task generation, MM and thread generation.
+A mismatch invokes zero native effects. A matching entry invokes its one
+native operation; native custody returns a LifecycleOutcome, never publishes
+a second completion. Existing ARM consumers supply no process venue.
+
+The VM-free `process_native_hooks_require_every_execution_identity_component`
+test independently changes each binding component and checks all three hooks.
+The native hook absence is red before the bridge. The
+`x86_parked_context_roots_clone_through_shared_fork_owner` fixture inherits a
+real anonymous reservation through the existing shared fork traits with CPL0
+parked contexts and aligned, co-located reservation/zone storage. The previous
+ARM-only trait implementations are structural red; context parameterization
+preserves the ARM default. This is adapter and owner-custody evidence; CPU1
+execution and the live two-MM PRIVATE witness remain required.

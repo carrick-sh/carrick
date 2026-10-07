@@ -209,8 +209,11 @@ fn refusal_to_fork_error(e: Refusal) -> ForkError {
     }
 }
 
-impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> ForkChildRoot
-    for Reservations<'_, Policy, Geometry>
+impl<
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+> ForkChildRoot for Reservations<'_, Policy, Geometry, C>
 {
     fn incarnation(&self) -> u64 {
         self.incarnation().raw()
@@ -254,8 +257,12 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> ForkChildRoot
     }
 }
 
-impl<'b, Policy: ReservationPolicy, Geometry: ReservationGeometry>
-    ForkParentRoot<Reservations<'b, Policy, Geometry>> for Reservations<'_, Policy, Geometry>
+impl<
+    'b,
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+> ForkParentRoot<Reservations<'b, Policy, Geometry, C>> for Reservations<'_, Policy, Geometry, C>
 {
     fn incarnation(&self) -> u64 {
         self.incarnation().raw()
@@ -284,7 +291,7 @@ impl<'b, Policy: ReservationPolicy, Geometry: ReservationGeometry>
 
     fn clone_into(
         &mut self,
-        child: &mut Reservations<'b, Policy, Geometry>,
+        child: &mut Reservations<'b, Policy, Geometry, C>,
     ) -> Result<(), ForkError> {
         self.clone_into(child).map_err(refusal_to_fork_error)
     }

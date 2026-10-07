@@ -267,6 +267,7 @@ where
         zone,
         ipc,
         lifecycle::guest_venue(),
+        None,
         cache_lookup,
     )
 }
@@ -287,6 +288,7 @@ pub fn dispatch_syscall_with_lifecycle<'a, F, C, U>(
     zone: Option<Zone<'a, C, U>>,
     ipc: Option<&'a ipc::IpcVenue<'a>>,
     lifecycle: Option<&'a dyn lifecycle::LifecycleVenue>,
+    process: Option<&'a mut dyn lifecycle::ProcessNative>,
     cache_lookup: F,
 ) -> Action
 where
@@ -310,6 +312,7 @@ where
         zone,
         ipc,
         lifecycle,
+        process,
         cache_lookup,
     };
     let control = if cfg!(feature = "allocator-test-control") {
@@ -355,6 +358,7 @@ pub struct El1PendingFamilies<'a, F, C: sched::ThreadCpu, U: sched::UserWord> {
     pub(super) zone: Option<Zone<'a, C, U>>,
     pub(super) ipc: Option<&'a ipc::IpcVenue<'a>>,
     pub(super) lifecycle: Option<&'a dyn lifecycle::LifecycleVenue>,
+    pub(super) process: Option<&'a mut dyn lifecycle::ProcessNative>,
     pub(super) cache_lookup: F,
 }
 impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFamilies<'a>
@@ -1052,6 +1056,7 @@ mod tests {
                     zone: None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
                     ipc: None,
                     lifecycle: Some(&venue),
+                    process: None,
                     cache_lookup: |_| core::ptr::null_mut(),
                 };
                 assert_eq!(
@@ -1225,6 +1230,7 @@ mod tests {
                             }),
                             ipc: None,
                             lifecycle: None,
+                            process: None,
                             cache_lookup: |_| core::ptr::null_mut(),
                         };
                         assert_eq!(

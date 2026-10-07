@@ -28,6 +28,7 @@ path = "src/entry.rs"
 path = "src/lib.rs"
 
 [dev-dependencies]
+carrick-test-support = { path = "../carrick-test-support" }
 carrick-core = { path = "../carrick-core", features = ["host-test"] }
 carrick-aarch64 = { path = "../carrick-aarch64" }
 carrick-hal = { path = "../carrick-hal" }

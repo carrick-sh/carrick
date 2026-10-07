@@ -214,6 +214,7 @@ fn admitted_thread_creation_owns_one_completion_at_1_8_32() {
                             }),
                             None,
                             Some(venue),
+                            None,
                             |_| core::ptr::null_mut(),
                         ),
                         Action::Served
