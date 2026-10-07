@@ -1431,6 +1431,50 @@ impl Cpl0Carrier {
     pub(crate) fn binding(&self, index: usize) -> &CpuBinding {
         self.metadata(BINDING_OFFSET + index as u64 * STRIDE)
     }
+    /// Override the stopped fixture CPU's published clock for a source-order
+    /// witness. The KVM clock itself is unchanged; only the guest binding is
+    /// sampled by the frequency syscall below.
+    pub fn fixture_publish_tsc_hz(&mut self, index: usize, hz: u64) -> Result<(), TrapError> {
+        if index >= self.cpus.len() || hz == 0 {
+            return Err(fail("invalid fixture TSC binding"));
+        }
+        self.binding(index).tsc_hz.store(hz, Ordering::Release);
+        Ok(())
+    }
+    /// Publish a distinct architectural CPUID rate before the fixture vCPU
+    /// runs, so the witness can prove the carrier binding wins the selection.
+    pub fn fixture_publish_cpuid_tsc_hz(&mut self, index: usize, hz: u32) -> Result<(), TrapError> {
+        let cpu = self
+            .cpus
+            .get(index)
+            .ok_or_else(|| fail("unknown CPL0 CPU slot"))?;
+        if hz == 0 {
+            return Err(fail("invalid fixture CPUID clock"));
+        }
+        let cpuid = cpu
+            .fd()
+            .get_cpuid2(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .map_err(|e| fail(format!("KVM_GET_CPUID2: {e}")))?;
+        let mut entries = cpuid.as_slice().to_vec();
+        let leaf0 = entries
+            .iter_mut()
+            .find(|entry| entry.function == 0)
+            .ok_or_else(|| fail("missing CPUID leaf zero"))?;
+        leaf0.eax = leaf0.eax.max(0x15);
+        entries.retain(|entry| entry.function != 0x15);
+        entries.push(kvm_bindings::kvm_cpuid_entry2 {
+            function: 0x15,
+            eax: 1,
+            ebx: 1,
+            ecx: hz,
+            ..Default::default()
+        });
+        let cpuid = kvm_bindings::CpuId::from_entries(&entries)
+            .map_err(|e| fail(format!("fixture CPUID entries: {e}")))?;
+        cpu.fd()
+            .set_cpuid2(&cpuid)
+            .map_err(|e| fail(format!("KVM_SET_CPUID2: {e}")))
+    }
     /// Observe the stopped fixture vCPU's local timer configuration.
     pub fn lapic_register(&self, index: usize, offset: usize) -> Result<u32, TrapError> {
         let cpu = self
