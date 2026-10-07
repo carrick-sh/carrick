@@ -133,7 +133,20 @@ fn fixture_cpuid_with_tsc_hz(
 /// The host's disposition of one Linux call forwarded by the shared guest.
 pub enum InitialSyscallDisposition {
     Return(i64),
-    Exit(i32),
+    Refused(carrick_abi::LinuxErrno),
+    Exit(GuestExitStatus),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuestExitStatus(u8);
+impl GuestExitStatus {
+    pub const fn from_linux_code(code: i32) -> Self {
+        Self(code as u8)
+    }
+
+    pub const fn code(self) -> i32 {
+        self.0 as i32
+    }
 }
 
 fn backing_identity(ids: &ObjectIdRegistry) -> Result<BackingIdentity, TrapError> {
@@ -1397,6 +1410,7 @@ impl Cpl0Carrier {
                 thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(101),
             },
         )?;
+        self.task(0).publish_visible_pid(41);
         zone.current_or_new(
             slot,
             carrick_sched_core::ThreadIdentity {
@@ -1493,7 +1507,10 @@ impl Cpl0Carrier {
             self.host_forwards += 1;
             match forward(self, &frame)? {
                 InitialSyscallDisposition::Return(value) => frame.rax = value as u64,
-                InitialSyscallDisposition::Exit(code) => return Ok((code, exits)),
+                InitialSyscallDisposition::Refused(errno) => {
+                    frame.rax = errno.guest_retval() as u64;
+                }
+                InitialSyscallDisposition::Exit(code) => return Ok((code.code(), exits)),
             }
             // SAFETY: `ptr` names the validated retained supervisor stack and
             // the vCPU is stopped until the next `HvVcpu::run` above.

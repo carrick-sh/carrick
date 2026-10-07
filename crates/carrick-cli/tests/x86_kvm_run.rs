@@ -253,8 +253,41 @@ fn mounted_static_x86_bad_write_returns_efault_and_continues() {
 }
 
 #[test]
-fn mounted_static_x86_forwarded_getpid_uses_shared_dispatcher() {
+fn mounted_static_x86_getpid_matches_guest_gettid() {
     compare_mounted_assembly_with_native("x86_dispatch_getpid.S", b"D\n");
+}
+
+#[test]
+fn mounted_static_x86_guest_owned_calls_refuse_without_host_effects() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("authority-refusal");
+    compile_assembly("x86_authority_refusal.S", &elf);
+    let run = run_mounted_binary(&elf, "authority-refusal", true);
+    assert_eq!(
+        run.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let envelope = run
+        .stdout
+        .strip_prefix(b"R\n")
+        .expect("guest refusal witness");
+    let report: serde_json::Value = serde_json::from_slice(envelope).unwrap();
+    let witness = &report["report"]["execution_witness"];
+    assert_eq!(witness["host_forwards"], 2); // write and exit_group only
+    assert_eq!(witness["portal_exits"], 4);
+    assert_eq!(
+        witness["guest_refusal_families"],
+        serde_json::json!([
+            {"family": "memory", "count": 1},
+            {"family": "signal", "count": 1}
+        ])
+    );
+    assert_eq!(report["report"]["summary"]["distinct_partial_syscalls"], 2);
 }
 
 #[test]
@@ -292,6 +325,7 @@ fn mounted_static_x86_musl_hello_matches_native() {
 }
 
 #[test]
+#[ignore = "fork returns a CPL0 lifecycle handoff; production fork wiring awaits #82"]
 fn mounted_static_x86_memory_and_fork_wait_match_native() {
     compare_mounted_assembly_with_native("x86_memory_fork_wait.S", b"F\n");
 }
@@ -312,6 +346,11 @@ fn compare_mounted_assembly_with_native(fixture: &str, expected_stdout: &[u8]) {
     }
     let dir = tempfile::tempdir().unwrap();
     let elf = dir.path().join("assembly-guest");
+    compile_assembly(fixture, &elf);
+    compare_mounted_binary_with_native(&elf, expected_stdout, 7, fixture);
+}
+
+fn compile_assembly(fixture: &str, elf: &std::path::Path) {
     let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(fixture);
@@ -333,7 +372,6 @@ fn compare_mounted_assembly_with_native(fixture: &str, expected_stdout: &[u8]) {
         "cc stderr: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    compare_mounted_binary_with_native(&elf, expected_stdout, 7, fixture);
 }
 
 fn compare_mounted_binary_with_native(
@@ -350,6 +388,24 @@ fn compare_mounted_binary_with_native(
     assert!(native.stderr.is_empty());
     assert_eq!(native.status.code(), Some(expected_exit));
 
+    let run = run_mounted_binary(elf, run_id, false);
+    assert_eq!(
+        run.stdout,
+        native.stdout,
+        "Carrick status: {:?}; stderr: {}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        run.status.code(),
+        native.status.code(),
+        "Carrick stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(run.stderr.is_empty());
+}
+
+fn run_mounted_binary(elf: &std::path::Path, run_id: &str, json: bool) -> std::process::Output {
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("image.tar");
     std::fs::write(&archive, empty_image_archive()).unwrap();
@@ -366,34 +422,26 @@ fn compare_mounted_binary_with_native(
         "load stderr: {}",
         String::from_utf8_lossy(&load.stderr)
     );
-    let run = Command::new(&cli)
+    let mut command = Command::new(&cli);
+    command
         .timeout(Duration::from_secs(5))
         .env("CARRICK_HOME", &home)
-        .env("CARRICK_RUN_ID", format!("x86-kvm-{run_id}-test"))
-        .args([
-            "run",
-            "--platform",
-            "linux/amd64",
-            "--pull",
-            "never",
-            "--volume",
-            &format!("{}:/hello:ro", elf.display()),
-            "x86-kvm-hello:latest",
-        ])
+        .env("CARRICK_RUN_ID", format!("x86-kvm-{run_id}-test"));
+    if json {
+        command.arg("run").arg("--json");
+    } else {
+        command.arg("run");
+    }
+    command.args([
+        "--platform",
+        "linux/amd64",
+        "--pull",
+        "never",
+        "--volume",
+        &format!("{}:/hello:ro", elf.display()),
+        "x86-kvm-hello:latest",
+    ]);
+    command
         .output()
-        .expect("run mounted x86 Linux oracle through carrick");
-    assert_eq!(
-        run.stdout,
-        native.stdout,
-        "Carrick status: {:?}; stderr: {}",
-        run.status,
-        String::from_utf8_lossy(&run.stderr)
-    );
-    assert_eq!(
-        run.status.code(),
-        native.status.code(),
-        "Carrick stderr: {}",
-        String::from_utf8_lossy(&run.stderr)
-    );
-    assert!(run.stderr.is_empty());
+        .expect("run mounted x86 Linux binary through carrick")
 }

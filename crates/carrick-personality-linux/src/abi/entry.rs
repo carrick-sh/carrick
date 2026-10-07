@@ -64,12 +64,15 @@ impl Default for LinuxTaskState {
 pub struct LinuxTaskMetadata {
     pub lifecycle_page: AtomicU64,
     pub control_slot: AtomicU64,
+    /// Namespace-visible process leader, published by the task owner.
+    pub visible_pid: AtomicU32,
 }
 impl LinuxTaskMetadata {
     pub const fn new() -> Self {
         Self {
             lifecycle_page: AtomicU64::new(0),
             control_slot: AtomicU64::new(0),
+            visible_pid: AtomicU32::new(0),
         }
     }
 }
@@ -85,7 +88,7 @@ const _: () = {
     assert!(core::mem::offset_of!(LinuxTaskState, orig_arg0) == 16);
     assert!(core::mem::offset_of!(LinuxTaskState, pending_host_work) == 24);
     assert!(core::mem::offset_of!(LinuxTaskState, served_with_work) == 28);
-    assert!(core::mem::size_of::<LinuxTaskMetadata>() == 16);
+    assert!(core::mem::size_of::<LinuxTaskMetadata>() == 24);
 };
 
 /// What a thread owes the host after EL1 served its syscall with work.

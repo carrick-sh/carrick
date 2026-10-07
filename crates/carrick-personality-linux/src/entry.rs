@@ -24,6 +24,7 @@ pub fn decode_x86_64(native: u64, mut args: [u64; 6], stack: u64) -> CanonicalCa
         }
         60 => 93,
         186 => 178,
+        39 => 172,
         14 => 135,
         131 => 132,
         202 => 98,
@@ -83,6 +84,8 @@ pub enum EntryOutcome {
 
 pub trait LinuxEntryVenue {
     fn binding(&self) -> ExecutionBinding;
+    fn process_pid(&self) -> Option<u32>;
+    fn visible_tid(&self) -> Option<u32>;
     fn set_robust_list(&self, head: u64, len: u64) -> Option<i64>;
     fn task_state(&self) -> &crate::abi::entry::LinuxTaskState;
     fn record_forwarded(&self, ordinal: usize);
@@ -95,12 +98,20 @@ pub struct SharedVenue<'a, B, R> {
     pub state: &'a crate::abi::entry::LinuxTaskState,
     pub counters: crate::dispatch::EntryCounters<'a>,
     pub robust_list: R,
+    pub process_pid: Option<u32>,
+    pub visible_tid: Option<u32>,
 }
 impl<B: Fn() -> ExecutionBinding, R: Fn(u64, u64) -> Option<i64>> LinuxEntryVenue
     for SharedVenue<'_, B, R>
 {
     fn binding(&self) -> ExecutionBinding {
         (self.binding)()
+    }
+    fn process_pid(&self) -> Option<u32> {
+        self.process_pid
+    }
+    fn visible_tid(&self) -> Option<u32> {
+        self.visible_tid
     }
     fn task_state(&self) -> &crate::abi::entry::LinuxTaskState {
         self.state
@@ -243,6 +254,12 @@ impl<'a> crate::lifecycle::LifecycleNative<'a> for CommonFamilies<'a> {
     }
     fn task_state(&self) -> Option<&'a crate::abi::entry::LinuxTaskState> {
         Some(self.venue.task_state())
+    }
+    fn process_pid(&self) -> Option<u32> {
+        self.venue.process_pid()
+    }
+    fn visible_tid(&self) -> Option<u32> {
+        self.venue.visible_tid()
     }
     fn register_robust_list(&self, head: u64, len: u64) -> Option<SyscallResult> {
         self.venue

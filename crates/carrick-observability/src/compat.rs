@@ -532,7 +532,22 @@ pub struct CompatReport {
 pub struct ExecutionWitness {
     pub backend: String,
     pub guest_entries: u64,
+    /// All visits to the CPL0 host portal, including refused calls.
+    #[serde(default)]
+    pub portal_exits: u64,
     pub host_forwards: u64,
+    /// Temporary host semantic scaffolding, counted by crossing family.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_forward_families: Vec<ExecutionFamilyCount>,
+    /// CPL0-owned or unclassified calls that did not enter host dispatch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guest_refusal_families: Vec<ExecutionFamilyCount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionFamilyCount {
+    pub family: String,
+    pub count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
