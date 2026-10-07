@@ -1,0 +1,95 @@
+//! Native CPL0 IRQ entry shared by the production and fixture images.
+//!
+//! The entry saves every user GPR and the qualified XCR0=7 xstate before
+//! calling Rust. It retains an IRQ reason in the per-CPU binding for the
+//! shared scheduler; no semantic host exit or result publication occurs here.
+
+use carrick_el1::isa::x86::{context::scheduler::InterruptFrame, interrupt, interrupts};
+
+// SAFETY: these interrupt gates run at CPL0 on private TSS stacks. The push
+// order is InterruptFrame's asserted layout, and the 896-byte scratch leaves
+// at least 832 aligned bytes for the admitted XCR0=7 XSAVE image. IF stays
+// masked until IRETQ; SWAPGS is paired only for a user-origin interrupt.
+core::arch::global_asm!(
+    ".section .irq_header, \"a\"",
+    ".quad {magic}",
+    ".quad carrick_x86_timer_irq",
+    ".quad carrick_x86_kick_irq",
+    ".quad carrick_x86_resched_irq",
+    ".quad carrick_x86_shootdown_irq",
+    ".section .text.irq, \"ax\"",
+    ".global carrick_x86_timer_irq",
+    "carrick_x86_timer_irq:",
+    "push rdi",
+    "mov edi, {timer}",
+    "jmp carrick_x86_irq_common",
+    ".global carrick_x86_kick_irq",
+    "carrick_x86_kick_irq:",
+    "push rdi",
+    "mov edi, {kick}",
+    "jmp carrick_x86_irq_common",
+    ".global carrick_x86_resched_irq",
+    "carrick_x86_resched_irq:",
+    "push rdi",
+    "mov edi, {resched}",
+    "jmp carrick_x86_irq_common",
+    ".global carrick_x86_shootdown_irq",
+    "carrick_x86_shootdown_irq:",
+    "push rdi",
+    "mov edi, {shootdown}",
+    "carrick_x86_irq_common:",
+    "push rsi", "push rdx", "push rcx", "push rax",
+    "push r8", "push r9", "push r10", "push r11",
+    "push rbx", "push rbp", "push r12", "push r13", "push r14", "push r15",
+    "test byte ptr [rsp + 128], 3",
+    "jz 2f",
+    "swapgs",
+    "2:",
+    "mov r12, rsp",
+    "sub rsp, 896",
+    "and rsp, -64",
+    "mov eax, 7", "xor edx, edx", "xsave64 [rsp]",
+    "mov rsi, r12",
+    "call carrick_x86_receive_irq",
+    "mov eax, 7", "xor edx, edx", "xrstor64 [rsp]",
+    "mov rsp, r12",
+    "test byte ptr [rsp + 128], 3",
+    "jz 3f",
+    "swapgs",
+    "3:",
+    "pop r15", "pop r14", "pop r13", "pop r12", "pop rbp", "pop rbx",
+    "pop r11", "pop r10", "pop r9", "pop r8", "pop rax", "pop rcx",
+    "pop rdx", "pop rsi", "pop rdi",
+    "iretq",
+    magic = const interrupts::IRQ_HEADER_MAGIC,
+    timer = const interrupts::TIMER_VECTOR,
+    kick = const interrupts::KICK_VECTOR,
+    resched = const interrupts::RESCHED_VECTOR,
+    shootdown = const interrupts::SHOOTDOWN_VECTOR,
+);
+
+#[unsafe(no_mangle)]
+extern "C" fn carrick_x86_receive_irq(vector: u32, frame: *const InterruptFrame) {
+    // SAFETY: the IRQ assembly passes its own complete saved register frame;
+    // a user-origin frame includes the five IRET words validated below.
+    let frame = unsafe { &*frame };
+    if (frame.cs & 3 == 3 && !frame.valid_user_return())
+        || (frame.cs & 3 == 0 && frame.cs != 8)
+        || u8::try_from(vector)
+            .ok()
+            .and_then(|vector| interrupt::capture_irq(vector).ok())
+            .is_none()
+    {
+        // SAFETY: a refused native IRQ must leave through the declared fatal
+        // doorbell; it must not IRET with an unacknowledged or unknown vector.
+        unsafe {
+            core::arch::asm!(
+                "out dx, al",
+                in("dx") carrick_el1::isa::x86::context::native::FATAL_PORT,
+                in("al") 0u8,
+                options(nostack)
+            );
+        }
+        crate::kernel::halt();
+    }
+}
