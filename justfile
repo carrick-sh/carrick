@@ -216,6 +216,9 @@ lint-domains-host:
 # Host-independent domain checks; live compiler capture runs separately.
 lint-domains-source:
     python3 scripts/conformance/check-next-strategy.py
+    # Every test target is in exactly one gate lane (Cargo metadata), derived
+    # lanes are consumed by their recipes, named-lane targets are named.
+    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-lanes check
     {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- probe-coverage
     {{_admit}} {{_cargo}} test -p carrick-xtask --test probe_coverage
     ./scripts/closure-assert-vmfree-schedule.sh
@@ -525,18 +528,24 @@ test *ARGS:
         # those belong to a guest-capable lane (`just conformance*`,
         # `cargo test -p carrick-cli --test <name>`).
         {{_admit}} {{_cargo}} test --workspace --exclude carrick-runtime --exclude carrick-kernel --exclude carrick-cli --exclude carrick-host --exclude carrick-vfs --exclude carrick-vmm-hvf --lib --bins {{ARGS}}
-        # carrick-kernel-example's proof (`tests/fork_pipe_wait.rs`) is an
-        # integration target, and the `--lib --bins` line above never reaches
-        # a crate's `tests/` directory -- the same house trap the `--bins`
-        # note describes -- so it is named here. Its Linux tasks are host
-        # threads (no `libc::fork()` from the harness), so it needs no serial
-        # slot. One case deliberately costs its 5 s wait bound.
-        {{_admit}} {{_cargo}} test -p carrick-kernel-example --tests {{ARGS}}
-        # The contract registry's own tests (`tests/claims.rs` loads the live
-        # conformance-contracts/ tree) are integration targets too, so the
-        # `--lib --bins` line never ran them; name the crate.
-        {{_admit}} {{_cargo}} test -p carrick-conformance-contract --tests {{ARGS}}
-        {{_admit}} {{_cargo}} test -p carrick-xtask --test probe_coverage {{ARGS}}
+        # Integration targets (`tests/*.rs`) are invisible to `--lib --bins`;
+        # a test moved out of `src/` used to leave every gate silently. The
+        # host-lane selection is DERIVED from Cargo metadata: every test target
+        # not declared in another lane under `[package.metadata.carrick.test-lanes]`
+        # (carrick-xtask `test_lanes.rs`) runs here, and `lint-domains-source`
+        # runs `test-lanes check`, which fails on any target no gate runs.
+        selections="$({{_admit}} {{_cargo}} run -q --locked -p carrick-xtask -- test-lanes args --lane host)"
+        # Every selection runs; the recipe fails after the last one, naming each red.
+        red=()
+        while IFS= read -r selection; do
+            [ -n "$selection" ] || continue
+            {{_admit}} {{_cargo}} test --no-fail-fast $selection {{ARGS}} -- --skip serial_host </dev/null || red+=("$selection")
+            env RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test --no-fail-fast $selection {{ARGS}} serial_host </dev/null || red+=("$selection (serial_host)")
+        done <<< "$selections"
+        if [ "${#red[@]}" -ne 0 ]; then
+            printf 'test: red host-lane selection: %s\n' "${red[@]}" >&2
+            exit 1
+        fi
         # The authenticated jit-shape builders/parsers have measured >1 MiB
         # debug frames. Several tests need two in one body; libtest's ~2 MiB
         # default has repeatedly been tipped over by unrelated additions. Keep
@@ -611,8 +620,56 @@ test *ARGS:
     # Runtime still has process-wide carrier lifecycle, root-slot pool, env and
     # host-fork tests; fixture-owned injections alone do not make it parallel-safe.
     env RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test -p carrick-runtime {{_platform_features}} --lib {{ARGS}}
-    {{_admit}} {{_cargo}} test -p carrick-conformance-contract --tests {{ARGS}}
-    {{_admit}} {{_cargo}} test -p carrick-xtask --test probe_coverage {{ARGS}}
+    # Derived host-lane integration targets, as on macOS; packages whose
+    # default features select platform-macos get this host's backend features.
+    selections="$({{_admit}} {{_cargo}} run -q --locked -p carrick-xtask -- test-lanes args --lane host --platform-features "{{_platform_features}}")"
+    # Every selection runs; the recipe fails after the last one, naming each red.
+    red=()
+    while IFS= read -r selection; do
+        [ -n "$selection" ] || continue
+        {{_admit}} {{_cargo}} test --no-fail-fast $selection {{ARGS}} -- --skip serial_host </dev/null || red+=("$selection")
+        env RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test --no-fail-fast $selection {{ARGS}} serial_host </dev/null || red+=("$selection (serial_host)")
+    done <<< "$selections"
+    if [ "${#red[@]}" -ne 0 ]; then
+        printf 'test: red host-lane selection: %s\n' "${red[@]}" >&2
+        exit 1
+    fi
+
+# Every KVM-lane test target (`kvm` in `[package.metadata.carrick.test-lanes]`,
+# derived by `carrick-xtask test-lanes`), plus carrick-vmm-kvm's own lib/bin
+# tests. Linux x86_64 with a usable /dev/kvm only: the recipe refuses anywhere
+# else, and exports CARRICK_REQUIRE_KVM=1 so a test that would skip on a
+# missing device or fixture fails instead. Run by `just accept --profile
+# linux-portable` (kvm-tests) and the KVM job in kernel-runtime.yml.
+test-kvm *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{os()}}" != "linux" ] || [ "{{arch()}}" != "x86_64" ]; then
+        echo "test-kvm: needs Linux x86_64 with /dev/kvm (this host: {{os()}}/{{arch()}})" >&2
+        exit 1
+    fi
+    if ! { [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; }; then
+        echo "test-kvm: /dev/kvm is missing or not read/write for $(id -un)" >&2
+        exit 1
+    fi
+    export CARRICK_REQUIRE_KVM=1
+    # live_vcpu_x86's M2 case runs this static musl fixture (needs the
+    # x86_64-unknown-linux-musl target; see docs/perf-results/2026-10-04-x86-kvm-lane-health.md).
+    RUSTFLAGS='-C linker=rust-lld -C linker-flavor=ld.lld -C relocation-model=static -C link-arg=--no-pie' \
+        {{_cargo}} build --release \
+        --manifest-path crates/carrick-vmm-bhyve/fixtures/hello-x86_64/Cargo.toml \
+        --target x86_64-unknown-linux-musl
+    {{_admit}} {{_cargo}} test --locked -p carrick-vmm-kvm --lib --bins {{ARGS}}
+    selections="$({{_admit}} {{_cargo}} run -q --locked -p carrick-xtask -- test-lanes args --lane kvm --platform-features "{{_platform_features}}")"
+    red=()
+    while IFS= read -r selection; do
+        [ -n "$selection" ] || continue
+        {{_admit}} {{_cargo}} test --locked --no-fail-fast $selection {{ARGS}} </dev/null || red+=("$selection")
+    done <<< "$selections"
+    if [ "${#red[@]}" -ne 0 ]; then
+        printf 'test-kvm: red kvm-lane selection: %s\n' "${red[@]}" >&2
+        exit 1
+    fi
 
 # Rustdoc gate: broken intra-doc links / unclosed-tag lints fail the build (matches CI).
 doc *ARGS:
