@@ -285,6 +285,58 @@ mod kernel {
     pub static CARRICK_CPL0_ISA_UNSUPPORTED_FORWARDS: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
 
+    /// Host crossings allowed to leave CPL0 as forwards.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[repr(u64)]
+    pub enum AllowedHostCrossing {
+        Read = 0,
+        Write = 1,
+        Lseek = 8,
+        Pread64 = 17,
+        Pwrite64 = 18,
+        Exit = 60,
+        ExitGroup = 231,
+        EpollPwait = 281,
+    }
+
+    impl AllowedHostCrossing {
+        pub const fn from_native(native: u64) -> Option<Self> {
+            match native {
+                0 => Some(Self::Read),
+                1 => Some(Self::Write),
+                8 => Some(Self::Lseek),
+                17 => Some(Self::Pread64),
+                18 => Some(Self::Pwrite64),
+                60 => Some(Self::Exit),
+                231 => Some(Self::ExitGroup),
+                281 => Some(Self::EpollPwait),
+                _ => None,
+            }
+        }
+    }
+
+    fn record_refusal(counters: &Counters, frame: &mut NativeFrame, native: Option<u64>) {
+        frame.rax = (-38_i64) as u64;
+        let bucket = match native {
+            Some(nr) if nr < 512 => {
+                match carrick_syscall_abi::syscall_x86_64::lookup_x86_64(nr) {
+                    Some(entry)
+                        if !matches!(
+                            entry.remap,
+                            carrick_syscall_abi::syscall_x86_64::SyscallRemap::Unknown
+                                | carrick_syscall_abi::syscall_x86_64::SyscallRemap::Private(_)
+                        ) =>
+                    {
+                        nr as usize
+                    }
+                    _ => 512,
+                }
+            }
+            _ => 512,
+        };
+        counters.refused[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
     // The KVM fault fixture owns one exact MM and one host-backed prepared
     // page. These records stay live across the native syscall boundary.
     fixture_items! {
@@ -1279,7 +1331,19 @@ mod kernel {
         }
         let Some(call) = carrick_personality_linux::entry::decode_x86_snapshot(frame.snapshot())
         else {
-            doorbell(FORWARD_PORT, frame);
+            record_refusal(counters, frame, None);
+            binding.completions.fetch_add(1, Ordering::Relaxed);
+            fixture_stmt! { if binding.scheduler_witness.load(Ordering::Acquire)
+                == super::scheduler::PROGRESS_STATE {
+                super::progress::return_boundary();
+            } }
+            if binding.return_kick.swap(0, Ordering::AcqRel) != 0 {
+                doorbell(RETURN_KICK_PORT, frame);
+            }
+            if task.linux.has_pending_host_work() {
+                task.linux.record_completed_with_work();
+                doorbell(WORK_PORT, frame);
+            }
             return;
         };
         binding
@@ -1364,7 +1428,11 @@ mod kernel {
                     halt();
                 }
                 ProductionBoundary::Forward => {
-                    doorbell(FORWARD_PORT, frame);
+                    if AllowedHostCrossing::from_native(call.native.raw()).is_some() {
+                        doorbell(FORWARD_PORT, frame);
+                    } else {
+                        record_refusal(counters, frame, Some(call.native.raw()));
+                    }
                 }
             }
         }

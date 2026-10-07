@@ -61,3 +61,54 @@ fn production_sigprocmask_uses_shared_lifecycle_family() {
     assert_eq!(status, 7);
     assert_eq!(semantic_host_exits, 1); // only exit_group reaches the host
 }
+
+#[test]
+fn production_cpl0_refuses_non_allowlisted_forwards_with_enosys() {
+    let code = [
+        // mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) -> -ENOSYS (-38)
+        0x31, 0xff, // xor edi, edi (NULL)
+        0xbe, 0x00, 0x10, 0x00, 0x00, // mov esi, 4096
+        0xba, 0x03, 0x00, 0x00, 0x00, // mov edx, 3 (PROT_READ|PROT_WRITE)
+        0x41, 0xba, 0x22, 0x00, 0x00, 0x00, // mov r10d, 0x22 (MAP_PRIVATE|MAP_ANONYMOUS)
+        0x49, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, // mov r8, -1
+        0x45, 0x31, 0xc9, // xor r9d, r9d (0)
+        0xb8, 0x09, 0x00, 0x00, 0x00, // mov eax, 9 (mmap)
+        0x0f, 0x05, // syscall
+        0x48, 0x83, 0xf8, 0xda, // cmp rax, -38
+        0x75, 0x2a, // jne failure (jump 42 bytes over futex + success)
+        // futex(0, 0, 0, NULL, NULL, 0) -> -ENOSYS (-38)
+        0x31, 0xff, // xor edi, edi
+        0x31, 0xf6, // xor esi, esi
+        0x31, 0xd2, // xor edx, edx
+        0x45, 0x31, 0xd2, // xor r10d, r10d
+        0x45, 0x31, 0xc0, // xor r8d, r8d
+        0x45, 0x31, 0xc9, // xor r9d, r9d
+        0xb8, 0xca, 0x00, 0x00, 0x00, // mov eax, 202 (futex)
+        0x0f, 0x05, // syscall
+        0x48, 0x83, 0xf8, 0xda, // cmp rax, -38
+        0x75, 0x0e, // jne failure (jump 14 bytes over success)
+        // Success: exit_group(42)
+        0xbf, 0x2a, 0x00, 0x00, 0x00, // mov edi, 42
+        0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, 231 (exit_group)
+        0x0f, 0x05, 0x0f, 0x0b, // syscall; ud2
+        // Failure: exit_group(1)
+        0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, 1
+        0xb8, 0xe7, 0x00, 0x00, 0x00, // mov eax, 231 (exit_group)
+        0x0f, 0x05, 0x0f, 0x0b, // syscall; ud2
+    ];
+    let elf = tiny_elf(&code);
+    let image = prepare_static_x86_elf(&elf).expect("static x86 ELF");
+    let extent =
+        Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("bounded initial extent");
+    let mut carrier = Cpl0Carrier::boot_production(extent).expect("production KVM image");
+    carrier
+        .load_guest_mm(&image, &[], &[])
+        .expect("initial guest MM");
+    let (status, semantic_host_exits) = carrier
+        .run_initial_process(8, |_, _| -1)
+        .expect("static x86 binary runs to completion");
+    assert_eq!(status, 42);
+    assert_eq!(semantic_host_exits, 1); // only exit_group reaches the host
+    assert_eq!(carrier.refusal_count(9), 1);
+    assert_eq!(carrier.refusal_count(202), 1);
+}
