@@ -1,0 +1,26 @@
+{
+  "schema": "carrick.fixtures.reviewed-build-code.v1",
+  "entries": [
+    {
+      "package": "crc32fast",
+      "location": "registry+https://github.com/rust-lang/crates.io-index#crc32fast@1.5.0",
+      "kind": "custom-build",
+      "source": "build.rs",
+      "sha256": "c773f74220b2895dbd7d6cff0398bb621cba672216b86b9faedfa1b937e9f7a4"
+    },
+    {
+      "package": "libc",
+      "location": "registry+https://github.com/rust-lang/crates.io-index#libc@0.2.186",
+      "kind": "custom-build",
+      "source": "build.rs",
+      "sha256": "bbbf2d0dc012f6be46d35933eb5ec54f2fea53cd923a2ee83cd2cfd126aa00a4"
+    },
+    {
+      "package": "libc",
+      "location": "registry+https://github.com/rust-lang/crates.io-index#libc@0.2.189",
+      "kind": "custom-build",
+      "source": "build.rs",
+      "sha256": "b83a78df66fbff5be821c79d49a609059399394e6fb6f388ca0c0edb1a005dfc"
+    }
+  ]
+}

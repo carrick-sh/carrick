@@ -12,12 +12,14 @@ use thiserror::Error;
 use crate::{command, probe_inventory, provision};
 
 pub mod archive;
+pub mod build_code;
 pub mod dep_info;
 mod environment;
 mod inputs;
+pub mod linker;
 use environment::BuildEnvironment;
 pub use environment::BuildPolicy;
-pub use inputs::source_hashes;
+pub use inputs::{current_build_code, source_hashes};
 
 const SCHEMA: &str = "carrick.fixtures.v3";
 pub const INSTALLED_MANIFEST: &str = "target/fixtures/installed.json";
@@ -78,6 +80,9 @@ pub enum FixturesAction {
         #[arg(long, value_enum)]
         source: crate::remote_accept::FixtureBundleSource,
     },
+    /// Print the build scripts and proc-macros in the fixture graphs in the
+    /// reviewed-list format, for review before updating the committed list.
+    BuildCode,
     /// Check a bundle or, by default, every installed signed-tier fixture.
     Verify {
         #[arg(long, conflicts_with = "bundle")]
@@ -116,7 +121,7 @@ type Result<T> = std::result::Result<T, FixturesError>;
 #[serde(try_from = "String", into = "String")]
 pub struct CommitSha(String);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ContentHash(String);
 
@@ -354,14 +359,19 @@ pub fn hash_source(root: &Path, relative: &str) -> Result<ContentHash> {
     let name = relative_path
         .file_name()
         .ok_or_else(|| fail("empty source path"))?;
-    let path = parent.join(name);
-    let file_type = fs::symlink_metadata(&path)?.file_type();
+    hash_regular_file(&parent.join(name))
+}
+
+/// The typed, length-framed digest of one regular file; links are refused.
+fn hash_regular_file(path: &Path) -> Result<ContentHash> {
+    let file_type = fs::symlink_metadata(path)?.file_type();
     if !file_type.is_file() {
         return Err(fail(format!(
-            "fixture source input is not a regular file (symlinks are refused): {relative}"
+            "fixture source input is not a regular file (symlinks are refused): {}",
+            path.display()
         )));
     }
-    let bytes = fs::read(&path)?;
+    let bytes = fs::read(path)?;
     let length = u64::try_from(bytes.len()).map_err(|e| fail(e.to_string()))?;
     let mut digest = Sha256::new();
     digest.update(SOURCE_DOMAIN);
@@ -899,6 +909,11 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
     external.push(PathBuf::from(sysroot.trim()));
     let compiler_inputs = dep_info::classify(&source, &dep_info_files, &external)?;
     let sources = source_hashes(root, &compiler_inputs)?;
+    linker::check_build_script_outputs(
+        &source,
+        inputs::FIXTURES,
+        &sources.keys().map(String::as_str).collect(),
+    )?;
     // Match the build snapshot byte-for-byte with the recorded source inputs.
     for (path, hash) in &sources {
         if &hash_source(&source, path)? != hash {
@@ -995,6 +1010,13 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
                 provenance.captured_path, provenance.identity, provenance.archive_sha256
             )?;
             archive::restore(root, Path::new(&provenance.captured_path), None)?;
+        }
+        FixturesAction::BuildCode => {
+            write!(
+                writer,
+                "{}",
+                build_code::render(&current_build_code(root)?)?
+            )?;
         }
         FixturesAction::Verify {
             manifest,
