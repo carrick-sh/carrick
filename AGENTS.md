@@ -239,8 +239,9 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
   commit: unrelated commits and dirty host sources keep a restored bundle
   valid for scoped `just test-embed <filter>` / `test-signed.sh` runs.
   Changed fixture inputs refuse it and need their own committed variant and
-  rebuilt bundle; new or changed build scripts/proc-macros also need an entry
-  in `fixtures/reviewed-build-code.json`. Acceptance independently requires
+  rebuilt bundle. Checkout build scripts/proc-macros and linker scripts are
+  forbidden in fixture graphs; registry build code needs an entry in
+  `fixtures/reviewed-build-code.json`. Acceptance independently requires
   no tracked or untracked changes (gitignored outputs excluded); receipts bind
   exact HEAD, the working tree and the input identity; see [`docs/signed-fixtures.md`](docs/signed-fixtures.md#input-identity).
 - **Report errno NUMBERS** (`seek_data_negative_errno = errno`) — Linux said

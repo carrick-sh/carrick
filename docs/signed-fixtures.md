@@ -85,29 +85,26 @@ prove is an input is refused rather than chased.
   at any component (or a path reaching the checkout through an outside
   symlink) fails the publish. Recording a link's current referent would let a
   retarget keep the identity.
-- **Reviewed build code.** Build scripts and proc-macros can read files that
-  dep-info never names (a `build.rs` that `fs::read`s a file and emits
-  `rustc-env` without `rerun-if-changed`). Every build script and proc-macro
-  in a fixture's unfiltered, non-dev graph must be listed in the committed
-  `fixtures/reviewed-build-code.json`, keyed by package, location
-  (`path:<manifest>` or `<cargo source>#<name>@<version>`), kind and entry
-  source, with the typed digest of that entry source. Publish and admission
-  refuse an unlisted, changed or stale entry, and the list is itself an
-  inventory input. `carrick-xtask fixtures build-code` prints the current
-  set; review each new or changed entry for undeclared reads before copying
-  it into the list. The seeded list holds the locked registry build scripts
-  of `crc32fast` 1.5.0, `libc` 0.2.186 and `libc` 0.2.189 (each reads only
-  environment variables and compiler version); no checkout package has a
-  build script or proc-macro.
-- **Linker inputs.** Linkers read files dep-info does not name. Builder
-  scripts and every inventoried `.cargo/config(.toml)` are scanned for
-  linker-script and response-file references (`-T <f>`, `-T<f>`,
-  `--script[=]<f>`, `@<f>`, any `*.ld`/`*.lds` token, including inside
-  `-Wl,` and `link-arg=` values). A reference must resolve, relative to the
-  file, its parent package or the checkout root, to an inventoried source;
-  shell expansions and absolute paths cannot be proven and are refused. At
-  publish, every build-script `output` in the fixture target directories is
-  scanned the same way for `cargo:rustc-link-arg*` values.
+- **Build code.** Build scripts and proc-macros can read files dep-info never
+  names, and an approved entry file can delegate to modules or
+  build-dependencies. Checkout packages in a fixture graph may therefore not
+  have a build script or be a proc-macro at all, and git or path build code is
+  refused. Only locked registry build code is admitted: each must be listed in
+  the committed `fixtures/reviewed-build-code.json` by package, version,
+  source, kind and its `Cargo.lock` checksum, which pins the whole crate.
+  Publish and admission refuse an unlisted, changed or stale entry; the list
+  is itself an inventory input. `carrick-xtask fixtures build-code` prints the
+  current set for review. The seeded list holds the build scripts of
+  `crc32fast` 1.5.0, `libc` 0.2.186 and `libc` 0.2.189 (each reads only
+  environment variables and the compiler version).
+- **No linker inputs.** Linkers read files dep-info does not name and resolve
+  them by their own search rules, and scripts or response files can pull in
+  more (`INCLUDE`, nested `@file`). Fixture builds therefore use none: any
+  linker-script or response-file reference (`-T`, `--script`, `@<f>`,
+  `INCLUDE`, `*.ld`/`*.lds`, including inside `-Wl,` and `link-arg=`) in a
+  builder script, an inventoried `.cargo/config(.toml)` or, at publish, a
+  build-script `cargo:rustc-link-arg*` output is refused. Nothing is resolved
+  or authorized.
 - **No generated sources.** A compiler input under any `target/` directory
   (an `OUT_DIR` `include!`) is refused. No fixture uses one today; adding one
   needs a design change, not an exception.
@@ -437,3 +434,13 @@ kept the identity); `unreviewed_build_script_refuses_publish_and_admission`
 inventoried a new `build.rs` that reads `../../shared/banner.txt` without
 complaint; `linker_script_reference_must_be_an_inventoried_input` admitted a
 repo-root `link.ld` named by `link-arg=-T../link.ld`. All three now refuse.
+
+A final review round found that approving one entry file, or resolving a
+linker reference against several bases, still left constructed holes. Each
+was closed by forbidding the construct, red-first against `5d54bf40f`:
+`checkout_build_script_module_change_refuses` (an approved `build.rs` whose
+`mod helper;` changes), `decoy_package_linker_script_refuses` (a package-local
+`link.ld` authorizing a reference the linker may resolve at the root) and
+`response_file_pulling_external_linker_script_refuses` (an inventoried
+`@link.rsp` naming an external script) all returned an Ok inventory and now
+refuse.
