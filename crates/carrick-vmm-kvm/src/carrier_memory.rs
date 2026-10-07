@@ -99,10 +99,33 @@ pub struct PreparedBacking {
 pub struct KvmSlotGeneration(NonZeroU64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackingHandle {
+    vm: CarrierVmId,
     slot: u32,
     generation: KvmSlotGeneration,
 }
+/// Exact carrier VM incarnation. Local MM, frame and slot numbers may repeat
+/// in another VM; exported physical capabilities always retain this domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CarrierVmId(NonZeroU64);
+impl CarrierVmId {
+    fn allocate() -> Result<Self, MemoryError> {
+        static CARRIERS: carrick_sched_core::process::identity_allocator::SerialAllocator =
+            carrick_sched_core::process::identity_allocator::SerialAllocator::new();
+        CARRIERS
+            .allocate()
+            .map(Self)
+            .ok_or_else(|| error("carrier identity exhausted"))
+    }
+    pub fn nonzero(self) -> NonZeroU64 {
+        self.0
+    }
+}
+
 impl BackingHandle {
+    pub fn vm(self) -> CarrierVmId {
+        self.vm
+    }
+
     pub fn slot_index(self) -> u32 {
         self.slot
     }
@@ -170,6 +193,7 @@ pub unsafe trait TranslationDrain {
 /// Drops VM before all registered backing. It exclusively owns its slot
 /// namespace; legacy HvVm::map_memory is never called on this VM.
 pub struct CarrierMemory {
+    identity: CarrierVmId,
     vm: KvmVm,
     slots: BTreeMap<u32, Slot>,
     by_gpa: BTreeMap<u64, u32>,
@@ -265,6 +289,7 @@ impl CarrierMemory {
         let vm = KvmVm::create_empty().map_err(|e| error(e.to_string()))?;
         let limit = vm.carrier_slot_limit().map_err(|e| error(e.to_string()))?;
         Ok(Self {
+            identity: CarrierVmId::allocate()?,
             vm,
             slots: BTreeMap::new(),
             by_gpa: BTreeMap::new(),
@@ -279,6 +304,10 @@ impl CarrierMemory {
             fail_install: None,
         })
     }
+    pub fn identity(&self) -> CarrierVmId {
+        self.identity
+    }
+
     pub fn is_quarantined(&self) -> bool {
         self.quarantined
     }
@@ -373,6 +402,7 @@ impl CarrierMemory {
                 return Err(reason);
             }
             let handle = BackingHandle {
+                vm: self.identity,
                 slot,
                 generation: KvmSlotGeneration(generation),
             };

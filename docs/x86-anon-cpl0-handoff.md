@@ -1153,3 +1153,31 @@ shared versus copied tables. Existing FileAuthorityRun registers its client
 and canonical root table binding; model ForkCopy/ShareTable commands do not
 import that live root table. Reuse the actual Kernel FileTable fork/descriptor
 primitives rather than treating model commands as a live authority.
+
+## Physical capability VM scope (2026-10-07)
+
+The real two-VM test issues local MM1/root0x1000/slot0/generation1 and
+identical backing identity in both VMs. Before the fix, the first VM
+accepted the second VM's handle: /tmp/x86-cont-vm-scope-red-filter.log,
+foreign VM handle authenticated as local backing (1 failed test).
+The first exact-filter invocation ran zero tests and proves nothing.
+
+CarrierMemory now owns a typed CarrierVmId. BackingHandle includes that
+origin, so SharedFrameEdge and independent inventory binding cannot be
+cross-fed between carriers. The existing grant portal carrier allocator
+moves into this owner and delegates to the shared monotonic SerialAllocator;
+the portal uses the same VM identity. Private per-VM roots and aliases remain
+local. ARM/HVPatch CARRIER_MM_IDS and file-description sources are untouched.
+
+All ten carrier_memory tests pass with CARRICK_REQUIRE_KVM=1 in
+/tmp/x86-cont-vm-scope-green.log, including two real live KVM VMs issuing
+the same local MM and retaining independent A/B bytes. Production fork,
+CPU1 child execution and the original two-MM private-leaf witness remain open.
+
+The namespace inventory positions were reconciled at 5958fabca.
+/tmp/x86-cont-incarnation-asm.log has 115/115 unchanged ARM assembly blocks.
+The first lint-domains attempt overlaps subsequent source edits: its clean
+capture checks fail, and independent receipt tests additionally report the
+reviewed projection differs from the old macOS capture. Rerun clean after
+pushing and obtain a guarded remote recapture for the moved source spans;
+never rewrite the compiler receipt by hand.

@@ -51,13 +51,7 @@ impl Cpl0Carrier {
     }
 
     pub(super) fn bind_grant_portal(&self) -> Result<(), TrapError> {
-        static CARRIERS: AtomicU64 = AtomicU64::new(1);
-        let carrier = CARRIERS
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(1)
-            })
-            .map_err(|_| fail("carrier identity exhausted"))?;
-        let carrier = NonZeroU64::new(carrier).ok_or_else(|| fail("zero carrier identity"))?;
+        let carrier = self._vm.identity().nonzero();
         if !self.grant_portal()?.bind_carrier(carrier) {
             return Err(fail("carrier portal already bound"));
         }
