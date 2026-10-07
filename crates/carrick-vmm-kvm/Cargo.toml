@@ -24,6 +24,7 @@ serde_json.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+goblin.workspace = true
 
 [dependencies]
 carrick-guest-arch = { path = "../carrick-guest-arch" }
@@ -70,12 +71,10 @@ kvm-bindings = "0.12.1"
 vmm-sys-util = "0.14.0"
 zerocopy.workspace = true
 
-[dev-dependencies]
-goblin.workspace = true
-
 # Test gate lanes (`just xtask test-lanes check`; carrick-xtask src/test_lanes.rs).
 # Every live target needs a real /dev/kvm on Linux x86_64: `just test-kvm`.
 # `cpl0_image_inputs` reads only sources and Cargo metadata, so it is VM-free.
 [package.metadata.carrick.test-lanes]
 "*" = "kvm"
 cpl0_image_inputs = "host"
+cpl0_shared_entry = "kvm"
