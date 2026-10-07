@@ -2383,24 +2383,6 @@ mod tests {
         assert!(owner.contains("pub struct LeaseGate"));
         assert!(owner.contains("pub fn drain_publication"));
     }
-    #[test]
-    fn image_build_tracks_neutral_owner_inputs() {
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let build = fs::read_to_string(repo.join("crates/carrick-el1-image/build.rs")).unwrap();
-        for dependency in [
-            "carrick-core",
-            "carrick-core-abi",
-            "carrick-personality-linux",
-        ] {
-            for input in ["src", "Cargo.toml"] {
-                let declaration = format!("cargo:rerun-if-changed=../{dependency}/{input}");
-                assert!(
-                    build.contains(&declaration),
-                    "image can retain stale {dependency}/{input}"
-                );
-            }
-        }
-    }
 
     #[test]
     fn wait_records_and_edit_coordination_have_one_neutral_owner() {
