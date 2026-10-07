@@ -23406,7 +23406,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/page_profile.rs",
-      "line": 87,
+      "line": 109,
       "categories": [
         "mapping"
       ],
@@ -23649,7 +23649,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/prepare.rs",
-      "line": 602,
+      "line": 604,
       "categories": [
         "mapping"
       ],
