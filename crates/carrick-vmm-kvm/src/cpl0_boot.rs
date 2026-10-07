@@ -1293,6 +1293,16 @@ impl Cpl0Carrier {
                 boot.star,
                 boot.sfmask | (1 << 10) | (1 << 8) | (1 << 18),
             )?;
+            if interrupts {
+                // KVM_CREATE_IRQCHIP leaves the secondary vCPU awaiting SIPI.
+                // Both native CPL0 entry states were installed while stopped;
+                // admit each CPU before exposing the carrier to its owner.
+                cpu.fd()
+                    .set_mp_state(kvm_mp_state {
+                        mp_state: KVM_MP_STATE_RUNNABLE,
+                    })
+                    .map_err(|e| fail(format!("CPL0 CPU admission: {e}")))?;
+            }
             let msrs = Msrs::from_entries(&[kvm_msr_entry {
                 index: 0xc000_0102,
                 data: METADATA_VA + BINDING_OFFSET + index as u64 * STRIDE,
@@ -1345,7 +1355,7 @@ impl Cpl0Carrier {
             // initialized above; atomic publication precedes guest entry.
             unsafe { (*binding).tsc_hz.store(hz, Ordering::Release) };
             if interrupts {
-                let lapic = cpu
+                let mut lapic = cpu
                     .fd()
                     .get_lapic()
                     .map_err(|e| fail(format!("KVM_GET_LAPIC: {e}")))?;
@@ -1357,6 +1367,16 @@ impl Cpl0Carrier {
                 ]);
                 apic_ids[index] = u16::try_from((id_word >> 24) + 1)
                     .map_err(|_| fail("APIC ID outside xAPIC destination range"))?;
+                // Each stopped vCPU needs its own software-enabled LAPIC
+                // before peer IPIs can be accepted, including the AP before
+                // its first guest syscall. The guest later owns its timer LVT.
+                let svr = 0x100_u32 | u32::from(carrick_x86::interrupts::SPURIOUS_VECTOR);
+                for (byte, value) in lapic.regs[0xf0..0xf4].iter_mut().zip(svr.to_le_bytes()) {
+                    *byte = value as i8;
+                }
+                cpu.fd()
+                    .set_lapic(&lapic)
+                    .map_err(|e| fail(format!("KVM_SET_LAPIC: {e}")))?;
             }
         }
         if interrupts {
