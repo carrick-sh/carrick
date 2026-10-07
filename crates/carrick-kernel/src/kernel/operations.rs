@@ -295,6 +295,24 @@ impl TaskSetReservation {
         })
     }
 
+    pub(super) fn acquired_exit(
+        kernel: &Arc<Kernel>,
+        state: &mut RegistryState,
+        plan: &carrick_sched_core::process::exit::PreparedExitTopology<
+            super::revision_capacity::RevisionReservation,
+        >,
+        transaction: KernelTransactionId,
+    ) -> Result<Self, KernelOperationError> {
+        let permit = state.reserve_exit_task_set(plan, transaction)?;
+        Ok(Self {
+            kernel: Arc::clone(kernel),
+            permit,
+            transaction,
+            active: true,
+            birth_admission: None,
+        })
+    }
+
     pub(super) fn validate(&self, state: &RegistryState) -> Result<(), KernelOperationError> {
         state.validate_task_set(&self.permit).map_err(Into::into)
     }
@@ -303,7 +321,7 @@ impl TaskSetReservation {
         &mut self,
         state: &mut RegistryState,
     ) -> Result<PendingReservationPublication, KernelOperationError> {
-        state.release_task_set(&self.permit)?;
+        let released = state.release_task_set(&self.permit)?;
         self.active = false;
         // Conflicting authority is committed. Release birth custody before
         // reservation subscribers can attempt their next host operation.
@@ -318,6 +336,7 @@ impl TaskSetReservation {
         // commit). The `Drop` arm below always had the correct order:
         // release the lock, then publish.
         Ok(PendingReservationPublication {
+            released,
             kernel: Arc::clone(&self.kernel),
         })
     }
@@ -330,11 +349,15 @@ impl TaskSetReservation {
 #[must_use = "reservation-change subscribers are not notified until publish() runs after the registry guard drops"]
 pub struct PendingReservationPublication {
     kernel: Arc<Kernel>,
+    released: carrick_sched_core::process::exit::ReleasedTaskSet<KernelTransactionId>,
 }
 
 impl PendingReservationPublication {
-    pub(crate) fn publish(self) {
+    pub(crate) fn publish(
+        self,
+    ) -> carrick_sched_core::process::exit::ReleasedTaskSet<KernelTransactionId> {
         self.kernel.publish_reservation_change();
+        self.released
     }
 }
 

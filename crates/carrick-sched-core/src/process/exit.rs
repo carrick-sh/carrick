@@ -442,6 +442,7 @@ impl<
 #[derive(Debug)]
 pub struct TaskGraphReservation<Transaction> {
     transaction: Transaction,
+    incarnation: Arc<TaskReservationIncarnation>,
     scope: TaskReservationScope,
 }
 #[derive(Debug)]
@@ -451,22 +452,20 @@ enum TaskReservationScope {
 }
 impl<Transaction: Copy> TaskGraphReservation<Transaction> {
     pub fn exclusive(transaction: Transaction) -> Self {
+        Self::with_incarnation(transaction, Arc::new(TaskReservationIncarnation))
+    }
+    fn with_incarnation(
+        transaction: Transaction,
+        incarnation: Arc<TaskReservationIncarnation>,
+    ) -> Self {
         Self {
             transaction,
+            incarnation,
             scope: TaskReservationScope::Exclusive,
         }
     }
     pub fn transaction(&self) -> Transaction {
         self.transaction
-    }
-    pub fn exit_participant(
-        transaction: Transaction,
-        revision: Arc<ExitParticipantRevision>,
-    ) -> Self {
-        Self {
-            transaction,
-            scope: TaskReservationScope::ExitParticipant(revision),
-        }
     }
     pub fn permits_nonfinal_thread_exit(&self) -> bool {
         matches!(self.scope, TaskReservationScope::ExitParticipant(_))
@@ -494,6 +493,7 @@ pub enum TaskSetError {
 #[derive(Debug)]
 pub struct ReservedTaskSet<Transaction> {
     task_ids: Vec<TaskId>,
+    incarnation: Arc<TaskReservationIncarnation>,
     transaction: Transaction,
 }
 impl<
@@ -520,12 +520,16 @@ impl<
                 return Err(TaskSetError::Busy(*id));
             }
         }
+        let incarnation = Arc::new(TaskReservationIncarnation);
         for id in &task_ids {
-            self.reservations
-                .insert(*id, TaskGraphReservation::exclusive(transaction));
+            self.reservations.insert(
+                *id,
+                TaskGraphReservation::with_incarnation(transaction, Arc::clone(&incarnation)),
+            );
         }
         Ok(ReservedTaskSet {
             task_ids,
+            incarnation,
             transaction,
         })
     }
@@ -534,10 +538,10 @@ impl<
         permit: &ReservedTaskSet<Transaction>,
     ) -> Result<(), TaskSetError> {
         if permit.task_ids.iter().all(|id| {
-            self.reservations
-                .get(id)
-                .map(TaskGraphReservation::transaction)
-                == Some(permit.transaction)
+            self.reservations.get(id).is_some_and(|row| {
+                row.transaction == permit.transaction
+                    && Arc::ptr_eq(&row.incarnation, &permit.incarnation)
+            })
         }) {
             Ok(())
         } else {
@@ -547,23 +551,25 @@ impl<
     pub fn release_task_set(
         &mut self,
         permit: &ReservedTaskSet<Transaction>,
-    ) -> Result<(), TaskSetError> {
+    ) -> Result<ReleasedTaskSet<Transaction>, TaskSetError> {
         self.validate_task_set(permit)?;
         for id in &permit.task_ids {
             self.reservations.remove(id);
         }
-        Ok(())
+        Ok(ReleasedTaskSet {
+            transaction: permit.transaction,
+            incarnation: Arc::clone(&permit.incarnation),
+            task_ids: permit.task_ids.clone(),
+        })
     }
     /// Rollback releases only identities still owned by this transaction.
     pub fn rollback_task_set(&mut self, permit: &ReservedTaskSet<Transaction>) -> bool {
         let mut changed = false;
         for id in &permit.task_ids {
-            if self
-                .reservations
-                .get(id)
-                .map(TaskGraphReservation::transaction)
-                == Some(permit.transaction)
-            {
+            if self.reservations.get(id).is_some_and(|row| {
+                row.transaction == permit.transaction
+                    && Arc::ptr_eq(&row.incarnation, &permit.incarnation)
+            }) {
                 self.reservations.remove(id);
                 changed = true;
             }
@@ -626,5 +632,320 @@ impl<
             retiring,
             autoreaped_receipt,
         })
+    }
+}
+
+/// Proof that the owner released this exact reservation set. Only a successful
+/// release constructs it; transport publication occurs before its consumption.
+#[derive(Debug)]
+pub struct ReleasedTaskSet<Transaction> {
+    transaction: Transaction,
+    incarnation: Arc<TaskReservationIncarnation>,
+    task_ids: Vec<TaskId>,
+}
+
+pub trait ExitMember {
+    fn exit_task(&self) -> TaskKey;
+}
+pub trait ExitEffectSource<C>: ExitLive<C> {
+    type Member: ExitMember;
+    type Resources;
+    fn exit_members(&self) -> (Vec<Self::Member>, Self::Resources);
+    fn exit_begin(&self) -> bool;
+}
+
+/// Cancellation targets are inaccessible until matching topology release.
+pub struct PendingExitEffects<Member, Resources, Transaction> {
+    task: TaskKey,
+    transaction: Transaction,
+    incarnation: Arc<TaskReservationIncarnation>,
+    resources: Option<Resources>,
+    members: Vec<Member>,
+    parent: Option<TaskKey>,
+    signal: ChildExitSignal,
+}
+/// Owned admission result shared by every execution-lane consumer.
+pub type ExitEffectAdmission<C, L, Transaction> = Result<
+    PendingExitEffects<
+        <L as ExitEffectSource<C>>::Member,
+        <L as ExitEffectSource<C>>::Resources,
+        Transaction,
+    >,
+    ExitError<<L as ExitLive<C>>::Error>,
+>;
+pub struct ReadyExitEffects<Member> {
+    members: Vec<Member>,
+    parent: Option<TaskKey>,
+    signal: ChildExitSignal,
+}
+pub struct ExitParentPermit {
+    parent: Option<TaskKey>,
+    signal: ChildExitSignal,
+}
+impl<Member, Resources, Transaction: Eq> PendingExitEffects<Member, Resources, Transaction> {
+    pub fn take_resources(&mut self) -> Option<Resources> {
+        self.resources.take()
+    }
+    pub fn after_release(
+        self,
+        release: ReleasedTaskSet<Transaction>,
+    ) -> Result<ReadyExitEffects<Member>, ExitTopologyChanged> {
+        if self.transaction != release.transaction
+            || !Arc::ptr_eq(&self.incarnation, &release.incarnation)
+            || !release.task_ids.contains(&self.task.id)
+        {
+            return Err(ExitTopologyChanged(self.task));
+        }
+        Ok(ReadyExitEffects {
+            members: self.members,
+            parent: self.parent,
+            signal: self.signal,
+        })
+    }
+}
+impl<Member> ReadyExitEffects<Member> {
+    /// Parent notification authority is published only after member cancellation.
+    pub fn cancel_members(self, mut cancel: impl FnMut(Member)) -> ExitParentPermit {
+        for member in self.members {
+            cancel(member);
+        }
+        ExitParentPermit {
+            parent: self.parent,
+            signal: self.signal,
+        }
+    }
+}
+impl ExitParentPermit {
+    pub fn parent(&self) -> Option<TaskKey> {
+        self.parent
+    }
+    pub fn signal(&self) -> ChildExitSignal {
+        self.signal
+    }
+}
+impl<
+    C: Copy + Ord,
+    L: ExitEffectSource<C>,
+    Z: ExitZombie,
+    R,
+    Transaction: Copy + Eq,
+    Retired,
+    Group,
+    Session,
+    Failure: RegistryFailure,
+> ProcessRegistry<C, L, Z, R, TaskGraphReservation<Transaction>, Retired, Group, Session, Failure>
+{
+    pub fn begin_exit_effects(
+        &self,
+        task: TaskKey,
+        plan: &PreparedExitTopology<L::Credit>,
+        permit: &ReservedTaskSet<Transaction>,
+    ) -> ExitEffectAdmission<C, L, Transaction> {
+        self.validate_task_set(permit)
+            .map_err(|_| ExitError::Topology(task.id))?;
+        if plan
+            .reserved_ids
+            .iter()
+            .any(|id| !permit.task_ids.contains(id))
+            || !matches!(self.reservations.get(&task.id).map(|row| &row.scope),
+                Some(TaskReservationScope::ExitParticipant(revision))
+                    if Arc::ptr_eq(revision, &plan.task_revision))
+            || plan.affected_revisions.iter().any(|(id, participant)| {
+                !matches!(self.reservations.get(id).map(|row| &row.scope),
+                    Some(TaskReservationScope::ExitParticipant(revision))
+                        if Arc::ptr_eq(revision, &participant.revision))
+            })
+        {
+            return Err(ExitError::Topology(task.id));
+        }
+        self.validate_exit_topology(task, plan)?;
+        let record = self
+            .tasks
+            .get(&task.id)
+            .ok_or(ExitError::Unknown(task.id))?;
+        if record.exit_lifecycle() != TaskLifecycle::Live {
+            return Err(ExitError::Topology(task.id));
+        }
+        let identity = record.wait_identity();
+        let (members, resources) = record.exit_members();
+        if members.iter().any(|member| member.exit_task() != task) {
+            return Err(ExitError::Topology(task.id));
+        }
+        if !record.exit_begin() {
+            return Err(ExitError::AlreadyExiting(task.id));
+        }
+        Ok(PendingExitEffects {
+            task,
+            transaction: permit.transaction,
+            incarnation: Arc::clone(&permit.incarnation),
+            resources: Some(resources),
+            members,
+            parent: identity.parent,
+            signal: identity.exit_signal,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExitSignalDisposition {
+    Default,
+    Ignore,
+    Caught,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExitSignalState {
+    pub disposition: ExitSignalDisposition,
+    pub blocked: bool,
+}
+impl ExitSignalState {
+    pub fn needs_notification(self, signal: super::LinuxSignal) -> bool {
+        match self.disposition {
+            ExitSignalDisposition::Ignore => false,
+            ExitSignalDisposition::Caught => true,
+            ExitSignalDisposition::Default => {
+                self.blocked
+                    || !matches!(
+                        carrick_signal_core::policy::Signal::from_number(signal.raw())
+                            .map(carrick_signal_core::policy::default_delivery),
+                        Some(carrick_signal_core::policy::Delivery::Ignore)
+                    )
+            }
+        }
+    }
+}
+pub trait ExitSignalSource {
+    fn exit_signal_state(&self, signal: super::LinuxSignal) -> ExitSignalState;
+}
+pub trait ExitNotificationSource {
+    type Target: ExitSignalSource;
+    fn exit_notification_target(&self) -> Self::Target;
+}
+pub struct ExitParentTarget<Target> {
+    parent: TaskKey,
+    signal: ChildExitSignal,
+    payload: Target,
+}
+pub struct ExitParentNotification<Target> {
+    pub parent: TaskKey,
+    pub signal: Option<super::LinuxSignal>,
+    pub payload: Target,
+}
+impl<Target: ExitSignalSource> ExitParentTarget<Target> {
+    /// Snapshot signal locks only after releasing the registry guard. The
+    /// retained exact parent handle preserves the consumer's resource lifetime.
+    pub fn prepare(self) -> ExitParentNotification<Target> {
+        let signal = match self.signal {
+            ChildExitSignal::Signal(signal)
+                if self
+                    .payload
+                    .exit_signal_state(signal)
+                    .needs_notification(signal) =>
+            {
+                Some(signal)
+            }
+            _ => None,
+        };
+        ExitParentNotification {
+            parent: self.parent,
+            signal,
+            payload: self.payload,
+        }
+    }
+}
+impl<
+    C: Copy + Ord,
+    L: WaitIdentitySource + ExitNotificationSource,
+    Z,
+    R,
+    Reservation,
+    Retired,
+    Group,
+    Session,
+    Failure: RegistryFailure,
+> ProcessRegistry<C, L, Z, R, Reservation, Retired, Group, Session, Failure>
+{
+    pub fn select_exit_parent(
+        &self,
+        permit: &ExitParentPermit,
+    ) -> Option<ExitParentTarget<L::Target>> {
+        let parent = permit.parent?;
+        let record = self
+            .tasks
+            .get(&parent.id)
+            .filter(|record| record.wait_identity().key == parent)?;
+        Some(ExitParentTarget {
+            parent,
+            signal: permit.signal,
+            payload: record.exit_notification_target(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct TaskReservationIncarnation;
+
+impl<
+    C: Copy + Ord,
+    L: ExitLive<C>,
+    Z,
+    R,
+    Transaction: Copy + Eq,
+    Retired,
+    Group,
+    Session,
+    Failure: RegistryFailure,
+> ProcessRegistry<C, L, Z, R, TaskGraphReservation<Transaction>, Retired, Group, Session, Failure>
+{
+    pub fn bind_exit_participants(
+        &mut self,
+        permit: &ReservedTaskSet<Transaction>,
+        plan: &PreparedExitTopology<L::Credit>,
+    ) -> Result<(), TaskSetError> {
+        self.validate_task_set(permit)?;
+        let task = plan.task_revision.task;
+        if !permit.task_ids.contains(&task.id)
+            || plan
+                .affected_revisions
+                .keys()
+                .any(|id| !permit.task_ids.contains(id))
+        {
+            return Err(TaskSetError::Stale);
+        }
+        if let Some(row) = self.reservations.get_mut(&task.id) {
+            row.scope = TaskReservationScope::ExitParticipant(Arc::clone(&plan.task_revision));
+        }
+        for (id, participant) in &plan.affected_revisions {
+            if let Some(row) = self.reservations.get_mut(id) {
+                row.scope = TaskReservationScope::ExitParticipant(participant.revision());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<
+    C: Copy + Ord,
+    L: ExitLive<C>,
+    Z,
+    R,
+    Transaction: Copy + Eq,
+    Retired,
+    Group,
+    Session,
+    Failure: RegistryFailure,
+> ProcessRegistry<C, L, Z, R, TaskGraphReservation<Transaction>, Retired, Group, Session, Failure>
+{
+    pub fn reserve_exit_task_set(
+        &mut self,
+        plan: &PreparedExitTopology<L::Credit>,
+        transaction: Transaction,
+    ) -> Result<ReservedTaskSet<Transaction>, TaskSetError> {
+        let permit =
+            self.reserve_task_set(plan.reserved_ids.iter().copied().collect(), transaction)?;
+        if let Err(error) = self.bind_exit_participants(&permit, plan) {
+            self.rollback_task_set(&permit);
+            return Err(error);
+        }
+        Ok(permit)
     }
 }
