@@ -1114,6 +1114,7 @@ impl PreparedRun {
                 guest_entries,
                 portal_exits,
                 host_forwards,
+                anonymous_private_pages: machine.anonymous_private_pages(),
                 host_forward_families: count_family(forward_families),
                 guest_refusal_families: count_family(refusal_families),
             });

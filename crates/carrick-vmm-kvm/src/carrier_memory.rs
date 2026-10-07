@@ -494,6 +494,60 @@ impl CarrierMemory {
         slot.backing.extent.ptr(pa.raw(), len)?;
         Some(slot)
     }
+    /// Initialize retained boot records before creating any vCPU.
+    pub(crate) fn initialize_fault_records(&mut self, region: FrameGpa) -> Result<(), MemoryError> {
+        fn record_ptr<T>(memory: &CarrierMemory, pa: FrameGpa) -> Result<*mut T, MemoryError> {
+            let slot = memory
+                .locate(pa, size_of::<T>())
+                .ok_or_else(|| error("boot record bounds"))?;
+            let ptr = slot
+                .backing
+                .extent
+                .ptr(pa.raw(), size_of::<T>())
+                .ok_or_else(|| error("boot record backing"))?;
+            if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+                return Err(error("boot record alignment"));
+            }
+            Ok(ptr.cast::<T>())
+        }
+        let residency = record_ptr::<carrick_el1_abi::FrameGrantResidencyTable>(
+            self,
+            FrameGpa::new(region.raw() + carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET),
+        )?;
+        let portal = record_ptr::<carrick_el1_abi::MmPortalSlots>(
+            self,
+            FrameGpa::new(region.raw() + carrick_el1_abi::EL1_MM_PORTAL_OFFSET),
+        )?;
+        // SAFETY: exclusive boot memory, before CarrierMachine creates vCPUs;
+        // both retained records have checked bounds and alignment.
+        unsafe {
+            carrick_el1_abi::FrameGrantResidencyTable::init_in_place(residency);
+            portal.write(carrick_el1_abi::MmPortalSlots::new());
+        }
+        Ok(())
+    }
+
+    /// Borrow an aligned record from retained stage-2 backing.
+    ///
+    /// # Safety
+    /// The caller must have initialized T before this borrow, and must use
+    /// atomic fields (or stopped vCPUs) for every concurrent guest access.
+    pub(crate) unsafe fn retained_record<T>(&self, pa: FrameGpa) -> Result<&T, MemoryError> {
+        let slot = self
+            .locate(pa, size_of::<T>())
+            .ok_or_else(|| error("retained record bounds"))?;
+        let ptr = slot
+            .backing
+            .extent
+            .ptr(pa.raw(), size_of::<T>())
+            .ok_or_else(|| error("retained record backing"))?;
+        if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            return Err(error("retained record alignment"));
+        }
+        // SAFETY: the caller owns record initialization and concurrency.
+        Ok(unsafe { &*ptr.cast::<T>() })
+    }
+
     fn contains(&self, output: FrameGpa, len: u64) -> bool {
         usize::try_from(len)
             .ok()

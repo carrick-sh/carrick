@@ -100,6 +100,34 @@ impl GuestMmuPublication {
         })
     }
 
+    /// Authenticate the isolated owner-grant wire receipt, then project its
+    /// native identity through the same ISA binding that executed the edit.
+    pub fn from_x86_owner_grant(
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+    ) -> Option<Self> {
+        use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
+        txn.verify_receipt(receipt).ok()?;
+        let DescriptorOutcome::Applied(applied) = receipt.outcome else {
+            return None;
+        };
+        carrick_mmu_core::x86::owner_mmu::X86Mmu::project_grant(txn.root.raw(), txn, |native| {
+            Some(Self {
+                revision: Self::REVISION,
+                outcome: Self::APPLIED,
+                mm_key: native.id.mm_key.get(),
+                root_gpa: native.root.address().raw(),
+                generation: native.id.generation.get(),
+                edit_identity: native.edit_identity(),
+                span_va: native.op.span().va,
+                span_len: native.op.span().len,
+                live_stores: applied.live_stores,
+                tables_linked: u32::from(applied.tables_linked),
+            })
+        })
+        .ok()?
+    }
+
     /// Match a host-held expected edit without interpreting descriptor words.
     /// A separate read-only postcondition check confirms the live guest graph.
     pub fn matches_x86_txn(

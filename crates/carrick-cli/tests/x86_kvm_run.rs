@@ -165,9 +165,37 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
 }
 
 #[test]
-#[ignore = "CPL0 anonymous mmap first touch needs the shared guest fault and descriptor editor"]
 fn mounted_static_x86_elf_matches_native_anonymous_memory() {
     compare_mounted_assembly_with_native("x86_memory_only.S", b"M\n");
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("memory-private");
+    compile_assembly("x86_memory_only.S", &elf);
+    let observed = run_mounted_binary(&elf, "x86-memory-private", true);
+    assert_eq!(
+        observed.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&observed.stderr)
+    );
+    let envelope = observed
+        .stdout
+        .strip_prefix(b"M\n")
+        .expect("guest anonymous memory output");
+    let report: serde_json::Value = serde_json::from_slice(envelope).unwrap();
+    let witness = &report["report"]["execution_witness"];
+    assert_eq!(witness["anonymous_private_pages"], 1);
+    assert_eq!(
+        witness["host_forwards"], 2,
+        "only write and exit cross host dispatch"
+    );
+    assert!(
+        witness["guest_refusal_families"]
+            .as_array()
+            .is_none_or(|rows| rows.is_empty())
+    );
 }
 
 #[test]

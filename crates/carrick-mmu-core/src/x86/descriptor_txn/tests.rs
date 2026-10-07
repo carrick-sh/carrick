@@ -6,6 +6,93 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
 #[test]
+fn owner_grant_projection_preserves_prepared_neighbors_and_refuses_exhaustion() {
+    use crate::aarch64::descriptor_txn::{
+        DescriptorOp as WireOp, DescriptorOutcome as WireOutcome, DescriptorTxn as WireTxn,
+        TableGrants,
+    };
+    use crate::aarch64::{GuestLeafPublication, SubstrateGpa};
+    use crate::owner_mmu::OwnerGrantMmu;
+    use crate::x86::owner_mmu::X86Mmu;
+    let grant = |tables: &[SubstrateGpa]| WireTxn {
+        id: txn(DescriptorOp::Unmap(PageSpan::new(0x4000, PAGE)), &[]).id,
+        root: SubstrateGpa(0x1000),
+        op: WireOp::Prepare {
+            publication: GuestLeafPublication {
+                va: 0x4000,
+                ipa: 0x100000,
+                len: 3 * PAGE,
+                writable: true,
+                executable: false,
+            },
+            resident: PageSpan::new(0x5000, PAGE),
+            backing: backing(),
+        },
+        tables: TableGrants::new(tables).unwrap(),
+    };
+    let words = Words::new();
+    let before = words.words.borrow().clone();
+    assert_eq!(
+        X86Mmu::execute_grant(&words, 0x1000, &grant(&[])),
+        WireOutcome::Refused(DescriptorRefusal::TablesExhausted)
+    );
+    assert_eq!(*words.words.borrow(), before);
+    let tables = [
+        SubstrateGpa(0x2000),
+        SubstrateGpa(0x3000),
+        SubstrateGpa(0x4000),
+    ];
+    assert_eq!(
+        X86Mmu::execute_grant(&words, 0x8000, &grant(&tables)),
+        WireOutcome::Refused(DescriptorRefusal::StaleRoot)
+    );
+    assert_eq!(*words.words.borrow(), before);
+    assert!(matches!(
+        X86Mmu::execute_grant(&words, 0x1000, &grant(&tables)),
+        WireOutcome::Applied(_)
+    ));
+    for (va, output, resident) in [
+        (0x4000, 0x100000, false),
+        (0x5000, 0x101000, true),
+        (0x6000, 0x102000, false),
+    ] {
+        let leaf = read_terminal_descriptor(&words, root(0x1000), UserVa::new(va)).unwrap();
+        assert_eq!(leaf.0 & ADDRESS, output);
+        assert_ne!(leaf.0 & PRIVATE, 0);
+        assert_eq!(leaf.0 & PRESENT != 0, resident);
+        assert_eq!(leaf.0 & PREPARED != 0, !resident);
+    }
+    let middle = read_terminal_descriptor(&words, root(0x1000), UserVa::new(0x5000))
+        .unwrap()
+        .0;
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::Publish {
+                span: PageSpan::new(0x6000, PAGE),
+                expected: FrameGpa::new(0x102000),
+                access: Access::Write
+            },
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(
+        read_terminal_descriptor(&words, root(0x1000), UserVa::new(0x5000))
+            .unwrap()
+            .0,
+        middle
+    );
+    assert_ne!(
+        read_terminal_descriptor(&words, root(0x1000), UserVa::new(0x4000))
+            .unwrap()
+            .0
+            & PREPARED,
+        0
+    );
+}
+
+#[test]
 fn neutral_prepare_intent_publishes_one_native_page() {
     use carrick_guest_arch::{
         EditBacking, EditIntent, EditOperation, EditOwner, EditPermissions, GuestLen, UserRange,

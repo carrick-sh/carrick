@@ -7,14 +7,17 @@ use carrick_mmu_core::owner_mmu::{OwnerGrantMmu, OwnerMmu};
 use carrick_sched_core::SpaceEditor;
 
 /// An editor retained from target admission through descriptor completion.
-pub struct GrantTarget<'a> {
+pub struct GrantTarget<
+    'a,
+    C: Copy + Send + Sync + zerocopy::FromZeros = carrick_sched_core::ThreadCtx,
+> {
     window: carrick_core_abi::PortalGrantWindow,
     grant: carrick_sched_core::SpaceGrant,
-    _editor: SpaceEditor<'a>,
+    _editor: SpaceEditor<'a, C>,
     authenticated: bool,
 }
 
-impl<'a> GrantTarget<'a> {
+impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> GrantTarget<'a, C> {
     pub fn grant(&self) -> carrick_sched_core::SpaceGrant {
         self.grant
     }
@@ -23,7 +26,7 @@ impl<'a> GrantTarget<'a> {
     ) -> (
         PortalGrantWindow,
         carrick_sched_core::SpaceGrant,
-        SpaceEditor<'a>,
+        SpaceEditor<'a, C>,
         bool,
     ) {
         (self.window, self.grant, self._editor, self.authenticated)
@@ -68,6 +71,56 @@ pub fn grant_target<
         .grant(index, window.operation.mm.raw())
         .ok_or_else(|| gate.map_or(MmError::Busy, MmError::Wait))?;
     let mut root = portal.root_for(handle, worker)?;
+    authenticate_target(window, grant, editor, &mut root)
+}
+
+/// Admit a grant through an already borrowed owner root and its typed
+/// scheduler source. The root and editor retain the same parked-context ABI;
+/// publication uses the same authentication as the portal owner below.
+pub fn grant_target_in<
+    'a,
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    carrier: core::num::NonZeroU64,
+    window: PortalGrantWindow,
+    spaces: carrick_sched_core::spaces::notification::SpaceAccess<'a, C>,
+    worker: u32,
+    root: &mut crate::mm::reservation::Reservations<'_, Policy, Geometry, C>,
+) -> Result<GrantTarget<'a, C>, MmError> {
+    if carrier != window.operation.carrier || root.mm() != window.operation.mm {
+        return Err(MmError::Stale);
+    }
+    let index = spaces
+        .find(window.operation.mm.raw())
+        .ok_or(MmError::Stale)?;
+    let owner = core::num::NonZeroU64::new(u64::from(worker) + 1).ok_or(MmError::Invalid)?;
+    let editor = spaces
+        .try_begin_edit(index, window.operation.mm.raw(), owner)
+        .ok_or(MmError::Busy)?;
+    let grant = spaces
+        .grant(index, window.operation.mm.raw())
+        .ok_or(MmError::Busy)?;
+    authenticate_target(window, grant, editor, root)
+}
+
+fn authenticate_target<
+    'a,
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    window: PortalGrantWindow,
+    grant: carrick_sched_core::SpaceGrant,
+    editor: SpaceEditor<'a, C>,
+    root: &mut crate::mm::reservation::Reservations<'_, Policy, Geometry, C>,
+) -> Result<GrantTarget<'a, C>, MmError> {
+    if root.mm() != window.operation.mm
+        || root.incarnation().raw() != window.operation.incarnation.get()
+    {
+        return Err(MmError::Stale);
+    }
     let authenticated = root.authenticate_fork_transfer_fault(
         ReservationFaultPlan {
             mm: window.operation.mm,
@@ -118,7 +171,7 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
     slot: &carrick_core_abi::PortalGrantSlot,
     words: &W,
     residency: &FrameGrantResidencyTable,
-    target: GrantTarget<'_>,
+    target: GrantTarget<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     invalidate: impl FnOnce(),
 ) -> Option<carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt> {
     use carrick_mmu_core::aarch64::descriptor_txn::{
