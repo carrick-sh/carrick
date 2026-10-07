@@ -1307,6 +1307,12 @@ impl ZoneTables {
             seq,
         }
     }
+
+    /// Whether any completion handbacks are waiting to be drained by the host.
+    pub fn has_completion_handbacks(&self) -> bool {
+        self.completion_handbacks.has_pending()
+    }
+
     /// Called at a notified host boundary, never as a periodic poll.
     pub fn take_completion_handbacks(
         &self,

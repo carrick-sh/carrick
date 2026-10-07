@@ -40,6 +40,13 @@ pub(crate) fn deliver_completion(
                 cpu.send_sgi(target | (u64::from(carrick_el1_abi::GIC_RESCHED_INTID) << 24));
             }
         }
+        if deferred {
+            let target_slot = zone.find_any_idle().unwrap_or(SlotId::new(0));
+            let target = zone.slot(target_slot).sgi_target();
+            if target != 0 {
+                cpu.send_sgi(target | (u64::from(carrick_el1_abi::GIC_RESCHED_INTID) << 24));
+            }
+        }
         if effects.misplaced
             && let Some(slot) = own
             && let Some(task) = carrick_el1_abi::current_task_guest(usize::from(slot.raw()))

@@ -2097,6 +2097,21 @@ impl ZoneTables {
             && (home || rec.allows_cpu(s.cpu.load(Ordering::Relaxed)))
     }
 
+    /// An idle slot in EL1, if any.
+    pub fn find_any_idle(&self) -> Option<SlotId> {
+        for (word_index, word) in self.idle_map.iter().enumerate() {
+            let mut bits = word.load(Ordering::Acquire);
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if let Some(slot) = SlotId::from_index(word_index * 64 + bit) {
+                    return Some(slot);
+                }
+            }
+        }
+        None
+    }
+
     /// An idle slot other than `waker` that may take `rec`.
     fn find_idle(&self, rec: &ZoneRecord, waker: SlotId) -> Option<SlotId> {
         self.find_idle_except(rec, Some(waker))
@@ -2865,7 +2880,7 @@ impl ZoneTables {
         let Some(_guard) = self.slot_lock(slot, &SpinForever) else {
             return false;
         };
-        if s.len.load(Ordering::Acquire) != 0 {
+        if s.len.load(Ordering::Acquire) != 0 || self.has_completion_handbacks() {
             return false;
         }
         s.state.store(SlotState::IdleWfi as u32, Ordering::Release);
