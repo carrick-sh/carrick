@@ -51,6 +51,34 @@ result batching, retries, budget changes or host-copy bypass is proposed.
 This design still needs concrete table/resolver/wake integration; no native
 adapter implementation or signed acceptance is claimed here.
 
+### Native completion prerequisite
+
+The shared owner's prepared settlement had a separate completion callback
+that unconditionally published `Waker::El1`, even for a host `OwnerVenue`.
+The VM-free `prepared_copy_host_venue_preserves_host_completion_authority`
+witness fails before correction: actual `El1 { slot: SlotId(0) }`, expected
+`Host`. Settlement now authenticates and retains the venue's existing
+`SpaceReleaseVenue` before consuming the claim. Commit and cancel use that
+same wake authority, and a subsequent preparation proves permit recovery.
+The ten `prepared_copy_` owner tests pass. This prerequisite introduces no
+native transfer adapter and does not claim maintenance-budget closure.
+
+### Exact-HEAD milestone at 0910d9949
+
+`target/n1cm-sol-0910-full.log` uses the published exact-HEAD fixture bundle.
+The IPC witnesses pass. Task-load adds 7,942 maintenance exits for 722 loads,
+against the unchanged zero budget. The scheduler executable is killed after
+a spawn-slope teardown watchdog; its reaper also kills later burst/inotify
+executables. Those collateral kills and unexecuted scheduler cases cannot
+qualify as independent failures or passes. The comparison is explicitly
+incomplete in `target/n1cm-sol-0910-full-comparison.json`.
+
+A focused spawn sample also terminates with the EL1 panic sentinel at source
+line 859, column 13. Further fixed diagnostic samples reach the unchanged
+forwarded-clone budget failure. An attempted live attach loses the carrier
+before LLDB attaches; no live backtrace or core attribution is claimed from
+that attempt. Neither varying outcome is closure of the lifecycle flaw.
+
 ## Separate IPC evidence
 
 `target/n1cm-sol-ipc-red.log` reproduces `el1_ipc_pairs_blocking`: one pair
