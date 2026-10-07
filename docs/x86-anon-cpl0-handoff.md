@@ -796,3 +796,40 @@ Focused verification: 97 core tests in /tmp/x86-process-hooks-core.log;
 /tmp/x86-process-hooks-focused-clippy-green.log after removing an unnecessary
 explicit drop from the new test. Production ProcessNative is not yet bound;
 shared guest registry, CPU1, per-execution grants and two-MM green are next.
+
+## Native bridge and rebased shared-kernel push receipts (2026-10-07)
+
+b52aaf504 is pushed on work/x86-process-owner. Foreground KVM, clippy,
+fmt-check, reconciliation and clean domains gates all exit zero in
+/tmp/x86-process-hooks-{kvm,clippy,fmt,reconcile,domains}.log and .status.
+KVM has 130 passed, zero failed, five pre-existing ignored cases, with no
+new ignores. Explicit parent ASM comparison is zero; explicit N1 comparison
+retains the previously recorded one fatal_entry_binding hvc difference.
+Push and hook exit zero in /tmp/x86-process-hooks-push.log.
+
+c695c98b1 merges the director-authorized rebased shared head d355743b2.
+The ancestry rebase produces equivalent add/add conflicts. Reconcile the
+actual tree delta from already merged 51236d3d5; preserve reviewed process
+sources and PR82's single #PF entry and early settlement call. The incoming
+source changes are fixture build/input tooling. Its 84 fixture tests and
+foreground KVM, clippy, fmt, reconciliation and clean domains gates exit
+zero: /tmp/x86-process-shared-rebased-{fixtures,kvm,clippy,fmt,reconcile,domains}.log.
+Parent ASM is zero; N1 retains the same inherited difference. Hook/push zero
+in /tmp/x86-process-shared-rebased-push.log. No ARM/HVF or Docker run here.
+
+## Owner-selected stage-2 inventory MM (2026-10-07)
+
+InitialInventory is still the one physical custody transaction, now taking
+and retaining typed MmId. Initial-image callers select their admitted initial
+MM; anonymous inventory uses the existing owner-selected operation's MM.
+Publication authenticates the retained MM against its receipt and exact live
+frame inventory rather than always charging INITIAL_MM_KEY. No host VMA,
+process selection or descriptor store is added.
+
+Red /tmp/x86-process-inventory-mm-red.log asserts the second live receipt
+must name MM302 and gets MM301 from the old hardcoded implementation.
+Green /tmp/x86-process-inventory-mm-green.log passes all six initial reply/
+inventory tests, including two simultaneously retained MM transactions with
+different GPA and mapping identities and the existing wrong-MM refusal.
+This is physical custody proof only: production CPU1, process hooks, exact
+per-execution pending grants and the two-MM PRIVATE live witness remain open.

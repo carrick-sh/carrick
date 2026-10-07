@@ -344,6 +344,7 @@ fn append_records<T: Copy>(buffer: &mut Vec<u8>, records: &[T]) -> Result<u64, T
 }
 
 struct InitialInventory {
+    mm: MmId,
     authority: Arc<FrameInventoryAuthority>,
     receipt: Option<carrick_hal::FrameInventoryApplyReceipt>,
     frames: Vec<(FrameGpa, BackingIdentity)>,
@@ -360,6 +361,7 @@ impl InitialInventory {
         table_grants: usize,
         frame_len: u64,
         owner_generation: NonZeroU64,
+        mm: MmId,
     ) -> Result<(Self, Vec<X86InitialBootGrant>), TrapError> {
         let gpas: Vec<_> = gpas.into_iter().collect();
         if table_grants >= gpas.len() {
@@ -413,7 +415,6 @@ impl InitialInventory {
             }
             rows.push((gpa, frame, mapping, index >= table_grants));
         }
-        let mm = MmId::from_raw_u64(INITIAL_MM_KEY).ok_or_else(|| fail("initial inventory MM"))?;
         let (_, receipt) = authority
             .apply_with_receipt(mm, reservation.commit(()))
             .map_err(|error| fail(format!("initial inventory apply: {error}")))?;
@@ -446,6 +447,7 @@ impl InitialInventory {
         frames.sort_unstable_by_key(|(gpa, _)| gpa.raw());
         Ok((
             Self {
+                mm,
                 authority,
                 receipt: Some(receipt),
                 frames,
@@ -471,9 +473,7 @@ impl InventoryTransaction for InitialInventory {
         let receipt = self.receipt.as_ref().ok_or_else(|| {
             crate::carrier_memory::MemoryError("initial inventory receipt absent".into())
         })?;
-        let mm = MmId::from_raw_u64(INITIAL_MM_KEY).ok_or_else(|| {
-            crate::carrier_memory::MemoryError("initial inventory MM absent".into())
-        })?;
+        let mm = self.mm;
         if receipt.mm().get() != mm.raw() {
             return Err(crate::carrier_memory::MemoryError(
                 "inventory MM mismatch".into(),
@@ -1237,6 +1237,7 @@ impl Cpl0Carrier {
             table_grants,
             4096,
             NonZeroU64::MIN,
+            MmId::from_raw_u64(INITIAL_MM_KEY).ok_or_else(|| fail("initial inventory MM"))?,
         )?;
         inventory
             .publish()
@@ -3751,6 +3752,42 @@ mod initial_reply_tests {
     use super::*;
 
     #[test]
+    fn inventory_retains_two_live_owner_selected_mms() {
+        let authority = Arc::new(FrameInventoryAuthority::new());
+        let ids = ObjectIdRegistry::new();
+        let owners = [INITIAL_MM_KEY, INITIAL_MM_KEY + 1];
+        let mut staged = Vec::new();
+        for (index, owner) in owners.into_iter().enumerate() {
+            let mm = MmId::from_raw_u64(owner).unwrap();
+            let (mut inventory, _) = InitialInventory::stage(
+                Arc::clone(&authority),
+                &ids,
+                [FrameGpa::new(0x2_0000_0000 + index as u64 * 4096)],
+                0,
+                4096,
+                NonZeroU64::MIN,
+                mm,
+            )
+            .expect("owner-selected inventory");
+            assert_eq!(
+                inventory.receipt.as_ref().unwrap().mm().get(),
+                mm.raw(),
+                "stage-2 inventory must retain the selected MM, not the initial MM"
+            );
+            inventory.publish().expect("exact MM inventory publication");
+            staged.push(inventory);
+        }
+        assert_ne!(
+            staged[0].frames[0].1.mapping_id,
+            staged[1].frames[0].1.mapping_id
+        );
+        assert_ne!(staged[0].frames[0].0, staged[1].frames[0].0);
+        for inventory in &mut staged {
+            inventory.rollback().unwrap();
+        }
+    }
+
+    #[test]
     fn initial_inventory_refuses_a_receipt_from_another_mm() {
         let authority = Arc::new(FrameInventoryAuthority::new());
         let ids = ObjectIdRegistry::new();
@@ -3761,6 +3798,7 @@ mod initial_reply_tests {
             0,
             4096,
             NonZeroU64::MIN,
+            MmId::from_raw_u64(INITIAL_MM_KEY).expect("initial inventory MM"),
         )
         .expect("initial MM inventory");
         inventory.rollback().expect("original custody rollback");
@@ -3814,6 +3852,7 @@ mod initial_reply_tests {
             0,
             4096,
             NonZeroU64::MIN,
+            MmId::from_raw_u64(INITIAL_MM_KEY).expect("initial inventory MM"),
         )
         .expect("fresh exact inventory grant");
         inventory.frames[0].0 = FrameGpa::new(0x2_0000_1000);
@@ -3834,6 +3873,7 @@ mod initial_reply_tests {
                 0,
                 4096,
                 NonZeroU64::MIN,
+                MmId::from_raw_u64(INITIAL_MM_KEY).expect("initial inventory MM"),
             )
             .expect("fresh physical grant");
             inventory.guest_exposed = exposed;
@@ -3858,6 +3898,7 @@ mod initial_reply_tests {
             2,
             4096,
             NonZeroU64::MIN,
+            MmId::from_raw_u64(INITIAL_MM_KEY).expect("initial inventory MM"),
         )
         .expect("staged exact grants");
         assert_eq!(grants.len(), 4);

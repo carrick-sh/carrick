@@ -112,6 +112,7 @@ impl Cpl0Carrier {
             // A newly allocated physical mapping starts at generation one;
             // the guest operation sequence belongs to the descriptor txn.
             NonZeroU64::MIN,
+            MmId::from_raw_u64(mm.get()).ok_or_else(|| fail("owner inventory MM"))?,
         )?;
         let identity = inventory
             .frames
