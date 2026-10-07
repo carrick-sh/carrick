@@ -1571,6 +1571,10 @@ Filesystem     1024-blocks    Used Available Capacity Mounted on
                     .to_string()
                     .try_into()
                     .unwrap(),
+                checkout_tree: "89abcdef0123456789abcdef0123456789abcdef"
+                    .to_string()
+                    .try_into()
+                    .unwrap(),
                 bundle_source_head: "0123456789abcdef0123456789abcdef01234567"
                     .to_string()
                     .try_into()

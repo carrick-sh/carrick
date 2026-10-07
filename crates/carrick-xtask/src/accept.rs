@@ -811,7 +811,7 @@ pub fn verify_signed_fixtures(
     verify_clean_checkout(root)?;
     crate::fixtures::verify_installed_receipt(root).map_err(|error| {
         AcceptError::Failed(format!(
-            "signed fixture provenance: {error}; restore an exact-HEAD bundle with xtask fixtures restore --manifest <path>"
+            "signed fixture provenance: {error}; restore a bundle whose fixture input identity matches this checkout with xtask fixtures restore --manifest <path>"
         ))
     })
 }
