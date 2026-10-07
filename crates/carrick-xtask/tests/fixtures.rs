@@ -163,24 +163,15 @@ fn write(root: &Path, path: &str, bytes: &[u8]) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, bytes).unwrap();
 }
-/// The reviewed build-code list: the fixture graph's one build script
-/// (`embed-el1-sched/build.rs`, `fn main() {}`) plus `extra` entries.
+/// The reviewed (registry-only) build-code list; the synthetic fixture graph
+/// has no registry packages, so it is empty unless a test adds `extra`.
 fn write_reviewed_build_code(root: &Path, extra: &[serde_json::Value]) {
-    let mut entries = vec![serde_json::json!({
-        "package": "embed-el1-sched",
-        "location": "path:fixtures/embed-el1-sched/Cargo.toml",
-        "kind": "custom-build",
-        "source": "build.rs",
-        "sha256": String::from(source_hash(b"fn main() {}\n")),
-    })];
-    entries.extend(extra.iter().cloned());
-    entries.sort_by_key(|e| e.to_string());
     write(
         root,
         "fixtures/reviewed-build-code.json",
         &serde_json::to_vec_pretty(&serde_json::json!({
-            "schema": "carrick.fixtures.reviewed-build-code.v1",
-            "entries": entries,
+            "schema": "carrick.fixtures.reviewed-build-code.v2",
+            "entries": extra,
         }))
         .unwrap(),
     );
@@ -335,9 +326,6 @@ impl Fixture {
                 );
             } else {
                 write(root, &format!("{directory}/src/lib.rs"), b"// source\n");
-            }
-            if name == "embed-el1-sched" {
-                write(root, &format!("{directory}/build.rs"), b"fn main() {}\n");
             }
             let output = Command::new("cargo")
                 .current_dir(root)
@@ -2632,8 +2620,9 @@ fn dep_info_refuses_compiler_inputs_reached_through_symlinks() {
 }
 
 #[test]
-fn unreviewed_build_script_refuses_publish_and_admission() {
-    // A build script can read any file without telling dep-info.
+fn checkout_build_script_refuses_publish_and_admission() {
+    // A build script can read any file without telling dep-info. Checkout
+    // build code is forbidden outright; no review can admit it.
     let f = Fixture::new();
     let root = f.repo.path();
     commit(
@@ -2646,43 +2635,53 @@ fn unreviewed_build_script_refuses_publish_and_admission() {
     assert!(
         result
             .as_ref()
-            .is_err_and(|e| e.to_string().contains("unreviewed build code")),
+            .is_err_and(|e| e.to_string().contains("checkout build code is forbidden")),
         "{result:?}"
     );
-    // Reviewing it (recording its hash) admits it; the list is an input.
-    let build_rs = fs::read(root.join("fixtures/embed-zone-readers/build.rs")).unwrap();
-    let reviewed = serde_json::json!({
-        "package": "embed-zone-readers",
-        "location": "path:fixtures/embed-zone-readers/Cargo.toml",
-        "kind": "custom-build",
-        "source": "build.rs",
-        "sha256": String::from(source_hash(&build_rs)),
-    });
-    write_reviewed_build_code(root, std::slice::from_ref(&reviewed));
-    git(root, &["commit", "-qam", "review the build script"]);
-    let sources = fixtures::source_hashes(root, &f.manifest.compiler_inputs).unwrap();
-    assert!(sources.contains_key("fixtures/reviewed-build-code.json"));
-    // Changing the reviewed script refuses until it is reviewed again.
-    commit(
+}
+
+#[test]
+fn reviewed_registry_build_code_list_is_exact() {
+    // A stale entry (registry build code no longer in the graph) refuses, and
+    // the list is part of the inventory.
+    let f = Fixture::new();
+    let root = f.repo.path();
+    assert!(
+        fixtures::source_hashes(root, &f.manifest.compiler_inputs)
+            .unwrap()
+            .contains_key("fixtures/reviewed-build-code.json")
+    );
+    write_reviewed_build_code(
         root,
-        "fixtures/embed-zone-readers/build.rs",
-        b"fn main() {}\n",
-        "edit reviewed build script",
+        &[serde_json::json!({
+            "package": "libc",
+            "version": "0.2.189",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "kind": "custom-build",
+            "checksum": "00",
+        })],
     );
+    git(root, &["commit", "-qam", "stale reviewed entry"]);
     assert!(
         fixtures::source_hashes(root, &f.manifest.compiler_inputs)
             .unwrap_err()
             .to_string()
-            .contains("unreviewed build code")
+            .contains("stale reviewed entries: [custom-build libc@0.2.189")
     );
-    // A stale entry (reviewed code no longer in the graph) also refuses.
-    fs::remove_file(root.join("fixtures/embed-zone-readers/build.rs")).unwrap();
-    git(root, &["commit", "-qam", "drop the build script"]);
-    assert!(
-        fixtures::source_hashes(root, &f.manifest.compiler_inputs)
-            .unwrap_err()
-            .to_string()
-            .contains("stale reviewed entries: [custom-build path:fixtures/embed-zone-readers")
+}
+
+#[test]
+fn lockfile_checksums_key_registry_build_code() {
+    let lock = "version = 4\n\n[[package]]\nname = \"libc\"\nversion = \"0.2.189\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"abc\"\n\n[[package]]\nname = \"local\"\nversion = \"0.0.0\"\n";
+    let checksums = fixtures::build_code::lock_checksums(lock);
+    assert_eq!(checksums.len(), 1);
+    assert_eq!(
+        checksums[&(
+            "libc".to_owned(),
+            "0.2.189".to_owned(),
+            "registry+https://github.com/rust-lang/crates.io-index".to_owned()
+        )],
+        "abc"
     );
 }
 
@@ -2721,37 +2720,32 @@ fn unreviewed_proc_macro_refuses() {
         .unwrap_err()
         .to_string();
     assert!(
-        error.contains("proc-macro path:crates/fixture-macro/Cargo.toml src/lib.rs"),
+        error.contains("checkout build code is forbidden in fixture graphs: proc-macro"),
         "{error}"
     );
 }
 
 #[test]
-fn linker_references_resolve_only_to_inventoried_inputs() {
-    let inventory: std::collections::BTreeSet<&str> =
-        ["conformance-probes/link.ld", "scripts/link.ld"].into();
-    let check = |origin: &str, text: &str| fixtures::linker::check(origin, text, &inventory);
-    // Inside an inventoried package directory: admitted.
-    check(
-        "conformance-probes/.cargo/config.toml",
-        "rustflags = [\"-C\", \"link-arg=-Tlink.ld\"]",
-    )
-    .unwrap();
-    check(
-        "scripts/build-x.sh",
-        "\"$lld\" -flavor gnu -T link.ld -o out obj.o",
-    )
-    .unwrap();
+fn every_linker_input_reference_refuses() {
     for (origin, text) in [
+        (
+            "conformance-probes/.cargo/config.toml",
+            "rustflags = [\"-C\", \"link-arg=-Tlink.ld\"]",
+        ),
+        (
+            "scripts/build-x.sh",
+            "\"$lld\" -flavor gnu -T link.ld -o out obj.o",
+        ),
         ("scripts/build-x.sh", "\"$lld\" -T \"$repo_root/other.ld\""),
         ("scripts/build-x.sh", "cc -Wl,-T,/abs/link.ld"),
         ("scripts/build-x.sh", "cc -Wl,--script=missing.ld"),
         ("scripts/build-x.sh", "cc -Wl,@response.txt"),
         ("scripts/build-x.sh", "cc foo.lds"),
         ("scripts/build-x.sh", "ld -T"),
+        ("scripts/build-x.sh", "printf 'INCLUDE other.x' > link.x"),
     ] {
         assert!(
-            check(origin, text)
+            fixtures::linker::check(origin, text)
                 .unwrap_err()
                 .to_string()
                 .contains("linker input reference"),
@@ -2775,32 +2769,6 @@ fn linker_references_resolve_only_to_inventoried_inputs() {
             "{path}"
         );
     }
-}
-
-#[test]
-fn inventoried_linker_script_change_refuses_by_identity() {
-    let f = Fixture::new();
-    let root = f.repo.path();
-    write(root, "conformance-probes/link.ld", b"SECTIONS {}\n");
-    write(
-        root,
-        "conformance-probes/.cargo/config.toml",
-        b"[target.aarch64-unknown-linux-musl]\nrustflags = [\"-C\", \"link-arg=-Tlink.ld\"]\n",
-    );
-    git(root, &["add", "."]);
-    git(root, &["commit", "-qm", "package linker script"]);
-    let before = fixtures::source_hashes(root, &f.manifest.compiler_inputs).unwrap();
-    commit(
-        root,
-        "conformance-probes/link.ld",
-        b"SECTIONS { . = 0x1000; }\n",
-        "change linker script",
-    );
-    let after = fixtures::source_hashes(root, &f.manifest.compiler_inputs).unwrap();
-    assert_ne!(
-        before["conformance-probes/link.ld"],
-        after["conformance-probes/link.ld"]
-    );
 }
 
 #[test]
@@ -2839,17 +2807,92 @@ fn build_script_link_arg_outputs_follow_the_linker_rule() {
         output,
         b"cargo:rustc-cfg=foo\ncargo:rerun-if-changed=build.rs\n",
     );
-    let inventory = std::collections::BTreeSet::new();
-    fixtures::linker::check_build_script_outputs(root, &["fixtures/embed-x"], &inventory).unwrap();
+    fixtures::linker::check_build_script_outputs(root, &["fixtures/embed-x"]).unwrap();
     write(
         root,
         output,
         b"cargo:rustc-link-arg-bins=-T../../shared/link.ld\n",
     );
     assert!(
-        fixtures::linker::check_build_script_outputs(root, &["fixtures/embed-x"], &inventory)
+        fixtures::linker::check_build_script_outputs(root, &["fixtures/embed-x"])
             .unwrap_err()
             .to_string()
             .contains("linker input reference")
+    );
+}
+
+#[test]
+fn checkout_build_script_module_change_refuses() {
+    // An approved build.rs that `mod helper;`s: approval of the entry file
+    // alone would let helper.rs change behaviour.
+    let f = Fixture::new();
+    let root = f.repo.path();
+    let build_rs = b"mod helper;\nfn main() { helper::run(); }\n";
+    write(root, "fixtures/embed-zone-readers/build.rs", build_rs);
+    write(
+        root,
+        "fixtures/embed-zone-readers/helper.rs",
+        b"pub fn run() {}\n",
+    );
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "build script with helper module"]);
+    commit(
+        root,
+        "fixtures/embed-zone-readers/helper.rs",
+        b"pub fn run() { let _ = std::fs::read(\"../../shared/banner.txt\"); }\n",
+        "helper reads an outside file",
+    );
+    let result = fixtures::source_hashes(root, &f.manifest.compiler_inputs);
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("checkout build code is forbidden")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn decoy_package_linker_script_refuses() {
+    // An inventoried package-local link.ld must not authorize a reference the
+    // linker may resolve elsewhere (e.g. the repo root).
+    let f = Fixture::new();
+    let root = f.repo.path();
+    write(root, "conformance-probes/link.ld", b"SECTIONS {}\n");
+    write(root, "link.ld", b"SECTIONS { . = 0x1000; }\n");
+    write(
+        root,
+        "conformance-probes/.cargo/config.toml",
+        b"[target.aarch64-unknown-linux-musl]\nrustflags = [\"-C\", \"link-arg=-Tlink.ld\"]\n",
+    );
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "decoy linker script"]);
+    let result = fixtures::source_hashes(root, &f.manifest.compiler_inputs);
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("linker input")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn response_file_pulling_external_linker_script_refuses() {
+    let f = Fixture::new();
+    let root = f.repo.path();
+    write(root, "conformance-probes/link.rsp", b"-T ../external.ld\n");
+    write(root, "external.ld", b"SECTIONS {}\n");
+    write(
+        root,
+        "conformance-probes/.cargo/config.toml",
+        b"[target.aarch64-unknown-linux-musl]\nrustflags = [\"-C\", \"link-arg=@link.rsp\"]\n",
+    );
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "response file"]);
+    let result = fixtures::source_hashes(root, &f.manifest.compiler_inputs);
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("linker input")),
+        "{result:?}"
     );
 }
