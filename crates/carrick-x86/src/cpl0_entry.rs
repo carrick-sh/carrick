@@ -3,7 +3,7 @@
 use carrick_guest_arch::{
     CpuId, GuestIsa, NativeAbi, NativeEntrySnapshot, X86Register, X86Registers,
 };
-use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64};
 
 /// One xAPIC destination published for an issued scheduler CPU slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,6 +113,8 @@ pub struct ShootdownTable {
     pub kick_checks: [AtomicU64; CPL0_CPU_COUNT],
     /// Fixture-only two-live-CPU start barrier; production ignores it.
     pub fixture_arrived: AtomicU32,
+    /// Fixture hook: hold shootdown IPI dispatch until cleared.
+    pub fixture_hold_ipi: AtomicBool,
     pub requests: [ShootdownRequest; CPL0_CPU_COUNT],
     pub members: [ShootdownMember; CPL0_CPU_COUNT],
 }
@@ -123,6 +125,7 @@ impl ShootdownTable {
             next_generation: AtomicU64::new(0),
             kick_checks: [const { AtomicU64::new(0) }; CPL0_CPU_COUNT],
             fixture_arrived: AtomicU32::new(0),
+            fixture_hold_ipi: AtomicBool::new(false),
             requests: [const { ShootdownRequest::new() }; CPL0_CPU_COUNT],
             members: [const { ShootdownMember::new() }; CPL0_CPU_COUNT],
         }
@@ -172,6 +175,7 @@ impl PublishedApicIds {
 }
 
 pub const FORWARD_PORT: u16 = 0xc5;
+pub const FAULT_DOORBELL_PORT: u16 = 0xc7;
 pub const CONTROL_PORT: u16 = 0xc8;
 pub const ENTRY_KICK_PORT: u16 = 0xc9;
 pub const RETURN_KICK_PORT: u16 = 0xca;

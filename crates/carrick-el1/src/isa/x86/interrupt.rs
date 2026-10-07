@@ -274,6 +274,17 @@ pub fn rendezvous_context(context: AddressContext<RootGpa>) -> Result<ShootdownR
         }
         *awaited_peer = true;
         let apic = bound_apic_id(CpuId::new(peer as u32))?;
+        if table.fixture_hold_ipi.load(Ordering::Acquire) {
+            let tsc_hz = tsc_frequency().ok_or(ArchError::Unbound)?.get();
+            let limit = tsc_hz.checked_mul(5).ok_or(ArchError::Unbound)?;
+            let start = read_tsc();
+            while table.fixture_hold_ipi.load(Ordering::Acquire) {
+                if read_tsc().wrapping_sub(start) > limit {
+                    return Err(ArchError::Busy);
+                }
+                core::hint::spin_loop();
+            }
+        }
         // SAFETY: the retained request is published before this native IPI.
         unsafe { interrupts::hardware::send_shootdown(apic) }.map_err(|_| ArchError::Busy)?;
     }
