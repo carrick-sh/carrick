@@ -527,6 +527,25 @@ pub enum DispatchOutcome {
         #[serde(skip_serializing)]
         dependency: carrick_guest_mem::MemoryPrepareError,
     },
+    /// A getdents64 batch was already generated from the directory description
+    /// and its offset cursor was advanced. Retain the formatted records and
+    /// complete only the copyout after this exact owner dependency settles,
+    /// so the cursor does not skip or repeat entries.
+    OwnerGetdentsCopyout {
+        #[serde(skip_serializing)]
+        output: Box<super::fs::directory::GetdentsCopyout>,
+        #[serde(skip_serializing)]
+        dependency: carrick_guest_mem::MemoryPrepareError,
+    },
+    /// A readlinkat target was already captured and decoded. Retain the
+    /// target bytes and complete only the copyout after this exact owner
+    /// dependency settles.
+    OwnerReadlinkCopyout {
+        #[serde(skip_serializing)]
+        output: Box<super::fs::directory::ReadlinkCopyout>,
+        #[serde(skip_serializing)]
+        dependency: carrick_guest_mem::MemoryPrepareError,
+    },
     /// An admitted EL1 owner declined memory preparation before the host
     /// source was consumed. The runtime enrolls this exact owner/cause/revision
     /// in the zone, releases the executor, and retries the saved syscall only

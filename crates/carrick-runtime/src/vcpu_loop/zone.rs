@@ -37,6 +37,14 @@ pub(super) enum OwnerMemoryAction {
         frame: carrick_hal::RawSyscall,
         output: Box<carrick_kernel::dispatch::format_stat::StatCopyout>,
     },
+    GetdentsCopyout {
+        frame: carrick_hal::RawSyscall,
+        output: Box<carrick_kernel::dispatch::fs::directory::GetdentsCopyout>,
+    },
+    ReadlinkCopyout {
+        frame: carrick_hal::RawSyscall,
+        output: Box<carrick_kernel::dispatch::fs::directory::ReadlinkCopyout>,
+    },
     CloneParentTid {
         frame: carrick_hal::RawSyscall,
         address: u64,
@@ -702,6 +710,8 @@ where
         let syscall_state = match &action {
             OwnerMemoryAction::Syscall(_)
             | OwnerMemoryAction::StatCopyout { .. }
+            | OwnerMemoryAction::GetdentsCopyout { .. }
+            | OwnerMemoryAction::ReadlinkCopyout { .. }
             | OwnerMemoryAction::CloneParentTid { .. }
             | OwnerMemoryAction::Ipc {
                 boundary: IpcBoundary::Syscall(_),
@@ -819,6 +829,44 @@ where
                         )?;
                         self.phase =
                             HvpatchProductionPhase::ResumeStatCopyoutOwner { frame, output };
+                        Ok(exit)
+                    }
+                    (
+                        OwnerMemoryAction::GetdentsCopyout { frame, output },
+                        Some((state, _, request)),
+                    ) => {
+                        let exit = self.settle_into_zone(
+                            control,
+                            continuation::quantum::ZoneSave {
+                                base: state,
+                                record: zone.record_ref(record),
+                                origin: executor::residency::ZoneResumeOrigin::HostSyscall,
+                            },
+                            seq,
+                            None,
+                            request,
+                        )?;
+                        self.phase =
+                            HvpatchProductionPhase::ResumeGetdentsCopyoutOwner { frame, output };
+                        Ok(exit)
+                    }
+                    (
+                        OwnerMemoryAction::ReadlinkCopyout { frame, output },
+                        Some((state, _, request)),
+                    ) => {
+                        let exit = self.settle_into_zone(
+                            control,
+                            continuation::quantum::ZoneSave {
+                                base: state,
+                                record: zone.record_ref(record),
+                                origin: executor::residency::ZoneResumeOrigin::HostSyscall,
+                            },
+                            seq,
+                            None,
+                            request,
+                        )?;
+                        self.phase =
+                            HvpatchProductionPhase::ResumeReadlinkCopyoutOwner { frame, output };
                         Ok(exit)
                     }
                     (OwnerMemoryAction::Syscall(frame), Some((state, _, request))) => {
@@ -952,6 +1000,12 @@ where
                     }
                     OwnerMemoryAction::StatCopyout { frame, output } => {
                         self.complete_stat_copyout(engine, control, frame, output)
+                    }
+                    OwnerMemoryAction::GetdentsCopyout { frame, output } => {
+                        self.complete_getdents_copyout(engine, control, frame, output)
+                    }
+                    OwnerMemoryAction::ReadlinkCopyout { frame, output } => {
+                        self.complete_readlink_copyout(engine, control, frame, output)
                     }
                     OwnerMemoryAction::CloneParentTid {
                         frame,

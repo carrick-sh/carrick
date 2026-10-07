@@ -1481,6 +1481,8 @@ impl BlockedContinuation {
             | DispatchOutcome::SchedulerYield
             | DispatchOutcome::Errno { .. }
             | DispatchOutcome::OwnerStatCopyout { .. }
+            | DispatchOutcome::OwnerGetdentsCopyout { .. }
+            | DispatchOutcome::OwnerReadlinkCopyout { .. }
             | DispatchOutcome::OwnerMemoryWait { .. }
             | DispatchOutcome::OwnerMemorySupply { .. }
             | DispatchOutcome::OwnerPhysicalWait { .. }
