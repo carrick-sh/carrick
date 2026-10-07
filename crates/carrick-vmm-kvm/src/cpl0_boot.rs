@@ -53,11 +53,13 @@ const BINDING_OFFSET: u64 = 0x8000;
 const TASK_OFFSET: u64 = 0x9000;
 const CONTROL_OFFSET: u64 = 0xa000;
 const ROUTES_OFFSET: u64 = 0xd000;
+const SHOOTDOWN_OFFSET: u64 = 0xe000;
 const STRIDE: u64 = 0x100;
 const _: () = {
     assert!(size_of::<CpuBinding>() <= STRIDE as usize);
     assert!(ROUTES_OFFSET >= 0xc000 + 9 * size_of::<ThreadControlSlot>() as u64);
-    assert!(ROUTES_OFFSET + size_of::<PublishedApicIds>() as u64 <= COUNTERS_OFFSET);
+    assert!(ROUTES_OFFSET + size_of::<PublishedApicIds>() as u64 <= SHOOTDOWN_OFFSET);
+    assert!(SHOOTDOWN_OFFSET + size_of::<ShootdownTable>() as u64 <= COUNTERS_OFFSET);
 };
 const IST_STACK_BASE: u64 = 0xf0_0000;
 const IMAGE_VA: u64 = 0xffff_ffff_8000_0000;
@@ -1262,6 +1264,11 @@ impl Cpl0Carrier {
                 .ok_or_else(|| fail("APIC route table backing"))?
                 .cast::<PublishedApicIds>();
             routes.write(PublishedApicIds::new());
+            let shootdown = ram
+                .host_ptr(META_GPA + SHOOTDOWN_OFFSET, size_of::<ShootdownTable>())
+                .ok_or_else(|| fail("shootdown table backing"))?
+                .cast::<ShootdownTable>();
+            shootdown.write(ShootdownTable::new());
             for index in 0..2 {
                 let offset = index as u64 * STRIDE;
                 let slot = ram
@@ -1320,6 +1327,7 @@ impl Cpl0Carrier {
                     wake_routes_address: METADATA_VA + ROUTES_OFFSET,
                     apic_timer_hz: AtomicU64::new(0),
                     pending_irqs: AtomicU32::new(0),
+                    shootdown_table_address: METADATA_VA + SHOOTDOWN_OFFSET,
                 });
             }
         }
@@ -1650,6 +1658,18 @@ impl Cpl0Carrier {
         }
         Ok(self.binding(index).pending_irqs.load(Ordering::Acquire))
     }
+    /// Exact retained generations and acknowledgements for a stopped fixture.
+    pub fn fixture_shootdown_state(&self) -> [(u64, u64, [u64; 2]); 2] {
+        let table: &ShootdownTable = self.metadata(SHOOTDOWN_OFFSET);
+        core::array::from_fn(|sender| {
+            let request = &table.requests[sender];
+            (
+                request.root.load(Ordering::Acquire),
+                request.generation.load(Ordering::Acquire),
+                core::array::from_fn(|peer| request.ack[peer].load(Ordering::Acquire)),
+            )
+        })
+    }
     /// The installed KVM CPUID capability for the stopped fixture vCPU.
     pub fn has_tsc_deadline(&self, index: usize) -> Result<bool, TrapError> {
         let cpu = self
@@ -1775,6 +1795,78 @@ impl Cpl0Carrier {
     pub fn observe(&mut self, index: usize) -> Result<Observation, TrapError> {
         self.observe_with_forward(index, |frame| {
             Err(fail(format!("unported CPL0 native call {}", frame.rax)))
+        })
+    }
+
+    /// Run both admitted fixture CPUs at once through their first control
+    /// result. This is a bounded live rendezvous witness: neither CPU's KVM_RUN
+    /// may be replaced by a host-side completion of its peer's request.
+    pub fn fixture_observe_pair(&mut self) -> Result<[u64; 2], TrapError> {
+        fn first_result(
+            cpu: &mut KvmVcpu,
+            ram: &GuestRam,
+            stack_end: u64,
+        ) -> Result<u64, TrapError> {
+            let watchdog = Watchdog::start();
+            for _ in 0..32 {
+                let exit = watchdog.during_guest(|| HvVcpu::run(cpu))?;
+                if watchdog.expired() {
+                    return Err(fail("paired fixture guest interval deadline"));
+                }
+                match exit {
+                    VcpuExit::IoOut {
+                        port: CONTROL_PORT, ..
+                    } => {
+                        let address = cpu.get_gpr(X86Reg::Rax)?;
+                        if address & 7 != 0
+                            || address < stack_end - 0x1_0000
+                            || address
+                                .checked_add(size_of::<NativeFrame>() as u64)
+                                .is_none_or(|end| end > stack_end)
+                        {
+                            return Err(fail("paired control frame outside private stack"));
+                        }
+                        let ptr = ram
+                            .host_ptr(address - DIRECT_VA, size_of::<NativeFrame>())
+                            .ok_or_else(|| fail("paired control frame outside backing"))?
+                            .cast::<NativeFrame>();
+                        // SAFETY: this thread exclusively owns the stopped
+                        // vCPU and its retained private kernel stack.
+                        return Ok(unsafe { (*ptr).rdi });
+                    }
+                    VcpuExit::IoOut {
+                        port:
+                            carrick_x86::cpl0_scheduler::PROGRESS_ENTRY_PORT
+                            | carrick_x86::cpl0_scheduler::PROGRESS_RETURN_PORT,
+                        ..
+                    } => {}
+                    VcpuExit::IoOut {
+                        port: FATAL_PORT, ..
+                    } => {
+                        return Err(fail("paired fixture fatal exit"));
+                    }
+                    VcpuExit::IoOut { port, .. } => {
+                        return Err(fail(format!("paired fixture port {port:#x}")));
+                    }
+                    _ => return Err(fail("paired fixture non-control exit")),
+                }
+            }
+            Err(fail("paired fixture exit budget"))
+        }
+        let ram = Arc::clone(&self.ram);
+        let stacks = [
+            self.binding(0).kernel_stack + 16,
+            self.binding(1).kernel_stack + 16,
+        ];
+        let [a, b] = &mut self.cpus;
+        std::thread::scope(|scope| {
+            let left = scope.spawn(|| first_result(a, &ram, stacks[0]));
+            let right = scope.spawn(|| first_result(b, &ram, stacks[1]));
+            let a = left.join().map_err(|_| fail("paired CPU 0 host panic"))??;
+            let b = right
+                .join()
+                .map_err(|_| fail("paired CPU 1 host panic"))??;
+            Ok([a, b])
         })
     }
 

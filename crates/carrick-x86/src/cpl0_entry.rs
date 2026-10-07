@@ -14,6 +14,56 @@ pub struct PublishedApicIds {
     entries: [AtomicU16; carrick_sched_core::ZONE_SLOTS],
 }
 
+/// The current KVM carrier admits two native CPUs. Each sender owns one
+/// request cell, so mutual invalidations never wait for a global request lock.
+pub const CPL0_CPU_COUNT: usize = 2;
+
+pub struct ShootdownRequest {
+    pub root: AtomicU64,
+    pub generation: AtomicU64,
+    pub ack: [AtomicU64; CPL0_CPU_COUNT],
+}
+
+impl ShootdownRequest {
+    pub const fn new() -> Self {
+        Self {
+            root: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
+            ack: [const { AtomicU64::new(0) }; CPL0_CPU_COUNT],
+        }
+    }
+}
+
+impl Default for ShootdownRequest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Retained publication shared by the exact CPU bindings in one carrier.
+pub struct ShootdownTable {
+    pub next_generation: AtomicU64,
+    /// Fixture-only two-live-CPU start barrier; production ignores it.
+    pub fixture_arrived: AtomicU32,
+    pub requests: [ShootdownRequest; CPL0_CPU_COUNT],
+}
+
+impl ShootdownTable {
+    pub const fn new() -> Self {
+        Self {
+            next_generation: AtomicU64::new(0),
+            fixture_arrived: AtomicU32::new(0),
+            requests: [const { ShootdownRequest::new() }; CPL0_CPU_COUNT],
+        }
+    }
+}
+
+impl Default for ShootdownTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Default for PublishedApicIds {
     fn default() -> Self {
         Self::new()
@@ -188,6 +238,8 @@ pub struct CpuBinding {
     /// Coalesced native interrupt reasons awaiting the shared scheduler.
     /// The IRQ entry publishes here before completing the xAPIC ISR.
     pub pending_irqs: AtomicU32,
+    /// Retained per-sender shootdown table, published before any vCPU runs.
+    pub shootdown_table_address: u64,
 }
 const _: () = {
     assert!(core::mem::offset_of!(CpuBinding, kernel_stack) == 0);
