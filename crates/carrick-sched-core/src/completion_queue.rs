@@ -9,10 +9,30 @@ pub struct CompletionQueue {
     head: AtomicU32,
     tail: AtomicU32,
     stub_next: AtomicU32,
+    owner: AtomicU32,
+    consumer: AtomicU32,
+}
+pub struct CompletionConsumer<'a>(&'a CompletionQueue);
+impl Drop for CompletionConsumer<'_> {
+    fn drop(&mut self) {
+        self.0.consumer.store(0, Ordering::Release);
+    }
+}
+impl CompletionConsumer<'_> {
+    /// # Safety
+    /// The caller retains every queued node until this call transfers it.
+    pub unsafe fn pop(&self, load: impl Fn(u32) -> u32, store: impl Fn(u32, u32)) -> Option<u32> {
+        unsafe { self.0.pop_inner(load, store) }
+    }
 }
 impl CompletionQueue {
     /// Admission only. An in-progress initializer is a pre-effect refusal.
     pub fn initialize(&self) -> bool {
+        self.initialize_for(0)
+    }
+    /// Bind a queue to one semantic owner. Re-initialization by another owner
+    /// refuses before either can drain the other's records.
+    pub fn initialize_for(&self, owner: u32) -> bool {
         match self
             .initialized
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
@@ -21,11 +41,25 @@ impl CompletionQueue {
                 self.head.store(STUB, Ordering::Relaxed);
                 self.tail.store(STUB, Ordering::Relaxed);
                 self.stub_next.store(0, Ordering::Relaxed);
+                self.owner.store(owner, Ordering::Relaxed);
+                self.consumer.store(0, Ordering::Relaxed);
                 self.initialized.store(2, Ordering::Release);
                 true
             }
-            Err(value) => value == 2,
+            Err(value) => value == 2 && self.owner.load(Ordering::Acquire) == owner,
         }
+    }
+    pub fn owned_by(&self, owner: u32) -> bool {
+        self.initialized.load(Ordering::Acquire) == 2 && self.owner.load(Ordering::Acquire) == owner
+    }
+    pub fn try_consumer_for(&self, owner: u32) -> Option<CompletionConsumer<'_>> {
+        if !self.owned_by(owner) {
+            return None;
+        }
+        self.consumer
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .ok()?;
+        Some(CompletionConsumer(self))
     }
     /// Caller owns this entire chain; its tail link is zero. Links remain
     /// alive until pop transfers each member to the unique consumer.
@@ -48,6 +82,10 @@ impl CompletionQueue {
     /// # Safety
     /// The caller holds exclusive consumer authority until this call returns.
     pub unsafe fn pop(&self, load: impl Fn(u32) -> u32, store: impl Fn(u32, u32)) -> Option<u32> {
+        let consumer = self.try_consumer_for(0)?;
+        unsafe { consumer.pop(load, store) }
+    }
+    unsafe fn pop_inner(&self, load: impl Fn(u32) -> u32, store: impl Fn(u32, u32)) -> Option<u32> {
         if self.initialized.load(Ordering::Acquire) != 2 {
             return None;
         }
@@ -163,5 +201,42 @@ mod tests {
         };
         assert_eq!(popped, Some(1));
         assert!(!queue.has_pending());
+    }
+
+    #[test]
+    fn simultaneous_consumers_cannot_return_one_completion_twice() {
+        let queue: CompletionQueue = unsafe { core::mem::zeroed() };
+        assert!(queue.initialize());
+        let links = [AtomicU32::new(0), AtomicU32::new(0)];
+        queue.push(1, 1, |id, next| {
+            links[id as usize].store(next, Ordering::Release)
+        });
+        let linked = Barrier::new(2);
+        let resume = Barrier::new(2);
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| unsafe {
+                queue.pop(
+                    |id| links[id as usize].load(Ordering::Acquire),
+                    |id, next| {
+                        links[id as usize].store(next, Ordering::Release);
+                        linked.wait();
+                        resume.wait();
+                    },
+                )
+            });
+            linked.wait();
+            let competing = unsafe {
+                queue.pop(
+                    |id| links[id as usize].load(Ordering::Acquire),
+                    |id, next| links[id as usize].store(next, Ordering::Release),
+                )
+            };
+            resume.wait();
+            assert_eq!(first.join().unwrap(), Some(1));
+            assert_eq!(
+                competing, None,
+                "a second consumer duplicated the same record"
+            );
+        });
     }
 }
