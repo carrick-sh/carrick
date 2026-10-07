@@ -719,3 +719,39 @@ contracts = ["x86.run-elf.poll"]
 [[surfaces]]
 path = "crates/carrick-runtime/src/test_hooks.rs"
 contracts = ["kernel.vcpu.vm-lifetime"]
+
+[[surfaces]]
+path = "crates/carrick-timer-core/src/gate.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-timer-core/src/itimer.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-timer-core/src/lib.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-hal/src/guest_timer_bridge.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-hal/src/posix_timer.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-hal/src/timer_delivery.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/itimer.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/timer_delivery.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/vcpu_kick.rs"
+contracts = ["kernel.timer.delivery-gate"]
