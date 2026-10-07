@@ -648,6 +648,69 @@ pub(crate) fn read_pipe<M: CurrentMmMemory>(
         return DispatchOutcome::Returned { value: 0 };
     }
     let nonblocking = status_flags & LINUX_O_NONBLOCK != 0;
+    if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
+        // Observe readiness without retaining an IPC lock across owner
+        // preparation. The retained drain rechecks the same pipe afterwards.
+        let snapshot = pipe.snapshot();
+        let target = length.min(snapshot.unread);
+        if target == 0 {
+            return if snapshot.writers == 0 {
+                DispatchOutcome::Returned { value: 0 }
+            } else if nonblocking {
+                DispatchOutcome::errno(LINUX_EAGAIN)
+            } else {
+                wait_for_pipe_readable(pipe, authority)
+            };
+        }
+        let mut copied = 0usize;
+        while copied < target {
+            let Some(at) = address.checked_add(copied as u64) else {
+                return if copied == 0 {
+                    DispatchOutcome::errno(LINUX_EFAULT)
+                } else {
+                    DispatchOutcome::returned_len_or_errno(copied)
+                };
+            };
+            let step = (4096 - (at as usize & 4095)).min(target - copied);
+            let Some(range) =
+                carrick_guest_mem::GuestWriteRange::new(carrick_guest_mem::GuestVa(at), step)
+            else {
+                return if copied == 0 {
+                    DispatchOutcome::errno(LINUX_EFAULT)
+                } else {
+                    DispatchOutcome::returned_len_or_errno(copied)
+                };
+            };
+            let prepared = match memory.prepare_write(&[range]) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    return if copied == 0 {
+                        crate::el1_delegation::owner_prepare_refusal(error)
+                    } else {
+                        DispatchOutcome::returned_len_or_errno(copied)
+                    };
+                }
+            };
+            match take_pipe_bytes(pipe, step) {
+                PipeDrain::Bytes(source) => {
+                    let count = source.len();
+                    prepared.commit(&[&source]);
+                    source.commit(count);
+                    copied += count;
+                }
+                PipeDrain::Eof => break,
+                PipeDrain::WouldBlock if copied > 0 => break,
+                PipeDrain::WouldBlock => {
+                    return if nonblocking {
+                        DispatchOutcome::errno(LINUX_EAGAIN)
+                    } else {
+                        wait_for_pipe_readable(pipe, authority)
+                    };
+                }
+            }
+        }
+        return DispatchOutcome::returned_len_or_errno(copied);
+    }
     let mut offset = 0usize;
     let result = pipe.read_with(length, |bytes| {
         if memory.write_bytes(address + offset as u64, bytes).is_err() {

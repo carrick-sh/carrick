@@ -1541,11 +1541,57 @@ impl<'a> FsView<'a> {
                 let Some(authority) = this.captured_slot_authority(fd.0) else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
+                if state.counter_value() == 0 {
+                    return Ok(would_block_outcome(-1, libc::POLLIN, nonblocking, None, WaitFdAuthority::logical(authority)));
+                }
+                // Retain all eight output bytes before the counter can be
+                // consumed. A dependency is suspension, not a vector fault.
+                let mut owner_ranges = Vec::new();
+                let mut remaining = 8usize;
+                if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
+                    for iovec in &iovecs {
+                        let length = remaining.min(iovec.iov_len as usize);
+                        if length == 0 { continue; }
+                        let Some(range) = carrick_guest_mem::GuestWriteRange::new(
+                            carrick_guest_mem::GuestVa(iovec.iov_base), length,
+                        ) else { owner_ranges.clear(); break; };
+                        owner_ranges.push(range);
+                        remaining -= length;
+                        if remaining == 0 { break; }
+                    }
+                }
+                if !owner_ranges.is_empty() && remaining == 0 {
+                    let prepared = match memory.prepare_write(&owner_ranges) {
+                        Ok(prepared) => Some(prepared),
+                        // The existing path below preserves a valid vector
+                        // prefix before a genuine bad segment and consumption.
+                        Err(carrick_guest_mem::MemoryPrepareError::Fault(_)
+                            | carrick_guest_mem::MemoryPrepareError::Limit(_)) => None,
+                        Err(dependency) => return Ok(crate::el1_delegation::owner_prepare_refusal(dependency)),
+                    };
+                    if let Some(permit) = prepared {
+                        let result = state.read_with(|value| {
+                            let bytes = value.to_ne_bytes();
+                            let mut offset = 0usize;
+                            let outputs: Vec<_> = owner_ranges.iter().map(|range| {
+                                let at = offset;
+                                offset += range.len();
+                                &bytes[at..offset]
+                            }).collect();
+                            permit.commit(&outputs);
+                            true
+                        });
+                        return Ok(match result {
+                            Ok(_) => DispatchOutcome::Returned { value: 8 },
+                            Err(LINUX_EAGAIN) => would_block_outcome(-1, libc::POLLIN, nonblocking, None, WaitFdAuthority::logical(authority)),
+                            Err(errno) => DispatchOutcome::errno(errno),
+                        });
+                    }
+                }
                 let mut copied = false;
                 let result = state.read_with(|value| {
                     copied = matches!(read_from_contents_at(memory, &value.to_ne_bytes(), 0, &iovecs), Ok(8));
-                    // Linux eventfd read_iter consumes the counter even when
-                    // the user copy faults (native vector-fault oracle).
+                    // Linux consumes the counter on a genuine vector fault.
                     true
                 });
                 return Ok(match result {
@@ -1763,6 +1809,7 @@ impl<'a> FsView<'a> {
                                     break;
                                 }
                             }
+                            _ if total > 0 => return Ok(DispatchOutcome::Returned { value: total }),
                             DispatchOutcome::WaitOnFds { fds, timeout, sig_mask, completion } => {
                                 return Ok(DispatchOutcome::WaitOnFds {
                                     fds: fds.with_description_lease(read_lease),
@@ -3580,7 +3627,7 @@ impl<'a> FsView<'a> {
                         }
                         let bytes = match cx.memory.read_bytes(iovec.iov_base, 8) {
                             Ok(bytes) => bytes,
-                            Err(_) => return Ok(if total == 0 { DispatchOutcome::errno(LINUX_EFAULT) } else { DispatchOutcome::returned_len_or_errno(total) }),
+                            Err(error) => return Ok(if total == 0 { write_source_read_error(error) } else { DispatchOutcome::returned_len_or_errno(total) }),
                         };
                         let outcome = write_eventfd(this, &bytes, &state);
                         match outcome {
@@ -3797,7 +3844,7 @@ impl<'a> FsView<'a> {
                 }
                 let mut bytes = match (*cx.memory).read_bytes(iov_base, iov_len) {
                     Ok(bytes) => bytes,
-                    Err(_) => {
+                    Err(error) => {
                         // Bytes already written are already visible in the
                         // file, so reporting EFAULT here would both lose the
                         // count Linux returns AND leave the guest believing
@@ -3806,7 +3853,7 @@ impl<'a> FsView<'a> {
                         if total > 0 {
                             break;
                         }
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                        return Ok(write_source_read_error(error));
                     }
                 };
                 // Preserve this before any destination arm takes ownership of

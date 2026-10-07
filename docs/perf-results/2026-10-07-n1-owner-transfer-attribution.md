@@ -58,7 +58,7 @@ completes 128 rounds; the eight-pair case fails creating a pipe. The qualified
 `host-copyout-refusal.d` capture has two owner-bind controls, zero errors and
 zero drops, with no refusal events. That capture did not establish the pipe errno. The later qualified
 `target/n1cm-sol-ipc-prepare.raw` shows pipe2 errno 14 immediately after
-output preparation phase 4/detail 2 (an owner Editor wait). Its positive
+output preparation phase 4/detail 2 (an owner Reservations wait). Its positive
 return and owner-bind controls fired, errors and diagnostic bound were zero.
 The initially added blind observer duplicated default reporter returns; the
 final hook only registers the existing CompatReporter probe hook.
@@ -90,3 +90,43 @@ uninstrumented signed proof; it does not replace it.
 The reported pipe-creation failure now has deterministic red-to-green and
 focused signed proof. The rest of the reported failures and the full-suite
 comparison remain open. No history reword or review-ready claim is made.
+
+
+## Mixed-vector IPC attribution and repair
+
+At `832eb8d93`, the foreground signed witness
+`target/n1cm-sol-mixed-red.log` fails at writev (-1); main's retained signed
+log passes `el1_ipc_mixed_venue_roundtrips`. The qualified HOSTERR capture
+`target/n1cm-sol-mixed-hosterr.raw` reaches readv errno 14 immediately after
+PREPARE phase 4/detail 1. Both positive controls fired, errors and diagnostic
+bound were zero, and the consumer reported no drops. Detail 1 is Editor;
+detail 2 in the earlier pipe capture is Reservations. The earlier Editor
+label for detail 2 was incorrect; the wire encoding is now recorded in the
+durable trace header.
+
+The main-to-N1 diff introduces the owner transfer transport while the old
+pipe/vector payload handlers still collapsed every copy refusal into a bad
+pointer. `read_iovecs` itself already preserves exact input waits. The new
+VM-free `serial_host_ipc_vector_owner_wait_preserves_unconsumed_operation`
+fails first on writev errno 14, then on pipe readv errno 14, then on eventfd
+readv errno 14 as those boundaries are corrected. Its later-iovec witness
+also fails when a four-byte pipe prefix is followed by a wait claiming zero
+progress. These are dependency-lowering defects, not invalid user pointers.
+
+The corrected pipe path prepares at most one 4 KiB destination outside IPC
+locks, rechecks the existing retained drain, commits exact delivered bytes,
+and consumes only that prefix. A later refusal returns a genuine short pipe
+count. Vector eventfd prepares its whole eight-byte output before consuming
+the counter; genuine vector faults retain the existing partial-copy and
+counter-consumption ABI. Input copyin retains exact waits before any output;
+a committed prefix still returns its actual byte count. No retries, added
+executor capacity or host writes outside the owner were introduced.
+
+
+The focused signed confirmation `target/n1cm-sol-mixed-green.log` completes
+128 mixed rounds for both pipe and eventfd, passes the entitlement negative
+control and leaves zero scoped survivors. Its artifact receipt is retained
+at `target/n1cm-sol-evidence/mixed-green-artifacts.jsonl`. The VM-free owner
+witness passes along with the two existing eventfd vector semantic/fault
+cases and fourteen in-memory pipe neighbors. This proves the named IPC
+repair only; maintenance costs and the remaining N1 regressions stay open.
