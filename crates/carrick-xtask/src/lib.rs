@@ -19,5 +19,6 @@ pub mod remote_accept;
 pub mod remote_lock;
 pub mod remote_recapture;
 mod target_prune;
+pub mod test_lanes;
 pub mod worktree_admission;
 pub mod worktree_gc;

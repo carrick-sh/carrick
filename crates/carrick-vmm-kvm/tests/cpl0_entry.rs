@@ -133,8 +133,7 @@ fn user_access_walks_the_second_live_root() {
 }
 
 fn image() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/x86_64-unknown-none/release/carrick-x86-cpl0-fixture")
+    PathBuf::from(env!("CARRICK_X86_CPL0_FIXTURE_IMAGE"))
 }
 
 #[test]
@@ -246,8 +245,7 @@ fn cpl0_rechecks_host_modified_return_frame_before_iret() {
 
 #[test]
 fn production_image_rejects_fixture_syscalls() {
-    let production = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/x86_64-unknown-none/release/carrick-x86-cpl0");
+    let production = PathBuf::from(env!("CARRICK_X86_CPL0_IMAGE"));
     let bytes = std::fs::read(&production).expect("production CPL0 image built");
     let plan =
         carrick_mem::elf::plan_elf_load_bytes_for(&bytes, 62).expect("production CPL0 load image");
@@ -294,8 +292,7 @@ fn production_image_rejects_fixture_syscalls() {
 
 #[test]
 fn production_interrupt_boot_serves_an_ordinary_syscall() {
-    let production = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/x86_64-unknown-none/release/carrick-x86-cpl0");
+    let production = PathBuf::from(env!("CARRICK_X86_CPL0_IMAGE"));
     let first = program(&[(0x2345, 24)]);
     let mut carrier =
         Cpl0Carrier::boot_with_interrupts(&production, [&first, &first]).expect("KVM image");
