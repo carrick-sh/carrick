@@ -94,7 +94,7 @@ pub(super) fn read_epoll_event(
     memory: &impl CurrentMmMemory,
     address: u64,
     guest_abi: LinuxGuestAbi,
-) -> Result<LinuxEpollEvent, LinuxErrno> {
+) -> Result<LinuxEpollEvent, super::InputCopyError> {
     match guest_abi {
         LinuxGuestAbi::Aarch64 => read_kernel_struct(memory, address),
         LinuxGuestAbi::X86_64 => {
@@ -365,7 +365,7 @@ pub(in crate::dispatch) fn host_fd_has_oob(_host_fd: i32) -> bool {
 pub(super) fn read_pollfd(
     memory: &impl CurrentMmMemory,
     address: u64,
-) -> Result<LinuxPollFd, LinuxErrno> {
+) -> Result<LinuxPollFd, super::InputCopyError> {
     read_kernel_struct(memory, address)
 }
 
@@ -1944,7 +1944,7 @@ pub(super) fn write_sockopt_value<M: CurrentMmMemory>(
 pub(super) fn read_linux_msghdr(
     memory: &impl CurrentMmMemory,
     addr: u64,
-) -> Result<LinuxMsghdr, LinuxErrno> {
+) -> Result<LinuxMsghdr, super::InputCopyError> {
     read_kernel_struct(memory, addr)
 }
 

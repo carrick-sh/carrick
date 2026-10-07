@@ -196,7 +196,7 @@ impl<'a> FsView<'a> {
                     Ok(Ok(usize::try_from(offset)
                         .map_err(|_| DispatchError::LengthTooLarge(offset))?))
                 }
-                Err(errno) => Ok(Err(errno)),
+                Err(error) => Err(error.into()),
             };
         }
         let Some(in_file) = self.open_file(in_fd) else {

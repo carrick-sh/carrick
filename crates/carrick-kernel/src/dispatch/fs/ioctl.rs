@@ -151,7 +151,7 @@ fn pidfd_get_info(
     }
     let mut info: carrick_abi::LinuxPidfdInfo = match read_kernel_prefix(memory, arg, size) {
         Ok(info) => info,
-        Err(errno) => return DispatchOutcome::errno(errno),
+        Err(error) => return error.outcome(),
     };
     let requested = info.mask;
     info = carrick_abi::LinuxPidfdInfo::default();
@@ -176,7 +176,7 @@ fn procmap_query(
 ) -> DispatchOutcome {
     let mut query: carrick_abi::LinuxProcmapQuery = match read_kernel_struct(memory, arg) {
         Ok(query) => query,
-        Err(errno) => return DispatchOutcome::errno(errno),
+        Err(error) => return error.outcome(),
     };
     let size = query.size;
     if size < <carrick_abi::LinuxProcmapQuery as KernelAbi>::ABI_SIZE as u64 {

@@ -520,7 +520,7 @@ pub(super) fn adjtimex_bootstrap(
 ) -> DispatchOutcome {
     let timex = match read_kernel_struct::<LinuxTimex>(memory, address) {
         Ok(timex) => timex,
-        Err(errno) => return DispatchOutcome::Errno { errno },
+        Err(error) => return error.outcome(),
     };
     let modes = LinuxTimexModes::from_bits_retain(timex.modes);
     if modes.contains(LinuxTimexModes::OFFSET_SINGLESHOT_FLAG)
@@ -944,21 +944,21 @@ pub(super) fn duration_from_nanos_saturating(nanos: u128) -> Duration {
 pub(super) fn read_itimerspec(
     memory: &impl CurrentMmMemory,
     address: u64,
-) -> Result<LinuxItimerspec, LinuxErrno> {
+) -> Result<LinuxItimerspec, super::InputCopyError> {
     read_kernel_struct(memory, address)
 }
 
 pub(super) fn read_itimerval(
     memory: &impl CurrentMmMemory,
     address: u64,
-) -> Result<LinuxItimerval, LinuxErrno> {
+) -> Result<LinuxItimerval, super::InputCopyError> {
     read_kernel_struct(memory, address)
 }
 
 pub(super) fn read_timespec(
     memory: &impl CurrentMmMemory,
     address: u64,
-) -> Result<LinuxTimespec, LinuxErrno> {
+) -> Result<LinuxTimespec, super::InputCopyError> {
     read_kernel_struct(memory, address)
 }
 

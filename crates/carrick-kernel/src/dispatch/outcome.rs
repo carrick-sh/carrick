@@ -1128,6 +1128,8 @@ impl CurrentMmMemory for LinearMemory {}
 #[derive(Debug, Error)]
 #[allow(private_interfaces)]
 pub enum DispatchError {
+    #[error("guest input copy awaits owner memory: {0:?}")]
+    InputCopyWait(carrick_guest_mem::MemoryReadWait),
     #[error("owner memory preparation failed: {0}")]
     MemoryPreparation(String),
     #[error("host wait requires the exact outer resource scope")]
@@ -1185,6 +1187,39 @@ pub enum DispatchError {
     },
 }
 
+/// A guest input copy made before the syscall consumes any external state.
+/// Unlike a general memory error, a temporary owner wait can replay the
+/// saved syscall after wake without duplicating a side effect.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InputCopyError {
+    Errno(LinuxErrno),
+    Wait(carrick_guest_mem::MemoryReadWait),
+}
+
+impl InputCopyError {
+    pub(crate) fn outcome(self) -> DispatchOutcome {
+        match self {
+            Self::Errno(errno) => DispatchOutcome::errno(errno),
+            Self::Wait(wait) => input_copy_wait_outcome(wait),
+        }
+    }
+}
+
+impl From<LinuxErrno> for InputCopyError {
+    fn from(errno: LinuxErrno) -> Self {
+        Self::Errno(errno)
+    }
+}
+
+impl From<InputCopyError> for DispatchError {
+    fn from(error: InputCopyError) -> Self {
+        match error {
+            InputCopyError::Errno(errno) => Self::Errno(errno),
+            InputCopyError::Wait(wait) => Self::InputCopyWait(wait),
+        }
+    }
+}
+
 impl From<crate::file_authority::AuthorityFatal> for DispatchError {
     fn from(fatal: crate::file_authority::AuthorityFatal) -> Self {
         DispatchError::FileAuthorityFatal(fatal)
@@ -1211,6 +1246,45 @@ impl From<MemoryError> for DispatchError {
     }
 }
 
+impl DispatchError {
+    /// Only use before the syscall consumes an external resource. Replaying
+    /// the saved syscall after this wait then repeats the input copy safely.
+    pub(crate) fn input_copy(error: MemoryError) -> InputCopyError {
+        use carrick_guest_mem::MemoryReadWait;
+        match error {
+            // The syscall still owns its completion token. This read's private
+            // byte prefix has no external effect, so the token redoes the
+            // whole input copy after the owner dependency wakes.
+            MemoryError::ReadSuspended(suspended) => InputCopyError::Wait(suspended.wait),
+            MemoryError::OwnerWait(wait) => InputCopyError::Wait(MemoryReadWait::Owner(wait)),
+            MemoryError::Physical(wait) => InputCopyError::Wait(MemoryReadWait::Physical(wait)),
+            MemoryError::Supply(request) => InputCopyError::Wait(MemoryReadWait::Supply(*request)),
+            _ => InputCopyError::Errno(LINUX_EFAULT),
+        }
+    }
+}
+
+fn input_copy_wait_outcome(wait: carrick_guest_mem::MemoryReadWait) -> DispatchOutcome {
+    match wait {
+        carrick_guest_mem::MemoryReadWait::Owner(wait) => {
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        }
+        carrick_guest_mem::MemoryReadWait::Physical(wait) => {
+            DispatchOutcome::OwnerPhysicalWait { wait, committed: 0 }
+        }
+        carrick_guest_mem::MemoryReadWait::Supply(
+            carrick_guest_mem::MemorySupplyRequest::Metadata { observed, .. },
+        ) => DispatchOutcome::OwnerMemoryWait {
+            wait: observed,
+            committed: 0,
+        },
+        carrick_guest_mem::MemoryReadWait::Supply(request) => DispatchOutcome::OwnerMemorySupply {
+            request,
+            committed: 0,
+        },
+    }
+}
+
 /// Lower a syscall handler's result for the run loop. A
 /// [`DispatchError::Errno`] is a guest-visible errno, so it becomes a normal
 /// [`DispatchOutcome::Errno`]; every other `DispatchError` variant is a fatal
@@ -1221,6 +1295,78 @@ pub(crate) fn lower_handler_result(
 ) -> Result<DispatchOutcome, DispatchError> {
     match result {
         Err(DispatchError::Errno(errno)) => Ok(DispatchOutcome::Errno { errno }),
+        Err(DispatchError::InputCopyWait(wait)) => Ok(input_copy_wait_outcome(wait)),
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod owner_read_wait_tests {
+    use super::*;
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use std::num::NonZeroU64;
+
+    struct WaitingInput(PortalOwnerWait);
+
+    impl GuestMemory for WaitingInput {
+        fn read_bytes_raw(&self, _address: u64, _length: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::OwnerWait(self.0))
+        }
+
+        fn write_bytes_raw(&mut self, _address: u64, _bytes: &[u8]) -> Result<(), MemoryError> {
+            Ok(())
+        }
+    }
+
+    impl CurrentMmMemory for WaitingInput {}
+
+    #[test]
+    fn input_copy_waits_do_not_become_guest_efault() {
+        for cause in [
+            PortalWaitCause::Editor,
+            PortalWaitCause::Gate,
+            PortalWaitCause::Reservations,
+        ] {
+            // SAFETY: the mock names one exact admitted owner revision.
+            let wait = unsafe {
+                PortalOwnerWait::from_owner(
+                    El1MmHandle::from_admitted_owner(
+                        NonZeroU64::new(1).unwrap(),
+                        ReservationMm::new(2).unwrap(),
+                        NonZeroU64::new(3).unwrap(),
+                    ),
+                    cause,
+                    7,
+                )
+            };
+            let actual = lower_handler_result(Err(DispatchError::input_copy(
+                MemoryError::OwnerWait(wait),
+            )
+            .into()))
+            .unwrap();
+            assert!(
+                matches!(actual, DispatchOutcome::OwnerMemoryWait { wait: got, committed: 0 } if got == wait)
+            );
+            let source = WaitingInput(wait);
+            let error =
+                super::super::read_kernel_struct::<carrick_abi::LinuxTimespec>(&source, 0x1000)
+                    .unwrap_err();
+            assert!(
+                matches!(error, InputCopyError::Wait(carrick_guest_mem::MemoryReadWait::Owner(got)) if got == wait)
+            );
+            let error = super::super::read_u64(&source, 0x1000).unwrap_err();
+            assert!(
+                matches!(error, InputCopyError::Wait(carrick_guest_mem::MemoryReadWait::Owner(got)) if got == wait)
+            );
+            let suspended = carrick_guest_mem::MemoryReadSuspension {
+                wait: carrick_guest_mem::MemoryReadWait::Owner(wait),
+                continuation: carrick_guest_mem::OwnedReadContinuation::new((vec![1u8], 1usize)),
+            };
+            let actual = DispatchError::input_copy(MemoryError::ReadSuspended(Box::new(suspended)))
+                .outcome();
+            assert!(
+                matches!(actual, DispatchOutcome::OwnerMemoryWait { wait: got, committed: 0 } if got == wait)
+            );
+        }
     }
 }

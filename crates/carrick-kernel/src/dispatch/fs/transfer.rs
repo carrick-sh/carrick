@@ -440,7 +440,7 @@ impl<'a> FsView<'a> {
         }
         let out_off = match read_u64(memory, off_out_addr) {
             Ok(v) => v,
-            Err(errno) => return DispatchOutcome::errno(errno),
+            Err(error) => return error.outcome(),
         };
         let host_fd = match self.open_file(out_fd).as_ref() {
             Some(of) => match of.description.read_for_io().as_deref() {

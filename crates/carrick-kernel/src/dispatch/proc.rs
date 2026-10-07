@@ -2340,7 +2340,7 @@ impl<'a> ProcView<'a> {
             );
             let word = match read_futex_word(memory, address.0) {
                 Ok(word) => word,
-                Err(errno) if needs_word => return Ok(DispatchOutcome::Errno { errno }),
+                Err(error) if needs_word => return Ok(error.outcome()),
                 Err(_) => 0,
             };
 

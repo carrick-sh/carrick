@@ -791,7 +791,7 @@ impl<'a> IpcView<'a> {
                     let mq_attr: crate::linux_abi::LinuxMqAttr =
                         match read_kernel_struct(&*cx.memory, attr.0) {
                             Ok(a) => a,
-                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            Err(error) => return Ok(error.outcome()),
                         };
                     let req_max = mq_attr.mq_maxmsg;
                     let req_size = mq_attr.mq_msgsize;
@@ -888,7 +888,7 @@ impl<'a> IpcView<'a> {
 
             let deadline = match read_abs_deadline(&*cx.memory, abs_timeout.0) {
                 Ok(d) => d,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                Err(error) => return Ok(error.outcome()),
             };
 
             let nonblock = LinuxOpenFlags::from_bits_truncate(mq.description.common().status_flags())
@@ -929,7 +929,7 @@ impl<'a> IpcView<'a> {
             }
             let deadline = match read_abs_deadline(&*cx.memory, abs_timeout.0) {
                 Ok(d) => d,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                Err(error) => return Ok(error.outcome()),
             };
 
             let nonblock = LinuxOpenFlags::from_bits_truncate(mq.description.common().status_flags())
@@ -1023,7 +1023,7 @@ impl<'a> IpcView<'a> {
             let sev: crate::linux_abi::LinuxSigevent =
                 match read_kernel_struct(&*cx.memory, sevp.0) {
                     Ok(s) => s,
-                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    Err(error) => return Ok(error.outcome()),
                 };
             let sigev_notify = sev.sigev_notify;
             let sigev_value = sev.sigev_value;
@@ -1137,7 +1137,7 @@ impl<'a> IpcView<'a> {
                 let new_attr: crate::linux_abi::LinuxMqAttr =
                     match read_kernel_struct(&*cx.memory, newattr.0) {
                         Ok(a) => a,
-                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                        Err(error) => return Ok(error.outcome()),
                     };
                 let want_nonblock =
                     (new_attr.mq_flags as u64) & LinuxOpenFlags::NONBLOCK.bits() != 0;
@@ -1333,13 +1333,13 @@ fn mq_wait_interrupted(
 fn read_abs_deadline(
     memory: &impl CurrentMmMemory,
     addr: u64,
-) -> Result<Option<(i64, i64)>, LinuxErrno> {
+) -> Result<Option<(i64, i64)>, InputCopyError> {
     if addr == 0 {
         return Ok(None);
     }
     let ts = read_timespec(memory, addr)?;
     if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
-        return Err(LINUX_EINVAL);
+        return Err(LINUX_EINVAL.into());
     }
     Ok(Some((ts.tv_sec, ts.tv_nsec)))
 }

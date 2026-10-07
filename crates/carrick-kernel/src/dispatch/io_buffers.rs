@@ -37,19 +37,25 @@ pub(crate) fn random_device_bytes(len: usize) -> Vec<u8> {
     buf
 }
 
-pub(crate) fn read_u64(memory: &impl CurrentMmMemory, address: u64) -> Result<u64, LinuxErrno> {
+pub(crate) fn read_u64(
+    memory: &impl CurrentMmMemory,
+    address: u64,
+) -> Result<u64, super::InputCopyError> {
     let mut buf = [0u8; 8];
     memory
         .read_into(address, &mut buf)
-        .map_err(|_| LINUX_EFAULT)?;
+        .map_err(DispatchError::input_copy)?;
     Ok(u64::from_ne_bytes(buf))
 }
 
-pub(crate) fn read_u32(memory: &impl CurrentMmMemory, address: u64) -> Result<u32, LinuxErrno> {
+pub(crate) fn read_u32(
+    memory: &impl CurrentMmMemory,
+    address: u64,
+) -> Result<u32, super::InputCopyError> {
     let mut buf = [0u8; 4];
     memory
         .read_into(address, &mut buf)
-        .map_err(|_| LINUX_EFAULT)?;
+        .map_err(DispatchError::input_copy)?;
     Ok(u32::from_ne_bytes(buf))
 }
 
@@ -66,7 +72,7 @@ pub(crate) fn write_u32(
 pub(crate) fn read_open_how(
     memory: &impl CurrentMmMemory,
     address: u64,
-) -> Result<LinuxOpenHow, LinuxErrno> {
+) -> Result<LinuxOpenHow, super::InputCopyError> {
     read_kernel_struct(memory, address)
 }
 
@@ -74,9 +80,9 @@ pub(crate) fn read_iovecs(
     memory: &impl CurrentMmMemory,
     address: u64,
     count: usize,
-) -> Result<Vec<LinuxIovec>, LinuxErrno> {
+) -> Result<Vec<LinuxIovec>, super::InputCopyError> {
     if count > LINUX_IOV_MAX {
-        return Err(LINUX_EINVAL);
+        return Err(LINUX_EINVAL.into());
     }
 
     let mut iovecs = Vec::with_capacity(count);
@@ -95,11 +101,11 @@ pub(crate) fn read_iovecs(
         let iovec_address = address.checked_add(offset).ok_or(LINUX_EFAULT)?;
         let iovec: LinuxIovec = read_kernel_struct(memory, iovec_address)?;
         if iovec.iov_len > SSIZE_MAX {
-            return Err(LINUX_EINVAL);
+            return Err(LINUX_EINVAL.into());
         }
         total = total.checked_add(iovec.iov_len).ok_or(LINUX_EINVAL)?;
         if total > SSIZE_MAX {
-            return Err(LINUX_EINVAL);
+            return Err(LINUX_EINVAL.into());
         }
         iovecs.push(iovec);
     }
