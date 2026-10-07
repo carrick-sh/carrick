@@ -218,6 +218,14 @@ pub fn fatal_unacknowledged_shootdown(cpu: u32, root: u64, generation: u64) -> !
     panic!("fatal: shootdown ack never arrived for cpu {cpu}, root {root:#x}, gen {generation}");
 }
 
+#[cfg(target_os = "none")]
+unsafe extern "Rust" {
+    fn carrick_fixture_hold_check(
+        table: &super::context::native::ShootdownTable,
+        target_mode: u32,
+    ) -> Result<(), ArchError>;
+}
+
 /// Publish the exact edited root/MM generation and wait only for matching
 /// CPUs that were running when the request became visible. A stopped CPU
 /// settles its retained generation through KICK before its next user access.
@@ -250,6 +258,10 @@ pub fn rendezvous_context(context: AddressContext<RootGpa>) -> Result<ShootdownR
         let seen_gen = binding.last_seen_generation.load(Ordering::Acquire);
         return Ok(ShootdownReceipt::new(context, seen_gen));
     }
+    #[cfg(target_os = "none")]
+    unsafe {
+        carrick_fixture_hold_check(table, super::context::native::FIXTURE_HOLD_PUBLISH)?;
+    }
     let generation = publish_root_request(context, table, slot)?;
     let request = table.requests.get(slot).ok_or(ArchError::Unbound)?;
     binding
@@ -274,16 +286,9 @@ pub fn rendezvous_context(context: AddressContext<RootGpa>) -> Result<ShootdownR
         }
         *awaited_peer = true;
         let apic = bound_apic_id(CpuId::new(peer as u32))?;
-        if table.fixture_hold_ipi.load(Ordering::Acquire) {
-            let tsc_hz = tsc_frequency().ok_or(ArchError::Unbound)?.get();
-            let limit = tsc_hz.checked_mul(5).ok_or(ArchError::Unbound)?;
-            let start = read_tsc();
-            while table.fixture_hold_ipi.load(Ordering::Acquire) {
-                if read_tsc().wrapping_sub(start) > limit {
-                    return Err(ArchError::Busy);
-                }
-                core::hint::spin_loop();
-            }
+        #[cfg(target_os = "none")]
+        unsafe {
+            carrick_fixture_hold_check(table, super::context::native::FIXTURE_HOLD_IPI)?;
         }
         // SAFETY: the retained request is published before this native IPI.
         unsafe { interrupts::hardware::send_shootdown(apic) }.map_err(|_| ArchError::Busy)?;
@@ -355,7 +360,7 @@ pub fn rendezvous_root(root: u64) -> Result<u64, ArchError> {
     rendezvous_context(context).map(|receipt| receipt.generation)
 }
 
-fn read_tsc() -> u64 {
+pub fn read_tsc() -> u64 {
     let (lo, hi): (u32, u32);
     // SAFETY: RDTSC reads this admitted CPU's monotonic counter only.
     unsafe {
