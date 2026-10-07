@@ -1,4 +1,5 @@
 //! Four-level, 4 KiB x86 descriptor transactions. No MM or reservation ledger.
+pub use crate::aarch64::El1PrivateLeafState;
 pub use crate::aarch64::descriptor_txn::{
     BackingIdentity, DescriptorJournal, DescriptorTxnId, InlineJournal, JournalEntry,
     LiveDescriptorWords, PageSpan,
@@ -26,6 +27,23 @@ pub const MAY_EXEC: u64 = 1 << 53;
 pub const RETIRED: u64 = 1 << 8;
 pub const NX: u64 = 1 << 63;
 pub const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
+
+pub fn x86_private_leaf_state(descriptor: u64) -> El1PrivateLeafState {
+    if descriptor & PRIVATE == 0 {
+        return El1PrivateLeafState::Unowned;
+    }
+    if descriptor & PRESENT != 0 {
+        return El1PrivateLeafState::Resident;
+    }
+    if descriptor & RETIRED != 0 {
+        return El1PrivateLeafState::Retired;
+    }
+    if descriptor & PREPARED != 0 && descriptor & ADDRESS != 0 {
+        El1PrivateLeafState::Prepared
+    } else {
+        El1PrivateLeafState::Malformed
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Permissions {

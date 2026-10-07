@@ -1239,7 +1239,7 @@ mod kernel {
                 )
             } else {
                 let mut anonymous =
-                    anonymous::X86AnonymousVenue::new(&call, task, binding.cpu_slot, frame.rcx);
+                    anonymous::X86AnonymousVenue::new(&call, task, binding.cpu_slot, frame.rcx, counters);
                 serve_canonical_with_anonymous(
                     &call, counters, task, &GuestLifecycleVenue,
                     Some(&binding.publications), &mut anonymous,
