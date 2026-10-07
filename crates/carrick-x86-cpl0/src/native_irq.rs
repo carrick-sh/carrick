@@ -105,4 +105,3 @@ extern "C" fn carrick_x86_receive_irq(vector: u32, frame: *const InterruptFrame)
         crate::kernel::halt();
     }
 }
-

@@ -725,3 +725,20 @@ duplicate port declaration is separate in
 proof. Green: all three `two_running_vcpus_` tests pass with the call restored,
 in `/tmp/x86-process-owner-single-pf-green.log`. Full KVM, clean inventory,
 clippy and assembly push gates follow; no two-MM witness green is claimed.
+
+
+## Exit admission review follow-up (2026-10-07)
+
+Read-only review identified a stale-serial admission when a live source has
+zero members. The requested TaskKey now must equal the exact prepared task
+revision key before member capture or exit_begin. The work-budget fixture
+includes zero members and rejects a same-PID different-serial request at
+every scale. Red: /tmp/x86-process-exit-empty-identity-red.log fails that
+assertion. Green: /tmp/x86-process-exit-empty-identity-green.log passes all
+five exit tests. This adds no population scan or identity read.
+
+The authorized single-entry shootdown integration's full just test-kvm
+finished zero: /tmp/x86-process-owner-single-pf-kvm.log. The formerly
+separately owned shootdown red is closed on this merged artifact. Both
+read-only reviewers found no blocking current-consumer defect; the exact-key
+API finding above is fixed and the extra IRQ source EOF blank is removed.
