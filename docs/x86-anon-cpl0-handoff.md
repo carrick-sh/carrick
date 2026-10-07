@@ -1023,3 +1023,42 @@ This is payload custody only. Production ProcessNative, initial ELF/stack
 VMA and residency imports, frame-level inheritance, per-MM InitialWords,
 real COW and CPU1 execution remain to bind. No two-MM green, new ignore,
 Docker run, signed HVF result or review-ready milestone is claimed.
+
+## Shared numeric/serial allocation continuation (2026-10-07)
+
+The payload checkpoint d5157d2c2 and restored preserved witness d37570d90
+are normally pushed. Clean domain lint, formatting and workspace push-hook
+clippy pass. Explicit parent ARM ASM is 115/115 with zero differences.
+Full required KVM is 133 passed, one failed, five existing ignores: the
+restored two-MM fork witness is the sole red (exit91). No new ignore is added.
+Receipts: /tmp/x86-cont-payload-{domains-clean,fmt,asm-parent,kvm,push}.log;
+/tmp/x86-cont-two-mm-red.log records native Q/exit7 and Carrick exit91.
+The earlier domain attempt overlapped witness restoration and correctly
+refused dirty capture inputs in three orchestration fixtures; the committed
+clean-source repeat passes.
+
+Director confirmed moving pure PID collision/claim and serial allocation
+logic to scheduler core. `identity_allocator` now owns NamespaceState, role
+counters, IdError and SerialAllocator. Host IdRegistry retains its existing
+parking_lot lock and role-preserving RAII tokens, delegating all selection
+and counting. ObjectIdRegistry and the process-global file-description source
+delegate monotonic allocation to the same shared serial code; kernel/carrier
+and process-global scopes are preserved. Native RAII wrappers are still next.
+
+A compiling missing-selection scaffold fails two numeric lifecycle tests
+in /tmp/x86-cont-allocator-red.log. Returning constant serial1 fails reuse
+and monotonicity assertions in /tmp/x86-cont-allocator-serial-red.log. The
+restored shared owner passes all 164 scheduler-core tests in
+/tmp/x86-cont-allocator-green.log. Nested-domain composition distinguishes
+child-local numbers from retained ancestor claims; real namespace nesting
+and host RAII behavior additionally remain in the existing host suites.
+Applicable production contract is kernel.el1.creation-native-path, with
+kernel.el1.fork-cow for private-MM inheritance. No budget is weakened.
+
+Director resolved the seed boundary: transfer the real host launch
+task/namespace/session/group/claims once in one typed, counted boot crossing.
+Then the guest shared allocators are the VM's sole identity authority, and
+post-handoff host allocation must refuse. Delete fixed task41/generation11/
+thread101/PID41. Required red-first seed tests: namespace PID1 and requested
+session/group match, plus host post-boot allocation refusal. This binding
+and native MM/fork/COW/CPU1 remain open; no runtime milestone is claimed.

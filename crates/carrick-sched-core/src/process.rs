@@ -6,6 +6,7 @@ use core::time::Duration;
 
 pub mod birth;
 pub mod exit;
+pub mod identity_allocator;
 pub mod registry;
 pub mod wait;
 

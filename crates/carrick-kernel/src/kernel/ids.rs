@@ -1,9 +1,9 @@
+use carrick_sched_core::process::identity_allocator::SerialAllocator;
 pub use carrick_sched_core::process::{
     ChildExitSignal, InvalidLinuxId, InvalidLinuxSignal, LinuxSignal, ProcessGroupId, SessionId,
     TaskId, TaskSerial,
 };
 use std::num::{NonZeroI32, NonZeroU64};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use carrick_hal::{FrameId, KernelTransactionId, MappingId};
 
@@ -11,7 +11,7 @@ use carrick_hal::{FrameId, KernelTransactionId, MappingId};
 /// KernelContext has selected a table. A process-global monotonic source keeps
 /// their stable identities collision-free across every Kernel generation and
 /// independently copied table without recapturing registry state.
-static NEXT_FILE_DESCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_FILE_DESCRIPTION_ID: SerialAllocator = SerialAllocator::new();
 
 macro_rules! linux_i32_id {
     ($name:ident) => {
@@ -116,7 +116,7 @@ static CARRIER_MM_IDS: ObjectIdRegistry = ObjectIdRegistry::new();
 /// Monotonic source for object identities that are never reused by one kernel.
 #[derive(Debug)]
 pub struct ObjectIdRegistry {
-    next: AtomicU64,
+    allocator: SerialAllocator,
 }
 
 impl Default for ObjectIdRegistry {
@@ -128,23 +128,17 @@ impl Default for ObjectIdRegistry {
 impl ObjectIdRegistry {
     pub const fn new() -> Self {
         Self {
-            next: AtomicU64::new(1),
+            allocator: SerialAllocator::new(),
         }
     }
 
     #[cfg(test)]
     pub(in crate::kernel) fn exhaust_for_test(&self) {
-        self.next.store(u64::MAX, Ordering::Relaxed);
+        self.allocator.advance_to(NonZeroU64::MAX);
     }
 
     fn allocate(&self) -> Result<NonZeroU64, ObjectIdError> {
-        let raw = self
-            .next
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_| ObjectIdError::Exhausted)?;
-        NonZeroU64::new(raw).ok_or(ObjectIdError::Exhausted)
+        self.allocator.allocate().ok_or(ObjectIdError::Exhausted)
     }
 
     pub fn task_serial(&self) -> Result<TaskSerial, ObjectIdError> {
@@ -210,18 +204,15 @@ pub enum ObjectIdError {
 #[allow(dead_code)]
 pub(crate) fn restore_file_description_id(raw: u64) -> Result<FileDescriptionId, ObjectIdError> {
     let value = NonZeroU64::new(raw).ok_or(ObjectIdError::Exhausted)?;
-    let next = raw.checked_add(1).ok_or(ObjectIdError::Exhausted)?;
-    NEXT_FILE_DESCRIPTION_ID.fetch_max(next, Ordering::Relaxed);
+    NEXT_FILE_DESCRIPTION_ID
+        .advance_past(value)
+        .ok_or(ObjectIdError::Exhausted)?;
     Ok(FileDescriptionId::from_registry_allocation(value))
 }
 
 pub(crate) fn allocate_file_description_id() -> Result<FileDescriptionId, ObjectIdError> {
-    let raw = NEXT_FILE_DESCRIPTION_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_add(1)
-        })
-        .map_err(|_| ObjectIdError::Exhausted)?;
-    NonZeroU64::new(raw)
+    NEXT_FILE_DESCRIPTION_ID
+        .allocate()
         .map(FileDescriptionId::from_registry_allocation)
         .ok_or(ObjectIdError::Exhausted)
 }
