@@ -759,10 +759,7 @@ impl<'a> IpcView<'a> {
         /// message queue and returns a `mqd_t` (a real guest fd).
         fn mq_open(this, cx, name: GuestPtr, oflag: u64, mode: u64, attr: GuestPtr) {
             let _ = mode;
-            let name = match read_guest_c_string(&*cx.memory, name.0) {
-                Ok(s) => s,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-            };
+            let name = read_guest_c_string(&*cx.memory, name.0)?;
             let queue_name = match validate_mqueue_name(&name) {
                 Ok(p) => p,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
@@ -835,10 +832,7 @@ impl<'a> IpcView<'a> {
         /// mq_unlink(name). Remove the queue's name; the in-memory queue is
         /// removed from the registry. Existing open descriptors keep working.
         fn mq_unlink(this, cx, name: GuestPtr) {
-            let name = match read_guest_c_string(&*cx.memory, name.0) {
-                Ok(s) => s,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-            };
+            let name = read_guest_c_string(&*cx.memory, name.0)?;
             let queue_name = match validate_mqueue_name(&name) {
                 Ok(p) => p,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),

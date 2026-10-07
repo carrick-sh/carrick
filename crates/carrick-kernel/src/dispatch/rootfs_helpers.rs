@@ -14,7 +14,7 @@ use carrick_guest_mem::CurrentMmMemory;
 use crate::linux_abi::LinuxErrno;
 use carrick_vfs::rootfs::{RootFsDirEntry, RootFsEntryKind, RootFsMetadata};
 
-use super::DispatchOutcome;
+use super::{DispatchError, DispatchOutcome, InputCopyError};
 
 pub(crate) const MAX_GUEST_PATH: usize = 4096;
 /// Linux bounds one `execve(2)` argument or environment string, including its
@@ -329,7 +329,7 @@ pub(super) fn display_rootfs_path(path: &Path) -> String {
 pub(super) fn read_guest_string_array_bytes(
     memory: &impl CurrentMmMemory,
     array_addr: u64,
-) -> Result<Vec<Vec<u8>>, LinuxErrno> {
+) -> Result<Vec<Vec<u8>>, InputCopyError> {
     if array_addr == 0 {
         return Ok(Vec::new());
     }
@@ -338,15 +338,21 @@ pub(super) fn read_guest_string_array_bytes(
     for index in 0..MAX_ENTRIES {
         let slot_addr = array_addr
             .checked_add((index as u64) * 8)
-            .ok_or(LINUX_E2BIG)?;
-        let bytes = memory.read_bytes(slot_addr, 8).map_err(|_| LINUX_EFAULT)?;
-        let ptr = u64::from_le_bytes(bytes.try_into().map_err(|_| LINUX_EFAULT)?);
+            .ok_or(InputCopyError::Errno(LINUX_E2BIG))?;
+        let bytes = memory
+            .read_bytes(slot_addr, 8)
+            .map_err(DispatchError::input_copy)?;
+        let ptr = u64::from_le_bytes(
+            bytes
+                .try_into()
+                .map_err(|_| InputCopyError::Errno(LINUX_EFAULT))?,
+        );
         if ptr == 0 {
             return Ok(out);
         }
         out.push(read_guest_exec_string_bytes(memory, ptr)?);
     }
-    Err(LINUX_E2BIG)
+    Err(InputCopyError::Errno(LINUX_E2BIG))
 }
 
 pub(super) fn validate_exec_vector_size(
@@ -412,7 +418,7 @@ mod exec_vector_tests {
         let oversized = one_string_array(MAX_EXEC_STRING_BYTES);
         assert_eq!(
             read_guest_string_array_bytes(&oversized, BASE),
-            Err(LINUX_E2BIG)
+            Err(InputCopyError::Errno(LINUX_E2BIG))
         );
     }
 
@@ -422,7 +428,7 @@ mod exec_vector_tests {
         let path = one_string_array(MAX_GUEST_PATH);
         assert_eq!(
             read_guest_c_string_bytes(&path, BASE + 0x100),
-            Err(LINUX_ENAMETOOLONG)
+            Err(InputCopyError::Errno(LINUX_ENAMETOOLONG))
         );
 
         let mut pointer_only = vec![0_u8; 16];
@@ -430,7 +436,7 @@ mod exec_vector_tests {
         let unmapped = crate::dispatch::LinearMemory::new(BASE, pointer_only);
         assert_eq!(
             read_guest_string_array_bytes(&unmapped, BASE),
-            Err(LINUX_EFAULT)
+            Err(InputCopyError::Errno(LINUX_EFAULT))
         );
     }
 
@@ -506,14 +512,14 @@ pub mod linux_errno {
 pub(super) fn read_guest_c_string_bytes(
     memory: &impl CurrentMmMemory,
     address: u64,
-) -> Result<Vec<u8>, LinuxErrno> {
+) -> Result<Vec<u8>, InputCopyError> {
     read_guest_c_string_bytes_bounded(memory, address, MAX_GUEST_PATH, LINUX_ENAMETOOLONG)
 }
 
 fn read_guest_exec_string_bytes(
     memory: &impl CurrentMmMemory,
     address: u64,
-) -> Result<Vec<u8>, LinuxErrno> {
+) -> Result<Vec<u8>, InputCopyError> {
     read_guest_c_string_bytes_bounded(memory, address, MAX_EXEC_STRING_BYTES, LINUX_E2BIG)
 }
 
@@ -522,27 +528,28 @@ fn read_guest_c_string_bytes_bounded(
     address: u64,
     max_bytes_including_nul: usize,
     too_long: LinuxErrno,
-) -> Result<Vec<u8>, LinuxErrno> {
+) -> Result<Vec<u8>, InputCopyError> {
     const CHUNK: usize = 256;
     let mut bytes = Vec::new();
     let mut offset = 0usize;
     let mut stack_chunk = [0u8; CHUNK];
     while offset < max_bytes_including_nul {
-        let current_address = address.checked_add(offset as u64).ok_or(too_long)?;
+        let current_address = address
+            .checked_add(offset as u64)
+            .ok_or(InputCopyError::Errno(too_long))?;
         let to_read = CHUNK.min(max_bytes_including_nul - offset);
-        let read_len = if memory
-            .read_into(current_address, &mut stack_chunk[..to_read])
-            .is_ok()
-        {
-            to_read
-        } else if to_read > 1
-            && memory
-                .read_into(current_address, &mut stack_chunk[..1])
-                .is_ok()
-        {
-            1
-        } else {
-            return Err(LINUX_EFAULT);
+        let read_len = match memory.read_into(current_address, &mut stack_chunk[..to_read]) {
+            Ok(()) => to_read,
+            Err(err) => {
+                if to_read > 1 {
+                    match memory.read_into(current_address, &mut stack_chunk[..1]) {
+                        Ok(()) => 1,
+                        Err(single_err) => return Err(DispatchError::input_copy(single_err)),
+                    }
+                } else {
+                    return Err(DispatchError::input_copy(err));
+                }
+            }
         };
         let slice = &stack_chunk[..read_len];
         if let Some(nul) = slice.iter().position(|&byte| byte == 0) {
@@ -552,7 +559,7 @@ fn read_guest_c_string_bytes_bounded(
         offset += read_len;
         bytes.extend_from_slice(slice);
     }
-    Err(too_long)
+    Err(InputCopyError::Errno(too_long))
 }
 
 /// As [`read_guest_c_string_bytes`], carried into a Rust `String` for the paths
@@ -567,7 +574,7 @@ fn read_guest_c_string_bytes_bounded(
 pub(super) fn read_guest_c_string(
     memory: &impl CurrentMmMemory,
     address: u64,
-) -> Result<String, LinuxErrno> {
+) -> Result<String, InputCopyError> {
     const CHUNK: usize = 256;
     let mut stack_chunk = [0u8; CHUNK];
     if memory.read_into(address, &mut stack_chunk).is_ok() {
