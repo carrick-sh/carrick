@@ -8,19 +8,6 @@ use carrick_guest_arch::{
 pub const SYS_SET_ROBUST_LIST: usize = 99;
 pub const EINVAL: i64 = -22;
 
-#[cfg(test)]
-mod decode_tests {
-    use super::decode_x86_64;
-
-    #[test]
-    fn ordinary_x86_file_call_uses_canonical_family_ordinal() {
-        let call = decode_x86_64(0, [7, 0x1000, 8, 0, 0, 0], 0x8000);
-        assert_eq!(call.canonical.raw(), 63); // read, served by the shared IPC/file family
-        assert_eq!(call.args, [7, 0x1000, 8, 0, 0, 0]);
-        assert_eq!(call.native.raw(), 0);
-    }
-}
-
 /// Decode the Linux x86_64 syscall ABI from a native register snapshot.
 pub fn decode_x86_64(native: u64, mut args: [u64; 6], stack: u64) -> CanonicalCall {
     // clone's fourth and fifth native arguments are reversed relative to
@@ -83,5 +70,18 @@ pub const fn aarch64_child_vdso_identity(parent: u64, visible_tid: u32) -> u64 {
         0
     } else {
         (parent & !0xffff_ffff) | visible_tid as u64
+    }
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::decode_x86_64;
+
+    #[test]
+    fn ordinary_x86_file_call_uses_canonical_family_ordinal() {
+        let call = decode_x86_64(0, [7, 0x1000, 8, 0, 0, 0], 0x8000);
+        assert_eq!(call.canonical.raw(), 63); // read, served by the shared IPC/file family
+        assert_eq!(call.args, [7, 0x1000, 8, 0, 0, 0]);
+        assert_eq!(call.native.raw(), 0);
     }
 }
