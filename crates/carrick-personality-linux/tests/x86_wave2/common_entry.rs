@@ -522,6 +522,30 @@ fn arch_prctl_uses_shared_admission_and_completion_with_pending_work() {
         calls: core::cell::Cell::new(0),
         args: [0x1002, 0x7000, 0, 0, 0, 0],
     };
+    let private_slot = carrick_syscall_abi::private_x86_counter_slot(
+        carrick_syscall_abi::CanonicalNr(carrick_syscall_abi::CARRICK_PRIVATE_X86_ARCH_PRCTL),
+    )
+    .unwrap();
+    let getgroups = carrick_personality_linux::entry::decode_x86_64(115, [0; 6], 0x9000);
+    assert_eq!(getgroups.canonical.raw(), 158);
+    let mut getgroups_pending = NativePending {
+        world: &w,
+        calls: core::cell::Cell::new(0),
+        args: [0; 6],
+    };
+    assert_eq!(
+        carrick_personality_linux::dispatch::dispatch_x86(
+            getgroups.canonical.raw(),
+            u64::MAX,
+            &mut getgroups_pending,
+        ),
+        CompletionRoute::Forward
+    );
+    assert_eq!(w.counters.forwarded[158].load(Ordering::Relaxed), 1);
+    assert_eq!(
+        w.counters.forwarded[private_slot].load(Ordering::Relaxed),
+        0
+    );
     w.tasks[1].linux.mark_pending_host_work();
     let call =
         carrick_personality_linux::entry::decode_x86_64(158, [0x1002, 0x7000, 0, 0, 0, 0], 0x9000);
@@ -536,7 +560,8 @@ fn arch_prctl_uses_shared_admission_and_completion_with_pending_work() {
     );
     assert_eq!(route, CompletionRoute::WithWork);
     assert_eq!(pending.calls.get(), 1);
-    assert_eq!(w.counters.served[158].load(Ordering::Relaxed), 1);
+    assert_eq!(w.counters.served[158].load(Ordering::Relaxed), 0);
+    assert_eq!(w.counters.served[private_slot].load(Ordering::Relaxed), 1);
     assert_eq!(w.tasks[1].linux.served_with_work.load(Ordering::Relaxed), 1);
     assert_eq!(w.tasks[0].linux.served_with_work.load(Ordering::Relaxed), 0);
     assert_eq!(w.tasks[1].linux.orig_arg0.load(Ordering::Relaxed), 0x1002);
@@ -552,5 +577,11 @@ fn arch_prctl_uses_shared_admission_and_completion_with_pending_work() {
         1,
         "unadmitted native effects are forbidden"
     );
-    assert_eq!(w.counters.served[158].load(Ordering::Relaxed), 1);
+    assert_eq!(w.counters.served[158].load(Ordering::Relaxed), 0);
+    assert_eq!(w.counters.served[private_slot].load(Ordering::Relaxed), 1);
+    assert_eq!(
+        w.counters.forwarded[private_slot].load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(w.counters.forwarded[158].load(Ordering::Relaxed), 1);
 }

@@ -888,10 +888,6 @@ pub const CANONICAL_CLONE: u64 = 220;
 const X86_NR_FORK: u64 = 57;
 /// x86-64 `vfork(2)` (syscalls(2)). Desugars to clone(220)+CLONE_VM|CLONE_VFORK|SIGCHLD.
 const X86_NR_VFORK: u64 = 58;
-/// x86-64 `poll(2)` (syscalls(2)). Desugars to a private dispatcher shim because
-/// the canonical/asm-generic ABI has only `ppoll(2)`, whose 3rd arg is a
-/// `*timespec` POINTER — folding poll in would mis-read poll's INT `timeout_ms`
-/// (a `poll(.,.,0)` non-blocking probe would wedge as an infinite wait).
 /// x86-64 `select(2)` (syscalls(2)). Desugars to a private dispatcher shim
 /// because canonical/asm-generic has only `pselect6(2)` (a *timespec timeout +
 /// sigmask) — select's *timeval timeout would be mis-read as a *timespec.

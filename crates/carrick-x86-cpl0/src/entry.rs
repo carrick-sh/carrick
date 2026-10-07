@@ -1445,7 +1445,12 @@ mod kernel {
             doorbell(RETURN_KICK_PORT, frame);
         }
         if task.linux.has_pending_host_work() {
-            // Shared completion already published the work-bearing return.
+            // Shared finish/publish_work records ServedWithWork. A late return
+            // kick after Served, or a forward that just completed, still owes
+            // the boundary record. Preserve an already published disposition.
+            if task.linux.served_with_work.load(Ordering::Acquire) == 0 {
+                task.linux.record_completed_with_work();
+            }
             doorbell(WORK_PORT, frame);
         }
     }
