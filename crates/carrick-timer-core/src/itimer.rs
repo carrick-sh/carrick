@@ -188,7 +188,258 @@ impl SlotGate<'_> {
     }
 }
 
-static SLOTS: [ItimerSlot; WHICH_COUNT] = [ItimerSlot::new(), ItimerSlot::new(), ItimerSlot::new()];
+/// One Linux process's interval timers: a slot per `which`, each with its own
+/// transition gate. The 1:1 lanes (one host process per Linux process) keep a
+/// single process-global table behind the free functions of this module;
+/// HVPatch multiplexes many Linux processes in one carrier and gives each its
+/// own table. Every arm, disarm, expiry decision and delivery of either goes
+/// through the same gated methods.
+pub struct ItimerTable {
+    slots: [ItimerSlot; WHICH_COUNT],
+}
+
+impl Default for ItimerTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ItimerTable {
+    pub const fn new() -> Self {
+        Self {
+            slots: [ItimerSlot::new(), ItimerSlot::new(), ItimerSlot::new()],
+        }
+    }
+
+    /// The current arm generation of `which` (bumped on every arm/disarm).
+    pub fn generation(&self, which: usize) -> u64 {
+        self.slots
+            .get(which)
+            .map_or(0, |slot| slot.generation.load(Ordering::SeqCst))
+    }
+
+    /// Mark `which` armed with `spec` at guest CPU total `cpu_now_ns` (the
+    /// CPU-timer due point is `cpu_now_ns + spec.value`; ignored for
+    /// `ITIMER_REAL`). Returns the new generation, or 0 for an out-of-range
+    /// `which` (a real arm's generation is never 0).
+    pub fn arm_with_cpu_now(
+        &self,
+        which: usize,
+        spec: TimerSpecNs,
+        needs_periodic: bool,
+        cpu_now_ns: u64,
+    ) -> u64 {
+        let Some(slot) = self.slots.get(which) else {
+            return 0;
+        };
+        let _gate = slot.gate();
+        let generation = slot
+            .generation
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        slot.value_ns.store(spec.value, Ordering::SeqCst);
+        slot.interval_ns.store(spec.interval, Ordering::SeqCst);
+        slot.needs_periodic.store(needs_periodic, Ordering::SeqCst);
+        let cpu_due_ns = if is_cpu_timer(which) {
+            cpu_now_ns.saturating_add(spec.value)
+        } else {
+            0
+        };
+        slot.cpu_due_ns.store(cpu_due_ns, Ordering::SeqCst);
+        // Allocate a FRESH ident for this arm (Darwin poisons a fired EV_ONESHOT
+        // ident — re-arming it never counts down). disarm/fork-replay read this
+        // back so they act on the ident actually registered.
+        slot.live_ident.store(next_ident(which), Ordering::SeqCst);
+        // Publish `armed` last so a pump fire that observes `armed` also sees
+        // the interval/needs_periodic + live_ident written above.
+        slot.armed.store(true, Ordering::SeqCst);
+        generation
+    }
+
+    /// See the free [`live_ident`].
+    pub fn live_ident(&self, which: usize) -> usize {
+        match self.slots.get(which) {
+            Some(slot) => {
+                let stored = slot.live_ident.load(Ordering::SeqCst);
+                if stored == 0 {
+                    ident_for(which)
+                } else {
+                    stored
+                }
+            }
+            None => ident_for(which),
+        }
+    }
+
+    /// Mark `which` disarmed and clear its state. Returns only after any
+    /// in-flight gated delivery for `which` has finished; no deliverer of the
+    /// retired generation delivers afterwards.
+    pub fn disarm(&self, which: usize) {
+        if let Some(slot) = self.slots.get(which) {
+            slot.gate().disarm();
+        }
+    }
+
+    pub fn generation_matches(&self, which: usize, generation: u64) -> bool {
+        self.slots
+            .get(which)
+            .is_some_and(|slot| slot.generation.load(Ordering::SeqCst) == generation)
+    }
+
+    pub fn is_armed(&self, which: usize) -> bool {
+        self.slots
+            .get(which)
+            .is_some_and(|slot| slot.armed.load(Ordering::SeqCst))
+    }
+
+    pub fn interval_ns(&self, which: usize) -> u64 {
+        self.slots
+            .get(which)
+            .map_or(0, |slot| slot.interval_ns.load(Ordering::SeqCst))
+    }
+
+    /// See the free [`fire_wall_if_current`].
+    pub fn fire_wall_if_current(
+        &self,
+        which: usize,
+        generation: u64,
+        on_fire: impl FnOnce(),
+    ) -> FireOutcome {
+        let Some(slot) = self.slots.get(which) else {
+            return FireOutcome::Retired;
+        };
+        let gate = slot.gate();
+        if !gate.is_current(generation) {
+            return FireOutcome::Retired;
+        }
+        gate.fire(on_fire)
+    }
+
+    /// See the free [`fire_cpu_if_current`].
+    pub fn fire_cpu_if_current(
+        &self,
+        which: usize,
+        generation: u64,
+        now_ns: u64,
+        active_vcpus: u64,
+        on_fire: impl FnOnce(),
+    ) -> FireOutcome {
+        let Some(slot) = self.slots.get(which) else {
+            return FireOutcome::Retired;
+        };
+        if !is_cpu_timer(which) {
+            return FireOutcome::Retired;
+        }
+        let gate = slot.gate();
+        if !gate.is_current(generation) {
+            return FireOutcome::Retired;
+        }
+        match gate.cpu_decision(now_ns, active_vcpus) {
+            CpuTimerDecision::Wait { delay_ns } => FireOutcome::Wait { delay_ns },
+            CpuTimerDecision::Fire => gate.fire(on_fire),
+        }
+    }
+
+    /// See the free [`fire_kqueue_if_current`].
+    pub fn fire_kqueue_if_current(
+        &self,
+        which: usize,
+        generation: u64,
+        now_ns: u64,
+        active_vcpus: u64,
+        on_fire: impl FnOnce(),
+        rearm: impl FnOnce(KqueueRearm),
+    ) -> FireOutcome {
+        let Some(slot) = self.slots.get(which) else {
+            return FireOutcome::Retired;
+        };
+        let gate = slot.gate();
+        if !gate.is_current(generation) {
+            return FireOutcome::Retired;
+        }
+        let cpu_timer = is_cpu_timer(which);
+        if cpu_timer
+            && let CpuTimerDecision::Wait { delay_ns } = gate.cpu_decision(now_ns, active_vcpus)
+        {
+            rearm(KqueueRearm::OneShot { delay_ns });
+            return FireOutcome::Wait { delay_ns };
+        }
+        if gate.fire(on_fire) == FireOutcome::Retired {
+            return FireOutcome::Retired;
+        }
+        let interval_ns = slot.interval_ns.load(Ordering::SeqCst);
+        if cpu_timer {
+            // The repeat interval of a CPU timer is a guest-CPU budget, converted
+            // to a wall-clock recheck.
+            rearm(KqueueRearm::OneShot {
+                delay_ns: cpu_timer_recheck_delay_ns(CpuNs(interval_ns)),
+            });
+        } else if slot.needs_periodic.swap(false, Ordering::SeqCst) {
+            // Two-phase: the first expiry was a one-shot; switch to the periodic
+            // timer exactly once (later periodic fires must not re-arm, which
+            // would reset the period and accumulate drift).
+            rearm(KqueueRearm::Periodic {
+                interval_ns: WallNs(interval_ns),
+            });
+        }
+        FireOutcome::Fired
+    }
+
+    /// See the free [`current_arm`].
+    pub fn current_arm(&self, which: usize) -> Option<TimerArm> {
+        let slot = self.slots.get(which)?;
+        let _gate = slot.gate();
+        if !slot.armed.load(Ordering::SeqCst) {
+            return None;
+        }
+        let value_ns = slot.value_ns.load(Ordering::SeqCst);
+        let interval_ns = slot.interval_ns.load(Ordering::SeqCst);
+        let needs_periodic = slot.needs_periodic.load(Ordering::SeqCst);
+        if value_ns == 0 {
+            return None;
+        }
+        let flags = if interval_ns != 0
+            && !needs_periodic
+            && value_ns == interval_ns
+            && !is_cpu_timer(which)
+        {
+            TIMER_ARM_ADD
+        } else {
+            TIMER_ARM_ADD | TIMER_ARM_ONESHOT
+        };
+        let delay_ns = if is_cpu_timer(which) {
+            cpu_timer_recheck_delay_ns(CpuNs(value_ns))
+        } else {
+            WallNs(value_ns)
+        };
+        Some(TimerArm {
+            ident: self.live_ident(which),
+            flags,
+            delay_ns: i64::try_from(delay_ns.raw()).unwrap_or(i64::MAX),
+            generation: slot.generation.load(Ordering::SeqCst),
+        })
+    }
+
+    /// Disarm every `which`.
+    pub fn clear(&self) {
+        for which in 0..WHICH_COUNT {
+            self.disarm(which);
+        }
+    }
+
+    /// See the free [`reset_after_fork`]. Only sound while the caller is the
+    /// sole thread that can reach this table.
+    pub fn reset_after_fork(&self) {
+        for slot in &self.slots {
+            slot.gate.release_after_fork();
+            slot.gate().disarm();
+        }
+    }
+}
+
+/// The process-global table of the 1:1 lanes (one host process per Linux
+/// process), behind the free functions below.
+static SLOTS: ItimerTable = ItimerTable::new();
 
 /// EVFILT_TIMER ident for a `which`.
 pub fn ident_for(which: usize) -> usize {
@@ -250,9 +501,7 @@ pub struct TimerArm {
 /// The current arm generation of `which` (bumped on every arm/disarm). Used to
 /// validate a fired timer's `udata` against the live arm.
 pub fn generation(which: usize) -> u64 {
-    SLOTS
-        .get(which)
-        .map_or(0, |slot| slot.generation.load(Ordering::SeqCst))
+    SLOTS.generation(which)
 }
 
 /// Mark `which` armed with the given `spec` (`spec.interval == 0` = one-shot)
@@ -270,49 +519,14 @@ pub fn arm_with_cpu_now(
     needs_periodic: bool,
     cpu_now_ns: u64,
 ) -> u64 {
-    if let Some(slot) = SLOTS.get(which) {
-        let _gate = slot.gate();
-        let generation = slot
-            .generation
-            .fetch_add(1, Ordering::SeqCst)
-            .wrapping_add(1);
-        slot.value_ns.store(spec.value, Ordering::SeqCst);
-        slot.interval_ns.store(spec.interval, Ordering::SeqCst);
-        slot.needs_periodic.store(needs_periodic, Ordering::SeqCst);
-        let cpu_due_ns = if is_cpu_timer(which) {
-            cpu_now_ns.saturating_add(spec.value)
-        } else {
-            0
-        };
-        slot.cpu_due_ns.store(cpu_due_ns, Ordering::SeqCst);
-        // Allocate a FRESH ident for this arm (Darwin poisons a fired EV_ONESHOT
-        // ident — re-arming it never counts down). disarm/fork-replay read this
-        // back so they act on the ident actually registered.
-        slot.live_ident.store(next_ident(which), Ordering::SeqCst);
-        // Publish `armed` last so a pump fire that observes `armed` also sees
-        // the interval/needs_periodic + live_ident written above.
-        slot.armed.store(true, Ordering::SeqCst);
-        generation
-    } else {
-        0
-    }
+    SLOTS.arm_with_cpu_now(which, spec, needs_periodic, cpu_now_ns)
 }
 
 /// The EVFILT_TIMER ident the current arm of `which` registered, or the base
 /// ident if `which` was never armed. disarm + fork-replay use this so they touch
 /// the SAME ident the live arm registered (see [`next_ident`]).
 pub fn live_ident(which: usize) -> usize {
-    match SLOTS.get(which) {
-        Some(slot) => {
-            let stored = slot.live_ident.load(Ordering::SeqCst);
-            if stored == 0 {
-                ident_for(which)
-            } else {
-                stored
-            }
-        }
-        None => ident_for(which),
-    }
+    SLOTS.live_ident(which)
 }
 
 /// Mark `which` disarmed and clear its state. Called by `setitimer` on a zero
@@ -321,29 +535,21 @@ pub fn live_ident(which: usize) -> usize {
 /// Returns only after any in-flight fallback delivery for `which` has
 /// finished; no fallback thread of the retired generation delivers afterwards.
 pub fn disarm(which: usize) {
-    if let Some(slot) = SLOTS.get(which) {
-        slot.gate().disarm();
-    }
+    SLOTS.disarm(which);
 }
 
 pub fn generation_matches(which: usize, generation: u64) -> bool {
-    SLOTS
-        .get(which)
-        .is_some_and(|slot| slot.generation.load(Ordering::SeqCst) == generation)
+    SLOTS.generation_matches(which, generation)
 }
 
 /// Is `which` currently armed? The pump uses this to drop stale fires.
 pub fn is_armed(which: usize) -> bool {
-    SLOTS
-        .get(which)
-        .is_some_and(|slot| slot.armed.load(Ordering::SeqCst))
+    SLOTS.is_armed(which)
 }
 
 /// The repeat interval for `which` in nanoseconds (0 = no repeat).
 pub fn interval_ns(which: usize) -> u64 {
-    SLOTS
-        .get(which)
-        .map_or(0, |slot| slot.interval_ns.load(Ordering::SeqCst))
+    SLOTS.interval_ns(which)
 }
 
 /// Deliver a wall-clock (`ITIMER_REAL`) expiry for the fallback thread of arm
@@ -351,14 +557,7 @@ pub fn interval_ns(which: usize) -> u64 {
 /// one-shot, all under the slot gate, so an arm/disarm that returns before
 /// this call is never followed by a delivery for the superseded generation.
 pub fn fire_wall_if_current(which: usize, generation: u64, on_fire: impl FnOnce()) -> FireOutcome {
-    let Some(slot) = SLOTS.get(which) else {
-        return FireOutcome::Retired;
-    };
-    let gate = slot.gate();
-    if !gate.is_current(generation) {
-        return FireOutcome::Retired;
-    }
-    gate.fire(on_fire)
+    SLOTS.fire_wall_if_current(which, generation, on_fire)
 }
 
 /// [`fire_wall_if_current`] for a CPU-time timer: given the sampled guest CPU
@@ -373,20 +572,7 @@ pub fn fire_cpu_if_current(
     active_vcpus: u64,
     on_fire: impl FnOnce(),
 ) -> FireOutcome {
-    let Some(slot) = SLOTS.get(which) else {
-        return FireOutcome::Retired;
-    };
-    if !is_cpu_timer(which) {
-        return FireOutcome::Retired;
-    }
-    let gate = slot.gate();
-    if !gate.is_current(generation) {
-        return FireOutcome::Retired;
-    }
-    match gate.cpu_decision(now_ns, active_vcpus) {
-        CpuTimerDecision::Wait { delay_ns } => FireOutcome::Wait { delay_ns },
-        CpuTimerDecision::Fire => gate.fire(on_fire),
-    }
+    SLOTS.fire_cpu_if_current(which, generation, now_ns, active_vcpus, on_fire)
 }
 
 /// What a kqueue-driven deliverer (the HVF signal pump) must register for the
@@ -420,39 +606,7 @@ pub fn fire_kqueue_if_current(
     on_fire: impl FnOnce(),
     rearm: impl FnOnce(KqueueRearm),
 ) -> FireOutcome {
-    let Some(slot) = SLOTS.get(which) else {
-        return FireOutcome::Retired;
-    };
-    let gate = slot.gate();
-    if !gate.is_current(generation) {
-        return FireOutcome::Retired;
-    }
-    let cpu_timer = is_cpu_timer(which);
-    if cpu_timer
-        && let CpuTimerDecision::Wait { delay_ns } = gate.cpu_decision(now_ns, active_vcpus)
-    {
-        rearm(KqueueRearm::OneShot { delay_ns });
-        return FireOutcome::Wait { delay_ns };
-    }
-    if gate.fire(on_fire) == FireOutcome::Retired {
-        return FireOutcome::Retired;
-    }
-    let interval_ns = slot.interval_ns.load(Ordering::SeqCst);
-    if cpu_timer {
-        // The repeat interval of a CPU timer is a guest-CPU budget, converted
-        // to a wall-clock recheck.
-        rearm(KqueueRearm::OneShot {
-            delay_ns: cpu_timer_recheck_delay_ns(CpuNs(interval_ns)),
-        });
-    } else if slot.needs_periodic.swap(false, Ordering::SeqCst) {
-        // Two-phase: the first expiry was a one-shot; switch to the periodic
-        // timer exactly once (later periodic fires must not re-arm, which
-        // would reset the period and accumulate drift).
-        rearm(KqueueRearm::Periodic {
-            interval_ns: WallNs(interval_ns),
-        });
-    }
-    FireOutcome::Fired
+    SLOTS.fire_kqueue_if_current(which, generation, now_ns, active_vcpus, on_fire, rearm)
 }
 
 /// Convert remaining aggregate guest CPU time into a wall-clock delay for the
@@ -474,34 +628,7 @@ pub fn cpu_timer_recheck_delay_with_active(remaining_cpu_ns: CpuNs, active_vcpus
 
 /// Current kqueue timer arm for `which`, if it is armed.
 pub fn current_arm(which: usize) -> Option<TimerArm> {
-    let slot = SLOTS.get(which)?;
-    let _gate = slot.gate();
-    if !slot.armed.load(Ordering::SeqCst) {
-        return None;
-    }
-    let value_ns = slot.value_ns.load(Ordering::SeqCst);
-    let interval_ns = slot.interval_ns.load(Ordering::SeqCst);
-    let needs_periodic = slot.needs_periodic.load(Ordering::SeqCst);
-    if value_ns == 0 {
-        return None;
-    }
-    let flags =
-        if interval_ns != 0 && !needs_periodic && value_ns == interval_ns && !is_cpu_timer(which) {
-            TIMER_ARM_ADD
-        } else {
-            TIMER_ARM_ADD | TIMER_ARM_ONESHOT
-        };
-    let delay_ns = if is_cpu_timer(which) {
-        cpu_timer_recheck_delay_ns(CpuNs(value_ns))
-    } else {
-        WallNs(value_ns)
-    };
-    Some(TimerArm {
-        ident: live_ident(which),
-        flags,
-        delay_ns: i64::try_from(delay_ns.raw()).unwrap_or(i64::MAX),
-        generation: slot.generation.load(Ordering::SeqCst),
-    })
+    SLOTS.current_arm(which)
 }
 
 pub fn current_arms() -> impl Iterator<Item = TimerArm> {
@@ -510,9 +637,7 @@ pub fn current_arms() -> impl Iterator<Item = TimerArm> {
 
 /// Disarm every `which`.
 pub fn clear() {
-    for which in 0..WHICH_COUNT {
-        disarm(which);
-    }
+    SLOTS.clear();
 }
 
 /// Fork-child reset: disarm every `which` WITHOUT waiting on the slot gates.
@@ -522,10 +647,7 @@ pub fn clear() {
 /// with no interval timers armed. Only sound while the caller is the child's
 /// sole thread.
 pub fn reset_after_fork() {
-    for slot in &SLOTS {
-        slot.gate.release_after_fork();
-        slot.gate().disarm();
-    }
+    SLOTS.reset_after_fork();
 }
 
 #[cfg(test)]
@@ -612,10 +734,10 @@ mod tests {
         arm(0, spec, false);
         // Model a fork taken while a parent fallback thread held the gate:
         // the holder never runs in the child, so nothing will release it.
-        core::mem::forget(SLOTS[0].gate.hold());
+        core::mem::forget(SLOTS.slots[0].gate.hold());
         reset_after_fork();
         assert!(!is_armed(0), "a fork child starts with no interval timers");
-        assert!(!SLOTS[0].gate.is_held());
+        assert!(!SLOTS.slots[0].gate.is_held());
         let generation = arm(0, spec, false);
         assert!(is_armed(0));
         assert_eq!(super::generation(0), generation);
@@ -854,12 +976,12 @@ mod tests {
         );
         assert!(is_armed(which));
         assert_eq!(interval_ns(which), 5_000);
-        assert!(SLOTS[which].needs_periodic.load(Ordering::SeqCst));
+        assert!(SLOTS.slots[which].needs_periodic.load(Ordering::SeqCst));
 
         disarm(which);
         assert!(!is_armed(which));
         assert_eq!(interval_ns(which), 0);
-        assert!(!SLOTS[which].needs_periodic.load(Ordering::SeqCst));
+        assert!(!SLOTS.slots[which].needs_periodic.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -877,7 +999,7 @@ mod tests {
         );
         assert!(is_armed(which));
         assert_eq!(interval_ns(which), 0);
-        assert!(!SLOTS[which].needs_periodic.load(Ordering::SeqCst));
+        assert!(!SLOTS.slots[which].needs_periodic.load(Ordering::SeqCst));
         disarm(which);
     }
 
