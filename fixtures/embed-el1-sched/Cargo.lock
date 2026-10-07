@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "bitflags"
+version = "2.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
+
+[[package]]
 name = "carrick-core"
 version = "0.1.0"
 dependencies = [
@@ -10,6 +16,7 @@ dependencies = [
  "carrick-guest-arch",
  "carrick-mmu-core",
  "carrick-sched-core",
+ "zerocopy",
 ]
 
 [[package]]
@@ -27,6 +34,7 @@ version = "0.1.0"
 dependencies = [
  "carrick-core-abi",
  "carrick-fd-core",
+ "carrick-guest-arch",
  "carrick-inotify-core",
  "carrick-mmu-core",
  "carrick-personality-linux",
@@ -77,6 +85,7 @@ dependencies = [
  "carrick-guest-arch",
  "carrick-sched-core",
  "carrick-signal-core",
+ "carrick-syscall-abi",
 ]
 
 [[package]]
@@ -88,6 +97,7 @@ name = "carrick-sched-core"
 version = "0.1.0"
 dependencies = [
  "carrick-guest-arch",
+ "carrick-syscall-abi",
  "zerocopy",
 ]
 
@@ -96,8 +106,12 @@ name = "carrick-signal-core"
 version = "0.1.0"
 
 [[package]]
-name = "carrick-signal-core"
+name = "carrick-syscall-abi"
 version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "serde",
+]
 
 [[package]]
 name = "foldhash"
@@ -136,6 +150,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
+]
+
+[[package]]
+name = "serde"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
+dependencies = [
+ "serde_core",
+ "serde_derive",
+]
+
+[[package]]
+name = "serde_core"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41d385c7d4ca58e59fc732af25c3983b67ac852c1a25000afe1175de458b67ad"
+dependencies = [
+ "serde_derive",
+]
+
+[[package]]
+name = "serde_derive"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
