@@ -77,6 +77,20 @@ impl CompletionQueue {
         self.head.store(next, Ordering::Relaxed);
         Some(head)
     }
+    pub fn has_pending(&self) -> bool {
+        if self.initialized.load(Ordering::Acquire) != 2 {
+            return false;
+        }
+        let tail = self.tail.load(Ordering::Acquire);
+        if tail != STUB {
+            return true;
+        }
+        let head = self.head.load(Ordering::Acquire);
+        if head != STUB {
+            return true;
+        }
+        self.stub_next.load(Ordering::Acquire) != 0
+    }
 }
 
 #[cfg(test)]
@@ -128,5 +142,26 @@ mod tests {
         assert_eq!(pop(), Some(1));
         assert_eq!(pop(), Some(2));
         assert_eq!(pop(), None);
+    }
+
+    #[test]
+    fn has_pending_tracks_presence_of_elements() {
+        let queue: CompletionQueue = unsafe { core::mem::zeroed() };
+        assert!(!queue.has_pending());
+        assert!(queue.initialize());
+        assert!(!queue.has_pending());
+        let links = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+        queue.push(1, 1, |id, next| {
+            links[id as usize].store(next, Ordering::Release)
+        });
+        assert!(queue.has_pending());
+        let popped = unsafe {
+            queue.pop(
+                |id| links[id as usize].load(Ordering::Acquire),
+                |id, next| links[id as usize].store(next, Ordering::Release),
+            )
+        };
+        assert_eq!(popped, Some(1));
+        assert!(!queue.has_pending());
     }
 }
