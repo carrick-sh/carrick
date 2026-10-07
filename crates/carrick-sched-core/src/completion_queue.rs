@@ -1,6 +1,6 @@
 //! Intrusive MPSC custody queue. Producers publish with one exchange and one
 //! link store; a single owner drains ready links without waiting for producers.
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 const STUB: u32 = u32::MAX;
 
 #[repr(C)]
@@ -9,31 +9,10 @@ pub struct CompletionQueue {
     head: AtomicU32,
     tail: AtomicU32,
     stub_next: AtomicU32,
-    live_head: AtomicU64,
-    owner: AtomicU32,
-    consumer: AtomicU32,
-}
-pub struct CompletionConsumer<'a>(&'a CompletionQueue);
-impl Drop for CompletionConsumer<'_> {
-    fn drop(&mut self) {
-        self.0.consumer.store(0, Ordering::Release);
-    }
-}
-impl CompletionConsumer<'_> {
-    /// # Safety
-    /// The caller retains every queued node until this call transfers it.
-    pub unsafe fn pop(&self, load: impl Fn(u32) -> u32, store: impl Fn(u32, u32)) -> Option<u32> {
-        unsafe { self.0.pop_inner(load, store) }
-    }
 }
 impl CompletionQueue {
     /// Admission only. An in-progress initializer is a pre-effect refusal.
     pub fn initialize(&self) -> bool {
-        self.initialize_for(0)
-    }
-    /// Bind a queue to one semantic owner. Re-initialization by another owner
-    /// refuses before either can drain the other's records.
-    pub fn initialize_for(&self, owner: u32) -> bool {
         match self
             .initialized
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
@@ -42,34 +21,11 @@ impl CompletionQueue {
                 self.head.store(STUB, Ordering::Relaxed);
                 self.tail.store(STUB, Ordering::Relaxed);
                 self.stub_next.store(0, Ordering::Relaxed);
-                self.live_head.store(0, Ordering::Relaxed);
-                self.owner.store(owner, Ordering::Relaxed);
-                self.consumer.store(0, Ordering::Relaxed);
                 self.initialized.store(2, Ordering::Release);
                 true
             }
-            Err(value) => value == 2 && self.owner.load(Ordering::Acquire) == owner,
+            Err(value) => value == 2,
         }
-    }
-    pub fn owned_by(&self, owner: u32) -> bool {
-        self.initialized.load(Ordering::Acquire) == 2 && self.owner.load(Ordering::Acquire) == owner
-    }
-    /// Root-guarded live prepared records; separate from the MPSC links.
-    pub fn live_head(&self) -> u32 {
-        self.live_head.load(Ordering::Relaxed) as u32
-    }
-    /// The caller holds the reservation root's editor authority.
-    pub fn set_live_head(&self, id: u32) {
-        self.live_head.store(u64::from(id), Ordering::Relaxed);
-    }
-    pub fn try_consumer_for(&self, owner: u32) -> Option<CompletionConsumer<'_>> {
-        if !self.owned_by(owner) {
-            return None;
-        }
-        self.consumer
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .ok()?;
-        Some(CompletionConsumer(self))
     }
     /// Caller owns this entire chain; its tail link is zero. Links remain
     /// alive until pop transfers each member to the unique consumer.
@@ -92,10 +48,6 @@ impl CompletionQueue {
     /// # Safety
     /// The caller holds exclusive consumer authority until this call returns.
     pub unsafe fn pop(&self, load: impl Fn(u32) -> u32, store: impl Fn(u32, u32)) -> Option<u32> {
-        let consumer = self.try_consumer_for(0)?;
-        unsafe { consumer.pop(load, store) }
-    }
-    unsafe fn pop_inner(&self, load: impl Fn(u32) -> u32, store: impl Fn(u32, u32)) -> Option<u32> {
         if self.initialized.load(Ordering::Acquire) != 2 {
             return None;
         }
@@ -213,6 +165,8 @@ mod tests {
         assert!(!queue.has_pending());
     }
 
+    // Known red: callers must prove exclusive consumer custody. The queue
+    // itself currently permits two consumers to return one record twice.
     #[test]
     fn simultaneous_consumers_cannot_return_one_completion_twice() {
         let queue: CompletionQueue = unsafe { core::mem::zeroed() };
@@ -248,18 +202,5 @@ mod tests {
                 "a second consumer duplicated the same record"
             );
         });
-    }
-
-    #[test]
-    fn owner_claim_preserves_reserved_live_head_word() {
-        let queue: CompletionQueue = unsafe { core::mem::zeroed() };
-        assert!(queue.initialize_for(7));
-        // Reservation metadata places its guarded live-list head at word 2.
-        let words = (&queue as *const CompletionQueue).cast::<core::sync::atomic::AtomicU64>();
-        unsafe { (*words.add(2)).store(123, Ordering::Release) };
-        let consumer = queue.try_consumer_for(7).expect("owned queue");
-        assert_eq!(unsafe { (*words.add(2)).load(Ordering::Acquire) }, 123);
-        drop(consumer);
-        assert_eq!(unsafe { (*words.add(2)).load(Ordering::Acquire) }, 123);
     }
 }
