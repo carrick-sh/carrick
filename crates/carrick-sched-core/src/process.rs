@@ -5,6 +5,7 @@ use core::num::{NonZeroI32, NonZeroU64};
 use core::time::Duration;
 
 pub mod registry;
+pub mod wait;
 
 macro_rules! linux_i32_id {
     ($name:ident) => {
@@ -392,3 +393,6 @@ impl<Container, Uid> Zombie<Container, Uid> {
         }
     }
 }
+
+#[cfg(test)]
+mod wait_tests;
