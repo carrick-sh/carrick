@@ -119,6 +119,31 @@ fn native_argv_mirrors_docker_inputs_and_uses_unshare_chroot() {
         .unwrap();
     assert_eq!(&native[chroot + 2..chroot + 4], ["/bin/sh", "-c"]);
     assert!(native[chroot + 4].contains("exec 3>&-"));
+    assert!(native[chroot + 4].ends_with("exec \"$@\""));
+    let mut probe_root = rootfs.clone();
+    probe_root.probe_binary = Some("/fixture/probe".into());
+    let probe = argv::native_argv(&s, &probe_root).unwrap();
+    let chroot = probe
+        .iter()
+        .position(|arg| arg == "/usr/sbin/chroot")
+        .unwrap();
+    assert!(probe[chroot + 4].contains("\"$@\"; rc=$?; exit \"$rc\""));
+}
+
+#[test]
+fn empty_image_workdir_means_root_but_empty_suite_workdir_is_invalid() {
+    use carrick_conformance::{argv, native};
+    let mut suite = suite();
+    suite.workdir = None;
+    let root = native::NativeRootfs {
+        root: "/private/image".into(),
+        workdir: Some(String::new()),
+        ..Default::default()
+    };
+    let args = argv::native_argv(&suite, &root).unwrap();
+    assert!(!args.iter().any(|arg| arg == "native-workdir"));
+    suite.workdir = Some(String::new());
+    assert!(argv::native_argv(&suite, &root).is_err());
 }
 
 #[test]

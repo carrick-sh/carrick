@@ -177,8 +177,9 @@ pub fn native_argv(
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("non-UTF8 rootfs path"))?;
     // All data is positional argv, never interpolated into a shell program.
-    // PID 1 waits INSIDE the chroot: /proc/1/root must describe the image,
-    // never the host. Namespace exit kills orphaned descendants.
+    // PID 1 enters the chroot: /proc/1/root must describe the image, never
+    // the host. Ordinary commands exec as PID 1, matching Docker's argv;
+    // probe captures retain the existing harness's waiting shell.
     const SETUP: &str = r#"
 root=$1
 shift
@@ -257,16 +258,21 @@ exec "$@"
             .map(|kv| format!("{}={}", kv.key, kv.val)),
     );
     argv.extend(["/usr/sbin/chroot".into(), root.into()]);
+    let init = if rootfs.probe_binary.is_some() {
+        "printf 'ready\\n' >&3; exec 3>&-; \"$@\"; rc=$?; exit \"$rc\""
+    } else {
+        "printf 'ready\\n' >&3; exec 3>&-; exec \"$@\""
+    };
     argv.extend([
         "/bin/sh".into(),
         "-c".into(),
-        "printf 'ready\\n' >&3; exec 3>&-; \"$@\"; rc=$?; exit \"$rc\"".into(),
+        init.into(),
         "native-init".into(),
     ]);
     let workdir = suite
         .workdir
         .as_deref()
-        .or(rootfs.workdir.as_deref())
+        .or(rootfs.workdir.as_deref().filter(|dir| !dir.is_empty()))
         .unwrap_or("/");
     if workdir != "/" {
         anyhow::ensure!(workdir.starts_with('/'), "native workdir must be absolute");
