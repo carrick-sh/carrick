@@ -1158,6 +1158,7 @@ impl PreparedRun {
                         incarnation: row.incarnation,
                         generation: row.generation,
                         private_pages: row.private_pages,
+                        cpu_mask: row.cpu_mask,
                     })
                     .collect(),
                 cross_mm_private_aliases: machine.cross_mm_private_aliases(),

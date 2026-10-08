@@ -565,6 +565,9 @@ pub struct AnonymousPrivateMm {
     pub incarnation: u64,
     pub generation: u64,
     pub private_pages: u64,
+    /// Actual caller CPUs observed at authenticated live grant settlement.
+    #[serde(default)]
+    pub cpu_mask: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

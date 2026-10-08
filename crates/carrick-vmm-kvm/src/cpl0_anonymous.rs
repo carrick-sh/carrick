@@ -46,6 +46,80 @@ const _: () = {
     }
 };
 
+/// Immutable physical storage licensed by the supervisor image's ELF loads.
+/// This qualifies transport bytes without importing process or MM policy.
+pub(super) struct KernelPodStorage {
+    start: carrick_guest_arch::KernelVa,
+    len: u64,
+    physical: FrameGpa,
+}
+impl KernelPodStorage {
+    /// The global allocator admits exactly this ABI-declared aperture;
+    /// physical bootstrap owns its private window at the matching offset.
+    pub(super) fn for_bootstrap() -> Self {
+        Self {
+            start: carrick_guest_arch::KernelVa::new(X86_CPL0_BOOTSTRAP_METADATA_BASE),
+            len: EL1_BOOTSTRAP_METADATA_SIZE,
+            physical: FrameGpa::new(ALLOCATOR_GPA),
+        }
+    }
+
+    pub(super) fn from_load(segment: &carrick_mem::elf::LoadSegment) -> Option<Self> {
+        let end = segment.virtual_address.checked_add(segment.memory_size)?;
+        if !segment.perms.read
+            || !segment.perms.write
+            || segment.perms.execute
+            || segment.memory_size == 0
+            || segment.virtual_address < IMAGE_VA
+            || end > IMAGE_VA + 0x10_0000
+        {
+            return None;
+        }
+        Some(Self {
+            start: carrick_guest_arch::KernelVa::new(segment.virtual_address),
+            len: segment.memory_size,
+            physical: FrameGpa::new(IMAGE_GPA.checked_add(segment.virtual_address - IMAGE_VA)?),
+        })
+    }
+}
+
+pub(super) fn retained_kernel_pod_storage(
+    segments: &[carrick_mem::elf::LoadSegment],
+) -> Vec<KernelPodStorage> {
+    let mut storage: Vec<_> = segments
+        .iter()
+        .filter_map(KernelPodStorage::from_load)
+        .collect();
+    storage.push(KernelPodStorage::for_bootstrap());
+    storage
+}
+
+fn kernel_pod_physical(
+    storage: &[KernelPodStorage],
+    address: carrick_guest_arch::KernelVa,
+    len: usize,
+    alignment: usize,
+) -> Option<FrameGpa> {
+    if len == 0 || alignment == 0 || !address.raw().is_multiple_of(alignment as u64) {
+        return None;
+    }
+    let end = address.raw().checked_add(u64::try_from(len).ok()?)?;
+    let source = storage.iter().find(|source| {
+        address.raw() >= source.start.raw()
+            && source
+                .start
+                .raw()
+                .checked_add(source.len)
+                .is_some_and(|limit| end <= limit)
+    })?;
+    Some(FrameGpa::new(
+        source
+            .physical
+            .raw()
+            .checked_add(address.raw() - source.start.raw())?,
+    ))
+}
+
 #[derive(Clone, Copy)]
 struct GrantExecution {
     cpu: carrick_guest_arch::CpuId,
@@ -308,6 +382,63 @@ impl Cpl0HostCustody {
         Ok((physical, unsafe { record.assume_init() }))
     }
 
+    fn read_kernel_pod_bytes(
+        &self,
+        context: AddressContext<RootGpa>,
+        address: carrick_guest_arch::KernelVa,
+        len: usize,
+        alignment: usize,
+    ) -> Result<Vec<u8>, TrapError> {
+        let physical = kernel_pod_physical(&self.kernel_pod_storage, address, len, alignment)
+            .ok_or_else(|| fail(format!(
+                "physical kernel POD outside retained storage: va={:#x} len={len:#x} alignment={alignment} mm={} root={:#x} spans={:?}",
+                address.raw(), context.mm.raw(), context.root.address().raw(),
+                self.kernel_pod_storage.iter().map(|span| format!("{:#x}..{:#x}->{:#x}", span.start.raw(), span.start.raw() + span.len, span.physical.raw())).collect::<Vec<_>>()
+            )))?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| fail("physical kernel POD allocation"))?;
+        while bytes.len() < len {
+            let offset = bytes.len();
+            let va = address
+                .raw()
+                .checked_add(offset as u64)
+                .ok_or_else(|| fail("physical kernel POD address"))?;
+            let count = ((4096 - (va & 4095)) as usize).min(len - offset);
+            let leaf = translate_leaf(
+                &self._vm.words(),
+                context.root,
+                UserVa::new(va),
+                Access::Write,
+                false,
+            )
+            .map_err(|e| fail(format!("physical kernel POD translation: {e:?}")))?;
+            let expected = FrameGpa::new(
+                physical
+                    .raw()
+                    .checked_add(offset as u64)
+                    .ok_or_else(|| fail("physical kernel POD output"))?,
+            );
+            if leaf.descriptor & carrick_mmu_core::x86::descriptor_txn::USER != 0
+                || leaf.descriptor & carrick_mmu_core::x86::descriptor_txn::WRITE == 0
+                || !leaf.ancestors_writable
+                || leaf.executable
+                || leaf.output != expected
+            {
+                return Err(fail(
+                    "physical kernel POD supervisor permission/physical identity",
+                ));
+            }
+            bytes.extend(
+                self._vm
+                    .read(expected, count)
+                    .map_err(|e| fail(e.to_string()))?,
+            );
+        }
+        Ok(bytes)
+    }
+
     pub(super) fn service_root_exit(
         &self,
         lease: &StoppedCpuLease<'_>,
@@ -502,36 +633,7 @@ impl Cpl0HostCustody {
                 .checked_mul(32)
                 .and_then(|n| usize::try_from(n).ok())
                 .ok_or_else(|| fail("physical fork custody length"))?;
-            let mut wire = Vec::new();
-            wire.try_reserve_exact(len)
-                .map_err(|_| fail("physical fork custody allocation"))?;
-            let mut offset = 0usize;
-            while offset < len {
-                let va = custody
-                    .raw()
-                    .checked_add(offset as u64)
-                    .ok_or_else(|| fail("physical fork custody overflow"))?;
-                let n = ((4096 - (va & 4095)) as usize).min(len - offset);
-                let leaf = translate_leaf(
-                    &self._vm.words(),
-                    execution.context.root,
-                    UserVa::new(va),
-                    Access::Read,
-                    false,
-                )
-                .map_err(|e| fail(format!("physical fork custody translation: {e:?}")))?;
-                if va < DIRECT_VA || leaf.output.raw() != va - DIRECT_VA {
-                    return Err(fail(
-                        "physical fork custody is not exclusive supervisor storage",
-                    ));
-                }
-                wire.extend(
-                    self._vm
-                        .read(leaf.output, n)
-                        .map_err(|e| fail(e.to_string()))?,
-                );
-                offset += n;
-            }
+            let wire = self.read_kernel_pod_bytes(execution.context, custody, len, 8)?;
             let mut edges = Vec::new();
             let mut spans = std::collections::BTreeSet::new();
             for words in wire.chunks_exact(32) {
@@ -1030,6 +1132,7 @@ impl Cpl0HostCustody {
                     memory: &self._vm,
                     inventory: &self.frame_inventory,
                     binding: pending.execution.binding,
+                    cpu: pending.execution.cpu,
                     context: pending.execution.context,
                     window: pending.window,
                     txn: &pending.txn,
@@ -1199,6 +1302,101 @@ mod custody_tests {
             },
         }
     }
+    #[test]
+    fn kernel_pod_transport_authenticates_declared_bootstrap_allocator_aperture() {
+        use carrick_guest_arch::KernelVa;
+        let storage = retained_kernel_pod_storage(&[]);
+        let start = X86_CPL0_BOOTSTRAP_METADATA_BASE;
+        assert_eq!(
+            kernel_pod_physical(&storage, KernelVa::new(start + 0xff8), 64, 8),
+            Some(FrameGpa::new(ALLOCATOR_GPA + 0xff8))
+        );
+        assert!(kernel_pod_physical(&storage, KernelVa::new(start - 8), 64, 8).is_none());
+        assert!(
+            kernel_pod_physical(
+                &storage,
+                KernelVa::new(start + EL1_BOOTSTRAP_METADATA_SIZE - 32),
+                64,
+                8
+            )
+            .is_none()
+        );
+        assert!(
+            kernel_pod_physical(
+                &storage,
+                KernelVa::new(X86_CPL0_REGION_BASE + carrick_el1_abi::EL1_HEAP_OFFSET),
+                64,
+                8
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn kernel_pod_transport_uses_exact_writable_elf_storage_not_virtual_alias_shape() {
+        use carrick_guest_arch::KernelVa;
+        use carrick_mem::elf::{LoadSegment, SegmentPerms};
+        let segment = LoadSegment {
+            file_offset: 0,
+            virtual_address: IMAGE_VA + 0x70000,
+            file_size: 0,
+            memory_size: 0x3000,
+            alignment: 4096,
+            perms: SegmentPerms {
+                read: true,
+                write: true,
+                execute: false,
+            },
+        };
+        let writable = KernelPodStorage::from_load(&segment).unwrap();
+        let storage = [writable];
+        let address = KernelVa::new(segment.virtual_address + 0xff8);
+        assert_eq!(
+            kernel_pod_physical(&storage, address, 64, 8),
+            Some(FrameGpa::new(IMAGE_GPA + 0x70ff8))
+        );
+        assert!(
+            kernel_pod_physical(&storage, KernelVa::new(segment.virtual_address - 8), 64, 8)
+                .is_none()
+        );
+        assert!(
+            kernel_pod_physical(
+                &storage,
+                KernelVa::new(segment.virtual_address + 0x2fe0),
+                64,
+                8
+            )
+            .is_none()
+        );
+        assert!(kernel_pod_physical(&storage, KernelVa::new(address.raw() + 1), 64, 8).is_none());
+        assert!(
+            kernel_pod_physical(&storage, KernelVa::new(DIRECT_VA + 0x900000), 64, 8).is_none()
+        );
+        assert!(kernel_pod_physical(&storage, KernelVa::new(u64::MAX - 7), 64, 8).is_none());
+        assert!(
+            KernelPodStorage::from_load(&LoadSegment {
+                perms: SegmentPerms {
+                    read: true,
+                    write: true,
+                    execute: true
+                },
+                ..segment
+            })
+            .is_none()
+        );
+        assert!(
+            KernelPodStorage::from_load(&LoadSegment {
+                perms: SegmentPerms {
+                    read: true,
+                    write: false,
+                    execute: false
+                },
+                ..segment
+            })
+            .is_none()
+        );
+    }
+
     #[test]
     fn production_physical_ports_do_not_alias_native_or_fixture_doorbells() {
         let physical = [

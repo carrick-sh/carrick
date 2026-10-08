@@ -1,9 +1,11 @@
 //! Historical proof of PRIVATE anonymous leaves, authenticated while live at settlement.
 //! Work is bounded by the edited grant; no process census or inventory scan is retained.
+use carrick_guest_arch::CpuId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 pub(crate) struct SettledPrivateGrant<'a> {
+    pub cpu: CpuId,
     pub memory: &'a crate::carrier_memory::CarrierMemory,
     pub inventory: &'a carrick_kernel::kernel::frame_inventory::FrameInventoryAuthority,
     pub binding: carrick_el1_abi::ExecutionBinding,
@@ -30,11 +32,13 @@ pub struct PrivateAnonymousMmEvidence {
     pub incarnation: u64,
     pub generation: u64,
     pub private_pages: u64,
+    pub cpu_mask: u64,
 }
 #[derive(Default)]
 pub(crate) struct PrivateAnonymousWitness {
     carrier: Option<crate::carrier_memory::CarrierVmId>,
     rows: BTreeMap<(u64, u64, u64, u64), BTreeSet<u64>>,
+    cpu_masks: BTreeMap<(u64, u64, u64, u64), u64>,
     physical: BTreeMap<(u64, u64), u64>,
     grants: BTreeSet<(u64, u64, u64)>,
     aliases: u64,
@@ -140,6 +144,7 @@ impl PrivateAnonymousWitness {
         )
         .map_err(|_| fail("private witness projection refused"))??;
         self.record(
+            grant.cpu,
             (
                 mm.get(),
                 grant.context.root.address().raw(),
@@ -156,11 +161,15 @@ impl PrivateAnonymousWitness {
     }
     fn record(
         &mut self,
+        cpu: CpuId,
         key: (u64, u64, u64, u64),
         sequence: u64,
         leaves: &[(u64, u64, u64)],
         peer: PeerActivity,
     ) -> Result<(), &'static str> {
+        let cpu_mask = 1_u64
+            .checked_shl(cpu.raw())
+            .ok_or("private witness CPU mask exhausted")?;
         if leaves.iter().any(|&(_, pa, frame)| {
             self.physical
                 .get(&(pa, frame))
@@ -185,6 +194,10 @@ impl PrivateAnonymousWitness {
             self.rows.entry(key).or_default().insert(va);
             self.physical.insert((pa, frame), key.0);
         }
+        self.cpu_masks
+            .entry(key)
+            .and_modify(|mask| *mask |= cpu_mask)
+            .or_insert(cpu_mask);
         self.grants.insert(operation);
         self.peer_grants = peers;
         Ok(())
@@ -199,6 +212,11 @@ impl PrivateAnonymousWitness {
                     incarnation,
                     generation,
                     private_pages: pages.len() as u64,
+                    cpu_mask: self
+                        .cpu_masks
+                        .get(&(mm, root, incarnation, generation))
+                        .copied()
+                        .unwrap_or(0),
                 },
             )
             .collect()
@@ -210,9 +228,91 @@ impl PrivateAnonymousWitness {
         self.peer_grants
     }
 }
+
+impl crate::cpl0_boot::Cpl0Carrier {
+    pub fn anonymous_private_mms(&self) -> Vec<PrivateAnonymousMmEvidence> {
+        self.custody.private_anonymous_witness.rows()
+    }
+    pub fn cross_mm_private_aliases(&self) -> u64 {
+        self.custody
+            .private_anonymous_witness
+            .cross_mm_private_aliases()
+    }
+    pub fn peer_active_private_grants(&self) -> u64 {
+        self.custody
+            .private_anonymous_witness
+            .peer_active_private_grants()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn private_mm_cpu_evidence_uses_each_actual_settled_caller() {
+        let mut witness = PrivateAnonymousWitness::default();
+        witness
+            .record(
+                CpuId::new(0),
+                (7, 0x1000, 1, 4),
+                1,
+                &[(0x8000, 0x20000, 19)],
+                PeerActivity(false),
+            )
+            .unwrap();
+        witness
+            .record(
+                CpuId::new(1),
+                (8, 0x3000, 1, 4),
+                2,
+                &[(0x8000, 0x24000, 20)],
+                PeerActivity(true),
+            )
+            .unwrap();
+        assert_eq!(
+            witness
+                .rows()
+                .iter()
+                .map(|row| row.cpu_mask)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+    }
+
+    #[test]
+    fn cpu_evidence_accumulates_real_migration_without_duplicating_pages() {
+        let mut witness = PrivateAnonymousWitness::default();
+        let key = (7, 0x1000, 1, 4);
+        let leaves = [(0x8000, 0x20000, 19)];
+        witness
+            .record(CpuId::new(0), key, 1, &leaves, PeerActivity(false))
+            .unwrap();
+        witness
+            .record(CpuId::new(1), key, 2, &leaves, PeerActivity(false))
+            .unwrap();
+        assert_eq!(witness.rows()[0].cpu_mask, 3);
+        assert_eq!(witness.rows()[0].private_pages, 1);
+        assert_eq!(witness.peer_active_private_grants(), 0);
+    }
+
+    #[test]
+    fn an_unrepresentable_cpu_cannot_publish_partial_evidence() {
+        let mut witness = PrivateAnonymousWitness::default();
+        assert!(
+            witness
+                .record(
+                    CpuId::new(64),
+                    (7, 0x1000, 1, 4),
+                    1,
+                    &[(0x8000, 0x20000, 19)],
+                    PeerActivity(true)
+                )
+                .is_err()
+        );
+        assert!(witness.rows().is_empty());
+        assert_eq!(witness.peer_active_private_grants(), 0);
+    }
+
     #[test]
     fn actual_peer_samples_and_repeated_settlement_count_one_grant() {
         let actual = AtomicU32::new(0);
@@ -223,9 +323,11 @@ mod tests {
         let key = (7, 0x1000, 1, 4);
         let leaves = [(0x8000, 0x20000, 19)];
         witness
-            .record(key, 1, &leaves, selected.combine(settled))
+            .record(CpuId::new(0), key, 1, &leaves, selected.combine(settled))
             .unwrap();
-        witness.record(key, 1, &leaves, settled).unwrap();
+        witness
+            .record(CpuId::new(0), key, 1, &leaves, settled)
+            .unwrap();
         assert_eq!(witness.rows()[0].private_pages, 1);
         assert_eq!(witness.peer_active_private_grants(), 1);
     }
@@ -235,6 +337,7 @@ mod tests {
         let mut witness = PrivateAnonymousWitness::default();
         witness
             .record(
+                CpuId::new(0),
                 (7, 0x1000, 1, 4),
                 1,
                 &[(0x8000, 0x20000, 19)],
@@ -243,6 +346,7 @@ mod tests {
             .unwrap();
         witness
             .record(
+                CpuId::new(0),
                 (8, 0x3000, 1, 4),
                 2,
                 &[(0x8000, 0x24000, 20)],
@@ -262,6 +366,7 @@ mod tests {
         let mut witness = PrivateAnonymousWitness::default();
         witness
             .record(
+                CpuId::new(0),
                 (7, 0x1000, 1, 4),
                 1,
                 &[(0x8000, 0x20000, 19)],
@@ -271,6 +376,7 @@ mod tests {
         assert!(
             witness
                 .record(
+                    CpuId::new(0),
                     (8, 0x3000, 1, 4),
                     2,
                     &[(0x9000, 0x24000, 20), (0x8000, 0x20000, 19)],
@@ -287,6 +393,7 @@ mod tests {
         let mut witness = PrivateAnonymousWitness::default();
         witness
             .record(
+                CpuId::new(0),
                 (7, 0x1000, 1, 4),
                 1,
                 &[(0x8000, 0x20000, 19)],
@@ -295,6 +402,7 @@ mod tests {
             .unwrap();
         witness
             .record(
+                CpuId::new(0),
                 (8, 0x3000, 1, 4),
                 2,
                 &[(0x8000, 0x20000, 21)],
@@ -302,21 +410,5 @@ mod tests {
             )
             .unwrap();
         assert_eq!(witness.rows().len(), 2);
-    }
-}
-
-impl crate::cpl0_boot::Cpl0Carrier {
-    pub fn anonymous_private_mms(&self) -> Vec<PrivateAnonymousMmEvidence> {
-        self.custody.private_anonymous_witness.rows()
-    }
-    pub fn cross_mm_private_aliases(&self) -> u64 {
-        self.custody
-            .private_anonymous_witness
-            .cross_mm_private_aliases()
-    }
-    pub fn peer_active_private_grants(&self) -> u64 {
-        self.custody
-            .private_anonymous_witness
-            .peer_active_private_grants()
     }
 }

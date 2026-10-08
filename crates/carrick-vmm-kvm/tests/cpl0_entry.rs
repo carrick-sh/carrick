@@ -11,7 +11,9 @@
 use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
 use carrick_mmu_core::x86::descriptor_txn::Access;
 use carrick_sched_core::{ParkedContextWords, SlotId, ThreadIdentity, ZoneTables};
-use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
+use carrick_vmm_kvm::cpl0_boot::{
+    Cpl0Carrier, InitialProcessExit, InitialReservationLimits, InitialSyscallDisposition,
+};
 use carrick_x86::cpl0_entry::{
     OBSERVE_ALLOCATOR, OBSERVE_DESCRIPTOR_PREPARE_PUBLISH, OBSERVE_DESCRIPTOR_PROTECT,
     OBSERVE_FORK_TABLE_WINDOW, OBSERVE_MMU_DRAIN, OBSERVE_MMU_ROOT, OBSERVE_NATIVE,
@@ -252,6 +254,29 @@ fn cpl0_rechecks_host_modified_return_frame_before_iret() {
     );
 }
 
+fn production_probe_elf(code: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![0; 0xb0 + code.len()];
+    let file_size = bytes.len() as u64;
+    bytes[..4].copy_from_slice(b"\x7fELF");
+    bytes[4..7].copy_from_slice(&[2, 1, 1]);
+    bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
+    bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
+    bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+    bytes[24..32].copy_from_slice(&0x0040_00b0_u64.to_le_bytes());
+    bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+    bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+    bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+    bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+    bytes[64..68].copy_from_slice(&1u32.to_le_bytes());
+    bytes[68..72].copy_from_slice(&5u32.to_le_bytes());
+    bytes[80..88].copy_from_slice(&0x400000u64.to_le_bytes());
+    bytes[96..104].copy_from_slice(&file_size.to_le_bytes());
+    bytes[104..112].copy_from_slice(&0x1000u64.to_le_bytes());
+    bytes[112..120].copy_from_slice(&0x1000u64.to_le_bytes());
+    bytes[0xb0..].copy_from_slice(code);
+    bytes
+}
+
 #[test]
 fn production_image_rejects_fixture_syscalls() {
     let production = PathBuf::from(env!("CARRICK_X86_CPL0_IMAGE"));
@@ -317,16 +342,31 @@ fn production_image_rejects_fixture_syscalls() {
             "production image contains a fixture dispatch witness"
         );
     }
-    let probe = transport_program(0);
-    let mut carrier =
-        Cpl0Carrier::boot(&production, [&probe, &probe]).expect("production image on real KVM");
-    let err = carrier
-        .observe(0)
-        .expect_err("synthetic syscall must not dispatch");
-    assert!(
-        carrier.refusal_overflow_count() >= 1,
-        "synthetic syscall must be counted in refusal overflow bucket: {err}"
-    );
+    // Admit a real initial MM before testing the production syscall boundary.
+    // The fixture bootstrap's task rows do not authorize a native process.
+    let mut probe = vec![0x48, 0xb8]; // movabs rax, synthetic fixture ordinal
+    probe.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    probe.extend_from_slice(&[
+        0x0f, 0x05, 0x48, 0x83, 0xf8, 0xda, // syscall; cmp rax,-ENOSYS
+        0x75, 0x0e, // jne failure
+        0xbf, 7, 0, 0, 0, 0xb8, 0xe7, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b, 0xbf, 9, 0, 0, 0, 0xb8,
+        0xe7, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b,
+    ]);
+    let elf = production_probe_elf(&probe);
+    let image =
+        carrick_mem::x86_initial_image::prepare_static_x86_elf(&elf).expect("native probe image");
+    let extent =
+        Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("probe initial extent");
+    let mut carrier = Cpl0Carrier::boot_production(extent).expect("production KVM image");
+    carrier
+        .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
+        .expect("actual initial MM");
+    let exit = carrier
+        .run_initial_process(8, |_, _| Ok(InitialSyscallDisposition::Return(-1)))
+        .expect("synthetic refusal and native root exit");
+    assert!(matches!(exit, InitialProcessExit::Exited { code: 7, .. }));
+    assert_eq!(carrier.initial_execution_witness().1, 0);
+    assert_eq!(carrier.refusal_overflow_count(), 1);
 }
 
 #[test]
