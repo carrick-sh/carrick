@@ -2650,6 +2650,36 @@ impl PublicationContext<'static> {
                         && alias.owner_generation == page.identity.owner_generation
                 })
             });
+            if !peer_resident {
+                super::stage2_backend::record_owner_supply_detail(
+                    5,
+                    window.range.start(),
+                    window.fault_page,
+                    window.range.len() as u32,
+                    window.protection.bits() as u32,
+                );
+                for (_, alias) in &overlapping {
+                    let scope = match alias.ownership_scope {
+                        AliasOwnershipScope::MmRootSlot { .. } => 1,
+                        AliasOwnershipScope::ContainerRoot(_) => 2,
+                        AliasOwnershipScope::Global => 3,
+                    };
+                    super::stage2_backend::record_owner_supply_detail(
+                        6,
+                        alias.start,
+                        alias.ipa,
+                        scope,
+                        alias.size as u32,
+                    );
+                }
+                super::stage2_backend::record_owner_supply_detail(
+                    7,
+                    resident.map_or(0, |page| page.expected_ipa),
+                    resident.map_or(0, |page| page.identity.owner_generation),
+                    resident.map_or(0, |page| page.identity.len as u32),
+                    resident.map_or(0, |page| page.identity.semantic_base as u32),
+                );
+            }
             return Ok(if peer_resident {
                 TransferPreparation::PeerResident
             } else {
