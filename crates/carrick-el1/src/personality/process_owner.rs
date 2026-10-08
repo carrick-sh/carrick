@@ -498,6 +498,34 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
             })
         }))
     }
+    pub fn namespace_child_group(
+        &self,
+        caller: TaskKey,
+        visible_group: u32,
+    ) -> Result<Option<carrick_sched_core::process::ProcessGroupId>, GuestProcessError<N::Error>>
+    {
+        let parent = self.task(caller)?;
+        Ok(parent.children().iter().find_map(|key| {
+            if let Some(row) = self.registry.tasks.get(&key.id).filter(|row| {
+                row.key() == *key
+                    && row.parent() == Some(caller)
+                    && row.metadata.container == parent.metadata.container
+                    && row.metadata.namespace_process_group == visible_group
+            }) {
+                return Some(row.identity().process_group);
+            }
+            self.registry
+                .zombies
+                .get(&key.id)
+                .filter(|row| {
+                    row.receipt.key == *key
+                        && row.receipt.parent == Some(caller)
+                        && row.receipt.container == parent.metadata.container
+                        && row.receipt.namespace_process_group == visible_group
+                })
+                .map(|row| row.receipt.process_group)
+        }))
+    }
     pub fn capture_parent(
         &self,
         key: TaskKey,
