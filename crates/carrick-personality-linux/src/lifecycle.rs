@@ -149,9 +149,7 @@ pub trait LifecycleNative<'a>: UserCopy {
     ) -> Result<RecordRef, carrick_sched_core::Exhausted>;
     fn free_record(&mut self, record: RecordRef);
     /// ISA-only context availability, checked before any output or pool claim.
-    fn can_prepare_child(&self, _: UserVa, _: Option<UserVa>) -> bool {
-        true
-    }
+    fn can_prepare_child(&self, stack: UserVa, tls: Option<UserVa>) -> bool;
     fn prepare_child(&mut self, record: RecordRef, context: ChildContext);
     fn enqueue_born(&mut self, record: RecordRef);
     fn exit_record(&self) -> Option<ExitRecord>;
@@ -286,6 +284,19 @@ pub fn invoke<'a>(
         && let Some(tid) = native.visible_tid()
     {
         return Some(returned(SyscallResult::new(i64::from(tid)), false));
+    }
+    if call == LifecycleCall::Clone
+        && args
+            == [
+                carrick_signal_core::policy::Signal::CHLD.number() as u64,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]
+    {
+        return native.process_fork();
     }
     match call {
         LifecycleCall::Fork => return native.process_fork(),

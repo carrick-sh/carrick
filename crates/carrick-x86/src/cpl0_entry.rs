@@ -474,9 +474,11 @@ mod tests {
         assert_eq!(call.canonical.raw(), 99);
         assert_eq!(call.args, [1, 24, 3, 4, 5, 6]);
         assert_eq!(call.stack.raw(), frame.rsp);
+        // Native 99 is sysinfo, whose canonical number is 179. The full
+        // x86 table now decodes it instead of treating it as unsupported.
         assert_eq!(
             decode(&NativeFrame { rax: 99, ..frame }).canonical.raw(),
-            u64::MAX
+            179
         );
     }
     #[test]

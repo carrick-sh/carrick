@@ -1,8 +1,6 @@
 //! Linux decoding and dispatch at the shared native-entry seam.
 pub use crate::abi::entry::{CanonicalCall, CanonicalOrdinal, SyscallResult};
-use carrick_core_abi::EntryMmKey;
 pub use carrick_core_abi::ExecutionBinding;
-use carrick_core_abi::{BornInZoneSource, EntryContext};
 use carrick_guest_arch::{
     GuestIsa, NativeAbi, NativeEntrySnapshot, NativeOrdinal, UserVa, X86Register, X86Registers,
 };
@@ -12,28 +10,26 @@ pub const EINVAL: i64 = -22;
 
 /// Decode the Linux x86_64 syscall ABI from a native register snapshot.
 pub fn decode_x86_64(native: u64, mut args: [u64; 6], stack: u64) -> CanonicalCall {
-    let canonical = match native {
-        12 => 214, // brk
-        11 => 215, // munmap
-        25 => 216, // mremap
-        9 => 222,  // mmap
-        10 => 226, // mprotect
-        273 => SYS_SET_ROBUST_LIST as u64,
-        56 => {
-            args.swap(3, 4);
-            220
-        }
-        60 => 93,
-        186 => 178,
-        39 => 172,
-        14 => 135,
-        131 => 132,
-        202 => 98,
-        57 | 61 | 231 => carrick_syscall_abi::syscall_x86_64::canonical_x86_64(
-            carrick_syscall_abi::NativeNr(native),
-        )
-        .map_or(u64::MAX, carrick_syscall_abi::CanonicalNr::raw),
-        _ => u64::MAX,
+    // clone's fourth and fifth native arguments are reversed relative to
+    // the canonical asm-generic order.
+    if native == 56 {
+        args.swap(3, 4);
+    }
+    let canonical = if native == 57 {
+        // fork has no separate canonical syscall: normalize its no-argument
+        // ABI to the minimal process clone shape, preserving its native nr.
+        args = [
+            carrick_signal_core::policy::Signal::CHLD.number() as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        crate::lifecycle::SYS_CLONE as u64
+    } else {
+        carrick_syscall_abi::syscall_x86_64::canonical_x86_64(carrick_syscall_abi::NativeNr(native))
+            .map_or(u64::MAX, carrick_syscall_abi::CanonicalNr::raw)
     };
     CanonicalCall {
         isa: GuestIsa::X86_64,
@@ -79,297 +75,6 @@ pub fn decode_aarch64(native: u64, args: [u64; 6], stack: u64) -> CanonicalCall 
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub enum EntryOutcome {
-    Served {
-        result: SyscallResult,
-    },
-    ServedWithWork {
-        result: SyscallResult,
-    },
-    Forward,
-    InvalidCompletion,
-    /// Native custody retains the continuation; no result or host replay.
-    Suspended,
-}
-
-pub trait LinuxEntryVenue {
-    fn binding(&self) -> ExecutionBinding;
-    fn process_pid(&self) -> Option<u32>;
-    fn visible_tid(&self) -> Option<u32>;
-    fn set_robust_list(&self, head: u64, len: u64) -> Option<i64>;
-    fn task_state(&self) -> &crate::abi::entry::LinuxTaskState;
-    fn record_forwarded(&self, ordinal: usize);
-    fn record_served(&self, ordinal: usize);
-}
-
-/// Shared counter/work transport over live native binding and robust-list hooks.
-pub struct SharedVenue<'a, B, R> {
-    pub binding: B,
-    pub state: &'a crate::abi::entry::LinuxTaskState,
-    pub counters: crate::dispatch::EntryCounters<'a>,
-    pub robust_list: R,
-    pub process_pid: Option<u32>,
-    pub visible_tid: Option<u32>,
-}
-impl<B: Fn() -> ExecutionBinding, R: Fn(u64, u64) -> Option<i64>> LinuxEntryVenue
-    for SharedVenue<'_, B, R>
-{
-    fn binding(&self) -> ExecutionBinding {
-        (self.binding)()
-    }
-    fn process_pid(&self) -> Option<u32> {
-        self.process_pid
-    }
-    fn visible_tid(&self) -> Option<u32> {
-        self.visible_tid
-    }
-    fn task_state(&self) -> &crate::abi::entry::LinuxTaskState {
-        self.state
-    }
-    fn set_robust_list(&self, head: u64, len: u64) -> Option<i64> {
-        (self.robust_list)(head, len)
-    }
-    fn record_forwarded(&self, ordinal: usize) {
-        self.counters.forwarded(ordinal as u64);
-    }
-    fn record_served(&self, ordinal: usize) {
-        self.counters.served(ordinal as u64);
-    }
-}
-
-struct CommonFamilies<'a, C: EntryContext + 'a> {
-    venue: &'a dyn LinuxEntryVenue,
-    anonymous: Option<&'a mut (dyn crate::pending_anonymous::PendingAnonymousVenue + 'a)>,
-    process: Option<&'a mut dyn crate::lifecycle::ProcessNative<C>>,
-    source: Option<BornInZoneSource<'a, C>>,
-    args: [u64; 6],
-    result: Option<i64>,
-}
-impl<'a, C: EntryContext + 'a> crate::dispatch::PendingFamilies<'a, C> for CommonFamilies<'a, C> {
-    fn record_source(&self) -> Option<BornInZoneSource<'a, C>> {
-        self.source
-    }
-    fn take_handoff_receipt(&mut self) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
-        self.process.as_deref_mut()?.take_handoff_receipt()
-    }
-    fn anonymous(
-        &mut self,
-        call: crate::dispatch::AnonymousCall,
-    ) -> crate::dispatch::FamilyCompletion {
-        use crate::dispatch::FamilyCompletion;
-        let completion = self
-            .anonymous_venue()
-            .map_or(FamilyCompletion::Forward, |venue| {
-                crate::pending_anonymous::serve(call, venue)
-            });
-        match completion {
-            FamilyCompletion::Complete(value)
-            | FamilyCompletion::CompleteWithWork(value)
-            | FamilyCompletion::Switched(value)
-            | FamilyCompletion::SwitchedWithWork(value)
-            | FamilyCompletion::AccountedSwitched(value)
-            | FamilyCompletion::CommitOwed(value)
-            | FamilyCompletion::AccountedComplete(value) => self.result = Some(value),
-            _ => {}
-        }
-        completion
-    }
-    fn anonymous_venue(
-        &mut self,
-    ) -> Option<&mut dyn crate::pending_anonymous::PendingAnonymousVenue> {
-        match &mut self.anonymous {
-            Some(anonymous) => Some(&mut **anonymous),
-            None => None,
-        }
-    }
-    fn binding(&self) -> Option<ExecutionBinding> {
-        Some(self.venue.binding())
-    }
-    fn original_argument0(&self) -> u64 {
-        self.args[0]
-    }
-    fn install_result(&mut self, result: SyscallResult) {
-        self.result = Some(result.raw());
-    }
-    fn task_state(&self) -> Option<&crate::abi::entry::LinuxTaskState> {
-        Some(self.venue.task_state())
-    }
-    fn lifecycle_native(&mut self) -> Option<&mut dyn crate::lifecycle::LifecycleNative<'a>> {
-        Some(self)
-    }
-    fn lifecycle_available(&self) -> bool {
-        true
-    }
-    fn host_work(&self) -> bool {
-        self.venue.task_state().has_pending_host_work()
-    }
-    fn record_served(&self, ordinal: u64) {
-        self.venue.record_served(ordinal as usize);
-    }
-    fn record_forwarded(&self, ordinal: u64) {
-        self.venue.record_forwarded(ordinal as usize);
-    }
-    fn publish_work(&self, _: bool) {
-        self.venue.task_state().record_completed_with_work();
-    }
-}
-
-pub fn serve(call: &CanonicalCall, venue: &dyn LinuxEntryVenue) -> EntryOutcome {
-    serve_inner::<carrick_sched_core::ThreadCtx>(call, venue, None, None, None)
-}
-
-pub fn serve_with_custody<'a, C: EntryContext + 'a>(
-    call: &CanonicalCall,
-    venue: &'a dyn LinuxEntryVenue,
-    anonymous: &'a mut (dyn crate::pending_anonymous::PendingAnonymousVenue + 'a),
-    process: Option<&'a mut dyn crate::lifecycle::ProcessNative<C>>,
-    source: Option<BornInZoneSource<'a, C>>,
-) -> EntryOutcome {
-    serve_inner(call, venue, Some(anonymous), process, source)
-}
-
-fn serve_inner<'a, C: EntryContext + 'a>(
-    call: &CanonicalCall,
-    venue: &'a dyn LinuxEntryVenue,
-    anonymous: Option<&'a mut (dyn crate::pending_anonymous::PendingAnonymousVenue + 'a)>,
-    process: Option<&'a mut dyn crate::lifecycle::ProcessNative<C>>,
-    source: Option<BornInZoneSource<'a, C>>,
-) -> EntryOutcome {
-    let Ok(_) = usize::try_from(call.canonical.raw()) else {
-        return EntryOutcome::Forward;
-    };
-    let mut pending = CommonFamilies {
-        venue,
-        anonymous,
-        process,
-        source,
-        args: call.args,
-        result: None,
-    };
-    let route = crate::dispatch::dispatch(call.canonical.raw(), u64::MAX, &mut pending);
-    if route == crate::dispatch::CompletionRoute::InvalidCompletion {
-        return EntryOutcome::InvalidCompletion;
-    }
-    if route == crate::dispatch::CompletionRoute::Suspended {
-        return EntryOutcome::Suspended;
-    }
-    let Some(result) = pending.result else {
-        return EntryOutcome::Forward;
-    };
-    let result = SyscallResult::new(result);
-    match route {
-        crate::dispatch::CompletionRoute::Served => EntryOutcome::Served { result },
-        crate::dispatch::CompletionRoute::WithWork => EntryOutcome::ServedWithWork { result },
-        _ => EntryOutcome::Forward,
-    }
-}
-
-impl<C: EntryContext> crate::lifecycle::UserCopy for CommonFamilies<'_, C> {
-    fn copy_in(&mut self, _: &mut [u8], _: UserVa) -> bool {
-        false
-    }
-    fn copy_out(&mut self, _: UserVa, _: &[u8]) -> bool {
-        false
-    }
-}
-impl<'a, C: EntryContext + 'a> crate::lifecycle::LifecycleNative<'a> for CommonFamilies<'a, C> {
-    fn arguments(&self) -> [u64; 6] {
-        self.args
-    }
-    fn binding(&self) -> Option<ExecutionBinding> {
-        Some(self.venue.binding())
-    }
-    fn task_state(&self) -> Option<&'a crate::abi::entry::LinuxTaskState> {
-        Some(self.venue.task_state())
-    }
-    fn process_pid(&self) -> Option<u32> {
-        self.venue.process_pid()
-    }
-    fn visible_tid(&self) -> Option<u32> {
-        self.venue.visible_tid()
-    }
-    fn register_robust_list(&self, head: u64, len: u64) -> Option<SyscallResult> {
-        self.venue
-            .set_robust_list(head, len)
-            .map(SyscallResult::new)
-    }
-    fn process_fork(&mut self) -> Option<crate::lifecycle::LifecycleOutcome> {
-        let process = self.process.as_deref_mut()?;
-        (process.binding() == self.venue.binding()).then(|| process.fork())
-    }
-    fn process_wait4(
-        &mut self,
-        pid: crate::lifecycle::ProcessWaitPid,
-        status: UserVa,
-        options: crate::lifecycle::LinuxWaitOptions,
-        rusage: UserVa,
-    ) -> Option<crate::lifecycle::LifecycleOutcome> {
-        let process = self.process.as_deref_mut()?;
-        (process.binding() == self.venue.binding())
-            .then(|| process.wait4(pid, status, options, rusage))
-    }
-    fn process_exit_group(&mut self, status: u8) -> Option<crate::lifecycle::LifecycleOutcome> {
-        let process = self.process.as_deref_mut()?;
-        (process.binding() == self.venue.binding()).then(|| process.exit_group(status))
-    }
-    fn thread(&self) -> Option<crate::thread::LifecycleThread<'a>> {
-        None
-    }
-    fn born_slot(
-        &self,
-        _: &crate::abi::thread::ThreadLifecyclePage,
-        _: carrick_core_abi::EntryRef,
-    ) -> Option<&'a crate::abi::thread::ThreadControlSlot> {
-        None
-    }
-    fn record_decline(&self, _: crate::abi::thread::LifecycleDecline) {}
-    fn has_scheduler(&self) -> bool {
-        false
-    }
-    fn user_sp(&mut self) -> Option<UserVa> {
-        None
-    }
-    fn affinity(&self) -> Option<u64> {
-        None
-    }
-    fn allocate_record(
-        &mut self,
-        _: carrick_sched_core::ThreadIdentity,
-    ) -> Result<carrick_sched_core::RecordRef, carrick_sched_core::Exhausted> {
-        Err(carrick_sched_core::Exhausted)
-    }
-    fn free_record(&mut self, _: carrick_sched_core::RecordRef) {}
-    fn prepare_child(
-        &mut self,
-        _: carrick_sched_core::RecordRef,
-        _: crate::lifecycle::ChildContext,
-    ) {
-    }
-    fn enqueue_born(&mut self, _: carrick_sched_core::RecordRef) {}
-    fn exit_record(&self) -> Option<crate::lifecycle::ExitRecord> {
-        None
-    }
-    fn wake_child_tid(&mut self, _: EntryMmKey, _: UserVa) -> bool {
-        false
-    }
-    fn release_current(&mut self, _: carrick_sched_core::RecordRef) -> bool {
-        false
-    }
-    fn run_next(&mut self, _: SyscallResult) -> (carrick_core::Served, SyscallResult) {
-        (
-            carrick_core::Served::Idle,
-            SyscallResult::new(self.result.unwrap_or(0)),
-        )
-    }
-    fn result(&self) -> SyscallResult {
-        SyscallResult::new(self.result.unwrap_or(self.args[0] as i64))
-    }
-    fn set_result(&mut self, result: SyscallResult) {
-        self.result = Some(result.raw());
-    }
-}
-
 /// AArch64 Linux vDSO wire identity: preserve the process half and replace
 /// the thread's visible tid only when that native vDSO binding is present.
 pub const fn aarch64_child_vdso_identity(parent: u64, visible_tid: u32) -> u64 {
@@ -377,5 +82,26 @@ pub const fn aarch64_child_vdso_identity(parent: u64, visible_tid: u32) -> u64 {
         0
     } else {
         (parent & !0xffff_ffff) | visible_tid as u64
+    }
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::decode_x86_64;
+
+    #[test]
+    fn x86_fork_normalizes_to_the_shared_clone_shape() {
+        let call = decode_x86_64(57, [91, 92, 93, 94, 95, 96], 0x8000);
+        assert_eq!(call.canonical.raw(), crate::lifecycle::SYS_CLONE as u64);
+        assert_eq!(call.args, [17, 0, 0, 0, 0, 0]);
+        assert_eq!(call.native.raw(), 57);
+    }
+
+    #[test]
+    fn ordinary_x86_file_call_uses_canonical_family_ordinal() {
+        let call = decode_x86_64(0, [7, 0x1000, 8, 0, 0, 0], 0x8000);
+        assert_eq!(call.canonical.raw(), 63); // read, served by the shared IPC/file family
+        assert_eq!(call.args, [7, 0x1000, 8, 0, 0, 0]);
+        assert_eq!(call.native.raw(), 0);
     }
 }

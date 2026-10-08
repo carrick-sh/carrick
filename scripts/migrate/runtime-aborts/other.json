@@ -1038,37 +1038,26 @@
       "domain": "el1::entry_completion"
     },
     {
-      "file": "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
-      "function": "<InitialInventory as Drop>::drop",
+      "file": "crates/carrick-el1/src/personality/lifecycle.rs",
+      "function": "<El1PendingFamilies<'a,F,C,U,G> as LifecycleNative<'a>>::prepare_child",
       "ordinal_in_function": 1,
-      "fingerprint": "d4eb9c0ea04605a5058c94ee84059f06b1a3a409b99886b8967f0cb980b08721",
+      "fingerprint": "4f196a964b1d760152b4de23f5130a2d4fa483d3569a41527552b1a2b1d34ed0",
       "verdict": "carrier_fault",
-      "failure_domain": "vmm_kvm::initial_inventory_rollback",
-      "rationale": "A failed rollback of never-submitted initial inventory can leave logical inventory and KVM mappings inconsistent, so the carrier terminates. Re-reviewed 2026-10-07: guest-exposed or submitted inventory is never rolled back by Drop without a verified retirement; custody remains until VM teardown. The unverified_guest_completion_keeps_inventory_custody_until_vm_teardown test covers both branches.",
-      "sink": "raw",
-      "domain": null
-    },
-    {
-      "file": "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
-      "function": "Cpl0Carrier::publish_production_reservations::unexpected_boot_wake@5e40128f8620",
-      "ordinal_in_function": 1,
-      "fingerprint": "2aed7d148389d3507246bc0acf0f045b668bbb90f724a1f730b94751ac9644e4",
-      "verdict": "carrier_fault",
-      "failure_domain": "vmm_kvm::initial_root_wake",
-      "rationale": "The stopped initial root has no waiter or handback recipient. A wake during its admission violates root ownership and cannot be delivered safely by the boot carrier.",
-      "sink": "raw",
-      "domain": null
-    },
-    {
-      "file": "crates/carrick-el1/src/personality/process_owner.rs",
-      "function": "<GuestRegistryFailure as GuestProcessFailure>::fail_process",
-      "ordinal_in_function": 1,
-      "fingerprint": "6171f54063ff3fb4b4e5280c6751823bb212cff684ef80697114112cc7ab2e0d",
-      "verdict": "carrier_fault",
-      "failure_domain": "el1::process_owner",
-      "rationale": "Shared guest process graph corruption or abandoned irreversible exit custody cannot be represented by a recoverable guest errno. Exact reservation, topology publication and numeric claim custody must fail closed through the existing native fatal transport.",
+      "failure_domain": "el1::prepare_child",
+      "rationale": "Child creation was admitted with an ARM native frame, but that frame disappeared before context publication. Returning silently would leave a partially prepared child; this is carrier invariant failure.",
       "sink": "fatal",
-      "domain": "el1::process_owner"
+      "domain": "el1::prepare_child"
+    },
+    {
+      "file": "crates/carrick-el1/src/personality/lifecycle.rs",
+      "function": "<El1PendingFamilies<'a,F,C,U,G> as LifecycleNative<'a>>::run_next",
+      "ordinal_in_function": 1,
+      "fingerprint": "067465495ab07aa077d16acf0f5136c18f55a7fe7f9aaa12d861404b174e7632",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1::run_next",
+      "rationale": "A scheduler handoff admitted without a native ARM frame violates the exact execution binding; returning idle could discard the handoff. Bare-metal entry uses the existing fatal transport, and the host adapter reports the same invariant failure through the typed fatal sink.",
+      "sink": "fatal",
+      "domain": "el1::run_next"
     }
   ]
 }

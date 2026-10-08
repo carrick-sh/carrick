@@ -14,8 +14,8 @@ use carrick_sched_core::{ParkedContextWords, SlotId, ThreadIdentity, ZoneTables}
 use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
 use carrick_x86::cpl0_entry::{
     OBSERVE_ALLOCATOR, OBSERVE_DESCRIPTOR_PREPARE_PUBLISH, OBSERVE_DESCRIPTOR_PROTECT,
-    OBSERVE_FORK_TABLE_WINDOW, OBSERVE_INITIAL_MM, OBSERVE_MMU_DRAIN, OBSERVE_MMU_ROOT,
-    OBSERVE_NATIVE, OBSERVE_PORTAL_WINDOW, OBSERVE_RETIRE_REPOINT, OBSERVE_SHARED_COW_FAULT,
+    OBSERVE_FORK_TABLE_WINDOW, OBSERVE_MMU_DRAIN, OBSERVE_MMU_ROOT, OBSERVE_NATIVE,
+    OBSERVE_PORTAL_WINDOW, OBSERVE_RETIRE_REPOINT, OBSERVE_SHARED_COW_FAULT,
     OBSERVE_SHARED_PREPARED_FAULT,
 };
 use carrick_x86::cpl0_scheduler::{
@@ -216,14 +216,14 @@ fn cpl0_supervisor_stub_is_rx_while_tables_and_idt_are_rw_nx() {
 #[test]
 fn cpl0_forward_port_returns_host_result_through_shared_entry() {
     let mut program = vec![0x48, 0xb8];
-    program.extend_from_slice(&39u64.to_le_bytes()); // getpid, forwarded
+    program.extend_from_slice(&8u64.to_le_bytes()); // lseek, forwarded
     program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
     program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
     let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
     let result = carrier
         .observe_with_forward(0, |frame| {
-            assert_eq!(frame.rax, 39);
+            assert_eq!(frame.rax, 8);
             frame.rax = 42;
             Ok(())
         })
@@ -236,7 +236,7 @@ fn cpl0_forward_port_returns_host_result_through_shared_entry() {
 #[test]
 fn cpl0_rechecks_host_modified_return_frame_before_iret() {
     let mut program = vec![0x48, 0xb8];
-    program.extend_from_slice(&39_u64.to_le_bytes()); // forwarded getpid
+    program.extend_from_slice(&8_u64.to_le_bytes()); // forwarded lseek
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
     let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
     let failure = carrier
@@ -256,41 +256,65 @@ fn cpl0_rechecks_host_modified_return_frame_before_iret() {
 fn production_image_rejects_fixture_syscalls() {
     let production = PathBuf::from(env!("CARRICK_X86_CPL0_IMAGE"));
     let bytes = std::fs::read(&production).expect("production CPL0 image built");
-    let plan =
-        carrick_mem::elf::plan_elf_load_bytes_for(&bytes, 62).expect("production CPL0 load image");
-    for syscall in [
-        0xffff_ffff_ffff_ff10_u64,
-        0xffff_ffff_ffff_ff20,
-        0xffff_ffff_ffff_ff30,
-        0xffff_ffff_ffff_ff40,
-        OBSERVE_NATIVE,
-        OBSERVE_MMU_ROOT,
-        OBSERVE_ALLOCATOR,
-        OBSERVE_MMU_DRAIN,
-        OBSERVE_DESCRIPTOR_PROTECT,
-        OBSERVE_DESCRIPTOR_PREPARE_PUBLISH,
-        OBSERVE_SHARED_PREPARED_FAULT,
-        OBSERVE_SHARED_COW_FAULT,
-        OBSERVE_PORTAL_WINDOW,
-        OBSERVE_FORK_TABLE_WINDOW,
-        OBSERVE_RETIRE_REPOINT,
-        OBSERVE_INITIAL_MM,
+    let fixture = PathBuf::from(env!("CARRICK_X86_CPL0_FIXTURE_IMAGE"));
+    let fixture_bytes = std::fs::read(&fixture).expect("fixture CPL0 image built");
+    // The fixture observer's own symbol and opaque words prove that its
+    // dispatch body is absent. Negative errno values are valid production
+    // data, so they cannot serve as fixture-dispatch witnesses.
+    let fixture_elf = goblin::elf::Elf::parse(&fixture_bytes).expect("fixture ELF symbols");
+    let production_elf = goblin::elf::Elf::parse(&bytes).expect("production ELF symbols");
+    let symbol = |elf: &goblin::elf::Elf<'_>, name: &str| {
+        elf.syms
+            .iter()
+            .find(|symbol| elf.strtab.get_at(symbol.st_name) == Some(name))
+    };
+    let production_entry = symbol(&production_elf, "carrick_x86_enter")
+        .expect("production entry symbol must remain linked");
+    assert!(
+        production_elf.program_headers.iter().any(|header| {
+            header.p_type == goblin::elf::program_header::PT_LOAD
+                && production_entry.st_value >= header.p_vaddr
+                && production_entry.st_value < header.p_vaddr + header.p_filesz
+        }),
+        "production entry must occupy a LOAD segment"
+    );
+    for name in [
+        "carrick_x86_fixture_dispatch_witness",
+        "CARRICK_X86_FIXTURE_DISPATCH_WITNESSES",
     ] {
         assert!(
-            !plan
-                .segments
-                .iter()
-                .filter(|segment| segment.perms.execute)
-                .any(|segment| {
-                    let start = segment.file_offset as usize;
-                    let end = start + segment.file_size as usize;
-                    bytes[start..end]
-                        .windows(8)
-                        .any(|window| window == syscall.to_le_bytes())
-                }),
-            // Other owners can retain these bit patterns as signed error
-            // constants in rodata; only executable fixture selectors matter.
-            "production code contains fixture syscall {syscall:#x}"
+            symbol(&fixture_elf, name).is_some(),
+            "fixture symbol missing: {name}"
+        );
+        assert!(
+            symbol(&production_elf, name).is_none(),
+            "fixture symbol linked: {name}"
+        );
+    }
+    let witness_symbol = symbol(&fixture_elf, "CARRICK_X86_FIXTURE_DISPATCH_WITNESSES")
+        .expect("fixture witness symbol");
+    assert_eq!(witness_symbol.st_size, 16);
+    let load = fixture_elf
+        .program_headers
+        .iter()
+        .find(|header| {
+            header.p_type == goblin::elf::program_header::PT_LOAD
+                && witness_symbol.st_value >= header.p_vaddr
+                && witness_symbol.st_value + witness_symbol.st_size
+                    <= header.p_vaddr + header.p_filesz
+        })
+        .expect("witness is in fixture LOAD bytes");
+    let offset = (load.p_offset + witness_symbol.st_value - load.p_vaddr) as usize;
+    let plan =
+        carrick_mem::elf::plan_elf_load_bytes_for(&bytes, 62).expect("production CPL0 load image");
+    for word in fixture_bytes[offset..offset + witness_symbol.st_size as usize].chunks_exact(8) {
+        assert!(
+            !plan.segments.iter().any(|segment| {
+                let start = segment.file_offset as usize;
+                let end = start + segment.file_size as usize;
+                bytes[start..end].windows(8).any(|window| window == word)
+            }),
+            "production image contains a fixture dispatch witness"
         );
     }
     let probe = transport_program(0);
@@ -300,8 +324,8 @@ fn production_image_rejects_fixture_syscalls() {
         .observe(0)
         .expect_err("synthetic syscall must not dispatch");
     assert!(
-        err.to_string().contains("unported CPL0 native call"),
-        "{err}"
+        carrier.refusal_overflow_count() >= 1,
+        "synthetic syscall must be counted in refusal overflow bucket: {err}"
     );
 }
 
@@ -313,10 +337,10 @@ fn production_interrupt_boot_serves_an_ordinary_syscall() {
         Cpl0Carrier::boot_with_interrupts(&production, [&first, &first]).expect("KVM image");
     let err = carrier
         .observe(0)
-        .expect_err("production observer call must forward after the ordinary syscall");
+        .expect_err("production observer call is not handled in production image");
     assert!(
-        err.to_string().contains("unported CPL0 native call"),
-        "{err}"
+        carrier.refusal_overflow_count() >= 1,
+        "observer call must be counted in refusal overflow bucket: {err}"
     );
     assert_eq!(carrier.robust_list_head(0).expect("task head"), 0x2345);
 }
@@ -712,7 +736,9 @@ fn x4_linux_common_entry() {
                 assert_eq!(observed.forwarded, 0);
                 assert_eq!(observed.semantic_host_exits, 0, "no host Linux serving");
                 assert_eq!(observed.kicks, 2 * (entries[0] + entries[1]));
-                assert_eq!(observed.work_exits, entries[0] + entries[1]);
+                // Entry work is published by shared dispatch before the
+                // return kick requests a second, separately recorded exit.
+                assert_eq!(observed.work_exits, 2 * (entries[0] + entries[1]));
                 assert_eq!(observed.captured_stack, 0x3_1fe8 + task as u64 * 0x1_0000);
                 assert_eq!(observed.returned_stack, observed.captured_stack);
                 assert_eq!(observed.preserved_rbx, calls[task][round as usize].0);
@@ -721,7 +747,15 @@ fn x4_linux_common_entry() {
         }
     }
     // Native numbers are not canonical ARM ordinals. Refusals never call a
-    // family or receive a synthetic host result; inspect the stopped owner.
+    // family or receive a synthetic host result; they return -ENOSYS from CPL0
+    // and bump the refusal counter. getpid(39) will be served in CPL0 later by
+    // the x86 process lane. Inspect the stopped owner.
+    let binding = ExecutionBinding {
+        task: EntryTaskKey::from_raw(41),
+        generation: EntryGeneration::from_raw(100),
+        mm: EntryMmKey::from_raw(77),
+        thread_generation: EntryThreadGeneration::from_raw(101),
+    };
     for native in [39_u32, 99, 273] {
         let mut code = program(&[(0xdead, 24)]);
         let needle = [0xb8, 0x11, 0x01, 0, 0, 0x0f, 0x05];
@@ -732,20 +766,38 @@ fn x4_linux_common_entry() {
         code[offset + 1..offset + 5].copy_from_slice(&native.to_le_bytes());
         let peer = program(&[(0xbeef, 24)]);
         let mut carrier = Cpl0Carrier::boot(&image(), [&code, &peer]).unwrap();
+        carrier.bind_execution(0, binding).unwrap();
         if native == 273 {
             carrier.unload_execution(0).unwrap();
+            let err = carrier
+                .observe(0)
+                .expect_err("unloaded execution must fail closed");
+            assert!(err.to_string().contains("CPL0 fatal exit"), "{err}");
+            let stopped = carrier.entry_state();
+            assert_eq!(stopped.entries, [1, 0]);
+            assert_eq!(stopped.publications, [0, 0]);
+            assert_eq!(stopped.completions, [1, 0]);
+            assert_eq!(stopped.heads, [(0, 0); 2]);
+            assert_eq!(stopped.served, 0);
+            assert_eq!(stopped.host_forwards, 0);
+            assert_eq!(carrier.refusal_count(273), 1);
+            continue;
         }
-        assert!(carrier.observe(0).is_err());
+        let observed = carrier
+            .observe(0)
+            .expect("refusal returns -ENOSYS to guest");
+        assert_eq!(observed.result, -38);
         let stopped = carrier.entry_state();
         assert_eq!(stopped.entries, [1, 0]);
         assert_eq!(stopped.publications, [0, 0]);
-        assert_eq!(stopped.completions, [0, 0]);
+        assert_eq!(stopped.completions, [1, 0]);
         assert_eq!(stopped.heads, [(0, 0); 2]);
         assert_eq!(stopped.served, 0);
         assert_eq!(
-            stopped.host_forwards, 1,
-            "one explicit refusal, no host emulation"
+            stopped.host_forwards, 0,
+            "refusal is served directly in CPL0 with ENOSYS, no host forward"
         );
+        assert_eq!(carrier.refusal_count(native as u64), 1);
     }
 }
 
@@ -778,13 +830,40 @@ fn entry_and_return_kicks_never_republish_or_recomplete() {
             );
             assert_eq!(observation.returned_stack, observation.captured_stack);
             assert_eq!(observation.kicks, (entries[0] + entries[1]) * 2);
-            assert_eq!(observation.work_exits, entries[0] + entries[1]);
+            assert_eq!(observation.work_exits, 2 * (entries[0] + entries[1]));
             forwards = observation.forwarded + observation.semantic_host_exits;
         }
     }
     let observation_count = entries[0] + entries[1];
     assert_eq!(observation_count, 4);
     assert_eq!(forwards, 0, "kicks cannot forward a served call");
+}
+
+#[test]
+fn forwarded_call_completes_before_pending_kick_work_exit() {
+    let mut code = program(&[(0xdead, 24)]);
+    let native_robust_list = [0xb8, 0x11, 0x01, 0, 0, 0x0f, 0x05];
+    let offset = code
+        .windows(native_robust_list.len())
+        .position(|bytes| bytes == native_robust_list)
+        .expect("native syscall in fixture");
+    code[offset + 1..offset + 5].copy_from_slice(&8_u32.to_le_bytes()); // lseek forwards
+    let peer = program(&[(0xbeef, 24)]);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&code, &peer]).expect("real KVM image");
+    carrier
+        .inject_boundary_kicks(0)
+        .expect("entry and return kicks");
+    let observed = carrier
+        .observe_with_forward(0, |frame| {
+            frame.rax = 4321;
+            Ok(())
+        })
+        .expect("forward, completion, and pending work exit");
+    assert_eq!(observed.result, 4321);
+    assert_eq!(carrier.entry_state().host_forwards, 1);
+    assert_eq!(observed.kicks, 2);
+    assert_eq!(observed.work_exits, 1);
+    assert_eq!(observed.completions, [1, 0]);
 }
 
 #[test]

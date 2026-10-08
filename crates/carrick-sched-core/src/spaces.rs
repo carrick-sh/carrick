@@ -791,7 +791,9 @@ impl AddressSpaces {
         }
         let ttbr0 = entry.ttbr0.load(Ordering::Acquire);
         let ttbr1 = entry.ttbr1.load(Ordering::Acquire);
-        if ttbr0 == 0 || ttbr1 == 0 {
+        // The primary root authenticates this space, as in `grant`.
+        // A single-root MM has no separate secondary root.
+        if ttbr0 == 0 {
             return None;
         }
         Some(ClosedChildEditor {

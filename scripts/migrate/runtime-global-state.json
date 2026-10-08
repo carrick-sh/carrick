@@ -229,7 +229,7 @@
       "kind": "env_var",
       "file": "crates/carrick-observability/src/probes.rs",
       "symbol": "real::parse_guest_mem_probe_usize_env::name",
-      "fingerprint": "2004d7f691adfb3fbda3dec7e993acd4b27c4a5c1c5b7bb8f5f552b4e44a8c50",
+      "fingerprint": "2e095c71c8ad0be333df8c71d7ee1a97b6b20f1a9b0676abd8565ca066ae958d",
       "classification": "config_debug",
       "rationale": "Process diagnostic or tuning configuration; it changes instrumentation only and cannot select or overwrite container-owned state."
     },
@@ -1981,9 +1981,9 @@
       "kind": "static",
       "file": "crates/carrick-kernel/src/kernel/ids.rs",
       "symbol": "NEXT_FILE_DESCRIPTION_ID",
-      "fingerprint": "8cca60a42fc31e55686c65db09fae450edb82d8598588e1997729dc9874d6bcb",
+      "fingerprint": "e5de473ba863b6f4206b47d69226d2dbe46e9f2b22d11a52622aea523cfa8623",
       "classification": "monotonic_allocator",
-      "rationale": "Process-wide monotonic NEXT_FILE_DESCRIPTION_ID source in crates/carrick-kernel/src/kernel/ids.rs delegates the unchanged non-reusing atomic allocation and restored-ID high-water mark to the shared SerialAllocator. Its single process-global scope and monotonic_allocator classification are retained; it is not a per-task or namespace allocator."
+      "rationale": "Carrier-wide monotonic allocator NEXT_FILE_DESCRIPTION_ID in crates/carrick-runtime/src/kernel/ids.rs generating unique IDs across the host process."
     },
     {
       "kind": "static",
@@ -2189,7 +2189,7 @@
       "kind": "static",
       "file": "crates/carrick-observability/src/probes.rs",
       "symbol": "real::guest_mem_subrange_config::CONFIG",
-      "fingerprint": "ff15b14b509bd302787dab97bc1662d88f64258e569f8c7a34a1232636d94d6b",
+      "fingerprint": "c563aca3ba680ab2214653dfb8ca0eb49847d1dd528b3af0f3fa9a50873562b3",
       "classification": "config_debug",
       "rationale": "Process diagnostic or tuning configuration; it changes instrumentation only and cannot select or overwrite container-owned state."
     },
@@ -3413,7 +3413,7 @@
       "kind": "thread_local",
       "file": "crates/carrick-observability/src/probes.rs",
       "symbol": "real::EPOLL_MASKED_PROBE",
-      "fingerprint": "5c7abbbb2eb95c2800e4edfb6aeb4c867031950de918cefcbfa564908e6bddb5",
+      "fingerprint": "b6c09320bead5df3992bc55835c8d829a61219021077ef1b3d22de1b69a300ff",
       "classification": "config_debug",
       "rationale": "Process diagnostic or tuning configuration; it changes instrumentation only and cannot select or overwrite container-owned state."
     },
@@ -3421,7 +3421,7 @@
       "kind": "thread_local",
       "file": "crates/carrick-observability/src/probes.rs",
       "symbol": "real::EPOLL_REBIND_PROBE",
-      "fingerprint": "be7528ebd0538573bfc40866bdd6b01d4b1abd07324ce577b322c0a0bc24b447",
+      "fingerprint": "7ba2aaa50b5aaebb6b9c2173501dea74849adfb8bf27800d0469ddf5e1f89d87",
       "classification": "config_debug",
       "rationale": "Process diagnostic or tuning configuration; it changes instrumentation only and cannot select or overwrite container-owned state."
     },
@@ -3429,7 +3429,7 @@
       "kind": "thread_local",
       "file": "crates/carrick-observability/src/probes.rs",
       "symbol": "real::ULOCK_REQUEUE_PROBE",
-      "fingerprint": "010de993528a592dd7082d6906e8eb3e2163d1bdc15fd4e309d33551793cd1c0",
+      "fingerprint": "81fb6ed31ebc2e2e8ebe3cb378e3a9386640ceb8529aa862030bf1527bf12d2c",
       "classification": "config_debug",
       "rationale": "Process diagnostic or tuning configuration; it changes instrumentation only and cannot select or overwrite container-owned state."
     },
