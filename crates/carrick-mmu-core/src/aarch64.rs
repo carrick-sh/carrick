@@ -417,6 +417,12 @@ pub fn terminal_descriptor_may_write(descriptor: u64) -> bool {
     descriptor & SW_EL1_MAY_WRITE != 0
 }
 
+/// Whether a terminal descriptor records Linux execute intent.
+#[inline]
+pub fn terminal_descriptor_may_execute(descriptor: u64) -> bool {
+    descriptor & SW_EL1_MAY_EXEC != 0
+}
+
 /// Host buffer access for an EL1-owned leaf. COW writes are admitted only
 /// while Linux write intent survives; the caller must privatize before copyout.
 /// Non-EL1 mappings remain subject to the caller's ordinary permission checks.

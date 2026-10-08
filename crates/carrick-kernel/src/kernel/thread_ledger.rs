@@ -1183,7 +1183,7 @@ mod tests {
 
     use crate::kernel::LinuxTid;
     use carrick_abi::{LinuxCloneFlags, LinuxResource, LinuxRlimit, NsGid, NsUid};
-    use carrick_el1_abi::EntryState;
+    use carrick_el1_abi::{EntryState, Lifecycle};
     use carrick_hal::ThreadId;
 
     use crate::kernel::clone_plan::ClonePlan;

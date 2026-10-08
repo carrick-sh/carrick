@@ -1767,12 +1767,15 @@ mod tests {
         let records = [0usize, 1].map(|slot| {
             let record = current_task(&region, slot);
             (
-                record.task_id.load(Ordering::Acquire),
-                record.file_table.load(Ordering::Acquire),
+                record.execution.task.load(Ordering::Acquire),
+                record.linux.file_table.load(Ordering::Acquire),
             )
         });
         drop((occupier, resumed));
-        let after_release = current_task(&region, 1).file_table.load(Ordering::Acquire);
+        let after_release = current_task(&region, 1)
+            .linux
+            .file_table
+            .load(Ordering::Acquire);
         carrick_el1_abi::record_el1_region_host_ptr(previous);
         assert_eq!(
             records,
