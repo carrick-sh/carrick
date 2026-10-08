@@ -374,7 +374,7 @@ impl<'a> NetView<'a> {
         {
             return true;
         }
-        let Some(open) = open_file.description.inspect() else {
+        let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description) else {
             return false;
         };
         match &*open {
@@ -396,7 +396,7 @@ impl<'a> NetView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return false;
         };
-        match open_file.description.inspect().as_deref() {
+        match crate::kernel::FileDescription::inspect(&open_file.description).as_deref() {
             Some(OpenDescription::HostSocket { .. }) => true,
             Some(OpenDescription::InMemorySocket { socket, .. }) => {
                 (socket.family() == LINUX_AF_INET || socket.family() == LINUX_AF_INET6)
@@ -411,7 +411,7 @@ impl<'a> NetView<'a> {
             return false;
         };
         ::std::matches!(
-            open_file.description.inspect().as_deref(),
+            crate::kernel::FileDescription::inspect(&open_file.description).as_deref(),
             Some(OpenDescription::HostSocket { base, .. } | OpenDescription::InMemorySocket { base, .. }) if base.listening()
         )
     }
@@ -419,7 +419,7 @@ impl<'a> NetView<'a> {
     pub(super) fn interest_is_connected_host_socket(&self, slot: &EpollInterest, fd: i32) -> bool {
         let is_host_connected = |desc: &crate::kernel::FileDescription| {
             ::std::matches!(
-                desc.inspect().as_deref(),
+                crate::kernel::FileDescription::inspect(desc).as_deref(),
                 Some(OpenDescription::HostSocket { base, .. }) if !base.listening()
             )
         };
@@ -534,13 +534,15 @@ impl<'a> NetView<'a> {
                 InMemoryPipeEndpoint::Writer => interest.read = false,
             }
         }
-        let supports_oob = description.is_some_and(|desc| match desc.inspect().as_deref() {
-            Some(OpenDescription::HostSocket { .. }) => true,
-            Some(OpenDescription::InMemorySocket { socket, .. }) => {
-                (socket.family() == LINUX_AF_INET || socket.family() == LINUX_AF_INET6)
-                    && socket.socket_type == carrick_abi::LINUX_SOCK_STREAM
+        let supports_oob = description.is_some_and(|desc| {
+            match crate::kernel::FileDescription::inspect(desc).as_deref() {
+                Some(OpenDescription::HostSocket { .. }) => true,
+                Some(OpenDescription::InMemorySocket { socket, .. }) => {
+                    (socket.family() == LINUX_AF_INET || socket.family() == LINUX_AF_INET6)
+                        && socket.socket_type == carrick_abi::LINUX_SOCK_STREAM
+                }
+                _ => false,
             }
-            _ => false,
         });
         if interest.oob && !supports_oob {
             interest.oob = false;
@@ -913,7 +915,9 @@ impl<'a> NetView<'a> {
             let stale = match self.open_file(epfd) {
                 None => true,
                 Some(open_file) => {
-                    let Some(mut open) = open_file.description.write_for_io() else {
+                    let Some(mut open) =
+                        crate::kernel::FileDescription::write_for_io(&open_file.description)
+                    else {
                         return;
                     };
                     if let OpenDescription::Epoll {
@@ -1080,7 +1084,7 @@ impl<'a> NetView<'a> {
         detached_host_fd: Option<HostFd>,
     ) {
         for (owner, registration_fd) in target.take_epoll_owners() {
-            let Some(mut guard) = owner.write_for_io() else {
+            let Some(mut guard) = crate::kernel::FileDescription::write_for_io(&owner) else {
                 continue;
             };
             let OpenDescription::Epoll {
@@ -1199,7 +1203,7 @@ impl<'a> NetView<'a> {
         detached_host_fd: Option<HostFd>,
     ) {
         for description in owners {
-            let Some(mut guard) = description.write_for_io() else {
+            let Some(mut guard) = crate::kernel::FileDescription::write_for_io(&description) else {
                 continue;
             };
             if let OpenDescription::Epoll {
@@ -1378,7 +1382,9 @@ impl<'a> NetView<'a> {
         // reassigned on the multiplexer path below (it collects the
         // drained-and-tagged events), so the `mut` is load-bearing.
         let pending_ready = {
-            let Some(mut open) = open_file.description.write_for_io() else {
+            let Some(mut open) =
+                crate::kernel::FileDescription::write_for_io(&open_file.description)
+            else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             let OpenDescription::Epoll { pending_ready, .. } = &mut *open else {
@@ -1412,7 +1418,8 @@ impl<'a> NetView<'a> {
         // race without putting a live lock lookup on every returned event.
         {
             let (interests, kq, kq_fd) = {
-                let Some(open) = open_file.description.inspect() else {
+                let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description)
+                else {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 };
                 let OpenDescription::Epoll {
@@ -1502,7 +1509,9 @@ impl<'a> NetView<'a> {
                         // -> guest fds sharing it (dup fan-out). Types inferred
                         // from the inserts.
                         let (gfd_info, host_to_gfds) = {
-                            let Some(open) = open_file.description.inspect() else {
+                            let Some(open) =
+                                crate::kernel::FileDescription::inspect(&open_file.description)
+                            else {
                                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                             };
                             // Per-guest-fd epoll interest snapshot: (host_fd,
@@ -2080,7 +2089,9 @@ impl<'a> NetView<'a> {
                 .collect();
 
             if !ready_updates.is_empty() || !oneshot_fds.is_empty() {
-                if let Some(mut open) = open_file.description.write_for_io() {
+                if let Some(mut open) =
+                    crate::kernel::FileDescription::write_for_io(&open_file.description)
+                {
                     if let OpenDescription::Epoll {
                         interest, kqueue, ..
                     } = &mut *open
@@ -2208,7 +2219,9 @@ impl<'a> NetView<'a> {
                 .collect();
             if ready_tagged.len() > max_events {
                 let overflow: Vec<(i32, LinuxEpollEvent)> = ready_tagged.split_off(max_events);
-                if let Some(mut open) = open_file.description.write_for_io() {
+                if let Some(mut open) =
+                    crate::kernel::FileDescription::write_for_io(&open_file.description)
+                {
                     if let OpenDescription::Epoll { pending_ready, .. } = &mut *open {
                         pending_ready.extend(overflow);
                     }
@@ -2385,9 +2398,7 @@ mod synthetic_datagram_readiness_tests {
         let source = socket_addr_to_linux_sockaddr("172.31.0.1:53".parse().unwrap()).unwrap();
         {
             let open_file = dispatcher.open_file(fd).expect("udp socket open file");
-            let mut open = open_file
-                .description
-                .write_for_io()
+            let mut open = crate::kernel::FileDescription::write_for_io(&open_file.description)
                 .expect("udp socket open description");
             let OpenDescription::HostSocket { synthetic_recv, .. } = &mut *open else {
                 panic!("udp socket must be a HostSocket");
@@ -3844,7 +3855,7 @@ impl<'a> NetView<'a> {
             // harmless: the re-arm prunes it lazily.
             this.captured_file_table().write_epoll_fds().insert(epfd);
 
-            let Some(mut open) = open_file.description.write_for_io() else {
+            let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             let OpenDescription::Epoll {

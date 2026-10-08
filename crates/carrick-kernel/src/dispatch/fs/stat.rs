@@ -946,7 +946,9 @@ mod tests {
 
         let pipe_link = dispatcher
             .open_file(20)
-            .and_then(|file| file.description.inspect()?.readlink_target())
+            .and_then(|file| {
+                crate::kernel::FileDescription::inspect(&file.description)?.readlink_target()
+            })
             .expect("pipe readlink target");
         assert_eq!(pipe_link, format!("pipe:[{}]", pipe_read.ino));
     }

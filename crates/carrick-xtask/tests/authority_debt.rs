@@ -3255,7 +3255,7 @@ fn lifecycle_census_distinguishes_file_table_from_unrelated_types() {
         } else {
             "FileTable"
         };
-        write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), format!("fn poll(other: &Other) {{ crate::kernel::{authority}::{operation}(); crate::Other::{operation}(); other.{operation}(); }}")).unwrap();
+        write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), format!("struct Other; impl Other {{ fn {operation}(&self) {{}} }} fn poll(other: &Other) {{ crate::kernel::{authority}::{operation}(); crate::Other::{operation}(); other.{operation}(); }}")).unwrap();
         let census = load_census(root.path()).unwrap();
         assert_eq!(
             census
@@ -3293,6 +3293,9 @@ fn description_field_spelling_and_opaque_parameter_types_do_not_prove_authority(
         "fn poll(other: &Other) { other.description.inspect(); }",
         "fn poll(other: &impl Inspect) { other.inspect(); }",
         "fn poll(other: &dyn Inspect) { other.inspect(); }",
+        "fn poll(other: &Wrapper<FileDescription>) { other.inspect(); }",
+        "struct Other; impl Other { fn inspect(&self) {} } fn poll() { struct Other(FileDescription); impl Deref for Other { type Target = FileDescription; fn deref(&self) -> &FileDescription { &self.0 } } fn inner(x: &Other) { x.inspect(); } }",
+        "struct Other(FileDescription); impl Deref for Other { type Target = FileDescription; fn deref(&self) -> &FileDescription { &self.0 } } fn poll(other: &Other) { other.inspect(); }",
         "type Opaque = dyn Inspect; fn poll(other: &Opaque) { other.inspect(); }",
         "fn poll<T: Inspect>(other: &T) { other.inspect(); }",
         "impl<T: Inspect> Holder<T> { fn poll(other: &T) { other.inspect(); } }",
@@ -3301,4 +3304,36 @@ fn description_field_spelling_and_opaque_parameter_types_do_not_prove_authority(
         write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), source).unwrap();
         assert_dialect_rejection(root.path(), "unresolved authority receiver");
     }
+}
+
+#[test]
+fn typed_description_bindings_and_references_are_counted_without_name_hints() {
+    for operation in ["read_for_io", "write_for_io", "inspect", "try_inspect"] {
+        let root = source_fixture();
+        write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), format!("fn poll(unrelated_name: &FileDescription) {{ unrelated_name.{operation}(); let a = unrelated_name; a.{operation}(); let b = &a; b.{operation}(); }}")).unwrap();
+        let census = load_census(root.path()).unwrap();
+        assert_eq!(
+            census
+                .k1
+                .iter()
+                .filter(|site| site.operation == operation)
+                .count(),
+            3
+        );
+    }
+}
+
+#[test]
+fn file_table_type_alias_lifecycle_calls_remain_visible() {
+    let root = source_fixture();
+    write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), "type Alias = crate::kernel::FileTable; fn poll() { crate::Alias::for_fork_copy(id(), parent); }").unwrap();
+    assert_eq!(
+        load_census(root.path())
+            .unwrap()
+            .k1
+            .iter()
+            .filter(|site| site.operation == "for_fork_copy")
+            .count(),
+        1
+    );
 }

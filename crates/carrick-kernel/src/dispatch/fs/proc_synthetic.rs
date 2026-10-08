@@ -481,7 +481,9 @@ impl<'a> FsView<'a> {
         };
 
         let action = {
-            let Some(mut open) = open_file.description.write_for_io() else {
+            let Some(mut open) =
+                crate::kernel::FileDescription::write_for_io(&open_file.description)
+            else {
                 *reservation = None;
                 return Ok(self.duplicate_fd(
                     n,
@@ -658,7 +660,7 @@ impl<'a> FsView<'a> {
     /// the status flags from the live fd table. `None` if fd N is not open.
     pub(super) fn fdinfo_bytes(&self, n: i32) -> Option<Vec<u8>> {
         let of = self.open_file(n)?;
-        let desc = of.description.read_for_io();
+        let desc = crate::kernel::FileDescription::read_for_io(&of.description);
         let cloexec = of.fd_flags & LINUX_FD_CLOEXEC != 0;
         let flags = reportable_status_flags(of.description.common().status_flags())
             | if cloexec { LINUX_O_CLOEXEC } else { 0 };

@@ -1194,7 +1194,7 @@ impl<'a> ProcView<'a> {
         fd: i32,
     ) -> Option<PidfdTarget> {
         let open = self.open_file(fd)?;
-        let desc = open.description.inspect()?;
+        let desc = crate::kernel::FileDescription::inspect(&open.description)?;
         match &*desc {
             OpenDescription::Pidfd { target, .. } => Some(*target),
             // A `/proc/<pid>` directory fd is a valid pidfd on Linux (e.g.
@@ -1270,7 +1270,7 @@ impl<'a> ProcView<'a> {
         let Some(open) = self.open_file(fd) else {
             return false;
         };
-        let Some(desc) = open.description.inspect() else {
+        let Some(desc) = crate::kernel::FileDescription::inspect(&open.description) else {
             return false;
         };
         match &*desc {
@@ -3409,7 +3409,7 @@ impl<'a> ProcView<'a> {
                 // path it was opened at (HostFile/File/etc.) and execve that.
                 let fd = dirfd as i32;
                 let p = this.open_file(fd).and_then(|f| {
-                    let d = f.description.inspect()?;
+                    let d = crate::kernel::FileDescription::inspect(&f.description)?;
                     if d.retained_exec_source().is_some() {
                         Some(format!("/proc/self/fd/{fd}"))
                     } else {

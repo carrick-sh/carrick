@@ -208,7 +208,8 @@ impl OwnedHostFileCursor {
         let (reservation, lease) = ready.into_parts();
         let description = reservation.description();
         let fd = {
-            let open = description.inspect().ok_or(carrick_abi::LINUX_EBADF)?;
+            let open = crate::kernel::FileDescription::inspect(description)
+                .ok_or(carrick_abi::LINUX_EBADF)?;
             match &*open {
                 super::OpenDescription::HostFile {
                     host_fd, metadata, ..

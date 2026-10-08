@@ -556,11 +556,10 @@ impl<'a> FsView<'a> {
         } else if dirfd == LINUX_AT_FDCWD {
             (fs_context.cwd(), path)
         } else {
-            match self
-                .open_file(dirfd as i32)?
-                .description
-                .inspect()
-                .as_deref()
+            match crate::kernel::FileDescription::inspect(
+                &self.open_file(dirfd as i32)?.description,
+            )
+            .as_deref()
             {
                 Some(OpenDescription::Directory { path: dir, .. }) => (dir.clone(), path),
                 _ => return None,
@@ -693,32 +692,35 @@ impl<'a> FsView<'a> {
             (fs_context.cwd(), path)
         } else {
             match self.open_file(dirfd as i32).as_ref() {
-                Some(open_file) => match open_file.description.inspect().as_deref() {
-                    Some(OpenDescription::Directory {
-                        path: dir,
-                        trusted_host_dir,
-                        ..
-                    }) => {
-                        // A relative *at op through a dirfd whose directory has
-                        // since been removed (rmdir) resolves to ENOENT on Linux:
-                        // the open fd persists but its path no longer exists.
-                        // carrick keeps the Directory description cached, so
-                        // re-verify the anchor still exists in the layered view
-                        // (symlinkat01/linkat01 deldirfd cases → ENOENT).
-                        if let Some(trusted) = trusted_host_dir {
-                            let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                            if unsafe { libc::fstat(trusted.fd.raw(), &mut st) } != 0
-                                || st.st_nlink == 0
-                            {
+                Some(open_file) => {
+                    match crate::kernel::FileDescription::inspect(&open_file.description).as_deref()
+                    {
+                        Some(OpenDescription::Directory {
+                            path: dir,
+                            trusted_host_dir,
+                            ..
+                        }) => {
+                            // A relative *at op through a dirfd whose directory has
+                            // since been removed (rmdir) resolves to ENOENT on Linux:
+                            // the open fd persists but its path no longer exists.
+                            // carrick keeps the Directory description cached, so
+                            // re-verify the anchor still exists in the layered view
+                            // (symlinkat01/linkat01 deldirfd cases → ENOENT).
+                            if let Some(trusted) = trusted_host_dir {
+                                let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                                if unsafe { libc::fstat(trusted.fd.raw(), &mut st) } != 0
+                                    || st.st_nlink == 0
+                                {
+                                    return Err(LINUX_ENOENT);
+                                }
+                            } else if self.layered_metadata(dir).is_err() {
                                 return Err(LINUX_ENOENT);
                             }
-                        } else if self.layered_metadata(dir).is_err() {
-                            return Err(LINUX_ENOENT);
+                            (dir.clone(), path)
                         }
-                        (dir.clone(), path)
+                        _ => return Err(LINUX_ENOTDIR),
                     }
-                    _ => return Err(LINUX_ENOTDIR),
-                },
+                }
                 // A valid fd that isn't in the table (e.g. a stdio fd) is still a
                 // non-directory, so a relative path can't be anchored to it →
                 // ENOTDIR; only a genuinely-invalid fd is EBADF (statx03 uses
