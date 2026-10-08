@@ -67,6 +67,9 @@ pub mod carrier_memory;
 pub mod cpl0_boot;
 
 #[cfg(target_arch = "x86_64")]
+pub mod cpl0_actors;
+
+#[cfg(target_arch = "x86_64")]
 pub mod carrier_interrupts;
 
 // x86_64 KVM backend modules.
@@ -80,3 +83,6 @@ pub mod guest_setup_x86;
 pub mod kvm_x86_engine;
 #[cfg(target_arch = "x86_64")]
 pub mod run_elf_x86;
+
+#[cfg(target_arch = "x86_64")]
+mod cpl0_private_witness;
