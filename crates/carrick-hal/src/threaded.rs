@@ -3323,6 +3323,12 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     ) {
     }
 
+    /// Authenticate that the live stage-1 translation for `page` is in an EL1
+    /// private leaf state (`Prepared` or `Resident`) and maps `expected_ipa`.
+    fn live_el1_grant_page_authenticated(&self, _page: u64, _expected_ipa: u64) -> bool {
+        false
+    }
+
     /// Refresh fork-private backend state after the child frame inventory and
     /// exact MM/COW authority are live, but before the child enters guest code.
     fn refresh_fork_process_state(&mut self) -> Result<(), TrapError> {

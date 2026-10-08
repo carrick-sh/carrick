@@ -1368,6 +1368,21 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
     if !el1_frame_grants_enabled() {
         cancel_frame_grant_request(engine.mailbox_slot(), mm_key, address, access);
     }
+    let page = address & !(crate::linux_abi::LINUX_PAGE_SIZE - 1);
+    if let Some(table) = carrick_el1_abi::frame_grant_residency_host()
+        && let Some(grant_page) = table.lookup(mm_key, page)
+        && grant_page.identity.owner_generation != 0
+        && let Some(_pin) = table.pin_transfer(grant_page)
+    {
+        let permit = mutation.host_alias_permit();
+        if dispatcher.authenticated_live_frame_grant(&permit, address, grant_page.identity)
+            && engine.live_el1_grant_page_authenticated(page, grant_page.expected_ipa)
+        {
+            cancel_frame_grant_request(engine.mailbox_slot(), mm_key, address, access);
+            cancel_portal_grant_selection(engine.mailbox_slot(), mm_key, address);
+            return Ok(true);
+        }
+    }
     'bulk_grant: {
         if el1_frame_grants_enabled()
             && let Some(mailbox) = engine

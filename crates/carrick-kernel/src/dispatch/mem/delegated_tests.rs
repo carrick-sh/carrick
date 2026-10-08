@@ -5358,3 +5358,92 @@ fn delegated_replacement_with_owed_backing_cannot_revalidate_old_output() {
         "after return, first touch can allocate fresh zero backing"
     );
 }
+
+#[test]
+fn serial_host_prepared_grant_subsequent_page_authenticates_live_residency_without_fresh_grant() {
+    #[allow(dead_code)]
+    struct RegionGuard(Box<carrick_test_support::TestEl1Region>);
+    impl Drop for RegionGuard {
+        fn drop(&mut self) {
+            carrick_el1_abi::record_el1_region_host_ptr(0);
+        }
+    }
+
+    let region = carrick_test_support::TestEl1Region::zeroed();
+    carrick_el1_abi::record_el1_region_host_ptr(region.as_ptr() as usize);
+    let _guard = RegionGuard(region);
+
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let base = LINUX_MMAP_BASE + STOCK_WINDOW;
+    let fault = base + 2 * PAGE;
+    root.guest_mmap(
+        Placement::Fixed(fault),
+        4 * PAGE,
+        ReservationProtection::READ_WRITE,
+    )
+    .unwrap();
+    let ((start, len), _prepared) = dispatcher
+        .with_resident_frame_grant_plan_for_test(fault, STOCK_WINDOW, |plan| {
+            let prepared = dispatcher.adopt_frame_grant_provenance(&plan);
+            let state = dispatcher
+                .deferred_anonymous_state(dispatcher.mm_authority().mm_id)
+                .unwrap();
+            state
+                .begin_pristine_materialization(GuestVa(plan.start()), plan.len() as usize)
+                .unwrap()
+                .unwrap()
+                .commit();
+            ((plan.start(), plan.len()), prepared)
+        })
+        .unwrap();
+    let (_mapping, incarnation) = root.lock().node(fault).unwrap();
+    let grant = carrick_el1_abi::FrameGrantResidencyIdentity {
+        mm_key: dispatcher.mm_authority().mm_id.raw(),
+        semantic_base: start,
+        physical_ipa: 0x1234_0000,
+        len,
+        mapping_id: 1,
+        frame_id: 1,
+        owner_generation: incarnation.raw(),
+        inventory_revision: 1,
+    };
+    let table = carrick_el1_abi::frame_grant_residency_host().expect("host residency table");
+    let slot = table
+        .publish(grant)
+        .expect("publish grant in residency table");
+    let page2 = fault + PAGE;
+
+    // Sibling touch on page2: fresh grant is refused because the span is already in FrameGrantResidencyTable:
+    assert!(
+        dispatcher
+            .with_resident_frame_grant_plan_for_test(page2, STOCK_WINDOW, |_| ())
+            .is_none(),
+        "subsequent page in published grant cannot produce a fresh grant plan"
+    );
+
+    // But authenticated live frame grant verifies page2 against the admitted root and the published grant:
+    assert!(
+        dispatcher.with_authenticated_live_frame_grant_for_test(page2, grant),
+        "subsequent page in published grant must authenticate from live residency"
+    );
+
+    // Negative controls:
+    let mut wrong_owner = grant;
+    wrong_owner.owner_generation += 1;
+    assert!(
+        !dispatcher.with_authenticated_live_frame_grant_for_test(page2, wrong_owner),
+        "mismatched owner generation must be refused"
+    );
+    let mut wrong_mm = grant;
+    wrong_mm.mm_key += 1;
+    assert!(
+        !dispatcher.with_authenticated_live_frame_grant_for_test(page2, wrong_mm),
+        "mismatched MM must be refused"
+    );
+    assert!(
+        !dispatcher.with_authenticated_live_frame_grant_for_test(fault + len, grant),
+        "address outside grant must be refused"
+    );
+    table.retire(slot, grant);
+}

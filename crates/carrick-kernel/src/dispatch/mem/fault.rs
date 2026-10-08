@@ -1597,6 +1597,72 @@ impl<'a> MemView<'a> {
         })
     }
 
+    pub(crate) fn authenticated_live_frame_grant(
+        &self,
+        permit: &super::mm_mutation::HostAliasPermit<'_>,
+        address: u64,
+        grant: carrick_el1_abi::FrameGrantResidencyIdentity,
+    ) -> bool {
+        if grant.mm_key != permit.mm().raw() || grant.owner_generation == 0 {
+            return false;
+        }
+        let page_size = self.linux_page_size();
+        let page = page_floor(address, page_size);
+        if page < grant.semantic_base {
+            return false;
+        }
+        let Some(end) = grant.semantic_base.checked_add(grant.len) else {
+            return false;
+        };
+        if page >= end {
+            return false;
+        }
+        let _exclusion = self.begin_host_alias_dispatch(permit);
+        let mem_authority = self.mem();
+        let mem = mem_authority.lock();
+        if mem.root_owes_backing_at(page) {
+            return false;
+        }
+        if bus_fault_contains(&mem.bus_fault_ranges, page) {
+            return false;
+        }
+        if let Some(root) = mem.delegated_root() {
+            let mut retired = false;
+            let _ = root.with_root(|model| {
+                model.observe_deferred_returns(&mut |entry| {
+                    if entry.range.start() <= page && page < entry.range.end() {
+                        retired = true;
+                    }
+                });
+                Ok(())
+            });
+            if retired {
+                return false;
+            }
+        }
+        match mem.first_touch_owner(page) {
+            FirstTouchOwner::Root(mapping, incarnation) => {
+                if incarnation.raw() != grant.owner_generation {
+                    return false;
+                }
+                let prot = LinuxProtFlags::from_bits_truncate(mapping.protection.bits());
+                !prot.is_empty()
+            }
+            _ => false,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn with_authenticated_live_frame_grant_for_test(
+        &self,
+        address: u64,
+        grant: carrick_el1_abi::FrameGrantResidencyIdentity,
+    ) -> bool {
+        super::mm_mutation::test_support::with_permit(self.mm_mutation_coordinator(), |permit| {
+            self.authenticated_live_frame_grant(permit, address, grant)
+        })
+    }
+
     pub(crate) fn commit_resident_fault(&self, plan: ResidentFaultPlan) {
         if !self.owns_host_alias_dispatch(&plan.exclusion) {
             carrick_fatal!(
