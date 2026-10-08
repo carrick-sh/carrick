@@ -1,3 +1,7 @@
+> Historical inventory references below are retired. Do not execute the
+> positional reconciliation or remote capture instructions. Current landing
+> uses `just lint-domains` and fresh authority discovery with monotone ceilings.
+
 # Runner-first CI and a reactive PR bus
 
 Status: **plan of record; approved by the owner on 2026-10-05, with the

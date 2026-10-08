@@ -33,7 +33,6 @@ MESSAGES = (
 CLIPPY_CONFIG = ROOT / "clippy.toml"
 INVENTORY = ROOT / "scripts" / "migrate" / "host-authority-transition-inventory.json"
 CATALOG_MANIFEST = ROOT / "scripts" / "migrate" / "host-authority-catalog.json"
-MACOS_CAPTURE = ROOT / "scripts" / "migrate" / "host-authority-macos-capture.json"
 
 # Literal snapshot of every canonical operation in the rejected lexical
 # inventory.  This must not be derived from either production artifact: the

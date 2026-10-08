@@ -1,3 +1,7 @@
+> Historical inventory references below are retired. Do not execute the
+> positional reconciliation or remote capture instructions. Current landing
+> uses `just lint-domains` and fresh authority discovery with monotone ceilings.
+
 # Kernel Harness Conformance Loop Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
