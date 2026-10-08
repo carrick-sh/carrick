@@ -6,7 +6,7 @@
 //! zero semantic host forwards. Control observation/kicks are separate.
 //! Missing KVM or an image is a failure; no Docker, retries or timing claims.
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::needless_range_loop)]
 
 use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
 use carrick_mmu_core::x86::descriptor_txn::Access;
@@ -530,10 +530,9 @@ fn assert_opaque_registrations(calls: [&[(u64, u64)]; 2]) {
     let mut heads = [(0, 0); 2];
     let mut entries = [0; 2];
     let mut publications = [0; 2];
-    for (round, (&(head_a, len_a), &(head_b, len_b))) in
-        calls[0].iter().zip(calls[1].iter()).enumerate()
-    {
-        for (task, (head, len)) in [(0, (head_a, len_a)), (1, (head_b, len_b))] {
+    for round in 0..calls[0].len() {
+        for (task, task_calls) in calls.iter().enumerate() {
+            let (head, len) = task_calls[round];
             let observation = carrier.observe(task).expect("bounded native entry/return");
             if len == 24 {
                 heads[task] = (head, 24);

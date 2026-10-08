@@ -82,6 +82,7 @@ jobs:
           tool: sccache@0.18.0
       - name: Install Semgrep
         if: ${{ !cancelled() }}
+        timeout-minutes: 12
         run: just ci-install-semgrep
       - name: Formatting
         if: ${{ !cancelled() }}
@@ -127,6 +128,7 @@ jobs:
           tool: sccache@0.18.0
       - name: Install Linux C cross toolchain
         if: ${{ !cancelled() }}
+        timeout-minutes: 12
         run: just ci-install-linux-cross
       - name: Portable kernel compile (aarch64-linux lib, tests and semantics)
         if: ${{ !cancelled() }}
@@ -366,6 +368,7 @@ jobs:
           tool: sccache@0.18.0
       - name: Install FreeBSD C cross toolchain
         if: ${{ !cancelled() }}
+        timeout-minutes: 12
         run: just ci-install-freebsd-cross
       - name: Cache FreeBSD sysroot
         id: fbsd-sysroot

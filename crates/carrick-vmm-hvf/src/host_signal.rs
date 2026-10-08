@@ -853,7 +853,9 @@ pub fn reinit_after_fork() {
     // child's re-spawned signal pump reconcile loop (vcpu_kick.rs) re-registers
     // the inherited armed EVFILT_TIMER and the child wrongly receives the
     // parent's SIGALRM (LTP alarm07). Mirrors the KVM reinit_after_fork.
-    crate::itimer::clear();
+    // `reset_after_fork`, not `clear`: a slot gate may have been copied held by
+    // a parent fallback thread that does not exist in this child.
+    crate::itimer::reset_after_fork();
     // The child is single-threaded (fork copies only the calling thread); any
     // sibling-directed pending entries inherited from the parent are stale.
     clear_thread_pending();

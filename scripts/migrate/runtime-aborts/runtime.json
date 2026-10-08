@@ -1494,72 +1494,6 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/core.rs",
-      "function": "<HostRegistryFailure as carrick_sched_core::process::registry::RegistryFailure>::fail",
-      "ordinal_in_function": 1,
-      "fingerprint": "1f0c1f9c85c3bde507cf40ebde84e4d51385effe55af15e5097b672cc35d310e",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::process_birth",
-      "rationale": "The consumer child payload violated its exact admitted identity/session after irreversible PID and numeric-claim publication under retained exclusive registry custody; returning errno cannot restore a coherent process graph.",
-      "sink": "fatal",
-      "domain": "kernel::process_birth"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/core.rs",
-      "function": "<HostRegistryFailure as carrick_sched_core::process::registry::RegistryFailure>::fail",
-      "ordinal_in_function": 2,
-      "fingerprint": "1f0c1f9c85c3bde507cf40ebde84e4d51385effe55af15e5097b672cc35d310e",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::registry_epoch",
-      "rationale": "Kernel RegistryState epoch counter overflow would wrap epoch identity and corrupt process registry generation checks.",
-      "sink": "fatal",
-      "domain": "kernel::registry_epoch"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/core.rs",
-      "function": "<HostRegistryFailure as carrick_sched_core::process::registry::RegistryFailure>::fail",
-      "ordinal_in_function": 3,
-      "fingerprint": "1f0c1f9c85c3bde507cf40ebde84e4d51385effe55af15e5097b672cc35d310e",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::process_group_index",
-      "rationale": "Process-group publication collided in either the internal or container namespace index; continuing would make the two authoritative identity maps disagree.",
-      "sink": "fatal",
-      "domain": "kernel::process_group_index"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/core.rs",
-      "function": "<HostRegistryFailure as carrick_sched_core::process::registry::RegistryFailure>::fail",
-      "ordinal_in_function": 5,
-      "fingerprint": "1f0c1f9c85c3bde507cf40ebde84e4d51385effe55af15e5097b672cc35d310e",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::session_index",
-      "rationale": "Session publication collided in either the internal or container namespace index; continuing would make the two authoritative identity maps disagree.",
-      "sink": "fatal",
-      "domain": "kernel::session_index"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/core.rs",
-      "function": "<HostRegistryFailure as carrick_sched_core::process::registry::RegistryFailure>::fail",
-      "ordinal_in_function": 4,
-      "fingerprint": "1f0c1f9c85c3bde507cf40ebde84e4d51385effe55af15e5097b672cc35d310e",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::process_group_index",
-      "rationale": "Removing an internal process-group record did not remove the matching container namespace index edge; continuing would leave a stale group alias.",
-      "sink": "fatal",
-      "domain": "kernel::process_group_index"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/core.rs",
-      "function": "<HostRegistryFailure as carrick_sched_core::process::registry::RegistryFailure>::fail",
-      "ordinal_in_function": 6,
-      "fingerprint": "1f0c1f9c85c3bde507cf40ebde84e4d51385effe55af15e5097b672cc35d310e",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::session_index",
-      "rationale": "Removing an internal session record did not remove the matching container namespace index edge; continuing would leave a stale session alias.",
-      "sink": "fatal",
-      "domain": "kernel::session_index"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/core.rs",
       "function": "ReservationGate::subscribe",
       "ordinal_in_function": 1,
       "fingerprint": "891c000bd5526f116ee0fa24e96ab8a23cc00e1166c258704bfaaba254b7acab",
@@ -1813,28 +1747,6 @@
       "domain": "kernel::mm_io_uring"
     },
     {
-      "file": "crates/carrick-kernel/src/kernel/objects/process.rs",
-      "function": "capture_zombie",
-      "ordinal_in_function": 1,
-      "fingerprint": "8aea0a65ad68f742c0067dda239660e06424303b86c1f533392364be91b4c5c2",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::zombie_identity",
-      "rationale": "An exiting task's internal identity did not fit the PID namespace storage domain; continuing would create an unaddressable zombie.",
-      "sink": "fatal",
-      "domain": "kernel::zombie_identity"
-    },
-    {
-      "file": "crates/carrick-kernel/src/kernel/objects/process.rs",
-      "function": "capture_zombie",
-      "ordinal_in_function": 2,
-      "fingerprint": "708a0945c05fbfec777eb64b3244da040dffa828643009930c714fc9a4aa88ab",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::zombie_identity",
-      "rationale": "A live namespace member disappeared before its zombie captured the visible PID; continuing would make wait and signal identity disagree.",
-      "sink": "fatal",
-      "domain": "kernel::zombie_identity"
-    },
-    {
       "file": "crates/carrick-kernel/src/kernel/objects/session.rs",
       "function": "ProcessGroup::new",
       "ordinal_in_function": 1,
@@ -1904,7 +1816,7 @@
       "file": "crates/carrick-kernel/src/kernel/operations/exit.rs",
       "function": "Kernel::retire_task_exit_notifying",
       "ordinal_in_function": 3,
-      "fingerprint": "5dd0ca02c56bc48b4fa97c6b082345b37fd3b9dd6ecbdba1a0c78b2fd6a804b1",
+      "fingerprint": "c0bd6597988b6d3e13d67089e15098dc3f28ae60966be8f4612851d5bf784bcd",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::task_exit_identity",
       "rationale": "The PID namespace refused to remove a secondary TID already retired by the committed task-exit transaction; continuing would leave stale membership.",
@@ -1915,7 +1827,7 @@
       "file": "crates/carrick-kernel/src/kernel/operations/exit.rs",
       "function": "Kernel::retire_task_exit_notifying",
       "ordinal_in_function": 4,
-      "fingerprint": "5dd0ca02c56bc48b4fa97c6b082345b37fd3b9dd6ecbdba1a0c78b2fd6a804b1",
+      "fingerprint": "c0bd6597988b6d3e13d67089e15098dc3f28ae60966be8f4612851d5bf784bcd",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::task_exit_identity",
       "rationale": "A published autoreaped leader TID exceeded the namespace member domain after task-exit commit; continuing would prevent exact namespace cleanup.",
@@ -1926,7 +1838,7 @@
       "file": "crates/carrick-kernel/src/kernel/operations/exit.rs",
       "function": "Kernel::retire_task_exit_notifying",
       "ordinal_in_function": 5,
-      "fingerprint": "5dd0ca02c56bc48b4fa97c6b082345b37fd3b9dd6ecbdba1a0c78b2fd6a804b1",
+      "fingerprint": "c0bd6597988b6d3e13d67089e15098dc3f28ae60966be8f4612851d5bf784bcd",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::task_exit_identity",
       "rationale": "The PID namespace refused to remove the autoreaped leader already retired by the committed task-exit transaction; continuing would leave stale membership.",
@@ -2014,7 +1926,7 @@
       "file": "crates/carrick-kernel/src/kernel/operations/wait.rs",
       "function": "Kernel::wait_child_matching",
       "ordinal_in_function": 1,
-      "fingerprint": "7e8a2f6e163544a588cd1bcd410182d38938d0bee18eb4cecb2262b8e28e2ab9",
+      "fingerprint": "b0140bf5dc0e03c94d5f7a8f8b7e30cb44e89c0615ed038f4a4f4d8e56562537",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::child_reaping",
       "rationale": "A reaped child identity exceeded the PID namespace member domain after its zombie was consumed; continuing would be unable to retire the exact namespace slot.",
@@ -2025,7 +1937,7 @@
       "file": "crates/carrick-kernel/src/kernel/operations/wait.rs",
       "function": "Kernel::wait_child_matching",
       "ordinal_in_function": 2,
-      "fingerprint": "7e8a2f6e163544a588cd1bcd410182d38938d0bee18eb4cecb2262b8e28e2ab9",
+      "fingerprint": "b0140bf5dc0e03c94d5f7a8f8b7e30cb44e89c0615ed038f4a4f4d8e56562537",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::child_reaping",
       "rationale": "The PID namespace refused to remove the exact child just consumed by wait; continuing would permit stale PID reuse or double reaping.",
@@ -3844,7 +3756,7 @@
       "rationale": "The publication token lost its exact staged task incarnation after signal retirement; continuing could publish completion for a reused identity.",
       "failure_domain": "kernel::task_exit_publication",
       "domain": "kernel::task_exit_publication",
-      "fingerprint": "5dd0ca02c56bc48b4fa97c6b082345b37fd3b9dd6ecbdba1a0c78b2fd6a804b1",
+      "fingerprint": "c0bd6597988b6d3e13d67089e15098dc3f28ae60966be8f4612851d5bf784bcd",
       "sink": "fatal"
     },
     {
@@ -3857,6 +3769,94 @@
       "domain": "kernel::task_exit_publication",
       "fingerprint": "7ee6f9b0fd4b46702ea7f2e10d4e25f66abdd5a25e87501cd038728eb86a961a",
       "sink": "fatal"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/core.rs",
+      "function": "<HostRegistryFailure as carrick_sched_core::process::registry::RegistryFailure>::fail",
+      "ordinal_in_function": 1,
+      "fingerprint": "1f0c1f9c85c3bde507cf40ebde84e4d51385effe55af15e5097b672cc35d310e",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::process_birth",
+      "rationale": "The consumer child payload violated its exact admitted identity/session after irreversible PID and numeric-claim publication under retained exclusive registry custody; returning errno cannot restore a coherent process graph.",
+      "sink": "fatal",
+      "domain": "kernel::process_birth"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/core.rs",
+      "function": "<HostRegistryFailure as carrick_sched_core::process::registry::RegistryFailure>::fail",
+      "ordinal_in_function": 2,
+      "fingerprint": "1f0c1f9c85c3bde507cf40ebde84e4d51385effe55af15e5097b672cc35d310e",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::registry_epoch",
+      "rationale": "Kernel RegistryState epoch counter overflow would wrap epoch identity and corrupt process registry generation checks.",
+      "sink": "fatal",
+      "domain": "kernel::registry_epoch"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/core.rs",
+      "function": "<HostRegistryFailure as carrick_sched_core::process::registry::RegistryFailure>::fail",
+      "ordinal_in_function": 3,
+      "fingerprint": "1f0c1f9c85c3bde507cf40ebde84e4d51385effe55af15e5097b672cc35d310e",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::process_group_index",
+      "rationale": "Process-group publication collided in either the internal or container namespace index; continuing would make the two authoritative identity maps disagree.",
+      "sink": "fatal",
+      "domain": "kernel::process_group_index"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/core.rs",
+      "function": "<HostRegistryFailure as carrick_sched_core::process::registry::RegistryFailure>::fail",
+      "ordinal_in_function": 5,
+      "fingerprint": "1f0c1f9c85c3bde507cf40ebde84e4d51385effe55af15e5097b672cc35d310e",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::session_index",
+      "rationale": "Session publication collided in either the internal or container namespace index; continuing would make the two authoritative identity maps disagree.",
+      "sink": "fatal",
+      "domain": "kernel::session_index"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/core.rs",
+      "function": "<HostRegistryFailure as carrick_sched_core::process::registry::RegistryFailure>::fail",
+      "ordinal_in_function": 4,
+      "fingerprint": "1f0c1f9c85c3bde507cf40ebde84e4d51385effe55af15e5097b672cc35d310e",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::process_group_index",
+      "rationale": "Removing an internal process-group record did not remove the matching container namespace index edge; continuing would leave a stale group alias.",
+      "sink": "fatal",
+      "domain": "kernel::process_group_index"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/core.rs",
+      "function": "<HostRegistryFailure as carrick_sched_core::process::registry::RegistryFailure>::fail",
+      "ordinal_in_function": 6,
+      "fingerprint": "1f0c1f9c85c3bde507cf40ebde84e4d51385effe55af15e5097b672cc35d310e",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::session_index",
+      "rationale": "Removing an internal session record did not remove the matching container namespace index edge; continuing would leave a stale session alias.",
+      "sink": "fatal",
+      "domain": "kernel::session_index"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/objects/process.rs",
+      "function": "capture_zombie",
+      "ordinal_in_function": 1,
+      "fingerprint": "8aea0a65ad68f742c0067dda239660e06424303b86c1f533392364be91b4c5c2",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::zombie_identity",
+      "rationale": "An exiting task's internal identity did not fit the PID namespace storage domain; continuing would create an unaddressable zombie.",
+      "sink": "fatal",
+      "domain": "kernel::zombie_identity"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/objects/process.rs",
+      "function": "capture_zombie",
+      "ordinal_in_function": 2,
+      "fingerprint": "708a0945c05fbfec777eb64b3244da040dffa828643009930c714fc9a4aa88ab",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::zombie_identity",
+      "rationale": "A live namespace member disappeared before its zombie captured the visible PID; continuing would make wait and signal identity disagree.",
+      "sink": "fatal",
+      "domain": "kernel::zombie_identity"
     }
   ]
 }

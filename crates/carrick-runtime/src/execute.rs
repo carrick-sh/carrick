@@ -415,15 +415,16 @@ fn set_baseline_file_if_missing(
 
 #[cfg(test)]
 mod exit_code_tests {
-    use super::{
-        HostRootLayout, is_entrypoint_not_executable, is_entrypoint_not_found, prepare_host_root,
-        seed_guest_baseline,
-    };
+    #[cfg(target_os = "macos")]
+    use super::{HostRootLayout, prepare_host_root};
+    use super::{is_entrypoint_not_executable, is_entrypoint_not_found, seed_guest_baseline};
     use crate::elf::ElfInspectError;
     use crate::memory::AddressSpaceError;
     use carrick_kernel::run_result::RuntimeError;
     use carrick_spec::NetworkNamespaceSpec;
-    use carrick_vfs::fs_backend::{FsBackend, HostFsBackend, MemoryBackend};
+    #[cfg(target_os = "macos")]
+    use carrick_vfs::fs_backend::HostFsBackend;
+    use carrick_vfs::fs_backend::{FsBackend, MemoryBackend};
     use std::io::{Error as IoError, ErrorKind};
 
     fn rt_io(kind: ErrorKind) -> RuntimeError {

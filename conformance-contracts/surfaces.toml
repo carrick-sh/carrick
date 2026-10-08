@@ -392,7 +392,7 @@ contracts = ["kernel.mm.syscall-code-write", "kernel.mm.backing-maintenance-look
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/fs/rw.rs"
-contracts = ["kernel.mm.syscall-code-write"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.fs.lseek-sparse"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/fs/tests.rs"
@@ -735,6 +735,42 @@ contracts = ["x86.mm.initial-image"]
 [[surfaces]]
 path = "crates/carrick-runtime/src/test_hooks.rs"
 contracts = ["kernel.vcpu.vm-lifetime"]
+
+[[surfaces]]
+path = "crates/carrick-timer-core/src/gate.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-timer-core/src/itimer.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-timer-core/src/lib.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-hal/src/guest_timer_bridge.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-hal/src/posix_timer.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-hal/src/timer_delivery.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/itimer.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/timer_delivery.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/vcpu_kick.rs"
+contracts = ["kernel.timer.delivery-gate"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/personality/native_ownership_tests.rs"

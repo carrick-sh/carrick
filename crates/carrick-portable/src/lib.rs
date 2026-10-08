@@ -114,6 +114,129 @@ pub unsafe fn ptsname_r(
     }
 }
 
+/// Which sparse-file boundary [`lseek_sparse`] searches for: the next data
+/// byte (`SEEK_DATA`) or the next hole (`SEEK_HOLE`) at or after an offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SparseSeek {
+    Data,
+    Hole,
+}
+
+/// Host `lseek` with `SEEK_DATA`/`SEEK_HOLE`: returns the new offset (and
+/// moves the file position there), or `-1` with the host `errno` set.
+///
+/// macOS, FreeBSD and Linux implement both whences natively, so this is the
+/// host `lseek`. NetBSD's lseek(2) accepts only `SEEK_SET`/`SEEK_CUR`/
+/// `SEEK_END` (and the libc crate has no `SEEK_DATA`/`SEEK_HOLE` there), so
+/// NetBSD uses [`lseek_sparse_whole_file`].
+#[inline]
+pub fn lseek_sparse(fd: libc::c_int, offset: libc::off_t, kind: SparseSeek) -> libc::off_t {
+    #[cfg(not(target_os = "netbsd"))]
+    {
+        let whence = match kind {
+            SparseSeek::Data => libc::SEEK_DATA,
+            SparseSeek::Hole => libc::SEEK_HOLE,
+        };
+        // SAFETY: lseek takes no pointers; a bad fd fails with EBADF.
+        unsafe { libc::lseek(fd, offset, whence) }
+    }
+    #[cfg(target_os = "netbsd")]
+    {
+        lseek_sparse_whole_file(fd, offset, kind)
+    }
+}
+
+/// The `SEEK_DATA`/`SEEK_HOLE` answer for a file with no holes, the answer
+/// lseek(2) defines for a filesystem without hole support: the whole file is
+/// one data extent, so `SEEK_DATA` returns `offset`, `SEEK_HOLE` returns
+/// `size`, and an `offset` that is negative or at/after end of file has no
+/// answer (`None`, which callers report as `ENXIO`).
+#[inline]
+pub fn sparse_seek_whole_file(
+    offset: libc::off_t,
+    size: libc::off_t,
+    kind: SparseSeek,
+) -> Option<libc::off_t> {
+    if offset < 0 || offset >= size {
+        return None;
+    }
+    Some(match kind {
+        SparseSeek::Data => offset,
+        SparseSeek::Hole => size,
+    })
+}
+
+/// [`lseek_sparse`] for a host without native `SEEK_DATA`/`SEEK_HOLE`:
+/// answers with [`sparse_seek_whole_file`] against the descriptor's current
+/// size and moves the file position to the result like the native call.
+/// Returns `-1` with `errno` set (`ENXIO` when there is no answer). Built on
+/// every host so its semantics are tested everywhere; only NetBSD routes
+/// guest seeks through it.
+pub fn lseek_sparse_whole_file(
+    fd: libc::c_int,
+    offset: libc::off_t,
+    kind: SparseSeek,
+) -> libc::off_t {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `st` is a valid, writable `stat` for the call.
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return -1;
+    }
+    let Some(next) = sparse_seek_whole_file(offset, st.st_size, kind) else {
+        set_errno(libc::ENXIO);
+        return -1;
+    };
+    // SAFETY: lseek takes no pointers; a bad fd fails with EBADF.
+    unsafe { libc::lseek(fd, next, libc::SEEK_SET) }
+}
+
+#[cfg(test)]
+mod lseek_sparse_whole_file_tests {
+    use super::{SparseSeek, errno, lseek_sparse_whole_file, sparse_seek_whole_file};
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn whole_file_answers_follow_lseek_without_hole_support() {
+        assert_eq!(sparse_seek_whole_file(0, 100, SparseSeek::Data), Some(0));
+        assert_eq!(sparse_seek_whole_file(42, 100, SparseSeek::Data), Some(42));
+        assert_eq!(sparse_seek_whole_file(99, 100, SparseSeek::Data), Some(99));
+        assert_eq!(sparse_seek_whole_file(0, 100, SparseSeek::Hole), Some(100));
+        assert_eq!(sparse_seek_whole_file(99, 100, SparseSeek::Hole), Some(100));
+        for kind in [SparseSeek::Data, SparseSeek::Hole] {
+            assert_eq!(sparse_seek_whole_file(100, 100, kind), None, "at EOF");
+            assert_eq!(sparse_seek_whole_file(101, 100, kind), None, "past EOF");
+            assert_eq!(sparse_seek_whole_file(-1, 100, kind), None, "negative");
+            assert_eq!(sparse_seek_whole_file(0, 0, kind), None, "empty file");
+        }
+    }
+
+    #[test]
+    fn whole_file_seek_moves_the_position_and_reports_enxio() {
+        let mut file = tempfile::tempfile().expect("tempfile");
+        file.write_all(&[7u8; 100]).expect("write");
+        let fd = file.as_raw_fd();
+        let position = || unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+
+        assert_eq!(lseek_sparse_whole_file(fd, 10, SparseSeek::Data), 10);
+        assert_eq!(position(), 10);
+        assert_eq!(lseek_sparse_whole_file(fd, 10, SparseSeek::Hole), 100);
+        assert_eq!(position(), 100);
+
+        unsafe { libc::lseek(fd, 5, libc::SEEK_SET) };
+        for (offset, kind) in [
+            (100, SparseSeek::Data),
+            (100, SparseSeek::Hole),
+            (-1, SparseSeek::Data),
+            (-1, SparseSeek::Hole),
+        ] {
+            assert_eq!(lseek_sparse_whole_file(fd, offset, kind), -1);
+            assert_eq!(errno(), libc::ENXIO, "offset {offset} {kind:?}");
+            assert_eq!(position(), 5, "a failed seek leaves the position");
+        }
+    }
+}
+
 /// Whether this host exposes real OFD (open file description) lock fcntl
 /// commands with Linux-compatible ownership semantics.
 #[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
@@ -1415,21 +1538,25 @@ siginfo_accessor!(si_status -> libc::c_int);
 
 /// kqueue flag/filter/fflag constants. BSD-only; on Linux these are typed
 /// placeholders (see the module doc) carrying the canonical BSD numeric value.
-/// On macOS and FreeBSD the real `libc` constant is re-exported; on Linux a
-/// typed placeholder carrying the canonical 4.4BSD numeric value is used.
+/// On the kqueue hosts (macOS, FreeBSD, NetBSD) the real `libc` constant is
+/// re-exported, so its type and value match that host's `struct kevent`:
+/// NetBSD's `flags`/`filter` are `u32` and its `EVFILT_READ` is 0, not the
+/// 4.4BSD -1. On Linux a typed placeholder carrying the canonical 4.4BSD
+/// numeric value is used.
 macro_rules! port_kqueue {
     ($ty:ty: $($name:ident = $val:expr),+ $(,)?) => {
         $(
-            #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+            #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
             pub use libc::$name;
-            #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+            #[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
             pub const $name: $ty = $val;
         )+
     };
 }
 
-// kevent.flags (EV_*) are u16, kevent.filter (EVFILT_*) i16, kevent.fflags
-// (NOTE_*) u32. Linux placeholder values are the canonical 4.4BSD numbers.
+// Linux placeholder types follow macOS/FreeBSD: kevent.flags (EV_*) u16,
+// kevent.filter (EVFILT_*) i16, kevent.fflags (NOTE_*) u32; values are the
+// canonical 4.4BSD numbers.
 port_kqueue!(u16:
     EV_ADD = 0x0001,
     EV_DELETE = 0x0002,

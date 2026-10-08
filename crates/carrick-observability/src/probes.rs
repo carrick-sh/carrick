@@ -9408,6 +9408,10 @@ mod stub {
     stub!(resident_fault_protection_error(page: u64, prot: u64, error: &dyn std::fmt::Display));
     stub!(vcpu_fault_regs(esr: u64, elr: u64, far: u64, insn: u64, rn: u32, xrn: u64));
     stub!(vcpu_fault_gprs(x0: u64, x1: u64, x2: u64, x3: u64, x4: u64, x5: u64));
+    #[inline(always)]
+    pub fn vcpu_fault_regs_with(_args: impl FnOnce() -> (u64, u64, u64, u64, u32, u64)) {}
+    #[inline(always)]
+    pub fn vcpu_fault_gprs_with(_args: impl FnOnce() -> (u64, u64, u64, u64, u64, u64)) {}
     stub!(pt_alias_walk(va: u64, descs: [u64; 4], flag: i32));
     stub!(pt_alias_receipt(va: u64, leaf: u64, expected_ipa: u64, expected_ap: u64, phase: u32));
     stub!(hv_vm_map_alias(va: u64, ipa: u64, size: u64, rc: i32, forked: i32));
