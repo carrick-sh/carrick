@@ -43,14 +43,10 @@ impl GuestProcessTarget {
     }
 }
 
+/// Bootstrap the sole initial task in either an ordinary adapter container
+/// or the exact already prepared launch container. Host identity observation
+/// remains at this one existing root-bootstrap boundary.
 pub(crate) fn try_bootstrap_one_task_binding(
-    host_signal: Arc<dyn carrick_hal::HostSignalBridge>,
-) -> Result<(crate::kernel::KernelTaskBinding, crate::kernel::MmId), crate::run_result::RuntimeError>
-{
-    try_bootstrap_launch_binding(host_signal, None)
-}
-
-pub(super) fn try_bootstrap_launch_binding(
     host_signal: Arc<dyn carrick_hal::HostSignalBridge>,
     container: Option<Arc<crate::kernel::Container>>,
 ) -> Result<(crate::kernel::KernelTaskBinding, crate::kernel::MmId), crate::run_result::RuntimeError>
@@ -93,7 +89,7 @@ pub(super) fn try_bootstrap_launch_binding(
 pub(crate) fn bootstrap_one_task_binding(
     host_signal: Arc<dyn carrick_hal::HostSignalBridge>,
 ) -> (crate::kernel::KernelTaskBinding, crate::kernel::MmId) {
-    try_bootstrap_one_task_binding(host_signal).expect("mandatory one-task kernel adapter")
+    try_bootstrap_one_task_binding(host_signal, None).expect("mandatory one-task kernel adapter")
 }
 
 impl SyscallDispatcher {
@@ -1174,8 +1170,10 @@ mod tests {
 
     #[test]
     fn try_bootstrap_one_task_binding_succeeds() {
-        let res =
-            try_bootstrap_one_task_binding(Arc::new(carrick_hal::NullHostSignalBridge::default()));
+        let res = try_bootstrap_one_task_binding(
+            Arc::new(carrick_hal::NullHostSignalBridge::default()),
+            None,
+        );
         assert!(res.is_ok());
     }
 }
