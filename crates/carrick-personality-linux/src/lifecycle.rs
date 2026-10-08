@@ -4,7 +4,13 @@ use crate::abi::thread::*;
 pub use carrick_syscall_abi::LinuxWaitOptions;
 
 /// Linux `pid_t` selector carried by wait4 (including negative selectors).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct ProcessWaitPid(i32);
 impl ProcessWaitPid {
     pub const fn from_syscall_argument(raw: u64) -> Self {
@@ -14,7 +20,13 @@ impl ProcessWaitPid {
         self.0
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum LifecycleCall {
     Exit,
     SigAltStack,

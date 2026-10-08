@@ -154,7 +154,13 @@ pub struct BackingHandle {
 }
 /// Exact carrier VM incarnation. Local MM, frame and slot numbers may repeat
 /// in another VM; exported physical capabilities always retain this domain.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct CarrierVmId(NonZeroU64);
 impl carrick_kernel::kernel::boot_launch::BootVmIdentity for CarrierVmId {}
 impl CarrierVmId {
@@ -218,7 +224,7 @@ impl InheritedFrameEdge {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 struct Alias {
     slot: u32,
     span: PageSpan,

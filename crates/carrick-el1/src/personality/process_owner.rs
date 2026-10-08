@@ -13,9 +13,20 @@ use alloc::vec::Vec;
 use carrick_sched_core::process::birth::{
     AdmittedProcessBirth, BirthAttachment, BirthError, BirthLive, BirthSnapshot,
 };
-use carrick_sched_core::process::exit::*;
-use carrick_sched_core::process::registry::*;
-use carrick_sched_core::process::wait::*;
+use carrick_sched_core::process::exit::{
+    ExitEffectSource, ExitError, ExitLive, ExitLivePublication, ExitMember, ExitNotificationSource,
+    ExitParentPermit, ExitParentTarget, ExitRetiring, ExitSignalSource, ExitZombie,
+    ExitZombiePublication, PendingExitEffects, PreparedExitParticipant, PreparedExitTopology,
+    ReadyExitEffects, ReleasedTaskSet, ReservedTaskSet, TaskGraphReservation, TaskRevision,
+    TaskSetError,
+};
+use carrick_sched_core::process::registry::{
+    ProcessGroupRecord, ProcessRegistry, RegistryFailure, RegistryInvariant, SessionRecord,
+};
+use carrick_sched_core::process::wait::{
+    ConsumedWait, TaskWakeGeneration, WaitError, WaitIdentity, WaitIdentitySource, WaitJobControl,
+    WaitLive, WaitQuery, WaitReadiness, WaitSelection, WaitZombie,
+};
 use carrick_sched_core::process::{
     ChildExitSignal, LinuxWaitStatus, ProcessRelations, SessionId, TaskId, TaskIdentity, TaskKey,
     TaskLifecycle, TaskRusage, Zombie,
@@ -287,7 +298,7 @@ impl<N: NativeProcessCustody> ExitRetiring for GuestRetiring<N> {
     }
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub enum GuestProcessError<E> {
     InitialAlreadySeeded,
     InitialHasParent,
@@ -299,7 +310,13 @@ pub enum GuestProcessError<E> {
     Exit(ExitError<E>),
     Reservation(TaskSetError),
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum GuestProcessInvariant {
     Registry(RegistryInvariant),
     ExitCustodyLost(TaskKey),

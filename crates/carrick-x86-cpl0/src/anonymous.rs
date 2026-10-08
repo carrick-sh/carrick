@@ -40,7 +40,7 @@ pub(super) fn live_words(mm: carrick_el1_abi::ReservationMm) -> Option<InitialWo
     let end = TABLE_END.load(Ordering::Acquire);
     let start = TABLE_START.load(Ordering::Relaxed);
     let working = working_tables()?;
-    (start != 0 && end > start).then(|| InitialWords::live(start, end, context, working))
+    (start != 0 && end > start).then(|| crate::kernel::InitialWords::live(start, end, context, working))
 }
 
 pub(super) fn admit_tables(start: u64, end: u64, context: carrick_guest_arch::AddressContext<RootGpa>, working: carrick_el1_abi::X86PrepareTableSpan) {

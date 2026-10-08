@@ -201,7 +201,13 @@ pub enum InitialSyscallDisposition {
 }
 
 /// Physical services carry no guest Linux policy or host dispatch authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum PhysicalCrossingFamily {
     OwnerGrant,
     RootExit,
@@ -215,7 +221,7 @@ impl PhysicalCrossingFamily {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub struct InitialReservationLimits {
     pub address: carrick_abi::LinuxRlimit,
     pub data: carrick_abi::LinuxRlimit,
@@ -228,7 +234,13 @@ impl InitialReservationLimits {
     };
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct GuestExitStatus(u8);
 impl GuestExitStatus {
     pub const fn from_linux_code(code: i32) -> Self {
@@ -889,7 +901,7 @@ pub struct EntryState {
 #[path = "cpl0_anonymous.rs"]
 mod anonymous_owner;
 
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 struct ForwardExecution {
     cpu: carrick_guest_arch::CpuId,
     binding: carrick_el1_abi::ExecutionBinding,
@@ -1001,7 +1013,13 @@ mod forward_execution_tests {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 enum InitialPeerAdmission {
     Cold,
     Ready,
@@ -4631,7 +4649,7 @@ mod initial_reply_tests {
     }
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct LifecycleObservation {
     pub births: u64,
     pub retirements: u64,
@@ -5058,7 +5076,7 @@ impl Cpl0Carrier {
 }
 
 /// A guest exception is an owned process outcome, separate from carrier failure.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub enum InitialProcessExit {
     Exited {
         code: i32,
