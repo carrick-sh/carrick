@@ -24,7 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("carrick-vmm-kvm is not two levels below the workspace root")?
         .to_path_buf();
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let inputs = cpl0_inputs::derive(&workspace, &cargo)?;
+    let inputs = cpl0_inputs::derive(&workspace)?;
     for input in inputs.watch_list(&workspace) {
         println!("cargo:rerun-if-changed={}", input.display());
     }
