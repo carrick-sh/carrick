@@ -24,7 +24,7 @@ impl NodeFlagsPolicy for ReservationNodeFlags {
     }
 }
 /// Linux-owned state projected through the neutral root's opaque wire payload.
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 #[repr(C)]
 pub struct LinuxReservationState {
     pub brk: u64,
@@ -63,7 +63,7 @@ impl From<LinuxReservationState> for ReservationPolicyPayload {
     }
 }
 /// Linux admission record. This is an input projection, never a second store.
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 #[repr(C)]
 pub struct LinuxReservationLayout {
     pub heap: ReservationRange,

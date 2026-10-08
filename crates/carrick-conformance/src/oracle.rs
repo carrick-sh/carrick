@@ -18,7 +18,6 @@
 
 use crate::manifest::{Suite, VerdictKind};
 use crate::parsers::{Outcome, SuiteOutcome, SuiteResult};
-use serde::{Deserialize as _, Serialize as _};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 

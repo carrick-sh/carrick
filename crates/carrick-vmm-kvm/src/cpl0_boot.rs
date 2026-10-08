@@ -83,7 +83,13 @@ fn fail(message: impl Into<String>) -> TrapError {
     TrapError::Hypervisor(message.into())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 enum FixtureCpuidError {
     MissingLeafZero,
     FullTable,
@@ -190,7 +196,7 @@ enum WatchdogControl {
     Cancel,
 }
 
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 enum FixtureStopCondition {
     UserByte(u64, u8),
     PendingKick(usize),
@@ -432,7 +438,7 @@ pub struct Observation {
 
 /// Stopped-vCPU structural observation, including refusal paths that cannot
 /// return through the guest observation syscall. No semantic host service.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct EntryState {
     pub bindings: [carrick_el1_abi::ExecutionBinding; 2],
     pub heads: [(u64, u32); 2],
@@ -2885,7 +2891,7 @@ mod watchdog_tests {
     }
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct LifecycleObservation {
     pub births: u64,
     pub retirements: u64,

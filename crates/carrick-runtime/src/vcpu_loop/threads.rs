@@ -467,7 +467,7 @@ impl Drop for PersistentProcessMemberPublication {
     }
 }
 
-#[derive(Default)]
+#[derive(::core::default::Default)]
 struct ChildTidDrainCustody {
     pending: Vec<PendingChildTidClear>,
     births: std::collections::BTreeSet<carrick_kernel::kernel::ThreadKey>,
@@ -559,7 +559,7 @@ impl From<VcpuThreadRegistry> for Arc<parking_lot::Mutex<Vec<VcpuThreadHandle>>>
 mod clone_tid_output_tests {
     use super::*;
 
-    #[derive(Default)]
+    #[derive(::core::default::Default)]
     struct Memory {
         bytes: std::collections::BTreeMap<u64, Vec<u8>>,
         fail_write: Option<u64>,
@@ -1394,7 +1394,7 @@ mod child_tid_owner_tests {
         drop(enrollment);
     }
 
-    #[derive(Debug, Default)]
+    #[derive(::core::fmt::Debug, ::core::default::Default)]
     struct ClearDependency(std::sync::atomic::AtomicBool);
     impl carrick_guest_mem::PhysicalMemoryWait for ClearDependency {
         fn is_ready(&self) -> bool {

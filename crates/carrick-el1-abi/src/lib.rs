@@ -1886,7 +1886,13 @@ impl IpcLeave {
 /// (an MM with an admitted reservation root) for the host, counted beside
 /// `forwarded[nr]` so a signed run names each remaining forward cause.
 /// Append only: the embed witnesses read the ordinals.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(usize)]
 pub enum AnonymousLeave {
     /// Host work was pending at entry (a kick, a signal, an owed wake).

@@ -12,7 +12,13 @@ pub const MM_PORTAL_BIND_ESR: u64 = 0x4352_4d4d_4249_0004;
 /// holder of its unpublished address-space publication. It authorizes the
 /// BIND service to authenticate a root before its installation gate opens;
 /// the service rechecks that it is still never-opened and exact.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct PortalClosedRootBind {
     carrier: NonZeroU64,
     mm: ReservationMm,
@@ -42,7 +48,13 @@ impl PortalClosedRootBind {
 /// A proposal for one page of pending heap retirement, never user-copy authority.
 /// The owner must authenticate the complete request and admitted incarnation
 /// again before selecting any physical backing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct PortalBackingMaintenance {
     handle: El1MmHandle,
     pending: crate::ReservationRequest,

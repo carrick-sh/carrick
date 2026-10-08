@@ -11,7 +11,10 @@ use carrick_personality_linux::sched::{FutexCall, FutexFrequency, FutexVenue, Fu
 use core::sync::atomic::Ordering;
 
 pub fn is_served_futex_op(frame: &TrapFrame) -> bool {
-    carrick_personality_linux::sched::is_served_futex_op(frame.x[8], args(frame))
+    ::carrick_personality_linux::sched::is_served_futex_op(
+        frame.x[8],
+        crate::personality::sched::args(frame),
+    )
 }
 fn args(frame: &TrapFrame) -> [u64; 6] {
     [
@@ -68,8 +71,10 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         if !is_served_futex_op(frame) {
             return None;
         }
-        let call = FutexCall { args: args(frame) };
-        carrick_personality_linux::sched::serve_futex(call, &mut Adapter { sched: self, frame })
+        let call = FutexCall {
+            args: crate::personality::sched::args(frame),
+        };
+        ::carrick_personality_linux::sched::serve_futex(call, &mut Adapter { sched: self, frame })
     }
     pub fn serve_irq(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action {
         self.interrupt(frame, ETIMEDOUT_RESULT)

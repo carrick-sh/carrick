@@ -7,7 +7,14 @@ use carrick_guest_arch::{
     RootGpa, UserRange, UserVa,
 };
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct X86Mmu;
 impl OwnerForkMmu for X86Mmu {
     const ADDRESS_MASK: u64 = ADDRESS;

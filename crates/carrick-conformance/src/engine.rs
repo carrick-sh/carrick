@@ -38,7 +38,15 @@ pub struct RunOutput {
 }
 
 /// Which budget produced the deadline a run was actually held to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DeadlineOrigin {
     /// The suite's own declared `timeout_s` — the only budget the suite itself
@@ -54,7 +62,15 @@ pub enum DeadlineOrigin {
 }
 
 /// The deadline a run was held to, alongside the declaration it came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct CarrickDeadline {
     pub declared_s: u64,
     pub effective_s: u64,
@@ -89,7 +105,7 @@ impl CarrickDeadline {
 pub const PROGRESS_WINDOW_MS: u64 = 2_000;
 
 /// What the box looked like when a suite hit its deadline.
-#[derive(Debug, Clone, Copy)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy)]
 pub struct TimeoutEvidence {
     /// CPU (user+sys) the carrick process had consumed, sampled just BEFORE the
     /// kill. Low CPU against a long wall time means it was not spinning.
@@ -113,7 +129,15 @@ pub struct TimeoutEvidence {
 /// them alike: a healthy `kill10` "timed out" at ~suite 1000 of a full-tier run
 /// purely because leaked guests had degraded the box, and no amount of staring
 /// at kill10 would ever have explained it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TimeoutKind {
     /// Burned CPU the whole time: a real spin/livelock in carrick or the guest.
@@ -246,7 +270,7 @@ impl RunOutput {
     /// (lossy UTF-8 — guest output may contain non-UTF-8 bytes).
     pub fn raw(&self) -> crate::parsers::Raw {
         let read = |p: &Path| {
-            std::fs::read(p)
+            ::std::fs::read(p)
                 .map(|b| String::from_utf8_lossy(&b).into_owned())
                 .unwrap_or_default()
         };
@@ -485,11 +509,9 @@ pub fn run_native(
                 scratch.path().join("init.stat"),
             )),
         )?;
+        let init_ready = ::std::fs::read(scratch.path().join("init-ready"));
         anyhow::ensure!(
-            std::fs::read(scratch.path().join("init-ready"))
-                .ok()
-                .as_deref()
-                == Some(b"ready\n"),
+            init_ready.ok().as_deref() == Some(b"ready\n"),
             "native image init did not enter its chroot; /bin/sh and its loader are required"
         );
         Ok(output)
@@ -508,14 +530,14 @@ pub fn run_native(
     result
 }
 
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 enum Engine {
     Carrick,
     Docker,
     Native,
 }
 
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 enum ExecutionCleanup {
     Hvf,
     KvmLima(crate::lane::LimaConfig),

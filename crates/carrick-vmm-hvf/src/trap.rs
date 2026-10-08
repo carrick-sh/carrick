@@ -460,7 +460,13 @@ use carrick_hal::trap::{HostAliasBacking, HostAliasSharing};
 pub use carrick_hal::trap::{RawSyscall, SyscallTrap, TrapError};
 
 /// An exit as the run loop classifies it before deciding how to answer it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(crate) enum RunExitKind {
     /// `hv_vcpus_exit`: a kick or a cancel, landing at any instruction.
     Canceled,
@@ -476,7 +482,13 @@ pub(crate) enum RunExitKind {
 /// How the run loop answers an exit taken at EL1 inside the EL1 image,
 /// where an EL1 critical section may hold a lock (a reservation root, a
 /// zone bucket, a delegated object) that a host thread is waiting on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(crate) enum El1ImageExit {
     /// Not at EL1 inside the image: the ordinary decode applies.
     NotInImage,
@@ -2243,7 +2255,13 @@ pub(crate) fn hvpatch_task_state_test_fixture(
 
 #[cfg(test)]
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct HvpatchTaskStateTestIdentity {
     mm_root_slot: Option<(u64, u64)>,
     first_mapping: u64,

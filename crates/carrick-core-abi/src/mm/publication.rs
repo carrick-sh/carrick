@@ -26,9 +26,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub const PUBLICATION_GRANULE: u64 = 4096;
 
 macro_rules! nonzero_id {
-    ($($(#[$doc:meta])* $name:ident),+ $(,)?) => {$(
-        $(#[$doc])*
-        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    ($($(#[doc = $doc:expr])* $name:ident),+ $(,)?) => {$(
+        $(#[doc = $doc])*
+        #[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, ::core::cmp::Eq, ::core::hash::Hash, ::core::cmp::Ord, ::core::cmp::PartialEq, ::core::cmp::PartialOrd)]
         pub struct $name(NonZeroU64);
         impl $name {
             pub const fn new(raw: NonZeroU64) -> Self {
@@ -74,7 +74,16 @@ impl PublicationCounter {
 
 /// A stage-1 output address: the IPA a guest descriptor names. Never a
 /// global-frame IPA, host VA or user VA.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::hash::Hash,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialEq,
+    ::core::cmp::PartialOrd,
+)]
 pub struct Stage1Ipa(u64);
 impl Stage1Ipa {
     pub const fn new(raw: u64) -> Self {
@@ -86,7 +95,16 @@ impl Stage1Ipa {
 }
 
 /// Exact (mm, incarnation) key: every per-MM authority keys on both.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::hash::Hash,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialEq,
+    ::core::cmp::PartialOrd,
+)]
 pub struct MmIncarnationKey {
     pub mm: PublicationMm,
     pub incarnation: MmIncarnation,
@@ -94,14 +112,32 @@ pub struct MmIncarnationKey {
 
 /// How the publisher reaches the output extent: as its owner, or through
 /// one exact host-minted share edge.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::hash::Hash,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialEq,
+    ::core::cmp::PartialOrd,
+)]
 pub enum ExtentAccess {
     Owner,
     Edge(EdgeGeneration),
 }
 
 /// Number of interior table pages the edit linked from its grant list.
-#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialEq,
+    ::core::cmp::PartialOrd,
+)]
 pub struct TableGrantCount(pub u8);
 
 pub const fn leaf_bytes(leaf: EditLeafSize) -> u64 {
@@ -152,7 +188,13 @@ const fn permissions_from_wire(raw: u8) -> Option<EditPermissions> {
 }
 
 /// The descriptor operation class, mirroring `EditOperation` without ISA bits.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u8)]
 pub enum PublicationKind {
     Prepare = 1,
@@ -193,7 +235,13 @@ impl PublicationKind {
 }
 
 /// Settled guest outcome. There is intentionally no indeterminate variant.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u8)]
 pub enum PublicationOutcome {
     /// Every store landed and the claimed drain completed.
@@ -216,7 +264,13 @@ impl PublicationOutcome {
 
 /// The translation drain the guest claims it completed. The claim is
 /// ISA-specific; the consumer decides how much of it to trust.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u8)]
 pub enum PublicationDrain {
     /// Only the publishing CPU was drained.
@@ -265,7 +319,13 @@ const fn isa_from_wire(raw: u8) -> Option<GuestIsa> {
 /// typed [`PublicationView`] and consumers decode back to one, so no bare
 /// `u64` crosses the boundary in either direction.
 #[repr(C, align(8))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct MmPublication {
     revision: u8,
     kind: u8,
@@ -323,7 +383,13 @@ const _: () = {
 };
 
 /// Identity of the publishing edit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct PublicationIdentity {
     pub mm: PublicationMm,
     pub incarnation: MmIncarnation,
@@ -333,7 +399,13 @@ pub struct PublicationIdentity {
 }
 
 /// A new output named under a host admission ticket.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct PublishedOutput {
     pub address: Stage1Ipa,
     pub leaf: EditLeafSize,
@@ -344,7 +416,13 @@ pub struct PublishedOutput {
 }
 
 /// One exact prior alias the edit removed or replaced.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct PublishedPrior {
     pub address: Stage1Ipa,
     pub leaf: EditLeafSize,
@@ -352,7 +430,13 @@ pub struct PublishedPrior {
 }
 
 /// Typed content of one publication. Construct with [`PublicationView::checked`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct PublicationView {
     kind: PublicationKind,
     outcome: PublicationOutcome,
@@ -368,7 +452,13 @@ pub struct PublicationView {
 
 /// Why a record or view was rejected. Every variant is a quarantine cause at
 /// the consumer; none is a retry signal.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum PublicationDecodeError {
     Revision,
     Kind,
@@ -391,7 +481,13 @@ const fn aligned(raw: u64, bytes: u64) -> bool {
 }
 
 /// Shape of one publication, before validation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct PublicationShape {
     pub kind: PublicationKind,
     pub outcome: PublicationOutcome,
@@ -749,16 +845,34 @@ unsafe impl<const N: usize> Sync for PublicationRing<N> {}
 
 /// The ring could not accept a record; the producer must request a drain
 /// before continuing. The caller still holds the record; nothing was dropped.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct RingFull;
 
 /// The indices describe more than `N` records: the ring is corrupt and its
 /// producer must be quarantined.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct RingCorrupt;
 
 /// Occupancy after a successful push.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum RingPressure {
     Below,
     /// Occupancy reached the watermark: request a host drain now.

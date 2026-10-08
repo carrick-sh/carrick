@@ -5,7 +5,14 @@ use carrick_guest_arch::{AddressContext, RootGpa};
 /// The zero-valid x86 save area in a shared scheduler record.
 /// Its frame words are the fifteen PUSH registers followed by IRET's five.
 #[repr(C, align(64))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, zerocopy::FromZeros)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+    ::zerocopy::FromZeros,
+)]
 pub struct ParkedContextWords {
     pub frame: [u64; 20],
     root: u64,

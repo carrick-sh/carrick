@@ -844,7 +844,7 @@ pub struct ResidentFaultPlan<'permit> {
 }
 
 /// Why a verified publication cannot settle against this MM's current facts.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub enum PublishedFrameGrantRefusal {
     ReceiptShape,
     Identity,

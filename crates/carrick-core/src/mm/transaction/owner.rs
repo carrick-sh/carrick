@@ -88,7 +88,13 @@ impl<Venue: OwnerVenue> PreparedDelivery<'_, Venue> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum TransferStep {
     Selected(SelectedChunk),
     Supply(carrick_core_abi::PortalGrantWindow),

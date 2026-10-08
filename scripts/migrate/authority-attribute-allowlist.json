@@ -157,5 +157,9 @@
   {
     "name": "zerocopy::Unaligned",
     "reason": "Locked zerocopy Unaligned derive emits trait/data-layout glue, not synthesized Carrick authority acquisitions or std::process abort/exit. Input items remain scanned. Helper attributes are separately restricted/audited; arbitrary derive macros are rejected. Provider: zerocopy-derive 0.8.48 src/lib.rs and src/derive/."
+  },
+  {
+    "name": "zerocopy::FromZeros",
+    "reason": "Locked zerocopy-derive 0.8.48 emits the FromZeros marker trait implementation and layout/field validity assertions; it does not acquire Carrick authority or access environment/termination. Fields remain parsed census inputs. Provider src/derive/from_bytes.rs and src/lib.rs."
   }
 ]

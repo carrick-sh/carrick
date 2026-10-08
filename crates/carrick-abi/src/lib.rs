@@ -101,10 +101,17 @@
 
 pub use carrick_syscall_abi::*;
 
+use ::zerocopy::{Immutable, IntoBytes};
 use bitflags::bitflags;
-use zerocopy::{Immutable, IntoBytes};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::serde::Serialize,
+)]
 pub enum LinuxGuestAbi {
     Aarch64,
     X86_64,
@@ -210,7 +217,7 @@ pub const LINUX_PAGE_SIZE: u64 = 4096;
 
 bitflags! {
     /// AArch64 Linux `AT_HWCAP` feature bits published to the guest.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxAarch64Hwcap: u64 {
         const FP = 1 << 0;
         const ASIMD = 1 << 1;
@@ -254,7 +261,7 @@ bitflags! {
     /// HWCAP2, so pairing Docker's feature string with its raw
     /// `getauxval(AT_HWCAP2)` word (0x326181 on the native arm64 oracle)
     /// names each set bit exactly.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxAarch64Hwcap2: u64 {
         const DCPODP = 1 << 0;
         const FLAGM2 = 1 << 7;
@@ -365,7 +372,15 @@ pub const LINUX_SIGSYS: i32 = 31; // macOS 12
 /// instead of a bare `u64` so "which signals" values can't be silently mixed
 /// with counts, masks-of-other-things, or the wrong polarity (see
 /// [`SigBlockMask`]).
-#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::default::Default,
+    ::serde::Serialize,
+    ::serde::Deserialize,
+)]
 pub struct SigSet(u64);
 
 impl SigSet {
@@ -466,7 +481,15 @@ impl core::fmt::Debug for SigSet {
 /// `from_raw`: a block mask can only be built by the named semantic
 /// constructors, so every construction site states what may and may not wake
 /// the park.
-#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::default::Default,
+    ::serde::Serialize,
+    ::serde::Deserialize,
+)]
 pub struct SigBlockMask(u64);
 
 impl SigBlockMask {
@@ -528,7 +551,15 @@ impl core::fmt::Debug for SigBlockMask {
 /// temp mask unblocks must interrupt even if persistently blocked); `Additive`
 /// is a plain blocking syscall (the thread's persistent mask gates the wait;
 /// the carried set is ADDITIONALLY blocked, usually empty).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::fmt::Debug,
+    ::serde::Serialize,
+    ::serde::Deserialize,
+)]
 pub enum WaitSigMask {
     Additive(SigSet),
     Replace(SigSet),
@@ -609,11 +640,11 @@ pub const LINUX_DIRENT64_HEADER_SIZE: usize = core::mem::size_of::<LinuxDirent64
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -652,11 +683,11 @@ pub struct LinuxStat {
 /// this record writer instead of the canonical `newfstatat(2)` writer.
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -686,11 +717,11 @@ pub struct LinuxX8664Stat {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -714,11 +745,11 @@ pub struct LinuxStatfs {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -743,11 +774,11 @@ impl LinuxStatxTimestamp {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -790,11 +821,11 @@ pub struct LinuxStatx {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -850,11 +881,11 @@ pub const LINUX_CS8: u32 = 0o000060;
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -909,11 +940,11 @@ impl LinuxTermios {
 /// Linux `struct termio` (TCGETA/TCSETA) wire format (18 bytes).
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -932,11 +963,11 @@ pub struct LinuxTermio {
 /// Linux x86 FXSAVE 32-byte header wire layout.
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -957,11 +988,11 @@ pub struct LinuxFxsaveHeader {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -974,11 +1005,11 @@ pub struct LinuxEventfdValue {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -999,11 +1030,11 @@ pub struct LinuxEpollEvent {
 /// internal canonical representation for dispatcher state.
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1017,11 +1048,11 @@ pub struct LinuxX8664EpollEvent {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1036,11 +1067,11 @@ pub struct LinuxPollFd {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1061,11 +1092,11 @@ pub struct LinuxMsghdr {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1080,11 +1111,11 @@ pub struct LinuxMmsghdr {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1098,11 +1129,11 @@ pub struct LinuxCapabilityHeader {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1131,11 +1162,11 @@ impl LinuxCapabilityData {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1162,11 +1193,11 @@ pub struct LinuxFdPair {
 /// a `u32` would invite exactly that mistake.
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1189,11 +1220,11 @@ pub struct LinuxIpMreqSource {
 /// `struct nlmsghdr` — header on every netlink message.
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1211,11 +1242,11 @@ pub struct LinuxNlMsgHdr {
 /// `struct ifinfomsg` — payload of an RTM_NEWLINK message.
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1234,11 +1265,11 @@ pub struct LinuxIfInfoMsg {
 /// `struct ifaddrmsg` — payload of an RTM_NEWADDR message.
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1256,11 +1287,11 @@ pub struct LinuxIfAddrMsg {
 /// `struct rtmsg` — payload of an RTM_NEWROUTE message (a routing-table entry).
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1282,11 +1313,11 @@ pub struct LinuxRtMsg {
 /// `struct ndmsg` — payload of an RTM_NEWNEIGH message (a neighbour entry).
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1306,11 +1337,11 @@ pub struct LinuxNdMsg {
 /// `struct rtattr` — TLV attribute header used inside rtnetlink payloads.
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1384,11 +1415,11 @@ pub const LINUX_IFA_INFINITY_LIFE_TIME: u32 = u32::MAX;
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1404,11 +1435,11 @@ pub struct LinuxDirent64Header {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1436,11 +1467,11 @@ impl LinuxAuxvEntry {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1460,11 +1491,11 @@ impl LinuxIovec {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1479,11 +1510,11 @@ pub struct LinuxOpenHow {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1506,11 +1537,11 @@ pub struct LinuxCloneArgs {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1530,11 +1561,11 @@ impl LinuxTimespec {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1557,11 +1588,11 @@ impl LinuxItimerspec {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1578,11 +1609,11 @@ pub struct LinuxTimerfdExpirations {
 /// fields and zeroes the reserved tail.
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1612,11 +1643,11 @@ pub struct LinuxMqAttr {
 /// offsets: value@0, signo@8, notify@12.
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1642,11 +1673,11 @@ pub const LINUX_SIGEV_THREAD: i32 = 2;
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1713,11 +1744,11 @@ pub const LINUX_ADJ_OFFSET_SINGLESHOT_FLAG_ONLY: u32 = 0x8000;
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1788,11 +1819,11 @@ impl LinuxTimex {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1822,11 +1853,11 @@ impl LinuxItimerval {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1873,11 +1904,11 @@ pub const CARRICK_KERNEL_VERSION: &str = "#1 SMP PREEMPT_DYNAMIC";
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1955,11 +1986,11 @@ impl LinuxUtsname {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1979,11 +2010,11 @@ impl LinuxRlimit {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -2010,11 +2041,11 @@ impl LinuxTms {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -2065,11 +2096,11 @@ impl LinuxRusage {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -2101,11 +2132,11 @@ pub struct LinuxSysinfo {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -2155,11 +2186,11 @@ pub const LINUX_POLL_MSG: i32 = 3;
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -2277,11 +2308,11 @@ impl LinuxSiginfo {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -2308,11 +2339,11 @@ impl LinuxSignalStack {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -2345,11 +2376,11 @@ impl LinuxSignalContext {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -2394,11 +2425,11 @@ pub const LINUX_FPSIMD_MAGIC: u32 = 0x4650_8001;
 /// fpcr 4, vregs 512 = 528 bytes; `vregs` at offset 16).
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -2438,11 +2469,11 @@ pub const CARRICK_SIGFRAME_MAGIC: u64 = 0x4361_7272_6963_6b53; // 'CarrickS'
 /// are consumed only by Carrick's own `rt_sigreturn` handler.
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -2523,11 +2554,11 @@ pub const LINUX_X8664_USER_DS: u16 = 0x1b;
 /// clean-room signal-frame probes; component offsets come from CPUID leaf 0xD.
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -2559,11 +2590,11 @@ impl X8664FpxSwBytes {
 /// the Linux software descriptor occupying its final 48 bytes.
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -2608,11 +2639,11 @@ impl X8664Fpstate {
 /// Linux signal frame: `xcomp_bv` must be zero and all reserved words zero.
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -2646,11 +2677,11 @@ pub const CARRICK_X8664_XSTATE_TRAILER_VERSION: u16 = 3;
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -2691,11 +2722,11 @@ impl CarrickX8664XstateTrailer {
 /// (which alias the packed `REG_CSGSFS` u64: cs | gs<<16 | fs<<32 | ss<<48).
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -2775,11 +2806,11 @@ impl X8664Sigcontext {
 /// fields in the kernel-provided stack image.
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -2814,11 +2845,11 @@ impl X8664Ucontext {
 /// frame extent.
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -2915,11 +2946,11 @@ mod x8664_sigframe_tests {
 
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -2956,12 +2987,12 @@ impl LinuxSigaltstack {
 /// Linux 64-bit `struct flock` / `struct flock64` used by `fcntl` locking (`F_GETLK`, `F_SETLK`, `F_SETLKW`, `F_OFD_*`).
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Default,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::default::Default,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -2981,12 +3012,12 @@ pub struct LinuxFlock64 {
 /// Linux `struct f_owner_ex` used by `fcntl(F_GETOWN_EX, F_SETOWN_EX)`.
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Default,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::default::Default,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -3001,11 +3032,11 @@ pub struct LinuxFOwnerEx {
 /// Linux `struct ifreq` used by network ioctl requests (`SIOCGIFNAME`, `SIOCGIFINDEX`, `SIOCGIFFLAGS`, etc.).
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -3020,12 +3051,12 @@ pub struct LinuxIfreq {
 /// Linux `struct ifconf` used by `SIOCGIFCONF`.
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Default,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::default::Default,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -3042,12 +3073,12 @@ pub struct LinuxIfconf {
 /// `/proc/<pid>/maps` descriptor.
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Default,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::default::Default,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -3077,12 +3108,12 @@ pub struct LinuxProcmapQuery {
 /// and current headers use all 88 bytes.
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Default,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::default::Default,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -3114,12 +3145,12 @@ pub struct LinuxPidfdInfo {
 /// Linux sigset argument pack passed to `pselect6`, `ppoll`, and `epoll_pwait`.
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Default,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::default::Default,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -3134,12 +3165,12 @@ pub struct LinuxSigsetArgpack {
 /// Linux `struct inotify_event` fixed header (16 bytes).
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Default,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::default::Default,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -3156,12 +3187,12 @@ pub struct LinuxInotifyEventHeader {
 /// Linux `struct iocb` for legacy async I/O (`io_submit`).
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Default,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::default::Default,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -3186,12 +3217,12 @@ pub struct LinuxIocb {
 /// Linux `struct io_event` for legacy async I/O (`io_getevents`).
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Default,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::default::Default,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -3498,17 +3529,17 @@ assert_layout!(LinuxIoEvent, size = 32, data @ 0, obj @ 8, result @ 16, result2 
 /// A host-level User ID (e.g. Darwin / host Linux UID returned by `geteuid(2)`).
 #[repr(transparent)]
 #[derive(
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Debug,
-    Default,
-    serde::Serialize,
-    serde::Deserialize,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialOrd,
+    ::core::cmp::Ord,
+    ::core::hash::Hash,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::serde::Serialize,
+    ::serde::Deserialize,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -3558,17 +3589,17 @@ impl From<HostUid> for u32 {
 /// A guest namespace / Linux User ID (the UID inside a Linux user/pid namespace).
 #[repr(transparent)]
 #[derive(
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Debug,
-    Default,
-    serde::Serialize,
-    serde::Deserialize,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialOrd,
+    ::core::cmp::Ord,
+    ::core::hash::Hash,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::serde::Serialize,
+    ::serde::Deserialize,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -3618,17 +3649,17 @@ impl From<NsUid> for u32 {
 /// A host-level Group ID.
 #[repr(transparent)]
 #[derive(
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Debug,
-    Default,
-    serde::Serialize,
-    serde::Deserialize,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialOrd,
+    ::core::cmp::Ord,
+    ::core::hash::Hash,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::serde::Serialize,
+    ::serde::Deserialize,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -3678,17 +3709,17 @@ impl From<HostGid> for u32 {
 /// A guest namespace / Linux Group ID (the GID inside a Linux user namespace).
 #[repr(transparent)]
 #[derive(
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Debug,
-    Default,
-    serde::Serialize,
-    serde::Deserialize,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialOrd,
+    ::core::cmp::Ord,
+    ::core::hash::Hash,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::serde::Serialize,
+    ::serde::Deserialize,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -3743,7 +3774,14 @@ impl From<NsGid> for u32 {
 /// Serializes transparently as the positive errno number (a serde newtype
 /// struct is its inner value on the wire), so reporter/JSON output is
 /// unchanged by the typing.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::fmt::Debug,
+    ::serde::Serialize,
+)]
 pub struct LinuxErrno(i32);
 
 impl LinuxErrno {
@@ -4108,7 +4146,13 @@ pub const LINUX_MOUNT_ATTR_SIZE_VER0: u64 = 32;
 /// hand-numbered match arms). `from_raw` is total over the kernel's known
 /// range; an unknown raw command is the caller's EOPNOTSUPP case (oracle:
 /// `fsconfig(fd, 100, …)` is EOPNOTSUPP even on a non-fscontext or closed fd).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 #[repr(u32)]
 pub enum FsconfigCmd {
     SetFlag = 0,
@@ -4306,7 +4350,15 @@ pub const LINUX_MADV_WIPEONFORK: u64 = 18;
 pub const LINUX_MADV_KEEPONFORK: u64 = 19;
 
 /// Fork copy policy axis for a semantic VMA.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::hash::Hash,
+)]
 pub enum VmaForkCopyPolicy {
     #[default]
     Inherit,
@@ -4314,7 +4366,15 @@ pub enum VmaForkCopyPolicy {
 }
 
 /// Fork child-contents policy axis for a semantic VMA.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::hash::Hash,
+)]
 pub enum VmaForkChildPolicy {
     #[default]
     Preserve,
@@ -4327,7 +4387,15 @@ pub enum VmaForkChildPolicy {
 /// Linux keeps a `DONTDUMP` VMA in the core's program headers but writes no
 /// contents for it (`p_filesz == 0`), which is the same shape carrick already
 /// produces for executable file-backed mappings.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::hash::Hash,
+)]
 pub enum VmaDumpPolicy {
     #[default]
     Include,
@@ -4338,7 +4406,15 @@ pub enum VmaDumpPolicy {
 /// `copy` and `child_contents` are independent axes: DONTFORK and WIPEONFORK
 /// may coexist; DOFORK clears only `copy = Omit`; KEEPONFORK clears only
 /// `child_contents = ZeroInChild`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::hash::Hash,
+)]
 pub struct VmaForkPolicy {
     pub copy: VmaForkCopyPolicy,
     pub child_contents: VmaForkChildPolicy,
@@ -4396,7 +4472,16 @@ pub const LINUX_RLIM_INFINITY: u64 = u64::MAX;
 ///
 /// [`Self::from_guest_arg`] is the ONLY constructor from a guest value, so an
 /// out-of-range resource cannot become an index; it becomes `EINVAL`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialOrd,
+    ::core::cmp::Ord,
+    ::core::hash::Hash,
+)]
 #[repr(u8)]
 pub enum LinuxResource {
     Cpu = 0,
@@ -5172,7 +5257,7 @@ pub const LINUX_PERF_IOC_FLAG_GROUP: u64 = 1;
 
 bitflags! {
     /// `perf_event_open(2)` `flags` argument bits. Unknown bits are EINVAL.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct PerfEventOpenFlags: u64 {
         const FD_NO_GROUP = 1 << 0;
         const FD_OUTPUT = 1 << 1;
@@ -5181,7 +5266,7 @@ bitflags! {
     }
 
     /// `perf_event_attr.read_format` bits. Unknown bits are EINVAL.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct PerfEventReadFormat: u64 {
         const TOTAL_TIME_ENABLED = 1 << 0;
         const TOTAL_TIME_RUNNING = 1 << 1;
@@ -5193,7 +5278,7 @@ bitflags! {
     /// The `perf_event_attr` packed flag word (the bitfield starting at
     /// `disabled`), bit numbers in the man page's field order. Bits above
     /// `SIGTRAP` are reserved (`__reserved_1`) and are EINVAL when set.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct PerfEventAttrFlags: u64 {
         const DISABLED = 1 << 0;
         const INHERIT = 1 << 1;
@@ -5238,7 +5323,7 @@ bitflags! {
 }
 
 bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxOpenFlags: u64 {
         const CREAT = LINUX_O_CREAT;
         const EXCL = LINUX_O_EXCL;
@@ -5259,7 +5344,7 @@ bitflags! {
         const TMPFILE = 0o020000000;
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxAtFlags: u64 {
         const SYMLINK_NOFOLLOW = LINUX_AT_SYMLINK_NOFOLLOW;
         const EACCESS = LINUX_AT_EACCESS;
@@ -5270,7 +5355,7 @@ bitflags! {
         const STATX_DONT_SYNC = LINUX_AT_STATX_DONT_SYNC;
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxMmapFlags: u64 {
         const SHARED = LINUX_MAP_SHARED;
         const PRIVATE = LINUX_MAP_PRIVATE;
@@ -5291,7 +5376,7 @@ bitflags! {
 
     /// `mlock2(2)` flag bits. The full supported set is just MLOCK_ONFAULT, so
     /// `from_bits(...)` returning `None` is the Linux unknown-flag EINVAL path.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxMlock2Flags: u64 {
         const ONFAULT = 0x01;
     }
@@ -5299,7 +5384,7 @@ bitflags! {
     /// `mremap(2)` flag bits. The wire word stays raw at the syscall seam;
     /// `from_bits_retain` keeps unknown bits so the dispatcher's EINVAL
     /// validation still sees them.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxMremapFlags: u64 {
         const MAYMOVE = LINUX_MREMAP_MAYMOVE;
         const FIXED = LINUX_MREMAP_FIXED;
@@ -5308,20 +5393,20 @@ bitflags! {
 
     /// `mlockall(2)` flag bits. `MCL_ONFAULT` has a semantic precondition
     /// checked by the dispatcher: it must be paired with CURRENT and/or FUTURE.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxMlockallFlags: u64 {
         const CURRENT = LINUX_MCL_CURRENT;
         const FUTURE = LINUX_MCL_FUTURE;
         const ONFAULT = LINUX_MCL_ONFAULT;
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxFutexFlags: u64 {
         const PRIVATE = LINUX_FUTEX_PRIVATE_FLAG;
         const CLOCK_REALTIME = LINUX_FUTEX_CLOCK_REALTIME;
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxCloneFlags: u64 {
         const VM = LINUX_CLONE_VM;
         const FS = LINUX_CLONE_FS;
@@ -5358,13 +5443,13 @@ bitflags! {
         const NEWTIME = LINUX_CLONE_NEWTIME;
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxSocketTypeFlags: i32 {
         const NONBLOCK = LINUX_SOCK_NONBLOCK;
         const CLOEXEC = LINUX_SOCK_CLOEXEC;
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxFdFlags: u64 {
         const CLOEXEC = LINUX_FD_CLOEXEC;
     }
@@ -5373,7 +5458,7 @@ bitflags! {
     /// syscall boundary with `from_bits`; dispatch state stores this typed mask
     /// so directory-change notifications cannot drift back into untyped `u64`
     /// comparisons.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxDnotifyMask: u64 {
         const ACCESS = LINUX_DN_ACCESS;
         const MODIFY = LINUX_DN_MODIFY;
@@ -5387,7 +5472,7 @@ bitflags! {
     /// `mmap`/`mprotect` memory-protection bits. Previously tested as raw
     /// `prot & LINUX_PROT_* != 0`; the typed form makes the supported-bit check
     /// and the PROT_NONE predicate self-describing and drift-resistant.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxProtFlags: u64 {
         const READ = LINUX_PROT_READ;
         const WRITE = LINUX_PROT_WRITE;
@@ -5398,7 +5483,7 @@ bitflags! {
     /// `u32` in [`LinuxEpollEvent`]; convert with `from_bits_retain` at the
     /// read/write seam — Linux epoll ACCEPTS unknown event bits (they are
     /// simply never reported), so no site may reject on unknown bits.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxEpollEvents: u32 {
         const IN = LINUX_EPOLLIN;
         const PRI = LINUX_EPOLLPRI;
@@ -5415,7 +5500,7 @@ bitflags! {
     /// `adjtimex(2)` / `clock_adjtime(2)` mode bits. The wire field remains a
     /// raw `u32` in [`LinuxTimex`], while dispatch converts at the syscall
     /// boundary and carries this typed domain for every mask operation.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxTimexModes: u32 {
         const OFFSET = LINUX_ADJ_OFFSET;
         const FREQUENCY = LINUX_ADJ_FREQUENCY;
@@ -5445,7 +5530,7 @@ bitflags! {
     }
 
     /// `timex.status` state bits consumed by Carrick's clock-discipline seam.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxTimexStatus: i32 {
         const PLL = LINUX_STA_PLL;
         const PPSFREQ = LINUX_STA_PPSFREQ;
@@ -5469,7 +5554,7 @@ bitflags! {
     /// `splice`/`vmsplice`/`tee` flag bits. The full set IS the supported set
     /// (`LINUX_SPLICE_SUPPORTED_FLAGS`), so `from_bits(...)` returning `None`
     /// is exactly the historical `flags & !SUPPORTED != 0` EINVAL rejection.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxSpliceFlags: u64 {
         const MOVE = LINUX_SPLICE_F_MOVE;
         const NONBLOCK = LINUX_SPLICE_F_NONBLOCK;
@@ -5480,7 +5565,7 @@ bitflags! {
     /// `eventfd2` flag bits. The full set is the supported set, so
     /// `from_bits(...)` `None` is the historical unknown-bit EINVAL. NONBLOCK/
     /// CLOEXEC share the `O_*` values (Linux defines `EFD_*` from them).
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxEfdFlags: u64 {
         const SEMAPHORE = LINUX_EFD_SEMAPHORE;
         const NONBLOCK = LINUX_EFD_NONBLOCK;
@@ -5490,7 +5575,7 @@ bitflags! {
     /// `send*`/`recv*` `msg_flags` bits. Linux mostly IGNORES unknown flag
     /// bits on these syscalls, so sites convert with `from_bits_retain` and
     /// test with `.contains()` — never reject on unknown bits here.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxMsgFlags: i32 {
         const OOB = LINUX_MSG_OOB;
         const PEEK = LINUX_MSG_PEEK;
@@ -5506,7 +5591,7 @@ bitflags! {
         const CMSG_CLOEXEC = LINUX_MSG_CMSG_CLOEXEC;
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxSaFlags: u64 {
         const NOCLDSTOP = LINUX_SA_NOCLDSTOP;
         const NOCLDWAIT = LINUX_SA_NOCLDWAIT;
@@ -5518,13 +5603,13 @@ bitflags! {
         const RESTORER = LINUX_SA_RESTORER;
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxXattrFlags: i32 {
         const CREATE = LINUX_XATTR_CREATE;
         const REPLACE = LINUX_XATTR_REPLACE;
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxIoUringEnterFlags: u32 {
         const GETEVENTS = LINUX_IORING_ENTER_GETEVENTS;
         const SQ_WAKEUP = LINUX_IORING_ENTER_SQ_WAKEUP;
@@ -5534,7 +5619,7 @@ bitflags! {
     }
 
     /// `inotify_add_watch` and `struct inotify_event.mask` event bits.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxInotifyFlags: u32 {
         const ACCESS = LINUX_IN_ACCESS;
         const MODIFY = LINUX_IN_MODIFY;
@@ -5571,7 +5656,7 @@ bitflags! {
     /// never appear in a delivered mask. Use [`Self::DELIVERABLE`] to separate
     /// them — masking with the raw mark mask would leak a modifier into the
     /// wire event and break `event->mask == FAN_OPEN` equality checks.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxFanotifyEvents: u64 {
         const ACCESS = LINUX_FAN_ACCESS;
         const MODIFY = LINUX_FAN_MODIFY;
@@ -5599,7 +5684,7 @@ bitflags! {
     }
 
     /// `fanotify_init(2)` flags word.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxFanotifyInitFlags: u64 {
         const CLOEXEC = LINUX_FAN_CLOEXEC;
         const NONBLOCK = LINUX_FAN_NONBLOCK;
@@ -5618,7 +5703,7 @@ bitflags! {
     }
 
     /// `fanotify_mark(2)` flags word.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxFanotifyMarkFlags: u64 {
         const ADD = LINUX_FAN_MARK_ADD;
         const REMOVE = LINUX_FAN_MARK_REMOVE;
@@ -5634,7 +5719,7 @@ bitflags! {
     }
 
     /// `fallocate(2)` allocation mode flags.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxFallocateFlags: u64 {
         const KEEP_SIZE = LINUX_FALLOC_FL_KEEP_SIZE;
         const PUNCH_HOLE = LINUX_FALLOC_FL_PUNCH_HOLE;
@@ -5645,7 +5730,7 @@ bitflags! {
     }
 
     /// `preadv2`/`pwritev2` per-call RWF_* flags.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxRwfFlags: u64 {
         const HIPRI = LINUX_RWF_HIPRI;
         const DSYNC = LINUX_RWF_DSYNC;
@@ -5655,7 +5740,7 @@ bitflags! {
     }
 
     /// `memfd_create(2)` flag bits.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxMemfdFlags: u64 {
         const CLOEXEC = LINUX_MFD_CLOEXEC;
         const ALLOW_SEALING = LINUX_MFD_ALLOW_SEALING;
@@ -5665,7 +5750,7 @@ bitflags! {
     }
 
     /// File seals for `memfd_create`/`fcntl(F_ADD_SEALS/F_GET_SEALS)`.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxMemfdSeals: u32 {
         const SEAL = LINUX_F_SEAL_SEAL;
         const SHRINK = LINUX_F_SEAL_SHRINK;
@@ -5676,7 +5761,7 @@ bitflags! {
     }
 
     /// `flock(2)` file lock operations.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxFlockFlags: u64 {
         const SH = LINUX_LOCK_SH;
         const EX = LINUX_LOCK_EX;
@@ -5685,7 +5770,7 @@ bitflags! {
     }
 
     /// `renameat2(2)` flags.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxRenameat2Flags: u64 {
         const NOREPLACE = LINUX_RENAME_NOREPLACE;
         const EXCHANGE = LINUX_RENAME_EXCHANGE;
@@ -5693,7 +5778,7 @@ bitflags! {
     }
 
     /// `access(2)` / `faccessat(2)` check mode bits.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxAccessMode: u64 {
         const F_OK = LINUX_F_OK;
         const R_OK = LINUX_R_OK;
@@ -5702,7 +5787,7 @@ bitflags! {
     }
 
     /// `pipe2(2)` creation flags.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxPipe2Flags: u64 {
         const CLOEXEC = LINUX_O_CLOEXEC;
         const NONBLOCK = LINUX_O_NONBLOCK;
@@ -5710,7 +5795,7 @@ bitflags! {
     }
 
     /// `poll(2)` events / revents interest/readiness mask.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxPollEvents: i16 {
         const IN = LINUX_POLLIN;
         const OUT = LINUX_POLLOUT;
@@ -5722,7 +5807,7 @@ bitflags! {
     }
 
     /// `timerfd_create` and `timerfd_settime` flags.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxTfdFlags: u64 {
         const NONBLOCK = LINUX_TFD_NONBLOCK;
         const CLOEXEC = LINUX_TFD_CLOEXEC;
@@ -5731,14 +5816,14 @@ bitflags! {
     }
 
     /// `signalfd4(2)` creation flags.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxSignalfdFlags: u64 {
         const NONBLOCK = LINUX_O_NONBLOCK;
         const CLOEXEC = LINUX_O_CLOEXEC;
     }
 
     /// `sigaltstack(2)` flags.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxSigaltstackFlags: u64 {
         const ONSTACK = LINUX_SS_ONSTACK;
         const DISABLE = LINUX_SS_DISABLE;
@@ -5746,7 +5831,7 @@ bitflags! {
     }
 
     /// `statx(2)` request mask.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxStatxMask: u32 {
         const TYPE = LINUX_STATX_TYPE;
         const MODE = LINUX_STATX_MODE;
@@ -5767,7 +5852,7 @@ bitflags! {
     }
 
     /// `ptrace(PTRACE_SETOPTIONS)` option bits.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxPtraceOptions: u64 {
         const TRACESYSGOOD = LINUX_PTRACE_O_TRACESYSGOOD;
         const TRACEFORK = LINUX_PTRACE_O_TRACEFORK;
@@ -5782,7 +5867,7 @@ bitflags! {
     }
 
     /// `close_range(2)` flags.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxCloseRangeFlags: u32 {
         const UNSHARE = LINUX_CLOSE_RANGE_UNSHARE;
         const CLOEXEC = LINUX_CLOSE_RANGE_CLOEXEC;
@@ -5910,7 +5995,13 @@ impl LinuxEpollEvents {
 /// FAN_MARK_INODE` test is always false. Decode through
 /// [`LinuxFanotifyMarkFlags::mark_type`], which also rejects the illegal
 /// both-bits-set encoding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum LinuxFanotifyMarkType {
     /// Mark this one inode (the default).
     Inode,
@@ -5923,7 +6014,13 @@ pub enum LinuxFanotifyMarkType {
 /// Which notification class a `fanotify_init(2)` group belongs to. Also a
 /// FIELD, not a bit (`FAN_CLASS_NOTIF` is 0); decode through
 /// [`LinuxFanotifyInitFlags::class`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum LinuxFanotifyClass {
     /// Pure notification — the only class carrick implements.
     Notif,
@@ -6183,11 +6280,11 @@ pub const LINUX_IPV6_RECVERR: i32 = 25;
 /// IMMEDIATELY after this struct (`SO_EE_OFFENDER`).
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -6310,11 +6407,11 @@ pub const LINUX_TP_STATUS_BLK_TMO: u32 = 1 << 5;
 /// `struct sockaddr_ll` (`linux/if_packet.h`).
 #[repr(C)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -6333,11 +6430,11 @@ pub struct LinuxSockaddrLl {
 /// `struct tpacket_req` (`linux/if_packet.h`) for TPACKET_V1 and TPACKET_V2.
 #[repr(C)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -6353,11 +6450,11 @@ pub struct LinuxTpacketReq {
 /// `struct tpacket_req3` (`linux/if_packet.h`) for TPACKET_V3.
 #[repr(C)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -6376,11 +6473,11 @@ pub struct LinuxTpacketReq3 {
 /// `struct tpacket_bd_ts` (`linux/if_packet.h`).
 #[repr(C)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -6394,11 +6491,11 @@ pub struct LinuxTpacketBdTs {
 /// `struct tpacket_hdr_v1` (`linux/if_packet.h`).
 #[repr(C)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -6417,11 +6514,11 @@ pub struct LinuxTpacketHdrV1 {
 /// `struct tpacket_block_desc` (`linux/if_packet.h`) for TPACKET_V3.
 #[repr(C)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -6436,11 +6533,11 @@ pub struct LinuxTpacketBlockDesc {
 /// `struct tpacket_hdr_variant1` (`linux/if_packet.h`).
 #[repr(C)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -6456,11 +6553,11 @@ pub struct LinuxTpacketHdrVariant1 {
 /// `struct tpacket3_hdr` (`linux/if_packet.h`) for TPACKET_V3 packet header.
 #[repr(C)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -6482,11 +6579,11 @@ pub struct LinuxTpacket3Hdr {
 /// `struct tpacket2_hdr` (`linux/if_packet.h`) for TPACKET_V2 packet header.
 #[repr(C)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -6516,11 +6613,11 @@ pub struct LinuxTpacket2Hdr {
 /// opcodes touch (`off`/`addr`/`len`/`op_flags` cover the rw + fsync ops).
 #[repr(C)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -6545,11 +6642,11 @@ pub struct LinuxIoUringSqe {
 /// `struct io_uring_cqe` — a 16-byte completion-queue entry.
 #[repr(C)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -6565,12 +6662,12 @@ pub struct LinuxIoUringCqe {
 /// SQ region, reported back to the guest by `io_uring_setup`.
 #[repr(C)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    Default,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::default::Default,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -6591,12 +6688,12 @@ pub struct LinuxIoSqringOffsets {
 /// `struct io_cqring_offsets`.
 #[repr(C)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    Default,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::default::Default,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -6617,12 +6714,12 @@ pub struct LinuxIoCqringOffsets {
 /// `struct io_uring_params` — in/out argument of `io_uring_setup`.
 #[repr(C)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    Default,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::default::Default,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
