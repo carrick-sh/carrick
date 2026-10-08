@@ -732,7 +732,6 @@ pub enum Action {
     ::core::cmp::PartialEq,
     ::core::cmp::Eq,
     ::core::default::Default,
-    ::zerocopy::FromZeros,
 )]
 pub struct TrapFrame {
     /// General-purpose registers x0 through x30.
@@ -747,50 +746,6 @@ pub struct TrapFrame {
     pub slot: u64,
     /// Fault Address Register (FAR_EL1) for data/instruction aborts.
     pub far: u64,
-}
-impl TrapFrame {
-    pub fn authenticates(
-        &self,
-        expected: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
-    ) -> bool {
-        expected.root.address().raw() != 0
-    }
-
-    pub fn fork_child(
-        mut self,
-        _address: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
-    ) -> Self {
-        self.x[0] = 0;
-        self
-    }
-
-    pub fn set_syscall_return(&mut self, value: u64) {
-        self.x[0] = value;
-    }
-
-    pub fn syscall_return(&self) -> u64 {
-        self.x[0]
-    }
-}
-impl carrick_guest_arch::ProcessContext for TrapFrame {
-    fn authenticates(
-        &self,
-        expected: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
-    ) -> bool {
-        TrapFrame::authenticates(self, expected)
-    }
-    fn fork_child(
-        self,
-        address: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
-    ) -> Self {
-        TrapFrame::fork_child(self, address)
-    }
-    fn set_syscall_return(&mut self, value: u64) {
-        TrapFrame::set_syscall_return(self, value);
-    }
-    fn syscall_return(&self) -> u64 {
-        TrapFrame::syscall_return(self)
-    }
 }
 impl carrick_guest_arch::SyscallFrame for TrapFrame {
     fn canonical_ordinal(&self) -> carrick_guest_arch::CanonicalNr {

@@ -41,7 +41,6 @@ dependencies = [
  "carrick-personality-linux",
  "carrick-pipe-core",
  "carrick-sched-core",
- "zerocopy",
 ]
 
 [[package]]
