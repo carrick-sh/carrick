@@ -5494,8 +5494,9 @@ mod real {
         /// N1 reservation custody: phase 0 publish, 1 root retire, 2 prepared
         /// reap, 3 retirement begin, 4 graph-exit commit, 5 prepare copy.
         /// Args: phase, MM, incarnation, detail A,
-        /// detail B. Reap details are primary and tail node IDs; retirement
-        /// begin details are task PID and exact TaskSerial.
+        /// detail B. Reap details are primary and tail node IDs; prepare
+        /// details are primary ID and generation. Retirement begin details
+        /// are task PID and exact TaskSerial.
         fn hvpatch__n1__reservation__custody(_: u32, _: u64, _: u64, _: u64, _: u64) {}
         /// Raw stage-2 exec transition. Args: phase (0=unmap begin, 1=unmap
         /// end, 2=map begin, 3=map end), IPA, size, guest VA (`UINT64_MAX`

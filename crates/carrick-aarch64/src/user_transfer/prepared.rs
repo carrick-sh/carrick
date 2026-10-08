@@ -106,6 +106,13 @@ impl<'a, S: PreparedService, P: TransferPin> PreparedWrite<'a, S, P> {
                 )
             });
             if let Some(permit) = ticket.take_prepared() {
+                carrick_observability::probes::hvpatch_n1_reservation_custody(
+                    5,
+                    request.operation.mm.raw(),
+                    request.operation.incarnation.get(),
+                    u64::from(permit.index),
+                    permit.generation.get(),
+                );
                 prepared.pages[index].permit = Some(permit);
                 continue;
             }
