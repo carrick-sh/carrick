@@ -338,6 +338,6 @@ pub extern "C" fn carrick_x86_peer_boot() -> ! {
     if !zone.enter_idle(slot, true) { fatal_boot(); }
     // SAFETY: slot publication and its shared sleep guard precede this
     // physical readiness notification; the host admits CPU0 only afterwards.
-    unsafe { core::arch::asm!("out dx, al", in("dx") carrick_el1_abi::X86_NATIVE_PEER_READY_PORT, in("rax") u64::from(binding.cpu_slot), options(nostack, preserves_flags)); }
+    unsafe { core::arch::asm!("out dx, al", in("dx") carrick_el1_abi::NATIVE_PEER_READY_PORT, in("rax") u64::from(binding.cpu_slot), options(nostack, preserves_flags)); }
     super::native_execution::schedule(slot)
 }

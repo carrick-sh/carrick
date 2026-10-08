@@ -47,7 +47,12 @@ pub use carrick_observability::probes;
 pub mod darwin_kqueue;
 pub mod fork_coord;
 pub mod fork_quiesce;
+pub mod fork_stock;
 pub mod frame_pool;
+pub use fork_stock::{
+    ForkStockHostCustody, ForkStockServiceError, GrantExecution, PendingForkLoan,
+    take_fork_table_stock,
+};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod gic;
 pub mod host_signal;

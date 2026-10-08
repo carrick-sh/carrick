@@ -8415,7 +8415,16 @@ impl HvfInner {
                 return Ok(Aarch64Exit::Kicked);
             }
             if carrick_hal::is_aarch64_hvc_metadata_grant(exception.syndrome) {
-                crate::metadata_grant::handle_metadata_grant_trap(vcpu, custody, vm_generation)?;
+                let cpu = mailbox
+                    .leased_slot()
+                    .map(|slot| carrick_guest_arch::CpuId::new(u32::from(slot.raw())))
+                    .unwrap_or(carrick_guest_arch::CpuId::new(u32::MAX));
+                crate::metadata_grant::handle_metadata_grant_trap(
+                    vcpu,
+                    cpu,
+                    custody,
+                    vm_generation,
+                )?;
                 continue;
             }
             // Maintenance completion is a control exit, not a syscall. It
