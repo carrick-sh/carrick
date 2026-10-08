@@ -3966,10 +3966,11 @@ fn mem_authority_snapshot_honors_deadline_contention() {
     let held = std::sync::Arc::clone(&dispatcher);
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     let worker_barrier = std::sync::Arc::clone(&barrier);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
         held.with_vma_dispatch_for_test(|_dispatch| {
             worker_barrier.wait();
-            std::thread::sleep(std::time::Duration::from_millis(40));
+            let _ = release_rx.recv();
         });
     });
     barrier.wait();
@@ -3978,6 +3979,7 @@ fn mem_authority_snapshot_honors_deadline_contention() {
         source.snapshot(std::time::Instant::now() + std::time::Duration::from_millis(5)),
         Err(crate::kernel::SnapshotError::TimedOut)
     );
+    let _ = release_tx.send(());
     worker.join().expect("authority lock worker");
 }
 
