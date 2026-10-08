@@ -22,7 +22,7 @@ SPEC.loader.exec_module(GATE)
 
 Finding = GATE.Finding
 LedgerError = GATE.LedgerError
-from scripts.tests.authority_census_support import scan_source as census_scan, source_verdict
+from scripts.tests.authority_census_support import scan_source as census_scan, source_verdict, census_tree
 
 def scan_source(path, source):
     return census_scan(GATE.scan_source, path, source)
@@ -36,16 +36,15 @@ def validate_concurrent_source(path, source):
 
 class RuntimeGlobalStateTests(unittest.TestCase):
     def test_moved_neutral_counters_remain_in_the_default_census(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            expected = set()
-            for crate in ("carrick-core", "carrick-core-abi"):
-                relative = Path("crates") / crate / "src/lib.rs"
-                source = root / relative
-                source.parent.mkdir(parents=True)
-                source.write_text("static COUNTER: AtomicU64 = AtomicU64::new(1);\n")
-                expected.add(relative.as_posix())
-            self.assertEqual({row.file for row in GATE.discover(root)}, expected)
+        sources = {
+            f"crates/{crate}/src/lib.rs": "static COUNTER: AtomicU64 = AtomicU64::new(1);\n"
+            for crate in ("carrick-core", "carrick-core-abi")
+        }
+        with census_tree(sources) as (root, verdict):
+            self.assertEqual(
+                {row.file for row in GATE.discover(root, verdict=verdict)},
+                set(sources),
+            )
 
 
     def test_discovers_multiline_static_and_env_sources(self):
