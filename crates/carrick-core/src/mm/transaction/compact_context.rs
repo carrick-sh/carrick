@@ -225,3 +225,195 @@ fn compact_parked_context_owner_clones_two_roots_and_selects_exact_cow_supply() 
         assert_eq!(window.range, ReservationRange::new(VA, VA + 4096).unwrap());
     }
 }
+
+#[test]
+fn compact_native_portal_prepares_and_publishes_initial_private_ranges() {
+    type Portal<'a> = MmPortal<
+        'a,
+        NoPin,
+        LinuxReservationPolicy,
+        X86Cpl0ReservationGeometry,
+        CompactVenue,
+        X86Mmu,
+        ParkedContextWords,
+    >;
+    const _: () = {
+        assert!(core::mem::align_of::<X86Cpl0Reservations>() <= 64);
+        assert!(core::mem::align_of::<ZoneTables<ParkedContextWords>>() <= 64);
+    };
+    let region = Region::new();
+    // SAFETY: the retained aligned fixture region owns both zero-valid ABI
+    // records at their real CPL0 offsets until every borrowed guard drops.
+    let (roots, zone) = unsafe {
+        (
+            &*region
+                .ptr
+                .as_ptr()
+                .add(carrick_el1_abi::X86_CPL0_RESERVATIONS_OFFSET as usize)
+                .cast::<X86Cpl0Reservations>(),
+            &*region
+                .ptr
+                .as_ptr()
+                .add(carrick_el1_abi::X86_CPL0_ZONE_OFFSET as usize)
+                .cast::<ZoneTables<ParkedContextWords>>(),
+        )
+    };
+    let mms = [
+        ReservationMm::new(11).unwrap(),
+        ReservationMm::new(12).unwrap(),
+    ];
+    let indices = mms.map(|mm| {
+        zone.spaces
+            .publish_closed(mm.raw(), if mm.raw() == 11 { 0x6000 } else { 0x200000 }, 0)
+            .unwrap()
+    });
+    let layout = LinuxReservationLayout {
+        heap: ReservationRange::new(0x200000, 0x300000).unwrap(),
+        arena: ReservationRange::new(VA, VA + 0x400000).unwrap(),
+        brk: 0x200000,
+        address_limit: u64::MAX,
+        data_limit: u64::MAX,
+        external_address_bytes: 8192,
+        external_data_bytes: 0,
+    };
+    for (index, mm) in indices.into_iter().zip(mms) {
+        roots.publish(index.index(), mm, layout).unwrap();
+    }
+    let release = X86Cpl0RootReleaseVenue::new(
+        roots,
+        SpaceReleaseVenue {
+            zone,
+            waker: Waker::Host,
+            deliver,
+        },
+    )
+    .unwrap();
+
+    let request = {
+        let mut parent = release
+            .lock(indices[0].index(), mms[0], &NoRootWait)
+            .unwrap();
+        parent
+            .import(
+                ReservationRange::new(VA, VA + 4096).unwrap(),
+                ReservationProtection::READ,
+                true,
+            )
+            .unwrap();
+        parent
+            .import(
+                ReservationRange::new(VA + 4096, VA + 8192).unwrap(),
+                ReservationProtection::READ_WRITE,
+                true,
+            )
+            .unwrap();
+        parent.finish_import().unwrap();
+        PortalForkRequest {
+            operation: PortalOperation {
+                carrier: NonZeroU64::MIN,
+                mm: mms[0],
+                incarnation: NonZeroU64::new(parent.incarnation().raw()).unwrap(),
+                sequence: parent.next_transfer_sequence().unwrap(),
+            },
+            parent_generation: parent.generation(),
+            child_mm: mms[1],
+            child_tables: PortalForkTableArena::new(0x200000, 6 * 4096).unwrap(),
+            parent_tables: PortalForkTableArena::new(0x300000, 4096).unwrap(),
+            kernel_control_ipa: 0xa00000,
+        }
+    };
+    let portal = Portal {
+        backend: core::marker::PhantomData,
+        carrier: NonZeroU64::MIN,
+        roots,
+        spaces: &zone.spaces,
+        nodes: None,
+        zone: Some(zone),
+        vma_visits: core::sync::atomic::AtomicUsize::new(0),
+    };
+    CompactVenue::space_access(zone, SlotId::new(0)).open(indices[0]);
+    let parent = Tables::new(0x6000, IPA, 2);
+    for (entry, offset) in [(0, 4096), (513, 8192), (1024, 12288)] {
+        parent.words[entry].store(
+            (parent.base + offset) | PRESENT | WRITE | USER,
+            Ordering::Relaxed,
+        );
+    }
+    parent.words[1536].store(IPA | PRESENT | USER | PRIVATE, Ordering::Relaxed);
+    parent.words[1537].store(
+        (IPA + 4096) | PRESENT | USER | PRIVATE | WRITE | NX,
+        Ordering::Relaxed,
+    );
+    let child = Tables::new(0x200000, 0, 0);
+    let supply = Tables::new(0x300000, 0, 0);
+    for table in [&child, &supply] {
+        for word in table.words.iter() {
+            word.store(0, Ordering::Relaxed);
+        }
+    }
+    struct Words<'a>([&'a Tables; 3]);
+    impl Words<'_> {
+        fn word(
+            &self,
+            pa: u64,
+        ) -> Result<
+            &core::sync::atomic::AtomicU64,
+            carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
+        > {
+            self.0
+                .iter()
+                .find_map(|table| {
+                    pa.checked_sub(table.base)
+                        .filter(|offset| offset.is_multiple_of(8))
+                        .and_then(|offset| table.words.get(offset as usize / 8))
+                })
+                .ok_or(carrick_mmu_core::descriptor_refusal::DescriptorRefusal::TableOutsidePrimary)
+        }
+    }
+    impl carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords for Words<'_> {
+        fn load(
+            &self,
+            pa: u64,
+        ) -> Result<u64, carrick_mmu_core::descriptor_refusal::DescriptorRefusal> {
+            Ok(self.word(pa)?.load(Ordering::Acquire))
+        }
+        fn compare_exchange(
+            &self,
+            pa: u64,
+            before: u64,
+            after: u64,
+        ) -> Result<bool, carrick_mmu_core::descriptor_refusal::DescriptorRefusal> {
+            Ok(self
+                .word(pa)?
+                .compare_exchange(before, after, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok())
+        }
+        fn store_unlinked(
+            &self,
+            pa: u64,
+            value: u64,
+        ) -> Result<(), carrick_mmu_core::descriptor_refusal::DescriptorRefusal> {
+            self.word(pa)?.store(value, Ordering::Release);
+            Ok(())
+        }
+        fn publish_barrier(&self) {}
+        fn invalidate_range(&self, _: u64, _: u64) {}
+    }
+    use carrick_el1::personality::mm_portal::NativeForkPortal;
+    let words = Words([&parent, &child, &supply]);
+    let scratch = portal.census_fork(request, &words, 0).unwrap();
+    let plan = portal.prepare_fork(request, scratch, &words, 0).unwrap();
+    assert_eq!(plan.custody().len(), 2);
+    assert!(plan.custody().iter().all(|row| matches!(
+        row,
+        PortalForkCustody::Frame {
+            shared: false,
+            len: 4096,
+            ..
+        }
+    )));
+    let mut pending = portal.publish_fork(plan, &words, 0).unwrap();
+    pending.commit(&portal, 0).unwrap();
+    assert_eq!(parent.words[1537].load(Ordering::Acquire) & WRITE, 0);
+    assert_eq!(portal.admitted_handle(mms[1], 0).unwrap().mm(), mms[1]);
+}
