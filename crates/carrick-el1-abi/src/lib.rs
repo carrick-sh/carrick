@@ -190,6 +190,9 @@ pub const X86_CPL0_INITIAL_EXTENT_VA: u64 = 0xffff_fffe_0000_0000;
 pub const X86_CPL0_INITIAL_EXTENT_GPA: u64 = 0x40_00000;
 pub const X86_CPL0_INITIAL_EXTENT_MAX_SIZE: u64 = 0x2000_0000;
 pub const X86_CPL0_REGION_BASE: u64 = 0xffff_ffff_c000_0000;
+/// MM-private temporary supervisor copy pair.
+pub const X86_CPL0_COW_COPY_BASE: u64 = carrick_mmu_core::x86::copy_window::COW_COPY_WINDOW_BASE;
+pub const X86_CPL0_COW_COPY_SIZE: u64 = carrick_mmu_core::x86::copy_window::COW_COPY_WINDOW_LEN;
 /// Retained CPL0 root arena reachable through the supervisor direct window.
 pub const X86_CPL0_TABLE_ARENA_BYTES: u64 = 448 * 4096;
 
@@ -208,9 +211,10 @@ const _: () = {
     // Every fixed x86 supervisor alias, including the full initial-image
     // capacity, must be disjoint. This is checked at compile time for both
     // guest and host builds so a new map cannot silently replace another PTE.
-    const WINDOWS: [(u64, u64); 8] = [
+    const WINDOWS: [(u64, u64); 9] = [
         (0xffff_ffff_8000_0000, 0x10_0000), // executable image
-        (X86_CPL0_DIRECT_VA, 0x0200_0000),  // bootstrap direct window
+        (X86_CPL0_COW_COPY_BASE, X86_CPL0_COW_COPY_SIZE),
+        (X86_CPL0_DIRECT_VA, 0x0200_0000), // bootstrap direct window
         (X86_CPL0_DYNAMIC_METADATA_BASE, 0x0400_0000),
         (
             X86_CPL0_BOOTSTRAP_METADATA_BASE,

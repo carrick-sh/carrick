@@ -1,5 +1,35 @@
 # x86 anonymous CPL0 handoff (partial, 2026-10-07)
 
+## Exact continuation: production two-MM witness green (2026-10-08)
+
+The production witness now passes: shared-owner fork, CPU1 child, CPL0 wait4
+and exit, two roots/MMs with sixteen PRIVATE anonymous pages each, no physical
+alias and an active peer. Receipt: `/tmp/x86-private-copy-witness-green.log`.
+This is focused verification; required complete gates remain pending.
+
+The MM-private root entry 508 owns three tables and two idle supervisor copy
+leaves. A real 8 GiB replacement is mapped temporarily with a read-only source
+and writable destination, restored and drained before returning. Host initial
+admission decodes the actual branch and authenticates its three table grants
+separately from user mapping receipts. The shared fork predicate clones those
+three tables; other supervisor branches remain shared. The ARM predicate
+retains its old behavior; the final assembly comparison remains pending.
+
+Two later reds were genuine: kernel wait4 used stale CR2 for its physical
+loan demand; the crossing now carries its selected user address explicitly
+through the same helper as the one #PF path. The initial anonymous stack used
+Map and lacked PRIVATE; it now uses existing Prepare. VM-free stack red and
+green: `/tmp/x86-initial-private-stack-{red-exact,green}.log`. The global
+anonymous counter wrongly included stack COW; the report now derives the
+count from the existing authenticated anonymous witness instead.
+
+305 EL1 tests, three bounded copy-window tests and both bare-metal guest bins'
+clippy pass (`/tmp/x86-private-copy-{el1-suite,mmu-final,native-clippy}.log`).
+Next: commit/push this step, run test-kvm, test, clippy, lint-domains and
+asm-diff. Fixture COW roots may need genuine private copy table provisioning;
+retain the exact production algorithm, never a permanent-alias fallback.
+Deferred full boot-export/task41/identity/file-custody scope stays deferred.
+
 ## Exact continuation: private supervisor fork branch (2026-10-08)
 
 The neutral fork owner now asks the ISA whether each root entry is shared.

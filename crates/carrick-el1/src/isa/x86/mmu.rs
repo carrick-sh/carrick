@@ -38,9 +38,13 @@ pub(in crate::isa) fn register_shared_supervisor_tables<W: LiveDescriptorWords +
         Err(existing) if existing == root => Ok(()),
         Err(existing) => {
             // A later exec may start from a fork child. It is still allowed
-            // only when its whole upper root branch names the original
-            // retained supervisor tables, never a second table alias.
+            // only when its shared upper branches name the original retained
+            // supervisor tables. ISA-private branches belong to the new MM.
             for index in 256..512_u64 {
+                if !<carrick_mmu_core::x86::owner_mmu::X86Mmu as
+                    carrick_mmu_core::owner_mmu::OwnerForkMmu>::is_shared_root_entry(index as usize) {
+                    continue;
+                }
                 let old = words
                     .load(existing + index * 8)
                     .map_err(|_| ArchError::Unbound)?;

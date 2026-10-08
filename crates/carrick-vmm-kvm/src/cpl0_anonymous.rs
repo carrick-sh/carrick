@@ -1206,10 +1206,6 @@ impl Cpl0HostCustody {
         if !self.cow_pool()?.finish(pause.proof(), &pending.grant) {
             return Err(fail("owner COW completion changed after settlement"));
         }
-        self.anonymous_private_pages = self
-            .anonymous_private_pages
-            .checked_add(1)
-            .ok_or_else(|| fail("owner COW witness overflow"))?;
         let _retained = pending.handle;
         drop(pause);
         wake.finish()
@@ -1313,10 +1309,6 @@ impl Cpl0HostCustody {
                         )),
                 },
             )?;
-            self.anonymous_private_pages = self
-                .anonymous_private_pages
-                .checked_add(pending.window.range.len() / 4096)
-                .ok_or_else(|| fail("owner grant witness overflow"))?;
             let used = publication.tables_linked as usize;
             if pending.txn.tables.len() != pending.tables.len() || used > pending.tables.len() {
                 return Err(fail("owner grant table receipt"));
@@ -1329,7 +1321,9 @@ impl Cpl0HostCustody {
             let _retained = pending.handle;
             return Ok(());
         }
-        let far = lease.vcpu.get_gpr(X86Reg::Cr2)?;
+        // Hardware faults and kernel-owned user copies share this crossing.
+        // Its selected address is explicit; CR2 may name an unrelated fault.
+        let far = lease.vcpu.get_gpr(X86Reg::Rdi)?;
         if let Some((_, window)) = self
             .grant_portal()?
             .grant(index)

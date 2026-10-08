@@ -204,7 +204,7 @@ pub struct X86CowMmu;
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 impl carrick_core::mm::cow::OwnerCowMmu for X86CowMmu {
     const CARRIER_MAINT_ROOT_BASE: u64 = 0;
-    const DEFAULT_COW_COPY_BASE: u64 = carrick_el1_abi::X86_CPL0_DIRECT_VA;
+    const DEFAULT_COW_COPY_BASE: u64 = carrick_mmu_core::x86::copy_window::COW_COPY_WINDOW_BASE;
 
     fn classify_cow_write<
         W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
@@ -274,16 +274,7 @@ impl carrick_core::mm::cow::OwnerCowMmu for X86CowMmu {
         if plan_descriptor_txn(words, &txn, root).is_err() {
             return false;
         }
-        // Each retained supervisor alias must already map the exact copy frame.
-        // No new alias or late mapping is authored.
-        for offset in (0..op.len).step_by(4096) {
-            if x86_copy_page_alias(words, root, op.old_ipa + offset, false).is_none()
-                || x86_copy_page_alias(words, root, op.new_ipa + offset, true).is_none()
-            {
-                return false;
-            }
-        }
-        true
+        carrick_mmu_core::x86::copy_window::validate_cow_copy_window(words, root).is_ok()
     }
 
     fn with_copy_aliases<
@@ -299,18 +290,24 @@ impl carrick_core::mm::cow::OwnerCowMmu for X86CowMmu {
     ) -> Result<(), carrick_core::mm::cow::CowRepointOutcome> {
         use carrick_core::mm::cow::CowRepointOutcome;
         use carrick_guest_arch::{FrameGpa, RootGpa};
+        use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
         let Some(root) = RootGpa::page_aligned(FrameGpa::new(root)) else {
             return Err(CowRepointOutcome::Refused);
         };
-        if copy_base != carrick_el1_abi::X86_CPL0_DIRECT_VA {
+        if copy_base != carrick_mmu_core::x86::copy_window::COW_COPY_WINDOW_BASE {
             return Err(CowRepointOutcome::Refused);
         }
-        let source = x86_copy_page_alias(words, root, source_ipa, false)
-            .ok_or(CowRepointOutcome::Refused)?;
-        let destination = x86_copy_page_alias(words, root, destination_ipa, true)
-            .ok_or(CowRepointOutcome::Refused)?;
-        effect(source, destination);
-        Ok(())
+        carrick_mmu_core::x86::copy_window::with_cow_copy_aliases(
+            words,
+            root,
+            FrameGpa::new(source_ipa),
+            FrameGpa::new(destination_ipa),
+            effect,
+        )
+        .map_err(|outcome| match outcome {
+            DescriptorOutcome::Indeterminate(_) => CowRepointOutcome::Indeterminate,
+            _ => CowRepointOutcome::Refused,
+        })
     }
 
     fn execute_cow_repoint<
@@ -356,36 +353,6 @@ impl carrick_core::mm::cow::OwnerCowMmu for X86CowMmu {
             DescriptorOutcome::Indeterminate(_) => CowRepointOutcome::Indeterminate,
         }
     }
-}
-
-#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
-fn x86_copy_page_alias<
-    W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
->(
-    words: &W,
-    root: carrick_guest_arch::RootGpa,
-    ipa: u64,
-    writable: bool,
-) -> Option<u64> {
-    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-    use crate::isa::x86::user_tables::table_alias;
-    #[cfg(all(test, not(target_os = "none")))]
-    use crate::isa::x86_user_tables::table_alias;
-    use carrick_guest_arch::{FrameGpa, UserVa};
-    use carrick_mmu_core::x86::descriptor_txn::{Access, translate};
-    let va = table_alias(FrameGpa::new(ipa))?.raw();
-    (translate(
-        words,
-        root,
-        UserVa::new(va),
-        if writable {
-            Access::Write
-        } else {
-            Access::Read
-        },
-        false,
-    ) == Ok(FrameGpa::new(ipa)))
-    .then_some(va)
 }
 
 /// Resolve one CPL3 write fault with the common COW grant protocol and the
@@ -1446,7 +1413,56 @@ mod x86_cow_tests {
     }
 
     #[test]
-    fn x86_cow_uses_supplied_initial_extent_source_and_direct_replacement() {
+    fn x86_cow_maps_private_scratch_pair_for_high_physical_replacement() {
+        use carrick_guest_arch::{FrameGpa, RootGpa, UserVa};
+        use carrick_mmu_core::x86::descriptor_txn::{Access, NX, translate};
+        let base = 0xffff_fe00_0000_0000;
+        let words = Words::new();
+        let root = RootGpa::page_aligned(FrameGpa::new(ROOT)).unwrap();
+        let flags = PRESENT | WRITE | NX | (1 << 5);
+        words.image.borrow_mut().extend([
+            (ROOT + 508 * 8, (ROOT + 4096) | flags),
+            (ROOT + 4096, (ROOT + 8192) | flags),
+            (ROOT + 8192, (ROOT + 12288) | flags),
+        ]);
+        let destination = 0x2_0000_0000;
+        let mut copies = 0;
+        let result = X86CowMmu::with_copy_aliases(
+            &words,
+            ROOT,
+            base,
+            SOURCE,
+            destination,
+            &mut |source, target| {
+                copies += 1;
+                assert_eq!((source, target), (base, base + 4096));
+                assert_eq!(
+                    translate(&words, root, UserVa::new(source), Access::Read, false),
+                    Ok(FrameGpa::new(SOURCE))
+                );
+                assert_eq!(
+                    translate(&words, root, UserVa::new(target), Access::Write, false),
+                    Ok(FrameGpa::new(destination))
+                );
+                assert!(
+                    translate(&words, root, UserVa::new(source), Access::Write, false).is_err()
+                );
+                assert!(translate(&words, root, UserVa::new(target), Access::Read, true).is_err());
+            },
+        );
+        assert_eq!(
+            result,
+            Ok(()),
+            "the MM-private pair must map real cold COW frames"
+        );
+        assert_eq!(copies, 1);
+        assert_eq!(words.load(ROOT + 12288).unwrap(), 0);
+        assert_eq!(words.load(ROOT + 12288 + 8).unwrap(), 0);
+        assert_eq!(words.drains.get(), 2, "publish and restore must both drain");
+    }
+
+    #[test]
+    fn x86_cow_refuses_permanent_aliases_without_private_copy_window() {
         let words = Words::new();
         let source = carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_VA + SOURCE
             - carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_GPA;
@@ -1464,15 +1480,10 @@ mod x86_cow_tests {
         );
         assert_eq!(
             result,
-            Ok(()),
-            "inherited source has only its authenticated initial-extent alias"
+            Err(carrick_core::mm::cow::CowRepointOutcome::Refused)
         );
-        assert_eq!(aliases, Some((source, destination)));
-        assert_eq!(
-            words.loads.get(),
-            8,
-            "one bounded four-level walk per copy alias"
-        );
+        assert_eq!(aliases, None);
+        assert_eq!(words.loads.get(), 0);
     }
     #[test]
     fn x86_cow_repoint_executes_and_drains_supplied_words() {

@@ -409,6 +409,17 @@ mod kernel {
     fixture_items! { use core::sync::atomic::AtomicU64; }
     use core::sync::atomic::Ordering;
 
+    /// One physical grant crossing for hardware faults and kernel user copies.
+    /// RDI names the selected user page independently of the last hardware CR2.
+    fn cross_owner_grant(cpu: carrick_guest_arch::CpuId, address: UserVa) {
+        // SAFETY: this CPU owns the retained selection/completion slot. The
+        // host authenticates CPU, MM, root and selected address before lending.
+        unsafe {
+            core::arch::asm!("out dx, eax", in("dx") OWNER_GRANT_PORT,
+                in("eax") cpu.raw(), in("rdi") address.raw(), options(nostack));
+        }
+    }
+
     struct NativeDispatch<'a> {
         frame: &'a mut NativeFrame,
         call: carrick_personality_linux::entry::CanonicalCall,
@@ -666,16 +677,9 @@ mod kernel {
             }),
             &mut cow,
         );
-        fn cross_owner_grant(slot: u32) {
-            // SAFETY: this stopped-lane crossing lends only the exact physical
-            // grant selection/completion; process policy stays with CPL0.
-            unsafe {
-                core::arch::asm!("out dx, eax", in("dx") OWNER_GRANT_PORT, in("eax") slot, options(nostack))
-            };
-        }
         if result == Action::Served {
             if cow.completion.is_some() {
-                cross_owner_grant(binding.cpu_slot);
+                cross_owner_grant(carrick_guest_arch::CpuId::new(binding.cpu_slot), fault.address);
             }
             return 0;
         }
@@ -686,7 +690,7 @@ mod kernel {
             OwnerFaultSupplyOutcome::CowSelected => {
                 // The shared owner selected this exact inherited private page
                 // and released its editor before the physical loan crossing.
-                cross_owner_grant(binding.cpu_slot);
+                cross_owner_grant(carrick_guest_arch::CpuId::new(binding.cpu_slot), fault.address);
                 let supply = carrick_el1::fault::OwnerFaultSupply::new(portal);
                 let mut cow = carrick_el1::fault::X86CowResolver {
                     words: &words,
@@ -714,17 +718,11 @@ mod kernel {
                 }
                 // Guest COW owns the copy and descriptor stores. The retained
                 // completion now settles physical aliases before user return.
-                cross_owner_grant(binding.cpu_slot);
+                cross_owner_grant(carrick_guest_arch::CpuId::new(binding.cpu_slot), fault.address);
                 0
             }
             OwnerFaultSupplyOutcome::Selected => {
-                fn cross(slot: u32) {
-                    // SAFETY: this CPL0 CPU owns the physical grant service.
-                    unsafe {
-                        core::arch::asm!("out dx, eax", in("dx") OWNER_GRANT_PORT, in("eax") slot, options(nostack))
-                    };
-                }
-                cross(binding.cpu_slot);
+                cross_owner_grant(carrick_guest_arch::CpuId::new(binding.cpu_slot), fault.address);
                 let Some(grant_slot) = portal.grant(binding.cpu_slot as usize) else {
                     return 9;
                 };
@@ -770,7 +768,7 @@ mod kernel {
                         carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
                     )
                 });
-                cross(binding.cpu_slot);
+                cross_owner_grant(carrick_guest_arch::CpuId::new(binding.cpu_slot), fault.address);
                 if applied { 0 } else { 9 }
             }
         }

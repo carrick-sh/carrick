@@ -221,6 +221,11 @@ impl PrivateAnonymousWitness {
             )
             .collect()
     }
+    /// Count authenticated anonymous leaves, excluding other physical loans
+    /// such as an inherited process-entry stack's COW replacement.
+    pub(crate) fn private_pages(&self) -> u64 {
+        self.rows.values().map(|pages| pages.len() as u64).sum()
+    }
     pub(crate) fn cross_mm_private_aliases(&self) -> u64 {
         self.aliases
     }
@@ -292,6 +297,7 @@ mod tests {
             .unwrap();
         assert_eq!(witness.rows()[0].cpu_mask, 3);
         assert_eq!(witness.rows()[0].private_pages, 1);
+        assert_eq!(witness.private_pages(), 1);
         assert_eq!(witness.peer_active_private_grants(), 0);
     }
 
@@ -329,6 +335,7 @@ mod tests {
             .record(CpuId::new(0), key, 1, &leaves, settled)
             .unwrap();
         assert_eq!(witness.rows()[0].private_pages, 1);
+        assert_eq!(witness.private_pages(), 1);
         assert_eq!(witness.peer_active_private_grants(), 1);
     }
 

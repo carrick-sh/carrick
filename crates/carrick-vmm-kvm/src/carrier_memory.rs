@@ -968,11 +968,13 @@ impl CarrierMemory {
         // The guest may already have made its leaf present. Any mismatch now
         // quarantines the carrier and retains all backing; the host has no
         // authority to author an undo descriptor.
-        if !publication.matches_x86_txn(txn) || !self.guest_postcondition(txn) {
+        if !publication.matches_x86_txn(txn) {
             self.quarantined = true;
-            return Err(error(
-                "guest MMU publication does not match live descriptors",
-            ));
+            return Err(error("guest MMU publication transaction identity mismatch"));
+        }
+        if !self.guest_postcondition(txn) {
+            self.quarantined = true;
+            return Err(error("guest MMU publication live descriptor mismatch"));
         }
         let target = match self.authenticate(txn.id.mm_key, txn.op) {
             Ok(index) => index,
