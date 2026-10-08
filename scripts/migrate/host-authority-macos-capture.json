@@ -1566,15 +1566,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 129625,
-        "byte_start": 129611,
+        "byte_end": 129560,
+        "byte_start": 129546,
         "column": 20,
         "column_end": 34,
         "column_start": 20,
         "file": "crates/carrick-mem/src/memory.rs",
-        "line": 2995,
-        "line_end": 2995,
-        "line_start": 2995
+        "line": 2994,
+        "line_end": 2994,
+        "line_start": 2994
       }
     },
     {
@@ -4141,15 +4141,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 69294,
-        "byte_start": 69286,
+        "byte_end": 69229,
+        "byte_start": 69221,
         "column": 20,
         "column_end": 28,
         "column_start": 20,
         "file": "crates/carrick-mem/src/memory.rs",
-        "line": 1431,
-        "line_end": 1431,
-        "line_start": 1431
+        "line": 1430,
+        "line_end": 1430,
+        "line_start": 1430
       }
     },
     {
@@ -4162,15 +4162,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 69403,
-        "byte_start": 69395,
+        "byte_end": 69338,
+        "byte_start": 69330,
         "column": 81,
         "column_end": 89,
         "column_start": 81,
         "file": "crates/carrick-mem/src/memory.rs",
-        "line": 1433,
-        "line_end": 1433,
-        "line_start": 1433
+        "line": 1432,
+        "line_end": 1432,
+        "line_start": 1432
       }
     },
     {
@@ -12399,9 +12399,9 @@
       }
     }
   ],
-  "rows_sha256": "c0cffab653518671294c3260ade2770191c0307aae3a91dc299a566b932c29d7",
+  "rows_sha256": "e6c74e61357b16c7a136019a47bf55e2beedc6cbd9a8e57108ceaf2fa23b08f7",
   "schema": 1,
-  "source_head": "af1fe040ffb10566069b05718905f7f39ed5d43c",
+  "source_head": "ad16fe6bf86d53a816cb5e4b8b44706ee7ff68eb",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
