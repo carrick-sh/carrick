@@ -2249,20 +2249,27 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                 ) {
                     return Err(DescriptorRefusal::NotPrivateAnonymous);
                 }
-                if el1_cow(descriptor) {
-                    return Err(DescriptorRefusal::CowArmed);
-                }
-                if (edit.writable && descriptor & SW_EL1_MAY_WRITE == 0)
+                let cow = el1_cow(descriptor);
+                if (edit.writable && !cow && descriptor & SW_EL1_MAY_WRITE == 0)
                     || (edit.executable && descriptor & SW_EL1_MAY_EXEC == 0)
                 {
                     return Err(DescriptorRefusal::PermissionWidening);
                 }
                 let (ap, uxn) = if !(edit.readable || edit.writable || edit.executable) {
                     (AP_PRIV_RO, UXN)
-                } else if edit.writable {
+                } else if edit.writable && !cow {
                     (AP_RW, if edit.executable { 0 } else { UXN })
                 } else {
                     (AP_RO, if edit.executable { 0 } else { UXN })
+                };
+                let descriptor = if cow {
+                    // The root's mprotect proposal authorizes Linux write
+                    // intent, but the shared backing still needs a COW fault
+                    // before hardware may store to it.
+                    (descriptor & !SW_EL1_MAY_WRITE)
+                        | if edit.writable { SW_EL1_MAY_WRITE } else { 0 }
+                } else {
+                    descriptor
                 };
                 Ok((descriptor & !AP_MASK & !UXN) | ap | uxn)
             }
@@ -3659,12 +3666,41 @@ mod tests {
                 )
             }
             .unwrap();
-            let armed = words.image();
+            let armed = words.get(leaf_pa(VA));
+            applied(run(
+                &words,
+                DescriptorOp::Protect(readonly),
+                &TableGrants::NONE,
+            ));
+            let narrowed = words.get(leaf_pa(VA));
+            assert_eq!(narrowed & SW_EL1_COW, SW_EL1_COW);
+            assert_eq!(narrowed & SW_EL1_MAY_WRITE, 0);
+            assert_eq!(narrowed & AP_MASK, AP_RO);
+            assert_eq!(narrowed & PA_MASK_4KIB, armed & PA_MASK_4KIB);
+            applied(run(
+                &words,
+                DescriptorOp::Protect(GuestPermissionEdit {
+                    readable: false,
+                    ..readonly
+                }),
+                &TableGrants::NONE,
+            ));
+            let denied = words.get(leaf_pa(VA));
+            assert_eq!(denied & AP_MASK, AP_PRIV_RO);
+            assert_eq!(denied & SW_EL1_COW, SW_EL1_COW);
+            assert!(!crate::aarch64::terminal_descriptor_permits_host_buffer(
+                denied,
+                LeafAccess::Write
+            ));
+            applied(run(&words, DescriptorOp::Protect(rw), &TableGrants::NONE));
+            let restored = words.get(leaf_pa(VA));
+            assert_eq!(restored & SW_EL1_COW, SW_EL1_COW);
+            assert_eq!(restored & SW_EL1_MAY_WRITE, SW_EL1_MAY_WRITE);
             assert_eq!(
-                run(&words, DescriptorOp::Protect(readonly), &TableGrants::NONE),
-                DescriptorOutcome::Refused(DescriptorRefusal::CowArmed)
+                restored & AP_MASK,
+                AP_RO,
+                "COW still denies hardware writes"
             );
-            assert_eq!(words.image(), armed);
         }
 
         fn resident_block(words: &TestWords, output: u64) -> u64 {
