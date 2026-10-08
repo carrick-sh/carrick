@@ -1281,3 +1281,34 @@ fn namespace_child_group_resolves_a_child_job_group_and_preserves_scope() {
         WaitSelection::Exited(_)
     ));
 }
+
+#[test]
+fn nonchild_wait_has_no_ptrace_relationship_and_preserves_own_children() {
+    let mut owner = owner();
+    let root = key(1, 1);
+    let caller = key(2, 2);
+    let own_child = key(3, 3);
+    let peer = key(4, 4);
+    let releases = Rc::new(Cell::new(0));
+    birth(&mut owner, root, caller, releases.clone());
+    birth(&mut owner, caller, own_child, releases.clone());
+    birth(&mut owner, root, peer, releases.clone());
+    assert_eq!(owner.task(caller).unwrap().wait_identity().tracer, None);
+    assert!(owner.task(caller).unwrap().wait_tracees().is_empty());
+    assert_eq!(owner.namespace_child_key(caller, 4).unwrap(), None);
+    assert!(matches!(
+        owner
+            .scan_wait(caller, query(WaitTarget::Exact(peer)))
+            .unwrap(),
+        WaitSelection::NoChild
+    ));
+    assert_eq!(
+        owner.namespace_child_key(caller, 3).unwrap(),
+        Some(own_child)
+    );
+    assert!(matches!(
+        owner.scan_wait(caller, query(WaitTarget::Any)).unwrap(),
+        WaitSelection::StillRunning(_)
+    ));
+    assert_eq!(releases.get(), 0);
+}

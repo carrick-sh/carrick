@@ -215,11 +215,14 @@ through the existing ISA `ArchTypes::Context`. `authenticates(address)` and
 `fork_child(address)` retain exact MM-generation binding and child return
 construction in the ISA implementation.
 
-`same_owner_birth_exit_wait_accepts_arm_context_storage` runs the same
-VM-free graph owner with ARM `ThreadCtx`. It proves storage and shared policy,
-not native ARM resume or runtime wiring. Bare `ThreadCtx` does not contain the
-complete retained address binding; the ARM adapter must preserve that binding,
-TLS and vector state without another process owner.
+`actual_shared_root_admission_accepts_arm_asid_and_rejects_stale_binding`
+exercises actual shared runtime admission with an ASID-bearing ARM TTBR0 and
+rejects wrong roots and saved generations. Its test-only ARM context adapter
+retains the native save area and exact address binding. It does not prove
+native ARM fork, resume or production adapter wiring. The old generic Copy
+storage witness was removed because it could not detect ISA coupling. The
+ARM adapter must still preserve the binding, TLS and vector state without
+another process owner.
 
 ---
 
