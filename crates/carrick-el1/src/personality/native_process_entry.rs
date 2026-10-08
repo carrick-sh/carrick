@@ -30,14 +30,22 @@ impl<C, U> WaitStatusCopy<C, U> {
         Ok(CopiedWaitStatus(self))
     }
 }
+pub enum CopiedWaitOutcome<C, U, N: NativeProcessCustody> {
+    Consumed(GuestConsumedWait<C, U, N>),
+    Rescan(WaitWork<C, U, N>),
+}
 impl<C: Copy + Ord, U: Clone> CopiedWaitStatus<C, U> {
     pub fn consume<N: NativeProcessCustody, F: GuestProcessFailure>(
         self,
         owner: &mut GuestProcessOwner<C, U, N, F>,
-    ) -> Result<GuestConsumedWait<C, U, N>, GuestProcessError<N::Error>> {
+    ) -> Result<CopiedWaitOutcome<C, U, N>, GuestProcessError<N::Error>> {
         let mut query = self.0.query;
         query.target = WaitTarget::Exact(self.0.zombie.key);
-        owner.consume_wait(self.0.caller, query)
+        let consumed = owner.consume_wait(self.0.caller, query)?;
+        if matches!(consumed.selection, WaitSelection::NoChild) {
+            return scan_wait(owner, self.0.caller, self.0.query).map(CopiedWaitOutcome::Rescan);
+        }
+        Ok(CopiedWaitOutcome::Consumed(consumed))
     }
 }
 /// Preserve shared readiness and enrollment tokens for every non-zombie result.

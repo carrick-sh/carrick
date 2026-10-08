@@ -4,7 +4,7 @@
 extern crate alloc;
 use super::{
     native_process_custody::{ProcessResources, ProcessWake, RetainedProcessCustody},
-    native_process_entry::{self, ForkTryError, PreparedFork, WaitWork},
+    native_process_entry::{self, CopiedWaitOutcome, ForkTryError, PreparedFork, WaitWork},
     native_process_signals::{NativeExitSignals, NativeProcessSignals},
     process_owner::*,
 };
@@ -564,6 +564,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         status: UserVa,
         nohang: bool,
     ) -> Result<LifecycleOutcome, NativeProcessError> {
+        let mut rescan = None;
         loop {
             let (selection, mm, channel) = {
                 let graph = self.runtime.graph.lock();
@@ -579,8 +580,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .as_ref()
                     .ok_or(NativeProcessError::Stale)?
                     .clone();
-                let selected = native_process_entry::scan_wait(&graph.owner, self.key, query)
-                    .map_err(|_| NativeProcessError::Busy)?;
+                let selected = match rescan.take() {
+                    Some(selected) => selected,
+                    None => native_process_entry::scan_wait(&graph.owner, self.key, query)
+                        .map_err(|_| NativeProcessError::Busy)?,
+                };
                 (selected, mm, channel)
             };
             match selection {
@@ -597,6 +601,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         copied
                             .consume(&mut graph.owner)
                             .map_err(|_| NativeProcessError::Busy)?
+                    };
+                    let consumed = match consumed {
+                        CopiedWaitOutcome::Consumed(consumed) => consumed,
+                        CopiedWaitOutcome::Rescan(selection) => {
+                            rescan = Some(selection);
+                            continue;
+                        }
                     };
                     let result = match &consumed.selection {
                         WaitSelection::Exited(zombie) => i64::from(zombie.namespace_pid),
