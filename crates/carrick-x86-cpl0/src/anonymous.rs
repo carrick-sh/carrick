@@ -18,6 +18,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 static TABLE_START: AtomicU64 = AtomicU64::new(0);
 static TABLE_END: AtomicU64 = AtomicU64::new(0);
+// Boot publishes this disjoint physical license before either native actor runs.
+static WORKING_TABLES: carrick_el1::lock::SpinLock<Option<carrick_el1_abi::X86PrepareTableSpan>> =
+    carrick_el1::lock::SpinLock::new(None);
+pub(super) fn working_tables() -> Option<carrick_el1_abi::X86PrepareTableSpan> {
+    *WORKING_TABLES.lock()
+}
 
 static LIVE_CONTEXTS: carrick_el1::lock::SpinLock<carrick_el1::isa::x86::live_context::LiveContexts> =
     carrick_el1::lock::SpinLock::new(carrick_el1::isa::x86::live_context::LiveContexts::new());
@@ -33,10 +39,15 @@ pub(super) fn live_words(mm: carrick_el1_abi::ReservationMm) -> Option<InitialWo
     let context = LIVE_CONTEXTS.lock().authenticate(mm, root)?;
     let end = TABLE_END.load(Ordering::Acquire);
     let start = TABLE_START.load(Ordering::Relaxed);
-    (start != 0 && end > start).then(|| InitialWords::live(start, end, context))
+    let working = working_tables()?;
+    (start != 0 && end > start).then(|| InitialWords::live(start, end, context, working))
 }
 
-pub(super) fn admit_tables(start: u64, end: u64, context: carrick_guest_arch::AddressContext<RootGpa>) {
+pub(super) fn admit_tables(start: u64, end: u64, context: carrick_guest_arch::AddressContext<RootGpa>, working: carrick_el1_abi::X86PrepareTableSpan) {
+    let mut retained = WORKING_TABLES.lock();
+    if retained.is_some() { fatal_reservation(); }
+    *retained = Some(working);
+    drop(retained);
     if !LIVE_CONTEXTS.lock().admit(context) { fatal_reservation(); }
     TABLE_START.store(start, Ordering::Relaxed);
     TABLE_END.store(end, Ordering::Release);

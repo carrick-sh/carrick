@@ -1039,7 +1039,7 @@
     },
     {
       "file": "crates/carrick-el1/src/personality/lifecycle.rs",
-      "function": "<El1PendingFamilies<'a,F,C,U,G> as LifecycleNative<'a>>::prepare_child",
+      "function": "<El1PendingFamilies<'a,F,C,U,G,Context> as LifecycleNative<'a>>::prepare_child",
       "ordinal_in_function": 1,
       "fingerprint": "4f196a964b1d760152b4de23f5130a2d4fa483d3569a41527552b1a2b1d34ed0",
       "verdict": "carrier_fault",
@@ -1050,7 +1050,7 @@
     },
     {
       "file": "crates/carrick-el1/src/personality/lifecycle.rs",
-      "function": "<El1PendingFamilies<'a,F,C,U,G> as LifecycleNative<'a>>::run_next",
+      "function": "<El1PendingFamilies<'a,F,C,U,G,Context> as LifecycleNative<'a>>::run_next",
       "ordinal_in_function": 1,
       "fingerprint": "067465495ab07aa077d16acf0f5136c18f55a7fe7f9aaa12d861404b174e7632",
       "verdict": "carrier_fault",
@@ -1058,6 +1058,94 @@
       "rationale": "A scheduler handoff admitted without a native ARM frame violates the exact execution binding; returning idle could discard the handoff. Bare-metal entry uses the existing fatal transport, and the host adapter reports the same invariant failure through the typed fatal sink.",
       "sink": "fatal",
       "domain": "el1::run_next"
+    },
+    {
+      "file": "crates/carrick-el1/src/personality/native_process_custody.rs",
+      "function": "invalid_credit",
+      "ordinal_in_function": 1,
+      "fingerprint": "7e2e02a2156f8091958f71f63bf29205a45fc96248eac99e22ac546a29d4c1c9",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1::native_process_custody",
+      "rationale": "Retained revision publication credit was consumed with an invalid current revision or exhausted successor; publishing this credit would invalidate the exact process custody transition.",
+      "sink": "fatal",
+      "domain": "el1::native_process_custody"
+    },
+    {
+      "file": "crates/carrick-el1/src/personality/native_process_signals.rs",
+      "function": "invalid_signal",
+      "ordinal_in_function": 1,
+      "fingerprint": "71d294e2d265c0bfeb7684cafa5b78e6d7dcf63bada0de9e8ed5e55a442fd949",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1::native_process_signals",
+      "rationale": "An already validated shared Linux exit signal crossed an invalid native numbering domain; user signal inputs are rejected before this invariant conversion.",
+      "sink": "fatal",
+      "domain": "el1::native_process_signals"
+    },
+    {
+      "file": "crates/carrick-el1/src/personality/process_owner.rs",
+      "function": "<GuestRegistryFailure as GuestProcessFailure>::fail_process",
+      "ordinal_in_function": 1,
+      "fingerprint": "6171f54063ff3fb4b4e5280c6751823bb212cff684ef80697114112cc7ab2e0d",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1::process_owner",
+      "rationale": "The shared process registry or retained exit custody reported an ownership invariant violation; ordinary guest admission refusals remain typed results.",
+      "sink": "fatal",
+      "domain": "el1::process_owner"
+    },
+    {
+      "file": "crates/carrick-vmm-kvm/src/cpl0_actors.rs",
+      "function": "<ActorInterruptMask as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "8e44a48667e1e5e71067191f85d879d96d50ec7e6095d9587d2e724d6216c3f0",
+      "verdict": "carrier_fault",
+      "failure_domain": "kvm.actor_signal_mask",
+      "rationale": "The originating actor could not restore the host interrupt mask retained at admission, leaving its physical execution lane in an unknown signal-mask state.",
+      "sink": "fatal",
+      "domain": "kvm.actor_signal_mask"
+    },
+    {
+      "file": "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
+      "function": "<InitialInventory as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "7508cd36482558acfa9e1d879c7aa0467713752529a38ed82b6be0fc03564920",
+      "verdict": "carrier_fault",
+      "failure_domain": "kvm.initial_inventory_rollback",
+      "rationale": "The unexposed physical inventory transaction could not roll back during owned cleanup; continuing would lose its frame/publication custody.",
+      "sink": "fatal",
+      "domain": "kvm.initial_inventory_rollback"
+    },
+    {
+      "file": "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
+      "function": "Cpl0Carrier::unexpected_boot_wake",
+      "ordinal_in_function": 1,
+      "fingerprint": "dd939f3167e390c9ea21b42d689f171ca7c7c02bbb3fcb31dcf13daaf5fa77b2",
+      "verdict": "carrier_fault",
+      "failure_domain": "kvm.initial_boot_wake",
+      "rationale": "Boot-only publication released live guest wait or handback effects before the native execution owner exists; this venue cannot settle that completion custody.",
+      "sink": "fatal",
+      "domain": "kvm.initial_boot_wake"
+    },
+    {
+      "file": "crates/carrick-vmm-kvm/src/cpl0_anonymous.rs",
+      "function": "HostCowWake<'a>::deliver",
+      "ordinal_in_function": 1,
+      "fingerprint": "16a654ab82662d884db1180a54bdb443573d1606568baf52bd837b791046e548",
+      "verdict": "carrier_fault",
+      "failure_domain": "kvm.native_cow_handback",
+      "rationale": "A host COW release produced retained host-home handback custody, which this native guest-only wake venue cannot complete; silently discarding it would lose completion authority.",
+      "sink": "fatal",
+      "domain": "kvm.native_cow_handback"
+    },
+    {
+      "file": "crates/carrick-vmm-kvm/src/cpl0_anonymous.rs",
+      "function": "HostCowWake<'a>::deliver",
+      "ordinal_in_function": 2,
+      "fingerprint": "bfe343ca9a142e06c0bf04b0f5af5e387f1c8af8afd27b063c8806bca0a4c50a",
+      "verdict": "carrier_fault",
+      "failure_domain": "kvm.native_cow_waker",
+      "rationale": "A host-origin COW release produced guest-own or misplaced queue effects outside this venue's supported native wake domain; continuing would leave owned work without an execution owner.",
+      "sink": "fatal",
+      "domain": "kvm.native_cow_waker"
     }
   ]
 }

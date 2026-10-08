@@ -172,6 +172,11 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
             return None;
         }
     }
+    let occupied_end = first_grant.checked_add(grant_count.checked_mul(PAGE as usize)? as u64)?;
+    let working = carrick_el1_abi::X86PrepareTableSpan::derive(
+        GuestLen::new(extent_bytes), FrameGpa::new(occupied_end),
+        core::num::NonZeroUsize::new(2)?,
+    )?;
     let staged_end = first_grant;
     areas.push(area(first_grant, grant_count.checked_mul(PAGE as usize)? as u64, end)?);
     for region in regions {
@@ -249,7 +254,7 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
     request.result_table_used = source.tables_taken as u32;
     request.result_data_used = source.data_taken as u32;
     request.result_initial_break = loaded.initial_break.raw();
-    super::anonymous::admit_tables(first_grant, table_end, loaded.address);
+    super::anonymous::admit_tables(first_grant, table_end, loaded.address, working);
     Some((request.entry, loaded.stack_pointer))
 }
 

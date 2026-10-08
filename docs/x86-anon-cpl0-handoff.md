@@ -1,5 +1,54 @@
 # x86 anonymous CPL0 handoff (partial, 2026-10-07)
 
+## Exact continuation: physical table working stock (2026-10-08)
+
+The owner's reordered scope remains authoritative: finish the production
+two-live-MM private witness before extending boot export, deleting task41,
+VM identity hardening or opaque host file custody. The preserved boot-export
+WIP is committed; its real launch wiring remains deferred.
+
+The native shared process owner now reaches physical fork settlement. Main
+through 3de24ed69 is merged, never rebased. Sourceful gate releases and host
+COW releases are committed in 34f6edd1c. GDB identified the prior apparent
+hang as `native_process::settle` calling raw `AddressSpaces::open` after
+notification admission; the exact panic was "admitted gate requires a
+release venue". The compact gate regression and eight entry-completion
+tests pass. The actual stack is `/tmp/x86-native-debug/gdb-stack.log`.
+
+57c57b308 bounds physical table loans. ec8405794 retains a fallible owned
+editor exclusion and uses the existing shared read-only descriptor planner
+to loan the exact table count, without host descriptor publication. The
+deterministic post-CAS editor regression is red first; 31 shared space tests,
+six physical owner tests and the read-only qualification/work-budget test
+pass. No ARM assembly changes are intended. The latest checkpoint push
+must be checked: a pre-push attempt during the next staged regression failed
+on intentionally unfinished working-stock functions, without bypassing it.
+
+The exact witness is still red, now at genuine physical capacity exhaustion:
+one MM permanently links the two remaining ELF/fork table credits; the
+other MM gets zero. `/tmp/x86-native-exact-table-plan-live.log` records
+CPU0/MM301/root0x4001000 and the 64KiB reservation-clamped window. The
+canonical owner target is 2MiB, not 64KiB. The next step supplies an
+independent bounded Prepare working stock inside the actual retained root
+arena, plus an exact disjoint guest table-word license. Fork must not borrow
+this stock. Do not expand the table word bounds across the intervening data.
+
+The bounded Prepare stock and exact disjoint guest aperture are now
+implemented. Twelve zero physical pages follow the canonical two-lane
+window bound; fork cannot borrow them. The host custody suite passes 12/12,
+the ABI aperture regression passes 1/1, both guest binaries compile and
+scoped clippy passes. The unchanged witness advances beyond exhaustion
+but is still red: native wait4 COW reconstructs the old direct root alias
+at `0xffffffff94001000`, causing a CPL0 fault. Receipt:
+`/tmp/x86-native-working-stock-live.log`. The next fix must retain the
+authenticated words in the existing shared x86 COW adapter.
+
+N1 owns both the inherited-backing fault-window boundary fix and the
+untouched MAP_SHARED-before-fork defect on work/n1-cm. Do not duplicate
+those fixes. This witness exercises private mappings created after fork.
+PR86 remains pending; merge github/main again when the director reports
+it landed. Final witness and required focused gates remain open.
+
 ## Private Kernel boot export API (2026-10-08)
 
 The prepared launch bootstrap now carries a distinct population origin.

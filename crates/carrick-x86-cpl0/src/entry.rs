@@ -905,6 +905,7 @@ mod kernel {
         start: u64,
         end: u64,
         edit_root: Option<carrick_guest_arch::RootGpa>,
+        working: Option<carrick_el1_abi::X86PrepareTableSpan>,
         context: Option<carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>>,
     }
     impl InitialWords {
@@ -915,14 +916,16 @@ mod kernel {
                 start: 0x20_0000,
                 end: 0xd4_0000,
                 edit_root: Some(root),
+                working: None,
                 context: None,
             }
         }
-        const fn production(table_start: u64, table_end: u64) -> Self {
+        fn production(table_start: u64, table_end: u64) -> Self {
             Self {
                 start: table_start,
                 end: table_end,
                 edit_root: None,
+                working: anonymous::working_tables(),
                 context: None,
             }
         }
@@ -930,11 +933,13 @@ mod kernel {
             table_start: u64,
             table_end: u64,
             context: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
+            working: carrick_el1_abi::X86PrepareTableSpan,
         ) -> Self {
             Self {
                 start: table_start,
                 end: table_end,
                 edit_root: None,
+                working: Some(working),
                 context: Some(context),
             }
         }
@@ -953,7 +958,9 @@ mod kernel {
             } else {
                 self.start >= 0x40_00000 && (0x60_0000..0x60_1000).contains(&pa)
             };
-            if pa & 7 != 0 || !(in_grants || source_root) {
+            let in_working = self.working.is_some_and(|span|
+                span.contains_word(carrick_guest_arch::FrameGpa::new(pa)));
+            if pa & 7 != 0 || !(in_grants || in_working || source_root) {
                 return Err(DescriptorRefusal::TableOutsidePrimary);
             }
             let mapped = carrick_el1::isa::x86::user_tables::table_alias(
