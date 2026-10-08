@@ -1,5 +1,52 @@
 # x86 anonymous CPL0 handoff (partial, 2026-10-07)
 
+## Exact continuation: private initial admission and gate audit (2026-10-08)
+
+Private copy admission is pushed at ae0891e10. Fresh initial roots allocate
+three exclusive copy tables rather than inheriting entry 508 from the source
+MM. Fixtures reserve the same three pages outside constructor capacity. CPU1
+READY is retained across stopped runs. Nested-fault injection now stops at the
+syscall crossing; a global exit count could consume the first fault word
+before injection and leave a partial record on resume. The ordinary production
+syscall fixture now admits an actual initial MM and scheduler record.
+
+Verification: `/tmp/x86-private-admission-two-mm-green.log` (exact witness),
+`/tmp/x86-private-admission-el1.log` (306 tests),
+`/tmp/x86-private-admission-initial-suite.log` (nine KVM tests), and
+`/tmp/x86-private-admission-production-green.log` (one KVM test).
+
+The assembly audit found five unclassified native sites. Exact module review
+classifies authenticated XRSTOR/GPR/SWAPGS/IRET, guest FS/GS RDMSR, shared
+scheduler STI/HLT, and two typed fork-stock request/settlement port crossings.
+These are guest instruction boundaries, not host Linux dispatch. The existing
+Semgrep and token-helper boundary lists carry the same rationale. Receipts:
+`/tmp/x86-native-assembly-{red,green}.log`.
+
+### CLI failure attribution
+
+Clean detached github/main 048c2b6c1297d1ed466df676f40df2f3315dfd0b does not
+contain the six retained test cases. An external unchanged probe harness ran
+one real test per case against that clean main binary; zero-test selections
+were discarded. Main remained clean and its binary SHA-256 remained
+7a201ca9d3ffc0fde1c506403f91ba396aeda6590725a3dc0d1f4c4113e404ca.
+
+| Retained mounted_static_x86 case | Clean main | Pre-fix lane | Disposition |
+| --- | --- | --- | --- |
+| poll_stdio_matches_native | FAIL | FAIL | follow-up |
+| guest_owned_calls_refuse_without_host_effects | FAIL | FAIL | follow-up |
+| getpid_matches_guest_gettid | FAIL | FAIL | fixed by 01e86b399 |
+| arch_prctl_preserves_user_tls_bases | FAIL | FAIL | await PR 86 |
+| elf_matches_native_anonymous_memory | FAIL | FAIL | follow-up |
+| adjacent_anonymous_memory_keeps_existing_leaf | FAIL | FAIL | follow-up |
+
+Receipts: `/tmp/x86-main-retained-classification.tsv`, per-case
+`/tmp/x86-main-retained-mounted_static_x86_*.log`, probe input hashes
+`/tmp/x86-main-retained-probes-inputs.sha256`, and
+`/tmp/x86-two-mm-cli-baseline.log`. The director explicitly classified these
+as pre-existing follow-ups. Nonzero wait4 rusage is a separate lane regression
+and must be served through shared owner output custody before landing.
+Elastic per-fork grants and twenty-round/MAP_FIXED probes belong to the next PR.
+
 ## Exact continuation: production two-MM witness green (2026-10-08)
 
 The production witness now passes: shared-owner fork, CPU1 child, CPL0 wait4

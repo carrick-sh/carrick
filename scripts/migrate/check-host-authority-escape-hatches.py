@@ -70,6 +70,9 @@ ASSEMBLY_BOUNDARIES = frozenset(
         # Reviewed CPL0-only ISA leaves: stack/TSC instructions and named
         # UD2 fail-closed paths, with no host or Linux policy operation.
         PurePosixPath("crates/carrick-el1/src/isa/x86/context.rs"),
+        # Guest-only native return restores authenticated XSAVE/GPR state
+        # then SWAPGS/IRET; target_os=none excludes host execution.
+        PurePosixPath("crates/carrick-el1/src/isa/x86/context_resume.rs"),
         PurePosixPath("crates/carrick-el1/src/isa/x86/interrupt.rs"),
         PurePosixPath("crates/carrick-el1/src/isa/x86/interrupts.rs"),
         PurePosixPath("crates/carrick-el1/src/isa/x86/mmu.rs"),
@@ -83,6 +86,12 @@ ASSEMBLY_BOUNDARIES = frozenset(
         # CPL0 initial-image IRET and the declared KVM carrier completion
         # port execute only in the guest; no host syscall or other port.
         PurePosixPath("crates/carrick-x86-cpl0/src/initial_boot.rs"),
+        # Native execution reads guest FS/GS MSRs and sleeps under the shared
+        # scheduler's queue admission; neither instruction is a host crossing.
+        PurePosixPath("crates/carrick-x86-cpl0/src/native_execution.rs"),
+        # Two declared fork-stock port crossings carry typed request/settlement
+        # records under stopped carrier custody, with graph/MM guards released.
+        PurePosixPath("crates/carrick-x86-cpl0/src/native_process.rs"),
         # CPL0-only native IRQ/IRET, XSAVE, FS/GS MSRs, CR3 and IF/HLT
         # leaves. Their target_os=none guards exclude all host execution.
         PurePosixPath("crates/carrick-x86-cpl0/src/native_irq.rs"),
