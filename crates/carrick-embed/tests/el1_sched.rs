@@ -3805,6 +3805,29 @@ fn el1_delegated_root_concurrent_vma_ops() {
     }
 }
 
+/// Two-process owner-grant reducer: both processes keep their delegated MM
+/// active, while the short run retains the first refusal in the event ring.
+#[test]
+fn el1_delegated_root_vma_owner_grant_reducer() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let measured = run_fixture(
+        &carrier,
+        &["delegated-root-vma", "2"],
+        Duration::from_secs(30),
+    );
+    assert!(measured.result.success(), "{}", describe(&measured));
+    assert!(
+        measured
+            .result
+            .stdout_utf8()
+            .contains("parent_ok=true child_ok=true"),
+        "{}",
+        describe(&measured)
+    );
+}
+
 /// Contract `kernel.el1.delegated-root-fork`: `MAP_FIXED` in the forked child
 /// over pages still COW-shared with the parent (one range untouched, one
 /// already COW-broken) leaves the parent's bytes intact, and a parent
