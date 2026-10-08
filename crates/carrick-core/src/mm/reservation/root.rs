@@ -33,6 +33,10 @@ pub use notification::RootReleaseVenue;
 
 const ROOTS: usize = carrick_sched_core::spaces::ADDRESS_SPACES;
 const NODES: usize = 1024;
+// The high two bits of next_free describe node custody while it is outside a
+// free list. Prepared-copy phases use the same bits; every phase owns its node.
+const NODE_OWNED: u64 = 1 << 63;
+const NODE_CUSTODY_BITS: u64 = 3 << 62;
 /// Bootstrap metadata only. Exhaustion is a capacity request, never Linux
 /// ENOMEM. Existing reservations can still be observed and retired.
 const VERSION: u64 = 9;
@@ -690,7 +694,14 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
             return Err(Refusal::Busy);
         }
         if index != 0 {
-            let next = self.node(index, banks).next_free.load(Ordering::Relaxed) as u32;
+            let node = self.node(index, banks);
+            let link = node.next_free.load(Ordering::Acquire);
+            assert_eq!(
+                link & NODE_CUSTODY_BITS,
+                0,
+                "owned reservation node reached free head: {index}"
+            );
+            let next = link as u32;
             let generation = (head >> 32)
                 .checked_add(1)
                 .filter(|v| *v <= u32::MAX as u64)
@@ -699,13 +710,20 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
             self.free
                 .compare_exchange(head, tag | next as u64, Ordering::AcqRel, Ordering::Relaxed)
                 .map_err(|_| Refusal::Busy)?;
+            node.next_free.store(NODE_OWNED, Ordering::Release);
             return Ok(index);
         }
         self.allocated
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
                 (n < capacity).then_some(n + 1)
             })
-            .map(|n| n + 1)
+            .map(|n| {
+                let index = n + 1;
+                self.node(index, banks)
+                    .next_free
+                    .store(NODE_OWNED, Ordering::Release);
+                index
+            })
             .map_err(|_| Refusal::MetadataRequired)
     }
 
@@ -714,6 +732,17 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
             return;
         }
         let node = self.node(index, banks);
+        // Claim custody before publishing any link. A second return cannot
+        // observe an owned phase after this CAS, even with two callers racing.
+        let marker = node.next_free.load(Ordering::Acquire);
+        assert!(
+            marker & NODE_CUSTODY_BITS != 0
+                && node
+                    .next_free
+                    .compare_exchange(marker, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok(),
+            "reservation node returned twice: {index}"
+        );
         // Return uses a lock-free stack. Failed CAS reflects another completed
         // return, not polling for a guest/host event while holding a worker.
         let mut head = self.free.load(Ordering::Acquire);
@@ -729,6 +758,13 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
                 Err(actual) => head = actual,
             }
         }
+    }
+
+    fn release_reserved(&self, index: u32, banks: Option<&dyn storage::NodeBanks>) {
+        self.node(index, banks)
+            .next_free
+            .store(NODE_OWNED, Ordering::Release);
+        self.release(index, banks);
     }
 }
 
@@ -1810,10 +1846,16 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         }
         if self.host_venue && self.state().host_reserved < HOST_RESERVE {
             let head = self.state().host_reserve_head;
-            self.table
-                .node(id, self.banks)
-                .next_free
-                .store(u64::from(head), Ordering::Relaxed);
+            let link = &self.table.node(id, self.banks).next_free;
+            let marker = link.load(Ordering::Acquire);
+            assert!(
+                marker & NODE_CUSTODY_BITS != 0
+                    && link
+                        .compare_exchange(marker, 0, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok(),
+                "reservation node returned twice to host reserve: {id}"
+            );
+            link.store(u64::from(head), Ordering::Relaxed);
             self.state_mut().host_reserve_head = id;
             self.state_mut().host_reserved += 1;
         } else {
@@ -1838,6 +1880,10 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
             .load(Ordering::Relaxed);
         self.state_mut().host_reserve_head = next as u32;
         self.state_mut().host_reserved -= 1;
+        self.table
+            .node(head, self.banks)
+            .next_free
+            .store(NODE_OWNED, Ordering::Release);
         Ok(head)
     }
     /// [`Self::allocate_spares`] for a host-venue commit ([`Self::host_node`]).
@@ -1902,7 +1948,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
                 .load(Ordering::Relaxed);
             self.state_mut().host_reserve_head = next as u32;
             self.state_mut().host_reserved -= 1;
-            self.table.release(head, self.banks);
+            self.table.release_reserved(head, self.banks);
         }
     }
     /// Where [`Self::mmap`] places `len` bytes, without proposing anything.
@@ -3105,10 +3151,41 @@ mod tests {
         let second = table.lock(1, second_mm).unwrap();
         let id = first.pool_node().unwrap();
         first.free_node(id);
-        first.free_node(id);
+        let duplicate = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            first.free_node(id);
+        }));
+        assert!(duplicate.is_err(), "the second return must lose custody");
         let first_owner = first.pool_node().unwrap();
         let second_owner = second.pool_node().unwrap();
         assert_ne!(first_owner, second_owner, "two roots acquired node {id}");
+    }
+
+    #[test]
+    fn simultaneous_returns_claim_exactly_one_node() {
+        let table = table();
+        let mm = ReservationMm::new(64).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let id = table.lock(0, mm).unwrap().pool_node().unwrap();
+        let barrier = std::sync::Barrier::new(3);
+        let successes = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                barrier.wait();
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    table.release(id, None);
+                }))
+                .is_ok()
+            });
+            let second = scope.spawn(|| {
+                barrier.wait();
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    table.release(id, None);
+                }))
+                .is_ok()
+            });
+            barrier.wait();
+            u32::from(first.join().unwrap()) + u32::from(second.join().unwrap())
+        });
+        assert_eq!(successes, 1, "only one return may claim the node");
     }
 
     thread_local! {
