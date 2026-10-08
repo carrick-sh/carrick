@@ -1220,3 +1220,64 @@ fn failed_mm_commit_keeps_unpublished_child_preparation_and_exact_reservation() 
     };
     assert_eq!(mm, 97);
 }
+#[test]
+fn namespace_child_group_resolves_a_child_job_group_and_preserves_scope() {
+    let mut owner = owner();
+    let parent = key(1, 1);
+    let selected = key(2, 2);
+    let other = key(3, 3);
+    birth(&mut owner, parent, selected, Rc::new(Cell::new(0)));
+    birth(&mut owner, parent, other, Rc::new(Cell::new(0)));
+    let group = carrick_sched_core::process::ProcessGroupId::from_leader(selected.id);
+    let old_group = owner.task(selected).unwrap().identity().process_group;
+    owner
+        .registry
+        .process_groups
+        .get_mut(&old_group)
+        .unwrap()
+        .members
+        .remove(&selected);
+    let row = owner.registry.tasks.get_mut(&selected.id).unwrap();
+    row.metadata.identity.process_group = group;
+    row.metadata.namespace_process_group = 42;
+    owner.registry.publish_process_group(
+        group,
+        ProcessGroupRecord {
+            object: (),
+            members: BTreeSet::from([selected]),
+            container: (),
+            namespace_id: 42,
+        },
+    );
+    assert_eq!(
+        owner.namespace_child_group(parent, 42).unwrap(),
+        Some(group)
+    );
+    assert_eq!(owner.namespace_child_group(parent, 99).unwrap(), None);
+    let _ = exit(&mut owner, other, None);
+    assert!(matches!(
+        owner
+            .scan_wait(parent, query(WaitTarget::ProcessGroup(group)))
+            .unwrap(),
+        WaitSelection::StillRunning(_)
+    ));
+    let _ = exit(&mut owner, selected, None);
+    assert_eq!(
+        owner.namespace_child_group(parent, 42).unwrap(),
+        Some(group)
+    );
+    let result = owner
+        .consume_wait(parent, query(WaitTarget::ProcessGroup(group)))
+        .unwrap();
+    assert!(
+        matches!(result.selection, WaitSelection::Exited(ref zombie) if zombie.key == selected)
+    );
+    drop(result);
+    assert_eq!(owner.namespace_child_group(parent, 42).unwrap(), None);
+    assert!(matches!(
+        owner
+            .scan_wait(parent, query(WaitTarget::Exact(other)))
+            .unwrap(),
+        WaitSelection::Exited(_)
+    ));
+}
