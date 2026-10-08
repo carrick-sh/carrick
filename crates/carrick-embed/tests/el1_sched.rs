@@ -342,6 +342,11 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
         .pull_policy(PullPolicy::Missing)
         .command(command)
         .vfs_mount("/opt/carrick", Box::new(el1_sched_vfs()));
+    if args.first() == Some(&"ipc-processes") {
+        builder = builder.stderr(carrick_embed::StdioConfig::Piped(Box::new(
+            std::io::stderr(),
+        )));
+    }
     if std::env::var("CARRICK_SCHED_TRACE_RETURNS").as_deref() == Ok("1") {
         // Install the existing CompatReporter probe hook. Registration alone
         // preserves EL1 admission and enables host-return probes without
