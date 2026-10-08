@@ -13,7 +13,7 @@ mod native;
 #[cfg(all(test, not(target_os = "none")))]
 #[path = "../../../../carrick-x86/src/cpl0_scheduler.rs"]
 #[allow(dead_code)] // Host unit tests use only native context records.
-mod scheduler;
+pub(crate) mod scheduler;
 
 pub fn from_native(context: &scheduler::NativeContext) -> ParkedContextWords {
     scheduler::park_native_context(context)

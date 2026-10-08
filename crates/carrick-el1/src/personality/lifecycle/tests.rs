@@ -1121,10 +1121,12 @@ fn process_native_hooks_require_every_execution_identity_component() {
             pid: ProcessWaitPid,
             status: UserVa,
             options: LinuxWaitOptions,
+            rusage: UserVa,
         ) -> LifecycleOutcome {
             assert_eq!(pid.raw(), -1);
             assert_eq!(status, UserVa::new(0x1000));
             assert_eq!(options, LinuxWaitOptions::WNOHANG);
+            assert_eq!(rusage.raw(), 0);
             self.calls += 1;
             LifecycleOutcome::Returned {
                 result: SyscallResult::new(44),
@@ -1182,6 +1184,7 @@ fn process_native_hooks_require_every_execution_identity_component() {
                 ProcessWaitPid::from_syscall_argument(u64::MAX),
                 UserVa::new(0x1000),
                 LinuxWaitOptions::WNOHANG,
+                UserVa::new(0),
             ),
             LifecycleNative::process_exit_group(&mut native, 23),
         ];

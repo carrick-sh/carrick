@@ -465,6 +465,26 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
         }
         Ok(task)
     }
+    pub fn namespace_child_key(
+        &self,
+        caller: TaskKey,
+        visible_pid: u32,
+    ) -> Result<Option<TaskKey>, GuestProcessError<N::Error>> {
+        let parent = self.task(caller)?;
+        Ok(parent.children().iter().copied().find(|key| {
+            self.registry.tasks.get(&key.id).is_some_and(|row| {
+                row.key() == *key
+                    && row.parent() == Some(caller)
+                    && row.metadata.container == parent.metadata.container
+                    && row.metadata.namespace_pid == visible_pid
+            }) || self.registry.zombies.get(&key.id).is_some_and(|row| {
+                row.receipt.key == *key
+                    && row.receipt.parent == Some(caller)
+                    && row.receipt.container == parent.metadata.container
+                    && row.receipt.namespace_pid == visible_pid
+            })
+        }))
+    }
     pub fn capture_parent(
         &self,
         key: TaskKey,

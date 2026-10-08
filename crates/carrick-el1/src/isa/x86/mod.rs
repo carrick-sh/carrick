@@ -4,6 +4,7 @@ use super::ArchError;
 
 pub mod context;
 pub mod fork_mm;
+pub mod live_context;
 pub use super::x86_initial_mm as initial_mm;
 pub mod interrupt;
 pub(super) mod mmu;

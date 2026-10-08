@@ -133,6 +133,49 @@ pub fn select_fault_window<
     })
 }
 
+/// Select a replacement for a leaf already classified as private COW by the
+/// live MMU owner. Imported mappings are eligible; anonymous fault plans are
+/// deliberately not used for an existing private leaf.
+pub fn select_cow_supply_window<
+    Policy: crate::mm::reservation::ReservationPolicy,
+    Geometry: crate::mm::reservation::ReservationGeometry,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    root: &mut crate::mm::reservation::Reservations<'_, Policy, Geometry, Context>,
+    operation: carrick_core_abi::PortalOperation,
+    va: carrick_guest_arch::UserVa,
+    fork_sequence: Option<NonZeroU64>,
+) -> Result<carrick_core_abi::PortalGrantWindow, crate::mm::transaction::MmError> {
+    use crate::mm::transaction::MmError;
+    if operation.mm != root.mm() || operation.incarnation.get() != root.incarnation().raw() {
+        return Err(MmError::Stale);
+    }
+    if root.fork_pending() && !root.fork_write_authorized(fork_sequence) {
+        return Err(MmError::Busy);
+    }
+    let mapping = root.mapping(va.raw()).ok_or(MmError::Fault)?;
+    if !mapping
+        .protection
+        .permits(carrick_core_abi::ReservationProtection::READ_WRITE)
+    {
+        return Err(MmError::Fault);
+    }
+    let page = va.raw() & !4095;
+    Ok(carrick_core_abi::PortalGrantWindow {
+        operation,
+        generation: mapping.generation,
+        range: carrick_core_abi::ReservationRange::new(
+            page,
+            page.checked_add(4096).ok_or(MmError::Invalid)?,
+        )
+        .ok_or(MmError::Invalid)?,
+        protection: mapping.protection,
+        fault_page: page,
+        host_backing: None,
+        fork_sequence,
+    })
+}
+
 pub struct FileFaultVenue<
     'a,
     Policy: crate::mm::reservation::ReservationPolicy,

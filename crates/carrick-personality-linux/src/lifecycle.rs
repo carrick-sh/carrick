@@ -71,7 +71,10 @@ use core::sync::atomic::Ordering;
 
 /// Native process custody supplied by the execution lane. Registry decisions
 /// remain in the shared scheduler owner; this adapter retains machine context.
-pub trait ProcessNative {
+pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::ThreadCtx> {
+    fn take_handoff_receipt(&mut self) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
+        None
+    }
     fn binding(&self) -> ExecutionBinding;
     fn fork(&mut self) -> LifecycleOutcome;
     fn wait4(
@@ -79,6 +82,7 @@ pub trait ProcessNative {
         pid: ProcessWaitPid,
         status: UserVa,
         options: LinuxWaitOptions,
+        rusage: UserVa,
     ) -> LifecycleOutcome;
     fn exit_group(&mut self, status: u8) -> LifecycleOutcome;
 }
@@ -166,6 +170,7 @@ pub trait LifecycleNative<'a>: UserCopy {
         _pid: ProcessWaitPid,
         _status: UserVa,
         _options: LinuxWaitOptions,
+        _rusage: UserVa,
     ) -> Option<LifecycleOutcome> {
         None
     }
@@ -289,6 +294,7 @@ pub fn invoke<'a>(
                 ProcessWaitPid::from_syscall_argument(args[0]),
                 UserVa::new(args[1]),
                 LinuxWaitOptions::from_bits_retain(args[2]),
+                UserVa::new(args[3]),
             );
         }
         LifecycleCall::ExitGroup => return native.process_exit_group(args[0] as u8),

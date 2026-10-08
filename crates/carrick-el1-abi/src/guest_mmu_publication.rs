@@ -128,6 +128,51 @@ impl GuestMmuPublication {
         .ok()?
     }
 
+    /// Bind the existing guest COW completion to physical alias settlement.
+    /// The caller authenticates the pool's completed record under exact-MM
+    /// exclusion; CarrierMemory separately verifies the live leaf.
+    pub fn from_x86_cow_completion(
+        txn: &carrick_mmu_core::x86::descriptor_txn::DescriptorTxn<'_>,
+        completion: &crate::CowGrantCompletion,
+    ) -> Option<Self> {
+        use carrick_mmu_core::x86::descriptor_txn::DescriptorOp;
+        let DescriptorOp::CowRepoint {
+            span,
+            old,
+            new,
+            backing,
+        } = txn.op
+        else {
+            return None;
+        };
+        if !completion.is_well_formed()
+            || completion.purpose != crate::CowGrantPurpose::UserWrite
+            || completion.grant.mm_key != txn.id.mm_key.get()
+            || completion.grant.epoch != txn.id.generation.get()
+            || completion.span_va != span.va
+            || completion.span_len != span.len
+            || completion.old_ipa != old.raw()
+            || completion.new_ipa != new.raw()
+            || completion.grant.backing != backing
+            || old.raw() & !(crate::COW_GRANT_SIZE - 1) == completion.grant.physical_ipa
+            || !txn.tables.is_empty()
+        {
+            return None;
+        }
+        Some(Self {
+            revision: Self::REVISION,
+            outcome: Self::APPLIED,
+            mm_key: txn.id.mm_key.get(),
+            root_gpa: txn.root.address().raw(),
+            generation: txn.id.generation.get(),
+            edit_identity: txn.edit_identity(),
+            span_va: txn.op.span().va,
+            span_len: txn.op.span().len,
+            live_stores: u32::try_from(span.len / 4096).ok()?,
+            tables_linked: 0,
+        })
+    }
+
     /// Match a host-held expected edit without interpreting descriptor words.
     /// A separate read-only postcondition check confirms the live guest graph.
     pub fn matches_x86_txn(
@@ -171,6 +216,64 @@ mod tests {
         ReservationGeneration, ReservationMm,
     };
     use core::num::NonZeroU64;
+
+    #[test]
+    fn cow_publication_refuses_foreign_source_and_backing() {
+        use carrick_guest_arch::{FrameGpa, RootGpa};
+        use carrick_mmu_core::x86::descriptor_txn::{
+            BackingIdentity, DescriptorOp, DescriptorTxn, DescriptorTxnId, PageSpan,
+        };
+        let one = NonZeroU64::MIN;
+        let backing = BackingIdentity {
+            frame_id: one,
+            mapping_id: one,
+            owner_generation: one,
+            inventory_revision: one,
+        };
+        let grant = crate::CowGrant {
+            slot: 0,
+            epoch: 8,
+            mm_key: 77,
+            physical_ipa: 0x10000,
+            backing,
+        };
+        let completion = crate::CowGrantCompletion {
+            purpose: crate::CowGrantPurpose::UserWrite,
+            grant,
+            span_va: 0x401000,
+            span_len: 4096,
+            old_ipa: 0x21000,
+            new_ipa: 0x11000,
+        };
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: NonZeroU64::new(77).unwrap(),
+                generation: NonZeroU64::new(grant.epoch).unwrap(),
+            },
+            root: RootGpa::page_aligned(FrameGpa::new(0x30000)).unwrap(),
+            op: DescriptorOp::CowRepoint {
+                span: PageSpan::new(0x401000, 4096),
+                old: FrameGpa::new(0x21000),
+                new: FrameGpa::new(0x11000),
+                backing,
+            },
+            tables: &[],
+        };
+        let publication = GuestMmuPublication::from_x86_cow_completion(&txn, &completion).unwrap();
+        assert!(publication.matches_x86_txn(&txn));
+        let mut wrong = completion;
+        wrong.old_ipa = 0x31000;
+        assert!(GuestMmuPublication::from_x86_cow_completion(&txn, &wrong).is_none());
+        let mut wrong = completion;
+        wrong.grant.backing.mapping_id = NonZeroU64::new(2).unwrap();
+        assert!(GuestMmuPublication::from_x86_cow_completion(&txn, &wrong).is_none());
+        let mut wrong = completion;
+        wrong.grant.mm_key += 1;
+        assert!(GuestMmuPublication::from_x86_cow_completion(&txn, &wrong).is_none());
+        let mut wrong = completion;
+        wrong.purpose = crate::CowGrantPurpose::RetiredBacking;
+        assert!(GuestMmuPublication::from_x86_cow_completion(&txn, &wrong).is_none());
+    }
 
     #[test]
     fn x86_fork_publication_binds_child_root_and_parent_journal() {

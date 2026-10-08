@@ -100,7 +100,7 @@ fn classify_initial_x86_forward(
 /// in-zone descriptor namespace has no authority in the host dispatcher.
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
 fn initial_poll_has_only_host_fds(
-    machine: &carrick_vmm_kvm::cpl0_boot::Cpl0Carrier,
+    machine: &impl carrick_guest_mem::GuestMemory,
     args: [u64; 6],
 ) -> bool {
     use zerocopy::FromBytes;

@@ -1,8 +1,8 @@
 //! One MM admission, selection and prepared service transaction for both ISAs.
 use super::MmError;
 use crate::mm::reservation::{
-    ClaimedPreparedCopy, ReservationFaultPlan, ReservationGeometry, ReservationPolicy,
-    Reservations, ResolvedReservationNodes, RootReleaseVenue, SharedReservations,
+    ClaimedPreparedCopy, ReservationGeometry, ReservationPolicy, Reservations,
+    ResolvedReservationNodes, RootReleaseVenue, SharedReservations,
 };
 use crate::mm::transfer::resolver::{CowResolution, CowResolver, PreparedPageResolver};
 use crate::mm::transfer::{GuestVa, SelectedChunk, TransferContinuation, ValidatedChunk};
@@ -551,45 +551,18 @@ impl<
                     CowResolution::Refused => return Err(MmError::Core),
                     CowResolution::NeedsSupply => {
                         let mut root = self.root(continuation.handle.mm(), slot)?;
-                        if root.fork_pending()
-                            && !root.fork_write_authorized(continuation.fork_sequence())
-                        {
-                            return Err(MmError::Busy);
-                        }
-                        // The live classifier already proved private COW.
-                        // Imported file nodes participate here even though
-                        // anonymous zero-fill fault_plan must reject them.
-                        let mapping = root.mapping(va).ok_or(MmError::Fault)?;
-                        if !mapping
-                            .protection
-                            .permits(ReservationProtection::READ_WRITE)
-                        {
-                            return Err(MmError::Fault);
-                        }
-                        let page = va & !4095;
-                        let plan = ReservationFaultPlan {
-                            mm: continuation.handle.mm(),
-                            generation: mapping.generation,
-                            range: carrick_core_abi::ReservationRange::new(page, page + 4096)
-                                .ok_or(MmError::Invalid)?,
-                            protection: mapping.protection,
-                            fault_page: page,
-                        };
                         return Ok(TransferStep::CowSupply(
-                            carrick_core_abi::PortalGrantWindow {
-                                operation: carrick_core_abi::PortalOperation {
+                            crate::mm::fault::select_cow_supply_window(
+                                &mut root,
+                                carrick_core_abi::PortalOperation {
                                     carrier: continuation.handle.carrier(),
                                     mm: continuation.handle.mm(),
                                     incarnation: continuation.handle.incarnation(),
                                     sequence: continuation.sequence(),
                                 },
-                                generation: plan.generation,
-                                range: plan.range,
-                                protection: plan.protection,
-                                fault_page: plan.fault_page,
-                                host_backing: None,
-                                fork_sequence: continuation.fork_sequence(),
-                            },
+                                UserVa::new(va),
+                                continuation.fork_sequence(),
+                            )?,
                         ));
                     }
                 }

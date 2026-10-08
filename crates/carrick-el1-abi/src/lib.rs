@@ -28,6 +28,8 @@ mod guest_mmu_publication;
 pub use guest_mmu_publication::*;
 mod x86_initial_boot;
 pub use x86_initial_boot::*;
+mod x86_fork_stock;
+pub use x86_fork_stock::*;
 mod delegated_notification;
 pub use delegated_notification::*;
 mod mm_portal;
