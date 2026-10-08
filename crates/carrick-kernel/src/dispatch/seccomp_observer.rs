@@ -289,6 +289,9 @@ impl SyscallDispatcher {
         original: SyscallRequest,
         reporter: &CompatReporter,
     ) -> Result<PreparedDispatch, DispatchError> {
+        if !kernel.kernel().source_host_dispatch_available() {
+            return Err(DispatchError::SourceKernelAuthorityTransferred);
+        }
         let original_args = original.args;
         let process = crate::observe::ProcessInfo::new(kernel);
         let interception = match self.interceptors.as_ref() {

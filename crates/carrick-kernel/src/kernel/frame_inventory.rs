@@ -597,6 +597,24 @@ impl FrameInventoryAuthority {
         Ok((outcome, next_revision, mm_empty_at_revision))
     }
 
+    /// One published row of the exact MM, read under its inventory owner lock.
+    pub fn live_mapping_row(&self, mm: MmId, mapping: MappingId) -> Option<MappingRow> {
+        let state = self.state.lock();
+        let entry = state
+            .mappings
+            .get(&mapping)
+            .filter(|entry| entry.mm == mm && entry.state == MappingState::Published)?;
+        Some(MappingRow {
+            mapping,
+            frame: entry.frame,
+            mm: entry.mm,
+            generation: entry.generation,
+            gpa: entry.gpa,
+            length: entry.length,
+            permissions: entry.permissions,
+        })
+    }
+
     pub fn snapshot(&self) -> FrameInventorySnapshot {
         snapshot_state(&self.state.lock(), None)
     }
@@ -1279,6 +1297,34 @@ impl FrameInventoryError {
     }
 }
 
+impl FrameInventoryAuthority {
+    /// Authenticate a guest copy against the exact owner generation as well
+    /// as the physical row. A stale descriptor can retain its GPA after a
+    /// mapping is republished under a new generation.
+    pub fn mapping_is_live_exact_generation(
+        &self,
+        mm: MmId,
+        mapping: MappingId,
+        frame: FrameId,
+        generation: MappingGeneration,
+        gpa: Gpa,
+        length: FrameLength,
+    ) -> bool {
+        self.state
+            .lock()
+            .mappings
+            .get(&mapping)
+            .is_some_and(|entry| {
+                entry.state == MappingState::Published
+                    && entry.mm == mm
+                    && entry.frame == frame
+                    && entry.generation == generation
+                    && entry.gpa == gpa
+                    && entry.length == length
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1423,6 +1469,55 @@ mod tests {
     }
 
     #[test]
+    fn live_mapping_point_row_refuses_foreign_mm_and_preserves_current_protection() {
+        let fixture = Fixture::new();
+        let mut selected = None;
+        let publish = fixture.batch(2, |transaction, reservation| {
+            let frame = reservation.claim_frame().unwrap();
+            let mapping = reservation.claim_mapping().unwrap();
+            selected = Some((frame, mapping));
+            prepare_publish(reservation, transaction, frame, mapping, 0x4000, 4096);
+        });
+        fixture.authority.apply(fixture.mm1, publish).unwrap();
+        let (frame, mapping) = selected.unwrap();
+        let row = fixture
+            .authority
+            .live_mapping_row(fixture.mm1, mapping)
+            .unwrap();
+        assert_eq!(row.frame, frame);
+        assert_eq!(row.permissions, perms(true));
+        assert!(
+            fixture
+                .authority
+                .live_mapping_row(fixture.mm2, mapping)
+                .is_none()
+        );
+        assert!(
+            fixture
+                .authority
+                .live_mapping_row(fixture.mm1, fixture.ids.mapping_id().unwrap())
+                .is_none()
+        );
+        let protect = fixture.batch(1, |transaction, reservation| {
+            reservation
+                .push(FrameInventoryEvent::ProtectMapping {
+                    transaction,
+                    mapping,
+                    generation: generation(2),
+                    permissions: perms(false),
+                })
+                .unwrap();
+        });
+        fixture.authority.apply(fixture.mm1, protect).unwrap();
+        let row = fixture
+            .authority
+            .live_mapping_row(fixture.mm1, mapping)
+            .unwrap();
+        assert_eq!(row.permissions, perms(false));
+        assert_eq!(row.generation, generation(2));
+    }
+
+    #[test]
     fn retirement_emptiness_is_decided_under_the_applying_lock() {
         // `mm_empty_at_revision` is a claim ABOUT the revision the retirement
         // produced, so it has to be evaluated at that revision. Computing it
@@ -1490,6 +1585,22 @@ mod tests {
             frame,
             row.gpa,
             row.length
+        ));
+        assert!(fixture.authority.mapping_is_live_exact_generation(
+            fixture.mm1,
+            mapping,
+            frame,
+            generation(1),
+            row.gpa,
+            row.length,
+        ));
+        assert!(!fixture.authority.mapping_is_live_exact_generation(
+            fixture.mm1,
+            mapping,
+            frame,
+            generation(2),
+            row.gpa,
+            row.length,
         ));
 
         // A commit that publishes another extent than the grant names is

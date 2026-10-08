@@ -950,17 +950,22 @@ pub fn child_exit_signal_needs_notification(
     action: Option<LinuxSigaction>,
     blocked: bool,
 ) -> bool {
-    let signum = signal.raw();
-    if signum == 0 {
-        return false;
-    }
-    match action.map(|a| a.sa_handler) {
-        Some(handler) if handler == carrick_abi::LINUX_SIG_IGN => false,
-        Some(handler) if handler == carrick_abi::LINUX_SIG_DFL => {
-            blocked || !is_default_ignore_signal(signum)
-        }
-        Some(_) => true,
-        None => blocked || !is_default_ignore_signal(signum),
+    child_exit_signal_state(action, blocked).needs_notification(signal)
+}
+
+pub(in crate::kernel) fn child_exit_signal_state(
+    action: Option<LinuxSigaction>,
+    blocked: bool,
+) -> carrick_sched_core::process::exit::ExitSignalState {
+    use carrick_sched_core::process::exit::{ExitSignalDisposition, ExitSignalState};
+    let disposition = match action.map(|action| action.sa_handler) {
+        Some(handler) if handler == carrick_abi::LINUX_SIG_IGN => ExitSignalDisposition::Ignore,
+        Some(handler) if handler != carrick_abi::LINUX_SIG_DFL => ExitSignalDisposition::Caught,
+        _ => ExitSignalDisposition::Default,
+    };
+    ExitSignalState {
+        disposition,
+        blocked,
     }
 }
 

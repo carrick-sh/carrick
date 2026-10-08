@@ -4,6 +4,7 @@
 //! mm to an ASID-owned stage-1 root over globally addressed frames.
 
 pub mod address;
+pub mod boot_launch;
 #[cfg(any(test, feature = "test-support"))]
 pub mod builder;
 pub(crate) mod carrier_process;

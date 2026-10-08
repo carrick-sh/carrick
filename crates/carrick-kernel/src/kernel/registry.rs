@@ -1,5 +1,8 @@
-use std::collections::BTreeMap;
-use std::num::NonZeroI32;
+use carrick_sched_core::process::identity_allocator::{
+    ClaimKind, InternalIdentity, NamespaceState, TransferredNamespaceState, VisibleIdentity,
+    VisibleNamespace,
+};
+pub use carrick_sched_core::process::identity_allocator::{IdError, IdRegistryCounts};
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -38,13 +41,13 @@ impl IdRegistry {
 
     pub fn reserve_task(&self) -> Result<(TaskId, TaskReservation), IdError> {
         let reservation = self.reserve_next(ClaimKind::Task)?;
-        let id = TaskId::from_registry_allocation(reservation.raw);
+        let id = TaskId::from_registry_allocation(reservation.raw.nonzero());
         Ok((id, TaskReservation(reservation)))
     }
 
     pub fn reserve_thread(&self) -> Result<(LinuxTid, ThreadReservation), IdError> {
         let reservation = self.reserve_next(ClaimKind::Thread)?;
-        let id = LinuxTid::from_registry_allocation(reservation.raw);
+        let id = LinuxTid::from_registry_allocation(reservation.raw.nonzero());
         Ok((id, ThreadReservation(reservation)))
     }
 
@@ -72,97 +75,75 @@ impl IdRegistry {
             .map(SessionClaim)
     }
 
+    pub(crate) fn reserve_visible(&self, namespace: VisibleNamespace) -> Option<VisibleIdentity> {
+        self.state.lock().reserve_visible(namespace)
+    }
+    #[cfg(test)]
+    pub(crate) fn visible_namespace_count(&self) -> usize {
+        self.state.lock().visible_namespace_count()
+    }
+    pub(crate) fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+    pub(crate) fn retire_visible_namespace(&self, namespace: VisibleNamespace) {
+        self.state.lock().retire_visible_namespace(namespace);
+    }
     pub fn is_reserved_number(&self, raw: i32) -> bool {
-        self.state.lock().claims.contains_key(&raw)
+        self.state.lock().is_reserved_number(raw)
     }
-
     pub fn counts(&self) -> IdRegistryCounts {
-        let state = self.state.lock();
-        state
-            .claims
-            .values()
-            .fold(IdRegistryCounts::default(), |mut counts, claim| {
-                counts.reserved_numbers += 1;
-                counts.task_claims += claim.tasks as usize;
-                counts.thread_claims += claim.threads as usize;
-                counts.process_group_claims += claim.process_groups as usize;
-                counts.session_claims += claim.sessions as usize;
-                counts
-            })
+        self.state.lock().counts()
     }
-
+    /// Move the namespace authority once. Retained host handles remain closed;
+    /// their claim destructors cannot release the receiver's claims.
+    #[cfg(test)]
+    pub(in crate::kernel) fn transfer(&self) -> Option<TransferredNamespaceState> {
+        self.state.lock().transfer()
+    }
+    /// Validate the sole bootstrap claims under the same exclusion that moves
+    /// them, so a retained allocation handle cannot slip a reservation between
+    /// the scope census and transfer.
+    pub(in crate::kernel) fn transfer_boot_root(
+        &self,
+        root: TaskId,
+    ) -> Option<TransferredNamespaceState> {
+        let mut state = self.state.lock();
+        if !state.is_reserved_number(root.raw())
+            || state.counts()
+                != (IdRegistryCounts {
+                    reserved_numbers: 1,
+                    task_claims: 1,
+                    thread_claims: 1,
+                    process_group_claims: 1,
+                    session_claims: 1,
+                })
+        {
+            return None;
+        }
+        state.transfer()
+    }
+    pub fn transferred_refusals(&self) -> Option<u64> {
+        self.state.lock().refused_attempts()
+    }
     fn reserve_next(&self, kind: ClaimKind) -> Result<ReservationToken, IdError> {
-        let mut state = self.state.lock();
-        let start = state.next;
-        loop {
-            let candidate = state.next;
-            state.advance();
-            if !state.claims.contains_key(&candidate) {
-                let Some(candidate) = NonZeroI32::new(candidate) else {
-                    return Err(IdError::OutOfRange(candidate));
-                };
-                let incremented = state
-                    .claims
-                    .entry(candidate.get())
-                    .or_default()
-                    .increment(kind);
-                if !incremented {
-                    return Err(IdError::ClaimCountExhausted(candidate.get()));
-                }
-                return Ok(ReservationToken::new(
-                    Arc::clone(&self.state),
-                    candidate,
-                    kind,
-                ));
-            }
-            if state.next == start {
-                return Err(IdError::Exhausted);
-            }
-        }
+        let candidate = self.state.lock().reserve_next(kind)?;
+        Ok(ReservationToken::new(
+            Arc::clone(&self.state),
+            candidate,
+            kind,
+        ))
     }
-
     fn reserve_exact(&self, raw: i32, kind: ClaimKind) -> Result<ReservationToken, IdError> {
-        let mut state = self.state.lock();
-        if raw < state.first || raw > state.last {
-            return Err(IdError::OutOfRange(raw));
-        }
-        if state.claims.contains_key(&raw) {
-            return Err(IdError::AlreadyReserved(raw));
-        }
-        let Some(raw) = NonZeroI32::new(raw) else {
-            return Err(IdError::OutOfRange(raw));
-        };
-        if !state.claims.entry(raw.get()).or_default().increment(kind) {
-            return Err(IdError::ClaimCountExhausted(raw.get()));
-        }
+        let raw = self.state.lock().reserve_exact(raw, kind)?;
         Ok(ReservationToken::new(Arc::clone(&self.state), raw, kind))
     }
-
     fn claim_related(&self, raw: i32, kind: ClaimKind) -> Result<ClaimToken, IdError> {
-        let mut state = self.state.lock();
-        let Some(nonzero) = NonZeroI32::new(raw) else {
-            return Err(IdError::OutOfRange(raw));
-        };
-        let Some(claims) = state.claims.get_mut(&raw) else {
-            return Err(IdError::UnknownNamespaceId(raw));
-        };
-        if !claims.increment(kind) {
-            return Err(IdError::ClaimCountExhausted(raw));
-        }
+        let nonzero = self.state.lock().claim_related(raw, kind)?;
         Ok(ClaimToken::new(Arc::clone(&self.state), nonzero, kind))
     }
-
     fn with_range(first: i32, last: i32, next: i32) -> Self {
-        assert!(first > 0);
-        assert!(last >= first);
-        assert!((first..=last).contains(&next));
         Self {
-            state: Arc::new(Mutex::new(NamespaceState {
-                first,
-                last,
-                next,
-                claims: BTreeMap::new(),
-            })),
+            state: Arc::new(Mutex::new(NamespaceState::new(first, last, next))),
         }
     }
 
@@ -174,106 +155,20 @@ impl IdRegistry {
     #[cfg(test)]
     pub(crate) fn set_next_for_tests(&self, raw: i32) {
         let mut state = self.state.lock();
-        assert!((state.first..=state.last).contains(&raw));
-        state.next = raw;
-    }
-}
-
-#[derive(Debug)]
-struct NamespaceState {
-    first: i32,
-    last: i32,
-    next: i32,
-    claims: BTreeMap<i32, ClaimCounts>,
-}
-
-impl NamespaceState {
-    fn advance(&mut self) {
-        self.next = if self.next == self.last {
-            self.first
-        } else {
-            self.next + 1
-        };
-    }
-
-    fn release(&mut self, raw: NonZeroI32, kind: ClaimKind) {
-        let key = raw.get();
-        let remove = {
-            let Some(claims) = self.claims.get_mut(&key) else {
-                debug_assert!(false, "live identity token lost its registry claim");
-                return;
-            };
-            if !claims.decrement(kind) {
-                debug_assert!(false, "identity claim reference count underflow");
-                return;
-            }
-            claims.is_empty()
-        };
-        if remove {
-            self.claims.remove(&key);
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum ClaimKind {
-    Task,
-    Thread,
-    ProcessGroup,
-    Session,
-}
-
-#[derive(Debug, Default)]
-struct ClaimCounts {
-    tasks: u32,
-    threads: u32,
-    process_groups: u32,
-    sessions: u32,
-}
-
-impl ClaimCounts {
-    fn counter(&mut self, kind: ClaimKind) -> &mut u32 {
-        match kind {
-            ClaimKind::Task => &mut self.tasks,
-            ClaimKind::Thread => &mut self.threads,
-            ClaimKind::ProcessGroup => &mut self.process_groups,
-            ClaimKind::Session => &mut self.sessions,
-        }
-    }
-
-    fn increment(&mut self, kind: ClaimKind) -> bool {
-        let counter = self.counter(kind);
-        let Some(next) = counter.checked_add(1) else {
-            return false;
-        };
-        *counter = next;
-        true
-    }
-
-    fn decrement(&mut self, kind: ClaimKind) -> bool {
-        let counter = self.counter(kind);
-        let Some(next) = counter.checked_sub(1) else {
-            return false;
-        };
-        *counter = next;
-        true
-    }
-
-    fn is_empty(&self) -> bool {
-        self.tasks == 0 && self.threads == 0 && self.process_groups == 0 && self.sessions == 0
+        state.set_next(raw);
     }
 }
 
 #[derive(Debug)]
 struct ReservationToken {
     state: Arc<Mutex<NamespaceState>>,
-    raw: NonZeroI32,
+    raw: InternalIdentity,
     kind: ClaimKind,
     active: bool,
 }
 
 impl ReservationToken {
-    fn new(state: Arc<Mutex<NamespaceState>>, raw: NonZeroI32, kind: ClaimKind) -> Self {
+    fn new(state: Arc<Mutex<NamespaceState>>, raw: InternalIdentity, kind: ClaimKind) -> Self {
         Self {
             state,
             raw,
@@ -299,13 +194,13 @@ impl Drop for ReservationToken {
 #[derive(Debug)]
 struct ClaimToken {
     state: Arc<Mutex<NamespaceState>>,
-    raw: NonZeroI32,
+    raw: InternalIdentity,
     kind: ClaimKind,
     active: bool,
 }
 
 impl ClaimToken {
-    fn new(state: Arc<Mutex<NamespaceState>>, raw: NonZeroI32, kind: ClaimKind) -> Self {
+    fn new(state: Arc<Mutex<NamespaceState>>, raw: InternalIdentity, kind: ClaimKind) -> Self {
         Self {
             state,
             raw,
@@ -376,29 +271,6 @@ macro_rules! claim_role {
 
 claim_role!(ProcessGroupClaim);
 claim_role!(SessionClaim);
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct IdRegistryCounts {
-    pub reserved_numbers: usize,
-    pub task_claims: usize,
-    pub thread_claims: usize,
-    pub process_group_claims: usize,
-    pub session_claims: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum IdError {
-    #[error("Linux PID namespace is exhausted")]
-    Exhausted,
-    #[error("Linux namespace identity {0} is outside the allocator range")]
-    OutOfRange(i32),
-    #[error("Linux namespace identity {0} is already reserved")]
-    AlreadyReserved(i32),
-    #[error("Linux namespace identity {0} has no live task or object")]
-    UnknownNamespaceId(i32),
-    #[error("Linux namespace identity {0} has too many live claims")]
-    ClaimCountExhausted(i32),
-}
 
 /// Authoritative object index. Multi-object mutations take this lock first and
 /// may then take at most one Task or subsystem leaf lock.
@@ -530,6 +402,59 @@ impl RegistryLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transferred_registry_claims_survive_host_handle_cleanup() {
+        let registry = IdRegistry::with_range_for_tests(1, 8);
+        let peer = registry.clone();
+        let (root, reservation) = registry.reserve_task().unwrap();
+        let task = reservation.commit();
+        let thread = registry.claim_task_leader_thread(root).unwrap();
+        let group = registry
+            .claim_process_group(ProcessGroupId::from_leader(root))
+            .unwrap();
+        let session = registry
+            .claim_session(SessionId::from_leader(root))
+            .unwrap();
+        let counts = registry.counts();
+        let mut native = registry.transfer().unwrap().into_owner();
+        assert_eq!(
+            peer.reserve_task().unwrap_err(),
+            IdError::AuthorityTransferred
+        );
+        assert_eq!(
+            peer.reserve_thread().unwrap_err(),
+            IdError::AuthorityTransferred
+        );
+        assert!(peer.transfer().is_none());
+        assert_eq!(registry.transferred_refusals(), Some(3));
+        drop((task, thread, group, session));
+        assert_eq!(native.counts(), counts);
+        assert_eq!(registry.counts(), IdRegistryCounts::default());
+        assert_eq!(native.reserve_next(ClaimKind::Task).unwrap().get(), 2);
+    }
+
+    #[test]
+    fn bootstrap_transfer_refuses_an_outstanding_peer_reservation() {
+        let registry = IdRegistry::with_range_for_tests(1, 8);
+        let (root, reservation) = registry.reserve_task().unwrap();
+        let task = reservation.commit();
+        let thread = registry.claim_task_leader_thread(root).unwrap();
+        let group = registry
+            .claim_process_group(ProcessGroupId::from_leader(root))
+            .unwrap();
+        let session = registry
+            .claim_session(SessionId::from_leader(root))
+            .unwrap();
+        let (_, peer) = registry.reserve_thread().unwrap();
+        assert!(registry.transfer_boot_root(root).is_none());
+        assert_eq!(registry.counts().reserved_numbers, 2);
+        drop(peer);
+        let native = registry.transfer_boot_root(root).unwrap().into_owner();
+        drop((task, thread, group, session));
+        assert_eq!(native.counts().reserved_numbers, 1);
+        assert_eq!(native.counts().thread_claims, 1);
+    }
 
     #[test]
     fn task_and_thread_ids_share_one_namespace() {

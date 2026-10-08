@@ -34,12 +34,6 @@ impl From<crate::kernel::ids::LinuxTid> for El1TaskId {
     }
 }
 
-impl From<crate::kernel::ids::TaskId> for El1TaskId {
-    fn from(id: crate::kernel::ids::TaskId) -> Self {
-        El1TaskId::from_linux_tid(id.raw())
-    }
-}
-
 /// Settle the EL1 boundary flags of the vCPU at `slot` as the host takes
 /// it back: consume whether its last syscall was served in EL1 with host
 /// work owed (the return value) and its pending-host-work flag, and deliver

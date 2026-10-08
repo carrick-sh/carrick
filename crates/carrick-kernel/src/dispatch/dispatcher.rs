@@ -197,11 +197,20 @@ impl SyscallDispatcher {
         snapshot: Option<&carrick_vfs::HostResolverSnapshot>,
         bridges: CarrierBridges,
     ) -> Self {
+        let (kernel_binding, mm_id) = bootstrap_one_task_binding(Arc::clone(&bridges.host_signal));
+        Self::new_with_kernel_binding(snapshot, bridges, kernel_binding, mm_id)
+    }
+
+    fn new_with_kernel_binding(
+        snapshot: Option<&carrick_vfs::HostResolverSnapshot>,
+        bridges: CarrierBridges,
+        kernel_binding: crate::kernel::KernelTaskBinding,
+        mm_id: crate::kernel::MmId,
+    ) -> Self {
         let CarrierBridges {
             host_signal,
             timers,
         } = bridges;
-        let (kernel_binding, mm_id) = bootstrap_one_task_binding(Arc::clone(&host_signal));
         let mm_authority = Arc::new(DispatchMmAuthority::new(mm_id));
         Self {
             kernel_binding: RwLock::new(kernel_binding),
@@ -266,6 +275,34 @@ impl SyscallDispatcher {
         }
         dispatcher.network = network;
         dispatcher
+    }
+
+    /// Construct the CPL0 launch dispatcher over its own kernel and the
+    /// already prepared namespaces. Launch setup adopts files and filesystem
+    /// state into this graph before its identity authority is exported.
+    pub fn with_prepared_launch(
+        network: Arc<crate::network::RuntimeNetwork>,
+        snapshot: Option<&carrick_vfs::HostResolverSnapshot>,
+        bridges: CarrierBridges,
+        container: Arc<crate::kernel::Container>,
+    ) -> Result<Self, crate::run_result::RuntimeError> {
+        let (kernel_binding, mm_id) = super::kernel_context::try_bootstrap_launch_binding(
+            Arc::clone(&bridges.host_signal),
+            Some(Arc::clone(&container)),
+        )?;
+        let mut dispatcher =
+            Self::new_with_kernel_binding(snapshot, bridges, kernel_binding, mm_id);
+        dispatcher.set_container(container);
+        if should_mount_network_resolv_conf(&network.model) {
+            dispatcher.fs.vfs_mounts_mut().mount(
+                "/etc/resolv.conf",
+                Box::new(carrick_vfs::ResolvConfVfs::from_contents(
+                    resolv_conf_contents_for_network(&network.model),
+                )),
+            );
+        }
+        dispatcher.network = network;
+        Ok(dispatcher)
     }
 
     /// Install the container the root bootstrap boots into.
@@ -2312,6 +2349,15 @@ impl<'a> MemView<'a> {
 }
 
 impl SyscallDispatcher {
+    /// Initial limits transferred to the in-guest reservation owner before
+    /// the first task runs. Guest updates require their own owner publication.
+    pub fn launch_resource_limit(
+        &self,
+        resource: carrick_abi::LinuxResource,
+    ) -> carrick_abi::LinuxRlimit {
+        self.effective_resource_limit(resource.index() as u64)
+    }
+
     #[inline]
     pub fn fs_view(&self) -> FsView<'_> {
         FsView {

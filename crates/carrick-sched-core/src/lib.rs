@@ -80,8 +80,12 @@
 
 #![no_std]
 
+extern crate alloc;
+
 #[cfg(test)]
 extern crate std;
+
+pub mod process;
 
 pub mod completion_queue;
 pub mod object_wait;
@@ -1507,11 +1511,15 @@ fn mix(mm: u64, uaddr: u64) -> usize {
 impl ZoneTables<ThreadCtx> {
     /// The bucket that `(mm, uaddr)` hashes to.
     pub fn bucket_of(mm: u64, uaddr: u64) -> usize {
-        mix(mm, uaddr)
+        Self::bucket_of_with_context(mm, uaddr)
     }
 }
 
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
+    /// Context-independent hashing for an owner's actual saved-context ABI.
+    pub fn bucket_of_with_context(mm: u64, uaddr: u64) -> usize {
+        mix(mm, uaddr)
+    }
     pub fn record(&self, id: RecordId) -> &ZoneRecord<C> {
         &self.records[id.index()]
     }
@@ -2744,6 +2752,23 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         }
         self.record(record).home.store(0, Ordering::Release);
         self.free_record(record);
+    }
+
+    /// Retire the exact unpublished record retained for this running host lane.
+    /// Published or switched records must use their existing current owner.
+    pub fn release_host_home(&self, slot: SlotId, record: RecordId) -> bool {
+        let lane = self.slot(slot);
+        let owned = self.record(record);
+        if lane.current().is_some()
+            || lane.host_record() != Some(record)
+            || owned.claim() != Claim::Free
+            || owned.home.load(Ordering::Acquire) != slot.plus_one()
+            || owned.has_object_operation()
+        {
+            return false;
+        }
+        self.discard_unpublished(slot, record);
+        true
     }
 
     /// EL1: the running thread on `slot` parked (its record is published);

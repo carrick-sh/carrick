@@ -4,94 +4,23 @@
 //! child exit-signal classification, and lost-wake prevention across the
 //! child wait precheck.
 
-use carrick_abi::{LinuxWaitOptions, NsUid};
+#[cfg(test)]
+use carrick_abi::LinuxWaitOptions;
+use carrick_abi::NsUid;
 use carrick_fatal::carrick_fatal;
 
-use super::session::remove_group_member;
-use super::{KernelOperationError, ensure_task_unreserved, next_revision};
-use crate::kernel::core::{Kernel, RegistryState};
-use crate::kernel::ids::{ChildExitSignal, LinuxSignal, ProcessGroupId, TaskId};
+use super::{KernelOperationError, next_revision};
+use crate::kernel::core::{Kernel, RetiringTaskRecord, TaskRecord, TaskRevision, ZombieRecord};
+use crate::kernel::ids::{LinuxSignal, ProcessGroupId, TaskId};
 use crate::kernel::objects::{TaskJobControlEvent, TaskKey, Zombie};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WaitMode {
-    Observe,
-    Consume,
-}
+use carrick_sched_core::process::WaitTarget;
+pub use carrick_sched_core::process::{WaitChildClass, WaitMode};
 
-/// Which children a `wait(2)` call can see, by the child's exit signal.
-///
-/// Linux partitions a parent's children into ordinary ones (exit signal
-/// `SIGCHLD`) and "clone children" (any other exit signal, or none). A plain
-/// wait sees only the former; `__WCLONE` selects only the latter and
-/// `__WALL` both (wait(2)). The partition applies to real children in every
-/// arm of the wait -- the zombie scan, job-control state changes, and the
-/// `ECHILD`/block decision -- but not to ptrace tracees a tracer waits on
-/// without being their parent.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WaitChildClass {
-    /// The default: children whose exit signal is `SIGCHLD`.
-    Sigchld,
-    /// `__WCLONE`: only clone children.
-    Clone,
-    /// `__WALL`: every child regardless of exit signal.
-    All,
-}
-
-impl WaitChildClass {
-    pub fn from_wait_options(options: LinuxWaitOptions) -> Self {
-        if options.contains(LinuxWaitOptions::WALL) {
-            Self::All
-        } else if options.contains(LinuxWaitOptions::WCLONE) {
-            Self::Clone
-        } else {
-            Self::Sigchld
-        }
-    }
-
-    pub fn admits(self, exit_signal: ChildExitSignal) -> bool {
-        match self {
-            Self::Sigchld => !exit_signal.is_clone_child(),
-            Self::Clone => exit_signal.is_clone_child(),
-            Self::All => true,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct WaitJobControl {
-    stopped: bool,
-    continued: bool,
-}
-
-/// Which children one wait call may reap: the `pid` argument of
-/// `wait4`/`waitid` lowered to a single typed selector, so a pid, an exact
-/// generation and a process group can never be combined inconsistently.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WaitTarget {
-    Any,
-    Pid(TaskId),
-    Exact(TaskKey),
-    ProcessGroup(ProcessGroupId),
-}
-
-impl WaitTarget {
-    fn admits(self, child: TaskKey, process_group: ProcessGroupId) -> bool {
-        match self {
-            Self::Any => true,
-            Self::Pid(target) => target == child.id,
-            Self::Exact(target) => target == child,
-            Self::ProcessGroup(group) => group == process_group,
-        }
-    }
-}
-
-impl WaitJobControl {
-    const NONE: Self = Self {
-        stopped: false,
-        continued: false,
-    };
-}
+use carrick_sched_core::process::wait::{
+    TaskWakeGeneration, WaitError, WaitIdentity, WaitIdentitySource, WaitJobControl, WaitLive,
+    WaitQuery, WaitReadiness, WaitSelection, WaitZombie,
+};
 
 /// The waiting parent's task-wake generation, sampled by the SAME registry
 /// read that concluded no child was reapable.
@@ -251,417 +180,157 @@ impl Kernel {
         mode: WaitMode,
     ) -> Result<WaitOutcome, KernelOperationError> {
         self.sweep_retired_threads_for_process(Some(parent_id));
-
-        // Read-only path:
-        // For WaitMode::Observe, wait never modifies state; evaluate entirely under read lock.
-        // For WaitMode::Consume, check under read lock if any child is reapable or has a job control
-        // event. If none does, return StillRunning or NoChild without acquiring the write lock.
-        // Under NO circumstance does the read lock return Exited or job control state changes in
-        // WaitMode::Consume — check-and-consume must happen atomically under the write lock.
+        let query = WaitQuery {
+            target,
+            class,
+            job_control,
+        };
         {
             let state = self.registry().settled().read();
             if mode == WaitMode::Consume {
-                ensure_task_unreserved(&state, parent_id)?;
+                state.admit_wait(parent_id).map_err(wait_error)?;
             }
-            let Some((parent, _, children, tracees)) = state.tasks.get(&parent_id).map(|record| {
-                (
-                    record.task.key(),
-                    record.task.pid_ns_region(),
-                    record.task.children(),
-                    record.task.ptrace_tracees(),
-                )
-            }) else {
-                return Err(KernelOperationError::UnknownTask(parent_id));
-            };
-            let traced_non_children: Vec<TaskKey> = tracees
-                .into_iter()
-                .filter(|key| !children.contains(key))
-                .collect();
-
             if mode == WaitMode::Observe {
-                let exited = children.iter().find_map(|child_key| {
-                    let record = state.zombies.get(&child_key.id)?;
-                    if record.zombie.key == *child_key
-                        && record.zombie.parent == Some(parent)
-                        && class.admits(record.zombie.exit_signal)
-                        && target.admits(*child_key, record.zombie.process_group)
-                    {
-                        Some((child_key.id, record.zombie.clone()))
-                    } else {
-                        None
-                    }
-                });
-                if let Some((_id, zombie)) = exited {
-                    return Ok(WaitOutcome::Exited(zombie));
-                }
-
-                let state_change = children.iter().find_map(|child_key| {
-                    let record = state.tasks.get(&child_key.id)?;
-                    if record.task.key() == *child_key
-                        && record.task.parent() == Some(parent)
-                        && class.admits(record.task.exit_signal())
-                        && target.admits(*child_key, record.task.process_group())
-                    {
-                        record
-                            .task
-                            .waitable_job_control_event(
-                                job_control.stopped,
-                                job_control.continued,
-                                false,
-                            )
-                            .map(|event| match event {
-                                TaskJobControlEvent::Stopped { signal, kind } => {
-                                    WaitOutcome::Stopped {
-                                        task: child_key.id,
-                                        signal,
-                                        ruid: record.task.process_credentials().ruid(),
-                                        kind,
-                                    }
-                                }
-                                TaskJobControlEvent::Continued => WaitOutcome::Continued {
-                                    task: child_key.id,
-                                    ruid: record.task.process_credentials().ruid(),
-                                },
-                            })
-                    } else {
-                        None
-                    }
-                });
-                if let Some(state_change) = state_change {
-                    return Ok(state_change);
-                }
-
-                let tracee_stop = traced_non_children.iter().find_map(|tracee_key| {
-                    let record = state.tasks.get(&tracee_key.id)?;
-                    if record.task.key() == *tracee_key
-                        && record.task.ptrace_tracer() == Some(parent)
-                        && target.admits(*tracee_key, record.task.process_group())
-                    {
-                        record
-                            .task
-                            .waitable_job_control_event(true, job_control.continued, false)
-                            .map(|event| match event {
-                                TaskJobControlEvent::Stopped { signal, kind } => {
-                                    WaitOutcome::Stopped {
-                                        task: tracee_key.id,
-                                        signal,
-                                        ruid: record.task.process_credentials().ruid(),
-                                        kind,
-                                    }
-                                }
-                                TaskJobControlEvent::Continued => WaitOutcome::Continued {
-                                    task: tracee_key.id,
-                                    ruid: record.task.process_credentials().ruid(),
-                                },
-                            })
-                    } else {
-                        None
-                    }
-                });
-                if let Some(tracee_stop) = tracee_stop {
-                    return Ok(tracee_stop);
-                }
-
-                let live_tracee = traced_non_children.iter().any(|tracee_key| {
-                    let Some(record) = state.tasks.get(&tracee_key.id) else {
-                        return false;
-                    };
-                    record.task.key() == *tracee_key
-                        && record.task.ptrace_tracer() == Some(parent)
-                        && target.admits(*tracee_key, record.task.process_group())
-                });
-                let live_child = live_tracee
-                    || children.iter().any(|child_key| {
-                        let task = state
-                            .tasks
-                            .get(&child_key.id)
-                            .map(|record| &record.task)
-                            .or_else(|| {
-                                state
-                                    .retiring_tasks
-                                    .get(&child_key.id)
-                                    .map(|record| &record.task)
-                            });
-                        task.is_some_and(|task| {
-                            task.key() == *child_key
-                                && task.parent() == Some(parent)
-                                && class.admits(task.exit_signal())
-                                && target.admits(*child_key, task.process_group())
-                        })
-                    });
-                return Ok(if live_child {
-                    WaitOutcome::StillRunning(sample_precheck(&state, parent_id))
-                } else {
-                    WaitOutcome::NoChild
-                });
-            } else {
-                let has_exited_child = children.iter().any(|child_key| {
-                    state.zombies.get(&child_key.id).is_some_and(|record| {
-                        record.zombie.key == *child_key
-                            && record.zombie.parent == Some(parent)
-                            && class.admits(record.zombie.exit_signal)
-                            && target.admits(*child_key, record.zombie.process_group)
-                    })
-                });
-                let has_job_control = children.iter().any(|child_key| {
-                    state.tasks.get(&child_key.id).is_some_and(|record| {
-                        record.task.key() == *child_key
-                            && record.task.parent() == Some(parent)
-                            && class.admits(record.task.exit_signal())
-                            && target.admits(*child_key, record.task.process_group())
-                            && record
-                                .task
-                                .waitable_job_control_event(
-                                    job_control.stopped,
-                                    job_control.continued,
-                                    false,
-                                )
-                                .is_some()
-                    })
-                }) || traced_non_children.iter().any(|tracee_key| {
-                    state.tasks.get(&tracee_key.id).is_some_and(|record| {
-                        record.task.key() == *tracee_key
-                            && record.task.ptrace_tracer() == Some(parent)
-                            && target.admits(*tracee_key, record.task.process_group())
-                            && record
-                                .task
-                                .waitable_job_control_event(true, job_control.continued, false)
-                                .is_some()
-                    })
-                });
-
-                if !has_exited_child && !has_job_control {
-                    let live_tracee = traced_non_children.iter().any(|tracee_key| {
-                        let Some(record) = state.tasks.get(&tracee_key.id) else {
-                            return false;
-                        };
-                        record.task.key() == *tracee_key
-                            && record.task.ptrace_tracer() == Some(parent)
-                            && target.admits(*tracee_key, record.task.process_group())
-                    });
-                    let live_child = live_tracee
-                        || children.iter().any(|child_key| {
-                            let task = state
-                                .tasks
-                                .get(&child_key.id)
-                                .map(|record| &record.task)
-                                .or_else(|| {
-                                    state
-                                        .retiring_tasks
-                                        .get(&child_key.id)
-                                        .map(|record| &record.task)
-                                });
-                            task.is_some_and(|task| {
-                                task.key() == *child_key
-                                    && task.parent() == Some(parent)
-                                    && class.admits(task.exit_signal())
-                                    && target.admits(*child_key, task.process_group())
-                            })
-                        });
-                    return Ok(if live_child {
-                        WaitOutcome::StillRunning(sample_precheck(&state, parent_id))
-                    } else {
-                        WaitOutcome::NoChild
-                    });
-                }
+                return state
+                    .scan_wait(parent_id, query)
+                    .map(render_wait)
+                    .map_err(wait_error);
             }
-        }
-
-        let mut state = self.registry().settled().write();
-        if mode == WaitMode::Consume {
-            ensure_task_unreserved(&state, parent_id)?;
-        }
-        let Some((parent, parent_pid_region, children, tracees)) =
-            state.tasks.get(&parent_id).map(|record| {
-                (
-                    record.task.key(),
-                    record.task.pid_ns_region(),
-                    record.task.children(),
-                    record.task.ptrace_tracees(),
-                )
-            })
-        else {
-            return Err(KernelOperationError::UnknownTask(parent_id));
-        };
-        // ptrace(2): a tracer waits for its tracees' ptrace stops whether or
-        // not it is their parent. Only stop/continue events are reported for
-        // a non-child tracee here; its exit still belongs to the real parent
-        // (Linux would report that exit to the tracer first), so a tracer
-        // waiting on a non-child tracee that exits sees ECHILD instead.
-        let traced_non_children: Vec<TaskKey> = tracees
-            .into_iter()
-            .filter(|key| !children.contains(key))
-            .collect();
-        let exited = children.iter().find_map(|child_key| {
-            let record = state.zombies.get(&child_key.id)?;
-            if record.zombie.key == *child_key
-                && record.zombie.parent == Some(parent)
-                && class.admits(record.zombie.exit_signal)
-                && target.admits(*child_key, record.zombie.process_group)
+            match state
+                .precheck_wait::<NsUid>(parent_id, query)
+                .map_err(wait_error)?
             {
-                Some((child_key.id, record.zombie.clone()))
-            } else {
-                None
+                WaitReadiness::Ready => {}
+                WaitReadiness::StillRunning(token) => {
+                    return Ok(WaitOutcome::StillRunning(ChildWaitPrecheck(
+                        token.wake_generation().raw(),
+                    )));
+                }
+                WaitReadiness::NoChild => return Ok(WaitOutcome::NoChild),
             }
+        }
+        // A read-lock event is a reason to rescan, never an authorization to
+        // consume. The shared owner selects and reaps under this write guard.
+        let mut state = self.registry().settled().write();
+        let consumed = state.consume_wait(parent_id, query).map_err(wait_error)?;
+        // Preserve host numeric-claim release under the registry write guard,
+        // before namespace effects and reaped observers can run.
+        drop(consumed.reaped_record);
+        let region = consumed.reaped_parent.and_then(|_| {
+            state
+                .tasks
+                .get(&parent_id)
+                .and_then(|record| record.task.pid_ns_region())
         });
-        if let Some((id, zombie)) = exited {
-            if mode == WaitMode::Consume {
-                ensure_task_unreserved(&state, id)?;
-                let parent_revision = state
-                    .tasks
-                    .get(&parent_id)
-                    .map(|record| next_revision(&record.task, record.revision))
-                    .transpose()?
-                    .ok_or(KernelOperationError::UnknownTask(parent_id))?;
-                state.zombies.remove(&id);
-                remove_group_member(&mut state, zombie.process_group, zombie.session, zombie.key);
-                if let Some(parent_record) = state.tasks.get_mut(&parent_id) {
-                    parent_record.task.remove_child(zombie.key);
-                    // Reaping is the moment Linux moves a child's CPU into the
-                    // parent's CHILDREN ledger — the child's own time plus what
-                    // it had already reaped from its own children. Doing it here
-                    // means only a CONSUMING wait charges it, so a WNOHANG poll
-                    // or a WNOWAIT peek cannot double-count.
-                    parent_record
-                        .task
-                        .charge_reaped_child(zombie.total_charge_to_reaper());
-                    parent_record.revision = parent_revision;
-                }
-                drop(state);
-                self.auditors().reaped(parent, zombie.key);
-                if let Some(region) = parent_pid_region {
-                    let internal = u32::try_from(id.raw()).unwrap_or_else(|_| {
-                        carrick_fatal!(
-                            "kernel::child_reaping",
-                            "zombie id exceeds u32 in wait_child_matching"
-                        );
-                    });
-                    if !region.unregister_reaped(internal) {
-                        carrick_fatal!(
-                            "kernel::child_reaping",
-                            "failed to unregister reaped child in wait_child_matching"
-                        );
-                    }
-                }
-            }
-            return Ok(WaitOutcome::Exited(zombie));
-        }
-
+        drop(state);
+        if let (Some(parent), WaitSelection::Exited(zombie)) =
+            (consumed.reaped_parent, &consumed.selection)
         {
-            let state_change = children.iter().find_map(|child_key| {
-                let record = state.tasks.get(&child_key.id)?;
-                if record.task.key() == *child_key
-                    && record.task.parent() == Some(parent)
-                    && class.admits(record.task.exit_signal())
-                    && target.admits(*child_key, record.task.process_group())
-                {
-                    record
-                        .task
-                        .waitable_job_control_event(
-                            job_control.stopped,
-                            job_control.continued,
-                            mode == WaitMode::Consume,
-                        )
-                        .map(|event| match event {
-                            TaskJobControlEvent::Stopped { signal, kind } => WaitOutcome::Stopped {
-                                task: child_key.id,
-                                signal,
-                                ruid: record.task.process_credentials().ruid(),
-                                kind,
-                            },
-                            TaskJobControlEvent::Continued => WaitOutcome::Continued {
-                                task: child_key.id,
-                                ruid: record.task.process_credentials().ruid(),
-                            },
-                        })
-                } else {
-                    None
+            self.auditors().reaped(parent, zombie.key);
+            if let Some(region) = region {
+                let internal = u32::try_from(zombie.key.id.raw()).unwrap_or_else(|_| {
+                    carrick_fatal!(
+                        "kernel::child_reaping",
+                        "zombie id exceeds u32 in wait_child_matching"
+                    );
+                });
+                if !region.unregister_reaped(internal) {
+                    carrick_fatal!(
+                        "kernel::child_reaping",
+                        "failed to unregister reaped child in wait_child_matching"
+                    );
                 }
-            });
-            if let Some(state_change) = state_change {
-                return Ok(state_change);
             }
         }
-        {
-            let tracee_stop = traced_non_children.iter().find_map(|tracee_key| {
-                let record = state.tasks.get(&tracee_key.id)?;
-                if record.task.key() == *tracee_key
-                    && record.task.ptrace_tracer() == Some(parent)
-                    && target.admits(*tracee_key, record.task.process_group())
-                {
-                    record
-                        .task
-                        .waitable_job_control_event(
-                            true,
-                            job_control.continued,
-                            mode == WaitMode::Consume,
-                        )
-                        .map(|event| match event {
-                            TaskJobControlEvent::Stopped { signal, kind } => WaitOutcome::Stopped {
-                                task: tracee_key.id,
-                                signal,
-                                ruid: record.task.process_credentials().ruid(),
-                                kind,
-                            },
-                            TaskJobControlEvent::Continued => WaitOutcome::Continued {
-                                task: tracee_key.id,
-                                ruid: record.task.process_credentials().ruid(),
-                            },
-                        })
-                } else {
-                    None
-                }
-            });
-            if let Some(tracee_stop) = tracee_stop {
-                return Ok(tracee_stop);
-            }
-        }
-
-        let live_tracee = traced_non_children.iter().any(|tracee_key| {
-            let Some(record) = state.tasks.get(&tracee_key.id) else {
-                return false;
-            };
-            record.task.key() == *tracee_key
-                && record.task.ptrace_tracer() == Some(parent)
-                && target.admits(*tracee_key, record.task.process_group())
-        });
-        let live_child = live_tracee
-            || children.iter().any(|child_key| {
-                let task = state
-                    .tasks
-                    .get(&child_key.id)
-                    .map(|record| &record.task)
-                    .or_else(|| {
-                        state
-                            .retiring_tasks
-                            .get(&child_key.id)
-                            .map(|record| &record.task)
-                    });
-                task.is_some_and(|task| {
-                    task.key() == *child_key
-                        && task.parent() == Some(parent)
-                        && class.admits(task.exit_signal())
-                        && target.admits(*child_key, task.process_group())
-                })
-            });
-        Ok(if live_child {
-            WaitOutcome::StillRunning(sample_precheck(&state, parent_id))
-        } else {
-            WaitOutcome::NoChild
-        })
+        Ok(render_wait(consumed.selection))
     }
 }
 
-/// Sample the waiting parent's wake generation under the registry lock that
-/// just concluded nothing was reapable. See [`ChildWaitPrecheck`]: taking this
-/// reading anywhere else reintroduces the lost wake it exists to prevent.
-fn sample_precheck(state: &RegistryState, parent_id: TaskId) -> ChildWaitPrecheck {
-    ChildWaitPrecheck(
-        state
-            .tasks
-            .get(&parent_id)
-            .map_or(0, |record| record.task.wake_generation()),
-    )
+fn wait_error(error: WaitError<KernelOperationError>) -> KernelOperationError {
+    match error {
+        WaitError::UnknownTask(id) => KernelOperationError::UnknownTask(id),
+        WaitError::Busy(id) => KernelOperationError::TaskBusy(id),
+        WaitError::Revision(error) => error,
+    }
+}
+
+fn render_wait(selected: WaitSelection<Zombie, WaitOutcome>) -> WaitOutcome {
+    match selected {
+        WaitSelection::Exited(zombie) => WaitOutcome::Exited(zombie),
+        WaitSelection::Event(event) => event,
+        WaitSelection::StillRunning(token) => {
+            WaitOutcome::StillRunning(ChildWaitPrecheck(token.wake_generation().raw()))
+        }
+        WaitSelection::NoChild => WaitOutcome::NoChild,
+    }
+}
+
+fn task_wait_identity(task: &crate::kernel::objects::TaskRef) -> WaitIdentity {
+    WaitIdentity {
+        key: task.key(),
+        parent: task.parent(),
+        tracer: task.ptrace_tracer(),
+        group: task.process_group(),
+        exit_signal: task.exit_signal(),
+    }
+}
+impl WaitIdentitySource for TaskRecord {
+    fn wait_identity(&self) -> WaitIdentity {
+        task_wait_identity(&self.task)
+    }
+}
+impl WaitIdentitySource for RetiringTaskRecord {
+    fn wait_identity(&self) -> WaitIdentity {
+        task_wait_identity(&self.task)
+    }
+}
+impl WaitLive for TaskRecord {
+    type Event = WaitOutcome;
+    type Revision = TaskRevision;
+    type Error = KernelOperationError;
+    fn wait_children(&self) -> Vec<TaskKey> {
+        self.task.children()
+    }
+    fn wait_tracees(&self) -> Vec<TaskKey> {
+        self.task.ptrace_tracees()
+    }
+    fn wait_wake_generation(&self) -> TaskWakeGeneration {
+        TaskWakeGeneration::from_task_counter(self.task.wake_generation())
+    }
+    fn wait_event(&self, flags: WaitJobControl, consume: bool) -> Option<WaitOutcome> {
+        self.task
+            .waitable_job_control_event(flags.stopped, flags.continued, consume)
+            .map(|event| match event {
+                TaskJobControlEvent::Stopped { signal, kind } => WaitOutcome::Stopped {
+                    task: self.task.key().id,
+                    signal,
+                    ruid: self.task.process_credentials().ruid(),
+                    kind,
+                },
+                TaskJobControlEvent::Continued => WaitOutcome::Continued {
+                    task: self.task.key().id,
+                    ruid: self.task.process_credentials().ruid(),
+                },
+            })
+    }
+    fn prepare_reap(&self) -> Result<TaskRevision, KernelOperationError> {
+        next_revision(&self.task, self.revision)
+    }
+    fn commit_reap(
+        &mut self,
+        child: TaskKey,
+        charge: carrick_sched_core::process::TaskRusage,
+        revision: TaskRevision,
+    ) {
+        self.task.remove_child(child);
+        self.task.charge_reaped_child(charge);
+        self.revision = revision;
+    }
+}
+impl WaitZombie<crate::kernel::container::ContainerId, NsUid> for ZombieRecord {
+    fn wait_zombie(&self) -> &Zombie {
+        &self.zombie
+    }
 }
 
 #[cfg(test)]

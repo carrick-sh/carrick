@@ -5,17 +5,14 @@
 //! exit subscription notification, and unreferenced file table and MM I/O retirement.
 
 use carrick_el1_abi::Lifecycle;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use carrick_fatal::carrick_fatal;
 use carrick_hal::KernelTransactionId;
-use parking_lot::Mutex;
 
-use super::session::remove_group_member;
 use super::{
-    KernelFailpoint, KernelOperationError, TaskGraphReservation, TaskSetReservation,
-    check_failpoint, ensure_task_unreserved, next_revision,
+    KernelFailpoint, KernelOperationError, TaskSetReservation, check_failpoint, next_revision,
 };
 use crate::kernel::core::{
     FileCloseDisposition, FileCloseEvent, Kernel, KernelContext, RegistryState,
@@ -38,84 +35,138 @@ pub(in crate::kernel) enum ThreadRetirementLane {
     },
 }
 
-/// An exit owns a live participant's parent/child edges, not its runnable
-/// threads. Only a prepared membership transition may advance this revision
-/// while the topology reservation is held. Arbitrary revision drift still
-/// invalidates the exit; the exact task generation never changes.
-#[derive(Debug)]
-pub(in crate::kernel) struct ExitParticipantRevision {
-    task: TaskKey,
-    revision: Mutex<TaskRevision>,
+impl From<carrick_sched_core::process::exit::ExitTopologyChanged> for KernelOperationError {
+    fn from(error: carrick_sched_core::process::exit::ExitTopologyChanged) -> Self {
+        Self::ExitTopologyChanged(error.0.id)
+    }
 }
 
-impl ExitParticipantRevision {
-    fn validate(&self, task: TaskKey, current: TaskRevision) -> Result<(), KernelOperationError> {
-        if self.task != task || *self.revision.lock() != current {
-            return Err(KernelOperationError::ExitTopologyChanged(self.task.id));
+type PreparedExitParticipant = carrick_sched_core::process::exit::PreparedExitParticipant<
+    crate::kernel::revision_capacity::RevisionReservation,
+>;
+
+impl carrick_sched_core::process::exit::ExitLive<crate::kernel::container::ContainerId>
+    for TaskRecord
+{
+    type Credit = crate::kernel::revision_capacity::RevisionReservation;
+    type Error = KernelOperationError;
+    fn exit_container(&self) -> crate::kernel::container::ContainerId {
+        self.task.container().id()
+    }
+    fn exit_lifecycle(&self) -> TaskLifecycle {
+        self.task.lifecycle()
+    }
+    fn exit_children(&self) -> BTreeSet<TaskKey> {
+        self.task.children_set()
+    }
+    fn exit_autoreaps(&self) -> bool {
+        self.task.autoreaps_children()
+    }
+    fn exit_revision(&self) -> TaskRevision {
+        self.revision
+    }
+    fn exit_reserve_credit(&self) -> Result<Self::Credit, Self::Error> {
+        self.task
+            .reserve_exit_participant_revision(self.revision)
+            .ok_or(KernelOperationError::RevisionExhausted)
+    }
+}
+pub(in crate::kernel) struct HostExitMember(crate::kernel::objects::ThreadRef);
+impl carrick_sched_core::process::exit::ExitMember for HostExitMember {
+    fn exit_task(&self) -> TaskKey {
+        self.0.task_key()
+    }
+}
+impl carrick_sched_core::process::exit::ExitEffectSource<crate::kernel::container::ContainerId>
+    for TaskRecord
+{
+    type Member = HostExitMember;
+    type Resources = Vec<Arc<FileTable>>;
+    fn exit_members(&self) -> (Vec<Self::Member>, Self::Resources) {
+        let mut members = Vec::new();
+        let mut files = Vec::new();
+        let mut seen = BTreeSet::new();
+        for key in self.task.thread_keys() {
+            if let Some(thread) = self.task.thread(key.tid) {
+                let table = thread.resources().files();
+                if seen.insert(table.id()) {
+                    files.push(table);
+                }
+                members.push(HostExitMember(thread));
+            }
         }
-        Ok(())
+        (members, files)
     }
-
-    pub(super) fn prepare_membership(
-        self: &Arc<Self>,
-        task: TaskKey,
-        current: TaskRevision,
-        next: TaskRevision,
-    ) -> Result<PreparedExitMembershipRevision, KernelOperationError> {
-        self.validate(task, current)?;
-        if current.next() != Some(next) {
-            return Err(KernelOperationError::ExitTopologyChanged(self.task.id));
+    fn exit_begin(&self) -> bool {
+        self.task.begin_exit()
+    }
+}
+pub(in crate::kernel) struct HostExitParent(Arc<crate::kernel::objects::Task>);
+impl carrick_sched_core::process::exit::ExitSignalSource for HostExitParent {
+    fn exit_signal_state(
+        &self,
+        signal: crate::kernel::ids::LinuxSignal,
+    ) -> carrick_sched_core::process::exit::ExitSignalState {
+        let action = self.0.shared().sighand().action_entry(signal);
+        let blocked = self.0.threads().iter().any(|thread| {
+            let state = thread.signal_state.lock();
+            thread.blocked_mask().contains(signal.raw())
+                || state
+                    .active_wait_set()
+                    .is_some_and(|set| set.contains(signal.raw()))
+        });
+        crate::kernel::objects::signal::child_exit_signal_state(action, blocked)
+    }
+}
+impl carrick_sched_core::process::exit::ExitNotificationSource for TaskRecord {
+    type Target = HostExitParent;
+    fn exit_notification_target(&self) -> HostExitParent {
+        HostExitParent(Arc::clone(&self.task))
+    }
+}
+impl carrick_sched_core::process::exit::ExitLivePublication<crate::kernel::container::ContainerId>
+    for TaskRecord
+{
+    fn exit_reparent(&mut self, parent: Option<TaskKey>) {
+        self.task.reparent(parent);
+    }
+    fn exit_publish_children(&mut self, children: BTreeSet<TaskKey>) {
+        self.task.publish_prepared_children(children);
+    }
+    fn exit_publish_credit(&mut self, participant: PreparedExitParticipant) {
+        self.revision = participant.publish(self.revision, |credit, current| {
+            self.task.consume_reserved_revision(credit, current)
+        });
+    }
+}
+impl carrick_sched_core::process::exit::ExitZombiePublication for ZombieRecord {
+    fn exit_reparent(&mut self, parent: Option<TaskKey>) {
+        self.zombie.parent = parent;
+    }
+}
+impl carrick_sched_core::process::exit::ExitRetiring for RetiringTaskRecord {
+    fn exit_key(&self) -> TaskKey {
+        self.task.key()
+    }
+}
+impl carrick_sched_core::process::exit::ExitZombie for ZombieRecord {
+    fn exit_key(&self) -> TaskKey {
+        self.zombie.key
+    }
+}
+impl From<carrick_sched_core::process::exit::ExitError<KernelOperationError>>
+    for KernelOperationError
+{
+    fn from(error: carrick_sched_core::process::exit::ExitError<KernelOperationError>) -> Self {
+        use carrick_sched_core::process::exit::ExitError;
+        match error {
+            ExitError::Unknown(id) => Self::UnknownTask(id),
+            ExitError::Stale(id) => Self::StaleTaskGeneration(id),
+            ExitError::Busy(id) => Self::TaskBusy(id),
+            ExitError::AlreadyExiting(id) => Self::AlreadyExiting(id),
+            ExitError::Topology(id) => Self::ExitTopologyChanged(id),
+            ExitError::Resource(error) => error,
         }
-        Ok(PreparedExitMembershipRevision {
-            participant: Arc::clone(self),
-            next,
-        })
-    }
-}
-
-/// Affine membership publication admitted before irreversible thread work.
-/// Admission and publication both run under the same registry write guard.
-pub(super) struct PreparedExitMembershipRevision {
-    participant: Arc<ExitParticipantRevision>,
-    next: TaskRevision,
-}
-
-impl PreparedExitMembershipRevision {
-    pub(super) fn publish(self) {
-        *self.participant.revision.lock() = self.next;
-    }
-}
-
-/// One topology publication credit, retained across concurrent membership
-/// changes. Consuming it advances the current revision rather than overwriting
-/// a thread birth/exit with the successor computed before that activity.
-#[derive(Debug)]
-pub(super) struct PreparedExitParticipant {
-    revision: Arc<ExitParticipantRevision>,
-    publication: crate::kernel::revision_capacity::RevisionReservation,
-}
-
-impl PreparedExitParticipant {
-    fn reserve(record: &TaskRecord) -> Result<Self, KernelOperationError> {
-        let publication = record
-            .task
-            .reserve_exit_participant_revision(record.revision)
-            .ok_or(KernelOperationError::RevisionExhausted)?;
-        Ok(Self {
-            revision: Arc::new(ExitParticipantRevision {
-                task: record.task.key(),
-                revision: Mutex::new(record.revision),
-            }),
-            publication,
-        })
-    }
-
-    fn publish(mut self, record: &mut TaskRecord) {
-        let next = record
-            .task
-            .consume_reserved_revision(&mut self.publication, record.revision);
-        *self.revision.revision.lock() = next;
-        record.revision = next;
     }
 }
 
@@ -126,21 +177,9 @@ impl PreparedExitParticipant {
 pub struct PreparedTaskExit {
     pub(super) reservation: TaskSetReservation,
     pub(super) task: TaskKey,
-    pub(super) task_revision: Arc<ExitParticipantRevision>,
-    pub(super) children: Vec<TaskKey>,
-    pub(super) affected_revisions: BTreeMap<TaskId, PreparedExitParticipant>,
-    pub(super) adopter: Option<TaskKey>,
-    pub(super) prepared_adopter_children: Option<BTreeSet<TaskKey>>,
-    pub(super) autoreap_parent: Option<TaskKey>,
-    pub(super) prepared_parent_children: Option<BTreeSet<TaskKey>>,
-    /// The container's pid-namespace init as of this transaction, when it is
-    /// still LIVE (the exiting task itself counts: it is live until this exit
-    /// commits). `None` means the init has already become a zombie, so nothing
-    /// inside the namespace can adopt anyone any more and container retirement
-    /// is the reaper of last resort. Recorded here rather than re-read at
-    /// commit so the judgement comes from the same reserved snapshot that
-    /// chose `adopter`.
-    pub(super) namespace_init: Option<TaskKey>,
+    topology: carrick_sched_core::process::exit::PreparedExitTopology<
+        crate::kernel::revision_capacity::RevisionReservation,
+    >,
     pub(super) registry_zombie: Zombie,
     pub(super) result_zombie: Zombie,
 }
@@ -196,7 +235,7 @@ impl PreparedTaskExit {
     pub(crate) fn zombie_reaper(&self) -> crate::observe::ZombieReaper {
         match self.result_zombie.parent {
             Some(parent) => crate::observe::ZombieReaper::Parent(parent),
-            None => match self.namespace_init {
+            None => match self.topology.namespace_init() {
                 Some(init) if init != self.task => crate::observe::ZombieReaper::Unreapable,
                 _ => crate::observe::ZombieReaper::ContainerRetirement,
             },
@@ -654,172 +693,13 @@ impl Kernel {
         let task_id = task_key.id;
         let transaction = self.object_ids().transaction_id()?;
         let mut state = self.registry().settled().write();
-        ensure_task_unreserved(&state, task_id)?;
-        let Some(task_record) = state.tasks.get(&task_id) else {
-            return Err(KernelOperationError::UnknownTask(task_id));
-        };
-        if task_record.task.key() != task_key {
-            return Err(KernelOperationError::StaleTaskGeneration(task_id));
-        }
-        if task_record.task.lifecycle() == TaskLifecycle::Exiting {
-            return Err(KernelOperationError::AlreadyExiting(task_id));
-        }
-        if state.zombies.contains_key(&task_id) {
-            return Err(KernelOperationError::ExitTopologyChanged(task_id));
-        }
-
+        let topology = state.prepare_exit_topology(task_key, explicit_adopter)?;
+        let task_record = state
+            .tasks
+            .get(&task_id)
+            .ok_or(KernelOperationError::UnknownTask(task_id))?;
         let task = Arc::clone(&task_record.task);
-        let task_revision = Arc::new(ExitParticipantRevision {
-            task: task_key,
-            revision: Mutex::new(task_record.revision),
-        });
         let diagnostic_name = task_record.diagnostic_name.clone();
-        // The run's root task is the reparenting authority only while that
-        // exact generation is live. HVPatch process threads are joined by the
-        // outer runtime after individual process finalizers, so root teardown
-        // can race a descendant's final Kernel publication. Once root has
-        // already become a zombie, the descendant is an orphan with no live
-        // adopter; targeting the retired root would make terminal cleanup fail
-        // closed after the guest process has already exited.
-        let adopter = if let Some(adopter_key) = explicit_adopter {
-            let adopter_record = state
-                .tasks
-                .get(&adopter_key.id)
-                .ok_or(KernelOperationError::UnknownTask(adopter_key.id))?;
-            if adopter_record.task.key() != adopter_key {
-                return Err(KernelOperationError::StaleTaskGeneration(adopter_key.id));
-            }
-            if adopter_record.task.lifecycle() != TaskLifecycle::Live {
-                return Err(KernelOperationError::UnknownTask(adopter_key.id));
-            }
-
-            // An adopter must already be in the exiting task's authoritative
-            // ancestry. This rejects accidental child/self adoption, which
-            // would introduce a cycle when the children are published below.
-            let mut ancestor = task.parent();
-            let mut authenticated = false;
-            while let Some(ancestor_key) = ancestor {
-                if ancestor_key == adopter_key {
-                    authenticated = true;
-                    break;
-                }
-                let ancestor_record = state
-                    .tasks
-                    .get(&ancestor_key.id)
-                    .filter(|record| record.task.key() == ancestor_key)
-                    .ok_or(KernelOperationError::ExitTopologyChanged(ancestor_key.id))?;
-                ancestor = ancestor_record.task.parent();
-            }
-            if !authenticated {
-                return Err(KernelOperationError::ExitTopologyChanged(adopter_key.id));
-            }
-            Some(adopter_key)
-        } else {
-            let init = state.container_inits.get(&task.container().id()).copied();
-            init.filter(|init| *init != task_key).and_then(|init| {
-                state.tasks.get(&init.id).and_then(|record| {
-                    (record.task.key() == init && record.task.lifecycle() == TaskLifecycle::Live)
-                        .then(|| record.task.key())
-                })
-            })
-        };
-        // The namespace's reparenting authority, independent of whether THIS
-        // exit has anything to reparent. `adopter` below is additionally
-        // filtered to "not self" and "has children", which makes it useless as
-        // an answer to "could anything in this namespace still have adopted an
-        // orphan?" — the question a zombie's reaper depends on.
-        let namespace_init = state
-            .container_inits
-            .get(&task.container().id())
-            .copied()
-            .filter(|init| {
-                *init == task_key
-                    || state.tasks.get(&init.id).is_some_and(|record| {
-                        record.task.key() == *init && record.task.lifecycle() == TaskLifecycle::Live
-                    })
-            });
-        let mut children = task.children();
-        children.sort_by_key(|child| child.serial);
-        // The adopter is only a participant when there is something to
-        // reparent. A childless exit changes no parent edge on it, so it is
-        // neither reserved nor revision-bumped: otherwise every leaf exit in
-        // the VM contends with the run root's own in-flight fork/exec
-        // reservations, and a concurrent `reserve_fork` on root observes
-        // `TaskBusy` for an exit that never touches it. The adopter above was
-        // still validated so a stale explicit adopter fails closed.
-        let adopter = adopter.filter(|_| !children.is_empty());
-
-        let mut reserved_ids = BTreeSet::from([task_id]);
-        let mut affected_revisions = BTreeMap::new();
-        for child_key in &children {
-            ensure_task_unreserved(&state, child_key.id)?;
-            reserved_ids.insert(child_key.id);
-            if let Some(child) = state.tasks.get(&child_key.id) {
-                if child.task.key() != *child_key {
-                    return Err(KernelOperationError::ExitTopologyChanged(child_key.id));
-                }
-                affected_revisions.insert(child_key.id, PreparedExitParticipant::reserve(child)?);
-            } else if state
-                .zombies
-                .get(&child_key.id)
-                .is_none_or(|child| child.zombie.key != *child_key)
-            {
-                return Err(KernelOperationError::ExitTopologyChanged(child_key.id));
-            }
-        }
-
-        let autoreap_parent = if let Some(parent_key) = task.parent()
-            && task.exit_signal() == crate::kernel::ids::ChildExitSignal::SIGCHLD
-            && let Some(parent_record) = state.tasks.get(&parent_key.id)
-            && parent_record.task.key() == parent_key
-            && parent_record.task.autoreaps_children()
-        {
-            Some(parent_key)
-        } else {
-            None
-        };
-
-        let prepared_adopter_children = if let Some(adopter_key) = adopter {
-            reserved_ids.insert(adopter_key.id);
-            let adopter_record = state
-                .tasks
-                .get(&adopter_key.id)
-                .filter(|record| record.task.key() == adopter_key)
-                .ok_or(KernelOperationError::ExitTopologyChanged(adopter_key.id))?;
-            affected_revisions.insert(
-                adopter_key.id,
-                PreparedExitParticipant::reserve(adopter_record)?,
-            );
-            let mut prepared = adopter_record.task.children_set();
-            if autoreap_parent == Some(adopter_key) {
-                prepared.remove(&task_key);
-            }
-            prepared.extend(children.iter().copied());
-            Some(prepared)
-        } else {
-            None
-        };
-
-        let prepared_parent_children = if let Some(parent_key) = autoreap_parent
-            && adopter != Some(parent_key)
-        {
-            reserved_ids.insert(parent_key.id);
-            let parent_record = state
-                .tasks
-                .get(&parent_key.id)
-                .filter(|record| record.task.key() == parent_key)
-                .ok_or(KernelOperationError::ExitTopologyChanged(parent_key.id))?;
-            affected_revisions.insert(
-                parent_key.id,
-                PreparedExitParticipant::reserve(parent_record)?,
-            );
-            let mut prepared = parent_record.task.children_set();
-            prepared.remove(&task_key);
-            Some(prepared)
-        } else {
-            None
-        };
-
         let namespace_process_group = state
             .process_groups
             .get(&task.process_group())
@@ -832,7 +712,7 @@ impl Kernel {
             .filter(|session| session.container == task.container().id())
             .map(|session| session.namespace_id)
             .ok_or(KernelOperationError::ExitTopologyChanged(task_id))?;
-        let registry_zombie = Zombie::from_task(
+        let registry_zombie = crate::kernel::objects::process::capture_zombie(
             &task,
             status,
             diagnostic_name,
@@ -840,21 +720,8 @@ impl Kernel {
             namespace_session,
         );
         let result_zombie = registry_zombie.clone();
-        let task_ids: Vec<_> = reserved_ids.into_iter().collect();
-        let reservation = TaskSetReservation::acquired(self, &mut state, task_ids, transaction)?;
-        state.reservations.insert(
-            task_id,
-            TaskGraphReservation::exit_participant(transaction, Arc::clone(&task_revision)),
-        );
-        for (affected_id, participant) in &affected_revisions {
-            state.reservations.insert(
-                *affected_id,
-                TaskGraphReservation::exit_participant(
-                    transaction,
-                    Arc::clone(&participant.revision),
-                ),
-            );
-        }
+        let reservation =
+            TaskSetReservation::acquired_exit(self, &mut state, &topology, transaction)?;
         drop(state);
         check_failpoint(failpoint, KernelFailpoint::AfterReserve)?;
         check_failpoint(failpoint, KernelFailpoint::AfterObjects)?;
@@ -863,14 +730,7 @@ impl Kernel {
         Ok(PreparedTaskExit {
             reservation,
             task: task_key,
-            task_revision,
-            children,
-            affected_revisions,
-            adopter,
-            prepared_adopter_children,
-            autoreap_parent,
-            prepared_parent_children,
-            namespace_init,
+            topology,
             registry_zombie,
             result_zombie,
         })
@@ -916,38 +776,16 @@ impl Kernel {
         if exiting_record.task.lifecycle() != TaskLifecycle::Live {
             return Err(KernelOperationError::ExitTopologyChanged(prepared.task.id));
         }
-        prepared
-            .task_revision
-            .validate(exiting_record.task.key(), exiting_record.revision)?;
-        for (affected_id, participant) in &prepared.affected_revisions {
-            let Some(affected) = state.tasks.get(affected_id) else {
-                return Err(KernelOperationError::ExitTopologyChanged(*affected_id));
-            };
-            participant
-                .revision
-                .validate(affected.task.key(), affected.revision)?;
-        }
-        for child_key in &prepared.children {
-            let live_matches = state
-                .tasks
-                .get(&child_key.id)
-                .is_some_and(|record| record.task.key() == *child_key);
-            let zombie_matches = state
-                .zombies
-                .get(&child_key.id)
-                .is_some_and(|record| record.zombie.key == *child_key);
-            if !live_matches && !zombie_matches {
-                return Err(KernelOperationError::ExitTopologyChanged(child_key.id));
-            }
-        }
+        let own_tracer = exiting_record.task.ptrace_tracer();
+        let mut effects = state.begin_exit_effects(
+            prepared.task,
+            &prepared.topology,
+            &prepared.reservation.permit,
+        )?;
         // ptrace(2): a tracer's exit detaches every tracee it still owns, and
         // a detached stopped tracee resumes. Capture the tracer key before
         // `begin_exit` clears this task's own tracee-side record so the tracer
         // can drop its index entry and re-evaluate a wait on this task.
-        let own_tracer = exiting_record.task.ptrace_tracer();
-        if !exiting_record.task.begin_exit() {
-            return Err(KernelOperationError::AlreadyExiting(prepared.task.id));
-        }
         let mut released_tracees = Vec::new();
         for tracee_key in exiting_record.task.take_ptrace_tracees() {
             if let Some(tracee) = state
@@ -970,20 +808,7 @@ impl Kernel {
         if let Some(tracer) = &own_tracer {
             tracer.remove_ptrace_tracee(prepared.task);
         }
-        let mut exiting_threads = Vec::new();
-        let mut exiting_file_tables = Vec::new();
-        for thread_key in exiting_record.task.thread_keys() {
-            if let Some(thread) = exiting_record.task.thread(thread_key.tid) {
-                let files = thread.resources().files();
-                if !exiting_file_tables
-                    .iter()
-                    .any(|observed| Arc::ptr_eq(observed, &files))
-                {
-                    exiting_file_tables.push(files);
-                }
-                exiting_threads.push(thread);
-            }
-        }
+        let exiting_file_tables = effects.take_resources().unwrap_or_default();
 
         let record = state
             .tasks
@@ -1029,31 +854,7 @@ impl Kernel {
             state.retired_threads.push(dead_leader);
         }
 
-        for child_key in &prepared.children {
-            if let Some(child) = state.tasks.get(&child_key.id) {
-                child.task.reparent(prepared.adopter);
-            } else if let Some(child) = state.zombies.get_mut(&child_key.id) {
-                child.zombie.parent = prepared.adopter;
-            }
-        }
-        if let (Some(adopter_key), Some(children)) =
-            (prepared.adopter, prepared.prepared_adopter_children.take())
-            && let Some(adopter_record) = state.tasks.get(&adopter_key.id)
-        {
-            adopter_record.task.publish_prepared_children(children);
-        }
-        if let (Some(parent_key), Some(children)) = (
-            prepared.autoreap_parent,
-            prepared.prepared_parent_children.take(),
-        ) && let Some(parent_record) = state.tasks.get(&parent_key.id)
-        {
-            parent_record.task.publish_prepared_children(children);
-        }
-        for (affected_id, participant) in std::mem::take(&mut prepared.affected_revisions) {
-            if let Some(affected) = state.tasks.get_mut(&affected_id) {
-                participant.publish(affected);
-            }
-        }
+        state.publish_exit_topology(&mut prepared.topology);
 
         state.retiring_tasks.insert(
             prepared.task.id,
@@ -1070,35 +871,33 @@ impl Kernel {
                 // Include observers registered during the prepared clear;
                 // detach this exact generation before the zombie is visible.
                 let subscribers = kernel.exit_subscribers.take(prepared.task);
-                if state
-                    .retiring_tasks
-                    .remove(&prepared.task.id)
-                    .is_none_or(|record| record.task.key() != prepared.task)
-                {
-                    carrick_fatal!(
-                        "kernel::task_exit_publication",
-                        "retired task publication lost its exact incarnation"
-                    );
-                }
-                let process_group = task.process_group();
-                let session = task.session();
-                if prepared.autoreap_parent.is_some() {
-                    remove_group_member(&mut state, process_group, session, prepared.task);
-                } else {
-                    state.zombies.insert(
-                        prepared.task.id,
+                let carrick_sched_core::process::exit::ExitReceiptPublication {
+                    retiring,
+                    autoreaped_receipt: _autoreaped_receipt,
+                } = state
+                    .publish_exit_receipt(
+                        prepared.task,
+                        &prepared.topology,
                         ZombieRecord {
                             zombie: prepared.registry_zombie,
                             _task_claim: task_claim,
                         },
-                    );
-                }
+                        task.process_group(),
+                        task.session(),
+                    )
+                    .unwrap_or_else(|_| {
+                        carrick_fatal!(
+                            "kernel::task_exit_publication",
+                            "retired task publication lost its exact incarnation"
+                        );
+                    });
 
+                drop(retiring);
                 let pending_publication = prepared.reservation.commit(&mut state)?;
                 drop(state);
-                pending_publication.publish();
+                let released = pending_publication.publish();
 
-                if let Some(parent_key) = prepared.autoreap_parent {
+                if let Some(parent_key) = prepared.topology.autoreap_parent() {
                     kernel.auditors().reaped(parent_key, prepared.task);
                 } else {
                     kernel
@@ -1123,7 +922,7 @@ impl Kernel {
                             );
                         }
                     }
-                    if prepared.autoreap_parent.is_some() {
+                    if prepared.topology.autoreap_parent().is_some() {
                         let leader_tid =
                             u32::try_from(prepared.task.id.raw()).unwrap_or_else(|_| {
                                 carrick_fatal!(
@@ -1141,43 +940,31 @@ impl Kernel {
                 }
                 // Cancellation can wake a host waiter, whose callback may re-enter the
                 // registry. Never invoke it while holding the topology write lock.
-                for thread in exiting_threads {
-                    let _ = thread.cancel_kernel_owned_continuation(
+                let parent_permit = effects.after_release(released)?.cancel_members(|thread| {
+                    let _ = thread.0.cancel_kernel_owned_continuation(
                         crate::kernel::continuation::CancellationCause::ProcessExit,
                     );
-                }
+                });
                 // Queue the parent's exit notification after the exit reservation is
                 // committed. If notify_parent ran before commit, a parent that woke
                 // immediately would see TaskBusy in wait_child_matching and park in
                 // BlockedContinuation having already consumed this exit's wake edge,
                 // wedging forever.
-                if let Some(parent_key) = prepared.result_zombie.parent {
-                    let parent_task = {
-                        let state = kernel.registry().settled().read();
-                        state
-                            .tasks
-                            .get(&parent_key.id)
-                            .filter(|record| record.task.key() == parent_key)
-                            .map(|record| Arc::clone(&record.task))
-                    };
-                    if let Some(parent_task) = parent_task {
-                        let posted = match prepared.result_zombie.exit_signal {
-                            crate::kernel::ids::ChildExitSignal::Signal(signal) => {
-                                if child_exit_signal_needs_notification(&parent_task, signal) {
-                                    let siginfo = exit_siginfo_for_zombie(&prepared.result_zombie);
-                                    kernel.post_signal_to_task_key(parent_key, signal, siginfo)
-                                } else {
-                                    false
-                                }
-                            }
-                            crate::kernel::ids::ChildExitSignal::None => false,
-                        };
-                        if !posted {
-                            parent_task.wake();
-                        }
+                let parent_target = {
+                    let state = kernel.registry().settled().read();
+                    state.select_exit_parent(&parent_permit)
+                };
+                if let Some(target) = parent_target {
+                    let notification = target.prepare();
+                    let posted = notification.signal.is_some_and(|signal| {
+                        let siginfo = exit_siginfo_for_zombie(&prepared.result_zombie);
+                        kernel.post_signal_to_task_key(notification.parent, signal, siginfo)
+                    });
+                    if !posted {
+                        notification.payload.0.wake();
                     }
                 }
-                notify_parent(prepared.result_zombie.parent);
+                notify_parent(parent_permit.parent());
                 for tracee in released_tracees {
                     tracee.wake();
                 }
@@ -1302,25 +1089,6 @@ impl Kernel {
             }
         }
     }
-}
-
-fn child_exit_signal_needs_notification(
-    parent: &crate::kernel::objects::Task,
-    signal: crate::kernel::ids::LinuxSignal,
-) -> bool {
-    let action = parent.shared().sighand().action_entry(signal);
-    let any_thread_blocks = parent.threads().iter().any(|thread| {
-        let state = thread.signal_state.lock();
-        thread.blocked_mask().contains(signal.raw())
-            || state
-                .active_wait_set()
-                .is_some_and(|set| set.contains(signal.raw()))
-    });
-    crate::kernel::objects::signal::child_exit_signal_needs_notification(
-        signal,
-        action,
-        any_thread_blocks,
-    )
 }
 
 fn exit_siginfo_for_zombie(zombie: &Zombie) -> Option<carrick_abi::LinuxSiginfo> {
