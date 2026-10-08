@@ -4,7 +4,9 @@
 extern crate alloc;
 pub mod lifecycle;
 pub mod mm;
+#[cfg(target_os = "macos")]
+mod n1_diagnostics;
 pub mod wait;
 
-#[cfg(test)]
+#[cfg(any(test, target_os = "macos"))]
 extern crate std;

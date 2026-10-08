@@ -17,7 +17,7 @@ carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-sched-core = { path = "../carrick-sched-core" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-carrick-observability = { path = "../carrick-observability" }
+usdt.workspace = true
 
 [dev-dependencies]
 carrick-el1-abi = { path = "../carrick-el1-abi" }

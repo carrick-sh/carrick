@@ -181,7 +181,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
                 }
             }
             #[cfg(target_os = "macos")]
-            carrick_observability::probes::hvpatch_n1_reservation_custody(
+            crate::n1_diagnostics::reservation_custody(
                 2,
                 self.mm.raw(),
                 self.incarnation().raw(),
