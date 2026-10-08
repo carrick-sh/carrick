@@ -41,6 +41,15 @@ carrick*:::hvpatch-n1-reservation-custody
         (uint64_t)arg2, (uint64_t)arg3, (uint64_t)arg4);
 }
 
+carrick_core*:::reservation-custody
+/(pid == $target || progenyof($target))/
+{
+    events++;
+    printf("N1|root|ts=%llu|pid=%d|phase=%u|mm=%llu|inc=%llu|a=%llu|b=%llu\n",
+        (uint64_t)timestamp, pid, (uint32_t)arg0, (uint64_t)arg1,
+        (uint64_t)arg2, (uint64_t)arg3, (uint64_t)arg4);
+}
+
 carrick*:::hvpatch-mm-lease-lifecycle
 /(pid == $target || progenyof($target))/
 {

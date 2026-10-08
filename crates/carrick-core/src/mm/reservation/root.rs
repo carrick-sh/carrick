@@ -441,7 +441,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
                 self.set_admitted(index, false);
                 root.key.store(mm.raw(), Ordering::Release);
                 #[cfg(target_os = "macos")]
-                carrick_observability::probes::hvpatch_n1_reservation_custody(
+                crate::n1_diagnostics::reservation_custody(
                     0,
                     mm.raw(),
                     root.epoch.load(Ordering::Relaxed) + 1,
@@ -2986,7 +2986,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
             .store(self.state().generation.raw(), Ordering::Relaxed);
         self.table.set_admitted(self.index(), false);
         #[cfg(target_os = "macos")]
-        carrick_observability::probes::hvpatch_n1_reservation_custody(
+        crate::n1_diagnostics::reservation_custody(
             1,
             self.mm.raw(),
             self.incarnation().raw(),
