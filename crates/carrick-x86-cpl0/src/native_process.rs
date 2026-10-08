@@ -377,7 +377,7 @@ impl NativeProcessService<'static> for Service {
         }
     }
     fn settle_mm(&mut self, born: Box<Born>) -> Result<(), (NativeProcessError, Box<Born>)> {
-        settle(born)
+        settle(born, self.worker())
     }
     fn copy_status(
         &mut self,
@@ -505,7 +505,7 @@ impl NativeProcessService<'static> for Service {
     }
 }
 
-fn settle(born: Box<Born>) -> Result<(), (NativeProcessError, Box<Born>)> {
+fn settle(born: Box<Born>, worker: u32) -> Result<(), (NativeProcessError, Box<Born>)> {
     let p = &born.prepared;
     let mut custody = Vec::new();
     if custody.try_reserve_exact(p.custody.len()).is_err() {
@@ -536,7 +536,11 @@ fn settle(born: Box<Born>) -> Result<(), (NativeProcessError, Box<Born>)> {
     let Some(index) = owner.spaces.find(p.address.mm.raw().get()) else {
         return Err((NativeProcessError::Stale, born));
     };
-    owner.spaces.open(index);
+    let access = match owner.space_access(worker) {
+        Ok(access) => access,
+        Err(e) => return Err((error(e), born)),
+    };
+    access.open(index);
     Ok(())
 }
 fn fatal() -> ! {

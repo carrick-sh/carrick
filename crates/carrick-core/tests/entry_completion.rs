@@ -486,3 +486,75 @@ fn compact_handoff_rejects_stale_record_incarnation_receipt() {
         Err(CompletionError::WrongGeneration)
     );
 }
+
+#[test]
+fn compact_fork_child_gate_releases_owned_wait_with_sourceful_access() {
+    use carrick_sched_core::object_wait::OwnedObjectWakeEffects;
+    use carrick_sched_core::spaces::notification::SpaceAccess;
+    use carrick_sched_core::spaces::notification::{
+        SpaceReleaseVenue, SpaceWaitCause, SpaceWakeDelivery,
+    };
+    use carrick_sched_core::{BoundedSpin, Claim, Waker};
+    use core::num::NonZeroU64;
+    let zone = compact_zone();
+    let (slot, _, _) = running_compact(&zone, 11);
+    let index = zone.spaces.publish_closed(41, 0x30000, 0x30000).unwrap();
+    let entry = zone.space_entry(NonZeroU64::new(41).unwrap()).unwrap();
+    let complete = |effects: OwnedObjectWakeEffects<'_, carrick_sched_core::ParkedContextWords>| {
+        let _ = effects.deliver_handbacks(&mut |_| panic!("no host handback admitted"));
+    };
+    entry
+        .admit_notifications(NonZeroU64::MIN, &BoundedSpin(1024), &complete)
+        .unwrap();
+    let lease = entry.notifications(NonZeroU64::MIN).unwrap();
+    let before = lease.observe(SpaceWaitCause::Gate);
+    let record = zone
+        .alloc_record(ThreadIdentity {
+            tid: 72,
+            serial: 115,
+            mm: 29,
+            file_table: 9,
+            generation: 11,
+            affinity: 2,
+            lifecycle_page: 0,
+            control_slot: 0,
+        })
+        .unwrap();
+    lease
+        .reserve(SpaceWaitCause::Gate)
+        .park_host_rechecked(
+            before,
+            record,
+            OperationToken::new(41, 1).unwrap(),
+            &complete,
+            || true,
+        )
+        .unwrap();
+    let delivered = core::cell::Cell::new(0);
+    let handed = core::cell::Cell::new(0);
+    let delivery =
+        |actual: &ZoneTables<carrick_sched_core::ParkedContextWords>,
+         waker,
+         effects: OwnedObjectWakeEffects<'_, carrick_sched_core::ParkedContextWords>| {
+            assert!(core::ptr::eq(actual, &*zone));
+            assert_eq!(waker, Waker::El1 { slot });
+            let (_, work) = effects.deliver_handbacks(&mut |actual| {
+                assert_eq!(actual.id, record);
+                handed.set(handed.get() + 1);
+            });
+            assert!(!work.queued_own);
+            delivered.set(delivered.get() + 1);
+        };
+    let access = SpaceAccess::notified(SpaceReleaseVenue {
+        zone: &zone,
+        waker: Waker::El1 { slot },
+        deliver: SpaceWakeDelivery::Captured(&delivery),
+    });
+    access.open(index);
+    assert_eq!(zone.spaces.gate(index), 0);
+    assert_ne!(lease.observe(SpaceWaitCause::Gate), before);
+    assert!(zone.spaces.grant(index, 41).is_some());
+    assert!(matches!(zone.record(record).claim(), Claim::Host { .. }));
+    assert_eq!(handed.get(), 1);
+    assert_eq!(delivered.get(), 1);
+}

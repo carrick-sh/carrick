@@ -535,7 +535,10 @@ impl InventoryTransaction for InitialInventory {
 impl Drop for InitialInventory {
     fn drop(&mut self) {
         if self.receipt.is_some() && !self.guest_exposed && self.rollback().is_err() {
-            std::process::abort();
+            carrick_fatal::carrick_fatal!(
+                "kvm.initial_inventory_rollback",
+                "unexposed physical inventory rollback failed"
+            );
         }
     }
 }
@@ -1267,7 +1270,9 @@ impl Cpl0Carrier {
         let release = SpaceReleaseVenue {
             zone,
             waker: Waker::Host,
-            deliver: Self::unexpected_boot_wake,
+            deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(
+                Self::unexpected_boot_wake,
+            ),
         };
         let mut root = X86Cpl0RootReleaseVenue::new(table, release)
             .and_then(|venue| venue.lock(index.index(), mm, &NoRootWait))
@@ -1289,7 +1294,10 @@ impl Cpl0Carrier {
         let mut handed = false;
         let (_, effects) = owned.deliver_handbacks(&mut |_| handed = true);
         if handed || effects != carrick_sched_core::WakeEffects::default() {
-            std::process::abort();
+            carrick_fatal::carrick_fatal!(
+                "kvm.initial_boot_wake",
+                "boot-only publication unexpectedly released a live guest waiter"
+            );
         }
     }
 
@@ -1957,7 +1965,9 @@ impl Cpl0Carrier {
         let release = SpaceReleaseVenue {
             zone,
             waker: Waker::Host,
-            deliver: Self::unexpected_boot_wake,
+            deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(
+                Self::unexpected_boot_wake,
+            ),
         };
         X86Cpl0RootReleaseVenue::new(table, release)
             .map_err(|error| fail(format!("production root authority: {error:?}")))?

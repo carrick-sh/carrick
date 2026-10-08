@@ -288,7 +288,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for SpaceEditor<'_, C> {
         );
         if let Some((venue, lease)) = self.release.as_ref().or(late_release.as_ref()) {
             let completion = |effects: crate::object_wait::OwnedObjectWakeEffects<'_, C>| {
-                (venue.deliver)(venue.zone, venue.waker, effects)
+                venue.deliver.invoke(venue.zone, venue.waker, effects)
             };
             let receipt = lease
                 .reserve(SpaceWaitCause::Editor)
@@ -1234,7 +1234,7 @@ mod tests {
         let venue = SpaceReleaseVenue {
             zone: &zone,
             waker: crate::Waker::Host,
-            deliver,
+            deliver: crate::spaces::notification::SpaceWakeDelivery::Function(deliver),
         };
         let completion = |owned: crate::object_wait::OwnedObjectWakeEffects<'_>| {
             let _ = owned.deliver_handbacks(&mut |_| {});

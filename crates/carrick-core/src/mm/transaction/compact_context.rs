@@ -116,7 +116,7 @@ fn compact_parked_context_owner_clones_two_roots_and_selects_exact_cow_supply() 
         SpaceReleaseVenue {
             zone,
             waker: Waker::Host,
-            deliver,
+            deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(deliver),
         },
     )
     .unwrap();
@@ -180,7 +180,7 @@ fn compact_parked_context_owner_clones_two_roots_and_selects_exact_cow_supply() 
         SpaceAccess::notified(SpaceReleaseVenue {
             zone,
             waker: Waker::Host,
-            deliver,
+            deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(deliver),
         })
         .open(index);
     }
@@ -284,7 +284,7 @@ fn compact_native_portal_prepares_and_publishes_initial_private_ranges() {
         SpaceReleaseVenue {
             zone,
             waker: Waker::Host,
-            deliver,
+            deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(deliver),
         },
     )
     .unwrap();
