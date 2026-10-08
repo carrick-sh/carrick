@@ -1,6 +1,44 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use carrick_xtask::authority_debt::{AuthorityDebtCeilings, Counter, Family, Lane};
 
+fn fixture_manifests(root: &std::path::Path) {
+    if root.join("Cargo.toml").exists() {
+        return;
+    }
+    let mut members = Vec::new();
+    for entry in std::fs::read_dir(root.join("crates")).unwrap() {
+        let entry = entry.unwrap();
+        if !entry.path().join("src").is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        members.push(format!("crates/{name}"));
+        std::fs::write(entry.path().join("Cargo.toml"), format!(
+            "[package]\nname = {name:?}\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"src/lib.rs\"\n"
+        )).unwrap();
+    }
+    std::fs::write(
+        root.join("Cargo.toml"),
+        format!("[workspace]\nmembers = {members:?}\nresolver = \"3\"\n"),
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("cargo")
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+fn load_census(
+    root: &std::path::Path,
+) -> Result<carrick_xtask::authority_source::SourceCensus, carrick_xtask::authority_debt::DebtError>
+{
+    fixture_manifests(root);
+    carrick_xtask::authority_source::SourceCensus::load(root)
+}
+
 fn ceilings(count: u64) -> AuthorityDebtCeilings {
     AuthorityDebtCeilings {
         schema: 1,
@@ -149,13 +187,12 @@ impl IpcView {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         write_source(path, source).unwrap();
     }
+    fixture_manifests(root.path());
     root
 }
 
 fn assert_dialect_rejection(root: &std::path::Path, expected: &str) {
-    let error = carrick_xtask::authority_source::SourceCensus::load(root)
-        .unwrap_err()
-        .to_string();
+    let error = load_census(root).unwrap_err().to_string();
     assert!(error.contains(expected), "expected {expected}, got {error}");
 }
 
@@ -171,9 +208,7 @@ fn restricted_dialect_error(source: &str, expected: &str) {
         .unwrap();
     }
     write_source(src.join("lib.rs"), source).unwrap();
-    let error = carrick_xtask::authority_source::SourceCensus::load(root.path())
-        .unwrap_err()
-        .to_string();
+    let error = load_census(root.path()).unwrap_err().to_string();
     assert!(
         error.contains(expected),
         "expected {expected:?}, got {error}"
@@ -398,7 +433,6 @@ fn added_raw_lock_and_missing_owner_are_rejected() {
 #[cfg(target_os = "linux")]
 fn live_linux_breaker_alias_macro_and_cfg_cannot_use_stored_evidence() {
     use carrick_xtask::authority_debt::verify_host;
-    use carrick_xtask::authority_source::SourceCensus;
     let root = tempfile::tempdir().unwrap();
     let output = std::process::Command::new("python3")
         .arg(tools_root().join("scripts/migrate/tests/check_host_authority_linux_breaker.py"))
@@ -412,7 +446,7 @@ fn live_linux_breaker_alias_macro_and_cfg_cannot_use_stored_evidence() {
         String::from_utf8_lossy(&output.stderr)
     );
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let source = SourceCensus::load(root.path()).unwrap();
+    let source = load_census(root.path()).unwrap();
     let empty = AuthorityDebtCeilings {
         schema: 1,
         counters: vec![],
@@ -442,7 +476,7 @@ fn unrecognized_guard_accessor_definition_fails_closed() {
         "impl FileTable { fn unclassified_escape(&self) -> FileTableWriteGuard { todo!() } }",
     )
     .unwrap();
-    assert!(carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err());
+    assert!(load_census(root.path()).is_err());
 }
 
 #[test]
@@ -469,7 +503,7 @@ pub fn poll(table: &Table) {
         "fn ignored(table: &Table) { table.read_open_files(); }",
     )
     .unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     assert_eq!(census.k1.len(), 1);
 }
 
@@ -489,7 +523,7 @@ pub fn no_debt(table: &Table) {
 "#,
     )
     .unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     assert_eq!(census.k1.len(), 1);
     assert_eq!(census.k1[0].owner, "carrick_kernel::poll");
 }
@@ -509,7 +543,7 @@ fn macro_rules_authority_wrappers_fail_closed() {
     let root = source_fixture();
     let path = root.path().join("crates/carrick-kernel/src/lib.rs");
     write_source(path, "macro_rules! access { ($table:expr) => { $table.read_open_files() }; } pub fn poll(table: &Table) { access!(table); }").unwrap();
-    assert!(carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err());
+    assert!(load_census(root.path()).is_err());
 }
 
 #[test]
@@ -520,7 +554,7 @@ fn relocating_debt_into_definition_paths_cannot_hide_additions() {
     std::fs::create_dir_all(src.join("kernel")).unwrap();
     write_source(src.join("kernel/objects.rs"), "impl Thread { fn enter_crash_safe_point_participation(&self) {} } pub fn poll(table: &Table) { table.read_open_files(); }").unwrap();
     write_source(src.join("lib.rs"), "").unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     assert_eq!(census.k1.len(), 1);
     write_source(
         src.join("kernel/objects.rs"),
@@ -589,7 +623,7 @@ fn repeated_global_reads_are_one_symbol_counter() {
 
 #[test]
 fn review_same_count_global_substitution_between_modules_is_rejected() {
-    use carrick_xtask::{authority_debt::verify_source, authority_source::SourceCensus};
+    use carrick_xtask::authority_debt::verify_source;
     let root = source_fixture();
     let src = root.path().join("crates/carrick-kernel/src");
     write_source(src.join("lib.rs"), "mod fifo_beacon; mod unreviewed;").unwrap();
@@ -599,7 +633,7 @@ fn review_same_count_global_substitution_between_modules_is_rejected() {
     )
     .unwrap();
     write_source(src.join("unreviewed.rs"), "").unwrap();
-    let census = SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     let policy = AuthorityDebtCeilings {
         schema: 1,
         counters: vec![Counter {
@@ -627,11 +661,10 @@ fn review_same_count_global_substitution_between_modules_is_rejected() {
 
 #[test]
 fn exact_column_zero_does_not_merge_same_line_owners() {
-    use carrick_xtask::authority_source::SourceCensus;
     let root = source_fixture();
     let src = root.path().join("crates/carrick-kernel/src/lib.rs");
     write_source(&src, "static REVIEWED_STATE: AtomicBool = AtomicBool::new(false); static STATE: AtomicBool = AtomicBool::new(false);").unwrap();
-    let census = SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     assert_eq!(
         census
             .owner_at("crates/carrick-kernel/src/lib.rs", 1, 0)
@@ -647,7 +680,6 @@ fn exact_column_zero_does_not_merge_same_line_owners() {
 
 #[test]
 fn declared_root_owns_modules_physically_relocated_into_another_crate() {
-    use carrick_xtask::authority_source::SourceCensus;
     let root = source_fixture();
     let src = root.path().join("crates/carrick-kernel/src");
     std::fs::create_dir_all(root.path().join("crates/carrick-vmm-hvf/src")).unwrap();
@@ -662,7 +694,7 @@ fn declared_root_owns_modules_physically_relocated_into_another_crate() {
         "fn poll(table: &FileTable) { table.read_open_files(); }",
     )
     .unwrap();
-    let census = SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     assert_eq!(census.k1.len(), 1);
     assert_eq!(census.k1[0].owner, "carrick_kernel::moved::poll");
     assert_eq!(census.k1[0].lane, Lane::Shared);
@@ -690,7 +722,7 @@ fn unlisted_macro_item_scopes_are_rejected() {
 fn function_local_modules_and_impls_keep_distinct_owners() {
     let root = source_fixture();
     write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), "fn outer() { mod first { fn access() { table.read_open_files(); } } mod second { fn access() { table.read_open_files(); } } impl First for Thing { fn access() { table.read_open_files(); } } impl Second for Thing { fn access() { table.read_open_files(); } } }").unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     let owners: std::collections::BTreeSet<_> =
         census.k1.iter().map(|site| site.owner.as_str()).collect();
     assert_eq!(
@@ -707,7 +739,7 @@ fn associated_aliases_cannot_hide_raw_table_storage() {
     let root = source_fixture();
     write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), "impl Expose for FileTable { type Slots = RwLock<FileSlotMap>; fn raw_slots(&self) -> &Self::Slots { &self.open_files } }").unwrap();
     assert!(
-        carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+        load_census(root.path()).is_err(),
         "associated storage aliases must remain closed"
     );
 }
@@ -717,20 +749,19 @@ fn cfg_alias_alternatives_cannot_hide_raw_table_storage() {
     let root = source_fixture();
     write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), "#[cfg(target_os = \"linux\")] type Slots = RwLock<FileSlotMap>; #[cfg(target_os = \"macos\")] type Slots = Vec<u8>; impl FileTable { #[cfg(target_os = \"linux\")] fn raw_slots(&self) -> &Slots { &self.open_files } }").unwrap();
     assert!(
-        carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+        load_census(root.path()).is_err(),
         "every production alias alternative must be checked"
     );
 }
 
 #[test]
 fn review_out_of_line_modules_and_impl_traits_have_distinct_owners() {
-    use carrick_xtask::authority_source::SourceCensus;
     let root = source_fixture();
     let src = root.path().join("crates/carrick-kernel/src");
     write_source(src.join("lib.rs"), "mod outer;").unwrap();
     write_source(src.join("outer.rs"), "#[path = \"leaf.rs\"] mod inner;").unwrap();
     write_source(src.join("leaf.rs"), "impl First for Thing { fn access() { table.read_open_files(); } } impl Second for Thing { fn access() { table.read_open_files(); } }").unwrap();
-    let census = SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     assert_eq!(census.k1.len(), 2);
     assert_eq!(
         census.k1[0].owner,
@@ -767,7 +798,7 @@ fn review_raw_table_lock_references_and_aliases_fail_closed() {
         let src = root.path().join("crates/carrick-kernel/src/lib.rs");
         write_source(src, format!("type Slots = RwLock<FileSlotMap>; type SlotsGuard = RwLockReadGuard<'static, FileSlotMap>; impl FileTable {{ fn raw_slots(&self) -> {return_type} {{ &self.open_files }} }} pub fn poll(table: &FileTable) {{ table.raw_slots().read(); }}")).unwrap();
         assert!(
-            carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+            load_census(root.path()).is_err(),
             "unclassified raw_slots returning {return_type}"
         );
     }
@@ -883,10 +914,7 @@ fn imported_aliases_and_trait_impls_cannot_expose_raw_table_storage() {
     .unwrap();
     for implementation in ["FileTable", "<T> FileTable<T>", "Escape for FileTable"] {
         write_source(src.join("lib.rs"), format!("mod locks; use crate::locks::Storage as Slots; impl {implementation} {{ fn raw_slots(&self) -> &Slots {{ &self.open_files }} }}")).unwrap();
-        assert!(
-            carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
-            "{implementation}"
-        );
+        assert!(load_census(root.path()).is_err(), "{implementation}");
     }
 }
 
@@ -894,7 +922,7 @@ fn imported_aliases_and_trait_impls_cannot_expose_raw_table_storage() {
 fn local_statics_keep_the_enclosing_function_identity() {
     let root = source_fixture();
     write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), "fn first() { static STATE: AtomicBool = AtomicBool::new(false); }\nfn second() { static STATE: AtomicBool = AtomicBool::new(false); }").unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     assert_eq!(
         census
             .owner_at("crates/carrick-kernel/src/lib.rs", 1, 20)
@@ -942,7 +970,7 @@ fn round3_shared_test_declaration_cannot_hide_production_k1() {
         "fn access(table: &FileTable) { table.read_open_files(); }",
     )
     .unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     assert_eq!(
         census.k1.len(),
         1,
@@ -989,7 +1017,7 @@ fn unlicensed(thread: &Thread) { enter!(thread); }
     )
     .unwrap();
     assert!(
-        carrick_xtask::authority_source::SourceCensus::load(root.path())
+        load_census(root.path())
             .and_then(|census| census.verify_task_rules())
             .is_err(),
         "macro body cannot hide unlicensed crash participation"
@@ -1009,7 +1037,7 @@ impl CrashQuorum { fn poll(&self) { for thread in threads!(self.task) {} } }
     )
     .unwrap();
     assert!(
-        carrick_xtask::authority_source::SourceCensus::load(root.path())
+        load_census(root.path())
             .and_then(|census| census.verify_task_rules())
             .is_err(),
         "macro body cannot hide generic crash membership"
@@ -1029,7 +1057,7 @@ fn drain_exact_mm(census: &GuestExecutorCensus) { live!(census); }
     )
     .unwrap();
     assert!(
-        carrick_xtask::authority_source::SourceCensus::load(root.path())
+        load_census(root.path())
             .and_then(|census| census.verify_task_rules())
             .is_err(),
         "macro body cannot hide exact-MM census access"
@@ -1054,7 +1082,7 @@ fn unlicensed(table: &FileTable) {{ EscapeSlots::raw_slots(table).read(); }}
         )
         .unwrap();
         assert!(
-            carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+            load_census(root.path()).is_err(),
             "qualified raw-storage projection {projection} must be classified"
         );
     }
@@ -1077,7 +1105,7 @@ impl EscapeSlots for FileTable {{ fn {method}(&self) -> &RwLock<FileSlotMap> {{ 
 fn unlicensed(table: &FileTable) {{ let slots = EscapeSlots::{method}(table); slots.read(); }}
 "#)).unwrap();
         assert!(
-            carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+            load_census(root.path()).is_err(),
             "trait accessor {method} cannot inherit the inherent helper exemption"
         );
     }
@@ -1092,7 +1120,7 @@ fn round3_inherent_helper_exemptions_require_the_approved_module_and_signature()
     )
     .unwrap();
     assert!(
-        carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+        load_census(root.path()).is_err(),
         "same method name in another module is not an approved helper"
     );
     write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), "").unwrap();
@@ -1107,7 +1135,7 @@ fn round3_inherent_helper_exemptions_require_the_approved_module_and_signature()
         )
         .unwrap();
         assert!(
-            carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+            load_census(root.path()).is_err(),
             "changed approved helper signature/visibility must fail: {signature}"
         );
     }
@@ -1134,7 +1162,7 @@ impl FileTable { fn raw_slots(&self) -> &crate::production::Slots { todo!() } }
     )
     .unwrap();
     assert!(
-        carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+        load_census(root.path()).is_err(),
         "a test directory cannot hide a production storage alias"
     );
     write_source(
@@ -1142,7 +1170,7 @@ impl FileTable { fn raw_slots(&self) -> &crate::production::Slots { todo!() } }
         "fn access(table: &FileTable) { table.read_open_files(); }",
     )
     .unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     assert_eq!(census.k1.len(), 1);
     assert_eq!(census.k1[0].owner, "carrick_kernel::production::access");
 }
@@ -1161,7 +1189,7 @@ impl FileTable { fn raw_slots(&self) -> &<Self as EscapeSlots<u8>>::Slots { todo
     )
     .unwrap();
     assert!(
-        carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+        load_census(root.path()).is_err(),
         "one plain-data impl alternative cannot erase a storage projection"
     );
     write_source(
@@ -1175,14 +1203,14 @@ impl FileTable { fn data(&self) -> &EscapeSlots::Slots { todo!() } }
 "#,
     )
     .unwrap();
-    carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    load_census(root.path()).unwrap();
     write_source(
         &path,
         "impl FileTable { fn opaque(&self) -> &<Self as Unresolved>::Slots { todo!() } }",
     )
     .unwrap();
     assert!(
-        carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+        load_census(root.path()).is_err(),
         "unresolved qualified return projections cannot hide storage"
     );
 }
@@ -1204,7 +1232,7 @@ impl FileTable {
 "#,
     )
     .unwrap();
-    carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    load_census(root.path()).unwrap();
 }
 
 #[test]
@@ -1216,7 +1244,7 @@ macro_rules! metadata { () => { mod constants { const NUMBER: u32 = 17; } }; }
 #[cfg(test)] macro_rules! test_access { ($thread:expr) => { $thread.enter_crash_safe_point_participation() }; }
 fn data() { identity!(17); }
 "#).unwrap();
-    carrick_xtask::authority_source::SourceCensus::load(root.path())
+    load_census(root.path())
         .unwrap()
         .verify_task_rules()
         .unwrap();
@@ -1244,7 +1272,7 @@ fn every_production_declaration_including_function_and_literal_macro_is_followed
             assert_dialect_rejection(root.path(), "module path in macro input is unsupported");
             continue;
         }
-        let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+        let census = load_census(root.path()).unwrap();
         assert_eq!(census.k1.len(), 1, "production declaration: {declaration}");
         assert!(!census.is_test_at("crates/carrick-kernel/src/shared.rs", 1, 0));
     }
@@ -1269,7 +1297,7 @@ declare!();
     )
     .unwrap();
     assert!(
-        carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+        load_census(root.path()).is_err(),
         "unresolved production declarations cannot confer test-only classification"
     );
 }
@@ -1294,7 +1322,7 @@ fn round4_shared_production_includes_cannot_hide_k1() {
             "fn access(table: &FileTable) { table.read_open_files(); }",
         )
         .unwrap();
-        let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+        let census = load_census(root.path()).unwrap();
         assert_eq!(
             census.k1.len(),
             1,
@@ -1341,7 +1369,7 @@ fn round4_nonliteral_source_inclusions_fail_closed() {
         };
         write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), source).unwrap();
         assert!(
-            carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+            load_census(root.path()).is_err(),
             "unresolved {inclusion}! must fail closed"
         );
     }
@@ -1352,7 +1380,7 @@ fn check_round4_inspection_macro(operation: &str) {
         let root = source_fixture();
         write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), format!("macro_rules! legacy_access {{ ($slot:expr) => {{ $slot.description.{operation}() }}; }}\nfn unlicensed(slot: &FileSlot) {{ legacy_access!(slot); }}")).unwrap();
         assert!(
-            carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+            load_census(root.path()).is_err(),
             "description.{operation}() in macro must not escape K1 admission"
         );
     }
@@ -1382,7 +1410,7 @@ fn round4_macro_and_main_scanners_share_the_authority_vocabulary() {
             let path = root.path().join("crates/carrick-kernel/src/lib.rs");
             write_source(&path, format!("macro_rules! hidden {{ ($slot:expr) => {{ $slot.description.{operation}() }}; }}")).unwrap();
             assert!(
-                carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+                load_census(root.path()).is_err(),
                 "macro must recognize shared {kind} operation {operation}"
             );
             if ["k1", "description_io", "description_guard"].contains(&kind.as_str()) {
@@ -1391,8 +1419,7 @@ fn round4_macro_and_main_scanners_share_the_authority_vocabulary() {
                     format!("fn access(slot: &FileSlot) {{ slot.description.{operation}(); }}"),
                 )
                 .unwrap();
-                let census =
-                    carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+                let census = load_census(root.path()).unwrap();
                 assert_eq!(
                     census.k1.len(),
                     1,
@@ -1430,12 +1457,12 @@ fn source_inclusions_keep_physical_lookup_and_logical_owner() {
         "fn access(table: &FileTable) { table.read_open_files(); }",
     )
     .unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     assert_eq!(census.k1.len(), 1);
     assert_eq!(census.k1[0].owner, "carrick_kernel::logical::access");
     std::fs::rename(src.join("leaf.rs"), src.join("moved.rs")).unwrap();
     write_source(src.join("shared.rs"), "include!(\"moved.rs\");").unwrap();
-    let moved = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    let moved = load_census(root.path()).unwrap();
     assert_eq!(moved.k1[0].owner, census.k1[0].owner);
 }
 
@@ -1468,7 +1495,7 @@ fn unresolved_inclusion_templates_and_outside_source_files_fail_closed() {
         )
         .unwrap();
         assert!(
-            carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+            load_census(root.path()).is_err(),
             "inclusion must resolve to discoverable source: {source}"
         );
     }
@@ -1486,7 +1513,7 @@ fn renamed_source_inclusions_cannot_hide_production_files() {
     .unwrap();
     assert_dialect_rejection(root.path(), "renamed protected import include");
     write_source(src.join("lib.rs"), "use std::include as compiled; macro_rules! hidden { () => { compiled!(\"shared.rs\"); }; }").unwrap();
-    assert!(carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err());
+    assert!(load_census(root.path()).is_err());
 }
 
 fn macro_input_alias_source(invocation: &str) -> String {
@@ -1558,9 +1585,7 @@ fn review_macro_input_inclusion_alias_rejects_nonliteral_paths() {
         "fn hidden(table: &Table) { table.read_open_files(); }",
     )
     .unwrap();
-    let error = carrick_xtask::authority_source::SourceCensus::load(root.path())
-        .unwrap_err()
-        .to_string();
+    let error = load_census(root.path()).unwrap_err().to_string();
     assert!(
         error.contains("renamed protected import include"),
         "{error}"
@@ -1614,7 +1639,7 @@ fn review_dsl_source_literals_mark_production_in_every_token_position() {
         .unwrap();
         write_source(src.join("shared.rs"), "fn data() {}").unwrap();
         if invocation.starts_with("#[cfg(test)]") {
-            let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+            let census = load_census(root.path()).unwrap();
             assert!(census.is_test_file("crates/carrick-kernel/src/shared.rs"));
         } else {
             assert_dialect_rejection(root.path(), "restricted census dialect");
@@ -1717,7 +1742,7 @@ pub fn poll(table: &Table) { table.read_open_files(); }
             format!("const SOURCE: &str = include_str!(\"shared.rs\");\n{lines}"),
         )
         .unwrap();
-        let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+        let census = load_census(root.path()).unwrap();
         assert!(!census.is_test_file("crates/carrick-kernel/src/census_child.rs"));
         write_source(src.join("census_child.rs"), hidden).unwrap();
         assert!(
@@ -1768,7 +1793,7 @@ pub fn poll(table: &Table) { table.read_open_files(); }
             format!("const SOURCE: &str = include_str!(\"shared.rs\");\n{lines}"),
         )
         .unwrap();
-        let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+        let census = load_census(root.path()).unwrap();
         assert!(!census.is_test_file("crates/carrick-kernel/src/census_child.rs"));
         assert!(!census.is_test_file("crates/carrick-kernel/src/census_grandchild.rs"));
         write_source(src.join("census_grandchild.rs"), hidden).unwrap();
@@ -1889,7 +1914,7 @@ fn test(table: &Table) { table.read_open_files(); }
         ),
     )
     .unwrap();
-    let error = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap_err();
+    let error = load_census(root.path()).unwrap_err();
     assert!(
         error.to_string().contains("recursive module graph"),
         "{error}"
@@ -1946,7 +1971,7 @@ fn review_fail_closed_raw_identifier_methods_and_ufcs_are_counted() {
             format!("pub fn r#poll(table: &Table) {{ {call}; }}"),
         )
         .unwrap();
-        let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+        let census = load_census(root.path()).unwrap();
         assert_eq!(census.k1.len(), 1, "{call}");
         assert_eq!(census.k1[0].operation, "read_open_files");
         assert_eq!(census.k1[0].owner, "carrick_kernel::poll");
@@ -1964,7 +1989,7 @@ pub fn poll(table: &Table) { table.read_open_files(); }
 "#,
     )
     .unwrap();
-    assert!(carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err());
+    assert!(load_census(root.path()).is_err());
 }
 
 #[test]
@@ -1972,7 +1997,7 @@ fn review_fail_closed_raw_identifiers_reach_retained_lock_scanner() {
     for call in ["this.proc.r#lock()", "this.r#proc.r#lock()"] {
         let root = source_fixture();
         write_source(root.path().join("crates/carrick-kernel/src/dispatch/mod.rs"), format!("mod sysv; mod mm_authority; mod mm_quiesce; fn r#hidden(this: &Dispatcher) {{ {call}; }}")).unwrap();
-        let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+        let census = load_census(root.path()).unwrap();
         assert!(!census.is_test_file("crates/carrick-kernel/src/dispatch/mod.rs"));
         assert!(
             carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
@@ -1995,7 +2020,7 @@ fn review_fail_closed_raw_identifiers_reach_global_and_termination_scanners() {
             format!("mod sysv; mod mm_authority; mod mm_quiesce; fn hidden() {{ {call}; }}"),
         )
         .unwrap();
-        carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+        load_census(root.path()).unwrap();
         assert!(
             carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
                 .is_err(),
@@ -2023,7 +2048,7 @@ fn review_fail_closed_test_include_cycle_does_not_seed_production() {
         "const SOURCE: &str = include_str!(\"a.rs\");",
     )
     .unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     assert!(census.is_test_file("crates/carrick-kernel/src/a.rs"));
     assert!(census.is_test_file("crates/carrick-kernel/src/b.rs"));
     assert_eq!(census.k1.len(), 1);
@@ -2332,7 +2357,7 @@ fn restricted_dialect_inline_literal_path_uses_inline_directory() {
         "fn access(table: &Table) { table.read_open_files(); }",
     )
     .unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     assert_eq!(census.k1.len(), 1);
     assert_eq!(census.k1[0].owner, "carrick_kernel::parent::child::access");
     assert!(!census.is_test_file("crates/carrick-kernel/src/parent/selected.rs"));
@@ -2343,7 +2368,7 @@ fn restricted_dialect_test_scope_glob_cannot_exclude_production() {
     let root = source_fixture();
     let src = root.path().join("crates/carrick-kernel/src");
     write_source(src.join("lib.rs"), "#[cfg(test)] mod tests { use tracing::*; #[test] fn helper(table: &Table) { table.read_open_files(); } } pub fn poll(table: &Table) { table.read_open_files(); }").unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     assert_eq!(census.k1.len(), 1);
     assert_eq!(census.k1[0].owner, "carrick_kernel::poll");
     carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1)).unwrap();
@@ -2469,7 +2494,7 @@ fn restricted_dialect_absolute_providers_prove_helpers_despite_globs() {
     let root = source_fixture();
     let src = root.path().join("crates/carrick-kernel/src");
     write_source(src.join("lib.rs"), "use external::*; #[derive(::serde::Serialize)] #[serde(rename = \"Data\")] struct Data { #[serde(skip)] value: usize } #[::usdt::provider] mod probes {}").unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     assert!(census.k1.is_empty());
     for source in [
         "#[derive(::serde::Serialize)] #[error(\"bad\")] struct Data;",
@@ -2584,7 +2609,6 @@ fn review_restricted_compiler_derive_bindings_are_rejected() {
 
 #[test]
 fn review_generated_metadata_requires_the_declared_owner() {
-    use carrick_xtask::authority_source::SourceCensus;
     let root = source_fixture();
     let cli = root.path().join("crates/carrick-cli/src");
     std::fs::create_dir_all(&cli).unwrap();
@@ -2594,7 +2618,7 @@ fn review_generated_metadata_requires_the_declared_owner() {
         r#"#[derive(::clap::Parser)] struct Cli { #[arg(env="CARRICK_HOME")] home: String }"#,
     )
     .unwrap();
-    SourceCensus::load(root.path()).unwrap();
+    load_census(root.path()).unwrap();
     write_source(
         root.path().join("crates/carrick-kernel/src/lib.rs"),
         r#"#[path="../../carrick-cli/src/args.rs"] mod injected;"#,
@@ -2605,7 +2629,6 @@ fn review_generated_metadata_requires_the_declared_owner() {
 
 #[test]
 fn review_verdict_records_item_scope_and_rejects_changed_inputs() {
-    use carrick_xtask::authority_source::SourceCensus;
     let root = source_fixture();
     let file = "crates/carrick-kernel/src/lib.rs";
     write_source(
@@ -2613,7 +2636,7 @@ fn review_verdict_records_item_scope_and_rejects_changed_inputs() {
         "#[cfg(test)] fn hidden() { this.proc.lock(); } fn shown() { this.proc.lock(); }",
     )
     .unwrap();
-    let source = SourceCensus::load(root.path()).unwrap();
+    let source = load_census(root.path()).unwrap();
     let verdict = source.verdict(root.path()).unwrap();
     assert_eq!(verdict["dialect"], "strict");
     assert_eq!(verdict["rejections"], serde_json::json!([]));
@@ -2638,7 +2661,7 @@ fn review_retained_verdict_transport_exceeds_one_argument() {
         source.push_str(&format!("fn helper_{index}() {{}}\n"));
     }
     write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), source).unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     let proof = serde_json::to_vec(&census.verdict(root.path()).unwrap()).unwrap();
     assert!(
         proof.len() > 131_072,
@@ -2728,7 +2751,7 @@ fn round8_audited_expression_input_counts_the_direct_call() {
         "fn poll(table: &Table) { let values = ::std::vec![table.read_open_files()]; }",
     )
     .unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     assert_eq!(census.k1.len(), 1);
     assert_eq!(census.k1[0].owner, "carrick_kernel::poll");
     carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1)).unwrap();
@@ -2788,7 +2811,7 @@ fn round8_all_boundaries_reject_matrix() {
         }
         write_source(path, source).unwrap();
         // Execute both boundaries before asserting, including on the red head.
-        let census = carrick_xtask::authority_source::SourceCensus::load(root.path());
+        let census = load_census(root.path());
         let verification =
             carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1));
         println!(
@@ -2832,7 +2855,7 @@ fn round8_direct_receiver_closures_are_counted() {
     let root = source_fixture();
     write_source(root.path().join("crates/carrick-kernel/src/lib.rs"),
         "fn poll(table: &Table) { let acquire = |table: &Table| table.read_open_files(); acquire(table); }").unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     assert_eq!(census.k1.len(), 1);
     assert_eq!(census.k1[0].owner, "carrick_kernel::poll");
     carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1)).unwrap();
@@ -2860,7 +2883,7 @@ fn round8_audited_syscall_dsl_preserves_the_counted_owner() {
         "mod dispatch;",
     )
     .unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     assert_eq!(census.k1.len(), 1);
     assert_eq!(census.k1[0].owner, "carrick_kernel::dispatch::poll");
     let mut policy = ceilings(1);
@@ -2877,7 +2900,7 @@ fn round8_internal_core_cannot_impersonate_a_compiler_macro() {
     let root = source_fixture();
     write_source(root.path().join("crates/carrick-kernel/src/lib.rs"),
         "mod core { mod mem {} } fn poll(table: &Table) { let offset = ::core::mem::offset_of!(Data, args); table.read_open_files(); }").unwrap();
-    carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    load_census(root.path()).unwrap();
     carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1)).unwrap();
 }
 
@@ -2886,7 +2909,7 @@ fn round8_plain_absolute_item_import_and_generic_receiver_remain_counted() {
     let root = source_fixture();
     write_source(root.path().join("crates/carrick-kernel/src/lib.rs"),
         "use crate::unrelated::*; use ::carrick_kernel::api::read_open_files; fn poll(table: &Table) { read_open_files(table); table.read_open_files::<usize>(); }").unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     assert_eq!(census.k1.len(), 2);
     carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(2)).unwrap();
 }
@@ -2914,7 +2937,7 @@ fn round8_audited_metadata_declares_data_but_rejects_operation_values() {
         .unwrap();
         if tail.contains("hidden") {
             assert!(
-                carrick_xtask::authority_source::SourceCensus::load(root.path())
+                load_census(root.path())
                     .unwrap_err()
                     .to_string()
                     .contains("protected operation shape")
@@ -2930,7 +2953,7 @@ fn round8_audited_metadata_declares_data_but_rejects_operation_values() {
                 .contains("protected operation shape")
             );
         } else {
-            carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+            load_census(root.path()).unwrap();
             carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
                 .unwrap();
         }
@@ -2946,7 +2969,7 @@ fn round8_data_names_do_not_become_task_operations() {
         "fn drain_exact_mm(live: impl FnOnce() -> u64, threads: u64) -> u64 { ::std::vec![live(), threads][0] }",
     )
     .unwrap();
-    carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    load_census(root.path()).unwrap();
     carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1)).unwrap();
 }
 
@@ -2954,7 +2977,7 @@ fn round8_data_names_do_not_become_task_operations() {
 fn round8_audited_macro_preserves_description_io_call_counts() {
     let root = source_fixture();
     write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), "fn poll() { ::std::vec![description.write_for_io(), open_file.description.write_for_io()]; }").unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     assert_eq!(census.k1.len(), 2);
     assert!(
         census
@@ -2974,7 +2997,7 @@ fn round8_audited_macro_preserves_description_guard_call_counts() {
         root.path().join("crates/carrick-kernel/src/lib.rs"),
         "fn poll() { let _ = ::std::matches!(description.inspect(), Some(_)); ::std::vec![description.inspect(), open_file.description.try_inspect()]; }",
     ).unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    let census = load_census(root.path()).unwrap();
     assert_eq!(census.k1.len(), 3);
     assert_eq!(
         census
@@ -2999,4 +3022,125 @@ fn round8_audited_macro_preserves_description_guard_call_counts() {
     second.ceiling = 1;
     policy.counters.push(second);
     carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &policy).unwrap();
+}
+
+fn build_program_fixture(build: &str, production: &str) -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("crates/carrick-build-fixture/src")).unwrap();
+    write_source(
+        root.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/carrick-build-fixture\"]\nresolver = \"3\"\n",
+    )
+    .unwrap();
+    write_source(
+        root.path().join("crates/carrick-build-fixture/Cargo.toml"),
+        "[package]\nname = \"carrick-build-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    write_source(
+        root.path().join("crates/carrick-build-fixture/build.rs"),
+        build,
+    )
+    .unwrap();
+    write_source(
+        root.path().join("crates/carrick-build-fixture/src/lib.rs"),
+        production,
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("cargo")
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(root.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    root
+}
+
+#[test]
+fn build_program_authority_has_its_own_boundary_and_owner() {
+    let root = build_program_fixture(
+        "fn main() { let _ = std::fs::read(\"input\"); }",
+        "pub fn runtime() {}",
+    );
+    let census = load_census(root.path()).unwrap();
+    assert_eq!(
+        census
+            .owner_at("crates/carrick-build-fixture/build.rs", 1, 0)
+            .unwrap(),
+        "carrick_build_fixture::build_program::main"
+    );
+    assert_eq!(
+        census.verdict(root.path()).unwrap()["files"]["crates/carrick-build-fixture/build.rs"]["boundary"],
+        "build_time"
+    );
+}
+
+#[test]
+fn build_program_cannot_path_load_production_source() {
+    let root = build_program_fixture(
+        "#[path = \"src/lib.rs\"] mod runtime; fn main() {}",
+        "pub fn runtime() {}",
+    );
+    let error = load_census(root.path()).unwrap_err().to_string();
+    assert!(
+        error.contains("build-time/production source overlap"),
+        "{error}"
+    );
+}
+
+#[test]
+fn production_cannot_path_load_build_program_source() {
+    let root = build_program_fixture("fn main() {}", "#[path = \"../build.rs\"] mod build;");
+    let error = load_census(root.path()).unwrap_err().to_string();
+    assert!(
+        error.contains("build-time/production source overlap"),
+        "{error}"
+    );
+}
+
+#[test]
+fn build_program_cannot_include_production_source() {
+    for inclusion in ["include", "include_str", "include_bytes"] {
+        let root = build_program_fixture(
+            &format!("{inclusion}!(\"src/lib.rs\"); fn main() {{}}"),
+            "pub fn runtime() {}",
+        );
+        let error = load_census(root.path()).unwrap_err().to_string();
+        assert!(
+            error.contains("build-time/production source overlap"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn build_program_compiler_authority_requires_a_separate_ceiling() {
+    use carrick_xtask::authority_debt::verify_host;
+    let root = build_program_fixture(
+        "fn main() { let _ = std::fs::read(\"input\"); }",
+        "pub fn runtime() {}",
+    );
+    let census = load_census(root.path()).unwrap();
+    let result = serde_json::json!({"rows":[{
+        "source":{"file":"crates/carrick-build-fixture/build.rs","line_start":1,"column_start":12},
+        "expansion":null,"operation":"std::fs::read","profiles":["linux-cli"]
+    }]});
+    let mut policy = AuthorityDebtCeilings {
+        schema: 1,
+        counters: vec![Counter {
+            family: Family::BuildTime,
+            operation: "std::fs::read".into(),
+            owner: "carrick_build_fixture::build_program::main".into(),
+            lane: Lane::LinuxCli,
+            ceiling: 1,
+        }],
+    };
+    verify_host(&result, &policy, &census).unwrap();
+    policy.counters[0].ceiling = 0;
+    assert!(verify_host(&result, &policy, &census).is_err());
+    policy.counters[0].ceiling = 1;
+    policy.counters[0].family = Family::HostBacking;
+    assert!(verify_host(&result, &policy, &census).is_err());
 }

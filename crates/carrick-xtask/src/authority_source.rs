@@ -95,7 +95,8 @@ struct Owner {
 }
 #[derive(Debug, Default)]
 pub struct SourceCensus {
-    historical_snapshot: bool,
+    build_roots: Vec<super::authority_build::BuildRoot>,
+    build_files: BTreeSet<String>,
     source_hashes: BTreeMap<String, String>,
     classifications: BTreeMap<String, Vec<ItemClassification>>,
     canonical_calls: BTreeMap<String, Vec<super::authority_dialect::CanonicalCall>>,
@@ -600,77 +601,6 @@ fn test_inclusions(
 // owners, but cannot prove that a referenced source file is test-only. Every
 // source literal takes precedence over parsed test module references, even in
 // cfg-gated macros, definitions, attributes, or nested DSL groups.
-fn macro_source_references(
-    root: &Path,
-    parsed: &BTreeMap<PathBuf, syn::File>,
-) -> Result<BTreeMap<PathBuf, BTreeSet<PathBuf>>, DebtError> {
-    struct References<'a> {
-        directory: &'a Path,
-        crates: &'a Path,
-        files: BTreeSet<PathBuf>,
-    }
-    impl References<'_> {
-        fn tokens(&mut self, tokens: TokenStream) {
-            for token in tokens {
-                match token {
-                    TokenTree::Group(group) => self.tokens(group.stream()),
-                    TokenTree::Literal(literal) => {
-                        if let Ok(literal) = syn::parse2::<syn::LitStr>(literal.into_token_stream())
-                        {
-                            let path = normalized_path(&self.directory.join(literal.value()));
-                            if path.starts_with(self.crates)
-                                && path.extension().is_some_and(|ext| ext == "rs")
-                                && path.is_file()
-                            {
-                                self.files.insert(path);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    impl<'ast> Visit<'ast> for References<'_> {
-        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-            self.tokens(mac.tokens.clone());
-        }
-        fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
-            // Attribute macros also receive arbitrary input tokens.
-            if let syn::Meta::List(list) = &attr.meta {
-                self.tokens(list.tokens.clone());
-            }
-            visit::visit_attribute(self, attr);
-        }
-    }
-    let crates = root.join("crates");
-    let mut references = BTreeMap::new();
-    for (source, syntax) in parsed {
-        let directory = source
-            .parent()
-            .ok_or_else(|| DebtError::Policy("missing source parent".into()))?;
-        let mut visitor = References {
-            directory,
-            crates: &crates,
-            files: BTreeSet::new(),
-        };
-        visitor.visit_file(syntax);
-        for path in &visitor.files {
-            if !parsed.contains_key(path) {
-                // All retained lexical/zero scanners must cover production
-                // source. Classifying it without that coverage would silently
-                // lose raw locks or global-state operations outside src.
-                return Err(DebtError::Policy(format!(
-                    "production macro source reference outside discoverable Rust files: {}",
-                    path.display()
-                )));
-            }
-        }
-        references.insert(source.clone(), visitor.files);
-    }
-    Ok(references)
-}
-
 // Strict source edges come only from literal built-in inclusions in parsed
 // production syntax. Opaque references are rejected by dialect validation,
 // never used to promote a file or to confer test-only scope.
@@ -1306,32 +1236,29 @@ pub(super) fn expression_test_only(expression: &syn::Expr) -> bool {
     );
     test_only(attributes)
 }
-struct LegacyBaseSnapshot;
 
 impl SourceCensus {
     pub fn load(root: &Path) -> Result<Self, DebtError> {
-        Self::read(root, None)
+        Self::read(&root.canonicalize()?)
     }
 
-    // Only the schema-absent archived PR base may use historical owner recovery.
-    // Undercounting escapes in that base can only make its ceilings/ratchet
-    // stricter; this never supplies exemptions to working-source verification.
-    pub(super) fn legacy_base(root: &Path) -> Result<Self, DebtError> {
-        if root.join(crate::authority_debt::CEILINGS_PATH).exists() {
-            return Err(DebtError::Policy(
-                "legacy base census is unreachable with the ceilings schema".into(),
-            ));
-        }
-        Self::read(root, Some(LegacyBaseSnapshot))
-    }
-
-    fn read(root: &Path, historical: Option<LegacyBaseSnapshot>) -> Result<Self, DebtError> {
+    fn read(root: &Path) -> Result<Self, DebtError> {
         let mut result = Self {
-            historical_snapshot: historical.is_some(),
             vocabulary: authority_vocabulary()?,
             ..Self::default()
         };
-        let mut leaves = Vec::new();
+        let build_roots = super::authority_build::metadata_roots(root)?;
+        let build_parsed = super::authority_build::load(root, &build_roots)?;
+        let mut leaves: Vec<_> = build_parsed.keys().cloned().collect();
+        result.build_roots = build_roots;
+        result.build_files = build_parsed
+            .keys()
+            .map(|path| {
+                path.strip_prefix(root)
+                    .map(|relative| relative.to_string_lossy().to_string())
+                    .map_err(|error| DebtError::Policy(error.to_string()))
+            })
+            .collect::<Result<_, _>>()?;
         for entry in std::fs::read_dir(root.join("crates"))? {
             let entry = entry?;
             if entry.file_name() == "carrick-xtask" {
@@ -1340,6 +1267,17 @@ impl SourceCensus {
             let src = entry.path().join("src");
             if src.is_dir() {
                 files(&src, &mut leaves)?;
+            }
+        }
+        for path in &leaves {
+            let canonical = path.canonicalize()?;
+            if path.components().any(|part| part.as_os_str() == "src")
+                && build_parsed.contains_key(&canonical)
+            {
+                return Err(DebtError::Policy(format!(
+                    "build-time/production source overlap: {}",
+                    path.display()
+                )));
             }
         }
         leaves.sort();
@@ -1385,7 +1323,7 @@ impl SourceCensus {
         }
         collect_source_inclusion_aliases(&parsed, &mut result.vocabulary)?;
         test_inclusions(&parsed, &result.vocabulary, &mut test_files);
-        if historical.is_none() {
+        {
             // Reject invalid selectors before attempting module resolution.
             // A second pass below validates any file also reached in production.
             let provisional = parsed
@@ -1447,13 +1385,18 @@ impl SourceCensus {
                 )?;
             }
         }
+        if let Some(path) = build_parsed
+            .keys()
+            .find(|path| resolved.contains_key(*path))
+        {
+            return Err(DebtError::Policy(format!(
+                "build-time/production source overlap: {}",
+                path.display()
+            )));
+        }
         // Macro literals force production scope without inventing a logical
         // owner or extending the retained scanners' source discovery domain.
-        let macro_references = if historical.is_some() {
-            macro_source_references(root, &parsed)?
-        } else {
-            resolved_source_references(&parsed)?
-        };
+        let macro_references = resolved_source_references(&parsed)?;
         let mut production = resolved.keys().cloned().collect::<BTreeSet<_>>();
         // Only production files seed reachability. Their macro inputs remain
         // conservative even in cfg-gated syntax, but a test-only literal cycle
@@ -1465,12 +1408,28 @@ impl SourceCensus {
                 .to_string_lossy();
             let probe =
                 relative.contains("/src/bin/") && !relative.starts_with("crates/carrick-cli/");
-            if !test_files.contains(path) && !probe {
+            if !test_files.contains(path) && !probe && !build_parsed.contains_key(path) {
                 production.insert(path.clone());
             }
         }
         let production = production_files(&parsed, &macro_references, production)?;
-        if historical.is_none() {
+        if let Some(path) = build_parsed.keys().find(|path| production.contains(*path)) {
+            return Err(DebtError::Policy(format!(
+                "build-time/production source overlap: {}",
+                path.display()
+            )));
+        }
+        for build in &result.build_roots {
+            declared_modules(
+                &root.join(&build.source),
+                &[build.package.replace('-', "_"), "build_program".into()],
+                true,
+                &parsed,
+                &mut resolved,
+                &result.vocabulary,
+            )?;
+        }
+        {
             result.canonical_calls = crate::authority_dialect::validate(
                 root,
                 &parsed,
@@ -1659,7 +1618,8 @@ impl SourceCensus {
                 serde_json::json!({
                     "sha256": hash,
                     "production": !self.test_files.contains(file),
-                    "product_profile": !self.non_product_files.contains(file),
+                    "product_profile": !self.non_product_files.contains(file) && !self.is_build_file(file),
+                    "boundary": if self.is_build_file(file) { "build_time" } else { "production" },
                     "items": self.classifications.get(file),
                     "canonical_calls": self.canonical_calls.get(file).map(Vec::as_slice).unwrap_or_default(),
                 }),
@@ -1678,9 +1638,12 @@ impl SourceCensus {
             }
         }
         Ok(
-            serde_json::json!({"schema": 1, "dialect": if self.historical_snapshot { "historical_base" } else { "strict" }, "root": root.canonicalize()?, "tool_root": tools,
-            "inputs": inputs, "rejections": [], "files": files}),
+            serde_json::json!({"schema": 1, "dialect": "strict", "root": root.canonicalize()?, "tool_root": tools,
+            "inputs": inputs, "build_roots": self.build_roots, "rejections": [], "files": files}),
         )
+    }
+    pub fn is_build_file(&self, file: &str) -> bool {
+        self.build_files.contains(file)
     }
     pub fn is_test_file(&self, file: &str) -> bool {
         self.test_files.contains(file)
@@ -2105,13 +2068,14 @@ impl Scanner<'_> {
             .current_owner
             .as_ref()
             .map_or_else(|| parts.join("::"), |parent| format!("{parent}::{name}"));
+        let lane = self.lane();
         self.census
             .owners
             .entry(self.file.clone())
             .or_default()
             .push(Owner {
                 name: name.clone(),
-                lane: Lane::module(&self.krate, &self.modules),
+                lane,
                 start: span.start(),
                 end: span.end(),
             });
@@ -2181,8 +2145,7 @@ impl Scanner<'_> {
             }
             if let TokenTree::Ident(method) = &tokens[index] {
                 let method_name = method.unraw().to_string();
-                if self.census.historical_snapshot
-                    || matches!(tokens.get(index + 1), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis)
+                if matches!(tokens.get(index + 1), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis)
                     || matches!(tokens.get(index + 1), Some(TokenTree::Punct(p)) if p.as_char() == ':')
                 {
                     self.task_call(&method_name);
@@ -2208,6 +2171,13 @@ impl Scanner<'_> {
             .entry(self.file.clone())
             .or_default()
             .push((span.start(), span.end()));
+    }
+    fn lane(&self) -> Lane {
+        if self.census.is_build_file(&self.file) {
+            Lane::BuildTime
+        } else {
+            Lane::module(&self.krate, &self.modules)
+        }
     }
     fn prefix(&self) -> String {
         std::iter::once(self.krate.as_str())
@@ -2277,7 +2247,7 @@ impl Scanner<'_> {
             line: span.start().line,
             owner: owner.clone(),
             operation: operation.into(),
-            lane: Lane::module(&self.krate, &self.modules),
+            lane: self.lane(),
         });
     }
 }
@@ -2467,11 +2437,7 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         }
     }
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-        // Historical bootstrap keeps the historical token census semantics;
-        // modern audits must never reinterpret the comparison-base counts.
-        if self.census.historical_snapshot {
-            self.macro_tokens(mac.tokens.clone());
-        } else if let Some(input) = super::authority_macro::parse(&mac.path, mac.tokens.clone()) {
+        if let Some(input) = super::authority_macro::parse(&mac.path, mac.tokens.clone()) {
             let previous = self.audited_input;
             self.audited_input = true;
             input.visit(self);
@@ -2552,11 +2518,6 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
                 self.call(&operation, path.span());
             }
         }
-        if self.census.historical_snapshot
-            && let Some(segment) = path.path.segments.last()
-        {
-            self.task_call(&segment.ident.unraw().to_string());
-        }
         visit::visit_expr_path(self, path);
     }
 }
@@ -2586,6 +2547,10 @@ fn census_inputs() -> BTreeMap<&'static str, String> {
         (
             "crates/carrick-xtask/src/authority_source.rs",
             include_bytes!("authority_source.rs").as_slice(),
+        ),
+        (
+            "crates/carrick-xtask/src/authority_build.rs",
+            include_bytes!("authority_build.rs").as_slice(),
         ),
         (
             "crates/carrick-xtask/src/authority_dialect.rs",

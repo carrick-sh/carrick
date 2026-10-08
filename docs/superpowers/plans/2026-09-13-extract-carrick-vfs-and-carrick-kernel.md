@@ -281,11 +281,11 @@ edge and saw \`layering FAIL\`."
 ### Task 0.2: Teach the line-pinned inventory reconciler to follow a path move
 
 **Files:**
-- Modify: `scripts/migrate/reconcile-line-pinned-inventories.py`
+Historical positional maintenance is retired; use `just lint-domains`.
 - Test: `scripts/migrate/tests/test_reconcile_rename.py` (create)
 
 **Interfaces:**
-- Produces: `python3 scripts/migrate/reconcile-line-pinned-inventories.py --rehome --rename OLD_PREFIX=NEW_PREFIX [--rename …]` rewrites every inventory row's `path` (or `file`) field whose value starts with `OLD_PREFIX` to start with `NEW_PREFIX` **before** the existing position reconciliation runs, so fingerprints re-match at the new location.
+Historical positional maintenance is retired; use `just lint-domains`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -293,7 +293,7 @@ edge and saw \`layering FAIL\`."
 # scripts/migrate/tests/test_reconcile_rename.py
 import json, subprocess, sys, pathlib
 
-SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "reconcile-line-pinned-inventories.py"
+# Historical positional maintenance retired; use just lint-domains.
 
 def test_rename_prefix_rewrites_paths(tmp_path):
     inv = tmp_path / "inv.json"
@@ -353,12 +353,12 @@ def apply_renames(rows, renames):
 
 - [ ] **Step 4: Run the test; it passes.** Run: `python3 -m pytest scripts/migrate/tests/test_reconcile_rename.py -q` → `1 passed`.
 
-- [ ] **Step 5: Prove the unrenamed path is a no-op.** Run: `python3 scripts/migrate/reconcile-line-pinned-inventories.py && git status --porcelain scripts/migrate` → clean (the reconciler has no `--check`; the `--check` flag belongs to `check-host-authority-transitions.py`).
+Historical positional maintenance is retired; use `just lint-domains`.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add scripts/migrate/reconcile-line-pinned-inventories.py scripts/migrate/tests/test_reconcile_rename.py
+# Historical positional maintenance retired; use just lint-domains.
 git commit -m "chore(migrate): let the inventory reconciler follow a path move
 
 Why: the vfs/kernel extraction git-mv's ~200k lines; the line-pinned
@@ -421,7 +421,7 @@ Same for ~3085 (`ptrace`), ~3520 (`waitid`), and ~4741 (`pidfd_send_signal`, unc
 
 - [ ] **Step 4: Run the serial runtime tests.** Run: `RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib` → pass.
 
-- [ ] **Step 5: Reconcile inventories on the clean tree, dropping retired host-authority rows by hand.** Run: `python3 scripts/migrate/reconcile-line-pinned-inventories.py --rehome && python3 scripts/migrate/check-host-authority-transitions.py --check`; delete each row the checker reports as gone and name it in the commit.
+Historical positional maintenance is retired; use `just lint-domains`.
 
 - [ ] **Step 6: Full gate and signed smoke**
 
@@ -682,7 +682,7 @@ For `crate::vfs::X`: `X ∈ {proc, sys, dev, devpts, ProcVfs, SysVfs, DevVfs, De
 - [ ] **Step 5: Inventories and lint paths**
 
 ```bash
-python3 scripts/migrate/reconcile-line-pinned-inventories.py --rehome \
+# Historical positional maintenance retired; use just lint-domains.
   --rename crates/carrick-runtime/src/vfs/mod.rs=crates/carrick-vfs/src/vfs/mod.rs \
   $(for f in bind dentry mount sparse_buffer etc_services resolvconf rootfs namespace_mutation errno; do printf -- "--rename crates/carrick-runtime/src/vfs/%s.rs=crates/carrick-vfs/src/vfs/%s.rs " $f $f; done) \
   --rename crates/carrick-runtime/src/fs_backend=crates/carrick-vfs/src/fs_backend \
@@ -851,7 +851,7 @@ pub trait Stage1MmProjection: Send + Sync {
   1. `git mv`-style: move that machinery into `crates/carrick-runtime/src/dispatch/mm_quiesce.rs` (sibling of `mm_mutation.rs`/`mm_authority.rs`, in Task 2.9's moving set); `with_sole_mm_stage1` becomes a method on `MmExecutorParticipation` (or a free fn in the new module); `vcpu_loop` imports downward from `crate::dispatch::mm_quiesce`.
   2. The ~20 carrier-side pause/COW tests in `vcpu_loop/quiesce.rs` (L3397-3808; they use `Stage1MmPool::new_root_for_tests`, ruled carrier-side in Task 2.3) STAY in `quiesce.rs`, importing from the new module.
   3. `stamp_identity_page`, `stamp_identity_page_at`, `identity_gate_word`, `stamp_identity_values` (`vcpu_loop/memory.rs` L602-718) and the test `identity_page_stamp_surfaces_guest_memory_write_failure` move to the kernel as pure functions over `M: CurrentMmMemory` (`kernel/identity_page.rs`); the carrier calls them with its engine memory.
-  4. Inventories: function moves within/between files are rehomed with `reconcile-line-pinned-inventories.py --rehome` (the `EXACT_MM_STAGE1` global-state row re-homes to the new module); reconcile on the clean tree after the move commit, as its own commit.
+  Historical positional maintenance is retired; use `just lint-domains`.
   Option B (hal traits + projection methods) is rejected: it would duplicate the election into the test double or hal-ify the kernel census. `Stage1MmProjection` keeps the three foreign-COW methods Task 2.3 gave it. The pre-ruling text follows for reference only:
 - [ ] **(superseded) Step 2:** The quiesce entry points become `Stage1MmProjection` methods:
 
@@ -1025,7 +1025,7 @@ for f in container container_policy event_ring seccomp inotify fanotify keyring 
 - [ ] **Step 6: Inventories, lint paths, justfile**
 
 ```bash
-python3 scripts/migrate/reconcile-line-pinned-inventories.py --rehome \
+# Historical positional maintenance retired; use just lint-domains.
   $(for d in kernel dispatch namespace network file_authority observe vfs; do printf -- "--rename crates/carrick-runtime/src/%s=crates/carrick-kernel/src/%s " $d $d; done) \
   $(for f in container container_policy event_ring seccomp inotify fanotify keyring cred_ipc core_dump host_tty pty_relay page_profile eventfd_shm run_result run_state syslog exec_stamps exec_helpers deadlock_watchdog; do printf -- "--rename crates/carrick-runtime/src/%s.rs=crates/carrick-kernel/src/%s.rs " $f $f; done)
 ```

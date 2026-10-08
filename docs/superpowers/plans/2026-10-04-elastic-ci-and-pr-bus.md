@@ -63,7 +63,7 @@ The owner's 2026-10-04 operational evidence explains the change:
    | --- | --- |
    | (9) Rustdoc exemption receipt binds the exact PR base SHA | Bind the exemption to covered inputs: reviewed file hashes plus toolchain. An unrelated merge must preserve validity; a covered-input change must invalidate it. This does not relax exact-SHA gate/artifact receipts. |
    | (12) Source-hash-pinned schedule replay receipts | Futex wake/exit and setid receipts currently fail after any unrelated kernel source edit. Scope validation to the replay's actual covered inputs and prove unrelated edits preserve validity while relevant changes invalidate it; do not simply disable freshness checks. |
-   | (11) Failed `remote-recapture` leaks `gate-worktree.lock` | Release on failure/cancellation and prove the next checkout can acquire it; preserve checkout-before-host-lease ordering. |
+   Historical positional maintenance is retired; use `just lint-domains`.
    | (13) `remote-accept` refuses a held checkout lock | Queue with an explicit bound, report the holder, and prove timeout/cancellation removes the waiter. Cleanup must be bound to the checkout and run ID, never another checkout's gate. |
 
 3. Land [PR #2, merge-queue workflows](https://github.com/carrick-sh/carrick/pull/2),

@@ -252,7 +252,7 @@ acceptance receipt.
 checks pass, but three authority artifact self-tests fail because the
 committed Mac capture and seven moved inventory spans disagree. The
 clean Linux reconciler cannot authoritatively update Mac spans. The guarded
-`just remote-recapture --ref 7d720ba614158bc55f0475605076a0f308f24dc5`
+Historical positional maintenance is retired; use `just lint-domains`.
 attempt fails before remote contact: `cloudmac` does not resolve here.
 A reachable Mac recapture and its reviewed patch are required. No capture
 was fabricated and no gate exception was added.
