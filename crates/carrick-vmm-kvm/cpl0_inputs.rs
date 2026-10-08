@@ -9,18 +9,16 @@
 //! * the workspace files that configure the image build (lockfile, toolchain,
 //!   root manifest, `.cargo/config.toml` with its `code-model=kernel` flags);
 //! * the directory of every path (workspace) package in the normal/build
-//!   dependency closure of `carrick-x86-cpl0` for `x86_64-unknown-none`, from
-//!   `cargo metadata`;
+//!   dependency closure of `carrick-x86-cpl0`, conservatively read from
+//!   manifest path declarations (including workspace inheritance);
 //! * every file a source in those directories pulls in by `#[path = ...]`,
 //!   `include!`, `include_str!` or `include_bytes!` with a literal path that
 //!   resolves outside them.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 pub const IMAGE_PACKAGE: &str = "carrick-x86-cpl0";
-pub const IMAGE_TARGET: &str = "x86_64-unknown-none";
 
 /// Workspace-relative files that configure every image build.
 pub const WORKSPACE_INPUTS: &[&str] = &[
@@ -59,30 +57,8 @@ impl Cpl0Inputs {
     }
 }
 
-pub fn derive(workspace: &Path, cargo: &std::ffi::OsStr) -> Result<Cpl0Inputs, String> {
-    let output = Command::new(cargo)
-        .current_dir(workspace)
-        .args([
-            "metadata",
-            "--format-version",
-            "1",
-            "--locked",
-            "--offline",
-            "--filter-platform",
-            IMAGE_TARGET,
-        ])
-        .env_remove("CARGO_TARGET_DIR")
-        .output()
-        .map_err(|error| format!("cargo metadata: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "cargo metadata failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())?;
-    let package_dirs = closure_dirs(&metadata)?;
+pub fn derive(workspace: &Path) -> Result<Cpl0Inputs, String> {
+    let package_dirs = closure_dirs(workspace)?;
     let mut inputs = Cpl0Inputs {
         package_dirs,
         ..Cpl0Inputs::default()
@@ -116,64 +92,55 @@ pub fn derive(workspace: &Path, cargo: &std::ffi::OsStr) -> Result<Cpl0Inputs, S
     Ok(inputs)
 }
 
-fn closure_dirs(metadata: &serde_json::Value) -> Result<BTreeSet<PathBuf>, String> {
-    let packages = metadata["packages"]
-        .as_array()
-        .ok_or("metadata has no packages")?;
-    let mut manifest_dirs = BTreeMap::new();
-    let mut root = None;
-    for package in packages {
-        let (Some(id), Some(manifest)) =
-            (package["id"].as_str(), package["manifest_path"].as_str())
-        else {
-            continue;
-        };
-        if package["name"] == IMAGE_PACKAGE {
-            root = Some(id.to_owned());
-        }
-        if package["source"].is_null()
-            && let Some(dir) = Path::new(manifest).parent()
-        {
-            let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-            manifest_dirs.insert(id.to_owned(), dir);
-        }
-    }
-    let root = root.ok_or("carrick-x86-cpl0 is not a workspace package")?;
-    let nodes: BTreeMap<&str, &serde_json::Value> = metadata["resolve"]["nodes"]
-        .as_array()
-        .ok_or("metadata has no resolve graph")?
-        .iter()
-        .filter_map(|node| node["id"].as_str().map(|id| (id, node)))
-        .collect();
-    let mut stack = vec![root];
+// Conservatively include every normal/build path dependency, including optional
+// and target-specific ones. Extra watches are safe; omitting a compiled input
+// is not. Registry dependencies are immutable under the watched Cargo.lock.
+fn closure_dirs(workspace: &Path) -> Result<BTreeSet<PathBuf>, String> {
+    let root = read_manifest(&workspace.join("Cargo.toml"))?;
+    let mut stack = vec![workspace.join("crates").join(IMAGE_PACKAGE)];
     let mut visited = BTreeSet::new();
-    while let Some(id) = stack.pop() {
-        if !visited.insert(id.clone()) {
+    while let Some(dir) = stack.pop() {
+        let dir = dir.canonicalize().map_err(|error| error.to_string())?;
+        if !visited.insert(dir.clone()) {
             continue;
         }
-        let Some(node) = nodes.get(id.as_str()) else {
-            continue;
-        };
-        for dep in node["deps"]
-            .as_array()
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-        {
-            let linked = dep["dep_kinds"]
-                .as_array()
-                .map(Vec::as_slice)
-                .unwrap_or_default()
-                .iter()
-                .any(|kind| kind["kind"].is_null() || kind["kind"] == "build");
-            if let (true, Some(pkg)) = (linked, dep["pkg"].as_str()) {
-                stack.push(pkg.to_owned());
+        let manifest = read_manifest(&dir.join("Cargo.toml"))?;
+        let mut tables = vec![&manifest];
+        if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+            tables.extend(targets.values());
+        }
+        for table in tables {
+            for kind in ["dependencies", "build-dependencies"] {
+                let Some(deps) = table.get(kind).and_then(toml::Value::as_table) else {
+                    continue;
+                };
+                for (name, declaration) in deps {
+                    let inherited =
+                        declaration.get("workspace").and_then(toml::Value::as_bool) == Some(true);
+                    let (dependency, base) = if inherited {
+                        let dependency = root
+                            .get("workspace")
+                            .and_then(|value| value.get("dependencies"))
+                            .and_then(|value| value.get(name))
+                            .ok_or_else(|| format!("missing workspace dependency {name}"))?;
+                        (dependency, workspace)
+                    } else {
+                        (declaration, dir.as_path())
+                    };
+                    if let Some(path) = dependency.get("path").and_then(toml::Value::as_str) {
+                        stack.push(base.join(path));
+                    }
+                }
             }
         }
     }
-    Ok(visited
-        .iter()
-        .filter_map(|id| manifest_dirs.get(id).cloned())
-        .collect())
+    Ok(visited)
+}
+
+fn read_manifest(path: &Path) -> Result<toml::Value, String> {
+    let source =
+        std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    toml::from_str(&source).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
