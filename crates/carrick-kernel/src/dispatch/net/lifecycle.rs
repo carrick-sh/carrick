@@ -544,7 +544,7 @@ impl<'a> NetView<'a> {
         let description = match self.open_file(guest_fd) {
             Some(open_file) => {
                 if ::std::matches!(
-                    open_file.description.inspect().as_deref(),
+                    crate::kernel::FileDescription::inspect(&open_file.description).as_deref(),
                     Some(OpenDescription::Closed { .. }) | None
                 ) {
                     return Err(LINUX_EBADF);
@@ -687,7 +687,8 @@ impl<'a> NetView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return Err(LINUX_EBADF);
         };
-        let open = open_file.description.inspect().ok_or(LINUX_ENOTSOCK)?;
+        let open = crate::kernel::FileDescription::inspect(&open_file.description)
+            .ok_or(LINUX_ENOTSOCK)?;
         match &*open {
             OpenDescription::HostSocket {
                 host_fd, family, ..
@@ -713,7 +714,7 @@ impl<'a> NetView<'a> {
     /// fd is missing or not a HostSocket). See `OpenDescriptionBase.connect_in_progress`.
     fn socket_connect_in_progress(&self, fd: i32) -> bool {
         self.open_file(fd).is_some_and(|of| {
-            ::std::matches!(of.description.inspect().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.connect_in_progress())
+            ::std::matches!(crate::kernel::FileDescription::inspect(&of.description).as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.connect_in_progress())
         })
     }
 
@@ -725,7 +726,8 @@ impl<'a> NetView<'a> {
         connected: Option<bool>,
     ) {
         if let Some(open_file) = self.open_file(fd)
-            && let Some(mut open) = open_file.description.write_for_io()
+            && let Some(mut open) =
+                crate::kernel::FileDescription::write_for_io(&open_file.description)
             && let OpenDescription::HostSocket { base, .. } = &mut *open
         {
             if let Some(on) = connect_in_progress {
@@ -739,7 +741,8 @@ impl<'a> NetView<'a> {
 
     fn set_socket_pending_error(&self, fd: i32, errno: carrick_abi::LinuxErrno) {
         if let Some(open_file) = self.open_file(fd)
-            && let Some(mut open) = open_file.description.write_for_io()
+            && let Some(mut open) =
+                crate::kernel::FileDescription::write_for_io(&open_file.description)
         {
             let base = match &mut *open {
                 OpenDescription::HostSocket { base, .. }
@@ -752,7 +755,7 @@ impl<'a> NetView<'a> {
 
     pub(super) fn take_socket_pending_error(&self, fd: i32) -> Option<carrick_abi::LinuxErrno> {
         let open_file = self.open_file(fd)?;
-        let mut open = open_file.description.write_for_io()?;
+        let mut open = crate::kernel::FileDescription::write_for_io(&open_file.description)?;
         let base = match &mut *open {
             OpenDescription::HostSocket { base, .. }
             | OpenDescription::InMemorySocket { base, .. } => base,
@@ -764,7 +767,8 @@ impl<'a> NetView<'a> {
 
     fn set_socket_error_after_send(&self, fd: i32, errno: carrick_abi::LinuxErrno) {
         if let Some(open_file) = self.open_file(fd)
-            && let Some(mut open) = open_file.description.write_for_io()
+            && let Some(mut open) =
+                crate::kernel::FileDescription::write_for_io(&open_file.description)
             && let OpenDescription::HostSocket { base, .. } = &mut *open
         {
             base.set_socket_error_after_send(errno.get());
@@ -773,7 +777,8 @@ impl<'a> NetView<'a> {
 
     fn clear_socket_error_after_send(&self, fd: i32) {
         if let Some(open_file) = self.open_file(fd)
-            && let Some(mut open) = open_file.description.write_for_io()
+            && let Some(mut open) =
+                crate::kernel::FileDescription::write_for_io(&open_file.description)
             && let OpenDescription::HostSocket { base, .. } = &mut *open
         {
             base.clear_socket_error_after_send();
@@ -784,7 +789,8 @@ impl<'a> NetView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return Err(LINUX_EBADF);
         };
-        let mut open = open_file.description.write_for_io().ok_or(LINUX_ENOTSOCK)?;
+        let mut open = crate::kernel::FileDescription::write_for_io(&open_file.description)
+            .ok_or(LINUX_ENOTSOCK)?;
         let OpenDescription::HostSocket {
             host_fd,
             family,
@@ -874,7 +880,8 @@ impl<'a> NetView<'a> {
         let open_file = self.open_file(fd).ok_or(LINUX_EBADF)?;
         let description = open_file.description();
         let (socket, local, cleanup) = {
-            let open = description.inspect().ok_or(LINUX_ENOTSOCK)?;
+            let open =
+                crate::kernel::FileDescription::inspect(&description).ok_or(LINUX_ENOTSOCK)?;
             let OpenDescription::InMemorySocket { base, socket } = &*open else {
                 return Err(LINUX_ENOTSOCK);
             };
@@ -979,7 +986,8 @@ impl<'a> NetView<'a> {
             state.inzone_cleanup = Some(Arc::clone(&cleanup));
         }
         let key = crate::network::SocketKey::for_in_memory(Arc::as_ptr(&socket) as usize as u64);
-        let mut open = description.write_for_io().ok_or(LINUX_EBADF)?;
+        let mut open =
+            crate::kernel::FileDescription::write_for_io(&description).ok_or(LINUX_EBADF)?;
         let OpenDescription::InMemorySocket { base, socket: live } = &mut *open else {
             return Err(LINUX_EBADF);
         };
@@ -1020,7 +1028,8 @@ impl<'a> NetView<'a> {
 
     pub(super) fn queue_socket_error_after_send(&self, fd: i32) {
         if let Some(open_file) = self.open_file(fd)
-            && let Some(mut open) = open_file.description.write_for_io()
+            && let Some(mut open) =
+                crate::kernel::FileDescription::write_for_io(&open_file.description)
             && let OpenDescription::HostSocket { base, .. } = &mut *open
             && let Some(errno) = base.socket_error_after_send()
         {
@@ -1111,7 +1120,7 @@ impl<'a> NetView<'a> {
     /// True iff `fd` is a HostSocket with SO_PASSCRED enabled (audit M2).
     pub(super) fn socket_so_passcred(&self, fd: i32) -> bool {
         self.open_file(fd).is_some_and(|of| {
-            ::std::matches!(of.description.inspect().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.so_passcred())
+            ::std::matches!(crate::kernel::FileDescription::inspect(&of.description).as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.so_passcred())
         })
     }
 
@@ -1157,7 +1166,7 @@ impl<'a> NetView<'a> {
     /// with a host SOCK_STREAM, so the host's SO_TYPE would mis-report it.
     pub(in crate::dispatch) fn socket_guest_type(&self, fd: i32) -> Option<i32> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.inspect()?;
+        let open = crate::kernel::FileDescription::inspect(&open_file.description)?;
         match &*open {
             OpenDescription::HostSocket { type_, .. } => Some(*type_),
             OpenDescription::Netlink { sock_type, .. } => Some(*sock_type),
@@ -1168,7 +1177,7 @@ impl<'a> NetView<'a> {
 
     pub(super) fn socket_guest_domain_type_and_protocol(&self, fd: i32) -> Option<(i32, i32, i32)> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.inspect()?;
+        let open = crate::kernel::FileDescription::inspect(&open_file.description)?;
         match &*open {
             OpenDescription::HostSocket {
                 family,
@@ -1190,7 +1199,7 @@ impl<'a> NetView<'a> {
 
     pub(in crate::dispatch) fn socket_guest_protocol(&self, fd: i32) -> Option<i32> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.inspect()?;
+        let open = crate::kernel::FileDescription::inspect(&open_file.description)?;
         match &*open {
             OpenDescription::HostSocket { protocol, .. } => Some(*protocol),
             OpenDescription::Netlink { protocol, .. } => Some(*protocol),
@@ -1275,7 +1284,9 @@ impl<'a> NetView<'a> {
             return false;
         };
         {
-            let Some(mut open) = open_file.description.write_for_io() else {
+            let Some(mut open) =
+                crate::kernel::FileDescription::write_for_io(&open_file.description)
+            else {
                 return false;
             };
             let OpenDescription::HostSocket { synthetic_recv, .. } = &mut *open else {
@@ -1292,7 +1303,7 @@ impl<'a> NetView<'a> {
         fd: i32,
     ) -> Option<(Vec<u8>, Vec<u8>)> {
         let open_file = self.open_file(fd)?;
-        let mut open = open_file.description.write_for_io()?;
+        let mut open = crate::kernel::FileDescription::write_for_io(&open_file.description)?;
         let OpenDescription::HostSocket { synthetic_recv, .. } = &mut *open else {
             return None;
         };
@@ -1339,7 +1350,7 @@ impl<'a> NetView<'a> {
             {
                 return DispatchOutcome::errno(LINUX_EBADF);
             }
-            match open_file.description.inspect().as_deref() {
+            match crate::kernel::FileDescription::inspect(&open_file.description).as_deref() {
                 Some(OpenDescription::HostSocket {
                     host_fd,
                     family,
@@ -2098,7 +2109,7 @@ impl<'a> NetView<'a> {
             // requested pid/groups, then assign a pid (the guest's own pid
             // when the caller passed 0, i.e. "let the kernel choose").
             if let Some(open_file) = this.open_file(fd)
-                && let Some(mut open) = open_file.description.write_for_io()
+                && let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description)
             {
                 match &mut *open {
                     OpenDescription::Netlink {
@@ -2446,7 +2457,7 @@ impl<'a> NetView<'a> {
             // keeping this description write-locked makes its HostFdRef the
             // live owner throughout the host syscall and the publication.
             let mut bound_description = if inzone_pending.is_some() {
-                let Some(open) = bind_description.write_for_io() else {
+                let Some(open) = crate::kernel::FileDescription::write_for_io(&bind_description) else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
                 let OpenDescription::HostSocket {
@@ -2727,7 +2738,7 @@ impl<'a> NetView<'a> {
             // host syscall and publication, while the captured HostFdRef keeps
             // the exact host descriptor alive even if the numeric guest slot
             // closes and is reused concurrently.
-            let Some(mut open) = listen_description.write_for_io() else {
+            let Some(mut open) = crate::kernel::FileDescription::write_for_io(&listen_description) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             if let OpenDescription::InMemorySocket { base, socket } = &mut *open {
@@ -3006,7 +3017,7 @@ impl<'a> NetView<'a> {
             // Linux's EFAULT/EINVAL precedence and EISCONN result.
             if let Some(open_file) = this.open_file(fd) {
                 let in_memory_stream = {
-                    let Some(open) = open_file.description.inspect() else {
+                    let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description) else {
                         return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
                     };
                     match &*open {
@@ -3030,7 +3041,7 @@ impl<'a> NetView<'a> {
                     {
                         let open_file = this.open_file(fd).ok_or(LINUX_EBADF)?;
                         let description = open_file.description();
-                        let mut open = description.write_for_io().ok_or(LINUX_ENOTSOCK)?;
+                        let mut open = crate::kernel::FileDescription::write_for_io(&description).ok_or(LINUX_ENOTSOCK)?;
                         let OpenDescription::InMemorySocket { base, socket } = &mut *open else {
                             return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
                         };
@@ -3141,7 +3152,7 @@ impl<'a> NetView<'a> {
                         };
                         let status_flags = open_file.description.common().status_flags();
                         let old_host_fd = {
-                            let open = open_file.description.inspect();
+                            let open = crate::kernel::FileDescription::inspect(&open_file.description);
                             if let Some(OpenDescription::HostSocket { host_fd, .. }) = open.as_deref() {
                                 Some(host_fd.raw())
                             } else {
@@ -3175,7 +3186,7 @@ impl<'a> NetView<'a> {
                             pure_sock.queue_mock_response(&initial_bytes);
                             this.notify_inmem_epoll();
                         }
-                        if let Some(mut open) = open_file.description.write_for_io() {
+                        if let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description) {
                             *open = OpenDescription::InMemorySocket {
                                 base: OpenDescriptionBase::new(status_flags),
                                 socket: pure_sock,
@@ -3190,7 +3201,7 @@ impl<'a> NetView<'a> {
                         let file_desc = open_file.description();
                         let status_flags = file_desc.common().status_flags();
                         let (old_cleanup, old_host_fd, old_family, description_local, guest_protocol) = {
-                            let open = file_desc.inspect();
+                            let open = crate::kernel::FileDescription::inspect(&file_desc);
                             match open.as_deref() {
                                 Some(OpenDescription::HostSocket {
                                     base,
@@ -3378,7 +3389,7 @@ impl<'a> NetView<'a> {
                             this.network.provider.forget_socket_addresses(socket_key);
                             return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EADDRNOTAVAIL));
                         }
-                        let Some(mut open) = file_desc.write_for_io() else {
+                        let Some(mut open) = crate::kernel::FileDescription::write_for_io(&file_desc) else {
                             this.network.provider.forget_socket_addresses(socket_key);
                             return Ok(DispatchOutcome::errno(LINUX_EBADF));
                         };
@@ -3479,7 +3490,7 @@ impl<'a> NetView<'a> {
                                 return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EADDRNOTAVAIL));
                             };
                             let guest_local = std::net::SocketAddr::new(source_ip, host_local.port());
-                            let Some(mut open) = connect_description.write_for_io() else {
+                            let Some(mut open) = crate::kernel::FileDescription::write_for_io(&connect_description) else {
                                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
                             };
                             let OpenDescription::HostSocket {
@@ -3784,7 +3795,7 @@ impl<'a> NetView<'a> {
             // AF_NETLINK getsockname: hand back a sockaddr_nl carrying the
             // bound pid/groups (or pid=0 if the socket was never bound).
             if let Some(open_file) = this.open_file(fd)
-                && let Some(OpenDescription::Netlink { pid, groups, .. }) = open_file.description.inspect().as_deref()
+                && let Some(OpenDescription::Netlink { pid, groups, .. }) = crate::kernel::FileDescription::inspect(&open_file.description).as_deref()
             {
                 let nl = sockaddr_nl_bytes(*pid, *groups);
                 if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &nl).is_err() {
@@ -3793,7 +3804,7 @@ impl<'a> NetView<'a> {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             if let Some(open_file) = this.open_file(fd)
-                && let Some(open) = open_file.description.inspect()
+                && let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description)
             {
                 match &*open {
                     OpenDescription::InMemorySocket { socket, .. } => {
@@ -3883,7 +3894,7 @@ impl<'a> NetView<'a> {
             let addr_addr = addr.0;
             let addrlen_addr = addrlen.0;
             if let Some(open_file) = this.open_file(fd)
-                && let Some(open) = open_file.description.inspect()
+                && let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description)
             {
                 match &*open {
                     OpenDescription::InMemorySocket { socket, .. } => {
@@ -3988,7 +3999,7 @@ impl<'a> NetView<'a> {
             let fd: Fd = fd;
             let how = how as i32;
             if let Some(open_file) = this.open_file(fd.0)
-                && let Some(open) = open_file.description.inspect()
+                && let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description)
                 && let OpenDescription::InMemorySocket { socket, .. } = &*open
             {
                 let socket = Arc::clone(socket);

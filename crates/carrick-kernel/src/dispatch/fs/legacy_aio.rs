@@ -179,7 +179,7 @@ fn legacy_aio_iocb_errno(this: &FsView<'_>, iocb: LegacyAioIocb) -> Option<Linux
         if access == LINUX_O_RDONLY {
             return Some(LINUX_EBADF);
         }
-        if let Some(open) = open_file.description.inspect() {
+        if let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description) {
             match &*open {
                 OpenDescription::File {
                     writable: false, ..

@@ -626,7 +626,7 @@ impl<'a> NetView<'a> {
             return described();
         }
         if let Some(open_file) = self.open_file(fd) {
-            let Some(open) = open_file.description.inspect() else {
+            let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description) else {
                 return described();
             };
             return match &*open {
@@ -839,7 +839,7 @@ impl<'a> NetView<'a> {
         description: &Arc<crate::kernel::FileDescription>,
     ) -> bool {
         ::std::matches!(
-            description.inspect().as_deref(),
+            crate::kernel::FileDescription::inspect(description).as_deref(),
             Some(OpenDescription::HostPipe {
                 is_read_end: true,
                 bidirectional: false,
@@ -970,7 +970,7 @@ impl<'a> NetView<'a> {
     pub(super) fn fd_is_eventfd(&self, fd: i32) -> bool {
         self.open_file(fd).is_some_and(|f| {
             ::std::matches!(
-                f.description.inspect().as_deref(),
+                crate::kernel::FileDescription::inspect(&f.description).as_deref(),
                 Some(OpenDescription::EventFd { .. })
             )
         })

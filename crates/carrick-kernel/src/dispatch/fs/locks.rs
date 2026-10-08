@@ -53,7 +53,7 @@ fn retained_host_file_for_lock(
         return Err(LINUX_EBADF);
     };
     let desc_ptr = Arc::as_ptr(lease.description()) as usize;
-    let Some(description) = lease.description().read_for_io() else {
+    let Some(description) = crate::kernel::FileDescription::read_for_io(lease.description()) else {
         return Err(LINUX_EBADF);
     };
     let host_fd = match &*description {
@@ -1184,9 +1184,7 @@ impl<'a> FsView<'a> {
             return Vec::new();
         };
         let target_id = {
-            target
-                .description
-                .read_for_io()
+            crate::kernel::FileDescription::read_for_io(&target.description)
                 .and_then(|desc| Self::lease_file_identity(&desc))
         };
         let Some(target_id) = target_id else {
@@ -1203,7 +1201,7 @@ impl<'a> FsView<'a> {
             if Arc::ptr_eq(&open_file.description, &target.description) {
                 continue;
             }
-            if let Some(desc) = open_file.description.read_for_io()
+            if let Some(desc) = crate::kernel::FileDescription::read_for_io(&open_file.description)
                 && Self::lease_file_identity(&desc).as_ref() == Some(&target_id)
             {
                 others.push(open_file.description.common().status_flags() & LINUX_O_ACCMODE);
@@ -1251,9 +1249,7 @@ impl<'a> FsView<'a> {
             return;
         }
         let file = {
-            open_file
-                .description
-                .read_for_io()
+            crate::kernel::FileDescription::read_for_io(&open_file.description)
                 .and_then(|description| Self::lease_file_identity(&description))
         };
         if let Some(file) = file {
@@ -1415,7 +1411,7 @@ impl<'a> FsView<'a> {
         &self,
         open_file: &OpenFile,
     ) -> Option<u64> {
-        let open = open_file.description.inspect()?;
+        let open = crate::kernel::FileDescription::inspect(&open_file.description)?;
         let host_socket_fd = match &*open {
             OpenDescription::PipeReader { pipe, .. } | OpenDescription::PipeWriter { pipe, .. } => {
                 return Some(pipe.pipe_id());
@@ -1475,7 +1471,7 @@ impl<'a> FsView<'a> {
                     let Some(open_file) = this.open_file(fd.0) else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
-                    let Some(open) = open_file.description.inspect() else {
+                    let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description) else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
                     match &*open {
@@ -1505,7 +1501,7 @@ impl<'a> FsView<'a> {
                         let Some(open_file) = this.open_file(fd.0) else {
                             return Ok(DispatchOutcome::errno(LINUX_EBADF));
                         };
-                        let Some(open) = open_file.description.inspect() else {
+                        let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description) else {
                             return Ok(DispatchOutcome::errno(LINUX_EBADF));
                         };
                         match &*open {
@@ -1672,7 +1668,7 @@ impl<'a> FsView<'a> {
                         // exactly O_RDONLY|O_LARGEFILE, as Linux does).
                         let mut flags =
                             reportable_status_flags(open_file.description.common().status_flags());
-                        if let Some(open) = open_file.description.inspect()
+                        if let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description)
                             && matches!(&*open, OpenDescription::HostPipe { pty: Some(_), .. })
                         {
                             flags |= LINUX_O_RDWR;
@@ -1740,7 +1736,7 @@ impl<'a> FsView<'a> {
                     const LINUX_F_SETFL_MUTABLE: u64 =
                         LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_ASYNC;
                     crate::el1_delegation::recall_if_delegated(&open_file.description);
-                    let Some(open) = open_file.description.write_for_io() else {
+                    let Some(open) = crate::kernel::FileDescription::write_for_io(&open_file.description) else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
                     let next_flags = (open_file.description.common().status_flags()
@@ -2013,7 +2009,7 @@ impl<'a> FsView<'a> {
                         return Ok(DispatchOutcome::errno(LINUX_EBUSY));
                     }
                     {
-                        let _guard = open_file.description.write_for_io();
+                        let _guard = crate::kernel::FileDescription::write_for_io(&open_file.description);
                         common.set_seals(Some((current | new_seals).bits()));
                         crate::el1_delegation::recall_if_delegated(&open_file.description);
                     }
@@ -2137,7 +2133,7 @@ impl<'a> FsView<'a> {
             }
 
             let file = {
-                let Some(description) = lease.description().read_for_io() else {
+                let Some(description) = crate::kernel::FileDescription::read_for_io(lease.description()) else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
                 Self::lease_file_identity(&description)

@@ -80,14 +80,14 @@ impl ThreadResources {
     ) -> Result<Self, ObjectIdError> {
         let files = match plan.files() {
             CloneObjectMode::Share => Arc::clone(&parent.files),
-            CloneObjectMode::Copy => Arc::new(FileTable::for_fork_copy(
+            CloneObjectMode::Copy => Arc::new(crate::kernel::FileTable::for_fork_copy(
                 ids.file_table_id()?,
                 &parent.files,
             )),
         };
         let fs_context = match plan.fs_context() {
             CloneObjectMode::Share => Arc::clone(&parent.fs_context),
-            CloneObjectMode::Copy => Arc::new(FsContext::for_fork_copy(
+            CloneObjectMode::Copy => Arc::new(crate::kernel::FsContext::for_fork_copy(
                 ids.fs_context_id()?,
                 &parent.fs_context,
             )),
@@ -107,7 +107,10 @@ impl ThreadResources {
         ids: &ObjectIdRegistry,
     ) -> Result<Self, ObjectIdError> {
         Ok(Self::new(
-            Arc::new(FileTable::for_exec(ids.file_table_id()?, &caller.files)),
+            Arc::new(crate::kernel::FileTable::for_exec(
+                ids.file_table_id()?,
+                &caller.files,
+            )),
             Arc::clone(&caller.fs_context),
             Arc::clone(&caller.credentials),
         ))

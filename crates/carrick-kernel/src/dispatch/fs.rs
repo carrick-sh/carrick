@@ -1385,7 +1385,7 @@ impl<'a> FsView<'a> {
                 Err(LINUX_EBADF)
             };
         };
-        let Some(open) = open_file.description.read_for_io() else {
+        let Some(open) = crate::kernel::FileDescription::read_for_io(&open_file.description) else {
             return Ok(None);
         };
         Ok(match &*open {
@@ -1398,7 +1398,8 @@ impl<'a> FsView<'a> {
         let files = self.captured_file_table();
         let table = files.read_open_files();
         for (fd, other) in table.iter() {
-            let Some(other_open) = other.description.inspect() else {
+            let Some(other_open) = crate::kernel::FileDescription::inspect(&other.description)
+            else {
                 continue;
             };
             if let OpenDescription::HostPipe {
@@ -1428,7 +1429,8 @@ impl<'a> FsView<'a> {
         let files = self.captured_file_table();
         let table = files.read_open_files();
         for (_fd, other) in table.iter() {
-            let Some(other_open) = other.description.inspect() else {
+            let Some(other_open) = crate::kernel::FileDescription::inspect(&other.description)
+            else {
                 continue;
             };
             if let OpenDescription::HostPipe {
@@ -1481,7 +1483,8 @@ impl<'a> FsView<'a> {
         let files = self.captured_file_table();
         let table = files.read_open_files();
         for other in table.values() {
-            let Some(other_open) = other.description.try_inspect() else {
+            let Some(other_open) = crate::kernel::FileDescription::try_inspect(&other.description)
+            else {
                 continue;
             };
             if let OpenDescription::HostPipe {
@@ -1507,7 +1510,7 @@ impl<'a> FsView<'a> {
     fn fd_lacks_fsync(&self, fd: i32) -> bool {
         self.open_file(fd).is_some_and(|of| {
             ::std::matches!(
-                of.description.inspect().as_deref(),
+                crate::kernel::FileDescription::inspect(&of.description).as_deref(),
                 Some(
                     OpenDescription::HostPipe { .. }
                         | OpenDescription::HostSocket { .. }
@@ -1843,7 +1846,7 @@ impl<'a> FsView<'a> {
             let writeback: Option<(String, Vec<u8>)>;
             let outcome: DispatchOutcome;
             {
-                let Some(mut open) = open_file.description.write_for_io() else {
+                let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description) else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
                 match &mut *open {
@@ -2056,7 +2059,7 @@ impl<'a> FsView<'a> {
             let writeback: Option<(String, Vec<u8>)>;
             let outcome: DispatchOutcome;
             {
-                let Some(mut open) = open_file.description.write_for_io() else {
+                let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description) else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
                 match &mut *open {
@@ -2264,7 +2267,7 @@ impl<'a> FsView<'a> {
             // inotify/signalfd/netlink fd has no page-cache range to sync →
             // ESPIPE.
             let is_special = ::std::matches!(
-                open_file.description.inspect().as_deref(),
+                crate::kernel::FileDescription::inspect(&open_file.description).as_deref(),
                 Some(
                     OpenDescription::SyntheticDevice { .. }
                         | OpenDescription::HostPipe { .. }
@@ -2312,7 +2315,7 @@ impl<'a> FsView<'a> {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             let file_size: u64 = {
-                let Some(open) = open_file.description.read_for_io() else {
+                let Some(open) = crate::kernel::FileDescription::read_for_io(&open_file.description) else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
                 match &*open {

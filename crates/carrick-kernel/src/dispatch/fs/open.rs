@@ -932,7 +932,7 @@ impl<'a> FsView<'a> {
             return None; // AT_FDCWD and friends
         }
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.inspect()?;
+        let open = crate::kernel::FileDescription::inspect(&open_file.description)?;
         match &*open {
             OpenDescription::Directory {
                 path,
@@ -2076,16 +2076,18 @@ impl<'a> FsView<'a> {
             return Ok(self.cwd());
         }
         match self.open_file(dirfd as i32).as_ref() {
-            Some(open_file) => match open_file.description.inspect().as_deref() {
-                Some(OpenDescription::Directory { path, .. }) => {
-                    if self.layered_metadata(path).is_err() {
-                        Err(LINUX_ENOENT)
-                    } else {
-                        Ok(path.clone())
+            Some(open_file) => {
+                match crate::kernel::FileDescription::inspect(&open_file.description).as_deref() {
+                    Some(OpenDescription::Directory { path, .. }) => {
+                        if self.layered_metadata(path).is_err() {
+                            Err(LINUX_ENOENT)
+                        } else {
+                            Ok(path.clone())
+                        }
                     }
+                    _ => Err(LINUX_ENOTDIR),
                 }
-                _ => Err(LINUX_ENOTDIR),
-            },
+            }
             None if self.fd_is_valid(dirfd as i32) => Err(LINUX_ENOTDIR),
             None => Err(LINUX_EBADF),
         }
