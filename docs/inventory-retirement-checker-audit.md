@@ -286,7 +286,7 @@ The four existing runtime environment-read reductions remain. Direct review of
 current main confirms those four source calls still exist, while no other
 runtime source authority operation changed since the prior bootstrap. Source
 counts and all executed compiler lanes are re-derived, not padded. The initial
-bootstrap provenance now binds exactly the final main SHA above.
+bootstrap records the final main SHA above as informational provenance.
 
 The 22 probe owners (each in both `freebsd_cli` and `freebsd_runtime`):
 
@@ -312,3 +312,21 @@ The 22 probe owners (each in both `freebsd_cli` and `freebsd_runtime`):
 - `carrick_observability::probes::real::ulock_requeue`
 - `carrick_observability::probes::real::ulock_wait`
 - `carrick_observability::probes::real::ulock_wake`
+
+## Initial bootstrap acceptance
+
+The owner-approved one-time cutover accepts the audited symbolic bootstrap only
+when the base lacks the symbolic schema. `source_commit` is informational census
+provenance, not an acceptance identity. A schema-bearing base always refuses the
+bootstrap and uses the normal monotone ratchet instead.
+
+CI and the merge queue census the actual merged tree under test. That tree must
+satisfy the restricted dialect, exact committed ceilings and unconditional zero
+rules. A test-only advance of main therefore needs no provenance rewrite; a new
+production authority operation fails the merged-tree ceiling or unknown-cohort
+check. No raw-base interpreter or normalization patch is introduced.
+
+Red-first: a schema-absent base with a different SHA was refused before dropping
+the SHA comparison. Regression tests also prove that two merged-tree lifecycle
+calls exceed a committed ceiling of one, and that a schema-bearing base refuses
+the bootstrap.

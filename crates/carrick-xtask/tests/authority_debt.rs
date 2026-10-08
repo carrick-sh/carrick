@@ -3242,6 +3242,25 @@ fn added_file_table_lifecycle_caller_exceeds_exact_ceiling() {
 }
 
 #[test]
+fn bootstrap_does_not_excuse_merged_tree_authority_growth() {
+    let root = source_fixture();
+    write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), "fn poll(parent: &FileTable) { crate::kernel::FileTable::for_fork_copy(id(), parent); crate::kernel::FileTable::for_fork_copy(id(), parent); }").unwrap();
+    let committed = AuthorityDebtCeilings {
+        schema: 1,
+        counters: vec![Counter {
+            family: Family::K1Lifecycle,
+            operation: "for_fork_copy".into(),
+            owner: "carrick_kernel::poll".into(),
+            lane: Lane::Shared,
+            ceiling: 1,
+        }],
+    };
+    let error = carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &committed)
+        .unwrap_err();
+    assert!(error.to_string().contains("exceeds ceiling 1"), "{error}");
+}
+
+#[test]
 fn lifecycle_census_distinguishes_file_table_from_unrelated_types() {
     for operation in [
         "for_fork_copy",
