@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "source_commit": "8f6e6bc08aea90244b66a43192cf970462d33909",
+  "source_commit": "9cbe10d75a93dfeb37cb0a3d32026a332857ad7f",
   "platforms": [
     "linux",
     "macos",
@@ -875,6 +875,20 @@
         "family": "fatal_carrier_fault",
         "operation": "fatal:el1::entry_completion",
         "owner": "carrick_el1::personality::dispatch::invalid_completion",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "fatal_carrier_fault",
+        "operation": "fatal:el1::prepare_child",
+        "owner": "carrick_el1::personality::lifecycle::<El1PendingFamilies<'a,F,C,U,G> as LifecycleNative<'a>>::prepare_child",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "fatal_carrier_fault",
+        "operation": "fatal:el1::run_next",
+        "owner": "carrick_el1::personality::lifecycle::<El1PendingFamilies<'a,F,C,U,G> as LifecycleNative<'a>>::run_next",
         "lane": "shared",
         "ceiling": 1
       },

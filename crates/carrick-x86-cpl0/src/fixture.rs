@@ -31,8 +31,11 @@ static CARRICK_X86_FIXTURE_DISPATCH_WITNESSES: [u64; 2] =
 #[inline(never)]
 fn carrick_x86_fixture_dispatch_witness() -> bool {
     // A volatile read keeps the fixture-only witness in the linked image.
-    (unsafe { core::ptr::read_volatile(core::ptr::addr_of!(CARRICK_X86_FIXTURE_DISPATCH_WITNESSES).cast::<u64>()) })
-        == 0x7bd6_8a91_c4e2_5f03
+    (unsafe {
+        core::ptr::read_volatile(
+            core::ptr::addr_of!(CARRICK_X86_FIXTURE_DISPATCH_WITNESSES).cast::<u64>(),
+        )
+    }) == 0x7bd6_8a91_c4e2_5f03
 }
 include!("entry.rs");
 

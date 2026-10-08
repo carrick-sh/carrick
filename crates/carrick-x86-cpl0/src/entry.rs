@@ -251,7 +251,13 @@ mod kernel {
         core::sync::atomic::AtomicU64::new(0);
 
     /// Host crossings allowed to leave CPL0 as forwards.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(
+        ::core::clone::Clone,
+        ::core::marker::Copy,
+        ::core::fmt::Debug,
+        ::core::cmp::PartialEq,
+        ::core::cmp::Eq,
+    )]
     #[repr(u64)]
     pub enum AllowedHostCrossing {
         Read = 0,
