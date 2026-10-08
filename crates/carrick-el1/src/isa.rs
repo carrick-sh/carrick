@@ -88,6 +88,10 @@ pub mod aarch64;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod x86;
 
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+#[path = "isa/x86/user_tables.rs"]
+pub mod x86_user_tables;
+
 #[cfg(all(test, not(target_os = "none")))]
 #[path = "isa/x86/live_context.rs"]
 mod x86_live_context;

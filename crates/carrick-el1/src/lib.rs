@@ -29,7 +29,3 @@ mod x86_context_words_tests;
 #[path = "isa/x86/interrupts.rs"]
 #[allow(dead_code)]
 mod x86_interrupt_timer_tests;
-
-#[cfg(test)]
-#[path = "isa/x86/user_tables.rs"]
-mod x86_user_tables_tests;

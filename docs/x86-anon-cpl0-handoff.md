@@ -43,6 +43,18 @@ at `0xffffffff94001000`, causing a CPL0 fault. Receipt:
 `/tmp/x86-native-working-stock-live.log`. The next fix must retain the
 authenticated words in the existing shared x86 COW adapter.
 
+The COW adapter now retains authenticated caller words and executes its
+repoint through the shared descriptor transaction. The genuine mixed-alias
+regression is red first; 304 EL1 tests and scoped clippy pass. Both guest
+binaries compile. The extra executor red used a host-only exposure stub,
+not the old hardware executor, and is not native red evidence. Actual
+witness receipt `/tmp/x86-native-supplied-cow-live.log` still fails with
+`owner fault selection absent`: real 8GiB replacements have no permanent
+copy alias. The next step provisions one two-page idle supervisor copy
+window in a dedicated MM-private upper root branch. Shared fork must clone
+that branch while retaining all other shared supervisor branches. No
+random GPA rebasing or direct-window expansion is allowed.
+
 N1 owns both the inherited-backing fault-window boundary fix and the
 untouched MAP_SHARED-before-fork defect on work/n1-cm. Do not duplicate
 those fixes. This witness exercises private mappings created after fork.
