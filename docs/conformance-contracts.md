@@ -750,7 +750,8 @@ owned pending exit leaves live topology, revisions and resources unchanged.
 `early_error_after_exit_begin_preserves_live_graph_and_reservation_custody`
 checks this with both a live child and a zombie. Publication wakes the direct
 parent and adopter once each, including inherited zombies;
-`blocked_adopter_wait` binds this through a parked native wait continuation.
+`blocked_adopter_wait_resumes_with_an_inherited_zombie` binds this through
+a parked native wait continuation.
 A competing reap retains the original Any or process-group selector and
 requires fresh status copying before consuming a replacement zombie;
 `competing_reap_keeps_original_any_and_group_query` checks both selectors and
