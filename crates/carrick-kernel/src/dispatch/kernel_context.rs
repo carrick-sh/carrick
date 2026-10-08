@@ -47,24 +47,42 @@ pub(crate) fn try_bootstrap_one_task_binding(
     host_signal: Arc<dyn carrick_hal::HostSignalBridge>,
 ) -> Result<(crate::kernel::KernelTaskBinding, crate::kernel::MmId), crate::run_result::RuntimeError>
 {
-    let observed_pid = i32::try_from(std::process::id()).unwrap_or(1);
+    try_bootstrap_launch_binding(host_signal, None)
+}
+
+pub(super) fn try_bootstrap_launch_binding(
+    host_signal: Arc<dyn carrick_hal::HostSignalBridge>,
+    container: Option<Arc<crate::kernel::Container>>,
+) -> Result<(crate::kernel::KernelTaskBinding, crate::kernel::MmId), crate::run_result::RuntimeError>
+{
+    let observed_pid = i32::try_from(std::process::id())
+        .map_err(|error| crate::run_result::RuntimeError::Configuration(error.to_string()))?;
     let registry_id = crate::thread::ThreadId::main_from_host_pid();
-    let bootstrap = crate::kernel::RootBootstrap::for_one_task_adapter(
-        observed_pid,
-        registry_id,
-        "one-task-dispatch-adapter".to_owned(),
-        host_signal,
-    )
+    let bootstrap = match container {
+        Some(container) => crate::kernel::RootBootstrap::for_prepared_launch(
+            observed_pid,
+            registry_id,
+            "cpl0-prepared-launch".to_owned(),
+            container,
+            host_signal,
+        ),
+        None => crate::kernel::RootBootstrap::for_one_task_adapter(
+            observed_pid,
+            registry_id,
+            "one-task-dispatch-adapter".to_owned(),
+            host_signal,
+        ),
+    }
     .map_err(|error| {
-        tracing::error!(%error, "cannot build mandatory one-task kernel adapter");
+        tracing::error!(%error, "cannot build initial kernel binding");
         crate::run_result::RuntimeError::CarrierFailed(format!(
-            "cannot build mandatory one-task kernel adapter: {error}"
+            "cannot build initial kernel binding: {error}"
         ))
     })?;
     let (_, context) = crate::kernel::Kernel::bootstrap_root(bootstrap).map_err(|error| {
-        tracing::error!(%error, "cannot bootstrap mandatory one-task kernel adapter");
+        tracing::error!(%error, "cannot bootstrap initial kernel binding");
         crate::run_result::RuntimeError::CarrierFailed(format!(
-            "cannot bootstrap mandatory one-task kernel adapter: {error}"
+            "cannot bootstrap initial kernel binding: {error}"
         ))
     })?;
     let mm_id = context.shared().mm().id();
@@ -536,6 +554,62 @@ mod tests {
     use carrick_abi::LINUX_FD_CLOEXEC;
     use carrick_vfs::fs_backend::FsBackend;
     use parking_lot::RwLock;
+
+    #[test]
+    fn prepared_cpl0_dispatcher_boots_in_exact_launch_container() {
+        let network = Arc::new(crate::network::RuntimeNetwork::host_default());
+        let container = Arc::new(crate::kernel::Container::new_with_namespaces(
+            crate::kernel::LaunchContext::unmanaged(crate::kernel::RunId::new("cpl0-launch-test")),
+            network.model.clone(),
+            "cpl0-launch-hostname",
+        ));
+        let arena = Box::leak(Box::new(
+            carrick_kernel_arena::arena::KernelArena::create().expect("launch test arena"),
+        ));
+        let region =
+            crate::namespace::pid::NsSharedRegion::allocate(arena).expect("launch PID namespace");
+        container
+            .install_pid_ns(Arc::clone(&region))
+            .expect("install launch namespace");
+        let dispatcher = SyscallDispatcher::with_prepared_launch(
+            network,
+            None,
+            super::super::CarrierBridges::null(),
+            Arc::clone(&container),
+        )
+        .expect("prepared launch");
+        let context = dispatcher
+            .capture_one_task_context()
+            .expect("launch context");
+        assert!(Arc::ptr_eq(&container, &context.container()));
+        assert_eq!(
+            context.container().uts_ns().nodename(),
+            "cpl0-launch-hostname"
+        );
+        assert!(Arc::ptr_eq(
+            &region,
+            &context
+                .container()
+                .pid_region()
+                .expect("captured namespace")
+        ));
+        assert_eq!(dispatcher.identity_snapshot(&context).pid, 1);
+        let identity = context.task().identity();
+        assert_eq!(
+            context
+                .kernel()
+                .registry()
+                .process_group_to_namespace(container.id(), identity.process_group),
+            Some(1)
+        );
+        assert_eq!(
+            context
+                .kernel()
+                .registry()
+                .session_to_namespace(container.id(), identity.session),
+            Some(1)
+        );
+    }
 
     #[test]
     fn entering_hvpatch_lane_unpublishes_legacy_projection_only_once() {

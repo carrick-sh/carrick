@@ -637,12 +637,22 @@ fn prepare_host_backend(
         record_detached_scratch(id, scratch);
     }
 
-    let mut dispatcher = SyscallDispatcher::with_network_and_host_resolver(
-        Arc::clone(&plan.network),
-        plan.host_resolver.as_ref(),
-        crate::platform_bridges(),
-    );
-    dispatcher.set_container(Arc::clone(container));
+    let mut dispatcher = if plan.page.backend == ExecutionBackend::KvmX86Cpl0 {
+        SyscallDispatcher::with_prepared_launch(
+            Arc::clone(&plan.network),
+            plan.host_resolver.as_ref(),
+            crate::platform_bridges(),
+            Arc::clone(container),
+        )?
+    } else {
+        let mut dispatcher = SyscallDispatcher::with_network_and_host_resolver(
+            Arc::clone(&plan.network),
+            plan.host_resolver.as_ref(),
+            crate::platform_bridges(),
+        );
+        dispatcher.set_container(Arc::clone(container));
+        dispatcher
+    };
     if let HostRootLayout::CachedLower(rootfs) = root_layout {
         dispatcher.set_rootfs_layer(rootfs);
     }
@@ -681,12 +691,26 @@ fn prepare_memory_backend(
 ) -> Result<(SyscallDispatcher, carrick_vfs::rootfs::RootFs), RuntimeError> {
     let rootfs = carrick_vfs::rootfs::RootFs::from_layer_paths(&layer_paths(spec))
         .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("failed to compose rootfs: {e}")))?;
-    let mut dispatcher = SyscallDispatcher::with_rootfs_and_executable_on(
-        crate::platform_bridges(),
-        rootfs.clone(),
-        spec.process.executable.clone(),
-    );
-    dispatcher.set_container(Arc::clone(container));
+    let mut dispatcher = if plan.page.backend == ExecutionBackend::KvmX86Cpl0 {
+        let mut dispatcher = SyscallDispatcher::with_prepared_launch(
+            Arc::clone(&plan.network),
+            plan.host_resolver.as_ref(),
+            crate::platform_bridges(),
+            Arc::clone(container),
+        )?;
+        dispatcher.set_rootfs_layer(rootfs.clone());
+        dispatcher.sandbox_exec_to_container();
+        dispatcher.set_executable_path(spec.process.executable.clone());
+        dispatcher
+    } else {
+        let mut dispatcher = SyscallDispatcher::with_rootfs_and_executable_on(
+            crate::platform_bridges(),
+            rootfs.clone(),
+            spec.process.executable.clone(),
+        );
+        dispatcher.set_container(Arc::clone(container));
+        dispatcher
+    };
     if let Some(snapshot) = plan.host_resolver.as_ref() {
         dispatcher.set_host_resolver_snapshot(snapshot);
     }

@@ -326,6 +326,25 @@ pub struct RootBootstrap {
 }
 
 impl RootBootstrap {
+    /// Prepare a private production kernel directly in the resolved launch
+    /// container, without constructing a reference-model namespace first.
+    pub fn for_prepared_launch(
+        observed_pid: i32,
+        registry_id: ThreadId,
+        diagnostic_name: String,
+        container: Arc<Container>,
+        host_signal: Arc<dyn HostSignalBridge>,
+    ) -> Result<Self, KernelError> {
+        Ok(Self {
+            task_id: TaskId::for_root_bootstrap(observed_pid)?,
+            shared_futex: carrick_thread::platform_futex::SharedFutexTable::new(),
+            registry_id,
+            mm_backend: None,
+            diagnostic_name,
+            container,
+            host_signal,
+        })
+    }
     /// Build an identity-only root for the in-crate reference model: the
     /// test-support constructor, on the Null (bridge-less) host-signal
     /// bridge. Product code uses [`Self::for_one_task_adapter`] or
