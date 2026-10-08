@@ -22,6 +22,28 @@ impl std::fmt::Display for MemoryError {
     }
 }
 impl std::error::Error for MemoryError {}
+fn inventory_page_live(
+    authority: &carrick_kernel::kernel::frame_inventory::FrameInventoryAuthority,
+    mm: NonZeroU64,
+    identity: BackingIdentity,
+    gpa: FrameGpa,
+) -> bool {
+    let Some(mm) = carrick_kernel::kernel::MmId::from_raw_u64(mm.get()) else {
+        return false;
+    };
+    let Some(length) = NonZeroU64::new(PAGE) else {
+        return false;
+    };
+    authority.mapping_is_live_exact_generation(
+        mm,
+        carrick_hal::MappingId::from_kernel_allocation(identity.mapping_id),
+        carrick_hal::FrameId::from_kernel_allocation(identity.frame_id),
+        carrick_hal::MappingGeneration::from_backend_counter(identity.owner_generation),
+        carrick_guest_mem::Gpa(gpa.raw()),
+        carrick_hal::FrameLength::from_mapping_extent(length),
+    )
+}
+
 fn error(message: impl Into<String>) -> MemoryError {
     MemoryError(message.into())
 }
@@ -140,15 +162,40 @@ pub struct SharedFrameEdge {
     handle: BackingHandle,
     identity: BackingIdentity,
 }
+/// One selected inherited page in this carrier. The source root, physical
+/// registration and original inventory identity remain bound to this edge.
+/// Creating it neither allocates physical memory nor authorizes another MM.
+pub struct InheritedFrameEdge {
+    handle: BackingHandle,
+    parent: AddressContext<RootGpa>,
+    span: PageSpan,
+    gpa: FrameGpa,
+    identity: BackingIdentity,
+    shared: bool,
+}
+impl InheritedFrameEdge {
+    pub fn physical(&self) -> FrameGpa {
+        self.gpa
+    }
+    pub fn span(&self) -> PageSpan {
+        self.span
+    }
+    pub fn identity(&self) -> BackingIdentity {
+        self.identity
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Alias {
     slot: u32,
     span: PageSpan,
+    inherited: Option<FrameGpa>,
 }
 struct Slot {
     handle: BackingHandle,
     backing: PreparedBacking,
     frame_identities: BTreeMap<u64, BackingIdentity>,
+    inherited_identities: BTreeMap<(NonZeroU64, u64), BackingIdentity>,
     bootstrap: bool,
     alias_count: usize,
     allowed: Vec<NonZeroU64>,
@@ -413,6 +460,7 @@ impl CarrierMemory {
                     handle,
                     backing: b.clone(),
                     frame_identities: BTreeMap::new(),
+                    inherited_identities: BTreeMap::new(),
                     bootstrap: false,
                     alias_count: 0,
                     allowed: Vec::new(),
@@ -579,6 +627,192 @@ impl CarrierMemory {
         Ok(unsafe { &*ptr.cast::<T>() })
     }
 
+    /// Recover the exact retained identity at a physical page for this MM.
+    pub fn frame_identity(
+        &self,
+        mm: NonZeroU64,
+        gpa: FrameGpa,
+    ) -> Result<BackingIdentity, MemoryError> {
+        let slot = self
+            .locate(gpa, PAGE as usize)
+            .ok_or_else(|| error("unbacked inherited page"))?;
+        let identity = slot
+            .inherited_identities
+            .get(&(mm, gpa.raw()))
+            .copied()
+            .or_else(|| slot.frame_identities.get(&gpa.raw()).copied())
+            .or_else(|| {
+                slot.frame_identities
+                    .is_empty()
+                    .then_some(slot.backing.identity)
+            })
+            .ok_or_else(|| error("missing inherited frame identity"))?;
+        let op = DescriptorOp::Map {
+            span: PageSpan::new(0, PAGE),
+            output: gpa,
+            permissions: Permissions {
+                writable: false,
+                executable: false,
+                user: true,
+            },
+            size: LeafSize::Page,
+            resident: true,
+            backing: identity,
+        };
+        self.authenticate(mm, op)?;
+        Ok(identity)
+    }
+
+    /// Retain only physical pages named by the shared fork owner's selection.
+    /// The caller excludes parent editors until these edges are attached.
+    pub fn select_inherited_frames(
+        &self,
+        parent: AddressContext<RootGpa>,
+        selection: carrick_el1_abi::PortalForkCustody,
+        authority: &carrick_kernel::kernel::frame_inventory::FrameInventoryAuthority,
+    ) -> Result<Vec<InheritedFrameEdge>, MemoryError> {
+        self.admit()?;
+        if self.root(parent.mm.raw()) != Some(parent) {
+            return Err(error("stale inherited source root"));
+        }
+        let carrick_el1_abi::PortalForkCustody::Frame {
+            va,
+            ipa,
+            len,
+            shared,
+        } = selection
+        else {
+            return Err(error("inheritance requires selected frame custody"));
+        };
+        if len == 0
+            || !va.is_multiple_of(PAGE)
+            || !ipa.is_multiple_of(PAGE)
+            || !len.is_multiple_of(PAGE)
+            || va.checked_add(len).is_none()
+            || ipa.checked_add(len).is_none()
+        {
+            return Err(error("invalid inherited physical span"));
+        }
+        let mut edges = Vec::new();
+        for offset in (0..len).step_by(PAGE as usize) {
+            let gpa = FrameGpa::new(ipa + offset);
+            let span = PageSpan::new(va + offset, PAGE);
+            let identity = self.frame_identity(parent.mm.raw(), gpa)?;
+            let slot = self
+                .locate(gpa, PAGE as usize)
+                .ok_or_else(|| error("inherited registration absent"))?;
+            if !self.leaf_names(parent, span, gpa)
+                || !inventory_page_live(authority, parent.mm.raw(), identity, gpa)
+            {
+                return Err(error("selected source is not a live inventoried page"));
+            }
+            edges.push(InheritedFrameEdge {
+                handle: slot.handle,
+                parent,
+                span,
+                gpa,
+                identity,
+                shared,
+            });
+        }
+        Ok(edges)
+    }
+
+    /// Attach a selected page after guest-owned child descriptors and its fresh
+    /// mapping row exist. Private inheritance also requires both live leaves
+    /// to be read-only; guest-owned COW publication must precede attachment.
+    /// This creates no memslot and writes no descriptor.
+    pub fn attach_inherited_frame(
+        &mut self,
+        child: AddressContext<RootGpa>,
+        edge: &InheritedFrameEdge,
+        identity: BackingIdentity,
+        receipt: &carrick_hal::FrameInventoryApplyReceipt,
+        authority: &carrick_kernel::kernel::frame_inventory::FrameInventoryAuthority,
+    ) -> Result<(), MemoryError> {
+        self.admit()?;
+        self.record(edge.handle)?;
+        let mapping = carrick_hal::MappingId::from_kernel_allocation(identity.mapping_id);
+        let frame = carrick_hal::FrameId::from_kernel_allocation(identity.frame_id);
+        if child.mm == edge.parent.mm
+            || self.root(child.mm.raw()) != Some(child)
+            || self.root(edge.parent.mm.raw()) != Some(edge.parent)
+            || identity.frame_id != edge.identity.frame_id
+            || identity.mapping_id == edge.identity.mapping_id
+            || identity.owner_generation != NonZeroU64::MIN
+            || receipt.mm() != child.mm.raw()
+            || receipt.revision() != identity.inventory_revision.get()
+            || !receipt.authorizes(mapping, frame)
+            || self.frame_identity(edge.parent.mm.raw(), edge.gpa)? != edge.identity
+            || !inventory_page_live(authority, edge.parent.mm.raw(), edge.identity, edge.gpa)
+            || !inventory_page_live(authority, child.mm.raw(), identity, edge.gpa)
+            || !self.leaf_names(edge.parent, edge.span, edge.gpa)
+            || !self.leaf_names(child, edge.span, edge.gpa)
+            || (!edge.shared
+                && (!self.leaf_read_only(edge.parent, edge.span)
+                    || !self.leaf_read_only(child, edge.span)))
+        {
+            return Err(error("stale or unauthenticated inherited physical edge"));
+        }
+        let end = edge.span.va + PAGE;
+        if self.aliases.get(&child.mm.raw()).is_some_and(|aliases| {
+            aliases
+                .range(..end)
+                .next_back()
+                .is_some_and(|(_, alias)| alias.span.va + alias.span.len > edge.span.va)
+        }) || self
+            .record(edge.handle)?
+            .inherited_identities
+            .contains_key(&(child.mm.raw(), edge.gpa.raw()))
+        {
+            return Err(error("inherited child alias already occupied"));
+        }
+        let count = self
+            .record(edge.handle)?
+            .alias_count
+            .checked_add(1)
+            .ok_or_else(|| error("inherited physical alias count exhausted"))?;
+        let slot = self
+            .slots
+            .get_mut(&edge.handle.slot)
+            .ok_or_else(|| error("missing inherited registration"))?;
+        slot.inherited_identities
+            .insert((child.mm.raw(), edge.gpa.raw()), identity);
+        slot.alias_count = count;
+        self.aliases.entry(child.mm.raw()).or_default().insert(
+            edge.span.va,
+            Alias {
+                slot: edge.handle.slot,
+                span: edge.span,
+                inherited: Some(edge.gpa),
+            },
+        );
+        Ok(())
+    }
+
+    fn leaf_read_only(&self, context: AddressContext<RootGpa>, span: PageSpan) -> bool {
+        read_terminal_descriptor(
+            &self.words(),
+            context.root,
+            carrick_guest_arch::UserVa::new(span.va),
+        )
+        .is_ok_and(|(entry, size)| size == PAGE && entry & WRITE == 0)
+    }
+
+    fn leaf_names(&self, context: AddressContext<RootGpa>, span: PageSpan, gpa: FrameGpa) -> bool {
+        read_terminal_descriptor(
+            &self.words(),
+            context.root,
+            carrick_guest_arch::UserVa::new(span.va),
+        )
+        .is_ok_and(|(entry, size)| {
+            entry & PRESENT != 0
+                && entry & USER != 0
+                && size == PAGE
+                && entry & ADDRESS == gpa.raw()
+        })
+    }
+
     fn contains(&self, output: FrameGpa, len: u64) -> bool {
         usize::try_from(len)
             .ok()
@@ -598,7 +832,12 @@ impl CarrierMemory {
         let slot = self
             .locate(output, op.span().len as usize)
             .ok_or_else(|| error("unbacked descriptor output"))?;
-        let expected = if slot.frame_identities.is_empty() {
+        let inherited = (op.span().len == PAGE)
+            .then(|| slot.inherited_identities.get(&(mm, output.raw())))
+            .flatten();
+        let expected = if let Some(identity) = inherited {
+            *identity
+        } else if slot.frame_identities.is_empty() {
             slot.backing.identity
         } else {
             if op.span().len != PAGE {
@@ -611,7 +850,7 @@ impl CarrierMemory {
         };
         if slot.bootstrap
             || expected != identity
-            || (!slot.allowed.is_empty() && !slot.allowed.contains(&mm))
+            || (inherited.is_none() && !slot.allowed.is_empty() && !slot.allowed.contains(&mm))
         {
             return Err(error(
                 "unauthenticated backing or missing explicit shared-frame edge",
@@ -747,6 +986,7 @@ impl CarrierMemory {
                 Alias {
                     slot: index,
                     span: txn.op.span(),
+                    inherited: None,
                 },
             );
         }
@@ -898,6 +1138,9 @@ impl CarrierMemory {
                 return;
             };
             slot.alias_count -= 1;
+            if let Some(gpa) = alias.inherited {
+                slot.inherited_identities.remove(&(mm, gpa.raw()));
+            }
             let alias_end = alias.span.va + alias.span.len;
             for remainder in [
                 (alias.span.va, span.va.saturating_sub(alias.span.va)),
@@ -909,6 +1152,7 @@ impl CarrierMemory {
                         Alias {
                             slot: alias.slot,
                             span: PageSpan::new(remainder.0, remainder.1),
+                            inherited: alias.inherited,
                         },
                     );
                     slot.alias_count += 1;
