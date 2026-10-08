@@ -1,7 +1,7 @@
 //! Neutral one-owner entry completion.
 use carrick_core_abi::{
-    BornEntryCompletion, BornInZoneSource, EntryCompletion, EntryGeneration, EntryMmKey,
-    EntryRecordBinding, EntryRecordGeneration, EntryRecordIncarnation, EntryTaskKey,
+    BornEntryCompletion, BornInZoneSource, EntryCompletion, EntryContext, EntryGeneration,
+    EntryMmKey, EntryRecordBinding, EntryRecordGeneration, EntryRecordIncarnation, EntryTaskKey,
     EntryThreadGeneration, ExecutionBinding, ExecutionIdentity, ExecutionMm,
 };
 use core::sync::atomic::Ordering;
@@ -30,10 +30,10 @@ pub fn binding(identity: &ExecutionIdentity, mm: &ExecutionMm) -> ExecutionBindi
     }
 }
 
-pub fn admit(
+pub fn admit<C: EntryContext>(
     binding: ExecutionBinding,
-    source: Option<BornInZoneSource<'_>>,
-) -> Option<EntryCompletion<'_>> {
+    source: Option<BornInZoneSource<'_, C>>,
+) -> Option<EntryCompletion<'_, C>> {
     if !binding.issued() {
         return None;
     }
@@ -56,10 +56,10 @@ pub enum CompletionError {
 
 /// Consume the sole completion authority after authenticating the same exact
 /// execution binding that was admitted.
-pub fn complete(
-    completion: EntryCompletion<'_>,
+pub fn complete<C: EntryContext>(
+    completion: EntryCompletion<'_, C>,
     current: ExecutionBinding,
-    source: Option<BornInZoneSource<'_>>,
+    source: Option<BornInZoneSource<'_, C>>,
 ) -> Result<(), CompletionError> {
     let scope = match source {
         Some(source) => {
@@ -79,11 +79,11 @@ enum RecordPhase {
     Admission,
     Completion,
 }
-fn current_born_record(
+fn current_born_record<C: EntryContext>(
     binding: ExecutionBinding,
-    source: BornInZoneSource<'_>,
+    source: BornInZoneSource<'_, C>,
     phase: RecordPhase,
-) -> Option<EntryRecordBinding> {
+) -> Option<EntryRecordBinding<C>> {
     if binding.generation.raw() != 0
         || binding.task.raw() == 0
         || binding.mm.raw() == 0
@@ -129,24 +129,24 @@ fn current_born_record(
 /// ```compile_fail
 /// use carrick_core::entry::admit_born_in_zone;
 /// use carrick_core_abi::{BornEntryCompletion, BornInZoneSource, ExecutionBinding};
-/// fn escape(binding: ExecutionBinding, source: BornInZoneSource<'_>) -> Option<BornEntryCompletion<'static>> {
+/// fn escape<C: carrick_core_abi::EntryContext>(binding: ExecutionBinding, source: BornInZoneSource<'_, C>) -> Option<BornEntryCompletion<'static, C>> {
 ///     admit_born_in_zone(binding, source)
 /// }
 /// ```
-pub fn admit_born_in_zone<'a>(
+pub fn admit_born_in_zone<'a, C: EntryContext>(
     binding: ExecutionBinding,
-    source: BornInZoneSource<'a>,
-) -> Option<BornEntryCompletion<'a>> {
+    source: BornInZoneSource<'a, C>,
+) -> Option<BornEntryCompletion<'a, C>> {
     let record = current_born_record(binding, source, RecordPhase::Admission)?;
     // SAFETY: current_born_record authenticated an unadopted OnCpu record's
     // owner/slot/claim/incarnation, installed MM and every loaded identity word.
     Some(unsafe { BornEntryCompletion::from_admitted_record(binding, record, source.zone) })
 }
 
-pub fn complete_born_in_zone(
-    completion: BornEntryCompletion<'_>,
+pub fn complete_born_in_zone<C: EntryContext>(
+    completion: BornEntryCompletion<'_, C>,
     current: ExecutionBinding,
-    source: BornInZoneSource<'_>,
+    source: BornInZoneSource<'_, C>,
 ) -> Result<(), CompletionError> {
     if completion.binding() == current
         && Some(completion.record())
@@ -159,9 +159,9 @@ pub fn complete_born_in_zone(
 }
 
 /// Consume ordinary entry authority against its actual owned transition.
-pub fn handoff(
-    completion: EntryCompletion<'_>,
-    receipt: carrick_core_abi::EntryHandoffReceipt,
+pub fn handoff<C: EntryContext>(
+    completion: EntryCompletion<'_, C>,
+    receipt: carrick_core_abi::EntryHandoffReceipt<C>,
 ) -> Result<(), CompletionError> {
     if completion.binding() != receipt.binding() {
         return Err(CompletionError::WrongGeneration);
@@ -184,9 +184,9 @@ pub fn handoff(
 
 /// Born handoff retains the exact initiating owner/slot/claim/incarnation,
 /// even though publication has already transferred or retired the record.
-pub fn handoff_born_in_zone(
-    completion: BornEntryCompletion<'_>,
-    receipt: carrick_core_abi::EntryHandoffReceipt,
+pub fn handoff_born_in_zone<C: EntryContext>(
+    completion: BornEntryCompletion<'_, C>,
+    receipt: carrick_core_abi::EntryHandoffReceipt<C>,
 ) -> Result<(), CompletionError> {
     if completion.binding() == receipt.binding() && completion.record() == receipt.record() {
         Ok(())
@@ -197,15 +197,15 @@ pub fn handoff_born_in_zone(
 
 /// Authenticated prepublication custody. Only a successful existing wait or
 /// retirement authority can turn this into a handoff receipt.
-pub struct HandoffStart<'a> {
-    source: BornInZoneSource<'a>,
+pub struct HandoffStart<'a, C: EntryContext = carrick_sched_core::ThreadCtx> {
+    source: BornInZoneSource<'a, C>,
     binding: ExecutionBinding,
-    record: EntryRecordBinding,
+    record: EntryRecordBinding<C>,
 }
-fn execution_scope(
+fn execution_scope<C: EntryContext>(
     binding: ExecutionBinding,
-    source: BornInZoneSource<'_>,
-) -> Option<carrick_core_abi::EntryExecutionScope> {
+    source: BornInZoneSource<'_, C>,
+) -> Option<carrick_core_abi::EntryExecutionScope<C>> {
     let record = match source.zone.slot(source.slot).current() {
         Some(record) => Some(record_binding(binding, source, record)?),
         None => None,
@@ -216,11 +216,11 @@ fn execution_scope(
         record,
     })
 }
-fn record_binding(
+fn record_binding<C: EntryContext>(
     binding: ExecutionBinding,
-    source: BornInZoneSource<'_>,
+    source: BornInZoneSource<'_, C>,
     record: carrick_sched_core::RecordId,
-) -> Option<EntryRecordBinding> {
+) -> Option<EntryRecordBinding<C>> {
     let owned = source.zone.record(record);
     let identity = owned.identity();
     if identity.tid != binding.task.raw()
@@ -254,23 +254,23 @@ fn record_binding(
         incarnation: EntryRecordIncarnation(owned.incarnation()),
     })
 }
-pub fn prepare_handoff(
+pub fn prepare_handoff<C: EntryContext>(
     binding: ExecutionBinding,
-    source: BornInZoneSource<'_>,
+    source: BornInZoneSource<'_, C>,
     record: carrick_sched_core::RecordId,
-) -> Option<HandoffStart<'_>> {
+) -> Option<HandoffStart<'_, C>> {
     Some(HandoffStart {
         source,
         binding,
         record: record_binding(binding, source, record)?,
     })
 }
-impl HandoffStart<'_> {
-    pub(crate) fn published(self) -> carrick_core_abi::EntryHandoffReceipt {
+impl<C: EntryContext> HandoffStart<'_, C> {
+    pub(crate) fn published(self) -> carrick_core_abi::EntryHandoffReceipt<C> {
         // SAFETY: callers invoke this only after their existing exact-record
         // publication succeeds, using the captured prepublication custody.
         unsafe {
-            carrick_core_abi::EntryHandoffReceipt::from_published_transition(
+            carrick_core_abi::EntryHandoffReceipt::<C>::from_published_transition(
                 self.binding,
                 self.record,
             )
@@ -280,11 +280,11 @@ impl HandoffStart<'_> {
 
 /// Publish under the existing futex guard, without reading the record after
 /// its successful CAS transfers ownership to a waker/cancellation authority.
-pub fn publish_handoff_park(
-    start: HandoffStart<'_>,
-    guard: &carrick_sched_core::BucketGuard<'_>,
+pub fn publish_handoff_park<C: EntryContext>(
+    start: HandoffStart<'_, C>,
+    guard: &carrick_sched_core::BucketGuard<'_, C>,
     sequence: EntryRecordGeneration,
-) -> Option<carrick_core_abi::EntryHandoffReceipt> {
+) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
     if !core::ptr::eq(start.source.zone, guard.zone())
         || record_binding(start.binding, start.source, start.record.record) != Some(start.record)
         || sequence.0 != start.source.zone.next_seq(start.record.record)
@@ -301,12 +301,12 @@ pub fn publish_handoff_park(
 }
 
 /// Authenticate and retire the current record through its existing owner.
-pub fn retire_current(
+pub fn retire_current<C: EntryContext>(
     binding: ExecutionBinding,
-    source: BornInZoneSource<'_>,
+    source: BornInZoneSource<'_, C>,
     record: carrick_sched_core::RecordId,
     spins: u32,
-) -> Option<carrick_core_abi::EntryHandoffReceipt> {
+) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
     if source.zone.slot(source.slot).current() != Some(record) {
         return None;
     }
@@ -321,12 +321,25 @@ pub fn retire_current(
     Some(start.published())
 }
 
+/// A compact-context receipt cannot authorize a second entry turn.
+/// ```compile_fail
+/// use carrick_core::entry::handoff_born_in_zone;
+/// use carrick_core_abi::{BornEntryCompletion, EntryHandoffReceipt};
+/// use carrick_sched_core::ParkedContextWords;
+/// fn replay(first: BornEntryCompletion<'_, ParkedContextWords>,
+///           second: BornEntryCompletion<'_, ParkedContextWords>,
+///           receipt: EntryHandoffReceipt<ParkedContextWords>) {
+///     let _ = handoff_born_in_zone(first, receipt);
+///     let _ = handoff_born_in_zone(second, receipt);
+/// }
+/// ```
+///
 /// A transferred token cannot subsequently complete the same call.
 /// ```compile_fail
 /// use carrick_core::entry::{admit, complete, handoff};
 /// use carrick_core_abi::{ExecutionBinding, EntryHandoffReceipt};
 /// fn park(binding: ExecutionBinding, receipt: EntryHandoffReceipt) {
-///     if let Some(token) = admit(binding, None) {
+///     if let Some(token) = admit::<carrick_sched_core::ThreadCtx>(binding, None) {
 ///         let _ = handoff(token, receipt);
 ///         let _ = complete(token, binding, None);
 ///     }
@@ -346,9 +359,9 @@ mod tests {
             mm: EntryMmKey::from_raw(13),
             thread_generation: EntryThreadGeneration::from_raw(17),
         };
-        let completion = admit(binding, None).unwrap();
+        let completion = admit::<carrick_sched_core::ThreadCtx>(binding, None).unwrap();
         assert_eq!(complete(completion, binding, None), Ok(()));
-        let completion = admit(binding, None).unwrap();
+        let completion = admit::<carrick_sched_core::ThreadCtx>(binding, None).unwrap();
         assert_eq!(
             complete(
                 completion,
