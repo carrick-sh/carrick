@@ -24,6 +24,10 @@
 pub const LINUX_VVAR_BASE: u64 = 0x2E_0000_0000;
 pub const LINUX_VVAR_SIZE: u64 = 0x1000;
 
+/// Boot-mapped shared aperture; EL1 fork preserves live leaves in this window.
+pub const LINUX_SHARED_FILE_BASE: u64 = 0x90_0000_0000;
+pub const LINUX_SHARED_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
 mod cow_grants;
 pub use cow_grants::*;
 mod descriptor_txn;

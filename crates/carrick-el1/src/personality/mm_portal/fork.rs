@@ -79,9 +79,18 @@ impl carrick_core::mm::fork::MappingInheritancePolicy for LinuxForkPolicy {
         })
     }
     fn unreserved_policy(&self, base: u64, span: u64) -> Option<carrick_core::mm::fork::Policy> {
+        let limit = base.checked_add(span)?;
+        let shared_start = carrick_el1_abi::LINUX_SHARED_FILE_BASE;
+        let shared_end = shared_start + carrick_el1_abi::LINUX_SHARED_FILE_SIZE;
+        if base < shared_end && limit > shared_start {
+            return Some(if base >= shared_start && limit <= shared_end {
+                carrick_core::mm::fork::Policy::Keep
+            } else {
+                carrick_core::mm::fork::Policy::Mixed
+            });
+        }
         let start = carrick_el1_abi::LINUX_VVAR_BASE;
         let end = start + carrick_el1_abi::LINUX_VVAR_SIZE;
-        let limit = base.checked_add(span)?;
         if base >= end || limit <= start {
             return None;
         }

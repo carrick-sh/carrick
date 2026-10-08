@@ -675,8 +675,7 @@ impl MemoryLayout {
 // `linux_runtime_regions`), then guest MAP_SHARED|MAP_ANON and MAP_SHARED file
 // mmaps sub-allocate sub-ranges via `shared_aperture::SharedAperture` — no
 // post-vCPU hv_vm_map. Kept disjoint from the private anonymous mmap arena.
-pub const LINUX_SHARED_FILE_BASE: u64 = 0x90_0000_0000; // 576 GiB
-pub const LINUX_SHARED_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+pub use carrick_el1_abi::{LINUX_SHARED_FILE_BASE, LINUX_SHARED_FILE_SIZE};
 
 // Private overlay aperture: mirrors the shared aperture but its host backing is
 // NOT MAP_SHARED, so fork(2) takes a per-process private snapshot of it (like

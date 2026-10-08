@@ -1758,6 +1758,47 @@ fn owner_fork_inherits_unreserved_vvar_as_private() {
 }
 
 #[test]
+fn owner_fork_keeps_unreserved_shared_aperture_leaf() {
+    use carrick_core::mm::fork::{Policy, policy};
+    use carrick_mmu_core::owner_mmu::Aarch64Mmu;
+    let va = carrick_mem::memory::LINUX_SHARED_FILE_BASE;
+    let user_leaf = 1 << 6;
+    assert_eq!(
+        policy::<Aarch64Mmu, _>(
+            &super::fork::LinuxForkPolicy::default(),
+            &[],
+            va,
+            0x1000,
+            user_leaf
+        )
+        .unwrap(),
+        Policy::Keep,
+    );
+    assert_eq!(
+        policy::<Aarch64Mmu, _>(
+            &super::fork::LinuxForkPolicy::default(),
+            &[],
+            va,
+            1 << 30,
+            user_leaf
+        )
+        .unwrap(),
+        Policy::Keep,
+    );
+    assert_eq!(
+        policy::<Aarch64Mmu, _>(
+            &super::fork::LinuxForkPolicy::default(),
+            &[],
+            va - (1 << 30),
+            2 << 30,
+            user_leaf
+        )
+        .unwrap(),
+        Policy::Mixed,
+    );
+}
+
+#[test]
 fn owner_fork_drops_only_proven_pristine_prepared_child_grants() {
     use carrick_core::mm::fork::{Mapping, MappingInheritancePolicy, Policy, copy_entry};
     use carrick_el1_abi::{FrameGrantResidencyIdentity, ReservationGeneration};
