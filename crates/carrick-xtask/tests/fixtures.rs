@@ -1496,6 +1496,24 @@ fn cache_selection_preserves_ambient_wrapper_rejection_at_fixture_publish() {
         assert!(stderr.contains("ambient RUSTC_WRAPPER"), "{stderr}");
         assert!(!p.checkout.join("target/fixtures/published").exists());
     }
+    #[cfg(target_os = "macos")]
+    {
+        let out = p
+            .command("just")
+            .current_dir(&p.checkout)
+            .arg("fixtures-publish")
+            .arg(&sha)
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("fixtures build requires Linux; restore on cloudmac"),
+            "{stderr}"
+        );
+    }
 }
 
 #[test]

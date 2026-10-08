@@ -416,6 +416,8 @@ fn fork_fixture_rejects_abnormal_fork_exit() {
         .env("CARRICK_HOST_LEASE_PATH", lock.path())
         .env("CARRICK_LEASE_READY", ready.path())
         .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -434,9 +436,19 @@ fn fork_fixture_rejects_abnormal_fork_exit() {
     // SAFETY: the fixture retains and reaps this exact child until stdin EOF.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
     drop(fixture.stdin.take());
+    let output = fixture.wait_with_output().unwrap();
     assert!(
-        !fixture.wait().unwrap().success(),
+        !output.status.success(),
         "fixture accepted a SIGKILLed fork as normal completion"
+    );
+    let combined_output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined_output.contains("fork did not exit normally: 9"),
+        "{combined_output}"
     );
 }
 
