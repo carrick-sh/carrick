@@ -144,10 +144,14 @@ impl ObjectIdRegistry {
 
     /// Revoke this kernel's MM admission and move only its local serial cursor.
     /// The carrier MM source and file-description source are separate owners.
-    pub fn transfer_local_serials(&self) -> Option<TransferredSerialAllocator> {
+    pub(in crate::kernel) fn transfer_local_serials(&self) -> Option<TransferredSerialAllocator> {
         let mut authority = self.host_mm.write();
         *authority = HostMmIdentityAuthority::Transferred;
         self.allocator.transfer()
+    }
+
+    pub(in crate::kernel) fn local_transfer_available(&self) -> bool {
+        !self.allocator.is_transferred()
     }
 
     pub fn transferred_refusals(&self) -> Option<u64> {

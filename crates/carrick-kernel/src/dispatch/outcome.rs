@@ -1128,6 +1128,8 @@ impl CurrentMmMemory for LinearMemory {}
 #[derive(Debug, Error)]
 #[allow(private_interfaces)]
 pub enum DispatchError {
+    #[error("the launch kernel exported its Linux process authority")]
+    SourceKernelAuthorityTransferred,
     #[error("owner memory preparation failed: {0}")]
     MemoryPreparation(String),
     #[error("host wait requires the exact outer resource scope")]

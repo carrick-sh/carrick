@@ -1,5 +1,46 @@
 # x86 anonymous CPL0 handoff (partial, 2026-10-07)
 
+## Private Kernel boot export API (2026-10-08)
+
+The prepared launch bootstrap now carries a distinct population origin.
+Only that private origin may adopt or export boot custody; attaching a
+container to a shared host bootstrap does not turn it into this lane.
+The adopted namespace, filesystem service, mounts, actual file table,
+filesystem context, credentials, argv and opaque environment are retained
+as the real resources, not reference-model replacements. Export preserves
+actual task/thread keys, revision, affinity, MM, visible identities and
+namespace incarnation. MM and object serial custody carry the backend's
+typed VM incarnation; primitive VM integers cannot satisfy the API.
+
+The staged export still left one host task row: semantic red is
+`/tmp/x86-boot-export-scope-red.log`. Removing population indexes alone
+still let an old context prepare getpid: semantic red is
+`/tmp/x86-boot-stale-dispatch-red.log`. Export now retires bootstrap thread
+membership, removes all population indexes and observation edges, and
+retires the host namespace publication. Old host dispatch is separately
+refused and counted, including prepared entry points. The namespace claim
+census and move use one lock; an outstanding peer reservation refuses
+transfer without moving it. Local allocation transfer is private to the
+Kernel; the generic registry adapter is test-only.
+
+The initial fixture compile error called Kernel.task_count rather than
+Registry.task_count (`/tmp/x86-boot-export-red.log`). Two intermediate
+green builds failed compilation (struct literal parentheses, then missing
+Lifecycle trait import); these are not semantic red evidence. The final
+focused receipts pass nine context tests in
+`/tmp/x86-boot-export-owner-context.log` and eight registry tests in
+`/tmp/x86-boot-export-owner-registry.log`. The final clippy receipt is
+`/tmp/x86-boot-export-owner-clippy.log`.
+
+This API is not yet called by Runtime or serialized into the CPL0 image.
+Do not claim production is frozen: task41, thread101, generation11 and
+MM301 remain in the KVM load path, and fork still exits91. Continue the
+owner reordered scope: production native fork/CPU1/wait/exit and two-MM
+private leaves first. Boot export wiring, task41 removal, VM identity
+hardening and opaque host file custody are deferred to follow-up PRs.
+CARRIER_MM_IDS remains neither moved nor frozen. This is a buildable WIP
+checkpoint; do not extend boot export before the witness is green.
+
 ## Namespace handoff component (2026-10-08)
 
 NamespaceState now owns its allocation through an optional private owner.

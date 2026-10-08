@@ -107,6 +107,7 @@ pub struct BackingHandle {
 /// in another VM; exported physical capabilities always retain this domain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CarrierVmId(NonZeroU64);
+impl carrick_kernel::kernel::boot_launch::BootVmIdentity for CarrierVmId {}
 impl CarrierVmId {
     fn allocate() -> Result<Self, MemoryError> {
         static CARRIERS: carrick_sched_core::process::identity_allocator::SerialAllocator =
