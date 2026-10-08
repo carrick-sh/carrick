@@ -2567,6 +2567,28 @@ impl SyscallDispatcher {
     }
 
     #[inline]
+    pub fn authenticated_live_frame_grant(
+        &self,
+        permit: &super::mm_mutation::HostAliasPermit<'_>,
+        address: u64,
+        grant: carrick_el1_abi::FrameGrantResidencyIdentity,
+    ) -> bool {
+        self.mem_view()
+            .authenticated_live_frame_grant(permit, address, grant)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[inline]
+    pub fn with_authenticated_live_frame_grant_for_test(
+        &self,
+        address: u64,
+        grant: carrick_el1_abi::FrameGrantResidencyIdentity,
+    ) -> bool {
+        self.mem_view()
+            .with_authenticated_live_frame_grant_for_test(address, grant)
+    }
+
+    #[inline]
     pub fn commit_resident_fault(&self, plan: ResidentFaultPlan) {
         self.mem_view().commit_resident_fault(plan);
     }

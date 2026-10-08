@@ -6042,6 +6042,29 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         });
     }
 
+    fn live_el1_grant_page_authenticated(&self, page: u64, expected_ipa: u64) -> bool {
+        if self.process_asid.is_none() {
+            return false;
+        }
+        const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
+        let Ok(ttbr) = self.vcpu.borrow().get_sys_reg(SysReg::Ttbr0) else {
+            return false;
+        };
+        let root = ttbr & TTBR_ROOT_MASK;
+        let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
+        let Some(host) = self.page_table_host_ptr(root, size) else {
+            return false;
+        };
+        let descriptors = unsafe {
+            carrick_mmu_core::aarch64::walk_descriptors_host(host.cast_const(), size, root, page)
+        };
+        let leaf = carrick_mmu_core::aarch64::terminal_descriptor(descriptors);
+        let state = carrick_mmu_core::aarch64::el1_private_leaf_state(leaf);
+        (state == carrick_mmu_core::aarch64::El1PrivateLeafState::Prepared
+            || state == carrick_mmu_core::aarch64::El1PrivateLeafState::Resident)
+            && leaf & 0x0000_FFFF_FFFF_F000 == expected_ipa
+    }
+
     fn refresh_fork_process_state(&mut self) -> Result<(), TrapError> {
         let slot = self.mailbox_slot();
         let tables = self.page_tables.clone();

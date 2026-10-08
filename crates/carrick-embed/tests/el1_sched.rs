@@ -302,6 +302,36 @@ struct Measured {
     zone: ZoneCounts,
 }
 
+fn assert_no_surviving_portal_claims(context: &str) {
+    let region = carrick_el1_abi::get_el1_region_host_ptr();
+    if region != 0 {
+        let base = (region + carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize) as *const u8;
+        let slots = unsafe { &*(base as *const carrick_el1_abi::MmPortalSlots) };
+        for i in 0..carrick_el1_abi::EL1_STACK_SLOTS as usize {
+            if let Some(slot) = slots.slot(i) {
+                let state = unsafe {
+                    (*(slot as *const _ as *const std::sync::atomic::AtomicU64))
+                        .load(std::sync::atomic::Ordering::Acquire)
+                };
+                assert_eq!(
+                    state, 0,
+                    "portal transfer slot {i} survived {context} (state {state})"
+                );
+            }
+            if let Some(grant) = slots.grant(i) {
+                let state = unsafe {
+                    (*(grant as *const _ as *const std::sync::atomic::AtomicU64))
+                        .load(std::sync::atomic::Ordering::Acquire)
+                };
+                assert_eq!(
+                    state, 0,
+                    "portal grant slot {i} survived {context} (state {state})"
+                );
+            }
+        }
+    }
+}
+
 fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured {
     let mut command = vec![FIXTURE.to_owned()];
     command.extend(args.iter().map(|arg| (*arg).to_owned()));
@@ -446,6 +476,7 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
     let host_work_after = carrick_el1_abi::host_work_publication_counts();
     let host_work_publications = std::array::from_fn(|i| host_work_after[i] - host_work_before[i]);
     let zone = ZoneCounts::read().since(zone_before);
+    assert_no_surviving_portal_claims("fixture execution");
     watchdog.disarm();
     Measured {
         result,
@@ -1223,6 +1254,7 @@ fn ipc_blocking_population(mode: &str) {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert_no_surviving_portal_claims("IPC test execution");
 }
 
 /// Production IPC continuation witness using the existing two-pipe fixture.
