@@ -721,7 +721,7 @@ pub fn census_table<
     count.child = count.child.checked_add(512).ok_or(ForkError::NoMemory)?;
     count.live = count.live.checked_add(512).ok_or(ForkError::NoMemory)?;
     for index in 0..512 {
-        if level == 0 && index as usize >= B::shared_root_start() {
+        if level == 0 && B::is_shared_root_entry(index as usize) {
             continue;
         }
         census_entry::<B, P, W>(
@@ -825,7 +825,7 @@ pub fn copy_table<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
             return Err(ForkError::NoMemory);
         }
         scratch.reads.push((address, descriptor));
-        if cursor.level == 0 && index >= B::shared_root_start() {
+        if cursor.level == 0 && B::is_shared_root_entry(index) {
             scratch.child[cursor.child_offset + index] = descriptor;
             continue;
         }
