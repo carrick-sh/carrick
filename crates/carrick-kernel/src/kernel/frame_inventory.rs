@@ -96,9 +96,7 @@ impl carrick_hal::PhysicalFrameInventory for PhysicalInventoryProjection {
         std::sync::Arc::new(PhysicalInventoryBinding {
             inventory: std::sync::Arc::clone(&self.inventory),
             ids: std::sync::Arc::clone(&self.ids),
-            mm: MmId::from_raw_u64(mm.raw().get()).unwrap_or_else(|| {
-                carrick_fatal!("kernel::frame_inventory", "nonzero MM binding refused")
-            }),
+            mm: MmId::for_owner_binding(mm),
         })
     }
     fn allocate_backing_ids(
