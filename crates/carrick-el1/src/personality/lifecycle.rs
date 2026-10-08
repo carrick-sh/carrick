@@ -121,6 +121,19 @@ impl<
             .get(self.frame.task_index())
             .map(super::common_entry::execution_binding)
     }
+    fn process_pid(&self) -> Option<u32> {
+        self.current_tasks
+            .get(self.frame.task_index())?
+            .visible_pid()
+    }
+    fn visible_tid(&self) -> Option<u32> {
+        let binding = LifecycleNative::binding(self)?;
+        let process = self.process.as_deref()?;
+        if process.binding() != binding {
+            return None;
+        }
+        self.thread()?.slot.visible_tid()
+    }
     fn task_state(&self) -> Option<&'a LinuxTaskState> {
         self.current_tasks
             .get(self.frame.task_index())
