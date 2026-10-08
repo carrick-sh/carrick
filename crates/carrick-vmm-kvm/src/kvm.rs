@@ -656,16 +656,6 @@ impl KvmVcpu {
         })
     }
 
-    /// Close this vCPU fd on drop instead of parking it for reuse.
-    ///
-    /// Normal sibling-thread exit parks vCPU fds because KVM vCPU ids are finite
-    /// within a live VM. `execve(2)` replaces the whole VM on the x86 backend, so
-    /// parking the old vCPU into the old VM's pool would keep obsolete KVM fds
-    /// alive past image replacement.
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn close_on_drop(&mut self) {
-        self.recycle = None;
-    }
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn record_x86_restore_state(&mut self, state: KvmX86RestoreState) {
         self.last_x86_restore = Some(state);
