@@ -18,6 +18,19 @@ import authority_census_verdict
 
 
 def census_json(root):
+    if not (root / "Cargo.toml").exists():
+        members = []
+        for crate in sorted((root / "crates").iterdir()):
+            if not (crate / "src").is_dir():
+                continue
+            members.append(f"crates/{crate.name}")
+            (crate / "Cargo.toml").write_text(
+                f'[package]\nname = {json.dumps(crate.name)}\nversion = "0.1.0"\nedition = "2024"\n[lib]\npath = "src/lib.rs"\n'
+            )
+        (root / "Cargo.toml").write_text(
+            f'[workspace]\nmembers = {json.dumps(members)}\nresolver = "3"\n'
+        )
+        subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=root, check=True, capture_output=True)
     result = subprocess.run(
         [
             str(ROOT / "target/debug/carrick-xtask"),

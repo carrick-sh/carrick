@@ -158,7 +158,7 @@ Workers run focused checks, push feature branches and open draft PRs; runners
 supply hosted feedback and the director reviews diffs and coordinates the batch
 gate during rollout. No per-worker `accept`/`remote-accept` is introduced here.
 Keep those tools for diagnosis and director-owned bootstrap/rollback, and keep
-`remote-recapture` for authoritative inventory patches. This PR does not change
+Historical positional maintenance is retired; use `just lint-domains`.
 AGENTS.md or install runner services.
 
 If activation fails, freeze enqueueing, retain run logs, and restore the recorded

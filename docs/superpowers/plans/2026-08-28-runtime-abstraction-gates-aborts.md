@@ -429,7 +429,7 @@ git add clippy.toml scripts/migrate/host-authority-catalog.json \
   scripts/migrate/check-host-authority-transitions.py \
   scripts/tests/test_host_authority_transitions.py \
   scripts/migrate/host-authority-transition-inventory.json \
-  scripts/migrate/host-authority-macos-capture.json
+  # Historical positional maintenance retired; use just lint-domains.
 git commit -m "chore(runtime): complete host pid authority catalog"
 ```
 

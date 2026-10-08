@@ -1,11 +1,10 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
-use std::env;
-use std::fs;
 use std::path::PathBuf;
 
 fn main() {
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let manifest_dir =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let repo_root = manifest_dir
         .parent()
         .and_then(|p| p.parent())
@@ -18,7 +17,7 @@ fn main() {
         .expect("failed to load probe inventory in build.rs");
     let partition = carrick_xtask::probe_inventory::derive_partition(&inventory);
 
-    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let dest_path = out_dir.join("shard_arrays.rs");
 
     let mut content = String::new();
@@ -30,5 +29,5 @@ fn main() {
         content.push_str("];\n\n");
     }
 
-    fs::write(&dest_path, content).expect("failed to write shard_arrays.rs");
+    std::fs::write(&dest_path, content).expect("failed to write shard_arrays.rs");
 }

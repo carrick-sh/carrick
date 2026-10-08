@@ -1221,8 +1221,7 @@ def discover_runtime_aborts(root: Path, *, verdict=None) -> Sequence[AbortFindin
     verdict = census_verdict.require(verdict)
     verdict.validate_tree(root)
     findings: list[AbortFinding] = []
-    crates_dir = root / "crates"
-    for p in sorted(crates_dir.glob("*/src/**/*.rs")):
+    for p in verdict.source_paths(root):
         rel = p.relative_to(root).as_posix()
         if rel.startswith("crates/carrick-xtask/") or any(
             (rel.startswith(ex) for ex in EXCLUDED_CRATE_PREFIXES)

@@ -631,17 +631,15 @@ def discover(
     verdict.validate_tree(root)
     workspace_root = root.resolve()
 
-    for rel_root in scan_roots:
-        target_dir = workspace_root / rel_root
-        if not target_dir.is_dir():
+    for file_path in verdict.source_paths(workspace_root):
+        rel_path = file_path.relative_to(workspace_root).as_posix()
+        if not verdict.is_build_file(rel_path) and not any(
+            rel_path.startswith(rel_root.rstrip("/") + "/") for rel_root in scan_roots
+        ):
             continue
-        for file_path in sorted(target_dir.rglob("*.rs")):
-            if not file_path.is_file():
-                continue
-            rel_path = file_path.relative_to(workspace_root).as_posix()
-            source = file_path.read_text(encoding="utf-8")
-            findings = _scan_production_globals(rel_path, verdict.production_source(rel_path, source))
-            all_findings.extend(findings)
+        source = file_path.read_text(encoding="utf-8")
+        all_findings.extend(_scan_production_globals(
+            rel_path, verdict.production_source(rel_path, source)))
 
     verdict.validate_tree(root)
     return tuple(sorted(all_findings))

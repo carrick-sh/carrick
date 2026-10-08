@@ -208,6 +208,10 @@ lint-domains: lint-domains-source
 authority-discover OUTPUT:
     python3 scripts/migrate/check-host-authority-transitions.py > {{quote(OUTPUT)}}
 
+# Run the same ceiling gate with an explicit BSD compiler target and C sysroot.
+authority-check-cross TARGET CC CFLAGS AR:
+    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- authority-debt --cross-target {{quote(TARGET)}} --cross-cc {{quote(CC)}} --cross-cflags={{quote(CFLAGS)}} --cross-ar {{quote(AR)}}
+
 # Host-independent domain checks; live compiler capture runs separately.
 lint-domains-source:
     python3 scripts/conformance/check-next-strategy.py
@@ -1030,6 +1034,19 @@ ci-freebsd-sysroot:
     mkdir -p "${FBSD_SYSROOT:?}"
     curl -fSL "https://archive.freebsd.org/old-releases/amd64/${FBSD_VERSION:?}/base.txz" -o "$archive"
     tar -xf "$archive" -C "$FBSD_SYSROOT" ./usr/include ./usr/lib ./lib
+
+# NetBSD's comp set has architecture headers; base supplies the machine link.
+ci-netbsd-sysroot:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    archive="$(mktemp -d)"
+    trap 'rm -rf "$archive"' EXIT
+    mkdir -p "${NBSD_SYSROOT:?}"
+    release="https://archive.netbsd.org/pub/NetBSD-archive/NetBSD-${NBSD_VERSION:?}/amd64/binary/sets"
+    curl -fSL "$release/comp.tar.xz" -o "$archive/comp.tar.xz"
+    curl -fSL "$release/base.tar.xz" -o "$archive/base.tar.xz"
+    tar -xJf "$archive/comp.tar.xz" -C "$NBSD_SYSROOT" ./usr/include
+    tar -xJf "$archive/base.tar.xz" -C "$NBSD_SYSROOT" ./usr/include/machine
 
 # These tests use the real host epoll backend but no KVM device or guest.
 test-host-linux:

@@ -23,7 +23,7 @@
 - A test that goes red against the current kernel is a conformance defect: fix it in-task when the root cause is in the dispatch path of that syscall and the fix touches at most two files; otherwise land the test as `#[ignore = "defect: <one line>"]`, append a `### Defect` entry to the plan's ledger, and continue. No test is deleted or weakened to go green.
 - Bounded waits only: every park uses `WAIT_BOUND` (5 s) and a lost wake fails with `ExampleError::WaitTimedOut(label)`. No test sleeps to "let things settle".
 - `just test` total wall time is measured before Task 11 and after Task 13 on the same host with the same command (`time just test`), recorded in the plan ledger; the kernel and vfs lanes must not lose a single test (count `test result:` lines per crate before/after).
-- Conventional Commits with a Why/What/Verified body; never `git stash`; never `--no-verify`; line-pinned inventories reconciled on a clean tree after any move (`python3 scripts/migrate/reconcile-line-pinned-inventories.py`, `--rename OLD=NEW` for moved files), then `just lint-domains`.
+Historical positional maintenance is retired; use `just lint-domains`.
 - The fork/`Command::new`/`set_var`/`setrlimit` tests keep running, serially, under `RUST_TEST_THREADS=1`; the parallel lane must be run 10× consecutively green before the recipe changes land.
 
 ---
@@ -639,7 +639,7 @@ Note: the scanner treats a call as test code when it is inside any `fn` that fol
 
 - [x] **Step 3: Move the tests** into `mod serial_host { use super::*; … }` blocks (pure cut/paste; keep `#[test]` attributes; `cargo test -p carrick-kernel --lib --features test-support serial_host -- --list | wc -l` equals the number moved). Re-run the ratchet → exit 0.
 - [x] **Step 4: Prove the parallel lane** — run `cargo test -p carrick-kernel --lib --features test-support -- --skip serial_host` **10 times** in a row (`for i in $(seq 10); do … || break; done`), all green. Any failure is a process-global collision: move that test into `serial_host` too (name the static it collides with in the commit body) — never add a sleep or a retry. Then `RUST_TEST_THREADS=1 cargo test -p carrick-kernel --lib --features test-support serial_host` green.
-- [x] **Step 5: Wire the justfile** (recipe lines above; `lint-domains` gets `python3 scripts/migrate/check-serial-host-tests.py --self-test` and `python3 scripts/migrate/check-serial-host-tests.py` next to the other `--self-test` lines). Reconcile line-pinned inventories on the clean tree (`python3 scripts/migrate/reconcile-line-pinned-inventories.py`; the moves shift positions), `just lint-domains`, `just test`.
+Historical positional maintenance is retired; use `just lint-domains`.
 - [x] **Step 6: Commit** — `git commit -m "test(kernel): run the fork-free kernel lane in parallel; serial_host keeps the forking tests alone"` (+ the `chore(migrate):` reconcile commit).
 
 ### Task 12: partition the carrick-vfs lane

@@ -195,3 +195,53 @@ that test-only definition.
 Rust-proof fixtures cover the test-only shape, deletion of a required
 production helper, and unauthorized visibility on a production mutation
 helper. No runtime code or ceiling changes accompany this contract correction.
+
+## Rebase onto the shared-kernel main
+
+The initial schema-absent base is `8ebd6fe41`. Its one-time symbolic bootstrap
+records exact source and compiler cohorts in
+`scripts/migrate/authority-initial-base-counts.json`, with the full source commit
+and the four observed platforms. It contains no source locations or capture
+hashes. A base with the symbolic schema cannot use this bootstrap; later PRs
+compare directly with that base's ceilings. The historical census interpreter
+and positional host-row bootstrap have been deleted.
+
+BuildTime is a separate boundary selected by Cargo `custom-build` metadata and
+exact source inclusion edges. It has independent source and compiled-profile
+counts. Unresolved inputs or sharing a file with production are hard errors.
+The main build program in `carrick-conformance-next` imports `std::env` and
+reads `CARGO_MANIFEST_DIR` and `OUT_DIR`: these two exact reads are recorded in
+the bootstrap and spelled canonically in head, rather than omitted by the
+retired lexical interpreter.
+
+New host cohorts on current main keep their existing runtime implementation.
+They are classified by the actual crossing below; ceilings equal observed
+counts. The owning crate is the first component of each symbolic owner.
+
+| Owner / operation | Family | Crossing |
+| --- | --- | --- |
+| `carrick_vfs::rootfs::extract_native_layer_paths_to_dir` / `libc::geteuid` | `host_substrate` | Reads host identity for native image ownership. |
+| `carrick_vmm_bhyve::guest_setup_x86::fresh_anonymous_object` / `libc::getpid` | `host_substrate` | Names the actual allocating host for bhyve backing objects. |
+| `carrick_vmm_bhyve::vmm::sweep_dead_vm_nodes` / `libc::kill` | `host_substrate` | Probes host carrier liveness before destroying orphaned VM devices. |
+| `carrick_host::netbsd_futex::imp::wait` / `libc::syscall` | `host_backing` | Parks on a runtime-owned shared notification word, matching existing shared_word backing classification. |
+| `carrick_host::netbsd_futex::imp::wake` / `libc::syscall` | `host_backing` | Wakes runtime-owned shared notification words; guest semantics remain in the kernel. |
+| `carrick_portable::freebsd_minherit` / `libc::syscall` | `host_backing` | Sets host mapping inheritance for shared memory backing. |
+| `carrick_vfs::rootfs::extract_layer_paths_with_metadata` / `std::fs::File::open` | `host_backing` | Opens host image-layer bytes. |
+| `carrick_cli::commands::export_native_rootfs` / `std::fs::create_dir_all` | `host_backing` | Creates host export directories. |
+| `carrick_vmm_bhyve::vmm::reap_leaked_child_vm` / `std::fs::read_dir` | `host_substrate` | Enumerates host VM device resources owned by a reaped carrier. |
+| `carrick_vmm_bhyve::vmm::sweep_dead_vm_nodes` / `std::fs::read_dir` | `host_substrate` | Enumerates host VM device resources for orphan cleanup. |
+| `carrick_cli::commands::export_native_rootfs` / `std::fs::rename` | `host_backing` | Publishes exported rootfs on the host. |
+| `carrick_vmm_bhyve::vmm::BhyveVm::create` / `std::process::id` | `host_substrate` | Identifies the carrier owning the host bhyve VM device. |
+| `carrick_kernel::el1_delegation::owned_recall::driver` / `std::thread::Builder::new` | `host_substrate` | Creates carrier recall execution capacity. |
+| `carrick_hal::timer_delivery::run_fallback` / `std::thread::sleep` | `host_substrate` | Waits on the host clock for timer delivery. |
+| `carrick_vmm_kvm::cpl0_boot::Watchdog::start_with_timeout` / `std::thread::spawn` | `host_substrate` | Starts the host CPL0 watchdog. |
+
+The strict head census tightens four eliminated `CARRICK_RUN_ID` environment
+reads to zero: embed `deadline::wedged`, kernel `deadlock_watchdog::arm`, runtime
+`el1_census::snapshot`, and runtime `ProcessGraphLiveness::abort`. Their zero
+cohorts remain for this first ratchet because the base contained nonzero debt;
+they can be deleted once the accepted base itself records zero. No ceiling
+was padded. Current head has 1,184 runtime source cohorts, 21 BuildTime source
+cohorts, and 3,746 compiled-profile cohorts (six of those are BuildTime).
+The main bootstrap has four additional runtime source cohorts, all eliminated
+by the previously reviewed central run-ID ownership change.

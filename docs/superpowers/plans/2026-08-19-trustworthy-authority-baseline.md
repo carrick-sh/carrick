@@ -63,7 +63,7 @@ musl/GNU conformance probes.
 - `scripts/migrate/host-authority-transition-inventory.json` — checked
   compiler-resolved callsite inventory with structured evidence and human
   classification.
-- `scripts/migrate/host-authority-macos-capture.json` — independent binding of
+Historical positional maintenance is retired; use `just lint-domains`.
   the local compiler diagnostics and exact profile memberships.
 - `.semgrep/host-authority-escape-hatches.yml` — narrow deny rules for raw
   syscall, dynamic lookup, assembly, and watched local FFI declarations.

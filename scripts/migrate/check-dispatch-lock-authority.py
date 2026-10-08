@@ -436,21 +436,11 @@ def scan_sources(repo_root: Path, *, verdict=None) -> list[RawLockSite]:
     all_sites: list[RawLockSite] = []
     # A declared kernel module can use #[path] outside its physical crate.
     # The Rust census binds these diagnostics to the declaring module owner.
-    for target in sorted((repo_root / "crates").glob("*/src")):
-        if target.parent.name == "carrick-xtask":
-            continue
-        if target.is_file():
-            files = [target]
-        elif target.is_dir():
-            files = sorted(target.rglob("*.rs"))
-        else:
-            continue
-
-        for rs_file in files:
-            relative = str(rs_file.relative_to(repo_root))
-            source = rs_file.read_text(encoding="utf-8")
-            file_sites = _scan_production_tokens(lex_rust(verdict.production_source(relative, source)), relative)
-            all_sites.extend(file_sites)
+    for rs_file in verdict.source_paths(repo_root):
+        relative = str(rs_file.relative_to(repo_root))
+        source = rs_file.read_text(encoding="utf-8")
+        all_sites.extend(_scan_production_tokens(
+            lex_rust(verdict.production_source(relative, source)), relative))
 
     # Validate that every site ID is globally unique
     seen_ids: set[str] = set()

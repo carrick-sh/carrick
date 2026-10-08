@@ -300,7 +300,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - Modify: `crates/carrick-runtime/src/hvpatch/mod.rs:1179-1187` (`ea0dac4c`: 1296-1304, inside `initialize_root_process` at 1282) (root bootstrap takes the dispatcher's container). NOTE: this file has THREE `RootBootstrap::with_mm_backend` sites — `"hvpatch-test-root"` (:56), `"hvpatch-root"` (:1179 / :1296) and `"adapter-root"` (:1560 / :1736). Only the `"hvpatch-root"` one changes; the other two keep the reference-model default container.
 - Modify: `crates/carrick-runtime/src/execute.rs:74-92,196-236,264-286,321-324,424` (build one `LaunchContext` and one `Arc<Container>`, delete the dead `CARRICK_JOIN_REGION` branch, install the container on the dispatcher)
 - Modify: `crates/carrick-runtime/src/namespace/pid.rs:101-118,604-617` (delete dead `attach_region` / `join_existing` — this task is the ONLY cluster that deletes them; B2 Tasks 16–19 and C2 Task 28 do not touch them)
-- Modify: `scripts/migrate/host-authority-transition-inventory.json`, `scripts/migrate/host-authority-macos-capture.json` (reconcile the coordinate-keyed host-authority census — Step 15)
+Historical positional maintenance is retired; use `just lint-domains`.
 - Test: `crates/carrick-runtime/src/kernel/core.rs` (tests module), `crates/carrick-runtime/src/kernel/objects.rs` (tests module), `crates/carrick-runtime/src/kernel/container.rs` (tests module); run with `env RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib kernel::` (the exact per-crate line `just test` runs, `justfile:196`), then `just test`
 
 **Interfaces:**
@@ -1814,7 +1814,7 @@ Expected position-insensitive delta: exactly ONE `+` (`crates/carrick-runtime/sr
 - Carry every shifted row's review to its new coordinates (review id, classification, evidence, rationale unchanged; update `source` and the `At <file>:<line>` prefix of the rationale).
 - Drop `HA-000536`.
 - Review the new row — never bulk re-bless: classification `declared_backing`, evidence `{"authority": "authorized_backing", "resource": "run-scoped fallback run id used by `from_process_env`"}`, rationale `At crates/carrick-runtime/src/kernel/container.rs:<line> in `from_process_env`, `std::process::id` accesses only the run-scoped fallback run id used by `from_process_env`; ...` — the same classification the tree gives `runtime.rs:721 kernel_arena_run_scope` and `sysv.rs:888 sysv_run_scope`, whose fallback this mirrors (B2 retires both of those rows when it deletes/replaces them). Assign the next monotonic `HA-` id.
-- Re-bind the macOS compiler receipt (`scripts/migrate/host-authority-macos-capture.json`) from the candidate so `validate_inventory_against_receipt` (exact row equality, run first by `--check`) agrees, as the `bind ... compiler receipt` commits do.
+Historical positional maintenance is retired; use `just lint-domains`.
 
 ```sh
 cd /Volumes/CaseSensitive/carrick
@@ -1851,7 +1851,7 @@ Expected: the marker string is present in the signed binary (count ≥ 1); the g
 
 ```sh
 cd /Volumes/CaseSensitive/carrick
-git add crates/carrick-runtime/src/kernel/container.rs crates/carrick-runtime/src/kernel/mod.rs crates/carrick-runtime/src/kernel/netns.rs crates/carrick-runtime/src/kernel/objects.rs crates/carrick-runtime/src/kernel/core.rs crates/carrick-runtime/src/kernel/operations.rs crates/carrick-runtime/src/dispatch/mod.rs crates/carrick-runtime/src/hvpatch/mod.rs crates/carrick-runtime/src/execute.rs crates/carrick-runtime/src/namespace/pid.rs scripts/migrate/host-authority-transition-inventory.json scripts/migrate/host-authority-macos-capture.json
+# Historical positional maintenance retired; use just lint-domains.
 git commit -m "feat(runtime): put the container on the kernel graph
 
 Why: under HVPatch every guest process is a thread of ONE carrier, so
@@ -1917,7 +1917,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - fixed: Task 11 Files/line numbers drifted at the current HEAD ea0dac4c (34 commits after 3dc6cc72): objects.rs `Task::new` 2809->2813, `NsProxy::default()` 2845->2849, `uts_ns` 3031->3033, tests 6690->6689, fork test 6855->6859; operations.rs `Task::new` 619->639; dispatch/mod.rs struct 2570->2619, fork clone 4232->4281, `new` 4404->4453, `set_host_resolver_snapshot` 4549->4598; hvpatch/mod.rs `initialize_root_process` 1165->1282, bootstrap call 1179->1296. core.rs, netns.rs, execute.rs, pid.rs, kernel/mod.rs anchors unchanged. Recorded both revisions in the Files list. Also made explicit that hvpatch/mod.rs has THREE `RootBootstrap::with_mm_backend` sites (`hvpatch-test-root` :56, `hvpatch-root` :1179/:1296, `adapter-root` :1560/:1736) and only the `hvpatch-root` one changes (the quoted anchor is unique at both revisions).
 - fixed: Task 11 netns.rs range '145-190 beginning `#[derive(Debug, Clone)]`': the derive is at line 144; struct at 145. Corrected to 144-190.
 - fixed: Task 11 Step 10 doc comment claims `RunId::scope_component` matches BOTH `kernel_arena_run_scope` and `sysv_run_scope`; the draft marked this unverified. Verified: the two sanitizers are byte-identical at 3dc6cc72 (runtime.rs:723-731, sysv.rs:895-903). Left the claim, added the citation.
-- fixed: Task 11 commit body claimed 'just clippy / doc / lint-domains / test green' without the inventory reconcile; rewritten to describe the census reconcile and to add `scripts/migrate/host-authority-transition-inventory.json` + `host-authority-macos-capture.json` to `git add`.
+Historical positional maintenance is retired; use `just lint-domains`.
 - UNVERIFIED: That no exhaustive `match` over KernelError exists elsewhere in the tree; adding two variants would make such a match a compile error (grep `match .* KernelError` was not run). If one exists, add the two arms.
 - UNVERIFIED: The exact line numbers 1179-1187 of hvpatch/mod.rs and 4231-4232 / 4403-4404 / 4548-4555 of dispatch/mod.rs were read at 3dc6cc72; the quoted text is the anchor, the numbers may shift after Phase A commits land.
 - UNVERIFIED: That `dispatch::sysv::sysv_run_scope` applies exactly the same sanitizer as `kernel_arena_run_scope` (only the first lines of its `raw.chars()` map were read); RunId::scope_component copies the arena sanitizer verbatim and the doc comment claims parity for both — verify before B2 routes sysv through it.

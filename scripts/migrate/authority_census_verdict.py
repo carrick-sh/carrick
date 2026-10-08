@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
@@ -14,7 +15,7 @@ class CensusError(Exception):
 
 
 class CensusVerdict:
-    def __init__(self, data, *, allow_historical_snapshot=False):
+    def __init__(self, data):
         if not isinstance(data, dict) or data.get("schema") != 1:
             raise CensusError("missing or unsupported Rust census verdict")
         if data.get("rejections"):
@@ -25,13 +26,7 @@ class CensusVerdict:
             or "files" not in data
         ):
             raise CensusError("missing Rust census verdict fields")
-        if data.get("dialect") != "strict" and not (
-            allow_historical_snapshot
-            and data.get("dialect") == "historical_base"
-            and not (
-                Path(data["root"]) / "scripts/migrate/authority-debt-ceilings.json"
-            ).exists()
-        ):
+        if data.get("dialect") != "strict":
             raise CensusError("strict Rust dialect verdict required")
         self.data = data
         self._validate_policy()
@@ -66,10 +61,36 @@ class CensusVerdict:
             for p in (root / "crates").glob("*/src/**/*.rs")
             if p.is_file() and p.relative_to(root).parts[1] != "carrick-xtask"
         }
+        result = subprocess.run(
+            ["cargo", "metadata", "--locked", "--offline", "--no-deps", "--format-version", "1"],
+            cwd=root, capture_output=True, text=True, check=True,
+        )
+        metadata = json.loads(result.stdout)
+        members = set(metadata["workspace_members"])
+        build_roots = sorted(
+            ({"package": package["name"], "source": str(Path(target["src_path"]).resolve().relative_to(root))}
+             for package in metadata["packages"] if package["id"] in members
+             for target in package["targets"] if "custom-build" in target["kind"]),
+            key=lambda entry: (entry["package"], entry["source"]),
+        )
+        if build_roots != self.data.get("build_roots"):
+            raise CensusError("stale Rust census verdict: Cargo build targets changed")
+        build_files = {file for file, record in self.data["files"].items() if record.get("boundary") == "build_time"}
+        if paths & build_files:
+            raise CensusError("build-time/production source overlap")
+        if any(entry["source"] not in build_files for entry in build_roots):
+            raise CensusError("missing build target source verdict")
+        paths |= build_files
         if paths != self.data["files"].keys():
             raise CensusError("stale Rust census verdict: source file set changed")
         for file in paths:
             self._file(file, (root / file).read_text())
+
+    def source_paths(self, root):
+        return [Path(root) / file for file in sorted(self.data["files"])]
+
+    def is_build_file(self, file):
+        return self.data["files"].get(file, {}).get("boundary") == "build_time"
 
     def _file(self, file, source):
         file = Path(file).as_posix()

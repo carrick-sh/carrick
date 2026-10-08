@@ -394,12 +394,18 @@ jobs:
           CFLAGS_x86_64_unknown_freebsd: --target=x86_64-unknown-freebsd${{ env.FBSD_MAJOR }} --sysroot=${{ env.FBSD_SYSROOT }}
           CXXFLAGS_x86_64_unknown_freebsd: --target=x86_64-unknown-freebsd${{ env.FBSD_MAJOR }} --sysroot=${{ env.FBSD_SYSROOT }}
         run: just check-freebsd
+      - name: Enforce live FreeBSD authority ceilings
+        if: ${{ !cancelled() }}
+        run: just authority-check-cross x86_64-unknown-freebsd clang "--target=x86_64-unknown-freebsd${{ env.FBSD_MAJOR }} --sysroot=${{ env.FBSD_SYSROOT }}" llvm-ar
 
   cross-check-netbsd:
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      NBSD_VERSION: "10.1"
+      NBSD_SYSROOT: ${{ github.workspace }}/.netbsd-sysroot
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -414,9 +420,25 @@ jobs:
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Install BSD C cross toolchain
+        if: ${{ !cancelled() }}
+        timeout-minutes: 12
+        run: just ci-install-freebsd-cross
+      - name: Cache NetBSD sysroot
+        id: nbsd-sysroot
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.NBSD_SYSROOT }}
+          key: netbsd-authority-sysroot-${{ env.NBSD_VERSION }}
+      - name: Fetch NetBSD C headers from permanent archive
+        if: ${{ !cancelled() && steps.nbsd-sysroot.outputs.cache-hit != 'true' }}
+        run: just ci-netbsd-sysroot
       - name: Cross-check NetBSD NVMM backend (including tests)
         if: ${{ !cancelled() }}
         run: just check-netbsd
+      - name: Enforce live NetBSD authority ceilings
+        if: ${{ !cancelled() }}
+        run: just authority-check-cross x86_64-unknown-netbsd clang "--target=x86_64-unknown-netbsd --sysroot=${{ env.NBSD_SYSROOT }}" llvm-ar
 
   # Single ruleset check. Only a successful docs-only PR filter permits skips;
   # a failed/cancelled filter or an unexpectedly skipped dependency is red.
