@@ -31,6 +31,11 @@ impl VisibleNamespace {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VisibleIdentity(NonZeroU32);
 impl VisibleIdentity {
+    /// Carry an already admitted namespace member, including its root.
+    /// This constructor does not reserve or issue another visible number.
+    pub const fn from_existing_member(raw: NonZeroU32) -> Self {
+        Self(raw)
+    }
     pub const fn get(self) -> u32 {
         self.0.get()
     }

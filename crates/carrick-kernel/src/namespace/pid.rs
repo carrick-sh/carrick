@@ -254,6 +254,20 @@ impl NsSharedRegion {
         })
     }
 
+    pub(crate) fn visible_domain(
+        &self,
+    ) -> Option<carrick_sched_core::process::identity_allocator::VisibleNamespace> {
+        if !self.claim_is_live() {
+            return None;
+        }
+        Some(
+            carrick_sched_core::process::identity_allocator::VisibleNamespace::new(
+                self.claim.ns_id,
+                std::num::NonZeroU32::new(self.claim.generation.raw())?,
+            ),
+        )
+    }
+
     /// This namespace's id — the `pid:[N]` inode and the member record tag.
     pub fn ns_id(&self) -> NsId {
         self.claim.ns_id.get()

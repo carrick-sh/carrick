@@ -174,6 +174,32 @@ impl SyscallDispatcher {
         proc.hvpatch_process = Some(process);
     }
 
+    /// Admit the actual prepared root's launch bytes and filesystem/file
+    /// custody before the one-way native identity export.
+    pub fn adopt_cpl0_boot_launch(
+        &self,
+        argv: Vec<String>,
+        env: Vec<Vec<u8>>,
+    ) -> Result<(), crate::kernel::boot_launch::BootExportError> {
+        let context = self
+            .capture_one_task_context()
+            .map_err(|_| crate::kernel::boot_launch::BootExportError::RootScope)?;
+        let binding = context.task_binding();
+        binding.kernel().adopt_boot_launch(
+            &binding,
+            crate::kernel::boot_launch::BootLaunchResources {
+                namespace: context.container(),
+                rootfs: Arc::clone(&self.fs.rootfs_vfs),
+                mounts: Arc::clone(&self.fs.vfs_mounts),
+                files: context.resources().files(),
+                fs_context: context.resources().fs_context(),
+                credentials: context.resources().credentials(),
+                argv,
+                env,
+            },
+        )
+    }
+
     pub fn capture_kernel_context(
         &self,
         tid: crate::kernel::LinuxTid,
@@ -608,6 +634,124 @@ mod tests {
                 .registry()
                 .session_to_namespace(container.id(), identity.session),
             Some(1)
+        );
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        struct VmOrigin(std::num::NonZeroU64);
+        impl crate::kernel::boot_launch::BootVmIdentity for VmOrigin {}
+        let vm = VmOrigin(std::num::NonZeroU64::new(9).unwrap());
+        let task = context.task().key();
+        let thread = context.thread().key();
+        let mm = context.shared().mm().id();
+        let files = context.resources().files();
+        let rootfs = Arc::clone(&dispatcher.fs.rootfs_vfs);
+        let mounts = Arc::clone(&dispatcher.fs.vfs_mounts);
+        let argv = vec!["/actual/program".into(), "argument".into()];
+        let env = vec![b"BYTES=\xff".to_vec()];
+        let initial_binding = context.task_binding();
+        assert!(matches!(
+            context.kernel().export_boot_launch(&initial_binding, vm),
+            Err(crate::kernel::boot_launch::BootExportError::Unadopted)
+        ));
+        assert!(context.exact_thread_is_live());
+        assert_eq!(context.kernel().boot_export_receipt().exports, 0);
+        dispatcher
+            .adopt_cpl0_boot_launch(argv.clone(), env.clone())
+            .unwrap();
+        let binding = context.task_binding();
+        let export = context.kernel().export_boot_launch(&binding, vm).unwrap();
+        assert_eq!(export.identity.task.local, task);
+        assert_eq!(export.identity.task.vm, vm);
+        assert_eq!(export.identity.thread.local, thread);
+        assert_eq!(export.identity.mm.local, mm);
+        assert_eq!(export.identity.mm.vm, vm);
+        assert_eq!(export.identity.revision, context.revision());
+        assert_eq!(export.identity.affinity, context.thread().affinity());
+        assert_eq!(export.serials.vm, vm);
+        assert_eq!(export.identity.namespace_pid.get(), 1);
+        assert_eq!(export.identity.namespace_tid.get(), 1);
+        assert_eq!(export.identity.namespace_process_group.get(), 1);
+        assert_eq!(export.identity.namespace_session.get(), 1);
+        assert_eq!(export.resources.argv(), argv);
+        assert_eq!(export.resources.env(), env);
+        assert!(Arc::ptr_eq(export.resources.namespace(), &container));
+        assert!(Arc::ptr_eq(export.resources.rootfs(), &rootfs));
+        assert!(Arc::ptr_eq(export.resources.mounts(), &mounts));
+        assert!(Arc::ptr_eq(&export.resources.files, &files));
+        // A retained caller cannot keep a second host process authority alive.
+        assert_eq!(context.kernel().registry().task_count(), 0);
+        assert_eq!(context.kernel().registry().process_group_count(), 0);
+        assert_eq!(context.kernel().registry().session_count(), 0);
+        let snapshot = context
+            .kernel()
+            .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(snapshot.tasks.is_empty());
+        assert!(snapshot.threads.is_empty());
+        assert!(snapshot.mms.is_empty());
+        assert!(!context.exact_thread_is_live());
+        assert!(dispatcher.capture_one_task_context().is_err());
+        assert!(
+            dispatcher
+                .prepare_syscall(
+                    &context,
+                    super::super::SyscallRequest::new(172, crate::compat::SyscallArgs::new([0; 6])),
+                    &crate::compat::CompatReporter::default(),
+                )
+                .is_err()
+        );
+        assert!(container.pid_root().is_none());
+        assert_eq!(
+            context.kernel().ids().reserve_task().unwrap_err(),
+            crate::kernel::IdError::AuthorityTransferred
+        );
+        assert_eq!(
+            context.kernel().ids().reserve_thread().unwrap_err(),
+            crate::kernel::IdError::AuthorityTransferred
+        );
+        assert_eq!(
+            context.kernel().object_ids().task_serial(),
+            Err(crate::kernel::ObjectIdError::AuthorityTransferred)
+        );
+        assert_eq!(
+            context.kernel().object_ids().thread_serial(),
+            Err(crate::kernel::ObjectIdError::AuthorityTransferred)
+        );
+        assert_eq!(
+            context.kernel().object_ids().mm_id(),
+            Err(crate::kernel::ObjectIdError::AuthorityTransferred)
+        );
+        assert!(matches!(
+            context.kernel().export_boot_launch(&binding, vm),
+            Err(crate::kernel::boot_launch::BootExportError::AlreadyExported)
+        ));
+        let receipt = context.kernel().boot_export_receipt();
+        assert_eq!(receipt.exports, 1);
+        assert_eq!(receipt.refused, Some(1));
+        assert_eq!(receipt.semantic_refusals, Some(1));
+        assert_eq!(receipt.namespace_refusals, Some(2));
+        assert_eq!(receipt.object_refusals, Some(3));
+        let mut native_ids = export.namespaces.into_owner();
+        assert_eq!(native_ids.counts().task_claims, 1);
+        assert_eq!(native_ids.counts().thread_claims, 1);
+        assert_eq!(native_ids.counts().process_group_claims, 1);
+        assert_eq!(native_ids.counts().session_claims, 1);
+        assert_eq!(
+            native_ids
+                .reserve_next(carrick_sched_core::process::identity_allocator::ClaimKind::Task)
+                .unwrap()
+                .get(),
+            task.id.raw() + 1
+        );
+        assert!(
+            export
+                .serials
+                .local
+                .into_allocator()
+                .allocate()
+                .unwrap()
+                .get()
+                > thread.serial.raw()
         );
     }
 

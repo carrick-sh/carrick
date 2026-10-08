@@ -96,8 +96,31 @@ impl IdRegistry {
     }
     /// Move the namespace authority once. Retained host handles remain closed;
     /// their claim destructors cannot release the receiver's claims.
-    pub fn transfer(&self) -> Option<TransferredNamespaceState> {
+    #[cfg(test)]
+    pub(in crate::kernel) fn transfer(&self) -> Option<TransferredNamespaceState> {
         self.state.lock().transfer()
+    }
+    /// Validate the sole bootstrap claims under the same exclusion that moves
+    /// them, so a retained allocation handle cannot slip a reservation between
+    /// the scope census and transfer.
+    pub(in crate::kernel) fn transfer_boot_root(
+        &self,
+        root: TaskId,
+    ) -> Option<TransferredNamespaceState> {
+        let mut state = self.state.lock();
+        if !state.is_reserved_number(root.raw())
+            || state.counts()
+                != (IdRegistryCounts {
+                    reserved_numbers: 1,
+                    task_claims: 1,
+                    thread_claims: 1,
+                    process_group_claims: 1,
+                    session_claims: 1,
+                })
+        {
+            return None;
+        }
+        state.transfer()
     }
     pub fn transferred_refusals(&self) -> Option<u64> {
         self.state.lock().refused_attempts()
@@ -409,6 +432,28 @@ mod tests {
         assert_eq!(native.counts(), counts);
         assert_eq!(registry.counts(), IdRegistryCounts::default());
         assert_eq!(native.reserve_next(ClaimKind::Task).unwrap().get(), 2);
+    }
+
+    #[test]
+    fn bootstrap_transfer_refuses_an_outstanding_peer_reservation() {
+        let registry = IdRegistry::with_range_for_tests(1, 8);
+        let (root, reservation) = registry.reserve_task().unwrap();
+        let task = reservation.commit();
+        let thread = registry.claim_task_leader_thread(root).unwrap();
+        let group = registry
+            .claim_process_group(ProcessGroupId::from_leader(root))
+            .unwrap();
+        let session = registry
+            .claim_session(SessionId::from_leader(root))
+            .unwrap();
+        let (_, peer) = registry.reserve_thread().unwrap();
+        assert!(registry.transfer_boot_root(root).is_none());
+        assert_eq!(registry.counts().reserved_numbers, 2);
+        drop(peer);
+        let native = registry.transfer_boot_root(root).unwrap().into_owner();
+        drop((task, thread, group, session));
+        assert_eq!(native.counts().reserved_numbers, 1);
+        assert_eq!(native.counts().thread_claims, 1);
     }
 
     #[test]
