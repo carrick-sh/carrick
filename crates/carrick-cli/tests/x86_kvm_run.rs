@@ -857,3 +857,27 @@ fn mounted_static_x86_signal_tkill_dependency() {
 fn mounted_static_x86_signal_tgkill_dependency() {
     compare_mounted_assembly_with_native("x86_signal_tgkill.S", b"S\n");
 }
+
+#[test]
+fn mounted_static_x86_signal_self_abort_dependency() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("self-abort");
+    compile_assembly("x86_signal_self_abort.S", &elf);
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .unwrap();
+    assert_eq!(native.status.signal(), Some(6));
+    let run = run_mounted_binary(&elf, "self-abort", false);
+    assert_eq!(
+        run.status.code(),
+        Some(134),
+        "stdout={:?} stderr={}",
+        run.stdout,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(run.stdout.is_empty());
+}

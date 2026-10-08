@@ -714,8 +714,13 @@ impl<'a, M: Clone, S: NativeProcessService<'a, Mm = M>> NativeProcessEntry<'_, '
         Ok(())
     }
     fn exit_owned(&mut self, status: u8) -> Result<LifecycleOutcome, NativeProcessError> {
+        self.exit_wait_status(LinuxWaitStatus::from_wait_encoding(i32::from(status) << 8))
+    }
+    fn exit_wait_status(
+        &mut self,
+        wait_status: LinuxWaitStatus,
+    ) -> Result<LifecycleOutcome, NativeProcessError> {
         let root_exit = self.is_root_process();
-        let wait_status = LinuxWaitStatus::from_wait_encoding(i32::from(status) << 8);
         let (page, control) = {
             let graph = self.runtime.graph.lock();
             let resources = graph
@@ -1149,6 +1154,73 @@ impl<'a, M: Clone, S: NativeProcessService<'a, Mm = M>> NativeProcessEntry<'_, '
 impl<'a, M: Clone, S: NativeProcessService<'a, Mm = M>> ProcessNative<ParkedContextWords>
     for NativeProcessEntry<'_, 'a, M, S>
 {
+    fn signal_action(
+        &mut self,
+        signal: carrick_signal_core::policy::Signal,
+        replacement: Option<carrick_signal_core::policy::Action>,
+    ) -> Option<Result<carrick_signal_core::policy::Action, SyscallResult>> {
+        let signals = {
+            let graph = self.runtime.graph.lock();
+            let row = match graph.owner.task(self.key) {
+                Ok(row) => row,
+                Err(_) => return Some(Err(SyscallResult::new(-3))),
+            };
+            row.native().resources().signals.clone()
+        };
+        Some(match replacement {
+            Some(action) => signals
+                .install_action(self.key, signal, action)
+                .map_err(|_| SyscallResult::new(-22)),
+            None => Ok(signals.action(signal)),
+        })
+    }
+    fn thread_signal(
+        &mut self,
+        request: carrick_personality_linux::signal_syscalls::ThreadSignalRequest,
+    ) -> Option<LifecycleOutcome> {
+        use carrick_signal_core::policy::{Delivery, Disposition, default_delivery};
+        let (pid, tid, signals, mask) = {
+            let graph = self.runtime.graph.lock();
+            let row = match graph.owner.task(self.key) {
+                Ok(row) => row,
+                Err(_) => return Some(returned(-3)),
+            };
+            let resources = row.native().resources();
+            (
+                row.metadata().namespace_pid,
+                resources.control.visible_tid(),
+                resources.signals.clone(),
+                resources.control.blocked(),
+            )
+        };
+        if !tid.is_some_and(|tid| request.matches(pid, tid)) {
+            return Some(returned(-3));
+        }
+        let Some(signal) = request.signal() else {
+            return Some(returned(0));
+        };
+        let delivery = match signals.action(signal).disposition {
+            Disposition::Ignore => Delivery::Ignore,
+            Disposition::Default => default_delivery(signal),
+            Disposition::Handler(_) => return Some(returned(-95)),
+        };
+        match delivery {
+            Delivery::Ignore | Delivery::Continue => Some(returned(0)),
+            Delivery::Terminate { core_dump } if mask.0 & signal.bit() == 0 => {
+                // No host process signal: shared retirement publishes Linux wait status.
+                let wait = LinuxWaitStatus::from_wait_encoding(
+                    signal.number() | if core_dump { 128 } else { 0 },
+                );
+                Some(match self.exit_wait_status(wait) {
+                    Ok(outcome) => outcome,
+                    Err(error) => self.fail(error),
+                })
+            }
+            // Native handler-frame delivery and job-control transitions are not
+            // installed in this lane. Refuse explicitly rather than lose a signal.
+            _ => Some(returned(-95)),
+        }
+    }
     fn binding(&self) -> ExecutionBinding {
         self.binding
     }
@@ -1304,6 +1376,13 @@ mod tests {
     }
     #[test]
     fn actual_compact_root_can_exit_before_its_first_park() {
+        exercise_root_exit(false);
+    }
+    #[test]
+    fn actual_compact_root_owns_actions_and_self_signal_termination() {
+        exercise_root_exit(true);
+    }
+    fn exercise_root_exit(signaled: bool) {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
         let zone = unsafe {
@@ -1374,8 +1453,58 @@ mod tests {
         let mut entry = runtime
             .enter(source, &task, words(address), &mut service)
             .unwrap();
+        let expected = if signaled { 6 | 128 } else { 9 << 8 };
+        let outcome = if signaled {
+            use carrick_signal_core::policy::{Action, Disposition, Signal};
+            assert!(control.publish_visible_tid(41));
+            let pipe = Signal::from_number(13).unwrap();
+            let ignored = Action {
+                disposition: Disposition::Ignore,
+                ..Action::default()
+            };
+            assert_eq!(
+                entry.signal_action(pipe, Some(ignored)).unwrap().unwrap(),
+                Action::default()
+            );
+            assert_eq!(entry.signal_action(pipe, None).unwrap().unwrap(), ignored);
+            for (group, tid, signal, expected) in [
+                (None, 41_u32, 0_u32, 0),
+                (Some(41_u32), 41, 0, 0),
+                (Some(42), 41, 0, -3),
+                (None, 42, 0, -3),
+                (None, 41, 65, -22),
+                (None, 41, 13, 0),
+            ] {
+                let request =
+                    carrick_personality_linux::signal_syscalls::ThreadSignalRequest::decode(
+                        group.map(u64::from),
+                        u64::from(tid),
+                        u64::from(signal),
+                    );
+                let result = match request {
+                    Ok(request) => match entry.thread_signal(request).unwrap() {
+                        LifecycleOutcome::Returned { result, .. } => result,
+                        _ => panic!("signal probe transferred"),
+                    },
+                    Err(result) => result,
+                };
+                assert_eq!(result.raw(), expected);
+            }
+            entry
+                .thread_signal(
+                    carrick_personality_linux::signal_syscalls::ThreadSignalRequest::decode(
+                        Some(41),
+                        41,
+                        6,
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+        } else {
+            entry.exit_group(9)
+        };
         assert!(matches!(
-            entry.exit_group(9),
+            outcome,
             LifecycleOutcome::Transferred {
                 progress: carrick_core::Served::Idle,
                 ..
@@ -1383,7 +1512,7 @@ mod tests {
         ));
         assert_eq!(
             entry.take_root_exit(),
-            Some(LinuxWaitStatus::from_wait_encoding(9 << 8))
+            Some(LinuxWaitStatus::from_wait_encoding(expected))
         );
         assert!(entry.take_handoff_receipt().is_some());
         assert_eq!(page.live(), 0);

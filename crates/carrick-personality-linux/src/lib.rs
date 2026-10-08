@@ -16,3 +16,5 @@ pub mod pending_anonymous;
 
 pub mod lifecycle;
 pub mod thread;
+
+pub mod signal_syscalls;

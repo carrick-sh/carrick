@@ -2060,6 +2060,13 @@ mod kernel {
                 CompletionRoute::Suspended => {
                     drop(_user_fault_gate);
                     if let Some(status) = root_exit {
+                        // The command completion protocol carries an exit code;
+                        // shared retirement retains the original signal wait status.
+                        let code = carrick_personality_linux::signal_syscalls::command_exit_code(status)
+                            .unwrap_or_else(|| initial_boot::fatal_boot());
+                        let status = carrick_sched_core::process::LinuxWaitStatus::from_wait_encoding(
+                            i32::from(code) << 8,
+                        );
                         let exit = carrick_el1_abi::X86NativeRootExit::new(
                             carrick_el1::personality::common_entry::execution_binding(task), status,
                         ).unwrap_or_else(|| initial_boot::fatal_boot());

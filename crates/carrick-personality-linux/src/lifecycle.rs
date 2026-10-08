@@ -17,6 +17,9 @@ impl ProcessWaitPid {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LifecycleCall {
     Exit,
+    SigAction,
+    ThreadKill,
+    ThreadGroupKill,
     SigAltStack,
     SigProcMask,
     SetRobustList,
@@ -76,6 +79,21 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     fn take_handoff_receipt(&mut self) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
         None
     }
+
+    /// Exact process action owner; None means this execution lane has no owner.
+    fn signal_action(
+        &mut self,
+        _signal: carrick_signal_core::policy::Signal,
+        _replacement: Option<carrick_signal_core::policy::Action>,
+    ) -> Option<Result<carrick_signal_core::policy::Action, SyscallResult>> {
+        None
+    }
+    fn thread_signal(
+        &mut self,
+        _request: crate::signal_syscalls::ThreadSignalRequest,
+    ) -> Option<LifecycleOutcome> {
+        None
+    }
     fn binding(&self) -> ExecutionBinding;
     fn fork(&mut self) -> LifecycleOutcome;
     fn wait4(
@@ -114,6 +132,20 @@ pub struct ExitRecord {
 /// ISA hooks acquire retained metadata and move real native context. They do
 /// not route, validate clone flags, lower errno or publish entry completion.
 pub trait LifecycleNative<'a>: UserCopy {
+    /// Exact process action owner; None means this execution lane has no owner.
+    fn signal_action(
+        &mut self,
+        _signal: carrick_signal_core::policy::Signal,
+        _replacement: Option<carrick_signal_core::policy::Action>,
+    ) -> Option<Result<carrick_signal_core::policy::Action, SyscallResult>> {
+        None
+    }
+    fn thread_signal(
+        &mut self,
+        _request: crate::signal_syscalls::ThreadSignalRequest,
+    ) -> Option<LifecycleOutcome> {
+        None
+    }
     fn arguments(&self) -> [u64; 6];
     fn binding(&self) -> Option<ExecutionBinding>;
     fn task_state(&self) -> Option<&'a crate::abi::entry::LinuxTaskState>;
@@ -303,6 +335,18 @@ pub fn invoke<'a>(
         return native.process_fork();
     }
     match call {
+        LifecycleCall::SigAction => return crate::signal_syscalls::sigaction(native),
+        LifecycleCall::ThreadKill | LifecycleCall::ThreadGroupKill => {
+            let request = if call == LifecycleCall::ThreadKill {
+                crate::signal_syscalls::ThreadSignalRequest::decode(None, args[0], args[1])
+            } else {
+                crate::signal_syscalls::ThreadSignalRequest::decode(Some(args[0]), args[1], args[2])
+            };
+            return match request {
+                Ok(request) => native.thread_signal(request),
+                Err(result) => Some(returned(result, false)),
+            };
+        }
         LifecycleCall::Fork => return native.process_fork(),
         LifecycleCall::Wait4 => {
             return native.process_wait4(
