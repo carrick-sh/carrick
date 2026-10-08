@@ -357,3 +357,29 @@ The recorded bootstrap source SHA describes this newly audited content;
 bootstrap acceptance remains schema-absent-only. The actual merged tree must
 satisfy the restricted dialect, exact ceilings and zero rules. Scanner logic,
 vocabulary and discovery output format are unchanged from `e2588bd4f`.
+
+## PR 118 landing rebase
+
+The landing base is `048c2b6c1297d1ed466df676f40df2f3315dfd0b`.
+Keep the positional inventory deleted and preserve main's `cpl0_inputs.rs`
+and `build.rs` byte-for-byte. Manifest traversal no longer invokes nested Cargo
+metadata. Source census and compiler discovery observe exactly two new BuildTime
+cohorts: `std::fs::read_to_string` at
+`carrick_vmm_kvm::build_program::cpl0_inputs::read_manifest`, one each in
+`linux_cli` and `linux_runtime`. Existing source/compiler cohorts are unchanged.
+The image builder still reads `CARGO` and runs Cargo to build the image; those
+source counts remain rather than being assumed removed with metadata traversal.
+
+| Counter | Before PR 118 | Landing |
+|---|---:|---:|
+| `build_time` | 30 | 32 |
+| `linux_cli` compiled crossings | 572 | 573 |
+| `linux_runtime` compiled crossings | 455 | 456 |
+| Head ceiling sum | 5799 | 5801 |
+| Initial-main bootstrap ceiling sum | 5803 | 5805 |
+| Retained cohorts | 4991 | 4993 |
+
+The bootstrap records this newly audited main content and remains
+schema-absent-only; actual merged-tree census, exact ceilings and unconditional
+zero rules remain mandatory. Scanner logic, vocabulary and discovery output
+format are unchanged. No macOS-only source changed in this rebase.
