@@ -662,7 +662,7 @@ impl Cpl0HostCustody {
                         .cow_residency()?
                         .lookup(resident.mm_key, edge.span().va)
                         .ok_or_else(|| fail("physical fork source residency publication"))?;
-                    if !self.cow_residency()?.record_commit(page) {
+                    if edge.is_resident() && !self.cow_residency()?.record_commit(page) {
                         return Err(fail("physical fork source commit proof"));
                     }
                 }
@@ -680,7 +680,7 @@ impl Cpl0HostCustody {
                     .lookup(resident.mm_key, edge.span().va)
                     .ok_or_else(|| fail("physical fork child residency publication"))?;
                 if page.expected_ipa != edge.physical().raw()
-                    || !self.cow_residency()?.record_commit(page)
+                    || (edge.is_resident() && !self.cow_residency()?.record_commit(page))
                 {
                     return Err(fail("physical fork child commit proof"));
                 }

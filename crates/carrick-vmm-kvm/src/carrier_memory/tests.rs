@@ -853,3 +853,107 @@ fn inherited_inventory_edges_authorize_only_selected_child_pages() {
     assert!(!retirement.live);
     assert_eq!(drain.calls, 2);
 }
+
+#[test]
+fn inherited_prepared_leaf_retains_exact_storage_without_committing_it() {
+    let gpa = FrameGpa::new(0x800000);
+    let prepared = gpa.raw() | USER | PREPARED | PRIVATE | COW | MAY_WRITE;
+    assert!(inherited_leaf_names(prepared, PAGE, gpa));
+    assert!(!inherited_leaf_names(prepared | RETIRED, PAGE, gpa));
+    assert!(!inherited_leaf_names(prepared | PRESENT, PAGE, gpa));
+    assert!(!inherited_leaf_names(
+        prepared,
+        PAGE,
+        FrameGpa::new(0x801000)
+    ));
+    assert!(!inherited_leaf_names(prepared & !USER, PAGE, gpa));
+    assert!(!inherited_leaf_names(prepared, 0x200000, gpa));
+    assert!(inherited_leaf_names(
+        (prepared & !PREPARED) | PRESENT,
+        PAGE,
+        gpa
+    ));
+}
+
+#[test]
+fn inherited_compound_inventory_authenticates_only_exact_live_owner_pages() {
+    use carrick_hal::{
+        FrameEventCapacity, FrameInventoryEvent, FrameLength, MappingGeneration, MemPerms,
+    };
+    use carrick_kernel::kernel::{FrameInventoryAuthority, ObjectIdRegistry};
+    let authority = FrameInventoryAuthority::new();
+    let ids = ObjectIdRegistry::new();
+    let mm = ids.mm_id().unwrap();
+    let other_mm = ids.mm_id().unwrap();
+    let mut reservation = authority
+        .reserve(&ids, 1, 1, FrameEventCapacity::for_event_count(2).unwrap())
+        .unwrap();
+    let transaction = reservation.transaction();
+    let frame = reservation.claim_frame().unwrap();
+    let mapping = reservation.claim_mapping().unwrap();
+    let generation = MappingGeneration::from_backend_counter(nz(1));
+    reservation
+        .push(FrameInventoryEvent::PrepareMapping {
+            transaction,
+            frame,
+            mapping,
+            generation,
+            gpa: carrick_guest_mem::Gpa(0x800000),
+            length: FrameLength::from_mapping_extent(nz(0x4000)),
+            permissions: MemPerms {
+                read: true,
+                write: true,
+                exec: false,
+            },
+        })
+        .unwrap();
+    reservation
+        .push(FrameInventoryEvent::PublishMapping {
+            transaction,
+            mapping,
+            generation,
+        })
+        .unwrap();
+    let (_, receipt) = authority
+        .apply_with_receipt(mm, reservation.commit(()))
+        .unwrap();
+    let identity = BackingIdentity {
+        frame_id: nz(frame.raw()),
+        mapping_id: nz(mapping.raw()),
+        owner_generation: nz(1),
+        inventory_revision: nz(receipt.revision()),
+    };
+    assert!(inventory_page_live(
+        &authority,
+        nz(mm.raw()),
+        identity,
+        FrameGpa::new(0x801000)
+    ));
+    assert!(!inventory_page_live(
+        &authority,
+        nz(other_mm.raw()),
+        identity,
+        FrameGpa::new(0x801000)
+    ));
+    assert!(!inventory_page_live(
+        &authority,
+        nz(mm.raw()),
+        BackingIdentity {
+            owner_generation: nz(2),
+            ..identity
+        },
+        FrameGpa::new(0x801000)
+    ));
+    assert!(!inventory_page_live(
+        &authority,
+        nz(mm.raw()),
+        identity,
+        FrameGpa::new(0x804000)
+    ));
+    assert!(!inventory_page_live(
+        &authority,
+        nz(mm.raw()),
+        identity,
+        FrameGpa::new(0x801001)
+    ));
+}
