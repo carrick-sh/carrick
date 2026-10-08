@@ -353,18 +353,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:277 in `set_init`, the host result from `libc::getpgrp` determines the guest PID-namespace identity mapping used by `set_init`.",
+    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:280 in `set_init`, the host result from `libc::getpgrp` determines the guest PID-namespace identity mapping used by `set_init`.",
     "review_id": "HA-000013",
     "source": {
-      "byte_end": 10492,
-      "byte_start": 10479,
+      "byte_end": 10676,
+      "byte_start": 10663,
       "column": 39,
       "column_end": 52,
       "column_start": 39,
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 277,
-      "line_end": 277,
-      "line_start": 277
+      "line": 280,
+      "line_end": 280,
+      "line_start": 280
     }
   },
   {
@@ -382,18 +382,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:509 in `refresh_init_host_pgid`, the host result from `libc::getpgrp` determines the guest PID-namespace identity mapping used by `refresh_init_host_pgid`.",
+    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:529 in `refresh_init_host_pgid`, the host result from `libc::getpgrp` determines the guest PID-namespace identity mapping used by `refresh_init_host_pgid`.",
     "review_id": "HA-000014",
     "source": {
-      "byte_end": 19661,
-      "byte_start": 19648,
+      "byte_end": 20432,
+      "byte_start": 20419,
       "column": 25,
       "column_end": 38,
       "column_start": 25,
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 509,
-      "line_end": 509,
-      "line_start": 509
+      "line": 529,
+      "line_end": 529,
+      "line_start": 529
     }
   },
   {
@@ -1175,18 +1175,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:621 in `self_ns_ppid`, the host result from `libc::getppid` determines the guest PID-namespace identity mapping used by `self_ns_ppid`.",
+    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:641 in `self_ns_ppid`, the host result from `libc::getppid` determines the guest PID-namespace identity mapping used by `self_ns_ppid`.",
     "review_id": "HA-000052",
     "source": {
-      "byte_end": 24796,
-      "byte_start": 24783,
+      "byte_end": 25567,
+      "byte_start": 25554,
       "column": 25,
       "column_end": 38,
       "column_start": 25,
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 621,
-      "line_end": 621,
-      "line_start": 621
+      "line": 641,
+      "line_end": 641,
+      "line_start": 641
     }
   },
   {
@@ -1204,18 +1204,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:640 in `self_ns_ppid`, the host result from `libc::getppid` determines the guest PID-namespace identity mapping used by `self_ns_ppid`.",
+    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:660 in `self_ns_ppid`, the host result from `libc::getppid` determines the guest PID-namespace identity mapping used by `self_ns_ppid`.",
     "review_id": "HA-000053",
     "source": {
-      "byte_end": 25444,
-      "byte_start": 25431,
+      "byte_end": 26215,
+      "byte_start": 26202,
       "column": 30,
       "column_end": 43,
       "column_start": 30,
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 640,
-      "line_end": 640,
-      "line_start": 640
+      "line": 660,
+      "line_end": 660,
+      "line_start": 660
     }
   },
   {
@@ -1435,18 +1435,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:283 in `set_init`, the host result from `libc::getsid` determines the guest PID-namespace session identity used by `set_init`.",
+    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:286 in `set_init`, the host result from `libc::getsid` determines the guest PID-namespace session identity used by `set_init`.",
     "review_id": "HA-000061",
     "source": {
-      "byte_end": 10707,
-      "byte_start": 10695,
+      "byte_end": 10891,
+      "byte_start": 10879,
       "column": 38,
       "column_end": 50,
       "column_start": 38,
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 283,
-      "line_end": 283,
-      "line_start": 283
+      "line": 286,
+      "line_end": 286,
+      "line_start": 286
     }
   },
   {
@@ -1900,18 +1900,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-portable/src/lib.rs:2042, process_exit_fd uses libc::syscall to issue only SYS_pidfd_open on a typed positive HostProcessId supplied by a native supervisor. The lease/watchdog callers validate their owner against getppid and obtain their worker identity from the Child they spawned; guest process IDs never select this native exit watch. The returned descriptor is uniquely owned as OwnedFd and the kernel creates it close-on-exec. This is native parent-death/cancellation substrate, not forwarding of a guest syscall.",
+    "rationale": "At crates/carrick-portable/src/lib.rs:2169, process_exit_fd uses libc::syscall to issue only SYS_pidfd_open on a typed positive HostProcessId supplied by a native supervisor. The lease/watchdog callers validate their owner against getppid and obtain their worker identity from the Child they spawned; guest process IDs never select this native exit watch. The returned descriptor is uniquely owned as OwnedFd and the kernel creates it close-on-exec. This is native parent-death/cancellation substrate, not forwarding of a guest syscall.",
     "review_id": "HA-000755",
     "source": {
-      "byte_end": 74612,
-      "byte_start": 74599,
+      "byte_end": 79758,
+      "byte_start": 79745,
       "column": 23,
       "column_end": 36,
       "column_start": 23,
       "file": "crates/carrick-portable/src/lib.rs",
-      "line": 2042,
-      "line_end": 2042,
-      "line_start": 2042
+      "line": 2169,
+      "line_end": 2169,
+      "line_start": 2169
     }
   },
   {
@@ -6482,8 +6482,8 @@
     "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:245 in `load_execve_image`, `std::fs::read` accesses only the selected absolute executable in the explicitly enabled bare RunElf host-filesystem fallback (`exec_host_fs_fallback`); container dispatchers keep it disabled so an absent rootfs target ENOENTs.",
     "review_id": "HA-000727",
     "source": {
-      "byte_end": 11229,
-      "byte_start": 11216,
+      "byte_end": 11213,
+      "byte_start": 11200,
       "column": 17,
       "column_end": 30,
       "column_start": 17,
@@ -6620,18 +6620,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:1206 in `Cpl0Carrier::boot`, `std::fs::read` reads only the caller-selected CPL0 bootstrap ELF, whose segments and entry are validated before the fixture registers memory or runs either vCPU; no guest syscall argument or guest identity selects this host path.",
+    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:1845 in `Cpl0Carrier::boot`, `std::fs::read` reads only the caller-selected CPL0 bootstrap ELF, whose segments and entry are validated before the fixture registers memory or runs either vCPU; no guest syscall argument or guest identity selects this host path.",
     "review_id": "HA-000752",
     "source": {
-      "byte_end": 47554,
-      "byte_start": 47541,
+      "byte_end": 73008,
+      "byte_start": 72995,
       "column": 21,
       "column_end": 34,
       "column_start": 21,
       "file": "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
-      "line": 1206,
-      "line_end": 1206,
-      "line_start": 1206
+      "line": 1845,
+      "line_end": 1845,
+      "line_start": 1845
     }
   },
   {
@@ -7574,18 +7574,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-portable/src/lib.rs:1722 in the Linux `fd_abs_path`, `std::fs::read_link` reads only `/proc/self/fd/<fd>` for a descriptor the carrier already holds (the hostfs scratch directory passed by `HostFsBackend::from_existing_dir`) to name its backing path.",
+    "rationale": "At crates/carrick-portable/src/lib.rs:1849 in the Linux `fd_abs_path`, `std::fs::read_link` reads only `/proc/self/fd/<fd>` for a descriptor the carrier already holds (the hostfs scratch directory passed by `HostFsBackend::from_existing_dir`) to name its backing path.",
     "review_id": "HA-000731",
     "source": {
-      "byte_end": 63137,
-      "byte_start": 63119,
+      "byte_end": 68283,
+      "byte_start": 68265,
       "column": 9,
       "column_end": 27,
       "column_start": 9,
       "file": "crates/carrick-portable/src/lib.rs",
-      "line": 1722,
-      "line_end": 1722,
-      "line_start": 1722
+      "line": 1849,
+      "line_end": 1849,
+      "line_start": 1849
     }
   },
   {
@@ -13305,18 +13305,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/dispatcher.rs:750 in `event_ring_guest_pid`, `std::process::id` acts only on the current carrier event-ring diagnostic fallback used by `event_ring_guest_pid`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/dispatcher.rs:787 in `event_ring_guest_pid`, `std::process::id` acts only on the current carrier event-ring diagnostic fallback used by `event_ring_guest_pid`; no guest identity selects its host target.",
     "review_id": "HA-000497",
     "source": {
-      "byte_end": 33868,
-      "byte_start": 33852,
+      "byte_end": 35462,
+      "byte_start": 35446,
       "column": 32,
       "column_end": 48,
       "column_start": 32,
       "file": "crates/carrick-kernel/src/dispatch/dispatcher.rs",
-      "line": 750,
-      "line_end": 750,
-      "line_start": 750
+      "line": 787,
+      "line_end": 787,
+      "line_start": 787
     }
   },
   {
@@ -13363,18 +13363,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/kernel_context.rs:50 in `bootstrap_one_task_binding`, the host result from `std::process::id` determines the guest root-process identity in the one-task adapter used by `bootstrap_one_task_binding`.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/kernel_context.rs:58 in `bootstrap_one_task_binding`, the host result from `std::process::id` determines the guest root-process identity in the one-task adapter used by `bootstrap_one_task_binding`.",
     "review_id": "HA-000495",
     "source": {
-      "byte_end": 1839,
-      "byte_start": 1823,
+      "byte_end": 2153,
+      "byte_start": 2137,
       "column": 38,
       "column_end": 54,
       "column_start": 38,
       "file": "crates/carrick-kernel/src/dispatch/kernel_context.rs",
-      "line": 50,
-      "line_end": 50,
-      "line_start": 50
+      "line": 58,
+      "line_end": 58,
+      "line_start": 58
     }
   },
   {
@@ -13392,18 +13392,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/kernel_context.rs:273 in `reset_one_task_kernel_binding_for_current_process`, the host result from `std::process::id` determines the guest fork-child identity in the one-task adapter used by `reset_one_task_kernel_binding_for_current_process`.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/kernel_context.rs:291 in `reset_one_task_kernel_binding_for_current_process`, the host result from `std::process::id` determines the guest fork-child identity in the one-task adapter used by `reset_one_task_kernel_binding_for_current_process`.",
     "review_id": "HA-000496",
     "source": {
-      "byte_end": 12068,
-      "byte_start": 12052,
+      "byte_end": 12714,
+      "byte_start": 12698,
       "column": 42,
       "column_end": 58,
       "column_start": 42,
       "file": "crates/carrick-kernel/src/dispatch/kernel_context.rs",
-      "line": 273,
-      "line_end": 273,
-      "line_start": 273
+      "line": 291,
+      "line_end": 291,
+      "line_start": 291
     }
   },
   {
@@ -14316,18 +14316,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:578 in `self_ns_pid`, the host result from `std::process::id` determines the guest PID-namespace self identity used by `self_ns_pid`.",
+    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:598 in `self_ns_pid`, the host result from `std::process::id` determines the guest PID-namespace self identity used by `self_ns_pid`.",
     "review_id": "HA-000534",
     "source": {
-      "byte_end": 22908,
-      "byte_start": 22892,
+      "byte_end": 23679,
+      "byte_start": 23663,
       "column": 16,
       "column_end": 32,
       "column_start": 16,
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 578,
-      "line_end": 578,
-      "line_start": 578
+      "line": 598,
+      "line_end": 598,
+      "line_start": 598
     }
   },
   {
@@ -14345,18 +14345,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:623 in `self_ns_ppid`, the host result from `std::process::id` determines the guest PID-namespace parent identity used by `self_ns_ppid`.",
+    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:643 in `self_ns_ppid`, the host result from `std::process::id` determines the guest PID-namespace parent identity used by `self_ns_ppid`.",
     "review_id": "HA-000535",
     "source": {
-      "byte_end": 24851,
-      "byte_start": 24835,
+      "byte_end": 25622,
+      "byte_start": 25606,
       "column": 21,
       "column_end": 37,
       "column_start": 21,
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 623,
-      "line_end": 623,
-      "line_start": 623
+      "line": 643,
+      "line_end": 643,
+      "line_start": 643
     }
   },
   {
@@ -14374,18 +14374,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:954 in `is_execed_child_of_current`, the host result from `std::process::id` determines the guest exec-child ancestry result used by `is_execed_child_of_current`.",
+    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:974 in `is_execed_child_of_current`, the host result from `std::process::id` determines the guest exec-child ancestry result used by `is_execed_child_of_current`.",
     "review_id": "HA-000537",
     "source": {
-      "byte_end": 38824,
-      "byte_start": 38808,
+      "byte_end": 39595,
+      "byte_start": 39579,
       "column": 43,
       "column_end": 59,
       "column_start": 43,
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 954,
-      "line_end": 954,
-      "line_start": 954
+      "line": 974,
+      "line_end": 974,
+      "line_start": 974
     }
   },
   {
@@ -15485,18 +15485,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:7587 in `host_image_base_snapshot`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_image_base_snapshot`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:7541 in `host_image_base_snapshot`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_image_base_snapshot`; no guest identity selects its host target.",
     "review_id": "HA-000466",
     "source": {
-      "byte_end": 293974,
-      "byte_start": 293958,
-      "column": 18,
-      "column_end": 34,
-      "column_start": 18,
+      "byte_end": 291654,
+      "byte_start": 291638,
+      "column": 41,
+      "column_end": 57,
+      "column_start": 41,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 7587,
-      "line_end": 7587,
-      "line_start": 7587
+      "line": 7541,
+      "line_end": 7541,
+      "line_start": 7541
     }
   },
   {
@@ -16301,18 +16301,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/src/kvm.rs:201 in `print_kvm_stats_once`, `std::process::id` names only the current carrier in the `CARRICK_KVM_STATS` diagnostic line on stderr; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-kvm/src/kvm.rs:211 in `print_kvm_stats_once`, `std::process::id` names only the current carrier in the `CARRICK_KVM_STATS` diagnostic line on stderr; no guest identity selects its host target.",
     "review_id": "HA-000747",
     "source": {
-      "byte_end": 7256,
-      "byte_start": 7240,
+      "byte_end": 7470,
+      "byte_start": 7454,
       "column": 9,
       "column_end": 25,
       "column_start": 9,
       "file": "crates/carrick-vmm-kvm/src/kvm.rs",
-      "line": 201,
-      "line_end": 201,
-      "line_start": 201
+      "line": 211,
+      "line_end": 211,
+      "line_start": 211
     }
   },
   {
@@ -18311,18 +18311,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:279 in `Watchdog::start`, `std::thread::spawn` creates one bounded timeout witness for the current KVM_RUN host thread in fixture and production entry. Its retained KvmKickHandle targets that exact host thread; cancellation and Drop join retain its lifetime. It neither creates a guest task nor implements a guest wait, and no guest identity selects the host target.",
+    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:641 in `Watchdog::start`, `std::thread::spawn` creates one bounded timeout witness for the current KVM_RUN host thread in fixture and production entry. Its retained KvmKickHandle targets that exact host thread; cancellation and Drop join retain its lifetime. It neither creates a guest task nor implements a guest wait, and no guest identity selects the host target.",
     "review_id": "HA-000753",
     "source": {
-      "byte_end": 10677,
-      "byte_start": 10659,
+      "byte_end": 24774,
+      "byte_start": 24756,
       "column": 22,
       "column_end": 40,
       "column_start": 22,
       "file": "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
-      "line": 279,
-      "line_end": 279,
-      "line_start": 279
+      "line": 641,
+      "line_end": 641,
+      "line_start": 641
     }
   },
   {
@@ -18576,18 +18576,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/el1_delegation.rs:1166 in `lock_delegated_file`, `std::thread::yield_now` acts only on the current host thread waiting on delegated file lock held by EL1 used by `lock_delegated_file`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/el1_delegation.rs:1160 in `lock_delegated_file`, `std::thread::yield_now` acts only on the current host thread waiting on delegated file lock held by EL1 used by `lock_delegated_file`; no guest identity selects its host target.",
     "review_id": "HA-000671",
     "source": {
-      "byte_end": 43699,
-      "byte_start": 43677,
+      "byte_end": 43538,
+      "byte_start": 43516,
       "column": 9,
       "column_end": 31,
       "column_start": 9,
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 1166,
-      "line_end": 1166,
-      "line_start": 1166
+      "line": 1160,
+      "line_end": 1160,
+      "line_start": 1160
     }
   },
   {
@@ -18605,18 +18605,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/el1_delegation.rs:1949 in `HostInstanceLock::acquire`, `std::thread::yield_now` acts only on the current host thread waiting on an in-zone inotify instance lock held by EL1 used by `HostInstanceLock::acquire`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/el1_delegation.rs:1943 in `HostInstanceLock::acquire`, `std::thread::yield_now` acts only on the current host thread waiting on an in-zone inotify instance lock held by EL1 used by `HostInstanceLock::acquire`; no guest identity selects its host target.",
     "review_id": "HA-000673",
     "source": {
-      "byte_end": 72459,
-      "byte_start": 72437,
+      "byte_end": 72298,
+      "byte_start": 72276,
       "column": 13,
       "column_end": 35,
       "column_start": 13,
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 1949,
-      "line_end": 1949,
-      "line_start": 1949
+      "line": 1943,
+      "line_end": 1943,
+      "line_start": 1943
     }
   },
   {
@@ -18721,18 +18721,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:1076 in `PidNamespace::register`, `std::thread::yield_now` schedules only the current carrier worker while kernel namespace-record ownership settles; no host identity supplies the namespace membership answer.",
+    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:1096 in `PidNamespace::register`, `std::thread::yield_now` schedules only the current carrier worker while kernel namespace-record ownership settles; no host identity supplies the namespace membership answer.",
     "review_id": "HA-000634",
     "source": {
-      "byte_end": 42899,
-      "byte_start": 42877,
+      "byte_end": 43670,
+      "byte_start": 43648,
       "column": 13,
       "column_end": 35,
       "column_start": 13,
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 1076,
-      "line_end": 1076,
-      "line_start": 1076
+      "line": 1096,
+      "line_end": 1096,
+      "line_start": 1096
     }
   },
   {
@@ -18750,18 +18750,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:1446 in `PidNamespace::unregister_reaped_ref`, `std::thread::yield_now` schedules only the current carrier worker while an exact kernel record transition settles; no host identity supplies the retirement answer.",
+    "rationale": "At crates/carrick-kernel/src/namespace/pid.rs:1466 in `PidNamespace::unregister_reaped_ref`, `std::thread::yield_now` schedules only the current carrier worker while an exact kernel record transition settles; no host identity supplies the retirement answer.",
     "review_id": "HA-000635",
     "source": {
-      "byte_end": 56343,
-      "byte_start": 56321,
+      "byte_end": 57114,
+      "byte_start": 57092,
       "column": 21,
       "column_end": 43,
       "column_start": 21,
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 1446,
-      "line_end": 1446,
-      "line_start": 1446
+      "line": 1466,
+      "line_end": 1466,
+      "line_start": 1466
     }
   },
   {
