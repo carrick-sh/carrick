@@ -432,3 +432,98 @@ pub(super) fn x4_linux_common_entry() {
         }
     }
 }
+
+#[test]
+fn common_linux_entry_calls_native_process_custody() {
+    use carrick_personality_linux::entry::{SharedVenue, serve_with_custody};
+    use carrick_personality_linux::lifecycle::{LifecycleOutcome, ProcessNative, ProcessWaitPid};
+    struct Process {
+        binding: carrick_core_abi::ExecutionBinding,
+        visits: std::vec::Vec<u64>,
+    }
+    impl ProcessNative for Process {
+        fn binding(&self) -> carrick_core_abi::ExecutionBinding {
+            self.binding
+        }
+        fn fork(&mut self) -> LifecycleOutcome {
+            self.visits.push(57);
+            LifecycleOutcome::Returned {
+                result: SyscallResult::new(42),
+                work: false,
+            }
+        }
+        fn wait4(
+            &mut self,
+            pid: ProcessWaitPid,
+            status: UserVa,
+            options: carrick_personality_linux::lifecycle::LinuxWaitOptions,
+        ) -> LifecycleOutcome {
+            assert_eq!(pid.raw(), 42);
+            assert_eq!(status.raw(), 0x7000);
+            assert_eq!(options.bits(), 0);
+            self.visits.push(61);
+            LifecycleOutcome::Returned {
+                result: SyscallResult::new(42),
+                work: false,
+            }
+        }
+        fn exit_group(&mut self, status: u8) -> LifecycleOutcome {
+            assert_eq!(status, 7);
+            self.visits.push(231);
+            LifecycleOutcome::Returned {
+                result: SyscallResult::new(0),
+                work: false,
+            }
+        }
+    }
+    let world = World::new(LifecycleHatches::ON);
+    let venue = SharedVenue {
+        binding: || execution_binding(&world.tasks[0]),
+        state: &world.tasks[0].linux,
+        counters: carrick_personality_linux::dispatch::EntryCounters {
+            served: &world.counters.served,
+            forwarded: &world.counters.forwarded,
+        },
+        robust_list: |_, _| None,
+        process_pid: Some(41),
+        visible_tid: Some(41),
+    };
+    let mut process = Process {
+        binding: execution_binding(&world.tasks[0]),
+        visits: std::vec::Vec::new(),
+    };
+    let mut anonymous = AnonymousBreak;
+    for (native, args, result) in [
+        (57, [0; 6], 42),
+        (61, [42, 0x7000, 0, 0, 0, 0], 42),
+        (231, [7, 0, 0, 0, 0, 0], 0),
+    ] {
+        let call = carrick_personality_linux::entry::decode_x86_64(native, args, 0x7fff0000);
+        assert_eq!(
+            served_result(serve_with_custody(
+                &call,
+                &venue,
+                &mut anonymous,
+                Some(&mut process)
+            )),
+            Some(result)
+        );
+        assert_eq!(
+            world
+                .counters
+                .forwarded
+                .iter()
+                .map(|count| count.load(Ordering::Relaxed))
+                .sum::<u64>(),
+            0
+        );
+    }
+    assert_eq!(process.visits, [57, 61, 231]);
+    process.binding = execution_binding(&world.tasks[1]);
+    let call = carrick_personality_linux::entry::decode_x86_64(57, [0; 6], 0x7fff0000);
+    assert_eq!(
+        serve_with_custody(&call, &venue, &mut anonymous, Some(&mut process)),
+        EntryOutcome::Forward
+    );
+    assert_eq!(process.visits, [57, 61, 231]);
+}

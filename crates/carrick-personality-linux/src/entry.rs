@@ -134,6 +134,7 @@ impl<B: Fn() -> ExecutionBinding, R: Fn(u64, u64) -> Option<i64>> LinuxEntryVenu
 struct CommonFamilies<'a> {
     venue: &'a dyn LinuxEntryVenue,
     anonymous: Option<&'a mut (dyn crate::pending_anonymous::PendingAnonymousVenue + 'a)>,
+    process: Option<&'a mut dyn crate::lifecycle::ProcessNative>,
     args: [u64; 6],
     result: Option<i64>,
 }
@@ -201,21 +202,23 @@ impl<'a> crate::dispatch::PendingFamilies<'a> for CommonFamilies<'a> {
 }
 
 pub fn serve(call: &CanonicalCall, venue: &dyn LinuxEntryVenue) -> EntryOutcome {
-    serve_inner(call, venue, None)
+    serve_inner(call, venue, None, None)
 }
 
-pub fn serve_with_anonymous<'a>(
+pub fn serve_with_custody<'a>(
     call: &CanonicalCall,
     venue: &'a dyn LinuxEntryVenue,
     anonymous: &'a mut (dyn crate::pending_anonymous::PendingAnonymousVenue + 'a),
+    process: Option<&'a mut dyn crate::lifecycle::ProcessNative>,
 ) -> EntryOutcome {
-    serve_inner(call, venue, Some(anonymous))
+    serve_inner(call, venue, Some(anonymous), process)
 }
 
 fn serve_inner<'a>(
     call: &CanonicalCall,
     venue: &'a dyn LinuxEntryVenue,
     anonymous: Option<&'a mut (dyn crate::pending_anonymous::PendingAnonymousVenue + 'a)>,
+    process: Option<&'a mut dyn crate::lifecycle::ProcessNative>,
 ) -> EntryOutcome {
     let Ok(_) = usize::try_from(call.canonical.raw()) else {
         return EntryOutcome::Forward;
@@ -223,6 +226,7 @@ fn serve_inner<'a>(
     let mut pending = CommonFamilies {
         venue,
         anonymous,
+        process,
         args: call.args,
         result: None,
     };
@@ -269,6 +273,23 @@ impl<'a> crate::lifecycle::LifecycleNative<'a> for CommonFamilies<'a> {
         self.venue
             .set_robust_list(head, len)
             .map(SyscallResult::new)
+    }
+    fn process_fork(&mut self) -> Option<crate::lifecycle::LifecycleOutcome> {
+        let process = self.process.as_deref_mut()?;
+        (process.binding() == self.venue.binding()).then(|| process.fork())
+    }
+    fn process_wait4(
+        &mut self,
+        pid: crate::lifecycle::ProcessWaitPid,
+        status: UserVa,
+        options: crate::lifecycle::LinuxWaitOptions,
+    ) -> Option<crate::lifecycle::LifecycleOutcome> {
+        let process = self.process.as_deref_mut()?;
+        (process.binding() == self.venue.binding()).then(|| process.wait4(pid, status, options))
+    }
+    fn process_exit_group(&mut self, status: u8) -> Option<crate::lifecycle::LifecycleOutcome> {
+        let process = self.process.as_deref_mut()?;
+        (process.binding() == self.venue.binding()).then(|| process.exit_group(status))
     }
     fn thread(&self) -> Option<crate::thread::LifecycleThread<'a>> {
         None
