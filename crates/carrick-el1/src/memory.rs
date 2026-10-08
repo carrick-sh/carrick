@@ -838,6 +838,24 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
         Ok(()) => DelegatedAnonymous::Served,
         // The descriptor edit is live but the root refused to commit it.
         Err(refusal) if retired => {
+            let code = match refusal {
+                reservations::Refusal::Busy => 1,
+                reservations::Refusal::PreparedConflict => 2,
+                reservations::Refusal::Stale => 3,
+                reservations::Refusal::Invalid => 4,
+                reservations::Refusal::Collision => 5,
+                reservations::Refusal::Hole => 6,
+                reservations::Refusal::ForeignMapping => 7,
+                reservations::Refusal::Limit => 8,
+                reservations::Refusal::MetadataRequired => 9,
+            };
+            carrick_el1_abi::record_reservation_event(
+                carrick_el1_abi::ANONYMOUS_RETIRE_REFUSED,
+                mm.raw(),
+                model.incarnation().raw(),
+                code,
+                request.sequence.raw() as u32,
+            );
             panic!("EL1 anonymous retirement commit refused: {refusal:?}")
         }
         Err(_) => refuse(pending, &mut model, Leave::RootUnavailable),

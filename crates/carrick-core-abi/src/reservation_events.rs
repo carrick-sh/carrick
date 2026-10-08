@@ -4,6 +4,7 @@ use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 pub const RESERVATION_EVENT_SLOTS: usize = 256;
 pub const PREPARED_SETTLED: u64 = 1;
 pub const PREPARED_REAP: u64 = 2;
+pub const ANONYMOUS_RETIRE_REFUSED: u64 = 3;
 
 #[repr(C)]
 pub struct ReservationEvent {
