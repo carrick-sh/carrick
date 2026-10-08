@@ -163,6 +163,22 @@ pub struct SpaceGrant {
     pub cow_owed: Option<u64>,
 }
 
+#[cfg(test)]
+pub(super) mod editor_test_hook {
+    std::thread_local! {
+        static AFTER_CAS: std::cell::RefCell<Option<std::boxed::Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+    pub fn install(hook: impl FnOnce() + 'static) {
+        AFTER_CAS.with(|slot| *slot.borrow_mut() = Some(std::boxed::Box::new(hook)));
+    }
+    pub fn run() {
+        let hook = AFTER_CAS.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 /// Exclusive guest EL1 mutation ownership for one published address space.
 /// Dropping the guard acknowledges a host pause or retirement waiting after
 /// it closed the entry's gate.
@@ -723,6 +739,8 @@ impl AddressSpaces {
             index,
             key,
         };
+        #[cfg(test)]
+        editor_test_hook::run();
         if entry.key.load(Ordering::SeqCst) != key {
             return Err(EditAdmissionRefusal::Stale);
         }
