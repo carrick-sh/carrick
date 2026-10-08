@@ -316,6 +316,7 @@ fn retained_cow_zone(ram: &GuestRam) -> Result<&X86Cpl0Zone, TrapError> {
     // SAFETY: boot initialized aligned production zone retained by this RAM.
     Ok(unsafe { &*ptr.cast::<X86Cpl0Zone>() })
 }
+
 struct HostCowWake<'a> {
     routes: &'a PublishedApicIds,
     vm: Arc<VmFd>,
@@ -344,16 +345,14 @@ impl<'a> HostCowWake<'a> {
         >,
     ) {
         let (_, effects) = owned.deliver_handbacks(&mut |_| {
-            carrick_fatal::carrick_fatal!(
-                "kvm.native_cow_handback",
-                "native COW release produced unsupported host-home completion custody"
-            );
+            self.error.borrow_mut().get_or_insert_with(|| {
+                fail("native COW release produced unsupported host-home completion custody")
+            });
         });
         if effects.misplaced || effects.queued_own {
-            carrick_fatal::carrick_fatal!(
-                "kvm.native_cow_waker",
-                "host COW release produced guest-own wake effects"
-            );
+            self.error
+                .borrow_mut()
+                .get_or_insert_with(|| fail("host COW release produced guest-own wake effects"));
         }
         for slot in effects.sgi_slots() {
             let result = self
