@@ -1734,14 +1734,120 @@ fn owner_fork_inherits_unreserved_vvar_as_private() {
     let va = carrick_mem::vdso::LINUX_VVAR_BASE;
     let user_leaf = 1 << 6;
     assert_eq!(
-        policy::<Aarch64Mmu, _>(&super::fork::LinuxForkPolicy, &[], va, 0x20_0000, user_leaf)
-            .unwrap(),
+        policy::<Aarch64Mmu, _>(
+            &super::fork::LinuxForkPolicy::default(),
+            &[],
+            va,
+            0x20_0000,
+            user_leaf
+        )
+        .unwrap(),
         Policy::Mixed,
     );
     assert_eq!(
-        policy::<Aarch64Mmu, _>(&super::fork::LinuxForkPolicy, &[], va, 0x1000, user_leaf).unwrap(),
+        policy::<Aarch64Mmu, _>(
+            &super::fork::LinuxForkPolicy::default(),
+            &[],
+            va,
+            0x1000,
+            user_leaf
+        )
+        .unwrap(),
         Policy::Private,
     );
+}
+
+#[test]
+fn owner_fork_drops_only_proven_pristine_prepared_child_grants() {
+    use carrick_core::mm::fork::{Mapping, MappingInheritancePolicy, Policy, copy_entry};
+    use carrick_el1_abi::{FrameGrantResidencyIdentity, ReservationGeneration};
+    use carrick_mmu_core::owner_mmu::Aarch64Mmu;
+
+    struct ExactGrant<'a> {
+        mm: u64,
+        table: &'a FrameGrantResidencyTable,
+    }
+    impl MappingInheritancePolicy for ExactGrant<'_> {
+        fn inheritance_policy(&self, _: &Mapping) -> Policy {
+            Policy::Private
+        }
+        fn is_shared(&self, _: &Mapping) -> bool {
+            false
+        }
+        fn drop_pristine_prepared(&self, va: u64, ipa: u64) -> bool {
+            self.table
+                .lookup(self.mm, va)
+                .is_some_and(|page| page.expected_ipa == ipa)
+                && !self.table.is_guest_committed(self.mm, va)
+        }
+    }
+
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let parent = admit(&region, &spaces, 77, ROOT, 2, 128);
+    let parent_tables = Tables::new(ROOT, IPA, 2);
+    let child = Tables::new(ROOT + 0x100000, 0, 0);
+    let supply = Tables::new(ROOT + 0x200000, 0, 0);
+    let request = fork_request(&region, &spaces, parent, 78, &child, &supply);
+    let prepared = (parent_tables.words[1537].load(Ordering::Acquire) & !1) | (1 << 56) | (1 << 57);
+    let grant = residency();
+    let policy = ExactGrant {
+        mm: parent.raw(),
+        table: &grant,
+    };
+    let mapping = Mapping {
+        range: ReservationRange::new(VA, VA + 8192).unwrap(),
+        protection: ReservationProtection::READ_WRITE,
+        anonymous: true,
+        flags: ReservationNodeFlags::PRIVATE,
+        generation: ReservationGeneration::new(1).unwrap(),
+        host_backing: None,
+    };
+    let copy = |descriptor| {
+        let mut scratch = ForkScratch::new(request, 1).unwrap();
+        scratch.mappings.push(mapping);
+        let pair = copy_entry::<Aarch64Mmu, _, _>(
+            &policy,
+            &parent_tables.live(&CallerInvalidatesAsid),
+            request,
+            &mut scratch,
+            descriptor,
+            3,
+            VA + 4096,
+        )
+        .unwrap();
+        (pair, scratch.custody)
+    };
+    let ((_, unknown_child), _) = copy(prepared);
+    assert_ne!(unknown_child, 0, "unknown backing must retain custody");
+    grant
+        .publish(FrameGrantResidencyIdentity {
+            mm_key: parent.raw(),
+            semantic_base: VA,
+            physical_ipa: IPA,
+            len: 8192,
+            mapping_id: 7,
+            frame_id: 6,
+            owner_generation: 8,
+            inventory_revision: 9,
+        })
+        .unwrap();
+    let ((_, different_child), _) = copy(prepared + 4096);
+    assert_ne!(different_child, 0, "different IPA must retain custody");
+    let ((parent_leaf, child_leaf), custody) = copy(prepared);
+    assert_eq!(parent_leaf, prepared);
+    assert_eq!(
+        child_leaf, 0,
+        "pristine child must first-touch its own frame"
+    );
+    assert!(
+        custody.is_empty(),
+        "pristine child must not borrow parent frame"
+    );
+    grant.record_commit(grant.lookup(parent.raw(), VA + 4096).unwrap());
+    let ((_, child_leaf), custody) = copy(prepared);
+    assert_ne!(child_leaf, 0, "prior resident bytes survive PROT_NONE");
+    assert_eq!(custody.len(), 1);
 }
 
 #[test]

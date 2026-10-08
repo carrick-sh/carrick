@@ -57,6 +57,9 @@ pub trait OwnerForkMmu: OwnerMmu {
     fn is_retired(word: u64) -> bool;
     fn is_absent_unowned(word: u64) -> bool;
     fn is_owned_resident(word: u64) -> bool;
+    fn is_prepared_private(_word: u64) -> bool {
+        false
+    }
     fn is_writable_user(word: u64) -> bool;
     fn is_executable_control(word: u64) -> bool;
     fn control_needs_copy(va: UserVa, word: u64) -> bool;
