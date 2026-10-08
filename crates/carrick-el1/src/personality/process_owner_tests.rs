@@ -93,7 +93,7 @@ struct Native<C = ParkedContextWords> {
     own_usage: TaskRusage,
     wake: u64,
 }
-impl<C: Copy> NativeProcessCustody for Native<C> {
+impl<C: ProcessContext> NativeProcessCustody for Native<C> {
     type Context = C;
     type Claim = Claim;
     type Event = ();
@@ -1068,7 +1068,7 @@ fn entry_exit_returns_resources_and_cancel_effects_before_native_service() {
     drop(published);
 }
 
-impl<C: Copy> super::super::native_process_custody::ProcessResources for Native<C> {
+impl<C: ProcessContext> super::super::native_process_custody::ProcessResources for Native<C> {
     type Context = C;
     type Claim = Claim;
     type Event = ();
@@ -1311,4 +1311,142 @@ fn nonchild_wait_has_no_ptrace_relationship_and_preserves_own_children() {
         WaitSelection::StillRunning(_)
     ));
     assert_eq!(releases.get(), 0);
+}
+
+#[test]
+fn owner_instantiated_with_aarch64_context_checks_fork_child_and_syscall_return() {
+    let mut native_ctx = carrick_sched_core::ThreadCtx::ZERO;
+    native_ctx.x[0] = 0xdead_beef;
+    native_ctx.x[1] = 0x1234;
+    native_ctx.pc = 0x400000;
+    native_ctx.sp_el0 = 0x800000;
+
+    let child_ctx = native_ctx.fork_child(address(key(2, 1)));
+    assert_eq!(child_ctx.syscall_return(), 0);
+    assert_eq!(child_ctx.x[0], 0);
+    assert_eq!(child_ctx.x[1], 0x1234);
+    assert_eq!(child_ctx.pc, 0x400000);
+    assert_eq!(child_ctx.sp_el0, 0x800000);
+
+    let mut returned_ctx = native_ctx;
+    returned_ctx.set_syscall_return(42);
+    assert_eq!(returned_ctx.syscall_return(), 42);
+    assert_eq!(returned_ctx.x[0], 42);
+    assert_eq!(returned_ctx.x[1], 0x1234);
+
+    let releases = Rc::new(Cell::new(0));
+    let native = Native {
+        context_type: PhantomData::<carrick_sched_core::ThreadCtx>,
+        task: key(1, 1),
+        members: 1,
+        work: Rc::new(Work::default()),
+        budget: Rc::new(Budget {
+            reserved: Cell::new(0),
+        }),
+        signals: Signals {
+            state: Rc::new(Cell::new(ExitSignalState {
+                disposition: ExitSignalDisposition::Caught,
+                blocked: false,
+            })),
+            order: Rc::new(RefCell::new(Vec::new())),
+            work: Rc::new(Work::default()),
+        },
+        autoreap: false,
+        own_usage: TaskRusage {
+            user_time: Duration::from_micros(7),
+            system_time: Duration::from_micros(3),
+        },
+        wake: 11,
+    };
+    let task = GuestTask::new(
+        GuestTaskMetadata {
+            key: key(1, 1),
+            container: (),
+            namespace_pid: 1,
+            identity: TaskIdentity::led_by(key(1, 1).id),
+            namespace_process_group: 1,
+            namespace_session: 1,
+            ruid: Uid(0),
+            euid: Uid(0),
+            exit_signal: ChildExitSignal::SIGCHLD,
+            diagnostic_name: "native_arm".into(),
+        },
+        None,
+        returned_ctx,
+        native,
+        Claim(releases),
+    );
+    let mut owner =
+        GuestProcessOwner::<(), Uid, Native<carrick_sched_core::ThreadCtx>, Failure>::new();
+    owner.seed_initial(task).unwrap();
+    let row = owner.task(key(1, 1)).unwrap();
+    assert_eq!(row.context().syscall_return(), 42);
+    assert_eq!(row.context().x[0], 42);
+
+    let mut trap_frame = carrick_el1_abi::TrapFrame::default();
+    trap_frame.x[0] = 0xdead_beef;
+    trap_frame.x[1] = 0x5678;
+    trap_frame.elr = 0x400000;
+    trap_frame.spsr = 0x202;
+
+    let child_tf = trap_frame.fork_child(address(key(2, 1)));
+    assert_eq!(child_tf.syscall_return(), 0);
+    assert_eq!(child_tf.x[0], 0);
+    assert_eq!(child_tf.x[1], 0x5678);
+    assert_eq!(child_tf.elr, 0x400000);
+    assert_eq!(child_tf.spsr, 0x202);
+
+    let mut returned_tf = trap_frame;
+    returned_tf.set_syscall_return(99);
+    assert_eq!(returned_tf.syscall_return(), 99);
+    assert_eq!(returned_tf.x[0], 99);
+    assert_eq!(returned_tf.x[1], 0x5678);
+
+    let tf_native = Native {
+        context_type: PhantomData::<carrick_el1_abi::TrapFrame>,
+        task: key(2, 1),
+        members: 1,
+        work: Rc::new(Work::default()),
+        budget: Rc::new(Budget {
+            reserved: Cell::new(0),
+        }),
+        signals: Signals {
+            state: Rc::new(Cell::new(ExitSignalState {
+                disposition: ExitSignalDisposition::Caught,
+                blocked: false,
+            })),
+            order: Rc::new(RefCell::new(Vec::new())),
+            work: Rc::new(Work::default()),
+        },
+        autoreap: false,
+        own_usage: TaskRusage {
+            user_time: Duration::from_micros(7),
+            system_time: Duration::from_micros(3),
+        },
+        wake: 12,
+    };
+    let tf_task = GuestTask::new(
+        GuestTaskMetadata {
+            key: key(2, 1),
+            container: (),
+            namespace_pid: 2,
+            identity: TaskIdentity::led_by(key(2, 1).id),
+            namespace_process_group: 2,
+            namespace_session: 2,
+            ruid: Uid(0),
+            euid: Uid(0),
+            exit_signal: ChildExitSignal::SIGCHLD,
+            diagnostic_name: "native_arm_trapframe".into(),
+        },
+        None,
+        returned_tf,
+        tf_native,
+        Claim(Rc::new(Cell::new(0))),
+    );
+    let mut tf_owner =
+        GuestProcessOwner::<(), Uid, Native<carrick_el1_abi::TrapFrame>, Failure>::new();
+    tf_owner.seed_initial(tf_task).unwrap();
+    let tf_row = tf_owner.task(key(2, 1)).unwrap();
+    assert_eq!(tf_row.context().syscall_return(), 99);
+    assert_eq!(tf_row.context().x[0], 99);
 }

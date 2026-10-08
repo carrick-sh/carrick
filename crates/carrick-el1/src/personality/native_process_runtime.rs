@@ -1213,7 +1213,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::drop_non_drop
+)]
 mod tests {
     use super::*;
     use carrick_guest_arch::{ContextGeneration, FrameGpa};
@@ -1345,8 +1350,18 @@ mod tests {
                 && self.mm == address.mm.raw().get()
                 && self.generation == address.generation.raw().get()
         }
-        fn fork_child(self, _: AddressContext<RootGpa>) -> Self {
-            panic!("this admission-only fixture does not implement ARM fork")
+        fn fork_child(mut self, address: AddressContext<RootGpa>) -> Self {
+            self.native = self.native.fork_child(address);
+            self.root = address.root.address().raw();
+            self.mm = address.mm.raw().get();
+            self.generation = address.generation.raw().get();
+            self
+        }
+        fn set_syscall_return(&mut self, value: u64) {
+            self.native.set_syscall_return(value);
+        }
+        fn syscall_return(&self) -> u64 {
+            self.native.syscall_return()
         }
     }
     #[test]
