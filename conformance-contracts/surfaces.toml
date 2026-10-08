@@ -867,6 +867,10 @@ path = "crates/carrick-x86-cpl0/src/lib.rs"
 contracts = ["core.entry.completion"]
 
 [[surfaces]]
+path = "crates/carrick-vmm-kvm/src/vcpu_x86.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
 path = "crates/carrick-cli/tests/x86_kvm_run.rs"
 contracts = ["x86.carrier.cli-run"]
 
