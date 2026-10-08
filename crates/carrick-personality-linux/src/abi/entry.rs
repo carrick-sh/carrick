@@ -105,17 +105,7 @@ pub enum ServedBoundary {
 }
 
 /// Ordinal in the Linux personality's AArch64-shaped dispatch namespace.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(transparent)]
-pub struct CanonicalOrdinal(u64);
-impl CanonicalOrdinal {
-    pub const fn new(raw: u64) -> Self {
-        Self(raw)
-    }
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-}
+pub type CanonicalOrdinal = carrick_syscall_abi::CanonicalNr;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalCall {
     pub isa: carrick_guest_arch::GuestIsa,

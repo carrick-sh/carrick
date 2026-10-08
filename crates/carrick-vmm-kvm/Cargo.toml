@@ -24,6 +24,7 @@ serde_json.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+goblin.workspace = true
 
 [dependencies]
 carrick-guest-arch = { path = "../carrick-guest-arch" }
@@ -78,3 +79,4 @@ zerocopy.workspace = true
 [package.metadata.carrick.test-lanes]
 "*" = "kvm"
 cpl0_image_inputs = "host"
+cpl0_shared_entry = "kvm"

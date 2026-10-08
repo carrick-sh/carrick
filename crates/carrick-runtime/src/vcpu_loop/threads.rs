@@ -1252,6 +1252,7 @@ pub(super) fn wake_removed_persistent_sibling_threads(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod child_tid_owner_tests {
     use super::*;
+    use crate::vcpu_loop::terminal::ProcessExitClaim;
     use carrick_el1::personality::mm_portal::{
         GuestVa as OwnerVa, MmError, MmPortal, TransferIntent,
         test_support::{IPA, NoPin, ROOT, Region, Tables, VA, admit_notified, nodes, residency},

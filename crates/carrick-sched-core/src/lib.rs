@@ -156,41 +156,7 @@ impl RecordId {
     }
 }
 
-/// A vCPU slot (the syscall-mailbox slot index).
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-#[repr(transparent)]
-pub struct SlotId(u8);
-
-impl SlotId {
-    pub const fn new(raw: u8) -> Self {
-        Self(raw)
-    }
-
-    /// A slot from a mailbox slot index; `None` beyond [`ZONE_SLOTS`].
-    pub fn from_index(index: usize) -> Option<Self> {
-        u8::try_from(index).ok().map(Self)
-    }
-
-    pub const fn raw(self) -> u8 {
-        self.0
-    }
-
-    /// `slot + 1`, the encoding of an optional slot in a record word.
-    pub const fn plus_one(self) -> u32 {
-        self.0 as u32 + 1
-    }
-
-    /// The slot a `slot + 1` word names (0: none).
-    pub fn from_plus_one(word: u32) -> Option<Self> {
-        word.checked_sub(1)
-            .and_then(|index| u8::try_from(index).ok())
-            .map(Self)
-    }
-
-    const fn index(self) -> usize {
-        self.0 as usize
-    }
-}
+pub use carrick_guest_arch::SlotId;
 
 /// A vCPU slot's run state, as the other vCPUs see it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -268,13 +234,13 @@ impl Claim {
             Self::Free => STATE_FREE,
             Self::Parked { seq } => STATE_PARKED | ((seq as u64) << 16),
             Self::Queued { slot, seq } => {
-                STATE_QUEUED | ((slot.0 as u64) << 8) | ((seq as u64) << 16)
+                STATE_QUEUED | ((slot.raw() as u64) << 8) | ((seq as u64) << 16)
             }
             Self::OnCpu { slot, seq } => {
-                STATE_ONCPU | ((slot.0 as u64) << 8) | ((seq as u64) << 16)
+                STATE_ONCPU | ((slot.raw() as u64) << 8) | ((seq as u64) << 16)
             }
             Self::OnCpuRequested { slot, seq } => {
-                STATE_ONCPU_REQUESTED | ((slot.0 as u64) << 8) | ((seq as u64) << 16)
+                STATE_ONCPU_REQUESTED | ((slot.raw() as u64) << 8) | ((seq as u64) << 16)
             }
             Self::Host { seq } => STATE_HOST | ((seq as u64) << 16),
             Self::Transferring {
@@ -295,7 +261,7 @@ impl Claim {
 
     pub const fn decode(word: u64) -> Self {
         let seq = (word >> 16) as u32;
-        let slot = SlotId(((word >> 8) & 0xff) as u8);
+        let slot = SlotId::new(((word >> 8) & 0xff) as u8);
         match word & 0xff {
             STATE_PARKED => Self::Parked { seq },
             STATE_QUEUED => Self::Queued { slot, seq },
@@ -1434,7 +1400,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     }
 
     pub fn slot(&self, slot: SlotId) -> &ZoneSlot {
-        &self.slots[slot.0 as usize]
+        &self.slots[slot.index()]
     }
 
     /// A record reference for its current incarnation.

@@ -16,15 +16,19 @@
 //!
 //! Layout:
 //!   * `real` — the genuine `#[usdt::provider]` plus its safe wrappers, compiled
-//!     where usdt can emit probe anchors: `macos` (both arches — the HVF aarch64
-//!     path) and `x86_64` `linux`/`freebsd`. usdt 0.6's SDT backend emits x86
-//!     asm and keys the decision off the BUILD HOST, so an `aarch64`
-//!     `linux`/`freebsd` target cross-built from an x86_64 host would otherwise
-//!     emit `rdi`/`rsi`/… and fail with "invalid register" — those targets take
-//!     the stub instead.
+//!     under `cfg(carrick_usdt_probes)`, which the crate build.rs emits when the
+//!     target is `macos` (both arches — the HVF aarch64 path) or `x86_64`
+//!     `linux`/`freebsd`, AND the build host would make usdt generate code for
+//!     that target. `#[usdt::provider]` is a proc-macro: it and `usdt-impl`
+//!     are compiled for the HOST, and `usdt-impl` 0.6 picks both its backend
+//!     (host `target_os`) and its argument registers (host `target_arch`) from
+//!     that host compilation. A cross check of x86_64 Linux from an aarch64
+//!     Mac therefore expanded to macOS/aarch64 asm and failed with ~900
+//!     "invalid register `x0`" errors. Native builds keep the real provider;
+//!     such cross builds take the stub (see build.rs for the full rule).
 //!   * `stub` — a byte-for-byte signature mirror with empty bodies, compiled on
-//!     every OTHER target (NetBSD, and aarch64 linux/freebsd), which is also
-//!     exactly the set that links NO `usdt` at all. The non-probe
+//!     every OTHER target (NetBSD, aarch64 linux/freebsd, and host-mismatched
+//!     cross builds). The non-probe
 //!     helpers (`guest_mem_probe_points`,
 //!     `guest_mem_copy`, `guest_mem_point`) carry their REAL bodies in BOTH arms
 //!     so behaviour is identical regardless of platform.
@@ -194,21 +198,9 @@ impl HostProcessBirth {
     }
 }
 
-#[cfg(any(
-    target_os = "macos",
-    all(
-        any(target_os = "linux", target_os = "freebsd"),
-        target_arch = "x86_64"
-    )
-))]
+#[cfg(carrick_usdt_probes)]
 pub use real::*;
-#[cfg(not(any(
-    target_os = "macos",
-    all(
-        any(target_os = "linux", target_os = "freebsd"),
-        target_arch = "x86_64"
-    )
-)))]
+#[cfg(not(carrick_usdt_probes))]
 pub use stub::*;
 
 #[derive(Clone, Copy, Debug)]
@@ -4930,13 +4922,7 @@ mod native_owned_range_probe_abi {
     }
 }
 
-#[cfg(any(
-    target_os = "macos",
-    all(
-        any(target_os = "linux", target_os = "freebsd"),
-        target_arch = "x86_64"
-    )
-))]
+#[cfg(carrick_usdt_probes)]
 mod real {
     //! THEORY OF OPERATION
     //!
@@ -9057,13 +9043,7 @@ mod real {
     }
 }
 
-#[cfg(not(any(
-    target_os = "macos",
-    all(
-        any(target_os = "linux", target_os = "freebsd"),
-        target_arch = "x86_64"
-    )
-)))]
+#[cfg(not(carrick_usdt_probes))]
 mod stub {
     //! No-op probe surface for the targets that link no `usdt` at all — NetBSD,
     //! plus aarch64 linux/freebsd (see the module header: usdt 0.6's SDT backend

@@ -8,10 +8,13 @@ fn main() {}
 // Cargo compiles this source as two distinct targets. The fixture target is
 // the only image that can dispatch synthetic observation syscalls. The const
 // predicate is folded before production linking, so those leaves are absent
-// from the ordinary carrick-x86-cpl0 image.
+// from the ordinary carrick-x86-cpl0 image. Every fixture dispatch branch
+// passes through the same retained, high-entropy witness.
 #[cfg(target_os = "none")]
-const fn fixture_image() -> bool {
-    fixture_expr!(true)
+macro_rules! fixture_dispatch_enabled {
+    () => {
+        fixture_expr!(crate::carrick_x86_fixture_dispatch_witness())
+    };
 }
 
 #[cfg(target_os = "none")]
@@ -27,6 +30,21 @@ mod native_irq;
 fixture_items! {
     #[cfg(target_os = "none")]
     mod progress;
+}
+fixture_items! {
+    #[cfg(target_os = "none")]
+    #[unsafe(no_mangle)]
+    static CARRICK_X86_FIXTURE_DISPATCH_WITNESSES: [u64; 2] =
+        [0x7bd6_8a91_c4e2_5f03, 0xa239_4c7d_8e15_b6f0];
+
+    #[cfg(target_os = "none")]
+    #[unsafe(no_mangle)]
+    #[inline(never)]
+    fn carrick_x86_fixture_dispatch_witness() -> bool {
+        // A volatile read keeps the fixture-only witness in the linked image.
+        (unsafe { core::ptr::read_volatile(core::ptr::addr_of!(CARRICK_X86_FIXTURE_DISPATCH_WITNESSES).cast::<u64>()) })
+            == 0x7bd6_8a91_c4e2_5f03
+    }
 }
 fixture_items! {
     #[cfg(target_os = "none")]
@@ -382,21 +400,110 @@ mod kernel {
     }
     use super::adapter::*;
     use carrick_el1::lock::SpinLock;
-    use carrick_el1::personality::common_entry::{
-        EntryOutcome, serve_canonical, serve_canonical_with_native,
-    };
     use carrick_el1::personality::thread_setup::GuestLifecycleVenue;
-    use carrick_el1_abi::{Counters, CurrentTask};
-    use carrick_guest_arch::InterruptArch;
+    use carrick_el1::personality::{dispatch, sched};
+    use carrick_el1_abi::{Counters, CurrentTask, InotifyNameCache};
+    use carrick_guest_arch::{CanonicalNr, InterruptArch, LayoutBackend, NativeReturnWord, SyscallFrame, UserVa};
+    use carrick_x86_cpl0::ProductionBoundary;
     fixture_items! { use carrick_guest_arch::EntryArch; }
     fixture_items! { use core::sync::atomic::AtomicU64; }
     use core::sync::atomic::Ordering;
+
+    struct NativeDispatch<'a> {
+        frame: &'a mut NativeFrame,
+        call: carrick_personality_linux::entry::CanonicalCall,
+        publications: &'a core::sync::atomic::AtomicU64,
+        slot: Option<carrick_guest_arch::SlotId>,
+    }
+
+    impl SyscallFrame for NativeDispatch<'_> {
+        fn canonical_ordinal(&self) -> CanonicalNr { self.call.canonical }
+        fn argument(&self, index: usize) -> Option<u64> { self.call.args.get(index).copied() }
+        fn result(&self) -> NativeReturnWord { NativeReturnWord(self.frame.rax) }
+        fn set_result(&mut self, result: NativeReturnWord) { self.frame.rax = result.0; }
+        fn slot(&self) -> Option<carrick_guest_arch::SlotId> { self.slot }
+        // The retained metadata stores task records at an ISA-specific stride;
+        // this call projects only the authenticated current task as a slice.
+        fn task_index(&self) -> usize { if self.slot.is_some() { 0 } else { usize::MAX } }
+        fn user_sp(&self) -> Option<UserVa> { Some(self.call.stack) }
+    }
+    impl dispatch::GuestDispatchFrame for NativeDispatch<'_> {
+        fn arm_frame(&mut self) -> Option<&mut carrick_el1_abi::TrapFrame> { None }
+        fn arm_frame_ref(&self) -> Option<&carrick_el1_abi::TrapFrame> { None }
+        fn arm_scheduler(&self) -> bool { false }
+        fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
+            Some(self.publications)
+        }
+        fn record_isa_unsupported_forward(&self) {
+            CARRICK_CPL0_ISA_UNSUPPORTED_FORWARDS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    static EMPTY_NAME_CACHE: InotifyNameCache = InotifyNameCache::new();
 
     // Count native exits across CPL0 CPUs for image/link and live diagnostics.
     // A port write exits the VM, so no lock may remain held across it: another
     // CPU can enter and need the same lock before the first CPU resumes.
     #[unsafe(no_mangle)]
     pub static CARRICK_CPL0_DOORBELL_COUNT: SpinLock<u64> = SpinLock::new(0);
+
+    /// Refusals caused by an ARM-only saved-frame leaf, distinct from Linux
+    /// semantic forwards and from absent file/IPC/MM venues.
+    #[unsafe(no_mangle)]
+    pub static CARRICK_CPL0_ISA_UNSUPPORTED_FORWARDS: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+
+    /// Host crossings allowed to leave CPL0 as forwards.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[repr(u64)]
+    pub enum AllowedHostCrossing {
+        Read = 0,
+        Write = 1,
+        Lseek = 8,
+        Pread64 = 17,
+        Pwrite64 = 18,
+        Exit = 60,
+        ExitGroup = 231,
+        EpollPwait = 281,
+    }
+
+    impl AllowedHostCrossing {
+        pub const fn from_native(native: u64) -> Option<Self> {
+            match native {
+                0 => Some(Self::Read),
+                1 => Some(Self::Write),
+                8 => Some(Self::Lseek),
+                17 => Some(Self::Pread64),
+                18 => Some(Self::Pwrite64),
+                60 => Some(Self::Exit),
+                231 => Some(Self::ExitGroup),
+                281 => Some(Self::EpollPwait),
+                _ => None,
+            }
+        }
+    }
+
+    fn record_refusal(counters: &Counters, frame: &mut NativeFrame, native: Option<u64>) {
+        frame.rax = (-38_i64) as u64;
+        let bucket = match native {
+            Some(nr) if nr < 512 => {
+                match carrick_syscall_abi::syscall_x86_64::lookup_x86_64(nr) {
+                    Some(entry)
+                        if !matches!(
+                            entry.remap,
+                            carrick_syscall_abi::syscall_x86_64::SyscallRemap::Unknown
+                                | carrick_syscall_abi::syscall_x86_64::SyscallRemap::Private(_)
+                        ) =>
+                    {
+                        nr as usize
+                    }
+                    _ => 512,
+                }
+            }
+            _ => 512,
+        };
+        counters.refused[bucket].fetch_add(1, Ordering::Relaxed);
+    }
 
     // The KVM fault fixture owns one exact MM and one host-backed prepared
     // page. These records stay live across the native syscall boundary.
@@ -1077,12 +1184,12 @@ mod kernel {
                 halt();
             }
         } }
-        if crate::fixture_image() && frame.rax == OBSERVE_NATIVE {
+        fixture_stmt! { if frame.rax == OBSERVE_NATIVE && fixture_dispatch_enabled!() {
             doorbell(CONTROL_PORT, frame);
             frame.rax = 0;
             return;
-        }
-        if crate::fixture_image() && frame.rax == OBSERVE_INITIAL_MM {
+        } }
+        if fixture_dispatch_enabled!() && frame.rax == OBSERVE_INITIAL_MM {
             use carrick_el1::isa::x86::initial_mm::{
                 InitialImageRegion, InitialImageSpec, InitialSourceRange, InitialStackSpec,
                 install_initial_image,
@@ -1193,8 +1300,7 @@ mod kernel {
             frame.rax = 0;
             return;
         }
-        if crate::fixture_image()
-            && frame.rax == 231
+        if fixture_dispatch_enabled!() && frame.rax == 231
             && carrick_el1::isa::x86::hardware_live_root()
                 .is_ok_and(|root| matches!(root.address().raw(), 0xd3_0000 | 0x30_0000))
         {
@@ -1203,13 +1309,13 @@ mod kernel {
             doorbell(CONTROL_PORT, frame);
             return;
         }
-        if crate::fixture_image() && frame.rax == OBSERVE_MMU_ROOT {
+        if fixture_dispatch_enabled!() && frame.rax == OBSERVE_MMU_ROOT {
             use carrick_guest_arch::MmuBackend;
             let mut arch = carrick_el1::isa::x86::X86Backend;
             frame.rax = arch.live_root().map_or(0, |root| root.address().raw());
             return;
         }
-        if crate::fixture_image() && frame.rax == OBSERVE_PORTAL_WINDOW {
+        if fixture_dispatch_enabled!() && frame.rax == OBSERVE_PORTAL_WINDOW {
             let root =
                 carrick_el1::isa::x86::hardware_live_root().map_or(0, |root| root.address().raw());
             frame.rax = u64::from(
@@ -1218,7 +1324,7 @@ mod kernel {
             );
             return;
         }
-        if crate::fixture_image() && frame.rax == OBSERVE_FORK_TABLE_WINDOW {
+        if fixture_dispatch_enabled!() && frame.rax == OBSERVE_FORK_TABLE_WINDOW {
             use carrick_el1::isa::x86::ForkDescriptorWords;
             use carrick_el1_abi::PortalForkTableArena;
             use carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords;
@@ -1243,7 +1349,7 @@ mod kernel {
             );
             return;
         }
-        if crate::fixture_image() && frame.rax == OBSERVE_RETIRE_REPOINT {
+        if fixture_dispatch_enabled!() && frame.rax == OBSERVE_RETIRE_REPOINT {
             use carrick_guest_arch::{
                 EditBacking, EditCowAccess, EditOperation, EditPermissions, FrameGpa, GuestLen,
                 UserRange, UserVa,
@@ -1309,7 +1415,7 @@ mod kernel {
             frame.rax = u64::from(repointed);
             return;
         }
-        if crate::fixture_image() && frame.rax == OBSERVE_MMU_DRAIN {
+        if fixture_dispatch_enabled!() && frame.rax == OBSERVE_MMU_DRAIN {
             use carrick_guest_arch::{
                 AddressContext, ContextGeneration, FrameGpa, GuestLen, MmGeneration, MmuBackend,
                 RootGpa, UserRange, UserVa,
@@ -1333,7 +1439,7 @@ mod kernel {
                 .map_or(u64::MAX, |receipt| receipt.root().address().raw());
             return;
         }
-        if crate::fixture_image() && frame.rax == OBSERVE_DESCRIPTOR_PROTECT {
+        if fixture_dispatch_enabled!() && frame.rax == OBSERVE_DESCRIPTOR_PROTECT {
             use carrick_guest_arch::{
                 EditBacking, EditOperation, EditPermissions, FrameGpa, GuestLen, UserRange, UserVa,
             };
@@ -1391,7 +1497,7 @@ mod kernel {
             };
             return;
         }
-        if crate::fixture_image() && frame.rax == OBSERVE_DESCRIPTOR_PREPARE_PUBLISH {
+        if fixture_dispatch_enabled!() && frame.rax == OBSERVE_DESCRIPTOR_PREPARE_PUBLISH {
             use carrick_core::mm::transfer::resolver::PreparedPageResolver;
             use carrick_guest_arch::{
                 EditBacking, EditLeafSize, EditOperation, EditPermissions, FrameGpa,
@@ -1729,7 +1835,7 @@ mod kernel {
             return;
         }
         }
-        if crate::fixture_image() && frame.rax == OBSERVE_ALLOCATOR {
+        if fixture_dispatch_enabled!() && frame.rax == OBSERVE_ALLOCATOR {
             let layout = match core::alloc::Layout::from_size_align(128, 64) {
                 Ok(layout) => layout,
                 Err(_) => {
@@ -1762,13 +1868,14 @@ mod kernel {
         let task = unsafe { &*(binding.task_address as *const CurrentTask) };
         let counters = unsafe { &*(binding.counters_address as *const Counters) };
         let _user_fault_gate = super::user_fault_gate::install();
-        if crate::fixture_image()
-            && frame.rax == carrick_el1::isa::x86::user_access::USER_ACCESS_WITNESS
-        {
+        if fixture_dispatch_enabled!()
+            && frame.rax == carrick_el1::isa::x86::user_access::USER_ACCESS_WITNESS {
             frame.rax = carrick_el1::isa::x86::user_access::witness(task, frame.rdi, frame.rsi);
             return;
         }
-        if crate::fixture_image() && frame.rax == OBSERVE_CPL0_UACCESS_SHOOTDOWN {
+        if fixture_dispatch_enabled!()
+            && frame.rax == OBSERVE_CPL0_UACCESS_SHOOTDOWN
+        {
             let address = frame.rdi;
             let word1 = carrick_el1::isa::x86::user_access::witness(task, address, 6);
             if word1 as i64 == -14 {
@@ -1782,19 +1889,18 @@ mod kernel {
             doorbell(FORWARD_PORT, frame);
             return;
         }
-        if crate::fixture_image()
-            && frame.rax == carrick_el1::isa::x86::transport::TRANSPORT_WITNESS
-        {
+        if fixture_dispatch_enabled!()
+            && frame.rax == carrick_el1::isa::x86::transport::TRANSPORT_WITNESS {
             frame.rax = carrick_el1::isa::x86::transport::witness(frame.rdi);
             return;
         }
-        if crate::fixture_image() && frame.rax == carrick_el1::isa::x86::context::CONTEXT_WITNESS {
+        if fixture_dispatch_enabled!()
+            && frame.rax == carrick_el1::isa::x86::context::CONTEXT_WITNESS {
             frame.rax = carrick_el1::isa::x86::context::witness(frame.rdi);
             return;
         }
-        if crate::fixture_image()
-            && frame.rax == carrick_el1::isa::x86::interrupt::INTERRUPT_WITNESS
-        {
+        if fixture_dispatch_enabled!()
+            && frame.rax == carrick_el1::isa::x86::interrupt::INTERRUPT_WITNESS {
             frame.rax = carrick_el1::isa::x86::interrupt::witness(frame.rdi, frame.rsi);
             return;
         }
@@ -1808,7 +1914,19 @@ mod kernel {
         }
         let Some(call) = carrick_personality_linux::entry::decode_x86_snapshot(frame.snapshot())
         else {
-            doorbell(FORWARD_PORT, frame);
+            record_refusal(counters, frame, None);
+            binding.completions.fetch_add(1, Ordering::Relaxed);
+            fixture_stmt! { if binding.scheduler_witness.load(Ordering::Acquire)
+                == super::scheduler::PROGRESS_STATE {
+                super::progress::return_boundary();
+            } }
+            if binding.return_kick.swap(0, Ordering::AcqRel) != 0 {
+                doorbell(RETURN_KICK_PORT, frame);
+            }
+            if task.linux.has_pending_host_work() {
+                task.linux.record_completed_with_work();
+                doorbell(WORK_PORT, frame);
+            }
             return;
         };
         binding
@@ -1871,18 +1989,34 @@ mod kernel {
             }
         });
         if !handled_by_fixture {
+            use carrick_personality_linux::dispatch::CompletionRoute;
+            let layout = <carrick_el1::isa::x86::X86Backend as LayoutBackend>::KERNEL_LAYOUT;
+            let cache_lookup = |handle: u32| {
+                handle.checked_sub(1).and_then(|index| {
+                    u64::from(index).checked_mul(carrick_el1_abi::DELEGATED_FILE_MAX_SIZE)
+                }).and_then(|offset| {
+                    layout.region.raw().checked_add(carrick_el1_abi::EL1_CACHE_OFFSET)?.checked_add(offset)
+                }).map_or(core::ptr::null_mut(), |address| address as *mut u8)
+            };
             let mut root_exit = None;
-            let outcome = if crate::fixture_image() {
-                serve_canonical(
-                    &call,
-                    counters,
-                    task,
-                    &GuestLifecycleVenue,
-                    Some(&binding.publications),
-                )
+            let route = if fixture_dispatch_enabled!() {
+                let mut native = NativeDispatch {
+                    frame, call, publications: &binding.publications,
+                    slot: carrick_guest_arch::SlotId::from_index(binding.cpu_slot as usize),
+                };
+                match carrick_x86_cpl0::production_boundary(dispatch::dispatch_syscall_with_lifecycle(
+                    &mut native, counters, core::slice::from_ref(task),
+                    &[], &[], &[], &[], &EMPTY_NAME_CACHE,
+                    None::<dispatch::Zone<'_, sched::HardwareCpu, sched::HardwareUserWord>>,
+                    None, Some(&GuestLifecycleVenue), None, cache_lookup,
+                )) {
+                    ProductionBoundary::Continue => CompletionRoute::Served,
+                    ProductionBoundary::Work => CompletionRoute::WithWork,
+                    ProductionBoundary::Forward => CompletionRoute::Forward,
+                    ProductionBoundary::Invalid => CompletionRoute::InvalidCompletion,
+                }
             } else {
-                let mut anonymous =
-                    anonymous::X86AnonymousVenue::new(&call, task, binding.cpu_slot, frame.rcx);
+                let mut anonymous = anonymous::X86AnonymousVenue::new(&call, task, binding.cpu_slot, frame.rcx);
                 let slot = checked_scheduler_slot(carrick_guest_arch::CpuId::new(binding.cpu_slot))
                     .unwrap_or_else(|| initial_boot::fatal_boot());
                 let source = native_execution::source(slot);
@@ -1890,59 +2024,57 @@ mod kernel {
                 native_process::admit_root(words, source, task)
                     .unwrap_or_else(|_| initial_boot::fatal_boot());
                 let mut service = native_process::Service::new(task, slot);
-                let outcome = {
-                    let mut process = native_process::runtime()
-                        .enter(source, task, words, &mut service)
+                let route = {
+                    let mut process = native_process::runtime().enter(source, task, words, &mut service)
                         .unwrap_or_else(|_| initial_boot::fatal_boot());
-                    let outcome = serve_canonical_with_native(
-                        &call,
-                        counters,
-                        task,
-                        &GuestLifecycleVenue,
-                        Some(&binding.publications),
-                        &mut anonymous,
-                        &mut process,
-                        source,
+                    let mut native = NativeDispatch {
+                        frame, call, publications: &binding.publications,
+                        slot: carrick_guest_arch::SlotId::from_index(binding.cpu_slot as usize),
+                    };
+                    let route = dispatch::dispatch_syscall_with_native(
+                        &mut native, counters, core::slice::from_ref(task),
+                        &[], &[], &[], &[], &EMPTY_NAME_CACHE,
+                        None::<dispatch::Zone<'_, sched::HardwareCpu, sched::HardwareUserWord>>,
+                        None, Some(&GuestLifecycleVenue), Some(&mut process),
+                        Some(source), Some(&mut anonymous), cache_lookup,
                     );
                     root_exit = process.take_root_exit();
-                    outcome
+                    route
                 };
                 native_execution::migrate(slot);
-                outcome
+                route
             };
-            match outcome {
-                EntryOutcome::Served { result } | EntryOutcome::ServedWithWork { result } => {
-                    frame.rax = result.raw() as u64;
-                }
-                EntryOutcome::Suspended => {
+            match route {
+                CompletionRoute::Served => {}
+                CompletionRoute::WithWork => doorbell(WORK_PORT, frame),
+                CompletionRoute::Suspended => {
                     drop(_user_fault_gate);
                     if let Some(status) = root_exit {
                         let exit = carrick_el1_abi::X86NativeRootExit::new(
-                            carrick_el1::personality::common_entry::execution_binding(task),
-                            status,
-                        )
-                        .unwrap_or_else(|| initial_boot::fatal_boot());
-                        // SAFETY: authenticated shared retirement completed;
-                        // this is an opaque physical VM completion crossing.
+                            carrick_el1::personality::common_entry::execution_binding(task), status,
+                        ).unwrap_or_else(|| initial_boot::fatal_boot());
+                        // SAFETY: shared retirement authenticated this physical VM completion.
                         unsafe {
                             core::arch::asm!("out dx, al",
-                            in("dx") carrick_el1_abi::X86_NATIVE_ROOT_EXIT_PORT,
-                            in("rax") &exit as *const _ as u64,
-                            options(nostack, preserves_flags));
+                                in("dx") carrick_el1_abi::X86_NATIVE_ROOT_EXIT_PORT,
+                                in("rax") &exit as *const _ as u64,
+                                options(nostack, preserves_flags));
                         }
                         halt();
                     }
-                    let slot =
-                        checked_scheduler_slot(carrick_guest_arch::CpuId::new(binding.cpu_slot))
-                            .unwrap_or_else(|| initial_boot::fatal_boot());
+                    let slot = checked_scheduler_slot(carrick_guest_arch::CpuId::new(binding.cpu_slot))
+                        .unwrap_or_else(|| initial_boot::fatal_boot());
                     native_execution::schedule(slot);
                 }
-                EntryOutcome::InvalidCompletion => {
-                    doorbell(FATAL_PORT, frame);
-                    halt();
+                CompletionRoute::InvalidCompletion => {
+                    doorbell(FATAL_PORT, frame); halt();
                 }
-                EntryOutcome::Forward => {
-                    doorbell(FORWARD_PORT, frame);
+                CompletionRoute::Forward => {
+                    if AllowedHostCrossing::from_native(call.native.raw()).is_some() {
+                        doorbell(FORWARD_PORT, frame);
+                    } else {
+                        record_refusal(counters, frame, Some(call.native.raw()));
+                    }
                 }
             }
         }

@@ -4,7 +4,7 @@
 
 pub const X86_INITIAL_BOOT_MAGIC: u64 = u64::from_le_bytes(*b"CXRUN001");
 pub const X86_INITIAL_BOOT_VERSION: u32 = 3;
-pub const X86_INITIAL_BOOT_HEADER_GPA: u64 = 0x1e_0000;
+pub const X86_INITIAL_BOOT_HEADER_GPA: u64 = 0x10_1000;
 pub const X86_INITIAL_BOOT_PORT: u16 = 0xc6;
 pub const X86_INITIAL_MAX_REGIONS: usize = 32;
 pub const X86_INITIAL_MAX_STRINGS: usize = 256;

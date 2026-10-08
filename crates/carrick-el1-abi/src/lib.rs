@@ -496,6 +496,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(Counters, fault_taken) as u64,
         core::mem::offset_of!(Counters, ipc_leaves) as u64,
         core::mem::offset_of!(Counters, anonymous_leaves) as u64,
+        core::mem::offset_of!(Counters, refused) as u64,
         core::mem::size_of::<CurrentTask>() as u64,
         core::mem::offset_of!(CurrentTask, linux.file_table) as u64,
         core::mem::offset_of!(CurrentTask, linux.pending_host_work) as u64,
@@ -714,6 +715,28 @@ pub struct TrapFrame {
     pub slot: u64,
     /// Fault Address Register (FAR_EL1) for data/instruction aborts.
     pub far: u64,
+}
+impl carrick_guest_arch::SyscallFrame for TrapFrame {
+    fn canonical_ordinal(&self) -> carrick_guest_arch::CanonicalNr {
+        carrick_guest_arch::CanonicalNr::new(self.x[8])
+    }
+    fn argument(&self, index: usize) -> Option<u64> {
+        self.x.get(index).copied()
+    }
+    fn result(&self) -> carrick_guest_arch::NativeReturnWord {
+        carrick_guest_arch::NativeReturnWord(self.x[0])
+    }
+    fn set_result(&mut self, result: carrick_guest_arch::NativeReturnWord) {
+        self.x[0] = result.0;
+    }
+    fn slot(&self) -> Option<carrick_guest_arch::SlotId> {
+        usize::try_from(self.slot)
+            .ok()
+            .and_then(carrick_guest_arch::SlotId::from_index)
+    }
+    fn user_sp(&self) -> Option<carrick_guest_arch::UserVa> {
+        None
+    }
 }
 const _: () = {
     assert!(core::mem::offset_of!(TrapFrame, x) == 0);
@@ -1859,6 +1882,10 @@ pub struct Counters {
     /// Delegated-MM anonymous calls EL1 left for the host, by
     /// [`AnonymousLeave`].
     pub anonymous_leaves: [AtomicU64; AnonymousLeave::COUNT],
+    /// Syscall refusals answering -ENOSYS directly from kernel entry, indexed
+    /// by native ordinal 0..512 plus one overflow bucket for values >= 512
+    /// and unmapped/undecodable natives.
+    pub refused: [AtomicU64; 513],
 }
 
 impl Counters {
@@ -1872,6 +1899,7 @@ impl Counters {
             ipc_leaves: [const { AtomicU64::new(0) }; IpcLeave::COUNT],
             lifecycle_declines: [const { AtomicU64::new(0) }; LifecycleDecline::COUNT],
             anonymous_leaves: [const { AtomicU64::new(0) }; AnonymousLeave::COUNT],
+            refused: [const { AtomicU64::new(0) }; 513],
         }
     }
 
@@ -1913,6 +1941,9 @@ impl Counters {
                 self.anonymous_leaves[i].load(Ordering::Relaxed),
                 Ordering::Relaxed,
             );
+        }
+        for i in 0..513 {
+            snapshot.refused[i].store(self.refused[i].load(Ordering::Relaxed), Ordering::Relaxed);
         }
         snapshot
     }
@@ -3122,7 +3153,7 @@ impl Default for InotifyNameCache {
     }
 }
 
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x3ff0_698f_9f1a_67f1);
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x6c47_2801_7fe6_f330);
 
 #[cfg(test)]
 mod tests {
@@ -3203,7 +3234,8 @@ mod tests {
                 + El1ExitReason::COUNT
                 + IpcLeave::COUNT
                 + LifecycleDecline::COUNT
-                + AnonymousLeave::COUNT)
+                + AnonymousLeave::COUNT
+                + 513)
                 * 8
         );
         assert_eq!(core::mem::offset_of!(Counters, served), 0);
@@ -3217,6 +3249,17 @@ mod tests {
         assert_eq!(
             core::mem::offset_of!(Counters, exit_reasons),
             (1024 + 32 + 1) * 8
+        );
+        assert_eq!(
+            core::mem::offset_of!(Counters, refused),
+            (1024
+                + 32
+                + 1
+                + El1ExitReason::COUNT
+                + IpcLeave::COUNT
+                + LifecycleDecline::COUNT
+                + AnonymousLeave::COUNT)
+                * 8
         );
     }
 

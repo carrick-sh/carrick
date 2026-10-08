@@ -377,7 +377,7 @@ fn runner_death_with_admission(
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let (alive, release) = observe_exclusion(
-                || libc::kill(pid, 0) == 0,
+                || is_process_alive(pid),
                 || libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB),
             );
             assert!(
@@ -416,6 +416,8 @@ fn fork_fixture_rejects_abnormal_fork_exit() {
         .env("CARRICK_HOST_LEASE_PATH", lock.path())
         .env("CARRICK_LEASE_READY", ready.path())
         .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -434,9 +436,19 @@ fn fork_fixture_rejects_abnormal_fork_exit() {
     // SAFETY: the fixture retains and reaps this exact child until stdin EOF.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
     drop(fixture.stdin.take());
+    let output = fixture.wait_with_output().unwrap();
     assert!(
-        !fixture.wait().unwrap().success(),
+        !output.status.success(),
         "fixture accepted a SIGKILLed fork as normal completion"
+    );
+    let combined_output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined_output.contains("fork did not exit normally: 9"),
+        "{combined_output}"
     );
 }
 
@@ -590,21 +602,16 @@ fn cancellation_preserves_another_checkout_with_identical_command() {
     victim.runner.wait().unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        // SAFETY: liveness probes for exact PIDs recorded by both fixtures.
-        unsafe {
-            assert_eq!(
-                libc::kill(other.pids[0], 0),
-                0,
-                "cancellation selected another checkout's fork"
-            );
-            assert_eq!(
-                libc::kill(other.pids[1], 0),
-                0,
-                "cancellation selected another checkout's test process"
-            );
-            if libc::kill(victim.pids[0], 0) < 0 && libc::kill(victim.pids[1], 0) < 0 {
-                break;
-            }
+        assert!(
+            is_process_alive(other.pids[0]),
+            "cancellation selected another checkout's fork"
+        );
+        assert!(
+            is_process_alive(other.pids[1]),
+            "cancellation selected another checkout's test process"
+        );
+        if !is_process_alive(victim.pids[0]) && !is_process_alive(victim.pids[1]) {
+            break;
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -742,4 +749,132 @@ fn release_between_observations_is_detected() {
         || if released.get() { 0 } else { -1 },
     );
     assert!(alive && release == 0, "missed release while workload alive");
+}
+
+#[cfg(target_os = "macos")]
+fn is_process_alive(pid: libc::pid_t) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: correctly sized proc_bsdinfo output buffer.
+    // arg=1 includes zombies so we can distinguish dead zombies from live processes.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            1,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if got == size {
+        let info = unsafe { info.assume_init() };
+        info.pbi_status != libc::SZOMB
+    } else {
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_process_alive(pid: libc::pid_t) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some(after_comm) = stat.rfind(')').and_then(|idx| stat.get(idx + 1..)) else {
+        return false;
+    };
+    let Some(state) = after_comm.split_whitespace().next() else {
+        return false;
+    };
+    state != "Z"
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn is_process_alive(pid: libc::pid_t) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[test]
+fn zombie_process_is_reported_dead_by_liveness_helper() {
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork failed");
+    if pid == 0 {
+        // Child exits immediately to become a zombie.
+        unsafe { libc::_exit(0) };
+    }
+    // Parent does NOT waitpid yet.
+    // Wait until the child has exited and entered zombie state,
+    // detected by observing its status through the platform API (not by sleeping).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        #[cfg(target_os = "macos")]
+        {
+            let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+            let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+            let got = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    1,
+                    info.as_mut_ptr().cast(),
+                    size,
+                )
+            };
+            if got == size && unsafe { info.assume_init() }.pbi_status == libc::SZOMB {
+                break;
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                if let Some(after_comm) = stat.rfind(')').and_then(|idx| stat.get(idx + 1..)) {
+                    if after_comm.split_whitespace().next() == Some("Z") {
+                        break;
+                    }
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        break;
+
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for child {pid} to enter zombie state"
+        );
+        std::hint::spin_loop();
+    }
+
+    // The OLD probe (kill(pid, 0) == 0) erroneously reports the zombie as alive.
+    let old_probe_alive = unsafe { libc::kill(pid, 0) == 0 };
+    assert!(
+        old_probe_alive,
+        "old kill(pid, 0) probe must report zombie process {pid} as alive"
+    );
+
+    // The NEW helper must report the zombie as dead.
+    assert!(
+        !is_process_alive(pid),
+        "new liveness helper must report zombie process {pid} as dead"
+    );
+
+    // Finally reap it.
+    let mut status = 0;
+    let reaped = unsafe { libc::waitpid(pid, &mut status, 0) };
+    assert_eq!(reaped, pid, "failed to reap child process {pid}");
+    assert!(
+        !is_process_alive(pid),
+        "reaped process must be reported dead"
+    );
+    assert!(
+        unsafe { libc::kill(pid, 0) != 0 },
+        "reaped process must return ESRCH from kill(pid, 0)"
+    );
 }
