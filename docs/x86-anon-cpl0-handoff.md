@@ -1,5 +1,44 @@
 # x86 anonymous CPL0 handoff (partial, 2026-10-07)
 
+## Fresh continuation: real launch namespace boundary (2026-10-08)
+
+4627454b7 boots the production CPL0 launch dispatcher in a fresh private
+Kernel over the actual prepared Container. Both host and memory rootfs
+preparation use this constructor before credential/filesystem/stdio setup.
+It never constructs a reference-model Container for this lane and never
+boots a RuntimeCarrier kernel root or an HvpatchRuntimeDirectory. Other
+lanes retain their existing adapter. One shared bootstrap helper retains
+the existing host identity query; failed PID conversion refuses rather
+than substituting PID1.
+
+The exact-Container assertion fails through the old constructor in
+`/tmp/x86-launch-container-red.log`. The final focused test passes in
+`/tmp/x86-real-launch-final-unit.log`, with a real private namespace and
+namespace PID1/group1/session1. The production two-MM witness still fails
+at fork exit91, with native Q/exit7, in
+`/tmp/x86-real-launch-two-mm-red.log`. That production receipt predates the
+final shared-bootstrap helper consolidation; no final runtime green is
+claimed. The extended test's first compile failure called registry methods
+on Kernel and is retained in `/tmp/x86-launch-container-final-green.log`;
+it is not semantic red evidence.
+
+The director's root-scope choice is resolved: adopt the real launch resources
+into this per-VM Kernel, export the identity seed once through one typed,
+counted crossing, then refuse and count every host identity allocation for
+that VM. Do not use/split RuntimeCarrier population or create an HVPatch
+directory. Keep host files behind FileTableId, with (FileTableId, fd)
+forwards and actual FileTable copy/share primitives. VM-qualify MM/serial
+crossings; leave CARRIER_MM_IDS and global file-description counters alone.
+
+Next: finish resource adoption and the one-way identity export/refusal,
+delete production task41/generation11/thread101/PID41, bind native shared
+birth/wait/exit custody and CPU1, import initial ELF/stack reservations and
+residency, and inherit per-MM private/COW leaves through InitialWords and
+the sole production #PF. The namespace boundary is only a first step. No
+two-MM green, final gates, push, draft PR or review-ready claim belongs to
+this checkpoint. No Docker, signed/HVF test or load generator was run.
+The pre-existing arena prefork red remains separately owned.
+
 ## Current continuation checkpoint (2026-10-07)
 
 Guest payload adapter d5157d2c2 and the exactly restored two-MM witness
