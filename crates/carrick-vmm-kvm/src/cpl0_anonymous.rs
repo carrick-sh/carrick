@@ -640,7 +640,14 @@ impl Cpl0HostCustody {
             request.child_bytes,
             request.parent_bytes,
         ) {
+            let metadata = carrick_el1_abi::X86ForkMetadataSpan::new(
+                FrameGpa::new(META_GPA + 0x4000),
+                KernelVa::new(METADATA_VA + 0x4000),
+                0x4000,
+            )
+            .ok_or_else(|| fail("physical fork lifecycle extent"))?;
             let lifecycle = X86ForkLifecycleLoan::new(
+                metadata,
                 KernelVa::new(METADATA_VA + 0x4000),
                 KernelVa::new(METADATA_VA + 0x5000),
             )
