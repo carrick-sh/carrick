@@ -2,7 +2,7 @@
 //!
 //! Provides the Linux/KVM VMM backend for carrick. The aarch64 lane owns the
 //! KVM machine/vCPU wrappers and aarch64-specific bring-up/trap pieces; the
-//! x86_64 lane plugs KVM into the shared `carrick-x86` engine. All hypervisor
+//! x86_64 lane runs the shared kernel at CPL0. All hypervisor
 //! code is `cfg(target_os = "linux")`; on any other host this crate is
 //! intentionally empty.
 //!
@@ -32,8 +32,8 @@ pub mod timer_delivery;
 
 // aarch64-only modules: the MMIO-sentinel trap engine and the aarch64 standalone
 // run-elf loop all use ARM-specific KVM APIs (KVM_GET/SET_ONE_REG, ARM sysregs,
-// EL1 vector, vDSO vvar) that do not exist on x86_64.  The x86_64 analogues live
-// in the cfg(x86_64) stubs below.
+// EL1 vector, vDSO vvar) that do not exist on x86_64. The x86 carrier
+// modules below boot the shared kernel at CPL0.
 // The KVM aarch64 lane on the shared `carrick-aarch64` scaffold (Stage 2-KVM):
 // `KvmAarch64Vmm`/`impl Aarch64Vcpu for KvmVcpu` + `bring_up` →
 // `Aarch64EngineCore<KvmAarch64Vmm>`. Replaces the hand-rolled `KvmTrapEngine`.
@@ -69,14 +69,6 @@ pub mod cpl0_boot;
 #[cfg(target_arch = "x86_64")]
 pub mod carrier_interrupts;
 
-// x86_64 KVM backend modules.
-// Compiled only on Linux x86_64 — invisible to the aarch64 build.
+// Register-only KVM adapter used by shared-kernel carrier CPUs.
 #[cfg(target_arch = "x86_64")]
-pub mod guest_setup_x86;
-// The KVM x86 lane on the shared `carrick-x86` scaffold (portability S4-KVM):
-// `KvmVmm`/`impl X86Vcpu for KvmVcpu` + `bring_up` → `X86EngineCore<KvmVmm>`.
-// Replaces the hand-rolled `KvmX86TrapEngine`.
-#[cfg(target_arch = "x86_64")]
-pub mod kvm_x86_engine;
-#[cfg(target_arch = "x86_64")]
-pub mod run_elf_x86;
+pub mod vcpu_x86;

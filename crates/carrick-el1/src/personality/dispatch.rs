@@ -322,6 +322,7 @@ where
     U: sched::UserWord,
     G: GuestDispatchFrame,
 {
+    let is_x86 = frame.arm_frame_ref().is_none();
     let ordinal = frame.canonical_ordinal().raw();
     let mut pending = El1PendingFamilies {
         handoff: None,
@@ -345,7 +346,12 @@ where
     } else {
         u64::MAX
     };
-    match carrick_personality_linux::dispatch::dispatch(ordinal, control, &mut pending) {
+    let route = if is_x86 {
+        carrick_personality_linux::dispatch::dispatch_x86(ordinal, control, &mut pending)
+    } else {
+        carrick_personality_linux::dispatch::dispatch(ordinal, control, &mut pending)
+    };
+    match route {
         carrick_personality_linux::dispatch::CompletionRoute::Served => Action::Served,
         carrick_personality_linux::dispatch::CompletionRoute::WithWork => Action::ServedWithWork,
         carrick_personality_linux::dispatch::CompletionRoute::Suspended => Action::Idle,
@@ -396,6 +402,26 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: Gues
 {
     fn take_handoff_receipt(&mut self) -> Option<carrick_el1_abi::EntryHandoffReceipt> {
         self.handoff.take()
+    }
+    #[cfg(target_arch = "x86_64")]
+    fn arch_prctl(&mut self) -> Option<SyscallResult> {
+        let task = self.task()?;
+        let operation = carrick_personality_linux::abi::x86_64::ArchPrctlOperation::decode(
+            self.frame.argument(0).unwrap_or(0),
+        );
+        let address = carrick_guest_arch::UserVa::new(self.frame.argument(1).unwrap_or(0));
+        #[cfg(target_os = "none")]
+        {
+            Some(
+                super::x86_native::arch_prctl(task, operation, address)
+                    .unwrap_or_else(|_| crate::isa::x86::fatal_entry_binding()),
+            )
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = (task, operation, address);
+            None
+        }
     }
     fn binding(&self) -> Option<carrick_el1_abi::ExecutionBinding> {
         self.task().map(super::common_entry::execution_binding)

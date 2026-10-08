@@ -1179,7 +1179,14 @@ impl Cpl0Carrier {
                         stdio(fd, &bytes) as u64
                     };
                 }
-                60 | 231 => return Ok(((frame.rdi & 255) as i32, exits)),
+                60 | 231 => {
+                    if self.slot(0).clear_child_tid() != 0 {
+                        return Err(fail(
+                            "initial terminal clear-tid requires shared scheduler custody",
+                        ));
+                    }
+                    return Ok(((frame.rdi & 255) as i32, exits));
+                }
                 call => return Err(fail(format!("unported initial x86 syscall {call}"))),
             }
         }
@@ -2417,11 +2424,48 @@ impl Cpl0Carrier {
     }
 
     pub fn inject_boundary_kicks(&mut self, index: usize) -> Result<(), TrapError> {
+        self.inject_entry_kick(index)?;
+        self.inject_return_kick(index)
+    }
+
+    pub fn inject_entry_kick(&mut self, index: usize) -> Result<(), TrapError> {
         if index >= 2 {
             return Err(fail("unknown CPL0 task"));
         }
         self.binding(index).entry_kick.store(1, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn inject_return_kick(&mut self, index: usize) -> Result<(), TrapError> {
+        if index >= 2 {
+            return Err(fail("unknown CPL0 task"));
+        }
         self.binding(index).return_kick.store(1, Ordering::Release);
+        Ok(())
+    }
+
+    /// Seed a stopped lifecycle fixture's mask and queued-signal summary.
+    pub fn fixture_lifecycle_signals(
+        &mut self,
+        index: usize,
+        blocked: BlockedMask,
+        pending: carrick_el1_abi::PendingSignals,
+    ) -> Result<(), TrapError> {
+        if index >= 2
+            || self
+                .binding(index)
+                .scheduler_witness
+                .load(Ordering::Acquire)
+                != carrick_x86::cpl0_lifecycle::LIFECYCLE_LANE
+                    + index as u64 * carrick_x86::cpl0_lifecycle::LIFECYCLE_STRIDE
+        {
+            return Err(fail("unknown lifecycle lane"));
+        }
+        let controls: &[ThreadControlSlot; 9] = self.metadata(0xb000 + index as u64 * 0x1000);
+        let _ = controls[0].store_blocked_then_read_pending(blocked, controls[0].pending());
+        let _ = controls[0]
+            .pending()
+            .post_then_read_blocked(pending, &controls[0]);
         Ok(())
     }
 

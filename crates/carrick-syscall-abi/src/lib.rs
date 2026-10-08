@@ -81,6 +81,7 @@ enum PrivateX86Ordinal {
     EpollCreate,
     Alarm,
     Time,
+    ArchPrctl,
 }
 
 /// The private numbers grow DOWN from `u64::MAX - 0x20`, far outside any real
@@ -88,6 +89,22 @@ enum PrivateX86Ordinal {
 const fn private_x86_number(ordinal: PrivateX86Ordinal) -> u64 {
     u64::MAX - 0x20 - ordinal as u64
 }
+
+/// Dedicated diagnostic counter slots for private x86 operations. Slots
+/// 480..511 are outside the current asm-generic table; 511 remains the panic
+/// sentinel. Derive the slots from the same enum as the private call numbers
+/// so they cannot collide with each other or with native/canonical number 158.
+/// This uses spare slots in the existing 512-counter ABI without changing it.
+pub const fn private_x86_counter_slot(number: CanonicalNr) -> Option<usize> {
+    let first = private_x86_number(PrivateX86Ordinal::Dup2);
+    let last = private_x86_number(PrivateX86Ordinal::ArchPrctl);
+    if number.raw() >= last && number.raw() <= first {
+        Some(480 + (first - number.raw()) as usize)
+    } else {
+        None
+    }
+}
+const _: () = assert!(480 + (PrivateX86Ordinal::ArchPrctl as usize) < 511);
 
 /// Carrick-internal normalized syscall number for x86_64 `dup2(2)`.
 ///
@@ -186,12 +203,16 @@ pub const CARRICK_PRIVATE_X86_ALARM: u64 = private_x86_number(PrivateX86Ordinal:
 /// the same 64-bit `time_t` through the guest pointer.
 pub const CARRICK_PRIVATE_X86_TIME: u64 = private_x86_number(PrivateX86Ordinal::Time);
 
+/// Guest-native TLS/CPUID operation admitted by the shared Linux entry owner.
+/// This is not a host-forward request: the personality supplies the ISA leaf.
+pub const CARRICK_PRIVATE_X86_ARCH_PRCTL: u64 = private_x86_number(PrivateX86Ordinal::ArchPrctl);
+
 // Every CARRICK_PRIVATE_X86_* number must be UNIQUE: a collision silently
 // routes one syscall through another's handler (alarm(2) briefly shared
 // 0x2a with epoll_create, so guest alarm() returned fresh epoll FDS — LTP
 // alarm02's "invalid retval 4/5/6"). Compile-time, like the SIG* table.
 const _: () = {
-    const PRIVATE_X86: [u64; 13] = [
+    const PRIVATE_X86: [u64; 14] = [
         CARRICK_PRIVATE_X86_DUP2,
         CARRICK_PRIVATE_X86_STAT,
         CARRICK_PRIVATE_X86_FSTAT,
@@ -205,6 +226,7 @@ const _: () = {
         CARRICK_PRIVATE_X86_EPOLL_CREATE,
         CARRICK_PRIVATE_X86_ALARM,
         CARRICK_PRIVATE_X86_TIME,
+        CARRICK_PRIVATE_X86_ARCH_PRCTL,
     ];
     let mut i = 0;
     while i < PRIVATE_X86.len() {

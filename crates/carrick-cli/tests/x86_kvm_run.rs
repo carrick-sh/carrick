@@ -7,7 +7,6 @@
 ))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use assert_cmd::Command;
@@ -79,33 +78,78 @@ fn empty_image_archive() -> Vec<u8> {
     archive
 }
 
-#[test]
-fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
-    let present = std::path::Path::new("/dev/kvm").exists();
+fn kvm_host_available(present: bool, required: bool) -> bool {
     assert!(
-        present || std::env::var_os("CARRICK_REQUIRE_KVM").is_none_or(|value| value != "1"),
-        "CARRICK_REQUIRE_KVM=1 but /dev/kvm is absent: the KVM gate must not skip"
+        present || !required,
+        "required KVM CLI gate cannot run: /dev/kvm is absent"
     );
-    if !present {
+    present
+}
+
+fn kvm_available() -> bool {
+    if !kvm_host_available(
+        std::path::Path::new("/dev/kvm").exists(),
+        std::env::var_os("CARRICK_REQUIRE_KVM").is_some_and(|value| value == "1"),
+    ) {
         let message = b"SKIP x86 KVM CLI run: /dev/kvm is absent on this host\n";
         // libtest captures eprintln! from passing tests. Write to the host
         // descriptor so an ordinary test invocation shows the skip reason.
         // SAFETY: message is a retained byte literal and fd 2 is the test
         // process's stderr; a short write affects only this diagnostic.
         unsafe { libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len()) };
-        return;
+        return false;
+    }
+    true
+}
+
+fn assert_shared_kernel_elf(
+    bytes: &[u8],
+    expected: &[u8],
+    status: i32,
+    run_id: &str,
+) -> Option<u64> {
+    if !kvm_available() {
+        return None;
     }
     let dir = tempfile::tempdir().unwrap();
     let elf = dir.path().join("hello");
-    std::fs::write(&elf, hello_elf()).unwrap();
-    std::fs::set_permissions(&elf, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Writing executables in this multithreaded process lets another test's
+    // fork transiently inherit the writer fd, yielding ETXTBSY at exec even
+    // after our own close. An owned publisher process closes and exits before
+    // publication completes; guest tests retain their full concurrency.
+    let writer_source = dir.path().join("publish.rs");
+    let writer = dir.path().join("publish");
+    std::fs::write(&writer_source, include_str!("fixtures/publish_elf.rs")).unwrap();
+    let compiled = Command::new("rustc")
+        .timeout(Duration::from_secs(30))
+        .args(["--edition=2021", "-o"])
+        .arg(&writer)
+        .arg(&writer_source)
+        .output()
+        .expect("compile isolated executable publisher");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let published = Command::new(writer)
+        .timeout(Duration::from_secs(5))
+        .arg(&elf)
+        .write_stdin(bytes.to_vec())
+        .output()
+        .expect("publish executable in owned process");
+    assert!(
+        published.status.success(),
+        "{}",
+        String::from_utf8_lossy(&published.stderr)
+    );
     let native = Command::new(&elf)
         .timeout(Duration::from_secs(5))
         .output()
         .expect("run native x86 Linux oracle");
-    assert_eq!(native.stdout, b"hello\n");
+    assert_eq!(native.stdout, expected);
     assert!(native.stderr.is_empty());
-    assert_eq!(native.status.code(), Some(7));
+    assert_eq!(native.status.code(), Some(status));
 
     let archive = dir.path().join("image.tar");
     std::fs::write(&archive, empty_image_archive()).unwrap();
@@ -126,7 +170,7 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
     let run = Command::new(&cli)
         .timeout(Duration::from_secs(5))
         .env("CARRICK_HOME", &home)
-        .env("CARRICK_RUN_ID", "x86-kvm-hello-test")
+        .env("CARRICK_RUN_ID", run_id)
         .args([
             "run",
             "--platform",
@@ -141,13 +185,13 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
         .expect("run mounted x86 ELF through carrick");
     assert_eq!(
         run.stdout,
-        b"hello\n",
+        expected,
         "stderr: {}",
         String::from_utf8_lossy(&run.stderr)
     );
     assert_eq!(
         run.status.code(),
-        Some(7),
+        Some(status),
         "stderr: {}",
         String::from_utf8_lossy(&run.stderr)
     );
@@ -163,7 +207,7 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
     let observed = Command::new(&cli)
         .timeout(Duration::from_secs(5))
         .env("CARRICK_HOME", &home)
-        .env("CARRICK_RUN_ID", "x86-kvm-hello-receipt-test")
+        .env("CARRICK_RUN_ID", format!("{run_id}-receipt"))
         .args([
             "run",
             "--json",
@@ -177,10 +221,10 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
         ])
         .output()
         .expect("observe shared CPL0 run receipt");
-    assert_eq!(observed.status.code(), Some(7));
+    assert_eq!(observed.status.code(), Some(status));
     let envelope = observed
         .stdout
-        .strip_prefix(b"hello\n")
+        .strip_prefix(expected)
         .expect("guest stdout before JSON receipt");
     let json: serde_json::Value = serde_json::from_slice(envelope).expect("run JSON receipt");
     assert_eq!(
@@ -197,4 +241,107 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
             .as_u64()
             .is_some_and(|n| n >= 2)
     );
+    json["report"]["execution_witness"]["host_forwards"].as_u64()
+}
+
+#[test]
+fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
+    let _ = assert_shared_kernel_elf(&hello_elf(), b"hello\n", 7, "x86-kvm-hello-test");
+}
+
+/// Migrated M2 coverage: compile the same Rust/std musl fixture rather than
+/// silently skipping a missing prebuilt executable. This exercises libc
+/// startup, TLS, poll and exit_group through the production shared kernel.
+#[test]
+#[ignore = "PR #81: shared host dispatch, startup memory/signals and terminal clear-tid custody"]
+fn musl_static_hello_runs_through_shared_kernel() {
+    if !kvm_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("hello.rs");
+    let executable = dir.path().join("hello");
+    std::fs::write(
+        &source,
+        include_str!("../../carrick-vmm-bhyve/fixtures/hello-x86_64/src/main.rs"),
+    )
+    .unwrap();
+    let compile = Command::new("rustc")
+        .timeout(Duration::from_secs(30))
+        .arg(&source)
+        .args([
+            "--edition=2021",
+            "--target",
+            "x86_64-unknown-linux-musl",
+            "-C",
+            "relocation-model=static",
+            "-C",
+            "opt-level=z",
+            "-C",
+            "panic=abort",
+            "-o",
+        ])
+        .arg(&executable)
+        .output()
+        .expect("compile migrated static musl fixture (requires Rust musl target)");
+    assert!(
+        compile.status.success(),
+        "musl fixture compile stderr: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let _ = assert_shared_kernel_elf(
+        &std::fs::read(&executable).unwrap(),
+        include_bytes!("../../carrick-vmm-bhyve/fixtures/hello-x86_64/oracle.expected"),
+        0,
+        "x86-kvm-musl-test",
+    );
+}
+
+#[test]
+fn arch_prctl_tls_and_errno_match_native_linux_through_shared_kernel() {
+    use carrick_abi::syscall_x86_64::{ARCH_PRCTL_X86_NR, ArchPrctlOperation};
+    if !kvm_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tls.S");
+    let executable = dir.path().join("tls");
+    std::fs::write(&source, include_str!("fixtures/x86_arch_prctl.S")).unwrap();
+    let compile = Command::new("cc")
+        .timeout(Duration::from_secs(30))
+        .args(["-nostdlib", "-static", "-Wl,--build-id=none"])
+        .args([
+            format!("-DNR_ARCH_PRCTL={ARCH_PRCTL_X86_NR}"),
+            format!("-DSET_FS={}", ArchPrctlOperation::SetFs as u32),
+            format!("-DGET_FS={}", ArchPrctlOperation::GetFs as u32),
+            format!("-DSET_GS={}", ArchPrctlOperation::SetGs as u32),
+            format!("-DGET_GS={}", ArchPrctlOperation::GetGs as u32),
+        ])
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .expect("compile native TLS witness");
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let forwards = assert_shared_kernel_elf(
+        &std::fs::read(executable).unwrap(),
+        b"tls-ok\n",
+        0,
+        "x86-kvm-tls-test",
+    )
+    .unwrap();
+    assert_eq!(
+        forwards, 2,
+        "only stdout write and terminal exit cross to the host"
+    );
+}
+
+#[test]
+#[should_panic(expected = "required KVM CLI gate cannot run")]
+fn required_gate_rejects_missing_kvm() {
+    kvm_host_available(false, true);
 }

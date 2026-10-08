@@ -11,6 +11,38 @@ use super::scheduler;
 #[allow(dead_code)] // Host unit tests use only native context records.
 mod scheduler;
 
+/// The task's user TLS base, distinct from CPL0's active GS binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TlsRegister {
+    Fs,
+    Gs,
+}
+
+pub fn tls_base(words: &ParkedContextWords, register: TlsRegister) -> carrick_guest_arch::UserVa {
+    carrick_guest_arch::UserVa::new(match register {
+        TlsRegister::Fs => words.fs_base,
+        TlsRegister::Gs => words.gs_base,
+    })
+}
+
+/// Edit only the selected task-owned base; refuse supervisor/noncanonical
+/// addresses, including the reserved final lower-half page, before either
+/// saved state or native MSRs can change.
+pub fn set_tls_base(
+    words: &mut ParkedContextWords,
+    register: TlsRegister,
+    base: carrick_guest_arch::UserVa,
+) -> Result<(), ArchError> {
+    if base.raw() >= 0x0000_7fff_ffff_f000 {
+        return Err(ArchError::InvalidContext);
+    }
+    match register {
+        TlsRegister::Fs => words.fs_base = base.raw(),
+        TlsRegister::Gs => words.gs_base = base.raw(),
+    }
+    Ok(())
+}
+
 pub fn from_native(context: &scheduler::NativeContext) -> ParkedContextWords {
     scheduler::park_native_context(context)
 }
@@ -40,6 +72,54 @@ mod tests {
         effects: OwnedObjectWakeEffects<'_, ParkedContextWords>,
     ) {
         let _ = effects.deliver_handbacks(&mut |_| {});
+    }
+
+    #[test]
+    fn tls_base_edits_preserve_the_other_task_and_context() {
+        let mut a = ParkedContextWords::ZERO;
+        a.fs_base = 0x1000;
+        a.gs_base = 0x2000;
+        a.frame[0] = 0xfeed;
+        a.xsave[816] = 0xa5;
+        let b = a;
+        let mut expected = a;
+        expected.fs_base = 0x7000;
+        set_tls_base(
+            &mut a,
+            TlsRegister::Fs,
+            carrick_guest_arch::UserVa::new(0x7000),
+        )
+        .unwrap();
+        assert_eq!(a, expected);
+        assert_eq!(b.fs_base, 0x1000);
+        assert_eq!(b.gs_base, 0x2000);
+        expected.gs_base = 0x9000;
+        set_tls_base(
+            &mut a,
+            TlsRegister::Gs,
+            carrick_guest_arch::UserVa::new(0x9000),
+        )
+        .unwrap();
+        assert_eq!(a, expected);
+        assert_eq!(tls_base(&a, TlsRegister::Fs).raw(), 0x7000);
+        assert_eq!(tls_base(&a, TlsRegister::Gs).raw(), 0x9000);
+        let before = a;
+        for invalid in [
+            0x0000_7fff_ffff_f000,
+            0x0000_8000_0000_0000,
+            0xffff_8000_0000_0000,
+            u64::MAX,
+        ] {
+            assert_eq!(
+                set_tls_base(
+                    &mut a,
+                    TlsRegister::Fs,
+                    carrick_guest_arch::UserVa::new(invalid)
+                ),
+                Err(ArchError::InvalidContext)
+            );
+            assert_eq!(a, before);
+        }
     }
 
     #[test]

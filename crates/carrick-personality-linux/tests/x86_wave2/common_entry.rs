@@ -251,6 +251,29 @@ fn pending_host_work_completes_once_and_leaves_with_work() {
 }
 
 #[test]
+fn tid_registration_uses_shared_completion_with_pending_work() {
+    let w = World::new(LifecycleHatches::ON);
+    assert!(w.venue.slots[1].publish_visible_tid(TID_B as u32));
+    w.tasks[1].linux.mark_pending_host_work();
+    let (action, frame) = w.call(
+        1,
+        NativeFrame {
+            rax: 218,
+            rdi: 0x1004,
+            rsp: 0x9000,
+            ..Default::default()
+        },
+    );
+    assert_eq!(action, Action::ServedWithWork);
+    assert_eq!(frame.rax, TID_B);
+    assert_eq!(w.venue.slots[1].clear_child_tid(), 0x1004);
+    assert_eq!(w.venue.slots[0].clear_child_tid(), 0);
+    assert_eq!(w.counters.served[96].load(Ordering::Relaxed), 1);
+    assert_eq!(w.tasks[1].linux.served_with_work.load(Ordering::Relaxed), 1);
+    assert_eq!(w.tasks[1].linux.orig_arg0.load(Ordering::Relaxed), 0x1004);
+}
+
+#[test]
 fn closed_gate_or_hatch_forwards_without_effect() {
     let w = World::new(LifecycleHatches::ON);
     w.venue.pages[0].close();
@@ -443,4 +466,125 @@ pub(super) fn x4_linux_common_entry() {
             word.store(original, Ordering::Release);
         }
     }
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn arch_prctl_uses_shared_admission_and_completion_with_pending_work() {
+    use carrick_personality_linux::abi::x86_64::ArchPrctlOperation;
+    use carrick_personality_linux::dispatch::{CompletionRoute, EntryCounters, PendingFamilies};
+    use carrick_personality_linux::entry::SyscallResult;
+    struct NativePending<'a> {
+        world: &'a World,
+        calls: core::cell::Cell<u64>,
+        args: [u64; 6],
+    }
+    impl<'a> PendingFamilies<'a> for NativePending<'a> {
+        fn binding(&self) -> Option<carrick_core_abi::ExecutionBinding> {
+            let generation = self.world.tasks[1]
+                .execution
+                .generation
+                .load(Ordering::Acquire);
+            if generation == 0 {
+                None
+            } else {
+                Some(execution_binding(&self.world.tasks[1]))
+            }
+        }
+        fn original_argument0(&self) -> u64 {
+            self.args[0]
+        }
+        fn install_result(&mut self, _: SyscallResult) {}
+        fn task_state(&self) -> Option<&carrick_personality_linux::abi::entry::LinuxTaskState> {
+            Some(&self.world.tasks[1].linux)
+        }
+        fn host_work(&self) -> bool {
+            self.world.tasks[1].linux.has_pending_host_work()
+        }
+        fn arch_prctl(&mut self) -> Option<SyscallResult> {
+            let operation = ArchPrctlOperation::decode(self.args[0]);
+            let address = UserVa::new(self.args[1]);
+            assert_eq!(operation, Some(ArchPrctlOperation::SetFs));
+            assert_eq!(address.raw(), 0x7000);
+            self.calls.set(self.calls.get() + 1);
+            Some(SyscallResult::new(0))
+        }
+        fn entry_counters(&self) -> Option<EntryCounters<'_>> {
+            Some(EntryCounters {
+                served: &self.world.counters.served,
+                forwarded: &self.world.counters.forwarded,
+            })
+        }
+        fn publish_work(&self, _: bool) {
+            self.world.tasks[1].linux.record_completed_with_work();
+        }
+    }
+    let w = World::new(LifecycleHatches::ON);
+    let mut pending = NativePending {
+        world: &w,
+        calls: core::cell::Cell::new(0),
+        args: [0x1002, 0x7000, 0, 0, 0, 0],
+    };
+    let private_slot = carrick_syscall_abi::private_x86_counter_slot(
+        carrick_syscall_abi::CanonicalNr(carrick_syscall_abi::CARRICK_PRIVATE_X86_ARCH_PRCTL),
+    )
+    .unwrap();
+    let getgroups = carrick_personality_linux::entry::decode_x86_64(115, [0; 6], 0x9000);
+    assert_eq!(getgroups.canonical.raw(), 158);
+    let mut getgroups_pending = NativePending {
+        world: &w,
+        calls: core::cell::Cell::new(0),
+        args: [0; 6],
+    };
+    assert_eq!(
+        carrick_personality_linux::dispatch::dispatch_x86(
+            getgroups.canonical.raw(),
+            u64::MAX,
+            &mut getgroups_pending,
+        ),
+        CompletionRoute::Forward
+    );
+    assert_eq!(w.counters.forwarded[158].load(Ordering::Relaxed), 1);
+    assert_eq!(
+        w.counters.forwarded[private_slot].load(Ordering::Relaxed),
+        0
+    );
+    w.tasks[1].linux.mark_pending_host_work();
+    let call =
+        carrick_personality_linux::entry::decode_x86_64(158, [0x1002, 0x7000, 0, 0, 0, 0], 0x9000);
+    assert_eq!(
+        call.canonical.raw(),
+        carrick_syscall_abi::CARRICK_PRIVATE_X86_ARCH_PRCTL
+    );
+    let route = carrick_personality_linux::dispatch::dispatch_x86(
+        call.canonical.raw(),
+        u64::MAX,
+        &mut pending,
+    );
+    assert_eq!(route, CompletionRoute::WithWork);
+    assert_eq!(pending.calls.get(), 1);
+    assert_eq!(w.counters.served[158].load(Ordering::Relaxed), 0);
+    assert_eq!(w.counters.served[private_slot].load(Ordering::Relaxed), 1);
+    assert_eq!(w.tasks[1].linux.served_with_work.load(Ordering::Relaxed), 1);
+    assert_eq!(w.tasks[0].linux.served_with_work.load(Ordering::Relaxed), 0);
+    assert_eq!(w.tasks[1].linux.orig_arg0.load(Ordering::Relaxed), 0x1002);
+    w.tasks[1].execution.generation.store(0, Ordering::Release);
+    let route = carrick_personality_linux::dispatch::dispatch_x86(
+        call.canonical.raw(),
+        u64::MAX,
+        &mut pending,
+    );
+    assert_eq!(route, CompletionRoute::Forward);
+    assert_eq!(
+        pending.calls.get(),
+        1,
+        "unadmitted native effects are forbidden"
+    );
+    assert_eq!(w.counters.served[158].load(Ordering::Relaxed), 0);
+    assert_eq!(w.counters.served[private_slot].load(Ordering::Relaxed), 1);
+    assert_eq!(
+        w.counters.forwarded[private_slot].load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(w.counters.forwarded[158].load(Ordering::Relaxed), 1);
 }
