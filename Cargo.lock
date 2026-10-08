@@ -477,6 +477,7 @@ dependencies = [
  "carrick-guest-arch",
  "carrick-mmu-core",
  "carrick-sched-core",
+ "zerocopy",
 ]
 
 [[package]]
