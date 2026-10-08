@@ -700,11 +700,17 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         if index != 0 {
             let node = self.node(index, banks);
             let link = node.next_free.load(Ordering::Acquire);
-            assert_eq!(
-                link & NODE_CUSTODY_BITS,
-                0,
-                "owned reservation node reached free head: {index}"
-            );
+            if link & NODE_CUSTODY_BITS != 0 {
+                // Another allocator may have popped this head after our head
+                // load and marked it owned. The tag proves a changed head;
+                // only an unchanged head with an owned link is corruption.
+                assert_ne!(
+                    self.free.load(Ordering::Acquire),
+                    head,
+                    "owned reservation node reached free head: {index}"
+                );
+                return Err(Refusal::Busy);
+            }
             let next = link as u32;
             let generation = (head >> 32)
                 .checked_add(1)
