@@ -2,6 +2,10 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::expect_used)]
 
+#[path = "common/physical_inventory.rs"]
+mod physical_inventory;
+use physical_inventory::physical_inventory;
+
 use carrick_guest_mem::GuestMemory;
 use carrick_mem::x86_initial_image::prepare_static_x86_elf;
 use carrick_vmm_kvm::cpl0_boot::{
@@ -83,7 +87,8 @@ fn initial_write_returns_prefix_or_efault_without_aborting_carrier() {
         let image = prepare_static_x86_elf(&elf).expect("static write ELF");
         let extent =
             Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("initial grant extent");
-        let mut carrier = Cpl0Carrier::boot_production(extent).expect("production KVM boot");
+        let mut carrier = Cpl0Carrier::boot_production(physical_inventory(), extent)
+            .expect("production KVM boot");
         carrier
             .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
             .expect("shared MM owner");
@@ -122,7 +127,8 @@ fn explicit_initial_process_cancel_stops_without_a_deadline() {
     let image = prepare_static_x86_elf(&elf).expect("static ELF");
     let extent =
         Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("initial grant extent");
-    let mut carrier = Cpl0Carrier::boot_production(extent).expect("production KVM boot");
+    let mut carrier =
+        Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM boot");
     carrier
         .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
         .expect("shared MM owner");
@@ -157,7 +163,8 @@ fn shared_guest_owner_loads_static_elf_and_exits_seven() {
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
     program.resize(0x100, 0x90);
     program.extend_from_slice(&elf);
-    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("real KVM image");
+    let mut carrier = Cpl0Carrier::boot(physical_inventory(), &image(), [&program, &program])
+        .expect("real KVM image");
     let observed = carrier.observe(0).expect("static ELF exit");
     assert_eq!(observed.result, 7);
     assert_eq!(observed.semantic_host_exits, 0);
@@ -168,7 +175,8 @@ fn production_extent_cannot_alias_kernel_metadata() {
     use carrick_el1_abi::{EL1_DYNAMIC_METADATA_SIZE, X86_CPL0_DYNAMIC_METADATA_BASE};
 
     let extent_bytes = 192 * 1024 * 1024 + 4096;
-    let mut carrier = Cpl0Carrier::boot_production(extent_bytes).expect("production KVM image");
+    let mut carrier = Cpl0Carrier::boot_production(physical_inventory(), extent_bytes)
+        .expect("production KVM image");
     let elf = tiny_elf();
     let image = prepare_static_x86_elf(&elf).expect("static ELF");
     carrier
@@ -186,7 +194,8 @@ fn production_extent_cannot_alias_kernel_metadata() {
 
 #[test]
 fn production_boot_binds_both_kvm_local_apics() {
-    let carrier = Cpl0Carrier::boot_production(0x20_000).expect("production KVM boot");
+    let carrier =
+        Cpl0Carrier::boot_production(physical_inventory(), 0x20_000).expect("production KVM boot");
     assert!(
         carrier
             .bootstrap_lapic_mapped()
@@ -208,7 +217,8 @@ fn production_irq_entry_retains_each_native_vector_from_live_user_mode() {
         let image = prepare_static_x86_elf(&elf).expect("static ELF");
         let extent =
             Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("initial grant extent");
-        let mut carrier = Cpl0Carrier::boot_production(extent).expect("production KVM boot");
+        let mut carrier = Cpl0Carrier::boot_production(physical_inventory(), extent)
+            .expect("production KVM boot");
         carrier
             .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
             .expect("shared MM owner");
@@ -244,7 +254,8 @@ fn production_initial_mm_admits_one_shared_reservation_root() {
     let argv = vec!["/tiny".to_owned()];
     let extent =
         Cpl0Carrier::initial_extent_bytes_for(&plan, &argv, &[]).expect("typed initial extent");
-    let mut carrier = Cpl0Carrier::boot_production(extent).expect("production CPL0 image");
+    let mut carrier =
+        Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production CPL0 image");
     carrier
         .load_guest_mm(&plan, &argv, &[], InitialReservationLimits::UNLIMITED)
         .expect("guest initial MM publication");
@@ -281,7 +292,8 @@ fn production_user_page_fault_forwards_the_original_user_frame() {
     let elf = production_fault_elf();
     let plan = prepare_static_x86_elf(&elf).expect("static fault ELF");
     let extent = Cpl0Carrier::initial_extent_bytes_for(&plan, &[], &[]).expect("extent");
-    let mut carrier = Cpl0Carrier::boot_production(extent).expect("production KVM");
+    let mut carrier =
+        Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM");
     carrier
         .load_guest_mm(&plan, &[], &[], InitialReservationLimits::UNLIMITED)
         .expect("production initial MM");
@@ -324,7 +336,8 @@ fn nested_kernel_fault_preserves_outer_diagnostics_and_refuses() {
     let elf = production_fault_elf();
     let plan = prepare_static_x86_elf(&elf).expect("fault ELF");
     let extent = Cpl0Carrier::initial_extent_bytes_for(&plan, &[], &[]).expect("extent");
-    let mut carrier = Cpl0Carrier::boot_production(extent).expect("production KVM");
+    let mut carrier =
+        Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM");
     carrier
         .load_guest_mm(&plan, &[], &[], InitialReservationLimits::UNLIMITED)
         .expect("initial MM");

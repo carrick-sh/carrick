@@ -66,6 +66,124 @@ pub struct FrameInventoryAuthority {
     entropy: Mutex<ProvenanceEntropyBatch>,
 }
 
+/// A projection of the existing inventory and object ID source, never a
+/// second inventory. Bindings retain exact MM identity across publication.
+struct PhysicalInventoryProjection {
+    inventory: std::sync::Arc<FrameInventoryAuthority>,
+    ids: std::sync::Arc<ObjectIdRegistry>,
+}
+struct PhysicalInventoryBinding {
+    inventory: std::sync::Arc<FrameInventoryAuthority>,
+    ids: std::sync::Arc<ObjectIdRegistry>,
+    mm: MmId,
+}
+impl FrameInventoryAuthority {
+    pub fn physical_projection(
+        self: &std::sync::Arc<Self>,
+        ids: std::sync::Arc<ObjectIdRegistry>,
+    ) -> std::sync::Arc<dyn carrick_hal::PhysicalFrameInventory> {
+        std::sync::Arc::new(PhysicalInventoryProjection {
+            inventory: std::sync::Arc::clone(self),
+            ids,
+        })
+    }
+}
+impl carrick_hal::PhysicalFrameInventory for PhysicalInventoryProjection {
+    fn bind(
+        &self,
+        mm: carrick_hal::MmGeneration,
+    ) -> std::sync::Arc<dyn carrick_hal::FrameCowAuthority> {
+        std::sync::Arc::new(PhysicalInventoryBinding {
+            inventory: std::sync::Arc::clone(&self.inventory),
+            ids: std::sync::Arc::clone(&self.ids),
+            mm: MmId::from_raw_u64(mm.raw().get()).unwrap_or_else(|| {
+                carrick_fatal!("kernel::frame_inventory", "nonzero MM binding refused")
+            }),
+        })
+    }
+    fn allocate_backing_ids(
+        &self,
+    ) -> Result<(FrameId, MappingId), Box<dyn std::error::Error + Send + Sync>> {
+        Ok((self.ids.frame_id()?, self.ids.mapping_id()?))
+    }
+}
+impl carrick_hal::FrameCowAuthority for PhysicalInventoryBinding {
+    fn quiesce(
+        &self,
+    ) -> Result<Box<dyn carrick_hal::FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        Err(Box::new(std::io::Error::other(
+            "physical projection does not quiesce execution",
+        )))
+    }
+    fn reserve(
+        &self,
+        frames: usize,
+        mappings: usize,
+        events: usize,
+    ) -> Result<FrameInventoryReservation, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.inventory.reserve(
+            &self.ids,
+            frames,
+            mappings,
+            FrameEventCapacity::for_event_count(events)?,
+        )?)
+    }
+    fn apply(
+        &self,
+        commit: FrameInventoryCommit<()>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inventory.apply(self.mm, commit)?;
+        Ok(())
+    }
+    fn apply_with_receipt(
+        &self,
+        commit: FrameInventoryCommit<()>,
+    ) -> Result<FrameInventoryApplyReceipt, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.inventory.apply_with_receipt(self.mm, commit)?.1)
+    }
+    fn live_mapping_row(&self, mapping: MappingId) -> Option<carrick_hal::PhysicalMappingRow> {
+        self.inventory
+            .live_mapping_row(self.mm, mapping)
+            .map(|row| carrick_hal::PhysicalMappingRow {
+                mapping: row.mapping,
+                frame: row.frame,
+                generation: row.generation,
+                gpa: row.gpa,
+                length: row.length,
+                permissions: row.permissions,
+            })
+    }
+    fn rollback_unpublished_apply(
+        &self,
+        receipt: &FrameInventoryApplyReceipt,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if receipt.mm().get() != self.mm.raw() {
+            return Err(Box::new(std::io::Error::other(
+                "inventory rollback MM mismatch",
+            )));
+        }
+        Ok(self.inventory.rollback_unpublished_apply(receipt)?)
+    }
+    fn mapping_is_live(
+        &self,
+        mapping: MappingId,
+        frame: FrameId,
+        gpa: Gpa,
+        length: FrameLength,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .inventory
+            .mapping_is_live_exact(self.mm, mapping, frame, gpa, length))
+    }
+    fn frame_mapping_count(
+        &self,
+        frame: FrameId,
+    ) -> Result<Option<usize>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.inventory.frame_mapping_count(frame))
+    }
+}
+
 /// Eight independent OS-generated tokens; consumed slots are cleared and
 /// cached bytes are discarded if the authority is inherited by a host fork.
 #[derive(Default)]
@@ -2885,6 +3003,132 @@ mod tests {
             vec![true, true, false, false, false, false, false, false]
         );
         assert_eq!(batch_counts, vec![Some(3), Some(1), Some(1), Some(1), None]);
+    }
+}
+
+#[cfg(test)]
+mod physical_projection_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn publish_fixture(
+        source: &dyn carrick_hal::PhysicalFrameInventory,
+    ) -> carrick_hal::UnpublishedFrameInventoryApply<dyn carrick_hal::FrameCowAuthority> {
+        let bound = source.bind(carrick_hal::MmGeneration::new(NonZeroU64::new(41).unwrap()));
+        let mut reservation = bound.reserve(1, 1, 2).unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation = MappingGeneration::from_backend_counter(NonZeroU64::MIN);
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa: Gpa(0x1000),
+                length: FrameLength::from_mapping_extent(NonZeroU64::new(4096).unwrap()),
+                permissions: MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        carrick_hal::UnpublishedFrameInventoryApply::apply(bound, reservation.commit(())).unwrap()
+    }
+
+    #[test]
+    fn unpublished_apply_retains_original_source_for_same_number_receipts() {
+        let first = Arc::new(FrameInventoryAuthority::new());
+        let second = Arc::new(FrameInventoryAuthority::new());
+        let first_source = first.physical_projection(Arc::new(ObjectIdRegistry::new()));
+        let second_source = second.physical_projection(Arc::new(ObjectIdRegistry::new()));
+        let mut first_receipt = publish_fixture(&*first_source);
+        let mut second_receipt = publish_fixture(&*second_source);
+        assert_eq!(first_receipt.mm(), second_receipt.mm());
+        assert_eq!(first_receipt.mapping_set(), second_receipt.mapping_set());
+        let mapping = first_receipt.mapping_set()[0].0;
+        let mm = MmId::from_raw_u64(first_receipt.mm().get()).unwrap();
+        first_receipt.rollback().unwrap();
+        assert!(first.live_mapping_row(mm, mapping).is_none());
+        assert!(
+            second.live_mapping_row(mm, mapping).is_some(),
+            "rollback must retain its issuing source despite matching peer IDs"
+        );
+        second_receipt.rollback().unwrap();
+        assert!(second.live_mapping_row(mm, mapping).is_none());
+    }
+
+    #[test]
+    fn physical_projection_retains_exact_mm_generation_and_rollback_authority() {
+        let inventory = Arc::new(FrameInventoryAuthority::new());
+        let ids = Arc::new(ObjectIdRegistry::new());
+        let source = inventory.physical_projection(ids);
+        let mm = NonZeroU64::new(41).unwrap();
+        let sibling_mm = NonZeroU64::new(42).unwrap();
+        let owner = source.bind(carrick_hal::MmGeneration::new(mm));
+        let sibling = source.bind(carrick_hal::MmGeneration::new(sibling_mm));
+        let mut reservation = owner.reserve(1, 1, 2).unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation = MappingGeneration::from_backend_counter(NonZeroU64::MIN);
+        let gpa = Gpa(0x1000);
+        let length = FrameLength::from_mapping_extent(NonZeroU64::new(4096).unwrap());
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa,
+                length,
+                permissions: MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        let commit = reservation.commit(());
+        let challenge = commit.receipt_challenge();
+        let receipt = owner.apply_with_receipt(commit).unwrap();
+        assert!(challenge.authenticate_apply(&receipt, mm));
+        assert_eq!(receipt.mm(), mm);
+        assert!(owner.mapping_is_live_exact_generation(mapping, frame, generation, gpa, length));
+        assert!(!owner.mapping_is_live_exact_generation(
+            mapping,
+            frame,
+            MappingGeneration::from_backend_counter(NonZeroU64::new(2).unwrap()),
+            gpa,
+            length
+        ));
+        assert!(sibling.live_mapping_row(mapping).is_none());
+        assert!(sibling.rollback_unpublished_apply(&receipt).is_err());
+        assert!(
+            inventory
+                .live_mapping_row(MmId::from_raw_u64(mm.get()).unwrap(), mapping)
+                .is_some(),
+            "the projection must publish into the original inventory"
+        );
+        owner.rollback_unpublished_apply(&receipt).unwrap();
+        assert!(owner.live_mapping_row(mapping).is_none());
+        assert_eq!(inventory.frame_mapping_count(frame), None);
     }
 }
 

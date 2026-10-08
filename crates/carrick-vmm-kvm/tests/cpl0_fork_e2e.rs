@@ -2,6 +2,10 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::expect_used)]
 
+#[path = "common/physical_inventory.rs"]
+mod physical_inventory;
+use physical_inventory::physical_inventory;
+
 use carrick_mem::x86_initial_image::prepare_static_x86_elf;
 use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
 use carrick_x86::cpl0_entry::OBSERVE_INITIAL_MM;
@@ -92,7 +96,8 @@ fn static_elf_fork_child_cow_wait_and_parent_exit_seven() {
     assert_eq!(plan.entry, 0x4000b0);
     let program = initial_process_program(&elf);
     let mut carrier =
-        Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("real KVM image");
+        Cpl0Carrier::boot_lifecycle(physical_inventory(), &image(), [&program, &program])
+            .expect("real KVM image");
     carrier
         .arm_user_fault_stack_canary()
         .expect("arm vCPU0 fault stack boundary");
@@ -134,7 +139,8 @@ fn static_elf_wait4_wnohang_reap_then_echild() {
     let elf = fork_wait_elf_with_nonblocking_probe();
     let program = initial_process_program(&elf);
     let mut carrier =
-        Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("real KVM image");
+        Cpl0Carrier::boot_lifecycle(physical_inventory(), &image(), [&program, &program])
+            .expect("real KVM image");
     let observed = carrier.observe(0).expect("nonblocking then blocking wait4");
     assert_eq!(observed.result, 7);
     assert_eq!(observed.semantic_host_exits, 0);
@@ -145,7 +151,8 @@ fn user_cow_fault_clears_poisoned_xsave_header() {
     let elf = fork_wait_elf_with_child_marker();
     let program = initial_process_program(&elf);
     let mut carrier =
-        Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("real KVM image");
+        Cpl0Carrier::boot_lifecycle(physical_inventory(), &image(), [&program, &program])
+            .expect("real KVM image");
     assert_eq!(carrier.observe(0).expect("child before COW").result, 42);
     carrier
         .poison_user_fault_xsave_header(0)
@@ -201,7 +208,8 @@ fn wait_any_parks_with_the_issued_child_pid_result() {
     elf[96..104].copy_from_slice(&size.to_le_bytes());
     let program = initial_process_program(&elf);
     let mut carrier =
-        Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("real KVM image");
+        Cpl0Carrier::boot_lifecycle(physical_inventory(), &image(), [&program, &program])
+            .expect("real KVM image");
     assert_eq!(carrier.observe(0).expect("child before COW").result, 42);
     assert_eq!(
         carrier
@@ -235,7 +243,9 @@ fn exhausted_fork_spaces_return_eagain_without_host_forwarding() {
     elf[96..104].copy_from_slice(&size.to_le_bytes());
     let program = initial_process_program(&elf);
     for records in [false, true] {
-        let mut carrier = Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("KVM");
+        let mut carrier =
+            Cpl0Carrier::boot_lifecycle(physical_inventory(), &image(), [&program, &program])
+                .expect("KVM");
         assert_eq!(carrier.observe(0).expect("before fork").result, 42);
         if records {
             carrier
@@ -270,7 +280,9 @@ fn second_fixture_fork_returns_eagain_before_any_mutation() {
     let size = elf.len() as u64;
     elf[96..104].copy_from_slice(&size.to_le_bytes());
     let program = initial_process_program(&elf);
-    let mut carrier = Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("KVM");
+    let mut carrier =
+        Cpl0Carrier::boot_lifecycle(physical_inventory(), &image(), [&program, &program])
+            .expect("KVM");
     let result = carrier.observe(0).expect("bounded repeated fork");
     assert_eq!(result.result, 7);
     assert_eq!(result.semantic_host_exits, 0);
@@ -308,7 +320,9 @@ fn exhausted_wait_entries_leave_record_capacity_unchanged() {
     let size = elf.len() as u64;
     elf[96..104].copy_from_slice(&size.to_le_bytes());
     let program = initial_process_program(&elf);
-    let mut carrier = Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("KVM");
+    let mut carrier =
+        Cpl0Carrier::boot_lifecycle(physical_inventory(), &image(), [&program, &program])
+            .expect("KVM");
     assert_eq!(carrier.observe(0).expect("before wait4").result, 42);
     carrier
         .exhaust_lifecycle_capacity(true)
@@ -367,7 +381,9 @@ fn wait4_zeroes_the_full_rusage_record() {
     let size = elf.len() as u64;
     elf[96..104].copy_from_slice(&size.to_le_bytes());
     let program = initial_process_program(&elf);
-    let mut carrier = Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("KVM");
+    let mut carrier =
+        Cpl0Carrier::boot_lifecycle(physical_inventory(), &image(), [&program, &program])
+            .expect("KVM");
     assert_eq!(carrier.observe(0).expect("full rusage write").result, 7);
 }
 
@@ -399,7 +415,9 @@ fn wait4_rejects_unwritable_rusage_without_writing_status() {
     let size = elf.len() as u64;
     elf[96..104].copy_from_slice(&size.to_le_bytes());
     let program = initial_process_program(&elf);
-    let mut carrier = Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("KVM");
+    let mut carrier =
+        Cpl0Carrier::boot_lifecycle(physical_inventory(), &image(), [&program, &program])
+            .expect("KVM");
     assert_eq!(carrier.observe(0).expect("rusage EFAULT").result, 7);
     assert_eq!(
         carrier
@@ -423,7 +441,9 @@ fn wait4_without_an_admitted_child_returns_echild() {
     let size = elf.len() as u64;
     elf[96..104].copy_from_slice(&size.to_le_bytes());
     let program = initial_process_program(&elf);
-    let mut carrier = Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("KVM");
+    let mut carrier =
+        Cpl0Carrier::boot_lifecycle(physical_inventory(), &image(), [&program, &program])
+            .expect("KVM");
     assert_eq!(carrier.observe(0).expect("no admitted child").result, 7);
     assert_eq!(carrier.lifecycle_state(0).expect("no birth").births, 0);
 }
