@@ -130,6 +130,14 @@ pub const EL1_FRAME_GRANT_MAILBOX_BASE: u64 = EL1_REGION_BASE + EL1_FRAME_GRANT_
 pub const EL1_FRAME_GRANT_RESIDENCY_OFFSET: u64 = EL1_CURRENT_TASKS_OFFSET + 0x30_000;
 pub const EL1_FRAME_GRANT_RESIDENCY_BASE: u64 = EL1_REGION_BASE + EL1_FRAME_GRANT_RESIDENCY_OFFSET;
 
+/// Guest VA/IPA base of the 2 MiB AArch64 kernel control window (L1 index 180).
+pub const AARCH64_KERNEL_CONTROL_BASE: u64 =
+    carrick_mmu_core::aarch64::owner_fork::KERNEL_CONTROL_BASE;
+
+/// Span of the AArch64 kernel control window (exactly one 2 MiB Level-2 block).
+pub const AARCH64_KERNEL_CONTROL_SIZE: u64 =
+    carrick_mmu_core::aarch64::owner_fork::KERNEL_CONTROL_SPAN;
+
 /// EL1-only virtual alias of the current MM's primary AArch64 stage-1 table
 /// arena. Every published address space maps its own arena at this fixed VA.
 pub const AARCH64_STAGE1_TABLES_ALIAS_BASE: u64 =

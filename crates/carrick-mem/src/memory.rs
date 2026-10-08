@@ -217,9 +217,9 @@ use zerocopy::IntoBytes;
 // the `go` toolchain — load their first segment at vaddr 0x10000 and collided
 // with both the regions and the kernel-only first-2 MiB block, so they couldn't
 // run. Moving the hole high frees the low VA range for such binaries.
-pub const LINUX_KERNEL_REGION_BASE: u64 = 0x2D_0000_0000;
+pub const LINUX_KERNEL_REGION_BASE: u64 = carrick_el1_abi::AARCH64_KERNEL_CONTROL_BASE;
 /// Exact stage-1 span governed by the kernel-only AP/PXN regime.
-pub const LINUX_KERNEL_REGION_SIZE: u64 = 0x20_0000;
+pub const LINUX_KERNEL_REGION_SIZE: u64 = carrick_el1_abi::AARCH64_KERNEL_CONTROL_SIZE;
 // The NULL guard: stage-1 leaves VA 0..0x10000 UNMAPPED (16 4 KiB pages in
 // L3A), mirroring Linux's default `vm.mmap_min_addr` (65536) — a guest NULL
 // deref faults cleanly at stage 1 instead of reading backing memory. Backends
