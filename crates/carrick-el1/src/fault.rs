@@ -1143,6 +1143,7 @@ pub enum OwnerFaultSupplyOutcome {
     Unavailable,
     PolicyDeclined,
     Selected,
+    CowSelected,
 }
 
 pub struct OwnerFaultSupply<'a> {
@@ -1371,8 +1372,41 @@ fn dispatch_classified_fault<
             cow_resolver.editor_busy();
             return Action::Forward;
         };
-        if cow_resolver.resolve_cow(grant.ttbr0, mm_key, far) {
-            return Action::Served;
+        match cow_resolver.resolve_cow_outcome(grant.ttbr0, mm_key, far) {
+            CowResolution::Resolved => return Action::Served,
+            CowResolution::Refused => return Action::Forward,
+            CowResolution::NeedsSupply => {
+                if let FaultSupply::Owner(owner) = supply {
+                    let selected = (|| {
+                        let roots = prepared.as_ref()?.roots?;
+                        let mm = carrick_el1_abi::ReservationMm::new(mm_key)?;
+                        let mut root =
+                            roots.lock_in(spaces, index.index(), mm, slot as u32).ok()?;
+                        let operation = carrick_el1_abi::PortalOperation {
+                            carrier: owner.slots.carrier()?,
+                            mm,
+                            incarnation: NonZeroU64::new(root.incarnation().raw())?,
+                            sequence: root.next_transfer_sequence().ok()?,
+                        };
+                        let window = carrick_core::mm::fault::select_cow_supply_window(
+                            &mut root,
+                            operation,
+                            carrick_guest_arch::UserVa::new(far),
+                            None,
+                        )
+                        .ok()?;
+                        drop(root);
+                        owner
+                            .slots
+                            .grant(slot as usize)?
+                            .publish_cow_fault_selection(operation.sequence.get(), window)
+                            .then_some(())
+                    })();
+                    if selected.is_some() {
+                        owner.outcome.set(OwnerFaultSupplyOutcome::CowSelected);
+                    }
+                }
+            }
         }
         return Action::Forward;
     }
@@ -2345,6 +2379,126 @@ mod tests {
             Action::Forward
         );
         assert!(!mailbox.has_guest_work());
+    }
+
+    #[test]
+    fn owner_cow_fault_preserves_validated_empty_pool_supply() {
+        use crate::personality::mm_portal::test_support::{IPA, ROOT, RW, Tables, VA};
+        use carrick_el1_abi::FrameGrantResidencyTable;
+        use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
+        struct EmptyCow<'a>(
+            &'a Tables,
+            &'a carrick_el1_abi::CowGrantPool,
+            &'a FrameGrantResidencyTable,
+        );
+        impl CowResolver for EmptyCow<'_> {
+            fn resolve_cow(&mut self, _: u64, _: u64, _: u64) -> bool {
+                panic!("typed COW outcome must survive fault dispatch")
+            }
+            fn resolve_cow_outcome(&mut self, ttbr: u64, mm: u64, va: u64) -> CowResolution {
+                let live = self.0.live(&CallerInvalidatesAsid);
+                let result = crate::cow::resolve_guest_cow(
+                    &crate::cow::GuestCowVenue {
+                        words: &live,
+                        root: carrick_mmu_core::aarch64::SubstrateGpa(ttbr),
+                        pool: self.1,
+                        residency: self.2,
+                        copy_window: crate::cow::CowCopyWindow::target(
+                            &live,
+                            carrick_mmu_core::aarch64::SubstrateGpa(ttbr),
+                        ),
+                        publish_executable: None,
+                    },
+                    mm,
+                    va,
+                    |_, _| panic!("empty pool must not copy"),
+                    || {},
+                );
+                assert_eq!(
+                    result,
+                    Ok(crate::cow::GuestCowOutcome::Declined(
+                        carrick_el1_abi::CowDecline::PoolEmpty
+                    ))
+                );
+                CowResolution::NeedsSupply
+            }
+        }
+        let mm = 77;
+        let spaces = published_space(mm, ROOT);
+        let roots = admitted_root(&spaces, mm, &[(VA, 4096, 3)]);
+        let tables = Tables::new(ROOT, IPA, 1);
+        tables.words[1536].store(
+            IPA | RW | (3 << 6) | (1 << 55) | (1 << 56) | (1 << 57),
+            Ordering::Release,
+        );
+        let pool = carrick_el1_abi::CowGrantPool::new();
+        let resident_ptr = unsafe {
+            std::alloc::alloc_zeroed(std::alloc::Layout::new::<FrameGrantResidencyTable>())
+        };
+        assert!(!resident_ptr.is_null());
+        let residency =
+            unsafe { std::boxed::Box::from_raw(resident_ptr.cast::<FrameGrantResidencyTable>()) };
+        let ptr = unsafe {
+            std::alloc::alloc_zeroed(std::alloc::Layout::new::<carrick_el1_abi::MmPortalSlots>())
+        };
+        assert!(!ptr.is_null());
+        let slots =
+            unsafe { std::boxed::Box::from_raw(ptr.cast::<carrick_el1_abi::MmPortalSlots>()) };
+        assert!(slots.bind_carrier(NonZeroU64::new(9).unwrap()));
+        let supply = OwnerFaultSupply::new(&slots);
+        let task = CurrentTask::new();
+        task.mm.key.store(mm, Ordering::Release);
+        assert_eq!(
+            dispatch_classified_fault(
+                0,
+                VA + 3,
+                FaultClass::WritePermission,
+                &Counters::default(),
+                Some(&task),
+                SpaceAccess::source_free(&spaces),
+                FaultSupply::Owner(&supply),
+                Some(PreparedFaultPath::<_> {
+                    residency: &residency,
+                    resolver: &mut NoopPreparedResolver,
+                    roots: Some(&roots),
+                    file_slots: None
+                }),
+                &mut EmptyCow(&tables, &pool, &residency)
+            ),
+            Action::Forward
+        );
+        assert_eq!(supply.outcome(), OwnerFaultSupplyOutcome::CowSelected);
+        let (_, window) = slots
+            .grant(0)
+            .unwrap()
+            .pending_cow_fault_selection(mm, VA + 3)
+            .unwrap();
+        assert_eq!(window.operation.mm.raw(), mm);
+        assert_eq!(window.operation.carrier.get(), 9);
+        let mut root = roots
+            .lock(
+                spaces.find(mm).unwrap().index(),
+                carrick_el1_abi::ReservationMm::new(mm).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(window.operation.incarnation.get(), root.incarnation().raw());
+        assert_eq!(window.generation, root.mapping(VA).unwrap().generation);
+        drop(root);
+        assert_eq!(window.range.start(), VA);
+        assert_eq!(window.range.len(), 4096);
+        assert!(window.host_backing.is_none());
+        assert!(
+            slots
+                .grant(0)
+                .unwrap()
+                .pending_fault_selection(mm, VA)
+                .is_none()
+        );
+        assert!(
+            spaces
+                .try_begin_edit(spaces.find(mm).unwrap(), mm, NonZeroU64::new(2).unwrap())
+                .is_some()
+        );
     }
 
     #[test]

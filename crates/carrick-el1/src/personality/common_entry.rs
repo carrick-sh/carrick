@@ -21,7 +21,16 @@ pub fn serve_canonical(
     venue: &dyn LifecycleVenue,
     publications: Option<&AtomicU64>,
 ) -> EntryOutcome {
-    serve_canonical_inner(call, counters, task, venue, publications, None)
+    serve_canonical_inner::<carrick_sched_core::ThreadCtx>(
+        call,
+        counters,
+        task,
+        venue,
+        publications,
+        None,
+        None,
+        None,
+    )
 }
 
 pub fn serve_canonical_with_anonymous(
@@ -32,19 +41,58 @@ pub fn serve_canonical_with_anonymous(
     publications: Option<&AtomicU64>,
     anonymous: &mut dyn carrick_personality_linux::pending_anonymous::PendingAnonymousVenue,
 ) -> EntryOutcome {
-    serve_canonical_inner(call, counters, task, venue, publications, Some(anonymous))
+    serve_canonical_inner::<carrick_sched_core::ThreadCtx>(
+        call,
+        counters,
+        task,
+        venue,
+        publications,
+        Some(anonymous),
+        None,
+        None,
+    )
 }
 
-fn serve_canonical_inner(
+/// Serve a native process through the same ordered Linux dispatch and exact
+/// scheduler completion authority as the default architecture.
+#[allow(clippy::too_many_arguments)]
+pub fn serve_canonical_with_native<'a>(
+    call: &CanonicalCall,
+    counters: &'a Counters,
+    task: &'a CurrentTask,
+    venue: &'a dyn LifecycleVenue,
+    publications: Option<&'a AtomicU64>,
+    anonymous: &'a mut dyn carrick_personality_linux::pending_anonymous::PendingAnonymousVenue,
+    process: &'a mut dyn carrick_personality_linux::lifecycle::ProcessNative<
+        carrick_sched_core::ParkedContextWords,
+    >,
+    source: carrick_el1_abi::BornInZoneSource<'a, carrick_sched_core::ParkedContextWords>,
+) -> EntryOutcome {
+    serve_canonical_inner(
+        call,
+        counters,
+        task,
+        venue,
+        publications,
+        Some(anonymous),
+        Some(process),
+        Some(source),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve_canonical_inner<C: carrick_el1_abi::EntryContext>(
     call: &CanonicalCall,
     counters: &Counters,
     task: &CurrentTask,
     venue: &dyn LifecycleVenue,
     publications: Option<&AtomicU64>,
     anonymous: Option<&mut dyn carrick_personality_linux::pending_anonymous::PendingAnonymousVenue>,
+    mut process: Option<&mut dyn carrick_personality_linux::lifecycle::ProcessNative<C>>,
+    source: Option<carrick_el1_abi::BornInZoneSource<'_, C>>,
 ) -> EntryOutcome {
     let shared = SharedVenue {
-        binding: || execution_binding(task),
+        binding: move || execution_binding(task),
         state: &task.linux,
         process_pid: task.visible_pid(),
         visible_tid: venue
@@ -54,7 +102,7 @@ fn serve_canonical_inner(
             served: &counters.served,
             forwarded: &counters.forwarded,
         },
-        robust_list: |head, len| {
+        robust_list: move |head, len| {
             venue.thread(task).and_then(|thread| {
                 carrick_personality_linux::thread::set_robust_list(
                     thread.page,
@@ -67,7 +115,15 @@ fn serve_canonical_inner(
         },
     };
     match anonymous {
-        Some(anonymous) => entry::serve_with_custody(call, &shared, anonymous, None),
+        Some(anonymous) => entry::serve_with_custody::<C>(
+            call,
+            &shared,
+            anonymous,
+            process.as_mut().map(|p| {
+                &mut **p as &mut (dyn carrick_personality_linux::lifecycle::ProcessNative<C> + '_)
+            }),
+            source,
+        ),
         None => entry::serve(call, &shared),
     }
 }

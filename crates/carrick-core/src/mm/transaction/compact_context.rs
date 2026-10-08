@@ -163,6 +163,13 @@ fn compact_parked_context_owner_clones_two_roots_and_selects_exact_cow_supply() 
     }
     .with_zone(zone)
     .unwrap();
+    fn accepts_native_fork<
+        T: carrick_el1::personality::mm_portal::NativeForkPortal<NoPin, X86Mmu>,
+    >(
+        _: &T,
+    ) {
+    }
+    accepts_native_fork(&portal);
     for (index, mm) in indices.into_iter().zip(mms) {
         let handle = portal.admitted_handle(mm, 0).unwrap();
         // Root admission already published this exact notification source.

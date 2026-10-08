@@ -1420,11 +1420,15 @@ fn mix(mm: u64, uaddr: u64) -> usize {
 impl ZoneTables<ThreadCtx> {
     /// The bucket that `(mm, uaddr)` hashes to.
     pub fn bucket_of(mm: u64, uaddr: u64) -> usize {
-        mix(mm, uaddr)
+        Self::bucket_of_with_context(mm, uaddr)
     }
 }
 
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
+    /// Context-independent hashing for an owner's actual saved-context ABI.
+    pub fn bucket_of_with_context(mm: u64, uaddr: u64) -> usize {
+        mix(mm, uaddr)
+    }
     pub fn record(&self, id: RecordId) -> &ZoneRecord<C> {
         &self.records[id.index()]
     }

@@ -117,6 +117,22 @@ impl NamespaceState {
     pub fn reserve_visible(&mut self, namespace: VisibleNamespace) -> Option<VisibleIdentity> {
         self.allocation().ok()?.reserve_visible(namespace)
     }
+    /// Admit an existing visible member without issuing it again. This only
+    /// advances its exact namespace cursor; it does not create a claim.
+    pub fn advance_visible_past(
+        &mut self,
+        namespace: VisibleNamespace,
+        member: VisibleIdentity,
+    ) -> Option<()> {
+        let owner = self.allocation().ok()?;
+        let next = member.get().checked_add(1)?;
+        if member.get() > i32::MAX as u32 {
+            return None;
+        }
+        let cursor = owner.visible_next.entry(namespace).or_insert(2);
+        *cursor = (*cursor).max(next);
+        Some(())
+    }
     pub fn set_next(&mut self, raw: i32) {
         if let Ok(owner) = self.allocation() {
             owner.set_next(raw);
@@ -627,6 +643,39 @@ mod tests {
         assert_eq!(source.refused_attempts(), None);
         assert!(source.transfer().is_none());
         assert_eq!(source.refused_attempts(), None);
+    }
+
+    #[test]
+    fn admitted_visible_root_advances_only_its_namespace_cursor() {
+        let mut owner = NamespaceState::new(1, 100, 1);
+        let namespace = VisibleNamespace::new(NonZeroU32::MIN, NonZeroU32::MIN);
+        let other = VisibleNamespace::new(NonZeroU32::new(2).unwrap(), NonZeroU32::MIN);
+        let root = VisibleIdentity::from_existing_member(NonZeroU32::new(41).unwrap());
+        assert_eq!(owner.advance_visible_past(namespace, root), Some(()));
+        assert_eq!(owner.reserve_visible(namespace).unwrap().get(), 42);
+        assert_eq!(owner.reserve_visible(other).unwrap().get(), 2);
+        assert_eq!(owner.advance_visible_past(namespace, root), Some(()));
+        assert_eq!(owner.reserve_visible(namespace).unwrap().get(), 43);
+        assert_eq!(owner.counts().reserved_numbers, 0);
+    }
+
+    #[test]
+    fn visible_root_admission_refuses_overflow_and_preserves_exhaustion() {
+        let mut owner = NamespaceState::new(1, 100, 1);
+        let namespace = VisibleNamespace::new(NonZeroU32::MIN, NonZeroU32::MIN);
+        let invalid = VisibleIdentity::from_existing_member(NonZeroU32::MAX);
+        assert_eq!(owner.advance_visible_past(namespace, invalid), None);
+        assert_eq!(owner.visible_namespace_count(), 0);
+        let last = VisibleIdentity::from_existing_member(NonZeroU32::new(i32::MAX as u32).unwrap());
+        assert_eq!(owner.advance_visible_past(namespace, last), Some(()));
+        assert_eq!(owner.reserve_visible(namespace), None);
+        let root = VisibleIdentity::from_existing_member(NonZeroU32::MIN);
+        assert_eq!(owner.advance_visible_past(namespace, root), Some(()));
+        assert_eq!(owner.reserve_visible(namespace), None);
+        let transferred = owner.transfer().unwrap();
+        assert_eq!(owner.advance_visible_past(namespace, root), None);
+        assert_eq!(owner.refused_attempts(), Some(1));
+        assert_eq!(transferred.into_owner().reserve_visible(namespace), None);
     }
 
     #[test]

@@ -127,7 +127,7 @@ fn served_result(outcome: EntryOutcome) -> Option<i64> {
         EntryOutcome::Served { result, .. } | EntryOutcome::ServedWithWork { result, .. } => {
             Some(result.raw())
         }
-        EntryOutcome::Forward | EntryOutcome::InvalidCompletion => None,
+        EntryOutcome::Forward | EntryOutcome::InvalidCompletion | EntryOutcome::Suspended => None,
     }
 }
 
@@ -440,6 +440,7 @@ fn common_linux_entry_calls_native_process_custody() {
     struct Process {
         binding: carrick_core_abi::ExecutionBinding,
         visits: std::vec::Vec<u64>,
+        idle: bool,
     }
     impl ProcessNative for Process {
         fn binding(&self) -> carrick_core_abi::ExecutionBinding {
@@ -457,11 +458,19 @@ fn common_linux_entry_calls_native_process_custody() {
             pid: ProcessWaitPid,
             status: UserVa,
             options: carrick_personality_linux::lifecycle::LinuxWaitOptions,
+            rusage: UserVa,
         ) -> LifecycleOutcome {
             assert_eq!(pid.raw(), 42);
             assert_eq!(status.raw(), 0x7000);
             assert_eq!(options.bits(), 0);
+            assert_eq!(rusage.raw(), 0x8000);
             self.visits.push(61);
+            if self.idle {
+                return LifecycleOutcome::Transferred {
+                    progress: carrick_core_abi::Served::Idle,
+                    result: SyscallResult::new(0),
+                };
+            }
             LifecycleOutcome::Returned {
                 result: SyscallResult::new(42),
                 work: false,
@@ -491,11 +500,12 @@ fn common_linux_entry_calls_native_process_custody() {
     let mut process = Process {
         binding: execution_binding(&world.tasks[0]),
         visits: std::vec::Vec::new(),
+        idle: false,
     };
     let mut anonymous = AnonymousBreak;
     for (native, args, result) in [
         (57, [0; 6], 42),
-        (61, [42, 0x7000, 0, 0, 0, 0], 42),
+        (61, [42, 0x7000, 0, 0x8000, 0, 0], 42),
         (231, [7, 0, 0, 0, 0, 0], 0),
     ] {
         let call = carrick_personality_linux::entry::decode_x86_64(native, args, 0x7fff0000);
@@ -504,7 +514,8 @@ fn common_linux_entry_calls_native_process_custody() {
                 &call,
                 &venue,
                 &mut anonymous,
-                Some(&mut process)
+                Some(&mut process),
+                None
             )),
             Some(result)
         );
@@ -519,11 +530,209 @@ fn common_linux_entry_calls_native_process_custody() {
         );
     }
     assert_eq!(process.visits, [57, 61, 231]);
+    process.idle = true;
+    let call = carrick_personality_linux::entry::decode_x86_64(
+        61,
+        [42, 0x7000, 0, 0x8000, 0, 0],
+        0x7fff0000,
+    );
+    assert_eq!(
+        serve_with_custody(&call, &venue, &mut anonymous, Some(&mut process), None),
+        EntryOutcome::InvalidCompletion
+    );
+    assert_eq!(process.visits, [57, 61, 231, 61]);
+    assert_eq!(
+        world
+            .counters
+            .forwarded
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .sum::<u64>(),
+        0
+    );
     process.binding = execution_binding(&world.tasks[1]);
     let call = carrick_personality_linux::entry::decode_x86_64(57, [0; 6], 0x7fff0000);
     assert_eq!(
-        serve_with_custody(&call, &venue, &mut anonymous, Some(&mut process)),
+        serve_with_custody(&call, &venue, &mut anonymous, Some(&mut process), None),
         EntryOutcome::Forward
     );
-    assert_eq!(process.visits, [57, 61, 231]);
+    assert_eq!(process.visits, [57, 61, 231, 61]);
+}
+
+#[test]
+fn compact_common_entry_suspends_only_after_authenticated_park() {
+    use carrick_core_abi::{BornInZoneSource, EntryHandoffReceipt};
+    use carrick_personality_linux::entry::{SharedVenue, serve_with_custody};
+    use carrick_personality_linux::lifecycle::{LifecycleOutcome, ProcessNative, ProcessWaitPid};
+    use carrick_sched_core::{
+        ExecutionSlot, ParkedContextWords, SlotId, ThreadIdentity, ZoneTables,
+    };
+    struct Process<'a> {
+        binding: carrick_core_abi::ExecutionBinding,
+        source: BornInZoneSource<'a, ParkedContextWords>,
+        record: carrick_sched_core::RecordId,
+        receipt: Option<EntryHandoffReceipt<ParkedContextWords>>,
+        visits: usize,
+    }
+    impl ProcessNative<ParkedContextWords> for Process<'_> {
+        fn binding(&self) -> carrick_core_abi::ExecutionBinding {
+            self.binding
+        }
+        fn take_handoff_receipt(&mut self) -> Option<EntryHandoffReceipt<ParkedContextWords>> {
+            self.receipt.take()
+        }
+        fn fork(&mut self) -> LifecycleOutcome {
+            panic!("wrong lifecycle family")
+        }
+        fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
+            panic!("wrong lifecycle family")
+        }
+        fn wait4(
+            &mut self,
+            pid: ProcessWaitPid,
+            status: UserVa,
+            options: carrick_personality_linux::lifecycle::LinuxWaitOptions,
+            rusage: UserVa,
+        ) -> LifecycleOutcome {
+            assert_eq!(pid.raw(), 72);
+            assert_eq!(status.raw(), 0x7000);
+            assert_eq!(options.bits(), 0);
+            assert_eq!(rusage.raw(), 0);
+            self.visits += 1;
+            let start =
+                carrick_core::entry::prepare_handoff(self.binding, self.source, self.record)
+                    .unwrap();
+            let zone = self.source.zone;
+            let guard = zone
+                .lock(
+                    ZoneTables::bucket_of(self.binding.mm.raw(), 0x1000),
+                    &carrick_sched_core::BoundedSpin(1024),
+                )
+                .unwrap();
+            let sequence = zone.next_seq(self.record);
+            zone.enqueue(
+                &guard,
+                self.record,
+                sequence,
+                self.binding.mm.raw(),
+                0x1000,
+                u32::MAX,
+                0,
+            )
+            .unwrap();
+            self.receipt = Some(
+                carrick_core::entry::publish_handoff_park(
+                    start,
+                    &guard,
+                    carrick_core_abi::EntryRecordGeneration(sequence),
+                )
+                .unwrap(),
+            );
+            zone.clear_current(self.source.slot);
+            LifecycleOutcome::Transferred {
+                progress: carrick_core_abi::Served::Idle,
+                result: SyscallResult::new(0),
+            }
+        }
+    }
+    for generation in [0, 11] {
+        type CompactZone = ZoneTables<ParkedContextWords>;
+        let layout = std::alloc::Layout::new::<CompactZone>();
+        // SAFETY: exact zero-initialized scheduler allocation with its native
+        // context alignment; Box retains it for this one entry turn.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<CompactZone>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let slot = SlotId::new(1);
+        let identity = ThreadIdentity {
+            tid: 71,
+            serial: 113,
+            mm: 29,
+            file_table: 9,
+            generation,
+            affinity: 2,
+            lifecycle_page: 0x1000,
+            control_slot: 0x2000,
+        };
+        zone.drive(slot, 3);
+        zone.publish_slot(slot, identity.mm, None, 0);
+        let here = ExecutionSlot::zone(slot);
+        zone.occupancy.vacate_any(here);
+        assert!(zone.occupancy.replace(here, 0, identity.mm));
+        zone.enter_guest(slot);
+        let space = zone
+            .spaces
+            .publish_closed(identity.mm, 0x9000, 0x9000)
+            .unwrap();
+        zone.spaces.open(space);
+        assert!(zone.install_space(slot, identity.mm).is_some());
+        let record = zone.alloc_record(identity).unwrap();
+        zone.requeue_preempted(slot, record);
+        assert_eq!(zone.switch_in(slot), Some(record));
+        let binding = carrick_core_abi::ExecutionBinding {
+            task: carrick_core_abi::EntryTaskKey::from_raw(identity.tid),
+            generation: carrick_core_abi::EntryGeneration::from_raw(identity.generation),
+            mm: carrick_core_abi::EntryMmKey::from_raw(identity.mm),
+            thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(identity.serial),
+        };
+        let source = BornInZoneSource { zone: &zone, slot };
+        let mut process = Process {
+            binding,
+            source,
+            record,
+            receipt: None,
+            visits: 0,
+        };
+        let state = carrick_personality_linux::abi::entry::LinuxTaskState::new();
+        state.orig_arg0.store(123, Ordering::Relaxed);
+        let counters = Counters::default();
+        let venue = SharedVenue {
+            binding: || binding,
+            state: &state,
+            counters: carrick_personality_linux::dispatch::EntryCounters {
+                served: &counters.served,
+                forwarded: &counters.forwarded,
+            },
+            robust_list: |_, _| None,
+            process_pid: Some(71),
+            visible_tid: Some(71),
+        };
+        let call = carrick_personality_linux::entry::decode_x86_64(
+            61,
+            [72, 0x7000, 0, 0, 0, 0],
+            0x7fff0000,
+        );
+        assert_eq!(
+            serve_with_custody(
+                &call,
+                &venue,
+                &mut AnonymousBreak,
+                Some(&mut process),
+                Some(source)
+            ),
+            EntryOutcome::Suspended
+        );
+        assert_eq!(process.visits, 1);
+        assert!(process.receipt.is_none());
+        assert!(zone.slot(slot).current().is_none());
+        assert_eq!(state.orig_arg0.load(Ordering::Relaxed), 123);
+        assert_eq!(
+            counters
+                .forwarded
+                .iter()
+                .map(|v| v.load(Ordering::Relaxed))
+                .sum::<u64>(),
+            0
+        );
+        assert_eq!(
+            counters
+                .served
+                .iter()
+                .map(|v| v.load(Ordering::Relaxed))
+                .sum::<u64>(),
+            1
+        );
+    }
 }

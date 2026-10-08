@@ -2,6 +2,7 @@
 pub use crate::abi::entry::{CanonicalCall, CanonicalOrdinal, SyscallResult};
 use carrick_core_abi::EntryMmKey;
 pub use carrick_core_abi::ExecutionBinding;
+use carrick_core_abi::{BornInZoneSource, EntryContext};
 use carrick_guest_arch::{
     GuestIsa, NativeAbi, NativeEntrySnapshot, NativeOrdinal, UserVa, X86Register, X86Registers,
 };
@@ -80,10 +81,16 @@ pub fn decode_aarch64(native: u64, args: [u64; 6], stack: u64) -> CanonicalCall 
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum EntryOutcome {
-    Served { result: SyscallResult },
-    ServedWithWork { result: SyscallResult },
+    Served {
+        result: SyscallResult,
+    },
+    ServedWithWork {
+        result: SyscallResult,
+    },
     Forward,
     InvalidCompletion,
+    /// Native custody retains the continuation; no result or host replay.
+    Suspended,
 }
 
 pub trait LinuxEntryVenue {
@@ -131,14 +138,21 @@ impl<B: Fn() -> ExecutionBinding, R: Fn(u64, u64) -> Option<i64>> LinuxEntryVenu
     }
 }
 
-struct CommonFamilies<'a> {
+struct CommonFamilies<'a, C: EntryContext + 'a> {
     venue: &'a dyn LinuxEntryVenue,
     anonymous: Option<&'a mut (dyn crate::pending_anonymous::PendingAnonymousVenue + 'a)>,
-    process: Option<&'a mut dyn crate::lifecycle::ProcessNative>,
+    process: Option<&'a mut dyn crate::lifecycle::ProcessNative<C>>,
+    source: Option<BornInZoneSource<'a, C>>,
     args: [u64; 6],
     result: Option<i64>,
 }
-impl<'a> crate::dispatch::PendingFamilies<'a> for CommonFamilies<'a> {
+impl<'a, C: EntryContext + 'a> crate::dispatch::PendingFamilies<'a, C> for CommonFamilies<'a, C> {
+    fn record_source(&self) -> Option<BornInZoneSource<'a, C>> {
+        self.source
+    }
+    fn take_handoff_receipt(&mut self) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
+        self.process.as_deref_mut()?.take_handoff_receipt()
+    }
     fn anonymous(
         &mut self,
         call: crate::dispatch::AnonymousCall,
@@ -202,23 +216,25 @@ impl<'a> crate::dispatch::PendingFamilies<'a> for CommonFamilies<'a> {
 }
 
 pub fn serve(call: &CanonicalCall, venue: &dyn LinuxEntryVenue) -> EntryOutcome {
-    serve_inner(call, venue, None, None)
+    serve_inner::<carrick_sched_core::ThreadCtx>(call, venue, None, None, None)
 }
 
-pub fn serve_with_custody<'a>(
+pub fn serve_with_custody<'a, C: EntryContext + 'a>(
     call: &CanonicalCall,
     venue: &'a dyn LinuxEntryVenue,
     anonymous: &'a mut (dyn crate::pending_anonymous::PendingAnonymousVenue + 'a),
-    process: Option<&'a mut dyn crate::lifecycle::ProcessNative>,
+    process: Option<&'a mut dyn crate::lifecycle::ProcessNative<C>>,
+    source: Option<BornInZoneSource<'a, C>>,
 ) -> EntryOutcome {
-    serve_inner(call, venue, Some(anonymous), process)
+    serve_inner(call, venue, Some(anonymous), process, source)
 }
 
-fn serve_inner<'a>(
+fn serve_inner<'a, C: EntryContext + 'a>(
     call: &CanonicalCall,
     venue: &'a dyn LinuxEntryVenue,
     anonymous: Option<&'a mut (dyn crate::pending_anonymous::PendingAnonymousVenue + 'a)>,
-    process: Option<&'a mut dyn crate::lifecycle::ProcessNative>,
+    process: Option<&'a mut dyn crate::lifecycle::ProcessNative<C>>,
+    source: Option<BornInZoneSource<'a, C>>,
 ) -> EntryOutcome {
     let Ok(_) = usize::try_from(call.canonical.raw()) else {
         return EntryOutcome::Forward;
@@ -227,12 +243,16 @@ fn serve_inner<'a>(
         venue,
         anonymous,
         process,
+        source,
         args: call.args,
         result: None,
     };
     let route = crate::dispatch::dispatch(call.canonical.raw(), u64::MAX, &mut pending);
     if route == crate::dispatch::CompletionRoute::InvalidCompletion {
         return EntryOutcome::InvalidCompletion;
+    }
+    if route == crate::dispatch::CompletionRoute::Suspended {
+        return EntryOutcome::Suspended;
     }
     let Some(result) = pending.result else {
         return EntryOutcome::Forward;
@@ -245,7 +265,7 @@ fn serve_inner<'a>(
     }
 }
 
-impl crate::lifecycle::UserCopy for CommonFamilies<'_> {
+impl<C: EntryContext> crate::lifecycle::UserCopy for CommonFamilies<'_, C> {
     fn copy_in(&mut self, _: &mut [u8], _: UserVa) -> bool {
         false
     }
@@ -253,7 +273,7 @@ impl crate::lifecycle::UserCopy for CommonFamilies<'_> {
         false
     }
 }
-impl<'a> crate::lifecycle::LifecycleNative<'a> for CommonFamilies<'a> {
+impl<'a, C: EntryContext + 'a> crate::lifecycle::LifecycleNative<'a> for CommonFamilies<'a, C> {
     fn arguments(&self) -> [u64; 6] {
         self.args
     }
@@ -283,9 +303,11 @@ impl<'a> crate::lifecycle::LifecycleNative<'a> for CommonFamilies<'a> {
         pid: crate::lifecycle::ProcessWaitPid,
         status: UserVa,
         options: crate::lifecycle::LinuxWaitOptions,
+        rusage: UserVa,
     ) -> Option<crate::lifecycle::LifecycleOutcome> {
         let process = self.process.as_deref_mut()?;
-        (process.binding() == self.venue.binding()).then(|| process.wait4(pid, status, options))
+        (process.binding() == self.venue.binding())
+            .then(|| process.wait4(pid, status, options, rusage))
     }
     fn process_exit_group(&mut self, status: u8) -> Option<crate::lifecycle::LifecycleOutcome> {
         let process = self.process.as_deref_mut()?;

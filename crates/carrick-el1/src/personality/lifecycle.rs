@@ -67,8 +67,9 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord> LifecycleNative<'a>
         pid: ProcessWaitPid,
         status: UserVa,
         options: LinuxWaitOptions,
+        rusage: UserVa,
     ) -> Option<LifecycleOutcome> {
-        Some(self.process_venue()?.wait4(pid, status, options))
+        Some(self.process_venue()?.wait4(pid, status, options, rusage))
     }
     fn process_exit_group(&mut self, status: u8) -> Option<LifecycleOutcome> {
         Some(self.process_venue()?.exit_group(status))

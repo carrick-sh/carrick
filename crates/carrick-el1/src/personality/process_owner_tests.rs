@@ -721,3 +721,345 @@ fn adapter_wait_work_visits_only_own_children_with_512_unrelated_rows() {
         }
     }
 }
+
+#[test]
+fn copied_wait_status_must_not_reap_a_newly_ready_other_child() {
+    use super::super::native_process_entry::{WaitWork, scan_wait};
+    let mut owner = owner();
+    let parent = key(1, 1);
+    let first = key(2, 2);
+    let child = key(3, 3);
+    birth(&mut owner, parent, first, Rc::new(Cell::new(0)));
+    birth(&mut owner, parent, child, Rc::new(Cell::new(0)));
+    let _ = exit(&mut owner, child, None);
+    let WaitWork::Status(observed) = scan_wait(&owner, parent, query(WaitTarget::Any)).unwrap()
+    else {
+        panic!("zombie")
+    };
+    let observed_key = observed.zombie().key;
+    let copied = observed.copy_with(|_| Ok::<_, ()>(())).unwrap();
+    let _ = exit(&mut owner, first, None);
+    let consumed = copied.consume(&mut owner).unwrap();
+    let WaitSelection::Exited(consumed) = consumed.selection else {
+        panic!("zombie")
+    };
+    assert_eq!(consumed.key, observed_key);
+    assert!(matches!(
+        owner
+            .scan_wait(parent, query(WaitTarget::Exact(first)))
+            .unwrap(),
+        WaitSelection::Exited(_)
+    ));
+}
+
+#[test]
+fn failed_external_status_copy_leaves_zombie_and_claim_owned() {
+    use super::super::native_process_entry::{WaitWork, scan_wait};
+    let mut owner = owner();
+    let parent = key(1, 1);
+    let child = key(2, 2);
+    let releases = Rc::new(Cell::new(0));
+    birth(&mut owner, parent, child, releases.clone());
+    let _ = exit(&mut owner, child, None);
+    let WaitWork::Status(work) = scan_wait(&owner, parent, query(WaitTarget::Any)).unwrap() else {
+        panic!("zombie")
+    };
+    assert!(work.copy_with(|_| Err::<(), _>(14)).is_err());
+    assert_eq!(releases.get(), 0);
+    assert!(matches!(
+        owner
+            .scan_wait(parent, query(WaitTarget::Exact(child)))
+            .unwrap(),
+        WaitSelection::Exited(_)
+    ));
+}
+
+#[test]
+fn visible_child_pid_lookup_survives_exit_and_rejects_unowned_rows() {
+    let mut owner = owner();
+    let parent = key(1, 1);
+    let child = key(2, 2);
+    let snapshot = owner.capture_parent(parent).unwrap();
+    let mut row = task(
+        child,
+        Some(parent),
+        Rc::new(Cell::new(0)),
+        1,
+        Rc::new(RefCell::new(Vec::new())),
+    );
+    row.metadata.namespace_pid = 72;
+    owner
+        .admit_child(snapshot, snapshot, &row, BirthAttachment::Parent, None)
+        .unwrap()
+        .publish(row);
+    assert_eq!(owner.namespace_child_key(parent, 72).unwrap(), Some(child));
+    assert_eq!(owner.namespace_child_key(parent, 2).unwrap(), None);
+    assert_eq!(owner.namespace_child_key(child, 72).unwrap(), None);
+    let _ = exit(&mut owner, child, None);
+    assert_eq!(owner.namespace_child_key(parent, 72).unwrap(), Some(child));
+    drop(
+        owner
+            .consume_wait(parent, query(WaitTarget::Exact(child)))
+            .unwrap(),
+    );
+    assert_eq!(owner.namespace_child_key(parent, 72).unwrap(), None);
+}
+
+#[test]
+fn entry_fork_admission_precedes_mm_commit_and_returns_reserved_publication() {
+    use super::super::native_process_entry::PreparedFork;
+    let mut owner = owner();
+    let parent = key(1, 1);
+    let child = key(2, 2);
+    let releases = Rc::new(Cell::new(0));
+    let row = task(
+        child,
+        Some(parent),
+        releases.clone(),
+        1,
+        Rc::new(RefCell::new(Vec::new())),
+    );
+    let committed = Rc::new(Cell::new(0));
+    let prep = match PreparedFork::prepare(
+        &mut owner,
+        parent,
+        parent,
+        row,
+        committed.clone(),
+        BirthAttachment::Parent,
+        Transaction(83),
+    ) {
+        Ok(prep) => prep,
+        Err(_) => panic!("prepare"),
+    };
+    assert!(matches!(
+        owner.precheck_wait(parent, query(WaitTarget::Any)),
+        Err(GuestProcessError::Wait(WaitError::Busy(_)))
+    ));
+    let published = match prep.publish_with(&mut owner, |mm| {
+        mm.set(mm.get() + 1);
+        child
+    }) {
+        Ok(published) => published,
+        Err(_) => panic!("publish"),
+    };
+    assert_eq!(published.born, child);
+    assert_eq!(committed.get(), 1);
+    assert_eq!(releases.get(), 0);
+    owner.release_birth(&published.reservation).unwrap();
+    assert_eq!(owner.task(child).unwrap().parent(), Some(parent));
+}
+
+#[test]
+fn entry_fork_abort_returns_mm_and_child_custody_without_publication() {
+    use super::super::native_process_entry::PreparedFork;
+    let mut owner = owner();
+    let parent = key(1, 1);
+    let child = key(2, 2);
+    let row = task(
+        child,
+        Some(parent),
+        Rc::new(Cell::new(0)),
+        1,
+        Rc::new(RefCell::new(Vec::new())),
+    );
+    let prep = match PreparedFork::prepare(
+        &mut owner,
+        parent,
+        parent,
+        row,
+        97u32,
+        BirthAttachment::Parent,
+        Transaction(84),
+    ) {
+        Ok(prep) => prep,
+        Err(_) => panic!("prepare"),
+    };
+    let (row, mm) = match prep.abort(&mut owner) {
+        Ok(returned) => returned,
+        Err(_) => panic!("abort"),
+    };
+    assert_eq!(row.key(), child);
+    assert_eq!(mm, 97);
+    assert!(owner.task(child).is_err());
+    assert_eq!(
+        owner.precheck_wait(parent, query(WaitTarget::Any)).unwrap(),
+        WaitReadiness::NoChild
+    );
+}
+
+#[test]
+fn entry_exit_returns_resources_and_cancel_effects_before_native_service() {
+    use super::super::native_process_entry::publish_exit;
+    let mut owner = owner();
+    let parent = key(1, 1);
+    let child = key(2, 2);
+    birth(&mut owner, parent, child, Rc::new(Cell::new(0)));
+    let work = owner.task(child).unwrap().native().work.clone();
+    let (resources, published) = publish_exit(
+        &mut owner,
+        child,
+        None,
+        Transaction(85),
+        LinuxWaitStatus::from_wait_encoding(9 << 8),
+    )
+    .unwrap();
+    assert!(Rc::ptr_eq(&resources.unwrap(), &work));
+    assert_eq!(work.signal_reads.get(), 0);
+    assert!(owner.task(child).is_err());
+    assert!(matches!(
+        owner
+            .scan_wait(parent, query(WaitTarget::Exact(child)))
+            .unwrap(),
+        WaitSelection::Exited(_)
+    ));
+    drop(published);
+}
+
+impl super::super::native_process_custody::ProcessResources for Native {
+    type Claim = Claim;
+    type Event = ();
+    type Transaction = Transaction;
+    type Member = Member;
+    type Resources = Rc<Work>;
+    type SignalTarget = Signals;
+    fn wait_event(&self, flags: WaitJobControl, consume: bool) -> Option<()> {
+        NativeProcessCustody::wait_event(self, flags, consume)
+    }
+    fn own_members_and_resources(&self) -> (Vec<Member>, Rc<Work>) {
+        NativeProcessCustody::own_members_and_resources(self)
+    }
+    fn signal_target(&self) -> Signals {
+        NativeProcessCustody::signal_target(self)
+    }
+    fn autoreaps_children(&self) -> bool {
+        NativeProcessCustody::autoreaps_children(self)
+    }
+    fn own_rusage(&self) -> TaskRusage {
+        NativeProcessCustody::own_rusage(self)
+    }
+}
+
+#[test]
+fn entry_adapter_uses_retained_primitive_custody_through_fork_exit_wait() {
+    use super::super::native_process_custody::RetainedProcessCustody;
+    use super::super::native_process_entry::{PreparedFork, WaitWork, publish_exit, scan_wait};
+    fn retained(row: Task) -> GuestTask<(), Uid, RetainedProcessCustody<Native>> {
+        let parent = row.parent();
+        GuestTask::new(
+            row.metadata,
+            parent,
+            row.context,
+            RetainedProcessCustody::new(row.native),
+            row.claim,
+        )
+    }
+    let mut owner = GuestProcessOwner::<(), Uid, RetainedProcessCustody<Native>, Failure>::new();
+    let parent = key(1, 1);
+    let child = key(2, 2);
+    owner
+        .seed_initial(retained(task(
+            parent,
+            None,
+            Rc::new(Cell::new(0)),
+            1,
+            Rc::new(RefCell::new(Vec::new())),
+        )))
+        .unwrap();
+    let releases = Rc::new(Cell::new(0));
+    let row = retained(task(
+        child,
+        Some(parent),
+        releases.clone(),
+        1,
+        Rc::new(RefCell::new(Vec::new())),
+    ));
+    let prepared = match PreparedFork::prepare(
+        &mut owner,
+        parent,
+        parent,
+        row,
+        (),
+        BirthAttachment::Parent,
+        Transaction(89),
+    ) {
+        Ok(prepared) => prepared,
+        Err(_) => panic!("prepare"),
+    };
+    let published = match prepared.publish_with(&mut owner, |()| ()) {
+        Ok(published) => published,
+        Err(_) => panic!("publish"),
+    };
+    owner.release_birth(&published.reservation).unwrap();
+    let (resources, effects) = publish_exit(
+        &mut owner,
+        child,
+        None,
+        Transaction(90),
+        LinuxWaitStatus::from_wait_encoding(4 << 8),
+    )
+    .unwrap();
+    assert!(resources.is_some());
+    drop(effects);
+    let WaitWork::Status(status) = scan_wait(&owner, parent, query(WaitTarget::Any)).unwrap()
+    else {
+        panic!("status")
+    };
+    let copied = status
+        .copy_with(|zombie| {
+            assert_eq!(zombie.key, child);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    let consumed = copied.consume(&mut owner).unwrap();
+    assert_eq!(releases.get(), 0);
+    drop(consumed);
+    assert_eq!(releases.get(), 1);
+}
+
+#[test]
+fn failed_mm_commit_keeps_unpublished_child_preparation_and_exact_reservation() {
+    use super::super::native_process_entry::{ForkTryError, PreparedFork};
+    let mut owner = owner();
+    let parent = key(1, 1);
+    let child = key(2, 2);
+    let releases = Rc::new(Cell::new(0));
+    let row = task(
+        child,
+        Some(parent),
+        releases.clone(),
+        1,
+        Rc::new(RefCell::new(Vec::new())),
+    );
+    let prep = match PreparedFork::prepare(
+        &mut owner,
+        parent,
+        parent,
+        row,
+        97u32,
+        BirthAttachment::Parent,
+        Transaction(93),
+    ) {
+        Ok(prep) => prep,
+        Err(_) => panic!("prepare"),
+    };
+    let ForkTryError::Commit(error, prep) = prep
+        .try_publish_with(&mut owner, |mm| Err::<(), _>((14, mm)))
+        .err()
+        .unwrap()
+    else {
+        panic!("commit refusal")
+    };
+    assert_eq!(error, 14);
+    assert_eq!(releases.get(), 0);
+    assert!(owner.task(child).is_err());
+    assert!(matches!(
+        owner.precheck_wait(parent, query(WaitTarget::Any)),
+        Err(GuestProcessError::Wait(WaitError::Busy(_)))
+    ));
+    let (_, mm) = match prep.abort(&mut owner) {
+        Ok(returned) => returned,
+        Err(_) => panic!("abort"),
+    };
+    assert_eq!(mm, 97);
+}

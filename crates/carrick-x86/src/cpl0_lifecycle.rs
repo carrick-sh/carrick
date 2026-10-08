@@ -746,6 +746,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         pid: carrick_personality_linux::lifecycle::ProcessWaitPid,
         status: UserVa,
         options: carrick_syscall_abi::LinuxWaitOptions,
+        _rusage: UserVa,
     ) -> Option<LifecycleOutcome> {
         use crate::kernel::process;
         use carrick_syscall_abi::LinuxWaitOptions;
@@ -760,6 +761,9 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
                 work: false,
             })
         };
+        if _rusage.raw() != 0 {
+            return returned(carrick_syscall_abi::LinuxErrno::new(38).guest_retval());
+        }
         if options.bits() & !LinuxWaitOptions::WAIT4_SUPPORTED.bits() != 0 {
             return returned(carrick_syscall_abi::LINUX_EINVAL.guest_retval()); // EINVAL
         }

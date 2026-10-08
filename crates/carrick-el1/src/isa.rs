@@ -87,6 +87,10 @@ pub mod arm_edit;
 pub mod aarch64;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod x86;
+
+#[cfg(all(test, not(target_os = "none")))]
+#[path = "isa/x86/live_context.rs"]
+mod x86_live_context;
 // The carrier and CPL0 share one pure initial-MM module. Host tests exercise
 // that same module on every host; native hardware leaves stay gated.
 #[cfg(any(target_arch = "x86_64", test))]
