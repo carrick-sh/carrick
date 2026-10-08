@@ -5689,6 +5689,18 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.prepare_el1_frame_grant(request)
     }
 
+    fn el1_frame_grant_vacant_span(
+        &self,
+        start: u64,
+        len: u64,
+        fault: u64,
+    ) -> Result<Option<(u64, u64)>, TrapError> {
+        if self.page_tables.live_descriptor_owner() != LiveDescriptorOwner::Guest {
+            return Ok(Some((start, len)));
+        }
+        self.vm.el1_frame_grant_vacant_span(start, len, fault)
+    }
+
     fn roll_back_el1_frame_grant(
         &mut self,
         grant: carrick_hal::threaded::El1FrameGrantRollback,

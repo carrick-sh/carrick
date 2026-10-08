@@ -3158,6 +3158,18 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
         Ok(None)
     }
 
+    /// Bound a proposed grant to the vacant live stage-1 run containing the
+    /// fault. Guest-owned fork children may have inherited resident leaves
+    /// which the host's fresh child residency facts do not yet describe.
+    fn el1_frame_grant_vacant_span(
+        &self,
+        start: u64,
+        len: u64,
+        _fault: u64,
+    ) -> Result<Option<(u64, u64)>, TrapError> {
+        Ok(Some((start, len)))
+    }
+
     /// Expose prepared grant backing with only `fault_va` accessible and
     /// the other pages prepared. The engine's live-descriptor owner decides
     /// the lane: on the host-owned lane it stores the leaves itself; on the

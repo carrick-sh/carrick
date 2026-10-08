@@ -967,6 +967,23 @@ impl Drop for PreparedRootGrant {
 }
 
 impl ResidentFrameGrantPlan<'_> {
+    /// Narrow the proposal under the same MM exclusion, retaining the fault.
+    /// Stage-1 occupancy is authoritative for a fork child before host facts
+    /// have imported its inherited resident terminals.
+    pub fn clamp_to_vacant(mut self, start: u64, len: u64) -> Option<Self> {
+        let end = start.checked_add(len)?;
+        if len == 0
+            || start < self.start
+            || end > self.start.checked_add(self.len)?
+            || !(start..end).contains(&self.fault_page)
+        {
+            return None;
+        }
+        self.start = start;
+        self.len = len;
+        Some(self)
+    }
+
     pub fn fault_page(&self) -> u64 {
         self.fault_page
     }
