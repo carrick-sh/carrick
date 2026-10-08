@@ -604,6 +604,31 @@ impl<
             leaf = translated::<B, W>(words, root, va, access, continuation.intent)?;
         }
         let Some((ipa, executable)) = leaf else {
+            // Preserve the guest's actual terminal word when a later host
+            // grant finds an alias without residency. The host shadow may
+            // lag EL1's page-table editor, so this must be sampled here.
+            #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+            {
+                let mut table = root.address().raw();
+                let mut terminal = 0;
+                for (level, shift) in [39, 30, 21, 12].into_iter().enumerate() {
+                    let Ok(word) = words.load(table + ((va >> shift) & 511) * 8) else {
+                        break;
+                    };
+                    terminal = word;
+                    if word & 3 != 3 || level == 3 {
+                        break;
+                    }
+                    table = word & 0x0000_ffff_ffff_f000;
+                }
+                carrick_core_abi::record_reservation_event(
+                    11,
+                    mm,
+                    va,
+                    terminal as u32,
+                    (terminal >> 32) as u32,
+                );
+            }
             // Permission policy was already checked. Reuse the one lazy supply
             // owner receipt; no fault-mailbox transport is consumed by selection.
             let bits = match access {
