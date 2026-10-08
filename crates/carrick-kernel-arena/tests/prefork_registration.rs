@@ -58,6 +58,75 @@ fn prefork_claim_is_complete_when_child_publishes_pid() {
     );
 }
 
+/// Fork at the existing fill hook, after ancestry but before namespace fill.
+/// The shared arena must hide this partially filled record from the child.
+#[test]
+fn fork_during_fill_keeps_record_unpublished() {
+    let arena = KernelArena::create().expect("create arena");
+    let section = &arena.layout().processes;
+    let pid = HostPid::new(std::process::id());
+    let r = section
+        .claim(Some(pid), arena.allocate_generation(), |record| {
+            record.parent_host_pid.store(pid.raw(), Ordering::Relaxed);
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0, "fork failed");
+            if child == 0 {
+                let hidden = record.state().is_registering() && section.find(pid).is_none();
+                unsafe { libc::_exit(if hidden { 0 } else { 70 }) };
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+            record.ns_pid.store(88, Ordering::Relaxed);
+        })
+        .expect("claim record");
+    assert_eq!(section.find(pid), Some(r));
+    assert_eq!(section.records[r.index].ns_pid.load(Ordering::Acquire), 88);
+}
+
+// The hook fixes the observation/reap interleaving without wall-clock timing.
+#[allow(clippy::expect_used)]
+fn observe_parent(
+    record: &carrick_kernel_arena::process::ProcessRecord,
+    observation: &std::sync::Mutex<()>,
+    after_identity: impl FnOnce(),
+) -> Option<(u32, u32, u32)> {
+    let _observation = observation.lock().expect("observation lock");
+    let host = record.state().host_pid()?.raw();
+    let ns = record.ns_pid.load(Ordering::Acquire);
+    after_identity();
+    Some((host, ns, record.parent_host_pid.load(Ordering::Acquire)))
+}
+
+#[test]
+fn observation_cannot_mix_publication_with_reap() {
+    let arena = KernelArena::create().expect("create arena");
+    let section = &arena.layout().processes;
+    let r = section
+        .claim(
+            Some(HostPid::new(77)),
+            arena.allocate_generation(),
+            |record| {
+                record.ns_pid.store(88, Ordering::Relaxed);
+                record.parent_host_pid.store(99, Ordering::Relaxed);
+            },
+        )
+        .expect("claim record");
+    let observation = std::sync::Mutex::new(());
+    let observed = observe_parent(&section.records[r.index], &observation, || {
+        // Force reap immediately after the observer captured identity. An
+        // exact observation owns the guard, so reap cannot clear its body.
+        if let Ok(_reap) = observation.try_lock() {
+            assert!(section.release(r));
+        }
+    });
+    assert!(
+        observed == Some((77, 88, 99)),
+        "observation mixed a published identity with a retired body: {observed:?}"
+    );
+}
+
 /// Plan B6 Step 1's storm variant: 200 real fork children while a sibling
 /// scanner thread continuously reads the section. The pre-fork registration
 /// invariant is that a record whose host pid is PUBLISHED is already complete
@@ -74,23 +143,26 @@ fn fork_storm_never_exposes_incomplete_records() {
 
     let arena = Arc::new(KernelArena::create().expect("create arena"));
     let stop = Arc::new(AtomicBool::new(false));
+    // Only the test observer and terminal reap share this lock. Registration,
+    // fork and child validation retain their original concurrency.
+    let observation = Arc::new(std::sync::Mutex::new(()));
 
     let scanner = {
         let arena = Arc::clone(&arena);
         let stop = Arc::clone(&stop);
+        let observation = Arc::clone(&observation);
         std::thread::spawn(move || -> Result<(), String> {
             let section = &arena.layout().processes;
             while !stop.load(Ordering::Acquire) {
                 for record in section.records.iter() {
-                    let Some(host_pid) = record.state().host_pid() else {
+                    let Some((host, ns, parent)) = observe_parent(record, &observation, || {})
+                    else {
                         continue; // unpublished: invisible by contract
                     };
-                    let host = host_pid.raw();
-                    let ns = record.ns_pid.load(Ordering::Acquire);
                     if !(NS_BASE..NS_BASE + CHILDREN).contains(&ns) {
                         continue; // not one of this test's records
                     }
-                    if record.parent_host_pid.load(Ordering::Acquire) == 0 {
+                    if parent == 0 {
                         return Err(format!(
                             "published record for host pid {host} (ns {ns}) has no parent — \
                              the pre-fork fill was observed incomplete"
@@ -136,7 +208,8 @@ fn fork_storm_never_exposes_incomplete_records() {
         let reaped = section
             .find(HostPid::new(child as u32))
             .expect("reaped child record");
-        section.release(reaped);
+        let _observation = observation.lock().expect("reap lock");
+        assert!(section.release(reaped));
     }
 
     stop.store(true, Ordering::Release);
