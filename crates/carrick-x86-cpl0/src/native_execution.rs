@@ -3,7 +3,7 @@ use super::{anonymous, initial_boot, native_process};
 use carrick_el1::isa::x86::{self, context};
 use carrick_el1_abi::{BornInZoneSource, CurrentTask, ReservationMm};
 use carrick_guest_arch::{MmuBackend, InterruptBackend};
-use carrick_sched_core::process::{TaskId, TaskKey, TaskSerial};
+use carrick_el1_abi::ExecutionBinding;
 use carrick_sched_core::process::cpu_accounting::{CpuMode, CpuSample};
 use carrick_el1::lock::SpinLock;
 static INITIAL_SLICE: SpinLock<Option<CpuSample>> = SpinLock::new(None);
@@ -34,13 +34,8 @@ pub(super) fn sample() -> CpuSample {
         frequency: cpu.frequency().unwrap_or_else(|_| initial_boot::fatal_boot()),
     }
 }
-fn task_key(current: &CurrentTask) -> TaskKey {
-    let binding = carrick_core::entry::binding(&current.execution, &current.mm);
-    TaskKey {
-        id: TaskId::from_abi_positive(i32::try_from(binding.task.raw()).unwrap_or_else(|_| initial_boot::fatal_boot()))
-            .unwrap_or_else(|_| initial_boot::fatal_boot()),
-        serial: TaskSerial::from_raw_u64(binding.generation.raw()).unwrap_or_else(|| initial_boot::fatal_boot()),
-    }
+fn task_binding(current: &CurrentTask) -> ExecutionBinding {
+    carrick_core::entry::binding(&current.execution, &current.mm)
 }
 pub(super) fn initial_resume() {
     let mut initial = INITIAL_SLICE.lock();
@@ -49,7 +44,7 @@ pub(super) fn initial_resume() {
 }
 pub(super) fn kernel_entry(current: &CurrentTask) {
     let runtime = native_process::runtime();
-    let key = task_key(current);
+    let key = task_binding(current);
     if let Some(start) = INITIAL_SLICE.lock().take() {
         runtime.resume_cpu(key, start, CpuMode::User).unwrap_or_else(|_| initial_boot::fatal_boot());
     }
@@ -59,7 +54,7 @@ pub(super) fn kernel_entry(current: &CurrentTask) {
 }
 pub(super) fn user_return() {
     let Some(runtime) = native_process::try_runtime() else { return; };
-    let key = task_key(task());
+    let key = task_binding(task());
     let now = sample();
     runtime.stop_cpu(key, now).unwrap_or_else(|_| initial_boot::fatal_boot());
     runtime.resume_cpu(key, now, CpuMode::User).unwrap_or_else(|_| initial_boot::fatal_boot());
@@ -68,12 +63,12 @@ pub(super) fn user_return() {
 /// Real host custody time is not guest CPU time. Preserve the exact task's
 /// current mode while a declared physical crossing stops this vCPU.
 pub(super) struct CrossingCharge {
-    paused: Option<(TaskKey, CpuMode)>,
+    paused: Option<(ExecutionBinding, CpuMode)>,
 }
 impl CrossingCharge {
     pub(super) fn pause() -> Self {
         let paused = native_process::try_runtime().and_then(|runtime| {
-            let key = task_key(task());
+            let key = task_binding(task());
             runtime.stop_cpu(key, sample()).unwrap_or_else(|_| initial_boot::fatal_boot())
                 .map(|mode| (key, mode))
         });
@@ -157,7 +152,7 @@ pub(super) fn schedule(slot: SlotId) -> ! {
     let source = source(slot);
     let current = task();
     if let Some(runtime) = native_process::try_runtime() {
-        runtime.stop_cpu(task_key(current), sample()).unwrap_or_else(|_| initial_boot::fatal_boot());
+        runtime.stop_cpu(task_binding(current), sample()).unwrap_or_else(|_| initial_boot::fatal_boot());
     }
     source.zone.release_space(slot);
     loop {
@@ -188,7 +183,7 @@ pub(super) fn schedule(slot: SlotId) -> ! {
                 initial_boot::fatal_boot();
             }
             let mut words = state.words;
-            runtime.resume_cpu(state.key, sample(), CpuMode::System).unwrap_or_else(|_| initial_boot::fatal_boot());
+            runtime.resume_cpu(task_binding(current), sample(), CpuMode::System).unwrap_or_else(|_| initial_boot::fatal_boot());
             let mut service = native_process::Service::new(current, slot);
             {
                 let mut entry = runtime
