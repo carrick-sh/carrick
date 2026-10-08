@@ -157,7 +157,7 @@ pub fn space_access<'a, C: Copy + Send + Sync + zerocopy::FromZeros>(
     SpaceAccess::notified(SpaceReleaseVenue {
         zone,
         waker: Waker::El1 { slot },
-        deliver,
+        deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(deliver),
     })
 }
 

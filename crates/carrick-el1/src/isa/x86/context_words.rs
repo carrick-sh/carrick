@@ -402,7 +402,9 @@ mod tests {
             SpaceReleaseVenue {
                 zone,
                 waker: Waker::Host,
-                deliver: deliver_x86_notification,
+                deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(
+                    deliver_x86_notification,
+                ),
             },
         )
         .unwrap();
@@ -468,7 +470,9 @@ mod tests {
         let venue = SpaceReleaseVenue {
             zone: &zone,
             waker: Waker::Host,
-            deliver: deliver_x86_notification,
+            deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(
+                deliver_x86_notification,
+            ),
         };
         let access = SpaceAccess::notified(venue);
         access.open(space);

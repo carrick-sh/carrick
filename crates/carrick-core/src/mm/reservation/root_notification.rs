@@ -221,7 +221,10 @@ impl<
         }
         let completion =
             |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>| {
-                (venue.release.deliver)(venue.release.zone, venue.release.waker, effects)
+                venue
+                    .release
+                    .deliver
+                    .invoke(venue.release.zone, venue.release.waker, effects)
             };
         entry
             .admit_notifications(
