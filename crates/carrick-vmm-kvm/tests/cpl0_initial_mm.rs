@@ -328,10 +328,16 @@ fn nested_kernel_fault_preserves_outer_diagnostics_and_refuses() {
     carrier
         .load_guest_mm(&plan, &[], &[], InitialReservationLimits::UNLIMITED)
         .expect("initial MM");
-    let stop = carrier
-        .run_initial_process(1, |_, _| Ok(InitialSyscallDisposition::Return(0)))
-        .expect_err("stopped after first syscall");
-    assert!(stop.to_string().contains("exit budget exceeded"));
+    // Stop at the syscall crossing, before any fault-record word can be
+    // consumed. A global exit budget also counts peer IRQ/HLT events and
+    // cannot license a deterministic injection point on two active CPUs.
+    carrier
+        .run_initial_process(32, |_, _| {
+            Ok(InitialSyscallDisposition::Exit(
+                GuestExitStatus::from_linux_code(0),
+            ))
+        })
+        .expect("stopped at first syscall");
     carrier
         .invalidate_user_fault_counters_venue()
         .expect("inject kernel venue fault");
