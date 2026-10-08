@@ -30,10 +30,13 @@ impl Channel {
     }
     fn receive(&self) -> u64 {
         let mut bytes = [0u8; 8];
+        let count = unsafe { libc::read(self.read, bytes.as_mut_ptr().cast(), bytes.len()) };
         assert_eq!(
-            unsafe { libc::read(self.read, bytes.as_mut_ptr().cast(), bytes.len()) },
+            count,
             8,
-            "receive"
+            "receive fd={} errno={}",
+            self.read,
+            std::io::Error::last_os_error()
         );
         u64::from_ne_bytes(bytes)
     }
