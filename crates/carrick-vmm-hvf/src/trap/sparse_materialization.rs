@@ -2671,6 +2671,13 @@ impl PublicationContext<'static> {
                         scope,
                         alias.size as u32,
                     );
+                    super::stage2_backend::record_owner_supply_detail(
+                        10,
+                        alias.physical_ipa,
+                        alias.owner_generation,
+                        alias.physical_size as u32,
+                        scope,
+                    );
                 }
                 super::stage2_backend::record_owner_supply_detail(
                     7,
