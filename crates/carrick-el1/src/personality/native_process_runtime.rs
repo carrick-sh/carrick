@@ -545,12 +545,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .map_err(|_| NativeProcessError::Stale)?
                     .ok_or(NativeProcessError::NoChild)?,
             ),
-            p => {
-                if p.unsigned_abs() != row.metadata().namespace_process_group {
-                    return Err(NativeProcessError::NoChild);
-                };
-                WaitTarget::ProcessGroup(row.identity().process_group)
-            }
+            p => WaitTarget::ProcessGroup(
+                graph
+                    .owner
+                    .namespace_child_group(self.key, p.unsigned_abs())
+                    .map_err(|_| NativeProcessError::Stale)?
+                    .ok_or(NativeProcessError::NoChild)?,
+            ),
         };
         Ok(WaitQuery {
             target,
