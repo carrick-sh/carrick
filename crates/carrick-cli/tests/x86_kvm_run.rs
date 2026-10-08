@@ -905,3 +905,8 @@ fn mounted_static_x86_signal_masked_abort_dependency() {
     );
     assert!(run.stdout.is_empty());
 }
+
+#[test]
+fn mounted_static_x86_signal_stack_mapping_dependency() {
+    compare_mounted_assembly_with_native("x86_signal_stack_mapping.S", b"S\n");
+}
