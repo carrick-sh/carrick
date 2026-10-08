@@ -49,6 +49,8 @@ rules:
         # native stack/TSC reads and named UD2 fail-closed paths. These execute
         # in the guest and have no host operation or semantic syscall escape.
         - /crates/carrick-el1/src/isa/x86/context.rs
+        # Guest-only authenticated XRSTOR/GPR restore followed by SWAPGS/IRET.
+        - /crates/carrick-el1/src/isa/x86/context_resume.rs
         - /crates/carrick-el1/src/isa/x86/interrupt.rs
         - /crates/carrick-el1/src/isa/x86/interrupts.rs
         - /crates/carrick-el1/src/isa/x86/mmu.rs
@@ -64,6 +66,11 @@ rules:
         # boot-completion port reports to the retained KVM carrier. No host
         # syscall or undeclared port is reachable from this guest module.
         - /crates/carrick-x86-cpl0/src/initial_boot.rs
+        # Guest FS/GS RDMSR and STI/HLT under shared queue admission.
+        - /crates/carrick-x86-cpl0/src/native_execution.rs
+        # Two declared fork-stock port crossings use typed supervisor records;
+        # stopped carrier authentication runs with graph/MM guards released.
+        - /crates/carrick-x86-cpl0/src/native_process.rs
         # Reviewed target_os=none CPL0 hardware leaves: native IRQ/IRET and
         # XSAVE, FS/GS MSRs, CR3, IF/HLT, declared fixture control port I/O.
         # No host instruction path or host semantic syscall dispatch.
