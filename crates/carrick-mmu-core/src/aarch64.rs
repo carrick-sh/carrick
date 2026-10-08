@@ -831,8 +831,9 @@ pub unsafe fn publish_existing_invalid_private_pages(
 /// carrying EL1's private-anonymous authority, prepared or resident (a
 /// prepared leaf stays invalid; its AP/UXN govern its later commit and host
 /// buffer access). The complete range, terminal coverage, and permission
-/// ceiling are checked before the first store; COW-armed leaves report
-/// `PermissionWidening`. This entry point carries no table grants, so a
+/// ceiling are checked before the first store; COW-armed leaves retain their
+/// hardware write arm while their Linux write intent changes. This entry
+/// point carries no table grants, so a
 /// partially covered block is refused; a host submission carrying grants
 /// splits it (see [`descriptor_txn`]). A rolled-back edit restores every
 /// word; the caller still invalidates the ASID only after success.
@@ -12160,7 +12161,7 @@ mod tests {
                     },
                 )
             },
-            Err(GuestPermissionEditError::PermissionWidening)
+            Ok(1)
         );
         assert_eq!(words[l3].load(Ordering::Acquire), armed);
 
