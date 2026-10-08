@@ -535,6 +535,15 @@ pub struct SpaceAccess<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadC
     venue: Option<SpaceReleaseVenue<'a, C>>,
 }
 impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceAccess<'a, C> {
+    /// Source-free tests retain the caller's exact parked context type.
+    #[cfg(any(test, feature = "host-test"))]
+    pub fn source_free_with_context(spaces: &'a super::AddressSpaces) -> Self {
+        Self {
+            spaces,
+            venue: None,
+        }
+    }
+
     pub fn notified(venue: SpaceReleaseVenue<'a, C>) -> Self {
         Self {
             spaces: &venue.zone.spaces,
@@ -633,10 +642,7 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceAccess<'a, C> {
 impl<'a> SpaceAccess<'a> {
     #[cfg(any(test, feature = "host-test"))]
     pub fn source_free(spaces: &'a super::AddressSpaces) -> Self {
-        Self {
-            spaces,
-            venue: None,
-        }
+        Self::source_free_with_context(spaces)
     }
 }
 

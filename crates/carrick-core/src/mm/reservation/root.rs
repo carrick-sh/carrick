@@ -486,6 +486,17 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         mm: ReservationMm,
         slot: u32,
     ) -> Result<Reservations<'_, Policy, Geometry>, Refusal> {
+        self.lock_el1_with_context(index, mm, slot)
+    }
+
+    /// The same source-free test acquisition with the caller's context ABI.
+    #[cfg(any(test, feature = "host-test"))]
+    pub fn lock_el1_with_context<Context: Copy + Send + Sync + zerocopy::FromZeros>(
+        &self,
+        index: usize,
+        mm: ReservationMm,
+        slot: u32,
+    ) -> Result<Reservations<'_, Policy, Geometry, Context>, Refusal> {
         self.lock_using(
             index,
             mm,
