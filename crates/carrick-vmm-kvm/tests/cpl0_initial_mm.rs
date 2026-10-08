@@ -248,6 +248,26 @@ fn production_initial_mm_admits_one_shared_reservation_root() {
     carrier
         .load_guest_mm(&plan, &argv, &[], InitialReservationLimits::UNLIMITED)
         .expect("guest initial MM publication");
+    let mappings = carrier.initial_reservation_census().expect("fork census");
+    assert_eq!(
+        mappings.len(),
+        plan.regions.len() + 1,
+        "fork must inherit every ELF region and the stack"
+    );
+    for region in &plan.regions {
+        assert!(
+            mappings
+                .iter()
+                .any(|mapping| mapping.range.start() == region.start
+                    && mapping.range.end() == region.end)
+        );
+    }
+    assert!(mappings.iter().any(|mapping| {
+        mapping.range.len() >= 4096
+            && mapping
+                .protection
+                .permits(carrick_el1_abi::ReservationProtection::WRITE)
+    }));
     assert!(carrier.initial_reservation_admitted());
     assert!(carrier.initial_inventory_custody());
     assert!(

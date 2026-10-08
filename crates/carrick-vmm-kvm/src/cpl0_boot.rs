@@ -979,6 +979,66 @@ impl Cpl0Carrier {
             .is_some_and(|index| table.admitted(index.index(), mm))
     }
 
+    /// Observe the stopped boot owner's actual mapping census used by fork.
+    pub fn initial_reservation_census(
+        &self,
+    ) -> Result<Vec<carrick_core::mm::reservation::Mapping>, TrapError> {
+        let table = self
+            .ram
+            .host_ptr(
+                META_GPA + carrick_el1_abi::X86_CPL0_RESERVATIONS_OFFSET,
+                size_of::<X86Cpl0Reservations>(),
+            )
+            .ok_or_else(|| fail("initial census table"))?;
+        let zone = self
+            .ram
+            .host_ptr(
+                META_GPA + carrick_el1_abi::X86_CPL0_ZONE_OFFSET,
+                size_of::<X86Cpl0Zone>(),
+            )
+            .ok_or_else(|| fail("initial census zone"))?;
+        // SAFETY: the stopped carrier retains both aligned initialized records
+        // in one metadata region for the entire observation and root guard.
+        let (table, zone) = unsafe {
+            (
+                &*table.cast::<X86Cpl0Reservations>(),
+                &*zone.cast::<X86Cpl0Zone>(),
+            )
+        };
+        let mm = ReservationMm::new(INITIAL_MM_KEY).ok_or_else(|| fail("initial census MM"))?;
+        let index = zone
+            .spaces
+            .find(mm.raw())
+            .ok_or_else(|| fail("initial census space"))?;
+        let release = SpaceReleaseVenue {
+            zone,
+            waker: Waker::Host,
+            deliver: Self::unexpected_boot_wake,
+        };
+        let mut root = X86Cpl0RootReleaseVenue::new(table, release)
+            .and_then(|venue| venue.lock(index.index(), mm, &NoRootWait))
+            .map_err(|error| fail(format!("initial census authority: {error:?}")))?;
+        let mut mappings = Vec::new();
+        root.observe_mappings(&mut |mapping| mappings.push(mapping))
+            .map_err(|error| fail(format!("initial census: {error:?}")))?;
+        Ok(mappings)
+    }
+
+    fn unexpected_boot_wake(
+        _: &X86Cpl0Zone,
+        _: Waker,
+        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_sched_core::ParkedContextWords,
+        >,
+    ) {
+        let mut handed = false;
+        let (_, effects) = owned.deliver_handbacks(&mut |_| handed = true);
+        if handed || effects != carrick_sched_core::WakeEffects::default() {
+            std::process::abort();
+        }
+    }
+
     /// The initial host-loaded task retains an x86-shaped scheduler record
     /// in the same zone that owns its MM notifications.
     pub fn initial_thread_custody(&self) -> bool {
@@ -1552,6 +1612,7 @@ impl Cpl0Carrier {
             root,
             reply.result_initial_break,
             reply.stack_top,
+            image,
             limits,
         )?;
         inventory.finish()?;
@@ -1575,6 +1636,7 @@ impl Cpl0Carrier {
         root: RootGpa,
         initial_break: u64,
         stack_top: u64,
+        image: &carrick_mem::x86_initial_image::X86InitialImage<'_>,
         limits: InitialReservationLimits,
     ) -> Result<(), TrapError> {
         const ARENA_START: u64 = 0x4000_0000;
@@ -1621,29 +1683,36 @@ impl Cpl0Carrier {
                 },
             )
             .map_err(|error| fail(format!("production reservation publication: {error:?}")))?;
-        fn unexpected_boot_wake(
-            _: &X86Cpl0Zone,
-            _: Waker,
-            owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
-                '_,
-                carrick_sched_core::ParkedContextWords,
-            >,
-        ) {
-            let mut handed = false;
-            let (_, effects) = owned.deliver_handbacks(&mut |_| handed = true);
-            if handed || effects != carrick_sched_core::WakeEffects::default() {
-                std::process::abort();
-            }
-        }
         let release = SpaceReleaseVenue {
             zone,
             waker: Waker::Host,
-            deliver: unexpected_boot_wake,
+            deliver: Self::unexpected_boot_wake,
         };
         X86Cpl0RootReleaseVenue::new(table, release)
             .map_err(|error| fail(format!("production root authority: {error:?}")))?
             .lock(index.index(), mm, &NoRootWait)
-            .and_then(|mut model| model.finish_import())
+            .and_then(|mut model| {
+                model.finish_import()?;
+                for region in &image.regions {
+                    let bits = u64::from(region.perms.read)
+                        | (u64::from(region.perms.write) << 1)
+                        | (u64::from(region.perms.execute) << 2);
+                    model.insert_opaque(
+                        ReservationRange::new(region.start, region.end)
+                            .ok_or(carrick_el1::memory::reservations::Refusal::Invalid)?,
+                        carrick_el1_abi::ReservationProtection::from_bits(bits)
+                            .ok_or(carrick_el1::memory::reservations::Refusal::Invalid)?,
+                        carrick_el1_abi::ReservationNodeFlags::PRIVATE,
+                    )?;
+                }
+                model.insert_opaque(
+                    ReservationRange::new(stack_top - INITIAL_STACK_SIZE, stack_top)
+                        .ok_or(carrick_el1::memory::reservations::Refusal::Invalid)?,
+                    carrick_el1_abi::ReservationProtection::READ_WRITE,
+                    carrick_el1_abi::ReservationNodeFlags::PRIVATE
+                        .union(carrick_el1_abi::ReservationNodeFlags::GROWSDOWN),
+                )
+            })
             .map_err(|error| fail(format!("production root admission: {error:?}")))?;
         SpaceAccess::notified(release).open(index);
         let slot = SlotId::new(0);
