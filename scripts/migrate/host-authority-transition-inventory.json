@@ -13353,7 +13353,7 @@
     "classification": "forbidden_semantic",
     "evidence": {
       "authority": "guest_answer",
-      "resource": "guest root-process identity in the one-task adapter used by `bootstrap_one_task_binding`"
+      "resource": "initial Kernel task identity seeded by `try_bootstrap_launch_binding`, including the remaining legacy one-task adapter"
     },
     "expansion": null,
     "operation": "std::process::id",
@@ -13363,7 +13363,7 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/kernel_context.rs:58 in `bootstrap_one_task_binding`, the host result from `std::process::id` determines the guest root-process identity in the one-task adapter used by `bootstrap_one_task_binding`.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/kernel_context.rs:58 in `try_bootstrap_launch_binding`, `std::process::id` supplies the observed carrier PID that seeds the initial Kernel internal task identity. Prepared CPL0 launches bind the real Container and its private namespace PID1; the legacy adapter still exposes a host-derived identity. Preserve forbidden_semantic: the CPL0 one-way export and counted post-export refusal remain unimplemented.",
     "review_id": "HA-000495",
     "source": {
       "byte_end": 2153,
@@ -15455,18 +15455,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:7541 in `host_image_base`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_image_base`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:7587 in `host_image_base_snapshot`, `std::process::id` identifies the current carrier image whose dyld base, slide and path are collected for offline symbolication; no guest identity selects its host process target.",
     "review_id": "HA-000467",
     "source": {
-      "byte_end": 291654,
-      "byte_start": 291638,
-      "column": 41,
-      "column_end": 57,
-      "column_start": 41,
+      "byte_end": 293974,
+      "byte_start": 293958,
+      "column": 18,
+      "column_end": 34,
+      "column_start": 18,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 7541,
-      "line_end": 7541,
-      "line_start": 7541
+      "line": 7587,
+      "line_end": 7587,
+      "line_start": 7587
     }
   },
   {
@@ -15485,7 +15485,7 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:7541 in `host_image_base_snapshot`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_image_base_snapshot`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:7541 in `execve_argv`, `std::process::id` supplies the current carrier identity for its USDT execve argument diagnostic event; the opaque guest path/arguments are trace payload and do not select the host process target.",
     "review_id": "HA-000466",
     "source": {
       "byte_end": 291654,
