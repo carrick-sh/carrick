@@ -7,10 +7,10 @@
 //! - `TG0 = 0b00`: 4 KiB translation granule (`1 << 12` = 4096 bytes)
 //! - `IPS = 0b010`: 40-bit intermediate physical address space
 //! - 4 levels of translation table walks with 512 entries (9 bits) each:
-//!   - Level 0: bits [47:39], shift 39 (512 GiB block span)
-//!   - Level 1: bits [38:30], shift 30 (1 GiB block span)
-//!   - Level 2: bits [29:21], shift 21 (2 MiB block span)
-//!   - Level 3: bits [20:12], shift 12 (4 KiB page span)
+//!   - Level 0: bits \[47:39\], shift 39 (512 GiB block span)
+//!   - Level 1: bits \[38:30\], shift 30 (1 GiB block span)
+//!   - Level 2: bits \[29:21\], shift 21 (2 MiB block span)
+//!   - Level 3: bits \[20:12\], shift 12 (4 KiB page span)
 //!
 //! # Kernel Control Window
 //! The kernel control window is mapped in stage-1 translation at L1 index 180
