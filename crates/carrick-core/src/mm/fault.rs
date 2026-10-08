@@ -193,7 +193,13 @@ pub fn owner_fault_plan<
     let mut plan = root.fork_transfer_fault_plan(address.raw(), target, access, fork_sequence)?;
     let table = hardware_root.address().raw();
     let fault_page = plan.fault_page;
-    let unbacked = |va: u64| -> Result<bool, Refusal> {
+    // The MM editor keeps this walk's table lineage stable. Adjacent pages
+    // share upper descriptors, so retain those exact loaded child tables
+    // while inspecting the bounded grant window.
+    let mut cached_indices = [0u64; 3];
+    let mut cached_tables = [0u64; 3];
+    let mut cached_depth = 0usize;
+    let mut unbacked = |va: u64| -> Result<bool, Refusal> {
         // VALID can still be clear for a host-published grant's untouched
         // pages. Its live residency owns the physical range, so a later VMA
         // extension must stop before that range instead of selecting an
@@ -210,15 +216,23 @@ pub fn owner_fault_plan<
         }
         let mut table = table;
         for (level, shift) in [39, 30, 21, 12].into_iter().enumerate() {
-            let word = words
-                .load(table + ((va >> shift) & 511) * 8)
-                .map_err(|_| Refusal::Stale)?;
+            let index = (va >> shift) & 511;
+            if level < cached_depth && cached_indices[level] == index {
+                table = cached_tables[level];
+                continue;
+            }
+            let word = words.load(table + index * 8).map_err(|_| Refusal::Stale)?;
             if word == 0 {
+                cached_depth = level;
                 return Ok(true);
             }
             if B::is_table(word, level) {
                 table = word & B::ADDRESS_MASK;
+                cached_indices[level] = index;
+                cached_tables[level] = table;
+                cached_depth = level + 1;
             } else {
+                cached_depth = level;
                 return Ok(B::is_retired(word) || B::is_absent_unowned(word));
             }
         }

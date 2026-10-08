@@ -11,7 +11,7 @@ use carrick_core_abi::*;
 use carrick_guest_arch::UserVa;
 use carrick_mmu_core::aarch64::descriptor_txn::{LiveDescriptorWords, PageSpan};
 use carrick_mmu_core::aarch64::{GuestPreparedCommit, LeafAccess};
-use carrick_mmu_core::owner_mmu::{Aarch64Mmu, OwnerMmu, OwnerMmuRefusal};
+use carrick_mmu_core::owner_mmu::{Aarch64Mmu, OwnerForkMmu, OwnerMmu, OwnerMmuRefusal};
 use carrick_sched_core::{AddressSpaces, SpaceEditor};
 use core::num::NonZeroU64;
 
@@ -478,7 +478,10 @@ impl<
         continuation: &TransferContinuation,
         words: &W,
         venues: SelectionVenues<'_, R, C>,
-    ) -> Result<TransferStep, MmError> {
+    ) -> Result<TransferStep, MmError>
+    where
+        B: OwnerForkMmu,
+    {
         let SelectionVenues {
             prepared,
             cow,
@@ -636,21 +639,17 @@ impl<
                 LeafAccess::Write => 2,
                 LeafAccess::Execute => 4,
             };
+            let hardware_root = root;
             let mut root = self.root(continuation.handle.mm(), slot)?;
             if root.fork_pending() && !root.fork_write_authorized(continuation.fork_sequence()) {
                 return Err(MmError::Busy);
             }
-            let target = if root
-                .mapping(va)
-                .is_some_and(|mapping| mapping.host_backing.is_some())
-            {
-                4096
-            } else {
-                carrick_core_abi::EL1_FRAME_GRANT_TARGET_SIZE
-            };
-            let plan = root.fork_transfer_fault_plan(
-                va,
-                target,
+            let plan = crate::mm::fault::owner_fault_plan::<_, _, B, _>(
+                &mut root,
+                words,
+                crate::mm::fault::OwnerFaultResidency::new(residency, continuation.handle.mm()),
+                hardware_root,
+                UserVa::new(va),
                 ReservationProtection::from_bits(bits).ok_or(MmError::Invalid)?,
                 continuation.fork_sequence(),
             )?;
