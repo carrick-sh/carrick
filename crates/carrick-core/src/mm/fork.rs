@@ -1001,8 +1001,12 @@ pub fn copy_entry<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
             if B::is_retired(descriptor) {
                 return Ok((descriptor, 0));
             }
-            let armed =
-                B::arm_private(descriptor, level, UserVa::new(va)).map_err(|_| ForkError::Core)?;
+            let armed = if policy_provider.unreserved_policy(va, span) == Some(Policy::Private) {
+                B::arm_synthetic_private(descriptor, level, UserVa::new(va))
+            } else {
+                B::arm_private(descriptor, level, UserVa::new(va))
+            }
+            .map_err(|_| ForkError::Core)?;
             let output_mask = B::ADDRESS_MASK & !(span - 1);
             let ipa = descriptor & output_mask;
             if ipa != 0 {

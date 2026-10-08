@@ -61,6 +61,10 @@ pub trait OwnerForkMmu: OwnerMmu {
     fn control_needs_copy(va: UserVa, word: u64) -> bool;
     fn split(word: u64, level: usize, index: usize) -> Result<u64, OwnerMmuRefusal>;
     fn arm_private(word: u64, level: usize, va: UserVa) -> Result<u64, OwnerMmuRefusal>;
+    /// Arm an explicitly private synthetic leaf even when its EL0 mapping is read-only.
+    fn arm_synthetic_private(word: u64, level: usize, va: UserVa) -> Result<u64, OwnerMmuRefusal> {
+        Self::arm_private(word, level, va)
+    }
     fn needs_break_before_make(before: u64, after: u64, level: usize) -> bool;
 }
 
