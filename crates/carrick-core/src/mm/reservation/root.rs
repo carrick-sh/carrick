@@ -53,7 +53,13 @@ const DEFERRED_SLOTS: usize = 64;
 /// The frames stay unreusable, and no `Prepare` may hand the range out again,
 /// until the host venue reconciles the extent and acknowledges `sequence`
 /// ([`Reservations::acknowledge_deferred_returns`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct DeferredReturn {
     pub range: ReservationRange,
     /// The newest completed request whose retirement this extent covers.
@@ -64,7 +70,7 @@ pub struct DeferredReturn {
 /// before a retirement's descriptor step and consumed by its commit or
 /// released by its refusal.
 #[must_use]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct ReturnSlot {
     index: usize,
     /// Joins the owed extent already in the slot.
@@ -73,7 +79,13 @@ pub struct ReturnSlot {
 
 /// Replacement for a host FirstTouchArming-derived frame-grant plan. The host
 /// service must revalidate this exact generation before publishing its receipt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct ReservationFaultPlan {
     pub mm: ReservationMm,
     pub generation: ReservationGeneration,
@@ -82,7 +94,7 @@ pub struct ReservationFaultPlan {
     pub fault_page: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 #[repr(C)]
 struct Pending {
     request: ReservationRequest,
@@ -122,7 +134,13 @@ struct State {
 }
 
 /// Who holds a root's guard, as its lock word spells it (0: free).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum RootHolder {
     /// A host thread (host venue, publication, final settlement).
     Host,
@@ -193,7 +211,7 @@ const fn pack_flags(flags: ReservationNodeFlags) -> u16 {
     flags.bits() as u16
 }
 
-#[derive(Default)]
+#[derive(::core::default::Default)]
 struct CopyList {
     head: u32,
     tail: u32,
@@ -4174,7 +4192,7 @@ mod tests {
 
     #[test]
     fn reservation_clone_is_linear_skips_dontfork_and_keeps_generations_independent() {
-        #[derive(Clone, Copy, Debug)]
+        #[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
         enum Row {
             Plain,
             AllDontfork,

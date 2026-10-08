@@ -126,7 +126,14 @@ pub const IDLE_SPIN_NS: u64 = 20_000;
 const NIL: u32 = 0;
 
 /// A record index in `1..ZONE_RECORDS`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+    ::core::hash::Hash,
+)]
 #[repr(transparent)]
 pub struct RecordId(u32);
 
@@ -155,7 +162,13 @@ impl RecordId {
 pub use carrick_guest_arch::SlotId;
 
 /// A vCPU slot's run state, as the other vCPUs see it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum SlotState {
     /// Stopped at a host exit, or never entered: its executor owns the slot
@@ -191,7 +204,13 @@ impl SlotState {
 }
 
 /// Who owns a parked thread's context. See the crate docs.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum Claim {
     /// The record is not in use.
     Free,
@@ -298,7 +317,13 @@ impl Claim {
 }
 
 /// Why the host owns a record, set with the transition to [`Claim::Host`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum Handback {
     /// Woken by a futex wake: apply [`ZoneRecord::result`] as the syscall's
@@ -346,7 +371,14 @@ impl Handback {
 /// what an in-guest switch saves and restores. FP/SIMD state is 16-byte
 /// aligned for `stp q`/`ldp q` (`v` at offset 304, FPSR and FPCR after it).
 #[repr(C, align(16))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, zerocopy::FromZeros)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+    ::zerocopy::FromZeros,
+)]
 pub struct ThreadCtx {
     /// X0..X30.
     pub x: [u64; 31],
@@ -415,7 +447,7 @@ impl ThreadCtx {
 /// guest side cannot make on every call solely to shrink the two empty
 /// variants, for a type read at most once per thread per crash generation.
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub enum ParkedContextRead<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     /// No record matching that exact thread identity is `Parked` right now:
     /// it is running (`Queued`/`OnCpu`), host-owned, or its record is gone.
@@ -432,7 +464,14 @@ pub enum ParkedContextRead<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadC
 
 /// The identity a parked thread carries so the host can find its kernel
 /// thread and EL1 can publish it as the running task after a switch.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct ThreadIdentity {
     /// The `El1TaskId` word (zero-extended Linux tid).
     pub tid: u64,
@@ -750,14 +789,26 @@ pub struct ZoneBucket {
 /// The one record a slot's virtual timer serves, with the sequence of the
 /// park it bounds. Each slot holds at most one ([`ZoneTables::arm_timer`]
 /// refuses a second live owner).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct TimerOwner {
     pub record: RecordId,
     pub seq: u32,
 }
 
 /// [`ZoneTables::arm_timer`]: another record's timed park holds the timer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct TimerBusy;
 
 /// A timed park of a record other than the slot's home record, taken off
@@ -765,7 +816,7 @@ pub struct TimerBusy;
 /// any longer: the host claims the record (a control handback; its thread
 /// re-runs the call with what is left of its deadline).
 #[must_use = "a foreign timed park taken off its slot must be claimed by the host"]
-#[derive(Debug, Eq, PartialEq)]
+#[derive(::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub struct ForeignTimer {
     pub record: RecordRef,
     pub seq: u32,
@@ -1101,7 +1152,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> BucketGuard<'_, C> {
 }
 
 /// A wake would need a feature the caller's venue does not serve.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum WakeRefusal {
     /// A matching waiter parks on several futexes (`futex_waitv`).
     MultiEntry,
@@ -1114,7 +1171,14 @@ pub enum WakeRefusal {
 /// reschedule SGI once the waker released its locks, and whether it had to
 /// queue a waiter on its own slot although the waiter belongs elsewhere (the
 /// waker then leaves through the host, whose exit hands that thread over).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct WakeEffects {
     /// One bit per slot to send a reschedule SGI to ([`ZoneSlot::sgi_target`]).
     pub sgi: [u64; ZONE_SLOT_WORDS],
@@ -1147,7 +1211,13 @@ impl WakeEffects {
 }
 
 /// A thread EL1 switched in on its slot ([`ZoneTables::switch_in`]).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct SwitchedIn {
     pub record: RecordId,
     /// The syscall result to load into x0 (a woken or timed-out wait), or
@@ -1161,7 +1231,13 @@ pub struct SwitchedIn {
 }
 
 /// Who performs a wake.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum Waker {
     /// EL1 on `slot`: woken threads go to its run queue.
     El1 { slot: SlotId },
@@ -1171,7 +1247,13 @@ pub enum Waker {
 }
 
 /// The outcome of a host claim.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum HostClaim {
     /// The host now owns the record (and every queue entry was unlinked).
     Claimed,
@@ -1296,7 +1378,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> WakeRecord<'_, C> {
 }
 
 /// What [`ZoneTables::drain_slot`] found on a slot.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct SlotDrain {
     /// Records handed back as woken (the first `woken` of the caller's buffer).
     pub woken: usize,
@@ -1309,7 +1397,13 @@ pub struct SlotDrain {
 }
 
 /// How [`ZoneTables::place_in_guest`] ended.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 enum Placement {
     Placed(HostPlacement),
     /// No slot in the guest may run it now; its claim is unchanged.
@@ -1319,7 +1413,13 @@ enum Placement {
 }
 
 /// Where [`ZoneTables::place_from_host`] queued a thread.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HostPlacement {
     pub slot: SlotId,
     /// The slot's vCPU must be forced out to take a reschedule SGI.
@@ -1328,7 +1428,13 @@ pub struct HostPlacement {
 
 /// The outcome of [`ZoneTables::release_current`]: either way the slot
 /// holds nothing switched in afterwards.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[must_use = "a requeued record must be settled into its thread's zone wait"]
 pub enum CurrentRelease {
     /// The thread is simply running again; its record is retired.
@@ -1341,7 +1447,13 @@ pub enum CurrentRelease {
 }
 
 /// The outcome of [`ZoneTables::handback_current`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum CurrentHandback {
     /// Host-owned: publish it to its thread. Usually [`Handback::Resumed`];
     /// a cancelled pending object operation requires adapter cleanup first.
@@ -1353,7 +1465,14 @@ pub enum CurrentHandback {
 }
 
 /// A record and the incarnation that names one use of it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+    ::core::hash::Hash,
+)]
 pub struct RecordRef {
     pub id: RecordId,
     pub incarnation: u64,
@@ -1368,7 +1487,13 @@ impl RecordRef {
 }
 
 /// Allocation of a table index failed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct Exhausted;
 
 fn mix(mm: u64, uaddr: u64) -> usize {

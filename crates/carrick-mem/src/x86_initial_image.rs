@@ -3,9 +3,8 @@
 //! path. This module supplies no page-table or physical-frame authority.
 
 use crate::elf::{ElfInspectError, ElfType, SegmentPerms, plan_elf_load_bytes_for};
-use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(::core::fmt::Debug, ::thiserror::Error)]
 pub enum X86InitialImageError {
     #[error("invalid x86 ELF: {0}")]
     Elf(#[from] ElfInspectError),
@@ -21,7 +20,7 @@ pub enum X86InitialImageError {
 
 /// An ELF load description. The guest MM owner builds the stack, allocates
 /// frames, writes descriptors and publishes its exact edit receipts.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct X86InitialImage<'a> {
     pub entry: u64,
     pub phdr: u64,
@@ -32,7 +31,7 @@ pub struct X86InitialImage<'a> {
 
 /// A page-rounded PT_LOAD description borrowing only initialized file bytes.
 /// The guest's zeroed frame grants supply every BSS and padding byte.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct X86InitialRegion<'a> {
     pub start: u64,
     pub end: u64,

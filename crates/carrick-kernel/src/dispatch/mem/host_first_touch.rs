@@ -418,10 +418,8 @@ impl SyscallDispatcher {
     /// grant re-asks under it.
     pub fn first_touch_is_root_owned(&self, page: u64) -> bool {
         let page = page_floor(page, self.linux_page_size());
-        matches!(
-            self.mem().lock().first_touch_owner(page),
-            FirstTouchOwner::Root(..)
-        )
+        let first_touch_owner = self.mem().lock().first_touch_owner(page);
+        matches!(first_touch_owner, FirstTouchOwner::Root(..))
     }
 
     /// Read-only access prevalidation for an untouched root-owned page.

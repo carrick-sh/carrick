@@ -57,7 +57,7 @@ const DEFAULT_MAX_GATING: usize = 50;
 const PERF_WARN_RATIO: f64 = 10.0;
 const PERF_CRITICAL_RATIO: f64 = 100.0;
 
-#[derive(::clap::Parser, Debug)]
+#[derive(::clap::Parser, ::core::fmt::Debug)]
 #[command(about = "Differential conformance harness (carrick vs docker)")]
 struct Args {
     /// Which tier to run: `smoke` (fast gate) or `full` (everything).
@@ -545,8 +545,9 @@ fn run() -> anyhow::Result<ExitCode> {
             timing_bytes.status.success(),
             "committed oracle timings unavailable"
         );
+        let current_timings = ::std::fs::read(timing_path)?;
         anyhow::ensure!(
-            std::fs::read(timing_path)? == timing_bytes.stdout,
+            current_timings == timing_bytes.stdout,
             "sharding requires committed unchanged oracle timings"
         );
         let timings = shard::timings(timing_path)?;
@@ -567,7 +568,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 binary_identity(&args.carrick_bin)?
             },
             kernel: String::from_utf8(kernel.stdout)?.trim().into(),
-            manifest_hash: shard::hash(&std::fs::read(&args.manifest)?),
+            manifest_hash: shard::hash(&::std::fs::read(&args.manifest)?),
             selection_hash: shard::hash(&serde_json::to_vec(&selected)?),
             oracle_backend: format!("{:?}", args.oracle),
             lane: args.lane.clone(),
@@ -1427,7 +1428,7 @@ fn binary_identity(path: &Path) -> anyhow::Result<String> {
     // Operator-controlled CLI path in a local dev tool; same trust model as the
     // other IO helpers here.
     let bytes =
-        std::fs::read(path) // nosemgrep
+        ::std::fs::read(path) // nosemgrep
             .map_err(|error| {
                 anyhow::anyhow!("cannot read {} for identity: {error}", path.display())
             })?;
@@ -1449,7 +1450,7 @@ struct DockerSide {
     timed_out: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 enum ClassificationPolicy<'a> {
     Closure,
     Baseline(&'a Baseline),
@@ -1757,7 +1758,13 @@ fn seed_oracle(
 /// (`baseline.<key>.jsonl`) — never the shared baseline, never the matrix — so a
 /// lane's observations can never overwrite the hvf ground truth. An unrecognized
 /// lane is refused outright.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 enum BlessTarget {
     /// hvf: rewrite the shared `baseline.jsonl` + `docs/support-matrix.md`.
     SharedBaseline,
@@ -1864,7 +1871,7 @@ fn bless_blocks(target: BlessTarget, verdict: Verdict) -> bool {
 /// How a run's reports partition against the bless gate. Pure (no IO) so the
 /// policy is unit-tested directly; the side-effecting [`bless`] only prints and
 /// writes what this decides.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(::core::fmt::Debug, ::core::default::Default, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 struct BlessGate<'a> {
     /// Suites that must be resolved before this target can be blessed.
     blocking: Vec<&'a str>,
@@ -2013,7 +2020,7 @@ fn bless(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 struct FailFast {
     force: bool,
     max_gating: usize,
@@ -2171,7 +2178,7 @@ struct SchedulerLanes {
     generic_heavy_limit: usize,
 }
 
-#[derive(Default)]
+#[derive(::core::default::Default)]
 struct SchedulerLaneState {
     active_total: usize,
     active_cpython_heavy: usize,
@@ -2179,7 +2186,7 @@ struct SchedulerLaneState {
     exclusive_active: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 enum SchedulerLaneKind {
     Light,
     CpythonHeavy,

@@ -60,7 +60,13 @@ pub const THREAD_POOL_ENTRIES: usize = 8;
 
 /// Why a lifecycle service leaves its unchanged syscall to the host.
 #[repr(usize)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum LifecycleDecline {
     ExitDisabled,
     ExitGate,
@@ -122,7 +128,13 @@ impl LifecycleDecline {
 pub const THREAD_LIFECYCLE_PAGE_SIZE: usize = 4096;
 
 /// The identity the kernel issues into an entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct EntryIdentity {
     /// Reserved namespace-independent tid.
     pub tid: u32,
@@ -136,7 +148,13 @@ pub struct EntryIdentity {
 
 /// Written by the claimant between claim and `Born`. Creds, blocked mask and
 /// affinity bind at claim (director ruling 2), so the mask is captured here.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct BornRecord {
     /// Caller's `TaskKey` (task id word).
     pub caller_task: u64,
@@ -150,17 +168,31 @@ pub struct BornRecord {
 }
 
 /// Signal blocked mask (bit `n-1` is signal `n`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 #[repr(transparent)]
 pub struct BlockedMask(pub u64);
 /// Set of pending signals (bit `n-1` is signal `n`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 #[repr(transparent)]
 pub struct PendingSignals(pub u64);
 
 /// A pool entry: state word plus payload.
 #[repr(C, align(16))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct PoolEntry {
     state: AtomicEntry,
     tid: AtomicU32,
@@ -193,7 +225,7 @@ impl PoolEntry {
 
 /// The shared pending-signal summary of the process.
 #[repr(transparent)]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct PendingSummary(AtomicU64);
 
 impl PendingSummary {
@@ -235,7 +267,14 @@ impl Default for PendingSummary {
 /// Snapshot of a thread's `sigaltstack`. Size 0 is the disabled stack
 /// (zeroed storage, and what `SS_DISABLE` stores): an enabled one is at least
 /// `MINSIGSTKSZ` bytes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct AltStack {
     pub sp: u64,
     pub size: u64,
@@ -258,7 +297,7 @@ impl AltStack {
 /// altstack/robust record; other threads and the host only read (senders read
 /// `blocked` through [`PendingSummary::post_then_read_blocked`]).
 #[repr(C, align(64))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct ThreadControlSlot {
     /// Namespace-visible identity, published before this incarnation is runnable.
     visible_tid: AtomicU32,
@@ -487,7 +526,7 @@ impl Default for ThreadControlSlot {
 
 /// One per process; kernel-only.
 #[repr(C, align(4096))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct ThreadLifecyclePage {
     gate: AtomicU32,
     live: AtomicU32,
@@ -512,7 +551,13 @@ pub const EL1_SIGMASK_HATCH_ENV: &str = "CARRICK_EL1_SIGMASK";
 /// `sigaltstack` and `set_robust_list`. The host reads each variable once
 /// ([`Self::from_lookup`]) and builds every page with the result, so EL1 and
 /// the host decide from the same bits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct LifecycleHatches {
     pub threads: bool,
     pub sigmask: bool,
@@ -546,7 +591,13 @@ const _: () = assert!(core::mem::size_of::<ThreadControlSlot>() == 128);
 const _: () = assert!(core::mem::size_of::<PoolEntry>() == 80);
 
 /// Linux keeps the last thread's exit with the terminal runtime owner.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct LastThread;
 
 impl ThreadLifecyclePage {
@@ -760,28 +811,28 @@ impl Default for ThreadLifecyclePage {
 pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 24] = [
     THREAD_LIFECYCLE_PROTOCOL_VERSION,
     core::mem::size_of::<ThreadLedgerActivity>() as u64,
-    core::mem::offset_of!(ThreadLifecyclePage, ledger_host) as u64,
-    core::mem::offset_of!(ThreadLifecyclePage, ledger_guest) as u64,
-    core::mem::offset_of!(ThreadLifecyclePage, controls) as u64,
+    ::core::mem::offset_of!(ThreadLifecyclePage, ledger_host) as u64,
+    ::core::mem::offset_of!(ThreadLifecyclePage, ledger_guest) as u64,
+    ::core::mem::offset_of!(ThreadLifecyclePage, controls) as u64,
     THREAD_POOL_ENTRIES as u64,
     core::mem::size_of::<ThreadLifecyclePage>() as u64,
     core::mem::align_of::<ThreadLifecyclePage>() as u64,
-    core::mem::offset_of!(ThreadLifecyclePage, gate) as u64,
-    core::mem::offset_of!(ThreadLifecyclePage, live) as u64,
-    core::mem::offset_of!(ThreadLifecyclePage, pending) as u64,
-    core::mem::offset_of!(ThreadLifecyclePage, entries) as u64,
+    ::core::mem::offset_of!(ThreadLifecyclePage, gate) as u64,
+    ::core::mem::offset_of!(ThreadLifecyclePage, live) as u64,
+    ::core::mem::offset_of!(ThreadLifecyclePage, pending) as u64,
+    ::core::mem::offset_of!(ThreadLifecyclePage, entries) as u64,
     core::mem::size_of::<PoolEntry>() as u64,
     core::mem::size_of::<ThreadControlSlot>() as u64,
-    core::mem::offset_of!(ThreadControlSlot, visible_tid) as u64,
-    core::mem::offset_of!(ThreadControlSlot, alt_seq) as u64,
-    core::mem::offset_of!(ThreadControlSlot, robust_head) as u64,
-    core::mem::offset_of!(ThreadControlSlot, clear_child_tid) as u64,
-    core::mem::offset_of!(ThreadControlSlot, entry) as u64,
-    core::mem::offset_of!(ThreadControlSlot, pending) as u64,
-    core::mem::offset_of!(ThreadControlSlot, zone_seq) as u64,
-    core::mem::offset_of!(ThreadControlSlot, zone_incarnation) as u64,
-    core::mem::offset_of!(ThreadControlSlot, zone_id) as u64,
-    core::mem::offset_of!(ThreadLifecyclePage, serving) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, visible_tid) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, alt_seq) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, robust_head) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, clear_child_tid) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, entry) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, pending) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, zone_seq) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, zone_incarnation) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, zone_id) as u64,
+    ::core::mem::offset_of!(ThreadLifecyclePage, serving) as u64,
 ];
 
 #[cfg(test)]

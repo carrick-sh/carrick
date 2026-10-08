@@ -27,43 +27,8 @@ use carrick_el1::isa::x86::context::native as adapter;
 use carrick_el1::isa::x86::interrupts;
 #[cfg(target_os = "none")]
 mod native_irq;
-fixture_items! {
-    #[cfg(target_os = "none")]
-    mod progress;
-}
-fixture_items! {
-    #[cfg(target_os = "none")]
-    #[unsafe(no_mangle)]
-    static CARRICK_X86_FIXTURE_DISPATCH_WITNESSES: [u64; 2] =
-        [0x7bd6_8a91_c4e2_5f03, 0xa239_4c7d_8e15_b6f0];
-
-    #[cfg(target_os = "none")]
-    #[unsafe(no_mangle)]
-    #[inline(never)]
-    fn carrick_x86_fixture_dispatch_witness() -> bool {
-        // A volatile read keeps the fixture-only witness in the linked image.
-        (unsafe { core::ptr::read_volatile(core::ptr::addr_of!(CARRICK_X86_FIXTURE_DISPATCH_WITNESSES).cast::<u64>()) })
-            == 0x7bd6_8a91_c4e2_5f03
-    }
-}
-fixture_items! {
-    #[cfg(target_os = "none")]
-    mod cpl0_scheduler {
-        pub(crate) use super::scheduler::*;
-    }
-    #[cfg(target_os = "none")]
-    mod cpl0_entry {
-        pub use crate::adapter::*;
-    }
-}
 #[cfg(target_os = "none")]
 const _: () = assert!(core::mem::offset_of!(adapter::CpuBinding, task_address) == 24);
-fixture_items! {
-    #[cfg(target_os = "none")]
-    #[path = "../../carrick-x86/src/cpl0_lifecycle.rs"]
-    mod lifecycle;
-}
-
 fixture_items! {
     #[cfg(target_os = "none")]
     use carrick_el1::isa::x86::context::scheduler;
@@ -365,7 +330,7 @@ mod kernel {
         }
     }
 
-    fn doorbell(port: u16, frame: &mut NativeFrame) {
+    pub(crate) fn doorbell(port: u16, frame: &mut NativeFrame) {
         write_port(port, frame, admit_exit());
     }
 
@@ -1349,42 +1314,7 @@ mod kernel {
         binding
             .captured_stack
             .store(call.stack.raw(), Ordering::Release);
-        let handled_by_fixture = fixture_expr!({
-            let lifecycle_address = binding.scheduler_witness.load(Ordering::Acquire);
-            if lifecycle_address == super::lifecycle::LIFECYCLE_LANE
-            || lifecycle_address
-                == super::lifecycle::LIFECYCLE_LANE + super::lifecycle::LIFECYCLE_STRIDE
-        {
-            // SAFETY: stopped-host bootstrap published and retains the aligned
-            // native lane/zone/page custody for this exact CPU binding.
-            let Some(mut lane) =
-                (unsafe { super::lifecycle::acquire(frame, binding, task, counters, call.args) })
-            else {
-                doorbell(FATAL_PORT, frame);
-                halt();
-            };
-            match carrick_personality_linux::dispatch::dispatch(
-                call.canonical.raw(),
-                u64::MAX,
-                &mut lane,
-            ) {
-                carrick_personality_linux::dispatch::CompletionRoute::Served => {}
-                carrick_personality_linux::dispatch::CompletionRoute::WithWork => {
-                    doorbell(WORK_PORT, frame);
-                }
-                carrick_personality_linux::dispatch::CompletionRoute::Forward => {
-                    doorbell(FORWARD_PORT, frame);
-                }
-                _ => {
-                    doorbell(FATAL_PORT, frame);
-                    halt();
-                }
-            }
-            true
-        } else {
-            false
-        }
-        });
+        let handled_by_fixture = fixture_expr!(crate::fixture_handled(frame, binding, task, counters, &call));
         if !handled_by_fixture {
             let layout = <carrick_el1::isa::x86::X86Backend as LayoutBackend>::KERNEL_LAYOUT;
             let mut native = NativeDispatch {

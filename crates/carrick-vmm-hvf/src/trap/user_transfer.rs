@@ -6,7 +6,7 @@ use carrick_el1_abi::{PortalRetainedData, PortalSelectedData, PortalTransferInte
 use core::num::NonZeroU64;
 use std::sync::Arc;
 
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub struct UserTransferCustody {
     custody: Arc<CarrierVmCustody>,
     transport: Option<Arc<CarrierForeignMmTransport>>,

@@ -287,7 +287,13 @@ impl ObjectWaitSnapshot {
     }
 }
 
-#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum ObjectWaitError {
     Busy,
     Stale,
@@ -761,7 +767,7 @@ const ADMISSION_CUSTODY: u32 = 1 << 31;
 const ADMISSION_POSTED: u32 = 1 << 30;
 const ADMISSION_RELEASED: u32 = 1 << 29;
 /// Where an owned operation may execute after its producer completes.
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 enum OperationDestination {
     Guest,
     Host,

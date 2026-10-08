@@ -367,7 +367,7 @@ pub struct OwnedRecallRequest {
 
 /// A completed recall paired with the exact continuously held cursor and
 /// functional description. No caller can substitute a later reservation.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct OwnedRecallReady {
     cursor: FileCursorReservation,
     lease: FileDescriptionFdLease,

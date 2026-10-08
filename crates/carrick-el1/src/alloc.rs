@@ -34,7 +34,13 @@ pub struct MetadataStorage {
 }
 
 #[cfg(target_os = "none")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 enum MailboxSync {
     None,
     AllocReady,

@@ -1171,7 +1171,7 @@ unsafe impl Sync for GlobalFrameSharedMapping {}
 
 /// Completion of one unpublished physical incarnation. Consumers retain only
 /// the wait; producer leases finish after exact descriptor settlement/rollback.
-#[derive(Debug, Default)]
+#[derive(::core::fmt::Debug, ::core::default::Default)]
 struct PhysicalGrantWait {
     ready: std::sync::atomic::AtomicBool,
     callbacks: carrick_thread::completion::CompletionCallbacks,
@@ -1188,7 +1188,7 @@ impl carrick_guest_mem::PhysicalMemoryWait for PhysicalGrantWait {
         (Box::new(enrollment), self.is_ready())
     }
 }
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 struct PhysicalGrantProducer(std::sync::Arc<PhysicalGrantWait>);
 impl Drop for PhysicalGrantProducer {
     fn drop(&mut self) {
@@ -1200,7 +1200,7 @@ impl Drop for PhysicalGrantProducer {
 }
 /// Last producer release signals completion. Keep it beyond rollback and all
 /// inventory/alias guards; callbacks may reenter physical preparation.
-#[derive(Clone, Debug)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
 pub(crate) struct PhysicalGrantCompletion(std::sync::Arc<PhysicalGrantProducer>);
 impl PhysicalGrantCompletion {
     pub(crate) fn new() -> Self {
@@ -4321,11 +4321,11 @@ pub(crate) fn unreturned_el1_grant_census(custody: &CarrierVmCustody) -> Vec<Str
             describe(*key, entry.owner(), state)
         })
         .collect();
+    let detached_owners = custody.pending_global_frame_owners.lock().len();
+    let directory_retries = custody.pending_global_frame_directory_retries.lock().len();
+    let detached_retries = custody.pending_global_frame_detached_retries.lock().len();
     census.push(format!(
-        "detached_owners={} directory_retries={} detached_retries={}",
-        custody.pending_global_frame_owners.lock().len(),
-        custody.pending_global_frame_directory_retries.lock().len(),
-        custody.pending_global_frame_detached_retries.lock().len()
+        "detached_owners={detached_owners} directory_retries={directory_retries} detached_retries={detached_retries}"
     ));
     census
 }

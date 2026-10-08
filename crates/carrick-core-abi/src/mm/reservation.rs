@@ -3,9 +3,9 @@ pub use carrick_guest_arch::{GuestLen, UserVa};
 pub use carrick_mmu_core::HostBackingIdentity;
 
 macro_rules! identity {
-    ($(#[$meta:meta])* $name:ident) => {
-        $(#[$meta])*
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    ($(#[doc = $meta:expr])* $name:ident) => {
+        $(#[doc = $meta])*
+        #[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
         #[repr(transparent)]
         pub struct $name(u64);
         impl $name {
@@ -39,7 +39,13 @@ identity!(
 );
 
 /// Page-aligned half-open Linux 4 KiB virtual range; never an IPA/host VA.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 #[repr(C)]
 pub struct ReservationRange {
     start: u64,
@@ -70,7 +76,13 @@ impl ReservationRange {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 #[repr(transparent)]
 pub struct ReservationProtection(u64);
 impl ReservationProtection {
@@ -94,7 +106,13 @@ impl ReservationProtection {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 #[repr(u64)]
 pub enum ReservationOperation {
     Prepare = 1,
@@ -109,7 +127,13 @@ pub enum ReservationOperation {
 /// The generation is the *current* committed root revision. The pending
 /// sequence is never reused, including after refusal. Every successful edit
 /// advances the revision; a stale fault grant cannot authorize a reused VA.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 #[repr(C)]
 pub struct ReservationRequest {
     pub mm: ReservationMm,
@@ -125,7 +149,13 @@ pub struct ReservationRequest {
 /// Exact backing service accounting. Zero is valid for a lazy reservation or
 /// permission-only transaction; it does not imply anonymous pages are resident.
 /// `receipt` identifies the substrate transaction even when no frames moved.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 #[repr(C)]
 pub struct ReservationBackingReceipt {
     pub receipt: u64,
@@ -135,7 +165,13 @@ pub struct ReservationBackingReceipt {
 
 /// Created only by the admitted exact-MM descriptor/backing transaction owner.
 /// Fields are private so policy cannot accidentally treat the request as done.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 #[repr(C)]
 pub struct ReservationCompletion {
     request: ReservationRequest,
@@ -226,7 +262,14 @@ mod tests {
 /// import, host opaque insertion, or a host attribute edit). EL1 edits only
 /// plain private anonymous nodes; any edit touching another node is a
 /// host-served operation.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 #[repr(transparent)]
 pub struct ReservationNodeFlags(u32);
 impl ReservationNodeFlags {
@@ -291,7 +334,13 @@ impl ReservationNodeFlags {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct Mapping {
     pub range: ReservationRange,
     pub protection: ReservationProtection,
@@ -306,14 +355,21 @@ pub struct Mapping {
 
 /// Byte charges of committed nodes, whole-root or within one range: every
 /// node (`RLIMIT_AS`), `RLIMIT_DATA` nodes, and `LOCKED` anonymous nodes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct Charges {
     pub bytes: u64,
     pub data: u64,
     pub locked: u64,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::default::Default)]
 #[repr(C)]
 pub struct ReservationNodeData {
     pub start: u64,
@@ -433,7 +489,13 @@ pub unsafe trait ReservationMetadataAllocator {
     fn deallocate(&self, ptr: *mut u8, layout: core::alloc::Layout);
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum Refusal {
     Busy,
     PreparedConflict,
@@ -446,7 +508,7 @@ pub enum Refusal {
     MetadataRequired,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 #[repr(C)]
 pub struct Layout {
     pub heap: ReservationRange,
@@ -455,7 +517,7 @@ pub struct Layout {
     pub policy: ReservationPolicyPayload,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 #[repr(transparent)]
 pub struct ReservationPolicyPayload([u64; 5]);
 impl ReservationPolicyPayload {
@@ -467,7 +529,13 @@ impl ReservationPolicyPayload {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum Placement {
     Anywhere,
     Hint(u64),
@@ -476,7 +544,13 @@ pub enum Placement {
 }
 
 /// Destination intent interpreted by the selected reservation client.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum MoveTarget {
     /// No `MREMAP_MAYMOVE`: resize in place or fail with ENOMEM.
     InPlace,
@@ -492,14 +566,20 @@ pub enum MoveTarget {
     KeepSource(Option<u64>),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum Decision {
     Complete(u64),
     Work(ReservationRequest),
 }
 
 /// Inputs to one uncommitted reservation edit; this record grants no authority.
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub struct ReservationProposal {
     pub range: ReservationRange,
     pub protection: ReservationProtection,

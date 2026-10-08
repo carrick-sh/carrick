@@ -44,7 +44,7 @@ use std::ops::Range;
 use carrick_guest_mem::HostVa;
 
 /// Stopped-vCPU observations of one syscall mailbox incarnation.
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 #[repr(u32)]
 pub enum SyscallMailboxPhase {
     RequestObserved = 1,
@@ -1043,7 +1043,13 @@ impl HvpatchFirstTouchDeliverReason {
 
 /// Where an address space's reservation root admission came from. Append
 /// only: `scripts/dtrace/` reads the ordinals.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchEl1RootOrigin {
     /// The MM's first load: the initial runner, or the new MM of an exec.
@@ -1060,7 +1066,13 @@ impl HvpatchEl1RootOrigin {
 
 /// What a published address space's root admission decided. Append only:
 /// `scripts/dtrace/` reads the ordinals.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchEl1RootAdmission {
     /// The root owns the MM's anonymous-private memory: EL1 serves it.

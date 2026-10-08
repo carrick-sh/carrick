@@ -4,7 +4,13 @@
 use core::fmt;
 use core::ops::DerefMut;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum ResidencyError {
     Retiring,
     AlreadyRetiring,
@@ -27,7 +33,14 @@ impl fmt::Display for ResidencyError {
 }
 impl core::error::Error for ResidencyError {}
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 enum ResidencyLifecycle {
     #[default]
     Live,
@@ -36,7 +49,7 @@ enum ResidencyLifecycle {
 }
 
 /// The sole logical residency state. Its fields cannot be mutated by adapters.
-#[derive(Debug, Default)]
+#[derive(::core::fmt::Debug, ::core::default::Default)]
 pub struct ResidencyState {
     lifecycle: ResidencyLifecycle,
     loading: usize,
@@ -69,7 +82,7 @@ pub unsafe trait InvalidationProof<G> {
     fn generation(&self) -> G;
 }
 
-#[derive(Clone, Debug)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
 pub struct AddressResidency<V: ResidencyVenue, G: Copy + Eq> {
     generation: G,
     venue: V,
@@ -116,7 +129,7 @@ impl<V: ResidencyVenue, G: Copy + Eq> AddressResidency<V, G> {
     }
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct ResidencyLoad<V: ResidencyVenue> {
     venue: V,
     active: bool,
@@ -158,7 +171,7 @@ impl<V: ResidencyVenue> Drop for ResidencyLoad<V> {
     }
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct PreparedResidencyRetirement<V: ResidencyVenue, G: Copy + Eq> {
     residency: AddressResidency<V, G>,
     active: bool,
@@ -190,7 +203,7 @@ impl<V: ResidencyVenue, G: Copy + Eq> Drop for PreparedResidencyRetirement<V, G>
     }
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct ResidencyRetirement<V: ResidencyVenue, G: Copy + Eq> {
     generation: G,
     venue: V,
@@ -248,7 +261,13 @@ pub unsafe trait TerminalRootProof {
     fn size(&self) -> u64;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum RootRetirementError {
     Incomplete,
     TicketAlreadyIssued,
@@ -270,7 +289,7 @@ impl fmt::Display for RootRetirementError {
 impl core::error::Error for RootRetirementError {}
 
 /// One-shot ticket; it carries the nonce through terminal backend custody.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct RootRetirementTicket<S: RootSlot> {
     slot: S,
     nonce: u64,
@@ -300,7 +319,7 @@ impl<S: RootSlot> RootRetirementTicket<S> {
         })
     }
 }
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct RootRetirementReceipt<S: RootSlot> {
     slot: S,
     nonce: u64,
@@ -309,7 +328,7 @@ pub struct RootRetirementReceipt<S: RootSlot> {
 /// The sole root-reuse gate for one retirement. Neither cloneable nor mintable
 /// from a receipt. Allocate it only when retirement commits; unpublished
 /// preparation and rollback do not need proof identity.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct RootQuarantine<S: RootSlot> {
     slot: Option<S>,
     nonce: Option<u64>,
@@ -424,7 +443,7 @@ pub fn record_identity_mismatch(
 pub trait RecordPinVenue: fmt::Debug {
     fn release_pin(&self, identity: CarrierStage2RecordIdentity);
 }
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct RecordPin<V: RecordPinVenue> {
     venue: V,
     identity: CarrierStage2RecordIdentity,
@@ -502,7 +521,7 @@ pub fn request_record_retirement(
     record.snapshot.retry_eligible = record.snapshot.pin_count == 0;
     CarrierStage2RetireOutcome::DeferredActivePins
 }
-#[derive(Debug, Eq, PartialEq)]
+#[derive(::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub enum RecordRetirement {
     Complete(CarrierStage2RetireOutcome),
     Unmap { ipa: u64, len: usize },
@@ -633,7 +652,7 @@ pub trait PendingRetirementReference {
 /// receipt that leaves the mm non-empty, one that covers a different number of
 /// mappings, and one that omits a pending fork frame call for entirely different
 /// fixes, and a bare "malformed" verdict cannot tell them apart.
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub struct PendingRetirementAudit {
     mm_empty_at_revision: bool,
     expected_non_empty: bool,
@@ -695,7 +714,7 @@ pub fn authenticate_pending_retirement<P: PendingRetirementReference>(
 
 /// The existing lease publication gate, now neutral. It is separate from
 /// hardware residency: an uninstalled root still must close publication.
-#[derive(Debug, Default)]
+#[derive(::core::fmt::Debug, ::core::default::Default)]
 pub struct LeaseGate {
     lifecycle: ResidencyLifecycle,
 }
@@ -742,7 +761,13 @@ pub fn drain_publication<V: ResidencyVenue, G: Copy + Eq, P: AddressPublication>
 mod nonce_tests {
     use super::*;
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[derive(
+        ::core::clone::Clone,
+        ::core::marker::Copy,
+        ::core::fmt::Debug,
+        ::core::cmp::Eq,
+        ::core::cmp::PartialEq,
+    )]
     struct Slot;
     impl RootSlot for Slot {
         fn base(self) -> u64 {

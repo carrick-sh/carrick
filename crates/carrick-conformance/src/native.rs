@@ -1,5 +1,4 @@
 //! Native Linux oracle envelope and fail-closed probe provenance.
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -16,10 +15,22 @@ pub const UNSHARE_FLAGS: &[&str] = &[
 pub const SOURCE_HASH_SCHEME: &str = "sha256-bin-lib-cargo-manifest-lock-v1";
 pub const INIT_POLICY: &str = "chroot-shell-pid1-v1";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 struct NativeStartTicks(u64);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 struct NativeInitIdentity {
     pid: carrick_kernel_arena::domains::HostPid,
     start: NativeStartTicks,
@@ -88,7 +99,7 @@ pub fn kernel_major_minor(release: &str) -> anyhow::Result<String> {
     Ok(format!("{major}.{minor}"))
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::serde::Serialize, ::serde::Deserialize)]
 pub struct ProbeProvenance {
     pub oracle_backend: String,
     pub kernel: String,
@@ -149,7 +160,7 @@ pub fn validate_probe_provenance(provenance: &ProbeProvenance, kernel: &str) -> 
 
 pub fn validate_probe_oracle_dir(dir: &Path) -> Result<(), String> {
     let provenance: ProbeProvenance = serde_json::from_slice(
-        &std::fs::read(dir.join("PROVENANCE.json")).map_err(|e| e.to_string())?,
+        &::std::fs::read(dir.join("PROVENANCE.json")).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     validate_probe_provenance(&provenance, &kernel_release().map_err(|e| e.to_string())?)?;
@@ -166,7 +177,13 @@ pub fn validate_probe_oracle_dir(dir: &Path) -> Result<(), String> {
 
 /// JSON emitted by `carrick rootfs export`. The lower is immutable; every
 /// execution gets a private writable copy before namespace admission.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::serde::Serialize,
+    ::serde::Deserialize,
+)]
 pub struct NativeRootfs {
     pub root: PathBuf,
     pub image_digest: String,
@@ -233,7 +250,7 @@ pub fn static_init_inputs() -> anyhow::Result<std::collections::BTreeMap<String,
     paths
         .into_iter()
         .map(|path| {
-            let hash = crate::shard::hash(&std::fs::read(&path)?);
+            let hash = crate::shard::hash(&::std::fs::read(&path)?);
             Ok((path, hash))
         })
         .collect()
@@ -254,8 +271,9 @@ pub fn static_probe_root(
                 .ok_or_else(|| anyhow::anyhow!("init path missing parent"))?,
         )?;
         std::fs::copy(source, &destination)?;
+        let copied_bytes = ::std::fs::read(destination)?;
         anyhow::ensure!(
-            crate::shard::hash(&std::fs::read(destination)?) == *expected_hash,
+            crate::shard::hash(&copied_bytes) == *expected_hash,
             "native init input changed while copying"
         );
     }
@@ -277,7 +295,7 @@ pub fn run_probe_in_root(probe: &Path, lower: &NativeRootfs) -> anyhow::Result<S
         status.lines().any(|line| line == "Seccomp:\t0"),
         "native probe requires a seccomp-unconfined process"
     );
-    let bytes = std::fs::read(probe)?;
+    let bytes = ::std::fs::read(probe)?;
     anyhow::ensure!(
         bytes.starts_with(b"\x7fELF") && bytes.get(18..20) == Some(&[62, 0]),
         "probe must be an x86_64 ELF"
@@ -334,7 +352,7 @@ pub fn probe_source_hash(repo: &Path, name: &str) -> anyhow::Result<String> {
         "Cargo.toml".into(),
         "Cargo.lock".into(),
     ] {
-        let bytes = std::fs::read(repo.join("conformance-probes").join(&relative))?;
+        let bytes = ::std::fs::read(repo.join("conformance-probes").join(&relative))?;
         hash.update(relative.as_bytes());
         hash.update([0]);
         hash.update((bytes.len() as u64).to_le_bytes());
