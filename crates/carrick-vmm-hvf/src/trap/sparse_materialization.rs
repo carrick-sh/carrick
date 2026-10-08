@@ -2653,6 +2653,12 @@ impl PublicationContext<'static> {
             return Ok(if peer_resident {
                 TransferPreparation::PeerResident
             } else {
+                super::stage2_backend::record_owner_supply_decline(
+                    window.operation.mm.raw(),
+                    window.operation.incarnation.get(),
+                    4,
+                    overlapping.len() as u32,
+                );
                 TransferPreparation::Declined
             });
         }
@@ -2767,6 +2773,12 @@ impl PublicationContext<'static> {
             pending.context.mm_root_slot,
             pending.context.container_root,
         ) {
+            super::stage2_backend::record_owner_supply_decline(
+                window.operation.mm.raw(),
+                window.operation.incarnation.get(),
+                5,
+                0,
+            );
             return Ok(TransferPreparation::Declined);
         }
         drop(pending.registry.take());

@@ -940,6 +940,19 @@ pub(crate) fn record_el1_counters_host_ptr(ptr: usize) {
     EL1_COUNTERS_HOST_PTR.store(ptr, std::sync::atomic::Ordering::Release);
 }
 
+/// Host-side producer for the guest-visible reservation ring. The carrier
+/// aperture stays mapped until counter snapshot/clear during VM teardown.
+pub(super) fn record_owner_supply_decline(mm: u64, incarnation: u64, reason: u32, detail: u32) {
+    let ptr = EL1_COUNTERS_HOST_PTR.load(std::sync::atomic::Ordering::Acquire);
+    if ptr != 0 {
+        // SAFETY: the live carrier owns this permanently mapped counters page.
+        let counters = unsafe { &*(ptr as *const carrick_el1_abi::Counters) };
+        counters
+            .reservation_events
+            .record(4, mm, incarnation, reason, detail);
+    }
+}
+
 pub(crate) fn record_el1_region_host_ptr(ptr: usize) {
     EL1_REGION_HOST_PTR.store(ptr, std::sync::atomic::Ordering::Release);
     carrick_el1_abi::record_el1_region_host_ptr(ptr);
