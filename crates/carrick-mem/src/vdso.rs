@@ -15,12 +15,12 @@
 
 /// Guest VA of the vvar (timekeeping) data page. The embedded code loads this
 /// with a single `movz x9, #0x2E, lsl #32`, so it MUST match the asm.
-pub const LINUX_VVAR_BASE: u64 = 0x2E_0000_0000;
+pub use carrick_el1_abi::LINUX_VVAR_BASE;
 /// Guest VA of the vDSO code/ELF page (one 64 KiB slot above vvar). This is the
 /// value published in `AT_SYSINFO_EHDR`.
 pub const LINUX_VDSO_BASE: u64 = 0x2E_0001_0000;
 /// Page sizes reserved for each region.
-pub const LINUX_VVAR_SIZE: u64 = 0x1000;
+pub use carrick_el1_abi::LINUX_VVAR_SIZE;
 pub const LINUX_VDSO_SIZE: u64 = 0x1000;
 
 /// Byte offsets into the vvar data page (little-endian u64s). carrick fills

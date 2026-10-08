@@ -646,6 +646,10 @@ pub enum Policy {
 pub trait MappingInheritancePolicy {
     fn inheritance_policy(&self, mapping: &Mapping) -> Policy;
     fn is_shared(&self, mapping: &Mapping) -> bool;
+    /// Explicit synthetic windows with no reservation node.
+    fn unreserved_policy(&self, _base: u64, _span: u64) -> Option<Policy> {
+        None
+    }
 }
 
 pub fn policy<B: OwnerForkMmu, P: MappingInheritancePolicy>(
@@ -683,11 +687,15 @@ pub fn policy<B: OwnerForkMmu, P: MappingInheritancePolicy>(
             result
         })
     } else {
-        Ok(if B::is_user(descriptor) {
-            Policy::Omit
-        } else {
-            Policy::Keep
-        })
+        Ok(policy_provider
+            .unreserved_policy(base, span)
+            .unwrap_or_else(|| {
+                if B::is_user(descriptor) {
+                    Policy::Omit
+                } else {
+                    Policy::Keep
+                }
+            }))
     }
 }
 

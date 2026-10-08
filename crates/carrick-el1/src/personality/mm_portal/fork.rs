@@ -55,6 +55,19 @@ pub type PreparedOwnerFork<B = NativeForkMmu> = carrick_core::mm::fork::Prepared
 pub struct LinuxForkPolicy;
 
 impl carrick_core::mm::fork::MappingInheritancePolicy for LinuxForkPolicy {
+    fn unreserved_policy(&self, base: u64, span: u64) -> Option<carrick_core::mm::fork::Policy> {
+        let start = carrick_el1_abi::LINUX_VVAR_BASE;
+        let end = start + carrick_el1_abi::LINUX_VVAR_SIZE;
+        let limit = base.checked_add(span)?;
+        if base >= end || limit <= start {
+            return None;
+        }
+        Some(if base >= start && limit <= end {
+            carrick_core::mm::fork::Policy::Private
+        } else {
+            carrick_core::mm::fork::Policy::Mixed
+        })
+    }
     fn inheritance_policy(
         &self,
         mapping: &carrick_core::mm::fork::Mapping,
