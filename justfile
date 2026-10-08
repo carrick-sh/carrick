@@ -203,6 +203,11 @@ clippy *ARGS:
 lint-domains: lint-domains-source
     cargo run --locked -p carrick-xtask -- authority-debt
 
+# Emit exact compiler diagnostics for the selected native host profiles.
+# Output is transient; accepted authority identity uses symbolic cohorts only.
+authority-discover OUTPUT:
+    python3 scripts/migrate/check-host-authority-transitions.py > {{quote(OUTPUT)}}
+
 # Host-independent domain checks; live compiler capture runs separately.
 lint-domains-source:
     python3 scripts/conformance/check-next-strategy.py

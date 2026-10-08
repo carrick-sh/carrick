@@ -1,3 +1,7 @@
+> Historical inventory references below are retired. Do not execute the
+> positional reconciliation or remote capture instructions. Current landing
+> uses `just lint-domains` and fresh authority discovery with monotone ceilings.
+
 # Inventory retirement audit: PR 1
 
 Authoritative section copied from `/home/carrick/dev/batch-tools/inventory-retirement-audit.md`, audited at `51bfe67f40f879c46ae506612c37e76f4867d5c7`.

@@ -48,7 +48,7 @@ It also runs clippy for the CLI's `platform-linux,syscall-shim` closure and work
 harnesses with `-D warnings`, fmt-check, and the shared `lint-domains-source` checks. A separate authority compiler
 step executes Linux profiles; live macOS/FreeBSD/NetBSD profiles require those
 hosts and are explicitly recorded in the receipt's skipped steps. Source checks
-and validation of the committed macOS compiler capture still run. This is host
+and absolute authority ceilings still run. This is host
 evidence, not guest execution or complete authority-matrix evidence. Snapshot
 extraction validates every Git archive member before writing; Python versions
 with extraction filters also apply the data filter, while Python 3.11 uses the
@@ -61,36 +61,20 @@ The receipt annotates matching failures and separately names unallowlisted ones;
 no failing command is silently turned green. Backend ABI failures require fixes,
 not additions to this allowlist. All steps run even after an earlier step fails.
 
-When a Linux source edit moves reviewed shared sites, commit the edit first,
-then run `just remote-recapture --ref <commit>`. It uses remote-accept's host,
-gate ref namespace, persistent worktree and checkout lock, followed by an
-exclusive host lease for compiler capture. It refuses a dirty remote tree and
-checks that remote HEAD matches the requested commit. The partial macOS
-candidate's expected exit status is 1; other failures stop reconciliation.
-
-The command returns `target/remote-recapture/<run-id>/recapture.patch`, without
-applying it. Run `git apply <patch>`, review the diff, commit the two inventory
-artifacts, then run `just lint-domains` on the clean tree. Patch validation
-rejects any other path, file mode change, review addition/removal, classification,
-evidence, profile, operation or rationale prose change. Only source coordinates
-and the matching leading rationale location can move. Generated files on the
-Mac are restored before the checkout lock is released. Transfer failures never
-publish a validated patch. If the execution SSH connection fails, the checkout
-lock stays held: the remote launch shell joined it as a holder, and a disconnect
-cannot prove compiler work stopped.
+Authority checks use operation/owner/lane ceilings and fresh compiler discovery.
+Moving unrelated source lines needs no inventory maintenance or remote capture.
+Run `just lint-domains` with the actual PR base in `CARRICK_AUTHORITY_BASE`.
 
 The checkout lock (`gate-worktree.lock`) records each gate-host process holding
 it in `holders/<pid>` with that process's start time. The acquiring SSH session
 keeps a remote keeper process alive until the driver releases or dies; work
-that outlives the driver (the detached accept job, the recapture shell) joins
+that outlives the driver (the detached accept job) joins
 as a holder while a live holder sponsors it. A later acquirer reclaims the lock
 only when every recorded holder process is gone and the holder set did not
 change while it looked, and appends the recovered run-id to
 `gate-worktree.lock.recoveries`. A lock without holder records is reclaimed
 only through its run's published `exit` file; otherwise it is reported and
 left for a human.
-Recapture is inventory maintenance, not an acceptance
-receipt; run the acceptance gates on the resulting commit.
 
 `remote-accept` pushes the committed ref to the gate Mac (default
 `rentamac@cloudmac`, `/Volumes/carrick/dev`), runs the regular macOS acceptance

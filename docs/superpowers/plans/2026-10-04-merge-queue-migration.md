@@ -1,3 +1,7 @@
+> Historical inventory references below are retired. Do not execute the
+> positional reconciliation or remote capture instructions. Current landing
+> uses `just lint-domains` and fresh authority discovery with monotone ceilings.
+
 # Hosted CI and merge queue migration
 
 Status: workflow implementation for the owner-approved runner-first direction

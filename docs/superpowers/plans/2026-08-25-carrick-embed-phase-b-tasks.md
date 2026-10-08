@@ -1,3 +1,7 @@
+> Historical inventory references below are retired. Do not execute the
+> positional reconciliation or remote capture instructions. Current landing
+> uses `just lint-domains` and fresh authority discovery with monotone ceilings.
+
 # carrick-embed Plan — Phase B — Container as a kernel-graph object
 
 > Part of [`2026-08-25-carrick-embed-phase-a-c-plan.md`](2026-08-25-carrick-embed-phase-a-c-plan.md); read that index and the spec first. Line numbers verified at `39426141`; quoted existing text is the authority.

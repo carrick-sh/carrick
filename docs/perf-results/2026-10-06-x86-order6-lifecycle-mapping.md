@@ -1,3 +1,7 @@
+> Historical inventory references below are retired. Do not execute the
+> positional reconciliation or remote capture instructions. Current landing
+> uses `just lint-domains` and fresh authority discovery with monotone ceilings.
+
 # Order 6: lifecycle ownership and X5 comparison packet
 
 Historical pre-rebase evidence. The current reviewed-base resolution and
