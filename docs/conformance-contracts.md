@@ -275,6 +275,12 @@ capacity. VM-free bindings: `reservation_admission_secures_one_forwarding_reques
 `reservation_failed_admission_returns_import_and_reserve_nodes`,
 `delegated_initial_reserve_refusal_leaves_the_mm_unadmitted`, and
 `delegated_carrier_exhaustion_returns_enomem_without_handback_and_recovers`.
+Each metadata node has one owner: a return must atomically claim its live
+custody before publishing a free link, and two roots may never acquire the
+same node. `repeated_node_return_must_not_allocate_one_id_to_two_roots` is the
+VM-free two-root witness; `simultaneous_returns_claim_exactly_one_node`
+checks the competing-return boundary. This is an exact ownership budget of
+one successful return per checkout, independent of metadata capacity.
 `delegated_host_brk_uses_secured_metadata_when_the_shared_pool_is_empty`
 checks that host-forwarded heap moves use the same secured reserve rather
 than incorrectly returning the old break while metadata remains available.
