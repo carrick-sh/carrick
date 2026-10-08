@@ -1,5 +1,36 @@
 # x86 anonymous CPL0 handoff (partial, 2026-10-07)
 
+## Exact continuation: shared fixes extracted; runtime work parked (2026-10-08)
+
+The director changed priority: park elastic per-fork loans and nonzero rusage,
+and deliver the shared fixes promptly for N1 ARM. Do not resume either parked
+feature without a new instruction. The runtime lane is clean and pushed at
+8dc07eec3 on github/work/x86-process-owner. Its exact production two-live-MM
+witness passes: `/tmp/x86-parked-span-two-mm.log`. Full lane gates are not green;
+populated fork-stock and nonzero-rusage tests remain red.
+
+The shared-only extraction is clean and pushed at 7cab20c99, based on published
+main 1ce4fd32d, in `/home/carrick/dev/wt-x86-shared-fixes`, branch
+work/shared-x86-fork-fixes. Draft PR: https://github.com/carrick-sh/carrick/pull/120.
+Three independent commits fix single-root closed-child admission, ISA-private
+supervisor branch cloning/sharing, and owned fallible exact-MM editor exclusion.
+Fresh VM-free reds were captured against that main base. ARM keeps its existing
+fork walk and waiting callers; no ARM call-site migration is included.
+
+Extraction verification: 140 scheduler, 97 core, 243 MMU and 14 acceleration
+tests; workspace Clippy; lint-domains including live Linux compiler discovery;
+49 real KVM tests in cpl0_entry/cpl0_initial_mm/cpl0_progress; ARM asm-diff
+111/111 unchanged, no exclusions. Receipts: `/tmp/x86-shared-main-*.log` and
+PR body. Main lacks the native process owner and exact production witness;
+the preserved runtime-lane witness is separate evidence, not an extraction
+verification claim. Signed ARM/HVF is unavailable on this Linux host.
+
+Main 1ce4fd32d deleted line-pinned inventories and macOS capture. Do not
+reconcile or recapture those retired inventories. If the runtime lane resumes,
+merge published main (never rebase per director), retain these shared fixes,
+and address the actual elastic stock admission before its rusage runtime reds.
+The latest typed extent checkpoint does not implement elastic allocation.
+
 ## Exact continuation: private initial admission and gate audit (2026-10-08)
 
 Private copy admission is pushed at ae0891e10. Fresh initial roots allocate
