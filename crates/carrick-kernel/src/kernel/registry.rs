@@ -1,5 +1,6 @@
 use carrick_sched_core::process::identity_allocator::{
-    ClaimKind, InternalIdentity, NamespaceState, VisibleIdentity, VisibleNamespace,
+    ClaimKind, InternalIdentity, NamespaceState, TransferredNamespaceState, VisibleIdentity,
+    VisibleNamespace,
 };
 pub use carrick_sched_core::process::identity_allocator::{IdError, IdRegistryCounts};
 use std::sync::Arc;
@@ -92,6 +93,14 @@ impl IdRegistry {
     }
     pub fn counts(&self) -> IdRegistryCounts {
         self.state.lock().counts()
+    }
+    /// Move the namespace authority once. Retained host handles remain closed;
+    /// their claim destructors cannot release the receiver's claims.
+    pub fn transfer(&self) -> Option<TransferredNamespaceState> {
+        self.state.lock().transfer()
+    }
+    pub fn transferred_refusals(&self) -> Option<u64> {
+        self.state.lock().refused_attempts()
     }
     fn reserve_next(&self, kind: ClaimKind) -> Result<ReservationToken, IdError> {
         let candidate = self.state.lock().reserve_next(kind)?;
@@ -370,6 +379,37 @@ impl RegistryLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transferred_registry_claims_survive_host_handle_cleanup() {
+        let registry = IdRegistry::with_range_for_tests(1, 8);
+        let peer = registry.clone();
+        let (root, reservation) = registry.reserve_task().unwrap();
+        let task = reservation.commit();
+        let thread = registry.claim_task_leader_thread(root).unwrap();
+        let group = registry
+            .claim_process_group(ProcessGroupId::from_leader(root))
+            .unwrap();
+        let session = registry
+            .claim_session(SessionId::from_leader(root))
+            .unwrap();
+        let counts = registry.counts();
+        let mut native = registry.transfer().unwrap().into_owner();
+        assert_eq!(
+            peer.reserve_task().unwrap_err(),
+            IdError::AuthorityTransferred
+        );
+        assert_eq!(
+            peer.reserve_thread().unwrap_err(),
+            IdError::AuthorityTransferred
+        );
+        assert!(peer.transfer().is_none());
+        assert_eq!(registry.transferred_refusals(), Some(3));
+        drop((task, thread, group, session));
+        assert_eq!(native.counts(), counts);
+        assert_eq!(registry.counts(), IdRegistryCounts::default());
+        assert_eq!(native.reserve_next(ClaimKind::Task).unwrap().get(), 2);
+    }
 
     #[test]
     fn task_and_thread_ids_share_one_namespace() {

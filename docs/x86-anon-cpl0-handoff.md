@@ -1,5 +1,26 @@
 # x86 anonymous CPL0 handoff (partial, 2026-10-07)
 
+## Namespace handoff component (2026-10-08)
+
+NamespaceState now owns its allocation through an optional private owner.
+Transfer removes the actual claims, internal cursor and per-incarnation
+visible cursors, through a non-Clone token. The closed source has no
+allocation state to restart, and refuses/counts task, thread, exact,
+related, visible and cursor-import attempts. Old claim destructors and
+namespace retirement are inert at that source; they cannot alter the
+receiver's live claims. The shared allocation policy remains one body.
+
+The staged move with the old allocator reproduced visible PID2 issuance
+from the emptied host source in `/tmp/x86-namespace-transfer-red.log`.
+The initial shared suite passes 171 tests in
+`/tmp/x86-namespace-transfer-green.log`; the final suite with overflow
+passes 172 in `/tmp/x86-namespace-transfer-suite-final.log`. Full clippy
+passes in `/tmp/x86-namespace-transfer-clippy.log`. The seven kernel registry tests
+pass in `/tmp/x86-namespace-registry-green.log`, including real RAII host
+claim destruction after transfer and exact receiver counts. This remains
+an allocation component: production Kernel boot export and guest seed
+transport are not wired, and the two-MM witness remains red at fork91.
+
 ## Allocation handoff component (2026-10-08)
 
 The local serial cursor now transfers through an owned, non-Clone token.

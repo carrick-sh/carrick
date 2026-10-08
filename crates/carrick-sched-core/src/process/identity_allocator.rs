@@ -36,16 +36,115 @@ impl VisibleIdentity {
     }
 }
 
+/// Namespace authority. A transferred source retains only refusal accounting.
 #[derive(Debug)]
 pub struct NamespaceState {
+    owner: Option<NamespaceAllocation>,
+    refused: u64,
+}
+#[derive(Debug)]
+struct NamespaceAllocation {
     first: i32,
     last: i32,
     next: i32,
     claims: BTreeMap<i32, ClaimCounts>,
     visible_next: BTreeMap<VisibleNamespace, u32>,
 }
-
+/// Owned claims and cursors, moved once rather than mirrored at the source.
+#[derive(Debug)]
+pub struct TransferredNamespaceState {
+    owner: NamespaceAllocation,
+}
+impl TransferredNamespaceState {
+    pub fn into_owner(self) -> NamespaceState {
+        NamespaceState {
+            owner: Some(self.owner),
+            refused: 0,
+        }
+    }
+}
 impl NamespaceState {
+    pub fn new(first: i32, last: i32, next: i32) -> Self {
+        Self {
+            owner: Some(NamespaceAllocation::new(first, last, next)),
+            refused: 0,
+        }
+    }
+    fn refuse(&mut self) {
+        self.refused = self.refused.saturating_add(1);
+    }
+    pub fn refused_attempts(&self) -> Option<u64> {
+        (self.refused != u64::MAX).then_some(self.refused)
+    }
+    pub fn transfer(&mut self) -> Option<TransferredNamespaceState> {
+        match self.owner.take() {
+            Some(owner) => Some(TransferredNamespaceState { owner }),
+            None => {
+                self.refuse();
+                None
+            }
+        }
+    }
+    fn allocation(&mut self) -> Result<&mut NamespaceAllocation, IdError> {
+        if self.owner.is_none() {
+            self.refuse();
+            return Err(IdError::AuthorityTransferred);
+        }
+        self.owner.as_mut().ok_or(IdError::AuthorityTransferred)
+    }
+    pub fn reserve_next(&mut self, kind: ClaimKind) -> Result<InternalIdentity, IdError> {
+        self.allocation()?.reserve_next(kind)
+    }
+    pub fn reserve_exact(
+        &mut self,
+        raw: i32,
+        kind: ClaimKind,
+    ) -> Result<InternalIdentity, IdError> {
+        self.allocation()?.reserve_exact(raw, kind)
+    }
+    pub fn claim_related(
+        &mut self,
+        raw: i32,
+        kind: ClaimKind,
+    ) -> Result<InternalIdentity, IdError> {
+        self.allocation()?.claim_related(raw, kind)
+    }
+    pub fn reserve_visible(&mut self, namespace: VisibleNamespace) -> Option<VisibleIdentity> {
+        self.allocation().ok()?.reserve_visible(namespace)
+    }
+    pub fn set_next(&mut self, raw: i32) {
+        if let Ok(owner) = self.allocation() {
+            owner.set_next(raw);
+        }
+    }
+    pub fn release(&mut self, raw: InternalIdentity, kind: ClaimKind) {
+        if let Some(owner) = self.owner.as_mut() {
+            owner.release(raw, kind);
+        }
+    }
+    pub fn retire_visible_namespace(&mut self, namespace: VisibleNamespace) {
+        if let Some(owner) = self.owner.as_mut() {
+            owner.retire_visible_namespace(namespace);
+        }
+    }
+    pub fn is_reserved_number(&self, raw: i32) -> bool {
+        self.owner
+            .as_ref()
+            .is_some_and(|owner| owner.is_reserved_number(raw))
+    }
+    pub fn counts(&self) -> IdRegistryCounts {
+        self.owner
+            .as_ref()
+            .map_or_else(IdRegistryCounts::default, NamespaceAllocation::counts)
+    }
+    pub fn visible_namespace_count(&self) -> usize {
+        self.owner
+            .as_ref()
+            .map_or(0, NamespaceAllocation::visible_namespace_count)
+    }
+}
+
+impl NamespaceAllocation {
     fn advance(&mut self) {
         self.next = if self.next == self.last {
             self.first
@@ -133,6 +232,7 @@ pub struct IdRegistryCounts {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IdError {
+    AuthorityTransferred,
     Exhausted,
     OutOfRange(i32),
     AlreadyReserved(i32),
@@ -140,7 +240,7 @@ pub enum IdError {
     ClaimCountExhausted(i32),
 }
 
-impl NamespaceState {
+impl NamespaceAllocation {
     pub fn new(first: i32, last: i32, next: i32) -> Self {
         assert!(first > 0);
         assert!(last >= first);
@@ -254,6 +354,9 @@ impl NamespaceState {
 impl core::fmt::Display for IdError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::AuthorityTransferred => {
+                f.write_str("Linux namespace authority has been transferred")
+            }
             Self::Exhausted => f.write_str("Linux PID namespace is exhausted"),
             Self::OutOfRange(raw) => write!(
                 f,
@@ -461,6 +564,67 @@ mod tests {
     }
 
     #[test]
+    fn transferred_namespace_cannot_restart_visible_numbering() {
+        let mut source = NamespaceState::new(1, 8, 1);
+        let namespace = VisibleNamespace::new(NonZeroU32::MIN, NonZeroU32::MIN);
+        let root = source.reserve_next(ClaimKind::Task).unwrap();
+        source.claim_related(root.get(), ClaimKind::Thread).unwrap();
+        source
+            .claim_related(root.get(), ClaimKind::ProcessGroup)
+            .unwrap();
+        source
+            .claim_related(root.get(), ClaimKind::Session)
+            .unwrap();
+        assert_eq!(source.reserve_visible(namespace).unwrap().get(), 2);
+        let mut native = source.transfer().unwrap().into_owner();
+        assert_eq!(source.reserve_visible(namespace), None);
+        assert_eq!(
+            source.reserve_next(ClaimKind::Task),
+            Err(IdError::AuthorityTransferred)
+        );
+        assert_eq!(
+            source.reserve_next(ClaimKind::Thread),
+            Err(IdError::AuthorityTransferred)
+        );
+        assert_eq!(
+            source.reserve_exact(7, ClaimKind::Task),
+            Err(IdError::AuthorityTransferred)
+        );
+        assert_eq!(
+            source.claim_related(root.get(), ClaimKind::Session),
+            Err(IdError::AuthorityTransferred)
+        );
+        source.set_next(7);
+        assert!(source.transfer().is_none());
+        assert_eq!(source.refused_attempts(), Some(7));
+        assert_eq!(source.counts(), IdRegistryCounts::default());
+        assert_eq!(native.counts().thread_claims, 1);
+        assert_eq!(native.counts().process_group_claims, 1);
+        assert_eq!(native.counts().session_claims, 1);
+
+        assert_eq!(native.reserve_visible(namespace).unwrap().get(), 3);
+        assert_eq!(native.reserve_next(ClaimKind::Task).unwrap().get(), 2);
+        source.release(root, ClaimKind::Task);
+        source.retire_visible_namespace(namespace);
+        assert_eq!(native.counts().task_claims, 2);
+        assert_eq!(native.reserve_visible(namespace).unwrap().get(), 4);
+    }
+
+    #[test]
+    fn namespace_refusal_overflow_remains_unknown() {
+        let mut source = NamespaceState::new(1, 8, 1);
+        let _native = source.transfer().unwrap();
+        source.refused = u64::MAX - 1;
+        assert_eq!(
+            source.reserve_next(ClaimKind::Task),
+            Err(IdError::AuthorityTransferred)
+        );
+        assert_eq!(source.refused_attempts(), None);
+        assert!(source.transfer().is_none());
+        assert_eq!(source.refused_attempts(), None);
+    }
+
+    #[test]
     fn reused_namespace_number_has_distinct_incarnation_custody() {
         let mut owner = NamespaceState::new(1, 8, 1);
         let old = VisibleNamespace::new(NonZeroU32::MIN, NonZeroU32::MIN);
@@ -469,7 +633,7 @@ mod tests {
         assert_eq!(owner.reserve_visible(new).unwrap().get(), 2);
         owner.retire_visible_namespace(old);
         assert_eq!(owner.reserve_visible(new).unwrap().get(), 3);
-        assert_eq!(owner.visible_next.len(), 1);
+        assert_eq!(owner.owner.as_mut().unwrap().visible_next.len(), 1);
     }
 
     #[test]
@@ -484,14 +648,19 @@ mod tests {
         assert_eq!(owner.reserve_visible(namespace).unwrap().get(), 3);
         let other = VisibleNamespace::new(NonZeroU32::new(2).unwrap(), NonZeroU32::MIN);
         assert_eq!(owner.reserve_visible(other).unwrap().get(), 2);
-        owner.visible_next.insert(namespace, i32::MAX as u32 - 1);
+        owner
+            .owner
+            .as_mut()
+            .unwrap()
+            .visible_next
+            .insert(namespace, i32::MAX as u32 - 1);
         assert_eq!(
             owner.reserve_visible(namespace).unwrap().get(),
             i32::MAX as u32 - 1
         );
         assert_eq!(owner.reserve_visible(namespace), None);
         owner.retire_visible_namespace(namespace);
-        assert_eq!(owner.visible_next.len(), 1);
+        assert_eq!(owner.owner.as_mut().unwrap().visible_next.len(), 1);
         assert_eq!(owner.reserve_visible(other).unwrap().get(), 3);
     }
 
