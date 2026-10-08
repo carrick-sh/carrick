@@ -311,6 +311,22 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         nodes: &'a ResolvedReservationNodes<P, Policy, Geometry>,
         slot: u32,
     ) -> Result<Reservations<'a, Policy, Geometry>, Refusal> {
+        self.lock_el1_resolved_with_context(index, mm, nodes, slot)
+    }
+
+    /// Source-free resolved acquisition preserves the caller's context ABI.
+    #[cfg(any(test, feature = "host-test"))]
+    pub fn lock_el1_resolved_with_context<
+        'a,
+        P: PinnedMetadataExtent,
+        Context: Copy + Send + Sync + zerocopy::FromZeros,
+    >(
+        &'a self,
+        index: usize,
+        mm: ReservationMm,
+        nodes: &'a ResolvedReservationNodes<P, Policy, Geometry>,
+        slot: u32,
+    ) -> Result<Reservations<'a, Policy, Geometry, Context>, Refusal> {
         if !core::ptr::eq(nodes.table, self) {
             return Err(Refusal::Stale);
         }
@@ -364,7 +380,12 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
     }
 }
 
-impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, Policy, Geometry> {
+impl<
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+> Reservations<'_, Policy, Geometry, C>
+{
     /// Consume the MM guard before asking the existing allocator for capacity.
     /// MetadataRequired leaves the Linux operation uncommitted; service the
     /// allocator request at the ordinary host boundary, then reacquire/redecide.

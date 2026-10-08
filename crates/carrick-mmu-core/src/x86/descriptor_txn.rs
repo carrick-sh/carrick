@@ -1,9 +1,9 @@
 //! Four-level, 4 KiB x86 descriptor transactions. No MM or reservation ledger.
 pub use crate::aarch64::descriptor_txn::{
-    BackingIdentity, DescriptorJournal, DescriptorTxnId, InlineJournal, JournalEntry,
-    LiveDescriptorWords, PageSpan,
+    BackingIdentity, DescriptorJournal, DescriptorTxnId, InlineJournal, JournalEntry, PageSpan,
 };
 pub use crate::descriptor_refusal::DescriptorRefusal;
+pub use crate::live_descriptor_words::LiveDescriptorWords;
 use alloc::{collections::BTreeMap, vec::Vec};
 use carrick_guest_arch::{
     Access as GuestAccess, EditBacking, EditCowAccess, EditIntent, EditLeafSize, EditOperation,

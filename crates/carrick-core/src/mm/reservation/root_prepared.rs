@@ -78,7 +78,12 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         .map_err(|_| Refusal::Stale)
     }
 }
-impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, Policy, Geometry> {
+impl<
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+> Reservations<'_, Policy, Geometry, C>
+{
     pub fn prepared_wait_key(&self) -> Option<carrick_sched_core::object_wait::ObjectWaitKey> {
         carrick_sched_core::object_wait::ObjectWaitKey::address_space(
             self.index(),

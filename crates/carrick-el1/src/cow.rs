@@ -196,15 +196,15 @@ pub fn resolve_guest_cow<
 }
 
 /// CPL0's owner adapter reuses the common claim/copy/repoint/completion
-/// policy. Only the PML4 classification, direct-window access and intent
-/// execution differ from AArch64.
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+/// policy. The x86 projection retains the caller's descriptor-word authority
+/// for classification, copy-alias authentication and descriptor publication.
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 pub struct X86CowMmu;
 
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 impl carrick_core::mm::cow::OwnerCowMmu for X86CowMmu {
     const CARRIER_MAINT_ROOT_BASE: u64 = 0;
-    const DEFAULT_COW_COPY_BASE: u64 = carrick_el1_abi::X86_CPL0_DIRECT_VA;
+    const DEFAULT_COW_COPY_BASE: u64 = carrick_mmu_core::x86::copy_window::COW_COPY_WINDOW_BASE;
 
     fn classify_cow_write<
         W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
@@ -274,16 +274,7 @@ impl carrick_core::mm::cow::OwnerCowMmu for X86CowMmu {
         if plan_descriptor_txn(words, &txn, root).is_err() {
             return false;
         }
-        // The single upper-half direct window must already map every copy
-        // source and destination. No new alias or late mapping is authored.
-        for offset in (0..op.len).step_by(4096) {
-            if !x86_direct_page_matches(words, root, op.old_ipa + offset, false)
-                || !x86_direct_page_matches(words, root, op.new_ipa + offset, true)
-            {
-                return false;
-            }
-        }
-        true
+        carrick_mmu_core::x86::copy_window::validate_cow_copy_window(words, root).is_ok()
     }
 
     fn with_copy_aliases<
@@ -299,171 +290,99 @@ impl carrick_core::mm::cow::OwnerCowMmu for X86CowMmu {
     ) -> Result<(), carrick_core::mm::cow::CowRepointOutcome> {
         use carrick_core::mm::cow::CowRepointOutcome;
         use carrick_guest_arch::{FrameGpa, RootGpa};
+        use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
         let Some(root) = RootGpa::page_aligned(FrameGpa::new(root)) else {
             return Err(CowRepointOutcome::Refused);
         };
-        if copy_base != carrick_el1_abi::X86_CPL0_DIRECT_VA
-            || !x86_direct_page_matches(words, root, source_ipa, false)
-            || !x86_direct_page_matches(words, root, destination_ipa, true)
-        {
+        if copy_base != carrick_mmu_core::x86::copy_window::COW_COPY_WINDOW_BASE {
             return Err(CowRepointOutcome::Refused);
         }
-        effect(copy_base + source_ipa, copy_base + destination_ipa);
-        Ok(())
+        carrick_mmu_core::x86::copy_window::with_cow_copy_aliases(
+            words,
+            root,
+            FrameGpa::new(source_ipa),
+            FrameGpa::new(destination_ipa),
+            effect,
+        )
+        .map_err(|outcome| match outcome {
+            DescriptorOutcome::Indeterminate(_) => CowRepointOutcome::Indeterminate,
+            _ => CowRepointOutcome::Refused,
+        })
     }
 
     fn execute_cow_repoint<
         W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
     >(
-        _words: &W,
+        words: &W,
         root: u64,
         op: carrick_core::mm::cow::CowRepointOp,
     ) -> carrick_core::mm::cow::CowRepointOutcome {
         use carrick_core::mm::cow::CowRepointOutcome;
-        use carrick_guest_arch::{
-            EditBacking, EditCowAccess, EditIntent, EditOperation, EditOwner, FrameGpa, GuestLen,
-            KernelVa, RootGpa, TableWindow, UserRange, UserVa,
+        use carrick_guest_arch::{FrameGpa, RootGpa};
+        use carrick_mmu_core::x86::descriptor_txn::{
+            DescriptorOp, DescriptorOutcome, DescriptorTxn, DescriptorTxnId, InlineJournal,
+            PageSpan, execute_descriptor_txn,
         };
-        use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
         use core::num::NonZeroU64;
-        let (Some(root), Some(mm_key), Some(generation), Some(range)) = (
+        let (Some(root), Some(mm_key), Some(generation)) = (
             RootGpa::page_aligned(FrameGpa::new(root)),
             NonZeroU64::new(op.mm_key),
             NonZeroU64::new(op.grant_epoch),
-            UserRange::checked(UserVa::new(op.va), GuestLen::new(op.len)),
         ) else {
             return CowRepointOutcome::Refused;
         };
-        let Some(mapped) = carrick_el1_abi::X86_CPL0_DIRECT_VA.checked_add(root.address().raw())
-        else {
-            return CowRepointOutcome::Refused;
-        };
-        // SAFETY: the common COW resolver runs under the exact-MM editor;
-        // CPL0's retained table arena has one upper supervisor direct window.
-        let Some(tables) = (unsafe {
-            TableWindow::issue(
-                root.address(),
-                KernelVa::new(mapped),
-                GuestLen::new(carrick_el1_abi::X86_CPL0_TABLE_ARENA_BYTES),
-            )
-        }) else {
-            return CowRepointOutcome::Refused;
-        };
-        // SAFETY: the caller's exact editor remains held through this native
-        // intent and its local invalidation receipt.
-        let owner = unsafe { EditOwner::issue(root, mm_key, generation) };
-        let Some(intent) = EditIntent::checked(
-            owner,
-            range,
-            EditOperation::CowRepoint {
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId { mm_key, generation },
+            root,
+            op: DescriptorOp::CowRepoint {
+                span: PageSpan::new(op.va, op.len),
                 old: FrameGpa::new(op.old_ipa),
                 new: FrameGpa::new(op.new_ipa),
-                backing: EditBacking {
-                    frame_id: op.backing.frame_id,
-                    mapping_id: op.backing.mapping_id,
-                    owner_generation: op.backing.owner_generation,
-                    inventory_revision: op.backing.inventory_revision,
-                },
-                access: EditCowAccess::RecordedPrivate,
+                backing: op.backing,
             },
-            &[],
-        ) else {
-            return CowRepointOutcome::Refused;
+            tables: &[],
         };
-        // SAFETY: the retained supervisor alias and exact editor outlive the
-        // descriptor transaction and its local drain.
-        match unsafe { crate::isa::x86::execute_native_edit_intent(intent, tables) } {
-            Ok(receipt) => match receipt.outcome {
-                DescriptorOutcome::Applied { .. } => CowRepointOutcome::Applied {
-                    // The native executor acknowledges the local drain before
-                    // it returns an Applied receipt.
-                    flush_required: false,
-                },
-                DescriptorOutcome::Refused(_) => CowRepointOutcome::Refused,
-                DescriptorOutcome::RolledBack(_) => CowRepointOutcome::RolledBack,
-                DescriptorOutcome::Indeterminate(_) => CowRepointOutcome::Indeterminate,
+        match execute_descriptor_txn(words, &txn, root, &mut InlineJournal::new()).outcome {
+            DescriptorOutcome::Applied { .. } => CowRepointOutcome::Applied {
+                // The supplied words acknowledge their exact-root drain before
+                // the shared descriptor executor returns an Applied receipt.
+                flush_required: false,
             },
-            Err(_) => CowRepointOutcome::Refused,
+            DescriptorOutcome::Refused(_) => CowRepointOutcome::Refused,
+            DescriptorOutcome::RolledBack(_) => CowRepointOutcome::RolledBack,
+            DescriptorOutcome::Indeterminate(_) => CowRepointOutcome::Indeterminate,
         }
     }
 }
 
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
-fn x86_direct_page_matches<
-    W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
->(
-    words: &W,
-    root: carrick_guest_arch::RootGpa,
-    ipa: u64,
-    writable: bool,
-) -> bool {
-    use carrick_guest_arch::{FrameGpa, UserVa};
-    use carrick_mmu_core::x86::descriptor_txn::{Access, translate};
-    let Some(va) = carrick_el1_abi::X86_CPL0_DIRECT_VA.checked_add(ipa) else {
-        return false;
-    };
-    translate(
-        words,
-        root,
-        UserVa::new(va),
-        if writable {
-            Access::Write
-        } else {
-            Access::Read
-        },
-        false,
-    ) == Ok(FrameGpa::new(ipa))
-}
-
 /// Resolve one CPL3 write fault with the common COW grant protocol and the
-/// native x86 descriptor intent. The caller retains the exact-MM editor.
+/// shared x86 descriptor transaction. The caller retains the exact-MM editor.
 ///
 /// # Safety
-/// `root` must be the live CR3 root for `mm_key`, and the retained table arena
-/// must be mapped at the single upper supervisor direct window throughout
-/// this operation. The caller excludes other descriptor writers.
+/// The venue must retain authenticated table mappings and acknowledge their
+/// descriptor drains. Its root must be the live CR3 root for
+/// `mm_key`; the caller excludes other descriptor writers throughout.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub unsafe fn resolve_x86_guest_cow<C: FnMut(u64, u64), I: FnMut()>(
-    root: u64,
+pub unsafe fn resolve_x86_guest_cow<
+    W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords,
+    C: FnMut(u64, u64),
+    I: FnMut(),
+>(
+    venue: &carrick_core::mm::cow::GuestCowVenue<'_, X86CowMmu, W>,
     mm_key: u64,
     far: u64,
-    pool: &dyn carrick_el1_abi::CowGrantVenue,
-    residency: &carrick_el1_abi::FrameGrantResidencyTable,
     copy_page: C,
     invalidate: I,
 ) -> Result<GuestCowOutcome, CowError> {
-    use carrick_guest_arch::{FrameGpa, GuestLen, KernelVa, RootGpa, TableWindow};
-    use carrick_mmu_core::aarch64::SubstrateGpa;
-    use carrick_mmu_core::x86::descriptor_txn::DescriptorTxnId;
-    use core::num::NonZeroU64;
-    let root_gpa = RootGpa::page_aligned(FrameGpa::new(root)).ok_or(CowError::Refused)?;
-    let mapped = carrick_el1_abi::X86_CPL0_DIRECT_VA
-        .checked_add(root)
-        .ok_or(CowError::Refused)?;
-    // SAFETY: the caller retains the mapped table arena under its editor.
-    let tables = unsafe {
-        TableWindow::issue(
-            root_gpa.address(),
-            KernelVa::new(mapped),
-            GuestLen::new(carrick_el1_abi::X86_CPL0_TABLE_ARENA_BYTES),
-        )
+    use carrick_guest_arch::{FrameGpa, RootGpa};
+    let root_gpa =
+        RootGpa::page_aligned(FrameGpa::new(venue.root.raw())).ok_or(CowError::Refused)?;
+    if crate::isa::x86::hardware_live_root().map_err(|_| CowError::Refused)? != root_gpa
+        || mm_key == 0
+    {
+        return Err(CowError::Refused);
     }
-    .ok_or(CowError::Refused)?;
-    let id = DescriptorTxnId {
-        mm_key: NonZeroU64::new(mm_key).ok_or(CowError::Refused)?,
-        generation: NonZeroU64::MIN,
-    };
-    let words = crate::isa::x86::NativeDescriptorWords::checked(root_gpa, id, &tables)
-        .map_err(|_| CowError::Refused)?;
-    let venue = carrick_core::mm::cow::GuestCowVenue::<X86CowMmu, _> {
-        words: &words,
-        root: SubstrateGpa(root),
-        pool,
-        residency,
-        copy_window: carrick_core::mm::cow::CowCopyWindow::target(&words, SubstrateGpa(root)),
-        publish_executable: None,
-    };
-    carrick_core::mm::cow::resolve_guest_cow(&venue, mm_key, far, copy_page, invalidate)
+    carrick_core::mm::cow::resolve_guest_cow(venue, mm_key, far, copy_page, invalidate)
 }
 
 #[cfg(test)]
@@ -1417,5 +1336,266 @@ mod tests {
             Action::Forward,
             "must not continue via Action::Forward"
         );
+    }
+}
+
+#[cfg(test)]
+mod x86_cow_tests {
+    use super::X86CowMmu;
+    use carrick_core::mm::cow::OwnerCowMmu;
+    use carrick_mmu_core::aarch64::descriptor_txn::{DescriptorRefusal, LiveDescriptorWords};
+    use carrick_mmu_core::x86::descriptor_txn::{ADDRESS, PRESENT, WRITE};
+    use core::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
+
+    const ROOT: u64 = 0x4001000;
+    const SOURCE: u64 = 0x4100000;
+    const DESTINATION: u64 = 0x800000;
+
+    struct Words {
+        image: RefCell<BTreeMap<u64, u64>>,
+        next: Cell<u64>,
+        loads: Cell<usize>,
+        drains: Cell<usize>,
+    }
+    impl Words {
+        fn new() -> Self {
+            Self {
+                image: RefCell::new(BTreeMap::new()),
+                next: Cell::new(ROOT + 4096),
+                loads: Cell::new(0),
+                drains: Cell::new(0),
+            }
+        }
+        fn map(&self, va: u64, output: u64, flags: u64) {
+            let mut table = ROOT;
+            for shift in [39, 30, 21] {
+                let pa = table + ((va >> shift) & 511) * 8;
+                let existing = self.image.borrow().get(&pa).copied();
+                table = match existing {
+                    Some(word) => word & ADDRESS,
+                    None => {
+                        let next = self.next.get();
+                        self.next.set(next + 4096);
+                        self.image
+                            .borrow_mut()
+                            .insert(pa, next | PRESENT | WRITE | 4);
+                        next
+                    }
+                };
+            }
+            self.image
+                .borrow_mut()
+                .insert(table + ((va >> 12) & 511) * 8, output | flags);
+        }
+    }
+    impl LiveDescriptorWords for Words {
+        fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
+            self.loads.set(self.loads.get() + 1);
+            Ok(self.image.borrow().get(&pa).copied().unwrap_or(0))
+        }
+        fn compare_exchange(&self, pa: u64, old: u64, new: u64) -> Result<bool, DescriptorRefusal> {
+            let mut image = self.image.borrow_mut();
+            if image.get(&pa).copied().unwrap_or(0) != old {
+                return Ok(false);
+            }
+            image.insert(pa, new);
+            Ok(true)
+        }
+        fn store_unlinked(&self, pa: u64, value: u64) -> Result<(), DescriptorRefusal> {
+            self.image.borrow_mut().insert(pa, value);
+            Ok(())
+        }
+        fn publish_barrier(&self) {}
+        fn invalidate_range(&self, _va: u64, _len: u64) {
+            self.drains.set(self.drains.get() + 1);
+        }
+    }
+
+    #[test]
+    fn x86_cow_maps_private_scratch_pair_for_high_physical_replacement() {
+        use carrick_guest_arch::{FrameGpa, RootGpa, UserVa};
+        use carrick_mmu_core::x86::descriptor_txn::{Access, NX, translate};
+        let base = 0xffff_fe00_0000_0000;
+        let words = Words::new();
+        let root = RootGpa::page_aligned(FrameGpa::new(ROOT)).unwrap();
+        let flags = PRESENT | WRITE | NX | (1 << 5);
+        words.image.borrow_mut().extend([
+            (ROOT + 508 * 8, (ROOT + 4096) | flags),
+            (ROOT + 4096, (ROOT + 8192) | flags),
+            (ROOT + 8192, (ROOT + 12288) | flags),
+        ]);
+        let destination = 0x2_0000_0000;
+        let mut copies = 0;
+        let result = X86CowMmu::with_copy_aliases(
+            &words,
+            ROOT,
+            base,
+            SOURCE,
+            destination,
+            &mut |source, target| {
+                copies += 1;
+                assert_eq!((source, target), (base, base + 4096));
+                assert_eq!(
+                    translate(&words, root, UserVa::new(source), Access::Read, false),
+                    Ok(FrameGpa::new(SOURCE))
+                );
+                assert_eq!(
+                    translate(&words, root, UserVa::new(target), Access::Write, false),
+                    Ok(FrameGpa::new(destination))
+                );
+                assert!(
+                    translate(&words, root, UserVa::new(source), Access::Write, false).is_err()
+                );
+                assert!(translate(&words, root, UserVa::new(target), Access::Read, true).is_err());
+            },
+        );
+        assert_eq!(
+            result,
+            Ok(()),
+            "the MM-private pair must map real cold COW frames"
+        );
+        assert_eq!(copies, 1);
+        assert_eq!(words.load(ROOT + 12288).unwrap(), 0);
+        assert_eq!(words.load(ROOT + 12288 + 8).unwrap(), 0);
+        assert_eq!(words.drains.get(), 2, "publish and restore must both drain");
+    }
+
+    #[test]
+    fn x86_cow_refuses_permanent_aliases_without_private_copy_window() {
+        let words = Words::new();
+        let source = carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_VA + SOURCE
+            - carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_GPA;
+        let destination = carrick_el1_abi::X86_CPL0_DIRECT_VA + DESTINATION;
+        words.map(source, SOURCE, PRESENT);
+        words.map(destination, DESTINATION, PRESENT | WRITE);
+        let mut aliases = None;
+        let result = X86CowMmu::with_copy_aliases(
+            &words,
+            ROOT,
+            carrick_el1_abi::X86_CPL0_DIRECT_VA,
+            SOURCE,
+            DESTINATION,
+            &mut |from, to| aliases = Some((from, to)),
+        );
+        assert_eq!(
+            result,
+            Err(carrick_core::mm::cow::CowRepointOutcome::Refused)
+        );
+        assert_eq!(aliases, None);
+        assert_eq!(words.loads.get(), 0);
+    }
+    #[test]
+    fn x86_cow_repoint_executes_and_drains_supplied_words() {
+        use carrick_core::mm::cow::{CowRepointOp, CowRepointOutcome};
+        use carrick_guest_arch::{FrameGpa, RootGpa, UserVa};
+        use carrick_mmu_core::x86::descriptor_txn::{
+            Access, BackingIdentity, COW, MAY_WRITE, NX, PRIVATE, USER, translate,
+        };
+        use core::num::NonZeroU64;
+        let words = Words::new();
+        let va = 0x401000;
+        words.map(va, SOURCE, PRESENT | USER | NX | COW | PRIVATE | MAY_WRITE);
+        let id = NonZeroU64::new(1).unwrap();
+        let outcome = X86CowMmu::execute_cow_repoint(
+            &words,
+            ROOT,
+            CowRepointOp {
+                mm_key: 77,
+                grant_epoch: 1,
+                va,
+                len: 4096,
+                old_ipa: SOURCE,
+                new_ipa: DESTINATION,
+                backing: BackingIdentity {
+                    frame_id: id,
+                    mapping_id: id,
+                    owner_generation: id,
+                    inventory_revision: id,
+                },
+            },
+        );
+        assert_eq!(
+            outcome,
+            CowRepointOutcome::Applied {
+                flush_required: false
+            }
+        );
+        assert_eq!(
+            words.drains.get(),
+            1,
+            "supplied words acknowledge descriptor publication drain"
+        );
+        assert_eq!(
+            translate(
+                &words,
+                RootGpa::page_aligned(FrameGpa::new(ROOT)).unwrap(),
+                UserVa::new(va),
+                Access::Write,
+                true
+            ),
+            Ok(FrameGpa::new(DESTINATION))
+        );
+    }
+    #[test]
+    fn x86_cow_refuses_wrong_or_nonwritable_copy_aliases_without_copying() {
+        use carrick_core::mm::cow::CowRepointOutcome;
+        let source = carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_VA + SOURCE
+            - carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_GPA;
+        let destination = carrick_el1_abi::X86_CPL0_DIRECT_VA + DESTINATION;
+        for (source_output, destination_output, destination_flags) in [
+            (SOURCE + 4096, DESTINATION, PRESENT | WRITE),
+            (SOURCE, DESTINATION + 4096, PRESENT | WRITE),
+            (SOURCE, DESTINATION, PRESENT),
+        ] {
+            let words = Words::new();
+            words.map(source, source_output, PRESENT);
+            words.map(destination, destination_output, destination_flags);
+            let mut copies = 0;
+            assert_eq!(
+                X86CowMmu::with_copy_aliases(
+                    &words,
+                    ROOT,
+                    carrick_el1_abi::X86_CPL0_DIRECT_VA,
+                    SOURCE,
+                    DESTINATION,
+                    &mut |_, _| copies += 1
+                ),
+                Err(CowRepointOutcome::Refused)
+            );
+            assert_eq!(copies, 0);
+            assert!(
+                words.loads.get() <= 8,
+                "at most two bounded permission walks"
+            );
+            assert_eq!(words.drains.get(), 0);
+        }
+    }
+    #[test]
+    fn x86_cow_refuses_unpublished_high_gpa_copy_alias() {
+        use carrick_core::mm::cow::CowRepointOutcome;
+        let words = Words::new();
+        let destination_gpa = 0x2_0000_0000;
+        assert!(
+            carrick_el1_abi::X86_CPL0_DIRECT_VA
+                .checked_add(destination_gpa)
+                .is_none()
+        );
+        let source = carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_VA + SOURCE
+            - carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_GPA;
+        words.map(source, SOURCE, PRESENT);
+        let mut copies = 0;
+        assert_eq!(
+            X86CowMmu::with_copy_aliases(
+                &words,
+                ROOT,
+                carrick_el1_abi::X86_CPL0_DIRECT_VA,
+                SOURCE,
+                destination_gpa,
+                &mut |_, _| copies += 1
+            ),
+            Err(CowRepointOutcome::Refused)
+        );
+        assert_eq!(copies, 0);
     }
 }

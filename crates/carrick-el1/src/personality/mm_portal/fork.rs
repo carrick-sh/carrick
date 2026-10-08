@@ -1,7 +1,11 @@
 //! Owner-selected fork over live descriptors and the production reservation root.
-use super::{El1MmHandle, MmError, MmPortal};
+#[cfg(target_os = "none")]
+use super::MmPortal;
+use super::{El1MmHandle, MmError};
 #[cfg(target_os = "none")]
 use crate::rust_alloc::vec::Vec;
+use carrick_core::mm::transaction::{MmPortal as CoreMmPortal, OwnerVenue};
+use carrick_el1_abi::{EntryContext, ReservationGeometry, ReservationPolicy};
 use carrick_el1_abi::{
     PinnedMetadataExtent, PortalForkCompletion, PortalForkCustody, PortalForkRequest,
     ReservationNodeFlags,
@@ -95,9 +99,15 @@ impl<B: OwnerForkMmu> core::ops::DerefMut for UnpublishedEl1Child<B> {
 }
 
 impl<B: OwnerForkMmu> UnpublishedEl1Child<B> {
-    pub fn commit<P: PinnedMetadataExtent>(
+    pub fn commit<
+        P: PinnedMetadataExtent,
+        Policy: ReservationPolicy,
+        Geometry: ReservationGeometry,
+        Venue: OwnerVenue<Context>,
+        Context: EntryContext,
+    >(
         &mut self,
-        portal: &MmPortal<'_, P, B>,
+        portal: &CoreMmPortal<'_, P, Policy, Geometry, Venue, B, Context>,
         worker: u32,
     ) -> Result<PortalForkCompletion, MmError> {
         let request = self.inner.completion.request;
@@ -106,9 +116,16 @@ impl<B: OwnerForkMmu> UnpublishedEl1Child<B> {
         self.inner.commit(parent, child).map_err(Into::into)
     }
 
-    pub fn abort<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
+    pub fn abort<
+        P: PinnedMetadataExtent,
+        W: LiveDescriptorWords + ?Sized,
+        Policy: ReservationPolicy,
+        Geometry: ReservationGeometry,
+        Venue: OwnerVenue<Context>,
+        Context: EntryContext,
+    >(
         &mut self,
-        portal: &MmPortal<'_, P, B>,
+        portal: &CoreMmPortal<'_, P, Policy, Geometry, Venue, B, Context>,
         words: &W,
         worker: u32,
     ) -> Result<(), MmError> {
@@ -154,7 +171,15 @@ pub trait NativeForkPortal<P: PinnedMetadataExtent, B: OwnerForkMmu = NativeFork
         worker: u32,
     ) -> Result<UnpublishedEl1Child<B>, MmError>;
 }
-impl<P: PinnedMetadataExtent, B: OwnerForkMmu> NativeForkPortal<P, B> for MmPortal<'_, P, B> {
+impl<
+    P: PinnedMetadataExtent,
+    B: OwnerForkMmu,
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    Venue: OwnerVenue<Context>,
+    Context: EntryContext,
+> NativeForkPortal<P, B> for CoreMmPortal<'_, P, Policy, Geometry, Venue, B, Context>
+{
     /// First census the reachable graph with fixed recursion and a bounded
     /// temporary owner reservation observation. Allocate undo/table storage
     /// only after releasing editors and metadata, proportional to actual work.

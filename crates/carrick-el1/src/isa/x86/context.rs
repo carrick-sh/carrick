@@ -27,6 +27,10 @@ const _: () = assert!(core::mem::align_of::<scheduler::XsaveArea>() == 64);
 pub mod context_words;
 pub use context_words::ParkedContextWords;
 
+#[path = "context_resume.rs"]
+pub mod resume;
+pub use resume::{prepare_parked_resume, resume_parked};
+
 impl EntryBackend for X86Backend {
     fn current_stack_pointer(&mut self) -> Result<KernelStackPointer, Self::Error> {
         let sp: u64;

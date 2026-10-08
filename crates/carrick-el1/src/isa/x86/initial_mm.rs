@@ -51,6 +51,7 @@ pub enum InitialMmError {
     StackTooLarge,
     FrameUnavailable,
     DescriptorRefused,
+    DescriptorIndeterminate,
     PublicationRefused,
 }
 
@@ -301,6 +302,8 @@ pub struct InitialMmImage {
     pub address: AddressContext<RootGpa>,
     pub context: ParkedContextWords,
     pub stack_pointer: u64,
+    /// First byte beyond the highest ELF PT_LOAD page; Linux brk begins here.
+    pub initial_break: UserVa,
     pub publications: Vec<GuestMmuPublication>,
 }
 
@@ -408,6 +411,14 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
     }) {
         return Err(InitialMmError::InvalidRange);
     }
+    let initial_break = UserVa::new(
+        image
+            .regions
+            .iter()
+            .map(|region| region.start.raw() + region.len.raw())
+            .max()
+            .ok_or(InitialMmError::InvalidRange)?,
+    );
     let root = source
         .take_zeroed_table()
         .ok_or(InitialMmError::FrameUnavailable)?;
@@ -417,9 +428,13 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
     let mut seen = BTreeSet::new();
     seen.insert(source_root.address().raw());
     seen.insert(root.address().raw());
-    // The fresh root inherits exactly the supervisor half. Its lower half is
-    // zero from the frame grant, so it has no second alias of source user PTEs.
+    // Inherit shared supervisor branches only. The fresh MM must never
+    // borrow another MM's temporary copy tables; its lower half is zero.
     for index in 256..512_u64 {
+        if !<carrick_mmu_core::x86::owner_mmu::X86Mmu as
+            carrick_mmu_core::owner_mmu::OwnerForkMmu>::is_shared_root_entry(index as usize) {
+            continue;
+        }
         let word = words
             .load(source_root.address().raw() + index * 8)
             .map_err(|_| InitialMmError::DescriptorRefused)?;
@@ -485,12 +500,20 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
             let intent = EditIntent::checked(
                 owner,
                 range,
-                EditOperation::Map {
-                    output: grant.frame,
-                    permissions: region.perms,
-                    size: EditLeafSize::Page,
-                    resident: true,
-                    backing: grant.backing,
+                match region.contents {
+                    RegionContents::Stack(_) => EditOperation::Prepare {
+                        output: grant.frame,
+                        permissions: region.perms,
+                        resident: range,
+                        backing: grant.backing,
+                    },
+                    RegionContents::Guest(_) => EditOperation::Map {
+                        output: grant.frame,
+                        permissions: region.perms,
+                        size: EditLeafSize::Page,
+                        resident: true,
+                        backing: grant.backing,
+                    },
                 },
                 &tables[used_tables..],
             )
@@ -507,11 +530,28 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
             publications.push(publication);
         }
     }
+    let mut copy_tables = [root; carrick_mmu_core::x86::copy_window::COW_COPY_TABLE_PAGES];
+    for table in &mut copy_tables {
+        *table = source
+            .take_zeroed_table()
+            .ok_or(InitialMmError::FrameUnavailable)?;
+        if !valid_page(table.address()) || !seen.insert(table.address().raw()) {
+            return Err(InitialMmError::FrameUnavailable);
+        }
+    }
+    carrick_mmu_core::x86::copy_window::provision_cow_copy_window(words, root, copy_tables)
+        .map_err(|outcome| match outcome {
+            DescriptorOutcome::Indeterminate(_) => InitialMmError::DescriptorIndeterminate,
+            _ => InitialMmError::DescriptorRefused,
+        })?;
     let address = AddressContext {
         root,
         mm: MmGeneration::new(mm_key),
         generation: ContextGeneration::new(generation),
     };
+    #[cfg(target_os = "none")]
+    super::x86::mmu::register_shared_supervisor_tables(words, source_root)
+        .map_err(|_| InitialMmError::DescriptorRefused)?;
     let mut frame = [0; 20];
     frame[15] = image.stack.entry;
     frame[16] = 0x23; // user 64-bit code selector in the CPL0 GDT
@@ -522,6 +562,7 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
         address,
         context: ParkedContextWords::from_parts(frame, address, 0, 0, [0; X86_XSAVE_BYTES]),
         stack_pointer: stack.rsp,
+        initial_break,
         publications,
     })
 }
@@ -704,6 +745,14 @@ mod tests {
             stack,
         };
         let source_root = RootGpa::page_aligned(FrameGpa::new(0x60_0000)).unwrap();
+        let source_copy_tables = [0x61_0000, 0x61_1000, 0x61_2000]
+            .map(|pa| RootGpa::page_aligned(FrameGpa::new(pa)).unwrap());
+        carrick_mmu_core::x86::copy_window::provision_cow_copy_window(
+            &words,
+            source_root,
+            source_copy_tables,
+        )
+        .unwrap();
         // SAFETY: this isolated fixture owns its source root and every fresh
         // table/data frame until the unpublished image is inspected.
         let loaded = unsafe {
@@ -717,7 +766,30 @@ mod tests {
             )
         }
         .unwrap();
+        let child_copy_tables =
+            carrick_mmu_core::x86::copy_window::cow_copy_table_frames(&words, loaded.address.root)
+                .unwrap();
+        for (child, source) in child_copy_tables.iter().zip(source_copy_tables) {
+            assert_ne!(
+                *child, source,
+                "initial MM must own its private supervisor branch"
+            );
+        }
+        let stack_leaf = translate_leaf(
+            &words,
+            loaded.address.root,
+            UserVa::new(loaded.stack_pointer),
+            Access::Write,
+            true,
+        )
+        .unwrap();
+        assert_ne!(
+            stack_leaf.descriptor & carrick_mmu_core::x86::descriptor_txn::PRIVATE,
+            0,
+            "the initial anonymous stack needs owner-private COW custody"
+        );
         assert_eq!(loaded.publications.len(), 3);
+        assert_eq!(loaded.initial_break.raw(), 0x403000);
         assert_eq!(loaded.context.frame[15], 0x400000);
         assert_eq!(loaded.context.frame[16], 0x23);
         assert_eq!(loaded.context.frame[17], 0x202);
@@ -767,8 +839,8 @@ mod tests {
         );
         assert_eq!(frames.next_data, 0x90_3000, "one data grant per user page");
         assert_eq!(
-            frames.next_table, 0x80_6000,
-            "one root plus five table pages"
+            frames.next_table, 0x80_9000,
+            "one root, five user tables and three private copy tables"
         );
         assert_ne!(loaded.address.root.address().raw(), 0x60_0000);
     }

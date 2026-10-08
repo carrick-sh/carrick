@@ -51,6 +51,61 @@ impl PortalGrantSlot {
         self.state.store(3, Ordering::Release);
         true
     }
+    /// Select a physical replacement loan; this never admits a Prepare descriptor.
+    pub fn publish_cow_fault_selection(
+        &self,
+        request_generation: u64,
+        window: PortalGrantWindow,
+    ) -> bool {
+        if request_generation == 0
+            || !window.valid()
+            || window.host_backing.is_some()
+            || window.range.len() != 4096
+            || window.range.start() != window.fault_page
+            || self
+                .state
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return false;
+        }
+        for (word, value) in self.window.iter().zip(window.words()) {
+            word.store(value, Ordering::Relaxed);
+        }
+        self.fault_generation
+            .store(request_generation, Ordering::Relaxed);
+        self.state.store(4, Ordering::Release);
+        true
+    }
+    pub fn pending_cow_fault_selection(
+        &self,
+        mm_key: u64,
+        fault_va: u64,
+    ) -> Option<(u64, PortalGrantWindow)> {
+        if self.state.load(Ordering::Acquire) != 4 {
+            return None;
+        }
+        let generation = self.fault_generation.load(Ordering::Relaxed);
+        let window = PortalGrantWindow::decode(core::array::from_fn(|i| {
+            self.window[i].load(Ordering::Relaxed)
+        }))?;
+        (window.operation.mm.raw() == mm_key && window.fault_page == fault_va & !4095)
+            .then_some((generation, window))
+    }
+    /// Consume the exact demand only after its replacement loan is published.
+    /// The caller retains exact-MM exclusion across inspection and consumption.
+    pub fn take_cow_fault_selection(&self, window: PortalGrantWindow) -> bool {
+        if self
+            .pending_cow_fault_selection(window.operation.mm.raw(), window.fault_page)
+            .map(|(_, selected)| selected)
+            != Some(window)
+        {
+            return false;
+        }
+        self.state
+            .compare_exchange(4, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
     pub fn fault_selection(
         &self,
         mm_key: u64,
@@ -187,6 +242,30 @@ mod layout_manifest {
                 concat!(stringify!($record), "::", stringify!($field))
             );
         };
+    }
+
+    #[test]
+    fn cow_selection_is_distinct_exact_and_consumed_once() {
+        let window =
+            PortalGrantWindow::decode([1, 77, 2, 3, 4, 0x4000, 0x5000, 3, 0x4000, 0, 0, 0, 0])
+                .unwrap();
+        let slot = PortalGrantSlot::new();
+        assert!(slot.publish_cow_fault_selection(3, window));
+        assert!(slot.pending_fault_selection(77, 0x4003).is_none());
+        assert_eq!(
+            slot.pending_cow_fault_selection(77, 0x4003),
+            Some((3, window))
+        );
+        assert!(slot.pending_cow_fault_selection(78, 0x4003).is_none());
+        assert!(slot.pending_cow_fault_selection(77, 0x5000).is_none());
+        let mut stale = window;
+        stale.operation.incarnation = core::num::NonZeroU64::new(9).unwrap();
+        assert!(!slot.take_cow_fault_selection(stale));
+        assert!(slot.take_cow_fault_selection(window));
+        assert!(!slot.take_cow_fault_selection(window));
+        assert!(slot.publish_fault_selection(4, window));
+        assert!(slot.pending_cow_fault_selection(77, 0x4000).is_none());
+        assert_eq!(slot.pending_fault_selection(77, 0x4000), Some((4, window)));
     }
 
     #[test]

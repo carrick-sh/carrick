@@ -90,3 +90,14 @@ impl ParkedContextWords {
             && self.generation == expected.generation.raw().get()
     }
 }
+
+impl carrick_guest_arch::ProcessContext for ParkedContextWords {
+    fn authenticates(&self, expected: AddressContext<RootGpa>) -> bool {
+        ParkedContextWords::authenticates(self, expected)
+    }
+    fn fork_child(self, address: AddressContext<RootGpa>) -> Self {
+        let mut frame = self.frame;
+        frame[10] = 0; // RAX in the ISA-owned interrupt save order.
+        Self::from_parts(frame, address, self.fs_base, self.gs_base, self.xsave)
+    }
+}

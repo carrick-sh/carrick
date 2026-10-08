@@ -34,16 +34,38 @@ pub struct SpaceNotificationIdentity {
     pub mm: NonZeroU64,
     pub incarnation: NonZeroU64,
 }
+pub type CapturedSpaceWake<'a, C> =
+    dyn for<'z> Fn(&'z ZoneTables<C>, Waker, OwnedObjectWakeEffects<'z, C>) + 'a;
+
+/// Delivery authority borrowed for the lifetime of a release venue.
+#[derive(Clone, Copy)]
+pub enum SpaceWakeDelivery<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
+    Function(for<'z> fn(&'z ZoneTables<C>, Waker, OwnedObjectWakeEffects<'z, C>)),
+    Captured(&'a CapturedSpaceWake<'a, C>),
+}
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> SpaceWakeDelivery<'_, C> {
+    pub fn invoke(
+        self,
+        zone: &ZoneTables<C>,
+        waker: Waker,
+        effects: OwnedObjectWakeEffects<'_, C>,
+    ) {
+        match self {
+            Self::Function(deliver) => deliver(zone, waker, effects),
+            Self::Captured(deliver) => deliver(zone, waker, effects),
+        }
+    }
+}
 #[derive(Clone, Copy)]
 pub struct SpaceReleaseVenue<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     pub zone: &'a ZoneTables<C>,
     pub waker: Waker,
-    pub deliver: for<'z> fn(&'z ZoneTables<C>, Waker, OwnedObjectWakeEffects<'z, C>),
+    pub deliver: SpaceWakeDelivery<'a, C>,
 }
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> SpaceReleaseVenue<'_, C> {
     pub fn publish(self, ticket: ObjectNotificationTicket<'_, C>) {
         ticket.publish(self.waker, &|effects| {
-            (self.deliver)(self.zone, self.waker, effects)
+            self.deliver.invoke(self.zone, self.waker, effects)
         });
     }
 }
@@ -299,7 +321,7 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceNotificationLease<'a,
         // unavailable, not that a resource is ready for another attempt.
         // Retain all receipts before the first callback can run.
         let complete = |effects: OwnedObjectWakeEffects<'_, C>| {
-            (venue.deliver)(venue.zone, venue.waker, effects)
+            venue.deliver.invoke(venue.zone, venue.waker, effects)
         };
         let publications = SpaceWaitCause::ALL
             .map(|cause| self.reserve(cause).advance_revision(venue.waker, &complete));
@@ -365,7 +387,7 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceNotificationLease<'a,
             "release belongs to exact source zone"
         );
         let completion = |effects: crate::object_wait::OwnedObjectWakeEffects<'_, C>| {
-            (venue.deliver)(venue.zone, venue.waker, effects)
+            venue.deliver.invoke(venue.zone, venue.waker, effects)
         };
         let mut release = ResourceRelease {
             word,
@@ -561,6 +583,15 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for SpaceExclusion<'_, C>
 }
 
 impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceAccess<'a, C> {
+    /// Source-free tests retain the caller's exact parked context type.
+    #[cfg(any(test, feature = "host-test"))]
+    pub fn source_free_with_context(spaces: &'a super::AddressSpaces) -> Self {
+        Self {
+            spaces,
+            venue: None,
+        }
+    }
+
     pub fn notified(venue: SpaceReleaseVenue<'a, C>) -> Self {
         Self {
             spaces: &venue.zone.spaces,
@@ -641,7 +672,7 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceAccess<'a, C> {
         let entry = self.spaces.entry(index);
         if let Some((venue, lease)) = release {
             let completion = |effects: OwnedObjectWakeEffects<'_, C>| {
-                (venue.deliver)(venue.zone, venue.waker, effects)
+                venue.deliver.invoke(venue.zone, venue.waker, effects)
             };
             let publication = lease
                 .reserve(SpaceWaitCause::Gate)
@@ -701,10 +732,7 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceAccess<'a, C> {
 impl<'a> SpaceAccess<'a> {
     #[cfg(any(test, feature = "host-test"))]
     pub fn source_free(spaces: &'a super::AddressSpaces) -> Self {
-        Self {
-            spaces,
-            venue: None,
-        }
+        Self::source_free_with_context(spaces)
     }
 }
 
@@ -732,7 +760,7 @@ mod tests {
         SpaceAccess::notified(SpaceReleaseVenue {
             zone,
             waker: Waker::Host,
-            deliver,
+            deliver: crate::spaces::notification::SpaceWakeDelivery::Function(deliver),
         })
     }
     fn admitted(zone: &ZoneTables) -> SpaceEntryHandle<'_> {
@@ -744,6 +772,32 @@ mod tests {
             })
             .unwrap();
         entry
+    }
+    #[test]
+    fn captured_release_delivers_exact_admitted_gate_notification() {
+        let zone = zone();
+        let entry = admitted(&zone);
+        let notifications = entry.notifications(NonZeroU64::MIN).unwrap();
+        let before = notifications.observe(SpaceWaitCause::Gate);
+        let calls = core::cell::Cell::new(0);
+        let delivery = |actual: &ZoneTables, waker: Waker, effects: OwnedObjectWakeEffects<'_>| {
+            assert!(core::ptr::eq(actual, &*zone));
+            assert_eq!(waker, Waker::Host);
+            let (actual_waker, work) =
+                effects.deliver_handbacks(&mut |_| panic!("no waiters enrolled"));
+            assert_eq!(actual_waker, Waker::Host);
+            assert_eq!(work, crate::WakeEffects::default());
+            calls.set(calls.get() + 1);
+        };
+        SpaceAccess::notified(SpaceReleaseVenue {
+            zone: &zone,
+            waker: Waker::Host,
+            deliver: SpaceWakeDelivery::Captured(&delivery),
+        })
+        .open(entry.index());
+        assert_eq!(zone.spaces.gate(entry.index()), 0);
+        assert_ne!(notifications.observe(SpaceWaitCause::Gate), before);
+        assert_eq!(calls.get(), 1);
     }
     #[test]
     fn source_retirement_completes_already_parked_gate_operation() {
