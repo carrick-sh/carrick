@@ -67,7 +67,7 @@ fn serve_canonical_inner(
         },
     };
     match anonymous {
-        Some(anonymous) => entry::serve_with_anonymous(call, &shared, anonymous),
+        Some(anonymous) => entry::serve_with_custody(call, &shared, anonymous, None),
         None => entry::serve(call, &shared),
     }
 }
