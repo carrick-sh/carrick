@@ -327,6 +327,7 @@ pub enum GuestProcessInvariant {
 pub trait GuestProcessFailure: RegistryFailure {
     fn fail_process(invariant: GuestProcessInvariant) -> !;
 }
+#[derive(::core::fmt::Debug)]
 pub struct GuestRegistryFailure;
 impl RegistryFailure for GuestRegistryFailure {
     fn fail(invariant: RegistryInvariant) -> ! {
