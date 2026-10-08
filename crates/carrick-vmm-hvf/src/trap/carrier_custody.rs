@@ -414,6 +414,7 @@ pub(crate) struct CarrierVmCustody {
     pub(crate) metadata_completion:
         parking_lot::Mutex<Option<std::sync::Arc<dyn carrick_el1_abi::MetadataCompletionWake>>>,
     pub(crate) metadata_aperture: parking_lot::Mutex<crate::metadata_grant::HostApertureState>,
+    pub(crate) fork_stock: parking_lot::Mutex<crate::fork_stock::ForkStockHostCustody>,
     pub(crate) state: parking_lot::Mutex<CarrierVmCustodyState>,
     pub(crate) structural_backings: parking_lot::Mutex<
         std::collections::BTreeMap<
@@ -612,10 +613,11 @@ impl CarrierVmCustody {
             .unwrap_or_else(|_| {
                 carrick_fatal::carrick_fatal!("hvf::transfer", "carrier identity exhausted")
             });
+        let transfer_carrier = core::num::NonZeroU64::new(id).unwrap_or_else(|| {
+            carrick_fatal::carrick_fatal!("hvf::transfer", "zero carrier identity")
+        });
         Self {
-            transfer_carrier: core::num::NonZeroU64::new(id).unwrap_or_else(|| {
-                carrick_fatal::carrick_fatal!("hvf::transfer", "zero carrier identity")
-            }),
+            transfer_carrier,
             el1_frame_grants: std::sync::Arc::new(parking_lot::Mutex::new(
                 El1FrameGrantLedger::default(),
             )),
@@ -624,6 +626,9 @@ impl CarrierVmCustody {
             metadata_aperture: parking_lot::Mutex::new(
                 crate::metadata_grant::HostApertureState::new(),
             ),
+            fork_stock: parking_lot::Mutex::new(crate::fork_stock::ForkStockHostCustody::new(
+                transfer_carrier,
+            )),
             state: parking_lot::Mutex::new(CarrierVmCustodyState {
                 next_generation: 1,
                 lifecycle: CarrierVmLifecycle::Vacant,
