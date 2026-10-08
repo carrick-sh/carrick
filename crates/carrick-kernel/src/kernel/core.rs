@@ -1578,15 +1578,19 @@ impl Kernel {
             .tasks
             .get(&binding.task.id)
             .ok_or(BootExportError::RootScope)?;
-        if root.task.key() != binding.task || root.task.threads().len() != 1 {
-            return Err(BootExportError::RootScope);
-        }
         let thread = root
             .task
-            .threads()
-            .into_iter()
-            .next()
+            .thread(LinuxTid::for_task_leader(binding.task.id))
             .ok_or(BootExportError::RootScope)?;
+        // Reuse the authenticated durable participant witness, not a scalar
+        // membership count or an arbitrary thread from a copied collection.
+        let participants = root
+            .task
+            .fork_barrier_participants(thread.key())
+            .map_err(|_| BootExportError::RootScope)?;
+        if root.task.key() != binding.task || participants.requires_quiesce() {
+            return Err(BootExportError::RootScope);
+        }
         let actual = thread.resources();
         if !Arc::ptr_eq(&root.task.container(), &resources.namespace)
             || !Arc::ptr_eq(&actual.files(), &resources.files)
@@ -1652,6 +1656,14 @@ impl Kernel {
             .get(&binding.task.id)
             .ok_or(BootExportError::RootScope)?;
         let container = root.task.container();
+        let thread = root
+            .task
+            .thread(LinuxTid::for_task_leader(binding.task.id))
+            .ok_or(BootExportError::RootScope)?;
+        let participants = root
+            .task
+            .fork_barrier_participants(thread.key())
+            .map_err(|_| BootExportError::RootScope)?;
         if root.task.key() != binding.task
             || state.tasks.len() != 1
             || !state.zombies.is_empty()
@@ -1661,7 +1673,7 @@ impl Kernel {
             || state.sessions.len() != 1
             || container.pid_root() != Some(binding.task)
             || container.pid_region().is_none()
-            || root.task.threads().len() != 1
+            || participants.requires_quiesce()
             || state.retired_threads.len() != 0
             || self.containers.lock().len() != 1
             || !self.pending_container_roots.lock().is_empty()
@@ -1676,12 +1688,6 @@ impl Kernel {
         {
             return Err(BootExportError::RootScope);
         }
-        let thread = root
-            .task
-            .threads()
-            .into_iter()
-            .next()
-            .ok_or(BootExportError::RootScope)?;
         let actual_resources = thread.resources();
         let BootLaunchState::Adopted(resources) = &launch.state else {
             return Err(BootExportError::Unadopted);
