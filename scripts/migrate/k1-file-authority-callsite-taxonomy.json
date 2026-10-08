@@ -1843,7 +1843,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/kernel_context.rs",
-      "line": 755,
+      "line": 899,
       "categories": [
         "table_guard"
       ],
@@ -1854,7 +1854,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/kernel_context.rs",
-      "line": 798,
+      "line": 942,
       "categories": [
         "table_guard"
       ],
@@ -1865,7 +1865,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/kernel_context.rs",
-      "line": 806,
+      "line": 950,
       "categories": [
         "table_guard"
       ],
