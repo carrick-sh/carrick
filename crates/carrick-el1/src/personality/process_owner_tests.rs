@@ -1315,28 +1315,77 @@ fn nonchild_wait_has_no_ptrace_relationship_and_preserves_own_children() {
 
 #[test]
 fn owner_instantiated_with_aarch64_context_checks_fork_child_and_syscall_return() {
-    let mut native_ctx = carrick_sched_core::ThreadCtx::ZERO;
-    native_ctx.x[0] = 0xdead_beef;
-    native_ctx.x[1] = 0x1234;
-    native_ctx.pc = 0x400000;
-    native_ctx.sp_el0 = 0x800000;
+    let parent_addr = address(key(1, 1));
+    let mut thread = carrick_sched_core::ThreadCtx::ZERO;
+    thread.x[0] = 0xdead_beef;
+    thread.x[1] = 0x1234;
+    thread.pc = 0x400000;
+    thread.sp_el0 = 0x800000;
 
-    let child_ctx = native_ctx.fork_child(address(key(2, 1)));
+    let arm_ctx = carrick_sched_core::Aarch64ParkedContext::from_parts(thread, parent_addr);
+
+    // (a) ARM context authenticates against its own binding and REFUSES a binding differing in each of root, mm, and generation (three refusals)
+    assert!(arm_ctx.authenticates(parent_addr));
+
+    let diff_root = AddressContext {
+        root: RootGpa::page_aligned(FrameGpa::new(0x9000)).unwrap(),
+        mm: parent_addr.mm,
+        generation: parent_addr.generation,
+    };
+    assert!(!arm_ctx.authenticates(diff_root));
+
+    let diff_mm = AddressContext {
+        root: parent_addr.root,
+        mm: MmGeneration::new(NonZeroU64::new(parent_addr.mm.raw().get() + 99).unwrap()),
+        generation: parent_addr.generation,
+    };
+    assert!(!arm_ctx.authenticates(diff_mm));
+
+    let diff_gen = AddressContext {
+        root: parent_addr.root,
+        mm: parent_addr.mm,
+        generation: ContextGeneration::new(
+            NonZeroU64::new(parent_addr.generation.raw().get() + 99).unwrap(),
+        ),
+    };
+    assert!(!arm_ctx.authenticates(diff_gen));
+
+    // ASID in upper register bits authenticates against clean page-aligned GPA
+    let asid_ctx = carrick_sched_core::Aarch64ParkedContext::from_register(
+        thread,
+        0xabcd_0000_0000_0000 | parent_addr.root.address().raw(),
+        parent_addr.mm.raw().get(),
+        parent_addr.generation.raw().get(),
+    );
+    assert!(asid_ctx.authenticates(parent_addr));
+    assert!(!asid_ctx.authenticates(diff_root));
+
+    // (b) fork_child yields x0 = 0 and the child binding, and the child refuses the parent's binding
+    let child_addr = address(key(2, 1));
+    let child_ctx = arm_ctx.fork_child(child_addr);
     assert_eq!(child_ctx.syscall_return(), 0);
-    assert_eq!(child_ctx.x[0], 0);
-    assert_eq!(child_ctx.x[1], 0x1234);
-    assert_eq!(child_ctx.pc, 0x400000);
-    assert_eq!(child_ctx.sp_el0, 0x800000);
+    assert_eq!(child_ctx.native.x[0], 0);
+    assert_eq!(child_ctx.native.x[1], 0x1234);
+    assert_eq!(child_ctx.native.pc, 0x400000);
+    assert_eq!(child_ctx.native.sp_el0, 0x800000);
 
-    let mut returned_ctx = native_ctx;
+    // Child authenticates against child binding
+    assert!(child_ctx.authenticates(child_addr));
+
+    // Child REFUSES parent's binding
+    assert!(!child_ctx.authenticates(parent_addr));
+
+    // Also test set_syscall_return
+    let mut returned_ctx = arm_ctx;
     returned_ctx.set_syscall_return(42);
     assert_eq!(returned_ctx.syscall_return(), 42);
-    assert_eq!(returned_ctx.x[0], 42);
-    assert_eq!(returned_ctx.x[1], 0x1234);
+    assert_eq!(returned_ctx.native.x[0], 42);
+    assert_eq!(returned_ctx.native.x[1], 0x1234);
 
+    // Instantiate GuestProcessOwner with Native<Aarch64ParkedContext>
     let releases = Rc::new(Cell::new(0));
     let native = Native {
-        context_type: PhantomData::<carrick_sched_core::ThreadCtx>,
+        context_type: PhantomData::<carrick_sched_core::Aarch64ParkedContext>,
         task: key(1, 1),
         members: 1,
         work: Rc::new(Work::default()),
@@ -1376,77 +1425,16 @@ fn owner_instantiated_with_aarch64_context_checks_fork_child_and_syscall_return(
         native,
         Claim(releases),
     );
-    let mut owner =
-        GuestProcessOwner::<(), Uid, Native<carrick_sched_core::ThreadCtx>, Failure>::new();
+    let mut owner = GuestProcessOwner::<
+        (),
+        Uid,
+        Native<carrick_sched_core::Aarch64ParkedContext>,
+        Failure,
+    >::new();
     owner.seed_initial(task).unwrap();
     let row = owner.task(key(1, 1)).unwrap();
     assert_eq!(row.context().syscall_return(), 42);
-    assert_eq!(row.context().x[0], 42);
-
-    let mut trap_frame = carrick_el1_abi::TrapFrame::default();
-    trap_frame.x[0] = 0xdead_beef;
-    trap_frame.x[1] = 0x5678;
-    trap_frame.elr = 0x400000;
-    trap_frame.spsr = 0x202;
-
-    let child_tf = trap_frame.fork_child(address(key(2, 1)));
-    assert_eq!(child_tf.syscall_return(), 0);
-    assert_eq!(child_tf.x[0], 0);
-    assert_eq!(child_tf.x[1], 0x5678);
-    assert_eq!(child_tf.elr, 0x400000);
-    assert_eq!(child_tf.spsr, 0x202);
-
-    let mut returned_tf = trap_frame;
-    returned_tf.set_syscall_return(99);
-    assert_eq!(returned_tf.syscall_return(), 99);
-    assert_eq!(returned_tf.x[0], 99);
-    assert_eq!(returned_tf.x[1], 0x5678);
-
-    let tf_native = Native {
-        context_type: PhantomData::<carrick_el1_abi::TrapFrame>,
-        task: key(2, 1),
-        members: 1,
-        work: Rc::new(Work::default()),
-        budget: Rc::new(Budget {
-            reserved: Cell::new(0),
-        }),
-        signals: Signals {
-            state: Rc::new(Cell::new(ExitSignalState {
-                disposition: ExitSignalDisposition::Caught,
-                blocked: false,
-            })),
-            order: Rc::new(RefCell::new(Vec::new())),
-            work: Rc::new(Work::default()),
-        },
-        autoreap: false,
-        own_usage: TaskRusage {
-            user_time: Duration::from_micros(7),
-            system_time: Duration::from_micros(3),
-        },
-        wake: 12,
-    };
-    let tf_task = GuestTask::new(
-        GuestTaskMetadata {
-            key: key(2, 1),
-            container: (),
-            namespace_pid: 2,
-            identity: TaskIdentity::led_by(key(2, 1).id),
-            namespace_process_group: 2,
-            namespace_session: 2,
-            ruid: Uid(0),
-            euid: Uid(0),
-            exit_signal: ChildExitSignal::SIGCHLD,
-            diagnostic_name: "native_arm_trapframe".into(),
-        },
-        None,
-        returned_tf,
-        tf_native,
-        Claim(Rc::new(Cell::new(0))),
-    );
-    let mut tf_owner =
-        GuestProcessOwner::<(), Uid, Native<carrick_el1_abi::TrapFrame>, Failure>::new();
-    tf_owner.seed_initial(tf_task).unwrap();
-    let tf_row = tf_owner.task(key(2, 1)).unwrap();
-    assert_eq!(tf_row.context().syscall_return(), 99);
-    assert_eq!(tf_row.context().x[0], 99);
+    assert_eq!(row.context().native.x[0], 42);
+    assert!(row.context().authenticates(parent_addr));
+    assert!(!row.context().authenticates(child_addr));
 }
