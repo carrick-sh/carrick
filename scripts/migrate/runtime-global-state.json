@@ -1195,6 +1195,14 @@
     },
     {
       "kind": "static",
+      "file": "crates/carrick-core-abi/src/reservation_events.rs",
+      "symbol": "ACTIVE_RING",
+      "fingerprint": "835d53b9bae68841b4a8445c4ec831322457a43096b3a4a2cd18af84a156e63a",
+      "classification": "carrier_infra",
+      "rationale": "The EL1 image registers its carrier-wide shared counters aperture on syscall entry. This pointer carries diagnostic reservation edges only; it does not select an MM owner or mutable container state."
+    },
+    {
+      "kind": "static",
       "file": "crates/carrick-embed/src/deadline.rs",
       "symbol": "carrier_budget_override_ms::CELL",
       "fingerprint": "aa877e87e881070ff0133ff7c12178fa3a321a1486db1b61313ea73e66e8205b",
