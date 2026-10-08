@@ -1641,11 +1641,11 @@ impl<'a> MemView<'a> {
             }
         }
         match mem.first_touch_owner(page) {
-            FirstTouchOwner::Root(mapping, incarnation) => {
+            FirstTouchOwner::Root(entry, incarnation) => {
                 if incarnation.raw() != grant.owner_generation {
                     return false;
                 }
-                let prot = LinuxProtFlags::from_bits_truncate(mapping.protection.bits());
+                let prot = LinuxProtFlags::from_bits_truncate(entry.protection.bits());
                 !prot.is_empty()
             }
             _ => false,
