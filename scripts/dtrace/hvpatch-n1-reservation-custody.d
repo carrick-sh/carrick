@@ -9,8 +9,10 @@
  */
 #pragma D option quiet
 #pragma D option dynvarsize=16m
+#pragma D option bufsize=32m
+#pragma D option switchrate=1ms
 
-dtrace:::BEGIN { events = 0; }
+dtrace:::BEGIN { events = 0; started = timestamp; }
 
 carrick*:::hvpatch-guest-lifecycle-identity
 /(pid == $target || progenyof($target))/
@@ -26,7 +28,7 @@ carrick*:::hvpatch-guest-lifecycle
 {
     events++;
     printf("N1|guest|ts=%llu|pid=%d|phase=%u|task_pid=%d|serial=%llu|mm=%llu|parent_serial=%llu\n",
-        timestamp, pid, (uint32_t)arg0, self->task_pid,
+        (uint64_t)timestamp, pid, (uint32_t)arg0, self->task_pid,
         self->task_serial, self->mm, self->parent_serial);
 }
 
@@ -35,7 +37,7 @@ carrick*:::hvpatch-n1-reservation-custody
 {
     events++;
     printf("N1|root|ts=%llu|pid=%d|phase=%u|mm=%llu|inc=%llu|a=%llu|b=%llu\n",
-        timestamp, pid, (uint32_t)arg0, (uint64_t)arg1,
+        (uint64_t)timestamp, pid, (uint32_t)arg0, (uint64_t)arg1,
         (uint64_t)arg2, (uint64_t)arg3, (uint64_t)arg4);
 }
 
@@ -44,10 +46,28 @@ carrick*:::hvpatch-mm-lease-lifecycle
 {
     events++;
     printf("N1|lease|ts=%llu|pid=%d|phase=%u|task_pid=%d|serial=%llu|asid=%u|owners=%u\n",
-        timestamp, pid, (uint32_t)arg0, (int)arg1,
+        (uint64_t)timestamp, pid, (uint32_t)arg0, (int)arg1,
         (uint64_t)arg2, (uint32_t)arg3, (uint32_t)arg4);
 }
 
 dtrace:::DROP { printf("N1|DROP\n"); }
 dtrace:::ERROR { printf("N1|ERROR\n"); }
-dtrace:::END { printf("N1|end|events=%llu\n", events); }
+dtrace:::END { printf("N1|end|events=%llu\n", (uint64_t)events); }
+
+carrick*:::trace-witness-exit
+/pid == $target/
+{
+    exit(0);
+}
+
+proc:::exit
+/pid == $target/
+{
+    exit(0);
+}
+
+profile:::tick-1sec
+/timestamp - started > 600 * 1000000000/
+{
+    exit(4);
+}
