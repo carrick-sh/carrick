@@ -224,6 +224,12 @@ impl TransferCustody for UserTransferCustody {
         window: carrick_el1_abi::PortalGrantWindow,
     ) -> Result<carrick_aarch64::user_transfer::TransferPreparation, TrapError> {
         let Some(transport) = &self.transport else {
+            super::stage2_backend::record_owner_supply_decline(
+                window.operation.mm.raw(),
+                window.operation.incarnation.get(),
+                1,
+                0,
+            );
             carrick_observability::probes::hvpatch_el1_owner_grant_supply(
                 window.range.start(),
                 window.range.len(),
@@ -233,6 +239,12 @@ impl TransferCustody for UserTransferCustody {
             return Ok(carrick_aarch64::user_transfer::TransferPreparation::Declined);
         };
         let Some(asid) = core::num::NonZeroU16::new((target.ttbr0() >> 48) as u16) else {
+            super::stage2_backend::record_owner_supply_decline(
+                window.operation.mm.raw(),
+                window.operation.incarnation.get(),
+                2,
+                0,
+            );
             carrick_observability::probes::hvpatch_el1_owner_grant_supply(
                 window.range.start(),
                 window.range.len(),
@@ -251,6 +263,12 @@ impl TransferCustody for UserTransferCustody {
             .get(&binding)
             .and_then(CarrierForeignMmStateEntry::upgrade);
         let Some(state) = state else {
+            super::stage2_backend::record_owner_supply_decline(
+                window.operation.mm.raw(),
+                window.operation.incarnation.get(),
+                3,
+                0,
+            );
             carrick_observability::probes::hvpatch_el1_owner_grant_supply(
                 window.range.start(),
                 window.range.len(),
