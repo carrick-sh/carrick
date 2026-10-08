@@ -524,3 +524,50 @@ fn run_mounted_binary(elf: &std::path::Path, run_id: &str, json: bool) -> std::p
         .output()
         .expect("run mounted x86 Linux binary through carrick")
 }
+
+// Scalar reductions of embed-el1-sched fork-cow and MAP_FIXED-over-COW.
+// Threaded population and IPC bindings remain separate requirements.
+#[test]
+fn mounted_static_x86_fork_cow_twenty_rounds() {
+    compare_cow_reduction("x86_fork_cow.S");
+}
+
+#[test]
+fn mounted_static_x86_map_fixed_over_cow_thirty_two_rounds() {
+    compare_cow_reduction("x86_map_fixed_cow.S");
+}
+
+fn compare_cow_reduction(fixture: &str) {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("cow-reduction");
+    compile_assembly(fixture, &elf);
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), Some(7));
+    assert_eq!(native.stdout, b"C\n");
+    let observed = run_mounted_binary(&elf, fixture, true);
+    assert_eq!(
+        observed.status.code(),
+        Some(7),
+        "failure record = [zero-based round, phase (91 fork, 93 map, 94 bytes, 95 wait)]; record: {:?}; report: {}; stderr: {}",
+        &observed.stdout[..observed.stdout.len().min(2)],
+        String::from_utf8_lossy(&observed.stdout[observed.stdout.len().min(2)..]),
+        String::from_utf8_lossy(&observed.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(
+        observed
+            .stdout
+            .strip_prefix(b"C\n")
+            .expect("COW completion marker"),
+    )
+    .unwrap();
+    assert_eq!(
+        report["report"]["execution_witness"]["backend"],
+        "kvm-x86-cpl0"
+    );
+}
