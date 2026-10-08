@@ -26,6 +26,11 @@ impl ReservationEvent {
         }
     }
 }
+impl Default for ReservationEvent {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[repr(C)]
 pub struct ReservationEventRing {
@@ -49,6 +54,11 @@ impl ReservationEventRing {
         slot.id.store(u64::from(id), Ordering::Relaxed);
         slot.tail_id.store(u64::from(tail_id), Ordering::Relaxed);
         slot.sequence.store(sequence, Ordering::Release);
+    }
+}
+impl Default for ReservationEventRing {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
