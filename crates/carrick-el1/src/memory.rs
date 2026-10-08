@@ -849,8 +849,10 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
                 reservations::Refusal::Limit => 8,
                 reservations::Refusal::MetadataRequired => 9,
             };
+            // Diagnostic phase 3: retired descriptors with a refused root
+            // commit. Keep this local so fixture inputs need no new bundle.
             carrick_el1_abi::record_reservation_event(
-                carrick_el1_abi::ANONYMOUS_RETIRE_REFUSED,
+                3,
                 mm.raw(),
                 model.incarnation().raw(),
                 code,
