@@ -21,6 +21,34 @@
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "kind": "custom-build",
       "checksum": "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+    },
+    {
+      "package": "proc-macro2",
+      "version": "1.0.107",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "kind": "custom-build",
+      "checksum": "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
+    },
+    {
+      "package": "quote",
+      "version": "1.0.47",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "kind": "custom-build",
+      "checksum": "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
+    },
+    {
+      "package": "zerocopy",
+      "version": "0.8.61",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "kind": "custom-build",
+      "checksum": "879fb705ce98c32e41ebdb970fbe1204f8492423b314c6ab0354c3e7b5542866"
+    },
+    {
+      "package": "zerocopy-derive",
+      "version": "0.8.61",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "kind": "proc-macro",
+      "checksum": "708882a28301d604fa039cc7727607a98d04c4b86dc76ec9cc683f805d709759"
     }
   ]
 }
