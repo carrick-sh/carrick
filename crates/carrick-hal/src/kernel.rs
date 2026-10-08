@@ -15,9 +15,9 @@ use crate::MemPerms;
 pub const MAX_FRAME_INVENTORY_EVENTS_PER_BATCH: usize = 262_144;
 
 pub use carrick_core_abi::{
-    FrameId, FrameInventoryApplyReceipt, FrameInventoryProvenance, FrameInventoryReceiptChallenge,
-    FrameInventoryRetirementReceipt, FrameLength, KernelTransactionId, MappingGeneration,
-    MappingId,
+    FrameId, FrameInventoryApplyReceipt, FrameInventoryOrigin, FrameInventoryProvenance,
+    FrameInventoryReceiptChallenge, FrameInventoryRetirementReceipt, FrameLength,
+    KernelTransactionId, MappingGeneration, MappingId,
 };
 
 /// Revision of the backend MM binding observed by foreign-memory transport.

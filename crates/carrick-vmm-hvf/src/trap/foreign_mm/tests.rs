@@ -522,6 +522,7 @@ impl carrick_hal::FrameCowAuthority for TestForeignCowAuthority {
         let live = self.live.read();
         Ok(
             carrick_hal::FrameInventoryApplyReceipt::from_kernel_authority(
+                Default::default(),
                 carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0x7a; 32]),
                 transaction,
                 live.mm,
@@ -4330,6 +4331,7 @@ fn copied_fork_child_activation_publishes_exact_foreign_mm_binding() {
     let transaction =
         carrick_hal::KernelTransactionId::from_kernel_allocation(NonZeroU64::new(701).unwrap());
     let receipt = carrick_hal::FrameInventoryApplyReceipt::from_kernel_authority(
+        Default::default(),
         carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0x44; 32]),
         transaction,
         NonZeroU64::new(1).unwrap(),
@@ -4515,6 +4517,7 @@ fn production_manager_bound_through_runtime_task_state_grows_extension_arenas() 
     let transaction =
         carrick_hal::KernelTransactionId::from_kernel_allocation(NonZeroU64::new(701).unwrap());
     let receipt = carrick_hal::FrameInventoryApplyReceipt::from_kernel_authority(
+        Default::default(),
         carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0x44; 32]),
         transaction,
         NonZeroU64::new(1).unwrap(),
@@ -4673,6 +4676,7 @@ fn production_resolver_under_manager_lock_does_not_deadlock_on_multi_arena_sync(
     let transaction =
         carrick_hal::KernelTransactionId::from_kernel_allocation(NonZeroU64::new(702).unwrap());
     let receipt = carrick_hal::FrameInventoryApplyReceipt::from_kernel_authority(
+        Default::default(),
         carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0x45; 32]),
         transaction,
         NonZeroU64::new(1).unwrap(),
@@ -4868,6 +4872,7 @@ fn child_fork_replicates_multi_arena_stage1_page_tables() {
     let transaction =
         carrick_hal::KernelTransactionId::from_kernel_allocation(NonZeroU64::new(703).unwrap());
     let receipt = carrick_hal::FrameInventoryApplyReceipt::from_kernel_authority(
+        Default::default(),
         carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0x46; 32]),
         transaction,
         NonZeroU64::new(1).unwrap(),
@@ -8190,6 +8195,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
                 .collect();
             Ok(
                 carrick_hal::FrameInventoryApplyReceipt::from_kernel_authority(
+                    Default::default(),
                     carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0x33; 32]),
                     commit.batch().transaction(),
                     std::num::NonZeroU64::new(2).unwrap(),

@@ -1,4 +1,5 @@
 //! Exact logical inventory identities and receipt authentication.
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::{fmt, num::NonZeroU64};
 
@@ -80,8 +81,20 @@ pub struct FrameInventoryReceiptChallenge {
     transaction: KernelTransactionId,
 }
 
+/// Exact incarnation of one inventory owner. Local transaction, frame,
+/// mapping and MM numbers may repeat in another inventory.
+#[derive(Clone, Debug, Default)]
+pub struct FrameInventoryOrigin(Arc<()>);
+impl PartialEq for FrameInventoryOrigin {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for FrameInventoryOrigin {}
+
 #[derive(Debug, Eq, PartialEq)]
 pub struct FrameInventoryApplyReceipt {
+    origin: FrameInventoryOrigin,
     provenance: FrameInventoryProvenance,
     transaction: KernelTransactionId,
     mm: NonZeroU64,
@@ -99,6 +112,7 @@ impl FrameInventoryApplyReceipt {
     /// O(n^2) (~0.7 ms of a 2511-mapping cpython teardown).
     #[doc(hidden)]
     pub fn from_kernel_authority(
+        origin: FrameInventoryOrigin,
         provenance: FrameInventoryProvenance,
         transaction: KernelTransactionId,
         mm: NonZeroU64,
@@ -107,12 +121,17 @@ impl FrameInventoryApplyReceipt {
     ) -> Self {
         mappings.sort_unstable();
         Self {
+            origin,
             provenance,
             transaction,
             mm,
             revision,
             mappings,
         }
+    }
+
+    pub fn issued_by(&self, origin: &FrameInventoryOrigin) -> bool {
+        self.origin == *origin
     }
 
     pub const fn transaction(&self) -> KernelTransactionId {
@@ -238,6 +257,7 @@ mod tests {
             })
             .collect();
         let receipt = FrameInventoryApplyReceipt::from_kernel_authority(
+            Default::default(),
             FrameInventoryProvenance::from_kernel_entropy([7; 32]),
             KernelTransactionId::from_kernel_allocation(id(9)),
             id(3),
