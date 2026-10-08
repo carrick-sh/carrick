@@ -1,5 +1,5 @@
 #![cfg_attr(
-    all(not(target_os = "macos"), not(test)),
+    not(target_os = "macos"),
     expect(
         dead_code,
         reason = "bound by the KVM carrier at M5: docs/superpowers/plans/2026-10-04-kvm-hvpatch-carrier.md"
@@ -385,7 +385,7 @@ pub(crate) use exec::{
 pub(crate) mod quiesce;
 mod signal;
 mod threads;
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use threads::enroll_persistent_process_member;
 pub(crate) use threads::{
     PersistentProcessMemberPublication, VcpuThreadHandle, VcpuThreadRegistry,
@@ -420,7 +420,7 @@ pub(crate) use wait_wake::{
 pub(crate) mod terminal;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use terminal::ForkCloseAttempt;
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use terminal::ProcessExitClaim;
 pub(crate) use terminal::{
     CloneAdmissionChangeSubscription, CloneAdmissionGate, CloneAdmissionPermit, CloneEnrollment,
@@ -896,8 +896,11 @@ pub(crate) use binding::{HvpatchLogicalJobInput, prepare_hvpatch_logical_job};
 
 #[cfg(test)]
 pub(in crate::vcpu_loop) use binding::{
-    HvpatchLoopJob, HvpatchProductionPhase, PersistentTerminalRuntimeState,
-    ProductionHvpatchLoopJob, ProductionHvpatchLoopPoll, ScriptedHvpatchLoopEngine,
+    HvpatchLoopJob, HvpatchProductionPhase, ScriptedHvpatchLoopEngine,
+};
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(in crate::vcpu_loop) use binding::{
+    PersistentTerminalRuntimeState, ProductionHvpatchLoopJob, ProductionHvpatchLoopPoll,
 };
 
 pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
@@ -1066,7 +1069,7 @@ where
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
     fn install_exec_terminal_context_failpoint_for_test(
         &mut self,
         point: exec::ExecTerminalContextFailpoint,
@@ -2427,6 +2430,7 @@ pub(crate) mod tests {
     use super::binding::*;
     use super::signal::lower_el0_fault;
     use super::*;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use carrick_guest_mem::GuestMemory;
     use std::time::{Duration, Instant};
 
@@ -2703,8 +2707,11 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[derive(Default)]
     pub(crate) struct Memory(std::collections::BTreeMap<u64, Vec<u8>>);
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     impl carrick_guest_mem::GuestMemory for Memory {
         fn read_bytes_raw(
             &self,
@@ -2728,8 +2735,10 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     impl CurrentMmMemory for Memory {}
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     impl threads::CloneTidMemory for Memory {
         fn read_clone_tid_bytes(
             &self,

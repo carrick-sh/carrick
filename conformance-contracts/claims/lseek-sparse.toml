@@ -1,0 +1,8 @@
+[[claims]]
+id = "kernel.fs.lseek-sparse.whole-file-fallback"
+contract = "kernel.fs.lseek-sparse"
+description = "On a host without native SEEK_DATA/SEEK_HOLE, a host-file seek reports the whole file as data: SEEK_DATA -> offset, SEEK_HOLE -> size, negative or at/after EOF -> ENXIO, position moves only on success"
+linux_authority = ["man 2 lseek"]
+fixture_requirements = ["unit:lseek-sparse"]
+capability = { class = "vm-free-existing", capability = "carrick-portable::lseek_sparse_whole_file" }
+coverage = { status = "bound", layer = "vm-free" }

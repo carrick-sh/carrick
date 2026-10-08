@@ -1,0 +1,32 @@
+schema_version = 1
+id = "kernel.timer.delivery-gate"
+title = "Timer delivery gate serializes arm, disarm, delete, and expiry delivery"
+guest_surfaces = [
+  "syscall:setitimer",
+  "syscall:getitimer",
+  "syscall:timer_create",
+  "syscall:timer_settime",
+  "syscall:timer_gettime",
+  "syscall:timer_delete",
+  "signal:SIGALRM",
+  "signal:SIGVTALRM",
+  "signal:SIGPROF",
+]
+semantic_authority = [
+  "man 2 setitimer",
+  "man 2 timer_settime",
+  "man 2 timer_delete",
+  "man 7 signal",
+]
+fixture = "unit:timer_delivery_gate"
+scale_points = [1, 8, 32]
+rationale = "Each armed timer expiry is delivered at most once; a disarm or rearm racing with an expiry delivery never delivers a stale expiry or corrupts a replacement arm, and expiry delivery is serialised per slot through TransitionGate. Linearizability requires that once setitimer, timer_settime, or timer_delete returns, no expiry from the superseded arm generates a guest signal. Delivery threads winning the gate complete atomically before any racing transition modifies or clears the slot."
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-timer-core::gate::tests::{hold_excludes_until_dropped,release_after_fork_frees_an_orphaned_hold}; carrick-timer-core::itimer::tests::{reset_after_fork_releases_a_gate_copied_mid_delivery,kqueue_fire_drops_superseded_generation,kqueue_fire_two_phase_wall_timer_switches_to_periodic_once,kqueue_fire_cpu_timer_waits_then_fires_and_rechecks,one_shot_fire_retires_armed_slot,periodic_fire_keeps_armed_slot,cpu_due_decision_fires_when_due,cpu_due_decision_waits_when_not_due}; carrick-hal::timer_delivery::tests::{run_fallback_cpu_retires_on_generation_bump,run_fallback_cpu_stale_worker_leaves_replacement_arm_alone,run_fallback_real_retires_on_generation_bump,run_fallback_cpu_one_shot_fires_once_when_cpu_advances,fallback_posix_timer_publishes_process_signal_and_kicks_all}; carrick-hal::posix_timer::tests::{cpu_fallback_does_not_fire_after_timer_delete_returns,cpu_fallback_does_not_fire_after_disarming_settime_returns,cpu_fallback_stale_worker_leaves_replacement_arm_alone}; carrick-hal::guest_timer_bridge::tests::{kicker_itimer_virtual_fires_once_guest_cpu_crosses_due,kicker_cpu_posix_timer_fires_once_guest_cpu_crosses_due}"
+
+[bindings.unresolved]
+embed = "Signed embed integration for guest itimer/POSIX timer delivery races remains pending; covered in VM-free layer by carrick-timer-core and carrick-hal unit suites."
+embed_structural = "Structural work meters for timer delivery gate hold contention and fallback thread lifecycle remain pending."
+docker = "No dedicated differential Docker probe for linearizable disarm-versus-fire races; VM-free deterministic parking tests provide exact authority."

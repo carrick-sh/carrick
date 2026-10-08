@@ -517,20 +517,26 @@ impl<'a> FsView<'a> {
                 };
             }
         }
-        let host_whence = match whence {
-            LINUX_SEEK_SET => libc::SEEK_SET,
-            LINUX_SEEK_CUR => libc::SEEK_CUR,
-            LINUX_SEEK_END => libc::SEEK_END,
-            LINUX_SEEK_DATA => libc::SEEK_DATA,
-            LINUX_SEEK_HOLE => libc::SEEK_HOLE,
-            _ => return DispatchOutcome::errno(LINUX_EINVAL),
+        let sparse = match whence {
+            LINUX_SEEK_DATA => Some(carrick_portable::SparseSeek::Data),
+            LINUX_SEEK_HOLE => Some(carrick_portable::SparseSeek::Hole),
+            _ => None,
         };
-        if (whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE) && offset < 0 {
+        if sparse.is_some() && offset < 0 {
             return DispatchOutcome::errno(LINUX_ENXIO);
         }
-        match (unsafe { libc::lseek(host_io.raw(), offset as libc::off_t, host_whence) })
-            .host_syscall_errno()
-        {
+        let positioned = if let Some(kind) = sparse {
+            carrick_portable::lseek_sparse(host_io.raw(), offset as libc::off_t, kind)
+        } else {
+            let host_whence = match whence {
+                LINUX_SEEK_SET => libc::SEEK_SET,
+                LINUX_SEEK_CUR => libc::SEEK_CUR,
+                LINUX_SEEK_END => libc::SEEK_END,
+                _ => return DispatchOutcome::errno(LINUX_EINVAL),
+            };
+            unsafe { libc::lseek(host_io.raw(), offset as libc::off_t, host_whence) }
+        };
+        match positioned.host_syscall_errno() {
             Ok(positioned) => {
                 host_io.record_absolute_offset(positioned);
                 DispatchOutcome::returned_offset_or_errno(positioned)
@@ -655,14 +661,16 @@ impl<'a> FsView<'a> {
                                 if offset < 0 {
                                     return Ok(DispatchOutcome::errno(LINUX_ENXIO));
                                 }
-                                let host_whence = match whence {
-                                    LINUX_SEEK_DATA => libc::SEEK_DATA,
-                                    LINUX_SEEK_HOLE => libc::SEEK_HOLE,
-                                    _ => unreachable!(),
+                                let kind = if whence == LINUX_SEEK_DATA {
+                                    carrick_portable::SparseSeek::Data
+                                } else {
+                                    carrick_portable::SparseSeek::Hole
                                 };
-                                let r = match (unsafe {
-                                    libc::lseek(fd.as_raw_fd(), offset as libc::off_t, host_whence)
-                                })
+                                let r = match carrick_portable::lseek_sparse(
+                                    fd.as_raw_fd(),
+                                    offset as libc::off_t,
+                                    kind,
+                                )
                                 .host_syscall_errno()
                                 {
                                     Ok(r) => r,

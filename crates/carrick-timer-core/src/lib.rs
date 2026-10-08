@@ -1,8 +1,8 @@
 //! Platform-NEUTRAL interval/POSIX timer-slot bookkeeping + guest-CPU-due math,
 //! shared by every backend. Delivery (kqueue EVFILT_TIMER vs the wall-clock
 //! fallback thread) is the backend's concern; this crate owns the slot state,
-//! `cpu_timer_decision`, and the shared fallback-thread timing loop body
-//! (`run_fallback`). The thread spawn and the actual fire action (publish a
+//! the CPU-due decision and the gated delivery steps (`itimer::fire_*`) every
+//! deliverer goes through. The thread spawn and the actual fire action (publish a
 //! signal + kick) stay per-backend.
 //!
 //! The two timer families live in submodules ([`itimer`] for `setitimer`'s
@@ -16,8 +16,11 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod gate;
 pub mod itimer;
 pub mod posix;
+
+pub use gate::{FireOutcome, GateHold, TransitionGate};
 
 use core::time::Duration;
 

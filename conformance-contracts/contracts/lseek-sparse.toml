@@ -1,0 +1,16 @@
+schema_version = 1
+id = "kernel.fs.lseek-sparse"
+title = "lseek SEEK_DATA/SEEK_HOLE answer with Linux semantics on every host"
+guest_surfaces = ["syscall:lseek"]
+semantic_authority = ["man 2 lseek (SEEK_DATA, SEEK_HOLE, ENXIO; a filesystem without hole support reports the whole file as data)"]
+fixture = "unit:lseek-sparse"
+scale_points = [1]
+rationale = "Guest SEEK_DATA/SEEK_HOLE whence values are carrick-abi LINUX_SEEK_* and never host constants. Host files seek through carrick_portable::lseek_sparse: macOS, FreeBSD and Linux use the native host lseek; NetBSD's lseek(2) has no SEEK_DATA/SEEK_HOLE, so it answers as Linux does for a filesystem without hole support: SEEK_DATA returns the offset, SEEK_HOLE returns the file size, a negative offset or one at/after end of file is ENXIO, and the file position moves only on success. The fallback is built and tested on every host. Work is constant per seek (native: one host lseek; fallback: one fstat plus one lseek); no work-meter metric is bound yet, so no structural budget is claimed."
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-portable::lseek_sparse_whole_file_tests (whole_file_answers_follow_lseek_without_hole_support, whole_file_seek_moves_the_position_and_reports_enxio); carrick-kernel::dispatch::fs::tests::lseek_data_and_hole_across_backends (dispatch whence mapping, ENXIO and offset update over dense and rootfs-backed files)"
+docker = "probe:seekholedata"
+
+[bindings.unresolved]
+embed_structural = "No signed carrick-embed fixture seeks SEEK_DATA/SEEK_HOLE on a host file yet; the NetBSD fallback has no live NetBSD-host execution evidence."

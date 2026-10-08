@@ -163,7 +163,7 @@ fn live_registry_loads_all_claims() {
             .require(id)
             .expect("native contract must be registered");
     }
-    assert_eq!(registry.claims().len(), 16);
+    assert_eq!(registry.claims().len(), 17);
     assert!(
         registry
             .claims()

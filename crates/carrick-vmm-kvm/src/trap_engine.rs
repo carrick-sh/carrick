@@ -45,6 +45,7 @@ mod execve_tests {
     use carrick_aarch64::Aarch64Vcpu;
     use carrick_hal::{HostAliasBacking, HostAliasSharing, Reg, RegAccess, SyscallTrap};
     use carrick_mem::memory::{AddressSpace, LINUX_EL1_VECTORS_BASE, LINUX_PAGE_TABLES_BASE};
+    use std::os::fd::FromRawFd;
 
     use super::*;
 

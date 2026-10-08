@@ -1,5 +1,5 @@
 #![cfg_attr(
-    all(not(target_os = "macos"), not(test)),
+    not(target_os = "macos"),
     expect(
         dead_code,
         reason = "bound by the KVM carrier at M5: docs/superpowers/plans/2026-10-04-kvm-hvpatch-carrier.md"
@@ -34,7 +34,7 @@ pub(crate) fn signal_wait_expired(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|target| Instant::now() >= target)
 }
 
-#[cfg(any(test, feature = "platform-macos"))]
+#[cfg(any(feature = "platform-macos", all(test, target_os = "macos")))]
 pub(crate) use carrick_kernel::kernel::continuation::raise_sigpipe_for_blocking_write;
 
 pub(crate) fn partial_write_interrupt_outcome(
