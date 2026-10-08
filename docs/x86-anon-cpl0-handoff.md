@@ -1,5 +1,37 @@
 # x86 anonymous CPL0 handoff (partial, 2026-10-07)
 
+## Main integration checkpoint (2026-10-08)
+
+The director's final integration decision is merge, never rebase this lane.
+4beb157dc merges github/main 8ebd6fe41 into ce91d7d25. Source conflicts
+were resolved against the already integrated shared snapshot d355743b2,
+retaining this lane's extracted process owner, exact CPU/MM grants and
+prepared launch Kernel while accepting main's timer and host changes.
+Main's migration JSON was taken first; existing lane abort reviews were
+then reapplied for the extracted registry. Clean `just reconcile-inventories`
+passes in `/tmp/x86-main-reconcile-clean.log`; 7cf1a3078 records positions.
+
+The first domain gate exposed main's swapped USDT image-base/execve spans,
+which Linux reconciliation turned into a duplicate diagnostic identity.
+0e42f8ac0 restores distinct spans and existing lane rationales without
+changing classifications or profile membership. Guarded macOS recapture
+succeeds in `/tmp/x86-main-recapture.log`; b1d812458 applies its validated
+patch and compiler-owned provenance. Static checking passes in
+`/tmp/x86-main-static-recaptured.log`.
+
+Merged-source checks: `CARRICK_REQUIRE_KVM=1 just test-kvm` has 134 passes,
+five existing ignored tests, and exactly the original production two-MM
+fork exit91 failure (`/tmp/x86-main-test-kvm.log`). Full clippy passes in
+`/tmp/x86-main-clippy.log`. ARM asm against pre-merge ce91d7d25 has 115/115
+blocks and zero differences (`/tmp/x86-main-asm.log`). Clean domain lint
+passes, including 572 live Linux reviews, in
+`/tmp/x86-main-domains-qualified.log`. No two-MM green or review-ready claim.
+
+Continue the one-way boot identity export/refusal and production native
+fork/CPU1/wait/exit/MM work below. PR85/86 are being landed separately;
+when the director reports them on main, merge github/main again. Do not
+rebase or create a RuntimeCarrier population/HVPatch directory for CPL0.
+
 ## Fresh continuation: real launch namespace boundary (2026-10-08)
 
 4627454b7 boots the production CPL0 launch dispatcher in a fresh private
