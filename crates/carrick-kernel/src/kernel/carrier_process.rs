@@ -470,45 +470,10 @@ impl ProcessItimers {
         which: usize,
         generation: u64,
         spec: carrick_hal::TimerSpecNs,
-        mut sample_cpu: impl FnMut() -> Option<u64>,
-        mut deliver: impl FnMut() -> bool,
+        sample_cpu: impl FnMut() -> Option<u64>,
+        deliver: impl FnMut() -> bool,
     ) {
-        use carrick_timer_core::FireOutcome;
-
-        if carrick_timer_core::itimer::is_cpu_timer(which) {
-            loop {
-                // Sampled outside the gate; the decision against the LIVE arm
-                // happens inside it, so a sample taken before a disarm or
-                // re-arm can never be charged to the replacement.
-                let Some(now_ns) = sample_cpu() else {
-                    return;
-                };
-                let mut delivered = true;
-                match self
-                    .table
-                    .fire_cpu_if_current(which, generation, now_ns, 1, || {
-                        delivered = deliver();
-                    }) {
-                    FireOutcome::Wait { delay_ns } => {
-                        std::thread::sleep(std::time::Duration::from_nanos(delay_ns.raw()));
-                    }
-                    FireOutcome::Fired if delivered => {}
-                    FireOutcome::Fired | FireOutcome::Retired => return,
-                }
-            }
-        }
-
-        std::thread::sleep(std::time::Duration::from_nanos(spec.value));
-        loop {
-            let mut delivered = true;
-            let outcome = self.table.fire_wall_if_current(which, generation, || {
-                delivered = deliver();
-            });
-            if outcome != FireOutcome::Fired || !delivered {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_nanos(spec.interval));
-        }
+        ProcessTimerDelivery::drive_itimer(self, which, generation, spec, sample_cpu, deliver);
     }
 }
 
@@ -528,6 +493,52 @@ impl ProcessTimerDelivery {
                 task,
             },
             itimers: std::sync::Arc::new(ProcessItimers::new()),
+        }
+    }
+
+    fn drive_itimer(
+        itimers: &ProcessItimers,
+        which: usize,
+        generation: u64,
+        spec: carrick_hal::TimerSpecNs,
+        mut sample_cpu: impl FnMut() -> Option<u64>,
+        mut deliver: impl FnMut() -> bool,
+    ) {
+        use carrick_timer_core::FireOutcome;
+
+        if carrick_timer_core::itimer::is_cpu_timer(which) {
+            loop {
+                // Sampled outside the gate; the decision against the LIVE arm
+                // happens inside it, so a sample taken before a disarm or
+                // re-arm can never be charged to the replacement.
+                let Some(now_ns) = sample_cpu() else {
+                    return;
+                };
+                let mut delivered = true;
+                match itimers
+                    .table
+                    .fire_cpu_if_current(which, generation, now_ns, 1, || {
+                        delivered = deliver();
+                    }) {
+                    FireOutcome::Wait { delay_ns } => {
+                        std::thread::sleep(std::time::Duration::from_nanos(delay_ns.raw()));
+                    }
+                    FireOutcome::Fired if delivered => {}
+                    FireOutcome::Fired | FireOutcome::Retired => return,
+                }
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_nanos(spec.value));
+        loop {
+            let mut delivered = true;
+            let outcome = itimers.table.fire_wall_if_current(which, generation, || {
+                delivered = deliver();
+            });
+            if outcome != FireOutcome::Fired || !delivered {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_nanos(spec.interval));
         }
     }
 }
