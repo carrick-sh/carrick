@@ -799,14 +799,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 );
             }
         });
-        let (target, channel) = {
+        let (target, channels) = {
             let graph = self.runtime.graph.lock();
             let target = graph.owner.select_exit_parent(&permit);
-            let channel = permit
-                .parent()
-                .and_then(|key| graph.owner.task(key).ok())
-                .and_then(|row| row.native().resources().channel.clone());
-            (target, channel)
+            let mut channels = Vec::new();
+            for key in [permit.parent(), published.adopter].into_iter().flatten() {
+                if let Some(channel) = graph
+                    .owner
+                    .task(key)
+                    .ok()
+                    .and_then(|row| row.native().resources().channel.clone())
+                {
+                    if !channels.iter().any(|other| Arc::ptr_eq(other, &channel)) {
+                        channels.push(channel);
+                    }
+                }
+            }
+            (target, channels)
         };
         if let Some(target) = target {
             let notification = target.prepare();
@@ -829,8 +838,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .map_err(|_| NativeProcessError::Stale)?;
             }
         }
-        if let Some(channel) = channel {
-            self.publish_channel(&channel)?
+        for channel in channels {
+            self.publish_channel(&channel)?;
         }
         if let Some(mm) = resources {
             self.service.retire_mm(mm)
@@ -1751,5 +1760,262 @@ mod tests {
         assert!(parent_entry.take_root_exit().is_none());
         assert!(parent_entry.take_handoff_receipt().is_some());
         assert_eq!(page.live(), 0);
+    }
+    fn activate<'a>(
+        runtime: &NativeProcessRuntime<'a, AddressContext<RootGpa>, ParkedContextWords>,
+        source: BornInZoneSource<'a, ParkedContextWords>,
+        task: &CurrentTask,
+        key: TaskKey,
+    ) {
+        let graph = runtime.graph.lock();
+        let row = graph.owner.task(key).unwrap();
+        let resources = row.native().resources();
+        let zone = source.zone;
+        assert_eq!(
+            zone.switch_in_full(source.slot).unwrap().record,
+            resources.record.id
+        );
+        zone.install_space(source.slot, resources.address.mm.raw().get())
+            .unwrap();
+        let identity = zone.record(resources.record.id).identity();
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(key.id.raw()),
+            key.serial.raw(),
+            identity.file_table,
+        );
+        task.mm
+            .key
+            .store(resources.address.mm.raw().get(), Ordering::Release);
+        task.mm
+            .thread_generation
+            .store(identity.serial, Ordering::Release);
+        task.publish_visible_pid(row.metadata().namespace_pid);
+        task.publish_lifecycle(identity.lifecycle_page, identity.control_slot);
+    }
+    #[test]
+    fn blocked_adopter_wait_resumes_with_an_inherited_zombie() {
+        for depth_count in [2, 3] {
+            let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+            // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+            let zone = unsafe {
+                let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+                assert!(!ptr.is_null());
+                Box::from_raw(ptr)
+            };
+            let page = Box::new(ThreadLifecyclePage::new());
+            let control = Box::new(ThreadControlSlot::new());
+            let child_page = Box::new(ThreadLifecyclePage::new());
+            let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+                ThreadControlSlot::new()
+            }));
+            let task = CurrentTask::new();
+            task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+            task.mm.key.store(1, Ordering::Release);
+            task.mm.thread_generation.store(101, Ordering::Release);
+            task.publish_visible_pid(41);
+            task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+            let address = AddressContext {
+                root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+                mm: MmGeneration::new(NonZeroU64::MIN),
+                generation: ContextGeneration::new(NonZeroU64::MIN),
+            };
+            let slot = carrick_sched_core::SlotId::new(0);
+            let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+            zone.spaces.open(space);
+            zone.drive(slot, 1);
+            zone.publish_slot(slot, 1, Some(0), 1);
+            zone.enter_guest(slot);
+            zone.install_space(slot, 1).unwrap();
+            zone.current_or_new(
+                slot,
+                ThreadIdentity {
+                    tid: 41,
+                    serial: 101,
+                    mm: 1,
+                    file_table: 5,
+                    generation: 11,
+                    affinity: 1,
+                    lifecycle_page: &*page as *const _ as u64,
+                    control_slot: &*control as *const _ as u64,
+                },
+            )
+            .unwrap();
+            let source = BornInZoneSource { zone: &zone, slot };
+            assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
+            page.release_live(1).unwrap(); // fixture settles its bootstrap census
+            let runtime = NativeProcessRuntime::admit_fresh_root(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+            assert_eq!(page.live(), 1);
+            let mut service = Physical {
+                zone: &zone,
+                page: &child_page,
+                controls: &*child_controls,
+                copies: Vec::new(),
+                refuse_copy: false,
+            };
+            let parent = TaskKey {
+                id: TaskId::from_abi_positive(41).unwrap(),
+                serial: TaskSerial::from_raw_u64(11).unwrap(),
+            };
+            let descendant_pages = [ThreadLifecyclePage::new(), ThreadLifecyclePage::new()];
+            let descendant_controls: [[ThreadControlSlot; 9]; 2] =
+                core::array::from_fn(|_| core::array::from_fn(|_| ThreadControlSlot::new()));
+            let mut actors = vec![parent];
+            for depth in 0..depth_count {
+                let current = *actors.last().unwrap();
+                let row_address = runtime
+                    .graph
+                    .lock()
+                    .owner
+                    .task(current)
+                    .unwrap()
+                    .native()
+                    .resources()
+                    .address;
+                let mut entry = runtime
+                    .enter(source, &task, words(row_address), &mut service)
+                    .unwrap();
+                let LifecycleOutcome::Returned { result, .. } = entry.fork() else {
+                    panic!("fork")
+                };
+                let next = runtime
+                    .namespace_child_key(current, result.raw() as u32)
+                    .unwrap();
+                assert!(matches!(
+                    entry.wait4(
+                        ProcessWaitPid::from_syscall_argument(u64::MAX),
+                        UserVa::new(0x8000),
+                        LinuxWaitOptions::empty(),
+                        UserVa::new(0)
+                    ),
+                    LifecycleOutcome::Transferred { .. }
+                ));
+                assert!(entry.take_handoff_receipt().is_some());
+                drop(entry);
+                actors.push(next);
+                activate(&runtime, source, &task, next);
+                if depth + 1 < depth_count {
+                    service.page = &descendant_pages[depth];
+                    service.controls = &descendant_controls[depth];
+                }
+            }
+            let zombie = actors[depth_count];
+            let exiting = actors[depth_count - 1];
+            let direct_parent = actors[1];
+            let root_channel = runtime
+                .graph
+                .lock()
+                .owner
+                .task(parent)
+                .unwrap()
+                .native()
+                .resources()
+                .channel
+                .clone()
+                .unwrap();
+            let before = root_channel.generation.generation();
+            {
+                let address = runtime
+                    .graph
+                    .lock()
+                    .owner
+                    .task(zombie)
+                    .unwrap()
+                    .native()
+                    .resources()
+                    .address;
+                let mut entry = runtime
+                    .enter(source, &task, words(address), &mut service)
+                    .unwrap();
+                assert!(matches!(
+                    entry.exit_group(7),
+                    LifecycleOutcome::Transferred { .. }
+                ));
+                assert!(entry.take_handoff_receipt().is_some());
+            }
+            activate(&runtime, source, &task, exiting);
+            {
+                let address = runtime
+                    .graph
+                    .lock()
+                    .owner
+                    .task(exiting)
+                    .unwrap()
+                    .native()
+                    .resources()
+                    .address;
+                let mut entry = runtime
+                    .enter(source, &task, words(address), &mut service)
+                    .unwrap();
+                assert!(matches!(
+                    entry.exit_group(8),
+                    LifecycleOutcome::Transferred { .. }
+                ));
+                assert!(entry.take_handoff_receipt().is_some());
+            }
+            assert_eq!(
+                root_channel.generation.generation().raw(),
+                before.raw() + 1,
+                "inherited zombie must wake the already blocked adopter exactly once"
+            );
+            if depth_count == 3 {
+                // Hold the other woken parent at the host boundary so this assertion
+                // resumes the adopter before any additional exit can wake it.
+                let direct_record = runtime
+                    .graph
+                    .lock()
+                    .owner
+                    .task(direct_parent)
+                    .unwrap()
+                    .native()
+                    .resources()
+                    .record;
+                assert!(matches!(
+                    zone.claim_for_host(
+                        direct_record,
+                        None,
+                        Handback::Cancelled,
+                        &BoundedSpin(LOCK_SPINS)
+                    ),
+                    carrick_sched_core::HostClaim::Claimed
+                ));
+            }
+            activate(&runtime, source, &task, parent);
+            let mut entry = runtime
+                .enter(source, &task, words(address), &mut service)
+                .unwrap();
+            let Some(LifecycleOutcome::Returned { result, .. }) = entry.resume_pending_wait()
+            else {
+                panic!("adopter resume")
+            };
+            if depth_count == 2 {
+                // The original child has the lower PID and remains eligible.
+                assert_eq!(result.raw(), 42);
+                let LifecycleOutcome::Returned { result, .. } = entry.wait4(
+                    ProcessWaitPid::from_syscall_argument(u64::MAX),
+                    UserVa::new(0x8000),
+                    LinuxWaitOptions::empty(),
+                    UserVa::new(0),
+                ) else {
+                    panic!("inherited zombie return")
+                };
+                assert_eq!(result.raw(), 43);
+            } else {
+                assert_eq!(result.raw(), 44);
+            }
+            drop(entry);
+            assert_eq!(
+                service.copies.last(),
+                Some(&LinuxWaitStatus::from_wait_encoding(7 << 8))
+            );
+        }
     }
 }
