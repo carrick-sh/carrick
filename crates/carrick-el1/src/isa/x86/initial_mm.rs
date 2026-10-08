@@ -51,6 +51,7 @@ pub enum InitialMmError {
     StackTooLarge,
     FrameUnavailable,
     DescriptorRefused,
+    DescriptorIndeterminate,
     PublicationRefused,
 }
 
@@ -427,9 +428,13 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
     let mut seen = BTreeSet::new();
     seen.insert(source_root.address().raw());
     seen.insert(root.address().raw());
-    // The fresh root inherits exactly the supervisor half. Its lower half is
-    // zero from the frame grant, so it has no second alias of source user PTEs.
+    // Inherit shared supervisor branches only. The fresh MM must never
+    // borrow another MM's temporary copy tables; its lower half is zero.
     for index in 256..512_u64 {
+        if !<carrick_mmu_core::x86::owner_mmu::X86Mmu as
+            carrick_mmu_core::owner_mmu::OwnerForkMmu>::is_shared_root_entry(index as usize) {
+            continue;
+        }
         let word = words
             .load(source_root.address().raw() + index * 8)
             .map_err(|_| InitialMmError::DescriptorRefused)?;
@@ -525,6 +530,20 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
             publications.push(publication);
         }
     }
+    let mut copy_tables = [root; carrick_mmu_core::x86::copy_window::COW_COPY_TABLE_PAGES];
+    for table in &mut copy_tables {
+        *table = source
+            .take_zeroed_table()
+            .ok_or(InitialMmError::FrameUnavailable)?;
+        if !valid_page(table.address()) || !seen.insert(table.address().raw()) {
+            return Err(InitialMmError::FrameUnavailable);
+        }
+    }
+    carrick_mmu_core::x86::copy_window::provision_cow_copy_window(words, root, copy_tables)
+        .map_err(|outcome| match outcome {
+            DescriptorOutcome::Indeterminate(_) => InitialMmError::DescriptorIndeterminate,
+            _ => InitialMmError::DescriptorRefused,
+        })?;
     let address = AddressContext {
         root,
         mm: MmGeneration::new(mm_key),
@@ -726,6 +745,14 @@ mod tests {
             stack,
         };
         let source_root = RootGpa::page_aligned(FrameGpa::new(0x60_0000)).unwrap();
+        let source_copy_tables = [0x61_0000, 0x61_1000, 0x61_2000]
+            .map(|pa| RootGpa::page_aligned(FrameGpa::new(pa)).unwrap());
+        carrick_mmu_core::x86::copy_window::provision_cow_copy_window(
+            &words,
+            source_root,
+            source_copy_tables,
+        )
+        .unwrap();
         // SAFETY: this isolated fixture owns its source root and every fresh
         // table/data frame until the unpublished image is inspected.
         let loaded = unsafe {
@@ -739,6 +766,15 @@ mod tests {
             )
         }
         .unwrap();
+        let child_copy_tables =
+            carrick_mmu_core::x86::copy_window::cow_copy_table_frames(&words, loaded.address.root)
+                .unwrap();
+        for (child, source) in child_copy_tables.iter().zip(source_copy_tables) {
+            assert_ne!(
+                *child, source,
+                "initial MM must own its private supervisor branch"
+            );
+        }
         let stack_leaf = translate_leaf(
             &words,
             loaded.address.root,
@@ -803,8 +839,8 @@ mod tests {
         );
         assert_eq!(frames.next_data, 0x90_3000, "one data grant per user page");
         assert_eq!(
-            frames.next_table, 0x80_6000,
-            "one root plus five table pages"
+            frames.next_table, 0x80_9000,
+            "one root, five user tables and three private copy tables"
         );
         assert_ne!(loaded.address.root.address().raw(), 0x60_0000);
     }

@@ -995,6 +995,12 @@ mod forward_execution_tests {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InitialPeerAdmission {
+    Cold,
+    Ready,
+}
+
 pub struct Cpl0Carrier {
     pub(crate) cpus: [KvmVcpu; 2],
     pub(crate) custody: Cpl0HostCustody,
@@ -1015,6 +1021,7 @@ pub(crate) struct Cpl0HostCustody {
     kernel_pod_storage: Vec<anonymous_owner::KernelPodStorage>,
     initial_inventory: Option<InitialInventory>,
     peer_entry: Option<carrick_guest_arch::KernelVa>,
+    peer_admission: InitialPeerAdmission,
     grant_tables: Vec<RootGpa>,
     prepare_table_stock: Option<anonymous_owner::PrepareTableStock>,
     fork_pending: [Option<anonymous_owner::PendingForkLoan>; 2],
@@ -2090,6 +2097,11 @@ impl Cpl0Carrier {
     /// Resume the published initial MM through the existing shared Linux
     /// personality. Only host-crossing calls leave CPL0 through FORWARD_PORT.
     fn start_initial_peer(&mut self, max_exits: usize) -> Result<(), TrapError> {
+        // READY is a one-way physical boot receipt. Resuming a bounded run
+        // preserves CPU1's native context; it must never initialize it twice.
+        if self.custody.peer_admission == InitialPeerAdmission::Ready {
+            return Ok(());
+        }
         let peer = self
             .custody
             .peer_entry
@@ -2138,6 +2150,7 @@ impl Cpl0Carrier {
                 if self.cpus[1].get_gpr(X86Reg::Rax)? != 1 {
                     return Err(fail("initial peer ready physical slot"));
                 }
+                self.custody.peer_admission = InitialPeerAdmission::Ready;
                 Ok(())
             }
             VcpuExit::Kicked => Err(fail("initial peer cancelled")),
@@ -2609,12 +2622,19 @@ impl Cpl0Carrier {
         {
             return Err(fail("CPL0 supervisor map in user range"));
         }
-        let tables = pml4_tables(
-            &maps,
-            LAYOUT.pml4_base,
-            carrick_x86::X86_PML4_CAPACITY as usize,
-        )
-        .map_err(|e| fail(format!("CPL0 tables: {e:?}")))?;
+        // Fixture bootstrap roots reserve an exclusive zero suffix for the
+        // same private copy branch that production initial-MM admission owns.
+        // The constructor cannot allocate these pages into any other branch.
+        let fixture_copy = fixture_image && initial_extent_bytes.is_none();
+        let table_capacity = (carrick_x86::X86_PML4_CAPACITY as usize)
+            .checked_sub(if fixture_copy {
+                carrick_mmu_core::x86::copy_window::COW_COPY_TABLE_PAGES * 4096
+            } else {
+                0
+            })
+            .ok_or_else(|| fail("fixture private copy table capacity"))?;
+        let tables = pml4_tables(&maps, LAYOUT.pml4_base, table_capacity)
+            .map_err(|e| fail(format!("CPL0 tables: {e:?}")))?;
         ram.write_gpa(LAYOUT.pml4_base, &tables)
             .map_err(|e| fail(e.to_string()))?;
         if interrupts {
@@ -2623,7 +2643,7 @@ impl Cpl0Carrier {
             let second = pml4_tables(
                 &maps,
                 crate::carrier_interrupts::SECOND_ROOT,
-                carrick_x86::X86_PML4_CAPACITY as usize,
+                table_capacity,
             )
             .map_err(|e| fail(format!("second progress root: {e:?}")))?;
             ram.write_gpa(crate::carrier_interrupts::SECOND_ROOT, &second)
@@ -2834,6 +2854,31 @@ impl Cpl0Carrier {
         memory
             .install_bootstrap(Arc::clone(&ram))
             .map_err(|e| fail(e.to_string()))?;
+        if fixture_copy {
+            let mut roots = vec![LAYOUT.pml4_base];
+            if interrupts {
+                roots.push(crate::carrier_interrupts::SECOND_ROOT);
+            }
+            for base in roots {
+                let root = RootGpa::page_aligned(FrameGpa::new(base))
+                    .ok_or_else(|| fail("fixture copy root alignment"))?;
+                let mut grants = [root; carrick_mmu_core::x86::copy_window::COW_COPY_TABLE_PAGES];
+                for (index, grant) in grants.iter_mut().enumerate() {
+                    let pa = base
+                        .checked_add(table_capacity as u64)
+                        .and_then(|pa| pa.checked_add(index as u64 * 4096))
+                        .ok_or_else(|| fail("fixture copy table grant overflow"))?;
+                    *grant = RootGpa::page_aligned(FrameGpa::new(pa))
+                        .ok_or_else(|| fail("fixture copy table grant alignment"))?;
+                }
+                carrick_mmu_core::x86::copy_window::provision_cow_copy_window(
+                    &memory.words(),
+                    root,
+                    grants,
+                )
+                .map_err(|reason| fail(format!("fixture private copy branch: {reason:?}")))?;
+            }
+        }
         let kernel_region = if initial_extent_bytes.is_some() {
             let identity = backing_identity(&object_ids)?;
             let extent = BackingExtent::private(
@@ -3054,6 +3099,7 @@ impl Cpl0Carrier {
                 kernel_pod_storage,
                 initial_inventory: None,
                 peer_entry: None,
+                peer_admission: InitialPeerAdmission::Cold,
                 grant_tables: Vec::new(),
                 prepare_table_stock: None,
                 fork_pending: std::array::from_fn(|_| None),
