@@ -4358,7 +4358,35 @@ fn thread_witness(
         exit_breakdown(&measured),
         stdout.trim()
     );
-    assert!(measured.result.success(), "{mode}: {}", describe(&measured));
+    assert!(
+        measured.result.success(),
+        "{mode}: {}; reservation ring: {:?}",
+        describe(&measured),
+        read_el1_counters().map(|counters| {
+            use std::sync::atomic::Ordering;
+            let next = counters.reservation_events.next.load(Ordering::Relaxed);
+            let mut events = counters
+                .reservation_events
+                .slots
+                .iter()
+                .filter_map(|slot| {
+                    let sequence = slot.sequence.load(Ordering::Acquire);
+                    (sequence != 0).then(|| {
+                        (
+                            sequence,
+                            slot.phase.load(Ordering::Relaxed),
+                            slot.mm.load(Ordering::Relaxed),
+                            slot.incarnation.load(Ordering::Relaxed),
+                            slot.id.load(Ordering::Relaxed),
+                            slot.tail_id.load(Ordering::Relaxed),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            events.sort_by_key(|event| event.0);
+            (next, events)
+        })
+    );
     let summary = format!("{mode} summary parent_ok=true child_ok=true ok=true");
     let single = stdout
         .lines()
