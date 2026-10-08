@@ -73,12 +73,16 @@ pub enum Commands {
     #[command(
         name = "host-lease",
         about = "Run command under machine-global host lease flock (carrick shared, gate/docker exclusive)",
-        long_about = "Run command under machine-global host lease flock. Runner death and supervisor SIGTERM/SIGINT/SIGHUP cancel supervised work before successful release. Cleanup errors or the single five-second cleanup deadline fail the run explicitly and release the lease. SIGKILL of the sole supervisor releases flock immediately. On Darwin, detached descendants closing all inherited scope descriptors escape; the final process-start-time check to kill also has a PID reuse window. See docs/host-lease-containment-follow-up.md."
+        long_about = "Run command under machine-global host lease flock. Runner death and supervisor SIGTERM/SIGINT/SIGHUP cancel supervised work before successful release. Cleanup errors or the single five-second cleanup deadline fail the run explicitly and release the lease. On macOS, either supervisor or guardian survives the other's SIGKILL and retains exclusion during cleanup; loss of both releases flock. Linux still has a sole supervisor. On Darwin, detached descendants closing all inherited scope descriptors escape; the final process-start-time check to kill also has a PID reuse window. See docs/host-lease-containment-follow-up.md."
     )]
     HostLease(HostLeaseArgs),
 
     #[command(hide = true)]
     LeaseSupervisor(crate::lease_supervisor::SupervisorArgs),
+
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    LeaseGuardian(crate::lease_supervisor::GuardianArgs),
 
     #[command(about = "Run the host and/or signed landing gate and output a JSON receipt")]
     Accept(crate::accept::AcceptArgs),
@@ -412,6 +416,11 @@ where
         }
         Commands::LeaseSupervisor(args) => {
             let code = crate::lease_supervisor::run(args)?;
+            std::process::exit(code);
+        }
+        #[cfg(target_os = "macos")]
+        Commands::LeaseGuardian(args) => {
+            let code = crate::lease_supervisor::run_guardian(args)?;
             std::process::exit(code);
         }
         Commands::Accept(args) => {

@@ -1,10 +1,12 @@
 # Host lease supervision and containment follow-up
 
-The lease supervisor owns flock; arbitrary commands, tests and guests own zero
+On macOS the supervisor and an independent guardian share flock custody;
+arbitrary commands, tests and guests own zero
 flock descriptors. Caller exit and supervisor SIGTERM/SIGINT/SIGHUP request
 cancellation. The supervisor cancels and observes supervised work exiting,
 reaps its children, observes lifetime EOF, and only then releases exclusion on success. Cleanup failure releases with a
-reported failed-run error under the bounded policy below.
+reported failed-run error under the bounded policy below. If the supervisor
+fails cleanup, its guardian retains custody while recovering the workload.
 The existing direct `try_exclusive` still performs a zero-wait flock attempt.
 
 Linux uses a dedicated child subreaper. With child-list support, detached descendants remain owned even
@@ -16,11 +18,18 @@ Permission to signal is independent of permission to reap an adopted child.
 
 ## Explicit limits
 
-- **Sole supervisor SIGKILL:** the kernel closes its descriptors and releases
-  flock. Work can survive it. `supervisor_sigkill_cannot_preserve_exclusion` is
-  an ignored regression that deliberately fails when explicitly invoked on
-  either platform. A normal runner's SIGKILL is covered; it is a different
-  process from the flock owner.
+- **macOS single-custodian SIGKILL:** supervisor and guardian share the locked
+  description with last-close release authority. Guardian readiness and the
+  supervisor's guardian-exit watch precede workload admission. A child-specific
+  pre-exec handshake registers the workload session before user code can fork
+  or close its scope writer. The guardian
+  watches supervisor exit and the finish channel; the supervisor watches
+  guardian exit. Either survivor cancels scope members and confirms their
+  exit/reaping before dropping custody. Both single-holder SIGKILL cases are
+  active deterministic regressions. Commands inherit no raw flock fd.
+- **Loss of all custodians:** killing both macOS holders releases flock. Linux
+  retains the sole-supervisor limitation. An ordinary runner is a proxy, not
+  a custodian. No user-space watcher can survive its own SIGKILL.
 - **Darwin detached close-all-fds descendants:** leaving the session and closing
   every inherited scope descriptor removes both membership proofs.
   `detached_closed_scope_descendant_is_cancelled` deliberately fails on Darwin
@@ -45,17 +54,19 @@ Permission to signal is independent of permission to reap an adopted child.
   exiting and its PID being reused in that window can cause a wrong signal.
   Start-time comparison is not atomic signaling or full crash containment.
 
-These limits are part of the CLI/recipe help and the native contract. This PR
-does not claim to contain arbitrary host process trees or survive flock-owner
-SIGKILL. Ignored failures document missing guarantees; they confer no acceptance.
+These limits are part of the CLI/recipe help and the native contract. Single
+macOS custodian failure is covered; arbitrary process trees and simultaneous
+loss of all custodians are not. Ignored failures confer no acceptance.
 
 ## Bounded cleanup failure
 
 Cleanup has one five-second deadline across cancellation, worker and descendant
-reaping, and scope EOF. Permanent I/O errors return immediately; pending exit
+reaping, and scope EOF. Interrupted native observations resume the same syscall under the unchanged
+deadline, preserving exit authority across SIGCHLD. Permanent I/O errors return immediately; pending exit
 and reaping observations must finish within that deadline. A typed
 `HostLeaseError::Cleanup` reports the operation and cause, explicitly marks the
-run failed, and releases the lease. Failure is not acceptance or a promise that
+run failed. On macOS, supervisor failure leaves custody with the guardian
+through its recovery cleanup; final custodian failure releases the lease. Failure is not acceptance or a promise that
 unkillable work has stopped. The supervisor must not wedge the host indefinitely.
 Linux subreaper `waitpid(-1)` through `ECHILD` is release authority; procfs child
 lists only help cancel live adopted roots and are optional. Without those lists,
@@ -81,7 +92,8 @@ it needs a maintained libc binding, qualified token acquisition, platform
 availability checks, and native red-first tests. A start-time check followed by
 kill cannot replace that atomic operation.
 
-Move flock ownership into independent guardians, with an explicit fault model:
+The macOS implementation now uses cooperating supervisor/guardian custody.
+For stronger containment and other hosts, extend this explicit fault model:
 at least one dedicated holder survives any single supervised process failure.
 Guardians must receive durable membership and exit evidence before admission,
 retain exclusion while recovering a dead worker/supervisor, and never pass

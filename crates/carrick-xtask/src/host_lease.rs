@@ -55,9 +55,7 @@ pub enum HostLeaseError {
     },
     #[error("child process error: {0}")]
     ChildWait(#[source] io::Error),
-    #[error(
-        "host-lease cleanup incomplete during {operation}: {source}; lease released; run failed"
-    )]
+    #[error("host-lease cleanup incomplete during {operation}: {source}; run failed")]
     Cleanup {
         operation: &'static str,
         #[source]
@@ -80,9 +78,8 @@ pub enum HostLeaseError {
 }
 
 pub struct HostLease {
-    // Production workloads run below lease_supervisor, which alone owns this
-    // holder through successful cancellation, exit and reaping; cleanup failures
-    // release with a typed failed-run error rather than retaining forever.
+    // Commands never own this holder. macOS supervisor/guardian custody
+    // retains the shared description across either custodian's death.
     _holder: Option<LeaseHolder>,
     _scope: Option<OwnedFd>,
     socket: PathBuf,
@@ -144,7 +141,8 @@ impl Drop for LeaseHolder {
         if let Some(server) = self.server.take() {
             let _ = server.join();
         }
-        // The owned guard unlocks after the server stops, then closes its fd.
+        // Direct guards unlock here; supervised macOS custody releases only
+        // when the supervisor and guardian have both closed their copies.
         // Unrelated fork copies cannot extend this lease; clients never own it.
     }
 }
@@ -269,6 +267,19 @@ impl HostLease {
             std::thread::sleep(duration);
             Ok(false)
         })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn guardian_custody(&mut self) -> io::Result<OwnedFd> {
+        let holder = self
+            ._holder
+            .as_mut()
+            .ok_or_else(|| io::Error::other("supervisor must own lease"))?;
+        let duplicate = holder._fd.try_clone()?;
+        // Neither cooperating holder may explicitly unlock the shared file
+        // description: release is the last close after workload cleanup.
+        holder._fd.retain_until_last_close();
+        Ok(duplicate.into())
     }
 
     pub(crate) fn acquire_supervised(
