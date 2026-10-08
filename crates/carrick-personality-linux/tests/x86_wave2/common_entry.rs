@@ -9,7 +9,13 @@ use carrick_el1_abi::{
     PendingSignals, ThreadControlSlot, ThreadLifecyclePage, TrapFrame,
 };
 use carrick_guest_arch::{CanonicalNr, GuestIsa, NativeReturnWord, SyscallFrame, UserVa};
-use carrick_personality_linux::entry::decode_x86_snapshot;
+use carrick_personality_linux::dispatch::FamilyCompletion;
+use carrick_personality_linux::entry::{
+    CanonicalCall, SyscallResult, decode_aarch64, decode_x86_snapshot,
+};
+use carrick_personality_linux::pending_anonymous::{
+    DelegatedStep, PendingAnonymousVenue, PermissionStep, RetirementStep,
+};
 use carrick_x86::cpl0_entry::NativeFrame;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::boxed::Box;
@@ -145,6 +151,7 @@ impl World {
             None::<dispatch::Zone<'_, super::NoCpu, sched::HardwareUserWord>>,
             None,
             Some(&*self.venue),
+            None,
             |_| core::ptr::null_mut(),
         );
         (action, frame)
@@ -173,6 +180,168 @@ impl World {
     }
     fn forwarded(&self) -> u64 {
         self.counters.forwarded[SET_ROBUST_LIST].load(Ordering::Relaxed)
+    }
+}
+
+fn serve_full<'a, Context: dispatch::DispatchContext + 'a>(
+    call: &CanonicalCall,
+    world: &'a World,
+    anonymous: &'a mut dyn PendingAnonymousVenue,
+    mut process: Option<&'a mut dyn carrick_personality_linux::lifecycle::ProcessNative<Context>>,
+    source: Option<carrick_core_abi::BornInZoneSource<'a, Context>>,
+) -> (carrick_personality_linux::dispatch::CompletionRoute, i64) {
+    let mut frame = X86Frame {
+        canonical: call.canonical,
+        args: call.args,
+        rax: call.native.raw(),
+        slot: source.map_or(0, |source| source.slot.index()),
+        stack: call.stack,
+        publications: &world.publications,
+    };
+    let route = dispatch::dispatch_syscall_with_native(
+        &mut frame,
+        &world.counters,
+        &world.tasks,
+        &[],
+        &[],
+        &[],
+        &[],
+        &InotifyNameCache::new(),
+        None::<dispatch::Zone<'_, super::NoCpu, sched::HardwareUserWord>>,
+        None,
+        Some(&*world.venue),
+        process.as_mut().map(|process| {
+            &mut **process
+                as &mut (dyn carrick_personality_linux::lifecycle::ProcessNative<Context> + '_)
+        }),
+        source,
+        Some(anonymous),
+        |_| core::ptr::null_mut(),
+    );
+    (route, frame.result().0 as i64)
+}
+fn served_result(
+    (route, result): (carrick_personality_linux::dispatch::CompletionRoute, i64),
+) -> Option<i64> {
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    matches!(route, CompletionRoute::Served | CompletionRoute::WithWork).then_some(result)
+}
+
+struct AnonymousBreak;
+impl PendingAnonymousVenue for AnonymousBreak {
+    fn original_argument0(&self) -> u64 {
+        0
+    }
+    fn task_state(&self) -> Option<&carrick_personality_linux::abi::entry::LinuxTaskState> {
+        None
+    }
+    fn delegated(&mut self) -> DelegatedStep {
+        DelegatedStep::Served(SyscallResult::new(0x403000))
+    }
+    fn park_prepared(&mut self) -> Option<FamilyCompletion> {
+        None
+    }
+    fn permission(&mut self) -> PermissionStep {
+        PermissionStep::Forward
+    }
+    fn retirement(&mut self) -> RetirementStep {
+        RetirementStep::Forward
+    }
+    fn install_result(&mut self, _: SyscallResult) {}
+}
+
+#[test]
+fn x86_brk_enters_the_common_linux_anonymous_route() {
+    let world = World::new(LifecycleHatches::ON);
+    let call = decode_x86_snapshot(
+        NativeFrame {
+            rax: 12,
+            rsp: 0x7fff_0000,
+            ..Default::default()
+        }
+        .snapshot(),
+    )
+    .unwrap();
+    let mut anonymous = AnonymousBreak;
+    let result =
+        serve_full::<carrick_sched_core::ThreadCtx>(&call, &world, &mut anonymous, None, None);
+    assert_eq!(
+        served_result(result),
+        Some(0x403000),
+        "canonical: {:?}; served: {}; forwarded: {}",
+        call.canonical,
+        world.counters.served[214].load(Ordering::Relaxed),
+        world.counters.forwarded[214].load(Ordering::Relaxed)
+    );
+    assert_eq!(world.counters.served[214].load(Ordering::Relaxed), 1);
+    assert_eq!(world.counters.forwarded[214].load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn anonymous_result_is_not_installed_after_execution_changes() {
+    struct InvalidatingAnonymous<'a>(&'a AtomicU64);
+    impl PendingAnonymousVenue for InvalidatingAnonymous<'_> {
+        fn original_argument0(&self) -> u64 {
+            0x7000
+        }
+        fn task_state(&self) -> Option<&carrick_personality_linux::abi::entry::LinuxTaskState> {
+            None
+        }
+        fn delegated(&mut self) -> DelegatedStep {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            DelegatedStep::Served(SyscallResult::new(0x403000))
+        }
+        fn park_prepared(&mut self) -> Option<FamilyCompletion> {
+            None
+        }
+        fn permission(&mut self) -> PermissionStep {
+            PermissionStep::Forward
+        }
+        fn retirement(&mut self) -> RetirementStep {
+            RetirementStep::Forward
+        }
+        fn install_result(&mut self, _: SyscallResult) {
+            panic!("native result must use authenticated common finish")
+        }
+    }
+    let world = World::new(LifecycleHatches::ON);
+    let call =
+        carrick_personality_linux::entry::decode_x86_64(12, [0x7000, 0, 0, 0, 0, 0], 0x7fff0000);
+    let mut anonymous = InvalidatingAnonymous(&world.tasks[0].execution.generation);
+    let (route, result) =
+        serve_full::<carrick_sched_core::ThreadCtx>(&call, &world, &mut anonymous, None, None);
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion
+    );
+    assert_eq!(
+        result, 12,
+        "the completed value must not enter an unauthenticated return frame"
+    );
+    assert_eq!(world.counters.served[214].load(Ordering::Relaxed), 0);
+    assert_eq!(
+        world.counters.forwarded[214].load(Ordering::Relaxed),
+        0,
+        "an effect must not be forwarded for replay"
+    );
+}
+
+#[test]
+fn arm_process_calls_still_forward_without_native_hooks() {
+    let world = World::new(LifecycleHatches::ON);
+    for number in [94, 260] {
+        let call = decode_aarch64(number, [0; 6], 0x7000);
+        assert_eq!(
+            serve_full::<carrick_sched_core::ThreadCtx>(
+                &call,
+                &world,
+                &mut AnonymousBreak,
+                None,
+                None
+            )
+            .0,
+            carrick_personality_linux::dispatch::CompletionRoute::Forward,
+        );
     }
 }
 
@@ -395,6 +564,7 @@ pub(super) fn x4_linux_common_entry() {
                         None::<dispatch::Zone<'_, super::NoCpu, sched::HardwareUserWord>>,
                         None,
                         Some(&*w.venue),
+                        None,
                         |_| core::ptr::null_mut()
                     ),
                     Action::ServedWithWork
@@ -442,5 +612,313 @@ pub(super) fn x4_linux_common_entry() {
             assert_eq!(w.heads(), before);
             word.store(original, Ordering::Release);
         }
+    }
+}
+
+#[test]
+fn common_linux_entry_calls_native_process_custody() {
+    use carrick_personality_linux::lifecycle::{LifecycleOutcome, ProcessNative, ProcessWaitPid};
+    struct Process {
+        binding: carrick_core_abi::ExecutionBinding,
+        visits: std::vec::Vec<u64>,
+        idle: bool,
+    }
+    impl ProcessNative for Process {
+        fn binding(&self) -> carrick_core_abi::ExecutionBinding {
+            self.binding
+        }
+        fn fork(&mut self) -> LifecycleOutcome {
+            self.visits.push(57);
+            LifecycleOutcome::Returned {
+                result: SyscallResult::new(42),
+                work: false,
+            }
+        }
+        fn wait4(
+            &mut self,
+            pid: ProcessWaitPid,
+            status: UserVa,
+            options: carrick_personality_linux::lifecycle::LinuxWaitOptions,
+            rusage: UserVa,
+        ) -> LifecycleOutcome {
+            assert_eq!(pid.raw(), 42);
+            assert_eq!(status.raw(), 0x7000);
+            assert_eq!(options.bits(), 0);
+            assert_eq!(rusage.raw(), 0x8000);
+            self.visits.push(61);
+            if self.idle {
+                return LifecycleOutcome::Transferred {
+                    progress: carrick_core_abi::Served::Idle,
+                    result: SyscallResult::new(0),
+                };
+            }
+            LifecycleOutcome::Returned {
+                result: SyscallResult::new(42),
+                work: false,
+            }
+        }
+        fn exit_group(&mut self, status: u8) -> LifecycleOutcome {
+            assert_eq!(status, 7);
+            self.visits.push(231);
+            LifecycleOutcome::Returned {
+                result: SyscallResult::new(0),
+                work: false,
+            }
+        }
+    }
+    let world = World::new(LifecycleHatches::ON);
+    let mut process = Process {
+        binding: execution_binding(&world.tasks[0]),
+        visits: std::vec::Vec::new(),
+        idle: false,
+    };
+    let mut anonymous = AnonymousBreak;
+    for (native, args, result) in [
+        (57, [0; 6], 42),
+        (61, [42, 0x7000, 0, 0x8000, 0, 0], 42),
+        (231, [7, 0, 0, 0, 0, 0], 0),
+    ] {
+        let call = carrick_personality_linux::entry::decode_x86_64(native, args, 0x7fff0000);
+        assert_eq!(
+            served_result(serve_full(
+                &call,
+                &world,
+                &mut anonymous,
+                Some(&mut process),
+                None
+            )),
+            Some(result)
+        );
+        assert_eq!(
+            world
+                .counters
+                .forwarded
+                .iter()
+                .map(|count| count.load(Ordering::Relaxed))
+                .sum::<u64>(),
+            0
+        );
+    }
+    assert_eq!(process.visits, [57, 61, 231]);
+    process.idle = true;
+    let call = carrick_personality_linux::entry::decode_x86_64(
+        61,
+        [42, 0x7000, 0, 0x8000, 0, 0],
+        0x7fff0000,
+    );
+    assert_eq!(
+        serve_full(&call, &world, &mut anonymous, Some(&mut process), None).0,
+        carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion
+    );
+    assert_eq!(process.visits, [57, 61, 231, 61]);
+    assert_eq!(
+        world
+            .counters
+            .forwarded
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .sum::<u64>(),
+        0
+    );
+    process.binding = execution_binding(&world.tasks[1]);
+    let call = carrick_personality_linux::entry::decode_x86_64(57, [0; 6], 0x7fff0000);
+    assert_eq!(
+        serve_full(&call, &world, &mut anonymous, Some(&mut process), None).0,
+        carrick_personality_linux::dispatch::CompletionRoute::Forward
+    );
+    assert_eq!(process.visits, [57, 61, 231, 61]);
+    process.binding = execution_binding(&world.tasks[0]);
+    for index in 1..6 {
+        let mut args = [17, 0, 0, 0, 0, 0];
+        args[index] = 0x1000;
+        let call = carrick_personality_linux::entry::decode_x86_64(56, args, 0x7fff0000);
+        assert_eq!(
+            serve_full(&call, &world, &mut anonymous, Some(&mut process), None).0,
+            carrick_personality_linux::dispatch::CompletionRoute::Forward
+        );
+        assert_eq!(
+            process.visits,
+            [57, 61, 231, 61],
+            "unsupported clone shape must not call fork"
+        );
+    }
+}
+
+#[test]
+fn compact_common_entry_suspends_only_after_authenticated_park() {
+    use carrick_core_abi::{BornInZoneSource, EntryHandoffReceipt};
+    use carrick_personality_linux::lifecycle::{LifecycleOutcome, ProcessNative, ProcessWaitPid};
+    use carrick_sched_core::{
+        ExecutionSlot, ParkedContextWords, SlotId, ThreadIdentity, ZoneTables,
+    };
+    struct Process<'a> {
+        binding: carrick_core_abi::ExecutionBinding,
+        source: BornInZoneSource<'a, ParkedContextWords>,
+        record: carrick_sched_core::RecordId,
+        receipt: Option<EntryHandoffReceipt<ParkedContextWords>>,
+        visits: usize,
+    }
+    impl ProcessNative<ParkedContextWords> for Process<'_> {
+        fn binding(&self) -> carrick_core_abi::ExecutionBinding {
+            self.binding
+        }
+        fn take_handoff_receipt(&mut self) -> Option<EntryHandoffReceipt<ParkedContextWords>> {
+            self.receipt.take()
+        }
+        fn fork(&mut self) -> LifecycleOutcome {
+            panic!("wrong lifecycle family")
+        }
+        fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
+            panic!("wrong lifecycle family")
+        }
+        fn wait4(
+            &mut self,
+            pid: ProcessWaitPid,
+            status: UserVa,
+            options: carrick_personality_linux::lifecycle::LinuxWaitOptions,
+            rusage: UserVa,
+        ) -> LifecycleOutcome {
+            assert_eq!(pid.raw(), 72);
+            assert_eq!(status.raw(), 0x7000);
+            assert_eq!(options.bits(), 0);
+            assert_eq!(rusage.raw(), 0);
+            self.visits += 1;
+            let start =
+                carrick_core::entry::prepare_handoff(self.binding, self.source, self.record)
+                    .unwrap();
+            let zone = self.source.zone;
+            let guard = zone
+                .lock(
+                    ZoneTables::bucket_of(self.binding.mm.raw(), 0x1000),
+                    &carrick_sched_core::BoundedSpin(1024),
+                )
+                .unwrap();
+            let sequence = zone.next_seq(self.record);
+            zone.enqueue(
+                &guard,
+                self.record,
+                sequence,
+                self.binding.mm.raw(),
+                0x1000,
+                u32::MAX,
+                0,
+            )
+            .unwrap();
+            self.receipt = Some(
+                carrick_core::entry::publish_handoff_park(
+                    start,
+                    &guard,
+                    carrick_core_abi::EntryRecordGeneration(sequence),
+                )
+                .unwrap(),
+            );
+            zone.clear_current(self.source.slot);
+            LifecycleOutcome::Transferred {
+                progress: carrick_core_abi::Served::Idle,
+                result: SyscallResult::new(0),
+            }
+        }
+    }
+    for generation in [0, 11] {
+        type CompactZone = ZoneTables<ParkedContextWords>;
+        let layout = std::alloc::Layout::new::<CompactZone>();
+        // SAFETY: exact zero-initialized scheduler allocation with its native
+        // context alignment; Box retains it for this one entry turn.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<CompactZone>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let slot = SlotId::new(1);
+        let identity = ThreadIdentity {
+            tid: 71,
+            serial: 113,
+            mm: 29,
+            file_table: 9,
+            generation,
+            affinity: 2,
+            lifecycle_page: 0x1000,
+            control_slot: 0x2000,
+        };
+        zone.drive(slot, 3);
+        zone.publish_slot(slot, identity.mm, None, 0);
+        let here = ExecutionSlot::zone(slot);
+        zone.occupancy.vacate_any(here);
+        assert!(zone.occupancy.replace(here, 0, identity.mm));
+        zone.enter_guest(slot);
+        let space = zone
+            .spaces
+            .publish_closed(identity.mm, 0x9000, 0x9000)
+            .unwrap();
+        zone.spaces.open(space);
+        assert!(zone.install_space(slot, identity.mm).is_some());
+        let record = zone.alloc_record(identity).unwrap();
+        zone.requeue_preempted(slot, record);
+        assert_eq!(zone.switch_in(slot), Some(record));
+        let binding = carrick_core_abi::ExecutionBinding {
+            task: carrick_core_abi::EntryTaskKey::from_raw(identity.tid),
+            generation: carrick_core_abi::EntryGeneration::from_raw(identity.generation),
+            mm: carrick_core_abi::EntryMmKey::from_raw(identity.mm),
+            thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(identity.serial),
+        };
+        let source = BornInZoneSource { zone: &zone, slot };
+        let mut process = Process {
+            binding,
+            source,
+            record,
+            receipt: None,
+            visits: 0,
+        };
+        let mut world = World::new(LifecycleHatches::ON);
+        world.tasks[1].set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(identity.tid.try_into().unwrap()),
+            identity.generation,
+            identity.file_table,
+        );
+        world.tasks[1].mm.key.store(identity.mm, Ordering::Release);
+        world.tasks[1]
+            .mm
+            .thread_generation
+            .store(identity.serial, Ordering::Release);
+        world.venue.bindings[1] = binding;
+        let state = &world.tasks[1].linux;
+        state.orig_arg0.store(123, Ordering::Relaxed);
+        let counters = &world.counters;
+        let call = carrick_personality_linux::entry::decode_x86_64(
+            61,
+            [72, 0x7000, 0, 0, 0, 0],
+            0x7fff0000,
+        );
+        assert_eq!(
+            serve_full(
+                &call,
+                &world,
+                &mut AnonymousBreak,
+                Some(&mut process),
+                Some(source)
+            )
+            .0,
+            carrick_personality_linux::dispatch::CompletionRoute::Suspended
+        );
+        assert_eq!(process.visits, 1);
+        assert!(process.receipt.is_none());
+        assert!(zone.slot(slot).current().is_none());
+        assert_eq!(state.orig_arg0.load(Ordering::Relaxed), 123);
+        assert_eq!(
+            counters
+                .forwarded
+                .iter()
+                .map(|v| v.load(Ordering::Relaxed))
+                .sum::<u64>(),
+            0
+        );
+        assert_eq!(
+            counters
+                .served
+                .iter()
+                .map(|v| v.load(Ordering::Relaxed))
+                .sum::<u64>(),
+            1
+        );
     }
 }

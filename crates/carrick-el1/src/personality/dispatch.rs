@@ -294,6 +294,7 @@ where
         zone,
         ipc,
         lifecycle::guest_venue(),
+        None,
         cache_lookup,
     )
 }
@@ -314,6 +315,7 @@ pub fn dispatch_syscall_with_lifecycle<'a, F, C, U, G>(
     zone: Option<Zone<'a, C, U>>,
     ipc: Option<&'a ipc::IpcVenue<'a>>,
     lifecycle: Option<&'a dyn lifecycle::LifecycleVenue>,
+    process: Option<&'a mut dyn lifecycle::ProcessNative>,
     cache_lookup: F,
 ) -> Action
 where
@@ -321,6 +323,99 @@ where
     C: sched::ThreadCpu,
     U: sched::UserWord,
     G: GuestDispatchFrame,
+{
+    match dispatch_syscall_with_native(
+        frame,
+        counters,
+        current_tasks,
+        fd_map,
+        object_table,
+        open_table,
+        inotify_table,
+        name_cache,
+        zone,
+        ipc,
+        lifecycle,
+        process,
+        None,
+        None,
+        cache_lookup,
+    ) {
+        carrick_personality_linux::dispatch::CompletionRoute::Served => Action::Served,
+        carrick_personality_linux::dispatch::CompletionRoute::WithWork => Action::ServedWithWork,
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended => Action::Idle,
+        carrick_personality_linux::dispatch::CompletionRoute::Forward => Action::Forward,
+        carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion => {
+            invalid_completion()
+        }
+    }
+}
+
+/// Exact context capability for the shared dispatcher. Only the ARM context
+/// can obtain an ARM scheduler source or consume an ARM scheduler receipt.
+pub trait DispatchContext: carrick_el1_abi::EntryContext {
+    fn arm_source(
+        zone: &ZoneTables,
+        slot: SlotId,
+    ) -> Option<carrick_el1_abi::BornInZoneSource<'_, Self>>;
+    fn arm_receipt(
+        receipt: carrick_el1_abi::EntryHandoffReceipt,
+    ) -> Option<carrick_el1_abi::EntryHandoffReceipt<Self>>;
+}
+impl DispatchContext for carrick_sched_core::ThreadCtx {
+    fn arm_source(
+        zone: &ZoneTables,
+        slot: SlotId,
+    ) -> Option<carrick_el1_abi::BornInZoneSource<'_, Self>> {
+        Some(carrick_el1_abi::BornInZoneSource { zone, slot })
+    }
+    fn arm_receipt(
+        receipt: carrick_el1_abi::EntryHandoffReceipt,
+    ) -> Option<carrick_el1_abi::EntryHandoffReceipt<Self>> {
+        Some(receipt)
+    }
+}
+impl DispatchContext for carrick_sched_core::ParkedContextWords {
+    fn arm_source(
+        _: &ZoneTables,
+        _: SlotId,
+    ) -> Option<carrick_el1_abi::BornInZoneSource<'_, Self>> {
+        None
+    }
+    fn arm_receipt(
+        _: carrick_el1_abi::EntryHandoffReceipt,
+    ) -> Option<carrick_el1_abi::EntryHandoffReceipt<Self>> {
+        None
+    }
+}
+
+/// Supply native process and anonymous custody to the same full Linux pipeline.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_syscall_with_native<'a, F, C, U, G, Context>(
+    frame: &'a mut G,
+    counters: &'a Counters,
+    current_tasks: &'a [CurrentTask],
+    fd_map: &'a [FdMapSlot],
+    object_table: &'a [DelegatedFile],
+    open_table: &'a [DelegatedOpenFile],
+    inotify_table: &'a [DelegatedInotify],
+    name_cache: &'a InotifyNameCache,
+    zone: Option<Zone<'a, C, U>>,
+    ipc: Option<&'a ipc::IpcVenue<'a>>,
+    lifecycle: Option<&'a dyn lifecycle::LifecycleVenue>,
+    process: Option<&'a mut dyn lifecycle::ProcessNative<Context>>,
+    source: Option<carrick_el1_abi::BornInZoneSource<'a, Context>>,
+    anonymous: Option<
+        &'a mut dyn carrick_personality_linux::pending_anonymous::PendingAnonymousVenue,
+    >,
+    cache_lookup: F,
+) -> carrick_personality_linux::dispatch::CompletionRoute
+where
+    F: Fn(u32) -> *mut u8,
+    C: sched::ThreadCpu,
+    U: sched::UserWord,
+    G: GuestDispatchFrame,
+    Context: DispatchContext + 'a,
 {
     let ordinal = frame.canonical_ordinal().raw();
     let mut pending = El1PendingFamilies {
@@ -338,6 +433,9 @@ where
         zone,
         ipc,
         lifecycle,
+        process,
+        source,
+        anonymous,
         cache_lookup,
     };
     let control = if cfg!(feature = "allocator-test-control") {
@@ -345,15 +443,7 @@ where
     } else {
         u64::MAX
     };
-    match carrick_personality_linux::dispatch::dispatch(ordinal, control, &mut pending) {
-        carrick_personality_linux::dispatch::CompletionRoute::Served => Action::Served,
-        carrick_personality_linux::dispatch::CompletionRoute::WithWork => Action::ServedWithWork,
-        carrick_personality_linux::dispatch::CompletionRoute::Suspended => Action::Idle,
-        carrick_personality_linux::dispatch::CompletionRoute::Forward => Action::Forward,
-        carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion => {
-            invalid_completion()
-        }
-    }
+    carrick_personality_linux::dispatch::dispatch(ordinal, control, &mut pending)
 }
 
 /// A completed effect must never be forwarded for syscall replay when its
@@ -374,6 +464,7 @@ pub struct El1PendingFamilies<
     C: sched::ThreadCpu,
     U: sched::UserWord,
     G: GuestDispatchFrame = TrapFrame,
+    Context: DispatchContext = carrick_sched_core::ThreadCtx,
 > {
     pub(super) handoff: Option<carrick_el1_abi::EntryHandoffReceipt>,
     #[cfg(test)]
@@ -389,28 +480,48 @@ pub struct El1PendingFamilies<
     pub(super) zone: Option<Zone<'a, C, U>>,
     pub(super) ipc: Option<&'a ipc::IpcVenue<'a>>,
     pub(super) lifecycle: Option<&'a dyn lifecycle::LifecycleVenue>,
+    pub(super) process: Option<&'a mut dyn lifecycle::ProcessNative<Context>>,
+    pub(super) source: Option<carrick_el1_abi::BornInZoneSource<'a, Context>>,
+    pub(super) anonymous:
+        Option<&'a mut dyn carrick_personality_linux::pending_anonymous::PendingAnonymousVenue>,
     pub(super) cache_lookup: F,
 }
-impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame>
-    PendingFamilies<'a> for El1PendingFamilies<'a, F, C, U, G>
+impl<
+    'a,
+    F: Fn(u32) -> *mut u8,
+    C: sched::ThreadCpu,
+    U: sched::UserWord,
+    G: GuestDispatchFrame,
+    Context: DispatchContext,
+> PendingFamilies<'a, Context> for El1PendingFamilies<'a, F, C, U, G, Context>
 {
-    fn take_handoff_receipt(&mut self) -> Option<carrick_el1_abi::EntryHandoffReceipt> {
-        self.handoff.take()
+    fn take_handoff_receipt(&mut self) -> Option<carrick_el1_abi::EntryHandoffReceipt<Context>> {
+        self.process
+            .as_deref_mut()
+            .and_then(|process| process.take_handoff_receipt())
+            .or_else(|| self.handoff.take().and_then(Context::arm_receipt))
     }
     fn binding(&self) -> Option<carrick_el1_abi::ExecutionBinding> {
         self.task().map(super::common_entry::execution_binding)
     }
-    fn record_source(&self) -> Option<carrick_el1_abi::BornInZoneSource<'a>> {
-        Some(carrick_el1_abi::BornInZoneSource {
-            zone: self.zone.as_ref()?.tables,
-            slot: self.frame.slot()?,
-        })
+    fn record_source(&self) -> Option<carrick_el1_abi::BornInZoneSource<'a, Context>> {
+        self.source
+            .or_else(|| Context::arm_source(self.zone.as_ref()?.tables, self.frame.slot()?))
     }
-    #[cfg(target_os = "none")]
     fn anonymous_venue(
         &mut self,
     ) -> Option<&mut dyn carrick_personality_linux::pending_anonymous::PendingAnonymousVenue> {
-        Some(self)
+        if self.anonymous.is_some() {
+            return self.anonymous.as_mut().map(|anonymous| &mut **anonymous as &mut dyn carrick_personality_linux::pending_anonymous::PendingAnonymousVenue);
+        }
+        #[cfg(target_os = "none")]
+        {
+            Some(self)
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            None
+        }
     }
     fn file_venue(&mut self) -> Option<&mut dyn PendingFileVenue> {
         Some(self)
@@ -443,7 +554,9 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: Gues
     fn lifecycle_native(
         &mut self,
     ) -> Option<&mut dyn carrick_personality_linux::lifecycle::LifecycleNative<'a>> {
-        self.lifecycle?;
+        if self.lifecycle.is_none() && self.process.is_none() {
+            return None;
+        }
         self.current_tasks.get(self.frame.task_index())?;
         Some(self)
     }
@@ -555,7 +668,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: Gues
         self.ipc.is_some()
     }
     fn lifecycle_available(&self) -> bool {
-        self.lifecycle.is_some()
+        self.lifecycle.is_some() || self.process.is_some()
     }
     fn lifecycle_work_counters(&self) -> Option<LifecycleWorkCounters<'_>> {
         Some(LifecycleWorkCounters {
@@ -584,9 +697,14 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: Gues
     }
 }
 #[cfg(target_os = "none")]
-impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame>
-    carrick_personality_linux::pending_anonymous::PendingAnonymousVenue
-    for El1PendingFamilies<'_, F, C, U, G>
+impl<
+    F: Fn(u32) -> *mut u8,
+    C: sched::ThreadCpu,
+    U: sched::UserWord,
+    G: GuestDispatchFrame,
+    Context: DispatchContext,
+> carrick_personality_linux::pending_anonymous::PendingAnonymousVenue
+    for El1PendingFamilies<'_, F, C, U, G, Context>
 {
     fn original_argument0(&self) -> u64 {
         self.frame.argument(0).unwrap_or(0)
@@ -714,8 +832,8 @@ pub(super) fn native_scheduler<'s, C: sched::ThreadCpu, U: sched::UserWord>(
     }
 }
 
-impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame>
-    El1PendingFamilies<'_, F, C, U, G>
+impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context: DispatchContext>
+    El1PendingFamilies<'_, F, C, U, G, Context>
 {
     fn ipc_transfer(&mut self) -> FamilyCompletion {
         let Some(venue) = &self.ipc else {
@@ -755,8 +873,13 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame>
     }
 }
 
-impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame>
-    PendingFileVenue for El1PendingFamilies<'_, F, C, U, G>
+impl<
+    F: Fn(u32) -> *mut u8,
+    C: sched::ThreadCpu,
+    U: sched::UserWord,
+    G: GuestDispatchFrame,
+    Context: DispatchContext,
+> PendingFileVenue for El1PendingFamilies<'_, F, C, U, G, Context>
 {
     fn ordinal(&self) -> u64 {
         self.frame.canonical_ordinal().raw()
@@ -841,8 +964,8 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDis
             .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
     }
 }
-impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame>
-    El1PendingFamilies<'_, F, C, U, G>
+impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context: DispatchContext>
+    El1PendingFamilies<'_, F, C, U, G, Context>
 {
     fn file_access(&self) -> crate::substrate::file_notification::FileAccess<'_> {
         match (self.zone.as_ref(), self.frame.slot()) {
@@ -1086,6 +1209,7 @@ mod tests {
             None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
             None,
             None,
+            None,
             |_| core::ptr::null_mut(),
         );
         assert_eq!(action, Action::Forward);
@@ -1147,6 +1271,9 @@ mod tests {
                     zone: None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
                     ipc: None,
                     lifecycle: Some(&venue),
+                    process: None::<&mut dyn carrick_personality_linux::lifecycle::ProcessNative>,
+                    source: None,
+                    anonymous: None,
                     cache_lookup: |_| core::ptr::null_mut(),
                 };
                 assert_eq!(
@@ -1320,6 +1447,11 @@ mod tests {
                             }),
                             ipc: None,
                             lifecycle: None,
+                            process: None::<
+                                &mut dyn carrick_personality_linux::lifecycle::ProcessNative,
+                            >,
+                            source: None,
+                            anonymous: None,
                             cache_lookup: |_| core::ptr::null_mut(),
                         };
                         assert_eq!(

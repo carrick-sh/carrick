@@ -1,6 +1,7 @@
 //! The single Linux ordinal-to-family routing table.
 use crate::abi::entry::SyscallResult;
 use crate::lifecycle::{LifecycleCall, LifecycleOutcome};
+use carrick_core_abi::EntryContext;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AnonymousCall {
@@ -156,12 +157,12 @@ impl EntryCounters<'_> {
 /// Temporary order-5 seam for families whose bodies move in orders 6-9.
 /// Methods disappear with their named order; implementations never select a
 /// different family and never publish entry completion.
-pub trait PendingFamilies<'a> {
-    fn take_handoff_receipt(&mut self) -> Option<carrick_core_abi::EntryHandoffReceipt> {
+pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadCtx> {
+    fn take_handoff_receipt(&mut self) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
         None
     }
     fn binding(&self) -> Option<carrick_core_abi::ExecutionBinding>;
-    fn record_source(&self) -> Option<carrick_core_abi::BornInZoneSource<'a>> {
+    fn record_source(&self) -> Option<carrick_core_abi::BornInZoneSource<'a, C>> {
         None
     }
     fn anonymous_venue(
@@ -307,7 +308,11 @@ pub trait PendingFamilies<'a> {
 }
 
 /// The sole ordinal routing decision and family completion owner.
-fn serve_family(family: Family, ordinal: u64, pending: &mut dyn PendingFamilies<'_>) -> FamilyRun {
+fn serve_family<'a, C: EntryContext + 'a>(
+    family: Family,
+    ordinal: u64,
+    pending: &mut dyn PendingFamilies<'a, C>,
+) -> FamilyRun {
     if let Family::Lifecycle(call) = family {
         let original = pending.original_argument0();
         return pending
@@ -324,8 +329,25 @@ fn serve_family(family: Family, ordinal: u64, pending: &mut dyn PendingFamilies<
                 }
             });
     }
+    let mut returned = None;
     let completion = match family {
-        Family::Anonymous(call) => pending.anonymous(call),
+        Family::Anonymous(call) => {
+            // A native venue can retain a separate operation frame. Transport
+            // its completed result through the same authenticated finish as
+            // lifecycle results; never replay or alter a switched context.
+            let original = pending.original_argument0();
+            let completion = pending.anonymous(call);
+            returned = match completion {
+                FamilyCompletion::Complete(value)
+                | FamilyCompletion::CompleteWithWork(value)
+                | FamilyCompletion::AccountedComplete(value)
+                | FamilyCompletion::CommitOwed(value) => {
+                    Some((SyscallResult::new(value), original))
+                }
+                _ => None,
+            };
+            completion
+        }
         Family::Read => pending.read(),
         Family::Write => pending.write(),
         Family::EpollWait => pending.epoll_wait(),
@@ -338,7 +360,10 @@ fn serve_family(family: Family, ordinal: u64, pending: &mut dyn PendingFamilies<
         Family::AllocatorControl => pending.allocator_control(),
         Family::Unported => FamilyCompletion::Forward,
     };
-    completion.into()
+    FamilyRun {
+        completion,
+        returned,
+    }
 }
 
 /// Route one AArch64 Linux ordinal. Family implementations are temporary
@@ -364,7 +389,12 @@ pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
         135 => Family::Lifecycle(LifecycleCall::SigProcMask),
         99 => Family::Lifecycle(LifecycleCall::SetRobustList),
         178 => Family::Lifecycle(LifecycleCall::GetTid),
+        172 => Family::Lifecycle(LifecycleCall::GetPid),
         220 => Family::Lifecycle(LifecycleCall::Clone),
+        nr if nr == carrick_syscall_abi::nr::WAIT4.raw() => Family::Lifecycle(LifecycleCall::Wait4),
+        nr if nr == carrick_syscall_abi::nr::EXIT_GROUP.raw() => {
+            Family::Lifecycle(LifecycleCall::ExitGroup)
+        }
         nr if allocator_control != u64::MAX && nr == allocator_control => Family::AllocatorControl,
         _ => Family::Unported,
     }
@@ -405,9 +435,9 @@ pub fn completion_route(completion: FamilyCompletion, pending: bool) -> Completi
 // The retained allocator-test transport previously runs without a loaded task.
 // It is an explicitly enabled diagnostic, never a guest Linux admission and
 // never a fabricated task/MM identity. Its routing still has this one owner.
-enum CompletionAuthority<'a> {
-    Entry(carrick_core_abi::EntryCompletion<'a>),
-    BornInZone(carrick_core_abi::BornEntryCompletion<'a>),
+enum CompletionAuthority<'a, C: EntryContext> {
+    Entry(carrick_core_abi::EntryCompletion<'a, C>),
+    BornInZone(carrick_core_abi::BornEntryCompletion<'a, C>),
     AllocatorDiagnostic,
 }
 
@@ -424,11 +454,11 @@ impl From<FamilyCompletion> for FamilyRun {
     }
 }
 
-fn finish<'a>(
+fn finish<'a, C: EntryContext + 'a>(
     ordinal: u64,
     run: FamilyRun,
-    pending: &mut dyn PendingFamilies<'a>,
-    authority: CompletionAuthority<'a>,
+    pending: &mut dyn PendingFamilies<'a, C>,
+    authority: CompletionAuthority<'a, C>,
 ) -> CompletionRoute {
     let result = run.completion;
     let transfers = matches!(
@@ -486,10 +516,10 @@ fn finish<'a>(
 
 /// One routing and completion owner. A retained IPC operation is offered to
 /// its family before any fresh descriptor lookup, even with return work pending.
-pub fn dispatch<'a>(
+pub fn dispatch<'a, C: EntryContext + 'a>(
     ordinal: u64,
     control: u64,
-    pending: &mut dyn PendingFamilies<'a>,
+    pending: &mut dyn PendingFamilies<'a, C>,
 ) -> CompletionRoute {
     let family = route_aarch64(ordinal, control);
     let completion = match pending.binding().and_then(|binding| {

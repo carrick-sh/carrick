@@ -578,6 +578,14 @@ pub trait GuestMemory {
         self.read_bytes_raw(address, length)
     }
 
+    /// Copy the readable prefix for an I/O operation that Linux may complete
+    /// short after a later user-page fault. The default retains exact-copy
+    /// behavior; a stage-1 owner can stop at the first inaccessible page.
+    /// Callers must use the returned byte count as the transfer length.
+    fn read_bytes_prefix(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        self.read_bytes(address, length)
+    }
+
     /// PERMISSION-CHECKED guest write. DEFAULT: PROT_NONE gate then
     /// [`write_bytes_raw`](Self::write_bytes_raw). Backends/engines that model
     /// guest read-only syscall buffers add the no-write gate in their concrete

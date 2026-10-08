@@ -277,11 +277,8 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         #[cfg(target_arch = "x86_64")]
         let prepared = &mut carrick_core::mm::transfer::resolver::NoopPreparedResolver;
         #[cfg(target_arch = "x86_64")]
-        let mut cow = crate::fault::X86CowResolver {
-            pool: carrick_el1_abi::cow_grant_pool_guest(),
-            residency: carrick_el1_abi::frame_grant_residency_guest(),
-            completion: None,
-        };
+        // CPL0 COW is unavailable until its sole descriptor authority is bound.
+        let mut cow = carrick_core::mm::transfer::resolver::NoopCowResolver;
         #[cfg(target_arch = "aarch64")]
         let mut cow = crate::fault::HardwareCowResolver {
             publication: slots.executable(frame.slot as usize),
@@ -294,7 +291,7 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             carrick_core::mm::transaction::SelectionVenues {
                 prepared,
                 cow: &mut cow,
-                residency: carrick_el1_abi::frame_grant_residency_guest(),
+                residency: crate::isa::frame_grant_residency_guest(),
                 slot: frame.slot as u32,
             },
         )? {
@@ -429,7 +426,7 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     if apply_grant::<NativePortalMmu, _>(
         slot,
         &words,
-        carrick_el1_abi::frame_grant_residency_guest(),
+        crate::isa::frame_grant_residency_guest(),
         target,
         || {
             #[cfg(target_arch = "aarch64")]

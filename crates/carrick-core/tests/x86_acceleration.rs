@@ -2115,3 +2115,6 @@ fn x4_shared_wait_records() {
     assert_eq!(observed_key.get(), Some(wait_key));
     assert!(r_zone.completion_enabled(wait_key));
 }
+
+#[path = "../src/mm/transaction/compact_context.rs"]
+mod compact_context;

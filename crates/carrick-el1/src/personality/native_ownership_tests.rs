@@ -142,7 +142,15 @@ impl LiveProbe {
     }
 }
 impl AnonymousBackingProbe for LiveProbe {
-    fn backing(&mut self, ttbr0: u64, va: u64, len: u64) -> Stage1Backing {
+    fn backing(
+        &mut self,
+        ttbr0: carrick_guest_arch::AddressSpaceRegister,
+        va: carrick_guest_arch::UserVa,
+        len: carrick_guest_arch::GuestLen,
+    ) -> Stage1Backing {
+        let ttbr0 = ttbr0.raw();
+        let va = va.raw();
+        let len = len.raw();
         assert_eq!(ttbr0, self.tables.base());
         self.probes += 1;
         classify_stage1_range(
@@ -159,26 +167,34 @@ impl AnonymousBackingProbe for LiveProbe {
             len,
         )
     }
-    fn stock_span(&mut self, _mm: u64, _va: u64) -> Option<(u64, u64)> {
+    fn stock_span(
+        &mut self,
+        _mm: carrick_el1_abi::ReservationMm,
+        _va: carrick_guest_arch::UserVa,
+    ) -> Option<carrick_guest_arch::UserRange> {
         None
     }
 }
 impl AnonymousPermissionEditor for LiveProbe {
     fn protect_and_invalidate(
         &mut self,
-        _ttbr0: u64,
+        _ttbr0: carrick_guest_arch::AddressSpaceRegister,
         _edit: GuestPermissionEdit,
     ) -> Result<(), GuestPermissionEditError> {
+        let _ttbr0 = _ttbr0.raw();
         panic!("lazy-only witness must not invoke resident protection")
     }
 }
 impl AnonymousRetirementEditor for LiveProbe {
     fn retire_and_invalidate(
         &mut self,
-        _ttbr0: u64,
-        _address: u64,
-        _len: u64,
+        _ttbr0: carrick_guest_arch::AddressSpaceRegister,
+        _address: carrick_guest_arch::UserVa,
+        _len: carrick_guest_arch::GuestLen,
     ) -> Result<(), GuestRetirementError> {
+        let _ttbr0 = _ttbr0.raw();
+        let _address = _address.raw();
+        let _len = _len.raw();
         panic!("lazy-only witness must not invoke resident retirement")
     }
 }

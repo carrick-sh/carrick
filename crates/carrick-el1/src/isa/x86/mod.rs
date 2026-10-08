@@ -3,12 +3,14 @@
 use super::ArchError;
 
 pub mod context;
-pub mod initial_mm;
+pub mod fork_mm;
+pub mod live_context;
+pub use super::x86_initial_mm as initial_mm;
 pub mod interrupt;
-mod mmu;
+pub(super) mod mmu;
 pub mod transport;
 pub mod user_access;
-pub mod user_tables;
+pub use super::x86_user_tables as user_tables;
 
 pub mod interrupts;
 
@@ -39,8 +41,8 @@ impl carrick_guest_arch::ArchTypes for X86Backend {
 
 pub use context::{current_stack_slot, current_thread_cpu};
 pub use mmu::ForkDescriptorWords;
-pub(crate) use mmu::{NativeDescriptorWords, portal_descriptor_words, portal_invalidate_root};
 pub use mmu::{
     execute_native_edit_intent, hardware_live_root, portal_root_is_live, resident_leaf_matches,
 };
+pub(crate) use mmu::{portal_descriptor_words, portal_invalidate_root};
 pub use transport::{fatal_entry_binding, yield_host_effect};

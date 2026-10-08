@@ -64,12 +64,15 @@ impl Default for LinuxTaskState {
 pub struct LinuxTaskMetadata {
     pub lifecycle_page: AtomicU64,
     pub control_slot: AtomicU64,
+    /// Namespace-visible process leader, published by the task owner.
+    pub visible_pid: AtomicU32,
 }
 impl LinuxTaskMetadata {
     pub const fn new() -> Self {
         Self {
             lifecycle_page: AtomicU64::new(0),
             control_slot: AtomicU64::new(0),
+            visible_pid: AtomicU32::new(0),
         }
     }
 }
@@ -85,7 +88,7 @@ const _: () = {
     assert!(core::mem::offset_of!(LinuxTaskState, orig_arg0) == 16);
     assert!(core::mem::offset_of!(LinuxTaskState, pending_host_work) == 24);
     assert!(core::mem::offset_of!(LinuxTaskState, served_with_work) == 28);
-    assert!(core::mem::size_of::<LinuxTaskMetadata>() == 16);
+    assert!(core::mem::size_of::<LinuxTaskMetadata>() == 24);
 };
 
 /// What a thread owes the host after EL1 served its syscall with work.
@@ -176,14 +179,16 @@ mod layout_manifest {
                 size_of::<LinuxTaskMetadata>(),
                 align_of::<LinuxTaskMetadata>()
             ),
-            (16, 8)
+            (24, 8)
         );
         // Exhaustive pattern makes newly added fields require a manifest entry.
         let _ = |LinuxTaskMetadata {
                      lifecycle_page: _,
                      control_slot: _,
+                     visible_pid: _,
                  }: LinuxTaskMetadata| {};
         field!(LinuxTaskMetadata, lifecycle_page, AtomicU64, 0, 8, 8);
         field!(LinuxTaskMetadata, control_slot, AtomicU64, 8, 8, 8);
+        field!(LinuxTaskMetadata, visible_pid, AtomicU32, 16, 4, 4);
     }
 }

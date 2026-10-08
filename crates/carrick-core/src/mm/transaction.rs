@@ -4,13 +4,13 @@ use carrick_sched_core::SpaceEditor;
 
 /// # Safety
 /// `editor`, revision and output must be authenticated by the exact live MM owner.
-pub unsafe fn validate_selection<'a>(
+pub unsafe fn validate_selection<'a, Context: Copy + Send + Sync + zerocopy::FromZeros>(
     continuation: &TransferContinuation,
     selected: SelectedChunk,
-    editor: SpaceEditor<'a>,
+    editor: SpaceEditor<'a, Context>,
     generation: u64,
     output: Option<(u64, bool)>,
-) -> Result<Option<ValidatedChunk<'a>>, TransferError> {
+) -> Result<Option<ValidatedChunk<'a, Context>>, TransferError> {
     if !selected.matches(continuation) {
         return Err(TransferError::Stale);
     }

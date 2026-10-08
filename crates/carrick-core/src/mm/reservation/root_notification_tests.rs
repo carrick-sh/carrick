@@ -82,7 +82,7 @@ fn actual_root_release_publishes_blocked_probe() {
         carrick_sched_core::spaces::notification::SpaceReleaseVenue {
             zone,
             waker: carrick_sched_core::Waker::Host,
-            deliver,
+            deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(deliver),
         },
     )
     .unwrap();
@@ -139,7 +139,9 @@ fn wrong_region_notification_venue_is_rejected() {
             carrick_sched_core::spaces::notification::SpaceReleaseVenue {
                 zone: b.zone(),
                 waker: carrick_sched_core::Waker::Host,
-                deliver,
+                deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(
+                    deliver
+                ),
             }
         ),
         Err(Refusal::Stale)
@@ -168,7 +170,7 @@ fn delayed_old_root_admission_cannot_demote_reused_notification_word() {
         SpaceReleaseVenue {
             zone,
             waker: carrick_sched_core::Waker::Host,
-            deliver,
+            deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(deliver),
         },
     )
     .unwrap();

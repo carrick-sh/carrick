@@ -340,7 +340,12 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
 
 /// Holds one MM's metadata authority. Drop releases it; never carry this guard
 /// across host service, a context switch or descriptor/backing allocation.
-pub struct Reservations<'a, Policy: ReservationPolicy, Geometry: ReservationGeometry> {
+pub struct Reservations<
+    'a,
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros = carrick_sched_core::ThreadCtx,
+> {
     table: &'a SharedReservations<Policy, Geometry>,
     root: &'a Root,
     mm: ReservationMm,
@@ -357,14 +362,17 @@ pub struct Reservations<'a, Policy: ReservationPolicy, Geometry: ReservationGeom
     /// pool is empty. EL1's take one attempt and forward on `Busy`.
     host_holder: bool,
     host_proposal: bool,
-    release_venue: Option<RootReleaseVenue<'a, Policy, Geometry>>,
-    notification: Option<SpaceNotificationLease<'a>>,
+    release_venue: Option<RootReleaseVenue<'a, Policy, Geometry, C>>,
+    notification: Option<SpaceNotificationLease<'a, C>>,
     unlocked: ResourceUnlocked,
     pending_on_entry: bool,
     retiring_notifications: bool,
 }
-impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Drop
-    for Reservations<'_, Policy, Geometry>
+impl<
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+> Drop for Reservations<'_, Policy, Geometry, C>
 {
     fn drop(&mut self) {
         if let (Some(venue), Some(lease)) = (self.release_venue, &self.notification) {
@@ -500,6 +508,17 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         mm: ReservationMm,
         slot: u32,
     ) -> Result<Reservations<'_, Policy, Geometry>, Refusal> {
+        self.lock_el1_with_context(index, mm, slot)
+    }
+
+    /// The same source-free test acquisition with the caller's context ABI.
+    #[cfg(any(test, feature = "host-test"))]
+    pub fn lock_el1_with_context<Context: Copy + Send + Sync + zerocopy::FromZeros>(
+        &self,
+        index: usize,
+        mm: ReservationMm,
+        slot: u32,
+    ) -> Result<Reservations<'_, Policy, Geometry, Context>, Refusal> {
         self.lock_using(
             index,
             mm,
@@ -557,15 +576,15 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         })
     }
 
-    fn lock_using<'a>(
+    fn lock_using<'a, C: Copy + Send + Sync + zerocopy::FromZeros>(
         &'a self,
         index: usize,
         mm: ReservationMm,
         storage: RootStorageAccess<'a>,
         wait: &dyn RootWait,
         holder: u64,
-        authority: RootAuthority<'a, Policy, Geometry>,
-    ) -> Result<Reservations<'a, Policy, Geometry>, Refusal> {
+        authority: RootAuthority<'a, Policy, Geometry, C>,
+    ) -> Result<Reservations<'a, Policy, Geometry, C>, Refusal> {
         let RootStorageAccess { banks, identity } = storage;
         let release_venue = authority.release();
         if self.layout_hash.load(Ordering::Acquire) != Self::LAYOUT_HASH {
@@ -780,7 +799,12 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
 
 /// The host and guest translate this same offset, never persist either venue's
 /// pointer. The carrier owns the zeroed region throughout every borrowed view.
-impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, Policy, Geometry> {
+impl<
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+> Reservations<'_, Policy, Geometry, C>
+{
     fn state(&self) -> &State {
         unsafe { (&*self.root.state.get()).assume_init_ref() }
     }
@@ -2682,7 +2706,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
     /// generation; later edits of either MM never change the other.
     pub fn clone_into(
         &mut self,
-        child: &mut Reservations<'_, Policy, Geometry>,
+        child: &mut Reservations<'_, Policy, Geometry, C>,
     ) -> Result<(), Refusal> {
         if !core::ptr::eq(self.table, child.table) || core::ptr::eq(self.root, child.root) {
             return Err(Refusal::Invalid);
@@ -2746,7 +2770,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         &mut self,
         id: u32,
         list: &mut CopyList,
-        child: &mut Reservations<'_, Policy, Geometry>,
+        child: &mut Reservations<'_, Policy, Geometry, C>,
     ) -> Result<(), Refusal> {
         if id == 0 {
             return Ok(());
@@ -2931,8 +2955,11 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
     }
 }
 
-impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
-    carrick_core_abi::ReservationPolicyAccess for Reservations<'_, Policy, Geometry>
+impl<
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+> carrick_core_abi::ReservationPolicyAccess for Reservations<'_, Policy, Geometry, C>
 {
     fn is_admitted(&self) -> bool {
         self.is_admitted()

@@ -1,20 +1,31 @@
 //! Linux lifecycle policy over neutral pool transitions and native context hooks.
 use crate::abi::entry::SyscallResult;
 use crate::abi::thread::*;
-#[derive(
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::fmt::Debug,
-    ::core::cmp::Eq,
-    ::core::cmp::PartialEq,
-)]
+pub use carrick_syscall_abi::LinuxWaitOptions;
+
+/// Linux `pid_t` selector carried by wait4 (including negative selectors).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessWaitPid(i32);
+impl ProcessWaitPid {
+    pub const fn from_syscall_argument(raw: u64) -> Self {
+        Self(raw as i32)
+    }
+    pub const fn raw(self) -> i32 {
+        self.0
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LifecycleCall {
     Exit,
     SigAltStack,
     SigProcMask,
     SetRobustList,
+    GetPid,
     GetTid,
     Clone,
+    Fork,
+    Wait4,
+    ExitGroup,
 }
 
 /// A primitive returns data, never an entry completion or a final frame write.
@@ -58,6 +69,24 @@ use carrick_guest_arch::UserVa;
 use carrick_sched_core::{RecordRef, ThreadIdentity};
 use core::sync::atomic::Ordering;
 
+/// Native process custody supplied by the execution lane. Registry decisions
+/// remain in the shared scheduler owner; this adapter retains machine context.
+pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::ThreadCtx> {
+    fn take_handoff_receipt(&mut self) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
+        None
+    }
+    fn binding(&self) -> ExecutionBinding;
+    fn fork(&mut self) -> LifecycleOutcome;
+    fn wait4(
+        &mut self,
+        pid: ProcessWaitPid,
+        status: UserVa,
+        options: LinuxWaitOptions,
+        rusage: UserVa,
+    ) -> LifecycleOutcome;
+    fn exit_group(&mut self, status: u8) -> LifecycleOutcome;
+}
+
 pub trait UserCopy {
     fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool;
     fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool;
@@ -87,6 +116,12 @@ pub trait LifecycleNative<'a>: UserCopy {
     fn arguments(&self) -> [u64; 6];
     fn binding(&self) -> Option<ExecutionBinding>;
     fn task_state(&self) -> Option<&'a crate::abi::entry::LinuxTaskState>;
+    fn process_pid(&self) -> Option<u32> {
+        None
+    }
+    fn visible_tid(&self) -> Option<u32> {
+        None
+    }
     fn register_robust_list(&self, head: u64, len: u64) -> Option<SyscallResult> {
         let thread = self.thread()?;
         set_robust_list(
@@ -123,6 +158,23 @@ pub trait LifecycleNative<'a>: UserCopy {
     fn run_next(&mut self, timeout_result: SyscallResult) -> (Served, SyscallResult);
     fn result(&self) -> SyscallResult;
     fn set_result(&mut self, result: SyscallResult);
+    /// Native custody for a process fork. The shared owner selects this only
+    /// for an x86 process call with an admitted guest process venue.
+    fn process_fork(&mut self) -> Option<LifecycleOutcome> {
+        None
+    }
+    fn process_wait4(
+        &mut self,
+        _pid: ProcessWaitPid,
+        _status: UserVa,
+        _options: LinuxWaitOptions,
+        _rusage: UserVa,
+    ) -> Option<LifecycleOutcome> {
+        None
+    }
+    fn process_exit_group(&mut self, _status: u8) -> Option<LifecycleOutcome> {
+        None
+    }
 }
 /// Linux aarch64 syscall numbers served here (`SYS_SET_ROBUST_LIST` is the
 /// shared canonical number from [`crate::thread`]).
@@ -130,6 +182,7 @@ pub const SYS_EXIT: usize = 93;
 pub const SYS_SIGALTSTACK: usize = 132;
 pub const SYS_RT_SIGPROCMASK: usize = 135;
 pub const SYS_GETTID: usize = 178;
+pub const SYS_GETPID: usize = 172;
 pub const SYS_CLONE: usize = 220;
 
 // clone(2) flags.
@@ -202,6 +255,7 @@ pub const fn is_lifecycle_syscall(nr: usize) -> bool {
             | SYS_SIGALTSTACK
             | SYS_RT_SIGPROCMASK
             | SYS_GETTID
+            | SYS_GETPID
             | SYS_CLONE
     )
 }
@@ -219,6 +273,43 @@ pub fn invoke<'a>(
             native.register_robust_list(args[0], args[1])?,
             false,
         ));
+    }
+    if call == LifecycleCall::GetPid {
+        return Some(returned(
+            SyscallResult::new(i64::from(native.process_pid()?)),
+            false,
+        ));
+    }
+    if call == LifecycleCall::GetTid
+        && let Some(tid) = native.visible_tid()
+    {
+        return Some(returned(SyscallResult::new(i64::from(tid)), false));
+    }
+    if call == LifecycleCall::Clone
+        && args
+            == [
+                carrick_signal_core::policy::Signal::CHLD.number() as u64,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]
+    {
+        return native.process_fork();
+    }
+    match call {
+        LifecycleCall::Fork => return native.process_fork(),
+        LifecycleCall::Wait4 => {
+            return native.process_wait4(
+                ProcessWaitPid::from_syscall_argument(args[0]),
+                UserVa::new(args[1]),
+                LinuxWaitOptions::from_bits_retain(args[2]),
+                UserVa::new(args[3]),
+            );
+        }
+        LifecycleCall::ExitGroup => return native.process_exit_group(args[0] as u8),
+        _ => {}
     }
     let thread = native.thread().or_else(|| {
         if call == LifecycleCall::Exit {

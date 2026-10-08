@@ -30,51 +30,161 @@ pub fn request_lazy_frames(mailbox: &FrameGrantMailbox, mm_key: u64, va: u64, ac
 }
 
 /// Whether a delegated MM's root lets this prepared page be committed:
-/// `None` when the MM has no admitted root (its host arming decided), else
+/// NotDelegated when the MM has no admitted root (its host arming decided), else
 /// whether a node covers `page` and, for plain anonymous memory, permits
-/// `access`. A busy root answers `Some(false)`: the host decides.
-pub fn root_admits_commit<
+/// `access`. A busy root is Unavailable, never a Linux protection decline.
+pub fn root_fault_admission<
     Policy: crate::mm::reservation::ReservationPolicy,
     Geometry: crate::mm::reservation::ReservationGeometry,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
 >(
     roots: Option<&crate::mm::reservation::SharedReservations<Policy, Geometry>>,
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, Context>,
     slot: u32,
     mm_key: u64,
     page: u64,
     access: LeafAccess,
-) -> Option<bool> {
-    let roots = roots?;
-    let mm = carrick_core_abi::ReservationMm::new(mm_key)?;
-    let index = spaces.find(mm_key)?.index();
+) -> RootFaultAdmission {
+    let Some(roots) = roots else {
+        return RootFaultAdmission::NotDelegated;
+    };
+    let Some(mm) = carrick_core_abi::ReservationMm::new(mm_key) else {
+        return RootFaultAdmission::Unavailable;
+    };
+    let Some(index) = spaces.find(mm_key).map(|index| index.index()) else {
+        return RootFaultAdmission::Unavailable;
+    };
     if !roots.admitted(index, mm) {
-        return None;
+        return RootFaultAdmission::NotDelegated;
     }
     let Ok(mut model) = roots.lock_in(spaces, index, mm, slot) else {
-        return Some(false);
+        return RootFaultAdmission::Unavailable;
     };
     let bits = match access {
         LeafAccess::Read => 1,
         LeafAccess::Write => 2,
         LeafAccess::Execute => 4,
     };
-    Some(model.mapping(page).is_some_and(|mapping| {
+    if model.mapping(page).is_some_and(|mapping| {
         !mapping.anonymous
             || carrick_core_abi::ReservationProtection::from_bits(bits)
                 .is_some_and(|access| mapping.protection.permits(access))
-    }))
+    }) {
+        RootFaultAdmission::Allowed
+    } else {
+        RootFaultAdmission::Declined
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootFaultAdmission {
+    NotDelegated,
+    Allowed,
+    Declined,
+    Unavailable,
 }
 
 use core::num::NonZeroU64;
+
+/// Select physical supply from the exact reservation owner. The selected
+/// window carries no descriptor authority; its generation is revalidated by
+/// the shared grant target before any terminal becomes visible.
+pub fn select_fault_window<
+    Policy: crate::mm::reservation::ReservationPolicy,
+    Geometry: crate::mm::reservation::ReservationGeometry,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    root: &mut crate::mm::reservation::Reservations<'_, Policy, Geometry, Context>,
+    carrier: NonZeroU64,
+    va: carrick_guest_arch::UserVa,
+    max_len: carrick_guest_arch::GuestLen,
+    protection: carrick_core_abi::ReservationProtection,
+) -> Result<carrick_core_abi::PortalGrantWindow, crate::mm::reservation::Refusal> {
+    use crate::mm::reservation::Refusal;
+    let plan = root.transfer_fault_plan(va.raw() & !4095, max_len.raw(), protection)?;
+    let mapping = root.mapping(plan.range.start()).ok_or(Refusal::Stale)?;
+    let host_backing = match mapping.host_backing {
+        Some(source) => Some(
+            source
+                .advance(
+                    plan.range
+                        .start()
+                        .checked_sub(mapping.range.start())
+                        .ok_or(Refusal::Stale)?,
+                )
+                .ok_or(Refusal::Stale)?,
+        ),
+        None => None,
+    };
+    let sequence = root.next_transfer_sequence()?;
+    Ok(carrick_core_abi::PortalGrantWindow {
+        operation: carrick_core_abi::PortalOperation {
+            carrier,
+            mm: root.mm(),
+            incarnation: NonZeroU64::new(root.incarnation().raw()).ok_or(Refusal::Stale)?,
+            sequence,
+        },
+        generation: plan.generation,
+        range: plan.range,
+        protection: plan.protection,
+        fault_page: plan.fault_page,
+        host_backing,
+        fork_sequence: None,
+    })
+}
+
+/// Select a replacement for a leaf already classified as private COW by the
+/// live MMU owner. Imported mappings are eligible; anonymous fault plans are
+/// deliberately not used for an existing private leaf.
+pub fn select_cow_supply_window<
+    Policy: crate::mm::reservation::ReservationPolicy,
+    Geometry: crate::mm::reservation::ReservationGeometry,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    root: &mut crate::mm::reservation::Reservations<'_, Policy, Geometry, Context>,
+    operation: carrick_core_abi::PortalOperation,
+    va: carrick_guest_arch::UserVa,
+    fork_sequence: Option<NonZeroU64>,
+) -> Result<carrick_core_abi::PortalGrantWindow, crate::mm::transaction::MmError> {
+    use crate::mm::transaction::MmError;
+    if operation.mm != root.mm() || operation.incarnation.get() != root.incarnation().raw() {
+        return Err(MmError::Stale);
+    }
+    if root.fork_pending() && !root.fork_write_authorized(fork_sequence) {
+        return Err(MmError::Busy);
+    }
+    let mapping = root.mapping(va.raw()).ok_or(MmError::Fault)?;
+    if !mapping
+        .protection
+        .permits(carrick_core_abi::ReservationProtection::READ_WRITE)
+    {
+        return Err(MmError::Fault);
+    }
+    let page = va.raw() & !4095;
+    Ok(carrick_core_abi::PortalGrantWindow {
+        operation,
+        generation: mapping.generation,
+        range: carrick_core_abi::ReservationRange::new(
+            page,
+            page.checked_add(4096).ok_or(MmError::Invalid)?,
+        )
+        .ok_or(MmError::Invalid)?,
+        protection: mapping.protection,
+        fault_page: page,
+        host_backing: None,
+        fork_sequence,
+    })
+}
 
 pub struct FileFaultVenue<
     'a,
     Policy: crate::mm::reservation::ReservationPolicy,
     Geometry: crate::mm::reservation::ReservationGeometry,
     Slots: carrick_core_abi::GrantSlotVenue,
+    Context: Copy + Send + Sync + zerocopy::FromZeros = carrick_sched_core::ThreadCtx,
 > {
     pub roots: &'a crate::mm::reservation::SharedReservations<Policy, Geometry>,
-    pub spaces: SpaceAccess<'a>,
+    pub spaces: SpaceAccess<'a, Context>,
     pub slots: &'a Slots,
     pub worker: u32,
     pub mailbox: &'a FrameGrantMailbox,
@@ -83,7 +193,8 @@ impl<
     Policy: crate::mm::reservation::ReservationPolicy,
     Geometry: crate::mm::reservation::ReservationGeometry,
     Slots: carrick_core_abi::GrantSlotVenue,
-> FileFaultVenue<'_, Policy, Geometry, Slots>
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
+> FileFaultVenue<'_, Policy, Geometry, Slots, Context>
 {
     pub fn publish(&self, mm_key: u64, va: u64, access: u64) -> bool {
         let owner_source = core::cell::Cell::new(false);
@@ -99,31 +210,14 @@ impl<
                 .ok()?;
             root.mapping(va)?.host_backing?;
             owner_source.set(true);
-            let protection = carrick_core_abi::ReservationProtection::from_bits(access)?;
-            let plan = root
-                .transfer_fault_plan(va & !4095, 4096, protection)
-                .ok()?;
-            let mapping = root.mapping(plan.range.start())?;
-            let source = mapping
-                .host_backing?
-                .advance(plan.range.start().checked_sub(mapping.range.start())?)?;
-            let sequence = root.next_transfer_sequence().ok()?;
-            let carrier = self.slots.carrier()?;
-            let operation = carrick_core_abi::PortalOperation {
-                carrier,
-                mm,
-                incarnation: NonZeroU64::new(root.incarnation().raw())?,
-                sequence,
-            };
-            let window = carrick_core_abi::PortalGrantWindow {
-                operation,
-                generation: plan.generation,
-                range: plan.range,
-                protection: plan.protection,
-                fault_page: plan.fault_page,
-                host_backing: Some(source),
-                fork_sequence: None,
-            };
+            let window = select_fault_window(
+                &mut root,
+                self.slots.carrier()?,
+                carrick_guest_arch::UserVa::new(va),
+                carrick_guest_arch::GuestLen::new(4096),
+                carrick_core_abi::ReservationProtection::from_bits(access)?,
+            )
+            .ok()?;
             drop(root);
             let slot = self.slots.grant(self.worker as usize)?;
             let generation = next_frame_grant_generation();
@@ -134,7 +228,7 @@ impl<
                 mm_key,
                 request_generation: generation,
                 fault_va: va,
-                requested_len: plan.range.len(),
+                requested_len: window.range.len(),
                 access,
             }) {
                 slot.cancel_fault_selection(window, generation);

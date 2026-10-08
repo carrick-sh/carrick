@@ -156,11 +156,14 @@ pub struct SelectedChunk {
 /// Exact-MM authorization for one bounded copy. A host custodian must retain
 /// the selected physical identities before obtaining this fence. Drop before
 /// any host I/O, lazy supply, suspension, or selection of the next chunk.
-pub struct ValidatedChunk<'a> {
+pub struct ValidatedChunk<
+    'a,
+    Context: Copy + Send + Sync + zerocopy::FromZeros = carrick_sched_core::ThreadCtx,
+> {
     pub(crate) selected: SelectedChunk,
-    pub(crate) _editor: SpaceEditor<'a>,
+    pub(crate) _editor: SpaceEditor<'a, Context>,
 }
-impl ValidatedChunk<'_> {
+impl<Context: Copy + Send + Sync + zerocopy::FromZeros> ValidatedChunk<'_, Context> {
     pub fn selected(&self) -> SelectedChunk {
         self.selected
     }
