@@ -319,6 +319,8 @@ pub enum GuestProcessError<E> {
 )]
 pub enum GuestProcessInvariant {
     Registry(RegistryInvariant),
+    NamespaceInternalIdentityOutOfRange(TaskKey),
+    NamespaceVisibleIdentityLost(TaskKey),
     ExitCustodyLost(TaskKey),
     ExitPublicationLost(TaskKey),
     ExitReleaseLost(TaskKey),
