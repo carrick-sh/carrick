@@ -3206,15 +3206,16 @@ mod tests {
         let model = table.lock(0, mm).unwrap();
         let id = model.pool_node().unwrap();
         model.table.release(id, model.banks);
-        STALE_POP.with(|race| race.set(true));
+        LOSE_POPS.with(|race| race.set(u32::MAX));
         assert_eq!(table.allocate(None, NODES as u32), Err(Refusal::Busy));
-        assert_eq!(STALE_POPPED.with(|popped| popped.replace(0)), id);
+        assert_eq!(
+            table.node(id, None).next_free.load(Ordering::Acquire),
+            NODE_OWNED
+        );
     }
 
     thread_local! {
         static LOSE_POPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        static STALE_POP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-        static STALE_POPPED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
 
     pub(super) fn pop_head_before_link_read<
@@ -3225,9 +3226,15 @@ mod tests {
         banks: Option<&dyn storage::NodeBanks>,
         capacity: u32,
     ) {
-        if STALE_POP.with(|race| race.replace(false)) {
-            let popped = table.allocate(banks, capacity).unwrap();
-            STALE_POPPED.with(|slot| slot.set(popped));
+        if LOSE_POPS.with(|race| {
+            if race.get() == u32::MAX {
+                race.set(0);
+                true
+            } else {
+                false
+            }
+        }) {
+            table.allocate(banks, capacity).unwrap();
         }
     }
 
@@ -3235,8 +3242,12 @@ mod tests {
     pub(super) fn lose_pop_race() -> bool {
         LOSE_POPS.with(|lose| {
             let left = lose.get();
-            lose.set(left.saturating_sub(1));
-            left != 0
+            if left == u32::MAX {
+                false
+            } else {
+                lose.set(left.saturating_sub(1));
+                left != 0
+            }
         })
     }
 
