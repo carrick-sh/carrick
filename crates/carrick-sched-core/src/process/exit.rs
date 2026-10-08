@@ -747,7 +747,7 @@ impl<
     Failure: RegistryFailure,
 > ProcessRegistry<C, L, Z, R, TaskGraphReservation<Transaction>, Retired, Group, Session, Failure>
 {
-    pub fn begin_exit_effects(
+    pub fn prepare_exit_effects(
         &self,
         task: TaskKey,
         plan: &PreparedExitTopology<L::Credit>,
@@ -786,9 +786,6 @@ impl<
         if members.iter().any(|member| member.exit_task() != task) {
             return Err(ExitError::Topology(task.id));
         }
-        if !record.exit_begin() {
-            return Err(ExitError::AlreadyExiting(task.id));
-        }
         Ok(PendingExitEffects {
             task,
             transaction: permit.transaction,
@@ -798,6 +795,67 @@ impl<
             parent: identity.parent,
             signal: identity.exit_signal,
         })
+    }
+
+    /// Publish only the exact prepared effects after validating that the
+    /// original topology and reservation still authorize this live task.
+    pub fn begin_prepared_exit_effects(
+        &self,
+        task: TaskKey,
+        plan: &PreparedExitTopology<L::Credit>,
+        permit: &ReservedTaskSet<Transaction>,
+        effects: &PendingExitEffects<L::Member, L::Resources, Transaction>,
+    ) -> Result<(), ExitError<L::Error>> {
+        self.validate_task_set(permit)
+            .map_err(|_| ExitError::Topology(task.id))?;
+        if plan
+            .reserved_ids
+            .iter()
+            .any(|id| !permit.task_ids.contains(id))
+            || !matches!(self.reservations.get(&task.id).map(|row| &row.scope),
+                Some(TaskReservationScope::ExitParticipant(revision))
+                    if Arc::ptr_eq(revision, &plan.task_revision))
+            || plan.affected_revisions.iter().any(|(id, participant)| {
+                !matches!(self.reservations.get(id).map(|row| &row.scope),
+                    Some(TaskReservationScope::ExitParticipant(revision))
+                        if Arc::ptr_eq(revision, &participant.revision))
+            })
+        {
+            return Err(ExitError::Topology(task.id));
+        }
+        self.validate_exit_topology(task, plan)?;
+        if task != plan.task_revision.task
+            || effects.task != task
+            || effects.transaction != permit.transaction
+            || !Arc::ptr_eq(&effects.incarnation, &permit.incarnation)
+        {
+            return Err(ExitError::Topology(task.id));
+        }
+        self.activate_prepared_exit(task)
+    }
+
+    fn activate_prepared_exit(&self, task: TaskKey) -> Result<(), ExitError<L::Error>> {
+        let record = self
+            .tasks
+            .get(&task.id)
+            .ok_or(ExitError::Unknown(task.id))?;
+        if record.exit_lifecycle() != TaskLifecycle::Live || !record.exit_begin() {
+            return Err(ExitError::AlreadyExiting(task.id));
+        }
+        Ok(())
+    }
+
+    /// Existing consumers begin immediately; native owner preparation retains
+    /// the same nonpublishing effects until its owned publication point.
+    pub fn begin_exit_effects(
+        &self,
+        task: TaskKey,
+        plan: &PreparedExitTopology<L::Credit>,
+        permit: &ReservedTaskSet<Transaction>,
+    ) -> ExitEffectAdmission<C, L, Transaction> {
+        let effects = self.prepare_exit_effects(task, plan, permit)?;
+        self.activate_prepared_exit(task)?;
+        Ok(effects)
     }
 }
 

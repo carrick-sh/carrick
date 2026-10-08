@@ -306,7 +306,8 @@ mod tests {
                 .unwrap()
                 .begin(LinuxWaitStatus::from_wait_encoding(code << 8))
                 .unwrap()
-                .publish();
+                .publish()
+                .unwrap();
             let permit = published
                 .effects
                 .cancel_members(|member| assert_eq!(member.exit_task(), child));

@@ -230,10 +230,11 @@ pub fn publish_exit<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestPr
     transaction: N::Transaction,
     status: LinuxWaitStatus,
 ) -> ExitPublicationResult<C, U, N> {
-    let mut pending = owner
+    let pending = owner
         .prepare_exit(task, adopter)?
         .reserve(transaction)?
         .begin(status)?;
-    let resources = pending.take_resources();
-    Ok((resources, pending.publish()))
+    let mut published = pending.publish()?;
+    let resources = published.take_resources();
+    Ok((resources, published))
 }
