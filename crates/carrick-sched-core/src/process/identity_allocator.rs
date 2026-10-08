@@ -279,6 +279,20 @@ impl core::error::Error for IdError {}
 #[derive(Debug)]
 pub struct SerialAllocator {
     next: AtomicU64,
+    refused: AtomicU64,
+}
+
+/// Owned allocation cursor removed from its source. This value is deliberately
+/// neither Copy nor Clone: only its receiver can reopen the allocation owner.
+#[derive(Debug)]
+pub struct TransferredSerialAllocator {
+    next: NonZeroU64,
+}
+
+impl TransferredSerialAllocator {
+    pub fn into_allocator(self) -> SerialAllocator {
+        SerialAllocator::starting_at(self.next)
+    }
 }
 impl Default for SerialAllocator {
     fn default() -> Self {
@@ -292,30 +306,159 @@ impl SerialAllocator {
     pub const fn starting_at(next: NonZeroU64) -> Self {
         Self {
             next: AtomicU64::new(next.get()),
+            refused: AtomicU64::new(0),
+        }
+    }
+    /// Move the cursor once. Zero is a terminal source state, never a serial.
+    /// Atomic exchange settles concurrent allocation before or after transfer.
+    pub fn transfer(&self) -> Option<TransferredSerialAllocator> {
+        match NonZeroU64::new(self.next.swap(0, Ordering::AcqRel)) {
+            Some(next) => Some(TransferredSerialAllocator { next }),
+            None => {
+                self.record_refusal();
+                None
+            }
+        }
+    }
+    pub fn is_transferred(&self) -> bool {
+        self.next.load(Ordering::Acquire) == 0
+    }
+    /// MAX is an explicit unknown/overflow receipt, never a wrapped count.
+    pub fn refused_attempts(&self) -> Option<u64> {
+        let count = self.refused.load(Ordering::Acquire);
+        (count != u64::MAX).then_some(count)
+    }
+    fn record_refusal(&self) {
+        let _ = self
+            .refused
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                Some(count.saturating_add(1))
+            });
+    }
+    fn advance_owned_to(&self, next: NonZeroU64) -> Option<()> {
+        match self
+            .next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current != 0).then_some(current.max(next.get()))
+            }) {
+            Ok(_) => Some(()),
+            Err(_) => {
+                self.record_refusal();
+                None
+            }
         }
     }
     /// Import an already-established lower bound without reusing a serial.
     pub fn advance_to(&self, next: NonZeroU64) {
-        self.next.fetch_max(next.get(), Ordering::Relaxed);
+        let _ = self.advance_owned_to(next);
     }
     pub fn advance_past(&self, value: NonZeroU64) -> Option<()> {
-        let next = value.get().checked_add(1)?;
-        self.next.fetch_max(next, Ordering::Relaxed);
-        Some(())
+        let Some(next) = value.get().checked_add(1).and_then(NonZeroU64::new) else {
+            if self.is_transferred() {
+                self.record_refusal();
+            }
+            return None;
+        };
+        self.advance_owned_to(next)
     }
     pub fn allocate(&self) -> Option<NonZeroU64> {
-        let raw = self
+        match self
             .next
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                NonZeroU64::new(current)?;
                 current.checked_add(1)
-            })
-            .ok()?;
-        NonZeroU64::new(raw)
+            }) {
+            Ok(raw) => NonZeroU64::new(raw),
+            Err(0) => {
+                self.record_refusal();
+                None
+            }
+            Err(_) => None,
+        }
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transferred_serial_source_never_reopens_or_reuses_issued_values() {
+        let source = SerialAllocator::new();
+        for expected in 1..=5 {
+            assert_eq!(source.allocate().unwrap().get(), expected);
+        }
+        let native = source.transfer().unwrap().into_allocator();
+        assert_eq!(native.allocate().unwrap().get(), 6);
+        assert_eq!(source.allocate(), None);
+        assert_eq!(source.allocate(), None);
+        source.advance_to(NonZeroU64::new(100).unwrap());
+        assert_eq!(source.allocate(), None);
+        assert_eq!(source.advance_past(NonZeroU64::new(200).unwrap()), None);
+        assert!(source.transfer().is_none());
+        assert!(source.is_transferred());
+        assert_eq!(source.refused_attempts(), Some(6));
+        assert!(!native.is_transferred());
+        assert_eq!(native.refused_attempts(), Some(0));
+        assert_eq!(native.allocate().unwrap().get(), 7);
+    }
+
+    #[test]
+    fn transfer_preserves_imported_floor_and_exhaustion() {
+        let source = SerialAllocator::new();
+        source.advance_to(NonZeroU64::new(100).unwrap());
+        source.advance_past(NonZeroU64::new(200).unwrap()).unwrap();
+        let native = source.transfer().unwrap().into_allocator();
+        assert_eq!(native.allocate().unwrap().get(), 201);
+        let exhausted = SerialAllocator::starting_at(NonZeroU64::MAX);
+        assert_eq!(exhausted.allocate(), None);
+        let native = exhausted.transfer().unwrap().into_allocator();
+        assert_eq!(native.allocate(), None);
+        assert_eq!(exhausted.allocate(), None);
+        assert_eq!(exhausted.refused_attempts(), Some(1));
+        assert_eq!(native.refused_attempts(), Some(0));
+    }
+
+    #[test]
+    fn transferred_source_counts_calls_from_a_retained_peer() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let source = SerialAllocator::new();
+        let (issued_tx, issued_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let peer_source = &source;
+            let peer = scope.spawn(move || {
+                issued_tx.send(peer_source.allocate().unwrap()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                for _ in 0..64 {
+                    assert_eq!(peer_source.allocate(), None);
+                }
+            });
+            assert_eq!(
+                issued_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .get(),
+                1
+            );
+            let native = source.transfer().unwrap().into_allocator();
+            release_tx.send(()).unwrap();
+            assert_eq!(native.allocate().unwrap().get(), 2);
+            peer.join().unwrap();
+            assert_eq!(source.refused_attempts(), Some(64));
+        });
+    }
+
+    #[test]
+    fn refusal_receipt_reports_overflow_without_wrapping() {
+        let source = SerialAllocator::new();
+        let _native = source.transfer().unwrap();
+        source.refused.store(u64::MAX - 1, Ordering::Relaxed);
+        assert_eq!(source.allocate(), None);
+        assert_eq!(source.refused_attempts(), None);
+        assert_eq!(source.allocate(), None);
+        assert_eq!(source.refused_attempts(), None);
+    }
 
     #[test]
     fn reused_namespace_number_has_distinct_incarnation_custody() {

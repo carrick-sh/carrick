@@ -1,4 +1,6 @@
-use carrick_sched_core::process::identity_allocator::SerialAllocator;
+use carrick_sched_core::process::identity_allocator::{
+    SerialAllocator, TransferredSerialAllocator,
+};
 pub use carrick_sched_core::process::{
     ChildExitSignal, InvalidLinuxId, InvalidLinuxSignal, LinuxSignal, ProcessGroupId, SessionId,
     TaskId, TaskSerial,
@@ -117,6 +119,13 @@ static CARRIER_MM_IDS: ObjectIdRegistry = ObjectIdRegistry::new();
 #[derive(Debug)]
 pub struct ObjectIdRegistry {
     allocator: SerialAllocator,
+    host_mm: parking_lot::RwLock<HostMmIdentityAuthority>,
+}
+
+#[derive(Debug)]
+enum HostMmIdentityAuthority {
+    Available,
+    Transferred,
 }
 
 impl Default for ObjectIdRegistry {
@@ -129,7 +138,20 @@ impl ObjectIdRegistry {
     pub const fn new() -> Self {
         Self {
             allocator: SerialAllocator::new(),
+            host_mm: parking_lot::RwLock::new(HostMmIdentityAuthority::Available),
         }
+    }
+
+    /// Revoke this kernel's MM admission and move only its local serial cursor.
+    /// The carrier MM source and file-description source are separate owners.
+    pub fn transfer_local_serials(&self) -> Option<TransferredSerialAllocator> {
+        let mut authority = self.host_mm.write();
+        *authority = HostMmIdentityAuthority::Transferred;
+        self.allocator.transfer()
+    }
+
+    pub fn transferred_refusals(&self) -> Option<u64> {
+        self.allocator.refused_attempts()
     }
 
     #[cfg(test)]
@@ -138,7 +160,13 @@ impl ObjectIdRegistry {
     }
 
     fn allocate(&self) -> Result<NonZeroU64, ObjectIdError> {
-        self.allocator.allocate().ok_or(ObjectIdError::Exhausted)
+        self.allocator.allocate().ok_or_else(|| {
+            if self.allocator.is_transferred() {
+                ObjectIdError::AuthorityTransferred
+            } else {
+                ObjectIdError::Exhausted
+            }
+        })
     }
 
     pub fn task_serial(&self) -> Result<TaskSerial, ObjectIdError> {
@@ -156,6 +184,13 @@ impl ObjectIdRegistry {
     /// counter gave two containers' first MMs the same key, so a pause of
     /// one counted the other's vCPUs (the concurrent container gate).
     pub fn mm_id(&self) -> Result<MmId, ObjectIdError> {
+        let authority = self.host_mm.read();
+        if matches!(*authority, HostMmIdentityAuthority::Transferred) {
+            // The moved serial source also owns the refusal receipt. Its
+            // terminal state cannot allocate or be reopened by imports.
+            let _ = self.allocator.allocate();
+            return Err(ObjectIdError::AuthorityTransferred);
+        }
         CARRIER_MM_IDS
             .allocate()
             .map(MmId::from_registry_allocation)
@@ -199,6 +234,8 @@ impl ObjectIdRegistry {
 pub enum ObjectIdError {
     #[error("kernel object identity space exhausted")]
     Exhausted,
+    #[error("kernel identity authority was transferred to the native owner")]
+    AuthorityTransferred,
 }
 
 #[allow(dead_code)]
@@ -272,5 +309,31 @@ mod tests {
         // MM ids come from one carrier-wide source: another kernel's never
         // equals this one's.
         assert_ne!(mm, other_kernel_mm);
+    }
+    #[test]
+    fn transferred_object_owner_refuses_mm_without_freezing_carrier() {
+        let source = ObjectIdRegistry::new();
+        let _initial_mm = source.mm_id().expect("initial owned MM");
+        let first = source.task_serial().expect("source task serial");
+        let native = source
+            .transfer_local_serials()
+            .expect("one transfer")
+            .into_allocator();
+        assert_eq!(
+            native.allocate().expect("native cursor").get(),
+            first.raw() + 1
+        );
+        assert_eq!(
+            source.task_serial(),
+            Err(ObjectIdError::AuthorityTransferred)
+        );
+        assert_eq!(source.mm_id(), Err(ObjectIdError::AuthorityTransferred));
+        assert_eq!(source.mm_id(), Err(ObjectIdError::AuthorityTransferred));
+        assert!(source.transfer_local_serials().is_none());
+        assert_eq!(source.transferred_refusals(), Some(4));
+        let other = ObjectIdRegistry::new();
+        assert!(other.mm_id().is_ok());
+        assert!(other.file_description_id().is_ok());
+        assert_eq!(other.transferred_refusals(), Some(0));
     }
 }
