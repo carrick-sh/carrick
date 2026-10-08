@@ -1,12 +1,17 @@
 //! Deterministic longest-first placement and complete, identity-bound merging.
-use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub const UNKNOWN_TIMING_MS: u64 = 1_000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct Shard {
     /// User-facing indices are 1-based.
     pub index: usize,
@@ -89,7 +94,14 @@ pub fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::serde::Serialize,
+    ::serde::Deserialize,
+)]
 pub struct RunIdentity {
     pub head: String,
     pub carrick_sha256: String,
@@ -103,7 +115,7 @@ pub struct RunIdentity {
     pub native_images_hash: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::serde::Serialize, ::serde::Deserialize)]
 pub struct ShardHeader {
     pub identity: RunIdentity,
     pub shard_index: usize,

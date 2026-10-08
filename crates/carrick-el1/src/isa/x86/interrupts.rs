@@ -12,7 +12,13 @@ pub const LAPIC_BASE: u64 = 0xfee0_0000;
 pub const LAPIC_VA: u64 = 0xffff_ffff_d000_0000;
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct TimerTicks(pub u32);
 
 /// One calibrated APIC segment. A long TSC deadline is split at the hardware
@@ -52,13 +58,25 @@ mod fallback_tests {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct ApicId(pub u8);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct IpiBusy;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub struct InterruptMask {
     enabled: bool,
 }
@@ -106,8 +124,8 @@ pub mod hardware {
     /// Same hardware preconditions as `arm_timer`; vectors must be installed.
     pub unsafe fn enable() {
         unsafe {
-            write(0x80, 0);
-            write(0xf0, 0x100 | u32::from(SPURIOUS_VECTOR));
+            crate::isa::x86::interrupts::hardware::write(0x80, 0);
+            crate::isa::x86::interrupts::hardware::write(0xf0, 0x100 | u32::from(SPURIOUS_VECTOR));
         }
     }
     /// # Safety
@@ -115,12 +133,12 @@ pub mod hardware {
     /// None masks/disarms without a host wait, timer thread or semantic exit.
     pub unsafe fn arm_timer(ticks: Option<TimerTicks>) {
         unsafe {
-            write(0x3e0, 0b1011);
-            write(
+            crate::isa::x86::interrupts::hardware::write(0x3e0, 0b1011);
+            crate::isa::x86::interrupts::hardware::write(
                 0x320,
                 u32::from(TIMER_VECTOR) | if ticks.is_none() { 1 << 16 } else { 0 },
             );
-            write(0x380, ticks.map_or(0, |ticks| ticks.0));
+            crate::isa::x86::interrupts::hardware::write(0x380, ticks.map_or(0, |ticks| ticks.0));
         }
     }
     /// # Safety
@@ -128,7 +146,7 @@ pub mod hardware {
     /// The deadline is an absolute TSC value; zero disarms the local timer.
     pub unsafe fn arm_tsc_deadline(deadline: Option<u64>) {
         unsafe {
-            write(
+            crate::isa::x86::interrupts::hardware::write(
                 0x320,
                 u32::from(TIMER_VECTOR) | (1 << 18) | if deadline.is_none() { 1 << 16 } else { 0 },
             );
@@ -144,9 +162,12 @@ pub mod hardware {
     pub unsafe fn measure_timer_rate(tsc_hz: u64) -> Option<u64> {
         let sample_tsc = (tsc_hz / 1000).max(1);
         unsafe {
-            write(0x3e0, 0b1011); // divide by 1
-            write(0x320, u32::from(TIMER_VECTOR) | (1 << 16));
-            write(0x380, u32::MAX);
+            crate::isa::x86::interrupts::hardware::write(0x3e0, 0b1011); // divide by 1
+            crate::isa::x86::interrupts::hardware::write(
+                0x320,
+                u32::from(TIMER_VECTOR) | (1 << 16),
+            );
+            crate::isa::x86::interrupts::hardware::write(0x380, u32::MAX);
         }
         let start = rdtsc();
         while rdtsc().wrapping_sub(start) < sample_tsc {
@@ -154,7 +175,7 @@ pub mod hardware {
         }
         let elapsed = rdtsc().wrapping_sub(start);
         let remaining = unsafe { core::ptr::read_volatile((LAPIC_VA + 0x390) as *const u32) };
-        unsafe { write(0x380, 0) };
+        unsafe { crate::isa::x86::interrupts::hardware::write(0x380, 0) };
         let elapsed_apic = u64::from(u32::MAX - remaining);
         if elapsed == 0 || elapsed_apic == 0 {
             return None;
@@ -174,7 +195,7 @@ pub mod hardware {
     /// # Safety
     /// Complete exactly the interrupt accepted by this CPU's handler.
     pub unsafe fn end_interrupt() {
-        unsafe { write(0xb0, 0) };
+        unsafe { crate::isa::x86::interrupts::hardware::write(0xb0, 0) };
     }
     /// # Safety
     /// Caller has published wake ownership first. APIC destination names a
@@ -186,8 +207,8 @@ pub mod hardware {
             return Err(IpiBusy);
         }
         unsafe {
-            write(0x310, u32::from(apic_id.0) << 24);
-            write(0x300, u32::from(vector));
+            crate::isa::x86::interrupts::hardware::write(0x310, u32::from(apic_id.0) << 24);
+            crate::isa::x86::interrupts::hardware::write(0x300, u32::from(vector));
         }
         Ok(())
     }

@@ -442,7 +442,7 @@ pub(crate) struct InventoryFrameRegistry {
 /// ([`HvfVmState::settle_declined_lease_remainders`]). It is authenticated by
 /// owner generation, never by address.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub(crate) struct DeclinedLeaseRemainder {
     pub(crate) projection: RetiredStage2Projection,
     /// The frames of this lease the retirement did not retire.

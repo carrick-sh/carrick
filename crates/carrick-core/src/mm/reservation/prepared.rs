@@ -15,7 +15,13 @@ pub unsafe trait PreparedCopyNodes<'a>: Copy {
     fn node(self, index: u32) -> &'a ReservationNode;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum PreparedCopyError {
     Stale,
 }

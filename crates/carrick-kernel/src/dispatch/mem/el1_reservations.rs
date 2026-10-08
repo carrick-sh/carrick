@@ -691,7 +691,13 @@ impl Drop for BoundAddressSpaceAdmission<'_> {
 }
 
 /// What one published address space's root admission decided.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(crate) enum RootAdmission {
     Decided(El1Admission),
     Refused(Refusal),

@@ -205,17 +205,36 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
 
 /// Logical leaf references for one physical backing. The backend owns storage
 /// and the inventory's one journal; this value is the journaled logical state.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct FrameReferences {
     mapping_count: u32,
     retire_on_last_unmap: bool,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum ReferenceError {
     Exhausted,
     Underflow,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum ReferenceRetirement {
     Ready,
     AlreadyPending,

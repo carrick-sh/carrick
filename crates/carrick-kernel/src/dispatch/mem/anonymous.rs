@@ -115,7 +115,7 @@ enum HostVenue {
 }
 
 /// Metadata that one forwarded operation needs before touching its backend.
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub(in crate::dispatch) enum HostMetadataNeed {
     Mapping,
     Retire(ReservationRange),

@@ -22,14 +22,14 @@ pub struct ReservationNode {
     pub next_free: AtomicU64,
     pub data: UnsafeCell<ReservationNodePayload>,
 }
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 #[repr(C)]
 pub struct PreparedNodeHeader {
     pub next: u32,
     pub tail: u32,
     pub words: [u64; 13],
 }
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub union ReservationNodePayload {
     pub mapping: ReservationNodeData,
     pub prepared: PreparedNodeHeader,

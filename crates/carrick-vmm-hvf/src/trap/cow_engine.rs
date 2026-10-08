@@ -7819,7 +7819,13 @@ pub(crate) struct ProjectedForkMapping {
 /// Carrick-owned windows have no Linux VMA. Their explicit domain, rather
 /// than an absent projection row, authorizes inheritance across a copied MM.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum ForkCarrickWindow {
     KernelControl,
     El1Kernel,

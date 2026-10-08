@@ -386,7 +386,7 @@ impl Drop for ExitAdmission<'_> {
 
 /// Proof of a successful claim. Not `Copy`/`Clone`: the owner birth publication
 /// consumes it, so a claim is completed at most once.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub struct ClaimedEntry(EntryRef);
 impl ClaimedEntry {
     pub const fn entry(&self) -> EntryRef {
