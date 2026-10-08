@@ -446,15 +446,16 @@ where
     carrick_personality_linux::dispatch::dispatch(ordinal, control, &mut pending)
 }
 
-/// A completed effect must never be forwarded for syscall replay when its
-/// exact binding failed authentication. This is native fail-stop transport.
-fn invalid_completion() -> ! {
+/// Native preparation, scheduling and completion retain an exact execution
+/// binding. Missing frames and failed completion authentication share this
+/// fail-stop transport; a completed effect must never be replayed by forwarding.
+pub(super) fn invalid_completion() -> ! {
     #[cfg(target_os = "none")]
     crate::substrate::sched::hw::fatal_entry_binding();
     #[cfg(not(target_os = "none"))]
     carrick_fatal::carrick_fatal!(
         "el1::entry_completion",
-        "entry completion lost its exact execution binding"
+        "native entry lost its exact execution binding"
     )
 }
 

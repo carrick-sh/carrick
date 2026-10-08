@@ -490,15 +490,12 @@ mod kernel {
     // The KVM fault fixture owns one exact MM and one host-backed prepared
     // page. These records stay live across the native syscall boundary.
     fixture_items! {
-        static SHARED_FAULT_MAILBOX: carrick_el1_abi::FrameGrantMailbox =
+        pub(crate) static SHARED_FAULT_MAILBOX: carrick_el1_abi::FrameGrantMailbox =
             carrick_el1_abi::FrameGrantMailbox::new();
-        static SHARED_COW_POOL: carrick_el1_abi::CowGrantPool =
+        pub(crate) static SHARED_COW_POOL: carrick_el1_abi::CowGrantPool =
             carrick_el1_abi::CowGrantPool::new();
         // Retained by the stopped fixture carrier until VM retirement.
-        static FORK_RESIDENCY_ADDRESS: AtomicU64 = AtomicU64::new(0);
-        pub(super) mod process {
-            include!("process.rs");
-        }
+        pub(crate) static FORK_RESIDENCY_ADDRESS: AtomicU64 = AtomicU64::new(0);
     }
 
     #[repr(C)]
@@ -790,7 +787,7 @@ mod kernel {
     }
 
     fixture_items! {
-        pub(super) fn lifecycle_invariant_error(reason: super::lifecycle::LifecycleInvariant) -> ! {
+        pub(crate) fn lifecycle_invariant_error(reason: super::lifecycle::LifecycleInvariant) -> ! {
             // SAFETY: terminal kernel custody error; report the named stage
             // without replaying a partially committed syscall on the host.
             unsafe { core::arch::asm!("out dx, al", in("dx") FATAL_PORT,
@@ -873,7 +870,7 @@ mod kernel {
     /// One stopped-carrier fixture view of the retained supervisor direct
     /// window. The production MM owner receives its table authority from the
     /// portal instead of this fixed test grant.
-    struct InitialWords {
+    pub(crate) struct InitialWords {
         start: u64,
         end: u64,
         edit_root: Option<carrick_guest_arch::RootGpa>,
@@ -881,7 +878,7 @@ mod kernel {
         context: Option<carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>>,
     }
     impl InitialWords {
-        fn fixture() -> Self {
+        pub(crate) fn fixture() -> Self {
             let root = carrick_el1::isa::x86::hardware_live_root()
                 .unwrap_or_else(|_| carrick_el1::isa::x86::fatal_entry_binding());
             Self {
@@ -1033,12 +1030,12 @@ mod kernel {
         }
     }
 
-    struct InitialFrames {
+    pub(crate) struct InitialFrames {
         next_table: u64,
         next_data: u64,
     }
     impl InitialFrames {
-        fn zeroed(pa: u64) {
+        pub(crate) fn zeroed(pa: u64) {
             // SAFETY: these private fixture physical pages are mapped RW by
             // the one retained direct window and not reachable by user PTEs.
             unsafe { core::ptr::write_bytes((DIRECT_VA + pa) as *mut u8, 0, 4096) };
@@ -1267,7 +1264,7 @@ mod kernel {
             }
             fixture_stmt! {
                 if frame.rdx == 1
-                    && !process::admit_initial(binding, loaded.stack_pointer, loaded.address.root.address().raw())
+                    && !crate::process::admit_initial(binding, loaded.stack_pointer, loaded.address.root.address().raw())
                 {
                     doorbell(FATAL_PORT, frame);
                     halt();

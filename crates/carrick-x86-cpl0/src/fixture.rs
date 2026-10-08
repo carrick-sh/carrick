@@ -9,6 +9,8 @@ macro_rules! fixture_stmt { ($($tt:tt)*) => { $($tt)* }; }
 macro_rules! fixture_expr { ($($tt:tt)*) => { $($tt)* }; }
 
 #[cfg(target_os = "none")]
+mod process;
+#[cfg(target_os = "none")]
 mod progress;
 #[cfg(target_os = "none")]
 mod cpl0_scheduler {
