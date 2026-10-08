@@ -1108,6 +1108,8 @@ dependencies = [
  "kvm-ioctls",
  "libc",
  "serde_json",
+ "tempfile",
+ "toml",
  "vmm-sys-util",
  "zerocopy",
 ]

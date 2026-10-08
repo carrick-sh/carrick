@@ -3,7 +3,7 @@
 //! `cpl0_inputs.rs`; this test proves the derivation reaches every file the
 //! image's sources pull in by `#[path]`/`include*!` (carrick-x86's cpl0_*.rs
 //! sit outside the image's dependency closure) and the build configuration
-//! that sets `code-model=kernel`. VM-free: reads sources and Cargo metadata.
+//! that sets `code-model=kernel`. VM-free: reads sources and manifests.
 #![allow(clippy::expect_used)]
 
 #[path = "../cpl0_inputs.rs"]
@@ -19,8 +19,7 @@ fn workspace() -> PathBuf {
 }
 
 fn derive() -> cpl0_inputs::Cpl0Inputs {
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    cpl0_inputs::derive(&workspace(), &cargo).expect("derive CPL0 image inputs")
+    cpl0_inputs::derive(&workspace()).expect("derive CPL0 image inputs")
 }
 
 #[test]
@@ -68,7 +67,27 @@ fn carrick_x86_cpl0_sources_and_build_config_are_inputs() {
         cpl0_inputs::WORKSPACE_INPUTS.contains(&".cargo/config.toml"),
         "code-model=kernel lives in .cargo/config.toml"
     );
-    for package in ["carrick-x86-cpl0", "carrick-el1", "carrick-core"] {
+    // The original target-filtered closure plus the conservative host-only
+    // carrick-el1 -> carrick-fatal edge.
+    let packages = [
+        "carrick-core",
+        "carrick-core-abi",
+        "carrick-el1",
+        "carrick-el1-abi",
+        "carrick-fatal",
+        "carrick-fd-core",
+        "carrick-guest-arch",
+        "carrick-inotify-core",
+        "carrick-mmu-core",
+        "carrick-personality-linux",
+        "carrick-pipe-core",
+        "carrick-sched-core",
+        "carrick-signal-core",
+        "carrick-syscall-abi",
+        "carrick-x86-cpl0",
+    ];
+    assert_eq!(inputs.package_dirs.len(), packages.len());
+    for package in packages {
         let dir = root
             .join("crates")
             .join(package)
@@ -79,4 +98,54 @@ fn carrick_x86_cpl0_sources_and_build_config_are_inputs() {
             "{package} is in the image's dependency closure but not watched"
         );
     }
+}
+
+#[test]
+fn local_manifest_closure_needs_no_registry_or_lockfile() {
+    let temp = tempfile::tempdir().expect("fixture root");
+    let root = temp.path();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        r#"
+[workspace.dependencies]
+alias = { package = "shared", path = "crates/shared" }
+"#,
+    )
+    .expect("workspace manifest");
+    for (name, manifest) in [
+        (
+            "carrick-x86-cpl0",
+            r#"
+[dependencies]
+alias.workspace = true
+remote = "999.0"
+optional = { path = "../optional", optional = true }
+[target.'cfg(target_os = "none")'.build-dependencies]
+builder = { path = "../builder" }
+[dev-dependencies]
+missing = { path = "../missing" }
+"#,
+        ),
+        (
+            "shared",
+            "[dependencies]\ncycle = { path = '../carrick-x86-cpl0' }",
+        ),
+        ("optional", "[package]\nname = 'optional'"),
+        ("builder", "[package]\nname = 'builder'"),
+    ] {
+        let dir = root.join("crates").join(name);
+        std::fs::create_dir_all(&dir).expect("fixture crate");
+        std::fs::write(dir.join("Cargo.toml"), manifest).expect("fixture manifest");
+    }
+    let inputs = cpl0_inputs::derive(root).expect("file-only closure");
+    let expected = ["carrick-x86-cpl0", "shared", "optional", "builder"]
+        .into_iter()
+        .map(|name| {
+            root.join("crates")
+                .join(name)
+                .canonicalize()
+                .expect("crate path")
+        })
+        .collect();
+    assert_eq!(inputs.package_dirs, expected);
 }
