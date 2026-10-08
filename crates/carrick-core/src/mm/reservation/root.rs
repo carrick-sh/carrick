@@ -675,6 +675,10 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         if index != 0 && tests::lose_pop_race() {
             return Err(Refusal::Busy);
         }
+        #[cfg(test)]
+        if index != 0 {
+            tests::pop_head_before_link_read(self, banks, capacity);
+        }
         if index != 0 {
             let node = self.node(index, banks);
             let link = node.next_free.load(Ordering::Acquire);
@@ -3170,8 +3174,37 @@ mod tests {
         assert_eq!(successes, 1, "only one return may claim the node");
     }
 
+    #[test]
+    fn a_stale_free_head_read_must_not_panic_after_peer_pop() {
+        let table = table();
+        let mm = ReservationMm::new(65).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let model = table.lock(0, mm).unwrap();
+        let id = model.pool_node().unwrap();
+        model.table.release(id, model.banks);
+        STALE_POP.with(|race| race.set(true));
+        assert_eq!(table.allocate(None, NODES as u32), Err(Refusal::Busy));
+        assert_eq!(STALE_POPPED.with(|popped| popped.replace(0)), id);
+    }
+
     thread_local! {
         static LOSE_POPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static STALE_POP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static STALE_POPPED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn pop_head_before_link_read<
+        Policy: ReservationPolicy,
+        Geometry: ReservationGeometry,
+    >(
+        table: &super::SharedReservations<Policy, Geometry>,
+        banks: Option<&dyn storage::NodeBanks>,
+        capacity: u32,
+    ) {
+        if STALE_POP.with(|race| race.replace(false)) {
+            let popped = table.allocate(banks, capacity).unwrap();
+            STALE_POPPED.with(|slot| slot.set(popped));
+        }
     }
 
     /// Test hook: the next pops of this thread lose their free-list race.
