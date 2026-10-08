@@ -942,6 +942,14 @@ path = "crates/carrick-sched-core/src/process/registry.rs"
 contracts = ["kernel.el1.thread-lifecycle", "kernel.wait.process-group", "kernel.wait.child-rusage"]
 
 [[surfaces]]
+path = "crates/carrick-sched-core/src/aarch64_context.rs"
+contracts = ["kernel.el1.thread-lifecycle"]
+
+[[surfaces]]
+path = "crates/carrick-sched-core/src/process/context.rs"
+contracts = ["kernel.el1.thread-lifecycle"]
+
+[[surfaces]]
 path = "crates/carrick-sched-core/src/process/birth.rs"
 contracts = ["kernel.el1.thread-lifecycle"]
 
