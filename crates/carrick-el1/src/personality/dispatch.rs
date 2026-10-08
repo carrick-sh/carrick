@@ -346,7 +346,7 @@ where
         carrick_personality_linux::dispatch::CompletionRoute::Suspended => Action::Idle,
         carrick_personality_linux::dispatch::CompletionRoute::Forward => Action::Forward,
         carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion => {
-            invalid_completion()
+            invalid_completion(NativeInvariant::EntryBinding)
         }
     }
 }
@@ -449,13 +449,38 @@ where
 /// Native preparation, scheduling and completion retain an exact execution
 /// binding. Missing frames and failed completion authentication share this
 /// fail-stop transport; a completed effect must never be replayed by forwarding.
-pub(super) fn invalid_completion() -> ! {
+pub(super) enum NativeInvariant {
+    EntryBinding,
+    MissingNativeFrame,
+    RevisionCredit,
+    SignalNumber,
+    ProcessGraph(super::process_owner::GuestProcessInvariant),
+}
+
+impl core::fmt::Debug for NativeInvariant {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::EntryBinding => f.write_str("EntryBinding"),
+            Self::MissingNativeFrame => f.write_str("MissingNativeFrame"),
+            Self::RevisionCredit => f.write_str("RevisionCredit"),
+            Self::SignalNumber => f.write_str("SignalNumber"),
+            Self::ProcessGraph(invariant) => {
+                f.debug_tuple("ProcessGraph").field(invariant).finish()
+            }
+        }
+    }
+}
+
+pub(super) fn invalid_completion(reason: NativeInvariant) -> ! {
     #[cfg(target_os = "none")]
-    crate::substrate::sched::hw::fatal_entry_binding();
+    {
+        let _ = reason;
+        crate::substrate::sched::hw::fatal_entry_binding();
+    }
     #[cfg(not(target_os = "none"))]
     carrick_fatal::carrick_fatal!(
         "el1::entry_completion",
-        "native entry lost its exact execution binding"
+        "native entry invariant: {reason:?}"
     )
 }
 

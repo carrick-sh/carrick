@@ -213,7 +213,9 @@ impl<
         // SAFETY: this exact new record is unpublished and exclusively owned by this birth.
         let ctx = unsafe { record.ctx_mut() };
         let Some(frame) = self.frame.arm_frame() else {
-            super::dispatch::invalid_completion();
+            super::dispatch::invalid_completion(
+                super::dispatch::NativeInvariant::MissingNativeFrame,
+            );
         };
         zone.cpu.save(frame, ctx);
         ctx.x[0] = context.result.raw() as u64;
@@ -323,7 +325,9 @@ impl<
         let served = native_scheduler(zone, task, self.counters, slot, &mut self.handoff).run_next(
             match self.frame.arm_frame() {
                 Some(frame) => frame,
-                None => super::dispatch::invalid_completion(),
+                None => super::dispatch::invalid_completion(
+                    super::dispatch::NativeInvariant::MissingNativeFrame,
+                ),
             },
             timeout_result.raw() as u64,
         );

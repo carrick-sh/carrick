@@ -335,16 +335,9 @@ impl RegistryFailure for GuestRegistryFailure {
 }
 impl GuestProcessFailure for GuestRegistryFailure {
     fn fail_process(invariant: GuestProcessInvariant) -> ! {
-        #[cfg(target_os = "none")]
-        {
-            let _ = invariant;
-            crate::substrate::sched::hw::fatal_entry_binding()
-        }
-        #[cfg(not(target_os = "none"))]
-        carrick_fatal::carrick_fatal!(
-            "el1::process_owner",
-            "guest process owner invariant: {invariant:?}"
-        )
+        super::dispatch::invalid_completion(super::dispatch::NativeInvariant::ProcessGraph(
+            invariant,
+        ))
     }
 }
 
