@@ -673,11 +673,23 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         }
         if index != 0 {
             let link = self.node(index, banks).next_free.load(Ordering::Acquire);
-            assert_eq!(
-                link & (3 << 62),
-                0,
-                "live reservation node reached the free head: {index}"
-            );
+            if link & (3 << 62) != 0 {
+                // Another allocator may have popped this head and marked it
+                // active after our head load. Validate the tagged head before
+                // treating the observation as a custody violation.
+                if self
+                    .free
+                    .compare_exchange(head, head, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return Err(Refusal::Busy);
+                }
+                assert_eq!(
+                    link & (3 << 62),
+                    0,
+                    "live reservation node reached the free head: {index}"
+                );
+            }
             let next = link as u32;
             let generation = (head >> 32)
                 .checked_add(1)
