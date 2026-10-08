@@ -371,17 +371,31 @@ fn production_image_rejects_fixture_syscalls() {
 
 #[test]
 fn production_interrupt_boot_serves_an_ordinary_syscall() {
-    let production = PathBuf::from(env!("CARRICK_X86_CPL0_IMAGE"));
-    let first = program(&[(0x2345, 24)]);
-    let mut carrier =
-        Cpl0Carrier::boot_with_interrupts(&production, [&first, &first]).expect("KVM image");
-    let err = carrier
-        .observe(0)
-        .expect_err("production observer call is not handled in production image");
-    assert!(
-        carrier.refusal_overflow_count() >= 1,
-        "observer call must be counted in refusal overflow bucket: {err}"
-    );
+    use carrick_vmm_kvm::cpl0_boot::{
+        InitialProcessExit, InitialReservationLimits, InitialSyscallDisposition,
+    };
+    // Production entry requires an admitted initial MM and scheduler record.
+    // Keep the ordinary syscall and refusal checks on that real launch path.
+    let mut probe = vec![
+        0xbf, 0x45, 0x23, 0, 0, 0xbe, 24, 0, 0, 0, 0xb8, 0x11, 1, 0, 0, 0x0f, 0x05, 0x48, 0xb8,
+    ];
+    probe.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    probe.extend_from_slice(&[
+        0x0f, 0x05, 0x48, 0x83, 0xf8, 0xda, 0x75, 0x0e, 0xbf, 7, 0, 0, 0, 0xb8, 0xe7, 0, 0, 0,
+        0x0f, 0x05, 0x0f, 0x0b, 0xbf, 9, 0, 0, 0, 0xb8, 0xe7, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b,
+    ]);
+    let elf = production_probe_elf(&probe);
+    let plan = carrick_mem::x86_initial_image::prepare_static_x86_elf(&elf).expect("probe ELF");
+    let extent = Cpl0Carrier::initial_extent_bytes_for(&plan, &[], &[]).expect("initial extent");
+    let mut carrier = Cpl0Carrier::boot_production(extent).expect("production KVM image");
+    carrier
+        .load_guest_mm(&plan, &[], &[], InitialReservationLimits::UNLIMITED)
+        .expect("initial MM");
+    let exit = carrier
+        .run_initial_process(8, |_, _| Ok(InitialSyscallDisposition::Return(-1)))
+        .expect("native syscall, refusal and exit");
+    assert!(matches!(exit, InitialProcessExit::Exited { code: 7, .. }));
+    assert_eq!(carrier.refusal_overflow_count(), 1);
     assert_eq!(carrier.robust_list_head(0).expect("task head"), 0x2345);
 }
 
