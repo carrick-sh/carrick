@@ -125,17 +125,7 @@ impl<T> NativeProcessSignals<T> {
         }
     }
 }
-fn invalid_signal() -> ! {
-    #[cfg(target_os = "none")]
-    {
-        crate::substrate::sched::hw::fatal_entry_binding()
-    }
-    #[cfg(not(target_os = "none"))]
-    carrick_fatal::carrick_fatal!(
-        "el1::native_process_signals",
-        "validated Linux signal crossed invalid numbering domain"
-    )
-}
+
 /// Signal locks are sampled only when shared exit preparation requests them,
 /// after the process graph guard and member cancellation have completed.
 pub struct NativeExitSignals<T, M> {
@@ -145,7 +135,7 @@ pub struct NativeExitSignals<T, M> {
 impl<T, M: BlockedMaskSource> ExitSignalSource for NativeExitSignals<T, M> {
     fn exit_signal_state(&self, signal: LinuxSignal) -> ExitSignalState {
         let Some(signal) = Signal::from_number(signal.raw()) else {
-            invalid_signal()
+            super::dispatch::invalid_completion(super::dispatch::NativeInvariant::SignalNumber)
         };
         let action = self.signals.action(signal);
         let disposition = match action.disposition {
