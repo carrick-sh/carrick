@@ -106,6 +106,11 @@
 use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+mod fixture_common;
+use fixture_common::{
+    SYS_FUTEX, futex_wait_timeout, futex_wake, gettid, pipe_pair, poll_read_byte,
+    poll_read_count, raw6, write_count, write_signal_byte,
+};
 mod delegated_root;
 mod ipc;
 mod sample_buffer;
@@ -113,35 +118,14 @@ mod threads;
 mod tlb;
 use sample_buffer::measured_samples;
 
-const SYS_FUTEX: u64 = 98;
 const SYS_EXIT_GROUP: u64 = 94;
-const SYS_GETTID: u64 = 178;
 const SYS_TGKILL: u64 = 131;
 const FUTEX_WAIT_PRIVATE: u64 = 128;
-const FUTEX_WAKE_PRIVATE: u64 = 129;
 const EINTR: i64 = 4;
 const ETIMEDOUT: i64 = 110;
 const SYS_SCHED_SETAFFINITY: u64 = 122;
 const FUTEX_WAIT_BITSET_PRIVATE: u64 = 128 | 9;
 const FUTEX_BITSET_MATCH_ANY: u64 = 0xffff_ffff;
-
-unsafe fn raw6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
-    let ret: i64;
-    unsafe {
-        std::arch::asm!(
-            "svc #0",
-            inlateout("x0") a0 as i64 => ret,
-            in("x1") a1,
-            in("x2") a2,
-            in("x3") a3,
-            in("x4") a4,
-            in("x5") a5,
-            in("x8") nr,
-            options(nostack)
-        );
-    }
-    ret
-}
 
 /// `FUTEX_WAIT_PRIVATE` with no timeout: the in-guest (EL1) handoff case.
 fn futex_wait(word: &AtomicU32, expected: u32) -> i64 {
@@ -156,43 +140,6 @@ fn futex_wait(word: &AtomicU32, expected: u32) -> i64 {
             0,
         )
     }
-}
-
-/// `FUTEX_WAIT_PRIVATE` bounded by a relative timeout.
-fn futex_wait_timeout(word: &AtomicU32, expected: u32, timeout: Duration) -> i64 {
-    let ts = libc::timespec {
-        tv_sec: timeout.as_secs() as i64,
-        tv_nsec: libc::c_long::from(timeout.subsec_nanos() as i32),
-    };
-    unsafe {
-        raw6(
-            SYS_FUTEX,
-            word.as_ptr() as u64,
-            FUTEX_WAIT_PRIVATE,
-            u64::from(expected),
-            &ts as *const libc::timespec as u64,
-            0,
-            0,
-        )
-    }
-}
-
-fn futex_wake(word: &AtomicU32, count: u32) -> i64 {
-    unsafe {
-        raw6(
-            SYS_FUTEX,
-            word.as_ptr() as u64,
-            FUTEX_WAKE_PRIVATE,
-            u64::from(count),
-            0,
-            0,
-            0,
-        )
-    }
-}
-
-fn gettid() -> i32 {
-    unsafe { raw6(SYS_GETTID, 0, 0, 0, 0, 0, 0) as i32 }
 }
 
 fn tgkill(tid: i32, signal: i32) -> i64 {
@@ -873,13 +820,6 @@ fn pstate_mode() -> i32 {
 // ---------------------------------------------------------------------------
 // EL1 plan 1d modes
 
-fn pipe_pair() -> (i32, i32) {
-    let mut fds = [0i32; 2];
-    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-    assert_eq!(rc, 0, "pipe");
-    (fds[0], fds[1])
-}
-
 fn read_byte(fd: i32) -> i64 {
     let mut byte = 0u8;
     unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) as i64 }
@@ -1446,26 +1386,6 @@ fn mm_occupancy_process(role: &str, forks: usize) -> bool {
 // ---------------------------------------------------------------------------
 // EL1 increment 2: anonymous memory first-touch
 
-fn poll_read_byte(fd: libc::c_int, timeout_ms: libc::c_int) -> bool {
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-    if rc <= 0 || (pfd.revents & libc::POLLIN) == 0 {
-        return false;
-    }
-    let mut byte = 0u8;
-    let n = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
-    n == 1
-}
-
-fn write_signal_byte(fd: libc::c_int, byte: u8) -> bool {
-    let n = unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) };
-    n == 1
-}
-
 fn first_touch_process(
     role: &str,
     base: usize,
@@ -1739,36 +1659,6 @@ fn fork_cow_process(
         return None;
     }
     Some(verified_pages)
-}
-
-/// Send one observed count to the peer as 8 little-endian bytes.
-fn write_count(fd: libc::c_int, count: u64) -> bool {
-    let bytes = count.to_le_bytes();
-    let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-    n == bytes.len() as isize
-}
-
-/// Receive a count written by `write_count`, bounded by `timeout_ms`.
-fn poll_read_count(fd: libc::c_int, timeout_ms: libc::c_int) -> Option<u64> {
-    let mut bytes = [0u8; 8];
-    let mut have = 0;
-    while have < bytes.len() {
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-        if rc <= 0 || (pfd.revents & libc::POLLIN) == 0 {
-            return None;
-        }
-        let n = unsafe { libc::read(fd, bytes[have..].as_mut_ptr().cast(), bytes.len() - have) };
-        if n <= 0 {
-            return None;
-        }
-        have += n as usize;
-    }
-    Some(u64::from_le_bytes(bytes))
 }
 
 fn fork_cow(forks: usize, pages: usize) -> i32 {

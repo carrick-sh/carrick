@@ -39,11 +39,11 @@ use super::{
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-const SYS_KILL: u64 = 129;
-const SYS_TGKILL_NR: u64 = 131;
-const SYS_EXIT: u64 = 93;
-const SYS_EXIT_GROUP_NR: u64 = 94;
-const SYS_CLONE: u64 = 220;
+const SYS_KILL: u64 = libc::SYS_kill as u64;
+const SYS_TGKILL_NR: u64 = libc::SYS_tgkill as u64;
+const SYS_EXIT: u64 = libc::SYS_exit as u64;
+const SYS_EXIT_GROUP_NR: u64 = libc::SYS_exit_group as u64;
+const SYS_CLONE: u64 = libc::SYS_clone as u64;
 const FUTEX_WAIT_SHARED: u64 = 0;
 const EPERM: i64 = 1;
 const ESRCH: i64 = 3;
@@ -316,6 +316,7 @@ extern "C" fn raw_thread_body(_: *mut libc::c_void) -> libc::c_int {
 /// # Safety
 /// `stack_top` must be the 16-byte-aligned top of a live stack; `ptid`/`ctid`
 /// must stay valid for the child's lifetime.
+#[cfg(target_arch = "aarch64")]
 unsafe fn raw_clone_thread(
     flags: u64,
     stack_top: u64,
@@ -363,7 +364,7 @@ fn wait_cleartid(word: &AtomicU32, total: Duration) -> bool {
         };
         unsafe {
             raw6(
-                98,
+                libc::SYS_futex as u64,
                 word.as_ptr() as u64,
                 FUTEX_WAIT_SHARED,
                 u64::from(value),
@@ -1736,3 +1737,33 @@ fn flood_pipe_wait(fd: libc::c_int) -> bool {
 
 // The raw `exit` number is used by `raw_clone_thread`'s child stub.
 const _: u64 = SYS_EXIT;
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn raw_clone_thread(
+    flags: u64,
+    stack_top: u64,
+    ptid: *mut i32,
+    ctid: *mut u32,
+    func: extern "C" fn(*mut libc::c_void) -> libc::c_int,
+) -> i64 {
+    let ret = unsafe {
+        libc::clone(
+            func,
+            stack_top as *mut libc::c_void,
+            flags as i32,
+            std::ptr::null_mut(),
+            ptid,
+            0usize,
+            ctid,
+        )
+    };
+    if ret < 0 {
+        -i64::from(
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EINVAL),
+        )
+    } else {
+        i64::from(ret)
+    }
+}
