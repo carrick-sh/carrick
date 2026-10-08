@@ -580,7 +580,8 @@ mod kernel {
             // SAFETY: the boot owner published this supervisor-only zone and
             // retains it across the exact CPU's space-edit transaction.
             let zone = unsafe { &*(zone_address.raw() as *const carrick_sched_core::ZoneTables) };
-            let mut cow = X86CowResolver { pool, residency, completion: None };
+            let words = InitialWords::fixture();
+            let mut cow = X86CowResolver { words: &words, pool, residency, completion: None };
             let result = dispatch_x86_fault_with_prepared(
                 carrick_guest_arch::CpuId::new(0), fault, counters, task,
                 carrick_el1::substrate::sched::object_wait::space_access(
@@ -645,6 +646,7 @@ mod kernel {
         let mut prepared =
             unsafe { carrick_el1::fault::X86PreparedResolver::under_editor(prepared_mm, &words) };
         let mut cow = carrick_el1::fault::X86CowResolver {
+            words: &words,
             pool: cow_pool,
             residency,
             completion: None,
@@ -687,6 +689,7 @@ mod kernel {
                 cross_owner_grant(binding.cpu_slot);
                 let supply = carrick_el1::fault::OwnerFaultSupply::new(portal);
                 let mut cow = carrick_el1::fault::X86CowResolver {
+                    words: &words,
                     pool: cow_pool,
                     residency,
                     completion: None,
@@ -1801,7 +1804,9 @@ mod kernel {
                 doorbell(FATAL_PORT, frame);
                 halt();
             }
+            let words = InitialWords::fixture();
             let mut cow = X86CowResolver {
+                words: &words,
                 pool: &SHARED_COW_POOL,
                 residency,
                 completion: None,

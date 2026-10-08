@@ -1981,9 +1981,9 @@
       "kind": "static",
       "file": "crates/carrick-kernel/src/kernel/ids.rs",
       "symbol": "NEXT_FILE_DESCRIPTION_ID",
-      "fingerprint": "e5de473ba863b6f4206b47d69226d2dbe46e9f2b22d11a52622aea523cfa8623",
+      "fingerprint": "8cca60a42fc31e55686c65db09fae450edb82d8598588e1997729dc9874d6bcb",
       "classification": "monotonic_allocator",
-      "rationale": "Carrier-wide monotonic allocator NEXT_FILE_DESCRIPTION_ID in crates/carrick-runtime/src/kernel/ids.rs generating unique IDs across the host process."
+      "rationale": "Carrier-wide monotonic file-description identity source in crates/carrick-kernel/src/kernel/ids.rs. The shared SerialAllocator preserves process-global uniqueness across Kernel generations and independently copied tables; restore advances the same source past an established ID, and overflow refuses allocation rather than reusing an identity. This source is separate from transferable kernel-local serials and is not transferred by boot export."
     },
     {
       "kind": "static",

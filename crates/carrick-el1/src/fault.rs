@@ -412,14 +412,17 @@ impl CowResolver for HardwareCowResolver {
 /// shared pool and residency table; KVM fixtures can supply exact local
 /// records while exercising the production resolver.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub struct X86CowResolver<'a> {
+pub struct X86CowResolver<'a, W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords> {
+    pub words: &'a W,
     pub pool: &'a dyn carrick_el1_abi::CowGrantVenue,
     pub residency: &'a carrick_el1_abi::FrameGrantResidencyTable,
     pub completion: Option<carrick_el1_abi::CowGrantCompletion>,
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-impl CowResolver for X86CowResolver<'_> {
+impl<D: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords> CowResolver
+    for X86CowResolver<'_, D>
+{
     fn reconcile_parent_write<
         W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
     >(
@@ -445,7 +448,7 @@ impl CowResolver for X86CowResolver<'_> {
 
     fn resolve_cow_outcome(&mut self, root: u64, mm_key: u64, far: u64) -> CowResolution {
         let copy_page = |source: u64, destination: u64| {
-            // SAFETY: the x86 adapter verified both supervisor direct
+            // SAFETY: the x86 adapter verified both retained supervisor
             // translations for these distinct page frames.
             unsafe {
                 core::ptr::copy_nonoverlapping(source as *const u8, destination as *mut u8, 4096)
@@ -465,9 +468,10 @@ impl CowResolver for X86CowResolver<'_> {
         };
         // SAFETY: dispatch_classified_fault holds this MM's exact editor.
         // resolve_x86_guest_cow authenticates the live CR3 and retained
-        // supervisor table window before reading or changing descriptors.
+        // supplied descriptor-word authority before reading or changing descriptors.
         let outcome = unsafe {
             crate::cow::resolve_x86_guest_cow(
+                self.words,
                 root,
                 mm_key,
                 far,

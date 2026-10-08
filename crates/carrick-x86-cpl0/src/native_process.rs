@@ -422,6 +422,7 @@ impl NativeProcessService<'static> for Service {
                 carrick_el1::fault::X86PreparedResolver::under_editor(mm.mm.raw(), &words)
             };
             let mut cow = carrick_el1::fault::X86CowResolver {
+                words: &words,
                 pool,
                 residency,
                 completion: None,

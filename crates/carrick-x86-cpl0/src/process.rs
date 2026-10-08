@@ -325,8 +325,9 @@ fn prepare_parent_output(
     if address.raw()<STACK_TOP-4096 || address.raw().checked_add(size as u64).is_none_or(|end|end>STACK_TOP)
         || lane.task.mm.key.load(Ordering::Acquire)!=PARENT_MM { return None; }
     let root=carrick_el1::isa::x86::hardware_live_root().ok()?;
-    if translate_leaf(&InitialWords::fixture(),root,address,Access::Write,true).is_err() {
-        let mut cow=X86CowResolver { pool:&SHARED_COW_POOL,residency:residency()?,completion:None };
+    let words = InitialWords::fixture();
+    if translate_leaf(&words,root,address,Access::Write,true).is_err() {
+        let mut cow=X86CowResolver { words: &words, pool:&SHARED_COW_POOL,residency:residency()?,completion:None };
         let result=dispatch_x86_fault_with_prepared(
             carrick_guest_arch::CpuId::new(0),FaultInfo {address,access:FaultAccess::Write,present:true},lane.counters,lane.task,
             carrick_el1::substrate::sched::object_wait::space_access(lane.zone,lane.lane.slot),
@@ -335,7 +336,7 @@ fn prepare_parent_output(
         );
         if result!=Action::Served { return None; }
     }
-    let leaf=translate_leaf(&InitialWords::fixture(),root,address,Access::Write,true).ok()?;
+    let leaf=translate_leaf(&words,root,address,Access::Write,true).ok()?;
     let destination=carrick_el1_abi::X86_CPL0_DIRECT_VA.checked_add(leaf.output.raw())?;
     Some(PreparedParentOutput { destination:carrick_guest_arch::KernelVa::new(destination) })
 }
