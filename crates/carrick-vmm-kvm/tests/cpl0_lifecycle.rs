@@ -4,6 +4,10 @@
 //! This bounded context fixture does not qualify production-pool exhaustion.
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[path = "common/physical_inventory.rs"]
+mod physical_inventory;
+use physical_inventory::physical_inventory;
+
 use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
 use carrick_x86::cpl0_entry::OBSERVE_NATIVE;
 use carrick_x86::cpl0_lifecycle::LIFECYCLE_DATA;
@@ -60,8 +64,8 @@ fn x5_shared_clone_exit() {
     let a = program(0);
     let b = program(1);
     for births in [16, 64, 256] {
-        let mut carrier =
-            Cpl0Carrier::boot_lifecycle(&image(), [&a, &b]).expect("real CPL0 lifecycle binding");
+        let mut carrier = Cpl0Carrier::boot_lifecycle(physical_inventory(), &image(), [&a, &b])
+            .expect("real CPL0 lifecycle binding");
         for round in 0..births {
             for index in 0..2 {
                 let entry = carrier.stock_lifecycle(index).unwrap();

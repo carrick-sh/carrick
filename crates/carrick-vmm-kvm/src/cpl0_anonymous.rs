@@ -773,7 +773,7 @@ impl Cpl0HostCustody {
                     .ok_or_else(|| fail("physical fork custody encoding"))?;
                 let selected_edges = self
                     ._vm
-                    .select_inherited_frames(execution.context, selected, &self.frame_inventory)
+                    .select_inherited_frames(execution.context, selected, &*self.frame_inventory)
                     .map_err(|e| fail(e.to_string()))?;
                 for edge in selected_edges {
                     if !spans.insert(edge.span().va) {
@@ -782,17 +782,14 @@ impl Cpl0HostCustody {
                     edges.push(edge);
                 }
             }
-            let parent_mm = MmId::from_raw_u64(execution.context.mm.raw().get())
-                .ok_or_else(|| fail("physical parent inventory MM"))?;
-            let child_mm = MmId::from_raw_u64(child.mm.raw().get())
-                .ok_or_else(|| fail("physical child inventory MM"))?;
+            let parent_inventory = self.frame_inventory.bind(execution.context.mm);
+            let child_inventory = self.frame_inventory.bind(child.mm);
             let mut rows = std::collections::BTreeMap::new();
             for edge in &edges {
                 let identity = edge.identity();
                 let mapping = MappingId::from_kernel_allocation(identity.mapping_id);
-                let row = self
-                    .frame_inventory
-                    .live_mapping_row(parent_mm, mapping)
+                let row = parent_inventory
+                    .live_mapping_row(mapping)
                     .ok_or_else(|| fail("physical fork source mapping absent"))?;
                 if row.frame != FrameId::from_kernel_allocation(identity.frame_id)
                     || row.generation
@@ -815,9 +812,8 @@ impl Cpl0HostCustody {
                     .ok_or_else(|| fail("physical fork inventory capacity"))?,
             )
             .map_err(|e| fail(e.to_string()))?;
-            let mut reservation = self
-                .frame_inventory
-                .reserve(&self.object_ids, 0, rows.len(), capacity)
+            let mut reservation = child_inventory
+                .reserve(0, rows.len(), capacity.get())
                 .map_err(|e| fail(e.to_string()))?;
             let transaction = reservation.transaction();
             let generation = MappingGeneration::from_backend_counter(NonZeroU64::MIN);
@@ -846,9 +842,8 @@ impl Cpl0HostCustody {
                     .map_err(|e| fail(e.to_string()))?;
                 mappings.insert(*source, mapping);
             }
-            let (_, receipt) = self
-                .frame_inventory
-                .apply_with_receipt(child_mm, reservation.commit(()))
+            let receipt = child_inventory
+                .apply_with_receipt(reservation.commit(()))
                 .map_err(|e| fail(e.to_string()))?;
             self._vm
                 .install_root(child.mm.raw(), child)
@@ -868,7 +863,7 @@ impl Cpl0HostCustody {
                         .ok_or_else(|| fail("physical fork inventory revision"))?,
                 };
                 self._vm
-                    .attach_inherited_frame(child, edge, identity, &receipt, &self.frame_inventory)
+                    .attach_inherited_frame(child, edge, identity, &receipt, &*self.frame_inventory)
                     .map_err(|e| fail(e.to_string()))?;
                 let parent = self
                     .cow_residency()?
@@ -1057,12 +1052,11 @@ impl Cpl0HostCustody {
         );
         let (mut inventory, _) = InitialInventory::stage(
             Arc::clone(&self.frame_inventory),
-            &self.object_ids,
             [gpa],
             0,
             size,
             NonZeroU64::MIN,
-            MmId::from_raw_u64(mm.get()).ok_or_else(|| fail("owner COW MM"))?,
+            MmGeneration::new(mm),
         )?;
         let backing = inventory
             .frames
@@ -1294,7 +1288,7 @@ impl Cpl0HostCustody {
             self.private_anonymous_witness.record_settled(
                 crate::cpl0_private_witness::SettledPrivateGrant {
                     memory: &self._vm,
-                    inventory: &self.frame_inventory,
+                    inventory: &*self.frame_inventory,
                     binding: pending.execution.binding,
                     cpu: pending.execution.cpu,
                     context: pending.execution.context,
@@ -1356,14 +1350,13 @@ impl Cpl0HostCustody {
         );
         let (mut inventory, grants) = InitialInventory::stage(
             Arc::clone(&self.frame_inventory),
-            &self.object_ids,
             [gpa],
             0,
             len,
             // A newly allocated physical mapping starts at generation one;
             // the guest operation sequence belongs to the descriptor txn.
             NonZeroU64::MIN,
-            MmId::from_raw_u64(mm.get()).ok_or_else(|| fail("owner inventory MM"))?,
+            MmGeneration::new(mm),
         )?;
         let identity = inventory
             .frames

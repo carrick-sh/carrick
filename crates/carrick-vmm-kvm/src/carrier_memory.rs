@@ -32,18 +32,15 @@ fn inherited_leaf_names(entry: u64, size: u64, gpa: FrameGpa) -> bool {
 }
 
 fn inventory_page_live(
-    authority: &carrick_kernel::kernel::frame_inventory::FrameInventoryAuthority,
+    authority: &dyn carrick_hal::PhysicalFrameInventory,
     mm: NonZeroU64,
     identity: BackingIdentity,
     gpa: FrameGpa,
 ) -> bool {
-    let Some(mm) = carrick_kernel::kernel::MmId::from_raw_u64(mm.get()) else {
-        return false;
-    };
-    let Some(row) = authority.live_mapping_row(
-        mm,
-        carrick_hal::MappingId::from_kernel_allocation(identity.mapping_id),
-    ) else {
+    let bound = authority.bind(carrick_guest_arch::MmGeneration::new(mm));
+    let Some(row) = bound.live_mapping_row(carrick_hal::MappingId::from_kernel_allocation(
+        identity.mapping_id,
+    )) else {
         return false;
     };
     gpa.raw().is_multiple_of(PAGE)
@@ -162,7 +159,6 @@ pub struct BackingHandle {
     ::core::cmp::Eq,
 )]
 pub struct CarrierVmId(NonZeroU64);
-impl carrick_kernel::kernel::boot_launch::BootVmIdentity for CarrierVmId {}
 impl CarrierVmId {
     fn allocate() -> Result<Self, MemoryError> {
         static CARRIERS: carrick_sched_core::process::identity_allocator::SerialAllocator =
@@ -720,7 +716,7 @@ impl CarrierMemory {
         &self,
         parent: AddressContext<RootGpa>,
         selection: carrick_el1_abi::PortalForkCustody,
-        authority: &carrick_kernel::kernel::frame_inventory::FrameInventoryAuthority,
+        authority: &dyn carrick_hal::PhysicalFrameInventory,
     ) -> Result<Vec<InheritedFrameEdge>, MemoryError> {
         self.admit()?;
         if self.root(parent.mm.raw()) != Some(parent) {
@@ -781,7 +777,7 @@ impl CarrierMemory {
         edge: &InheritedFrameEdge,
         identity: BackingIdentity,
         receipt: &carrick_hal::FrameInventoryApplyReceipt,
-        authority: &carrick_kernel::kernel::frame_inventory::FrameInventoryAuthority,
+        authority: &dyn carrick_hal::PhysicalFrameInventory,
     ) -> Result<(), MemoryError> {
         self.admit()?;
         self.record(edge.handle)?;

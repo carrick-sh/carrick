@@ -2492,6 +2492,60 @@ pub enum OwnerFileFaultOutcome {
     BusFault,
 }
 
+/// Physical publication service over the existing kernel inventory and ID
+/// source. Binding retains one exact owner-selected MM; it grants no Linux
+/// process, VMA, permission or MM identity allocation policy to a backend.
+pub trait PhysicalFrameInventory: Send + Sync {
+    fn bind(&self, mm: carrick_guest_arch::MmGeneration) -> Arc<dyn FrameCowAuthority>;
+    fn allocate_backing_ids(
+        &self,
+    ) -> Result<(crate::FrameId, crate::MappingId), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// An unpublished apply retains the exact authority that issued its receipt.
+/// Rollback cannot accept a caller-selected source, MM or replacement receipt.
+/// Failures preserve this handle for the caller's existing custody policy.
+///
+/// ```compile_fail
+/// use carrick_hal::{FrameCowAuthority, FrameInventoryApplyReceipt, UnpublishedFrameInventoryApply};
+/// use std::sync::Arc;
+/// fn rebind(authority: Arc<dyn FrameCowAuthority>, receipt: FrameInventoryApplyReceipt) {
+///     UnpublishedFrameInventoryApply::from_receipt(authority, receipt);
+/// }
+/// ```
+pub struct UnpublishedFrameInventoryApply<A: FrameCowAuthority + ?Sized> {
+    authority: Arc<A>,
+    receipt: crate::FrameInventoryApplyReceipt,
+}
+impl<A: FrameCowAuthority + ?Sized> UnpublishedFrameInventoryApply<A> {
+    pub fn apply(
+        authority: Arc<A>,
+        commit: crate::FrameInventoryCommit<()>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let receipt = authority.apply_with_receipt(commit)?;
+        Ok(Self { authority, receipt })
+    }
+    pub fn rollback(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.authority.rollback_unpublished_apply(&self.receipt)
+    }
+}
+impl<A: FrameCowAuthority + ?Sized> core::ops::Deref for UnpublishedFrameInventoryApply<A> {
+    type Target = crate::FrameInventoryApplyReceipt;
+    fn deref(&self) -> &Self::Target {
+        &self.receipt
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalMappingRow {
+    pub mapping: crate::MappingId,
+    pub frame: crate::FrameId,
+    pub generation: crate::MappingGeneration,
+    pub gpa: carrick_guest_mem::Gpa,
+    pub length: crate::FrameLength,
+    pub permissions: crate::MemPerms,
+}
+
 pub trait FrameCowAuthority: Send + Sync {
     /// Bounded byte service for an owner-selected retained host source. No
     /// guest VA or permission decision crosses this physical boundary.
@@ -2725,6 +2779,40 @@ pub trait FrameCowAuthority: Send + Sync {
         Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "frame COW authority does not attest identity writes",
+        )))
+    }
+
+    /// Read one published row from this binding's exact MM.
+    fn live_mapping_row(&self, _mapping: crate::MappingId) -> Option<PhysicalMappingRow> {
+        None
+    }
+
+    fn mapping_is_live_exact_generation(
+        &self,
+        mapping: crate::MappingId,
+        frame: crate::FrameId,
+        generation: crate::MappingGeneration,
+        gpa: carrick_guest_mem::Gpa,
+        length: crate::FrameLength,
+    ) -> bool {
+        self.live_mapping_row(mapping).is_some_and(|row| {
+            row.frame == frame
+                && row.generation == generation
+                && row.gpa == gpa
+                && row.length == length
+        })
+    }
+
+    /// Owner implementation seam used by UnpublishedFrameInventoryApply.
+    /// Physical backends retain that source-bound handle instead of choosing
+    /// a rollback target for a raw receipt.
+    #[doc(hidden)]
+    fn rollback_unpublished_apply(
+        &self,
+        _receipt: &crate::FrameInventoryApplyReceipt,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(std::io::Error::other(
+            "inventory rollback unavailable",
         )))
     }
 

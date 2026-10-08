@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub(crate) struct SettledPrivateGrant<'a> {
     pub cpu: CpuId,
     pub memory: &'a crate::carrier_memory::CarrierMemory,
-    pub inventory: &'a carrick_kernel::kernel::frame_inventory::FrameInventoryAuthority,
+    pub inventory: &'a dyn carrick_hal::PhysicalFrameInventory,
     pub binding: carrick_el1_abi::ExecutionBinding,
     pub context: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
     pub window: carrick_el1_abi::PortalGrantWindow,
@@ -97,12 +97,10 @@ impl PrivateAnonymousWitness {
                 {
                     return Err(fail("private witness grant span mismatch"));
                 }
-                let owner_mm = carrick_kernel::kernel::MmId::from_raw_u64(mm.get())
-                    .ok_or_else(|| fail("private witness MM identity"))?;
+                let inventory = grant.inventory.bind(grant.context.mm);
                 let length = std::num::NonZeroU64::new(span.len)
                     .ok_or_else(|| fail("private witness empty grant"))?;
-                if !grant.inventory.mapping_is_live_exact_generation(
-                    owner_mm,
+                if !inventory.mapping_is_live_exact_generation(
                     carrick_hal::MappingId::from_kernel_allocation(backing.mapping_id),
                     carrick_hal::FrameId::from_kernel_allocation(backing.frame_id),
                     carrick_hal::MappingGeneration::from_backend_counter(backing.owner_generation),

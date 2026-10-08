@@ -23,6 +23,7 @@ workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+carrick-kernel = { path = "../carrick-kernel" }
 tempfile.workspace = true
 toml.workspace = true
 serde_json.workspace = true
@@ -68,7 +69,6 @@ getrandom.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 carrick-core = { path = "../carrick-core" }
 carrick-el1 = { path = "../carrick-el1" }
-carrick-kernel = { path = "../carrick-kernel" }
 carrick-host = { path = "../carrick-host" }
 kvm-ioctls = "0.22.1"
 kvm-bindings = "0.12.1"
