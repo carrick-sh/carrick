@@ -180,6 +180,14 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
                         u64::from(previous);
                 }
             }
+            #[cfg(target_os = "macos")]
+            carrick_observability::probes::hvpatch_n1_reservation_custody(
+                2,
+                self.mm.raw(),
+                self.incarnation().raw(),
+                u64::from(id),
+                u64::from(tail_id),
+            );
             self.free_node(tail_id);
             self.free_node(id);
         }

@@ -457,6 +457,7 @@ dependencies = [
  "carrick-el1-abi",
  "carrick-guest-arch",
  "carrick-mmu-core",
+ "carrick-observability",
  "carrick-personality-linux",
  "carrick-sched-core",
  "parking_lot",

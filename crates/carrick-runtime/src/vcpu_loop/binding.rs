@@ -1296,6 +1296,13 @@ where
                 "publish persistent failure Kernel exit failed: {failure}"
             );
         }
+        crate::probes::hvpatch_n1_reservation_custody(
+            4,
+            terminal_mm.raw(),
+            0,
+            terminal_context.task().key().id.raw() as u64,
+            terminal_context.task().key().serial.raw(),
+        );
         if owns_final_mm {
             if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
                 table.retire_overlapping(terminal_mm.raw(), 0, u64::MAX);
@@ -1399,7 +1406,14 @@ where
                 );
             }
         }
-        self.pending_terminal_retirement = Some(
+        self.pending_terminal_retirement = Some({
+            crate::probes::hvpatch_n1_reservation_custody(
+                3,
+                terminal_mm.raw(),
+                0,
+                terminal_context.task().key().id.raw() as u64,
+                terminal_context.task().key().serial.raw(),
+            );
             process
                 .begin_address_space_retirement(exit_code, self.state.this_tid, process_exit_event)
                 .unwrap_or_else(|failure| {
@@ -1408,8 +1422,8 @@ where
                         "kernel::terminal_settlement",
                         "retire persistent failure MM/ASID failed: {failure}"
                     );
-                }),
-        );
+                })
+        });
         drop(owner_set_edit);
         drop(topology);
         self.kernel.publish_process_terminal(terminal_publication);
