@@ -622,14 +622,17 @@ fn initial_base_policy(
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    if snapshot.schema != 1
-        || snapshot.source_commit != base
-        || snapshot.platforms.len() != expected.len()
-        || platforms != expected
-    {
-        return fail("no audited initial symbolic counts for this schema-absent base");
+    if snapshot.schema != 1 || snapshot.platforms.len() != expected.len() || platforms != expected {
+        return fail("invalid audited initial symbolic bootstrap metadata");
     }
     snapshot.policy.validate()?;
+    // This is a one-time schema cutover, not a receipt for one Git identity.
+    // The actual merged tree still passes the complete restricted census,
+    // absolute ceilings and zero rules; a schema-bearing base uses the ratchet.
+    println!(
+        "authority debt initial bootstrap: schema-absent base {base}; informational census provenance {}",
+        snapshot.source_commit
+    );
     Ok(snapshot.policy)
 }
 
@@ -715,6 +718,17 @@ pub fn run(root: &Path, args: &AuthorityDebtArgs) -> Result<(), DebtError> {
 #[cfg(test)]
 mod bootstrap_tests {
     use super::*;
+    #[test]
+    fn schema_absent_base_accepts_a_different_informational_sha() {
+        let base = tempfile::tempdir().unwrap();
+        let tools = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        assert!(initial_base_policy(base.path(), "test-only-main-advance", tools).is_ok());
+    }
+
     #[test]
     fn initial_bootstrap_refuses_schema_base() -> Result<(), DebtError> {
         let tools = Path::new(env!("CARGO_MANIFEST_DIR"))
