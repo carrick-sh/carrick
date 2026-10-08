@@ -243,9 +243,12 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
                     request.operation.mm.raw(),
                     request.operation.incarnation.get(),
                     request.operation.sequence.get() as u32,
-                    frame.slot as u32,
+                    changed.is_some() as u32,
                 );
-                service.complete(0, NativeOwnerVenue::encode_error(MmError::Busy));
+                service.suspend_prepare(changed.map_or(
+                    carrick_el1_abi::PortalPrepareSuspension::SelectionChanged,
+                    carrick_el1_abi::PortalPrepareSuspension::Owner,
+                ));
             }
             Err(error) => {
                 carrick_el1_abi::record_reservation_event(
