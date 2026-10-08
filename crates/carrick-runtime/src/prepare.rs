@@ -50,6 +50,115 @@ use carrick_kernel::run_result::{RunResult, RuntimeError};
 use carrick_vfs::fs_backend::{FsBackend, HostFsBackend};
 use carrick_vfs::{BindVfs, HostResolverSnapshot, Vfs};
 
+/// Only these x86 Linux requests may use the temporary host semantic venue.
+/// A portal exit is not itself authority to run a host dispatcher operation:
+/// all guest MM, identity, signal, wait, and IPC calls remain with CPL0.
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InitialForwardClass {
+    Host(&'static str),
+    Refuse(&'static str),
+}
+
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+impl InitialForwardClass {
+    const fn family(self) -> &'static str {
+        match self {
+            Self::Host(family) | Self::Refuse(family) => family,
+        }
+    }
+}
+
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+fn classify_initial_x86_forward(
+    native: carrick_abi::NativeNr,
+    args: [u64; 6],
+    poll_host_fds: bool,
+) -> InitialForwardClass {
+    use InitialForwardClass::{Host, Refuse};
+    // x86_64 Linux UAPI ordinals. The native-number type prevents a
+    // canonical/aarch64 ordinal from being classified at this boundary.
+    match native.0 {
+        0 if args[0] == 0 => Host("terminal"), // read(stdin)
+        1 | 20 if args[0] == 1 || args[0] == 2 => Host("terminal"), // write/writev
+        3 if args[0] <= 2 => Host("terminal"), // close(stdio)
+        7 if poll_host_fds => Host("terminal"), // bounded host-backed pollfds
+        60 | 231 => Host("exit"),
+        63 => Host("system_query"), // uname
+        96 | 228 => Host("clock"),  // gettimeofday/clock_gettime
+        318 => Host("entropy"),     // getrandom
+        9 | 10 | 11 | 12 | 25 | 28 => Refuse("memory"),
+        39 | 110 | 186 | 218 => Refuse("identity"),
+        13 | 14 | 15 | 62 | 200 | 234 => Refuse("signal"),
+        56 | 57 | 58 | 61 | 202 | 247 => Refuse("task_wait"),
+        97 | 160 | 302 => Refuse("limits"),
+        _ => Refuse("unclassified"),
+    }
+}
+
+/// Poll may cross only for the CLI's host-backed descriptors. The kernel's
+/// in-zone descriptor namespace has no authority in the host dispatcher.
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+fn initial_poll_has_only_host_fds(
+    machine: &impl carrick_guest_mem::GuestMemory,
+    args: [u64; 6],
+) -> bool {
+    use zerocopy::FromBytes;
+    let Ok(nfds) = usize::try_from(args[1]) else {
+        return false;
+    };
+    if nfds > 64 {
+        return false;
+    }
+    if nfds == 0 {
+        return true;
+    }
+    let Some(length) = nfds.checked_mul(core::mem::size_of::<carrick_abi::LinuxPollFd>()) else {
+        return false;
+    };
+    let Ok(bytes) = carrick_guest_mem::GuestMemory::read_bytes(machine, args[0], length) else {
+        return false;
+    };
+    bytes
+        .chunks_exact(core::mem::size_of::<carrick_abi::LinuxPollFd>())
+        .all(|chunk| {
+            carrick_abi::LinuxPollFd::read_from_bytes(chunk)
+                .is_ok_and(|entry| entry.fd < 0 || entry.fd <= 2)
+        })
+}
+
+#[cfg(all(test, feature = "platform-linux", target_arch = "x86_64"))]
+mod initial_x86_forward_tests {
+    use super::{InitialForwardClass, classify_initial_x86_forward};
+    use carrick_abi::NativeNr;
+
+    #[test]
+    fn only_explicit_host_crossings_reach_host_semantics() {
+        let classify =
+            |nr, fd| classify_initial_x86_forward(NativeNr(nr), [fd, 0, 0, 0, 0, 0], true);
+        assert_eq!(classify(1, 1), InitialForwardClass::Host("terminal"));
+        assert_eq!(classify(1, 2), InitialForwardClass::Host("terminal"));
+        assert_eq!(classify(1, 3), InitialForwardClass::Refuse("unclassified"));
+        assert_eq!(classify(9, 0), InitialForwardClass::Refuse("memory"));
+        assert_eq!(classify(10, 0), InitialForwardClass::Refuse("memory"));
+        assert_eq!(classify(11, 0), InitialForwardClass::Refuse("memory"));
+        assert_eq!(classify(39, 0), InitialForwardClass::Refuse("identity"));
+        assert_eq!(classify(13, 0), InitialForwardClass::Refuse("signal"));
+        assert_eq!(classify(7, 0), InitialForwardClass::Host("terminal"));
+        assert_eq!(
+            classify_initial_x86_forward(NativeNr(7), [0, 3, 0, 0, 0, 0], false),
+            InitialForwardClass::Refuse("unclassified")
+        );
+        assert_eq!(classify(62, 0), InitialForwardClass::Refuse("signal"));
+        assert_eq!(classify(57, 0), InitialForwardClass::Refuse("task_wait"));
+        assert_eq!(classify(160, 0), InitialForwardClass::Refuse("limits"));
+        assert_eq!(
+            classify(999, 0),
+            InitialForwardClass::Refuse("unclassified")
+        );
+    }
+}
+
 pub struct Runtime;
 
 /// Everything `prepare` resolves before it touches the filesystem: page
@@ -528,12 +637,22 @@ fn prepare_host_backend(
         record_detached_scratch(id, scratch);
     }
 
-    let mut dispatcher = SyscallDispatcher::with_network_and_host_resolver(
-        Arc::clone(&plan.network),
-        plan.host_resolver.as_ref(),
-        crate::platform_bridges(),
-    );
-    dispatcher.set_container(Arc::clone(container));
+    let mut dispatcher = if plan.page.backend == ExecutionBackend::KvmX86Cpl0 {
+        SyscallDispatcher::with_prepared_launch(
+            Arc::clone(&plan.network),
+            plan.host_resolver.as_ref(),
+            crate::platform_bridges(),
+            Arc::clone(container),
+        )?
+    } else {
+        let mut dispatcher = SyscallDispatcher::with_network_and_host_resolver(
+            Arc::clone(&plan.network),
+            plan.host_resolver.as_ref(),
+            crate::platform_bridges(),
+        );
+        dispatcher.set_container(Arc::clone(container));
+        dispatcher
+    };
     if let HostRootLayout::CachedLower(rootfs) = root_layout {
         dispatcher.set_rootfs_layer(rootfs);
     }
@@ -572,12 +691,26 @@ fn prepare_memory_backend(
 ) -> Result<(SyscallDispatcher, carrick_vfs::rootfs::RootFs), RuntimeError> {
     let rootfs = carrick_vfs::rootfs::RootFs::from_layer_paths(&layer_paths(spec))
         .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("failed to compose rootfs: {e}")))?;
-    let mut dispatcher = SyscallDispatcher::with_rootfs_and_executable_on(
-        crate::platform_bridges(),
-        rootfs.clone(),
-        spec.process.executable.clone(),
-    );
-    dispatcher.set_container(Arc::clone(container));
+    let mut dispatcher = if plan.page.backend == ExecutionBackend::KvmX86Cpl0 {
+        let mut dispatcher = SyscallDispatcher::with_prepared_launch(
+            Arc::clone(&plan.network),
+            plan.host_resolver.as_ref(),
+            crate::platform_bridges(),
+            Arc::clone(container),
+        )?;
+        dispatcher.set_rootfs_layer(rootfs.clone());
+        dispatcher.sandbox_exec_to_container();
+        dispatcher.set_executable_path(spec.process.executable.clone());
+        dispatcher
+    } else {
+        let mut dispatcher = SyscallDispatcher::with_rootfs_and_executable_on(
+            crate::platform_bridges(),
+            rootfs.clone(),
+            spec.process.executable.clone(),
+        );
+        dispatcher.set_container(Arc::clone(container));
+        dispatcher
+    };
     if let Some(snapshot) = plan.host_resolver.as_ref() {
         dispatcher.set_host_resolver_snapshot(snapshot);
     }
@@ -906,6 +1039,7 @@ impl PreparedRun {
         // (`.semgrep/typed-domains.yml::no-cfg-not-platform-macos`).
         #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
         let run = if backend == ExecutionBackend::KvmX86Cpl0 {
+            let mut dispatcher = dispatcher;
             let _ = (&debug_state_path, &root, &carrier, &carrier_lease);
             let bytes = dispatcher.read_exec_file(&executable).ok_or_else(|| {
                 RuntimeError::Unsupported(format!("guest executable not found: {executable}"))
@@ -917,22 +1051,143 @@ impl PreparedRun {
             )?;
             let mut machine =
                 carrick_vmm_kvm::cpl0_boot::Cpl0Carrier::boot_production(extent_bytes)?;
-            machine.load_guest_mm(&image, &argv, &env)?;
-            let (exit_code, traps) = machine.run_initial_process(max_traps, |fd, bytes| {
-                dispatcher.forward_stdio_bytes(fd, bytes)
+            let limits = carrick_vmm_kvm::cpl0_boot::InitialReservationLimits {
+                address: dispatcher.launch_resource_limit(carrick_abi::LinuxResource::As),
+                data: dispatcher.launch_resource_limit(carrick_abi::LinuxResource::Data),
+            };
+            machine.load_guest_mm(&image, &argv, &env, limits)?;
+            let reporter = carrick_kernel::compat::CompatReporter::default();
+            let mut forward_families = std::collections::BTreeMap::<&'static str, u64>::new();
+            let mut refusal_families = std::collections::BTreeMap::<&'static str, u64>::new();
+            let outcome = machine.run_initial_process(max_traps, |machine, frame| {
+                use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
+                use carrick_kernel::dispatch::{DispatchOutcome, SyscallRequest};
+                use carrick_vmm_kvm::cpl0_boot::InitialSyscallDisposition as Decision;
+                let syscall = carrick_guest_mem::X8664SyscallFrame {
+                    rax: frame.rax,
+                    rdi: frame.rdi,
+                    rsi: frame.rsi,
+                    rdx: frame.rdx,
+                    r10: frame.r10,
+                    r8: frame.r8,
+                    r9: frame.r9,
+                };
+                let raw = match X8664GuestArch::normalize_syscall(&syscall) {
+                    SyscallNorm::Plain(raw) => raw,
+                    SyscallNorm::ArchPrctl { code, addr } => {
+                        let value =
+                            carrick_hal::x8664_arch::service_arch_prctl(machine, code, addr)?;
+                        return Ok(Decision::Return(value));
+                    }
+                };
+                let poll_host_fds =
+                    raw.native_number.0 == 7 && initial_poll_has_only_host_fds(machine, raw.args);
+                match classify_initial_x86_forward(raw.native_number, raw.args, poll_host_fds) {
+                    InitialForwardClass::Host(family) => {
+                        *forward_families.entry(family).or_default() += 1;
+                    }
+                    refusal @ InitialForwardClass::Refuse(_) => {
+                        *refusal_families.entry(refusal.family()).or_default() += 1;
+                        reporter.record(carrick_kernel::compat::CompatEvent::partial_syscall(
+                            raw.number.0,
+                            format!("x86_native_{}", raw.native_number.0),
+                            carrick_kernel::compat::SyscallArgs::new(raw.args),
+                            format!("cpl0_{}_owner_unbound", refusal.family()),
+                        ));
+                        return Ok(Decision::Refused(carrick_abi::LINUX_ENOSYS));
+                    }
+                }
+                let kernel = dispatcher.capture_one_task_context().map_err(|error| {
+                    carrick_hal::TrapError::Hypervisor(format!(
+                        "capture x86 syscall context: {error}"
+                    ))
+                })?;
+                let request = SyscallRequest::from_raw(raw).with_current_guest_sp(Some(frame.rsp));
+                let outcome = dispatcher
+                    .dispatch(&kernel, request, machine, &reporter)
+                    .map_err(|error| {
+                        carrick_hal::TrapError::Hypervisor(format!("dispatch x86 syscall: {error}"))
+                    })?;
+                match outcome {
+                    DispatchOutcome::Returned { value } => Ok(Decision::Return(value)),
+                    DispatchOutcome::Errno { errno } => Ok(Decision::Refused(errno)),
+                    DispatchOutcome::Exit { code } | DispatchOutcome::ThreadExit { code } => {
+                        Ok(Decision::Exit(
+                            carrick_vmm_kvm::cpl0_boot::GuestExitStatus::from_linux_code(code),
+                        ))
+                    }
+                    other => Err(carrick_hal::TrapError::Hypervisor(format!(
+                        "x86 syscall needs runtime completion: {other:?}"
+                    ))),
+                }
             })?;
-            let (guest_entries, host_forwards) = machine.initial_execution_witness();
-            let report = crate::compat::CompatReport {
-                execution_witness: Some(crate::compat::ExecutionWitness {
-                    backend: "kvm-x86-cpl0".to_owned(),
-                    guest_entries,
-                    host_forwards,
-                }),
-                ..Default::default()
+            let (guest_entries, portal_exits) = machine.initial_execution_witness();
+            let physical_crossing_families: Vec<_> = machine
+                .physical_crossing_counts()
+                .into_iter()
+                .filter(|(_, count)| *count != 0)
+                .map(|(family, count)| crate::compat::ExecutionFamilyCount {
+                    family: family.as_str().to_owned(),
+                    count,
+                })
+                .collect();
+            let physical_exits: u64 = physical_crossing_families.iter().map(|row| row.count).sum();
+            let count_family = |families: std::collections::BTreeMap<&'static str, u64>| {
+                families
+                    .into_iter()
+                    .map(|(family, count)| crate::compat::ExecutionFamilyCount {
+                        family: family.to_owned(),
+                        count,
+                    })
+                    .collect()
+            };
+            let host_forwards = forward_families.values().sum();
+            let mut report = reporter.snapshot();
+            report.execution_witness = Some(crate::compat::ExecutionWitness {
+                backend: "kvm-x86-cpl0".to_owned(),
+                guest_entries,
+                portal_exits: portal_exits + physical_exits,
+                host_forwards,
+                anonymous_private_pages: machine.anonymous_private_pages(),
+                anonymous_private_mms: machine
+                    .anonymous_private_mms()
+                    .into_iter()
+                    .map(|row| carrick_observability::compat::AnonymousPrivateMm {
+                        mm: row.mm,
+                        root: row.root,
+                        incarnation: row.incarnation,
+                        generation: row.generation,
+                        private_pages: row.private_pages,
+                        cpu_mask: row.cpu_mask,
+                    })
+                    .collect(),
+                cross_mm_private_aliases: machine.cross_mm_private_aliases(),
+                peer_active_private_grants: machine.peer_active_private_grants(),
+                physical_crossing_families,
+                host_forward_families: count_family(forward_families),
+                guest_refusal_families: count_family(refusal_families),
+            });
+            let (exit_code, terminating_signal, traps) = match outcome {
+                carrick_vmm_kvm::cpl0_boot::InitialProcessExit::Exited { code, exits } => {
+                    (code, None, exits)
+                }
+                carrick_vmm_kvm::cpl0_boot::InitialProcessExit::Fault { record, exits } => {
+                    if record.cs & 3 != 3 {
+                        return Err(RuntimeError::Unsupported(format!(
+                            "CPL0 kernel fault: {record:?}"
+                        )));
+                    }
+                    let (signal, _) = record.linux_signal().ok_or_else(|| {
+                        RuntimeError::Unsupported(format!(
+                            "unclassified x86 user fault: {record:?}"
+                        ))
+                    })?;
+                    (128 + signal, Some(signal), exits)
+                }
             };
             Ok(RunResult {
                 exit_code,
-                terminating_signal: None,
+                terminating_signal,
                 stdout: dispatcher.stdout(),
                 stderr: dispatcher.stderr(),
                 traps,
