@@ -5,6 +5,7 @@ use core::num::{NonZeroI32, NonZeroU64};
 use core::time::Duration;
 
 pub mod birth;
+pub mod cpu_accounting;
 pub mod exit;
 pub mod identity_allocator;
 pub mod registry;

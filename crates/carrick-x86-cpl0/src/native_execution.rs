@@ -2,7 +2,11 @@
 use super::{anonymous, initial_boot, native_process};
 use carrick_el1::isa::x86::{self, context};
 use carrick_el1_abi::{BornInZoneSource, CurrentTask, ReservationMm};
-use carrick_guest_arch::MmuBackend;
+use carrick_guest_arch::{MmuBackend, InterruptBackend};
+use carrick_sched_core::process::{TaskId, TaskKey, TaskSerial};
+use carrick_sched_core::process::cpu_accounting::{CpuMode, CpuSample};
+use carrick_el1::lock::SpinLock;
+static INITIAL_SLICE: SpinLock<Option<CpuSample>> = SpinLock::new(None);
 use carrick_sched_core::{ParkedContextWords, SlotId, WakeEffects};
 use core::sync::atomic::Ordering;
 
@@ -21,6 +25,91 @@ fn task() -> &'static CurrentTask {
     }
     // SAFETY: this bound CPU owns the retained current-task record.
     unsafe { &*(binding.task_address as *const CurrentTask) }
+}
+
+pub(super) fn sample() -> CpuSample {
+    let mut cpu = x86::X86Backend;
+    CpuSample {
+        tick: cpu.counter().unwrap_or_else(|_| initial_boot::fatal_boot()),
+        frequency: cpu.frequency().unwrap_or_else(|_| initial_boot::fatal_boot()),
+    }
+}
+fn task_key(current: &CurrentTask) -> TaskKey {
+    let binding = carrick_core::entry::binding(&current.execution, &current.mm);
+    TaskKey {
+        id: TaskId::from_abi_positive(i32::try_from(binding.task.raw()).unwrap_or_else(|_| initial_boot::fatal_boot()))
+            .unwrap_or_else(|_| initial_boot::fatal_boot()),
+        serial: TaskSerial::from_raw_u64(binding.generation.raw()).unwrap_or_else(|| initial_boot::fatal_boot()),
+    }
+}
+pub(super) fn initial_resume() {
+    let mut initial = INITIAL_SLICE.lock();
+    if initial.is_some() { initial_boot::fatal_boot(); }
+    *initial = Some(sample());
+}
+pub(super) fn kernel_entry(current: &CurrentTask) {
+    let runtime = native_process::runtime();
+    let key = task_key(current);
+    if let Some(start) = INITIAL_SLICE.lock().take() {
+        runtime.resume_cpu(key, start, CpuMode::User).unwrap_or_else(|_| initial_boot::fatal_boot());
+    }
+    let now = sample();
+    runtime.stop_cpu(key, now).unwrap_or_else(|_| initial_boot::fatal_boot());
+    runtime.resume_cpu(key, now, CpuMode::System).unwrap_or_else(|_| initial_boot::fatal_boot());
+}
+pub(super) fn user_return() {
+    let Some(runtime) = native_process::try_runtime() else { return; };
+    let key = task_key(task());
+    let now = sample();
+    runtime.stop_cpu(key, now).unwrap_or_else(|_| initial_boot::fatal_boot());
+    runtime.resume_cpu(key, now, CpuMode::User).unwrap_or_else(|_| initial_boot::fatal_boot());
+}
+
+/// Real host custody time is not guest CPU time. Preserve the exact task's
+/// current mode while a declared physical crossing stops this vCPU.
+pub(super) struct CrossingCharge {
+    paused: Option<(TaskKey, CpuMode)>,
+}
+impl CrossingCharge {
+    pub(super) fn pause() -> Self {
+        let paused = native_process::try_runtime().and_then(|runtime| {
+            let key = task_key(task());
+            runtime.stop_cpu(key, sample()).unwrap_or_else(|_| initial_boot::fatal_boot())
+                .map(|mode| (key, mode))
+        });
+        Self { paused }
+    }
+}
+impl Drop for CrossingCharge {
+    fn drop(&mut self) {
+        if let Some((key, mode)) = self.paused.take() {
+            native_process::runtime().resume_cpu(key, sample(), mode)
+                .unwrap_or_else(|_| initial_boot::fatal_boot());
+        }
+    }
+}
+
+/// A returning hardware fault/IRQ temporarily executes in kernel mode while
+/// retaining the interrupted task and its previous accounting mode.
+pub(super) struct KernelCharge(CrossingCharge);
+impl KernelCharge {
+    pub(super) fn enter() -> Self {
+        let prior = CrossingCharge::pause();
+        if let Some((key, _)) = prior.paused {
+            native_process::runtime().resume_cpu(key, sample(), CpuMode::System)
+                .unwrap_or_else(|_| initial_boot::fatal_boot());
+        }
+        Self(prior)
+    }
+}
+impl Drop for KernelCharge {
+    fn drop(&mut self) {
+        if let Some((key, _)) = self.0.paused {
+            native_process::runtime().stop_cpu(key, sample())
+                .unwrap_or_else(|_| initial_boot::fatal_boot());
+        }
+        // The retained CrossingCharge restores the interrupted mode next.
+    }
 }
 
 /// Save the complete SYSCALL return using the early assembly-owned XSAVE.
@@ -67,6 +156,9 @@ pub(super) fn migrate(slot: SlotId) {
 pub(super) fn schedule(slot: SlotId) -> ! {
     let source = source(slot);
     let current = task();
+    if let Some(runtime) = native_process::try_runtime() {
+        runtime.stop_cpu(task_key(current), sample()).unwrap_or_else(|_| initial_boot::fatal_boot());
+    }
     source.zone.release_space(slot);
     loop {
         if let Some(selected) = source.zone.switch_in_full(slot) {
@@ -96,6 +188,7 @@ pub(super) fn schedule(slot: SlotId) -> ! {
                 initial_boot::fatal_boot();
             }
             let mut words = state.words;
+            runtime.resume_cpu(state.key, sample(), CpuMode::System).unwrap_or_else(|_| initial_boot::fatal_boot());
             let mut service = native_process::Service::new(current, slot);
             {
                 let mut entry = runtime
@@ -113,6 +206,7 @@ pub(super) fn schedule(slot: SlotId) -> ! {
                     words.frame[10] = result;
                 }
             }
+            user_return();
             // SAFETY: the shared claim is OnCpu on this exact slot; every
             // machine field and MM owner is checked again by the ISA return.
             match unsafe { context::resume_parked(words, state.address) } {

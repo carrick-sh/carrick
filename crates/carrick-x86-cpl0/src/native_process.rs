@@ -33,6 +33,9 @@ type Runtime = NativeProcessRuntime<'static, Mm>;
 static RUNTIME: SpinLock<Option<&'static Runtime>> = SpinLock::new(None);
 static RETIRED: SpinLock<Vec<Mm>> = SpinLock::new(Vec::new());
 
+pub(super) fn try_runtime() -> Option<&'static Runtime> {
+    RUNTIME.lock().as_ref().copied()
+}
 pub(super) fn runtime() -> &'static Runtime {
     RUNTIME.lock().as_ref().copied().unwrap_or_else(|| fatal())
 }
@@ -258,9 +261,11 @@ impl NativeProcessService<'static> for Service {
         let mut exchange = X86ForkStockExchange::new(request).ok_or(NativeProcessError::Invalid)?;
         // SAFETY: aligned exclusive supervisor stack record remains live
         // through stopped host authentication; DX is always the hardware port.
+        let charge = super::native_execution::CrossingCharge::pause();
         unsafe {
             core::arch::asm!("out dx, eax", in("dx") X86_FORK_STOCK_PORT, in("rax") &raw mut exchange, options(nostack));
         }
+        drop(charge);
         let loan = exchange
             .take(request)
             .ok_or(NativeProcessError::Stale)?
@@ -373,12 +378,83 @@ impl NativeProcessService<'static> for Service {
     fn settle_mm(&mut self, born: Box<Born>) -> Result<(), (NativeProcessError, Box<Born>)> {
         settle(born, self.worker())
     }
-    fn copy_status(
-        &mut self,
-        mm: &Mm,
-        address: UserVa,
-        status: LinuxWaitStatus,
-    ) -> Result<(), NativeProcessError> {
+    fn cpu_sample(&self) -> Option<carrick_sched_core::process::cpu_accounting::CpuSample> {
+        Some(super::native_execution::sample())
+    }
+    fn copy_status(&mut self, mm: &Mm, address: UserVa, status: LinuxWaitStatus) -> Result<(), NativeProcessError> {
+        self.copy_bytes(mm, address, &status.raw().to_ne_bytes())
+    }
+    fn copy_rusage(&mut self, mm: &Mm, address: UserVa, usage: carrick_sched_core::process::TaskRusage) -> Result<(), NativeProcessError> {
+        let record = carrick_personality_linux::abi::rusage::OwnedRusageOutput::from_usage(usage)
+            .ok_or(NativeProcessError::Invalid)?;
+        self.copy_bytes(mm, address, record.as_bytes())
+    }
+    fn quarantine_prepared(&mut self, p: Prepared) {
+        core::mem::forget(p);
+        fatal();
+    }
+    fn quarantine_fork(&mut self, p: NativeForkPreparation<'static, Mm, Prepared>) {
+        core::mem::forget(p);
+        fatal();
+    }
+    fn quarantine_born(&mut self, p: Box<Born>) {
+        core::mem::forget(p);
+        fatal();
+    }
+    fn retire_mm(&mut self, mm: Mm) {
+        RETIRED.lock().push(mm);
+    }
+    fn wake_effects(&mut self, effects: WakeEffects) {
+        deliver_wakes(effects);
+    }
+}
+
+fn settle(born: Box<Born>, worker: u32) -> Result<(), (NativeProcessError, Box<Born>)> {
+    let p = &born.prepared;
+    let mut custody = Vec::new();
+    if custody.try_reserve_exact(p.custody.len()).is_err() {
+        return Err((NativeProcessError::Exhausted, born));
+    }
+    custody.extend(p.custody.iter().copied().map(PortalForkCustody::words));
+    let Some(mut exchange) = X86ForkStockSettlement::new(
+        p.loan,
+        p.child.completion(),
+        KernelVa::new(custody.as_ptr() as u64),
+        custody.len() as u64,
+    ) else {
+        return Err((NativeProcessError::Stale, born));
+    };
+    // SAFETY: exact completion and original four-word custody records remain
+    // owned across the stopped crossing; graph and MM editors were released.
+    let charge = super::native_execution::CrossingCharge::pause();
+    unsafe {
+        core::arch::asm!("out dx, eax", in("dx") X86_FORK_STOCK_PORT, in("rax") &raw mut exchange, options(nostack));
+    }
+    drop(charge);
+    if !matches!(exchange.take(p.loan), Some(Ok(()))) {
+        return Err((NativeProcessError::Quarantined, born));
+    }
+    anonymous::admit_context(p.address);
+    let owner = match portal() {
+        Ok(owner) => owner,
+        Err(error) => return Err((error, born)),
+    };
+    let Some(index) = owner.spaces.find(p.address.mm.raw().get()) else {
+        return Err((NativeProcessError::Stale, born));
+    };
+    let access = match owner.space_access(worker) {
+        Ok(access) => access,
+        Err(e) => return Err((error(e), born)),
+    };
+    access.open(index);
+    Ok(())
+}
+fn fatal() -> ! {
+    super::initial_boot::fatal_boot()
+}
+
+impl Service {
+    fn copy_bytes(&mut self, mm: &Mm, address: UserVa, bytes: &[u8]) -> Result<(), NativeProcessError> {
         if carrick_el1::isa::x86::hardware_live_root().map_err(error)? != mm.root {
             return Err(NativeProcessError::Stale);
         }
@@ -392,7 +468,7 @@ impl NativeProcessService<'static> for Service {
             .begin(
                 handle,
                 carrick_core::mm::transfer::GuestVa::new(address.raw()),
-                4,
+                bytes.len() as u64,
                 carrick_el1_abi::PortalTransferIntent::UserWrite,
                 self.worker(),
             )
@@ -409,7 +485,6 @@ impl NativeProcessService<'static> for Service {
                 &*(carrick_el1::isa::x86_kernel_layout().portal.raw() as *const MmPortalSlots),
             )
         };
-        let bytes = status.raw().to_ne_bytes();
         while !continuation.is_complete() {
             // SAFETY: select acquires the exact editor before using this leaf.
             let mut prepared = unsafe {
@@ -480,64 +555,4 @@ impl NativeProcessService<'static> for Service {
         }
         Ok(())
     }
-    fn quarantine_prepared(&mut self, p: Prepared) {
-        core::mem::forget(p);
-        fatal();
-    }
-    fn quarantine_fork(&mut self, p: NativeForkPreparation<'static, Mm, Prepared>) {
-        core::mem::forget(p);
-        fatal();
-    }
-    fn quarantine_born(&mut self, p: Box<Born>) {
-        core::mem::forget(p);
-        fatal();
-    }
-    fn retire_mm(&mut self, mm: Mm) {
-        RETIRED.lock().push(mm);
-    }
-    fn wake_effects(&mut self, effects: WakeEffects) {
-        deliver_wakes(effects);
-    }
-}
-
-fn settle(born: Box<Born>, worker: u32) -> Result<(), (NativeProcessError, Box<Born>)> {
-    let p = &born.prepared;
-    let mut custody = Vec::new();
-    if custody.try_reserve_exact(p.custody.len()).is_err() {
-        return Err((NativeProcessError::Exhausted, born));
-    }
-    custody.extend(p.custody.iter().copied().map(PortalForkCustody::words));
-    let Some(mut exchange) = X86ForkStockSettlement::new(
-        p.loan,
-        p.child.completion(),
-        KernelVa::new(custody.as_ptr() as u64),
-        custody.len() as u64,
-    ) else {
-        return Err((NativeProcessError::Stale, born));
-    };
-    // SAFETY: exact completion and original four-word custody records remain
-    // owned across the stopped crossing; graph and MM editors were released.
-    unsafe {
-        core::arch::asm!("out dx, eax", in("dx") X86_FORK_STOCK_PORT, in("rax") &raw mut exchange, options(nostack));
-    }
-    if !matches!(exchange.take(p.loan), Some(Ok(()))) {
-        return Err((NativeProcessError::Quarantined, born));
-    }
-    anonymous::admit_context(p.address);
-    let owner = match portal() {
-        Ok(owner) => owner,
-        Err(error) => return Err((error, born)),
-    };
-    let Some(index) = owner.spaces.find(p.address.mm.raw().get()) else {
-        return Err((NativeProcessError::Stale, born));
-    };
-    let access = match owner.space_access(worker) {
-        Ok(access) => access,
-        Err(e) => return Err((error(e), born)),
-    };
-    access.open(index);
-    Ok(())
-}
-fn fatal() -> ! {
-    super::initial_boot::fatal_boot()
 }

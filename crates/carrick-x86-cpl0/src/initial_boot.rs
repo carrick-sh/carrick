@@ -306,6 +306,7 @@ pub extern "C" fn carrick_x86_initial_boot(request_va: u64) -> ! {
     if carrick_el1::isa::x86::X86Backend.install_context(context).is_err() { loop { core::hint::spin_loop(); } }
     // SAFETY: after host acknowledgement, the exact MM is published and the
     // user selectors/entry/stack came from the guest-owned image transaction.
+    super::native_execution::initial_resume();
     unsafe { carrick_x86_boot_iret(entry, stack) }
 }
 
