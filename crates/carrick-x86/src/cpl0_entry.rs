@@ -187,6 +187,8 @@ pub const WORK_PORT: u16 = 0xcb;
 pub const FATAL_PORT: u16 = 0xcc;
 pub const YIELD_PORT: u16 = 0xd0;
 /// Physical owner-grant submission/receipt boundary; Linux policy stays in CPL0.
+/// EAX names the CPU slot; RDI carries the exact selected user address, also
+/// for kernel-owned user copies whose target need not equal hardware CR2.
 pub const OWNER_GRANT_PORT: u16 = 0xd1;
 /// Fixture observation only, outside Linux semantic serving.
 pub const OBSERVE_NATIVE: u64 = u64::MAX;

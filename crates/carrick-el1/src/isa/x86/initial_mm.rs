@@ -495,12 +495,20 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
             let intent = EditIntent::checked(
                 owner,
                 range,
-                EditOperation::Map {
-                    output: grant.frame,
-                    permissions: region.perms,
-                    size: EditLeafSize::Page,
-                    resident: true,
-                    backing: grant.backing,
+                match region.contents {
+                    RegionContents::Stack(_) => EditOperation::Prepare {
+                        output: grant.frame,
+                        permissions: region.perms,
+                        resident: range,
+                        backing: grant.backing,
+                    },
+                    RegionContents::Guest(_) => EditOperation::Map {
+                        output: grant.frame,
+                        permissions: region.perms,
+                        size: EditLeafSize::Page,
+                        resident: true,
+                        backing: grant.backing,
+                    },
                 },
                 &tables[used_tables..],
             )
@@ -731,6 +739,19 @@ mod tests {
             )
         }
         .unwrap();
+        let stack_leaf = translate_leaf(
+            &words,
+            loaded.address.root,
+            UserVa::new(loaded.stack_pointer),
+            Access::Write,
+            true,
+        )
+        .unwrap();
+        assert_ne!(
+            stack_leaf.descriptor & carrick_mmu_core::x86::descriptor_txn::PRIVATE,
+            0,
+            "the initial anonymous stack needs owner-private COW custody"
+        );
         assert_eq!(loaded.publications.len(), 3);
         assert_eq!(loaded.initial_break.raw(), 0x403000);
         assert_eq!(loaded.context.frame[15], 0x400000);

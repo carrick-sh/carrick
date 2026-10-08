@@ -242,6 +242,15 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
         &InitialWords::production(first_grant, table_end), &mut source, source_root, mm, generation,
         &InitialImageSpec { regions: &image_regions, stack },
     ) }.ok()?;
+    let copy_tables = [source.take_zeroed_table()?, source.take_zeroed_table()?, source.take_zeroed_table()?];
+    match carrick_mmu_core::x86::copy_window::provision_cow_copy_window(
+        &InitialWords::production(first_grant, table_end), loaded.address.root, copy_tables,
+    ) {
+        Ok(()) => {},
+        Err(carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome::Indeterminate(_)) =>
+            carrick_el1::isa::x86::fatal_entry_binding(),
+        Err(_) => return None,
+    }
     if loaded.publications.len() > publications.len() { return None; }
     // SAFETY: the stopped host reserved exactly this writable publication
     // array and guest MM owner has completed every descriptor edit.

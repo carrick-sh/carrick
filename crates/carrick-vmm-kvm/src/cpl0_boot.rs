@@ -91,6 +91,12 @@ const IMAGE_GPA: u64 = 0x10_0000;
 const METADATA_VA: u64 = X86_CPL0_DYNAMIC_METADATA_BASE;
 pub const USER_CODE: u64 = 0x1_0000;
 pub(crate) use carrick_x86::cpl0_entry::DIRECT_VA;
+// Startup stocks one initial MM and its first fork child's private COW branch.
+// Later population admission remains bounded by actual available table grants.
+const fn initial_copy_branch_table_credits() -> usize {
+    2 * carrick_mmu_core::x86::copy_window::COW_COPY_TABLE_PAGES
+}
+
 const LAYOUT: BringupLayout = BringupLayout {
     trampoline_base: 0x10_0000,
     gdt_base: 0x50_0000,
@@ -1016,7 +1022,6 @@ pub(crate) struct Cpl0HostCustody {
     fork_lifecycle_available: bool,
     anonymous_next_gpa: FrameGpa,
     anonymous_pending: [Option<anonymous_owner::PendingGrant>; 2],
-    anonymous_private_pages: u64,
     owner_grant_crossings: u64,
     root_exit_crossings: u64,
     metadata_base: NonNull<u8>,
@@ -1153,6 +1158,7 @@ impl Cpl0Carrier {
         let table_pages = user_pages
             .checked_mul(3)
             .and_then(|n| n.checked_add(1))
+            .and_then(|n| n.checked_add(initial_copy_branch_table_credits()))
             .ok_or_else(|| fail("initial table grant count"))?;
         let grants = table_pages
             .checked_add(user_pages)
@@ -1508,6 +1514,7 @@ impl Cpl0Carrier {
         let table_grants = data_grants
             .checked_mul(3)
             .and_then(|n| n.checked_add(1))
+            .and_then(|n| n.checked_add(initial_copy_branch_table_credits()))
             .ok_or_else(|| fail("initial table grants"))?;
         let grant_count = table_grants
             .checked_add(data_grants)
@@ -1806,15 +1813,37 @@ impl Cpl0Carrier {
             }
             count.checked_add(publication.tables_linked as usize)
         });
-        if linked_tables != Some(reply.result_table_used as usize) {
+        let linked_tables =
+            linked_tables.ok_or_else(|| fail("initial publication table receipt count"))?;
+        let copy_tables = carrick_mmu_core::x86::copy_window::cow_copy_table_frames(
+            &self.custody._vm.words(),
+            root,
+        )
+        .map_err(|_| fail("initial private copy branch"))?;
+        let total_tables = linked_tables
+            .checked_add(copy_tables.len())
+            .ok_or_else(|| fail("initial publication table receipt overflow"))?;
+        if total_tables != reply.result_table_used as usize {
             return Err(fail("initial publication table receipt count"));
+        }
+        let copy_grants = grants
+            .get(linked_tables..total_tables)
+            .ok_or_else(|| fail("initial copy table grant range"))?;
+        if !copy_tables
+            .iter()
+            .zip(copy_grants)
+            .all(|(table, grant)| table.address().raw() == grant.gpa)
+        {
+            return Err(fail("initial copy table grant identity"));
         }
         self.custody
             ._vm
             .install_root(mm, context)
             .map_err(|error| fail(error.to_string()))?;
+        // Descriptor transaction identity names only user mapping tables;
+        // the separately authenticated private branch is not a user edit.
         let tables: Vec<RootGpa> = grants
-            .get(1..reply.result_table_used as usize)
+            .get(1..linked_tables)
             .ok_or_else(|| fail("initial table grant range"))?
             .iter()
             .map(|grant| {
@@ -1871,13 +1900,25 @@ impl Cpl0Carrier {
                     generation,
                 },
                 root,
-                op: DescriptorOp::Map {
-                    span: PageSpan::new(publication.span_va, 4096),
-                    output,
-                    permissions: perms,
-                    size: LeafSize::Page,
-                    resident: true,
-                    backing: identity,
+                op: if image.regions.iter().any(|region| {
+                    region.start <= publication.span_va && publication.span_va < region.end
+                }) {
+                    DescriptorOp::Map {
+                        span: PageSpan::new(publication.span_va, 4096),
+                        output,
+                        permissions: perms,
+                        size: LeafSize::Page,
+                        resident: true,
+                        backing: identity,
+                    }
+                } else {
+                    DescriptorOp::Prepare {
+                        span: PageSpan::new(publication.span_va, 4096),
+                        output,
+                        permissions: perms,
+                        resident: PageSpan::new(publication.span_va, 4096),
+                        backing: identity,
+                    }
                 },
                 tables: tables
                     .get(used_tables..)
@@ -2333,7 +2374,7 @@ impl Cpl0Carrier {
     /// Pages whose PRIVATE native descriptors and physical custody were
     /// checked at the stopped guest's applied owner-grant completion.
     pub fn anonymous_private_pages(&self) -> u64 {
-        self.custody.anonymous_private_pages
+        self.custody.private_anonymous_witness.private_pages()
     }
 
     pub fn physical_crossing_counts(&self) -> [(PhysicalCrossingFamily, u64); 2] {
@@ -3020,7 +3061,6 @@ impl Cpl0Carrier {
                 fork_lifecycle_available: true,
                 anonymous_next_gpa: FrameGpa::new(0x2_0000_0000),
                 anonymous_pending: [None, None],
-                anonymous_private_pages: 0,
                 owner_grant_crossings: 0,
                 root_exit_crossings: 0,
                 metadata_base,

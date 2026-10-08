@@ -153,13 +153,7 @@ impl Service {
     fn worker(&self) -> u32 {
         u32::from(self.slot.raw())
     }
-    fn owner_grant(&self) {
-        // SAFETY: this stopped lane's existing physical grant service reads
-        // only its authenticated shared grant selection and COW completion.
-        unsafe {
-            core::arch::asm!("out dx, eax", in("dx") super::OWNER_GRANT_PORT, in("eax") self.worker(), options(nostack));
-        }
-    }
+
 }
 
 impl NativeProcessService<'static> for Service {
@@ -440,7 +434,7 @@ impl NativeProcessService<'static> for Service {
                 )
                 .map_err(error)?;
             if pool.has_completions_for(mm.mm.raw().get()) {
-                self.owner_grant();
+                super::cross_owner_grant(carrick_guest_arch::CpuId::new(self.worker()), address);
             }
             match step {
                 TransferStep::CowSupply(window) => {
@@ -451,7 +445,7 @@ impl NativeProcessService<'static> for Service {
                     {
                         return Err(NativeProcessError::Busy);
                     }
-                    self.owner_grant();
+                    super::cross_owner_grant(carrick_guest_arch::CpuId::new(self.worker()), address);
                 }
                 TransferStep::Selected(selected) => {
                     let fence = owner
