@@ -53,3 +53,30 @@ does not create native caught-handler frames, implement stopped-task job control
 or emit a core file. Signed ARM/HVF verification and full acceptance are deferred
 to the director. Poll readiness remains the separate fd-authority work described
 in [the stdio/poll design](x86-native-stdio-poll-design.md).
+
+## Final startup dependency results
+
+N1's MAP_STACK admission fix was cherry-picked with `-x` from
+`853534225f01643dcfddc831a37f3f4588028005` as `fded82e7b`, preserving its author.
+The added static stack-mapping dependency was red with exact -38 before the
+pick. It now passes on required KVM, including the guard-page protection,
+both usable stack-end touches and alternate-stack installation/query. Its
+shared `admitted_anonymous_stack_mapping_stays_with_el1_root` test also passes.
+This correction admits Linux's advisory flag for both ISAs; GROWSDOWN and
+HUGETLB remain on their existing paths. No launch or aperture change is involved.
+
+All eight `mounted_static_x86_signal_` dependencies pass native Linux and
+required KVM in 4.20 seconds of test execution. The independent poll witness
+still returns exact -38. All eight unchanged same-source lifecycle/IPC workloads
+pass natively; KVM now exits with command code 134 and no scenario output,
+before main, instead of the old fatal hlt/125. Native poll ENOSYS fault injection
+and the masked-abort dependency identify this as poll -> guest-owned SIGABRT.
+Poll is the remaining blocker in the established pre-main startup set. The
+active workload tests remain red; no shared scenario failure is attributed.
+
+The tested debug CLI SHA-256 is
+`cc1eb3cf3bbe0a2c3d616bc3839d2913bdfcc9bf416cd00edb621313cb3f9505`.
+Focused VM-free results: 18 native owner tests, 36 shared entry tests,
+25 lifecycle tests and the N1 mapping test pass. Inventory reconciliation on
+the clean merged code snapshot produced no changes and left the original
+compiler capture untouched because its recorded host slice differs.
