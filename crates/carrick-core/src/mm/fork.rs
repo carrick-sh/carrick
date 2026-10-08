@@ -646,6 +646,11 @@ pub enum Policy {
 pub trait MappingInheritancePolicy {
     fn inheritance_policy(&self, mapping: &Mapping) -> Policy;
     fn is_shared(&self, mapping: &Mapping) -> bool;
+    /// The exact parent grant says this private prepared page was never
+    /// committed, so its child can first-touch a fresh zero frame.
+    fn drop_pristine_prepared(&self, _va: u64, _ipa: u64) -> bool {
+        false
+    }
     /// Explicit synthetic windows with no reservation node.
     fn unreserved_policy(&self, _base: u64, _span: u64) -> Option<Policy> {
         None
@@ -794,6 +799,10 @@ pub fn census_entry<
         }
     } else if (selected == Policy::Private || (selected == Policy::Keep && B::is_user(descriptor)))
         && !B::is_retired(descriptor)
+        && !(level == 3
+            && selected == Policy::Private
+            && B::is_prepared_private(descriptor)
+            && policy_provider.drop_pristine_prepared(va, descriptor & B::ADDRESS_MASK))
         && descriptor & (B::ADDRESS_MASK & !(span - 1)) != 0
     {
         count.custody = count.custody.checked_add(1).ok_or(ForkError::NoMemory)?;
@@ -999,6 +1008,15 @@ pub fn copy_entry<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
         Policy::Omit | Policy::Wipe => Ok((descriptor, 0)),
         Policy::Private => {
             if B::is_retired(descriptor) {
+                return Ok((descriptor, 0));
+            }
+            if level == 3
+                && B::is_prepared_private(descriptor)
+                && policy_provider.drop_pristine_prepared(va, descriptor & B::ADDRESS_MASK)
+            {
+                // The parent's exact grant records no committed bytes. The
+                // child gets a fresh zero page through its ordinary first
+                // touch; no shared writable frame or child residency is owed.
                 return Ok((descriptor, 0));
             }
             let armed = if policy_provider.unreserved_policy(va, span) == Some(Policy::Private) {

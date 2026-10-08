@@ -52,9 +52,32 @@ pub use carrick_core::mm::fork::ForkScratch;
 pub type PreparedOwnerFork<B = NativeForkMmu> = carrick_core::mm::fork::PreparedOwnerFork<B>;
 
 #[derive(Clone, Copy, Default)]
-pub struct LinuxForkPolicy;
+pub struct LinuxForkPolicy {
+    mm: Option<carrick_el1_abi::ReservationMm>,
+    residency: Option<&'static carrick_el1_abi::FrameGrantResidencyTable>,
+}
+
+impl LinuxForkPolicy {
+    fn for_mm(mm: carrick_el1_abi::ReservationMm) -> Self {
+        Self {
+            mm: Some(mm),
+            #[cfg(target_os = "none")]
+            residency: Some(carrick_el1_abi::frame_grant_residency_guest()),
+            #[cfg(not(target_os = "none"))]
+            residency: None,
+        }
+    }
+}
 
 impl carrick_core::mm::fork::MappingInheritancePolicy for LinuxForkPolicy {
+    fn drop_pristine_prepared(&self, va: u64, ipa: u64) -> bool {
+        self.mm.zip(self.residency).is_some_and(|(mm, table)| {
+            table
+                .lookup(mm.raw(), va)
+                .is_some_and(|page| page.expected_ipa == ipa)
+                && !table.is_guest_committed(mm.raw(), va)
+        })
+    }
     fn unreserved_policy(&self, base: u64, span: u64) -> Option<carrick_core::mm::fork::Policy> {
         let start = carrick_el1_abi::LINUX_VVAR_BASE;
         let end = start + carrick_el1_abi::LINUX_VVAR_SIZE;
@@ -232,7 +255,7 @@ impl<P: PinnedMetadataExtent, B: OwnerForkMmu> NativeForkPortal<P, B> for MmPort
                 .count(),
         };
         census_table::<B, _, _>(
-            &LinuxForkPolicy,
+            &LinuxForkPolicy::for_mm(request.operation.mm),
             words,
             &mappings,
             grant.ttbr0 & B::ADDRESS_MASK,
@@ -327,7 +350,7 @@ impl<P: PinnedMetadataExtent, B: OwnerForkMmu> NativeForkPortal<P, B> for MmPort
         }
         let parent_root = grant.ttbr0 & B::ADDRESS_MASK;
         copy_table::<B, _, _>(
-            &LinuxForkPolicy,
+            &LinuxForkPolicy::for_mm(request.operation.mm),
             words,
             request,
             &mut scratch,

@@ -68,6 +68,9 @@ impl OwnerForkMmu for Aarch64Mmu {
         crate::aarch64::el1_private_leaf_state(word)
             == crate::aarch64::El1PrivateLeafState::Resident
     }
+    fn is_prepared_private(word: u64) -> bool {
+        crate::aarch64::terminal_descriptor_is_prepared_private(word)
+    }
     fn is_writable_user(word: u64) -> bool {
         crate::aarch64::terminal_descriptor_permits_el0(word, LeafAccess::Write)
     }
