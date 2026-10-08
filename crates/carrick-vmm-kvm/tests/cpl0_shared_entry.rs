@@ -5,7 +5,8 @@
 
 use carrick_mem::x86_initial_image::prepare_static_x86_elf;
 use carrick_vmm_kvm::cpl0_boot::{
-    Cpl0Carrier, InitialProcessExit, InitialSyscallDisposition, PhysicalCrossingFamily,
+    Cpl0Carrier, InitialProcessExit, InitialReservationLimits, InitialSyscallDisposition,
+    PhysicalCrossingFamily,
 };
 
 fn tiny_elf(code: &[u8]) -> Vec<u8> {
@@ -55,7 +56,7 @@ fn production_sigprocmask_uses_shared_lifecycle_family() {
         Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("bounded initial extent");
     let mut carrier = Cpl0Carrier::boot_production(extent).expect("production KVM image");
     carrier
-        .load_guest_mm(&image, &[], &[])
+        .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
         .expect("initial guest MM");
     let exit = carrier
         .run_initial_process(4, |_, _| Ok(InitialSyscallDisposition::Return(-1)))
@@ -103,7 +104,7 @@ fn production_cpl0_refuses_non_allowlisted_forwards_with_enosys() {
         Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("bounded initial extent");
     let mut carrier = Cpl0Carrier::boot_production(extent).expect("production KVM image");
     carrier
-        .load_guest_mm(&image, &[], &[])
+        .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
         .expect("initial guest MM");
     let exit = carrier
         .run_initial_process(8, |_, _| Ok(InitialSyscallDisposition::Return(-1)))
