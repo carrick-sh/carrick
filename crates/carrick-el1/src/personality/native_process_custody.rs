@@ -130,9 +130,11 @@ impl<R: ProcessResources> NativeProcessCustody for RetainedProcessCustody<R> {
         current: TaskRevision,
     ) -> TaskRevision {
         if !credit.remaining || !Arc::ptr_eq(&credit.source, &self.reserved) {
-            invalid_credit();
+            super::dispatch::invalid_completion(super::dispatch::NativeInvariant::RevisionCredit);
         }
-        let next = current.next().unwrap_or_else(|| invalid_credit());
+        let next = current.next().unwrap_or_else(|| {
+            super::dispatch::invalid_completion(super::dispatch::NativeInvariant::RevisionCredit)
+        });
         credit.remaining = false;
         self.reserved.fetch_sub(1, Ordering::Relaxed);
         next
@@ -155,18 +157,6 @@ impl<R: ProcessResources> NativeProcessCustody for RetainedProcessCustody<R> {
     fn own_rusage(&self) -> TaskRusage {
         self.resources.own_rusage()
     }
-}
-
-fn invalid_credit() -> ! {
-    #[cfg(target_os = "none")]
-    {
-        crate::substrate::sched::hw::fatal_entry_binding()
-    }
-    #[cfg(not(target_os = "none"))]
-    carrick_fatal::carrick_fatal!(
-        "el1::native_process_custody",
-        "invalid revision publication credit"
-    )
 }
 
 #[cfg(test)]
