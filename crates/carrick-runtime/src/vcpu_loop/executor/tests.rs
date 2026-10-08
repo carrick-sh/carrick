@@ -4524,10 +4524,12 @@ fn demand_preemption_and_exact_signal_kick_advance_two_compute_tasks_without_sta
     let factory = Arc::new(FakeFactory::default());
     let first_gate = Arc::new(Barrier::new(2));
     let second_gate = Arc::new(Barrier::new(2));
+    let second_resume = Arc::new(Barrier::new(2));
     let first_binding = FakeBinding::new(40, [Step::ComputeUntilKick, Step::Exit]);
     *first_binding.entered.lock() = Some(Arc::clone(&first_gate));
     let second_binding = FakeBinding::new(50, [Step::ComputeUntilKick, Step::Exit]);
     *second_binding.entered.lock() = Some(Arc::clone(&second_gate));
+    *second_binding.resume.lock() = Some(Arc::clone(&second_resume));
     factory.install(&first, Arc::clone(&first_binding));
     factory.install(&second, Arc::clone(&second_binding));
     let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
@@ -4552,6 +4554,7 @@ fn demand_preemption_and_exact_signal_kick_advance_two_compute_tasks_without_sta
         scheduler.wake(second.thread().key()),
         Ok(carrick_kernel::kernel::WakeDisposition::Kicked)
     ));
+    second_resume.wait();
     drop((first_authority, second_authority));
     let report = pool.shutdown().expect("clean shutdown");
     assert!(first_binding.progress.load(Ordering::SeqCst) > 0);
