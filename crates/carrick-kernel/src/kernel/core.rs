@@ -3065,42 +3065,8 @@ pub(super) type RegistryState = carrick_sched_core::process::registry::ProcessRe
     super::thread_retirement::RetiredThreads,
     Arc<ProcessGroup>,
     Arc<Session>,
-    HostRegistryFailure,
+    carrick_el1::personality::process_owner::GuestRegistryFailure,
 >;
-
-#[derive(Debug)]
-pub(super) struct HostRegistryFailure;
-impl carrick_sched_core::process::registry::RegistryFailure for HostRegistryFailure {
-    fn fail(invariant: carrick_sched_core::process::registry::RegistryInvariant) -> ! {
-        use carrick_sched_core::process::registry::RegistryInvariant;
-        match invariant {
-            RegistryInvariant::BirthPayloadMismatch => carrick_fatal!(
-                "kernel::process_birth",
-                "process birth payload lost its admitted identity or registry custody"
-            ),
-            RegistryInvariant::EpochExhausted => carrick_fatal!(
-                "kernel::registry_epoch",
-                "Kernel RegistryState epoch counter overflow"
-            ),
-            RegistryInvariant::ProcessGroupCollision => carrick_fatal!(
-                "kernel::process_group_index",
-                "process-group publication collided in internal or container namespace index"
-            ),
-            RegistryInvariant::ProcessGroupIndexLost => carrick_fatal!(
-                "kernel::process_group_index",
-                "removing process-group did not remove matching container namespace index edge"
-            ),
-            RegistryInvariant::SessionCollision => carrick_fatal!(
-                "kernel::session_index",
-                "session publication collided in internal or container namespace index"
-            ),
-            RegistryInvariant::SessionIndexLost => carrick_fatal!(
-                "kernel::session_index",
-                "removing session did not remove matching container namespace index edge"
-            ),
-        }
-    }
-}
 
 fn fail_container_root(
     selected: Option<super::operations::KernelFailpoint>,
