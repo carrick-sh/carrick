@@ -14,11 +14,10 @@ than substituting PID1.
 The exact-Container assertion fails through the old constructor in
 `/tmp/x86-launch-container-red.log`. The final focused test passes in
 `/tmp/x86-real-launch-final-unit.log`, with a real private namespace and
-namespace PID1/group1/session1. The production two-MM witness still fails
-at fork exit91, with native Q/exit7, in
-`/tmp/x86-real-launch-two-mm-red.log`. That production receipt predates the
-final shared-bootstrap helper consolidation; no final runtime green is
-claimed. The extended test's first compile failure called registry methods
+namespace PID1/group1/session1. The final production two-MM witness still
+fails at fork exit91, with native Q/exit7, in
+`/tmp/x86-real-launch-final-two-mm.log`. No runtime green is claimed.
+The extended test's first compile failure called registry methods
 on Kernel and is retained in `/tmp/x86-launch-container-final-green.log`;
 it is not semantic red evidence.
 
@@ -35,8 +34,24 @@ delete production task41/generation11/thread101/PID41, bind native shared
 birth/wait/exit custody and CPU1, import initial ELF/stack reservations and
 residency, and inherit per-MM private/COW leaves through InitialWords and
 the sole production #PF. The namespace boundary is only a first step. No
-two-MM green, final gates, push, draft PR or review-ready claim belongs to
-this checkpoint. No Docker, signed/HVF test or load generator was run.
+two-MM green, full final gates, draft PR or review-ready claim belongs to
+this checkpoint. The source and positional checkpoint are pushed through
+969384347. Full clippy passes in `/tmp/x86-real-launch-clippy.log`; the
+115/115 ARM comparison against 5f0e5c812 has zero differences in
+`/tmp/x86-real-launch-asm.log`.
+
+The first macOS recapture compiled but rejected HA-000495's rationale for
+omitting the literal canonical operation `std::process::id`. 45705718c
+corrects that review text, retaining forbidden_semantic. The guarded
+recapture now succeeds in `/tmp/x86-real-launch-recapture-canonical.log`;
+its validated patch is
+`target/remote-recapture/45705718c86a-recapture-20261008-002936/recapture.patch`.
+Only three macOS source spans and compiler-owned receipt provenance change;
+619 captured operations/profiles and all classifications are retained.
+The patched static check passes in `/tmp/x86-real-launch-static-recaptured.log`.
+Clean domain lint and the final metadata push remain to run.
+
+No Docker, signed/HVF test or load generator was run.
 The pre-existing arena prefork red remains separately owned.
 
 ## Current continuation checkpoint (2026-10-07)
