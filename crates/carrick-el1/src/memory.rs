@@ -205,9 +205,13 @@ pub fn decide_anonymous_syscall<
         SYS_BRK => model.brk(frame.x[0]),
         SYS_MMAP => {
             let flags = frame.x[3];
-            let supported = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_FIXED_NOREPLACE;
+            // MAP_STACK is an advisory Linux hint. Keeping its anonymous
+            // mapping in the admitted root gives later stack faults an EL1
+            // reservation and grant plan.
+            let supported =
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_FIXED_NOREPLACE | MAP_STACK;
             if flags & (MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED) != MAP_ANONYMOUS | MAP_PRIVATE
-                || flags & (MAP_GROWSDOWN | MAP_STACK | MAP_HUGETLB) != 0
+                || flags & (MAP_GROWSDOWN | MAP_HUGETLB) != 0
                 || flags & !supported != 0
             {
                 return ReservationDisposition::Forward;
@@ -1725,6 +1729,28 @@ mod tests {
             );
             assert_eq!(route, DelegatedAnonymous::Forward);
             assert!(editor.calls.is_empty());
+        }
+
+        #[test]
+        fn admitted_anonymous_stack_mapping_stays_with_el1_root() {
+            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
+            let task = mm(&spaces, &table, 17, true);
+            let mut editor = Editor::over(RangeBacking::Empty);
+            let (route, address) = syscall(
+                &task,
+                &spaces,
+                &table,
+                &counters,
+                &mut editor,
+                SYS_MMAP,
+                [0, 0x2000, RW, ANON | MAP_STACK, u64::MAX, 0],
+            );
+            assert_eq!(route, DelegatedAnonymous::Served);
+            assert_eq!(address as u64, ARENA);
+            assert_eq!(
+                counters.forwarded[SYS_MMAP as usize].load(Ordering::Relaxed),
+                0
+            );
         }
 
         #[test]
