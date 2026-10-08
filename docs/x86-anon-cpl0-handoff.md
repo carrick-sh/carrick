@@ -1,5 +1,27 @@
 # x86 anonymous CPL0 handoff (partial, 2026-10-07)
 
+## Exact continuation: private supervisor fork branch (2026-10-08)
+
+The neutral fork owner now asks the ISA whether each root entry is shared.
+AArch64 retains its full-root walk. x86 shares the supervisor half except
+entry 508, reserved for the MM-private two-page COW copy window. The actual
+registered VM-free regression first failed because the child retained the
+parent's exact private branch pointer. With the fix it proves three distinct
+child tables, unchanged entry 511, idle leaves, preserved supervisor flags,
+no parent edits and exactly 1536 additional census words/reads.
+
+Receipts: `/tmp/x86-private-upper-fork-red.log` (one failing test),
+`/tmp/x86-private-upper-fork-green.log` (16 passing),
+`/tmp/x86-private-upper-core-fork.log` (four passing),
+`/tmp/x86-private-upper-clippy.log` (exit zero).
+
+Next: provision the dedicated supervisor copy branch before MM admission,
+with three named initial table credits and three for its first fork child.
+The two idle leaves must temporarily map real COW frames, restore and drain
+before release. Keep the existing authenticated words and shared COW policy;
+never rebase physical stock or widen the direct window. The witness and final
+gates remain open; deferred boot-export scope remains unchanged.
+
 ## Exact continuation: physical table working stock (2026-10-08)
 
 The owner's reordered scope remains authoritative: finish the production

@@ -7,12 +7,16 @@ use carrick_guest_arch::{
     RootGpa, UserRange, UserVa,
 };
 
+/// Dedicated MM-private supervisor branch for the two-page COW copy window.
+/// It is separate from retained image and kernel supervisor branches.
+pub const COW_COPY_ROOT_INDEX: usize = 508;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct X86Mmu;
 impl OwnerForkMmu for X86Mmu {
     const ADDRESS_MASK: u64 = ADDRESS;
-    fn shared_root_start() -> usize {
-        256
+    fn is_shared_root_entry(index: usize) -> bool {
+        index >= 256 && index != COW_COPY_ROOT_INDEX
     }
     fn control_window() -> Option<(UserVa, UserVa)> {
         None
