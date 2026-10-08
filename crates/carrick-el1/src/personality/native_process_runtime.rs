@@ -1335,35 +1335,6 @@ mod tests {
             );
         }
     }
-    // This test adapter keeps the ARM save area ABI unchanged and retains its
-    // address binding separately. It exercises shared admission, not ARM resume.
-    #[derive(Clone, Copy, zerocopy::FromZeros)]
-    struct ArmBoundContext {
-        native: carrick_sched_core::ThreadCtx,
-        root: u64,
-        mm: u64,
-        generation: u64,
-    }
-    impl ProcessContext for ArmBoundContext {
-        fn authenticates(&self, address: AddressContext<RootGpa>) -> bool {
-            self.root == address.root.address().raw()
-                && self.mm == address.mm.raw().get()
-                && self.generation == address.generation.raw().get()
-        }
-        fn fork_child(mut self, address: AddressContext<RootGpa>) -> Self {
-            self.native = self.native.fork_child(address);
-            self.root = address.root.address().raw();
-            self.mm = address.mm.raw().get();
-            self.generation = address.generation.raw().get();
-            self
-        }
-        fn set_syscall_return(&mut self, value: u64) {
-            self.native.set_syscall_return(value);
-        }
-        fn syscall_return(&self) -> u64 {
-            self.native.syscall_return()
-        }
-    }
     #[test]
     fn actual_shared_root_admission_accepts_arm_asid_and_rejects_stale_binding() {
         for (arm, register, saved_generation, accepted) in [
@@ -1376,10 +1347,12 @@ mod tests {
             (false, 0xabcd_0000_0000_1000, 1, false),
             (false, 0x1001, 1, false),
         ] {
-            let layout = std::alloc::Layout::new::<ZoneTables<ArmBoundContext>>();
+            let layout =
+                std::alloc::Layout::new::<ZoneTables<carrick_sched_core::Aarch64ParkedContext>>();
             // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
             let zone = unsafe {
-                let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ArmBoundContext>>();
+                let ptr = std::alloc::alloc_zeroed(layout)
+                    .cast::<ZoneTables<carrick_sched_core::Aarch64ParkedContext>>();
                 assert!(!ptr.is_null());
                 Box::from_raw(ptr)
             };
@@ -1421,12 +1394,12 @@ mod tests {
             native.x[0] = 99;
             native.tpidr_el0 = 0x4567;
             native.v[3] = u128::MAX;
-            let saved = ArmBoundContext {
+            let saved = carrick_sched_core::Aarch64ParkedContext::from_register(
                 native,
-                root: 0x1000,
-                mm: 1,
-                generation: saved_generation,
-            };
+                0x1000,
+                1,
+                saved_generation,
+            );
             let source = BornInZoneSource { zone: &zone, slot };
             let admitted = if arm {
                 NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::owner_mmu::Aarch64Mmu>(

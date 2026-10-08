@@ -87,11 +87,13 @@ extern crate std;
 
 pub mod process;
 
+mod aarch64_context;
 pub mod completion_queue;
 pub mod object_wait;
 pub mod occupancy;
 pub mod spaces;
 mod x86_context;
+pub use aarch64_context::{AARCH64_ROOT_ADDRESS_MASK, Aarch64ParkedContext};
 pub use x86_context::{ParkedContextWords, X86_XSAVE_BYTES, valid_user_return_words};
 
 pub use occupancy::{
@@ -439,50 +441,6 @@ impl ThreadCtx {
         fpsr: 0,
         fpcr: 0,
     };
-
-    pub fn authenticates(
-        &self,
-        expected: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
-    ) -> bool {
-        expected.root.address().raw() != 0
-    }
-
-    pub fn fork_child(
-        mut self,
-        _address: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
-    ) -> Self {
-        self.x[0] = 0;
-        self
-    }
-
-    pub fn set_syscall_return(&mut self, value: u64) {
-        self.x[0] = value;
-    }
-
-    pub fn syscall_return(&self) -> u64 {
-        self.x[0]
-    }
-}
-
-impl carrick_guest_arch::ProcessContext for ThreadCtx {
-    fn authenticates(
-        &self,
-        expected: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
-    ) -> bool {
-        ThreadCtx::authenticates(self, expected)
-    }
-    fn fork_child(
-        self,
-        address: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
-    ) -> Self {
-        ThreadCtx::fork_child(self, address)
-    }
-    fn set_syscall_return(&mut self, value: u64) {
-        ThreadCtx::set_syscall_return(self, value);
-    }
-    fn syscall_return(&self) -> u64 {
-        ThreadCtx::syscall_return(self)
-    }
 }
 
 /// Outcome of [`ZoneTables::read_parked_context`]: a thread's EL1 save area
