@@ -1900,18 +1900,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-portable/src/lib.rs:2042, process_exit_fd uses libc::syscall to issue only SYS_pidfd_open on a typed positive HostProcessId supplied by a native supervisor. The lease/watchdog callers validate their owner against getppid and obtain their worker identity from the Child they spawned; guest process IDs never select this native exit watch. The returned descriptor is uniquely owned as OwnedFd and the kernel creates it close-on-exec. This is native parent-death/cancellation substrate, not forwarding of a guest syscall.",
+    "rationale": "At crates/carrick-portable/src/lib.rs:2169, process_exit_fd uses libc::syscall to issue only SYS_pidfd_open on a typed positive HostProcessId supplied by a native supervisor. The lease/watchdog callers validate their owner against getppid and obtain their worker identity from the Child they spawned; guest process IDs never select this native exit watch. The returned descriptor is uniquely owned as OwnedFd and the kernel creates it close-on-exec. This is native parent-death/cancellation substrate, not forwarding of a guest syscall.",
     "review_id": "HA-000755",
     "source": {
-      "byte_end": 74612,
-      "byte_start": 74599,
+      "byte_end": 79758,
+      "byte_start": 79745,
       "column": 23,
       "column_end": 36,
       "column_start": 23,
       "file": "crates/carrick-portable/src/lib.rs",
-      "line": 2042,
-      "line_end": 2042,
-      "line_start": 2042
+      "line": 2169,
+      "line_end": 2169,
+      "line_start": 2169
     }
   },
   {
@@ -6482,8 +6482,8 @@
     "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:245 in `load_execve_image`, `std::fs::read` accesses only the selected absolute executable in the explicitly enabled bare RunElf host-filesystem fallback (`exec_host_fs_fallback`); container dispatchers keep it disabled so an absent rootfs target ENOENTs.",
     "review_id": "HA-000727",
     "source": {
-      "byte_end": 11229,
-      "byte_start": 11216,
+      "byte_end": 11213,
+      "byte_start": 11200,
       "column": 17,
       "column_end": 30,
       "column_start": 17,
@@ -7574,18 +7574,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-portable/src/lib.rs:1722 in the Linux `fd_abs_path`, `std::fs::read_link` reads only `/proc/self/fd/<fd>` for a descriptor the carrier already holds (the hostfs scratch directory passed by `HostFsBackend::from_existing_dir`) to name its backing path.",
+    "rationale": "At crates/carrick-portable/src/lib.rs:1849 in the Linux `fd_abs_path`, `std::fs::read_link` reads only `/proc/self/fd/<fd>` for a descriptor the carrier already holds (the hostfs scratch directory passed by `HostFsBackend::from_existing_dir`) to name its backing path.",
     "review_id": "HA-000731",
     "source": {
-      "byte_end": 63137,
-      "byte_start": 63119,
+      "byte_end": 68283,
+      "byte_start": 68265,
       "column": 9,
       "column_end": 27,
       "column_start": 9,
       "file": "crates/carrick-portable/src/lib.rs",
-      "line": 1722,
-      "line_end": 1722,
-      "line_start": 1722
+      "line": 1849,
+      "line_end": 1849,
+      "line_start": 1849
     }
   },
   {
@@ -15485,18 +15485,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:7573 in `host_image_base_snapshot`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_image_base_snapshot`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:7527 in `host_image_base_snapshot`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_image_base_snapshot`; no guest identity selects its host target.",
     "review_id": "HA-000466",
     "source": {
-      "byte_end": 293951,
-      "byte_start": 293935,
-      "column": 18,
-      "column_end": 34,
-      "column_start": 18,
+      "byte_end": 291631,
+      "byte_start": 291615,
+      "column": 41,
+      "column_end": 57,
+      "column_start": 41,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 7573,
-      "line_end": 7573,
-      "line_start": 7573
+      "line": 7527,
+      "line_end": 7527,
+      "line_start": 7527
     }
   },
   {
@@ -16301,18 +16301,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/src/kvm.rs:201 in `print_kvm_stats_once`, `std::process::id` names only the current carrier in the `CARRICK_KVM_STATS` diagnostic line on stderr; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-kvm/src/kvm.rs:211 in `print_kvm_stats_once`, `std::process::id` names only the current carrier in the `CARRICK_KVM_STATS` diagnostic line on stderr; no guest identity selects its host target.",
     "review_id": "HA-000747",
     "source": {
-      "byte_end": 7256,
-      "byte_start": 7240,
+      "byte_end": 7470,
+      "byte_start": 7454,
       "column": 9,
       "column_end": 25,
       "column_start": 9,
       "file": "crates/carrick-vmm-kvm/src/kvm.rs",
-      "line": 201,
-      "line_end": 201,
-      "line_start": 201
+      "line": 211,
+      "line_end": 211,
+      "line_start": 211
     }
   },
   {
