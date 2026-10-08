@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "source_commit": "9cbe10d75a93dfeb37cb0a3d32026a332857ad7f",
+  "source_commit": "048c2b6c1297d1ed466df676f40df2f3315dfd0b",
   "platforms": [
     "linux",
     "macos",
@@ -217,6 +217,20 @@
         "family": "build_time",
         "operation": "std::fs::read_to_string",
         "owner": "carrick_vmm_kvm::build_program::cpl0_inputs::derive",
+        "lane": "linux_runtime",
+        "ceiling": 1
+      },
+      {
+        "family": "build_time",
+        "operation": "std::fs::read_to_string",
+        "owner": "carrick_vmm_kvm::build_program::cpl0_inputs::read_manifest",
+        "lane": "linux_cli",
+        "ceiling": 1
+      },
+      {
+        "family": "build_time",
+        "operation": "std::fs::read_to_string",
+        "owner": "carrick_vmm_kvm::build_program::cpl0_inputs::read_manifest",
         "lane": "linux_runtime",
         "ceiling": 1
       },

@@ -212,6 +212,20 @@
       "ceiling": 1
     },
     {
+      "family": "build_time",
+      "operation": "std::fs::read_to_string",
+      "owner": "carrick_vmm_kvm::build_program::cpl0_inputs::read_manifest",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "build_time",
+      "operation": "std::fs::read_to_string",
+      "owner": "carrick_vmm_kvm::build_program::cpl0_inputs::read_manifest",
+      "lane": "linux_runtime",
+      "ceiling": 1
+    },
+    {
       "family": "fatal_carrier_fault",
       "operation": "fatal:IPC",
       "owner": "carrick_kernel::el1_ipc::HostIpc::region",
