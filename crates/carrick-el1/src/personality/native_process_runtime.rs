@@ -200,6 +200,7 @@ struct PendingWait {
 }
 struct Graph<'a, M: Clone> {
     owner: Owner<'a, M>,
+    root_key: TaskKey,
     namespace: Arc<SpinLock<NamespaceState>>,
     visible_namespace: VisibleNamespace,
     serials: SerialAllocator,
@@ -232,6 +233,9 @@ impl<M> NativeResources<'_, M> {
     }
 }
 impl<'a, M: Clone> NativeProcessRuntime<'a, M> {
+    pub fn zone(&self) -> &'a ZoneTables<ParkedContextWords> {
+        self.zone
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn admit_fresh_root(
         source: BornInZoneSource<'a, ParkedContextWords>,
@@ -383,6 +387,7 @@ impl<'a, M: Clone> NativeProcessRuntime<'a, M> {
         Ok(Self {
             graph: SpinLock::new(Graph {
                 owner,
+                root_key: key,
                 namespace: ns,
                 visible_namespace,
                 serials,
@@ -439,6 +444,7 @@ impl<'a, M: Clone> NativeProcessRuntime<'a, M> {
             words,
             service,
             handoff: None,
+            root_exit: None,
         })
     }
     pub fn namespace_child_key(&self, caller: TaskKey, visible: u32) -> Option<TaskKey> {
@@ -476,6 +482,7 @@ pub struct NativeProcessEntry<'r, 'a, M: Clone, S: NativeProcessService<'a, Mm =
     words: ParkedContextWords,
     service: &'r mut S,
     handoff: Option<EntryHandoffReceipt<ParkedContextWords>>,
+    root_exit: Option<LinuxWaitStatus>,
 }
 fn returned(value: i64) -> LifecycleOutcome {
     LifecycleOutcome::Returned {
@@ -484,6 +491,17 @@ fn returned(value: i64) -> LifecycleOutcome {
     }
 }
 impl<'a, M: Clone, S: NativeProcessService<'a, Mm = M>> NativeProcessEntry<'_, 'a, M, S> {
+    pub fn take_root_exit(&mut self) -> Option<LinuxWaitStatus> {
+        self.root_exit.take()
+    }
+    pub fn is_root_process(&self) -> bool {
+        let graph = self.runtime.graph.lock();
+        self.key == graph.root_key
+            && graph
+                .owner
+                .task(self.key)
+                .is_ok_and(|row| row.parent().is_none())
+    }
     fn fail(&self, error: NativeProcessError) -> LifecycleOutcome {
         returned(error.errno())
     }
@@ -696,6 +714,8 @@ impl<'a, M: Clone, S: NativeProcessService<'a, Mm = M>> NativeProcessEntry<'_, '
         Ok(())
     }
     fn exit_owned(&mut self, status: u8) -> Result<LifecycleOutcome, NativeProcessError> {
+        let root_exit = self.is_root_process();
+        let wait_status = LinuxWaitStatus::from_wait_encoding(i32::from(status) << 8);
         let (page, control) = {
             let graph = self.runtime.graph.lock();
             let resources = graph
@@ -723,7 +743,7 @@ impl<'a, M: Clone, S: NativeProcessService<'a, Mm = M>> NativeProcessEntry<'_, '
                 self.key,
                 None,
                 transaction,
-                LinuxWaitStatus::from_wait_encoding(i32::from(status) << 8),
+                wait_status,
             )
             .map_err(|_| NativeProcessError::Busy)?
         };
@@ -793,6 +813,9 @@ impl<'a, M: Clone, S: NativeProcessService<'a, Mm = M>> NativeProcessEntry<'_, '
         }
         drop(published.retiring);
         drop(published.autoreaped_receipt);
+        if root_exit {
+            self.root_exit = Some(wait_status);
+        }
         Ok(LifecycleOutcome::Transferred {
             progress: carrick_core::Served::Idle,
             result: SyscallResult::new(0),
@@ -1280,6 +1303,96 @@ mod tests {
         }
     }
     #[test]
+    fn actual_compact_root_can_exit_before_its_first_park() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let child_page = Box::new(ThreadLifecyclePage::new());
+        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        }));
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
+        let runtime = NativeProcessRuntime::admit_fresh_root(
+            source,
+            &task,
+            &page,
+            &control,
+            address,
+            address,
+            words(address),
+        )
+        .unwrap();
+        assert_eq!(page.live(), 1);
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &*child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+        };
+        assert!(zone.slot(slot).current().is_none());
+        let home = zone.slot(slot).host_record().unwrap();
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        assert!(matches!(
+            entry.exit_group(9),
+            LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                ..
+            }
+        ));
+        assert_eq!(
+            entry.take_root_exit(),
+            Some(LinuxWaitStatus::from_wait_encoding(9 << 8))
+        );
+        assert!(entry.take_handoff_receipt().is_some());
+        assert_eq!(page.live(), 0);
+        assert!(zone.slot(slot).host_record().is_none());
+        assert!(zone.slot(slot).current().is_none());
+        assert_eq!(zone.record(home).claim(), carrick_sched_core::Claim::Free);
+    }
+
+    #[test]
     fn actual_compact_root_forks_a_shared_owner_child_with_distinct_visible_identity() {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
@@ -1484,5 +1597,20 @@ mod tests {
         };
         assert_eq!(result.raw(), 42);
         assert!(runtime.namespace_child_key(parent, 42).is_none());
+        assert!(parent_entry.take_root_exit().is_none());
+        assert!(matches!(
+            parent_entry.exit_group(9),
+            LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                ..
+            }
+        ));
+        assert_eq!(
+            parent_entry.take_root_exit(),
+            Some(LinuxWaitStatus::from_wait_encoding(9 << 8))
+        );
+        assert!(parent_entry.take_root_exit().is_none());
+        assert!(parent_entry.take_handoff_receipt().is_some());
+        assert_eq!(page.live(), 0);
     }
 }

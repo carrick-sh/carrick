@@ -2663,6 +2663,23 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         self.free_record(record);
     }
 
+    /// Retire the exact unpublished record retained for this running host lane.
+    /// Published or switched records must use their existing current owner.
+    pub fn release_host_home(&self, slot: SlotId, record: RecordId) -> bool {
+        let lane = self.slot(slot);
+        let owned = self.record(record);
+        if lane.current().is_some()
+            || lane.host_record() != Some(record)
+            || owned.claim() != Claim::Free
+            || owned.home.load(Ordering::Acquire) != slot.plus_one()
+            || owned.has_object_operation()
+        {
+            return false;
+        }
+        self.discard_unpublished(slot, record);
+        true
+    }
+
     /// EL1: the running thread on `slot` parked (its record is published);
     /// nothing is switched in until [`Self::switch_in`].
     pub fn clear_current(&self, slot: SlotId) {

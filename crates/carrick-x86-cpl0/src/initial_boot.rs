@@ -298,3 +298,36 @@ pub extern "C" fn carrick_x86_initial_boot(request_va: u64) -> ! {
     // user selectors/entry/stack came from the guest-owned image transaction.
     unsafe { carrick_x86_boot_iret(entry, stack) }
 }
+
+/// The physical peer enters the same resident scheduler after boot settlement.
+/// It owns no process row until switch_in_full transfers a runnable claim.
+#[unsafe(no_mangle)]
+pub extern "C" fn carrick_x86_peer_boot() -> ! {
+    let Some(binding) = carrick_el1::isa::x86::context::current_cpu_binding() else { fatal_boot() };
+    if binding.cpu_slot != 1 { fatal_boot(); }
+    // SAFETY: initial boot has published and physically settled this retained
+    // request before the host admits the peer entry. It stays immutable here.
+    let request = unsafe { &*(X86_CPL0_INITIAL_EXTENT_VA as *const X86InitialBootRequest) };
+    if request.result_status != X86_INITIAL_BOOT_LOADED { fatal_boot(); }
+    let Some(root) = RootGpa::page_aligned(FrameGpa::new(request.result_root_gpa)) else { fatal_boot() };
+    let Some(mm) = NonZeroU64::new(request.mm_key) else { fatal_boot() };
+    let Some(generation) = NonZeroU64::new(request.generation) else { fatal_boot() };
+    let context = carrick_guest_arch::AddressContext {
+        root, mm: carrick_guest_arch::MmGeneration::new(mm),
+        generation: carrick_guest_arch::ContextGeneration::new(generation),
+    };
+    if carrick_el1::isa::x86::X86Backend.install_context(context).is_err() { fatal_boot(); }
+    let layout = carrick_el1::isa::x86_kernel_layout();
+    // SAFETY: physical bootstrap initialized and retains the compact zone.
+    let zone = unsafe { &*(layout.zone.raw() as *const carrick_el1::memory::reservations::X86Cpl0Zone) };
+    let slot = carrick_sched_core::SlotId::new(1);
+    zone.drive(slot, 2);
+    zone.publish_slot(slot, mm.get(), Some(binding.cpu_slot), 3);
+    zone.enter_guest(slot);
+    super::super::user_fault_gate::install_persistent();
+    if !zone.enter_idle(slot, true) { fatal_boot(); }
+    // SAFETY: slot publication and its shared sleep guard precede this
+    // physical readiness notification; the host admits CPU0 only afterwards.
+    unsafe { core::arch::asm!("out dx, al", in("dx") carrick_el1_abi::X86_NATIVE_PEER_READY_PORT, in("rax") u64::from(binding.cpu_slot), options(nostack, preserves_flags)); }
+    super::native_execution::schedule(slot)
+}

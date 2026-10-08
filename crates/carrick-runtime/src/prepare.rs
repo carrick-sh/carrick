@@ -1149,6 +1149,19 @@ impl PreparedRun {
                 portal_exits: portal_exits + physical_exits,
                 host_forwards,
                 anonymous_private_pages: machine.anonymous_private_pages(),
+                anonymous_private_mms: machine
+                    .anonymous_private_mms()
+                    .into_iter()
+                    .map(|row| carrick_observability::compat::AnonymousPrivateMm {
+                        mm: row.mm,
+                        root: row.root,
+                        incarnation: row.incarnation,
+                        generation: row.generation,
+                        private_pages: row.private_pages,
+                    })
+                    .collect(),
+                cross_mm_private_aliases: machine.cross_mm_private_aliases(),
+                peer_active_private_grants: machine.peer_active_private_grants(),
                 physical_crossing_families,
                 host_forward_families: count_family(forward_families),
                 guest_refusal_families: count_family(refusal_families),
