@@ -85,20 +85,6 @@ fn fork_during_fill_keeps_record_unpublished() {
     assert_eq!(section.records[r.index].ns_pid.load(Ordering::Acquire), 88);
 }
 
-// The hook fixes the observation/reap interleaving without wall-clock timing.
-#[allow(clippy::expect_used)]
-fn observe_parent(
-    record: &carrick_kernel_arena::process::ProcessRecord,
-    observation: &std::sync::Mutex<()>,
-    after_identity: impl FnOnce(),
-) -> Option<(u32, u32, u32)> {
-    let _observation = observation.lock().expect("observation lock");
-    let host = record.state().host_pid()?.raw();
-    let ns = record.ns_pid.load(Ordering::Acquire);
-    after_identity();
-    Some((host, ns, record.parent_host_pid.load(Ordering::Acquire)))
-}
-
 #[test]
 fn observation_cannot_mix_publication_with_reap() {
     let arena = KernelArena::create().expect("create arena");
@@ -113,17 +99,111 @@ fn observation_cannot_mix_publication_with_reap() {
             },
         )
         .expect("claim record");
-    let observation = std::sync::Mutex::new(());
-    let observed = observe_parent(&section.records[r.index], &observation, || {
-        // Force reap immediately after the observer captured identity. An
-        // exact observation owns the guard, so reap cannot clear its body.
-        if let Ok(_reap) = observation.try_lock() {
-            assert!(section.release(r));
-        }
+    let observed = section.read_record(r, |record| {
+        let host = record.host_pid().expect("published pid").raw();
+        let ns = record.ns_pid.load(Ordering::Acquire);
+        // Exact production read boundary: retire after identity, before body.
+        assert!(section.release(r));
+        (host, ns, record.parent_host_pid.load(Ordering::Acquire))
     });
+    assert_eq!(
+        observed,
+        Err(carrick_kernel_arena::process::ProcessRecordTransitionError::Stale)
+    );
+}
+
+#[test]
+fn observation_rejects_reuse_even_with_the_same_host_pid() {
+    let arena = KernelArena::create().expect("create arena");
+    let section = &arena.layout().processes;
+    let pid = HostPid::new(77);
+    let old = section
+        .claim(Some(pid), arena.allocate_generation(), |record| {
+            record.ns_pid.store(88, Ordering::Relaxed);
+            record.parent_host_pid.store(99, Ordering::Relaxed);
+        })
+        .expect("old record");
+    let observed = section.read_record(old, |record| {
+        let ns = record.ns_pid.load(Ordering::Acquire);
+        assert!(section.release(old));
+        let new = section
+            .claim(Some(pid), arena.allocate_generation(), |record| {
+                record.ns_pid.store(188, Ordering::Relaxed);
+                record.parent_host_pid.store(199, Ordering::Relaxed);
+            })
+            .expect("replacement record");
+        assert_eq!(old.index, new.index);
+        assert_ne!(old.generation, new.generation);
+        (ns, record.parent_host_pid.load(Ordering::Acquire))
+    });
+    assert_eq!(
+        observed,
+        Err(carrick_kernel_arena::process::ProcessRecordTransitionError::Stale)
+    );
+}
+
+#[test]
+fn observation_rejects_release_in_another_host_process() {
+    let arena = KernelArena::create().expect("create arena");
+    let section = &arena.layout().processes;
+    let r = section
+        .claim(
+            Some(HostPid::new(77)),
+            arena.allocate_generation(),
+            |record| {
+                record.ns_pid.store(88, Ordering::Relaxed);
+                record.parent_host_pid.store(99, Ordering::Relaxed);
+            },
+        )
+        .expect("record");
+    let observed = section.read_record(r, |record| {
+        let ns = record.ns_pid.load(Ordering::Acquire);
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            let released = section.release(r);
+            unsafe { libc::_exit(if released { 0 } else { 70 }) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        (ns, record.parent_host_pid.load(Ordering::Acquire))
+    });
+    assert_eq!(
+        observed,
+        Err(carrick_kernel_arena::process::ProcessRecordTransitionError::Stale)
+    );
+}
+
+#[test]
+fn validated_read_is_single_attempt_and_does_not_read_stale_body() {
+    let arena = KernelArena::create().expect("arena");
+    let section = &arena.layout().processes;
+    let r = section
+        .claim(Some(HostPid::new(77)), arena.allocate_generation(), |_| {})
+        .expect("record");
+    let attempts = std::cell::Cell::new(0);
     assert!(
-        observed == Some((77, 88, 99)),
-        "observation mixed a published identity with a retired body: {observed:?}"
+        section
+            .read_record(r, |_| {
+                attempts.set(attempts.get() + 1);
+            })
+            .is_ok()
+    );
+    assert_eq!(attempts.get(), 1);
+    assert!(section.release(r));
+    assert!(
+        section
+            .read_record(r, |_| {
+                attempts.set(attempts.get() + 1);
+            })
+            .is_err()
+    );
+    assert_eq!(
+        attempts.get(),
+        1,
+        "stale admission must not read or retry the body"
     );
 }
 
@@ -143,20 +223,21 @@ fn fork_storm_never_exposes_incomplete_records() {
 
     let arena = Arc::new(KernelArena::create().expect("create arena"));
     let stop = Arc::new(AtomicBool::new(false));
-    // Only the test observer and terminal reap share this lock. Registration,
-    // fork and child validation retain their original concurrency.
-    let observation = Arc::new(std::sync::Mutex::new(()));
 
     let scanner = {
         let arena = Arc::clone(&arena);
         let stop = Arc::clone(&stop);
-        let observation = Arc::clone(&observation);
         std::thread::spawn(move || -> Result<(), String> {
             let section = &arena.layout().processes;
             while !stop.load(Ordering::Acquire) {
-                for record in section.records.iter() {
-                    let Some((host, ns, parent)) = observe_parent(record, &observation, || {})
-                    else {
+                for index in 0..section.records.len() {
+                    let Some((_, (host, ns, parent))) = section.read_at(index, |record| {
+                        (
+                            record.host_pid().map(|pid| pid.raw()).unwrap_or(0),
+                            record.ns_pid.load(Ordering::Acquire),
+                            record.parent_host_pid.load(Ordering::Acquire),
+                        )
+                    }) else {
                         continue; // unpublished: invisible by contract
                     };
                     if !(NS_BASE..NS_BASE + CHILDREN).contains(&ns) {
@@ -208,7 +289,6 @@ fn fork_storm_never_exposes_incomplete_records() {
         let reaped = section
             .find(HostPid::new(child as u32))
             .expect("reaped child record");
-        let _observation = observation.lock().expect("reap lock");
         assert!(section.release(reaped));
     }
 

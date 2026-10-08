@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 use bitflags::bitflags;
 
@@ -507,24 +507,60 @@ impl ProcessSection {
         })
     }
 
+    /// Read owned values from one exact published lifetime. The closure must
+    /// not perform mutations and cannot return a borrow of the record.
+    pub fn read_record<T>(
+        &self,
+        r: ProcessRecordRef,
+        read: impl for<'a> FnOnce(&'a ProcessRecord) -> T,
+    ) -> Result<T, ProcessRecordTransitionError> {
+        let record = self
+            .record_for_ref(r)
+            .ok_or(ProcessRecordTransitionError::Stale)?;
+        let host_pid = record
+            .host_pid()
+            .ok_or(ProcessRecordTransitionError::Stale)?;
+        let value = read(record);
+        // Order every body load before the lifetime validation. Retirement
+        // invalidates generation/state and fences before clearing the body.
+        fence(Ordering::SeqCst);
+        if record.generation.load(Ordering::Acquire) != r.generation.raw()
+            || record.host_pid() != Some(host_pid)
+        {
+            return Err(ProcessRecordTransitionError::Stale);
+        }
+        Ok(value)
+    }
+
+    /// Scan one slot without retaining a raw record borrow across retirement.
+    pub fn read_at<T>(
+        &self,
+        index: usize,
+        read: impl for<'a> FnOnce(&'a ProcessRecord) -> T,
+    ) -> Option<(ProcessRecordRef, T)> {
+        let record = self.records.get(index)?;
+        let generation = record.generation.load(Ordering::Acquire);
+        if generation == 0 {
+            return None;
+        }
+        let r = ProcessRecordRef {
+            index,
+            generation: ProcessGeneration::new(generation),
+        };
+        self.read_record(r, read).ok().map(|value| (r, value))
+    }
+
     pub fn find(&self, host_pid: HostPid) -> Option<ProcessRecordRef> {
         let wanted = host_pid.raw();
         if wanted == 0 {
             return None;
         }
 
-        for (index, record) in self.records.iter().enumerate() {
-            match record.state() {
-                RecordState::Live { host_pid: p } | RecordState::Transitioning { host_pid: p }
-                    if p == host_pid => {}
-                _ => continue,
-            }
-            let generation = record.generation.load(Ordering::Acquire);
-            if generation != 0 {
-                return Some(ProcessRecordRef {
-                    index,
-                    generation: ProcessGeneration::new(generation),
-                });
+        for index in 0..self.records.len() {
+            if let Some((r, Some(pid))) = self.read_at(index, ProcessRecord::host_pid)
+                && pid == host_pid
+            {
+                return Some(r);
             }
         }
         None
@@ -632,8 +668,11 @@ impl ProcessSection {
         // generation. A registrar that did not win the transition claim cannot
         // attach to a half-released record.
         guard.retire();
-        record.host_pid.store(0, Ordering::Release);
         record.generation.store(0, Ordering::Release);
+        // A reader that observes cleared body bytes must also observe the
+        // invalidated lifetime at its trailing validation barrier.
+        fence(Ordering::SeqCst);
+        record.host_pid.store(0, Ordering::Release);
         record.clear_body_for_claim();
         record.state_cell.finish_retire();
     }

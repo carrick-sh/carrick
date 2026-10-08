@@ -361,23 +361,15 @@ pub(crate) fn try_clear_guest_process_with_timeout(
     // Clear every matching process-kind record rather than trusting a
     // first-match lookup: an old seed/publish race could have left a duplicate,
     // and retaining either duplicate still leaks one slot per exited task.
-    let records: Vec<_> = section
-        .records
-        .iter()
-        .enumerate()
-        .filter_map(|(index, record)| {
-            if record.host_pid.load(Ordering::Acquire) != pid {
-                return None;
-            }
-            let generation = record.generation.load(Ordering::Acquire);
-            if generation == 0 {
-                return None;
-            }
-            let raw = record.run_state.load(Ordering::Acquire);
-            (raw & KIND_TID == 0 && (raw & PID_MASK) as u32 == pid).then_some(ProcessRecordRef {
-                index,
-                generation: ProcessGeneration::new(generation),
-            })
+    let records: Vec<_> = (0..section.records.len())
+        .filter_map(|index| {
+            let (r, matching) = section.read_at(index, |record| {
+                let raw = record.run_state.load(Ordering::Acquire);
+                record.host_pid().map(|host| host.raw()) == Some(pid)
+                    && raw & KIND_TID == 0
+                    && (raw & PID_MASK) as u32 == pid
+            })?;
+            matching.then_some(r)
         })
         .collect();
     for record_ref in records {
@@ -389,6 +381,10 @@ pub(crate) fn try_clear_guest_process_with_timeout(
         let deadline = std::time::Instant::now() + timeout;
         loop {
             match section.with_record_transition(record_ref, HostPid::new(pid), |record| {
+                let raw = record.run_state.load(Ordering::Acquire);
+                if raw & KIND_TID != 0 || (raw & PID_MASK) as u32 != pid {
+                    return ((), ProcessRecordTransitionAction::Preserve);
+                }
                 record.run_state.store(0, Ordering::Release);
                 ((), ProcessRecordTransitionAction::RetireIfNamespaceUnowned)
             }) {
@@ -435,20 +431,14 @@ fn cached_record(
 }
 
 fn find_record(section: &ProcessSection, id: u32, want_tid: bool) -> Option<ProcessRecordRef> {
-    for (index, record) in section.records.iter().enumerate() {
-        if record.host_pid.load(Ordering::Acquire) != id {
-            continue;
-        }
-        let generation = record.generation.load(Ordering::Acquire);
-        if generation == 0 {
-            continue;
-        }
-        let raw = record.run_state.load(Ordering::Acquire);
-        if (raw & PID_MASK) as u32 == id && ((raw & KIND_TID) != 0) == want_tid {
-            return Some(ProcessRecordRef {
-                index,
-                generation: ProcessGeneration::new(generation),
-            });
+    for index in 0..section.records.len() {
+        if let Some((r, true)) = section.read_at(index, |record| {
+            let raw = record.run_state.load(Ordering::Acquire);
+            record.host_pid().map(|pid| pid.raw()) == Some(id)
+                && (raw & PID_MASK) as u32 == id
+                && ((raw & KIND_TID) != 0) == want_tid
+        }) {
+            return Some(r);
         }
     }
     None
@@ -619,27 +609,36 @@ pub fn published(pid: u32) -> Option<RunState> {
     }
 
     let section = processes();
+    published_in(section, pid, || {})
+}
+
+fn published_in(
+    section: &ProcessSection,
+    pid: u32,
+    mut after_identity: impl FnMut(),
+) -> Option<RunState> {
     let mut tid_hit = None;
     let mut booting_hit = None;
-    for record in section.records.iter() {
-        if record.host_pid.load(Ordering::Acquire) != pid {
+    for index in 0..section.records.len() {
+        let Some((_, raw)) = section.read_at(index, |record| {
+            (record.host_pid().map(|host| host.raw()) == Some(pid)).then(|| {
+                after_identity();
+                record.run_state.load(Ordering::Acquire)
+            })
+        }) else {
             continue;
-        }
-        let generation = record.generation.load(Ordering::Acquire);
-        if generation == 0 {
-            continue;
-        }
-        let raw = record.run_state.load(Ordering::Acquire);
-        if let Some((p, st)) = unpack(raw)
+        };
+        if let Some(raw) = raw
+            && let Some((p, st)) = unpack(raw)
             && p == pid
         {
             if raw & KIND_TID == 0 {
                 if st != RunState::Booting {
-                    return Some(st); // a live process state is authoritative
+                    return Some(st);
                 }
-                booting_hit = Some(st); // possibly a stale seed; prefer a live entry
+                booting_hit = Some(st);
             } else {
-                tid_hit = Some(st); // used only if no process entry exists
+                tid_hit = Some(st);
             }
         }
     }
@@ -675,6 +674,46 @@ pub(crate) fn wipe_id_for_tests(id: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn published_rejects_reuse_after_identity_read() {
+        let arena = KernelArena::create().expect("arena");
+        let section = &arena.layout().processes;
+        let pid = 770078;
+        let r = section
+            .claim(
+                Some(HostPid::new(pid)),
+                arena.allocate_generation(),
+                |record| {
+                    record
+                        .run_state
+                        .store(pack(pid, RunState::Running), Ordering::Relaxed);
+                },
+            )
+            .expect("record");
+        let mut fired = false;
+        let observed = published_in(section, pid, || {
+            assert!(!fired);
+            fired = true;
+            assert!(section.release(r));
+            section
+                .claim(
+                    Some(HostPid::new(pid)),
+                    arena.allocate_generation(),
+                    |record| {
+                        record
+                            .run_state
+                            .store(pack(pid, RunState::Blocked), Ordering::Relaxed);
+                    },
+                )
+                .expect("replacement");
+        });
+        assert!(fired);
+        assert_eq!(
+            observed, None,
+            "a replaced lifetime cannot satisfy the original observation"
+        );
+    }
 
     #[test]
     fn publish_adopts_the_existing_process_record() {
