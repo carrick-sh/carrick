@@ -1010,6 +1010,7 @@ pub(crate) struct Cpl0HostCustody {
     initial_inventory: Option<InitialInventory>,
     peer_entry: Option<carrick_guest_arch::KernelVa>,
     grant_tables: Vec<RootGpa>,
+    prepare_table_stock: Option<anonymous_owner::PrepareTableStock>,
     fork_pending: [Option<anonymous_owner::PendingForkLoan>; 2],
     fork_next_loan: u64,
     fork_lifecycle_available: bool,
@@ -1194,6 +1195,7 @@ impl Cpl0Carrier {
             .ok_or_else(|| fail("initial extent pages"))?;
         let bytes = total_pages
             .checked_mul(PAGE)
+            .and_then(|bytes| bytes.checked_add(anonymous_owner::prepare_table_working_bytes()?))
             .ok_or_else(|| fail("initial extent size"))?;
         if bytes > MAX_BYTES {
             return Err(fail("initial image exceeds carrier memory budget"));
@@ -1555,6 +1557,11 @@ impl Cpl0Carrier {
         {
             return Err(fail("initial extent too small for frame grants"));
         }
+        let occupied_end = frame_offset
+            .checked_add(grant_count * 4096)
+            .ok_or_else(|| fail("initial occupied physical extent"))?;
+        let prepare_span = anonymous_owner::prepare_table_suffix(extent_len, occupied_end)
+            .ok_or_else(|| fail("initial records/grants overlap Prepare working stock"))?;
         let (mut inventory, grants) = InitialInventory::stage(
             Arc::clone(&self.custody.frame_inventory),
             &self.custody.object_ids,
@@ -1903,6 +1910,16 @@ impl Cpl0Carrier {
                     .ok_or_else(|| fail("initial unused table alignment"))?,
             );
         }
+        let stock_bytes = self
+            .custody
+            ._vm
+            .read(prepare_span.start(), prepare_span.len().raw() as usize)
+            .map_err(|error| fail(error.to_string()))?;
+        self.custody.prepare_table_stock = Some(
+            anonymous_owner::PrepareTableStock::seed(prepare_span, &stock_bytes).ok_or_else(
+                || fail("Prepare working table suffix is not exclusive zero storage"),
+            )?,
+        );
         self.custody.initial_inventory = Some(inventory);
         Ok(())
     }
@@ -2997,6 +3014,7 @@ impl Cpl0Carrier {
                 initial_inventory: None,
                 peer_entry: None,
                 grant_tables: Vec::new(),
+                prepare_table_stock: None,
                 fork_pending: std::array::from_fn(|_| None),
                 fork_next_loan: 1,
                 fork_lifecycle_available: true,

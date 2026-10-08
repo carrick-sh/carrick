@@ -175,6 +175,72 @@ fn take_fork_table_stock(
     Some((child_tables, parent_tables))
 }
 
+pub(super) type PrepareTableSpan = carrick_el1_abi::X86PrepareTableSpan;
+
+pub(super) fn prepare_table_working_bytes() -> Option<usize> {
+    let lanes = core::num::NonZeroUsize::new(carrick_x86::cpl0_entry::CPL0_CPU_COUNT)?;
+    usize::try_from(PrepareTableSpan::working_bytes(lanes)?.raw()).ok()
+}
+
+pub(super) fn prepare_table_suffix(
+    extent_bytes: usize,
+    occupied_end: usize,
+) -> Option<PrepareTableSpan> {
+    PrepareTableSpan::derive(
+        carrick_guest_arch::GuestLen::new(u64::try_from(extent_bytes).ok()?),
+        FrameGpa::new(INITIAL_EXTENT_GPA.checked_add(u64::try_from(occupied_end).ok()?)?),
+        core::num::NonZeroUsize::new(carrick_x86::cpl0_entry::CPL0_CPU_COUNT)?,
+    )
+}
+
+/// Exclusive physical credits for owner-selected Prepare operations. This
+/// capability exposes no mutable vector that the fork stock service can take.
+pub(super) struct PrepareTableStock {
+    span: PrepareTableSpan,
+    pages: Vec<RootGpa>,
+}
+struct PrepareTableLoan {
+    span: PrepareTableSpan,
+    pages: Vec<RootGpa>,
+}
+impl PrepareTableStock {
+    pub(super) fn seed(span: PrepareTableSpan, bytes: &[u8]) -> Option<Self> {
+        if usize::try_from(span.len().raw()).ok()? != prepare_table_working_bytes()?
+            || bytes.len() != usize::try_from(span.len().raw()).ok()?
+            || bytes.iter().any(|byte| *byte != 0)
+        {
+            return None;
+        }
+        let pages = (0..span.page_count())
+            .map(|index| {
+                RootGpa::page_aligned(FrameGpa::new(span.start().raw() + index as u64 * 4096))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self { span, pages })
+    }
+    fn candidates(&self) -> &[RootGpa] {
+        &self.pages
+    }
+    fn loan(&mut self, required: usize) -> Option<PrepareTableLoan> {
+        Some(PrepareTableLoan {
+            span: self.span,
+            pages: reserve_table_stock(&mut self.pages, required)?,
+        })
+    }
+    fn return_unused(&mut self, loan: PrepareTableLoan, used: usize) -> Result<(), TrapError> {
+        if loan.span != self.span || used > loan.pages.len() {
+            return Err(fail("Prepare table loan custody mismatch"));
+        }
+        self.pages.extend(loan.pages.into_iter().skip(used));
+        Ok(())
+    }
+}
+impl PrepareTableLoan {
+    fn len(&self) -> usize {
+        self.pages.len()
+    }
+}
+
 fn reserve_table_stock(stock: &mut Vec<RootGpa>, required: usize) -> Option<Vec<RootGpa>> {
     if required > carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS
         || required > stock.len()
@@ -198,7 +264,7 @@ pub(super) struct PendingPrepare {
     inventory: InitialInventory,
     handle: BackingHandle,
     execution: GrantExecution,
-    tables: Vec<RootGpa>,
+    tables: PrepareTableLoan,
 }
 
 pub(super) struct PendingCow {
@@ -1252,10 +1318,13 @@ impl Cpl0HostCustody {
                 .checked_add(pending.window.range.len() / 4096)
                 .ok_or_else(|| fail("owner grant witness overflow"))?;
             let used = publication.tables_linked as usize;
-            if used > pending.txn.tables.len() {
+            if pending.txn.tables.len() != pending.tables.len() || used > pending.tables.len() {
                 return Err(fail("owner grant table receipt"));
             }
-            self.grant_tables.extend(pending.tables.drain(used..));
+            self.prepare_table_stock
+                .as_mut()
+                .ok_or_else(|| fail("Prepare table stock absent at settlement"))?
+                .return_unused(pending.tables, used)?;
             // Retained stage-2 custody now belongs to the live guest graph.
             let _retained = pending.handle;
             return Ok(());
@@ -1280,6 +1349,9 @@ impl Cpl0HostCustody {
             || window.range.len() > carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE
         {
             return Err(fail("owner grant selection identity"));
+        }
+        if self.prepare_table_stock.is_none() {
+            return Err(fail("Prepare table stock absent"));
         }
         let root = context.root;
         let gpa = self.anonymous_next_gpa;
@@ -1320,7 +1392,10 @@ impl Cpl0HostCustody {
         let handle = handles[0];
         let grant = grants[0];
         let tables: Vec<_> = self
-            .grant_tables
+            .prepare_table_stock
+            .as_ref()
+            .ok_or_else(|| fail("Prepare table stock absent"))?
+            .candidates()
             .iter()
             .take(carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS)
             .map(|table| SubstrateGpa(table.address().raw()))
@@ -1387,7 +1462,11 @@ impl Cpl0HostCustody {
                 return Err(error);
             }
         };
-        let owned_tables = match reserve_table_stock(&mut self.grant_tables, required) {
+        let owned_tables = match self
+            .prepare_table_stock
+            .as_mut()
+            .and_then(|stock| stock.loan(required))
+        {
             Some(owned) => owned,
             None => {
                 unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
@@ -1396,7 +1475,9 @@ impl Cpl0HostCustody {
                     "owner grant physical table credit exhausted: cpu={} mm={} required={required} available={}",
                     execution.cpu.raw(),
                     mm,
-                    self.grant_tables.len()
+                    self.prepare_table_stock
+                        .as_ref()
+                        .map_or(0, |stock| stock.candidates().len())
                 )));
             }
         };
@@ -1416,7 +1497,10 @@ impl Cpl0HostCustody {
             // admitted. The fresh extent has never been guest-visible.
             unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
                 .map_err(|error| fail(error.to_string()))?;
-            self.grant_tables.extend(owned_tables);
+            self.prepare_table_stock
+                .as_mut()
+                .ok_or_else(|| fail("Prepare stock absent on rollback"))?
+                .return_unused(owned_tables, 0)?;
             return Err(fail("owner grant admission refused"));
         }
         inventory.expected = 1;
@@ -1615,6 +1699,33 @@ mod custody_tests {
         let mut foreign = admitted;
         foreign.context.mm = MmGeneration::new(NonZeroU64::new(303).unwrap());
         assert!(!admitted.matches(foreign));
+    }
+    #[test]
+    fn prepare_working_stock_is_independent_owned_zero_suffix() {
+        let working = prepare_table_working_bytes().unwrap();
+        assert_eq!(working, 2 * 6 * 4096);
+        let span = prepare_table_suffix(0x20000, 0x10000).unwrap();
+        assert_eq!(
+            span.start().raw(),
+            INITIAL_EXTENT_GPA + 0x20000 - working as u64
+        );
+        assert_eq!(span.end().raw(), INITIAL_EXTENT_GPA + 0x20000);
+        assert_eq!(span.page_count(), 12);
+        assert!(prepare_table_suffix(0x20000, 0x20000 - working + 4096).is_none());
+        assert!(prepare_table_suffix(0x20001, 0x10000).is_none());
+        assert!(prepare_table_suffix(working - 4096, 0).is_none());
+        let mut bytes = vec![0; working];
+        let mut stock = PrepareTableStock::seed(span, &bytes).unwrap();
+        let first = stock.loan(6).unwrap();
+        let second = stock.loan(6).unwrap();
+        assert!(stock.loan(1).is_none());
+        assert!(first.pages.iter().all(|page| !second.pages.contains(page)));
+        stock.return_unused(first, 0).unwrap();
+        stock.return_unused(second, 2).unwrap();
+        assert_eq!(stock.candidates().len(), 10);
+        bytes[4096] = 1;
+        assert!(PrepareTableStock::seed(span, &bytes).is_none());
+        assert!(PrepareTableStock::seed(span, &bytes[..working - 1]).is_none());
     }
     #[test]
     fn owner_grants_reserve_disjoint_table_stock_before_receipt() {
