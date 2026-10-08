@@ -4454,7 +4454,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/kernel_context.rs",
-      "line": 307,
+      "line": 333,
       "categories": [
         "lifecycle"
       ],
@@ -4463,7 +4463,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/kernel_context.rs",
-      "line": 755,
+      "line": 899,
       "categories": [
         "table_guard"
       ],
@@ -4472,7 +4472,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/kernel_context.rs",
-      "line": 798,
+      "line": 942,
       "categories": [
         "table_guard"
       ],
@@ -4481,7 +4481,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/kernel_context.rs",
-      "line": 806,
+      "line": 950,
       "categories": [
         "table_guard"
       ],
@@ -17411,7 +17411,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/core.rs",
-      "line": 1327,
+      "line": 1338,
       "categories": [
         "mapping"
       ],
@@ -17420,7 +17420,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/core.rs",
-      "line": 2140,
+      "line": 2385,
       "categories": [
         "mapping"
       ],
@@ -22839,7 +22839,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 522,
+      "line": 536,
       "categories": [
         "mapping"
       ],
@@ -22848,7 +22848,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 553,
+      "line": 567,
       "categories": [
         "mapping"
       ],
@@ -22857,7 +22857,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 861,
+      "line": 875,
       "categories": [
         "mapping"
       ],
@@ -22866,7 +22866,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/namespace/pid.rs",
-      "line": 1723,
+      "line": 1737,
       "categories": [
         "mapping"
       ],
