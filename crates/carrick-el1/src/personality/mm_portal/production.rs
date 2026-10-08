@@ -3,6 +3,7 @@
 use super::{El1MmHandle, GuestVa, TransferIntent};
 use super::{MmError, MmErrorLinux};
 use crate::memory::reservations::NativeReservationGeometry;
+// Test fixture independence
 pub use carrick_core::mm::transaction::{
     SelectionVenues, TRANSFER_CHUNK_BYTES, TransferStep, admit_service_root, bind_service_root,
     grant_target, prepare_transfer, serve_transfer, settle_prepared_service,
@@ -118,6 +119,13 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         return;
     }
     let Some((service, grant)) = admit_service_root(&portal, service) else {
+        carrick_el1_abi::record_reservation_event(
+            70,
+            request.operation.mm.raw(),
+            request.operation.incarnation.get(),
+            request.operation.sequence.get() as u32,
+            frame.slot as u32,
+        );
         return;
     };
     #[cfg(target_arch = "aarch64")]
@@ -156,6 +164,102 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         service.complete(0, 5);
         return;
     };
+    if service.phase() == carrick_el1_abi::PortalTransferPhase::Prepare {
+        use carrick_core::mm::transaction::OwnerVenue;
+        let handle = unsafe {
+            El1MmHandle::from_admitted_owner(
+                request.operation.carrier,
+                request.operation.mm,
+                request.operation.incarnation,
+            )
+        };
+        let observations = (|| {
+            Ok::<_, MmError>((
+                portal.observe_wait(handle, carrick_el1_abi::PortalWaitCause::Reservations)?,
+                portal.observe_wait(handle, carrick_el1_abi::PortalWaitCause::Metadata)?,
+            ))
+        })();
+        let (changed, metadata) = match observations {
+            Ok(obs) => obs,
+            Err(error) => {
+                carrick_el1_abi::record_reservation_event(
+                    74,
+                    request.operation.mm.raw(),
+                    request.operation.incarnation.get(),
+                    request.operation.sequence.get() as u32,
+                    error.errno(),
+                );
+                service.complete(0, NativeOwnerVenue::encode_error(error));
+                return;
+            }
+        };
+
+        match prepare_transfer(&portal, request, &words, frame.slot as u32) {
+            Ok(Some(permit)) => {
+                if !service.complete_prepared(permit) {
+                    let _ = portal.cancel_prepared(permit, request, frame.slot as u32);
+                }
+            }
+            Ok(None) => {
+                carrick_el1_abi::record_reservation_event(
+                    75,
+                    request.operation.mm.raw(),
+                    request.operation.incarnation.get(),
+                    request.operation.sequence.get() as u32,
+                    changed.is_some() as u32,
+                );
+                service.suspend_prepare(changed.map_or(
+                    carrick_el1_abi::PortalPrepareSuspension::SelectionChanged,
+                    carrick_el1_abi::PortalPrepareSuspension::Owner,
+                ));
+            }
+            Err(MmError::Wait(wait)) => {
+                carrick_el1_abi::record_reservation_event(
+                    76,
+                    request.operation.mm.raw(),
+                    request.operation.incarnation.get(),
+                    request.operation.sequence.get() as u32,
+                    0,
+                );
+                let _ =
+                    service.suspend_prepare(carrick_el1_abi::PortalPrepareSuspension::Owner(wait));
+            }
+            Err(MmError::MetadataRequired) => {
+                carrick_el1_abi::record_reservation_event(
+                    77,
+                    request.operation.mm.raw(),
+                    request.operation.incarnation.get(),
+                    request.operation.sequence.get() as u32,
+                    0,
+                );
+                service.suspend_prepare(metadata.map_or(
+                    carrick_el1_abi::PortalPrepareSuspension::ReservationMetadata,
+                    carrick_el1_abi::PortalPrepareSuspension::Owner,
+                ));
+            }
+            Err(MmError::Busy) => {
+                carrick_el1_abi::record_reservation_event(
+                    78,
+                    request.operation.mm.raw(),
+                    request.operation.incarnation.get(),
+                    request.operation.sequence.get() as u32,
+                    frame.slot as u32,
+                );
+                service.complete(0, NativeOwnerVenue::encode_error(MmError::Busy));
+            }
+            Err(error) => {
+                carrick_el1_abi::record_reservation_event(
+                    79,
+                    request.operation.mm.raw(),
+                    request.operation.incarnation.get(),
+                    request.operation.sequence.get() as u32,
+                    error.errno(),
+                );
+                service.complete(0, NativeOwnerVenue::encode_error(error));
+            }
+        }
+        return;
+    }
     let _ = serve_transfer(&portal, service, &words, frame.slot as u32, || {
         // The host resumes this exact stack after copy OR cancellation. The
         // permit cannot be abandoned by resetting service-call registers.
