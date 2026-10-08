@@ -1091,23 +1091,23 @@ mod tests {
     #[test]
     fn exec_capability_is_returned_only_after_consumer_admission_and_tracks_result() {
         let runtime = Arc::new(ExecRuntime::new(2));
+        let (work_tx, work_rx) = std::sync::mpsc::sync_channel(1);
+        let consumer_runtime = Arc::clone(&runtime);
         runtime
-            .install_waker(Arc::new(|| {}))
+            .install_waker(Arc::new(move || {
+                if let Some(work) = consumer_runtime.try_take() {
+                    work_tx.send(work).expect("send work");
+                }
+            }))
             .expect("install waker");
         let submit = Arc::clone(&runtime);
         let request = minimal_exec_request();
         let capability = ExecCapability::from(ControlNonce([0x33; 16]));
         let submitter = std::thread::spawn(move || submit.admit(capability, request));
 
-        while runtime.query(capability) != ExecStatus::Pending {
-            std::thread::yield_now();
-        }
-        let mut work = loop {
-            if let Some(work) = runtime.try_take() {
-                break work;
-            }
-            std::thread::yield_now();
-        };
+        let mut work = work_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("receive work from synchronous waker");
         assert_eq!(runtime.query(capability), ExecStatus::Pending);
         work.admit(ControlTaskKey { pid: 22, serial: 7 });
         assert_eq!(submitter.join().expect("submitter"), Ok(capability));
@@ -1328,22 +1328,22 @@ mod tests {
             2,
             std::time::Duration::from_millis(250),
         ));
+        let (work_tx, work_rx) = std::sync::mpsc::sync_channel(1);
+        let consumer_runtime = Arc::clone(&runtime);
         runtime
-            .install_waker(Arc::new(|| {}))
+            .install_waker(Arc::new(move || {
+                if let Some(work) = consumer_runtime.try_take() {
+                    work_tx.send(work).expect("send work");
+                }
+            }))
             .expect("install waker");
         let capability = ExecCapability::from(ControlNonce([0x71; 16]));
         let submit = Arc::clone(&runtime);
         let submitter =
             std::thread::spawn(move || submit.admit(capability, minimal_exec_request()));
-        while runtime.query(capability) != ExecStatus::Pending {
-            std::thread::yield_now();
-        }
-        let mut work = loop {
-            if let Some(work) = runtime.try_take() {
-                break work;
-            }
-            std::thread::yield_now();
-        };
+        let mut work = work_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("receive work from synchronous waker");
         assert!(work.admit(ControlTaskKey { pid: 71, serial: 1 }));
         assert_eq!(submitter.join().expect("submitter"), Ok(capability));
 
