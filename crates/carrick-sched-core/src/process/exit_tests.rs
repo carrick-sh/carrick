@@ -520,3 +520,206 @@ fn exit_effect_work_visits_only_own_members_at_all_scales() {
         }
     }
 }
+
+#[test]
+fn prepared_exit_effects_reject_stale_membership_snapshot() {
+    use super::exit::*;
+    use super::registry::*;
+    use super::wait::{WaitIdentity, WaitIdentitySource};
+    use super::{ChildExitSignal, ProcessGroupId, TaskLifecycle};
+    use alloc::collections::{BTreeMap, BTreeSet};
+    use alloc::vec::Vec;
+    use core::cell::Cell;
+    use core::marker::PhantomData;
+    struct Member(TaskKey, usize);
+    impl ExitMember for Member {
+        fn exit_task(&self) -> TaskKey {
+            self.0
+        }
+    }
+    struct Live {
+        key: TaskKey,
+        members: usize,
+        revision: TaskRevision,
+        exiting: Cell<bool>,
+        reads: Cell<usize>,
+        member_reads: Cell<usize>,
+    }
+    impl WaitIdentitySource for Live {
+        fn wait_identity(&self) -> WaitIdentity {
+            self.reads.set(self.reads.get() + 1);
+            WaitIdentity {
+                key: self.key,
+                parent: None,
+                tracer: None,
+                group: ProcessGroupId::from_abi_positive(1).unwrap(),
+                exit_signal: ChildExitSignal::None,
+            }
+        }
+    }
+    impl ExitLive<()> for Live {
+        type Credit = ();
+        type Error = ();
+        fn exit_container(&self) {}
+        fn exit_lifecycle(&self) -> TaskLifecycle {
+            if self.exiting.get() {
+                TaskLifecycle::Exiting
+            } else {
+                TaskLifecycle::Live
+            }
+        }
+        fn exit_children(&self) -> BTreeSet<TaskKey> {
+            BTreeSet::new()
+        }
+        fn exit_autoreaps(&self) -> bool {
+            false
+        }
+        fn exit_revision(&self) -> TaskRevision {
+            self.revision
+        }
+        fn exit_reserve_credit(&self) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+    impl ExitEffectSource<()> for Live {
+        type Member = Member;
+        type Resources = ();
+        fn exit_members(&self) -> (Vec<Member>, ()) {
+            self.member_reads
+                .set(self.member_reads.get() + self.members);
+            (
+                (0..self.members)
+                    .map(|index| Member(self.key, index))
+                    .collect(),
+                (),
+            )
+        }
+        fn exit_begin(&self) -> bool {
+            !self.exiting.replace(true)
+        }
+    }
+    struct Dead;
+    impl ExitZombie for Dead {
+        fn exit_key(&self) -> TaskKey {
+            panic!("no zombie")
+        }
+    }
+    struct Failure;
+    impl RegistryFailure for Failure {
+        fn fail(_: RegistryInvariant) -> ! {
+            panic!("invariant")
+        }
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct Transaction(u32);
+    for n in [1] {
+        let task = key(1);
+        let mut owner: ProcessRegistry<
+            (),
+            Live,
+            Dead,
+            (),
+            TaskGraphReservation<Transaction>,
+            (),
+            (),
+            (),
+            Failure,
+        > = ProcessRegistry {
+            epoch: 1,
+            container_inits: BTreeMap::new(),
+            tasks: BTreeMap::new(),
+            zombies: BTreeMap::new(),
+            retiring_tasks: BTreeMap::new(),
+            reservations: BTreeMap::new(),
+            retired_threads: (),
+            process_groups: BTreeMap::new(),
+            process_group_by_namespace: BTreeMap::new(),
+            sessions: BTreeMap::new(),
+            session_by_namespace: BTreeMap::new(),
+            failure: PhantomData,
+        };
+        owner.tasks.insert(
+            task.id,
+            Live {
+                key: task,
+                members: n,
+                revision: TaskRevision::INITIAL,
+                exiting: Cell::new(false),
+                reads: Cell::new(0),
+                member_reads: Cell::new(0),
+            },
+        );
+        for id in 100..612 {
+            let other = TaskKey {
+                id: TaskId::from_abi_positive(id).unwrap(),
+                ..key(99)
+            };
+            owner.tasks.insert(
+                other.id,
+                Live {
+                    key: other,
+                    members: 1,
+                    revision: TaskRevision::INITIAL,
+                    exiting: Cell::new(false),
+                    reads: Cell::new(0),
+                    member_reads: Cell::new(0),
+                },
+            );
+        }
+        let plan = owner.prepare_exit_topology(task, None).unwrap();
+        let permit = owner.reserve_exit_task_set(&plan, Transaction(1)).unwrap();
+        let unactivated = owner.prepare_exit_effects(task, &plan, &permit).unwrap();
+        owner.release_task_set(&permit).unwrap();
+        assert!(
+            owner
+                .begin_prepared_exit_effects(task, &plan, &permit, unactivated)
+                .is_err()
+        );
+        assert_eq!(owner.tasks[&task.id].exit_lifecycle(), TaskLifecycle::Live);
+        let permit = owner.reserve_exit_task_set(&plan, Transaction(2)).unwrap();
+        let stale = owner.prepare_exit_effects(task, &plan, &permit).unwrap();
+        let current = owner.tasks[&task.id].revision;
+        let next = current.next().unwrap();
+        let membership = owner.reservations[&task.id]
+            .prepare_membership_revision(task, current, next)
+            .unwrap()
+            .unwrap();
+        let row = owner.tasks.get_mut(&task.id).unwrap();
+        row.members += 1;
+        row.revision = next;
+        membership.publish();
+        assert!(
+            owner
+                .begin_prepared_exit_effects(task, &plan, &permit, stale)
+                .is_err(),
+            "an admitted birth must invalidate the earlier member snapshot"
+        );
+        assert_eq!(owner.tasks[&task.id].exit_lifecycle(), TaskLifecycle::Live);
+        let effects = owner.prepare_exit_effects(task, &plan, &permit).unwrap();
+        let effects = owner
+            .begin_prepared_exit_effects(task, &plan, &permit, effects)
+            .unwrap();
+        assert_eq!(
+            owner.tasks[&task.id].exit_lifecycle(),
+            TaskLifecycle::Exiting
+        );
+        let release = owner.release_task_set(&permit).unwrap();
+        let mut cancelled = Vec::new();
+        let parent = effects
+            .after_release(release)
+            .unwrap()
+            .cancel_members(|member| {
+                assert_eq!(member.0, task);
+                cancelled.push(member.1);
+            });
+        assert_eq!(parent.parent(), None);
+        assert_eq!(cancelled, [0, 1]);
+        assert_eq!(owner.tasks[&task.id].member_reads.get(), 3 * n + 1);
+
+        for (id, other) in &owner.tasks {
+            if *id != task.id {
+                assert_eq!((other.reads.get(), other.member_reads.get()), (0, 0));
+            }
+        }
+    }
+}

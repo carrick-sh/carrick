@@ -748,7 +748,13 @@ that scope with two live sibling processes and the caller's own live child.
 Exit preparation must remain reversible until publication: abandoning an
 owned pending exit leaves live topology, revisions and resources unchanged.
 `early_error_after_exit_begin_preserves_live_graph_and_reservation_custody`
-checks this with both a live child and a zombie. Publication wakes the direct
+checks this with both a live child and a zombie. Shared effect preparation
+retains the exact exiting-task membership revision; activation refuses a
+snapshot invalidated by an admitted birth without changing lifecycle.
+`prepared_exit_effects_reject_stale_membership_snapshot` binds this and verifies
+fresh cancellation includes both members. `PreparedExitEffects` exposes neither
+cancellation nor resource transfer before activation (compile-fail witnesses).
+Publication wakes the direct
 parent and adopter once each, including inherited zombies;
 `blocked_adopter_wait_resumes_with_an_inherited_zombie` binds this through
 a parked native wait continuation.
