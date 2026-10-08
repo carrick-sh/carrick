@@ -685,25 +685,69 @@ mod tests {
     }
 
     fn take_claimed(runtime: &ExecRuntime) -> ExecWork {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             if let Some(work) = runtime.try_take() {
                 return work;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("timed out waiting to take claimed work");
             }
             std::thread::yield_now();
         }
     }
 
     #[test]
+    fn old_spin_shape_hangs_on_admission_expiration() {
+        let runtime = ExecRuntime::new_for_test(1, Duration::ZERO);
+        let submit = runtime.clone();
+        let capability = ExecCapability(ControlNonce([99; 16]));
+        let submitter = std::thread::spawn(move || submit.admit(capability, request()));
+        assert_eq!(
+            submitter.join().expect("submitter"),
+            Err(ExecAdmissionError::Unavailable)
+        );
+        assert_eq!(runtime.query(capability), ExecStatus::Unknown);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let runtime_clone = runtime.clone();
+        let spinner = std::thread::spawn(move || {
+            while runtime_clone.query(capability) != ExecStatus::Pending
+                && !stop_clone.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                std::thread::yield_now();
+            }
+            tx.send(()).ok();
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        spinner.join().expect("spinner");
+    }
+
+    #[test]
     fn claimed_work_cancels_cleanly_before_publication_deadline() {
         let runtime = ExecRuntime::new_for_test(1, Duration::from_millis(10));
+        let (work_tx, work_rx) = std::sync::mpsc::sync_channel(1);
+        let consumer_runtime = runtime.clone();
+        runtime
+            .install_waker(Arc::new(move || {
+                if let Some(work) = consumer_runtime.try_take() {
+                    work_tx.send(work).expect("send claimed work");
+                }
+            }))
+            .expect("install waker");
+
         let submit = runtime.clone();
         let capability = ExecCapability(ControlNonce([9; 16]));
         let thread = std::thread::spawn(move || submit.admit(capability, request()));
-        while runtime.query(capability) != ExecStatus::Pending {
-            std::thread::yield_now();
-        }
-        let mut work = take_claimed(&runtime);
-        std::thread::sleep(Duration::from_millis(20));
+        let mut work = work_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("receive claimed work from synchronous waker");
         assert_eq!(
             thread.join().expect("submitter"),
             Err(ExecAdmissionError::Unavailable)
@@ -715,42 +759,48 @@ mod tests {
     #[test]
     fn publishing_work_acknowledges_without_waiting_for_exact_admission() {
         let runtime = ExecRuntime::new_for_test(1, Duration::from_millis(10));
-        let submit = runtime.clone();
+        let (work_tx, work_rx) = std::sync::mpsc::sync_channel(1);
+        let consumer_runtime = runtime.clone();
+        runtime
+            .install_waker(Arc::new(move || {
+                if let Some(mut work) = consumer_runtime.try_take() {
+                    assert!(work.begin_publication());
+                    work_tx.send(work).expect("send publishing work");
+                }
+            }))
+            .expect("install waker");
+
         let capability = ExecCapability(ControlNonce([10; 16]));
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let thread = std::thread::spawn(move || {
-            done_tx
-                .send(submit.admit(capability, request()))
-                .expect("publish admission result");
-        });
-        while runtime.query(capability) != ExecStatus::Pending {
-            std::thread::yield_now();
-        }
-        let mut work = take_claimed(&runtime);
-        assert!(work.begin_publication());
-        assert_eq!(
-            done_rx
-                .recv_timeout(Duration::from_millis(50))
-                .expect("Publishing must not wait for child materialization"),
-            Ok(capability)
-        );
+        assert_eq!(runtime.admit(capability, request()), Ok(capability));
+
+        let mut work = work_rx
+            .try_recv()
+            .expect("receive publishing work from synchronous waker");
         assert_eq!(runtime.query(capability), ExecStatus::Pending);
         assert!(work.admit(ControlTaskKey { pid: 3, serial: 1 }));
-        thread.join().expect("submitter");
+        assert_eq!(runtime.query(capability), ExecStatus::Running);
     }
 
     #[test]
     fn dropped_publishing_work_completes_acknowledged_capability_with_terminal_failure() {
         let runtime = ExecRuntime::new_for_test(1, Duration::from_millis(250));
-        let submit = runtime.clone();
+        let (work_tx, work_rx) = std::sync::mpsc::sync_channel(1);
+        let consumer_runtime = runtime.clone();
+        runtime
+            .install_waker(Arc::new(move || {
+                if let Some(mut work) = consumer_runtime.try_take() {
+                    assert!(work.begin_publication());
+                    work_tx.send(work).expect("send publishing work");
+                }
+            }))
+            .expect("install waker");
+
         let capability = ExecCapability(ControlNonce([20; 16]));
-        let thread = std::thread::spawn(move || submit.admit(capability, request()));
-        while runtime.query(capability) != ExecStatus::Pending {
-            std::thread::yield_now();
-        }
-        let mut work = take_claimed(&runtime);
-        assert!(work.begin_publication());
-        assert_eq!(thread.join().expect("submitter"), Ok(capability));
+        assert_eq!(runtime.admit(capability, request()), Ok(capability));
+
+        let work = work_rx
+            .try_recv()
+            .expect("receive publishing work from synchronous waker");
 
         drop(work);
 
@@ -796,7 +846,11 @@ mod tests {
             })
             .collect();
         drop(done_tx);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while wakes.load(std::sync::atomic::Ordering::SeqCst) != capabilities.len() {
+            if std::time::Instant::now() >= deadline {
+                panic!("timed out waiting for wakes to coalesce");
+            }
             std::thread::yield_now();
         }
 
@@ -826,15 +880,22 @@ mod tests {
     #[test]
     fn wait_is_a_nonblocking_consume_poll_for_running_work() {
         let runtime = ExecRuntime::new_for_test(1, Duration::from_millis(250));
-        let submit = runtime.clone();
+        let (work_tx, work_rx) = std::sync::mpsc::sync_channel(1);
+        let consumer_runtime = runtime.clone();
+        runtime
+            .install_waker(Arc::new(move || {
+                if let Some(mut work) = consumer_runtime.try_take() {
+                    assert!(work.admit(ControlTaskKey { pid: 4, serial: 1 }));
+                    work_tx.send(work).expect("send running work");
+                }
+            }))
+            .expect("install waker");
+
         let capability = ExecCapability(ControlNonce([11; 16]));
-        let thread = std::thread::spawn(move || submit.admit(capability, request()));
-        while runtime.query(capability) != ExecStatus::Pending {
-            std::thread::yield_now();
-        }
-        let mut work = take_claimed(&runtime);
-        assert!(work.admit(ControlTaskKey { pid: 4, serial: 1 }));
-        assert_eq!(thread.join().expect("submitter"), Ok(capability));
+        assert_eq!(runtime.admit(capability, request()), Ok(capability));
+        let work = work_rx
+            .try_recv()
+            .expect("receive running work from synchronous waker");
 
         let (tx, rx) = std::sync::mpsc::channel();
         let poll_runtime = runtime.clone();
@@ -878,13 +939,22 @@ mod tests {
             Duration::from_millis(250),
             Duration::from_millis(5),
         );
+        let (work_tx, work_rx) = std::sync::mpsc::sync_channel(2);
+        let consumer_runtime = runtime.clone();
+        runtime
+            .install_waker(Arc::new(move || {
+                if let Some(work) = consumer_runtime.try_take() {
+                    work_tx.send(work).expect("send work");
+                }
+            }))
+            .expect("install waker");
+
         let first = ExecCapability(ControlNonce([12; 16]));
         let submit = runtime.clone();
         let thread = std::thread::spawn(move || submit.admit(first, request()));
-        while runtime.query(first) != ExecStatus::Pending {
-            std::thread::yield_now();
-        }
-        let mut work = take_claimed(&runtime);
+        let mut work = work_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("receive first work from synchronous waker");
         assert!(work.admit(ControlTaskKey { pid: 5, serial: 1 }));
         assert_eq!(thread.join().expect("submitter"), Ok(first));
         work.complete(ExecResult {
@@ -902,10 +972,10 @@ mod tests {
         let second = ExecCapability(ControlNonce([13; 16]));
         let submit = runtime.clone();
         let thread = std::thread::spawn(move || submit.admit(second, request()));
-        while runtime.query(second) != ExecStatus::Pending {
-            std::thread::yield_now();
-        }
-        drop(take_claimed(&runtime));
+        let second_work = work_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("receive second work from synchronous waker");
+        drop(second_work);
         assert_eq!(
             thread.join().expect("submitter"),
             Err(ExecAdmissionError::Rejected)
@@ -915,12 +985,23 @@ mod tests {
     #[test]
     fn duplicate_capability_at_capacity_is_rejected_not_unavailable() {
         let runtime = ExecRuntime::new_for_test(1, Duration::from_secs(5));
+        let (work_tx, work_rx) = std::sync::mpsc::sync_channel(1);
+        let consumer_runtime = runtime.clone();
+        runtime
+            .install_waker(Arc::new(move || {
+                if let Some(work) = consumer_runtime.try_take() {
+                    work_tx.send(work).expect("send work");
+                }
+            }))
+            .expect("install waker");
+
         let first = ExecCapability(ControlNonce([14; 16]));
         let submit = runtime.clone();
         let thread = std::thread::spawn(move || submit.admit(first, request()));
-        while runtime.query(first) != ExecStatus::Pending {
-            std::thread::yield_now();
-        }
+        let first_work = work_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("receive first work from synchronous waker");
+
         assert_eq!(
             runtime.admit(first, request()),
             Err(ExecAdmissionError::Rejected)
@@ -930,7 +1011,7 @@ mod tests {
             runtime.admit(second, request()),
             Err(ExecAdmissionError::Unavailable)
         );
-        drop(take_claimed(&runtime));
+        drop(first_work);
         assert_eq!(
             thread.join().expect("submitter"),
             Err(ExecAdmissionError::Rejected)
