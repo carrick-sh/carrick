@@ -1,7 +1,8 @@
-//! Lease ownership and workload lifetime share one supervisor process.
 //! The caller is a proxy: its death requests cancellation, never unlocks flock.
-//! Catchable termination cancels work before release. SIGKILL of this sole
-//! flock owner releases exclusion immediately; it is not crash containment.
+//! On macOS, supervisor and guardian retain the same locked description and
+//! observe each other before admitting work. Either survives the other's
+//! SIGKILL and cancels the workload before the last custody fd closes.
+//! Loss of both custodians is outside this single-process fault contract.
 
 use crate::host_lease::{HostLease, HostLeaseError, HostLeaseMode, extract_exit_code};
 use std::ffi::OsString;
@@ -82,14 +83,26 @@ pub fn run(args: SupervisorArgs) -> Result<i32, HostLeaseError> {
         return Ok(1);
     }
 
+    #[cfg(target_os = "macos")]
+    let mut lease = lease;
+
     // EOF grants release only after every inherited writer has closed. This
     // includes arbitrary Cargo/test forks and execs, without sharing flock.
     #[cfg(target_os = "macos")]
     let scope = macos_scope::PipeWriter::from_reader(lifetime.as_raw_fd())
         .map_err(HostLeaseError::ChildWait)?;
+    #[cfg(target_os = "macos")]
+    let mut guardian =
+        Guardian::launch(&mut lease, &lifetime).map_err(HostLeaseError::ChildWait)?;
+    #[cfg(target_os = "macos")]
+    events
+        .watch_worker(guardian.child.id() as libc::pid_t)
+        .map_err(HostLeaseError::ChildWait)?;
     let mut command = Command::new(&args.command[0]);
     command.args(&args.command[1..]);
     command.env("CARRICK_LEASE_SUPERVISOR", std::process::id().to_string());
+    #[cfg(target_os = "macos")]
+    command.env("CARRICK_LEASE_GUARDIAN", guardian.child.id().to_string());
     command.env(crate::host_lease::SCOPE_FD, writer.as_raw_fd().to_string());
     lease
         .configure_command(&mut command)
@@ -106,6 +119,10 @@ pub fn run(args: SupervisorArgs) -> Result<i32, HostLeaseError> {
             Ok(())
         });
     }
+    #[cfg(target_os = "macos")]
+    guardian
+        .configure_command(&mut command)
+        .map_err(HostLeaseError::ChildWait)?;
     let child = command.spawn().map_err(|source| HostLeaseError::Spawn {
         cmd: args.command[0].to_string_lossy().into_owned(),
         source,
@@ -145,6 +162,8 @@ pub fn run(args: SupervisorArgs) -> Result<i32, HostLeaseError> {
     complete_cleanup("descendant reaping", || {
         workload.wait_for_reaping(&cleanup.deadline)
     })?;
+    #[cfg(target_os = "macos")]
+    complete_cleanup("reap guardian", || guardian.finish(&mut cleanup))?;
     supervision.map_err(HostLeaseError::ChildWait)?;
     drop(lease);
     Ok(extract_exit_code(&status))
@@ -187,6 +206,7 @@ mod registration_tests {
 // cannot be killed. Expiry is an explicit failed run, never an accepted gate.
 const CLEANUP_LIMIT: Duration = Duration::from_secs(5);
 
+#[derive(Clone, Copy)]
 struct CleanupDeadline(Instant);
 
 impl CleanupDeadline {
@@ -756,6 +776,27 @@ impl ExitEvents {
         }
         Ok(())
     }
+    #[cfg(target_os = "macos")]
+    fn watch_fd(&self, fd: libc::c_int) -> io::Result<()> {
+        let mut event = unsafe { std::mem::zeroed::<libc::kevent>() };
+        event.ident = fd as _;
+        event.filter = libc::EVFILT_READ;
+        event.flags = libc::EV_ADD | libc::EV_ENABLE;
+        if unsafe {
+            libc::kevent(
+                self.queue.as_raw_fd(),
+                &event,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
     fn watch_worker(&mut self, worker: libc::pid_t) -> io::Result<()> {
         self.watch(worker)
     }
@@ -769,6 +810,16 @@ impl ExitEvents {
         self.poll(None).map(|_| ())
     }
     fn poll(&self, delay: Option<std::time::Duration>) -> io::Result<bool> {
+        self.poll_event(delay).map(|event| event.is_some())
+    }
+    #[cfg(target_os = "macos")]
+    fn wait_control(&self, fd: libc::c_int) -> io::Result<bool> {
+        let event = self.poll_event(None)?;
+        Ok(event.is_none_or(|event| {
+            event.filter != libc::EVFILT_READ || event.ident != fd as libc::uintptr_t
+        }))
+    }
+    fn poll_event(&self, delay: Option<std::time::Duration>) -> io::Result<Option<libc::kevent>> {
         let timeout = delay.map(|d| libc::timespec {
             tv_sec: d.as_secs() as _,
             tv_nsec: d.subsec_nanos() as _,
@@ -787,7 +838,7 @@ impl ExitEvents {
                 )
             };
             if result >= 0 {
-                return Ok(result > 0);
+                return Ok((result > 0).then_some(event));
             }
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::Interrupted {
@@ -908,4 +959,206 @@ mod serial_host {
             "cleanup retained exclusion"
         );
     }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(clap::Args, Debug)]
+pub struct GuardianArgs {
+    #[arg(long)]
+    owner: libc::pid_t,
+    #[arg(long)]
+    custody: libc::c_int,
+    #[arg(long)]
+    lifetime: libc::c_int,
+    #[arg(long)]
+    control: libc::c_int,
+}
+
+#[cfg(target_os = "macos")]
+struct Guardian {
+    child: Child,
+    control: std::os::unix::net::UnixStream,
+}
+
+#[cfg(target_os = "macos")]
+impl Guardian {
+    fn launch(lease: &mut HostLease, lifetime: &std::fs::File) -> io::Result<Self> {
+        use std::io::Write;
+        let custody = lease.guardian_custody()?;
+        let lifetime = lifetime.try_clone()?;
+        let (control, peer) = std::os::unix::net::UnixStream::pair()?;
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .args(["lease-guardian", "--owner"])
+            .arg(std::process::id().to_string())
+            .arg("--custody")
+            .arg(custody.as_raw_fd().to_string())
+            .arg("--lifetime")
+            .arg(lifetime.as_raw_fd().to_string())
+            .arg("--control")
+            .arg(peer.as_raw_fd().to_string())
+            .process_group(0);
+        // Only the trusted guardian receives custody; workload commands never
+        // inherit this fd. All three copies close on exec in the supervisor.
+        unsafe {
+            command.pre_exec(move || {
+                for fd in [custody.as_raw_fd(), lifetime.as_raw_fd(), peer.as_raw_fd()] {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn()?;
+        drop(command);
+        control.set_read_timeout(Some(CLEANUP_LIMIT))?;
+        let mut result = Self { child, control };
+        result.control.read_exact(&mut [0])?;
+        // Admission cannot start until the guardian owns custody and has
+        // registered the supervisor exit watch.
+        result.control.write_all(b"a")?;
+        Ok(result)
+    }
+
+    fn configure_command(&self, command: &mut Command) -> io::Result<()> {
+        let control = self.control.try_clone()?;
+        // Existing pre_exec has already created the workload session. Publish
+        // its leader and wait for guardian registration before any user code
+        // can execute, fork, or close the scope descriptor. This control fd
+        // remains CLOEXEC; it is never exposed to the workload after exec.
+        unsafe {
+            command.pre_exec(move || {
+                let pid = libc::getpid();
+                let mut message = [b'w'; 1 + size_of::<libc::pid_t>()];
+                message[1..].copy_from_slice(&pid.to_ne_bytes());
+                let fd = control.as_raw_fd();
+                if libc::write(fd, message.as_ptr().cast(), message.len())
+                    != message.len() as libc::ssize_t
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                let mut admitted = 0u8;
+                if libc::read(fd, (&mut admitted as *mut u8).cast(), 1) != 1 || admitted != b'w' {
+                    return Err(io::Error::from_raw_os_error(libc::ECANCELED));
+                }
+                Ok(())
+            });
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, cleanup: &mut Cleanup) -> io::Result<()> {
+        use std::io::Write;
+        // A dead guardian already triggered cancellation through ExitEvents.
+        if self.child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        self.control.write_all(b"f")?;
+        let status = cleanup.wait_child(&mut self.child)?;
+        if !status.success() {
+            return Err(io::Error::other("lease guardian cleanup failed"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn run_guardian(args: GuardianArgs) -> Result<i32, HostLeaseError> {
+    use std::io::Write;
+    // These owned descriptors are handed only by the supervisor's pre_exec.
+    // The guardian never spawns a workload or exposes custody to commands.
+    let _custody = unsafe { OwnedFd::from_raw_fd(args.custody) };
+    let mut lifetime = unsafe { std::fs::File::from_raw_fd(args.lifetime) };
+    let mut control = unsafe { std::os::unix::net::UnixStream::from_raw_fd(args.control) };
+    for fd in [args.custody, args.lifetime, args.control] {
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(HostLeaseError::ChildWait(io::Error::last_os_error()));
+        }
+    }
+    let scope = macos_scope::PipeWriter::from_reader(lifetime.as_raw_fd())
+        .map_err(HostLeaseError::ChildWait)?;
+    let events = ExitEvents::new(args.owner).map_err(HostLeaseError::ChildWait)?;
+    events
+        .watch_fd(control.as_raw_fd())
+        .map_err(HostLeaseError::ChildWait)?;
+    control.write_all(b"r").map_err(HostLeaseError::ChildWait)?;
+    // Consume the admission acknowledgement before waiting for finish/EOF.
+    control
+        .read_exact(&mut [0])
+        .map_err(HostLeaseError::ChildWait)?;
+    control
+        .set_nonblocking(true)
+        .map_err(HostLeaseError::ChildWait)?;
+    let mut session = None;
+    loop {
+        if unsafe { libc::getppid() } != args.owner
+            || events
+                .wait_control(control.as_raw_fd())
+                .map_err(HostLeaseError::ChildWait)?
+        {
+            break;
+        }
+        let mut operation = [0];
+        match control.read(&mut operation) {
+            Ok(0) => break,
+            Ok(1) if operation[0] == b'f' => break,
+            Ok(1) if operation[0] == b'w' && session.is_none() => {
+                let mut pid = [0; size_of::<libc::pid_t>()];
+                control
+                    .read_exact(&mut pid)
+                    .map_err(HostLeaseError::ChildWait)?;
+                let pid = libc::pid_t::from_ne_bytes(pid);
+                // The child remains blocked in pre_exec with its scope writer
+                // open until this session membership has been recorded.
+                if pid <= 0 || unsafe { libc::getsid(pid) } != pid {
+                    return Err(HostLeaseError::ChildWait(io::Error::other(
+                        "invalid workload session admission",
+                    )));
+                }
+                session = Some(pid);
+                control.write_all(b"w").map_err(HostLeaseError::ChildWait)?;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(HostLeaseError::ChildWait(error)),
+            _ => {
+                return Err(HostLeaseError::ChildWait(io::Error::other(
+                    "invalid guardian control operation",
+                )));
+            }
+        }
+    }
+    let deadline = CleanupDeadline(Instant::now() + CLEANUP_LIMIT);
+    let mut members = std::collections::BTreeMap::new();
+    complete_cleanup("guardian cancellation", || {
+        scope.cancel(session.unwrap_or(0), &mut members, &deadline)
+    })?;
+    complete_cleanup("guardian lifetime EOF", || {
+        let mut bytes = [0; 256];
+        loop {
+            deadline.wait_fd(lifetime.as_raw_fd())?;
+            match lifetime.read(&mut bytes) {
+                Ok(0) => return Ok(()),
+                Ok(_) => (),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => (),
+                Err(error) => return Err(error),
+            }
+        }
+    })?;
+    complete_cleanup("guardian descendant reaping", || {
+        for process in members.values() {
+            while !process.reaped()? {
+                deadline.next_observation(Duration::from_millis(1))?;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(0)
 }
