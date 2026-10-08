@@ -15446,34 +15446,6 @@
     "classification": "declared_substrate",
     "evidence": {
       "authority": "authenticated_carrier",
-      "resource": "current carrier USDT diagnostic event used by `host_image_base`"
-    },
-    "expansion": null,
-    "operation": "std::process::id",
-    "profiles": [
-      "macos-cli-default",
-      "macos-hvf-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:7587 in `host_image_base_snapshot`, `std::process::id` identifies the current carrier image whose dyld base, slide and path are collected for offline symbolication; no guest identity selects its host process target.",
-    "review_id": "HA-000467",
-    "source": {
-      "byte_end": 293974,
-      "byte_start": 293958,
-      "column": 18,
-      "column_end": 34,
-      "column_start": 18,
-      "file": "crates/carrick-observability/src/probes.rs",
-      "line": 7587,
-      "line_end": 7587,
-      "line_start": 7587
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-PROCESS-ID",
-    "classification": "declared_substrate",
-    "evidence": {
-      "authority": "authenticated_carrier",
       "resource": "current carrier USDT diagnostic event used by `host_image_base_snapshot`"
     },
     "expansion": null,
@@ -15497,6 +15469,34 @@
       "line": 7541,
       "line_end": 7541,
       "line_start": 7541
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-PROCESS-ID",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "current carrier USDT diagnostic event used by `host_image_base`"
+    },
+    "expansion": null,
+    "operation": "std::process::id",
+    "profiles": [
+      "macos-cli-default",
+      "macos-hvf-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-observability/src/probes.rs:7587 in `host_image_base_snapshot`, `std::process::id` identifies the current carrier image whose dyld base, slide and path are collected for offline symbolication; no guest identity selects its host process target.",
+    "review_id": "HA-000467",
+    "source": {
+      "byte_end": 293974,
+      "byte_start": 293958,
+      "column": 18,
+      "column_end": 34,
+      "column_start": 18,
+      "file": "crates/carrick-observability/src/probes.rs",
+      "line": 7587,
+      "line_end": 7587,
+      "line_start": 7587
     }
   },
   {
