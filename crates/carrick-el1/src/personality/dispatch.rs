@@ -449,8 +449,9 @@ where
 /// Native preparation, scheduling and completion retain an exact execution
 /// binding. Missing frames and failed completion authentication share this
 /// fail-stop transport; a completed effect must never be replayed by forwarding.
-pub(super) enum NativeInvariant {
+pub enum NativeInvariant {
     EntryBinding,
+    PhysicalCustody(&'static str),
     MissingNativeFrame,
     RevisionCredit,
     SignalNumber,
@@ -461,6 +462,9 @@ impl core::fmt::Debug for NativeInvariant {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::EntryBinding => f.write_str("EntryBinding"),
+            Self::PhysicalCustody(reason) => {
+                f.debug_tuple("PhysicalCustody").field(reason).finish()
+            }
             Self::MissingNativeFrame => f.write_str("MissingNativeFrame"),
             Self::RevisionCredit => f.write_str("RevisionCredit"),
             Self::SignalNumber => f.write_str("SignalNumber"),
@@ -471,7 +475,7 @@ impl core::fmt::Debug for NativeInvariant {
     }
 }
 
-pub(super) fn invalid_completion(reason: NativeInvariant) -> ! {
+pub fn invalid_completion(reason: NativeInvariant) -> ! {
     #[cfg(target_os = "none")]
     {
         let _ = reason;

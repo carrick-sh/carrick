@@ -162,15 +162,38 @@ impl Cancel for crate::KvmKickHandle {
     }
 }
 
+/// Actor threads are joined before their final host mask result is observed.
+/// A failed restore cannot leak into another job on these dedicated threads.
+#[derive(Default)]
+struct ActorMaskRestoration(std::sync::atomic::AtomicI32);
+impl ActorMaskRestoration {
+    fn record(&self, error: std::io::Error) {
+        self.0.store(
+            error.raw_os_error().unwrap_or(libc::EIO),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+    fn result(&self) -> Result<(), TrapError> {
+        match self.0.load(std::sync::atomic::Ordering::Acquire) {
+            0 => Ok(()),
+            code => Err(TrapError::Hypervisor(format!(
+                "actor signal mask restoration: {}",
+                std::io::Error::from_raw_os_error(code)
+            ))),
+        }
+    }
+}
+
 /// A signal queued before KVM_RUN remains pending until KVM atomically applies
 /// its run mask. Restore the original thread mask only after the actor stops.
 struct ActorInterruptMask {
     previous: libc::sigset_t,
+    restoration: std::sync::Arc<ActorMaskRestoration>,
     run: [u8; 8],
     _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 impl ActorInterruptMask {
-    fn block_kick() -> Result<Self, TrapError> {
+    fn block_kick(restoration: std::sync::Arc<ActorMaskRestoration>) -> Result<Self, TrapError> {
         // SAFETY: sigset APIs receive initialized, correctly sized host records.
         let (previous, run) = unsafe {
             let mut kick = std::mem::zeroed::<libc::sigset_t>();
@@ -194,6 +217,7 @@ impl ActorInterruptMask {
             (previous, bits.to_ne_bytes())
         };
         Ok(Self {
+            restoration,
             previous,
             run,
             _thread: std::marker::PhantomData,
@@ -208,11 +232,8 @@ impl Drop for ActorInterruptMask {
             libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut())
         };
         if error != 0 {
-            carrick_fatal::carrick_fatal!(
-                "kvm.actor_signal_mask",
-                "cannot restore actor signal mask: {}",
-                error
-            );
+            self.restoration
+                .record(std::io::Error::from_raw_os_error(error));
         }
     }
 }
@@ -254,18 +275,21 @@ pub fn run_two_actors<R>(
     service: impl FnMut(CpuId, &mut KvmVcpu, VcpuExit) -> Result<ActorDecision<R>, TrapError>,
     interrupt_ready: impl FnMut(CpuId, &mut KvmVcpu) -> Result<bool, TrapError>,
 ) -> Result<R, TrapError> {
-    drive(
+    let restoration = std::sync::Arc::new(ActorMaskRestoration::default());
+    let result = drive(
         cpus,
         |cpu| {
             let cancel = crate::KvmKickHandle::for_current_thread();
-            let guard = ActorInterruptMask::block_kick()?;
+            let guard = ActorInterruptMask::block_kick(std::sync::Arc::clone(&restoration))?;
             configure_actor_run_mask(cpu.fd(), guard.run)?;
             Ok((cancel, guard))
         },
         run,
         service,
         interrupt_ready,
-    )
+    );
+    restoration.result()?;
+    result
 }
 
 #[cfg(test)]
@@ -392,7 +416,9 @@ mod tests {
         std::thread::scope(|scope| {
             let worker = scope.spawn(move || {
                 let cancel = crate::KvmKickHandle::for_current_thread();
-                let guard = ActorInterruptMask::block_kick().unwrap();
+                let guard =
+                    ActorInterruptMask::block_kick(Arc::new(ActorMaskRestoration::default()))
+                        .unwrap();
                 configure_actor_run_mask(&cpu, guard.run).unwrap();
                 ready.send(cancel).unwrap();
                 start.recv().unwrap();
