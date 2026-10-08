@@ -286,7 +286,7 @@ impl SyscallDispatcher {
         bridges: CarrierBridges,
         container: Arc<crate::kernel::Container>,
     ) -> Result<Self, crate::run_result::RuntimeError> {
-        let (kernel_binding, mm_id) = super::kernel_context::try_bootstrap_launch_binding(
+        let (kernel_binding, mm_id) = super::kernel_context::try_bootstrap_one_task_binding(
             Arc::clone(&bridges.host_signal),
             Some(Arc::clone(&container)),
         )?;
