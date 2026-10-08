@@ -446,6 +446,15 @@ impl<
             {
                 return Err(MmError::Fault);
             }
+        } else if continuation.intent == TransferIntent::CarrickIdentityWrite {
+            let base = Geometry::identity_control_base().ok_or(MmError::Fault)?;
+            if !CarrickIdentityWrite::authorizes(
+                base,
+                continuation.address().raw(),
+                continuation.len(),
+            ) {
+                return Err(MmError::Fault);
+            }
         } else {
             let mapping = root.mapping(va).ok_or(MmError::Fault)?;
             let access = match continuation.intent {
@@ -504,12 +513,15 @@ impl<
             result => result?,
         };
         let access = match continuation.intent {
-            TransferIntent::UserWrite => LeafAccess::Write,
+            TransferIntent::UserWrite | TransferIntent::CarrickIdentityWrite => LeafAccess::Write,
             TransferIntent::ReadInstruction => LeafAccess::Execute,
             _ => LeafAccess::Read,
         };
         let root = B::root(grant.ttbr0).map_err(mmu_error)?;
         let mut leaf = match translated::<B, W>(words, root, va, access, continuation.intent) {
+            Err(MmError::Fault) if continuation.intent == TransferIntent::CarrickIdentityWrite => {
+                return Err(MmError::Fault);
+            }
             Err(MmError::Fault) if access == LeafAccess::Write => {
                 B::classify_cow(words, root, UserVa::new(va), cow.executable_publication())
                     .map_err(mmu_error)?;
@@ -572,6 +584,9 @@ impl<
             }
             result => result?,
         };
+        if leaf.is_none() && continuation.intent == TransferIntent::CarrickIdentityWrite {
+            return Err(MmError::Fault);
+        }
         if leaf.is_none() {
             if let Some(page) = residency.lookup(mm, va)
                 && matches!(
@@ -685,7 +700,7 @@ impl<
             result => result?,
         };
         let access = match continuation.intent {
-            TransferIntent::UserWrite => LeafAccess::Write,
+            TransferIntent::UserWrite | TransferIntent::CarrickIdentityWrite => LeafAccess::Write,
             TransferIntent::ReadInstruction => LeafAccess::Execute,
             _ => LeafAccess::Read,
         };
@@ -733,10 +748,20 @@ fn translated<B: OwnerMmu, W: LiveDescriptorWords + ?Sized>(
         root,
         UserVa::new(va),
         access,
-        intent != TransferIntent::CarrickInternalRead,
+        !matches!(
+            intent,
+            TransferIntent::CarrickInternalRead | TransferIntent::CarrickIdentityWrite
+        ),
     )
-    .map(|leaf| leaf.map(|leaf| (leaf.output.raw(), leaf.executable)))
     .map_err(mmu_error)
+    .and_then(|leaf| {
+        if intent == TransferIntent::CarrickIdentityWrite
+            && leaf.is_some_and(|leaf| !leaf.kernel_writable_nonexecutable)
+        {
+            return Err(MmError::Fault);
+        }
+        Ok(leaf.map(|leaf| (leaf.output.raw(), leaf.executable)))
+    })
 }
 
 /// PREPARE finishes all fault/supply work and authenticates physical custody

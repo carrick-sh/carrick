@@ -17,6 +17,9 @@ impl owner::ReservationGeometry for NativeReservationGeometry {
     fn authorizes_internal_read(address: u64, len: u64) -> bool {
         CarrickInternalReadRange::authorizes(address, len)
     }
+    fn identity_control_base() -> Option<IdentityControlBase> {
+        IdentityControlBase::new(CARRICK_IDENTITY_PAGE_BASE)
+    }
 }
 pub type SharedReservations =
     owner::SharedReservations<LinuxReservationPolicy, NativeReservationGeometry>;
