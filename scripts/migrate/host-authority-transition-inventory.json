@@ -8435,6 +8435,33 @@
     }
   },
   {
+    "catalog_id": "HA-CATALOG-FS-READ-TO-STRING",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "checkout Cargo manifests in the local CPL0 normal/build path-dependency closure and its workspace manifest"
+    },
+    "expansion": null,
+    "operation": "std::fs::read_to_string",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vmm-kvm/cpl0_inputs.rs:142 in `read_manifest`, `std::fs::read_to_string` reads only the trusted checkout workspace manifest and local CPL0 dependency manifests for build-input discovery; no guest path or syscall input selects these files.",
+    "review_id": "HA-000763",
+    "source": {
+      "byte_end": 5835,
+      "byte_start": 5812,
+      "column": 9,
+      "column_end": 32,
+      "column_start": 9,
+      "file": "crates/carrick-vmm-kvm/cpl0_inputs.rs",
+      "line": 142,
+      "line_end": 142,
+      "line_start": 142
+    }
+  },
+  {
     "catalog_id": "HA-CATALOG-FS-REMOVE-DIR",
     "classification": "declared_backing",
     "evidence": {
@@ -18876,33 +18903,6 @@
       "line": 1456,
       "line_end": 1456,
       "line_start": 1456
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-FS-READ-TO-STRING",
-    "classification": "declared_backing",
-    "evidence": {
-      "authority": "authorized_backing",
-      "resource": "checkout Cargo manifests in the local CPL0 normal/build path-dependency closure and its workspace manifest"
-    },
-    "expansion": null,
-    "operation": "std::fs::read_to_string",
-    "profiles": [
-      "linux-cli",
-      "linux-runtime"
-    ],
-    "rationale": "At crates/carrick-vmm-kvm/cpl0_inputs.rs:142 in `read_manifest`, `std::fs::read_to_string` reads only the trusted checkout workspace manifest and local CPL0 dependency manifests for build-input discovery; no guest path or syscall input selects these files.",
-    "review_id": "HA-000763",
-    "source": {
-      "byte_end": 5835,
-      "byte_start": 5812,
-      "column": 9,
-      "column_end": 32,
-      "column_start": 9,
-      "file": "crates/carrick-vmm-kvm/cpl0_inputs.rs",
-      "line": 142,
-      "line_end": 142,
-      "line_start": 142
     }
   }
 ]
