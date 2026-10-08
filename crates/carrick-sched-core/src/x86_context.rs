@@ -89,6 +89,20 @@ impl ParkedContextWords {
             && self.mm == expected.mm.raw().get()
             && self.generation == expected.generation.raw().get()
     }
+
+    pub fn fork_child(self, address: AddressContext<RootGpa>) -> Self {
+        let mut frame = self.frame;
+        frame[10] = 0; // RAX in the ISA-owned interrupt save order.
+        Self::from_parts(frame, address, self.fs_base, self.gs_base, self.xsave)
+    }
+
+    pub fn set_syscall_return(&mut self, value: u64) {
+        self.frame[10] = value;
+    }
+
+    pub fn syscall_return(&self) -> u64 {
+        self.frame[10]
+    }
 }
 
 impl carrick_guest_arch::ProcessContext for ParkedContextWords {
@@ -96,8 +110,12 @@ impl carrick_guest_arch::ProcessContext for ParkedContextWords {
         ParkedContextWords::authenticates(self, expected)
     }
     fn fork_child(self, address: AddressContext<RootGpa>) -> Self {
-        let mut frame = self.frame;
-        frame[10] = 0; // RAX in the ISA-owned interrupt save order.
-        Self::from_parts(frame, address, self.fs_base, self.gs_base, self.xsave)
+        ParkedContextWords::fork_child(self, address)
+    }
+    fn set_syscall_return(&mut self, value: u64) {
+        ParkedContextWords::set_syscall_return(self, value);
+    }
+    fn syscall_return(&self) -> u64 {
+        ParkedContextWords::syscall_return(self)
     }
 }

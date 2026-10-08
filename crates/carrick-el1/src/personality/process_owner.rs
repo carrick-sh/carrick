@@ -28,8 +28,8 @@ use carrick_sched_core::process::wait::{
     WaitLive, WaitQuery, WaitReadiness, WaitSelection, WaitZombie,
 };
 use carrick_sched_core::process::{
-    ChildExitSignal, LinuxWaitStatus, ProcessRelations, SessionId, TaskId, TaskIdentity, TaskKey,
-    TaskLifecycle, TaskRusage, Zombie,
+    ChildExitSignal, LinuxWaitStatus, ProcessContext, ProcessRelations, SessionId, TaskId,
+    TaskIdentity, TaskKey, TaskLifecycle, TaskRusage, Zombie,
 };
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -37,7 +37,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// Primitive resource accesses for this row only. These hooks never choose a
 /// process identity, adopter, zombie, exit target, mapping or process population.
 pub trait NativeProcessCustody {
-    type Context: Copy;
+    type Context: ProcessContext;
     type Claim;
     type Event;
     type Credit;

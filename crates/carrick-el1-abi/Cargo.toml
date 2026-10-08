@@ -16,3 +16,4 @@ carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-sched-core = { path = "../carrick-sched-core" }
 carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-personality-linux = { path = "../carrick-personality-linux" }
+zerocopy.workspace = true

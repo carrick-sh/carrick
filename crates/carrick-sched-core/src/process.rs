@@ -5,10 +5,13 @@ use core::num::{NonZeroI32, NonZeroU64};
 use core::time::Duration;
 
 pub mod birth;
+pub mod context;
 pub mod exit;
 pub mod identity_allocator;
 pub mod registry;
 pub mod wait;
+
+pub use context::ProcessContext;
 
 #[cfg(test)]
 mod exit_tests;
