@@ -837,18 +837,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/host_signal.rs:1367 in `raise_for_self`, the host result from `libc::getpid` determines the guest signal sender PID used by `raise_for_self`.",
+    "rationale": "At crates/carrick-vmm-hvf/src/host_signal.rs:1365 in `raise_for_self`, the host result from `libc::getpid` determines the guest signal sender PID used by `raise_for_self`.",
     "review_id": "HA-000041",
     "source": {
-      "byte_end": 62467,
-      "byte_start": 62455,
+      "byte_end": 62308,
+      "byte_start": 62296,
       "column": 36,
       "column_end": 48,
       "column_start": 36,
       "file": "crates/carrick-vmm-hvf/src/host_signal.rs",
-      "line": 1367,
-      "line_end": 1367,
-      "line_start": 1367
+      "line": 1365,
+      "line_end": 1365,
+      "line_start": 1365
     }
   },
   {
@@ -865,18 +865,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:8158 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:8193 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000048",
     "source": {
-      "byte_end": 365140,
-      "byte_start": 365128,
+      "byte_end": 366626,
+      "byte_start": 366614,
       "column": 21,
       "column_end": 33,
       "column_start": 21,
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 8158,
-      "line_end": 8158,
-      "line_start": 8158
+      "line": 8193,
+      "line_end": 8193,
+      "line_start": 8193
     }
   },
   {
@@ -893,18 +893,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:8237 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:8272 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000049",
     "source": {
-      "byte_end": 369442,
-      "byte_start": 369430,
+      "byte_end": 370928,
+      "byte_start": 370916,
       "column": 36,
       "column_end": 48,
       "column_start": 36,
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 8237,
-      "line_end": 8237,
-      "line_start": 8237
+      "line": 8272,
+      "line_end": 8272,
+      "line_start": 8272
     }
   },
   {
@@ -921,18 +921,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:8343 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:8378 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000050",
     "source": {
-      "byte_end": 375736,
-      "byte_start": 375724,
+      "byte_end": 377222,
+      "byte_start": 377210,
       "column": 29,
       "column_end": 41,
       "column_start": 29,
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 8343,
-      "line_end": 8343,
-      "line_start": 8343
+      "line": 8378,
+      "line_end": 8378,
+      "line_start": 8378
     }
   },
   {
@@ -4547,8 +4547,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/net/support.rs:1420 in `unix_socket_host_path`, `std::fs::create_dir_all` accesses only the run-scoped network backing directory used by `unix_socket_host_path`.",
     "review_id": "HA-000172",
     "source": {
-      "byte_end": 63587,
-      "byte_start": 63564,
+      "byte_end": 63609,
+      "byte_start": 63586,
       "column": 13,
       "column_end": 36,
       "column_start": 13,
@@ -4576,8 +4576,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/net/support.rs:1458 in `autobind_unix_host_path`, `std::fs::create_dir_all` accesses only the run-scoped network backing directory used by `autobind_unix_host_path`.",
     "review_id": "HA-000173",
     "source": {
-      "byte_end": 65366,
-      "byte_start": 65343,
+      "byte_end": 65388,
+      "byte_start": 65365,
       "column": 13,
       "column_end": 36,
       "column_start": 13,
@@ -6320,8 +6320,8 @@
     "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1515 in `run_static_hvpatch`, `std::fs::read` accesses only the selected guest interpreter image used by `run_static_hvpatch`.",
     "review_id": "HA-000231",
     "source": {
-      "byte_end": 55084,
-      "byte_start": 55071,
+      "byte_end": 55100,
+      "byte_start": 55087,
       "column": 16,
       "column_end": 29,
       "column_start": 16,
@@ -6347,8 +6347,8 @@
     "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1523 in `run_static_hvpatch`, `std::fs::read` accesses only the selected guest executable image used by `run_static_hvpatch`.",
     "review_id": "HA-000232",
     "source": {
-      "byte_end": 55563,
-      "byte_start": 55550,
+      "byte_end": 55579,
+      "byte_start": 55566,
       "column": 29,
       "column_end": 42,
       "column_start": 29,
@@ -9389,8 +9389,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/sysv.rs:3346 in `sysv_msgctl`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `sysv_msgctl`.",
     "review_id": "HA-000336",
     "source": {
-      "byte_end": 124399,
-      "byte_start": 124379,
+      "byte_end": 124385,
+      "byte_start": 124365,
       "column": 21,
       "column_end": 41,
       "column_start": 21,
@@ -9418,8 +9418,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/sysv.rs:3347 in `sysv_msgctl`, `std::fs::remove_file` accesses only the run-scoped SysV IPC backing object used by `sysv_msgctl`.",
     "review_id": "HA-000337",
     "source": {
-      "byte_end": 124447,
-      "byte_start": 124427,
+      "byte_end": 124433,
+      "byte_start": 124413,
       "column": 21,
       "column_end": 41,
       "column_start": 21,
@@ -10014,8 +10014,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/sysv.rs:3072 in `msgget_open`, `std::fs::rename` accesses only the run-scoped SysV IPC backing object used by `msgget_open`.",
     "review_id": "HA-000354",
     "source": {
-      "byte_end": 115585,
-      "byte_start": 115570,
+      "byte_end": 115571,
+      "byte_start": 115556,
       "column": 9,
       "column_end": 24,
       "column_start": 9,
@@ -11751,8 +11751,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/sysv.rs:3078 in `msgget_open`, `std::fs::write` accesses only the run-scoped SysV IPC queue identity object used by `msgget_open`.",
     "review_id": "HA-000668",
     "source": {
-      "byte_end": 115758,
-      "byte_start": 115744,
+      "byte_end": 115744,
+      "byte_start": 115730,
       "column": 5,
       "column_end": 19,
       "column_start": 5,
@@ -13424,8 +13424,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/mod.rs:2264 in `close_open_file_and_free_pty`, the host result from `std::process::id` determines the guest PTY entry lifetime decided by the host-process owner PID.",
     "review_id": "HA-000498",
     "source": {
-      "byte_end": 91063,
-      "byte_start": 91047,
+      "byte_end": 91079,
+      "byte_start": 91063,
       "column": 17,
       "column_end": 33,
       "column_start": 17,
@@ -13453,8 +13453,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/mod.rs:2481 in `register_controlling_pty`, the host result from `std::process::id` determines the guest controlling PTY identity assigned to the host-process owner PID.",
     "review_id": "HA-000499",
     "source": {
-      "byte_end": 99737,
-      "byte_start": 99721,
+      "byte_end": 99753,
+      "byte_start": 99737,
       "column": 47,
       "column_end": 63,
       "column_start": 47,
@@ -13508,18 +13508,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/mqueue.rs:1199 in `deliver_notify`, the host result from `std::process::id` determines the legacy host-fallback message-queue thread recipient used by `deliver_notify`.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/mqueue.rs:1193 in `deliver_notify`, the host result from `std::process::id` determines the legacy host-fallback message-queue thread recipient used by `deliver_notify`.",
     "review_id": "HA-000501",
     "source": {
-      "byte_end": 45589,
-      "byte_start": 45573,
+      "byte_end": 45277,
+      "byte_start": 45261,
       "column": 40,
       "column_end": 56,
       "column_start": 40,
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 1199,
-      "line_end": 1199,
-      "line_start": 1199
+      "line": 1193,
+      "line_end": 1193,
+      "line_start": 1193
     }
   },
   {
@@ -13537,18 +13537,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/mqueue.rs:1227 in `deliver_notify`, the host result from `std::process::id` determines the legacy host-fallback message-queue signal recipient used by `deliver_notify`.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/mqueue.rs:1221 in `deliver_notify`, the host result from `std::process::id` determines the legacy host-fallback message-queue signal recipient used by `deliver_notify`.",
     "review_id": "HA-000502",
     "source": {
-      "byte_end": 46853,
-      "byte_start": 46837,
+      "byte_end": 46541,
+      "byte_start": 46525,
       "column": 40,
       "column_end": 56,
       "column_start": 40,
       "file": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "line": 1227,
-      "line_end": 1227,
-      "line_start": 1227
+      "line": 1221,
+      "line_end": 1221,
+      "line_start": 1221
     }
   },
   {
@@ -15129,18 +15129,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:6104 in `native_tierd_unsupported`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `native_tierd_unsupported`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:6111 in `native_tierd_unsupported`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `native_tierd_unsupported`; no guest identity selects its host target.",
     "review_id": "HA-000455",
     "source": {
-      "byte_end": 244478,
-      "byte_start": 244462,
+      "byte_end": 244969,
+      "byte_start": 244953,
       "column": 62,
       "column_end": 78,
       "column_start": 62,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 6104,
-      "line_end": 6104,
-      "line_start": 6104
+      "line": 6111,
+      "line_end": 6111,
+      "line_start": 6111
     }
   },
   {
@@ -15159,18 +15159,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:6109 in `native_tierd_exception`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `native_tierd_exception`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:6116 in `native_tierd_exception`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `native_tierd_exception`; no guest identity selects its host target.",
     "review_id": "HA-000456",
     "source": {
-      "byte_end": 244665,
-      "byte_start": 244649,
+      "byte_end": 245156,
+      "byte_start": 245140,
       "column": 57,
       "column_end": 73,
       "column_start": 57,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 6109,
-      "line_end": 6109,
-      "line_start": 6109
+      "line": 6116,
+      "line_end": 6116,
+      "line_start": 6116
     }
   },
   {
@@ -15187,18 +15187,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:6272 in `host_process_birth_current`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_process_birth_current`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:6279 in `host_process_birth_current`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_process_birth_current`; no guest identity selects its host target.",
     "review_id": "HA-000457",
     "source": {
-      "byte_end": 249155,
-      "byte_start": 249139,
+      "byte_end": 249646,
+      "byte_start": 249630,
       "column": 23,
       "column_end": 39,
       "column_start": 23,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 6272,
-      "line_end": 6272,
-      "line_start": 6272
+      "line": 6279,
+      "line_end": 6279,
+      "line_start": 6279
     }
   },
   {
@@ -15217,18 +15217,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:6383 in `ulock_wake`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `ulock_wake`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:6390 in `ulock_wake`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `ulock_wake`; no guest identity selects its host target.",
     "review_id": "HA-000458",
     "source": {
-      "byte_end": 252774,
-      "byte_start": 252758,
+      "byte_end": 253265,
+      "byte_start": 253249,
       "column": 39,
       "column_end": 55,
       "column_start": 39,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 6383,
-      "line_end": 6383,
-      "line_start": 6383
+      "line": 6390,
+      "line_end": 6390,
+      "line_start": 6390
     }
   },
   {
@@ -15247,18 +15247,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:6387 in `ulock_wait`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `ulock_wait`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:6394 in `ulock_wait`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `ulock_wait`; no guest identity selects its host target.",
     "review_id": "HA-000459",
     "source": {
-      "byte_end": 252924,
-      "byte_start": 252908,
+      "byte_end": 253415,
+      "byte_start": 253399,
       "column": 41,
       "column_end": 57,
       "column_start": 41,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 6387,
-      "line_end": 6387,
-      "line_start": 6387
+      "line": 6394,
+      "line_end": 6394,
+      "line_start": 6394
     }
   },
   {
@@ -15277,18 +15277,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:6391 in `futex_route`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `futex_route`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:6398 in `futex_route`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `futex_route`; no guest identity selects its host target.",
     "review_id": "HA-000460",
     "source": {
-      "byte_end": 253087,
-      "byte_start": 253071,
+      "byte_end": 253578,
+      "byte_start": 253562,
       "column": 41,
       "column_end": 57,
       "column_start": 41,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 6391,
-      "line_end": 6391,
-      "line_start": 6391
+      "line": 6398,
+      "line_end": 6398,
+      "line_start": 6398
     }
   },
   {
@@ -15307,18 +15307,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:6396 in `itimer_fire`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `itimer_fire`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:6403 in `itimer_fire`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `itimer_fire`; no guest identity selects its host target.",
     "review_id": "HA-000461",
     "source": {
-      "byte_end": 253287,
-      "byte_start": 253271,
+      "byte_end": 253778,
+      "byte_start": 253762,
       "column": 13,
       "column_end": 29,
       "column_start": 13,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 6396,
-      "line_end": 6396,
-      "line_start": 6396
+      "line": 6403,
+      "line_end": 6403,
+      "line_start": 6403
     }
   },
   {
@@ -15337,18 +15337,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:6406 in `ulock_requeue`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `ulock_requeue`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:6413 in `ulock_requeue`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `ulock_requeue`; no guest identity selects its host target.",
     "review_id": "HA-000462",
     "source": {
-      "byte_end": 253525,
-      "byte_start": 253509,
+      "byte_end": 254016,
+      "byte_start": 254000,
       "column": 40,
       "column_end": 56,
       "column_start": 40,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 6406,
-      "line_end": 6406,
-      "line_start": 6406
+      "line": 6413,
+      "line_end": 6413,
+      "line_start": 6413
     }
   },
   {
@@ -15367,18 +15367,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:6459 in `futex_unexpected_errno`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `futex_unexpected_errno`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:6466 in `futex_unexpected_errno`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `futex_unexpected_errno`; no guest identity selects its host target.",
     "review_id": "HA-000463",
     "source": {
-      "byte_end": 255071,
-      "byte_start": 255055,
+      "byte_end": 255562,
+      "byte_start": 255546,
       "column": 18,
       "column_end": 34,
       "column_start": 18,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 6459,
-      "line_end": 6459,
-      "line_start": 6459
+      "line": 6466,
+      "line_end": 6466,
+      "line_start": 6466
     }
   },
   {
@@ -15397,18 +15397,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:6486 in `guest_exit`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `guest_exit`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:6493 in `guest_exit`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `guest_exit`; no guest identity selects its host target.",
     "review_id": "HA-000464",
     "source": {
-      "byte_end": 256334,
-      "byte_start": 256318,
+      "byte_end": 256825,
+      "byte_start": 256809,
       "column": 53,
       "column_end": 69,
       "column_start": 53,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 6486,
-      "line_end": 6486,
-      "line_start": 6486
+      "line": 6493,
+      "line_end": 6493,
+      "line_start": 6493
     }
   },
   {
@@ -15427,18 +15427,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:6490 in `path_open`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `path_open`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:6497 in `path_open`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `path_open`; no guest identity selects its host target.",
     "review_id": "HA-000465",
     "source": {
-      "byte_end": 256455,
-      "byte_start": 256439,
+      "byte_end": 256946,
+      "byte_start": 256930,
       "column": 40,
       "column_end": 56,
       "column_start": 40,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 6490,
-      "line_end": 6490,
-      "line_start": 6490
+      "line": 6497,
+      "line_end": 6497,
+      "line_start": 6497
     }
   },
   {
@@ -15455,18 +15455,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:7541 in `host_image_base`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_image_base`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:7565 in `host_image_base`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_image_base`; no guest identity selects its host target.",
     "review_id": "HA-000467",
     "source": {
-      "byte_end": 291654,
-      "byte_start": 291638,
+      "byte_end": 292510,
+      "byte_start": 292494,
       "column": 41,
       "column_end": 57,
       "column_start": 41,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 7541,
-      "line_end": 7541,
-      "line_start": 7541
+      "line": 7565,
+      "line_end": 7565,
+      "line_start": 7565
     }
   },
   {
@@ -15485,18 +15485,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:7587 in `host_image_base_snapshot`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_image_base_snapshot`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:7611 in `host_image_base_snapshot`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_image_base_snapshot`; no guest identity selects its host target.",
     "review_id": "HA-000466",
     "source": {
-      "byte_end": 293974,
-      "byte_start": 293958,
+      "byte_end": 294830,
+      "byte_start": 294814,
       "column": 18,
       "column_end": 34,
       "column_start": 18,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 7587,
-      "line_end": 7587,
-      "line_start": 7587
+      "line": 7611,
+      "line_end": 7611,
+      "line_start": 7611
     }
   },
   {
@@ -15513,18 +15513,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:7625 in `host_image_text_range_snapshot`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_image_text_range_snapshot`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:7649 in `host_image_text_range_snapshot`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_image_text_range_snapshot`; no guest identity selects its host target.",
     "review_id": "HA-000468",
     "source": {
-      "byte_end": 295497,
-      "byte_start": 295481,
+      "byte_end": 296353,
+      "byte_start": 296337,
       "column": 17,
       "column_end": 33,
       "column_start": 17,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 7625,
-      "line_end": 7625,
-      "line_start": 7625
+      "line": 7649,
+      "line_end": 7649,
+      "line_start": 7649
     }
   },
   {
@@ -15541,18 +15541,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:7733 in `host_image_catalog_snapshot`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_image_catalog_snapshot`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:7757 in `host_image_catalog_snapshot`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_image_catalog_snapshot`; no guest identity selects its host target.",
     "review_id": "HA-000469",
     "source": {
-      "byte_end": 299900,
-      "byte_start": 299884,
+      "byte_end": 300756,
+      "byte_start": 300740,
       "column": 23,
       "column_end": 39,
       "column_start": 23,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 7733,
-      "line_end": 7733,
-      "line_start": 7733
+      "line": 7757,
+      "line_end": 7757,
+      "line_start": 7757
     }
   },
   {
@@ -15569,18 +15569,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:7734 in `host_image_text_range_snapshot`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_image_text_range_snapshot`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:7758 in `host_image_text_range_snapshot`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_image_text_range_snapshot`; no guest identity selects its host target.",
     "review_id": "HA-000470",
     "source": {
-      "byte_end": 299950,
-      "byte_start": 299934,
+      "byte_end": 300806,
+      "byte_start": 300790,
       "column": 14,
       "column_end": 30,
       "column_start": 14,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 7734,
-      "line_end": 7734,
-      "line_start": 7734
+      "line": 7758,
+      "line_end": 7758,
+      "line_start": 7758
     }
   },
   {
@@ -15597,18 +15597,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:7776 in `guest_image_base`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `guest_image_base`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:7800 in `guest_image_base`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `guest_image_base`; no guest identity selects its host target.",
     "review_id": "HA-000471",
     "source": {
-      "byte_end": 301685,
-      "byte_start": 301669,
+      "byte_end": 302541,
+      "byte_start": 302525,
       "column": 18,
       "column_end": 34,
       "column_start": 18,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 7776,
-      "line_end": 7776,
-      "line_start": 7776
+      "line": 7800,
+      "line_end": 7800,
+      "line_start": 7800
     }
   },
   {
@@ -15627,18 +15627,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:7899 in `host_pipe_io`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_pipe_io`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:7923 in `host_pipe_io`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_pipe_io`; no guest identity selects its host target.",
     "review_id": "HA-000472",
     "source": {
-      "byte_end": 306432,
-      "byte_start": 306416,
+      "byte_end": 307288,
+      "byte_start": 307272,
       "column": 47,
       "column_end": 63,
       "column_start": 47,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 7899,
-      "line_end": 7899,
-      "line_start": 7899
+      "line": 7923,
+      "line_end": 7923,
+      "line_start": 7923
     }
   },
   {
@@ -15657,18 +15657,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:7905 in `fs_op`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `fs_op`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:7929 in `fs_op`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `fs_op`; no guest identity selects its host target.",
     "review_id": "HA-000473",
     "source": {
-      "byte_end": 306701,
-      "byte_start": 306685,
+      "byte_end": 307557,
+      "byte_start": 307541,
       "column": 45,
       "column_end": 61,
       "column_start": 45,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 7905,
-      "line_end": 7905,
-      "line_start": 7905
+      "line": 7929,
+      "line_end": 7929,
+      "line_start": 7929
     }
   },
   {
@@ -15687,18 +15687,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:7909 in `host_jit_range`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_jit_range`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:7933 in `host_jit_range`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `host_jit_range`; no guest identity selects its host target.",
     "review_id": "HA-000474",
     "source": {
-      "byte_end": 306829,
-      "byte_start": 306813,
+      "byte_end": 307685,
+      "byte_start": 307669,
       "column": 35,
       "column_end": 51,
       "column_start": 35,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 7909,
-      "line_end": 7909,
-      "line_start": 7909
+      "line": 7933,
+      "line_end": 7933,
+      "line_start": 7933
     }
   },
   {
@@ -15717,18 +15717,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:7913 in `execve_argv`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `execve_argv`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:7937 in `execve_argv`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `execve_argv`; no guest identity selects its host target.",
     "review_id": "HA-000475",
     "source": {
-      "byte_end": 306975,
-      "byte_start": 306959,
+      "byte_end": 307831,
+      "byte_start": 307815,
       "column": 43,
       "column_end": 59,
       "column_start": 43,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 7913,
-      "line_end": 7913,
-      "line_start": 7913
+      "line": 7937,
+      "line_end": 7937,
+      "line_start": 7937
     }
   },
   {
@@ -15747,18 +15747,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:8666 in `native_x86_resolve`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `native_x86_resolve`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:8690 in `native_x86_resolve`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `native_x86_resolve`; no guest identity selects its host target.",
     "review_id": "HA-000476",
     "source": {
-      "byte_end": 333568,
-      "byte_start": 333552,
+      "byte_end": 334424,
+      "byte_start": 334408,
       "column": 19,
       "column_end": 35,
       "column_start": 19,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 8666,
-      "line_end": 8666,
-      "line_start": 8666
+      "line": 8690,
+      "line_end": 8690,
+      "line_start": 8690
     }
   },
   {
@@ -15777,18 +15777,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:8681 in `native_x86_xstate_edge`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `native_x86_xstate_edge`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:8705 in `native_x86_xstate_edge`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `native_x86_xstate_edge`; no guest identity selects its host target.",
     "review_id": "HA-000477",
     "source": {
-      "byte_end": 334009,
-      "byte_start": 333993,
+      "byte_end": 334865,
+      "byte_start": 334849,
       "column": 19,
       "column_end": 35,
       "column_start": 19,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 8681,
-      "line_end": 8681,
-      "line_start": 8681
+      "line": 8705,
+      "line_end": 8705,
+      "line_start": 8705
     }
   },
   {
@@ -15807,18 +15807,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:8693 in `native_x86_xstate`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `native_x86_xstate`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:8717 in `native_x86_xstate`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `native_x86_xstate`; no guest identity selects its host target.",
     "review_id": "HA-000478",
     "source": {
-      "byte_end": 334318,
-      "byte_start": 334302,
+      "byte_end": 335174,
+      "byte_start": 335158,
       "column": 19,
       "column_end": 35,
       "column_start": 19,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 8693,
-      "line_end": 8693,
-      "line_start": 8693
+      "line": 8717,
+      "line_end": 8717,
+      "line_start": 8717
     }
   },
   {
@@ -15837,18 +15837,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:8700 in `native_x86_pc`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `native_x86_pc`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:8724 in `native_x86_pc`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `native_x86_pc`; no guest identity selects its host target.",
     "review_id": "HA-000479",
     "source": {
-      "byte_end": 334570,
-      "byte_start": 334554,
+      "byte_end": 335426,
+      "byte_start": 335410,
       "column": 19,
       "column_end": 35,
       "column_start": 19,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 8700,
-      "line_end": 8700,
-      "line_start": 8700
+      "line": 8724,
+      "line_end": 8724,
+      "line_start": 8724
     }
   },
   {
@@ -15867,18 +15867,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:8705 in `native_x86_fault_history`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `native_x86_fault_history`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:8729 in `native_x86_fault_history`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `native_x86_fault_history`; no guest identity selects its host target.",
     "review_id": "HA-000480",
     "source": {
-      "byte_end": 334784,
-      "byte_start": 334768,
+      "byte_end": 335640,
+      "byte_start": 335624,
       "column": 19,
       "column_end": 35,
       "column_start": 19,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 8705,
-      "line_end": 8705,
-      "line_start": 8705
+      "line": 8729,
+      "line_end": 8729,
+      "line_start": 8729
     }
   },
   {
@@ -15897,18 +15897,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:8727 in `native_x86_fault_stack`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `native_x86_fault_stack`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:8751 in `native_x86_fault_stack`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `native_x86_fault_stack`; no guest identity selects its host target.",
     "review_id": "HA-000481",
     "source": {
-      "byte_end": 335467,
-      "byte_start": 335451,
+      "byte_end": 336323,
+      "byte_start": 336307,
       "column": 19,
       "column_end": 35,
       "column_start": 19,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 8727,
-      "line_end": 8727,
-      "line_start": 8727
+      "line": 8751,
+      "line_end": 8751,
+      "line_start": 8751
     }
   },
   {
@@ -15927,18 +15927,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-observability/src/probes.rs:8739 in `native_x86_fault`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `native_x86_fault`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-observability/src/probes.rs:8763 in `native_x86_fault`, `std::process::id` acts only on the current carrier USDT diagnostic event used by `native_x86_fault`; no guest identity selects its host target.",
     "review_id": "HA-000482",
     "source": {
-      "byte_end": 335785,
-      "byte_start": 335769,
+      "byte_end": 336641,
+      "byte_start": 336625,
       "column": 19,
       "column_end": 35,
       "column_start": 19,
       "file": "crates/carrick-observability/src/probes.rs",
-      "line": 8739,
-      "line_end": 8739,
-      "line_start": 8739
+      "line": 8763,
+      "line_end": 8763,
+      "line_start": 8763
     }
   },
   {
@@ -15988,8 +15988,8 @@
     "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1068 in `initialize_root_process`, `std::process::id` acts only on the current carrier identity passed to the deliberately ignored HVPatch bootstrap seam used by `initialize_root_process`; no guest identity selects its host target.",
     "review_id": "HA-000523",
     "source": {
-      "byte_end": 38873,
-      "byte_start": 38857,
+      "byte_end": 38889,
+      "byte_start": 38873,
       "column": 44,
       "column_end": 60,
       "column_start": 44,
@@ -16017,8 +16017,8 @@
     "rationale": "At crates/carrick-runtime/src/threaded_loop.rs:284 in `run_threaded_loop`, the host result from `std::process::id` determines the guest root-process host mapping used by `run_threaded_loop`.",
     "review_id": "HA-000555",
     "source": {
-      "byte_end": 11484,
-      "byte_start": 11468,
+      "byte_end": 11500,
+      "byte_start": 11484,
       "column": 42,
       "column_end": 58,
       "column_start": 42,
@@ -16545,18 +16545,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-hal/src/guest_timer_bridge.rs:389 in `KickerTimerFiring::spawn_itimer_fallback`, `std::thread::Builder::new` acts only on the current kick+futex interval-timer helper thread used by `spawn_itimer_fallback`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-hal/src/guest_timer_bridge.rs:390 in `KickerTimerFiring::spawn_itimer_fallback`, `std::thread::Builder::new` acts only on the current kick+futex interval-timer helper thread used by `spawn_itimer_fallback`; no guest identity selects its host target.",
     "review_id": "HA-000656",
     "source": {
-      "byte_end": 15966,
-      "byte_start": 15941,
+      "byte_end": 15837,
+      "byte_start": 15812,
       "column": 17,
       "column_end": 42,
       "column_start": 17,
       "file": "crates/carrick-hal/src/guest_timer_bridge.rs",
-      "line": 389,
-      "line_end": 389,
-      "line_start": 389
+      "line": 390,
+      "line_end": 390,
+      "line_start": 390
     }
   },
   {
@@ -16578,8 +16578,8 @@
     "rationale": "At crates/carrick-hal/src/guest_timer_bridge.rs:418 in `KickerTimerFiring::spawn_posix_firing`, `std::thread::Builder::new` acts only on the current kick+futex POSIX-timer helper thread used by `spawn_posix_firing`; no guest identity selects its host target.",
     "review_id": "HA-000657",
     "source": {
-      "byte_end": 17196,
-      "byte_start": 17171,
+      "byte_end": 16986,
+      "byte_start": 16961,
       "column": 17,
       "column_end": 42,
       "column_start": 17,
@@ -17096,18 +17096,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/binding.rs:5444 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/binding.rs:5893 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
     "review_id": "HA-000644",
     "source": {
-      "byte_end": 236636,
-      "byte_start": 236611,
+      "byte_end": 257393,
+      "byte_start": 257368,
       "column": 35,
       "column_end": 60,
       "column_start": 35,
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5444,
-      "line_end": 5444,
-      "line_start": 5444
+      "line": 5893,
+      "line_end": 5893,
+      "line_start": 5893
     }
   },
   {
@@ -17645,18 +17645,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-hal/src/posix_timer.rs:268 in `run_fallback`, `std::thread::sleep` acts only on the current carrier POSIX-timer helper used by `run_fallback`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-hal/src/posix_timer.rs:228 in `run_fallback`, `std::thread::sleep` acts only on the current carrier POSIX-timer helper used by `run_fallback`; no guest identity selects its host target.",
     "review_id": "HA-000618",
     "source": {
-      "byte_end": 9720,
-      "byte_start": 9702,
+      "byte_end": 7923,
+      "byte_start": 7905,
       "column": 5,
       "column_end": 23,
       "column_start": 5,
       "file": "crates/carrick-hal/src/posix_timer.rs",
-      "line": 268,
-      "line_end": 268,
-      "line_start": 268
+      "line": 228,
+      "line_end": 228,
+      "line_start": 228
     }
   },
   {
@@ -17675,18 +17675,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-hal/src/posix_timer.rs:272 in `run_fallback`, `std::thread::sleep` acts only on the current carrier POSIX-timer helper used by `run_fallback`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-hal/src/posix_timer.rs:237 in `run_fallback`, `std::thread::sleep` acts only on the current carrier POSIX-timer helper used by `run_fallback`; no guest identity selects its host target.",
     "review_id": "HA-000619",
     "source": {
-      "byte_end": 9929,
-      "byte_start": 9911,
+      "byte_end": 8131,
+      "byte_start": 8113,
       "column": 9,
       "column_end": 27,
       "column_start": 9,
       "file": "crates/carrick-hal/src/posix_timer.rs",
-      "line": 272,
-      "line_end": 272,
-      "line_start": 272
+      "line": 237,
+      "line_end": 237,
+      "line_start": 237
     }
   },
   {
@@ -17705,18 +17705,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-hal/src/posix_timer.rs:310 in `run_fallback_cpu`, `std::thread::sleep` acts only on the current carrier POSIX-timer helper used by `run_fallback_cpu`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-hal/src/posix_timer.rs:280 in `run_fallback_cpu`, `std::thread::sleep` acts only on the current carrier POSIX-timer helper used by `run_fallback_cpu`; no guest identity selects its host target.",
     "review_id": "HA-000620",
     "source": {
-      "byte_end": 11059,
-      "byte_start": 11041,
+      "byte_end": 9393,
+      "byte_start": 9375,
       "column": 13,
       "column_end": 31,
       "column_start": 13,
       "file": "crates/carrick-hal/src/posix_timer.rs",
-      "line": 310,
-      "line_end": 310,
-      "line_start": 310
+      "line": 280,
+      "line_end": 280,
+      "line_start": 280
     }
   },
   {
@@ -17856,8 +17856,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/proc.rs:2378 in `futex`, `std::thread::sleep` acts only on the current process-dispatch wait worker used by `futex`; no guest identity selects its host target.",
     "review_id": "HA-000605",
     "source": {
-      "byte_end": 107879,
-      "byte_start": 107861,
+      "byte_end": 107862,
+      "byte_start": 107844,
       "column": 29,
       "column_end": 47,
       "column_start": 29,
@@ -18605,18 +18605,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/el1_delegation.rs:1949 in `HostInstanceLock::acquire`, `std::thread::yield_now` acts only on the current host thread waiting on an in-zone inotify instance lock held by EL1 used by `HostInstanceLock::acquire`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/el1_delegation.rs:1957 in `HostInstanceLock::acquire`, `std::thread::yield_now` acts only on the current host thread waiting on an in-zone inotify instance lock held by EL1 used by `HostInstanceLock::acquire`; no guest identity selects its host target.",
     "review_id": "HA-000673",
     "source": {
-      "byte_end": 72459,
-      "byte_start": 72437,
+      "byte_end": 72775,
+      "byte_start": 72753,
       "column": 13,
       "column_end": 35,
       "column_start": 13,
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "line": 1949,
-      "line_end": 1949,
-      "line_start": 1949
+      "line": 1957,
+      "line_end": 1957,
+      "line_start": 1957
     }
   },
   {
@@ -18806,18 +18806,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/runtime.rs:1206 in `run_combined_syscall_loop_with_dispatcher`, `std::thread::yield_now` acts only on the current carrier runtime helper used by `run_combined_syscall_loop_with_dispatcher`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/runtime.rs:1210 in `run_combined_syscall_loop_with_dispatcher`, `std::thread::yield_now` acts only on the current carrier runtime helper used by `run_combined_syscall_loop_with_dispatcher`; no guest identity selects its host target.",
     "review_id": "HA-000637",
     "source": {
-      "byte_end": 49336,
-      "byte_start": 49314,
+      "byte_end": 49589,
+      "byte_start": 49567,
       "column": 17,
       "column_end": 39,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 1206,
-      "line_end": 1206,
-      "line_start": 1206
+      "line": 1210,
+      "line_end": 1210,
+      "line_start": 1210
     }
   },
   {
