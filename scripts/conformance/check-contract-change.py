@@ -60,7 +60,7 @@ def is_evidence_path(path: str, contract_id: str, contracts: dict, surfaces: dic
         return True
 
     # If the surface path contains tests or probes, it's evidence
-    if "/tests/" in path or "conformance-probes/" in path or path.endswith("_test.rs"):
+    if "/tests/" in path or "conformance-probes/" in path or path.endswith(("_test.rs", "_tests.rs")):
         return True
 
     # Check contract declared bindings
