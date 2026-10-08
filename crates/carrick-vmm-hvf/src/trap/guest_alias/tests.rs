@@ -249,6 +249,7 @@ impl carrick_hal::FrameCowAuthority for Authority {
         self.live.lock().extend(mappings.iter().copied());
         Ok(
             carrick_hal::FrameInventoryApplyReceipt::from_kernel_authority(
+                Default::default(),
                 self.provenance,
                 commit.batch().transaction(),
                 self.mm,

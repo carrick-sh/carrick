@@ -2371,6 +2371,7 @@ pub(crate) fn test_kernel_apply(
     mappings: Vec<(carrick_hal::MappingId, carrick_hal::FrameId)>,
 ) -> carrick_hal::FrameInventoryApplyReceipt {
     carrick_hal::FrameInventoryApplyReceipt::from_kernel_authority(
+        Default::default(),
         carrick_hal::FrameInventoryProvenance::from_kernel_entropy([raw as u8; 32]),
         commit.batch().transaction(),
         mm,
