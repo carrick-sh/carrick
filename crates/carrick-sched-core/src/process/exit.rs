@@ -672,13 +672,42 @@ pub struct PendingExitEffects<Member, Resources, Transaction> {
     transaction: Transaction,
     incarnation: Arc<TaskReservationIncarnation>,
     resources: Option<Resources>,
+    membership_revision: TaskRevision,
     members: Vec<Member>,
     parent: Option<TaskKey>,
     signal: ChildExitSignal,
 }
+/// Unactivated member/resource snapshot. Cancellation and resource transfer
+/// require activation under the same exact exit reservation.
+///
+/// ```compile_fail
+/// use carrick_sched_core::process::exit::{PreparedExitEffects, ReleasedTaskSet};
+/// fn bypass(effects: PreparedExitEffects<(), (), u32>, release: ReleasedTaskSet<u32>) {
+///     effects.after_release(release);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use carrick_sched_core::process::exit::PreparedExitEffects;
+/// fn bypass(mut effects: PreparedExitEffects<(), (), u32>) {
+///     effects.take_resources();
+/// }
+/// ```
+pub struct PreparedExitEffects<Member, Resources, Transaction> {
+    effects: PendingExitEffects<Member, Resources, Transaction>,
+}
+
 /// Owned admission result shared by every execution-lane consumer.
 pub type ExitEffectAdmission<C, L, Transaction> = Result<
     PendingExitEffects<
+        <L as ExitEffectSource<C>>::Member,
+        <L as ExitEffectSource<C>>::Resources,
+        Transaction,
+    >,
+    ExitError<<L as ExitLive<C>>::Error>,
+>;
+pub type PreparedExitEffectAdmission<C, L, Transaction> = Result<
+    PreparedExitEffects<
         <L as ExitEffectSource<C>>::Member,
         <L as ExitEffectSource<C>>::Resources,
         Transaction,
@@ -752,7 +781,7 @@ impl<
         task: TaskKey,
         plan: &PreparedExitTopology<L::Credit>,
         permit: &ReservedTaskSet<Transaction>,
-    ) -> ExitEffectAdmission<C, L, Transaction> {
+    ) -> PreparedExitEffectAdmission<C, L, Transaction> {
         if task != plan.task_revision.task {
             return Err(ExitError::Topology(task.id));
         }
@@ -786,14 +815,17 @@ impl<
         if members.iter().any(|member| member.exit_task() != task) {
             return Err(ExitError::Topology(task.id));
         }
-        Ok(PendingExitEffects {
-            task,
-            transaction: permit.transaction,
-            incarnation: Arc::clone(&permit.incarnation),
-            resources: Some(resources),
-            members,
-            parent: identity.parent,
-            signal: identity.exit_signal,
+        Ok(PreparedExitEffects {
+            effects: PendingExitEffects {
+                task,
+                transaction: permit.transaction,
+                incarnation: Arc::clone(&permit.incarnation),
+                resources: Some(resources),
+                membership_revision: record.exit_revision(),
+                members,
+                parent: identity.parent,
+                signal: identity.exit_signal,
+            },
         })
     }
 
@@ -804,8 +836,9 @@ impl<
         task: TaskKey,
         plan: &PreparedExitTopology<L::Credit>,
         permit: &ReservedTaskSet<Transaction>,
-        effects: &PendingExitEffects<L::Member, L::Resources, Transaction>,
-    ) -> Result<(), ExitError<L::Error>> {
+        prepared: PreparedExitEffects<L::Member, L::Resources, Transaction>,
+    ) -> ExitEffectAdmission<C, L, Transaction> {
+        let effects = &prepared.effects;
         self.validate_task_set(permit)
             .map_err(|_| ExitError::Topology(task.id))?;
         if plan
@@ -824,6 +857,11 @@ impl<
             return Err(ExitError::Topology(task.id));
         }
         self.validate_exit_topology(task, plan)?;
+        // Topology tracks admitted participant changes, but member/resource
+        // effects authorize only the exiting task's exact captured population.
+        plan.task_revision
+            .validate(task, effects.membership_revision)
+            .map_err(|_| ExitError::Topology(task.id))?;
         if task != plan.task_revision.task
             || effects.task != task
             || effects.transaction != permit.transaction
@@ -831,7 +869,8 @@ impl<
         {
             return Err(ExitError::Topology(task.id));
         }
-        self.activate_prepared_exit(task)
+        self.activate_prepared_exit(task)?;
+        Ok(prepared.effects)
     }
 
     fn activate_prepared_exit(&self, task: TaskKey) -> Result<(), ExitError<L::Error>> {
@@ -855,7 +894,7 @@ impl<
     ) -> ExitEffectAdmission<C, L, Transaction> {
         let effects = self.prepare_exit_effects(task, plan, permit)?;
         self.activate_prepared_exit(task)?;
-        Ok(effects)
+        Ok(effects.effects)
     }
 }
 

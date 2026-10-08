@@ -16,7 +16,7 @@ use carrick_sched_core::process::birth::{
 use carrick_sched_core::process::exit::{
     ExitEffectSource, ExitError, ExitLive, ExitLivePublication, ExitMember, ExitNotificationSource,
     ExitParentPermit, ExitParentTarget, ExitRetiring, ExitSignalSource, ExitZombie,
-    ExitZombiePublication, PendingExitEffects, PreparedExitParticipant, PreparedExitTopology,
+    ExitZombiePublication, PreparedExitEffects, PreparedExitParticipant, PreparedExitTopology,
     ReadyExitEffects, ReleasedTaskSet, ReservedTaskSet, TaskGraphReservation, TaskRevision,
     TaskSetError,
 };
@@ -757,7 +757,7 @@ pub struct GuestPendingExit<
 > {
     reserved: GuestReservedExit<'a, C, U, N, F>,
     status: LinuxWaitStatus,
-    effects: PendingExitEffects<N::Member, N::Resources, N::Transaction>,
+    effects: PreparedExitEffects<N::Member, N::Resources, N::Transaction>,
 }
 impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
     GuestPendingExit<'_, C, U, N, F>
@@ -803,8 +803,8 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
             exit_signal: record.metadata.exit_signal,
             diagnostic_name: record.metadata.diagnostic_name.clone(),
         };
-        registry
-            .begin_prepared_exit_effects(task, topology, permit, &self.effects)
+        let mut effects = registry
+            .begin_prepared_exit_effects(task, topology, permit, self.effects)
             .map_err(GuestProcessError::Exit)?;
         let adopter = topology.adopter();
         let record = registry
@@ -831,9 +831,8 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
         let released = registry
             .release_task_set(permit)
             .unwrap_or_else(|_| F::fail_process(GuestProcessInvariant::ExitReleaseLost(task)));
-        let resources = self.effects.take_resources();
-        let effects = self
-            .effects
+        let resources = effects.take_resources();
+        let effects = effects
             .after_release(released)
             .unwrap_or_else(|_| F::fail_process(GuestProcessInvariant::ExitReleaseLost(task)));
         self.reserved.registry = None;
