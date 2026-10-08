@@ -1899,7 +1899,6 @@ mod tests {
                     LifecycleOutcome::Transferred { .. }
                 ));
                 assert!(entry.take_handoff_receipt().is_some());
-                drop(entry);
                 actors.push(next);
                 activate(&runtime, source, &task, next);
                 if depth + 1 < depth_count {
@@ -2011,7 +2010,6 @@ mod tests {
             } else {
                 assert_eq!(result.raw(), 44);
             }
-            drop(entry);
             assert_eq!(
                 service.copies.last(),
                 Some(&LinuxWaitStatus::from_wait_encoding(7 << 8))
