@@ -2098,6 +2098,34 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         }
         Ok(())
     }
+    /// Edit a retained private file mapping whose source is owned by the host.
+    pub fn set_backed_file_protection(
+        &mut self,
+        range: ReservationRange,
+        prot: ReservationProtection,
+    ) -> Result<(), Refusal> {
+        let generation = self.host_edit_admitted()?;
+        let mut cursor = range.start();
+        while cursor < range.end() {
+            let n = self.next(cursor).ok_or(Refusal::Hole)?;
+            if n.start > cursor {
+                return Err(Refusal::Hole);
+            }
+            if n.host_backing.is_none()
+                || !Policy::flags(&n)
+                    .contains(ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE))
+            {
+                return Err(Refusal::ForeignMapping);
+            }
+            cursor = n.end.min(range.end());
+        }
+        let needed = self.splits_needed(range);
+        let mut spares = Spares(self.host_spares(needed)?);
+        self.reprotect_range(range, prot, &mut spares)?;
+        self.release_spares(spares.0);
+        self.state_mut().generation = generation;
+        Ok(())
+    }
     pub fn complete(&mut self, completion: ReservationCompletion) -> Result<u64, Refusal> {
         self.complete_as(completion, false)
     }

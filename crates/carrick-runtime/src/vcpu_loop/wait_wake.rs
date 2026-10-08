@@ -1,5 +1,5 @@
 #![cfg_attr(
-    not(target_os = "macos"),
+    all(not(target_os = "macos"), not(test)),
     expect(
         dead_code,
         reason = "bound by the KVM carrier at M5: docs/superpowers/plans/2026-10-04-kvm-hvpatch-carrier.md"

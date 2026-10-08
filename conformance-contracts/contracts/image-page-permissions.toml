@@ -17,7 +17,11 @@ page exactly its mapping's permission: each region its own, then the ELF
 read-only and writable page spans. Every alias publication names its write
 and execute permission explicitly (`UserLeafAccess`); no mapping helper has
 an executable default, and a PROT_EXEC alias is executable only through its
-own published protection. The VM-free bindings bake a two-segment image with
+own published protection. The initial and exec builders add vvar/vdso before
+sealing stage-1 tables: vvar is read-only and non-executable before owner
+import. Native COW maintenance caps both write and execute authority even
+when an imported private leaf incorrectly carries MAY_WRITE/MAY_EXEC.
+The VM-free bindings bake a two-segment image with
 a stack and require text RO+X, data/bss/stack RW+NX, and require every alias
 leaf to carry exactly the named access; the signed binding runs the probe in
 the generic conformance-next shard (first image, fork child, after execve);
@@ -26,6 +30,6 @@ claimed.
 """
 
 [bindings]
-vm_free = "carrick-mem::memory::loader_tests::fresh_image_data_bss_and_stack_are_not_executable; carrick-mmu-core::aarch64::tests::alias_leaves_carry_exactly_the_named_access"
+vm_free = "carrick-mem::memory::loader_tests::fresh_image_data_bss_and_stack_are_not_executable; carrick-mmu-core::aarch64::tests::alias_leaves_carry_exactly_the_named_access; carrick-runtime::runtime::tests::initial_vvar_stage1_is_readonly_and_nonexecutable_before_owner_import; carrick-runtime::runtime::exec::tests::exec_vvar_stage1_is_readonly_and_nonexecutable_before_owner_import; carrick-mmu-core::aarch64::descriptor_txn::tests::executor::cow_native_readonly_vvar_caps_real_imported_leaf_permissions"
 embed = "carrick-conformance-next::probes_shard_1::generic_probe_shard_1"
 docker = "probe:nxwritableimage"

@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 use carrick_abi::LinuxCloneFlags;
 use carrick_hal::ThreadId;
 use carrick_hal::threaded::{Aarch64SyscallContinuationV1, Aarch64TaskCpuStateV1, GuestCpuState};
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use carrick_kernel::kernel::CarrierProcess;
 
 use super::{
@@ -310,8 +309,12 @@ impl PersistentTaskBinding for FakeBinding {
                 super::residency::TaskCpuResidency::Materialized(cpu) => {
                     return Ok(Some(cpu.clone()));
                 }
-                super::residency::TaskCpuResidency::Zone { base, record } => {
-                    return super::residency::materialize_zone(base, *record).map(Some);
+                super::residency::TaskCpuResidency::Zone {
+                    base,
+                    record,
+                    origin,
+                } => {
+                    return super::residency::materialize_zone(base, *record, *origin).map(Some);
                 }
                 super::residency::TaskCpuResidency::Resident { .. } => {
                     let now = std::time::Instant::now();

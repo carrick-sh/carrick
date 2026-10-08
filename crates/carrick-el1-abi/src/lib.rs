@@ -20,6 +20,10 @@
 
 #![no_std]
 
+/// Synthetic timekeeping page shared by the host mapper and EL1 fork policy.
+pub const LINUX_VVAR_BASE: u64 = 0x2E_0000_0000;
+pub const LINUX_VVAR_SIZE: u64 = 0x1000;
+
 mod cow_grants;
 pub use cow_grants::*;
 mod descriptor_txn;
@@ -492,6 +496,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(Counters, fault_taken) as u64,
         core::mem::offset_of!(Counters, ipc_leaves) as u64,
         core::mem::offset_of!(Counters, anonymous_leaves) as u64,
+        core::mem::offset_of!(Counters, reservation_events) as u64,
+        core::mem::size_of::<carrick_core_abi::ReservationEventRing>() as u64,
         core::mem::size_of::<CurrentTask>() as u64,
         core::mem::offset_of!(CurrentTask, linux.file_table) as u64,
         core::mem::offset_of!(CurrentTask, linux.pending_host_work) as u64,
@@ -1836,6 +1842,8 @@ pub struct Counters {
     /// Delegated-MM anonymous calls EL1 left for the host, by
     /// [`AnonymousLeave`].
     pub anonymous_leaves: [AtomicU64; AnonymousLeave::COUNT],
+    /// Guest-side SETTLED and prepared-reap edges, visible to carrier debuggers.
+    pub reservation_events: carrick_core_abi::ReservationEventRing,
 }
 
 impl Counters {
@@ -1849,6 +1857,7 @@ impl Counters {
             ipc_leaves: [const { AtomicU64::new(0) }; IpcLeave::COUNT],
             lifecycle_declines: [const { AtomicU64::new(0) }; LifecycleDecline::COUNT],
             anonymous_leaves: [const { AtomicU64::new(0) }; AnonymousLeave::COUNT],
+            reservation_events: carrick_core_abi::ReservationEventRing::new(),
         }
     }
 
@@ -1890,6 +1899,36 @@ impl Counters {
                 self.anonymous_leaves[i].load(Ordering::Relaxed),
                 Ordering::Relaxed,
             );
+        }
+        snapshot.reservation_events.next.store(
+            self.reservation_events.next.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        for (target, source) in snapshot
+            .reservation_events
+            .slots
+            .iter()
+            .zip(&self.reservation_events.slots)
+        {
+            target
+                .phase
+                .store(source.phase.load(Ordering::Relaxed), Ordering::Relaxed);
+            target
+                .mm
+                .store(source.mm.load(Ordering::Relaxed), Ordering::Relaxed);
+            target.incarnation.store(
+                source.incarnation.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            target
+                .id
+                .store(source.id.load(Ordering::Relaxed), Ordering::Relaxed);
+            target
+                .tail_id
+                .store(source.tail_id.load(Ordering::Relaxed), Ordering::Relaxed);
+            target
+                .sequence
+                .store(source.sequence.load(Ordering::Acquire), Ordering::Release);
         }
         snapshot
     }
@@ -3105,7 +3144,7 @@ impl Default for InotifyNameCache {
     }
 }
 
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x3ff0_698f_9f1a_67f1);
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x33b6_f70c_5cb8_9f38);
 
 #[cfg(test)]
 mod tests {
@@ -3188,6 +3227,7 @@ mod tests {
                 + LifecycleDecline::COUNT
                 + AnonymousLeave::COUNT)
                 * 8
+                + core::mem::size_of::<carrick_core_abi::ReservationEventRing>()
         );
         assert_eq!(core::mem::offset_of!(Counters, served), 0);
         assert_eq!(core::mem::offset_of!(Counters, forwarded), 512 * 8);

@@ -117,11 +117,30 @@ impl carrick_hal::ForeignMmSnapshot for CarrierForeignMmSnapshot {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub(crate) struct CarrierForeignMmStateEntry {
+    mm: carrick_hal::ForeignMmId,
+    state: std::sync::Weak<MmAccessState>,
+    registration: std::sync::Weak<CarrierForeignMmRegistrationOwner>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl CarrierForeignMmStateEntry {
+    fn is_exact(&self, mm: carrick_hal::ForeignMmId, state: &MmAccessState) -> bool {
+        self.mm == mm && std::ptr::eq(self.state.as_ptr(), state)
+    }
+
+    pub(crate) fn upgrade(&self) -> Option<std::sync::Arc<MmAccessState>> {
+        self.state.upgrade()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Clone, Default, Debug)]
 pub(crate) struct CarrierForeignMmTransport {
     pub(crate) states: std::sync::Arc<
         parking_lot::RwLock<
-            std::collections::HashMap<CarrierForeignMmBinding, std::sync::Weak<MmAccessState>>,
+            std::collections::HashMap<CarrierForeignMmBinding, CarrierForeignMmStateEntry>,
         >,
     >,
     #[allow(dead_code)] // migrated into the VM create/destroy paths in the next custody slice
@@ -151,12 +170,10 @@ impl CarrierForeignMmTransport {
         state: &std::sync::Arc<MmAccessState>,
     ) {
         let snapshot = CarrierForeignMmSnapshot::capture(snapshot);
-        state.install_identity(snapshot.mm, snapshot.binding);
-        self.states
-            .write()
-            .insert(snapshot.binding, std::sync::Arc::downgrade(state));
+        self.register_identity(snapshot.mm, snapshot.binding, state);
     }
 
+    #[cfg(any(test, feature = "foreign-cow-test-support"))]
     pub(crate) fn register_identity(
         &self,
         mm: carrick_hal::ForeignMmId,
@@ -164,41 +181,65 @@ impl CarrierForeignMmTransport {
         state: &std::sync::Arc<MmAccessState>,
     ) {
         state.install_identity(mm, binding);
-        self.states
-            .write()
-            .insert(binding, std::sync::Arc::downgrade(state));
+        Self::publish_state(&mut self.states.write(), mm, binding, state);
+    }
+
+    #[cfg(any(test, feature = "foreign-cow-test-support"))]
+    fn publish_state(
+        states: &mut std::collections::HashMap<CarrierForeignMmBinding, CarrierForeignMmStateEntry>,
+        mm: carrick_hal::ForeignMmId,
+        binding: CarrierForeignMmBinding,
+        state: &std::sync::Arc<MmAccessState>,
+    ) {
+        // Executor rebinds refresh the projection without ending any exact
+        // same-MM task's registration. A successor state inherits no owner.
+        let registration = states
+            .get(&binding)
+            .filter(|entry| entry.is_exact(mm, state))
+            .map(|entry| entry.registration.clone())
+            .unwrap_or_default();
+        states.insert(
+            binding,
+            CarrierForeignMmStateEntry {
+                mm,
+                state: std::sync::Arc::downgrade(state),
+                registration,
+            },
+        );
     }
 
     /// The closed first-load publication supplies its exact root while the
     /// user-memory admission guard is held. Register that root without trying
     /// to promote a pending owner through the guard's write lock.
     pub(crate) fn register_closed_initial_identity(
-        &self,
+        self: &std::sync::Arc<Self>,
         mm: carrick_hal::ForeignMmId,
         binding: CarrierForeignMmBinding,
         state: &std::sync::Arc<MmAccessState>,
-    ) -> Result<(), TrapError> {
+    ) -> Result<CarrierForeignMmRegistration, TrapError> {
         // Existing registration takes the state identity before the transport
         // map; preserve that lock order while committing both edges.
-        let mut identity = state.identity.write();
-        if identity.is_some_and(|current| current != (mm, binding)) {
-            return Err(TrapError::Hypervisor(
-                "closed initial root conflicts with bound MM identity".into(),
-            ));
-        }
-        let mut states = self.states.write();
-        if states
-            .get(&binding)
-            .and_then(std::sync::Weak::upgrade)
-            .is_some_and(|current| !std::sync::Arc::ptr_eq(&current, state))
-        {
-            return Err(TrapError::Hypervisor(
-                "closed initial root already belongs to another MM state".into(),
-            ));
-        }
-        *identity = Some((mm, binding));
-        states.insert(binding, std::sync::Arc::downgrade(state));
-        Ok(())
+        let owner = {
+            let mut identity = state.identity.write();
+            if identity.is_some_and(|current| current != (mm, binding)) {
+                return Err(TrapError::Hypervisor(
+                    "closed initial root conflicts with bound MM identity".into(),
+                ));
+            }
+            let mut states = self.states.write();
+            if states
+                .get(&binding)
+                .and_then(CarrierForeignMmStateEntry::upgrade)
+                .is_some_and(|current| !std::sync::Arc::ptr_eq(&current, state))
+            {
+                return Err(TrapError::Hypervisor(
+                    "closed initial root already belongs to another MM state".into(),
+                ));
+            }
+            *identity = Some((mm, binding));
+            self.retain_owner_in(&mut states, mm, binding, state)
+        };
+        Ok(CarrierForeignMmRegistration { _owner: owner })
     }
 
     pub(crate) fn register_owned_identity(
@@ -207,25 +248,53 @@ impl CarrierForeignMmTransport {
         binding: CarrierForeignMmBinding,
         state: &std::sync::Arc<MmAccessState>,
     ) -> CarrierForeignMmRegistration {
-        self.register_identity(mm, binding, state);
-        CarrierForeignMmRegistration {
-            transport: std::sync::Arc::clone(self),
-            mm,
-            binding,
-            state: std::sync::Arc::downgrade(state),
-        }
+        state.install_identity(mm, binding);
+        let owner = {
+            let mut states = self.states.write();
+            self.retain_owner_in(&mut states, mm, binding, state)
+        };
+        CarrierForeignMmRegistration { _owner: owner }
     }
 
-    pub(crate) fn unregister_exact(&self, registration: &CarrierForeignMmRegistration) {
-        let mut states = self.states.write();
-        let exact = states
-            .get(&registration.binding)
-            .and_then(std::sync::Weak::upgrade)
-            .zip(registration.state.upgrade())
-            .is_some_and(|(published, owned)| {
-                std::sync::Arc::ptr_eq(&published, &owned)
-                    && *owned.identity.read() == Some((registration.mm, registration.binding))
+    fn retain_owner_in(
+        self: &std::sync::Arc<Self>,
+        states: &mut std::collections::HashMap<CarrierForeignMmBinding, CarrierForeignMmStateEntry>,
+        mm: carrick_hal::ForeignMmId,
+        binding: CarrierForeignMmBinding,
+        state: &std::sync::Arc<MmAccessState>,
+    ) -> std::sync::Arc<CarrierForeignMmRegistrationOwner> {
+        let owner = states
+            .get(&binding)
+            .filter(|entry| entry.is_exact(mm, state))
+            .and_then(|entry| entry.registration.upgrade())
+            .unwrap_or_else(|| {
+                std::sync::Arc::new(CarrierForeignMmRegistrationOwner {
+                    transport: std::sync::Arc::clone(self),
+                    mm,
+                    binding,
+                    state: std::sync::Arc::downgrade(state),
+                })
             });
+        states.insert(
+            binding,
+            CarrierForeignMmStateEntry {
+                mm,
+                state: std::sync::Arc::downgrade(state),
+                registration: std::sync::Arc::downgrade(&owner),
+            },
+        );
+        // Move this Arc out before releasing it: a last owner destructor
+        // re-enters the directory, so no temporary owner drops under it.
+        owner
+    }
+
+    fn unregister_exact(&self, registration: &CarrierForeignMmRegistrationOwner) {
+        let mut states = self.states.write();
+        let exact = states.get(&registration.binding).is_some_and(|entry| {
+            entry.mm == registration.mm
+                && std::sync::Weak::ptr_eq(&entry.state, &registration.state)
+                && std::ptr::eq(entry.registration.as_ptr(), registration)
+        });
         if exact {
             states.remove(&registration.binding);
         }
@@ -242,7 +311,7 @@ impl CarrierForeignMmTransport {
             .ok_or(carrick_hal::ForeignMmTransportError::TimedOut)?;
         let state = states
             .get(&snapshot.binding)
-            .and_then(std::sync::Weak::upgrade)
+            .and_then(CarrierForeignMmStateEntry::upgrade)
             .ok_or(carrick_hal::ForeignMmTransportError::MissingBinding)?;
         drop(states);
         let identity = state
@@ -259,14 +328,39 @@ impl CarrierForeignMmTransport {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct CarrierForeignMmRegistration {
-    pub(crate) transport: std::sync::Arc<CarrierForeignMmTransport>,
-    pub(crate) mm: carrick_hal::ForeignMmId,
-    pub(crate) binding: CarrierForeignMmBinding,
-    pub(crate) state: std::sync::Weak<MmAccessState>,
+    _owner: std::sync::Arc<CarrierForeignMmRegistrationOwner>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl Drop for CarrierForeignMmRegistration {
+#[derive(Default)]
+pub(crate) struct CarrierForeignMmTaskClaim {
+    registration: parking_lot::Mutex<Option<CarrierForeignMmRegistration>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl CarrierForeignMmTaskClaim {
+    pub(crate) fn install(&self, registration: CarrierForeignMmRegistration) {
+        // The new identity is published and retained before the old claim is
+        // released. Its final destructor can re-enter the MM directory.
+        let previous = self.registration.lock().replace(registration);
+        drop(previous);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.registration.lock().is_none()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct CarrierForeignMmRegistrationOwner {
+    transport: std::sync::Arc<CarrierForeignMmTransport>,
+    mm: carrick_hal::ForeignMmId,
+    binding: CarrierForeignMmBinding,
+    state: std::sync::Weak<MmAccessState>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for CarrierForeignMmRegistrationOwner {
     fn drop(&mut self) {
         self.transport.unregister_exact(self);
         self.transport
@@ -2519,7 +2613,7 @@ pub(crate) fn perform_foreign_cow_transaction(
     let old_offset = old_ipa
         .checked_sub(old_physical_ipa)
         .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
-    let source_alias_guest_writable = alias_registry()
+    let (source_alias_guest_writable, source_native_executable) = alias_registry()
         .lock()
         .newest_matching_for_process(runtime.mm_root_slot, runtime.container_root, |alias| {
             let semantic_offset = span.va.checked_sub(alias.start);
@@ -2543,7 +2637,7 @@ pub(crate) fn perform_foreign_cow_transaction(
                 && alias.physical_host_addr == old_extent.owner.ptr() as usize
                 && alias.owner_generation == old_extent.owner.generation()
         })
-        .map(|alias| alias.guest_writable)
+        .map(|alias| (alias.guest_writable, alias.perms & 4 != 0))
         .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
     let source_guest_writable = source_alias_guest_writable;
     if (!source_guest_writable
@@ -2616,6 +2710,7 @@ pub(crate) fn perform_foreign_cow_transaction(
                 old_ipa,
                 old_offset,
                 source_guest_writable,
+                source_native_executable,
                 executable_authorized,
                 shape: CowInventorySplitShape {
                     old_key,
@@ -3115,6 +3210,7 @@ struct ForeignGuestCow<'a> {
     old_ipa: u64,
     old_offset: u64,
     source_guest_writable: bool,
+    source_native_executable: bool,
     executable_authorized: bool,
     shape: CowInventorySplitShape,
 }
@@ -3141,6 +3237,7 @@ fn perform_foreign_guest_cow(
         old_ipa,
         old_offset,
         source_guest_writable,
+        source_native_executable,
         executable_authorized,
         shape:
             CowInventorySplitShape {
@@ -3285,6 +3382,11 @@ fn perform_foreign_guest_cow(
             carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp::CowRepoint {
                 access: carrick_mmu_core::aarch64::descriptor_txn::CowRepointAccess::User {
                     writable_pages,
+                    executable_pages: if source_native_executable {
+                        (1_u8 << (span.len / 4096)) - 1
+                    } else {
+                        0
+                    },
                 },
                 va: span.va,
                 len: span.len as u64,
@@ -4707,6 +4809,102 @@ pub mod foreign_cow_test_support {
                 original_extents: vec![root_key, data_key],
                 data_va: shape.data_va,
                 data_len: shape.data_len,
+            })
+        }
+
+        /// Exercise the production engine/native copier on fresh exclusive
+        /// backing. No vCPU is created: this fixture never executes guest code.
+        /// Its borrowed proof and retained owners cannot leave the callback.
+        pub fn with_fresh_reserved_engine_for_test<R>(
+            &mut self,
+            operation: impl for<'scope> FnOnce(
+                &mut crate::hvf_aarch64_engine::HvfAarch64Engine,
+                &carrick_guest_mem::OwnerReservedWrite<'scope>,
+            ) -> R,
+        ) -> Result<R, String> {
+            let runtime = self
+                .state
+                .cow_runtime
+                .read()
+                .clone()
+                .ok_or("fixture runtime absent")?;
+            let tables = self.state.page_tables_authority();
+            tables.edit(
+                || Err("fixture tables absent".to_owned()),
+                |editor| {
+                    editor
+                        .manager
+                        .set_writable_preserving_attributes(
+                            self.data_va,
+                            self.data_len as usize,
+                            None,
+                        )
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                },
+            )?;
+            let incarnation = std::num::NonZeroU64::MIN;
+            // SAFETY: the installed kernel snapshot and retained carrier bind
+            // this test's one admitted MM; incarnation one is fixture-owned.
+            let handle = unsafe {
+                carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                    self.transport.custody.transfer_carrier,
+                    carrick_el1_abi::ReservationMm::new(runtime.identity.mm)
+                        .ok_or("fixture MM absent")?,
+                    incarnation,
+                )
+            };
+            let resolver = self
+                .state
+                .live_resolver
+                .read()
+                .clone()
+                .ok_or("fixture resolver absent")?;
+            self.state
+                .protections
+                .select_owner(handle, || {
+                    // SAFETY: the installed resolver retains this exact live root.
+                    unsafe {
+                        tables.bind_live_backing(resolver);
+                    }
+                    Ok::<_, String>(carrick_guest_mem::OwnerMemorySelection::Immediate)
+                })
+                .map_err(|e| format!("fixture owner selection: {e:?}"))?;
+            let mut task = HvfTaskState::neutral();
+            task.mm_access = std::sync::Arc::clone(&self.state);
+            task.cow_authority = Some(runtime.authority);
+            task.cow_identity = Some(runtime.identity);
+            task.mm_root_slot = runtime.mm_root_slot;
+            task.container_root = runtime.container_root;
+            task.persistent_vm_lifecycle = true;
+            let state = HvfVmState {
+                // This VM-free fixture uses only native memory operations;
+                // no method or destructor may touch the inert VM handle.
+                _vm: std::mem::ManuallyDrop::new(unsafe { std::mem::zeroed() }),
+                task,
+                carrier_foreign_mm_transport: std::sync::Arc::new(self.transport.clone()),
+                carrier_mappings: None,
+                mailbox_slots: std::sync::Arc::new(MailboxSlotAllocator::new()),
+                syscall_transport: HvfSyscallTransport::Mailbox,
+                executor_vcpu: None,
+                cached_fork_alias_snapshot: parking_lot::Mutex::new(None),
+                last_fork_host_mapping_allocations: std::sync::atomic::AtomicU64::new(0),
+                last_fork_projection_rows_visited: std::sync::atomic::AtomicU64::new(0),
+            };
+            let mut engine =
+                crate::hvf_aarch64_engine::native_reserved_content_engine_for_test(state)
+                    .map_err(str::to_owned)?;
+            // SAFETY: this fixture has one exclusive, inaccessible host venue,
+            // no running guest and retained exact physical owners throughout.
+            Ok(unsafe {
+                carrick_guest_mem::OwnerReservedWrite::with_scope(
+                    handle,
+                    carrick_guest_mem::GuestVaRange::from_len(
+                        GuestVa(self.data_va),
+                        self.data_len as usize,
+                    ),
+                    |admission| operation(&mut engine, admission),
+                )
             })
         }
 

@@ -691,17 +691,17 @@ impl MemState {
         }))
     }
 
-    /// Whether a root-owned anonymous row overlaps `[start, start + len)`.
-    pub(in crate::dispatch) fn root_anonymous_overlaps(&self, start: u64, len: u64) -> bool {
+    /// Whether any committed root mapping overlaps `[start, start + len)`.
+    /// Private file rows leave the host VMA projection when their backing
+    /// source becomes owner-held, but remain occupied for placement checks.
+    pub(in crate::dispatch) fn root_mapping_overlaps(&self, start: u64, len: u64) -> bool {
         let Some(root) = self.delegated_root() else {
             return false;
         };
         let Some(end) = start.checked_add(len).filter(|end| *end > start) else {
             return false;
         };
-        Self::root_mappings(root, start, end)
-            .iter()
-            .any(|mapping| mapping.anonymous)
+        !Self::root_mappings(root, start, end).is_empty()
     }
 
     /// Every Linux-visible VMA row of this MM: the host rows, plus the root's
@@ -834,19 +834,41 @@ impl MemState {
         Some(cursor >= end)
     }
 
-    /// Every committed root anonymous node overlapping `[start, end)`,
-    /// clipped to it.
-    fn root_anonymous_pieces(root: &DelegatedRoot, start: u64, end: u64) -> Vec<Mapping> {
+    fn root_backed_file_pieces(root: &DelegatedRoot, start: u64, end: u64) -> Vec<Mapping> {
         let mut pieces = Self::root_mappings(root, start, end);
-        pieces.retain(|mapping| mapping.anonymous);
+        pieces.retain(|mapping| {
+            mapping.host_backing.is_some()
+                && mapping
+                    .flags
+                    .contains(ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE))
+        });
         for mapping in &mut pieces {
             mapping.range = reservation_range(
                 mapping.range.start().max(start),
                 mapping.range.end().min(end),
             )
-            .unwrap_or_else(|refusal| broken_root("a clipped observation", refusal));
+            .unwrap_or_else(|refusal| broken_root("a clipped file observation", refusal));
         }
         pieces
+    }
+
+    pub(in crate::dispatch) fn reprotect_root_backed_files(
+        &mut self,
+        start: u64,
+        end: u64,
+        protection: ReservationProtection,
+    ) {
+        let Some(root) = self.delegated_root().cloned() else {
+            return;
+        };
+        let pieces = Self::root_backed_file_pieces(&root, start, end);
+        root.with_root(|model| {
+            for piece in pieces {
+                model.set_backed_file_protection(piece.range, protection)?;
+            }
+            Ok(())
+        })
+        .unwrap_or_else(|refusal| broken_root("a backed file protection edit", refusal));
     }
 
     /// Every locked range of this MM: the host's lock table (host-owned
@@ -1126,11 +1148,18 @@ impl MemState {
                 Refusal::Busy,
             );
         }
-        // Root-owned anonymous nodes are not host rows: the mirror replaces
-        // only the opaque part of the range.
+        // Owner-backed private file nodes have no host VMA row either. The
+        // mirror replaces only ranges whose rows the host actually keeps.
         let root = delegated.root.clone();
-        let covered: Vec<_> = Self::root_anonymous_pieces(&delegated.root, start, end)
+        let covered: Vec<_> = Self::root_mappings(&delegated.root, start, end)
             .iter()
+            .filter(|mapping| {
+                mapping.anonymous
+                    || (mapping.host_backing.is_some()
+                        && mapping.flags.contains(
+                            ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE),
+                        ))
+            })
             .map(|piece| (piece.range.start(), piece.range.end()))
             .collect();
         let segments = uncovered_segments(start, end, &covered);
@@ -1332,6 +1361,22 @@ impl MemState {
                 ..
             })
         )
+    }
+
+    /// Whether the current host mapping syscall owns an opaque reservation
+    /// covering this range. Backend preparation may write Carrick-owned file
+    /// content through the owner lane while the placeholder prevents
+    /// guest-visible access; settlement mirrors the final host mapping.
+    pub(in crate::dispatch::mem) fn owner_reserved_venue(
+        &self,
+    ) -> Option<(DelegatedRoot, ReservationRange)> {
+        let AnonymousAuthority::Delegated(delegated) = &self.anonymous else {
+            return None;
+        };
+        match delegated.venue {
+            Some(HostVenue::Reserved(range)) => Some((delegated.root.clone(), range)),
+            _ => None,
+        }
     }
 
     fn open_venue(&mut self, venue: HostVenue) {
@@ -1683,7 +1728,16 @@ impl MemView<'_> {
         match placed {
             Ok((placed, holes)) => {
                 mem.open_venue(HostVenue::Reserved(placed));
-                mem.retire_stale_first_touch(&holes);
+                if matches!(placement, Placement::Fixed(_)) {
+                    // The root has retired every prior node in this exact
+                    // replacement, including owner-held private file rows.
+                    // Their lazy recipes must leave before the new recipe is
+                    // offered; retiring only root holes leaves an overlapping
+                    // file view alive and forces an eager-copy fallback.
+                    mem.retire_stale_first_touch(&[(placed.start(), placed.end())]);
+                } else {
+                    mem.retire_stale_first_touch(&holes);
+                }
                 Ok(Ok(placed.start()))
             }
             Err(
@@ -1709,7 +1763,6 @@ impl MemView<'_> {
         flags: u64,
         congruence: MmapGrantCongruence,
         root_eligible: bool,
-        user_ceiling: UserVaCeiling,
     ) -> Result<Option<(u64, bool)>, DispatchError> {
         let page_size = self.linux_page_size();
         let layout = mem.layout;
@@ -1790,7 +1843,7 @@ impl MemView<'_> {
                     let rosetta_start = crate::memory::LINUX_ROSETTA_VA_BASE;
                     let rosetta_end =
                         rosetta_start.saturating_add(crate::memory::LINUX_ROSETTA_WINDOW_SIZE);
-                    if mmap_address_uses_alias(hint, length, layout, user_ceiling)
+                    if mmap_address_uses_alias(hint, length, layout)
                         && !guest_vma_overlaps_locked(mem, hint, length)
                         && !ranges_overlap(hint, length, rosetta_start, rosetta_end)
                     {
@@ -1804,12 +1857,7 @@ impl MemView<'_> {
             Ok(address) => Ok(grant(mem, address)),
             Err(Refusal::MetadataRequired) => Ok(None),
             // The arena is full: the host's high alias window.
-            Err(_) => Ok(find_canonical_high_va_gap(
-                mem,
-                length,
-                congruence,
-                user_ceiling,
-            )),
+            Err(_) => Ok(find_canonical_high_va_gap(mem, length, congruence)),
         }
     }
 

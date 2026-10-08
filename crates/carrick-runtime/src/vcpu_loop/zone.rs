@@ -18,7 +18,9 @@
 //! - [`ProductionHvpatchLoopJob::resume_zone`]: a zone-parked thread loaded
 //!   from its record applies how its wait ended ([`Handback`]).
 
-use super::binding::{HvpatchProductionPhase, ProductionHvpatchLoopJob};
+use super::binding::{
+    HvpatchProductionPhase, ProductionHvpatchLoopJob, registration_wake_callback,
+};
 use super::exec::ProductionHvpatchPollError;
 use super::outcome::HvpatchLoopSuspension;
 use super::*;
@@ -31,7 +33,41 @@ use carrick_kernel::el1_zone::HostLockWait;
 
 pub(super) enum OwnerMemoryAction {
     Syscall(carrick_hal::RawSyscall),
+    StatCopyout {
+        frame: carrick_hal::RawSyscall,
+        output: Box<carrick_kernel::dispatch::format_stat::StatCopyout>,
+    },
+    GetdentsCopyout {
+        frame: carrick_hal::RawSyscall,
+        output: Box<carrick_kernel::dispatch::fs::directory::GetdentsCopyout>,
+    },
+    ReadlinkCopyout {
+        frame: carrick_hal::RawSyscall,
+        output: Box<carrick_kernel::dispatch::fs::directory::ReadlinkCopyout>,
+    },
+    CloneParentTid {
+        frame: carrick_hal::RawSyscall,
+        address: u64,
+        internal_tid: i32,
+        tid: i32,
+    },
+    CloneChildTid {
+        address: u64,
+        tid: i32,
+    },
     Terminal,
+    Fault,
+    SignalFrame(Box<carrick_hal::sigframe::PendingSignalFrame>),
+    Ipc {
+        boundary: IpcBoundary,
+        token: host_ipc::OwnedIpcOperation,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum IpcBoundary {
+    Syscall(carrick_hal::RawSyscall),
+    El0,
 }
 
 thread_local! {
@@ -383,7 +419,17 @@ where
         };
         let own = zone.record_ref(own);
         let request = SyscallRequest::new(98, carrick_observability::compat::SyscallArgs([0; 6]));
-        let exit = self.settle_into_zone(control, state, own, seq, timeout, request)?;
+        let exit = self.settle_into_zone(
+            control,
+            continuation::quantum::ZoneSave {
+                base: state,
+                record: own,
+                origin: executor::residency::ZoneResumeOrigin::Guest,
+            },
+            seq,
+            timeout,
+            request,
+        )?;
         Ok(Some(exit))
     }
 
@@ -457,12 +503,12 @@ where
     fn settle_into_zone(
         &mut self,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
-        base: GuestCpuState,
-        record: RecordRef,
+        save: continuation::quantum::ZoneSave,
         seq: u32,
         timeout: Option<std::time::Duration>,
         request: SyscallRequest,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let record = save.record;
         let context = self
             .kernel
             .dispatcher
@@ -487,7 +533,7 @@ where
         let binding = control.binding.ok_or_else(|| {
             RuntimeError::Configuration("EL1 zone settle without a task binding".to_owned())
         })?;
-        binding.set_zone_save(continuation::quantum::ZoneSave { base, record });
+        binding.set_zone_save(save);
         self.state.service_kernel_context = Some(context);
         self.phase = HvpatchProductionPhase::ResumeZone;
         Ok(self.suspend(
@@ -600,7 +646,17 @@ where
         engine.discard_terminal_syscall_continuation()?;
         self.state.retire_syscall()?;
         let record = zone.record_ref(record);
-        self.settle_into_zone(control, state, record, seq, timeout, request)
+        self.settle_into_zone(
+            control,
+            continuation::quantum::ZoneSave {
+                base: state,
+                record,
+                origin: executor::residency::ZoneResumeOrigin::Guest,
+            },
+            seq,
+            timeout,
+            request,
+        )
     }
 
     /// Enroll an exact EL1 owner release before surrendering the executor.
@@ -653,7 +709,15 @@ where
                 as *const carrick_el1_abi::MmPortalSlots)
         };
         let syscall_state = match &action {
-            OwnerMemoryAction::Syscall(_) => {
+            OwnerMemoryAction::Syscall(_)
+            | OwnerMemoryAction::StatCopyout { .. }
+            | OwnerMemoryAction::GetdentsCopyout { .. }
+            | OwnerMemoryAction::ReadlinkCopyout { .. }
+            | OwnerMemoryAction::CloneParentTid { .. }
+            | OwnerMemoryAction::Ipc {
+                boundary: IpcBoundary::Syscall(_),
+                ..
+            } => {
                 let state = engine.snapshot_guest_state_for_publication()?;
                 let ctx = zone_ctx_from_state(&state, ZoneExit::Syscall { completed: true })?;
                 let request = self
@@ -664,7 +728,32 @@ where
                     .request;
                 Some((state, ctx, request))
             }
-            OwnerMemoryAction::Terminal => None,
+            OwnerMemoryAction::Ipc {
+                boundary: IpcBoundary::El0,
+                token,
+            } => {
+                let state = engine.snapshot_guest_state_for_publication()?;
+                let ctx = zone_ctx_from_state(&state, ZoneExit::El0)?;
+                let op = token
+                    .operation()
+                    .map_err(|error| ipc_error("owner wait operation", error))?;
+                let request = SyscallRequest::new(
+                    u64::from(op.nr),
+                    carrick_observability::compat::SyscallArgs([
+                        op.orig_x0,
+                        op.buf.0,
+                        op.progress.len,
+                        0,
+                        0,
+                        0,
+                    ]),
+                );
+                Some((state, ctx, request))
+            }
+            OwnerMemoryAction::Terminal
+            | OwnerMemoryAction::Fault
+            | OwnerMemoryAction::CloneChildTid { .. }
+            | OwnerMemoryAction::SignalFrame(_) => None,
         };
         let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
             RuntimeError::Configuration("owner wait lost its Kernel context".to_owned())
@@ -704,17 +793,183 @@ where
                     .host_parks
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 match (action, syscall_state) {
+                    (OwnerMemoryAction::Ipc { boundary, token }, Some((state, _, request))) => {
+                        let origin = match boundary {
+                            IpcBoundary::Syscall(_) => {
+                                executor::residency::ZoneResumeOrigin::HostSyscall
+                            }
+                            IpcBoundary::El0 => executor::residency::ZoneResumeOrigin::HostEl0,
+                        };
+                        let exit = self.settle_into_zone(
+                            control,
+                            continuation::quantum::ZoneSave {
+                                base: state,
+                                record: zone.record_ref(record),
+                                origin,
+                            },
+                            seq,
+                            None,
+                            request,
+                        )?;
+                        self.phase = HvpatchProductionPhase::ResumeIpcOwner { boundary, token };
+                        Ok(exit)
+                    }
+                    (
+                        OwnerMemoryAction::StatCopyout { frame, output },
+                        Some((state, _, request)),
+                    ) => {
+                        let exit = self.settle_into_zone(
+                            control,
+                            continuation::quantum::ZoneSave {
+                                base: state,
+                                record: zone.record_ref(record),
+                                origin: executor::residency::ZoneResumeOrigin::HostSyscall,
+                            },
+                            seq,
+                            None,
+                            request,
+                        )?;
+                        self.phase =
+                            HvpatchProductionPhase::ResumeStatCopyoutOwner { frame, output };
+                        Ok(exit)
+                    }
+                    (
+                        OwnerMemoryAction::GetdentsCopyout { frame, output },
+                        Some((state, _, request)),
+                    ) => {
+                        let exit = self.settle_into_zone(
+                            control,
+                            continuation::quantum::ZoneSave {
+                                base: state,
+                                record: zone.record_ref(record),
+                                origin: executor::residency::ZoneResumeOrigin::HostSyscall,
+                            },
+                            seq,
+                            None,
+                            request,
+                        )?;
+                        self.phase =
+                            HvpatchProductionPhase::ResumeGetdentsCopyoutOwner { frame, output };
+                        Ok(exit)
+                    }
+                    (
+                        OwnerMemoryAction::ReadlinkCopyout { frame, output },
+                        Some((state, _, request)),
+                    ) => {
+                        let exit = self.settle_into_zone(
+                            control,
+                            continuation::quantum::ZoneSave {
+                                base: state,
+                                record: zone.record_ref(record),
+                                origin: executor::residency::ZoneResumeOrigin::HostSyscall,
+                            },
+                            seq,
+                            None,
+                            request,
+                        )?;
+                        self.phase =
+                            HvpatchProductionPhase::ResumeReadlinkCopyoutOwner { frame, output };
+                        Ok(exit)
+                    }
                     (OwnerMemoryAction::Syscall(frame), Some((state, _, request))) => {
                         let exit = self.settle_into_zone(
                             control,
-                            state,
-                            zone.record_ref(record),
+                            continuation::quantum::ZoneSave {
+                                base: state,
+                                record: zone.record_ref(record),
+                                origin: executor::residency::ZoneResumeOrigin::HostSyscall,
+                            },
                             seq,
                             None,
                             request,
                         )?;
                         self.phase = HvpatchProductionPhase::ResumeOwnerZone { frame };
                         Ok(exit)
+                    }
+                    (
+                        OwnerMemoryAction::CloneParentTid {
+                            frame,
+                            address,
+                            internal_tid,
+                            tid,
+                        },
+                        Some((state, _, request)),
+                    ) => {
+                        let exit = self.settle_into_zone(
+                            control,
+                            continuation::quantum::ZoneSave {
+                                base: state,
+                                record: zone.record_ref(record),
+                                origin: executor::residency::ZoneResumeOrigin::HostSyscall,
+                            },
+                            seq,
+                            None,
+                            request,
+                        )?;
+                        self.phase = HvpatchProductionPhase::ResumeCloneParentTid {
+                            frame,
+                            address,
+                            internal_tid,
+                            tid,
+                        };
+                        Ok(exit)
+                    }
+                    (OwnerMemoryAction::CloneChildTid { address, tid }, None) => {
+                        let wait = carrick_kernel::kernel::continuation::ZoneWait::new(
+                            zone.record_ref(record),
+                            seq,
+                        );
+                        let continuation = carrick_kernel::kernel::continuation::BlockedContinuation::from_fault_zone_park(
+                            context,
+                            control.execution_lease_mut().map_err(RuntimeError::Trap)?,
+                            wait,
+                        ).map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+                        self.phase = HvpatchProductionPhase::ResumeCloneChildTid { address, tid };
+                        Ok(self.suspend(
+                            HvpatchLoopSuspension::BlockedContinuation,
+                            executor::ExecutorExit::BlockedContinuation {
+                                continuation: Box::new(continuation),
+                                vfork_activation: None,
+                            },
+                        ))
+                    }
+                    (OwnerMemoryAction::SignalFrame(pending), None) => {
+                        let wait = carrick_kernel::kernel::continuation::ZoneWait::new(
+                            zone.record_ref(record),
+                            seq,
+                        );
+                        let continuation = carrick_kernel::kernel::continuation::BlockedContinuation::from_signal_frame_zone_park(
+                            context,
+                            control.execution_lease_mut().map_err(RuntimeError::Trap)?,
+                            wait,
+                        ).map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+                        self.phase = HvpatchProductionPhase::ResumeSignalFrameOwner { pending };
+                        Ok(self.suspend(
+                            HvpatchLoopSuspension::BlockedContinuation,
+                            executor::ExecutorExit::BlockedContinuation {
+                                continuation: Box::new(continuation),
+                                vfork_activation: None,
+                            },
+                        ))
+                    }
+                    (OwnerMemoryAction::Fault, None) => {
+                        let wait = carrick_kernel::kernel::continuation::ZoneWait::new(
+                            zone.record_ref(record),
+                            seq,
+                        );
+                        let continuation = carrick_kernel::kernel::continuation::BlockedContinuation::from_fault_zone_park(
+                            context,
+                            control.execution_lease_mut().map_err(RuntimeError::Trap)?,
+                            wait,
+                        ).map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+                        self.phase = HvpatchProductionPhase::ResumeFaultOwner;
+                        Ok(self.suspend(
+                            HvpatchLoopSuspension::BlockedContinuation,
+                            executor::ExecutorExit::BlockedContinuation {
+                                continuation: Box::new(continuation),
+                                vfork_activation: None,
+                            },
+                        ))
                     }
                     (OwnerMemoryAction::Terminal, None) => {
                         let wait = carrick_kernel::kernel::continuation::ZoneWait::new(
@@ -752,6 +1007,10 @@ where
             Err((ObjectWaitError::Changed | ObjectWaitError::Stale, _token)) => {
                 zone.free_record(record);
                 match action {
+                    OwnerMemoryAction::Ipc { boundary, token } => {
+                        let route = self.ipc_continue(engine, token.into_token())?;
+                        self.drive_ipc_memory_route(engine, control, boundary, route)
+                    }
                     OwnerMemoryAction::Syscall(frame) => {
                         let outcome = self.state.redispatch_threaded_syscall(
                             &self.kernel,
@@ -759,6 +1018,35 @@ where
                             control.submission.host_wait_context(),
                         )?;
                         self.service_outcome(engine, control, frame, outcome)
+                    }
+                    OwnerMemoryAction::StatCopyout { frame, output } => {
+                        self.complete_stat_copyout(engine, control, frame, output)
+                    }
+                    OwnerMemoryAction::GetdentsCopyout { frame, output } => {
+                        self.complete_getdents_copyout(engine, control, frame, output)
+                    }
+                    OwnerMemoryAction::ReadlinkCopyout { frame, output } => {
+                        self.complete_readlink_copyout(engine, control, frame, output)
+                    }
+                    OwnerMemoryAction::CloneParentTid {
+                        frame,
+                        address,
+                        internal_tid,
+                        tid,
+                    } => self.complete_clone_parent_tid(
+                        engine,
+                        control,
+                        frame,
+                        address,
+                        internal_tid,
+                        tid,
+                    ),
+                    OwnerMemoryAction::CloneChildTid { address, tid } => {
+                        self.complete_clone_child_tid(engine, control, address, tid)
+                    }
+                    OwnerMemoryAction::Fault => Ok(executor::ExecutorExit::Syscall),
+                    OwnerMemoryAction::SignalFrame(pending) => {
+                        self.resume_signal_frame(engine, control, pending)
                     }
                     OwnerMemoryAction::Terminal => {
                         let action = self.take_terminal_memory_action()?;
@@ -802,6 +1090,67 @@ where
             )?,
         };
         self.service_outcome(engine, control, frame, outcome)
+    }
+
+    /// Consume the same exact owner handback as user-copy waits, preserving
+    /// the ordinary fault CPU save. Service a reserved signal at this fault
+    /// boundary now: no later syscall completion is required to deliver it.
+    pub(super) fn resume_owner_fault_zone(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let mut result = self.consume_owner_zone(control)?;
+        if result.completion
+            != carrick_kernel::kernel::continuation::ContinuationCompletion::ResumeFault
+        {
+            return Err(
+                RuntimeError::Configuration("owner fault resumed as a syscall".to_owned()).into(),
+            );
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let interrupted_pc = if carrick_hal::ExecLevel::from_pstate(
+            engine
+                .get_reg(carrick_hal::Reg::Pstate)
+                .map_err(|error| TrapError::Hypervisor(error.to_string()))?,
+        )
+        .is_guest()
+        {
+            Some(engine.current_pc()?)
+        } else {
+            None
+        };
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let interrupted_pc = Some(engine.current_pc()?);
+        let context = self
+            .state
+            .service_kernel_context
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::Configuration("owner fault resume lost context".to_owned())
+            })?
+            .retain_exact();
+        if let Some(outcome) = service_signals_threaded(
+            &self.kernel,
+            &context,
+            engine,
+            self.state.this_tid,
+            self.state.fatal_image_generation,
+            None,
+            interrupted_pc,
+            None,
+            result.take_reserved_signal(),
+            self.traps,
+        )? {
+            return Ok(self.enter_terminal_with_outcome(engine, outcome));
+        }
+        if let Some(exit) = self.suspend_for_process_quiesce(engine, control)? {
+            return Ok(exit);
+        }
+        if let Some(exit) = self.suspend_for_job_control(engine, control)? {
+            return Ok(exit);
+        }
+        Ok(executor::ExecutorExit::Syscall)
     }
 
     pub(super) fn consume_owner_zone(
@@ -1029,6 +1378,27 @@ pub(super) enum IpcHandbackRoute {
     Restart,
     /// The call must keep waiting: park the thread with its owned operation.
     Park(IpcPark),
+    Memory(IpcMemoryPark),
+}
+
+#[derive(Debug)]
+pub(crate) struct IpcMemoryPark {
+    token: host_ipc::OwnedIpcOperation,
+    dependency: carrick_guest_mem::MemoryPrepareError,
+}
+
+fn ipc_completion(
+    completion: Result<host_ipc::IpcHostOutcome, host_ipc::IpcCompletionError>,
+    services: host_ipc::ZoneHostServices,
+) -> Result<Result<host_ipc::IpcHostOutcome, IpcMemoryPark>, RuntimeError> {
+    match completion {
+        Ok(outcome) => Ok(Ok(outcome)),
+        Err(host_ipc::IpcCompletionError::Ipc(error)) => Err(ipc_error("completion", error)),
+        Err(host_ipc::IpcCompletionError::Memory { token, dependency }) => Ok(Err(IpcMemoryPark {
+            token: host_ipc::OwnedIpcOperation::new(token, services),
+            dependency,
+        })),
+    }
 }
 
 /// An owned operation the host parks on an object wait queue.
@@ -1099,16 +1469,20 @@ pub(super) fn ipc_handback_route<E: ThreadedEngine>(
     let object = IpcObjectHandle::from_raw(op.object);
     let snapshots =
         carrick_kernel::el1_zone::zone().map(|zone| host_ipc::lane_snapshots(zone, object));
-    let outcome = host_ipc::complete_handback(
+    let services = host_ipc::ZoneHostServices::new(context.kernel())
+        .map_err(|error| ipc_error("IPC owner", error))?;
+    let completion = host_ipc::complete_handback(
         &region,
         token,
         IpcMmKey(zone_mm.unwrap_or(0)),
         engine,
         None,
-        &host_ipc::ZoneHostServices::new(context.kernel())
-            .map_err(|error| ipc_error("IPC owner", error))?,
-    )
-    .map_err(|error| ipc_error("handback completion", error))?;
+        &services,
+    );
+    let outcome = match ipc_completion(completion, services)? {
+        Ok(outcome) => outcome,
+        Err(park) => return Ok(IpcHandbackRoute::Memory(park)),
+    };
     restart_with_remaining(engine, Some(request), &outcome)?;
     ipc_route(&kernel.dispatcher, context, tid, outcome, snapshots)
 }
@@ -1259,8 +1633,18 @@ where
                     self.state.retire_syscall()?;
                 }
                 let record = zone.record_ref(record);
-                self.settle_into_zone(control, state, record, seq, None, request)
-                    .map(IpcParkAttempt::Parked)
+                self.settle_into_zone(
+                    control,
+                    continuation::quantum::ZoneSave {
+                        base: state,
+                        record,
+                        origin: executor::residency::ZoneResumeOrigin::Guest,
+                    },
+                    seq,
+                    None,
+                    request,
+                )
+                .map(IpcParkAttempt::Parked)
             }
             Err((host_ipc::ObjectWaitError::Changed, token)) => {
                 let token = host_ipc::from_sched_token(token).ok_or_else(|| {
@@ -1288,16 +1672,20 @@ where
         let object = IpcObjectHandle::from_raw(op.object);
         let snapshots =
             carrick_kernel::el1_zone::zone().map(|zone| host_ipc::lane_snapshots(zone, object));
-        let outcome = host_ipc::complete_handback(
+        let services = host_ipc::ZoneHostServices::for_dispatcher(&self.kernel.dispatcher)
+            .map_err(|error| ipc_error("IPC owner", error))?;
+        let completion = host_ipc::complete_handback(
             &region,
             token,
             IpcMmKey(self.state.zone_mm.unwrap_or(0)),
             engine,
             None,
-            &host_ipc::ZoneHostServices::for_dispatcher(&self.kernel.dispatcher)
-                .map_err(|error| ipc_error("IPC owner", error))?,
-        )
-        .map_err(|error| ipc_error("continuation", error))?;
+            &services,
+        );
+        let outcome = match ipc_completion(completion, services)? {
+            Ok(outcome) => outcome,
+            Err(park) => return Ok(IpcHandbackRoute::Memory(park)),
+        };
         // Re-entered at the SVC, the re-run reads its timeout from x3.
         restart_with_remaining(engine, None, &outcome)?;
         let context = self
@@ -1312,6 +1700,379 @@ where
             outcome,
             snapshots,
         )?)
+    }
+
+    pub(super) fn resume_signal_frame(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        pending: Box<carrick_hal::sigframe::PendingSignalFrame>,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let (signum, restart) = (pending.signum(), pending.restart_syscall());
+        match engine.resume_signal_frame(pending) {
+            Ok(()) => {
+                carrick_kernel::event_ring::rec_signal_inject(
+                    self.state.this_tid.raw(),
+                    signum,
+                    restart,
+                );
+                Ok(executor::ExecutorExit::Syscall)
+            }
+            Err(TrapError::SignalFrameMemory {
+                pending,
+                dependency,
+            }) => self.park_signal_frame(engine, control, pending, *dependency),
+            Err(TrapError::SignalDeliveryFault) => {
+                self.kernel.record_fatal_signal(super::FatalSignalRecord {
+                    image_generation: self.state.fatal_image_generation,
+                    tid: self
+                        .state
+                        .service_kernel_context
+                        .as_ref()
+                        .ok_or_else(|| {
+                            RuntimeError::Configuration(
+                                "signal frame fault lost context".to_owned(),
+                            )
+                        })?
+                        .thread()
+                        .key()
+                        .tid,
+                    signo: 11,
+                    code: 0,
+                    addr: 0,
+                });
+                let result = assemble_run_result(&self.kernel, 139, Some(11), self.traps, false);
+                Ok(self.enter_terminal_with_outcome(
+                    engine,
+                    VcpuLoopOutcome::ProcessExit(Box::new(result)),
+                ))
+            }
+            Err(error) => Err(RuntimeError::Trap(error).into()),
+        }
+    }
+
+    pub(super) fn park_signal_frame(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        pending: Box<carrick_hal::sigframe::PendingSignalFrame>,
+        dependency: carrick_guest_mem::MemoryPrepareError,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        use carrick_guest_mem::MemoryPrepareError;
+        match dependency {
+            MemoryPrepareError::OwnerWait(wait)
+            | MemoryPrepareError::Supply(carrick_guest_mem::MemorySupplyRequest::Metadata {
+                observed: wait,
+                ..
+            }) => self.park_owner_memory_action(
+                engine,
+                control,
+                OwnerMemoryAction::SignalFrame(pending),
+                wait,
+            ),
+            MemoryPrepareError::Supply(request) => {
+                if let Some(wait) = self.supply_owner_memory(engine, request)? {
+                    let dependency = match wait {
+                        super::binding::OwnerSupplyWait::Owner(wait) => {
+                            MemoryPrepareError::OwnerWait(wait)
+                        }
+                        super::binding::OwnerSupplyWait::Physical(wait) => {
+                            MemoryPrepareError::Physical(wait)
+                        }
+                    };
+                    self.park_signal_frame(engine, control, pending, dependency)
+                } else {
+                    self.resume_signal_frame(engine, control, pending)
+                }
+            }
+            MemoryPrepareError::Physical(wait) => {
+                let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
+                    RuntimeError::Configuration(
+                        "signal frame physical wait lost context".to_owned(),
+                    )
+                })?;
+                let runtime = self.kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
+                    RuntimeError::Configuration(
+                        "signal frame physical wait lost scheduler".to_owned(),
+                    )
+                })?;
+                let scheduler = runtime.continuation_services(context.kernel()).0;
+                let wake = registration_wake_callback(scheduler, context.thread().key(), false);
+                let (subscription, ready) = wait.0.enroll(wake);
+                if ready || wait.0.is_ready() {
+                    drop(subscription);
+                    return self.resume_signal_frame(engine, control, pending);
+                }
+                self.phase = HvpatchProductionPhase::ResumeSignalFramePhysical {
+                    pending,
+                    wait,
+                    _subscription: subscription,
+                };
+                Ok(self.suspend(
+                    HvpatchLoopSuspension::BlockedContinuation,
+                    executor::ExecutorExit::Blocked(
+                        carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                    ),
+                ))
+            }
+            other => Err(RuntimeError::Configuration(format!(
+                "signal frame has invalid memory dependency: {other:?}"
+            ))
+            .into()),
+        }
+    }
+
+    pub(super) fn ipc_memory_park(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        boundary: IpcBoundary,
+        park: IpcMemoryPark,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        use carrick_guest_mem::MemoryPrepareError;
+        let IpcMemoryPark { token, dependency } = park;
+        match dependency {
+            MemoryPrepareError::OwnerWait(wait) => self.park_owner_memory_action(
+                engine,
+                control,
+                OwnerMemoryAction::Ipc { boundary, token },
+                wait,
+            ),
+            MemoryPrepareError::Supply(carrick_guest_mem::MemorySupplyRequest::Metadata {
+                observed,
+                ..
+            }) => self.park_owner_memory_action(
+                engine,
+                control,
+                OwnerMemoryAction::Ipc { boundary, token },
+                observed,
+            ),
+            MemoryPrepareError::Supply(request) => {
+                if let Some(wait) = self.supply_owner_memory(engine, request)? {
+                    let dependency = match wait {
+                        super::binding::OwnerSupplyWait::Owner(wait) => {
+                            MemoryPrepareError::OwnerWait(wait)
+                        }
+                        super::binding::OwnerSupplyWait::Physical(wait) => {
+                            MemoryPrepareError::Physical(wait)
+                        }
+                    };
+                    self.ipc_memory_park(
+                        engine,
+                        control,
+                        boundary,
+                        IpcMemoryPark { token, dependency },
+                    )
+                } else {
+                    let route = self.ipc_continue(engine, token.into_token())?;
+                    self.drive_ipc_memory_route(engine, control, boundary, route)
+                }
+            }
+            MemoryPrepareError::Physical(wait) => {
+                let context = self
+                    .state
+                    .service_kernel_context
+                    .as_ref()
+                    .ok_or_else(|| ipc_error("memory wait context", "missing"))?;
+                let runtime = self
+                    .kernel
+                    .hvpatch_runtime
+                    .as_ref()
+                    .ok_or_else(|| ipc_error("memory wait scheduler", "missing"))?;
+                let scheduler = runtime.continuation_services(context.kernel()).0;
+                let wake = registration_wake_callback(scheduler, context.thread().key(), false);
+                let (subscription, ready) = wait.0.enroll(wake);
+                if ready || wait.0.is_ready() {
+                    drop(subscription);
+                    let route = self.ipc_continue(engine, token.into_token())?;
+                    return self.drive_ipc_memory_route(engine, control, boundary, route);
+                }
+                self.phase = HvpatchProductionPhase::ResumeIpcPhysical {
+                    boundary,
+                    token,
+                    wait,
+                    _subscription: subscription,
+                };
+                Ok(self.suspend(
+                    HvpatchLoopSuspension::BlockedContinuation,
+                    executor::ExecutorExit::Blocked(
+                        carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                    ),
+                ))
+            }
+            other => Err(ipc_error("unexpected destination preparation refusal", other).into()),
+        }
+    }
+
+    pub(super) fn resume_ipc_owner(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        boundary: IpcBoundary,
+        token: host_ipc::OwnedIpcOperation,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let mut result = self.consume_owner_zone(control)?;
+        let reserved = result.take_reserved_signal();
+        let cause = reserved
+            .as_ref()
+            .map(|signal| {
+                let action = signal.action();
+                match boundary {
+                    // Common syscall completion derives SA_RESTART after the
+                    // actual committed prefix has become the guest return value.
+                    IpcBoundary::Syscall(_) => host_ipc::IpcCause::Signal { restart: false },
+                    IpcBoundary::El0 => ipc_signal_cause(
+                        Handback::Signal,
+                        carrick_kernel::kernel::evaluate_signal_delivery_action(
+                            signal.signum(),
+                            action,
+                        ),
+                        action.sa_flags & carrick_abi::LINUX_SA_RESTART != 0,
+                    ),
+                }
+            })
+            .or_else(|| {
+                owner_wait_interruption(&result.completion)
+                    .map(|_| host_ipc::IpcCause::Signal { restart: false })
+            });
+        self.state.reserved_signal = self.state.reserved_signal.take().or(reserved);
+        let route = if let Some(cause) = cause {
+            let region = host_ipc::host_region()
+                .ok_or_else(|| ipc_error("owner resume window", "missing"))?;
+            let outcome = host_ipc::interrupt(
+                &region,
+                token.into_token(),
+                cause,
+                &host_ipc::ZoneHostServices::for_dispatcher(&self.kernel.dispatcher)
+                    .map_err(|error| ipc_error("owner", error))?,
+            )
+            .map_err(|error| ipc_error("owner interruption", error))?;
+            let context = self
+                .state
+                .service_kernel_context
+                .as_ref()
+                .ok_or_else(|| ipc_error("owner resume context", "missing"))?;
+            ipc_route(
+                &self.kernel.dispatcher,
+                context,
+                self.state.this_tid,
+                outcome,
+                None,
+            )?
+        } else {
+            self.ipc_continue(engine, token.into_token())?
+        };
+        self.drive_ipc_memory_route(engine, control, boundary, route)
+    }
+
+    pub(super) fn continue_ipc_memory(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        boundary: IpcBoundary,
+        token: host_ipc::OwnedIpcOperation,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let route = self.ipc_continue(engine, token.into_token())?;
+        self.drive_ipc_memory_route(engine, control, boundary, route)
+    }
+
+    fn drive_ipc_memory_route(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        boundary: IpcBoundary,
+        mut route: IpcHandbackRoute,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        loop {
+            match route {
+                IpcHandbackRoute::Memory(park) => {
+                    return self.ipc_memory_park(engine, control, boundary, park);
+                }
+                IpcHandbackRoute::Complete(outcome) => match boundary {
+                    IpcBoundary::Syscall(frame) => {
+                        return self.service_outcome(engine, control, frame, outcome);
+                    }
+                    IpcBoundary::El0 => {
+                        let value = match outcome {
+                            DispatchOutcome::Returned { value } => value,
+                            DispatchOutcome::Errno { errno } => errno.guest_retval(),
+                            _ => return Err(ipc_error("memory completion", "not a return").into()),
+                        };
+                        let pc = engine.current_pc()?;
+                        engine
+                            .set_reg(carrick_hal::Reg::X(0), value as u64)
+                            .map_err(|error| ipc_error("memory x0", error))?;
+                        engine
+                            .set_reg(carrick_hal::Reg::Pc, pc.wrapping_add(4))
+                            .map_err(|error| ipc_error("memory pc", error))?;
+                        break;
+                    }
+                },
+                IpcHandbackRoute::Restart => match boundary {
+                    IpcBoundary::El0 => break,
+                    IpcBoundary::Syscall(_) => {
+                        return Err(ipc_error("memory restart", "unexpected").into());
+                    }
+                },
+                IpcHandbackRoute::Park(park) => match boundary {
+                    IpcBoundary::Syscall(frame) => {
+                        return self.ipc_park(engine, control, frame, park);
+                    }
+                    IpcBoundary::El0 => {
+                        let region = host_ipc::host_region()
+                            .ok_or_else(|| ipc_error("memory park window", "missing"))?;
+                        let op = region
+                            .operation(&park.token)
+                            .map_err(|error| ipc_error("memory park", error))?;
+                        let request = SyscallRequest::new(
+                            u64::from(op.nr),
+                            carrick_observability::compat::SyscallArgs([
+                                op.orig_x0,
+                                op.buf.0,
+                                op.progress.len,
+                                0,
+                                0,
+                                0,
+                            ]),
+                        );
+                        match self.ipc_park_attempt(
+                            engine,
+                            control,
+                            ZoneExit::El0,
+                            request,
+                            park,
+                        )? {
+                            IpcParkAttempt::Parked(exit) => return Ok(exit),
+                            IpcParkAttempt::Changed(token) => {
+                                route = self.ipc_continue(engine, token)?
+                            }
+                        }
+                    }
+                },
+            }
+        }
+        let context = self
+            .state
+            .service_kernel_context
+            .as_ref()
+            .ok_or_else(|| ipc_error("memory completion context", "missing"))?
+            .retain_exact();
+        let reserved = self.state.reserved_signal.take();
+        if let Some(outcome) = service_signals_threaded(
+            &self.kernel,
+            &context,
+            engine,
+            self.state.this_tid,
+            self.state.fatal_image_generation,
+            None,
+            Some(engine.current_pc()?),
+            None,
+            reserved,
+            self.traps,
+        )? {
+            return Ok(self.enter_terminal_with_outcome(engine, outcome));
+        }
+        Ok(executor::ExecutorExit::Syscall)
     }
 
     /// The handback's operation must wait: park it; a readiness change
@@ -1339,6 +2100,14 @@ where
             )? {
                 IpcParkAttempt::Parked(exit) => return Ok(exit),
                 IpcParkAttempt::Changed(token) => match self.ipc_continue(engine, token)? {
+                    IpcHandbackRoute::Memory(park) => {
+                        return self.ipc_memory_park(
+                            engine,
+                            control,
+                            IpcBoundary::Syscall(frame),
+                            park,
+                        );
+                    }
                     IpcHandbackRoute::Park(next) => park = next,
                     IpcHandbackRoute::Complete(outcome) => {
                         return self.service_outcome(engine, control, frame, outcome);
@@ -1471,6 +2240,11 @@ where
         };
         loop {
             match route {
+                IpcHandbackRoute::Memory(park) => {
+                    return self
+                        .ipc_memory_park(engine, control, IpcBoundary::El0, park)
+                        .map(Some);
+                }
                 IpcHandbackRoute::Complete(outcome) => {
                     let value = match outcome {
                         DispatchOutcome::Errno { errno } => errno.guest_retval(),

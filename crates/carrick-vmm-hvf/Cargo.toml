@@ -80,7 +80,3 @@ carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 # The real EL1 guest-COW resolver drives the host settlement model tests.
 carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
 sha2.workspace = true
-
-# Test gate lanes (`just xtask test-lanes check`; carrick-xtask src/test_lanes.rs).
-[package.metadata.carrick.test-lanes]
-"*" = "signed-hvf"

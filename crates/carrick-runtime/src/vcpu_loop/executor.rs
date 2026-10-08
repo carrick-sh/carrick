@@ -1545,6 +1545,7 @@ fn next_runnable<F: PersistentExecutor>(
             .lost_adoptions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    carrick_kernel::el1_zone::hand_back_completions();
     zone.sweep_cancelled(slot);
     carrick_kernel::el1_zone::hand_back_wanted(slot);
     if registration.is_spare() {

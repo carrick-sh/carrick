@@ -20,10 +20,11 @@ rationale = "EL1 increment 2, first-touch checkpoint (structural witness). Prior
 structural_budgets = []
 
 [bindings]
+vm_free = "carrick-aarch64::user_transfer::grant_wait_tests::fault_owner_wait_releases_physical_custody_before_parking; carrick-runtime::vcpu_loop::signal::first_touch_access_tests::{owner_fault_wait_clears_only_its_exact_request_without_denial,owner_fault_wait_from_another_mm_preserves_the_claimed_request}; carrick-kernel::kernel::continuation::tests::{fault_zone_capture_has_no_syscall_and_resumes_the_fault,fault_zone_capture_preserves_a_signal_reservation_without_eintr_or_restart,fault_zone_capture_rejects_another_threads_execution_lease} (unclaimed owner notification, exact mailbox and fault continuation only; no live EL0/MMU claim)"
 embed = "carrick-embed::el1_sched (signed; el1_memory_first_touch_stays_in_guest passes semantic completion across 256, 1024 and 4096 pages per process and asserts incremental host-exit slope < 0.125 exits/page across both processes; exact committed exit counts 99/107/113 and slopes 0.0052/0.0010)"
 
 [bindings.unresolved]
-vm_free = "VM-free dispatcher tests verify memory layout and mapping semantics, but cannot execute EL0 translation faults, MMU data aborts, or ARM stage-1 page-table installation."
+vm_free_fault_execution = "Owner-wait transport and continuation bindings cannot execute EL0 translation faults, MMU data aborts, or ARM stage-1 page-table installation. Fresh exact signed confirmation of the owner-wait repair remains required."
 docker = "The static first-touch fixture passed at 256/1024/4096 pages on native arm64 ubuntu image sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517. Raw transcripts and fixture hash are retained in target/el1-completion/first-touch; automated differential binding and permission/rollback/frame-return coverage remain open."
 embed_structural = "Incremental host-exit slope (< 0.125 exits/added page) is the accepted structural witness. The exact committed signed run records 0.0052 and 0.0010; exact frame-return and rollback counters remain required for the rest of checkpoint 2."
 embed_timing = "Timing is not asserted for this initial structural witness; uninstrumented release comparison against Docker will be conducted at full memory milestone acceptance."

@@ -648,6 +648,69 @@ pub(crate) fn read_pipe<M: CurrentMmMemory>(
         return DispatchOutcome::Returned { value: 0 };
     }
     let nonblocking = status_flags & LINUX_O_NONBLOCK != 0;
+    if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
+        // Observe readiness without retaining an IPC lock across owner
+        // preparation. The retained drain rechecks the same pipe afterwards.
+        let snapshot = pipe.snapshot();
+        let target = length.min(snapshot.unread);
+        if target == 0 {
+            return if snapshot.writers == 0 {
+                DispatchOutcome::Returned { value: 0 }
+            } else if nonblocking {
+                DispatchOutcome::errno(LINUX_EAGAIN)
+            } else {
+                wait_for_pipe_readable(pipe, authority)
+            };
+        }
+        let mut copied = 0usize;
+        while copied < target {
+            let Some(at) = address.checked_add(copied as u64) else {
+                return if copied == 0 {
+                    DispatchOutcome::errno(LINUX_EFAULT)
+                } else {
+                    DispatchOutcome::returned_len_or_errno(copied)
+                };
+            };
+            let step = (4096 - (at as usize & 4095)).min(target - copied);
+            let Some(range) =
+                carrick_guest_mem::GuestWriteRange::new(carrick_guest_mem::GuestVa(at), step)
+            else {
+                return if copied == 0 {
+                    DispatchOutcome::errno(LINUX_EFAULT)
+                } else {
+                    DispatchOutcome::returned_len_or_errno(copied)
+                };
+            };
+            let prepared = match memory.prepare_write(&[range]) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    return if copied == 0 {
+                        crate::el1_delegation::owner_prepare_refusal(error)
+                    } else {
+                        DispatchOutcome::returned_len_or_errno(copied)
+                    };
+                }
+            };
+            match take_pipe_bytes(pipe, step) {
+                PipeDrain::Bytes(source) => {
+                    let count = source.len();
+                    prepared.commit(&[&source]);
+                    source.commit(count);
+                    copied += count;
+                }
+                PipeDrain::Eof => break,
+                PipeDrain::WouldBlock if copied > 0 => break,
+                PipeDrain::WouldBlock => {
+                    return if nonblocking {
+                        DispatchOutcome::errno(LINUX_EAGAIN)
+                    } else {
+                        wait_for_pipe_readable(pipe, authority)
+                    };
+                }
+            }
+        }
+        return DispatchOutcome::returned_len_or_errno(copied);
+    }
     let mut offset = 0usize;
     let result = pipe.read_with(length, |bytes| {
         if memory.write_bytes(address + offset as u64, bytes).is_err() {
@@ -950,6 +1013,29 @@ impl<'a> FsView<'a> {
             let nonblock = flags & LINUX_O_NONBLOCK;
             let fd_flags = linux_fd_flags_from_open_flags(flags);
 
+            let owner_output = memory.user_memory_venue()
+                == carrick_guest_mem::UserMemoryVenue::Owner;
+            let mut prepared = None;
+            if owner_output
+                && let Some(range) = carrick_guest_mem::GuestWriteRange::new(
+                    carrick_guest_mem::GuestVa(address), LinuxFdPair::ABI_SIZE,
+                )
+            {
+                match memory.prepare_write(&[range]) {
+                    Ok(permit) => prepared = Some(permit),
+                    // Resource errors retain their existing precedence over a
+                    // genuine bad destination. Only owned dependencies leave
+                    // before creation, so resumption cannot replay a pipe.
+                    Err(
+                        carrick_guest_mem::MemoryPrepareError::Fault(_)
+                        | carrick_guest_mem::MemoryPrepareError::Limit(_),
+                    ) => {},
+                    Err(dependency) => {
+                        return Ok(crate::el1_delegation::owner_prepare_refusal(dependency));
+                    }
+                }
+            }
+
             let pipe_id = next_pipe_id();
             // Only the authority's own host memory is ENOMEM; creation
             // refusals are typed Linux limits (ENFILE), never a table size.
@@ -985,7 +1071,18 @@ impl<'a> FsView<'a> {
                 return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
             };
             let pair = LinuxFdPair { read_fd, write_fd };
-            if write_kernel_struct_raw(memory, address, &pair).is_err() {
+            let copied = if owner_output {
+                if let Some(permit) = prepared.take() {
+                    permit.commit(&[pair.abi_bytes()]);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                drop(prepared);
+                write_kernel_struct_raw(memory, address, &pair).is_ok()
+            };
+            if !copied {
                 let removed = {
                     let files = this.captured_file_table();
                     let mut table = files.write_open_files();

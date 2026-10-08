@@ -92,6 +92,10 @@ impl OwnerForkMmu for Aarch64Mmu {
         .map(|changed| changed.unwrap_or(word))
         .map_err(|_| OwnerMmuRefusal::Unreachable)
     }
+    fn arm_synthetic_private(word: u64, level: usize, va: UserVa) -> Result<u64, OwnerMmuRefusal> {
+        crate::aarch64::arm_synthetic_readonly_private(word, level, va.raw())
+            .map_err(|_| OwnerMmuRefusal::Unreachable)
+    }
     fn needs_break_before_make(before: u64, after: u64, level: usize) -> bool {
         before & 1 != 0 && Self::is_table(after, level)
     }

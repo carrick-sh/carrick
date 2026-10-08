@@ -1,5 +1,5 @@
 #![cfg_attr(
-    not(target_os = "macos"),
+    all(not(target_os = "macos"), not(test)),
     expect(
         dead_code,
         reason = "bound by the KVM carrier at M5: docs/superpowers/plans/2026-10-04-kvm-hvpatch-carrier.md"
@@ -209,7 +209,25 @@ pub(super) enum HvpatchProductionPhase {
     Resident,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     BootstrapProcessChild(ProcessChildBootstrap),
-    BootstrapThreadChild,
+    BootstrapThreadChild {
+        address: u64,
+        tid: i32,
+    },
+    ResumeCloneChildTid {
+        address: u64,
+        tid: i32,
+    },
+    ResumeCloneParentTid {
+        frame: carrick_hal::RawSyscall,
+        address: u64,
+        internal_tid: i32,
+        tid: i32,
+    },
+    ResumeMemoryCompletionPhysical {
+        action: zone::OwnerMemoryAction,
+        wait: carrick_guest_mem::OwnedMemoryWait,
+        _subscription: Box<dyn std::fmt::Debug + Send + Sync>,
+    },
     ResumeForkQuiesce {
         _subscription: carrick_thread::fork_quiesce::QuiesceSubscription,
     },
@@ -253,6 +271,18 @@ pub(super) enum HvpatchProductionPhase {
     ResumeOwnerZone {
         frame: carrick_hal::RawSyscall,
     },
+    ResumeStatCopyoutOwner {
+        frame: carrick_hal::RawSyscall,
+        output: Box<carrick_kernel::dispatch::format_stat::StatCopyout>,
+    },
+    ResumeGetdentsCopyoutOwner {
+        frame: carrick_hal::RawSyscall,
+        output: Box<carrick_kernel::dispatch::fs::directory::GetdentsCopyout>,
+    },
+    ResumeReadlinkCopyoutOwner {
+        frame: carrick_hal::RawSyscall,
+        output: Box<carrick_kernel::dispatch::fs::directory::ReadlinkCopyout>,
+    },
     ResumeTerminalOwner {
         action: Box<TerminalMemoryAction>,
     },
@@ -274,6 +304,27 @@ pub(super) enum HvpatchProductionPhase {
     /// The exact unpublished physical grant must settle before EL0 can
     /// reselect this fault. No syscall completion belongs to this wait.
     ResumeFaultPhysical {
+        wait: carrick_guest_mem::OwnedMemoryWait,
+        _subscription: Box<dyn std::fmt::Debug + Send + Sync>,
+    },
+    /// The semantic owner notification retains a fault, with the ordinary
+    /// saved CPU and no syscall completion or zone CPU substitution.
+    ResumeFaultOwner,
+    ResumeSignalFrameOwner {
+        pending: Box<carrick_hal::sigframe::PendingSignalFrame>,
+    },
+    ResumeSignalFramePhysical {
+        pending: Box<carrick_hal::sigframe::PendingSignalFrame>,
+        wait: carrick_guest_mem::OwnedMemoryWait,
+        _subscription: Box<dyn std::fmt::Debug + Send + Sync>,
+    },
+    ResumeIpcOwner {
+        boundary: zone::IpcBoundary,
+        token: carrick_kernel::kernel::continuation::ipc::OwnedIpcOperation,
+    },
+    ResumeIpcPhysical {
+        boundary: zone::IpcBoundary,
+        token: carrick_kernel::kernel::continuation::ipc::OwnedIpcOperation,
         wait: carrick_guest_mem::OwnedMemoryWait,
         _subscription: Box<dyn std::fmt::Debug + Send + Sync>,
     },
@@ -429,13 +480,24 @@ impl HvpatchProductionPhase {
             Self::TerminalClaimRetry { .. } => 10,
             Self::TerminalRetireRetry { .. } => 11,
             Self::Complete => 12,
-            Self::BootstrapThreadChild => 13,
+            Self::BootstrapThreadChild { .. } => 13,
             Self::ResumeZone | Self::ResumeOwnerZone { .. } => 14,
             Self::ResumeOwnerPhysical { .. } => 18,
             Self::ResumeTerminalOwner { .. } => 19,
             Self::ResumeTerminalPhysical { .. } => 20,
             Self::TerminalMemoryRetry { .. } => 21,
             Self::ResumeFaultPhysical { .. } => 22,
+            Self::ResumeFaultOwner => 23,
+            Self::ResumeIpcOwner { .. } => 24,
+            Self::ResumeIpcPhysical { .. } => 25,
+            Self::ResumeCloneChildTid { .. } => 26,
+            Self::ResumeCloneParentTid { .. } => 27,
+            Self::ResumeMemoryCompletionPhysical { .. } => 28,
+            Self::ResumeStatCopyoutOwner { .. } => 29,
+            Self::ResumeGetdentsCopyoutOwner { .. } => 30,
+            Self::ResumeReadlinkCopyoutOwner { .. } => 31,
+            Self::ResumeSignalFrameOwner { .. } => 32,
+            Self::ResumeSignalFramePhysical { .. } => 33,
         }
     }
 }
@@ -444,7 +506,7 @@ impl HvpatchProductionPhase {
 #[test]
 pub(crate) fn bootstrap_thread_child_probe_ordinal_is_append_only() {
     assert_eq!(
-        HvpatchProductionPhase::BootstrapThreadChild.probe_ordinal(),
+        HvpatchProductionPhase::BootstrapThreadChild { address: 0, tid: 0 }.probe_ordinal(),
         13
     );
 }
@@ -1234,6 +1296,13 @@ where
                 "publish persistent failure Kernel exit failed: {failure}"
             );
         }
+        crate::probes::hvpatch_n1_reservation_custody(
+            4,
+            terminal_mm.raw(),
+            0,
+            terminal_context.task().key().id.raw() as u64,
+            terminal_context.task().key().serial.raw(),
+        );
         if owns_final_mm {
             if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
                 table.retire_overlapping(terminal_mm.raw(), 0, u64::MAX);
@@ -1337,7 +1406,14 @@ where
                 );
             }
         }
-        self.pending_terminal_retirement = Some(
+        self.pending_terminal_retirement = Some({
+            crate::probes::hvpatch_n1_reservation_custody(
+                3,
+                terminal_mm.raw(),
+                0,
+                terminal_context.task().key().id.raw() as u64,
+                terminal_context.task().key().serial.raw(),
+            );
             process
                 .begin_address_space_retirement(exit_code, self.state.this_tid, process_exit_event)
                 .unwrap_or_else(|failure| {
@@ -1346,8 +1422,8 @@ where
                         "kernel::terminal_settlement",
                         "retire persistent failure MM/ASID failed: {failure}"
                     );
-                }),
-        );
+                })
+        });
         drop(owner_set_edit);
         drop(topology);
         self.kernel.publish_process_terminal(terminal_publication);
@@ -1900,7 +1976,7 @@ where
         )
     }
 
-    fn suspend_for_process_quiesce(
+    pub(super) fn suspend_for_process_quiesce(
         &mut self,
         engine: &E,
         _control: &executor::HvpatchQuantumControl<'_, '_>,
@@ -1983,7 +2059,7 @@ where
         }
     }
 
-    fn suspend_for_job_control(
+    pub(super) fn suspend_for_job_control(
         &mut self,
         engine: &mut E,
         _control: &executor::HvpatchQuantumControl<'_, '_>,
@@ -2094,13 +2170,11 @@ where
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[allow(clippy::too_many_arguments)]
-    fn rollback_published_hvpatch_clone<M: threads::CloneTidMemory>(
+    fn rollback_published_hvpatch_clone(
         &self,
-        memory: &mut M,
         context: &carrick_kernel::kernel::KernelContext,
         generation: carrick_kernel::kernel::objects::ExecutionGeneration,
         tid: ThreadId,
-        tid_outputs: &threads::CloneTidOutputTransaction,
         logical: Option<PreparedHvpatchLogicalJob>,
         registry_installed: bool,
     ) {
@@ -2160,13 +2234,6 @@ where
         if registry_installed {
             self.state.registry.exit(tid);
         }
-        tid_outputs.rollback(memory).unwrap_or_else(|error| {
-            eprintln!("carrick: FATAL: restore published HVPatch clone TID outputs: {error}");
-            carrick_fatal!(
-                "hvpatch::clone_rollback",
-                "restore published HVPatch clone TID outputs failed: {error}"
-            );
-        });
         if let Some(completion) = completion {
             let id = completion.id();
             let _ = self.state.threads.take_by_id(id);
@@ -2353,18 +2420,6 @@ where
         let linux_tid = prepared.tid();
         let visible_tid = prepared.visible_tid();
         let tid = ThreadId::from_guest_supplied_tid(linux_tid.raw());
-        let tid_outputs = match threads::CloneTidOutputTransaction::capture(
-            memory,
-            parent_tid_addr,
-            child_tid_addr,
-        ) {
-            Ok(outputs) => outputs,
-            Err(errno) => {
-                return Ok(PersistentHvpatchCloneAttempt::Complete(
-                    threads::CloneThreadSpawn::Errno(errno),
-                ));
-            }
-        };
         let (task_key, thread_key, mm, expected_generation) =
             prepared.prepared_execution_identity();
         let mm_binding = process.mm_binding().ok_or_else(|| {
@@ -2411,36 +2466,15 @@ where
             mm.raw(),
             asid_generation,
         )?;
-        if !tid_outputs.publish(memory, visible_tid, tid) {
-            tid_outputs.rollback(memory).map_err(|error| {
-                RuntimeError::Configuration(format!(
-                    "restore failed HVPatch clone TID copyout: {error}"
-                ))
-            })?;
-            ops.abort(prepared_backend)?;
-            return Ok(PersistentHvpatchCloneAttempt::Complete(
-                threads::CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EFAULT),
-            ));
-        }
         if let Err(error) =
             check_hvpatch_clone_failpoint(parent_context.task(), HvpatchCloneFailpoint::TidCopyout)
         {
-            tid_outputs.rollback(memory).map_err(|rollback| {
-                RuntimeError::Configuration(format!(
-                    "restore failpoint HVPatch clone TID outputs: {rollback}"
-                ))
-            })?;
             ops.abort(prepared_backend)?;
             return Err(error);
         }
         let published = match prepared.commit() {
             Ok(published) => published,
             Err(error) => {
-                tid_outputs.rollback(memory).map_err(|rollback| {
-                    RuntimeError::Configuration(format!(
-                        "restore unpublished HVPatch clone TID outputs: {rollback}"
-                    ))
-                })?;
                 ops.abort(prepared_backend)?;
                 return Err(RuntimeError::Configuration(format!(
                     "publish persistent HVPatch thread: {error}"
@@ -2509,13 +2543,6 @@ where
                         "retire generation-drifted clone failed: {error}"
                     );
                 });
-                tid_outputs.rollback(memory).unwrap_or_else(|error| {
-                    eprintln!("carrick: FATAL: restore generation-drifted clone TIDs: {error}");
-                    carrick_fatal!(
-                        "hvpatch::clone_lifecycle",
-                        "restore generation-drifted clone TIDs failed: {error}"
-                    );
-                });
                 return Err(RuntimeError::Configuration(
                     "persistent HVPatch child execution generation drifted".to_owned(),
                 ));
@@ -2538,13 +2565,6 @@ where
                             "retire unpublished clone failed: {retire}"
                         );
                     });
-                tid_outputs.rollback(memory).unwrap_or_else(|rollback| {
-                    eprintln!("carrick: FATAL: restore published clone TIDs: {rollback}");
-                    carrick_fatal!(
-                        "hvpatch::clone_lifecycle",
-                        "restore published clone TIDs failed: {rollback}"
-                    );
-                });
                 return Err(RuntimeError::Configuration(format!(
                     "publish persistent HVPatch child execution state: {error}"
                 )));
@@ -2578,13 +2598,6 @@ where
                         "retire carrier-commit clone failed: {retire}"
                     );
                 });
-                tid_outputs.rollback(memory).unwrap_or_else(|rollback| {
-                    eprintln!("carrick: FATAL: restore carrier-commit clone TIDs: {rollback}");
-                    carrick_fatal!(
-                        "hvpatch::clone_lifecycle",
-                        "restore carrier-commit clone TIDs failed: {rollback}"
-                    );
-                });
                 return Err(error);
             }
         };
@@ -2593,15 +2606,7 @@ where
             HvpatchCloneFailpoint::BackendCommit,
         ) {
             drop(task_backend);
-            self.rollback_published_hvpatch_clone(
-                memory,
-                &child_context,
-                generation,
-                tid,
-                &tid_outputs,
-                None,
-                false,
-            );
+            self.rollback_published_hvpatch_clone(&child_context, generation, tid, None, false);
             return Err(error);
         }
         let cow_identity = carrick_hal::FrameCowIdentity {
@@ -2612,6 +2617,7 @@ where
         };
         let cow_authority = Arc::new(KernelFrameCowAuthority {
             runtime: Arc::downgrade(&self.kernel),
+            host_backing: Some(self.kernel.dispatcher.mem_view().host_backing_access()),
             deferred_anonymous: self.kernel.dispatcher.deferred_anonymous_state(mm),
             kernel: Arc::clone(child_context.kernel()),
             mm,
@@ -2625,15 +2631,7 @@ where
             Ok(token) => token,
             Err(error) => {
                 drop(task_backend);
-                self.rollback_published_hvpatch_clone(
-                    memory,
-                    &child_context,
-                    generation,
-                    tid,
-                    &tid_outputs,
-                    None,
-                    false,
-                );
+                self.rollback_published_hvpatch_clone(&child_context, generation, tid, None, false);
                 return Err(RuntimeError::Configuration(error));
             }
         };
@@ -2646,15 +2644,7 @@ where
             })
         {
             drop(task_backend);
-            self.rollback_published_hvpatch_clone(
-                memory,
-                &child_context,
-                generation,
-                tid,
-                &tid_outputs,
-                None,
-                false,
-            );
+            self.rollback_published_hvpatch_clone(&child_context, generation, tid, None, false);
             return Err(error);
         }
 
@@ -2665,15 +2655,7 @@ where
         ) {
             Ok(runtime) => runtime,
             Err(error) => {
-                self.rollback_published_hvpatch_clone(
-                    memory,
-                    &child_context,
-                    generation,
-                    tid,
-                    &tid_outputs,
-                    None,
-                    false,
-                );
+                self.rollback_published_hvpatch_clone(&child_context, generation, tid, None, false);
                 return Err(error.into());
             }
         };
@@ -2686,19 +2668,11 @@ where
             generation,
             injected_lease: child_runtime.injected_lease,
             bootstrap_process_child: None,
-            bootstrap_thread_child: true,
+            bootstrap_thread_child: Some((child_tid_addr, visible_tid)),
         }) {
             Ok(logical) => logical,
             Err(error) => {
-                self.rollback_published_hvpatch_clone(
-                    memory,
-                    &child_context,
-                    generation,
-                    tid,
-                    &tid_outputs,
-                    None,
-                    false,
-                );
+                self.rollback_published_hvpatch_clone(&child_context, generation, tid, None, false);
                 return Err(RuntimeError::Trap(error));
             }
         };
@@ -2713,11 +2687,9 @@ where
             Ok(dormant) => dormant,
             Err(error) => {
                 self.rollback_published_hvpatch_clone(
-                    memory,
                     &child_context,
                     generation,
                     tid,
-                    &tid_outputs,
                     Some(logical),
                     false,
                 );
@@ -2734,11 +2706,9 @@ where
         ) {
             drop(dormant);
             self.rollback_published_hvpatch_clone(
-                memory,
                 &child_context,
                 generation,
                 tid,
-                &tid_outputs,
                 Some(logical),
                 true,
             );
@@ -2749,11 +2719,9 @@ where
             Err(error) => {
                 drop(dormant);
                 self.rollback_published_hvpatch_clone(
-                    memory,
                     &child_context,
                     generation,
                     tid,
-                    &tid_outputs,
                     Some(logical),
                     true,
                 );
@@ -2771,11 +2739,9 @@ where
             None => {
                 drop(dormant);
                 self.rollback_published_hvpatch_clone(
-                    memory,
                     &child_context,
                     generation,
                     tid,
-                    &tid_outputs,
                     Some(logical),
                     true,
                 );
@@ -2787,11 +2753,9 @@ where
         if let Err(error) = logical.install_start_gate(start_gate) {
             drop(dormant);
             self.rollback_published_hvpatch_clone(
-                memory,
                 &child_context,
                 generation,
                 tid,
-                &tid_outputs,
                 Some(logical),
                 true,
             );
@@ -2802,11 +2766,9 @@ where
             Err(error) => {
                 drop(dormant);
                 self.rollback_published_hvpatch_clone(
-                    memory,
                     &child_context,
                     generation,
                     tid,
-                    &tid_outputs,
                     Some(logical),
                     true,
                 );
@@ -2818,11 +2780,9 @@ where
         {
             drop(dormant);
             self.rollback_published_hvpatch_clone(
-                memory,
                 &child_context,
                 generation,
                 tid,
-                &tid_outputs,
                 Some(logical),
                 true,
             );
@@ -2834,11 +2794,9 @@ where
             proof,
         ) {
             self.rollback_published_hvpatch_clone(
-                memory,
                 &child_context,
                 generation,
                 tid,
-                &tid_outputs,
                 Some(logical),
                 true,
             );
@@ -2848,11 +2806,9 @@ where
             check_hvpatch_clone_failpoint(parent_context.task(), HvpatchCloneFailpoint::Activation)
         {
             self.rollback_published_hvpatch_clone(
-                memory,
                 &child_context,
                 generation,
                 tid,
-                &tid_outputs,
                 Some(logical),
                 true,
             );
@@ -2863,6 +2819,7 @@ where
             threads::CloneThreadSpawn::Started {
                 internal: linux_tid,
                 visible: visible_tid,
+                parent_tid_addr,
             },
         ))
     }
@@ -2871,13 +2828,24 @@ where
     pub(super) fn complete_persistent_hvpatch_clone(
         &mut self,
         engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        frame: carrick_hal::RawSyscall,
         spawned: threads::CloneThreadSpawn,
-    ) -> Result<executor::ExecutorExit, RuntimeError> {
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         let (completed_internal_tid, completed_visible_tid, completed_errno) = match spawned {
-            threads::CloneThreadSpawn::Started { internal, visible } => {
-                self.state
-                    .complete_returned(engine, &self.kernel.reporter, i64::from(visible))?;
-                (internal.raw(), visible, 0)
+            threads::CloneThreadSpawn::Started {
+                internal,
+                visible,
+                parent_tid_addr,
+            } => {
+                return self.complete_clone_parent_tid(
+                    engine,
+                    control,
+                    frame,
+                    parent_tid_addr,
+                    internal.raw(),
+                    visible,
+                );
             }
             threads::CloneThreadSpawn::Errno(errno) => {
                 self.state.complete_returned(
@@ -2904,6 +2872,253 @@ where
             completed_errno,
         );
         Ok(executor::ExecutorExit::Syscall)
+    }
+
+    pub(super) fn complete_clone_parent_tid(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        frame: carrick_hal::RawSyscall,
+        address: u64,
+        internal_tid: i32,
+        tid: i32,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        use carrick_guest_mem::MemoryPrepareError;
+        match threads::publish_clone_tid(engine, address, tid) {
+            Ok(()) => {
+                self.state
+                    .complete_returned(engine, &self.kernel.reporter, i64::from(tid))?;
+                carrick_kernel::event_ring::rec(
+                    carrick_kernel::event_ring::CLONESPAWN,
+                    self.state.this_tid.raw(),
+                    internal_tid,
+                    0,
+                );
+                crate::probes::mn_clone_outcome(
+                    tid,
+                    carrick_observability::probes::HvpatchCloneThreadPhase::Completed,
+                    0,
+                );
+                Ok(executor::ExecutorExit::Syscall)
+            }
+            Err(MemoryPrepareError::OwnerWait(wait)) => self.park_owner_memory_action(
+                engine,
+                control,
+                zone::OwnerMemoryAction::CloneParentTid {
+                    frame,
+                    address,
+                    internal_tid,
+                    tid,
+                },
+                wait,
+            ),
+            Err(error) => self.wait_for_memory_completion(
+                engine,
+                control,
+                zone::OwnerMemoryAction::CloneParentTid {
+                    frame,
+                    address,
+                    internal_tid,
+                    tid,
+                },
+                error,
+            ),
+        }
+    }
+
+    pub(super) fn complete_clone_child_tid(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        address: u64,
+        tid: i32,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        use carrick_guest_mem::MemoryPrepareError;
+        match threads::publish_clone_tid(engine, address, tid) {
+            Ok(()) => {
+                self.state
+                    .complete_precompleted_child(&self.kernel.reporter, 0)?;
+                Ok(executor::ExecutorExit::Syscall)
+            }
+            Err(MemoryPrepareError::OwnerWait(wait)) => self.park_owner_memory_action(
+                engine,
+                control,
+                zone::OwnerMemoryAction::CloneChildTid { address, tid },
+                wait,
+            ),
+            Err(error) => self.wait_for_memory_completion(
+                engine,
+                control,
+                zone::OwnerMemoryAction::CloneChildTid { address, tid },
+                error,
+            ),
+        }
+    }
+
+    pub(super) fn complete_stat_copyout(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        frame: carrick_hal::RawSyscall,
+        output: Box<carrick_kernel::dispatch::format_stat::StatCopyout>,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let outcome = (*output).resume(engine);
+        self.service_outcome(engine, control, frame, outcome)
+    }
+
+    #[allow(clippy::boxed_local)]
+    pub(super) fn complete_getdents_copyout(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        frame: carrick_hal::RawSyscall,
+        output: Box<carrick_kernel::dispatch::fs::directory::GetdentsCopyout>,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let outcome = (*output).resume(engine);
+        self.service_outcome(engine, control, frame, outcome)
+    }
+
+    #[allow(clippy::boxed_local)]
+    pub(super) fn complete_readlink_copyout(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        frame: carrick_hal::RawSyscall,
+        output: Box<carrick_kernel::dispatch::fs::directory::ReadlinkCopyout>,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let outcome = (*output).resume(engine);
+        self.service_outcome(engine, control, frame, outcome)
+    }
+
+    fn drive_memory_completion_action(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        action: zone::OwnerMemoryAction,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        match action {
+            zone::OwnerMemoryAction::StatCopyout { frame, output } => {
+                self.complete_stat_copyout(engine, control, frame, output)
+            }
+            zone::OwnerMemoryAction::GetdentsCopyout { frame, output } => {
+                self.complete_getdents_copyout(engine, control, frame, output)
+            }
+            zone::OwnerMemoryAction::ReadlinkCopyout { frame, output } => {
+                self.complete_readlink_copyout(engine, control, frame, output)
+            }
+            zone::OwnerMemoryAction::CloneParentTid {
+                frame,
+                address,
+                internal_tid,
+                tid,
+            } => self.complete_clone_parent_tid(engine, control, frame, address, internal_tid, tid),
+            zone::OwnerMemoryAction::CloneChildTid { address, tid } => {
+                self.complete_clone_child_tid(engine, control, address, tid)
+            }
+            _ => Err(RuntimeError::Configuration(
+                "invalid action in owned memory completion".to_owned(),
+            )
+            .into()),
+        }
+    }
+
+    fn wait_for_memory_completion(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        action: zone::OwnerMemoryAction,
+        error: carrick_guest_mem::MemoryPrepareError,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        use carrick_guest_mem::MemoryPrepareError;
+        match error {
+            MemoryPrepareError::Retired(handle) => {
+                let exact_owner = engine
+                    .user_memory_admission_authority()
+                    .and_then(|authority| authority.owner());
+                if exact_owner != Some(handle) {
+                    return Err(RuntimeError::Configuration(format!(
+                        "retired output owner differs from current memory authority: retired={handle:?} current={exact_owner:?}"
+                    ))
+                    .into());
+                }
+                if !self.kernel.process_exiting()
+                    && !thread_should_finish_for_exec_replacement(
+                        &self.state.registry,
+                        self.state.this_tid,
+                    )
+                {
+                    return Err(RuntimeError::Configuration(format!(
+                        "live owner memory retired during output preparation: {handle:?}"
+                    ))
+                    .into());
+                }
+                self.state.capture_child_tid_clear()?;
+                self.state.handoff_child_tid_clear();
+                if !self.state.thread_exit_withdrawn {
+                    self.state
+                        .withdraw_persistent_terminal_owner_runtime(&self.kernel, engine);
+                    self.state.thread_exit_withdrawn = true;
+                }
+                Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)))
+            }
+            MemoryPrepareError::OwnerWait(wait) => {
+                self.park_owner_memory_action(engine, control, action, wait)
+            }
+            MemoryPrepareError::Supply(carrick_guest_mem::MemorySupplyRequest::Metadata {
+                observed,
+                ..
+            }) => self.park_owner_memory_action(engine, control, action, observed),
+            MemoryPrepareError::Supply(request) => {
+                match self.supply_owner_memory(engine, request)? {
+                    Some(OwnerSupplyWait::Owner(wait)) => self.wait_for_memory_completion(
+                        engine,
+                        control,
+                        action,
+                        MemoryPrepareError::OwnerWait(wait),
+                    ),
+                    Some(OwnerSupplyWait::Physical(wait)) => self.wait_for_memory_completion(
+                        engine,
+                        control,
+                        action,
+                        MemoryPrepareError::Physical(wait),
+                    ),
+                    None => self.drive_memory_completion_action(engine, control, action),
+                }
+            }
+            MemoryPrepareError::Physical(wait) => {
+                let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
+                    RuntimeError::Configuration("owned memory completion lost context".to_owned())
+                })?;
+                let runtime = self.kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
+                    RuntimeError::Configuration("owned memory completion lost runtime".to_owned())
+                })?;
+                let scheduler = runtime.continuation_services(context.kernel()).0;
+                let (subscription, ready) = wait.0.enroll(registration_wake_callback(
+                    scheduler,
+                    context.thread().key(),
+                    false,
+                ));
+                if ready || wait.0.is_ready() {
+                    drop(subscription);
+                    return self.drive_memory_completion_action(engine, control, action);
+                }
+                self.phase = HvpatchProductionPhase::ResumeMemoryCompletionPhysical {
+                    action,
+                    wait,
+                    _subscription: subscription,
+                };
+                Ok(self.suspend(
+                    HvpatchLoopSuspension::BlockedContinuation,
+                    executor::ExecutorExit::Blocked(
+                        carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                    ),
+                ))
+            }
+            other => Err(RuntimeError::Configuration(format!(
+                "owned memory completion output preparation: {other:?}"
+            ))
+            .into()),
+        }
     }
 
     fn leave_executor(&mut self) {
@@ -3128,6 +3343,7 @@ where
                         .to_owned(),
                 ));
             }
+            carrick_kernel::el1_zone::hand_back_completions();
             Ok(None)
         })();
         self.state.guest_execution = Some(executor);
@@ -3141,6 +3357,30 @@ where
         frame: carrick_hal::RawSyscall,
         outcome: DispatchOutcome,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        if let DispatchOutcome::OwnerStatCopyout { output, dependency } = outcome {
+            return self.wait_for_memory_completion(
+                engine,
+                control,
+                zone::OwnerMemoryAction::StatCopyout { frame, output },
+                dependency,
+            );
+        }
+        if let DispatchOutcome::OwnerGetdentsCopyout { output, dependency } = outcome {
+            return self.wait_for_memory_completion(
+                engine,
+                control,
+                zone::OwnerMemoryAction::GetdentsCopyout { frame, output },
+                dependency,
+            );
+        }
+        if let DispatchOutcome::OwnerReadlinkCopyout { output, dependency } = outcome {
+            return self.wait_for_memory_completion(
+                engine,
+                control,
+                zone::OwnerMemoryAction::ReadlinkCopyout { frame, output },
+                dependency,
+            );
+        }
         if let DispatchOutcome::OwnerMemorySupply { request, committed } = outcome {
             self.state.owner_read_progress = self
                 .state
@@ -3578,41 +3818,48 @@ where
                     );
                     threads::CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EAGAIN)
                 };
-                let (completed_internal_tid, completed_visible_tid, completed_errno) = match spawned
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                return self.complete_persistent_hvpatch_clone(engine, control, frame, spawned);
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
                 {
-                    threads::CloneThreadSpawn::Started { internal, visible } => {
-                        self.state.complete_returned(
-                            engine,
-                            &self.kernel.reporter,
-                            i64::from(visible),
-                        )?;
-                        (internal.raw(), visible, 0)
-                    }
-                    threads::CloneThreadSpawn::Errno(errno) => {
-                        self.state.complete_returned(
-                            engine,
-                            &self.kernel.reporter,
-                            errno.guest_retval(),
-                        )?;
-                        (
-                            self.state.this_tid.raw(),
-                            self.state.this_tid.raw(),
-                            errno.get(),
-                        )
-                    }
-                };
-                carrick_kernel::event_ring::rec(
-                    carrick_kernel::event_ring::CLONESPAWN,
-                    self.state.this_tid.raw(),
-                    completed_internal_tid,
-                    completed_errno,
-                );
-                crate::probes::mn_clone_outcome(
-                    completed_visible_tid,
-                    carrick_observability::probes::HvpatchCloneThreadPhase::Completed,
-                    completed_errno,
-                );
-                executor::ExecutorExit::Syscall
+                    let (completed_internal_tid, completed_visible_tid, completed_errno) =
+                        match spawned {
+                            threads::CloneThreadSpawn::Started {
+                                internal, visible, ..
+                            } => {
+                                self.state.complete_returned(
+                                    engine,
+                                    &self.kernel.reporter,
+                                    i64::from(visible),
+                                )?;
+                                (internal.raw(), visible, 0)
+                            }
+                            threads::CloneThreadSpawn::Errno(errno) => {
+                                self.state.complete_returned(
+                                    engine,
+                                    &self.kernel.reporter,
+                                    errno.guest_retval(),
+                                )?;
+                                (
+                                    self.state.this_tid.raw(),
+                                    self.state.this_tid.raw(),
+                                    errno.get(),
+                                )
+                            }
+                        };
+                    carrick_kernel::event_ring::rec(
+                        carrick_kernel::event_ring::CLONESPAWN,
+                        self.state.this_tid.raw(),
+                        completed_internal_tid,
+                        completed_errno,
+                    );
+                    crate::probes::mn_clone_outcome(
+                        completed_visible_tid,
+                        carrick_observability::probes::HvpatchCloneThreadPhase::Completed,
+                        completed_errno,
+                    );
+                    executor::ExecutorExit::Syscall
+                }
             }
             DispatchOutcome::SignalThread {
                 tid,
@@ -4221,6 +4468,121 @@ where
                 HvpatchProductionPhase::ResumeOwnerZone { frame } => {
                     return self.resume_owner_zone(engine, control, frame);
                 }
+                HvpatchProductionPhase::ResumeStatCopyoutOwner { frame, output } => {
+                    let mut result = self.consume_owner_zone(control)?;
+                    self.state.reserved_signal = self
+                        .state
+                        .reserved_signal
+                        .take()
+                        .or(result.take_reserved_signal());
+                    // Lookup already succeeded. Complete its captured copyout
+                    // before servicing a reserved signal, without re-dispatch.
+                    self.state.continuation_restart = None;
+                    return self.complete_stat_copyout(engine, control, frame, output);
+                }
+                HvpatchProductionPhase::ResumeGetdentsCopyoutOwner { frame, output } => {
+                    let mut result = self.consume_owner_zone(control)?;
+                    self.state.reserved_signal = self
+                        .state
+                        .reserved_signal
+                        .take()
+                        .or(result.take_reserved_signal());
+                    self.state.continuation_restart = None;
+                    return self.complete_getdents_copyout(engine, control, frame, output);
+                }
+                HvpatchProductionPhase::ResumeReadlinkCopyoutOwner { frame, output } => {
+                    let mut result = self.consume_owner_zone(control)?;
+                    self.state.reserved_signal = self
+                        .state
+                        .reserved_signal
+                        .take()
+                        .or(result.take_reserved_signal());
+                    self.state.continuation_restart = None;
+                    return self.complete_readlink_copyout(engine, control, frame, output);
+                }
+                HvpatchProductionPhase::ResumeFaultOwner => {
+                    return self.resume_owner_fault_zone(engine, control);
+                }
+                HvpatchProductionPhase::ResumeSignalFrameOwner { pending } => {
+                    let mut result = self.consume_owner_zone(control)?;
+                    if result.completion != carrick_kernel::kernel::continuation::ContinuationCompletion::ResumeSignalFrame {
+                        return Err(RuntimeError::Configuration("signal frame wait lost its completion authority".to_owned()).into());
+                    }
+                    if let Some(reserved) = result.take_reserved_signal() {
+                        let context = self
+                            .state
+                            .service_kernel_context
+                            .as_ref()
+                            .ok_or_else(|| {
+                                RuntimeError::Configuration(
+                                    "signal frame wait lost exact context".to_owned(),
+                                )
+                            })?
+                            .retain_exact();
+                        if let Some(outcome) = service_signals_threaded(
+                            &self.kernel,
+                            &context,
+                            engine,
+                            self.state.this_tid,
+                            self.state.fatal_image_generation,
+                            None,
+                            None,
+                            None,
+                            Some(reserved),
+                            self.traps,
+                        )? {
+                            return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                        }
+                    }
+                    return self.resume_signal_frame(engine, control, pending);
+                }
+                HvpatchProductionPhase::ResumeSignalFramePhysical {
+                    pending,
+                    wait,
+                    _subscription,
+                } => {
+                    if !wait.0.is_ready() {
+                        self.phase = HvpatchProductionPhase::ResumeSignalFramePhysical {
+                            pending,
+                            wait,
+                            _subscription,
+                        };
+                        return Ok(self.suspend(
+                            HvpatchLoopSuspension::BlockedContinuation,
+                            executor::ExecutorExit::Blocked(
+                                carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                            ),
+                        ));
+                    }
+                    drop(_subscription);
+                    return self.resume_signal_frame(engine, control, pending);
+                }
+                HvpatchProductionPhase::ResumeIpcOwner { boundary, token } => {
+                    return self.resume_ipc_owner(engine, control, boundary, token);
+                }
+                HvpatchProductionPhase::ResumeIpcPhysical {
+                    boundary,
+                    token,
+                    wait,
+                    _subscription,
+                } => {
+                    if !wait.0.is_ready() {
+                        self.phase = HvpatchProductionPhase::ResumeIpcPhysical {
+                            boundary,
+                            token,
+                            wait,
+                            _subscription,
+                        };
+                        return Ok(self.suspend(
+                            HvpatchLoopSuspension::BlockedContinuation,
+                            executor::ExecutorExit::Blocked(
+                                carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                            ),
+                        ));
+                    }
+                    drop(_subscription);
+                    return self.continue_ipc_memory(engine, control, boundary, token);
+                }
                 HvpatchProductionPhase::ResumeOwnerPhysical {
                     frame,
                     wait,
@@ -4279,9 +4641,62 @@ where
                         return self.start_external_exec(engine, control);
                     }
                 }
-                HvpatchProductionPhase::BootstrapThreadChild => {
-                    self.state
-                        .complete_precompleted_child(&self.kernel.reporter, 0)?;
+                HvpatchProductionPhase::BootstrapThreadChild { address, tid } => {
+                    return self.complete_clone_child_tid(engine, control, address, tid);
+                }
+                HvpatchProductionPhase::ResumeCloneChildTid { address, tid } => {
+                    let result = self.consume_owner_zone(control)?;
+                    if result.completion
+                        != carrick_kernel::kernel::continuation::ContinuationCompletion::ResumeFault
+                    {
+                        return Err(RuntimeError::Configuration(
+                            "clone child TID resumed as another action".to_owned(),
+                        )
+                        .into());
+                    }
+                    return self.complete_clone_child_tid(engine, control, address, tid);
+                }
+                HvpatchProductionPhase::ResumeCloneParentTid {
+                    frame,
+                    address,
+                    internal_tid,
+                    tid,
+                } => {
+                    let mut result = self.consume_owner_zone(control)?;
+                    self.state.reserved_signal = self
+                        .state
+                        .reserved_signal
+                        .take()
+                        .or(result.take_reserved_signal());
+                    return self.complete_clone_parent_tid(
+                        engine,
+                        control,
+                        frame,
+                        address,
+                        internal_tid,
+                        tid,
+                    );
+                }
+                HvpatchProductionPhase::ResumeMemoryCompletionPhysical {
+                    action,
+                    wait,
+                    _subscription,
+                } => {
+                    if !wait.0.is_ready() {
+                        self.phase = HvpatchProductionPhase::ResumeMemoryCompletionPhysical {
+                            action,
+                            wait,
+                            _subscription,
+                        };
+                        return Ok(self.suspend(
+                            HvpatchLoopSuspension::BlockedContinuation,
+                            executor::ExecutorExit::Blocked(
+                                carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                            ),
+                        ));
+                    }
+                    drop(_subscription);
+                    return self.drive_memory_completion_action(engine, control, action);
                 }
                 HvpatchProductionPhase::ResumeForkQuiesce { _subscription } => {
                     drop(_subscription);
@@ -4382,9 +4797,8 @@ where
                         prepared,
                         &mut ProductionHvpatchCloneBackendOps,
                     )? {
-                        PersistentHvpatchCloneAttempt::Complete(spawned) => {
-                            Ok(self.complete_persistent_hvpatch_clone(engine, spawned)?)
-                        }
+                        PersistentHvpatchCloneAttempt::Complete(spawned) => Ok(self
+                            .complete_persistent_hvpatch_clone(engine, control, frame, spawned)?),
                         PersistentHvpatchCloneAttempt::Wait {
                             prepared,
                             subscription,
@@ -4844,6 +5258,7 @@ where
                             far,
                             fault_access,
                         );
+                        signal::cancel_portal_grant_selection(engine.mailbox_slot(), mm_key, far);
                     }
                     self.state
                         .note_cow_resolution(far, syndrome, translation, arm_generation)?;
@@ -4931,14 +5346,14 @@ where
                         VcpuLoopOutcome::ProcessExit(Box::new(result)),
                     ));
                 };
-                let owner_file_fault = match self.state.zone_mm {
+                let owner_fault = match self.state.zone_mm {
                     Some(mm_key) => {
-                        signal::resolve_owner_file_fault(engine, mm_key, si_addr, fault_access)
+                        signal::resolve_owner_fault(engine, mm_key, si_addr, fault_access)
                             .map_err(RuntimeError::Trap)?
                     }
                     None => None,
                 };
-                if let Some(carrick_hal::OwnerFileFaultOutcome::Pending(wait)) = &owner_file_fault {
+                if let Some(carrick_hal::OwnerFaultOutcome::Pending(wait)) = &owner_fault {
                     let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
                         RuntimeError::Configuration("physical fault wait lost context".to_owned())
                     })?;
@@ -4962,11 +5377,19 @@ where
                         ),
                     ));
                 }
-                if owner_file_fault == Some(carrick_hal::OwnerFileFaultOutcome::Resolved) {
+                if let Some(carrick_hal::OwnerFaultOutcome::OwnerWait(wait)) = owner_fault {
+                    return self.park_owner_memory_action(
+                        engine,
+                        control,
+                        zone::OwnerMemoryAction::Fault,
+                        wait,
+                    );
+                }
+                if owner_fault == Some(carrick_hal::OwnerFaultOutcome::Resolved) {
                     return Ok(executor::ExecutorExit::Syscall);
                 }
                 let (signum, si_code) =
-                    if owner_file_fault == Some(carrick_hal::OwnerFileFaultOutcome::BusFault) {
+                    if owner_fault == Some(carrick_hal::OwnerFaultOutcome::BusFault) {
                         (
                             crate::linux_abi::LINUX_SIGBUS,
                             carrick_abi::LINUX_BUS_ADRERR,
@@ -4977,7 +5400,7 @@ where
                 // Raw hardware/host faults can decode as MAPERR even when
                 // Carrick tracks a live VMA denying the access. Upgrade from the
                 // shared protection metadata (LTP mmap05 / roprotect probe).
-                let si_code = if owner_file_fault.is_none() {
+                let si_code = if owner_fault.is_none() {
                     carrick_kernel::kernel::objects::signal::upgrade_protection_si_code(
                         &*engine, signum, si_code, si_addr,
                     )
@@ -4988,7 +5411,7 @@ where
                 let faulting_tid = self.state.linux_tid;
                 let requires_mm_mutation =
                     self.kernel.dispatcher.fault_requires_mm_mutation(si_addr);
-                if owner_file_fault.is_none()
+                if owner_fault.is_none()
                     && requires_mm_mutation
                     && self
                         .state
@@ -5005,6 +5428,19 @@ where
                         })?
                         .map_err(RuntimeError::Trap)?
                 {
+                    if let Some(mm_key) = self.state.zone_mm {
+                        signal::cancel_frame_grant_request(
+                            engine.mailbox_slot(),
+                            mm_key,
+                            si_addr,
+                            fault_access,
+                        );
+                        signal::cancel_portal_grant_selection(
+                            engine.mailbox_slot(),
+                            mm_key,
+                            si_addr,
+                        );
+                    }
                     return Ok(executor::ExecutorExit::Syscall);
                 }
                 if let Some(mm_key) = self.state.zone_mm {
@@ -5014,6 +5450,7 @@ where
                         si_addr,
                         fault_access,
                     );
+                    signal::cancel_portal_grant_selection(engine.mailbox_slot(), mm_key, si_addr);
                 }
                 // Captured only now: a first touch resolved above never
                 // delivers a signal, and this capture is an `RwLock` read plus
@@ -5177,6 +5614,9 @@ where
         if let Some(park) = self.state.pending_ipc_park.take() {
             return self.ipc_park(engine, control, frame, park);
         }
+        if let Some(park) = self.state.pending_ipc_memory.take() {
+            return self.ipc_memory_park(engine, control, zone::IpcBoundary::Syscall(frame), park);
+        }
         self.service_outcome(engine, control, frame, outcome)
     }
 
@@ -5190,6 +5630,15 @@ where
             self.kernel.fork_quiesce(),
         );
         let result = self.poll_with_engine(engine, control);
+        let result = match result {
+            Err(ProductionHvpatchPollError::Runtime(RuntimeError::Trap(
+                TrapError::SignalFrameMemory {
+                    pending,
+                    dependency,
+                },
+            ))) => self.park_signal_frame(engine, control, pending, *dependency),
+            other => other,
+        };
         self.route_poll_result(result)
     }
 
@@ -5979,7 +6428,7 @@ pub(crate) struct HvpatchLogicalJobInput<E: ThreadedEngine> {
     pub(crate) generation: carrick_kernel::kernel::objects::ExecutionGeneration,
     pub(crate) injected_lease: Arc<InjectedExecutionLeaseSlot>,
     pub(crate) bootstrap_process_child: Option<ProcessChildBootstrap>,
-    pub(crate) bootstrap_thread_child: bool,
+    pub(crate) bootstrap_thread_child: Option<(u64, i32)>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -6056,8 +6505,8 @@ where
     let production = ProductionHvpatchLoopJob {
         kernel,
         state,
-        phase: if bootstrap_thread_child {
-            HvpatchProductionPhase::BootstrapThreadChild
+        phase: if let Some((address, tid)) = bootstrap_thread_child {
+            HvpatchProductionPhase::BootstrapThreadChild { address, tid }
         } else {
             bootstrap_process_child.map_or(
                 HvpatchProductionPhase::Resident,
@@ -6279,7 +6728,7 @@ where
             generation: prepared.generation,
             injected_lease,
             bootstrap_process_child: None,
-            bootstrap_thread_child: false,
+            bootstrap_thread_child: None,
         }) {
             Ok(logical) => logical,
             Err(error) => {
@@ -6441,6 +6890,7 @@ pub(crate) fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
         engine.bind_frame_cow(
             Arc::new(KernelFrameCowAuthority {
                 runtime: Arc::downgrade(kernel),
+                host_backing: Some(kernel.dispatcher.mem_view().host_backing_access()),
                 deferred_anonymous: kernel.dispatcher.deferred_anonymous_state(mm),
                 kernel: Arc::clone(context.kernel()),
                 mm,

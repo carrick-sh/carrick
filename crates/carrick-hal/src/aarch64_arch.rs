@@ -127,10 +127,6 @@ impl GuestArch for Aarch64GuestArch {
         carrick_abi::LinuxGuestAbi::Aarch64
     }
 
-    fn user_va_ceiling() -> crate::guest_arch::UserVaCeiling {
-        crate::guest_arch::UserVaCeiling::new(1 << 48)
-    }
-
     fn vdso_bytes() -> Vec<u8> {
         carrick_mem::vdso::vdso_image_bytes()
     }
@@ -258,6 +254,7 @@ mod tests {
         mem: std::collections::HashMap<u64, u8>,
         prepared_page: Option<u64>,
         resident: bool,
+        prepare_refusal: Option<carrick_guest_mem::MemoryError>,
         /// x0..x30 (31 GPRs).
         x: [u64; 31],
         sp: u64,
@@ -285,6 +282,9 @@ mod tests {
             address: u64,
             length: usize,
         ) -> Result<(), carrick_guest_mem::MemoryError> {
+            if let Some(error) = self.prepare_refusal.take() {
+                return Err(error);
+            }
             if self.prepared_page.is_some_and(|page| {
                 address < page + 4096
                     && address
@@ -385,6 +385,7 @@ mod tests {
             mem: std::collections::HashMap::new(),
             prepared_page: None,
             resident: false,
+            prepare_refusal: None,
             x: [0; 31],
             sp: 0,
             pc: 0,
@@ -417,6 +418,95 @@ mod tests {
             fpsimd_enabled: true,
             sigreturn_trampoline_base: 0x6666_0000,
         }
+    }
+
+    #[test]
+    fn aarch64_signal_frame_owner_wait_is_not_a_delivery_fault() {
+        use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+        let mut e = empty_engine();
+        e.sp = 0x20_0000;
+        e.elr_el1 = 0xDEAD_BEE0;
+        e.x[3] = 0xCAFE_1234;
+        // SAFETY: isolated owner identity for this VM-free engine double.
+        let handle = unsafe {
+            El1MmHandle::from_admitted_owner(
+                core::num::NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(7).unwrap(),
+                core::num::NonZeroU64::new(1).unwrap(),
+            )
+        };
+        // SAFETY: this VM-free receipt names the synthetic owner under test.
+        let wait = unsafe { PortalOwnerWait::from_owner(handle, PortalWaitCause::Editor, 84) };
+        e.prepare_refusal = Some(carrick_guest_mem::MemoryError::OwnerWait(wait));
+        let result = Aarch64GuestArch::build_sigframe(&mut e, inject_params(0));
+        assert!(result.is_err(), "a wait cannot enter the handler");
+        assert!(
+            !matches!(result, Err(crate::TrapError::SignalDeliveryFault)),
+            "an owner Editor wait must retain the signal frame, not force SIGSEGV"
+        );
+        assert_eq!(e.sp, 0x20_0000, "no register publication before copyout");
+        assert!(e.mem.is_empty(), "no frame bytes copied before admission");
+        let Err(crate::TrapError::SignalFrameMemory {
+            pending,
+            dependency,
+        }) = result
+        else {
+            panic!("memory wait must carry the exact captured signal frame");
+        };
+        assert!(
+            matches!(*dependency, carrick_guest_mem::MemoryPrepareError::OwnerWait(observed) if observed == wait)
+        );
+        // A reused physical vCPU is not the source of the saved frame. Its
+        // normal restore belongs to the runtime; the owned frame remains the
+        // immutable original context even if these values change meanwhile.
+        e.elr_el1 = 0xBEEF_0000;
+        e.x[3] = 0;
+        pending
+            .publish(&mut e)
+            .expect("owner admission is now ready");
+        assert_eq!(e.x[0], 11, "the original signal reaches the handler");
+        Aarch64GuestArch::restore_sigframe(&mut e, true).expect("original frame roundtrip");
+        assert_eq!(e.elr_el1, 0xDEAD_BEE0);
+        assert_eq!(e.x[3], 0xCAFE_1234);
+    }
+
+    #[test]
+    fn aarch64_sigframe_owner_wait_does_not_force_sigsegv_witness() {
+        use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+        let mut e = empty_engine();
+        e.sp = 0x20_0000;
+        e.elr_el1 = 0xDEAD_BEE0;
+        let handle = unsafe {
+            El1MmHandle::from_admitted_owner(
+                core::num::NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(7).unwrap(),
+                core::num::NonZeroU64::new(1).unwrap(),
+            )
+        };
+        let wait = unsafe { PortalOwnerWait::from_owner(handle, PortalWaitCause::Editor, 84) };
+        e.prepare_refusal = Some(carrick_guest_mem::MemoryError::OwnerWait(wait));
+        let result = Aarch64GuestArch::build_sigframe(&mut e, inject_params(0));
+        assert!(
+            !matches!(result, Err(crate::TrapError::SignalDeliveryFault)),
+            "owner wait must not force SignalDeliveryFault (SIGSEGV)"
+        );
+    }
+
+    #[test]
+    fn aarch64_signal_frame_invalid_stack_still_forces_sigsegv() {
+        let mut e = empty_engine();
+        e.sp = 0x20_0000;
+        e.elr_el1 = 0xDEAD_BEE0;
+        e.prepare_refusal = Some(carrick_guest_mem::MemoryError::OutOfBounds {
+            address: e.sp,
+            length: core::mem::size_of::<carrick_abi::CarrickSigframe>(),
+        });
+        assert!(matches!(
+            Aarch64GuestArch::build_sigframe(&mut e, inject_params(0)),
+            Err(crate::TrapError::SignalDeliveryFault)
+        ));
+        assert_eq!(e.sp, 0x20_0000);
+        assert!(e.mem.is_empty());
     }
 
     #[test]

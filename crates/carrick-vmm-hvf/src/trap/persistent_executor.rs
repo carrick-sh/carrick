@@ -1185,6 +1185,7 @@ impl HvfVmState {
                 pending_process_aliases: Vec::new(),
                 fail_next_begin_exec_inventory: false,
                 cow_rollback_scratch: None,
+                foreign_mm_claim: CarrierForeignMmTaskClaim::default(),
                 registration: None,
             },
             carrier_mappings: None,

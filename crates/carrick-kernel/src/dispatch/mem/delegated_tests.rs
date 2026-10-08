@@ -124,6 +124,10 @@ impl HostReservationProvider for UnavailableProvider {
     }
 }
 impl HostReservationProvider for Provider {
+    fn carrier_identity(&self) -> Result<std::num::NonZeroU64, Refusal> {
+        std::num::NonZeroU64::new(Arc::as_ptr(&self.0.table) as usize as u64).ok_or(Refusal::Stale)
+    }
+
     fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal> {
         Ok(Box::new(View(self.0.clone())))
     }
@@ -271,6 +275,30 @@ fn host_mmap(
     )
 }
 
+fn routed_host_mmap(
+    dispatcher: &SyscallDispatcher,
+    memory: &mut CountingMmapMemory,
+    address: u64,
+    len: u64,
+    prot: u64,
+    flags: u64,
+    fd: i32,
+) -> DispatchOutcome {
+    dispatcher
+        .dispatch_normalized_mutation_for_test(
+            &dispatcher.capture_one_task_context().unwrap(),
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([address, len, prot, flags, fd as i64 as u64, 0]),
+            ),
+            memory,
+            &CompatReporter::default(),
+            None,
+        )
+        .expect("mmap is a claimed mutation syscall")
+        .expect("routed mmap dispatch")
+}
+
 fn arena_memory() -> CountingMmapMemory {
     CountingMmapMemory::new(LINUX_MMAP_BASE, (32 * PAGE) as usize)
 }
@@ -386,6 +414,64 @@ fn delegated_host_map_fixed_over_an_el1_reservation_replaces_it() {
                 && vma.provenance.is_private_anonymous()),
         "the root, not MemState, owns the anonymous rows"
     );
+}
+
+#[test]
+fn delegated_fixed_file_map_reuses_a_retired_el1_reservation() {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    install_host_file_fd(&dispatcher, FILE_FD, &[0x5a; 4 * PAGE as usize]);
+    let mut memory = arena_memory();
+
+    let guest = root
+        .guest_mmap(
+            Placement::Anywhere,
+            4 * PAGE,
+            ReservationProtection::READ_WRITE,
+        )
+        .unwrap();
+    root.guest_munmap(guest, 4 * PAGE);
+    memory.fail_unchecked_write.set(true);
+    // The admitted native lane cannot prepare sparse backing through ordinary
+    // protection publication, even while this host syscall owns a reservation.
+    memory.fail_protect_non_zero.set(true);
+
+    let fixed = returned(routed_host_mmap(
+        &dispatcher,
+        &mut memory,
+        guest,
+        4 * PAGE,
+        LINUX_PROT_READ | LINUX_PROT_WRITE,
+        LINUX_MAP_PRIVATE | LINUX_MAP_FIXED,
+        FILE_FD,
+    ));
+    assert_eq!(fixed, guest as i64);
+    assert_eq!(memory.owner_reserved_write_calls.get(), 1);
+    let (owner, range) = memory
+        .owner_reserved_write_identity
+        .get()
+        .expect("closed native admission");
+    assert_eq!(
+        owner.carrier(),
+        std::num::NonZeroU64::new(Arc::as_ptr(&root.carrier.table) as usize as u64).unwrap()
+    );
+    assert_eq!(owner.mm(), root.lock().mm());
+    assert_eq!(owner.incarnation().get(), root.lock().incarnation().raw());
+    assert_eq!(
+        range,
+        carrick_guest_mem::GuestVaRange::from_len(GuestVa(guest), 4 * PAGE as usize)
+    );
+    assert_eq!(
+        &memory.bytes
+            [(guest - memory.base) as usize..(guest - memory.base) as usize + 4 * PAGE as usize],
+        &[0x5a; 4 * PAGE as usize]
+    );
+    let mapping = root.lock().mapping(guest).expect("fixed file mapping");
+    assert_eq!(
+        mapping.range,
+        ReservationRange::new(guest, guest + 4 * PAGE).unwrap()
+    );
+    assert!(!mapping.anonymous);
 }
 
 #[test]
@@ -1424,7 +1510,6 @@ fn delegated_exec_leaves_no_root_row_in_the_new_image() {
                 LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
                 MmapGrantCongruence::Any,
                 true,
-                UserVaCeiling::for_abi(carrick_abi::LinuxGuestAbi::Aarch64),
             )
             .unwrap()
     });
@@ -3490,6 +3575,94 @@ fn delegated_bind_admission_is_exact_against_its_host_setup_twin() {
     assert_eq!(
         admit(&live, El1AdmissionOrigin::Bind, true),
         Ok(El1Admission::Delegated)
+    );
+}
+
+#[test]
+fn delegated_boot_file_protection_keeps_owner_source_for_fork() {
+    let (dispatcher, _memory, _) = populated_host_setup_mm();
+    let root = Root::admit(&dispatcher);
+    let before = root
+        .lock()
+        .mapping(IMAGE + PAGE / 2)
+        .expect("boot file owner");
+    assert!(before.host_backing.is_some());
+    assert!(
+        dispatcher
+            .mem()
+            .lock()
+            .semantic_vmas
+            .overlapping(IMAGE, IMAGE + PAGE)
+            .next()
+            .is_none()
+    );
+
+    dispatcher
+        .mem()
+        .lock()
+        .set_mapping_prot(IMAGE, IMAGE + PAGE, LinuxProtFlags::READ);
+
+    let after = root
+        .lock()
+        .mapping(IMAGE + PAGE / 2)
+        .expect("boot file survives mprotect");
+    assert_eq!(after.host_backing, before.host_backing);
+    assert_eq!(after.protection, ReservationProtection::READ);
+    assert!(
+        dispatcher
+            .mem_view()
+            .read_host_backing(after.host_backing.unwrap(), PAGE as usize)
+            .is_ok()
+    );
+    assert!(
+        dispatcher
+            .mem()
+            .lock()
+            .semantic_vmas
+            .overlapping(IMAGE, IMAGE + PAGE)
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn exec_replacement_keeps_predecessor_source_custody_for_in_flight_owner_transfer() {
+    let (dispatcher, _memory, _) = populated_host_setup_mm();
+    let root = Root::admit(&dispatcher);
+    let source = root
+        .lock()
+        .mapping(IMAGE + PAGE / 2)
+        .unwrap()
+        .host_backing
+        .unwrap();
+    let mut replacement = dispatcher.mem().lock().fork_materialized();
+
+    replacement.reset_for_execve();
+
+    assert!(replacement.host_backing_custody.source(source).is_some());
+}
+
+#[test]
+fn retained_host_backing_access_outlives_dispatcher() {
+    let (dispatcher, _memory, _) = populated_host_setup_mm();
+    let root = Root::admit(&dispatcher);
+    let source = root
+        .lock()
+        .mapping(IMAGE + PAGE / 2)
+        .unwrap()
+        .host_backing
+        .unwrap();
+    let access = dispatcher.mem_view().host_backing_access();
+
+    drop(dispatcher);
+
+    assert!(access.retains_host_backing(source.handle(), source.generation()));
+    assert_eq!(
+        access
+            .read_host_backing(source, PAGE as usize)
+            .unwrap()
+            .len(),
+        PAGE as usize
     );
 }
 

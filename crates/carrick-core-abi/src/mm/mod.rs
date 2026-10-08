@@ -26,3 +26,5 @@ pub use fork::*;
 
 pub mod publication;
 pub use publication::*;
+pub mod identity_write;
+pub use identity_write::*;

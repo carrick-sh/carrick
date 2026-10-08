@@ -999,7 +999,11 @@ fn prepare_foreign_cow(
             states: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
                 (
                     CarrierForeignMmSnapshot::capture(&installed.snapshot).binding,
-                    Arc::downgrade(&installed.state),
+                    CarrierForeignMmStateEntry {
+                        mm: CarrierForeignMmSnapshot::capture(&installed.snapshot).mm,
+                        state: Arc::downgrade(&installed.state),
+                        registration: std::sync::Weak::new(),
+                    },
                 ),
             ]))),
             custody: Arc::clone(legacy_test_carrier_vm_custody_arc()),
@@ -1720,6 +1724,7 @@ fn foreign_el1_publisher_authenticates_the_exact_target_before_submission() {
             carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp::CowRepoint {
                 access: carrick_mmu_core::aarch64::descriptor_txn::CowRepointAccess::User {
                     writable_pages: 0,
+                    executable_pages: 0,
                 },
                 va: TEST_VA,
                 len: 4096,
@@ -2351,7 +2356,11 @@ fn rx_ptrace_text_cow_case(guest: bool) {
             states: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
                 (
                     CarrierForeignMmSnapshot::capture(&child.snapshot).binding,
-                    Arc::downgrade(&child.state),
+                    CarrierForeignMmStateEntry {
+                        mm: CarrierForeignMmSnapshot::capture(&child.snapshot).mm,
+                        state: Arc::downgrade(&child.state),
+                        registration: std::sync::Weak::new(),
+                    },
                 ),
             ]))),
             custody: Arc::clone(legacy_test_carrier_vm_custody_arc()),
@@ -2421,7 +2430,8 @@ fn rx_ptrace_text_cow_case(guest: bool) {
             [
                 carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp::CowRepoint {
                     access: carrick_mmu_core::aarch64::descriptor_txn::CowRepointAccess::User {
-                        writable_pages: 0
+                        writable_pages: 0,
+                        executable_pages: 0b0011,
                     },
                     ..
                 }
@@ -2547,7 +2557,11 @@ fn ptrace_text_cow_rejects_source_alias_shorter_than_authenticated_span() {
             states: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
                 (
                     CarrierForeignMmSnapshot::capture(&child.snapshot).binding,
-                    Arc::downgrade(&child.state),
+                    CarrierForeignMmStateEntry {
+                        mm: CarrierForeignMmSnapshot::capture(&child.snapshot).mm,
+                        state: Arc::downgrade(&child.state),
+                        registration: std::sync::Weak::new(),
+                    },
                 ),
             ]))),
             custody: Arc::clone(legacy_test_carrier_vm_custody_arc()),
@@ -2690,7 +2704,11 @@ fn ptrace_text_cow_uses_authenticated_span_when_preexisting_arm_differs() {
             states: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
                 (
                     CarrierForeignMmSnapshot::capture(&child.snapshot).binding,
-                    Arc::downgrade(&child.state),
+                    CarrierForeignMmStateEntry {
+                        mm: CarrierForeignMmSnapshot::capture(&child.snapshot).mm,
+                        state: Arc::downgrade(&child.state),
+                        registration: std::sync::Weak::new(),
+                    },
                 ),
             ]))),
             custody: Arc::clone(legacy_test_carrier_vm_custody_arc()),
@@ -5476,22 +5494,38 @@ fn structural_vvar_fork_inheritance_requires_exact_live_custody() {
 #[test]
 fn production_fork_plan_retains_structural_vvar_semantic_authority() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
-    production_fork_vvar_refresh(None);
+    production_fork_vvar_refresh(None, false, false);
 }
 
 #[test]
 fn owner_fork_refreshes_readonly_vvar_without_host_arm_ranges() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
-    production_fork_vvar_refresh(Some(4));
+    production_fork_vvar_refresh(Some(4), false, false);
 }
 
 #[test]
 fn owner_vvar_refresh_preserves_neighbors_outside_the_live_cow_arm() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
-    production_fork_vvar_refresh(Some(1));
+    production_fork_vvar_refresh(Some(1), false, false);
 }
 
-fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>) {
+#[test]
+fn owner_vvar_refresh_caps_real_imported_write_and_execute_intent() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    production_fork_vvar_refresh(Some(4), true, false);
+}
+
+#[test]
+fn owner_fork_adopts_native_readonly_vvar_before_refresh() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    production_fork_vvar_refresh(Some(4), false, true);
+}
+
+fn production_fork_vvar_refresh(
+    owner_cow_pages: Option<usize>,
+    imported_permissions: bool,
+    native_import: bool,
+) {
     let _external_alias_restore = ExternalAliasStateRestore::capture();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let transport = Arc::new(CarrierForeignMmTransport::new());
@@ -5685,15 +5719,22 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>) {
         pending_process_aliases: Vec::new(),
         fail_next_begin_exec_inventory: false,
         cow_rollback_scratch: None,
+        foreign_mm_claim: CarrierForeignMmTaskClaim::default(),
         registration: None,
     };
     // Each fixture owns its root slots; pooled custody from another test
     // must never choose this test's child or grandchild address.
-    let root_slot_offset = match owner_cow_pages {
-        None => 0x40_0000,
-        Some(4) => 0x80_0000,
-        Some(1) => 0xc0_0000,
-        _ => panic!("unsupported vvar fixture shape"),
+    let root_slot_offset = if native_import {
+        0x140_0000
+    } else if imported_permissions {
+        0x100_0000
+    } else {
+        match owner_cow_pages {
+            None => 0x40_0000,
+            Some(4) => 0x80_0000,
+            Some(1) => 0xc0_0000,
+            _ => panic!("unsupported vvar fixture shape"),
+        }
     };
     let root_slot_base = crate::memory::LINUX_HVPATCH_ROOT_SLOT_BASE + root_slot_offset;
     let root_slot_size = 0x20_0000_u64;
@@ -6038,6 +6079,7 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>) {
         pending_process_aliases: Vec::new(),
         fail_next_begin_exec_inventory: false,
         cow_rollback_scratch: None,
+        foreign_mm_claim: CarrierForeignMmTaskClaim::default(),
         registration: None,
     };
     assert!(
@@ -6055,22 +6097,29 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>) {
             .edit(
                 || panic!("prepared child tables"),
                 |editor| {
-                    for page in 0..4 {
-                        let va = vvar_ipa + page * 4096;
+                    if native_import {
                         editor
                             .manager
-                            .publish_private_pages(
-                                carrick_mmu_core::aarch64::GuestLeafPublication {
+                            .set_readonly(vvar_ipa, 4 * 4096, false, None)
+                            .expect("actual native vvar permissions before owner fork");
+                    } else {
+                        for page in 0..4 {
+                            let va = vvar_ipa + page * 4096;
+                            editor
+                                .manager
+                                .publish_private_pages(
+                                    carrick_mmu_core::aarch64::GuestLeafPublication {
+                                        va,
+                                        ipa: va,
+                                        len: 4096,
+                                        writable: imported_permissions,
+                                        executable: true,
+                                    },
                                     va,
-                                    ipa: va,
-                                    len: 4096,
-                                    writable: false,
-                                    executable: true,
-                                },
-                                va,
-                                None,
-                            )
-                            .expect("bootstrap-sealed private vvar page");
+                                    None,
+                                )
+                                .expect("bootstrap-sealed private vvar page");
+                        }
                     }
                     editor
                         .manager
@@ -6106,7 +6155,7 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>) {
             "fixture must carry actual private COW authority: {leaf:#x}"
         );
         assert!(
-            !carrick_mmu_core::aarch64::terminal_descriptor_may_write(leaf),
+            carrick_mmu_core::aarch64::terminal_descriptor_may_write(leaf) == imported_permissions,
             "read-only vvar must carry no Linux write intent: {leaf:#x}"
         );
         child_task.cow_armed.lock().ranges.clear();
@@ -6168,6 +6217,32 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>) {
             source_ipa: vvar_ipa,
             source_len: vvar_len,
         };
+        if native_import {
+            // Owner Fork publishes physical table custody, without the
+            // legacy fixed-VA table row. The bound resolver still retains
+            // the child's exact root arena.
+            child_task
+                .mappings
+                .retain(|row| row.start != crate::memory::LINUX_PAGE_TABLES_BASE);
+            assert!(
+                child_task
+                    .mapping_for_range_in(
+                        &transport.custody,
+                        crate::memory::LINUX_PAGE_TABLES_BASE,
+                        crate::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                    )
+                    .is_none()
+            );
+            assert_eq!(
+                child_page_tables_authority.with_manager(|manager| {
+                    manager
+                        .resolver()
+                        .and_then(|resolver| resolver.host_ptr_for_range(manager.base(), 8))
+                }),
+                Some(Some(child_page_table_host)),
+                "the actual child table authority remains available"
+            );
+        }
         child_task
             .refresh_fork_process_state_in(&transport.custody, &mut service)
             .expect("owner refresh must use live private COW leaves, not host arms");
@@ -6231,6 +6306,24 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>) {
             .is_none(),
         "successful privileged refresh must disarm the child vvar span",
     );
+    if owner_cow_pages.is_some() {
+        let leaf = child_page_tables_authority
+            .with_manager(|pt| {
+                carrick_mmu_core::aarch64::terminal_descriptor(pt.debug_walk(generation_address))
+            })
+            .unwrap();
+        assert_ne!(
+            leaf & (1 << 54),
+            0,
+            "native vvar remains NX after owner COW"
+        );
+        assert!(!carrick_mmu_core::aarch64::terminal_descriptor_may_write(
+            leaf
+        ));
+        assert!(!carrick_mmu_core::aarch64::terminal_descriptor_may_execute(
+            leaf
+        ));
+    }
     let child_private_key = (
         align_down(refreshed.ipa, CowArmedRanges::COMPOUND_SIZE),
         CowArmedRanges::COMPOUND_SIZE,
@@ -6259,6 +6352,19 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>) {
         "the fresh generation must land in the child-private COW owner",
     );
     let grandchild_root_slot = root_slot_base + root_slot_size;
+    if native_import {
+        // The separate host-plan grandchild witness below deliberately uses
+        // that plan's fixed-VA projection after the owner refresh was proved
+        // without it.
+        child_task.mappings.insert(
+            prepared
+                .mappings
+                .iter()
+                .find(|row| row.start == crate::memory::LINUX_PAGE_TABLES_BASE)
+                .map(HvpatchTaskMappingState::unowned_runtime_region)
+                .expect("host-plan table projection"),
+        );
+    }
     let mut grandchild_page_tables = child_page_tables_authority
         .snapshot_image()
         .expect("refreshed child page tables");
@@ -7350,6 +7456,198 @@ fn copied_fork_child_retain_preserves_borrowed_structural_owner() {
 }
 
 #[test]
+fn closed_initial_foreign_binding_survives_sibling_retirement() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let transport = Arc::new(CarrierForeignMmTransport::new());
+    let initial = HvfTaskState::neutral();
+    let mm = carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(31).unwrap());
+    let binding = CarrierForeignMmBinding {
+        asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(9).unwrap()),
+        stage1_root: Gpa(0x8800_0040_0000),
+    };
+    let snapshot = registration_snapshot(mm, binding);
+    let admission = initial.protections.begin_selection().unwrap();
+    initial
+        .publish_closed_foreign_mm_identity(&transport, mm, binding)
+        .expect("first-load publication holds the user's admission guard");
+    drop(admission);
+    let sibling = transport.register_owned_identity(mm, binding, &initial.mm_access);
+    drop(sibling);
+    let retained = transport
+        .state_for(&snapshot, Instant::now() + Duration::from_secs(1))
+        .expect("the closed initial task must retain its MM after its sibling retires");
+    assert!(Arc::ptr_eq(&retained, &initial.mm_access));
+    drop(initial);
+    assert!(matches!(
+        transport.state_for(&snapshot, Instant::now() + Duration::from_secs(1)),
+        Err(carrick_hal::ForeignMmTransportError::MissingBinding)
+    ));
+}
+
+#[test]
+fn initial_task_foreign_binding_survives_sibling_retirement() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let transport = Arc::new(CarrierForeignMmTransport::new());
+    let mut initial = HvfTaskState::neutral();
+    let mm = carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(31).unwrap());
+    let binding = CarrierForeignMmBinding {
+        asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(9).unwrap()),
+        stage1_root: Gpa(0x8800_0040_0000),
+    };
+    let snapshot = registration_snapshot(mm, binding);
+    // Initial task projections have no copied-child directory registration.
+    assert!(initial.registration.is_none());
+    initial.publish_foreign_mm_identity(&transport, mm, binding);
+    let sibling = transport.register_owned_identity(mm, binding, &initial.mm_access);
+    drop(sibling);
+    let retained = transport
+        .state_for(&snapshot, Instant::now() + Duration::from_secs(1))
+        .expect("an initial task must keep its MM after its only sibling retires");
+    assert!(Arc::ptr_eq(&retained, &initial.mm_access));
+    drop(initial);
+    assert!(matches!(
+        transport.state_for(&snapshot, Instant::now() + Duration::from_secs(1)),
+        Err(carrick_hal::ForeignMmTransportError::MissingBinding)
+    ));
+}
+
+#[test]
+fn exec_task_foreign_binding_survives_successor_sibling_retirement() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let transport = Arc::new(CarrierForeignMmTransport::new());
+    let mut task = HvfTaskState::neutral();
+    let old_mm = carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(31).unwrap());
+    let new_mm = carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(32).unwrap());
+    let old_binding = CarrierForeignMmBinding {
+        asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(9).unwrap()),
+        stage1_root: Gpa(0x8800_0040_0000),
+    };
+    let new_binding = CarrierForeignMmBinding {
+        asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(10).unwrap()),
+        stage1_root: Gpa(0x8800_0060_0000),
+    };
+    let old_snapshot = registration_snapshot(old_mm, old_binding);
+    let new_snapshot = registration_snapshot(new_mm, new_binding);
+    task.publish_foreign_mm_identity(&transport, old_mm, old_binding);
+    let predecessor_peer = transport.register_owned_identity(old_mm, old_binding, &task.mm_access);
+    let predecessor_state = Arc::clone(&task.mm_access);
+
+    // Exec replaces MmAccessState before binding the committed successor.
+    task.mm_access = HvfTaskState::neutral().mm_access;
+    task.publish_foreign_mm_identity(&transport, new_mm, new_binding);
+    let successor_peer = transport.register_owned_identity(new_mm, new_binding, &task.mm_access);
+    drop(successor_peer);
+    let retained = transport
+        .state_for(&new_snapshot, Instant::now() + Duration::from_secs(1))
+        .expect("an exec successor must keep its MM after its only sibling retires");
+    assert!(Arc::ptr_eq(&retained, &task.mm_access));
+    assert!(Arc::ptr_eq(
+        &transport
+            .state_for(&old_snapshot, Instant::now() + Duration::from_secs(1))
+            .expect("the predecessor peer still owns its distinct MM"),
+        &predecessor_state,
+    ));
+    drop(task);
+    assert!(matches!(
+        transport.state_for(&new_snapshot, Instant::now() + Duration::from_secs(1)),
+        Err(carrick_hal::ForeignMmTransportError::MissingBinding)
+    ));
+    drop(predecessor_peer);
+    assert!(matches!(
+        transport.state_for(&old_snapshot, Instant::now() + Duration::from_secs(1)),
+        Err(carrick_hal::ForeignMmTransportError::MissingBinding)
+    ));
+}
+
+fn registration_snapshot(
+    mm: carrick_hal::ForeignMmId,
+    binding: CarrierForeignMmBinding,
+) -> CarrierForeignMmSnapshot {
+    CarrierForeignMmSnapshot {
+        mm,
+        binding,
+        backend_revision: carrick_hal::ForeignBackendRevision::from_authority_raw(1),
+        vma_revision: carrick_hal::ForeignVmaRevision::from_authority_raw(1),
+        frame_inventory_revision: carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(1),
+        mapping_ids: Vec::new(),
+        executable_ranges: Vec::new(),
+        readable_ranges: Vec::new(),
+    }
+}
+
+#[test]
+fn owned_foreign_mm_registration_survives_same_mm_sibling_retirement() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let transport = Arc::new(CarrierForeignMmTransport::new());
+    let binding = CarrierForeignMmBinding {
+        asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(9).unwrap()),
+        stage1_root: Gpa(0x8800_0040_0000),
+    };
+    let state = MmAccessState::new_unbound(
+        carrick_aarch64::Stage1Authority::new(),
+        carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(MemoryProtections::default())),
+        Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+        Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+        Arc::new(parking_lot::Mutex::new(Vec::new())),
+        crate::hvf_aarch64_engine::HostCowStats::default(),
+    );
+    let mm = carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(31).unwrap());
+    let owner = transport.register_owned_identity(mm, binding, &state);
+    let sibling = transport.register_owned_identity(mm, binding, &state);
+    let snapshot = CarrierForeignMmSnapshot {
+        mm,
+        binding,
+        backend_revision: carrick_hal::ForeignBackendRevision::from_authority_raw(1),
+        vma_revision: carrick_hal::ForeignVmaRevision::from_authority_raw(1),
+        frame_inventory_revision: carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(1),
+        mapping_ids: Vec::new(),
+        executable_ranges: Vec::new(),
+        readable_ranges: Vec::new(),
+    };
+
+    transport.register_identity(mm, binding, &state);
+    drop(sibling);
+    assert!(
+        Arc::ptr_eq(
+            &transport
+                .state_for(&snapshot, Instant::now() + Duration::from_secs(1))
+                .expect("one retired sibling must not remove another live task's MM binding"),
+            &state,
+        ),
+        "same-MM task retirement must retain the exact physical supply state"
+    );
+
+    drop(owner);
+    assert!(matches!(
+        transport.state_for(&snapshot, Instant::now() + Duration::from_secs(1)),
+        Err(carrick_hal::ForeignMmTransportError::MissingBinding)
+    ));
+}
+
+#[test]
+fn owned_foreign_mm_registration_removes_expired_state_without_historical_rows() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let transport = Arc::new(CarrierForeignMmTransport::new());
+    let task = HvfTaskState::neutral();
+    let mm = carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(31).unwrap());
+    let binding = CarrierForeignMmBinding {
+        asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(9).unwrap()),
+        stage1_root: Gpa(0x8800_0040_0000),
+    };
+    let registration = transport.register_owned_identity(mm, binding, &task.mm_access);
+    let weak_state = Arc::downgrade(&task.mm_access);
+    drop(task);
+    assert!(weak_state.upgrade().is_none());
+    assert_eq!(transport.states.read().len(), 1);
+
+    drop(registration);
+    assert!(
+        transport.states.read().is_empty(),
+        "final claim teardown must retain zero historical rows after state destruction"
+    );
+}
+
+#[test]
 fn owned_foreign_mm_registration_teardown_is_exact_and_stale_safe() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = Arc::new(CarrierForeignMmTransport::new());
@@ -7831,6 +8129,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
         pending_process_aliases: Vec::new(),
         fail_next_begin_exec_inventory: false,
         cow_rollback_scratch: None,
+        foreign_mm_claim: CarrierForeignMmTaskClaim::default(),
         registration: None,
     };
 
@@ -13475,9 +13774,9 @@ mod guest_cow {
                 root | (1 << 48),
             )
         };
-        let transport = CarrierForeignMmTransport::new();
+        let transport = Arc::new(CarrierForeignMmTransport::new());
         let admission = protections.begin_selection().unwrap();
-        transport
+        let _registration = transport
             .register_closed_initial_identity(
                 carrick_hal::ForeignMmId::from_kernel_allocation(mm),
                 CarrierForeignMmBinding {
@@ -14041,7 +14340,17 @@ fn transfer_partial_remap_keeps_dirty_neighbor_in_same_compound() {
         matches!(receipt.outcome, DescriptorOutcome::Applied(_)),
         "{receipt:?}"
     );
+    let grants_before = global_frame::El1FrameGrantObserver::new(&custody)
+        .snapshot()
+        .grants_succeeded;
     assert!(pending.settle(&receipt).unwrap());
+    assert_eq!(
+        global_frame::El1FrameGrantObserver::new(&custody)
+            .snapshot()
+            .grants_succeeded,
+        grants_before + 1,
+        "the applied owner transfer must own an exact frame-grant receipt"
+    );
     assert_eq!(
         pins_at_wake.load(std::sync::atomic::Ordering::SeqCst),
         0,
@@ -14098,6 +14407,15 @@ fn transfer_partial_remap_keeps_dirty_neighbor_in_same_compound() {
         Some(Some(source.ipa + 4096))
     );
     assert!(alias_registry().lock().contains(&neighbor));
+    alias_registry()
+        .lock()
+        .remove_exact_values_in_batch(&[new_alias]);
+    let _ = retire_global_frame_host_owner_if_generation_in(
+        &custody,
+        new_alias.physical_ipa,
+        new_alias.physical_size as u64,
+        new_alias.owner_generation,
+    );
 }
 
 #[test]
@@ -14819,4 +15137,649 @@ fn concurrent_transfer_waits_for_exact_uncommitted_physical_grant() {
         next_alias.owner_generation,
     );
     assert!(next_wait.0.is_ready());
+}
+
+#[test]
+fn native_reserved_mutable_file_mapping_keeps_clean_page_cache_and_guest_receipt() {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::FileExt;
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let mut fixture = retained_reuse_fixture(
+        &transport,
+        314,
+        0x9a00_7400_0000,
+        0x9b00_7400_0000,
+        carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest,
+    );
+    let handle = unsafe {
+        carrick_el1_abi::El1MmHandle::from_admitted_owner(
+            transport.custody.transfer_carrier,
+            carrick_el1_abi::ReservationMm::new(314).unwrap(),
+            nonzero(1),
+        )
+    };
+    fixture
+        .installed
+        .state
+        .protections
+        .admit_owner(handle)
+        .unwrap();
+    fixture
+        .installed
+        .state
+        .bind_cow_runtime(MmCowRuntimeBinding {
+            authority: fixture.authority.clone(),
+            identity: fixture.task.cow_identity.unwrap(),
+            mm_root_slot: fixture.task.mm_root_slot,
+            container_root: fixture.task.container_root,
+            persistent_vm_lifecycle: true,
+        });
+    let tables = fixture.installed.state.page_tables_authority();
+    let published = std::cell::RefCell::new(Vec::new());
+    let mut service = RetainedReuseGuestService {
+        tables: tables.clone(),
+        authority: fixture.authority.clone(),
+        root: fixture.root_key,
+        host: fixture.root_host,
+        available: true,
+        published: &published,
+        maintenance: RetainedReuseMaintenance(std::cell::Cell::new(0)),
+        not_applied: None,
+    };
+    let path = std::env::temp_dir().join(format!("carrick-reserved-file-{}", std::process::id()));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    std::fs::remove_file(path).unwrap();
+    file.set_len(OWNER_LEN as u64).unwrap();
+    file.write_all_at(b"file", 0).unwrap();
+    let mut vm = crate::trap::budget_tests::test_vm_state(fixture.task);
+    let owners_before = owner_keys();
+    let aliases_before = alias_registry().lock().ordered();
+    let inventory_before = inventory_fingerprint(&vm.frame_inventory.lock());
+    let stage1_before = unsafe {
+        std::slice::from_raw_parts(fixture.root_host as *const u8, fixture.root_key.1 as usize)
+    }
+    .to_vec();
+    for rejected in [
+        unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                nonzero(handle.carrier().get() + 1),
+                handle.mm(),
+                handle.incarnation(),
+            )
+        },
+        unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                handle.carrier(),
+                carrick_el1_abi::ReservationMm::new(315).unwrap(),
+                handle.incarnation(),
+            )
+        },
+        unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                handle.carrier(),
+                handle.mm(),
+                nonzero(handle.incarnation().get() + 1),
+            )
+        },
+    ] {
+        unsafe {
+            carrick_guest_mem::OwnerReservedWrite::with_scope(
+                rejected,
+                carrick_guest_mem::GuestVaRange::from_len(GuestVa(TEST_VA), OWNER_LEN),
+                |admission| {
+                    assert!(
+                        vm.materialize_private_file_backing(
+                            TEST_VA,
+                            OWNER_LEN,
+                            file.as_fd(),
+                            0,
+                            carrick_guest_mem::PrivateFilePublication {
+                                source: carrick_guest_mem::PrivateFileSource::Mutable,
+                                admission: Some(admission)
+                            },
+                            &mut service
+                        )
+                        .is_err()
+                    );
+                },
+            );
+        }
+    }
+    unsafe {
+        carrick_guest_mem::OwnerReservedWrite::with_scope(
+            handle,
+            carrick_guest_mem::GuestVaRange::from_len(GuestVa(TEST_VA), OWNER_LEN),
+            |admission| {
+                assert!(
+                    vm.materialize_private_file_backing(
+                        TEST_VA + OWNER_LEN as u64,
+                        OWNER_LEN,
+                        file.as_fd(),
+                        0,
+                        carrick_guest_mem::PrivateFilePublication {
+                            source: carrick_guest_mem::PrivateFileSource::Mutable,
+                            admission: Some(admission)
+                        },
+                        &mut service
+                    )
+                    .is_err()
+                );
+                let old_binding = vm.mm_access.cow_runtime.read().clone().unwrap();
+                let mut stale = old_binding.clone();
+                stale.mm_root_slot =
+                    Some((old_binding.mm_root_slot.unwrap().0 + 0x20_0000, 0x20_0000));
+                vm.mm_access.bind_cow_runtime(stale);
+                assert!(
+                    vm.materialize_private_file_backing(
+                        TEST_VA,
+                        OWNER_LEN,
+                        file.as_fd(),
+                        0,
+                        carrick_guest_mem::PrivateFilePublication {
+                            source: carrick_guest_mem::PrivateFileSource::Mutable,
+                            admission: Some(admission)
+                        },
+                        &mut service
+                    )
+                    .is_err()
+                );
+                vm.mm_access.bind_cow_runtime(old_binding);
+                tables.select_live_descriptor_owner(
+                    carrick_mmu_core::aarch64::LiveDescriptorOwner::Host,
+                );
+                assert!(
+                    vm.materialize_private_file_backing(
+                        TEST_VA,
+                        OWNER_LEN,
+                        file.as_fd(),
+                        0,
+                        carrick_guest_mem::PrivateFilePublication {
+                            source: carrick_guest_mem::PrivateFileSource::Mutable,
+                            admission: Some(admission)
+                        },
+                        &mut service
+                    )
+                    .is_err()
+                );
+                tables.select_live_descriptor_owner(
+                    carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest,
+                );
+                assert!(
+                    published.borrow().is_empty(),
+                    "invalid admissions never reach descriptors"
+                );
+                let ordinary = vm
+                    .materialize_private_file_backing(
+                        TEST_VA,
+                        OWNER_LEN,
+                        file.as_fd(),
+                        0,
+                        carrick_guest_mem::PrivateFilePublication {
+                            source: carrick_guest_mem::PrivateFileSource::Mutable,
+                            admission: None,
+                        },
+                        &mut service,
+                    )
+                    .unwrap_err();
+                assert!(
+                    ordinary
+                        .to_string()
+                        .contains("cannot enter host sparse publication")
+                );
+                service.not_applied = Some(
+                    carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(
+                        carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::Occupied,
+                    ),
+                );
+                let refused = vm
+                    .materialize_private_file_backing(
+                        TEST_VA,
+                        OWNER_LEN,
+                        file.as_fd(),
+                        0,
+                        carrick_guest_mem::PrivateFilePublication {
+                            source: carrick_guest_mem::PrivateFileSource::Mutable,
+                            admission: Some(admission),
+                        },
+                        &mut service,
+                    )
+                    .unwrap_err();
+                assert!(refused.to_string().contains("did not apply"), "{refused}");
+                assert_eq!(published.borrow().len(), 1);
+                assert_eq!(owner_keys(), owners_before);
+                assert_eq!(alias_registry().lock().ordered(), aliases_before);
+                assert_eq!(
+                    inventory_fingerprint(&vm.frame_inventory.lock()),
+                    inventory_before
+                );
+                assert_eq!(
+                    std::slice::from_raw_parts(
+                        fixture.root_host as *const u8,
+                        fixture.root_key.1 as usize,
+                    ),
+                    stage1_before
+                );
+                assert!(vm.cow_deferred_publications.lock().is_empty());
+                assert!(fixture.authority.published.lock().is_none());
+                service.not_applied = None;
+                published.borrow_mut().clear();
+                let result = vm.materialize_private_file_backing(
+                    TEST_VA,
+                    OWNER_LEN,
+                    file.as_fd(),
+                    0,
+                    carrick_guest_mem::PrivateFilePublication {
+                        source: carrick_guest_mem::PrivateFileSource::Mutable,
+                        admission: Some(admission),
+                    },
+                    &mut service,
+                );
+                assert!(matches!(result, Ok(true)), "reserved file view: {result:?}");
+            },
+        );
+    }
+    assert_eq!(
+        published.borrow().len(),
+        1,
+        "one owner-selected descriptor receipt"
+    );
+    let mapping = vm.mappings.iter().find(|m| m.start == TEST_VA).unwrap();
+    fixture
+        .installed
+        .owners
+        .0
+        .push((mapping.physical_ipa, mapping.physical_size as u64));
+    let host = mapping.host_addr;
+    assert_eq!(unsafe { std::slice::from_raw_parts(host, 4) }, b"file");
+    file.write_all_at(b"live", 0).unwrap();
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(host, 4) },
+        b"live",
+        "clean private pages follow file writes"
+    );
+    assert_eq!(vm.cow_armed.lock().overlapping(TEST_VA, OWNER_LEN).len(), 1);
+    assert!(matches!(
+        vm.frame_inventory
+            .lock()
+            .extents
+            .get(&(mapping.physical_ipa, mapping.physical_size as u64))
+            .unwrap()
+            .backing,
+        InventoryBackingIdentity::PrivateFileView(_)
+    ));
+    let peer = install_mm(
+        &transport,
+        315,
+        0x9a00_7500_0000,
+        0x9b00_7500_0000,
+        *b"peer",
+    );
+    let peer_host = global_frame_host_owner_identity(peer.owners.0[0].0, peer.owners.0[0].1)
+        .unwrap()
+        .0;
+    // A task's boot lookup window may survive a root switch. It is not the
+    // selected MM's primary arena, even though both roots are live and pinned.
+    vm.mappings
+        .iter_mut()
+        .find(|mapping| mapping.start == carrick_mem::memory::LINUX_PAGE_TABLES_BASE)
+        .unwrap()
+        .host_addr = peer_host as *mut u8;
+    let protection = vm.observe_frame_cow_protection(TEST_VA, OWNER_LEN, 0);
+    assert!(
+        protection.is_ok(),
+        "deferred file protection must read the bound root: {protection:?}"
+    );
+    assert!(vm.cow_deferred_publications.lock().is_empty());
+}
+
+#[test]
+fn native_reserved_initial_root_uses_bound_root_without_a_pool_slot() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let installed = install_mm(
+        &transport,
+        313,
+        0x9a00_7300_0000,
+        0x9b00_7300_0000,
+        *b"keep",
+    );
+    let handle = unsafe {
+        carrick_el1_abi::El1MmHandle::from_admitted_owner(
+            transport.custody.transfer_carrier,
+            carrick_el1_abi::ReservationMm::new(313).unwrap(),
+            nonzero(1),
+        )
+    };
+    installed.state.protections.admit_owner(handle).unwrap();
+    let mut task = HvfTaskState::neutral();
+    task.mm_access = installed.state.clone();
+    task.cow_identity = Some(carrick_hal::FrameCowIdentity {
+        linux_pid: 313,
+        linux_tid: 313,
+        mm: 313,
+        asid: 313,
+    });
+    assert!(
+        task.mm_root_slot.is_none(),
+        "the initial root has no pool lease"
+    );
+    unsafe {
+        carrick_guest_mem::OwnerReservedWrite::with_scope(
+            handle,
+            carrick_guest_mem::GuestVaRange::from_len(GuestVa(TEST_VA), OWNER_LEN),
+            |admission| {
+                assert_eq!(
+                    task.authenticate_owner_reserved_write(
+                        &transport.custody,
+                        admission,
+                        TEST_VA,
+                        4
+                    ),
+                    Ok(()),
+                    "an exact admitted initial root must not require a pooled root slot"
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn native_reserved_file_content_uses_owner_cow_and_copy_admission() {
+    use carrick_aarch64::vmm::Aarch64Vmm;
+    use carrick_guest_mem::GuestMemory;
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let installed = install_mm(
+        &transport,
+        311,
+        0x9a00_7100_0000,
+        0x9b00_7100_0000,
+        *b"keep",
+    );
+    let peer = install_mm(
+        &transport,
+        312,
+        0x9a00_7200_0000,
+        0x9b00_7200_0000,
+        *b"peer",
+    );
+    let data_key = installed.owners.0[1];
+    let (data_host, data_generation) =
+        global_frame_host_owner_identity(data_key.0, data_key.1).unwrap();
+    let peer_host = global_frame_host_owner_identity(peer.owners.0[1].0, peer.owners.0[1].1)
+        .unwrap()
+        .0;
+    // Model the fresh private backing prepared for the reserved file load,
+    // before the N1 owner is selected. These are live production table words.
+    installed
+        .state
+        .page_tables_authority()
+        .edit(
+            || Err(carrick_mmu_core::aarch64::PageTableError::BadAddress),
+            |editor| {
+                editor
+                    .manager
+                    .set_writable_preserving_attributes(TEST_VA, OWNER_LEN, None)
+            },
+        )
+        .unwrap();
+    let handle = unsafe {
+        carrick_el1_abi::El1MmHandle::from_admitted_owner(
+            transport.custody.transfer_carrier,
+            carrick_el1_abi::ReservationMm::new(311).unwrap(),
+            nonzero(1),
+        )
+    };
+    installed.state.protections.admit_owner(handle).unwrap();
+    let mut task = HvfTaskState::neutral();
+    task.mm_access = installed.state.clone();
+    task.mm_root_slot = Some(installed.owners.0[0]);
+    task.persistent_vm_lifecycle = true;
+    let mut authority = TestForeignCowAuthority::new(&installed);
+    authority.old_frame_mappings = 1;
+    task.cow_authority = Some(Arc::new(authority));
+    task.cow_identity = Some(carrick_hal::FrameCowIdentity {
+        linux_pid: 311,
+        linux_tid: 311,
+        mm: 311,
+        asid: 311,
+    });
+    task.mappings.insert(HvfMappedRegion {
+        start: TEST_VA,
+        end: TEST_VA + OWNER_LEN as u64,
+        ipa: data_key.0,
+        physical_ipa: data_key.0,
+        host_addr: data_host as *mut u8,
+        size: OWNER_LEN,
+        physical_size: OWNER_LEN,
+        perms: applevisor::memory::MemPerms::ReadWrite,
+        memory: None,
+        host_mapping: None,
+        structural_owner: None,
+        stage2_lease: None,
+        is_dynamic_alias: true,
+        sharing: GuestMappingSharing::Private,
+        guest_writable: true,
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: data_generation,
+    });
+    let mut engine = crate::hvf_aarch64_engine::native_reserved_content_engine_for_test(
+        crate::trap::budget_tests::test_vm_state(task),
+    )
+    .unwrap();
+    assert!(engine.backend().state.protections.owner().is_some());
+    // This drives the production AArch64 GuestMemory consumer and the real
+    // HVF ensure_frame_cow_write/translated_write_unchecked implementations.
+    unsafe {
+        carrick_guest_mem::OwnerReservedWrite::with_scope(
+            handle,
+            carrick_guest_mem::GuestVaRange::from_len(GuestVa(TEST_VA), OWNER_LEN),
+            |admission| {
+                let owner_write = engine.write_owner_reserved_bytes(admission, TEST_VA, b"file");
+                // The same native copier also authenticates the closed admission,
+                // post-COW IPA and exact current physical owner generation.
+                let native_copy = engine
+                    .backend_mut_for_persistent_factory()
+                    .translated_write_unchecked(TEST_VA, data_key.0, b"file", Some(admission));
+                assert!(
+                    owner_write.is_ok() && native_copy.is_ok(),
+                    "reserved native owner COW={owner_write:?}; copy={native_copy:?}"
+                );
+                assert_eq!(
+                    std::slice::from_raw_parts(data_host as *const u8, 4),
+                    b"file"
+                );
+                assert_eq!(
+                    std::slice::from_raw_parts(peer_host as *const u8, 4),
+                    b"peer",
+                    "a same-VA peer retains its own exact physical backing"
+                );
+                assert!(
+                    engine
+                        .write_owner_reserved_bytes(admission, TEST_VA + OWNER_LEN as u64, b"away")
+                        .is_err()
+                );
+                assert!(
+                    engine
+                        .backend_mut_for_persistent_factory()
+                        .translated_write_unchecked(
+                            TEST_VA,
+                            peer.owners.0[1].0,
+                            b"away",
+                            Some(admission)
+                        )
+                        .is_err(),
+                    "stale/pre-COW IPA is refused"
+                );
+                assert!(
+                    engine
+                        .backend_mut_for_persistent_factory()
+                        .translated_write_unchecked(TEST_VA, data_key.0, b"away", None)
+                        .is_err(),
+                    "ordinary native raw copy stays closed"
+                );
+                let task = &mut engine.backend_mut_for_persistent_factory().state.task;
+                let root_slot = task.mm_root_slot;
+                task.mm_root_slot = Some(peer.owners.0[0]);
+                assert!(
+                    task.validate_owner_reserved_mapping(
+                        &transport.custody,
+                        admission,
+                        TEST_VA,
+                        4,
+                        None
+                    )
+                    .is_err(),
+                    "a reused or foreign root cannot adopt the admitted operation"
+                );
+                task.mm_root_slot = root_slot;
+                let data_frame = task
+                    .frame_inventory
+                    .lock()
+                    .extents
+                    .get(&data_key)
+                    .unwrap()
+                    .frame;
+                task.frame_inventory
+                    .lock()
+                    .frames
+                    .lock()
+                    .references
+                    .insert(data_frame, 2);
+                assert!(
+                    task.validate_owner_reserved_mapping(
+                        &transport.custody,
+                        admission,
+                        TEST_VA,
+                        4,
+                        None
+                    )
+                    .is_err(),
+                    "a missing arm does not authorize a shared private frame"
+                );
+                task.frame_inventory
+                    .lock()
+                    .frames
+                    .lock()
+                    .references
+                    .insert(data_frame, 1);
+                let saved_authority = task.cow_authority.clone();
+                task.cow_authority = Some(Arc::new(TestForeignCowAuthority::new(&installed)));
+                assert!(
+                    task.validate_owner_reserved_mapping(
+                        &transport.custody,
+                        admission,
+                        TEST_VA,
+                        4,
+                        None
+                    )
+                    .is_err(),
+                    "backend reference one must not override two live kernel mappings"
+                );
+                task.cow_authority = saved_authority;
+                let old_backing = task
+                    .frame_inventory
+                    .lock()
+                    .extents
+                    .get(&data_key)
+                    .unwrap()
+                    .backing;
+                task.frame_inventory
+                    .lock()
+                    .extents
+                    .get_mut(&data_key)
+                    .unwrap()
+                    .backing = InventoryBackingIdentity::PrivateFileView(999);
+                assert!(
+                    task.validate_owner_reserved_mapping(
+                        &transport.custody,
+                        admission,
+                        TEST_VA,
+                        4,
+                        None
+                    )
+                    .is_err(),
+                    "a missing arm does not authorize a private file view"
+                );
+                task.frame_inventory
+                    .lock()
+                    .extents
+                    .get_mut(&data_key)
+                    .unwrap()
+                    .backing = old_backing;
+                assert_eq!(
+                    std::slice::from_raw_parts(data_host as *const u8, 4),
+                    b"file"
+                );
+            },
+        )
+    };
+    for stale in [
+        unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                nonzero(handle.carrier().get() + 1),
+                handle.mm(),
+                handle.incarnation(),
+            )
+        },
+        unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                handle.carrier(),
+                carrick_el1_abi::ReservationMm::new(312).unwrap(),
+                handle.incarnation(),
+            )
+        },
+        unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                handle.carrier(),
+                handle.mm(),
+                nonzero(handle.incarnation().get() + 1),
+            )
+        },
+    ] {
+        // SAFETY: deliberately stale fixture proof tests native refusal only.
+        unsafe {
+            carrick_guest_mem::OwnerReservedWrite::with_scope(
+                stale,
+                carrick_guest_mem::GuestVaRange::from_len(GuestVa(TEST_VA), OWNER_LEN),
+                |admission| {
+                    assert!(
+                        engine
+                            .write_owner_reserved_bytes(admission, TEST_VA, b"away")
+                            .is_err()
+                    );
+                    assert!(
+                        engine
+                            .backend_mut_for_persistent_factory()
+                            .translated_write_unchecked(
+                                TEST_VA,
+                                data_key.0,
+                                b"away",
+                                Some(admission)
+                            )
+                            .is_err()
+                    );
+                },
+            )
+        };
+    }
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(data_host as *const u8, 4) },
+        b"file"
+    );
+    // Keep the source owners alive until all accesses above complete.
+    drop((engine, installed, peer));
 }

@@ -171,6 +171,7 @@ struct FileBackedLoweringMemory {
     bus_marks: std::cell::RefCell<Vec<(u64, usize)>>,
     deferred_offers:
         std::cell::RefCell<Vec<(u64, usize, u64, carrick_guest_mem::PrivateFileSource)>>,
+    deferred_state: Option<Arc<carrick_guest_mem::DeferredAnonymousState>>,
 }
 
 impl FileBackedLoweringMemory {
@@ -182,6 +183,7 @@ impl FileBackedLoweringMemory {
             offers: std::cell::RefCell::new(Vec::new()),
             bus_marks: std::cell::RefCell::new(Vec::new()),
             deferred_offers: std::cell::RefCell::new(Vec::new()),
+            deferred_state: None,
         }
     }
 
@@ -189,9 +191,26 @@ impl FileBackedLoweringMemory {
         self.defer = true;
         self
     }
+
+    fn deferred_with_state(
+        mut self,
+        state: Arc<carrick_guest_mem::DeferredAnonymousState>,
+    ) -> Self {
+        self.defer = true;
+        self.deferred_state = Some(state);
+        self
+    }
 }
 
 impl GuestMemory for FileBackedLoweringMemory {
+    fn user_memory_venue(&self) -> carrick_guest_mem::UserMemoryVenue {
+        if self.deferred_state.is_some() {
+            carrick_guest_mem::UserMemoryVenue::Owner
+        } else {
+            carrick_guest_mem::UserMemoryVenue::Legacy
+        }
+    }
+
     fn supports_lazy_private_file_mmap(&self) -> bool {
         self.defer
     }
@@ -220,6 +239,7 @@ impl GuestMemory for FileBackedLoweringMemory {
         _host_fd: std::os::fd::BorrowedFd<'_>,
         offset: u64,
         _source: carrick_guest_mem::PrivateFileSource,
+        _admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
     ) -> Result<bool, MemoryError> {
         self.offers.borrow_mut().push((address, len, offset));
         Ok(self.accept)
@@ -229,18 +249,125 @@ impl GuestMemory for FileBackedLoweringMemory {
         &mut self,
         address: u64,
         len: usize,
-        _host_fd: std::os::fd::BorrowedFd<'_>,
+        host_fd: std::os::fd::BorrowedFd<'_>,
         offset: u64,
         source: carrick_guest_mem::PrivateFileSource,
     ) -> Result<bool, MemoryError> {
         self.deferred_offers
             .borrow_mut()
             .push((address, len, offset, source));
+        if self.accept
+            && let Some(state) = &self.deferred_state
+        {
+            state
+                .reserve_private_file(GuestVa(address), len, host_fd, offset, source)
+                .map_err(|error| MemoryError::HostMap(error.to_string()))?;
+        }
         Ok(self.accept)
     }
 }
 
 impl CurrentMmMemory for FileBackedLoweringMemory {}
+
+#[test]
+fn delegated_fixed_lazy_file_replacement_retires_only_replaced_recipe() {
+    const SYS_MMAP: u64 = 222;
+    const PAGE: u64 = 4096;
+    const FILE_FD: i32 = 35;
+
+    let dispatcher = SyscallDispatcher::new();
+    let payload: Vec<u8> = (0..4 * PAGE as usize)
+        .map(|index| (index / PAGE as usize) as u8 + 1)
+        .collect();
+    install_host_file_fd_with_source(
+        &dispatcher,
+        FILE_FD,
+        &payload,
+        carrick_guest_mem::PrivateFileSource::ImmutableLower,
+    );
+    let _root = super::super::delegated_tests::Root::admit(&dispatcher);
+    let state = Arc::clone(&dispatcher.mem().lock().deferred_anonymous);
+    let mut memory = FileBackedLoweringMemory::new(LINUX_MMAP_BASE, 8 * PAGE as usize, true)
+        .deferred_with_state(Arc::clone(&state));
+    let registry =
+        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1306));
+    let reporter = CompatReporter::default();
+    let map = |memory: &mut FileBackedLoweringMemory, address, length, flags, offset| {
+        match threaded_memory_call(
+            &dispatcher,
+            memory,
+            &registry,
+            &reporter,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    address,
+                    length,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    flags,
+                    FILE_FD as u64,
+                    offset,
+                ]),
+            ),
+        ) {
+            DispatchOutcome::Returned { value } => value,
+            DispatchOutcome::Errno { errno } => errno.guest_retval(),
+            other => panic!("unexpected file mapping outcome: {other:?}"),
+        }
+    };
+    let first = map(&mut memory, 0, 3 * PAGE, LINUX_MAP_PRIVATE, 0) as u64;
+    let replacement = first + PAGE;
+    assert_eq!(
+        map(
+            &mut memory,
+            replacement,
+            PAGE,
+            LINUX_MAP_PRIVATE | LINUX_MAP_FIXED | crate::linux_abi::LINUX_MAP_FIXED_NOREPLACE,
+            3 * PAGE,
+        ),
+        crate::linux_abi::LINUX_EEXIST.guest_retval(),
+        "refused placement must retain the old file recipe"
+    );
+    let mut retained = vec![0; PAGE as usize];
+    assert!(
+        state
+            .copy_pristine_file(GuestVa(replacement), &mut retained)
+            .expect("recipe after refused placement")
+    );
+    assert!(retained.iter().all(|byte| *byte == 2));
+    assert_eq!(memory.deferred_offers.borrow().len(), 1);
+    assert_eq!(
+        map(
+            &mut memory,
+            replacement,
+            PAGE,
+            LINUX_MAP_PRIVATE | LINUX_MAP_FIXED,
+            3 * PAGE,
+        ) as u64,
+        replacement
+    );
+    for (address, expected) in [(first, 1), (replacement, 4), (first + 2 * PAGE, 3)] {
+        let mut bytes = vec![0; PAGE as usize];
+        assert!(
+            state
+                .copy_pristine_file(GuestVa(address), &mut bytes)
+                .expect("retained file recipe read"),
+            "replacement lost the deferred recipe at {address:#x}"
+        );
+        assert!(
+            bytes.iter().all(|byte| *byte == expected),
+            "replacement must preserve the exact new offset and both untouched fragments: address={address:#x} first_byte={} expected={expected}",
+            bytes[0]
+        );
+    }
+    assert_eq!(memory.deferred_offers.borrow().len(), 2);
+    assert!(memory.offers.borrow().is_empty());
+    assert_eq!(
+        memory.inner.write_calls.get(),
+        0,
+        "a lazy replacement must not fall back to eager file copying"
+    );
+}
 
 #[test]
 fn mmap_private_hostfile_lowers_file_backed_and_publishes_bus_tail() {

@@ -18,11 +18,8 @@
 //! behaviour only and now lives in `carrick-kernel/tests/integration/`.
 //!
 //! Tests that need their own process stay as top-level `tests/*.rs` binaries:
-//! - `runtime_loop` — creates the process-global HVF VM (`hv_vm_create` is
-//!   once-per-process).
-//! - `trap_hvf` — VM-free HVF trap-surface checks, kept as a separate host-lane
-//!   target; its VM-booting half is `carrick-vmm-hvf/tests/trap_engine_hvf.rs`
-//!   (signed only, `just test-hvf-trap-engine`).
+//! - `trap_hvf`, `runtime_loop` — create the process-global HVF VM
+//!   (`hv_vm_create` is once-per-process).
 //! - `interactive_supervisor`, `interactive_tty` — real host fork + PTY
 //!   raw-mode (process-global terminal state).
 //! - `syscall_process` — dispatches host `waitid`/`wait`, which observes ALL

@@ -389,6 +389,7 @@ where
                 Some((
                     Arc::new(memory::KernelFrameCowAuthority {
                         runtime: Arc::downgrade(&kernel),
+                        host_backing: Some(kernel.dispatcher.mem_view().host_backing_access()),
                         deferred_anonymous: kernel.dispatcher.deferred_anonymous_state(mm),
                         kernel: process.kernel_graph().clone(),
                         mm,
@@ -618,7 +619,7 @@ where
         generation,
         injected_lease: adopted.injected_lease,
         bootstrap_process_child: None,
-        bootstrap_thread_child: false,
+        bootstrap_thread_child: None,
     })?;
     let dormant = runtime.persistent_bindings().prepare_submission(
         &scheduler,

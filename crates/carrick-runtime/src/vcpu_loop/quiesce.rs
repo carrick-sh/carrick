@@ -1,5 +1,5 @@
 #![cfg_attr(
-    not(target_os = "macos"),
+    all(not(target_os = "macos"), not(test)),
     expect(
         dead_code,
         reason = "bound by the KVM carrier at M5: docs/superpowers/plans/2026-10-04-kvm-hvpatch-carrier.md"
@@ -1717,6 +1717,7 @@ where
         };
         let cow_authority = Arc::new(KernelFrameCowAuthority {
             runtime: Arc::downgrade(&child_kernel),
+            host_backing: Some(child_kernel.dispatcher.mem_view().host_backing_access()),
             deferred_anonymous: child_kernel
                 .dispatcher
                 .deferred_anonymous_state(child_mm_id),
@@ -1847,7 +1848,7 @@ where
                         .map(|address| (address, guest_child_pid)),
                 }
             }),
-            bootstrap_thread_child: false,
+            bootstrap_thread_child: None,
         })
         .unwrap_or_else(|error| {
             tracing::error!(child_pid, %error, "prepare process child logical job");

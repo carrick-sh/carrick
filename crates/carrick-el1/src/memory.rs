@@ -835,9 +835,47 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
         }
     };
     match completed {
-        Ok(()) => DelegatedAnonymous::Served,
+        Ok(()) => {
+            if retired {
+                carrick_el1_abi::record_reservation_event(
+                    8,
+                    mm.raw(),
+                    model.incarnation().raw(),
+                    request.sequence.raw() as u32,
+                    request.range.start() as u32,
+                );
+                carrick_el1_abi::record_reservation_event(
+                    9,
+                    request.range.start(),
+                    request.range.end(),
+                    mm.raw() as u32,
+                    request.sequence.raw() as u32,
+                );
+            }
+            DelegatedAnonymous::Served
+        }
         // The descriptor edit is live but the root refused to commit it.
         Err(refusal) if retired => {
+            let code = match refusal {
+                reservations::Refusal::Busy => 1,
+                reservations::Refusal::PreparedConflict => 2,
+                reservations::Refusal::Stale => 3,
+                reservations::Refusal::Invalid => 4,
+                reservations::Refusal::Collision => 5,
+                reservations::Refusal::Hole => 6,
+                reservations::Refusal::ForeignMapping => 7,
+                reservations::Refusal::Limit => 8,
+                reservations::Refusal::MetadataRequired => 9,
+            };
+            // Diagnostic phase 3: retired descriptors with a refused root
+            // commit. Keep this local so fixture inputs need no new bundle.
+            carrick_el1_abi::record_reservation_event(
+                3,
+                mm.raw(),
+                model.incarnation().raw(),
+                code,
+                request.sequence.raw() as u32,
+            );
             panic!("EL1 anonymous retirement commit refused: {refusal:?}")
         }
         Err(_) => refuse(pending, &mut model, Leave::RootUnavailable),

@@ -646,6 +646,10 @@ pub enum Policy {
 pub trait MappingInheritancePolicy {
     fn inheritance_policy(&self, mapping: &Mapping) -> Policy;
     fn is_shared(&self, mapping: &Mapping) -> bool;
+    /// Explicit synthetic windows with no reservation node.
+    fn unreserved_policy(&self, _base: u64, _span: u64) -> Option<Policy> {
+        None
+    }
 }
 
 pub fn policy<B: OwnerForkMmu, P: MappingInheritancePolicy>(
@@ -683,11 +687,15 @@ pub fn policy<B: OwnerForkMmu, P: MappingInheritancePolicy>(
             result
         })
     } else {
-        Ok(if B::is_user(descriptor) {
-            Policy::Omit
-        } else {
-            Policy::Keep
-        })
+        Ok(policy_provider
+            .unreserved_policy(base, span)
+            .unwrap_or_else(|| {
+                if B::is_user(descriptor) {
+                    Policy::Omit
+                } else {
+                    Policy::Keep
+                }
+            }))
     }
 }
 
@@ -993,8 +1001,12 @@ pub fn copy_entry<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
             if B::is_retired(descriptor) {
                 return Ok((descriptor, 0));
             }
-            let armed =
-                B::arm_private(descriptor, level, UserVa::new(va)).map_err(|_| ForkError::Core)?;
+            let armed = if policy_provider.unreserved_policy(va, span) == Some(Policy::Private) {
+                B::arm_synthetic_private(descriptor, level, UserVa::new(va))
+            } else {
+                B::arm_private(descriptor, level, UserVa::new(va))
+            }
+            .map_err(|_| ForkError::Core)?;
             let output_mask = B::ADDRESS_MASK & !(span - 1);
             let ipa = descriptor & output_mask;
             if ipa != 0 {

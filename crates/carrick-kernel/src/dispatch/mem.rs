@@ -52,7 +52,6 @@
 pub(crate) use super::dispatcher::MemView;
 use super::*;
 use carrick_fatal::carrick_fatal;
-use carrick_hal::guest_arch::UserVaCeiling;
 use carrick_vfs::{ProcMapSharing, ProcMapsEntry};
 
 pub use fault::core_data_runs;
@@ -74,6 +73,7 @@ pub(crate) use self::fault::*;
 pub(crate) use madvise::MadviseCoveredSegment;
 pub mod backing;
 pub(crate) use self::backing::*;
+pub use backing::HostBackingAccess;
 
 /// True when a non-empty guest range touches the runtime-owned raw-clock
 /// transport. The span is fixed in every HVPatch MM, so syscall paths which
@@ -554,6 +554,13 @@ impl MemState {
             prot.contains(LinuxProtFlags::WRITE),
             prot.contains(LinuxProtFlags::EXEC),
         );
+        mem.reprotect_root_backed_files(
+            start,
+            end,
+            carrick_el1_abi::ReservationProtection::from_bits(prot.bits()).unwrap_or_else(|| {
+                carrick_fatal!("dispatch::mprotect", "invalid typed protection")
+            }),
+        );
         coalesce_dynamic_maps_around(mem, start, end);
 
         let layout = mem.layout;
@@ -625,7 +632,12 @@ impl MemState {
         let layout = self.layout;
         let address_space_regions = self.address_space_regions.take();
         let linux_auxv_image = std::mem::take(&mut self.linux_auxv_image);
+        // An old MM may finish an owner-selected file transfer after exec
+        // publishes the replacement. Its source handle belongs to the same
+        // process lineage, even though all image-specific VMAs are reset.
+        let host_backing_custody = Arc::clone(&self.host_backing_custody);
         *self = Self::new_with_layout(layout);
+        self.host_backing_custody = host_backing_custody;
         self.address_space_regions = address_space_regions;
         self.linux_auxv_image = linux_auxv_image;
     }
@@ -1058,7 +1070,7 @@ pub(super) fn guest_vma_overlaps_locked(mem: &MemState, start: u64, len: u64) ->
         return true;
     };
     dynamic_mapping_overlaps_sorted(&mem.dynamic_maps, start, len)
-        || mem.root_anonymous_overlaps(start, len)
+        || mem.root_mapping_overlaps(start, len)
         || mem
             .growdown_ranges
             .iter()
@@ -1151,9 +1163,8 @@ pub(super) fn find_canonical_high_va_gap(
     mem: &MemState,
     length: u64,
     congruence: MmapGrantCongruence,
-    user_ceiling: UserVaCeiling,
 ) -> Option<(u64, bool)> {
-    if length == 0 || length > user_ceiling.exclusive_end() {
+    if length == 0 || length > (1u64 << 48) {
         return None;
     }
     let mut occupied: Vec<(u64, u64)> = Vec::new();
@@ -1204,7 +1215,7 @@ pub(super) fn find_canonical_high_va_gap(
         merged.push((s, e));
     }
 
-    let high_va_top = user_ceiling.exclusive_end();
+    let high_va_top = 1u64 << 48;
     let mut candidate = crate::memory::LINUX_HIGH_VA_THRESHOLD;
 
     for (occ_start, occ_end) in merged {
@@ -1330,7 +1341,7 @@ impl<'a> MemView<'a> {
         let authority = self.mem();
         let mem = authority.lock();
         dynamic_mapping_overlaps_sorted(&mem.dynamic_maps, start, len)
-            || mem.root_anonymous_overlaps(start, len)
+            || mem.root_mapping_overlaps(start, len)
     }
 
     /// Whether `[start, start + len)` overlaps a Linux-visible guest VMA.
@@ -1551,7 +1562,6 @@ impl<'a> MemView<'a> {
     /// delegated root can own itself (its proposal is then this syscall's
     /// host venue); every other mapping on a delegated MM is host-served and
     /// placed by the root around its nodes.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::dispatch) fn next_mmap_address(
         &self,
         requested: u64,
@@ -1560,7 +1570,6 @@ impl<'a> MemView<'a> {
         flags: u64,
         congruence: MmapGrantCongruence,
         root_eligible: bool,
-        user_ceiling: UserVaCeiling,
     ) -> Result<Option<(u64, bool)>, DispatchError> {
         {
             let authority = self.mem();
@@ -1575,12 +1584,10 @@ impl<'a> MemView<'a> {
                     flags,
                     congruence,
                     root_eligible,
-                    user_ceiling,
                 );
             }
         }
-        let granted =
-            self.next_mmap_address_inner(requested, length, prot, flags, congruence, user_ceiling);
+        let granted = self.next_mmap_address_inner(requested, length, prot, flags, congruence);
         // Grant audit: CARRICK_MMAP_GRANT_DEBUG=1 logs any non-FIXED grant that
         // overlaps a LIVE dynamic mapping, with the allocator state and caller.
         // A double-grant here scrubbed a live CPython interned-dict granule to
@@ -1643,7 +1650,6 @@ impl<'a> MemView<'a> {
         prot: u64,
         flags: u64,
         congruence: MmapGrantCongruence,
-        user_ceiling: UserVaCeiling,
     ) -> Option<(u64, bool)> {
         // Only a WRITABLE hand-out can ever leave a non-zero byte behind, so
         // only a writable hand-out raises the watermark. A `PROT_NONE` reserve
@@ -1725,7 +1731,7 @@ impl<'a> MemView<'a> {
                 }
             }
             let canonical_alias_hint =
-                aligned_hint && mmap_address_uses_alias(requested, length, layout, user_ceiling);
+                aligned_hint && mmap_address_uses_alias(requested, length, layout);
             if canonical_alias_hint {
                 let mem_authority_hint = self.mem();
                 let mem = mem_authority_hint.lock();
@@ -1790,7 +1796,7 @@ impl<'a> MemView<'a> {
             }
         }
 
-        find_canonical_high_va_gap(&mem, length, congruence, user_ceiling)
+        find_canonical_high_va_gap(&mem, length, congruence)
     }
 }
 
@@ -2482,15 +2488,7 @@ impl SyscallDispatcher {
         congruence: MmapGrantCongruence,
     ) -> Option<(u64, bool)> {
         self.mem_view()
-            .next_mmap_address(
-                requested,
-                length,
-                prot,
-                flags,
-                congruence,
-                false,
-                UserVaCeiling::for_abi(carrick_abi::LinuxGuestAbi::Aarch64),
-            )
+            .next_mmap_address(requested, length, prot, flags, congruence, false)
             .expect("host-setup placement has no root to refuse")
     }
 
@@ -2753,16 +2751,11 @@ fn mprotect_range_in_identity_image(address: u64, length: u64, layout: MemoryLay
         )
 }
 
-pub(super) fn mmap_address_uses_alias(
-    address: u64,
-    length: u64,
-    layout: MemoryLayout,
-    user_ceiling: UserVaCeiling,
-) -> bool {
+pub(super) fn mmap_address_uses_alias(address: u64, length: u64, layout: MemoryLayout) -> bool {
     let Some(end) = address.checked_add(length) else {
         return false;
     };
-    if end > user_ceiling.exclusive_end() {
+    if end > (1u64 << 48) {
         return false;
     }
     if range_within(address, length, layout.mmap_base, layout.mmap_size) {

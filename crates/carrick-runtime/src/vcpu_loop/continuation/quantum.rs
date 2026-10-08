@@ -1,5 +1,5 @@
 #![cfg_attr(
-    not(target_os = "macos"),
+    all(not(target_os = "macos"), not(test)),
     expect(
         dead_code,
         reason = "bound by the KVM carrier at M5: docs/superpowers/plans/2026-10-04-kvm-hvpatch-carrier.md"
@@ -194,6 +194,7 @@ impl HvpatchTaskQuantum {
 pub(crate) struct ZoneSave {
     pub(crate) base: carrick_hal::threaded::GuestCpuState,
     pub(crate) record: carrick_el1_abi::RecordRef,
+    pub(crate) origin: crate::vcpu_loop::executor::residency::ZoneResumeOrigin,
 }
 
 pub(crate) struct HvpatchTaskBinding {

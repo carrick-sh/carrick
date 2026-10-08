@@ -35,6 +35,45 @@ pub trait PhysicalForkBuilder<B>: ForkCustody<Retention = Box<dyn Send>> + Send 
     fn settle(self: Box<Self>, committed: bool) -> Result<(), TrapError>;
 }
 
+/// Assemble the child observer from the owner's exact completed physical root.
+///
+/// # Safety
+/// The completion must be authenticated against the pending Fork. `resolver`
+/// must retain and resolve all of that child's published physical capacity.
+pub unsafe fn observe_owner_fork_tables(
+    completion: PortalForkCompletion,
+    layout: carrick_mmu_core::aarch64::PageTableLayoutConfig,
+    resolver: std::sync::Arc<dyn carrick_mmu_core::aarch64::HostArenaResolver + Send + Sync>,
+    source: Option<Box<dyn carrick_mmu_core::aarch64::TableArenaSource>>,
+) -> Result<crate::Stage1Authority, TrapError> {
+    let tables = completion.request.child_tables;
+    // SAFETY: forwarded authenticated physical capacity/resolver contract.
+    let manager = unsafe {
+        carrick_mmu_core::aarch64::PageTableManager::new_live(
+            tables.base,
+            layout,
+            tables.len as usize,
+            std::sync::Arc::clone(&resolver),
+        )
+    }
+    .map_err(|error| TrapError::Hypervisor(format!("observe owner child tables: {error:?}")))?;
+    let authority = crate::Stage1Authority::new_with_manager(Some(manager));
+    // SAFETY: forwarded authenticated physical capacity/resolver contract.
+    unsafe { authority.bind_live_backing(resolver) };
+    authority.select_guest_descriptor_owner().map_err(|error| {
+        TrapError::Hypervisor(format!("select owner child descriptor lane: {error:?}"))
+    })?;
+    if let Some(source) = source {
+        authority.install_source(source).map_err(|error| {
+            TrapError::Hypervisor(format!("install owner child physical source: {error:?}"))
+        })?;
+    }
+    authority
+        .retain_owner_fork_control(completion)
+        .map_err(TrapError::Hypervisor)?;
+    Ok(authority)
+}
+
 pub use carrick_core::mm::fork::{ForkReceiptError, OwnerForkReceipt, validate_fork_completion};
 
 /// Prepared owner child. The live parent undo remains in EL1 until this exact

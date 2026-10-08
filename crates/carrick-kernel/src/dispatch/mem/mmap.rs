@@ -1,10 +1,103 @@
 //! Memory allocation, protection, and address space layout syscall implementations.
 
 use super::*;
+use carrick_el1::memory::reservations::Refusal;
+use carrick_el1_abi::{ReservationNodeFlags, ReservationProtection};
 use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::*;
 use carrick_vfs::ProcMapSharing;
 use std::os::fd::{FromRawFd, OwnedFd};
+
+fn with_file_mapping_admission<R>(
+    dispatcher: &MemView<'_>,
+    guard: &super::super::mm_mutation::MmMutationGuard<'_>,
+    operation: impl FnOnce(Option<&OwnerReservedWrite<'_>>) -> Result<R, MemoryError>,
+) -> Result<R, MemoryError> {
+    let authority = dispatcher.mm_authority();
+    if !guard.authorizes(&authority.mutation_coordinator, authority.mm_id) {
+        return Err(MemoryError::Unsupported);
+    }
+    let venue = authority.lock().owner_reserved_venue();
+    let Some((root, range)) = venue else {
+        return operation(None);
+    };
+    let carrier = root
+        .carrier_identity()
+        .map_err(|_| MemoryError::Unsupported)?;
+    let handle = root
+        .with_root(|model| {
+            let mapping = model.mapping(range.start()).ok_or(Refusal::Stale)?;
+            if model.mm().raw() != authority.mm_id.raw()
+                || mapping.anonymous
+                || mapping.range.start() > range.start()
+                || mapping.range.end() < range.end()
+                || mapping.protection != ReservationProtection::NONE
+                || mapping.flags != ReservationNodeFlags::EMPTY
+            {
+                return Err(Refusal::Stale);
+            }
+            let incarnation =
+                std::num::NonZeroU64::new(model.incarnation().raw()).ok_or(Refusal::Stale)?;
+            // SAFETY: this provider's live carrier and its borrowed, admitted root
+            // authenticate the complete identity. Exact-MM mutation exclusion is
+            // held across the subsequent backend operation.
+            Ok(unsafe {
+                carrick_el1_abi::El1MmHandle::from_admitted_owner(carrier, model.mm(), incarnation)
+            })
+        })
+        .map_err(|_| MemoryError::Unsupported)?;
+    let len = usize::try_from(range.len()).map_err(|_| MemoryError::Unsupported)?;
+    let reserved = GuestVaRange::from_len(GuestVa(range.start()), len);
+    // SAFETY: the exact open venue is an opaque NONE placeholder. Its MM
+    // mutation guard excludes settlement/replacement until this call returns;
+    // no MemState, provider, or reservation-root guard enters the backend.
+    unsafe {
+        OwnerReservedWrite::with_scope(handle, reserved, |admission| operation(Some(admission)))
+    }
+}
+
+fn write_file_mapping_content(
+    dispatcher: &MemView<'_>,
+    guard: &super::super::mm_mutation::MmMutationGuard<'_>,
+    memory: &mut impl CurrentMmMemory,
+    address: u64,
+    bytes: &[u8],
+) -> Result<(), MemoryError> {
+    with_file_mapping_admission(dispatcher, guard, |admission| match admission {
+        Some(admission) => {
+            if !admission.contains(GuestVa(address), bytes.len()) {
+                return Err(MemoryError::OutOfBounds {
+                    address,
+                    length: bytes.len(),
+                });
+            }
+            memory.write_owner_reserved_bytes(admission, address, bytes)
+        }
+        None => memory.write_bytes_unchecked(address, bytes),
+    })
+}
+
+fn protect_file_mapping(
+    dispatcher: &MemView<'_>,
+    guard: &super::super::mm_mutation::MmMutationGuard<'_>,
+    memory: &mut impl CurrentMmMemory,
+    address: u64,
+    len: usize,
+    prot: u64,
+) -> Result<(), MemoryError> {
+    with_file_mapping_admission(dispatcher, guard, |admission| match admission {
+        Some(admission) => {
+            if !admission.contains(GuestVa(address), len) {
+                return Err(MemoryError::OutOfBounds {
+                    address,
+                    length: len,
+                });
+            }
+            memory.protect_owner_reserved_range(address, len, prot)
+        }
+        None => memory.protect_range(address, len, prot),
+    })
+}
 
 fn retire_anonymous_mapping_backing(
     dispatcher: &MemView<'_>,
@@ -163,7 +256,6 @@ fn overlaps_clock_stub(address: u64, length: u64) -> Result<bool, LinuxErrno> {
 impl<'a> MemView<'a> {
     define_syscall! {
         mm_mutation fn mmap_served(this, cx, requested: GuestPtr, length: u64, prot: u64, flags: u64, fd: Fd, offset: u64) {
-            let user_ceiling = UserVaCeiling::for_abi(cx.guest_abi());
             let permit = cx.mm_mutation.host_alias_permit();
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             let mut flags = flags;
@@ -192,11 +284,7 @@ impl<'a> MemView<'a> {
                 fd: fd.0,
                 offset,
             };
-            let requested = if cx.request.guest_abi == carrick_abi::LinuxGuestAbi::Aarch64 {
-                GuestPtr(requested.0 & 0x0000_FFFF_FFFF_FFFF)
-            } else {
-                requested
-            };
+            let requested = GuestPtr(requested.0 & 0x0000_FFFF_FFFF_FFFF);
 
             let fixed_noreplace = flags & LINUX_MAP_FIXED_NOREPLACE != 0;
             if fixed_noreplace {
@@ -344,19 +432,6 @@ impl<'a> MemView<'a> {
                     ));
                 }
             };
-            // Native x86 pointers are never ARM/Rosetta tags. Refuse a fixed
-            // noncanonical range before replacing metadata or touching backing.
-            if cx.request.guest_abi == carrick_abi::LinuxGuestAbi::X86_64
-                && map_flags.contains(LinuxMmapFlags::FIXED)
-                && requested.0.checked_add(length)
-                    .is_none_or(|end| end > user_ceiling.exclusive_end())
-            {
-                return Ok(request.refused(
-                    MmapRefusal::Spec("MAP_FIXED outside the guest user VA range"),
-                    LINUX_ENOMEM,
-                ));
-            }
-
             if map_flags.contains(LinuxMmapFlags::FIXED) {
                 let refusal = match overlaps_clock_stub(requested.0, length) {
                     Ok(false) => None,
@@ -1125,7 +1200,7 @@ impl<'a> MemView<'a> {
                 // PROT_NONE -> writable commit can install the exact hinted VA
                 // while preserving the original MAP_SHARED provenance.
                 && (requested.0 == 0
-                    || !mmap_address_uses_alias(requested.0, length, this.mem().lock().layout, user_ceiling))
+                    || !mmap_address_uses_alias(requested.0, length, this.mem().lock().layout))
             {
                 let map_len = align_up_u64(length, hvf_page).unwrap_or(length);
                 let alloc = {
@@ -1329,7 +1404,6 @@ impl<'a> MemView<'a> {
                     flags,
                     congruence,
                     root_eligible,
-                    user_ceiling,
                 )? {
                 Some(pair) => pair,
                 None => {
@@ -1338,7 +1412,7 @@ impl<'a> MemView<'a> {
                     // too — CPython's `test_io` asks for 0x8000_0000_0000_1000
                     // on purpose. Only a request that would have fitted, and did
                     // not, is carrick's address space running out.
-                    let refusal = if length > user_ceiling.exclusive_end() {
+                    let refusal = if length > (1u64 << 48) {
                         MmapRefusal::Spec("length exceeds the entire mmap address-space arena")
                     } else {
                         MmapRefusal::Internal("no free address-space region: mmap arena exhausted")
@@ -1351,7 +1425,7 @@ impl<'a> MemView<'a> {
                 && map_flags.contains(LinuxMmapFlags::FIXED);
             let layout = this.mem().lock().layout;
             let in_arena = range_within(address, length, layout.mmap_base, layout.mmap_size);
-            let address_uses_alias_layout = mmap_address_uses_alias(address, length, layout, user_ceiling);
+            let address_uses_alias_layout = mmap_address_uses_alias(address, length, layout);
             // The backing query is only needed for a fixed, non-alias address
             // outside the semantic arena. An admitted owner serves reads via
             // EL1, and this syscall still holds the MM mutation gate.
@@ -2105,13 +2179,14 @@ impl<'a> MemView<'a> {
                             source,
                         )
                     } else {
-                        memory.map_private_file_backed(
+                        with_file_mapping_admission(this, cx.mm_mutation, |admission| memory.map_private_file_backed(
                             address,
                             length_usize,
                             borrowed,
                             offset,
                             source,
-                        )
+                            admission,
+                        ))
                     };
                     match lowering {
                         Ok(true) => {
@@ -2176,7 +2251,7 @@ impl<'a> MemView<'a> {
             // requested Linux permission immediately afterward.
             if !bytes.is_empty() {
                 let rw = crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE;
-                if let Err(error) = memory.protect_range(address, length_usize, rw)
+                if let Err(error) = protect_file_mapping(this, cx.mm_mutation, memory, address, length_usize, rw)
                     && (in_arena || memory.supports_concurrent_exec_protection())
                 {
                     mark_range_unmapped(memory, address, length_usize);
@@ -2190,7 +2265,8 @@ impl<'a> MemView<'a> {
                         ),
                     ));
                 }
-                if let Err(error) = memory.write_bytes_unchecked(address, &bytes) {
+                let content_write = write_file_mapping_content(this, cx.mm_mutation, memory, address, &bytes);
+                if let Err(error) = content_write {
                     mark_range_unmapped(memory, address, length_usize);
                     return Ok(request.refused_by(
                         MmapRefusal::Internal("file content could not be copied into the mapping"),
@@ -2214,7 +2290,7 @@ impl<'a> MemView<'a> {
             } else {
                 prot
             };
-            if let Err(error) = memory.protect_range(address, length_usize, initial_prot)
+            if let Err(error) = protect_file_mapping(this, cx.mm_mutation, memory, address, length_usize, initial_prot)
                 && (in_arena || memory.supports_concurrent_exec_protection())
             {
                 if deferred_file_backed_len.is_some() {
@@ -2237,8 +2313,7 @@ impl<'a> MemView<'a> {
                 && let Ok(bus_len_usize) = usize::try_from(bus_len)
             {
                 memory.set_no_access(bus_start, bus_len_usize, true);
-                if let Err(error) = memory
-                    .protect_range(bus_start, bus_len_usize, 0)
+                if let Err(error) = protect_file_mapping(this, cx.mm_mutation, memory, bus_start, bus_len_usize, 0)
                     .and_then(|()| memory.mark_bus_fault(bus_start, bus_len_usize))
                     && memory.supports_concurrent_exec_protection()
                 {
@@ -2323,7 +2398,6 @@ impl<'a> MemView<'a> {
         }
 
         mm_mutation fn munmap_served(this, cx, address: GuestPtr, length: u64) {
-            let user_ceiling = UserVaCeiling::for_abi(cx.guest_abi());
             let permit = cx.mm_mutation.host_alias_permit();
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             let page_size = this.linux_page_size();
@@ -2458,10 +2532,10 @@ impl<'a> MemView<'a> {
             // fd are reclaimed at process teardown.
             // Misaligned addresses (e.g. RLIM_INFINITY, which LTP munmap03 passes
             // to assert EINVAL) are already rejected by the alignment gate above;
-            // addresses outside the guest user VA range stay EINVAL below.
+            // addresses >= 2^48 stay EINVAL via the range check below.
             let layout = this.mem().lock().layout;
             if this.range_is_alias_vma(address.0, length)
-                || mmap_address_uses_alias(address.0, length, layout, user_ceiling)
+                || mmap_address_uses_alias(address.0, length, layout)
             {
                 let Ok(len_usize) = usize::try_from(aligned_len) else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
@@ -2520,7 +2594,6 @@ impl<'a> MemView<'a> {
         }
 
         mm_mutation fn mremap_served(this, cx, old_address: GuestPtr, old_size: u64, new_size_req: u64, flags: u64, new_address: GuestPtr) {
-            let user_ceiling = UserVaCeiling::for_abi(cx.guest_abi());
             let permit = cx.mm_mutation.host_alias_permit();
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             let memory = &mut *cx.memory;
@@ -2770,7 +2843,7 @@ impl<'a> MemView<'a> {
                 // MREMAP_FIXED replaces whatever was at the destination range.
                 if new_len > 0 {
                     if this.range_is_alias_vma(va, new_size)
-                        || mmap_address_uses_alias(va, new_size, layout, user_ceiling)
+                        || mmap_address_uses_alias(va, new_size, layout)
                     {
                         let _ = memory.unmap_alias_range(va, new_len);
                     } else {
@@ -2787,7 +2860,6 @@ impl<'a> MemView<'a> {
                         LINUX_MAP_FIXED,
                         MmapGrantCongruence::Any,
                         false,
-                        user_ceiling,
                     )
                     .ok()
                     .flatten()
@@ -2819,7 +2891,7 @@ impl<'a> MemView<'a> {
                 // Reclaim the source range.
                 if old_len > 0 {
                     if this.range_is_alias_vma(old_address.0, old_size)
-                        || mmap_address_uses_alias(old_address.0, old_size, layout, user_ceiling)
+                        || mmap_address_uses_alias(old_address.0, old_size, layout)
                     {
                         let _ = memory.unmap_alias_range(old_address.0, old_len);
                     } else {
@@ -3357,7 +3429,7 @@ impl<'a> MemView<'a> {
                         let unmap_result = if !tracked_shared
                             && !tracked_overlay
                             && (this.range_is_alias_vma(old_address.0, old_size)
-                                 || mmap_address_uses_alias(old_address.0, old_size, layout, user_ceiling))
+                                 || mmap_address_uses_alias(old_address.0, old_size, layout))
                         {
                             memory.unmap_alias_range(tail_start, tail_len_usize)
                         } else {
@@ -3487,7 +3559,6 @@ impl<'a> MemView<'a> {
                         0,
                     MmapGrantCongruence::Any,
                     false,
-                    user_ceiling,
                 )? else {
                         return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     };
@@ -3635,7 +3706,6 @@ impl<'a> MemView<'a> {
                     LINUX_MAP_FIXED,
                     MmapGrantCongruence::Any,
                     false,
-                    user_ceiling,
                 )? {
                     // Treat a fixed destination as reused: it may carry a prior
                     // owner's bytes, and the copy below fills only `copy_len`.
@@ -3650,7 +3720,6 @@ impl<'a> MemView<'a> {
                     0,
                     MmapGrantCongruence::Any,
                     false,
-                    user_ceiling,
                 )? else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
@@ -3702,7 +3771,6 @@ impl<'a> MemView<'a> {
         }
 
         mm_mutation fn mprotect_served(this, cx, address: GuestPtr, length: u64, prot: u64) {
-            let user_ceiling = UserVaCeiling::for_abi(cx.guest_abi());
             let permit = cx.mm_mutation.host_alias_permit();
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             let page_size = this.linux_page_size();
@@ -3749,7 +3817,7 @@ impl<'a> MemView<'a> {
                 .is_some_and(|p| p.range_unmapped(address.0, len));
             let layout = this.mem().lock().layout;
             let address_is_alias_vma = this.range_is_alias_vma(address.0, length)
-                || mmap_address_uses_alias(address.0, length, layout, user_ceiling);
+                || mmap_address_uses_alias(address.0, length, layout);
             // Complete VMA metadata answers whether the Linux address range is
             // mapped; it does NOT answer whether a deliberately-lazy anonymous
             // high-VA reservation has acquired physical alias backing. The

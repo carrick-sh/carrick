@@ -1,5 +1,5 @@
 #![cfg_attr(
-    not(target_os = "macos"),
+    all(not(target_os = "macos"), not(test)),
     expect(
         dead_code,
         reason = "bound by the KVM carrier at M5: docs/superpowers/plans/2026-10-04-kvm-hvpatch-carrier.md"
@@ -2195,6 +2195,7 @@ where
             let authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority> =
                 std::sync::Arc::new(super::KernelFrameCowAuthority {
                     runtime: std::sync::Arc::downgrade(kernel),
+                    host_backing: Some(kernel.dispatcher.mem_view().host_backing_access()),
                     deferred_anonymous: kernel.dispatcher.deferred_anonymous_state(committed_mm),
                     kernel: std::sync::Arc::clone(committed_context.kernel()),
                     mm: committed_mm,
@@ -2531,7 +2532,6 @@ where
 
 #[cfg(test)]
 pub(crate) mod tests {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use super as exec;
     use super::super::tests::*;
     use super::super::*;
@@ -2559,13 +2559,11 @@ pub(crate) mod tests {
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     struct CountingEntryObserver {
         entries: Arc<std::sync::atomic::AtomicUsize>,
         events: Arc<Mutex<Vec<&'static str>>>,
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     impl carrick_kernel::observe::SyscallObserver for CountingEntryObserver {
         fn on_syscall(
             &self,
@@ -2579,13 +2577,11 @@ pub(crate) mod tests {
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     struct CountingPreflightInterceptor {
         calls: Arc<std::sync::atomic::AtomicUsize>,
         events: Arc<Mutex<Vec<&'static str>>>,
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     impl carrick_kernel::observe::SyscallInterceptor for CountingPreflightInterceptor {
         fn intercept(
             &self,
@@ -2598,7 +2594,6 @@ pub(crate) mod tests {
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct ObservedCompletionIdentity {
         pid: i32,
@@ -2608,10 +2603,8 @@ pub(crate) mod tests {
         value: i64,
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     struct CompletionIdentityObserver(Arc<Mutex<Vec<ObservedCompletionIdentity>>>);
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     impl carrick_kernel::observe::SyscallObserver for CompletionIdentityObserver {
         fn on_syscall_return(
             &self,
@@ -2629,10 +2622,8 @@ pub(crate) mod tests {
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     struct ExecPreparationCounter(Arc<std::sync::atomic::AtomicUsize>);
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     impl carrick_kernel::observe::SyscallObserver for ExecPreparationCounter {
         fn on_exec(
             &self,
@@ -3523,6 +3514,7 @@ pub(crate) mod tests {
         let PersistentHvpatchCloneAttempt::Complete(threads::CloneThreadSpawn::Started {
             internal: child_tid,
             visible: child_visible_tid,
+            parent_tid_addr,
         }) = spawned
         else {
             panic!("persistent clone must start one child thread")
@@ -3530,9 +3522,12 @@ pub(crate) mod tests {
         assert!(matches!(
             job.complete_persistent_hvpatch_clone(
                 &mut parent_engine,
+                &mut parent_control,
+                frame,
                 threads::CloneThreadSpawn::Started {
                     internal: child_tid,
                     visible: child_visible_tid,
+                    parent_tid_addr,
                 },
             )
             .expect("parent clone completion"),
@@ -4455,7 +4450,6 @@ pub(crate) mod tests {
         assert_eq!(kernel.reporter.snapshot().summary.syscall_returns_errno, 1);
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn suffix_failure_test_executable() -> tempfile::NamedTempFile {
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
@@ -4477,26 +4471,22 @@ pub(crate) mod tests {
         executable
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     trait TestRuntimeError {
         fn into_runtime_error(self) -> RuntimeError;
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     impl TestRuntimeError for RuntimeError {
         fn into_runtime_error(self) -> RuntimeError {
             self
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     impl TestRuntimeError for ProductionHvpatchPollError {
         fn into_runtime_error(self) -> RuntimeError {
             ProductionHvpatchPollError::into_runtime_error(self)
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn assert_exact_configuration_error(error: impl TestRuntimeError, expected: &str) {
         match error.into_runtime_error() {
             RuntimeError::Configuration(actual) => assert_eq!(actual, expected),
@@ -4504,7 +4494,6 @@ pub(crate) mod tests {
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn assert_no_exec_return_publication(
         kernel: &Kernel,
         engine: &CrashCaptureTestEngine,
@@ -4519,7 +4508,6 @@ pub(crate) mod tests {
         assert_eq!(report.summary.syscall_returns_errno, 0);
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn install_exec_terminal_handoff_contender(
         gate: &Arc<CloneAdmissionGate>,
         contender: ThreadId,
@@ -4723,7 +4711,6 @@ pub(crate) mod tests {
         work
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn process_owner_drain_failure(
         state: &ThreadRuntimeState<CrashCaptureTestEngine>,
     ) -> HvpatchExternalTerminalSettlement {
@@ -4736,7 +4723,6 @@ pub(crate) mod tests {
         settlement
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn execve_test_frame() -> carrick_hal::RawSyscall {
         carrick_hal::RawSyscall {
             current_guest_sp: None,

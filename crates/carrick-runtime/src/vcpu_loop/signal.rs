@@ -1,5 +1,5 @@
 #![cfg_attr(
-    not(target_os = "macos"),
+    all(not(target_os = "macos"), not(test)),
     expect(
         dead_code,
         reason = "bound by the KVM carrier at M5: docs/superpowers/plans/2026-10-04-kvm-hvpatch-carrier.md"
@@ -34,7 +34,7 @@ pub(crate) fn signal_wait_expired(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|target| Instant::now() >= target)
 }
 
-#[cfg(any(feature = "platform-macos", all(test, target_os = "macos")))]
+#[cfg(any(test, feature = "platform-macos"))]
 pub(crate) use carrick_kernel::kernel::continuation::raise_sigpipe_for_blocking_write;
 
 pub(crate) fn partial_write_interrupt_outcome(
@@ -338,6 +338,7 @@ fn apply_first_touch(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum FrameGrantClaim {
     None,
     ResponsePending,
@@ -367,6 +368,7 @@ pub(super) fn ring_access(
     }
 }
 
+#[cfg(test)]
 fn claim_frame_grant_request(
     mailbox: &carrick_el1_abi::FrameGrantMailbox,
     mm_key: u64,
@@ -390,12 +392,12 @@ fn claim_frame_grant_request(
 
 /// Service a source selected by the owner before any host page-table pause.
 /// Absence leaves the scheduler request untouched for other fault venues.
-pub(super) fn resolve_owner_file_fault(
+pub(super) fn resolve_owner_fault(
     engine: &mut impl carrick_hal::threaded::ThreadedEngine,
     mm_key: u64,
     address: u64,
     access: Option<carrick_mmu_core::aarch64::LeafAccess>,
-) -> Result<Option<carrick_hal::OwnerFileFaultOutcome>, TrapError> {
+) -> Result<Option<carrick_hal::OwnerFaultOutcome>, TrapError> {
     let Some(index) = engine.mailbox_slot() else {
         return Ok(None);
     };
@@ -412,6 +414,9 @@ pub(super) fn resolve_owner_file_fault(
     let Some(slot) = slots.grant(index) else {
         return Ok(None);
     };
+    if let Some(wait) = slot.take_fault_wait(mm_key, address) {
+        return Ok(Some(carrick_hal::OwnerFaultOutcome::OwnerWait(wait)));
+    }
     let Some((generation, window)) = slot.pending_fault_selection(mm_key, address) else {
         crate::probes::hvpatch_el1_file_fault_handoff(
             address,
@@ -423,74 +428,81 @@ pub(super) fn resolve_owner_file_fault(
         return Ok(None);
     };
     let mailbox = carrick_el1_abi::frame_grant_mailbox_host_for_slot(index)
-        .ok_or_else(|| TrapError::Hypervisor("owner file fault has no frame mailbox".into()))?;
+        .ok_or_else(|| TrapError::Hypervisor("owner fault has no frame mailbox".into()))?;
     crate::probes::hvpatch_el1_file_fault_handoff(
         address,
         mailbox.state.load(std::sync::atomic::Ordering::Acquire),
         1,
     );
-    let request = match claim_frame_grant_request(mailbox, mm_key, address, access) {
-        FrameGrantClaim::Accepted(request) if request.request_generation == generation => request,
-        _ => {
+    let claim = match frame_grant_access(access)
+        .and_then(|actual| mailbox.claim_request_for_fault_owned(mm_key, address, actual))
+    {
+        Some(claim) => claim,
+        None => {
+            let _ = slot.cancel_fault_selection(window, generation);
             return Err(TrapError::Hypervisor(
-                "owner file fault scheduler request is stale".into(),
+                "owner fault scheduler request is stale".into(),
             ));
         }
     };
-    if window.host_backing.is_none() {
+    let request = claim.request();
+    if request.request_generation != generation {
+        let _ = slot.cancel_fault_selection(window, generation);
         return Err(TrapError::Hypervisor(
-            "owner file fault lost source identity".into(),
+            "owner fault scheduler request generation is stale".into(),
         ));
     }
-    let completed = engine
-        .service_owner_file_fault(mm_key, generation)?
-        .ok_or_else(|| TrapError::Hypervisor("owner file fault selection was displaced".into()))?;
-    if completed == carrick_hal::OwnerFileFaultOutcome::Resolved
-        || matches!(completed, carrick_hal::OwnerFileFaultOutcome::Pending(_))
-    {
-        crate::probes::hvpatch_el1_file_fault_handoff(
-            address,
-            mailbox.state.load(std::sync::atomic::Ordering::Acquire),
-            2,
-        );
-        if !mailbox.complete_resolved_owner_fault(request) {
-            carrick_fatal::carrick_fatal!(
-                "hvpatch::owner_file_fault",
-                "resolved owner file grant lost exact mailbox claim: mm={} generation={} fault=0x{:x}",
-                request.mm_key,
-                request.request_generation,
-                request.fault_va,
-            );
+    let completed = match engine.service_owner_fault(mm_key, generation) {
+        Ok(Some(completed)) => completed,
+        Ok(None) => {
+            let _ = slot.cancel_fault_selection(window, generation);
+            return Err(TrapError::Hypervisor(
+                "owner fault selection was displaced".into(),
+            ));
         }
+        Err(err) => {
+            let _ = slot.cancel_fault_selection(window, generation);
+            return Err(err);
+        }
+    };
+    finish_owner_fault_response(claim, &completed)?;
+    Ok(Some(completed))
+}
+
+fn finish_owner_fault_response(
+    claim: carrick_el1_abi::FrameGrantHostClaim<'_>,
+    completed: &carrick_hal::OwnerFaultOutcome,
+) -> Result<(), TrapError> {
+    let request = claim.request();
+    if let carrick_hal::OwnerFaultOutcome::OwnerWait(wait) = completed
+        && wait.handle().mm().raw() != request.mm_key
+    {
+        return Err(TrapError::Hypervisor(
+            "owner fault wait names another MM".to_owned(),
+        ));
+    }
+    let address = request.fault_va;
+    if *completed == carrick_hal::OwnerFaultOutcome::Resolved
+        || matches!(
+            completed,
+            carrick_hal::OwnerFaultOutcome::Pending(_)
+                | carrick_hal::OwnerFaultOutcome::OwnerWait(_)
+        )
+    {
+        crate::probes::hvpatch_el1_file_fault_handoff(address, 3, 2);
     } else {
         crate::probes::hvpatch_el1_file_fault_handoff(
             address,
-            mailbox.state.load(std::sync::atomic::Ordering::Acquire),
-            if completed == carrick_hal::OwnerFileFaultOutcome::BusFault {
+            3,
+            if *completed == carrick_hal::OwnerFaultOutcome::BusFault {
                 4
             } else {
                 3
             },
         );
-        publish_frame_grant_refusal(mailbox, request, carrick_el1_abi::FRAME_GRANT_ERR_DENIED);
     }
-    Ok(Some(completed))
-}
-
-fn publish_frame_grant_refusal(
-    mailbox: &carrick_el1_abi::FrameGrantMailbox,
-    request: carrick_el1_abi::FrameGrantRequest,
-    status: u64,
-) {
-    if !mailbox.publish_refusal(status) {
-        carrick_fatal::carrick_fatal!(
-            "hvpatch::el1_frame_grant",
-            "claimed frame-grant request could not publish backend refusal: mm={} generation={} status={}",
-            request.mm_key,
-            request.request_generation,
-            status
-        );
-    }
+    claim.decline();
+    Ok(())
 }
 
 /// Drop an exact EL1 request when the host resolved or delivered the fault
@@ -502,12 +514,28 @@ pub(super) fn cancel_frame_grant_request(
     address: u64,
     access: Option<carrick_mmu_core::aarch64::LeafAccess>,
 ) {
-    let Some(actual) = frame_grant_access(access) else {
-        return;
-    };
+    let actual = frame_grant_access(access).unwrap_or(0);
     if let Some(mailbox) = mailbox_slot.and_then(carrick_el1_abi::frame_grant_mailbox_host_for_slot)
     {
         let _ = mailbox.cancel_request_for_fault(mm_key, address, actual);
+    }
+}
+
+pub(super) fn cancel_portal_grant_selection(slot_index: Option<usize>, mm_key: u64, address: u64) {
+    let region = carrick_el1_abi::get_el1_region_host_ptr();
+    if region == 0 {
+        return;
+    }
+    let Some(slot_index) = slot_index else {
+        return;
+    };
+    // SAFETY: the carrier retains its EL1 portal region while running.
+    let slots = unsafe {
+        &*((region + carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+            as *const carrick_el1_abi::MmPortalSlots)
+    };
+    if let Some(slot) = slots.grant(slot_index) {
+        let _ = slot.cancel_fault_for_page(mm_key, address);
     }
 }
 
@@ -933,10 +961,22 @@ static GUEST_GRANT_LEDGER: GuestGrantLedger = GuestGrantLedger::new();
 /// that vCPU slot, whichever MM it next runs. Returns the descriptor entries
 /// released.
 pub(super) fn withdraw_guest_descriptor_work(mm_key: u64) -> usize {
+    let region = carrick_el1_abi::get_el1_region_host_ptr();
+    let grant_slots = (region != 0).then(|| {
+        // SAFETY: the carrier retains its EL1 portal region until final MM
+        // teardown has withdrawn all of this MM's outstanding work.
+        unsafe {
+            &*((region + carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+                as *const carrick_el1_abi::MmPortalSlots)
+        }
+    });
     for slot in 0..carrick_el1_abi::EL1_STACK_SLOTS as usize {
         if let Some(mailbox) = carrick_el1_abi::frame_grant_mailbox_host_for_slot(slot) {
             let _ = mailbox.withdraw_mm(mm_key);
         }
+        let _ = grant_slots
+            .and_then(|slots| slots.grant(slot))
+            .is_some_and(|grant| grant.withdraw_retired_mm_selection(mm_key));
     }
     carrick_el1_abi::descriptor_txn_slots_host()
         .map_or(0, |slots| GUEST_GRANT_LEDGER.withdraw_mm(slots, mm_key))
@@ -1328,31 +1368,46 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
     if !el1_frame_grants_enabled() {
         cancel_frame_grant_request(engine.mailbox_slot(), mm_key, address, access);
     }
-    if el1_frame_grants_enabled()
-        && let Some(mailbox) = engine
-            .mailbox_slot()
-            .and_then(carrick_el1_abi::frame_grant_mailbox_host_for_slot)
-    {
-        let claim = claim_frame_grant_request(mailbox, mm_key, address, access);
-        let (outcome, generation) = match claim {
-            FrameGrantClaim::None => (FrameGrantClaimOutcome::None, 0),
-            FrameGrantClaim::ResponsePending => (FrameGrantClaimOutcome::ResponsePending, 0),
-            FrameGrantClaim::Accepted(request) => {
-                (FrameGrantClaimOutcome::Accepted, request.request_generation)
+    'bulk_grant: {
+        if el1_frame_grants_enabled()
+            && let Some(mailbox) = engine
+                .mailbox_slot()
+                .and_then(carrick_el1_abi::frame_grant_mailbox_host_for_slot)
+        {
+            let actual = frame_grant_access(access);
+            let response_pending = actual
+                .and_then(|actual| mailbox.response_for_fault(mm_key, address, actual))
+                .is_some();
+            let claim = if response_pending {
+                None
+            } else {
+                actual.and_then(|actual| {
+                    mailbox.claim_request_for_fault_owned(mm_key, address, actual)
+                })
+            };
+            let (outcome, generation) = if response_pending {
+                (FrameGrantClaimOutcome::ResponsePending, 0)
+            } else if let Some(claim) = claim.as_ref() {
+                (
+                    FrameGrantClaimOutcome::Accepted,
+                    claim.request().request_generation,
+                )
+            } else {
+                (FrameGrantClaimOutcome::None, 0)
+            };
+            ring::rec_el1_frame_grant_claim(
+                ring_tid,
+                mm_key,
+                address,
+                ring_access(access),
+                outcome,
+                generation,
+            );
+            if response_pending {
+                return Ok(true);
             }
-        };
-        ring::rec_el1_frame_grant_claim(
-            ring_tid,
-            mm_key,
-            address,
-            ring_access(access),
-            outcome,
-            generation,
-        );
-        match claim {
-            FrameGrantClaim::None => {}
-            FrameGrantClaim::ResponsePending => return Ok(true),
-            FrameGrantClaim::Accepted(request) => {
+            if let Some(claim) = claim {
+                let request = claim.request();
                 let permit = mutation.host_alias_permit();
                 let Some(plan) =
                     dispatcher.resident_frame_grant_plan(&permit, address, request.requested_len)
@@ -1366,12 +1421,8 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                         None,
                         None,
                     );
-                    publish_frame_grant_refusal(
-                        mailbox,
-                        request,
-                        carrick_el1_abi::FRAME_GRANT_ERR_DENIED,
-                    );
-                    return Ok(true);
+                    claim.decline();
+                    break 'bulk_grant;
                 };
                 let prot = plan.prot();
                 crate::probes::hvpatch_el1_frame_grant_plan(
@@ -1400,12 +1451,8 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                         None,
                         None,
                     );
-                    publish_frame_grant_refusal(
-                        mailbox,
-                        request,
-                        carrick_el1_abi::FRAME_GRANT_ERR_DENIED,
-                    );
-                    return Ok(true);
+                    claim.decline();
+                    break 'bulk_grant;
                 }
                 // A root-owned span's provenance is the root's: publish it
                 // for exactly this span before its backing is prepared.
@@ -1426,12 +1473,8 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                         None,
                         None,
                     );
-                    publish_frame_grant_refusal(
-                        mailbox,
-                        request,
-                        carrick_el1_abi::FRAME_GRANT_ERR_DENIED,
-                    );
-                    return Ok(true);
+                    claim.decline();
+                    break 'bulk_grant;
                 };
                 let fault_page = plan.fault_page();
                 let plan_shape = (plan.start(), plan.len(), plan.prot());
@@ -1526,12 +1569,10 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                             ready,
                         },
                     )?;
-                    publish_frame_grant_refusal(
-                        mailbox,
-                        request,
-                        carrick_el1_abi::FRAME_GRANT_ERR_DENIED,
-                    );
+                    claim.decline();
+                    break 'bulk_grant;
                 } else {
+                    claim.finish_completed();
                     ring::rec_el1_frame_grant_decision(
                         ring_tid,
                         request.request_generation,
@@ -2689,6 +2730,99 @@ mod first_touch_access_tests {
         assert_eq!(ring_access(Some(LeafAccess::Read)), RingAccess::Read);
         assert_eq!(ring_access(Some(LeafAccess::Write)), RingAccess::Write);
         assert_eq!(ring_access(Some(LeafAccess::Execute)), RingAccess::Execute);
+    }
+
+    #[test]
+    fn owner_fault_wait_clears_only_its_exact_request_without_denial() {
+        use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+        use std::num::NonZeroU64;
+        let request = carrick_el1_abi::FrameGrantRequest {
+            mm_key: 5,
+            requested_len: 114688,
+            request_generation: 19,
+            fault_va: 0x6000_41bbf8,
+            access: crate::linux_abi::LINUX_PROT_WRITE,
+        };
+        let mailbox = carrick_el1_abi::FrameGrantMailbox::new();
+        let peer = carrick_el1_abi::FrameGrantMailbox::new();
+        assert!(mailbox.try_publish_request(request));
+        assert!(peer.try_publish_request(request));
+        let claimed = mailbox
+            .claim_request_for_fault_owned(request.mm_key, request.fault_va, request.access)
+            .expect("exact fault claim");
+        // SAFETY: isolated owner receipt, matching this claimed test request.
+        let handle = unsafe {
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(5).unwrap(),
+                NonZeroU64::new(1).unwrap(),
+            )
+        };
+        let wait = unsafe { PortalOwnerWait::from_owner(handle, PortalWaitCause::Editor, 84) };
+        finish_owner_fault_response(claimed, &carrick_hal::OwnerFaultOutcome::OwnerWait(wait))
+            .unwrap();
+        assert!(
+            mailbox.claim_response(5, 19).is_none(),
+            "an owner wait must not publish DENIED"
+        );
+        assert_eq!(
+            mailbox.state.load(std::sync::atomic::Ordering::Acquire),
+            carrick_el1_abi::FRAME_GRANT_MAILBOX_IDLE
+        );
+        assert!(
+            matches!(
+                claim_frame_grant_request(&peer, 5, request.fault_va, Some(LeafAccess::Write)),
+                FrameGrantClaim::Accepted(_)
+            ),
+            "peer request remains untouched"
+        );
+        let next = carrick_el1_abi::FrameGrantRequest {
+            request_generation: 20,
+            ..request
+        };
+        assert!(
+            mailbox.try_publish_request(next),
+            "resumption can reselect exactly once"
+        );
+        assert!(!mailbox.try_publish_request(next));
+    }
+
+    #[test]
+    fn owner_fault_wait_from_another_mm_releases_the_claimed_request() {
+        use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+        use std::num::NonZeroU64;
+        let request = carrick_el1_abi::FrameGrantRequest {
+            mm_key: 5,
+            requested_len: 114688,
+            request_generation: 19,
+            fault_va: 0x6000_41bbf8,
+            access: crate::linux_abi::LINUX_PROT_WRITE,
+        };
+        let mailbox = carrick_el1_abi::FrameGrantMailbox::new();
+        assert!(mailbox.try_publish_request(request));
+        let claimed = mailbox
+            .claim_request_for_fault_owned(5, request.fault_va, request.access)
+            .expect("exact fault claim");
+        // SAFETY: isolated competing live owner, deliberately another MM.
+        let handle = unsafe {
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(6).unwrap(),
+                NonZeroU64::new(1).unwrap(),
+            )
+        };
+        let wait = unsafe { PortalOwnerWait::from_owner(handle, PortalWaitCause::Editor, 84) };
+        let result =
+            finish_owner_fault_response(claimed, &carrick_hal::OwnerFaultOutcome::OwnerWait(wait));
+        assert!(
+            result.is_err(),
+            "another live MM must not complete this fault wait"
+        );
+        assert_eq!(
+            mailbox.state.load(std::sync::atomic::Ordering::Acquire),
+            carrick_el1_abi::FRAME_GRANT_MAILBOX_IDLE
+        );
+        assert!(mailbox.claim_response(5, 19).is_none());
     }
 
     #[test]

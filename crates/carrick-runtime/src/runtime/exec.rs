@@ -73,7 +73,6 @@ fn finalize_hvf_exec_base(
     staged
         .with_el0_trampoline_bytes(HvfArch::entry_trampoline_bytes())
         .and_then(|image| with_hvf_syscall_mailbox(image, requires_syscall_traps))
-        .and_then(|address_space| address_space.with_hvpatch_stage1_page_tables())
         .and_then(|image| {
             with_optional_vdso_for_clock_with_visibility::<HvfArch>(
                 image,
@@ -81,6 +80,7 @@ fn finalize_hvf_exec_base(
                 requires_syscall_traps,
             )
         })
+        .and_then(|address_space| address_space.with_hvpatch_stage1_page_tables())
         .map_err(|_| LINUX_ENOENT)
 }
 
@@ -318,6 +318,37 @@ mod tests {
             .find(|region| region.start == start)
             .expect("required exec image region")
             .bytes()
+    }
+
+    #[test]
+    fn exec_vvar_stage1_is_readonly_and_nonexecutable_before_owner_import() {
+        let image = finalize_hvf_exec_base(
+            &SyscallDispatcher::new(),
+            AddressSpace::from_regions(0x4000, Vec::new()).unwrap(),
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+        let region = image
+            .regions()
+            .iter()
+            .find(|region| region.start == carrick_mem::memory::LINUX_PAGE_TABLES_BASE)
+            .unwrap();
+        let manager = carrick_mmu_core::aarch64::PageTableManager::new(
+            region.bytes().to_vec(),
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        let leaf = carrick_mmu_core::aarch64::terminal_descriptor(
+            manager.debug_walk(carrick_mem::vdso::LINUX_VVAR_BASE),
+        );
+        assert_eq!(
+            leaf & (0b11 << 6),
+            0b11 << 6,
+            "vvar stage-1 AP must be read-only"
+        );
+        assert_ne!(leaf & (1 << 54), 0, "vvar stage-1 must be NX");
     }
 
     #[cfg(feature = "syscall-shim")]

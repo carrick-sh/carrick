@@ -948,9 +948,55 @@ pub(super) struct PublicationContext<'a> {
     _exclusion: Option<Box<dyn carrick_hal::FrameCowQuiesce>>,
     _invocation: Option<&'a carrick_hal::ForeignMmInvocation>,
     foreign: Option<CarrierForeignMmSnapshot>,
+    reserved: Option<(
+        carrick_el1_abi::El1MmHandle,
+        carrick_guest_mem::GuestVaRange,
+    )>,
 }
 
 impl<'a> PublicationContext<'a> {
+    /// The kernel's open opaque NONE reservation already owns exact-MM pause
+    /// and editor exclusion. Borrow its lifetime; never reacquire that gate.
+    pub(super) fn for_reserved(
+        state: std::sync::Arc<MmAccessState>,
+        custody: std::sync::Arc<CarrierVmCustody>,
+        admission: &'a carrick_guest_mem::OwnerReservedWrite<'_>,
+    ) -> Result<Self, TrapError> {
+        let invalid =
+            || TrapError::Hypervisor("reserved file publication identity mismatch".into());
+        let owner = admission.owner();
+        let bound = *state.identity.read();
+        let binding = state.cow_runtime.read().clone().ok_or_else(invalid)?;
+        if owner.carrier() != custody.transfer_carrier
+            || state.protections.owner() != Some(owner)
+            || !bound.is_some_and(|(mm, root)| {
+                mm.raw_for_probe() == owner.mm().raw()
+                    && binding.identity.mm == owner.mm().raw()
+                    && binding.identity.asid == root.asid.raw_for_probe()
+                    && state.page_tables_authority().root_base() == Some(root.stage1_root.raw())
+                    && binding
+                        .mm_root_slot
+                        .is_none_or(|slot| slot.0 == root.stage1_root.raw())
+            })
+            || !binding.persistent_vm_lifecycle
+            || state.page_tables_authority().live_descriptor_owner()
+                != carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest
+        {
+            return Err(invalid());
+        }
+        Ok(Self {
+            mm_key: std::num::NonZeroU64::new(owner.mm().raw()).ok_or_else(invalid)?,
+            state,
+            custody,
+            authority: binding.authority,
+            mm_root_slot: binding.mm_root_slot,
+            container_root: binding.container_root,
+            _exclusion: None,
+            _invocation: None,
+            foreign: None,
+            reserved: Some((owner, admission.range())),
+        })
+    }
     /// A physical grant selected by the target EL1 owner. No host policy
     /// snapshot or caller-vCPU identity can authorize this constructor. The
     /// guest revalidates the generation and window before exposing leaves.
@@ -1043,6 +1089,7 @@ impl<'a> PublicationContext<'a> {
             _exclusion: None,
             _invocation: None,
             foreign: None,
+            reserved: None,
         })
     }
 
@@ -1077,6 +1124,7 @@ impl<'a> PublicationContext<'a> {
             _exclusion: None,
             _invocation: Some(invocation),
             foreign: Some(requested.clone()),
+            reserved: None,
         })
     }
 
@@ -1158,6 +1206,7 @@ impl<'a> PublicationContext<'a> {
             _exclusion: Some(exclusion),
             _invocation: None,
             foreign: None,
+            reserved: None,
         })
     }
 }
@@ -1200,9 +1249,27 @@ pub(super) fn publish_replacing(
     flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     retire_previous: &mut dyn FnMut(),
 ) -> Result<PublishedSparseExtent, TrapError> {
-    let _legacy = context.state.protections.legacy().ok_or_else(|| {
-        TrapError::Hypervisor("admitted owner MM cannot enter host sparse publication".into())
-    })?;
+    let _legacy = match context.reserved {
+        Some((owner, range)) => {
+            if context.state.protections.owner() != Some(owner)
+                || start < range.start_raw()
+                || end > range.end_raw()
+                || context
+                    .state
+                    .page_tables_authority()
+                    .live_descriptor_owner()
+                    != carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest
+            {
+                return Err(TrapError::Hypervisor(
+                    "reserved file publication escaped its owner range".into(),
+                ));
+            }
+            None
+        }
+        None => Some(context.state.protections.legacy().ok_or_else(|| {
+            TrapError::Hypervisor("admitted owner MM cannot enter host sparse publication".into())
+        })?),
+    };
     let guest_lane = context
         .state
         .page_tables_authority()
@@ -1823,7 +1890,7 @@ pub(super) fn publish_replacing(
 
 /// Retain exact structural owners and stage-2 pins for a complete table edit.
 /// Raw pointers remain valid even if another holder requests retirement.
-struct PinnedStage1Arenas {
+pub(super) struct PinnedStage1Arenas {
     structural:
         std::collections::BTreeMap<u64, (std::sync::Arc<StructuralBackingOwner>, CarrierStage2Pin)>,
     relocated_primary: Option<(u64, GlobalFrameOwnerPin)>,
@@ -1917,7 +1984,7 @@ impl MmAccessState {
         Ok(())
     }
 
-    fn pinned_stage1_arenas(
+    pub(super) fn pinned_stage1_arenas(
         &self,
         custody: &std::sync::Arc<CarrierVmCustody>,
         primary_base: u64,
@@ -2570,12 +2637,12 @@ impl PublicationContext<'static> {
                 );
             }
             // An EL0 first touch can complete after PREPARE chose this page.
-            // A committed residency and the matching physical alias authorize
-            // only a fresh owner selection, never reuse of this stale window.
+            // The exact live residency and physical alias authorize a fresh
+            // owner selection. The guest-committed bit is set only after the
+            // guest installs its leaf, so requiring it here would refuse the
+            // first touch that this retry must complete.
             let peer_resident = resident.is_some_and(|page| {
-                carrick_el1_abi::frame_grant_residency_host().is_some_and(|table| {
-                    table.is_guest_committed(window.operation.mm.raw(), window.fault_page)
-                }) && overlapping.iter().any(|(_, alias)| {
+                overlapping.iter().any(|(_, alias)| {
                     window.fault_page >= alias.start
                         && window.fault_page < alias.start.saturating_add(alias.size as u64)
                         && alias.ipa.checked_add(window.fault_page - alias.start)
@@ -2583,9 +2650,45 @@ impl PublicationContext<'static> {
                         && alias.owner_generation == page.identity.owner_generation
                 })
             });
+            if !peer_resident {
+                super::stage2_backend::record_owner_supply_detail(
+                    5,
+                    window.range.start(),
+                    window.fault_page,
+                    window.range.len() as u32,
+                    window.protection.bits() as u32,
+                );
+                for (_, alias) in &overlapping {
+                    let scope = match alias.ownership_scope {
+                        AliasOwnershipScope::MmRootSlot { .. } => 1,
+                        AliasOwnershipScope::ContainerRoot(_) => 2,
+                        AliasOwnershipScope::Global => 3,
+                    };
+                    super::stage2_backend::record_owner_supply_detail(
+                        6,
+                        alias.start,
+                        alias.ipa,
+                        scope,
+                        alias.size as u32,
+                    );
+                }
+                super::stage2_backend::record_owner_supply_detail(
+                    7,
+                    resident.map_or(0, |page| page.expected_ipa),
+                    resident.map_or(0, |page| page.identity.owner_generation),
+                    resident.map_or(0, |page| page.identity.len as u32),
+                    resident.map_or(0, |page| page.identity.semantic_base as u32),
+                );
+            }
             return Ok(if peer_resident {
                 TransferPreparation::PeerResident
             } else {
+                super::stage2_backend::record_owner_supply_decline(
+                    window.operation.mm.raw(),
+                    window.operation.incarnation.get(),
+                    4,
+                    overlapping.len() as u32,
+                );
                 TransferPreparation::Declined
             });
         }
@@ -2700,6 +2803,12 @@ impl PublicationContext<'static> {
             pending.context.mm_root_slot,
             pending.context.container_root,
         ) {
+            super::stage2_backend::record_owner_supply_decline(
+                window.operation.mm.raw(),
+                window.operation.incarnation.get(),
+                5,
+                0,
+            );
             return Ok(TransferPreparation::Declined);
         }
         drop(pending.registry.take());
@@ -2757,6 +2866,29 @@ impl carrick_aarch64::user_transfer::TransferGrant for PendingTransferGrant {
                 carrick_fatal!(
                     "hvpatch::user_transfer",
                     "applied grant failed exact settlement; physical ownership retained: {error:?}"
+                )
+            });
+            let publication = self.publication.as_ref().unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::user_transfer",
+                    "applied owner grant lost its physical publication"
+                )
+            });
+            // The owner-selected path publishes the same physical frame lease
+            // as an ordinary first-touch grant. Bind its exact owner receipt
+            // before dropping the publisher pin, so retirement accounts for
+            // the grant and its eventual return even if a peer acts at once.
+            global_frame::mark_el1_frame_grant_in(
+                &self.context.custody,
+                publication.alias.physical_ipa,
+                publication.alias.physical_size as u64,
+                self.context.mm_key.get(),
+                publication.ready.owner_generation,
+            )
+            .unwrap_or_else(|error| {
+                carrick_fatal!(
+                    "hvpatch::user_transfer",
+                    "applied owner grant cannot bind exact frame receipt: {error:?}"
                 )
             });
             // Completion callbacks may immediately retire this exact owner.
@@ -3109,6 +3241,7 @@ impl PublicationContext<'static> {
             _exclusion: None,
             _invocation: None,
             foreign: None,
+            reserved: None,
         })
     }
     pub(crate) fn prepare_import<'a>(

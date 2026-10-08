@@ -1,5 +1,5 @@
 #![cfg_attr(
-    not(target_os = "macos"),
+    all(not(target_os = "macos"), not(test)),
     expect(
         dead_code,
         reason = "bound by the KVM carrier at M5: docs/superpowers/plans/2026-10-04-kvm-hvpatch-carrier.md"
@@ -88,14 +88,11 @@ impl<'a, M: carrick_guest_mem::CurrentMmMemory> PreparedChildTidClear<'a, M> {
 
     fn commit(self) {
         match self {
-            Self::Owner(write) => {
-                write.commit(&[&carrick_personality_linux::thread::CHILD_TID_CLEAR])
-            }
+            Self::Owner(write) => write.commit(&[&0_i32.to_le_bytes()]),
             Self::Legacy { memory, address } => {
                 // Legacy backends have no owner suspension protocol. Preserve
                 // their invalid-address exit disposition.
-                let _ = memory
-                    .write_bytes(address, &carrick_personality_linux::thread::CHILD_TID_CLEAR);
+                let _ = memory.write_bytes(address, &0_i32.to_le_bytes());
             }
             Self::Invalid => {}
         }
@@ -134,20 +131,11 @@ fn wake_persistent_child_tid(
     zone_mm: Option<u64>,
 ) {
     let count = if let Some((zone, mm)) = zone::zone_for(zone_mm) {
-        let woken = carrick_kernel::el1_zone::wake(
-            zone,
-            mm,
-            address,
-            carrick_personality_linux::thread::CHILD_TID_WAKE_MASK,
-            carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
-        );
+        let woken = carrick_kernel::el1_zone::wake(zone, mm, address, u32::MAX, 1);
         zone::publish_zone_handbacks(kernel, &woken.handed);
         woken.count
     } else {
-        futex.wake(
-            address,
-            carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
-        )
+        futex.wake(address, 1)
     };
     carrick_kernel::event_ring::rec_futex_wake(address, count);
 }
@@ -156,167 +144,41 @@ pub(super) enum CloneThreadSpawn {
     Started {
         internal: carrick_kernel::kernel::LinuxTid,
         visible: i32,
+        parent_tid_addr: u64,
     },
     Errno(crate::linux_abi::LinuxErrno),
 }
 
-pub(super) struct CloneTidOutputTransaction {
-    parent_address: u64,
-    parent_preimage: Option<Vec<u8>>,
-    child_address: u64,
-    child_preimage: Option<Vec<u8>>,
+/// Publish a clone TID only on the return path that owns it. Owner memory
+/// admits the whole word before changing any byte, so a fork gate can suspend
+/// this return without leaving a partial TID store behind.
+pub(super) fn publish_clone_tid<M: carrick_guest_mem::CurrentMmMemory>(
+    memory: &mut M,
+    address: u64,
+    tid: i32,
+) -> Result<(), carrick_guest_mem::MemoryPrepareError> {
+    use carrick_guest_mem::{GuestVa, GuestWriteRange, MemoryPrepareError, UserMemoryVenue};
+    if address == 0 {
+        return Ok(());
+    }
+    let bytes = tid.to_le_bytes();
+    if memory.user_memory_venue() == UserMemoryVenue::Legacy {
+        return memory
+            .write_bytes(address, &bytes)
+            .map_err(MemoryPrepareError::Fault);
+    }
+    let range = GuestWriteRange::new(GuestVa(address), bytes.len()).ok_or(
+        MemoryPrepareError::Fault(carrick_guest_mem::MemoryError::OutOfBounds {
+            address,
+            length: bytes.len(),
+        }),
+    )?;
+    memory.prepare_write(&[range])?.commit(&[&bytes]);
+    Ok(())
 }
 
-pub(super) trait CloneTidMemory {
-    fn read_clone_tid_bytes(
-        &self,
-        address: u64,
-        len: usize,
-    ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError>;
-    fn write_clone_tid_bytes(
-        &mut self,
-        address: u64,
-        bytes: &[u8],
-    ) -> Result<(), carrick_guest_mem::MemoryError>;
-}
-
-impl<E: ThreadedEngine> CloneTidMemory for E {
-    fn read_clone_tid_bytes(
-        &self,
-        address: u64,
-        len: usize,
-    ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
-        self.read_bytes(address, len)
-    }
-
-    fn write_clone_tid_bytes(
-        &mut self,
-        address: u64,
-        bytes: &[u8],
-    ) -> Result<(), carrick_guest_mem::MemoryError> {
-        self.write_bytes(address, bytes)
-    }
-}
-
-impl CloneTidOutputTransaction {
-    pub(super) fn capture<E: CloneTidMemory>(
-        engine: &E,
-        parent_address: u64,
-        child_address: u64,
-    ) -> Result<Self, crate::linux_abi::LinuxErrno> {
-        let read = |address: u64| {
-            if address == 0 {
-                Some(None)
-            } else {
-                engine
-                    .read_clone_tid_bytes(address, std::mem::size_of::<i32>())
-                    .ok()
-                    .map(Some)
-            }
-        };
-        Ok(Self {
-            parent_address,
-            parent_preimage: read(parent_address).ok_or(crate::linux_abi::LINUX_EFAULT)?,
-            child_address,
-            child_preimage: read(child_address).ok_or(crate::linux_abi::LINUX_EFAULT)?,
-        })
-    }
-
-    pub(super) fn publish<E: CloneTidMemory>(
-        &self,
-        engine: &mut E,
-        visible_tid: i32,
-        backend_tid: ThreadId,
-    ) -> bool {
-        let bytes = visible_tid.to_le_bytes();
-        self.publish_one(
-            engine,
-            backend_tid,
-            carrick_observability::probes::HvpatchCloneTidOutput::Parent,
-            self.parent_address,
-            &bytes,
-        ) && self.publish_one(
-            engine,
-            backend_tid,
-            carrick_observability::probes::HvpatchCloneTidOutput::Child,
-            self.child_address,
-            &bytes,
-        )
-    }
-
-    fn publish_one<E: CloneTidMemory>(
-        &self,
-        engine: &mut E,
-        backend_tid: ThreadId,
-        output: carrick_observability::probes::HvpatchCloneTidOutput,
-        address: u64,
-        bytes: &[u8],
-    ) -> bool {
-        if address == 0 {
-            return true;
-        }
-        let result = engine.write_clone_tid_bytes(address, bytes);
-        let result_kind = match &result {
-            Ok(()) => carrick_observability::probes::HvpatchCloneTidWriteResult::Success,
-            Err(carrick_guest_mem::MemoryError::OutOfBounds { .. }) => {
-                carrick_observability::probes::HvpatchCloneTidWriteResult::OutOfBounds
-            }
-            Err(carrick_guest_mem::MemoryError::Unsupported) => {
-                carrick_observability::probes::HvpatchCloneTidWriteResult::Unsupported
-            }
-            Err(carrick_guest_mem::MemoryError::MetadataAllocation) => {
-                carrick_observability::probes::HvpatchCloneTidWriteResult::MetadataAllocation
-            }
-            Err(carrick_guest_mem::MemoryError::HostMap(detail))
-                if detail.starts_with("HVPatch sparse mmap backing:") =>
-            {
-                carrick_observability::probes::HvpatchCloneTidWriteResult::SparseBacking
-            }
-            Err(carrick_guest_mem::MemoryError::HostMap(detail))
-                if detail.starts_with("HVPatch frame COW:") =>
-            {
-                carrick_observability::probes::HvpatchCloneTidWriteResult::FrameCow
-            }
-            Err(carrick_guest_mem::MemoryError::HostMap(_)) => {
-                carrick_observability::probes::HvpatchCloneTidWriteResult::HostMap
-            }
-            Err(
-                carrick_guest_mem::MemoryError::ReadSuspended(_)
-                | carrick_guest_mem::MemoryError::Physical(_)
-                | carrick_guest_mem::MemoryError::OwnerWait(_)
-                | carrick_guest_mem::MemoryError::Supply(_),
-            ) => carrick_observability::probes::HvpatchCloneTidWriteResult::Suspended,
-            Err(carrick_guest_mem::MemoryError::OwnerRetired(_)) => {
-                carrick_observability::probes::HvpatchCloneTidWriteResult::OwnerRetired
-            }
-        };
-        crate::probes::mn_clone_tid_output(backend_tid.raw(), output, address, result_kind);
-        result.is_ok()
-    }
-
-    pub(super) fn rollback<E: CloneTidMemory>(
-        &self,
-        engine: &mut E,
-    ) -> Result<(), carrick_guest_mem::MemoryError> {
-        let mut failure = None;
-        if let Some(bytes) = self.parent_preimage.as_ref() {
-            if let Err(error) = engine.write_clone_tid_bytes(self.parent_address, bytes) {
-                failure = Some(error);
-            }
-        }
-        if let Some(bytes) = self.child_preimage.as_ref() {
-            if let Err(error) = engine.write_clone_tid_bytes(self.child_address, bytes)
-                && failure.is_none()
-            {
-                failure = Some(error);
-            }
-        }
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-}
+pub(super) trait CloneTidMemory {}
+impl<E: ThreadedEngine> CloneTidMemory for E {}
 
 /// A guest thread's handle in the process-private thread list. The retired
 /// `Job` variant carried a transitional-runner task receipt, which nothing on
@@ -558,95 +420,6 @@ impl From<VcpuThreadRegistry> for Arc<parking_lot::Mutex<Vec<VcpuThreadHandle>>>
 #[cfg(test)]
 mod clone_tid_output_tests {
     use super::*;
-
-    #[derive(Default)]
-    struct Memory {
-        bytes: std::collections::BTreeMap<u64, Vec<u8>>,
-        fail_write: Option<u64>,
-        refuse_metadata: bool,
-    }
-
-    impl CloneTidMemory for Memory {
-        fn read_clone_tid_bytes(
-            &self,
-            address: u64,
-            _len: usize,
-        ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
-            self.bytes
-                .get(&address)
-                .cloned()
-                .ok_or(carrick_guest_mem::MemoryError::OutOfBounds { address, length: 4 })
-        }
-
-        fn write_clone_tid_bytes(
-            &mut self,
-            address: u64,
-            bytes: &[u8],
-        ) -> Result<(), carrick_guest_mem::MemoryError> {
-            if self.fail_write == Some(address) {
-                if self.refuse_metadata {
-                    return Err(carrick_guest_mem::MemoryError::MetadataAllocation);
-                }
-                return Err(carrick_guest_mem::MemoryError::HostMap(
-                    "injected clone TID copyout failure".to_owned(),
-                ));
-            }
-            self.bytes.insert(address, bytes.to_vec());
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn second_tid_copyout_failure_restores_both_exact_preimages() {
-        let parent = 0x1000;
-        let child = 0x2000;
-        let mut memory = Memory::default();
-        memory.bytes.insert(parent, 11_i32.to_le_bytes().to_vec());
-        memory.bytes.insert(child, 22_i32.to_le_bytes().to_vec());
-        let transaction = CloneTidOutputTransaction::capture(&memory, parent, child).unwrap();
-        memory.fail_write = Some(child);
-        assert!(!transaction.publish(&mut memory, 7, ThreadId::synthetic_for_tests(77),));
-        memory.fail_write = None;
-        transaction.rollback(&mut memory).unwrap();
-        assert_eq!(memory.bytes[&parent], 11_i32.to_le_bytes());
-        assert_eq!(memory.bytes[&child], 22_i32.to_le_bytes());
-    }
-
-    #[test]
-    fn metadata_refusal_during_tid_copyout_retains_rollback_preimages() {
-        let parent = 0x1000;
-        let child = 0x2000;
-        let mut memory = Memory::default();
-        memory.bytes.insert(parent, 11_i32.to_le_bytes().to_vec());
-        memory.bytes.insert(child, 22_i32.to_le_bytes().to_vec());
-        let transaction = CloneTidOutputTransaction::capture(&memory, parent, child).unwrap();
-        memory.fail_write = Some(child);
-        memory.refuse_metadata = true;
-        assert!(!transaction.publish(&mut memory, 7, ThreadId::synthetic_for_tests(77)));
-        assert_eq!(memory.bytes[&parent], 7_i32.to_le_bytes());
-        assert_eq!(memory.bytes[&child], 22_i32.to_le_bytes());
-        memory.fail_write = None;
-        transaction.rollback(&mut memory).unwrap();
-        assert_eq!(memory.bytes[&parent], 11_i32.to_le_bytes());
-        assert_eq!(memory.bytes[&child], 22_i32.to_le_bytes());
-    }
-
-    #[test]
-    fn rollback_write_failure_is_reported_after_attempting_every_preimage() {
-        let parent = 0x3000;
-        let child = 0x4000;
-        let mut memory = Memory::default();
-        memory.bytes.insert(parent, 31_i32.to_le_bytes().to_vec());
-        memory.bytes.insert(child, 41_i32.to_le_bytes().to_vec());
-        let transaction = CloneTidOutputTransaction::capture(&memory, parent, child).unwrap();
-        memory.bytes.insert(parent, 99_i32.to_le_bytes().to_vec());
-        memory.bytes.insert(child, 99_i32.to_le_bytes().to_vec());
-        memory.fail_write = Some(parent);
-
-        assert!(transaction.rollback(&mut memory).is_err());
-        assert_eq!(memory.bytes[&parent], 99_i32.to_le_bytes());
-        assert_eq!(memory.bytes[&child], 41_i32.to_le_bytes());
-    }
 
     /// The exec-from-thread teardown class (execfromthread, forkexecstorm,
     /// Go `os/exec` in net_http; 2026-09-12): the sibling drain drains the
@@ -1281,10 +1054,7 @@ mod child_tid_owner_tests {
             carrick_guest_mem::MemoryPrepareError,
         > {
             assert_eq!(ranges.len(), 1);
-            match self.write_bytes_raw(
-                ranges[0].address().raw(),
-                &carrick_personality_linux::thread::CHILD_TID_CLEAR,
-            ) {
+            match self.write_bytes_raw(ranges[0].address().raw(), &0_i32.to_le_bytes()) {
                 Err(MemoryError::OwnerWait(wait)) => {
                     Err(carrick_guest_mem::MemoryPrepareError::OwnerWait(wait))
                 }
@@ -1392,6 +1162,44 @@ mod child_tid_owner_tests {
             "owner wait must retain clear_child_tid before waking or retiring the thread"
         );
         drop(enrollment);
+    }
+
+    #[test]
+    fn clone_tid_publication_waits_for_the_owner_gate_without_changing_the_word() {
+        let region = Region::new();
+        let zone = region.zone();
+        let mm = admit_notified(&region, 77, ROOT, 1, 0);
+        let view = nodes(&region);
+        let portal = MmPortal::new(
+            NonZeroU64::new(1).unwrap(),
+            region.table(),
+            &zone.spaces,
+            &view,
+        )
+        .with_zone(zone)
+        .unwrap();
+        let handle = portal.admitted_handle(mm, 0).unwrap();
+        let tables = Tables::new(ROOT, IPA, 1);
+        let prior_tid = 70_303_i32;
+        let mut memory = OwnerClearMemory {
+            portal: &portal,
+            handle,
+            tables: &tables,
+            bytes: prior_tid.to_le_bytes(),
+            waits: 0,
+        };
+        let access =
+            carrick_el1::sched::object_wait::space_access(zone, carrick_sched_core::SlotId::new(1));
+        let index = zone.spaces.find(mm.raw()).unwrap();
+        access.raise(index);
+        let result = publish_clone_tid(&mut memory, VA, 70_304);
+        access.lower(index);
+        assert!(matches!(
+            result,
+            Err(carrick_guest_mem::MemoryPrepareError::OwnerWait(_))
+        ));
+        assert_eq!(memory.waits, 1);
+        assert_eq!(memory.bytes, prior_tid.to_le_bytes());
     }
 
     #[derive(Debug, Default)]

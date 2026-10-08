@@ -75,7 +75,7 @@ impl UserTransferCustody {
             .states
             .read()
             .get(&binding)
-            .and_then(std::sync::Weak::upgrade)
+            .and_then(CarrierForeignMmStateEntry::upgrade)
             .ok_or_else(invalid)?;
         sparse_materialization::PublicationContext::for_import(
             state,
@@ -136,7 +136,7 @@ impl TransferPin for RetainedUserData {
         authorization: carrick_el1_abi::PortalCopyRequest<'_>,
         bytes: &mut [u8],
     ) -> bool {
-        if self.intent == PortalTransferIntent::UserWrite {
+        if self.intent.is_write() {
             self.copy_out(authorization, bytes)
         } else {
             self.copy_bytes(authorization, TransferBytes::Read(bytes))
@@ -147,7 +147,7 @@ impl TransferPin for RetainedUserData {
         authorization: carrick_el1_abi::PortalCopyRequest<'_>,
         bytes: &[u8],
     ) -> bool {
-        if self.intent != PortalTransferIntent::UserWrite {
+        if !self.intent.is_write() {
             return false;
         }
         self.copy_bytes(authorization, TransferBytes::Write(bytes))
@@ -188,7 +188,7 @@ impl RetainedUserData {
                 }
             }
         }
-        if self.intent == PortalTransferIntent::UserWrite {
+        if self.intent.is_write() {
             // A peer MM may have consumed admission dirtiness before this
             // memcpy. Publish the completed write, then await I2 completion.
             let mapping = self._mapping.as_ref().unwrap_or_else(|| {
@@ -200,7 +200,7 @@ impl RetainedUserData {
             let offset = self.pointer as usize - mapping.host_base() as usize;
             mapping.code_content.mark_icache_dirty(offset, len);
         }
-        if self.intent == PortalTransferIntent::UserWrite && self.selected.executable {
+        if self.intent.is_write() && self.selected.executable {
             self.custody
                 .publish_user_executable(self.selected.ipa, len as u64, |_, _| None, |_, _| None)
                 .unwrap_or_else(|error| {
@@ -224,6 +224,12 @@ impl TransferCustody for UserTransferCustody {
         window: carrick_el1_abi::PortalGrantWindow,
     ) -> Result<carrick_aarch64::user_transfer::TransferPreparation, TrapError> {
         let Some(transport) = &self.transport else {
+            super::stage2_backend::record_owner_supply_decline(
+                window.operation.mm.raw(),
+                window.operation.incarnation.get(),
+                1,
+                0,
+            );
             carrick_observability::probes::hvpatch_el1_owner_grant_supply(
                 window.range.start(),
                 window.range.len(),
@@ -233,6 +239,12 @@ impl TransferCustody for UserTransferCustody {
             return Ok(carrick_aarch64::user_transfer::TransferPreparation::Declined);
         };
         let Some(asid) = core::num::NonZeroU16::new((target.ttbr0() >> 48) as u16) else {
+            super::stage2_backend::record_owner_supply_decline(
+                window.operation.mm.raw(),
+                window.operation.incarnation.get(),
+                2,
+                0,
+            );
             carrick_observability::probes::hvpatch_el1_owner_grant_supply(
                 window.range.start(),
                 window.range.len(),
@@ -249,8 +261,14 @@ impl TransferCustody for UserTransferCustody {
             .states
             .read()
             .get(&binding)
-            .and_then(std::sync::Weak::upgrade);
+            .and_then(CarrierForeignMmStateEntry::upgrade);
         let Some(state) = state else {
+            super::stage2_backend::record_owner_supply_decline(
+                window.operation.mm.raw(),
+                window.operation.incarnation.get(),
+                3,
+                0,
+            );
             carrick_observability::probes::hvpatch_el1_owner_grant_supply(
                 window.range.start(),
                 window.range.len(),
@@ -530,7 +548,7 @@ impl UserTransferCustody {
         };
         // Revocation returns owned readiness without waiting for native-code
         // users. Its writer exclusion survives suspension through pending().
-        let write = if intent == PortalTransferIntent::UserWrite {
+        let write = if intent.is_write() {
             Some(Arc::new(
                 mapping
                     .as_ref()
@@ -1065,6 +1083,96 @@ pub(super) mod tests {
                 .pin_count,
             0
         );
+    }
+
+    #[test]
+    fn identity_stamp_retains_two_private_structural_backings() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let physical = UserTransferCustody::new(Arc::clone(&custody));
+        let regions: Vec<_> = [0xa090_0000_0000, 0xa090_0020_0000]
+            .into_iter()
+            .map(|ipa| {
+                map_region_raw_in(
+                    &custody,
+                    &GuestMapping {
+                        guest_start: ipa,
+                        ipa_start: ipa,
+                        mapped_size: 0x4000,
+                        offset_in_mapping: 0,
+                        payload_size: 0x4000,
+                        perms: carrick_mem::elf::SegmentPerms {
+                            read: true,
+                            write: true,
+                            execute: false,
+                        },
+                        shared: false,
+                        image: Arc::new(vec![0; 0x4000]),
+                        private_file_backing: None,
+                    },
+                    false,
+                    true,
+                )
+                .unwrap()
+            })
+            .collect();
+        for (index, region) in regions.iter().enumerate() {
+            let word = carrick_el1_abi::CarrickIdentityWrite::Pid(701 + index as u32);
+            let selected = selection(region.physical_ipa);
+            let mut pin = physical
+                .retain(
+                    selected,
+                    word.len(),
+                    PortalTransferIntent::CarrickIdentityWrite,
+                )
+                .unwrap()
+                .unwrap();
+            let operation = PortalOperation {
+                carrier: physical.carrier(),
+                mm: ReservationMm::new(77 + index as u64).unwrap(),
+                incarnation: NonZeroU64::new(1).unwrap(),
+                sequence: NonZeroU64::new(1).unwrap(),
+            };
+            let request = carrick_el1_abi::PortalTransferRequest::new(
+                operation,
+                PortalByteRange::new(
+                    word.address(
+                        carrick_el1_abi::IdentityControlBase::new(
+                            carrick_el1_abi::CARRICK_IDENTITY_PAGE_BASE,
+                        )
+                        .unwrap(),
+                    ),
+                    word.len() as u64,
+                )
+                .unwrap(),
+                PortalTransferIntent::CarrickIdentityWrite,
+                selected,
+                pin.identity(),
+            )
+            .unwrap();
+            let slot = PortalTransferSlot::new();
+            let mut ticket = slot.submit(request).unwrap();
+            let service = slot.claim().unwrap();
+            assert!(
+                service.copy_with(|| assert!(ticket.copy_requested(|authorization| {
+                    pin.copy_out(authorization, &word.bytes()[..word.len()])
+                }))),
+                "identity stamp must consume its exact structural pin"
+            );
+            assert!(service.complete(word.len() as u64, 0));
+            assert_eq!(ticket.take_completion().unwrap().errno, 0);
+            // SAFETY: both live structural owners retain their complete mappings.
+            let bytes = unsafe { std::slice::from_raw_parts(region.host_addr, 4) };
+            assert_eq!(bytes, &(701 + index as u32).to_le_bytes());
+            let peer = &regions[1 - index];
+            // SAFETY: the peer's owner remains live throughout both publications.
+            let peer_bytes = unsafe { std::slice::from_raw_parts(peer.host_addr, 4) };
+            assert_eq!(
+                peer_bytes,
+                &if index == 0 { 0_u32 } else { 701_u32 }.to_le_bytes()
+            );
+        }
     }
 
     #[test]

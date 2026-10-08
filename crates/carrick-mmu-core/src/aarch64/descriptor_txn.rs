@@ -285,6 +285,7 @@ pub enum CowRepointAccess {
     RecordedPrivate,
     User {
         writable_pages: u8,
+        executable_pages: u8,
     },
     Kernel,
 }
@@ -295,7 +296,10 @@ impl CowRepointAccess {
             Self::Retired => 3,
             Self::RecordedPrivate => 0,
             Self::Kernel => 1,
-            Self::User { writable_pages } => 2 | (u64::from(writable_pages) << 8),
+            Self::User {
+                writable_pages,
+                executable_pages,
+            } => 2 | (u64::from(writable_pages) << 8) | (u64::from(executable_pages) << 16),
         }
     }
 
@@ -304,8 +308,9 @@ impl CowRepointAccess {
             3 => Some(Self::Retired),
             0 => Some(Self::RecordedPrivate),
             1 => Some(Self::Kernel),
-            value if value & !0xf00 == 2 => Some(Self::User {
-                writable_pages: (value >> 8) as u8,
+            value if value & !0xf0f00 == 2 => Some(Self::User {
+                writable_pages: ((value >> 8) & 0xf) as u8,
+                executable_pages: ((value >> 16) & 0xf) as u8,
             }),
             _ => None,
         }
@@ -313,7 +318,10 @@ impl CowRepointAccess {
 
     fn covers(self, len: u64) -> bool {
         match self {
-            Self::User { writable_pages } => u64::from(writable_pages) < (1_u64 << (len / PT_PAGE)),
+            Self::User {
+                writable_pages,
+                executable_pages,
+            } => u64::from(writable_pages | executable_pages) < (1_u64 << (len / PT_PAGE)),
             _ => true,
         }
     }
@@ -2294,8 +2302,16 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                         }
                         return Ok(output | super::KERNEL_PAGE_FLAGS | NON_GLOBAL);
                     }
-                    CowRepointAccess::User { writable_pages } => {
-                        let repointed = (descriptor & !PA_MASK_4KIB) | output;
+                    CowRepointAccess::User {
+                        writable_pages,
+                        executable_pages,
+                    } => {
+                        let permits_execute =
+                            executable_pages & (1 << ((base - va) / PT_PAGE)) != 0;
+                        let mut repointed = (descriptor & !PA_MASK_4KIB) | output;
+                        if !permits_execute {
+                            repointed = (repointed | UXN) & !SW_EL1_MAY_EXEC;
+                        }
                         if descriptor & VALID == 0 {
                             // Retired/prepared backing maintenance must leave
                             // the page inaccessible until its later publication.
@@ -2902,6 +2918,7 @@ mod tests {
             DescriptorOp::CowRepoint {
                 access: CowRepointAccess::User {
                     writable_pages: 0b0101,
+                    executable_pages: 0b1111,
                 },
                 len: 4 * PT_PAGE,
                 va: 0x9000,
@@ -4259,6 +4276,7 @@ mod tests {
                 DescriptorOp::CowRepoint {
                     access: CowRepointAccess::User {
                         writable_pages: 0b1001,
+                        executable_pages: 0b1111,
                     },
                     va: VA,
                     len: 4 * PT_PAGE,
@@ -4329,6 +4347,7 @@ mod tests {
                 (
                     CowRepointAccess::User {
                         writable_pages: 0b0011,
+                        executable_pages: 0b1111,
                     },
                     flags,
                 ),
@@ -4372,6 +4391,7 @@ mod tests {
                     DescriptorOp::CowRepoint {
                         access: CowRepointAccess::User {
                             writable_pages: 0b0011,
+                            executable_pages: 0b1111,
                         },
                         va: VA,
                         len: 2 * PT_PAGE,
@@ -4400,7 +4420,10 @@ mod tests {
             applied(run(
                 &words,
                 DescriptorOp::CowRepoint {
-                    access: CowRepointAccess::User { writable_pages: 0 },
+                    access: CowRepointAccess::User {
+                        writable_pages: 0,
+                        executable_pages: 0b1111,
+                    },
                     va: VA,
                     len: PT_PAGE,
                     old_ipa: SubstrateGpa(IPA),

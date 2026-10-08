@@ -141,6 +141,7 @@ fn measured_sample_backing_is_fixed_across_short_and_long_runs() {
 }
 
 fn carrier_or_fail() -> Carrier {
+    common::arm_fatal_debugger_hold();
     for _ in 0..50 {
         match Carrier::new() {
             Ok(carrier) => return carrier,
@@ -341,6 +342,13 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
         .pull_policy(PullPolicy::Missing)
         .command(command)
         .vfs_mount("/opt/carrick", Box::new(el1_sched_vfs()));
+    if std::env::var("CARRICK_SCHED_TRACE_RETURNS").as_deref() == Ok("1") {
+        // Install the existing CompatReporter probe hook. Registration alone
+        // preserves EL1 admission and enables host-return probes without
+        // printing during execution or adding another observer.
+        carrick_observability::probes::register_dtrace_probes()
+            .expect("register scheduler diagnostic return probes");
+    }
     let mut captured = None;
     if args.first() == Some(&"tlb-stale-threads")
         && (args.get(3) != Some(&"omit-first-write-ack")
@@ -355,7 +363,12 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
         })));
         captured = Some(bytes);
     }
-    let mut result = common::run_or_fail(builder.run_blocking());
+    let mut result = common::run_or_fail(builder.run_blocking().map_err(|error| {
+        panic!(
+            "container run failed: {error}; reservation ring: {:?}",
+            reservation_ring()
+        );
+    }));
     if let Some(bytes) = captured {
         result.stdout = std::mem::take(&mut *bytes.lock().unwrap());
     }
@@ -4311,6 +4324,35 @@ fn thread_counters() -> [[u64; 2]; 6] {
     })
 }
 
+type ReservationEdge = (u64, u64, u64, u64, u64, u64);
+
+fn reservation_ring() -> Option<(u64, Vec<ReservationEdge>)> {
+    use std::sync::atomic::Ordering;
+    read_el1_counters().map(|counters| {
+        let next = counters.reservation_events.next.load(Ordering::Relaxed);
+        let mut events = counters
+            .reservation_events
+            .slots
+            .iter()
+            .filter_map(|slot| {
+                let sequence = slot.sequence.load(Ordering::Acquire);
+                (sequence != 0).then(|| {
+                    (
+                        sequence,
+                        slot.phase.load(Ordering::Relaxed),
+                        slot.mm.load(Ordering::Relaxed),
+                        slot.incarnation.load(Ordering::Relaxed),
+                        slot.id.load(Ordering::Relaxed),
+                        slot.tail_id.load(Ordering::Relaxed),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        events.sort_by_key(|event| event.0);
+        (next, events)
+    })
+}
+
 /// Run one witness mode and assert its Linux-semantic line. Returns the
 /// measurement, the stdout and the per-syscall `[served, forwarded]` deltas.
 fn thread_witness(
@@ -4350,7 +4392,12 @@ fn thread_witness(
         exit_breakdown(&measured),
         stdout.trim()
     );
-    assert!(measured.result.success(), "{mode}: {}", describe(&measured));
+    assert!(
+        measured.result.success(),
+        "{mode}: {}; reservation ring: {:?}",
+        describe(&measured),
+        reservation_ring()
+    );
     let summary = format!("{mode} summary parent_ok=true child_ok=true ok=true");
     let single = stdout
         .lines()

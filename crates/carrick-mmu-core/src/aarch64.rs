@@ -417,6 +417,12 @@ pub fn terminal_descriptor_may_write(descriptor: u64) -> bool {
     descriptor & SW_EL1_MAY_WRITE != 0
 }
 
+/// Whether a terminal descriptor records Linux execute intent.
+#[inline]
+pub fn terminal_descriptor_may_execute(descriptor: u64) -> bool {
+    descriptor & SW_EL1_MAY_EXEC != 0
+}
+
 /// Host buffer access for an EL1-owned leaf. COW writes are admitted only
 /// while Linux write intent survives; the caller must privatize before copyout.
 /// Non-EL1 mappings remain subject to the caller's ordinary permission checks.
@@ -1378,6 +1384,26 @@ fn adopt_host_leaf_as_el1_private(desc: u64, level: usize) -> u64 {
         return desc;
     }
     desc | SW_EL1_PRIVATE | SW_EL1_MAY_WRITE | if desc & UXN == 0 { SW_EL1_MAY_EXEC } else { 0 }
+}
+
+/// Explicit synthetic private pages may be read-only to EL0 yet require an
+/// EL1-internal COW write after fork. The caller must authenticate their domain.
+pub fn arm_synthetic_readonly_private(
+    desc: u64,
+    level: usize,
+    va: u64,
+) -> Result<u64, TerminalRefusal> {
+    let adopted = if level == 3
+        && desc & (VALID | SW_EL1_PRIVATE) == VALID
+        && desc & TYPE_BITS == TYPE_TABLE_OR_PAGE
+        && desc & AP_MASK == AP_RO
+    {
+        desc | SW_EL1_PRIVATE | if desc & UXN == 0 { SW_EL1_MAY_EXEC } else { 0 }
+    } else {
+        desc
+    };
+    terminal_rule_edit(true, TerminalRule::fork_arm(true), adopted, level, va)
+        .map(|changed| changed.unwrap_or(adopted))
 }
 
 /// Apply `rule` to one covering terminal. `Ok(None)`: the terminal already
@@ -13105,6 +13131,17 @@ mod tests {
     /// so EL1 declined every write to it (`NotEl1Private`). Arming a guest-lane
     /// MM's compound range adopts it: the classifier then sees an armed leaf
     /// with recorded write intent, and a non-adopting arm still does not.
+    #[test]
+    fn explicit_synthetic_readonly_fork_has_private_cow_without_linux_write() {
+        let va = LINUX_MMAP_BASE + 0x4000;
+        let native_readonly = va | VALID | TYPE_TABLE_OR_PAGE | AP_RO | UXN;
+        let armed = arm_synthetic_readonly_private(native_readonly, 3, va).unwrap();
+        assert!(terminal_descriptor_is_fork_cow(armed));
+        assert_eq!(el1_private_leaf_state(armed), El1PrivateLeafState::Resident);
+        assert_eq!(armed & SW_EL1_MAY_WRITE, 0);
+        assert_eq!(armed & AP_MASK, AP_RO);
+    }
+
     #[test]
     fn fork_arming_adopts_host_published_leaves_for_el1_cow() {
         use descriptor_txn::guest_cow::{GuestCowClass, GuestCowNotArmed};

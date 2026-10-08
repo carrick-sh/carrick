@@ -376,10 +376,6 @@ pub fn reinit_after_fork<G: HostSignalGlue>(
     *PUMP_THREAD.lock().unwrap_or_else(|e| e.into_inner()) = None;
     PUMP_STOP.store(false, Ordering::SeqCst);
     carrick_signal_linux::child_watch::clear();
-    // Linux starts a fork child with no interval timers; the parent's fallback
-    // timer threads are absent here and one may have been copied mid-delivery
-    // holding a slot gate, so reset without waiting on it.
-    carrick_timer_core::itimer::reset_after_fork();
     PUMP_STARTED.store(false, Ordering::SeqCst);
     SIGCHLD_INSTALLED.store(false, Ordering::SeqCst);
     start_pump::<G>(registry, futex);

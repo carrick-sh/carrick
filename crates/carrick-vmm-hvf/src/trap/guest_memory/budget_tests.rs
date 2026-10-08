@@ -49,7 +49,7 @@ impl Drop for MmapBuffer {
     }
 }
 
-pub(super) fn test_vm_state(task: HvfTaskState) -> HvfVmState {
+pub(crate) fn test_vm_state(task: HvfTaskState) -> HvfVmState {
     HvfVmState {
         _vm: std::mem::ManuallyDrop::new(unsafe { std::mem::zeroed() }),
         task,

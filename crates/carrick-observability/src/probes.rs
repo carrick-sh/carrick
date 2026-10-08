@@ -5491,6 +5491,13 @@ mod real {
         fn hvpatch__mm__lease__lifecycle(_: u32, _: i32, _: u64, _: u32, _: u32) {}
         /// Parent TaskKey or executing ThreadKey relation for a lifecycle event.
         fn hvpatch__mm__lease__relation(_: u32, _: u64, _: i32, _: u64) {}
+        /// N1 reservation custody: phase 0 publish, 1 root retire, 2 prepared
+        /// reap, 3 retirement begin, 4 graph-exit commit, 5 prepare copy.
+        /// Args: phase, MM, incarnation, detail A,
+        /// detail B. Reap details are primary and tail node IDs; prepare
+        /// details are primary ID and generation. Retirement begin details
+        /// are task PID and exact TaskSerial.
+        fn hvpatch__n1__reservation__custody(_: u32, _: u64, _: u64, _: u64, _: u64) {}
         /// Raw stage-2 exec transition. Args: phase (0=unmap begin, 1=unmap
         /// end, 2=map begin, 3=map end), IPA, size, guest VA (`UINT64_MAX`
         /// when the unmap ledger has only an IPA extent), and raw HVF rc.
@@ -7396,6 +7403,23 @@ mod real {
     }
 
     #[inline(never)]
+    pub fn hvpatch_n1_reservation_custody(
+        phase: u32,
+        mm: u64,
+        incarnation: u64,
+        detail_a: u64,
+        detail_b: u64,
+    ) {
+        carrick_usdt::hvpatch__n1__reservation__custody!(|| (
+            phase,
+            mm,
+            incarnation,
+            detail_a,
+            detail_b
+        ));
+    }
+
+    #[inline(never)]
     pub fn hvpatch_exec_stage2(event: super::HvpatchExecStage2) {
         carrick_usdt::hvpatch__exec__stage2!(|| (
             event.phase().raw(),
@@ -9295,6 +9319,7 @@ mod stub {
     stub!(hvpatch_exec_predecessor_classification(event: super::HvpatchExecPredecessorClassification));
     stub!(hvpatch_mm_lease_lifecycle(event: super::HvpatchMmLeaseLifecycle));
     stub!(hvpatch_mm_lease_relation(event: super::HvpatchMmLeaseRelation));
+    stub!(hvpatch_n1_reservation_custody(phase: u32, mm: u64, incarnation: u64, detail_a: u64, detail_b: u64));
     stub!(hvpatch_exec_stage2(event: super::HvpatchExecStage2));
     stub!(hvpatch_exec_replace_stage(event: super::HvpatchExecReplaceStage));
     stub!(hvpatch_exec_runtime_stage(event: super::HvpatchExecRuntimeStage));

@@ -154,14 +154,19 @@ pub enum PortalTransferIntent {
     UserWrite,
     ReadInstruction,
     CarrickInternalRead,
+    CarrickIdentityWrite,
 }
 impl PortalTransferIntent {
+    pub const fn is_write(self) -> bool {
+        matches!(self, Self::UserWrite | Self::CarrickIdentityWrite)
+    }
     pub const fn encode(self) -> u64 {
         match self {
             Self::UserRead => 1,
             Self::UserWrite => 2,
             Self::ReadInstruction => 3,
             Self::CarrickInternalRead => 4,
+            Self::CarrickIdentityWrite => 5,
         }
     }
     pub const fn decode(raw: u64) -> Option<Self> {
@@ -170,6 +175,7 @@ impl PortalTransferIntent {
             2 => Some(Self::UserWrite),
             3 => Some(Self::ReadInstruction),
             4 => Some(Self::CarrickInternalRead),
+            5 => Some(Self::CarrickIdentityWrite),
             _ => None,
         }
     }

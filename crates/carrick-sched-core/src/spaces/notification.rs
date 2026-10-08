@@ -547,6 +547,13 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceAccess<'a, C> {
     pub fn table(self) -> &'a super::AddressSpaces {
         self.spaces
     }
+    pub fn current_notification(
+        self,
+        index: SpaceIndex,
+        mm: u64,
+    ) -> Option<SpaceNotificationLease<'a, C>> {
+        self.venue?.zone.editor_notification(index, mm)
+    }
     /// Preserve the nested host pause count; the release revision precedes
     /// the atomic decrement, and delivery follows it.
     pub fn lower(self, index: SpaceIndex) {
@@ -591,6 +598,30 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceAccess<'a, C> {
             self.spaces.open(index);
         } else {
             self.spaces.lower(index);
+        }
+    }
+    pub fn publish_metadata_all(self) {
+        for index in 0..super::ADDRESS_SPACES {
+            if let Some(index) = SpaceIndex::from_index(index) {
+                let entry = self.spaces.entry(index);
+                if !entry.notifications.attached() {
+                    continue;
+                }
+                let Some(venue) = self.venue else { continue };
+                let Some(lease) = venue
+                    .zone
+                    .editor_notification(index, self.spaces.key(index))
+                else {
+                    continue;
+                };
+                let completion = |effects: OwnedObjectWakeEffects<'_, C>| {
+                    (venue.deliver)(venue.zone, venue.waker, effects)
+                };
+                lease
+                    .reserve(SpaceWaitCause::Metadata)
+                    .advance_revision(venue.waker, &completion)
+                    .publish();
+            }
         }
     }
     pub fn try_begin_edit(

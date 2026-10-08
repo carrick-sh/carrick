@@ -2,6 +2,7 @@
 use crate::mm::reservation::{ReservationFaultPlan, ReservationGeometry, ReservationPolicy};
 use crate::mm::transaction::{MmError, MmPortal, OwnerVenue};
 use carrick_core_abi::*;
+pub use carrick_guest_arch::{FrameGpa, GuestLen};
 use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
 use carrick_mmu_core::owner_mmu::{OwnerGrantMmu, OwnerMmu};
 use carrick_sched_core::SpaceEditor;
@@ -250,5 +251,65 @@ impl FrameReferences {
             self.retire_on_last_unmap = true;
             ReferenceRetirement::Deferred
         }
+    }
+}
+
+/// A physical inventory extent, distinct from a leaf's user VA projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ForkFrameExtent {
+    start: carrick_guest_arch::FrameGpa,
+    len: carrick_guest_arch::GuestLen,
+}
+impl ForkFrameExtent {
+    pub fn new(
+        start: carrick_guest_arch::FrameGpa,
+        len: carrick_guest_arch::GuestLen,
+    ) -> Option<Self> {
+        (len.raw() != 0 && start.raw().checked_add(len.raw()).is_some())
+            .then_some(Self { start, len })
+    }
+    pub const fn start(self) -> carrick_guest_arch::FrameGpa {
+        self.start
+    }
+    pub const fn len(self) -> carrick_guest_arch::GuestLen {
+        self.len
+    }
+    fn contains(self, selected: Self) -> bool {
+        selected.start.raw() >= self.start.raw()
+            && selected.start.raw() + selected.len.raw() <= self.start.raw() + self.len.raw()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForkInventoryError {
+    OutsidePhysicalSource,
+}
+
+/// One fork's physical publication population. The backend supplies pinned
+/// physical custody and parent inventory identity; this core owns granularity
+/// and deduplication. It creates no persistent inventory or retirement ledger.
+#[derive(Debug, Default)]
+pub struct ForkFrameInventory {
+    inherited: alloc::collections::BTreeSet<(u64, u64)>,
+}
+impl ForkFrameInventory {
+    pub fn select(
+        &mut self,
+        selected: ForkFrameExtent,
+        physical: ForkFrameExtent,
+        source: Option<ForkFrameExtent>,
+    ) -> Result<Option<ForkFrameExtent>, ForkInventoryError> {
+        if !physical.contains(selected) || source.is_some_and(|source| !source.contains(selected)) {
+            return Err(ForkInventoryError::OutsidePhysicalSource);
+        }
+        // Leaves describe VA coverage, not physical ownership. Preserve the
+        // canonical parent's logical extent (which may be a COW fragment),
+        // or the complete pinned structural allocation when no inventory row
+        // exists. Repeated leaves/aliases retain that identity only once.
+        let inherited = source.unwrap_or(physical);
+        Ok(self
+            .inherited
+            .insert((inherited.start.raw(), inherited.len.raw()))
+            .then_some(inherited))
     }
 }

@@ -86,7 +86,10 @@ pub fn lower_edit_intent(intent: EditIntent<'_, RootGpa>) -> Result<DescriptorTx
             access: match access {
                 EditCowAccess::Retired => CowRepointAccess::Retired,
                 EditCowAccess::RecordedPrivate => CowRepointAccess::RecordedPrivate,
-                EditCowAccess::User { writable_pages } => CowRepointAccess::User { writable_pages },
+                EditCowAccess::User { writable_pages } => CowRepointAccess::User {
+                    writable_pages,
+                    executable_pages: 0b1111,
+                },
                 EditCowAccess::Kernel => CowRepointAccess::Kernel,
             },
             va: span.va,

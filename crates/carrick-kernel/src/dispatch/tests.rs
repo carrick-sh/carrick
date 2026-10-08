@@ -3617,11 +3617,11 @@ mod overlay_dispatch_tests {
 
         assert_eq!(
             read_kernel_struct::<LinuxTimespec>(&memory, 0),
-            Err(LINUX_EFAULT)
+            Err(InputCopyError::Errno(LINUX_EFAULT))
         );
         assert_eq!(
             read_kernel_struct::<LinuxTimespec>(&memory, MEM_BASE + MEM_LEN as u64 - 1),
-            Err(LINUX_EFAULT)
+            Err(InputCopyError::Errno(LINUX_EFAULT))
         );
     }
 
@@ -3644,7 +3644,7 @@ mod overlay_dispatch_tests {
                 address,
                 <LinuxCloneArgs as KernelAbi>::ABI_SIZE + 1,
             ),
-            Err(LINUX_EFAULT)
+            Err(InputCopyError::Errno(LINUX_EFAULT))
         );
     }
 
@@ -3954,7 +3954,10 @@ mod overlay_dispatch_tests {
         // No shared mapping -> EFAULT propagates unchanged (no regression for
         // a genuinely bad private/anon address).
         let lin = LinearMemory::new(0x1000, vec![0u8; 8]);
-        assert_eq!(read_futex_word(&lin, 0x9_9999_9999), Err(LINUX_EFAULT));
+        assert_eq!(
+            read_futex_word(&lin, 0x9_9999_9999),
+            Err(InputCopyError::Errno(LINUX_EFAULT))
+        );
     }
 
     struct CountingMemory {
@@ -11020,4 +11023,873 @@ fn exec_image_cache_single_flights_one_key() {
         start.wait();
     });
     assert_eq!(builds.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
+fn xattr_getxattr_path_owner_wait_returns_owner_memory_wait_not_efault() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{GuestMemory, MemoryError};
+    use carrick_observability::compat::SyscallArgs;
+    use std::num::NonZeroU64;
+
+    struct WaitingMemory(PortalOwnerWait);
+    impl GuestMemory for WaitingMemory {
+        fn read_bytes_raw(&self, _address: u64, _length: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::OwnerWait(self.0))
+        }
+        fn write_bytes_raw(&mut self, _address: u64, _bytes: &[u8]) -> Result<(), MemoryError> {
+            Ok(())
+        }
+    }
+    impl CurrentMmMemory for WaitingMemory {}
+
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(2).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Editor,
+            7,
+        )
+    };
+    let mut memory = WaitingMemory(wait);
+    let dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let reporter = CompatReporter::default();
+
+    // SYS_GETXATTR: getxattr(path, name, value, size)
+    let outcome = lower_handler_result(
+        dispatcher
+            .dispatch_normalized(
+                &context,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::GETXATTR.raw(),
+                    SyscallArgs::from([0x1000, 0x2000, 0x3000, 64, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+                None,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome,
+        DispatchOutcome::OwnerMemoryWait {
+            wait,
+            committed: 0,
+        },
+        "getxattr path owner wait must return OwnerMemoryWait, not EFAULT"
+    );
+}
+
+#[test]
+fn mount_api_fspick_path_owner_wait_returns_owner_memory_wait_not_efault() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{GuestMemory, MemoryError};
+    use carrick_observability::compat::SyscallArgs;
+    use std::num::NonZeroU64;
+
+    struct WaitingMemory(PortalOwnerWait);
+    impl GuestMemory for WaitingMemory {
+        fn read_bytes_raw(&self, _address: u64, _length: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::OwnerWait(self.0))
+        }
+        fn write_bytes_raw(&mut self, _address: u64, _bytes: &[u8]) -> Result<(), MemoryError> {
+            Ok(())
+        }
+    }
+    impl CurrentMmMemory for WaitingMemory {}
+
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(2).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Editor,
+            7,
+        )
+    };
+    let mut memory = WaitingMemory(wait);
+    let dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    context
+        .task()
+        .with_caps(|caps| *caps = crate::namespace::process::CapabilitySet::full());
+    let reporter = CompatReporter::default();
+
+    // SYS_FSPICK: fspick(dirfd, path, flags)
+    let outcome = lower_handler_result(
+        dispatcher
+            .dispatch_normalized(
+                &context,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::FSPICK.raw(),
+                    SyscallArgs::from([carrick_abi::LINUX_AT_FDCWD as u64, 0x1000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+                None,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome,
+        DispatchOutcome::OwnerMemoryWait {
+            wait,
+            committed: 0,
+        },
+        "fspick path owner wait must return OwnerMemoryWait, not EFAULT"
+    );
+}
+
+#[test]
+fn mqueue_mq_open_name_owner_wait_returns_owner_memory_wait_not_efault() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{GuestMemory, MemoryError};
+    use carrick_observability::compat::SyscallArgs;
+    use std::num::NonZeroU64;
+
+    struct WaitingMemory(PortalOwnerWait);
+    impl GuestMemory for WaitingMemory {
+        fn read_bytes_raw(&self, _address: u64, _length: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::OwnerWait(self.0))
+        }
+        fn write_bytes_raw(&mut self, _address: u64, _bytes: &[u8]) -> Result<(), MemoryError> {
+            Ok(())
+        }
+    }
+    impl CurrentMmMemory for WaitingMemory {}
+
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(2).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Editor,
+            7,
+        )
+    };
+    let mut memory = WaitingMemory(wait);
+    let dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let reporter = CompatReporter::default();
+
+    // SYS_MQ_OPEN: mq_open(name, oflag, mode, attr)
+    let outcome = lower_handler_result(
+        dispatcher
+            .dispatch_normalized(
+                &context,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::MQ_OPEN.raw(),
+                    SyscallArgs::from([0x1000, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+                None,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome,
+        DispatchOutcome::OwnerMemoryWait {
+            wait,
+            committed: 0,
+        },
+        "mq_open name owner wait must return OwnerMemoryWait, not EFAULT"
+    );
+}
+
+#[test]
+fn rootfs_helpers_execve_path_owner_wait_returns_owner_memory_wait_not_efault() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{GuestMemory, MemoryError};
+    use carrick_observability::compat::SyscallArgs;
+    use std::num::NonZeroU64;
+
+    struct WaitingMemory(PortalOwnerWait);
+    impl GuestMemory for WaitingMemory {
+        fn read_bytes_raw(&self, _address: u64, _length: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::OwnerWait(self.0))
+        }
+        fn write_bytes_raw(&mut self, _address: u64, _bytes: &[u8]) -> Result<(), MemoryError> {
+            Ok(())
+        }
+    }
+    impl CurrentMmMemory for WaitingMemory {}
+
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(2).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Editor,
+            7,
+        )
+    };
+    let mut memory = WaitingMemory(wait);
+    let dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let reporter = CompatReporter::default();
+
+    // SYS_EXECVE: execve(pathname, argv, envp)
+    let outcome = lower_handler_result(
+        dispatcher
+            .dispatch_normalized(
+                &context,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::EXECVE.raw(),
+                    SyscallArgs::from([0x1000, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+                None,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome,
+        DispatchOutcome::OwnerMemoryWait {
+            wait,
+            committed: 0,
+        },
+        "execve pathname owner wait must return OwnerMemoryWait, not EFAULT"
+    );
+}
+
+#[test]
+fn pipe2_copyout_owner_wait_preserves_admission_before_effects() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{GuestWriteRange, MemoryPrepareError, PreparedGuestWrite};
+    use std::num::NonZeroU64;
+
+    struct Permit<'a>(&'a mut [u8; 8]);
+    impl PreparedGuestWrite for Permit<'_> {
+        fn commit(self: Box<Self>, outputs: &[&[u8]]) {
+            assert_eq!(outputs.len(), 1);
+            self.0.copy_from_slice(outputs[0]);
+        }
+    }
+    struct WaitingMemory {
+        wait: Option<PortalOwnerWait>,
+        fault: bool,
+        output: [u8; 8],
+    }
+    impl GuestMemory for WaitingMemory {
+        fn user_memory_venue(&self) -> carrick_guest_mem::UserMemoryVenue {
+            carrick_guest_mem::UserMemoryVenue::Owner
+        }
+        fn prepare_write(
+            &mut self,
+            ranges: &[GuestWriteRange],
+        ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+            assert_eq!(ranges.len(), 1);
+            assert_eq!(ranges[0].address().raw(), 0x1000);
+            assert_eq!(ranges[0].len(), 8);
+            if let Some(wait) = self.wait.take() {
+                return Err(MemoryPrepareError::OwnerWait(wait));
+            }
+            if self.fault {
+                return Err(MemoryPrepareError::Fault(MemoryError::OutOfBounds {
+                    address: 0x1000,
+                    length: 8,
+                }));
+            }
+            Ok(Box::new(Permit(&mut self.output)))
+        }
+        fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::Unsupported)
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            Err(self
+                .wait
+                .take()
+                .map_or(MemoryError::Unsupported, MemoryError::OwnerWait))
+        }
+    }
+    impl CurrentMmMemory for WaitingMemory {}
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(2).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Editor,
+            7,
+        )
+    };
+    let mut dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let reporter = CompatReporter::default();
+    let request = SyscallRequest::new(59, SyscallArgs::from([0x1000, 0, 0, 0, 0, 0]));
+    let mut memory = WaitingMemory {
+        wait: Some(wait),
+        fault: false,
+        output: [0; 8],
+    };
+    let outcome = dispatcher
+        .dispatch(&context, request, &mut memory, &reporter)
+        .unwrap();
+    assert!(
+        matches!(outcome, DispatchOutcome::OwnerMemoryWait { wait: observed, committed: 0 } if observed == wait),
+        "pipe2 flattened the exact owner wait: {outcome:?}"
+    );
+    assert_eq!(memory.output, [0; 8]);
+    let outcome = dispatcher
+        .dispatch(&context, request, &mut memory, &reporter)
+        .unwrap();
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+    assert_eq!(
+        i32::from_ne_bytes(memory.output[..4].try_into().unwrap()),
+        3
+    );
+    assert_eq!(
+        i32::from_ne_bytes(memory.output[4..].try_into().unwrap()),
+        4
+    );
+    memory.fault = true;
+    let outcome = dispatcher
+        .dispatch(&context, request, &mut memory, &reporter)
+        .unwrap();
+    assert_eq!(outcome, DispatchOutcome::errno(LINUX_EFAULT));
+    memory.fault = false;
+    let outcome = dispatcher
+        .dispatch(&context, request, &mut memory, &reporter)
+        .unwrap();
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+    assert_eq!(
+        i32::from_ne_bytes(memory.output[..4].try_into().unwrap()),
+        5
+    );
+    assert_eq!(
+        i32::from_ne_bytes(memory.output[4..].try_into().unwrap()),
+        6
+    );
+    memory.fault = true;
+    context
+        .task()
+        .replace_rlimit(carrick_abi::LinuxResource::Nofile, |_| {
+            Ok::<_, ()>(carrick_abi::LinuxRlimit::new(3, 3))
+        })
+        .unwrap();
+    let outcome = dispatcher
+        .dispatch(&context, request, &mut memory, &reporter)
+        .unwrap();
+    assert_eq!(outcome, DispatchOutcome::errno(linux_errno::EMFILE));
+}
+
+#[test]
+fn getdents64_copyout_owner_wait_witness() {
+    use carrick_abi::LINUX_EFAULT;
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{
+        GuestMemory, GuestWriteRange, MemoryError, MemoryPrepareError, PreparedGuestWrite,
+        UserMemoryVenue,
+    };
+    use carrick_observability::compat::SyscallArgs;
+    use carrick_vfs::rootfs::{RootFsDirEntry, RootFsEntryKind, RootFsMetadata};
+    use std::num::NonZeroU64;
+
+    struct Permit<'a>(&'a mut [u8]);
+    impl PreparedGuestWrite for Permit<'_> {
+        fn commit(self: Box<Self>, outputs: &[&[u8]]) {
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(self.0.len(), outputs[0].len());
+            self.0.copy_from_slice(outputs[0]);
+        }
+    }
+
+    struct GetdentsWaitingMemory {
+        wait: Option<PortalOwnerWait>,
+        bytes: Vec<u8>,
+    }
+    impl GuestMemory for GetdentsWaitingMemory {
+        fn user_memory_venue(&self) -> UserMemoryVenue {
+            UserMemoryVenue::Owner
+        }
+        fn prepare_write(
+            &mut self,
+            ranges: &[GuestWriteRange],
+        ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+            assert_eq!(ranges.len(), 1);
+            if let Some(wait) = self.wait.take() {
+                return Err(MemoryPrepareError::OwnerWait(wait));
+            }
+            let range = ranges[0];
+            let offset = (range.address().raw() - 0x1000) as usize;
+            Ok(Box::new(Permit(
+                &mut self.bytes[offset..offset + range.len()],
+            )))
+        }
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            let offset = (address
+                .checked_sub(0x1000)
+                .ok_or(MemoryError::Unsupported)?) as usize;
+            let end = offset.checked_add(length).ok_or(MemoryError::Unsupported)?;
+            if end <= self.bytes.len() {
+                Ok(self.bytes[offset..end].to_vec())
+            } else {
+                Err(MemoryError::OutOfBounds { address, length })
+            }
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            Err(MemoryError::Unsupported)
+        }
+    }
+    impl CurrentMmMemory for GetdentsWaitingMemory {}
+
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(2).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Editor,
+            7,
+        )
+    };
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let desc = OpenDescription::Directory {
+        base: OpenDescriptionBase::new(carrick_abi::LINUX_O_RDONLY),
+        path: "/witness_dir".to_string(),
+        metadata: RootFsMetadata {
+            path: std::path::PathBuf::from("/witness_dir"),
+            kind: RootFsEntryKind::Directory,
+            mode: 0o755,
+            size: 0,
+        },
+        listing: DirListing::Loaded(vec![RootFsDirEntry {
+            name: "entry1".to_string(),
+            metadata: RootFsMetadata {
+                path: std::path::PathBuf::from("/witness_dir/entry1"),
+                kind: RootFsEntryKind::File,
+                mode: 0o644,
+                size: 100,
+            },
+            ino: 101,
+        }]),
+        offset: 0,
+        trusted_host_dir: None,
+    };
+    let outcome = dispatcher.install_fd(desc, 0);
+    let DispatchOutcome::Returned { value: fd } = outcome else {
+        panic!()
+    };
+
+    let mut memory = GetdentsWaitingMemory {
+        bytes: vec![0u8; 65536],
+        wait: Some(wait),
+    };
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let reporter = CompatReporter::default();
+    let outcome = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                carrick_abi::syscall::nr::GETDENTS64.raw(),
+                SyscallArgs::from([fd as u64, 0x1000, 4096, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+
+    assert_ne!(
+        outcome,
+        DispatchOutcome::errno(LINUX_EFAULT),
+        "getdents64 flattened owner wait to EFAULT"
+    );
+    assert!(
+        format!("{outcome:?}").starts_with("OwnerGetdentsCopyout"),
+        "expected OwnerGetdentsCopyout, got {outcome:?}"
+    );
+}
+
+#[test]
+fn readlinkat_copyout_owner_wait_witness() {
+    use carrick_abi::LINUX_EFAULT;
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{
+        GuestMemory, GuestWriteRange, MemoryError, MemoryPrepareError, PreparedGuestWrite,
+        UserMemoryVenue,
+    };
+    use carrick_observability::compat::SyscallArgs;
+    use std::num::NonZeroU64;
+
+    struct Permit<'a>(&'a mut [u8]);
+    impl PreparedGuestWrite for Permit<'_> {
+        fn commit(self: Box<Self>, outputs: &[&[u8]]) {
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(self.0.len(), outputs[0].len());
+            self.0.copy_from_slice(outputs[0]);
+        }
+    }
+
+    struct ReadlinkWaitingMemory {
+        wait: Option<PortalOwnerWait>,
+        bytes: Vec<u8>,
+    }
+    impl GuestMemory for ReadlinkWaitingMemory {
+        fn user_memory_venue(&self) -> UserMemoryVenue {
+            UserMemoryVenue::Owner
+        }
+        fn prepare_write(
+            &mut self,
+            ranges: &[GuestWriteRange],
+        ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+            assert_eq!(ranges.len(), 1);
+            if let Some(wait) = self.wait.take() {
+                return Err(MemoryPrepareError::OwnerWait(wait));
+            }
+            let range = ranges[0];
+            let offset = (range.address().raw() - 0x2000) as usize;
+            Ok(Box::new(Permit(
+                &mut self.bytes[offset..offset + range.len()],
+            )))
+        }
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            if address == 0x1000 {
+                let path = b"/proc/self/cwd\0";
+                let mut out = vec![0u8; length];
+                let copy_len = path.len().min(length);
+                out[..copy_len].copy_from_slice(&path[..copy_len]);
+                return Ok(out);
+            }
+            let offset = (address
+                .checked_sub(0x2000)
+                .ok_or(MemoryError::Unsupported)?) as usize;
+            let end = offset.checked_add(length).ok_or(MemoryError::Unsupported)?;
+            if end <= self.bytes.len() {
+                Ok(self.bytes[offset..end].to_vec())
+            } else {
+                Err(MemoryError::OutOfBounds { address, length })
+            }
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            Err(MemoryError::Unsupported)
+        }
+    }
+    impl CurrentMmMemory for ReadlinkWaitingMemory {}
+
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(2).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Gate,
+            7,
+        )
+    };
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let mut memory = ReadlinkWaitingMemory {
+        bytes: vec![0u8; 65536],
+        wait: Some(wait),
+    };
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let reporter = CompatReporter::default();
+    let outcome = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                carrick_abi::syscall::nr::READLINKAT.raw(),
+                SyscallArgs::from([
+                    carrick_abi::LINUX_AT_FDCWD as u64,
+                    0x1000,
+                    0x2000,
+                    1024,
+                    0,
+                    0,
+                ]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+
+    assert_ne!(
+        outcome,
+        DispatchOutcome::errno(LINUX_EFAULT),
+        "readlinkat flattened owner wait to EFAULT"
+    );
+    assert!(
+        format!("{outcome:?}").starts_with("OwnerReadlinkCopyout"),
+        "expected OwnerReadlinkCopyout, got {outcome:?}"
+    );
+}
+
+
+#[test]
+fn serial_host_ipc_vector_owner_wait_preserves_unconsumed_operation() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{
+        GuestWriteRange, MemoryPrepareError, PreparedGuestWrite, UserMemoryVenue,
+    };
+    use std::cell::Cell;
+    use std::num::NonZeroU64;
+
+    struct Permit<'a> {
+        memory: &'a mut LinearMemory,
+        ranges: Vec<GuestWriteRange>,
+    }
+    impl PreparedGuestWrite for Permit<'_> {
+        fn commit(self: Box<Self>, outputs: &[&[u8]]) {
+            assert_eq!(outputs.len(), self.ranges.len());
+            for (range, bytes) in self.ranges.iter().zip(outputs) {
+                assert!(bytes.len() <= range.len());
+                self.memory
+                    .write_bytes(range.address().raw(), bytes)
+                    .unwrap();
+            }
+        }
+    }
+    struct WaitingMemory {
+        memory: LinearMemory,
+        read_wait: Cell<Option<PortalOwnerWait>>,
+        write_wait: Option<PortalOwnerWait>,
+        wait_at: u64,
+    }
+    impl GuestMemory for WaitingMemory {
+        fn user_memory_venue(&self) -> UserMemoryVenue {
+            UserMemoryVenue::Owner
+        }
+        fn prepare_write(
+            &mut self,
+            ranges: &[GuestWriteRange],
+        ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+            assert!(ranges.iter().map(|r| r.len()).sum::<usize>() <= 4096);
+            if ranges
+                .iter()
+                .any(|range| range.address().raw() == self.wait_at)
+                && let Some(wait) = self.write_wait.take()
+            {
+                return Err(MemoryPrepareError::OwnerWait(wait));
+            }
+            Ok(Box::new(Permit {
+                memory: &mut self.memory,
+                ranges: ranges.to_vec(),
+            }))
+        }
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            if address == 0x4100
+                && let Some(wait) = self.read_wait.take()
+            {
+                return Err(MemoryError::OwnerWait(wait));
+            }
+            self.memory.read_bytes(address, length)
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            Err(self
+                .write_wait
+                .take()
+                .map_or(MemoryError::Unsupported, MemoryError::OwnerWait))
+        }
+    }
+    impl CurrentMmMemory for WaitingMemory {}
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(2).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Editor,
+            7,
+        )
+    };
+    for eventfd in [false, true] {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 8192]);
+        let (reader, writer) = if eventfd {
+            let outcome = dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(19, SyscallArgs([0, 2048, 0, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap();
+            let DispatchOutcome::Returned { value } = outcome else {
+                panic!("{outcome:?}");
+            };
+            (value as u64, value as u64)
+        } else {
+            assert_eq!(
+                dispatcher
+                    .dispatch(
+                        &context,
+                        SyscallRequest::new(59, SyscallArgs([0x4300, 0, 0, 0, 0, 0])),
+                        &mut memory,
+                        &reporter
+                    )
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 0 }
+            );
+            let pair = memory.read_bytes(0x4300, 8).unwrap();
+            (
+                i32::from_ne_bytes(pair[..4].try_into().unwrap()) as u64,
+                i32::from_ne_bytes(pair[4..].try_into().unwrap()) as u64,
+            )
+        };
+        memory
+            .write_bytes(0x4000, carrick_abi::LinuxIovec::new(0x4100, 8).as_bytes())
+            .unwrap();
+        memory.write_bytes(0x4100, &42u64.to_ne_bytes()).unwrap();
+        let mut memory = WaitingMemory {
+            memory,
+            read_wait: Cell::new(Some(wait)),
+            write_wait: Some(wait),
+            wait_at: 0x4100,
+        };
+        let write = SyscallRequest::new(66, SyscallArgs([writer, 0x4000, 1, 0, 0, 0]));
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, write, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+            "writev eventfd={eventfd}"
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, write, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::Returned { value: 8 }
+        );
+        let read = SyscallRequest::new(65, SyscallArgs([reader, 0x4000, 1, 0, 0, 0]));
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, read, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+            "readv eventfd={eventfd}"
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, read, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::Returned { value: 8 }
+        );
+        assert_eq!(
+            memory.memory.read_bytes(0x4100, 8).unwrap(),
+            42u64.to_ne_bytes()
+        );
+        // A pipe may report an already delivered prefix; an eventfd must
+        // retain the entire scalar counter until all destinations are ready.
+        memory
+            .memory
+            .write_bytes(0x4000, carrick_abi::LinuxIovec::new(0x4100, 4).as_bytes())
+            .unwrap();
+        memory
+            .memory
+            .write_bytes(0x4010, carrick_abi::LinuxIovec::new(0x4104, 4).as_bytes())
+            .unwrap();
+        let fill = SyscallRequest::new(64, SyscallArgs([writer, 0x4100, 8, 0, 0, 0]));
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, fill, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::Returned { value: 8 }
+        );
+        memory.write_wait = Some(wait);
+        memory.wait_at = 0x4104;
+        let scatter = SyscallRequest::new(65, SyscallArgs([reader, 0x4000, 2, 0, 0, 0]));
+        let outcome = dispatcher
+            .dispatch(&context, scatter, &mut memory, &reporter)
+            .unwrap();
+        if eventfd {
+            assert_eq!(
+                outcome,
+                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+            );
+            assert_eq!(
+                dispatcher
+                    .dispatch(&context, scatter, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 8 }
+            );
+        } else {
+            assert_eq!(outcome, DispatchOutcome::Returned { value: 4 });
+            let tail = SyscallRequest::new(63, SyscallArgs([reader, 0x4104, 4, 0, 0, 0]));
+            assert_eq!(
+                dispatcher
+                    .dispatch(&context, tail, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 4 }
+            );
+            assert_eq!(
+                dispatcher
+                    .dispatch(&context, fill, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 8 }
+            );
+            memory
+                .memory
+                .write_bytes(0x4000, carrick_abi::LinuxIovec::new(u64::MAX, 8).as_bytes())
+                .unwrap();
+            assert_eq!(
+                dispatcher
+                    .dispatch(&context, read, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::errno(LINUX_EFAULT)
+            );
+            memory
+                .memory
+                .write_bytes(0x4000, carrick_abi::LinuxIovec::new(0x4100, 8).as_bytes())
+                .unwrap();
+            assert_eq!(
+                dispatcher
+                    .dispatch(&context, read, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 8 }
+            );
+
+            // More than one owner step must complete without inventing a
+            // short read at the 4 KiB boundary when the pipe has all bytes.
+            let payload: Vec<u8> = (0..5000).map(|index| (index % 251) as u8).collect();
+            memory.memory.write_bytes(0x4500, &payload).unwrap();
+            memory
+                .memory
+                .write_bytes(
+                    0x4000,
+                    carrick_abi::LinuxIovec::new(0x4500, 5000).as_bytes(),
+                )
+                .unwrap();
+            assert_eq!(
+                dispatcher
+                    .dispatch(&context, write, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 5000 }
+            );
+            memory.memory.write_bytes(0x4500, &vec![0; 5000]).unwrap();
+            assert_eq!(
+                dispatcher
+                    .dispatch(&context, read, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 5000 }
+            );
+            assert_eq!(memory.memory.read_bytes(0x4500, 5000).unwrap(), payload);
+        }
+    }
 }

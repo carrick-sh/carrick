@@ -454,12 +454,6 @@ impl GuestArch for X8664GuestArch {
         carrick_abi::LinuxGuestAbi::X86_64
     }
 
-    fn user_va_ceiling() -> crate::guest_arch::UserVaCeiling {
-        // Native four-level Linux leaves the final guest page unmapped
-        // (TASK_SIZE_MAX), below the canonical lower-half boundary.
-        crate::guest_arch::UserVaCeiling::new((1u64 << 47) - (1u64 << X8664Mmu::page_shift()))
-    }
-
     fn vdso_bytes() -> Vec<u8> {
         carrick_mem::vdso::x8664_vdso_image_bytes()
     }

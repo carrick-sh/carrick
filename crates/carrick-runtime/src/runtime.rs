@@ -882,18 +882,19 @@ fn finalize_hvf_initial_image(
     let requires_syscall_traps = requires_syscall_traps || dispatcher.requires_syscall_traps();
     let image = image.with_el0_trampoline_bytes(HvfArch::entry_trampoline_bytes())?;
     let image = with_hvf_syscall_mailbox(image, requires_syscall_traps)?;
-    let image = image.with_hvpatch_stage1_page_tables()?;
-    with_optional_vdso_for_clock_with_visibility::<HvfArch>(
+    let image = with_optional_vdso_for_clock_with_visibility::<HvfArch>(
         image,
         dispatcher.container().clock(),
         requires_syscall_traps,
-    )
+    )?;
+    // Seal every user mapping, including the newly-added vvar/vDSO pages.
+    image.with_hvpatch_stage1_page_tables()
 }
 
 /// Finish a freshly-loaded image (its initial stack already set, if any) and
-/// run it: install the EL0 trampoline, EL1 vectors, stage-1 page tables and
-/// vDSO, optionally dump debug state, then enter the HVF run loop. This
-/// trampoline→vectors→page-tables→vdso→dump→run tail was duplicated verbatim
+/// run it: install the EL0 trampoline, EL1 vectors and vDSO, seal stage-1
+/// permissions, optionally dump debug state, then enter the HVF run loop. This
+/// trampoline→vectors→vdso→page-tables→dump→run tail was duplicated verbatim
 /// across every `run_*` entry point; the entry points now differ only in how
 /// they obtain the image bytes (host file / raw bytes / rootfs / overlay) and
 /// set up identity + Rosetta redirection.
@@ -1140,6 +1141,9 @@ where
 
         match outcome {
             DispatchOutcome::OwnerMemoryWait { .. }
+            | DispatchOutcome::OwnerStatCopyout { .. }
+            | DispatchOutcome::OwnerGetdentsCopyout { .. }
+            | DispatchOutcome::OwnerReadlinkCopyout { .. }
             | DispatchOutcome::OwnerMemorySupply { .. }
             | DispatchOutcome::OwnerPhysicalWait { .. } => {
                 return Err(RuntimeError::Configuration(
@@ -2394,6 +2398,14 @@ struct SplitView<'a, M: CurrentMmMemory, T: SyscallTrap> {
 }
 
 impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
+    fn write_carrick_identity(
+        &mut self,
+        base: carrick_el1_abi::IdentityControlBase,
+        word: carrick_el1_abi::CarrickIdentityWrite,
+    ) -> Result<(), MemoryError> {
+        self.mem.write_carrick_identity(base, word)
+    }
+
     // This adapter must be transparent. In particular, inheriting a modelless
     // default here silently bypasses the wrapped backend's physical repoint and
     // provenance publication while `run_syscall_loop` uses this split shape.
@@ -2453,6 +2465,15 @@ impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     }
     fn write_bytes_unchecked(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         self.mem.write_bytes_unchecked(address, bytes)
+    }
+    fn write_owner_reserved_bytes(
+        &mut self,
+        admission: &carrick_guest_mem::OwnerReservedWrite<'_>,
+        address: u64,
+        bytes: &[u8],
+    ) -> Result<(), MemoryError> {
+        self.mem
+            .write_owner_reserved_bytes(admission, address, bytes)
     }
     fn host_read(&self, address: u64, len: usize) -> Option<carrick_guest_mem::HostRead> {
         self.mem.host_read(address, len)
@@ -2534,6 +2555,26 @@ impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
         self.mem.protect_range(address, len, prot)
     }
+    fn protect_owner_reserved_range(
+        &mut self,
+        address: u64,
+        len: usize,
+        prot: u64,
+    ) -> Result<(), MemoryError> {
+        self.mem.protect_owner_reserved_range(address, len, prot)
+    }
+    fn map_private_file_backed(
+        &mut self,
+        address: u64,
+        len: usize,
+        host_fd: std::os::fd::BorrowedFd<'_>,
+        offset: u64,
+        source: carrick_guest_mem::PrivateFileSource,
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
+    ) -> Result<bool, MemoryError> {
+        self.mem
+            .map_private_file_backed(address, len, host_fd, offset, source, admission)
+    }
     fn supports_concurrent_exec_protection(&self) -> bool {
         self.mem.supports_concurrent_exec_protection()
     }
@@ -2606,6 +2647,12 @@ impl<M: CurrentMmMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {
     }
     fn inject_signal(&mut self, signal: carrick_hal::SignalInjection) -> Result<(), TrapError> {
         self.trap.inject_signal(signal)
+    }
+    fn resume_signal_frame(
+        &mut self,
+        pending: Box<carrick_hal::sigframe::PendingSignalFrame>,
+    ) -> Result<(), TrapError> {
+        self.trap.resume_signal_frame(pending)
     }
     fn last_syscall_nr(&self) -> Option<u64> {
         self.trap.last_syscall_nr()
@@ -3144,6 +3191,232 @@ mod tests {
         assert!(clock_stub.perms.execute);
         let vdso = image_region(&image, carrick_mem::vdso::LINUX_VDSO_BASE);
         assert_eq!(&vdso[..HvfArch::vdso_bytes().len()], HvfArch::vdso_bytes());
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn split_loop_preserves_reserved_file_content_writes() {
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
+        crate::vcpu_loop::memory::tests::with_reserved_native_content_fixture(
+            |memory, admission, source| {
+                let mut trap = RetryCompletionTrap::default();
+                let mut split = SplitView {
+                    mem: memory,
+                    trap: &mut trap,
+                };
+                let content = *b"file";
+                split
+                    .write_owner_reserved_bytes(admission, TEST_VA, &content)
+                    .expect("reserved file content must reach the production native copier");
+                let ipa = split
+                    .mem
+                    .page_tables()
+                    .with_manager(|m| m.translate(TEST_VA))
+                    .flatten()
+                    .unwrap();
+                assert_eq!(source.prefix(), content);
+                assert!(
+                    split
+                        .write_owner_reserved_bytes(
+                            admission,
+                            admission.range().end_raw(),
+                            &content
+                        )
+                        .is_err()
+                );
+                use carrick_aarch64::vmm::Aarch64Vmm;
+                assert!(
+                    split
+                        .mem
+                        .backend_mut_for_persistent_factory()
+                        .translated_write_unchecked(TEST_VA, ipa, &content, None)
+                        .is_err(),
+                    "ordinary native raw writes still require legacy admission"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn split_loop_keeps_reserved_file_backing_and_protection_venue() {
+        struct ReservedFile {
+            owner: carrick_el1_abi::El1MmHandle,
+            mapped: bool,
+            protected: bool,
+        }
+        impl GuestMemory for ReservedFile {
+            fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+                Err(MemoryError::Unsupported)
+            }
+            fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+                Err(MemoryError::Unsupported)
+            }
+            fn map_private_file_backed(
+                &mut self,
+                address: u64,
+                len: usize,
+                _: std::os::fd::BorrowedFd<'_>,
+                offset: u64,
+                source: carrick_guest_mem::PrivateFileSource,
+                admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
+            ) -> Result<bool, MemoryError> {
+                let proof = admission.ok_or(MemoryError::Unsupported)?;
+                assert_eq!(proof.owner(), self.owner);
+                assert!(proof.contains(carrick_guest_mem::GuestVa(address), len));
+                assert_eq!(offset, 0);
+                assert_eq!(source, carrick_guest_mem::PrivateFileSource::Mutable);
+                self.mapped = true;
+                Ok(true)
+            }
+            fn protect_owner_reserved_range(
+                &mut self,
+                address: u64,
+                len: usize,
+                prot: u64,
+            ) -> Result<(), MemoryError> {
+                assert_eq!((address, len, prot), (0x6000_0000_4000, 0x4000, 3));
+                self.protected = true;
+                Ok(())
+            }
+            fn protect_range(&mut self, _: u64, _: usize, _: u64) -> Result<(), MemoryError> {
+                Err(MemoryError::Unsupported)
+            }
+        }
+        impl CurrentMmMemory for ReservedFile {}
+        // SAFETY: this adapter witness never reaches native memory; it checks
+        // that a caller's sealed admission reaches the selected backend intact.
+        let owner = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                std::num::NonZeroU64::MIN,
+                carrick_el1_abi::ReservationMm::new(41_103).unwrap(),
+                std::num::NonZeroU64::MIN,
+            )
+        };
+        let mut memory = ReservedFile {
+            owner,
+            mapped: false,
+            protected: false,
+        };
+        let mut trap = RetryCompletionTrap::default();
+        let mut split = SplitView {
+            mem: &mut memory,
+            trap: &mut trap,
+        };
+        let file = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        use std::os::fd::AsFd;
+        unsafe {
+            carrick_guest_mem::OwnerReservedWrite::with_scope(
+                owner,
+                carrick_guest_mem::GuestVaRange::from_len(
+                    carrick_guest_mem::GuestVa(0x6000_0000_4000),
+                    0x4000,
+                ),
+                |admission| {
+                    let mapped = split.map_private_file_backed(
+                        0x6000_0000_4000,
+                        0x4000,
+                        file.as_fd(),
+                        0,
+                        carrick_guest_mem::PrivateFileSource::Mutable,
+                        Some(admission),
+                    );
+                    let protected = split.protect_owner_reserved_range(0x6000_0000_4000, 0x4000, 3);
+                    assert!(
+                        matches!(mapped, Ok(true)) && protected.is_ok(),
+                        "reserved backing route: {mapped:?}; protection route: {protected:?}"
+                    );
+                },
+            );
+        }
+        assert!(memory.mapped && memory.protected);
+    }
+
+    #[test]
+    fn split_loop_preserves_private_identity_publication() {
+        struct PrivateIdentity {
+            base: carrick_el1_abi::IdentityControlBase,
+            bytes: [u8; 20],
+        }
+        impl GuestMemory for PrivateIdentity {
+            fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+                Err(MemoryError::Unsupported)
+            }
+            fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+                Err(MemoryError::Unsupported)
+            }
+            fn write_carrick_identity(
+                &mut self,
+                base: carrick_el1_abi::IdentityControlBase,
+                word: carrick_el1_abi::CarrickIdentityWrite,
+            ) -> Result<(), MemoryError> {
+                if base != self.base {
+                    return Err(MemoryError::Unsupported);
+                }
+                let offset = word.offset() as usize;
+                self.bytes[offset..offset + word.len()]
+                    .copy_from_slice(&word.bytes()[..word.len()]);
+                Ok(())
+            }
+        }
+        impl CurrentMmMemory for PrivateIdentity {}
+        let base =
+            carrick_el1_abi::IdentityControlBase::new(carrick_el1_abi::CARRICK_IDENTITY_PAGE_BASE)
+                .unwrap();
+        let mut memory = PrivateIdentity {
+            base,
+            bytes: [0xff; 20],
+        };
+        let mut trap = RetryCompletionTrap::default();
+        let mut split = SplitView {
+            mem: &mut memory,
+            trap: &mut trap,
+        };
+        assert!(
+            split
+                .write_bytes(base.raw(), &701_u32.to_le_bytes())
+                .is_err()
+        );
+        carrick_kernel::kernel::identity_page::stamp_identity_values(
+            &mut split,
+            base.raw(),
+            701,
+            1,
+        )
+        .expect("split loop must retain private identity publication");
+        carrick_kernel::kernel::identity_page::stamp_clock_gate(&mut split, base.raw(), 1).unwrap();
+        assert_eq!(&memory.bytes[..4], &701_u32.to_le_bytes());
+        assert_eq!(&memory.bytes[4..8], &1_u32.to_le_bytes());
+        assert_eq!(&memory.bytes[8..16], &0_u64.to_le_bytes());
+        assert_eq!(&memory.bytes[16..20], &1_u32.to_le_bytes());
+    }
+
+    #[test]
+    fn initial_vvar_stage1_is_readonly_and_nonexecutable_before_owner_import() {
+        let image = finalize_hvf_initial_image(
+            AddressSpace::from_regions(0x4000, Vec::new()).unwrap(),
+            &SyscallDispatcher::new(),
+            false,
+        )
+        .unwrap();
+        let region = image
+            .regions()
+            .iter()
+            .find(|region| region.start == carrick_mem::memory::LINUX_PAGE_TABLES_BASE)
+            .unwrap();
+        let manager = carrick_mmu_core::aarch64::PageTableManager::new(
+            region.bytes().to_vec(),
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        let leaf = carrick_mmu_core::aarch64::terminal_descriptor(
+            manager.debug_walk(carrick_mem::vdso::LINUX_VVAR_BASE),
+        );
+        assert_eq!(
+            leaf & (0b11 << 6),
+            0b11 << 6,
+            "vvar stage-1 AP must be read-only"
+        );
+        assert_ne!(leaf & (1 << 54), 0, "vvar stage-1 must be NX");
     }
 
     #[test]

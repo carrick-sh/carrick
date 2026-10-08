@@ -93,6 +93,11 @@
  *     mapping-leaf phases are 0 prepare, 1 submit, 3 applied, 4 settled,
  *     5 before unmap, 6 after unmap. These were qualified on the same
  *     signed guest_smoke and el1_host_copyout executables, 2026-10-04.
+ *     hvpatch-fault-delivery(far,incoming,delivered,bus,tid),
+ *     hvpatch-fault-signal-frame-failure(far,signum,tid), and
+ *     hvpatch-signal-frame-step(step,va,len,error) are the source-qualified
+ *     signal lowering and frame-construction edges. They fire only on a
+ *     guest fault or attempted fault-signal frame.
  * (c) Perturbation: one event per transfer/fault/syscall step and a user
  *     stack on each owner wait while traced. Counts and provenance only;
  *     do not infer timing from this script. Sort ns across CPU buffers.
@@ -123,8 +128,8 @@ carrick*:::hvpatch-el1-host-write-prepare
 carrick*:::hvpatch-el1-owner-grant-supply
 /pid == $target || progenyof($target)/
 {
-    printf("EL1HOSTREAD1|ns=%d|grant-supply|va=0x%x|len=%d|phase=%d|detail=%d\n",
-        timestamp, arg0, arg1, arg2, arg3);
+    printf("EL1HOSTREAD1|ns=%d|pid=%d|grant-supply|va=0x%x|len=%d|phase=%d|detail=%d\n",
+        timestamp, pid, arg0, arg1, arg2, arg3);
     @grant_supply[arg2, arg3] = count();
 }
 
@@ -186,6 +191,27 @@ carrick*:::hvpatch-first-touch-deliver
         arg0, arg1, arg2);
 }
 
+carrick*:::hvpatch-fault-delivery
+/pid == $target || progenyof($target)/
+{
+    printf("EL1HOSTREAD1|fault-delivery|far=0x%x|incoming=%d|delivered=%d|bus=%d|guest-tid=%d\n",
+        arg0, arg1, arg2, arg3, arg4);
+}
+
+carrick*:::hvpatch-fault-signal-frame-failure
+/pid == $target || progenyof($target)/
+{
+    printf("EL1HOSTREAD1|fault-frame-failure|far=0x%x|signum=%d|guest-tid=%d\n",
+        arg0, arg1, arg2);
+}
+
+carrick*:::hvpatch-signal-frame-step
+/pid == $target || progenyof($target)/
+{
+    printf("EL1HOSTREAD1|signal-frame-step|step=%d|va=0x%x|len=%d|error=%d\n",
+        arg0, arg1, arg2, arg3);
+}
+
 carrick*:::hvpatch-el1-frame-grant-plan
 /pid == $target || progenyof($target)/
 {
@@ -244,6 +270,17 @@ carrick*:::hvpatch-fault-terminal
 
 proc:::exit
 /pid == $target/
+{
+    exit(0);
+}
+
+tick-1s
+{
+    seconds++;
+}
+
+tick-1s
+/seconds >= 10/
 {
     exit(0);
 }

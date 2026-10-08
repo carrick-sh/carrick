@@ -64,6 +64,9 @@
 //! `serde::Serialize`, and `thiserror::Error` — precisely so it sits at the
 //! bottom of the build graph and almost never has to be rebuilt.
 
+mod owner_reserved;
+pub use owner_reserved::OwnerReservedWrite;
+
 mod prepared;
 pub use prepared::{
     GuestWriteRange, LegacyProtectionRead, MemoryPrepareError, MemoryReadSuspension,
@@ -133,6 +136,13 @@ pub enum PrivateFileSource {
     /// The filesystem owns a published immutable lower inode. A host private
     /// view is safe because that inode cannot change; writes copy up elsewhere.
     ImmutableLower,
+}
+
+/// File coherence authority and the caller's borrowed reservation admission
+/// for one backing publication. The reservation proof remains scope-bound.
+pub struct PrivateFilePublication<'admission, 'scope> {
+    pub source: PrivateFileSource,
+    pub admission: Option<&'admission OwnerReservedWrite<'scope>>,
 }
 
 // ─── Address-domain newtypes (the mapping/translation seam) ─────────────────
@@ -545,6 +555,16 @@ pub trait GuestMemory {
         self.read_bytes_raw(range.address(), range.len() as usize)
     }
 
+    /// Publish one named identity/control word. This is a separate authority
+    /// from Linux user copyout; admitted backends must select it through EL1.
+    fn write_carrick_identity(
+        &mut self,
+        base: carrick_el1_abi::IdentityControlBase,
+        word: carrick_el1_abi::CarrickIdentityWrite,
+    ) -> Result<(), MemoryError> {
+        self.write_bytes(word.address(base), &word.bytes()[..word.len()])
+    }
+
     /// Check the legacy inaccessible-range gate, then delegate to the concrete
     /// access venue. Owner implementations authorize even raw reads through
     /// EL1, so an absent legacy mirror cannot bypass owner permissions.
@@ -693,6 +713,22 @@ pub trait GuestMemory {
     /// backend overrides this to its unchecked writer.
     fn write_bytes_unchecked(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         self.write_bytes_raw(address, bytes)
+    }
+
+    /// Write Carrick-owned mapping content while an exact host reservation
+    /// excludes guest execution and names the complete destination range.
+    ///
+    /// Owner backends may bypass the ordinary user-transfer permission check:
+    /// the opaque reservation is deliberately not a guest-readable or writable
+    /// mapping yet. Callers must hold the typed reservation through settlement;
+    /// the default preserves legacy backends' unchecked-write behavior.
+    fn write_owner_reserved_bytes(
+        &mut self,
+        _admission: &OwnerReservedWrite<'_>,
+        address: u64,
+        bytes: &[u8],
+    ) -> Result<(), MemoryError> {
+        self.write_bytes_unchecked(address, bytes)
     }
 
     /// Make a writable guest range resident before a privileged host copyout.
@@ -1021,6 +1057,8 @@ pub trait GuestMemory {
     /// is installed; the caller then publishes protection, sharing, and the
     /// beyond-EOF `BUS_ADRERR` tail. Errors degrade to the eager fallback rather
     /// than becoming guest-visible mmap errors.
+    /// An admitted opaque reservation supplies its borrowed exact-owner proof
+    /// through preparation and publication; ordinary calls supply no proof.
     fn map_private_file_backed(
         &mut self,
         _address: u64,
@@ -1028,6 +1066,7 @@ pub trait GuestMemory {
         _host_fd: std::os::fd::BorrowedFd<'_>,
         _offset: u64,
         _source: PrivateFileSource,
+        _admission: Option<&OwnerReservedWrite<'_>>,
     ) -> Result<bool, MemoryError> {
         Ok(false)
     }

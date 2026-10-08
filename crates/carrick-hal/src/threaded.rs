@@ -2482,12 +2482,15 @@ pub type PendingOwnerForkReceipt = (
     Vec<(std::num::NonZeroU64, std::num::NonZeroU64)>,
 );
 
-/// Result of servicing an owner-selected retained file page.
+/// Result of servicing an owner-selected anonymous or retained-source page.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OwnerFileFaultOutcome {
+pub enum OwnerFaultOutcome {
     Resolved,
     /// Reselect only after the exact predecessor publishes or rolls back.
     Pending(carrick_guest_mem::OwnedMemoryWait),
+    /// The semantic owner refused admission until this exact producer releases.
+    /// No speculative physical grant or syscall completion crosses this wait.
+    OwnerWait(carrick_el1_abi::PortalOwnerWait),
     Refused,
     BusFault,
 }
@@ -3134,13 +3137,13 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     ) {
     }
 
-    /// Service an exact file fault selected by the admitted owner. `None`
-    /// means no owner file selection exists for this transport request.
-    fn service_owner_file_fault(
+    /// Service an exact first-touch fault selected by the admitted owner.
+    /// `None` means no owner selection exists for this transport request.
+    fn service_owner_fault(
         &mut self,
         _mm_key: u64,
         _request_generation: u64,
-    ) -> Result<Option<OwnerFileFaultOutcome>, TrapError> {
+    ) -> Result<Option<OwnerFaultOutcome>, TrapError> {
         Ok(None)
     }
 

@@ -12,7 +12,7 @@ use carrick_abi::{
     LINUX_FUTEX_CMP_REQUEUE, LINUX_FUTEX_LOCK_PI, LINUX_FUTEX_PRIVATE_FLAG, LINUX_FUTEX_REQUEUE,
     LINUX_FUTEX_TID_MASK, LINUX_FUTEX_TRYLOCK_PI, LINUX_FUTEX_UNLOCK_PI, LINUX_FUTEX_WAIT,
     LINUX_FUTEX_WAIT_BITSET, LINUX_FUTEX_WAITV_MAX, LINUX_FUTEX_WAKE, LINUX_FUTEX_WAKE_BITSET,
-    LinuxErrno, LinuxFutexFlags,
+    LinuxFutexFlags,
 };
 use carrick_guest_mem::CurrentMmMemory;
 
@@ -203,7 +203,7 @@ pub(crate) fn dispatch_threaded_futex(
     );
     let word = match read_futex_word(memory, address) {
         Ok(word) => word,
-        Err(errno) if needs_word => return DispatchOutcome::Errno { errno },
+        Err(error) if needs_word => return error.outcome(),
         // WAKE / plain REQUEUE: the value is unused; proceed address-keyed.
         Err(_) => 0,
     };
@@ -374,7 +374,7 @@ pub(crate) fn dispatch_threaded_futex(
             } else {
                 let timespec = match read_timespec(memory, timeout_address) {
                     Ok(t) => t,
-                    Err(errno) => return DispatchOutcome::Errno { errno },
+                    Err(error) => return error.outcome(),
                 };
                 // FUTEX_WAIT uses a RELATIVE timeout; FUTEX_WAIT_BITSET uses an
                 // ABSOLUTE deadline (CLOCK_MONOTONIC, or CLOCK_REALTIME if
@@ -435,7 +435,7 @@ pub(crate) fn dispatch_threaded_futex(
                     };
                 }
                 Ok(_) => {}
-                Err(errno) => return DispatchOutcome::Errno { errno },
+                Err(error) => return error.outcome(),
             }
             DispatchOutcome::FutexWait { wait, timeout }
         }
@@ -557,7 +557,7 @@ fn dispatch_zone_futex(
             } else {
                 let timespec = match read_timespec(memory, timeout_address) {
                     Ok(t) => t,
-                    Err(errno) => return DispatchOutcome::Errno { errno },
+                    Err(error) => return error.outcome(),
                 };
                 if raw_command == LINUX_FUTEX_WAIT_BITSET {
                     Some(relative_from_absolute_timespec(
@@ -609,8 +609,8 @@ fn dispatch_zone_futex(
                     // waiter can enqueue between the check and the requeue.
                     match read_futex_word(memory, address) {
                         Ok(current) if current == val3 => Ok(()),
-                        Ok(_) => Err(LINUX_EAGAIN),
-                        Err(errno) => Err(errno),
+                        Ok(_) => Err(LINUX_EAGAIN.into()),
+                        Err(error) => Err(error),
                     }
                 },
             );
@@ -619,7 +619,7 @@ fn dispatch_zone_futex(
                     value: woken.len() as i64 + i64::from(moved),
                     woken,
                 },
-                Err(errno) => DispatchOutcome::Errno { errno },
+                Err(error) => error.outcome(),
             }
         }
         _ => DispatchOutcome::Errno {
@@ -664,7 +664,7 @@ pub(crate) fn dispatch_futex_waitv_args(
     } else {
         let timespec = match read_timespec(memory, timeout_address) {
             Ok(timespec) => timespec,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(error) => return error.outcome(),
         };
         Some(relative_from_absolute_timespec(
             clock,
@@ -735,7 +735,7 @@ pub(crate) fn dispatch_futex_waitv_args(
                     errno: LINUX_EAGAIN,
                 };
             }
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(error) => return error.outcome(),
         }
         entries.push(FutexWaitvEntry {
             address,
@@ -779,7 +779,7 @@ pub(crate) fn dispatch_futex_waitv_args(
                     return DispatchOutcome::returned_len_or_errno(index);
                 }
                 Ok(_) => {}
-                Err(errno) => return DispatchOutcome::Errno { errno },
+                Err(error) => return error.outcome(),
             }
             return DispatchOutcome::FutexWaitv {
                 wait,
@@ -795,7 +795,7 @@ pub(crate) fn dispatch_futex_waitv_args(
                 return DispatchOutcome::returned_len_or_errno(index);
             }
             Ok(_) => {}
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(error) => return error.outcome(),
         }
     }
     if let Some(timeout) = timeout {
@@ -823,10 +823,12 @@ pub(crate) fn dispatch_futex_waitv_args(
 pub(crate) fn read_futex_word(
     memory: &impl CurrentMmMemory,
     address: u64,
-) -> Result<u32, LinuxErrno> {
+) -> Result<u32, super::InputCopyError> {
     match read_u32(memory, address) {
         Ok(word) => Ok(word),
-        Err(errno) => match memory.shared_futex_location(address) {
+        Err(error @ super::InputCopyError::Wait(_)) => Err(error),
+        Err(error @ super::InputCopyError::Errno(_)) => match memory.shared_futex_location(address)
+        {
             // SAFETY: a resolved shared host addr points into a live MAP_SHARED
             // region in THIS process — the identical pointer `shared_futex_wait`
             // reads at the wait site. `read_unaligned` avoids assuming stricter
@@ -834,7 +836,7 @@ pub(crate) fn read_futex_word(
             Some(location) => {
                 Ok(unsafe { (location.wait_addr().raw() as *const u32).read_unaligned() })
             }
-            None => Err(errno),
+            None => Err(error),
         },
     }
 }

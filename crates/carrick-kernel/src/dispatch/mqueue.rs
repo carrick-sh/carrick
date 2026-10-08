@@ -759,10 +759,7 @@ impl<'a> IpcView<'a> {
         /// message queue and returns a `mqd_t` (a real guest fd).
         fn mq_open(this, cx, name: GuestPtr, oflag: u64, mode: u64, attr: GuestPtr) {
             let _ = mode;
-            let name = match read_guest_c_string(&*cx.memory, name.0) {
-                Ok(s) => s,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-            };
+            let name = read_guest_c_string(&*cx.memory, name.0)?;
             let queue_name = match validate_mqueue_name(&name) {
                 Ok(p) => p,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
@@ -791,7 +788,7 @@ impl<'a> IpcView<'a> {
                     let mq_attr: crate::linux_abi::LinuxMqAttr =
                         match read_kernel_struct(&*cx.memory, attr.0) {
                             Ok(a) => a,
-                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            Err(error) => return Ok(error.outcome()),
                         };
                     let req_max = mq_attr.mq_maxmsg;
                     let req_size = mq_attr.mq_msgsize;
@@ -835,10 +832,7 @@ impl<'a> IpcView<'a> {
         /// mq_unlink(name). Remove the queue's name; the in-memory queue is
         /// removed from the registry. Existing open descriptors keep working.
         fn mq_unlink(this, cx, name: GuestPtr) {
-            let name = match read_guest_c_string(&*cx.memory, name.0) {
-                Ok(s) => s,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-            };
+            let name = read_guest_c_string(&*cx.memory, name.0)?;
             let queue_name = match validate_mqueue_name(&name) {
                 Ok(p) => p,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
@@ -888,7 +882,7 @@ impl<'a> IpcView<'a> {
 
             let deadline = match read_abs_deadline(&*cx.memory, abs_timeout.0) {
                 Ok(d) => d,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                Err(error) => return Ok(error.outcome()),
             };
 
             let nonblock = LinuxOpenFlags::from_bits_truncate(mq.description.common().status_flags())
@@ -929,7 +923,7 @@ impl<'a> IpcView<'a> {
             }
             let deadline = match read_abs_deadline(&*cx.memory, abs_timeout.0) {
                 Ok(d) => d,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                Err(error) => return Ok(error.outcome()),
             };
 
             let nonblock = LinuxOpenFlags::from_bits_truncate(mq.description.common().status_flags())
@@ -1023,7 +1017,7 @@ impl<'a> IpcView<'a> {
             let sev: crate::linux_abi::LinuxSigevent =
                 match read_kernel_struct(&*cx.memory, sevp.0) {
                     Ok(s) => s,
-                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    Err(error) => return Ok(error.outcome()),
                 };
             let sigev_notify = sev.sigev_notify;
             let sigev_value = sev.sigev_value;
@@ -1137,7 +1131,7 @@ impl<'a> IpcView<'a> {
                 let new_attr: crate::linux_abi::LinuxMqAttr =
                     match read_kernel_struct(&*cx.memory, newattr.0) {
                         Ok(a) => a,
-                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                        Err(error) => return Ok(error.outcome()),
                     };
                 let want_nonblock =
                     (new_attr.mq_flags as u64) & LinuxOpenFlags::NONBLOCK.bits() != 0;
@@ -1333,13 +1327,13 @@ fn mq_wait_interrupted(
 fn read_abs_deadline(
     memory: &impl CurrentMmMemory,
     addr: u64,
-) -> Result<Option<(i64, i64)>, LinuxErrno> {
+) -> Result<Option<(i64, i64)>, InputCopyError> {
     if addr == 0 {
         return Ok(None);
     }
     let ts = read_timespec(memory, addr)?;
     if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
-        return Err(LINUX_EINVAL);
+        return Err(LINUX_EINVAL.into());
     }
     Ok(Some((ts.tv_sec, ts.tv_nsec)))
 }

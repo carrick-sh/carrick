@@ -112,7 +112,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/fs/directory.rs::FsView::readlinkat::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/fs/directory.rs",
-      "line": 668,
+      "line": 767,
       "item": "FsView::readlinkat",
       "category": "proc",
       "expression": ".proc.lock()",
@@ -238,7 +238,7 @@
     {
       "id": "crates/carrick-kernel/src/dispatch/mem/mmap.rs::MemView::mmap_served::proc#1",
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "line": 646,
+      "line": 721,
       "item": "MemView::mmap_served",
       "category": "proc",
       "expression": ".proc.lock()",

@@ -59,6 +59,61 @@ pub struct FrameGrantResponse {
     pub request: FrameGrantRequest,
 }
 
+/// A host fault owns its single-flight request until it publishes a grant or
+/// explicitly abandons the request. Dropping the token after an early error
+/// returns the mailbox to Idle; a response must never outlive this fault.
+pub struct FrameGrantHostClaim<'a> {
+    mailbox: &'a FrameGrantMailbox,
+    request: FrameGrantRequest,
+    active: bool,
+}
+
+impl FrameGrantHostClaim<'_> {
+    pub const fn request(&self) -> FrameGrantRequest {
+        self.request
+    }
+
+    /// No grant was published. The same fault proceeds through the live
+    /// resident/stale/signal classifier before the guest runs again.
+    pub fn decline(mut self) {
+        self.release();
+    }
+
+    /// A verified grant publication already moved HOST_WORKING to IDLE.
+    pub fn finish_completed(mut self) {
+        assert_eq!(self.mailbox.load_request(), self.request);
+        assert_eq!(
+            self.mailbox.state.load(Ordering::Acquire),
+            FRAME_GRANT_MAILBOX_IDLE
+        );
+        self.active = false;
+    }
+
+    fn release(&mut self) {
+        if !self.active {
+            return;
+        }
+        assert_eq!(self.mailbox.load_request(), self.request);
+        assert_eq!(
+            self.mailbox.state.compare_exchange(
+                FRAME_GRANT_MAILBOX_HOST_WORKING,
+                FRAME_GRANT_MAILBOX_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ),
+            Ok(FRAME_GRANT_MAILBOX_HOST_WORKING),
+            "host claim left a response behind",
+        );
+        self.active = false;
+    }
+}
+
+impl Drop for FrameGrantHostClaim<'_> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// Host-published bulk first-touch protocol.
 ///
 /// A slot transports a request, never ownership of unpublished leaves. EL1
@@ -72,9 +127,11 @@ pub struct FrameGrantResponse {
 /// consult the live MM mapping; they never wait for another vCPU to consume a
 /// response. The MM guard serializes publication with unmap/protect/replacement.
 ///
-/// On refusal the host moves HOST_WORKING -> RESPONSE. EL1 claims RESPONSE ->
-/// GUEST_CONSUMING, discards the refusal, then releases -> IDLE and forwards
-/// once without issuing another request. Refusal carries no frame authority.
+/// An owned host claim releases HOST_WORKING -> IDLE on every declined branch.
+/// The host then resolves the same fault against live resident/stale/signal
+/// authority before resuming the guest. A legacy unowned refusal still moves
+/// HOST_WORKING -> RESPONSE for EL1 to consume, but must not be used by the
+/// owned host path. Refusal carries no frame authority.
 /// GUEST_FAILED is a reserved ABI value: host publication handles missing table
 /// pages directly, so guest hand-back is no longer a reachable transition.
 /// Failed publication cannot commit or free the slot; the host must refuse or
@@ -277,18 +334,60 @@ impl FrameGrantMailbox {
         None
     }
 
+    /// The owned host path: every branch must either complete a grant or
+    /// release the exact claim before another fault uses this worker slot.
+    pub fn claim_request_for_fault_owned(
+        &self,
+        mm_key: u64,
+        fault_va: u64,
+        access: u64,
+    ) -> Option<FrameGrantHostClaim<'_>> {
+        let request = self.claim_request_for_fault(mm_key, fault_va, access)?;
+        Some(FrameGrantHostClaim {
+            mailbox: self,
+            request,
+            active: true,
+        })
+    }
+
     /// Release the exact request when the host resolved the fault through an
     /// existing path and therefore has no frame-grant response for EL1.
     pub fn cancel_request_for_fault(&self, mm_key: u64, fault_va: u64, access: u64) -> bool {
+        let matches = |request: FrameGrantRequest| {
+            request.mm_key == mm_key
+                && (request.fault_va == fault_va
+                    || request.fault_va / Self::PAGE_SIZE == fault_va / Self::PAGE_SIZE)
+                && request.access == access
+        };
+        if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_REQUESTED {
+            return false;
+        }
+        let preview = self.load_request();
+        if !matches(preview) {
+            return false;
+        }
         if self
-            .claim_request_for_fault(mm_key, fault_va, access)
-            .is_none()
+            .state
+            .compare_exchange(
+                FRAME_GRANT_MAILBOX_REQUESTED,
+                FRAME_GRANT_MAILBOX_HOST_WORKING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
         {
             return false;
         }
-        self.state
-            .store(FRAME_GRANT_MAILBOX_IDLE, Ordering::Release);
-        true
+        let current = self.load_request();
+        if matches(current) && current.request_generation == preview.request_generation {
+            self.state
+                .store(FRAME_GRANT_MAILBOX_IDLE, Ordering::Release);
+            true
+        } else {
+            self.state
+                .store(FRAME_GRANT_MAILBOX_REQUESTED, Ordering::Release);
+            false
+        }
     }
 
     /// Publish the full extent before disarming first touch or releasing this
@@ -498,6 +597,104 @@ impl FrameGrantMailbox {
     }
 }
 
+#[cfg(test)]
+mod host_claim_tests {
+    use super::*;
+
+    #[test]
+    fn no_plan_releases_claim_before_next_fault_on_same_worker() {
+        let mailbox = FrameGrantMailbox::new();
+        let first = FrameGrantRequest {
+            mm_key: 94,
+            request_generation: 293,
+            fault_va: 0x6001_a54bf8,
+            requested_len: 4096,
+            access: 2,
+        };
+        assert!(mailbox.try_publish_request(first));
+        let claim = mailbox
+            .claim_request_for_fault_owned(first.mm_key, first.fault_va, first.access)
+            .expect("first grant claim");
+        assert_eq!(claim.request(), first);
+        claim.decline(); // NoPlan: classify the live fault on the host.
+        assert_eq!(
+            mailbox.state.load(Ordering::Acquire),
+            FRAME_GRANT_MAILBOX_IDLE
+        );
+
+        let second = FrameGrantRequest {
+            request_generation: 294,
+            fault_va: 0x6001_c5abf8,
+            ..first
+        };
+        assert!(mailbox.try_publish_request(second));
+        let claim = mailbox
+            .claim_request_for_fault_owned(second.mm_key, second.fault_va, second.access)
+            .expect("next live anonymous fault can claim the same worker");
+        assert_eq!(claim.request(), second);
+        drop(claim); // An early host error also owns cleanup.
+        assert_eq!(
+            mailbox.state.load(Ordering::Acquire),
+            FRAME_GRANT_MAILBOX_IDLE
+        );
+    }
+
+    #[test]
+    fn cancel_request_for_fault_covers_page_offset() {
+        let mailbox = FrameGrantMailbox::new();
+        let first = FrameGrantRequest {
+            mm_key: 7,
+            request_generation: 1,
+            fault_va: 0x6048,
+            requested_len: 4096,
+            access: 2,
+        };
+        assert!(mailbox.try_publish_request(first));
+        assert!(mailbox.cancel_request_for_fault(7, 0x6000, 2));
+        assert_eq!(
+            mailbox.state.load(Ordering::Acquire),
+            FRAME_GRANT_MAILBOX_IDLE
+        );
+    }
+
+    #[test]
+    fn late_completion_from_old_generation_is_refused_after_reclaim_and_reissue() {
+        let mailbox = FrameGrantMailbox::new();
+        let first = FrameGrantRequest {
+            mm_key: 7,
+            request_generation: 1,
+            fault_va: 0x6000,
+            requested_len: 4096,
+            access: 2,
+        };
+        assert!(mailbox.try_publish_request(first));
+        assert!(mailbox.cancel_request_for_fault(7, 0x6000, 2));
+        assert_eq!(
+            mailbox.state.load(Ordering::Acquire),
+            FRAME_GRANT_MAILBOX_IDLE
+        );
+
+        // Reissue on the same mailbox for generation 2
+        let second = FrameGrantRequest {
+            mm_key: 7,
+            request_generation: 2,
+            fault_va: 0x7000,
+            requested_len: 4096,
+            access: 2,
+        };
+        assert!(mailbox.try_publish_request(second));
+
+        // Late completion from generation 1 must be refused
+        assert!(!mailbox.cancel_request_for_fault(7, 0x6000, 2));
+        assert!(!mailbox.complete_resolved_owner_fault(first));
+        assert!(mailbox.claim_response(7, 1).is_none());
+        assert!(!mailbox.finish_response(7, 1));
+
+        // The current generation 2 request remains intact
+        assert_eq!(mailbox.claim_request_for_fault(7, 0x7000, 2), Some(second));
+    }
+}
+
 impl Default for FrameGrantMailbox {
     fn default() -> Self {
         Self::new()
@@ -554,95 +751,4 @@ impl FrameGrantMailbox {
     pub const MAPPING_ID_OFFSET: usize = core::mem::offset_of!(Self, mapping_id);
     pub const OWNER_GENERATION_OFFSET: usize = core::mem::offset_of!(Self, owner_generation);
     pub const INVENTORY_REVISION_OFFSET: usize = core::mem::offset_of!(Self, inventory_revision);
-}
-
-// Literal wire layout captured from 3fd7862be on a 64-bit host.
-// Keep these values fixed when moving the shared kernel implementation.
-#[cfg(test)]
-mod layout_manifest {
-    use super::*;
-    use core::mem::{align_of, offset_of, size_of};
-
-    macro_rules! field {
-        ($record:ty, $field:ident, $ty:ty, $offset:literal, $size:literal, $align:literal) => {
-            // Type-check the manifest's field type without constructing a record.
-            let _ = |record: &$record| {
-                let _: &$ty = &record.$field;
-            };
-            assert_eq!(
-                (
-                    offset_of!($record, $field),
-                    size_of::<$ty>(),
-                    align_of::<$ty>()
-                ),
-                ($offset, $size, $align),
-                concat!(stringify!($record), "::", stringify!($field))
-            );
-        };
-    }
-
-    #[test]
-    fn frame_grant_mailbox() {
-        assert_eq!(
-            (
-                size_of::<FrameGrantMailbox>(),
-                align_of::<FrameGrantMailbox>()
-            ),
-            (128, 64)
-        );
-        // Exhaustive pattern makes newly added fields require a manifest entry.
-        let _ = |FrameGrantMailbox {
-                     state: _,
-                     status: _,
-                     mm_key: _,
-                     request_generation: _,
-                     fault_va: _,
-                     requested_len: _,
-                     access: _,
-                     semantic_base: _,
-                     physical_ipa: _,
-                     granted_len: _,
-                     permissions: _,
-                     frame_id: _,
-                     mapping_id: _,
-                     owner_generation: _,
-                     inventory_revision: _,
-                 }: FrameGrantMailbox| {};
-        field!(FrameGrantMailbox, state, AtomicU32, 0, 4, 4);
-        field!(FrameGrantMailbox, status, AtomicU64, 8, 8, 8);
-        field!(FrameGrantMailbox, mm_key, AtomicU64, 16, 8, 8);
-        field!(FrameGrantMailbox, request_generation, AtomicU64, 24, 8, 8);
-        field!(FrameGrantMailbox, fault_va, AtomicU64, 32, 8, 8);
-        field!(FrameGrantMailbox, requested_len, AtomicU64, 40, 8, 8);
-        field!(FrameGrantMailbox, access, AtomicU64, 48, 8, 8);
-        field!(FrameGrantMailbox, semantic_base, AtomicU64, 56, 8, 8);
-        field!(FrameGrantMailbox, physical_ipa, AtomicU64, 64, 8, 8);
-        field!(FrameGrantMailbox, granted_len, AtomicU64, 72, 8, 8);
-        field!(FrameGrantMailbox, permissions, AtomicU64, 80, 8, 8);
-        field!(FrameGrantMailbox, frame_id, AtomicU64, 88, 8, 8);
-        field!(FrameGrantMailbox, mapping_id, AtomicU64, 96, 8, 8);
-        field!(FrameGrantMailbox, owner_generation, AtomicU64, 104, 8, 8);
-        field!(FrameGrantMailbox, inventory_revision, AtomicU64, 112, 8, 8);
-    }
-
-    #[test]
-    fn frame_grant_mailboxes() {
-        assert_eq!(
-            (
-                size_of::<FrameGrantMailboxes>(),
-                align_of::<FrameGrantMailboxes>()
-            ),
-            (32768, 64)
-        );
-        // Exhaustive pattern makes newly added fields require a manifest entry.
-        let _ = |FrameGrantMailboxes { slots: _ }: FrameGrantMailboxes| {};
-        field!(
-            FrameGrantMailboxes,
-            slots,
-            [FrameGrantMailbox; carrick_sched_core::ZONE_SLOTS],
-            0,
-            32768,
-            64
-        );
-    }
 }

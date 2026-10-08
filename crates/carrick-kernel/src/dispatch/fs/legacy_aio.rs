@@ -178,7 +178,7 @@ pub(super) fn io_setup<M: CurrentMmMemory>(
     }
     let current = match read_u64(&*cx.memory, ctxp.0) {
         Ok(value) => value,
-        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+        Err(error) => return Ok(error.outcome()),
     };
     if current != 0 {
         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -250,7 +250,7 @@ pub(super) fn io_submit<M: CurrentMmMemory>(
         };
         let iocb_addr = match read_u64(&*cx.memory, slot_addr) {
             Ok(value) => value,
-            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            Err(error) => return Ok(error.outcome()),
         };
         let iocb = match LegacyAioIocb::read(&*cx.memory, GuestPtr(iocb_addr)) {
             Ok(value) => value,

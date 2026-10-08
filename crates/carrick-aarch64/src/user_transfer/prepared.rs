@@ -106,6 +106,13 @@ impl<'a, S: PreparedService, P: TransferPin> PreparedWrite<'a, S, P> {
                 )
             });
             if let Some(permit) = ticket.take_prepared() {
+                carrick_observability::probes::hvpatch_n1_reservation_custody(
+                    5,
+                    request.operation.mm.raw(),
+                    request.operation.incarnation.get(),
+                    u64::from(permit.index),
+                    permit.generation.get(),
+                );
                 prepared.pages[index].permit = Some(permit);
                 continue;
             }
@@ -154,9 +161,7 @@ impl<'a, S: PreparedService, P: TransferPin> PreparedWrite<'a, S, P> {
                         request.operation.incarnation,
                     )
                 };
-                return Err(MemoryPrepareError::Fault(
-                    carrick_guest_mem::MemoryError::OwnerRetired(handle),
-                ));
+                return Err(MemoryPrepareError::Retired(handle));
             }
             if completion.errno != 14 {
                 return Err(MemoryPrepareError::Fault(
@@ -271,6 +276,7 @@ mod tests {
         slots: &'a MmPortalSlots,
         state: Rc<State>,
         fail: Option<u64>,
+        retire: Option<u64>,
     }
     impl Drop for Service<'_> {
         fn drop(&mut self) {
@@ -289,7 +295,9 @@ mod tests {
             match service.phase() {
                 PortalTransferPhase::Prepare => {
                     self.state.events.borrow_mut().push(("prepare", sequence));
-                    if self.fail == Some(sequence) {
+                    if self.retire == Some(sequence) {
+                        assert!(service.complete(0, 3));
+                    } else if self.fail == Some(sequence) {
                         let handle = unsafe {
                             carrick_el1_abi::El1MmHandle::from_admitted_owner(
                                 request.operation.carrier,
@@ -406,6 +414,7 @@ mod tests {
             slots: &slots,
             state: state.clone(),
             fail: None,
+            retire: None,
         };
         let prepared = PreparedWrite::prepare(
             service,
@@ -443,12 +452,46 @@ mod tests {
                 slots: &slots,
                 state: state.clone(),
                 fail: Some(2),
+                retire: None,
             },
             &slots,
             vec![GuestWriteRange::new(carrick_guest_mem::GuestVa(0x40000), 12288).unwrap()],
             pages(&state),
         );
         assert!(matches!(result, Err(MemoryPrepareError::OwnerWait(_))));
+        assert!(state.copied.borrow().is_empty());
+        assert_eq!(
+            *state.events.borrow(),
+            [
+                ("prepare", 1),
+                ("prepare", 2),
+                ("cancel", 1),
+                ("loan returned", 0)
+            ]
+        );
+    }
+    #[test]
+    fn owner_retirement_during_later_prepare_cancels_prior_permit() {
+        let slots = MmPortalSlots::new();
+        let state = Rc::new(State::default());
+        let result = PreparedWrite::prepare(
+            Service {
+                slots: &slots,
+                state: state.clone(),
+                fail: None,
+                retire: Some(2),
+            },
+            &slots,
+            vec![GuestWriteRange::new(carrick_guest_mem::GuestVa(0x40000), 12288).unwrap()],
+            pages(&state),
+        );
+        assert!(matches!(
+            result,
+            Err(MemoryPrepareError::Retired(handle))
+                if handle.carrier().get() == 1
+                    && handle.mm() == ReservationMm::new(2).unwrap()
+                    && handle.incarnation().get() == 3
+        ));
         assert!(state.copied.borrow().is_empty());
         assert_eq!(
             *state.events.borrow(),
@@ -470,6 +513,7 @@ mod tests {
                     slots: &slots,
                     state: state.clone(),
                     fail: None,
+                    retire: None,
                 },
                 &slots,
                 vec![GuestWriteRange::new(carrick_guest_mem::GuestVa(0x40000), 12288).unwrap()],

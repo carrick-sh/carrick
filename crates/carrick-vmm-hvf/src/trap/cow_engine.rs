@@ -5,6 +5,13 @@
 use super::*;
 use carrick_fatal::carrick_fatal;
 
+pub(crate) enum SparseExtentMode {
+    FillHole {
+        receipt_range: Option<std::ops::Range<u64>>,
+    },
+    ReplaceFileView,
+}
+
 /// Check the engine's completed mapping before publishing alias metadata.
 /// Walk terminal spans, not every page of a coarse block; perform no writes,
 /// splits, allocation or TLB operations. The caller retains MM exclusion.
@@ -1047,7 +1054,10 @@ impl HvfVmState {
                 transition.len(),
                 transition.fd(),
                 transition.file_offset(),
-                transition.source(),
+                carrick_guest_mem::PrivateFilePublication {
+                    source: transition.source(),
+                    admission: None,
+                },
                 flush_stage1,
             )?;
             if !materialized {
@@ -1260,12 +1270,18 @@ impl HvfVmState {
         len: usize,
         fd: std::os::fd::BorrowedFd<'_>,
         offset: u64,
-        source: carrick_guest_mem::PrivateFileSource,
+        publication: carrick_guest_mem::PrivateFilePublication<'_, '_>,
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<bool, TrapError> {
+        let carrick_guest_mem::PrivateFilePublication { source, admission } = publication;
         const PAGE_SIZE: u64 = 4 * 1024;
         if !self.persistent_vm_lifecycle || len == 0 {
             return Ok(false);
+        }
+        if let Some(admission) = admission {
+            self.task
+                .authenticate_owner_reserved_write(&self.carrier_vm_custody(), admission, va, len)
+                .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
         }
         let arena_start = crate::memory::LINUX_MMAP_BASE;
         let arena_end = arena_start
@@ -1357,8 +1373,8 @@ impl HvfVmState {
                 hole_end,
                 backing,
                 flush_stage1,
-                None,
-                true,
+                SparseExtentMode::ReplaceFileView,
+                admission,
             )?;
             if next <= current {
                 return Err(TrapError::Hypervisor(format!(
@@ -1383,8 +1399,8 @@ impl HvfVmState {
             end,
             backing,
             flush_stage1,
-            receipt_range,
-            false,
+            SparseExtentMode::FillHole { receipt_range },
+            None,
         )
     }
 
@@ -1831,9 +1847,13 @@ impl HvfVmState {
         end: u64,
         backing: SparseExtentBacking<'_>,
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
-        receipt_range: Option<std::ops::Range<u64>>,
-        replacing: bool,
+        mode: SparseExtentMode,
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
     ) -> Result<u64, TrapError> {
+        let (receipt_range, replacing) = match mode {
+            SparseExtentMode::FillHole { receipt_range } => (receipt_range, false),
+            SparseExtentMode::ReplaceFileView => (None, true),
+        };
         const PAGE_SIZE: u64 = 4 * 1024;
 
         if start >= end || !start.is_multiple_of(PAGE_SIZE) || !end.is_multiple_of(PAGE_SIZE) {
@@ -1844,11 +1864,18 @@ impl HvfVmState {
         let identity = self.cow_identity.ok_or_else(|| {
             TrapError::Hypervisor("HVPatch sparse mmap has no bound mm identity".to_owned())
         })?;
-        let publication = sparse_materialization::PublicationContext::for_local(
-            std::sync::Arc::clone(&self.mm_access),
-            self.carrier_vm_custody(),
-            identity,
-        )?;
+        let publication = match admission {
+            Some(admission) => sparse_materialization::PublicationContext::for_reserved(
+                std::sync::Arc::clone(&self.mm_access),
+                self.carrier_vm_custody(),
+                admission,
+            )?,
+            None => sparse_materialization::PublicationContext::for_local(
+                std::sync::Arc::clone(&self.mm_access),
+                self.carrier_vm_custody(),
+                identity,
+            )?,
+        };
         let end = if replacing {
             // Eligibility was screened before exact-MM quiescence. Recheck
             // under topology exclusion before bypassing the hole checks: a
@@ -2969,7 +2996,6 @@ impl HvfTaskState {
 
     pub(crate) fn live_stage1_names_writable_private_mapping(
         &self,
-        custody: &CarrierVmCustody,
         fault_va: u64,
         mapping: MappingView,
     ) -> Result<bool, TrapError> {
@@ -2982,23 +3008,16 @@ impl HvfTaskState {
                 TrapError::Hypervisor("HVPatch winner PTE precedes mapping start".to_owned())
             })?)
             .ok_or_else(|| TrapError::Hypervisor("HVPatch winner PTE IPA overflow".to_owned()))?;
-        let page_table_host = self
-            .mapping_for_range_in(
-                custody,
-                crate::memory::LINUX_PAGE_TABLES_BASE,
-                carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
-            )
-            .map(|mapping| mapping.host_addr)
-            .ok_or_else(|| {
-                TrapError::Hypervisor("HVPatch winner PTE page-table backing is absent".to_owned())
-            })?;
         let page_tables_authority = self.page_tables_authority();
         page_tables_authority
             .with_manager(|manager| -> Result<bool, TrapError> {
                 let shadow = manager.debug_walk(page_va);
-                let page_table_resolver =
-                    self.page_table_resolver(manager.base(), Some(page_table_host));
-                let live = unsafe { manager.debug_walk_host(page_table_resolver, page_va) }
+                // A boot VA lookup can name another MM's table after a root
+                // switch. Pin the selected physical root and extensions.
+                let page_table_resolver = self
+                    .mm_access
+                    .pinned_stage1_arenas(&self.custody_arc(), manager.base())?;
+                let live = unsafe { manager.debug_walk_host(&page_table_resolver, page_va) }
                     .map_err(|e| {
                         TrapError::Hypervisor(format!(
                             "HVPatch winner PTE debug_walk_host failed: {e:?}"
@@ -3310,6 +3329,7 @@ impl HvfTaskState {
         custody: &std::sync::Arc<CarrierVmCustody>,
         fault_va: u64,
         intent: carrick_aarch64::vmm::FrameCowWriteIntent,
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
         trigger: FrameCowTrigger,
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<bool, TrapError> {
@@ -3349,18 +3369,38 @@ impl HvfTaskState {
                 len,
             )
         };
+        let span = if let Some(admission) = admission {
+            self.authenticate_owner_reserved_write(custody, admission, fault_va, 1)
+                .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+            span.and_then(|mut span| {
+                let start = span.va.max(admission.range().start_raw());
+                let end = (span.va + span.len as u64).min(admission.range().end_raw());
+                if start >= end {
+                    return None;
+                }
+                span.va = start;
+                span.len = (end - start) as usize;
+                Some(span)
+            })
+        } else {
+            span
+        };
         let Some(span) = span else {
             let mapping = self.mapping_for_range_in(custody, fault_va, 1);
-            let write_denied = self
-                .protections
-                .legacy()
-                .is_none_or(|protections| protections.range_write_denied(fault_va, 1));
+            // An EL1-owned MM has no legacy host protection table. Its live
+            // private terminal carries Linux write permission, so an absent
+            // host table cannot veto the exact-leaf winner check below.
+            let write_denied = !guest_lane
+                && self
+                    .protections
+                    .legacy()
+                    .is_none_or(|protections| protections.range_write_denied(fault_va, 1));
             let private_writable_mapping = mapping.is_some_and(|mapping| {
                 mapping.guest_writable && mapping.sharing == GuestMappingSharing::Private
             });
             let live_leaf_is_writable = match mapping {
                 Some(mapping) if private_writable_mapping && !write_denied => {
-                    self.live_stage1_names_writable_private_mapping(custody, fault_va, mapping)?
+                    self.live_stage1_names_writable_private_mapping(fault_va, mapping)?
                 }
                 _ => false,
             };
@@ -3602,16 +3642,31 @@ impl HvfTaskState {
         // first physical/staged-inventory mutation.  A fork-time response can
         // run while the engine's mapping metadata is being rebuilt; failing
         // here must leave no staged MappingId for terminal retirement to see.
-        let page_table_host = self
-            .mapping_for_range_in(
+        let page_table_host = if guest_lane {
+            // Owner Fork retains physical table custody, not the host-plan
+            // fixed-VA projection. Resolve the live manager's exact primary
+            // arena through its authenticated, retaining resolver.
+            self.page_tables_authority()
+                .with_manager(|manager| {
+                    manager.resolver().and_then(|resolver| {
+                        resolver.host_ptr_for_range(
+                            manager.base(),
+                            carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                        )
+                    })
+                })
+                .flatten()
+        } else {
+            self.mapping_for_range_in(
                 custody,
                 crate::memory::LINUX_PAGE_TABLES_BASE,
                 carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
             )
             .map(|mapping| mapping.host_addr)
-            .ok_or_else(|| {
-                TrapError::Hypervisor("HVPatch COW page-table backing is absent".to_owned())
-            })?;
+        }
+        .ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch COW page-table backing is absent".to_owned())
+        })?;
         // Reuse grants write to the span's leaves without repointing them, so
         // every 4 KiB page of the span must already name the old frame at its
         // offset (a valid or retained-output leaf). A page with no output at
@@ -4000,16 +4055,38 @@ impl HvfTaskState {
                     CowRepointAccess::Kernel
                 } else {
                     let mut writable_pages = 0_u8;
+                    let mut executable_pages = 0_u8;
                     for index in 0..(span.len as u64 / PAGE_SIZE) {
                         if source_guest_writable
-                            && !self.protections.legacy().is_none_or(|protections| {
+                            && !self.protections.legacy().is_some_and(|protections| {
                                 protections.range_write_denied(span.va + index * PAGE_SIZE, 1)
                             })
                         {
                             writable_pages |= 1 << index;
                         }
+                        let executable = self
+                            .with_mapping_for_range_in(
+                                custody,
+                                span.va + index * PAGE_SIZE,
+                                1,
+                                |source| match source {
+                                    super::host_writes::MappingSource::Region(row) => {
+                                        u64::from(row.perms) & 4 != 0
+                                    }
+                                    super::host_writes::MappingSource::Alias(row) => {
+                                        row.perms & 4 != 0
+                                    }
+                                },
+                            )
+                            .unwrap_or(false);
+                        if executable {
+                            executable_pages |= 1 << index;
+                        }
                     }
-                    CowRepointAccess::User { writable_pages }
+                    CowRepointAccess::User {
+                        writable_pages,
+                        executable_pages,
+                    }
                 };
                 let tables = self.page_tables_authority();
                 let mm_key = std::num::NonZeroU64::new(identity.mm)
@@ -4563,6 +4640,7 @@ impl HvfTaskState {
             custody,
             generation_address,
             carrick_aarch64::vmm::FrameCowWriteIntent::PrivilegedInternal,
+            None,
             FrameCowTrigger {
                 class:
                     carrick_observability::probes::HvpatchFrameCowTriggerClass::PrivilegedInternal,
@@ -4709,14 +4787,6 @@ impl ScrubRun {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfVmState {
-    pub(crate) fn page_table_resolver<'a>(
-        &'a self,
-        manager_base: u64,
-        primary_host: Option<*mut u8>,
-    ) -> HvfPageTableResolver<'a> {
-        self.task.page_table_resolver(manager_base, primary_host)
-    }
-
     pub(crate) fn record_stage1_populated_prefix(&mut self, base: u64, prefix: usize) {
         self.task.record_stage1_populated_prefix(base, prefix);
     }
@@ -4757,6 +4827,7 @@ impl HvfVmState {
                 &custody,
                 fault_va,
                 carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible,
+                None,
                 FrameCowTrigger {
                     class: carrick_observability::probes::HvpatchFrameCowTriggerClass::Stage1PermissionFault,
                     syndrome,
@@ -4789,6 +4860,7 @@ impl HvfVmState {
         va: u64,
         len: usize,
         intent: carrick_aarch64::vmm::FrameCowWriteIntent,
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<(), TrapError> {
         if intent != carrick_aarch64::vmm::FrameCowWriteIntent::BackingMaintenance
@@ -4797,10 +4869,10 @@ impl HvfVmState {
                 len as u64,
             )
         {
-            return self.ensure_frame_cow_write_routed(va, len, intent, flush_stage1);
+            return self.ensure_frame_cow_write_routed(va, len, intent, admission, flush_stage1);
         }
         let before = MmMaintenanceVisits::read();
-        let outcome = self.ensure_frame_cow_write_routed(va, len, intent, flush_stage1);
+        let outcome = self.ensure_frame_cow_write_routed(va, len, intent, admission, flush_stage1);
         self.emit_mm_maintenance_census(
             carrick_observability::probes::HvpatchMmMaintenanceSite::BackingMaintenanceRoute,
             va,
@@ -4852,12 +4924,29 @@ impl HvfVmState {
         va: u64,
         len: usize,
         intent: carrick_aarch64::vmm::FrameCowWriteIntent,
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<(), TrapError> {
         let authority = self.protections.clone();
-        let _legacy = authority.legacy().ok_or_else(|| {
-            TrapError::Hypervisor("admitted owner MM cannot enter host COW selection".into())
-        })?;
+        let _legacy = match admission {
+            Some(admission) => {
+                if intent != carrick_aarch64::vmm::FrameCowWriteIntent::PrivilegedInternal {
+                    return Err(TrapError::UnsupportedPlatform);
+                }
+                self.task
+                    .authenticate_owner_reserved_write(
+                        &self.carrier_vm_custody(),
+                        admission,
+                        va,
+                        len,
+                    )
+                    .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+                None
+            }
+            None => Some(authority.legacy().ok_or_else(|| {
+                TrapError::Hypervisor("admitted owner MM cannot enter host COW selection".into())
+            })?),
+        };
         if len == 0 {
             return Ok(());
         }
@@ -4877,10 +4966,16 @@ impl HvfVmState {
             };
             // The live span, not the armed granule: a page past it names
             // another frame and is routed on its own next iteration.
-            let armed_span_end = candidate.map(|candidate| {
-                let span = self.task.live_cow_span(candidate, current);
-                span.va.saturating_add(span.len as u64)
-            });
+            let armed_span_end = if admission.is_some() {
+                self.task
+                    .guest_private_cow_span(current)
+                    .map(|span| span.va.saturating_add(span.len as u64))
+            } else {
+                candidate.map(|candidate| {
+                    let span = self.task.live_cow_span(candidate, current);
+                    span.va.saturating_add(span.len as u64)
+                })
+            };
             let armed = armed_span_end.is_some();
             let (retained_output_has_no_physical_source, retained_output_source_is_shared) =
                 if intent == carrick_aarch64::vmm::FrameCowWriteIntent::BackingMaintenance
@@ -5025,6 +5120,7 @@ impl HvfVmState {
                         &custody,
                         current,
                         intent,
+                        admission,
                         FrameCowTrigger {
                             class,
                             syndrome: 0,
@@ -5038,7 +5134,20 @@ impl HvfVmState {
                         )));
                     }
                 }
-                FrameCowWriteRoute::Direct => {}
+                FrameCowWriteRoute::Direct => {
+                    if let Some(admission) = admission {
+                        let fragment = (end - current).min(0x1000 - (current & 0xfff)) as usize;
+                        self.task
+                            .validate_owner_reserved_mapping(
+                                &self.carrier_vm_custody(),
+                                admission,
+                                current,
+                                fragment,
+                                None,
+                            )
+                            .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+                    }
+                }
             }
             current =
                 next_frame_cow_write_probe(intent, current, end, armed_span_end, next_armed_start);
@@ -5078,17 +5187,6 @@ impl HvfVmState {
             return Ok(());
         }
 
-        let page_table_host = self
-            .mapping_for_range(
-                crate::memory::LINUX_PAGE_TABLES_BASE,
-                carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
-            )
-            .map(|mapping| mapping.host_addr)
-            .ok_or_else(|| {
-                TrapError::Hypervisor(
-                    "deferred COW protection has no page-table backing".to_owned(),
-                )
-            })?;
         let prot_flags = carrick_abi::LinuxProtFlags::from_bits_truncate(prot);
         let (expected_ap, phase, must_be_valid) =
             if prot_flags.contains(carrick_abi::LinuxProtFlags::WRITE) {
@@ -5124,8 +5222,11 @@ impl HvfVmState {
         let page_tables_authority = self.page_tables_authority();
         let authenticated = page_tables_authority
             .with_manager(|manager| -> Result<Vec<PendingFrameCowPublication>, TrapError> {
-                let page_table_resolver =
-                    self.page_table_resolver(manager.base(), Some(page_table_host));
+                // A boot VA lookup can still name another live MM's root.
+                // Resolve and pin the selected physical root and extensions.
+                let page_table_resolver = self.mm_access.pinned_stage1_arenas(
+                    &self.carrier_vm_custody(), manager.base(),
+                )?;
                 let mut authenticated = Vec::with_capacity(pending.len());
                 for receipt in pending {
                     let receipt_end = receipt.va.checked_add(receipt.len as u64).ok_or_else(|| {
@@ -5153,7 +5254,7 @@ impl HvfVmState {
                                 )
                             })?;
                         let shadow = manager.debug_walk(page);
-                        let live = unsafe { manager.debug_walk_host(page_table_resolver, page) }
+                        let live = unsafe { manager.debug_walk_host(&page_table_resolver, page) }
                             .map_err(|e| {
                                 TrapError::Hypervisor(format!(
                                     "deferred COW debug_walk_host failed: {e:?}"
@@ -5859,6 +5960,9 @@ impl HvfVmState {
     /// True if `[address, address+length)` overlaps any PROT_NONE range. Used
     /// to fault syscall-path accesses to a guest PROT_NONE buffer (EFAULT).
     pub(crate) fn range_no_access(&self, address: u64, length: usize) -> bool {
+        if self.protections.owner().is_some() {
+            return false;
+        }
         self.protections
             .legacy()
             .is_none_or(|protections| protections.range_no_access(address, length))
@@ -5880,6 +5984,8 @@ impl HvfVmState {
         self.write_guest_bytes(
             crate::vdso::LINUX_VVAR_BASE + crate::vdso::VVAR_OFF_RNG_GENERATION as u64,
             &generation.to_le_bytes(),
+            None,
+            None,
         )
     }
 
@@ -5938,7 +6044,9 @@ impl HvfVmState {
             (crate::vdso::VVAR_OFF_FREQ, freq),
             (crate::vdso::VVAR_OFF_REALTIME_OFF_NS, realtime_off),
         ] {
-            if let Err(error) = self.write_guest_bytes(base + offset as u64, &word.to_le_bytes()) {
+            if let Err(error) =
+                self.write_guest_bytes(base + offset as u64, &word.to_le_bytes(), None, None)
+            {
                 tracing::error!(%error, offset, "vDSO vvar stamp failed");
             }
         }

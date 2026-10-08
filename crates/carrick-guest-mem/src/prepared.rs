@@ -134,12 +134,14 @@ pub enum MemorySupplyRequest {
         observed: PortalOwnerWait,
     },
 }
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum MemoryPrepareError {
     /// The caller must split a stream before source consumption. This is not
     /// an invalid guest address and must not be lowered to EFAULT.
     Limit(PreparedWriteLimit),
     Fault(MemoryError),
+    /// The exact owner retired while this output was being prepared.
+    Retired(carrick_el1_abi::El1MmHandle),
     Physical(OwnedMemoryWait),
     OwnerWait(PortalOwnerWait),
     Supply(MemorySupplyRequest),

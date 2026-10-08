@@ -20,34 +20,6 @@ use carrick_guest_mem::CurrentMmMemory;
 // here so all `guest_arch` consumers get a single path.
 pub use carrick_abi::SyscallRemap;
 
-/// Exclusive upper bound of the executing guest ISA's user virtual addresses.
-/// The bound belongs to the guest, independent of host ISA and `uname` (an ARM
-/// guest running Rosetta still uses the ARM layout).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct UserVaCeiling(u64);
-
-impl UserVaCeiling {
-    pub(crate) const fn new(exclusive_end: u64) -> Self {
-        Self(exclusive_end)
-    }
-
-    pub const fn exclusive_end(self) -> u64 {
-        self.0
-    }
-
-    /// Resolve the existing syscall ABI selector through the per-ISA seam.
-    pub fn for_abi(abi: carrick_abi::LinuxGuestAbi) -> Self {
-        match abi {
-            carrick_abi::LinuxGuestAbi::Aarch64 => {
-                crate::aarch64_arch::Aarch64GuestArch::user_va_ceiling()
-            }
-            carrick_abi::LinuxGuestAbi::X86_64 => {
-                crate::x8664_arch::X8664GuestArch::user_va_ceiling()
-            }
-        }
-    }
-}
-
 /// Encode/decode for the guest page-table descriptor format (AArch64
 /// long-descriptor vs x86-64 4-level). Same operation shape per ISA. The
 /// surface is the granule parameters plus the descriptor-editing entry
@@ -132,8 +104,6 @@ pub trait GuestArch: Copy + 'static {
     fn uname_machine() -> &'static str;
     /// Guest Linux UAPI struct layout family for syscall marshalling.
     fn linux_guest_abi() -> carrick_abi::LinuxGuestAbi;
-    /// Exclusive user VA limit for placement and range validation.
-    fn user_va_ceiling() -> UserVaCeiling;
 
     /// vDSO image bytes for this ISA. Computed (not a `'static` slice) — the
     /// aarch64 image is assembled at boot from `carrick-mem::vdso`, so this
@@ -236,9 +206,6 @@ mod tests {
         }
         fn linux_guest_abi() -> carrick_abi::LinuxGuestAbi {
             carrick_abi::LinuxGuestAbi::Aarch64
-        }
-        fn user_va_ceiling() -> UserVaCeiling {
-            UserVaCeiling::new(1 << 48)
         }
         fn vdso_bytes() -> Vec<u8> {
             Vec::new()

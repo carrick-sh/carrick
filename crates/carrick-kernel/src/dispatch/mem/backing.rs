@@ -856,14 +856,49 @@ pub(crate) fn alloc_alias_ipa_for_publication_with(
     }
 }
 
+/// Retained byte access for an MM whose executor may have been replaced by exec.
+/// The authority pins memory custody, without retaining the old runtime graph.
+#[derive(Clone)]
+pub struct HostBackingAccess {
+    mem: Arc<super::MemAuthority>,
+    page_size: u64,
+}
+
 impl<'a> MemView<'a> {
+    pub fn host_backing_access(&self) -> HostBackingAccess {
+        HostBackingAccess {
+            mem: Arc::clone(&self.mem().mem),
+            page_size: self.linux_page_size(),
+        }
+    }
+
+    pub fn retains_host_backing(
+        &self,
+        handle: core::num::NonZeroU64,
+        generation: core::num::NonZeroU64,
+    ) -> bool {
+        self.host_backing_access()
+            .retains_host_backing(handle, generation)
+    }
+
+    pub fn read_host_backing(
+        &self,
+        identity: carrick_el1_abi::HostBackingIdentity,
+        length: usize,
+    ) -> Result<Vec<u8>, LinuxErrno> {
+        self.host_backing_access()
+            .read_host_backing(identity, length)
+    }
+}
+
+impl HostBackingAccess {
     /// Check physical source custody without byte I/O or a VMA lookup.
     pub fn retains_host_backing(
         &self,
         handle: core::num::NonZeroU64,
         generation: core::num::NonZeroU64,
     ) -> bool {
-        self.mem()
+        self.mem
             .lock()
             .host_backing_leases
             .contains_key(&(handle, generation))
@@ -879,17 +914,18 @@ impl<'a> MemView<'a> {
             return Err(LINUX_EINVAL);
         }
         let source = self
-            .mem()
+            .mem
             .lock()
             .host_backing_custody
             .source(identity)
             .ok_or(LINUX_EBADF)?;
         match source {
-            PrivateFileBacking::Description(description) => self
-                .snapshot_private_mmap_description(
+            PrivateFileBacking::Description(description) => {
+                MemView::snapshot_private_mmap_description(
                     description.description(),
                     identity.offset(),
                     length,
+                    self.page_size,
                 )
                 .and_then(|snapshot| {
                     if snapshot.bus_fault_offset == Some(0) {
@@ -897,7 +933,8 @@ impl<'a> MemView<'a> {
                     } else {
                         Ok(snapshot.bytes)
                     }
-                }),
+                })
+            }
             PrivateFileBacking::LoadedImage {
                 initialized_offset,
                 bytes,
@@ -918,7 +955,9 @@ impl<'a> MemView<'a> {
             }
         }
     }
+}
 
+impl<'a> MemView<'a> {
     pub(in crate::dispatch::mem) fn recover_private_repoint_failure(
         &self,
         candidate: u64,
@@ -1090,18 +1129,22 @@ impl<'a> MemView<'a> {
         let Some(open_file) = self.open_file(fd.0) else {
             return Err(LINUX_EBADF);
         };
-        self.snapshot_private_mmap_description(&open_file.description, offset, length)
+        Self::snapshot_private_mmap_description(
+            &open_file.description,
+            offset,
+            length,
+            self.linux_page_size(),
+        )
     }
 
     fn snapshot_private_mmap_description(
-        &self,
         description: &crate::kernel::FileDescription,
         offset: u64,
         length: usize,
+        page_size: u64,
     ) -> Result<PrivateMmapSnapshot, LinuxErrno> {
         let mut bytes = vec![0; length];
         let length_u64 = u64::try_from(length).map_err(|_| linux_errno::EOVERFLOW)?;
-        let page_size = self.linux_page_size();
         let Some(open) = description.read_for_io() else {
             return Err(LINUX_EBADF);
         };
@@ -1239,10 +1282,11 @@ impl<'a> MemView<'a> {
                     continue;
                 }
             };
-            let snapshot = self.snapshot_private_mmap_description(
+            let snapshot = Self::snapshot_private_mmap_description(
                 description.description(),
                 source.offset,
                 len,
+                self.linux_page_size(),
             )?;
             let valid_len = usize::try_from(snapshot.bus_fault_offset.unwrap_or(len as u64))
                 .map_err(|_| LINUX_ENOMEM)?;
@@ -1266,6 +1310,7 @@ impl<'a> MemView<'a> {
                                 fd,
                                 source.offset,
                                 provenance,
+                                None,
                             )
                             .map_err(|error| {
                                 carrick_observability::probes::mmap_lowering_error(

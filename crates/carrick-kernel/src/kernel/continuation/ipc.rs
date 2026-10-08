@@ -161,6 +161,62 @@ impl IpcHostServices for ZoneHostServices {
     }
 }
 
+/// Custody of an IPC operation while a host memory dependency is parked.
+/// Dropping a cancelled runtime job retires the operation and its endpoint
+/// through the retained kernel authority, even after its numeric fd closes.
+pub struct OwnedIpcOperation {
+    token: Option<IpcOpToken>,
+    services: ZoneHostServices,
+}
+
+impl std::fmt::Debug for OwnedIpcOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnedIpcOperation")
+            .field("token", &self.token)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OwnedIpcOperation {
+    pub fn new(token: IpcOpToken, services: ZoneHostServices) -> Self {
+        Self {
+            token: Some(token),
+            services,
+        }
+    }
+
+    pub fn into_token(mut self) -> IpcOpToken {
+        match self.token.take() {
+            Some(token) => token,
+            None => carrick_fatal::carrick_fatal!(
+                "kernel::ipc_continuation",
+                "IPC operation custody was already consumed"
+            ),
+        }
+    }
+
+    pub fn operation(&self) -> Result<IpcOperation, IpcError> {
+        self.services
+            .owner
+            .region()
+            .operation(self.token.as_ref().ok_or(IpcError::Stale)?)
+    }
+}
+
+impl Drop for OwnedIpcOperation {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            if let Err(error) = finish(&self.services.owner.region(), token, &self.services) {
+                carrick_fatal::carrick_fatal!(
+                    "kernel::ipc_continuation",
+                    "IPC operation cancellation failed: {error:?}"
+                );
+            }
+        }
+    }
+}
+
 /// The host IPC authority's memory for the carrier to map into the IPC
 /// window, or `None` while the kernel has no authority (every IPC path then
 /// stays closed: nothing is mapped, EL1 never attaches, no table is
@@ -383,6 +439,151 @@ pub fn interrupt(
 /// Most bytes one host step can move (the largest pipe capacity).
 const HOST_STEP_BYTES: u64 = 1 << 20;
 
+/// A handback retains its operation and endpoint pin while destination
+/// preparation is suspended. No pipe bytes have been consumed for this step.
+#[derive(Debug)]
+pub enum IpcCompletionError {
+    Ipc(IpcError),
+    Memory {
+        token: IpcOpToken,
+        dependency: carrick_guest_mem::MemoryPrepareError,
+    },
+}
+
+impl From<IpcError> for IpcCompletionError {
+    fn from(error: IpcError) -> Self {
+        Self::Ipc(error)
+    }
+}
+
+/// Staging bounded by the prepared destination, allocated before object
+/// admission. Commit is infallible and happens after releasing the IPC lock.
+struct PreparedCopy {
+    base: u64,
+    bytes: Vec<u8>,
+    copied: usize,
+}
+
+impl UserCopy for PreparedCopy {
+    fn copy_out(&mut self, dst: u64, src: &[u8]) -> bool {
+        if dst.checked_sub(self.base) != Some(self.copied as u64) {
+            return false;
+        }
+        let Some(end) = self.copied.checked_add(src.len()) else {
+            return false;
+        };
+        let Some(output) = self.bytes.get_mut(self.copied..end) else {
+            return false;
+        };
+        output.copy_from_slice(src);
+        self.copied = end;
+        true
+    }
+
+    fn copy_in(&mut self, _: &mut [u8], _: u64) -> bool {
+        false
+    }
+}
+
+fn transfer_owner_read<M: carrick_guest_mem::CurrentMmMemory>(
+    region: &IpcRegion<'_>,
+    token: &IpcOpToken,
+    object: IpcObjectHandle,
+    op: &mut IpcOperation,
+    memory: &mut M,
+    services: &impl IpcHostServices,
+) -> Result<Result<StepStatus, carrick_guest_mem::MemoryPrepareError>, IpcError> {
+    use carrick_guest_mem::{GuestWriteRange, MemoryPrepareError};
+    loop {
+        // Readiness precedes preparation: an empty source must not fault an
+        // invalid destination. The second check under the transfer lock may
+        // find fewer bytes; the permit accepts a real short prefix.
+        let available = {
+            let mut guard = region.lock(object, &HostIpcWait)?;
+            let available = match op.kind {
+                IpcOpKind::PipeRead => guard.pipe()?.unread_bytes(),
+                IpcOpKind::EventFdRead => usize::from(guard.eventfd()?.value() != 0) * 8,
+                _ => return Err(IpcError::Corrupt),
+            };
+            if available == 0 || op.progress.remaining() == 0 {
+                if op.progress.written > 0 {
+                    return Ok(Ok(StepStatus::Complete));
+                }
+                // Decide an empty source under the same lock as the check:
+                // a new writer must not make an unprepared copy eligible.
+                let mut copy = PreparedCopy {
+                    base: op.buf.0,
+                    bytes: Vec::new(),
+                    copied: 0,
+                };
+                let (status, _) = transfer(&mut guard, op, &mut PrefixCopy::new(&mut copy))?;
+                return Ok(Ok(status));
+            }
+            available
+        };
+        let Some(base) = op.buf.0.checked_add(op.progress.written) else {
+            return Ok(Ok(StepStatus::Fault));
+        };
+        let capacity = available
+            .min(op.progress.remaining())
+            .min((4096 - base % 4096) as usize);
+        // Eventfd is a whole eight-byte record even across a page boundary.
+        let capacity = if op.kind == IpcOpKind::EventFdRead {
+            8
+        } else {
+            capacity
+        };
+        let mut copy = PreparedCopy {
+            base,
+            bytes: vec![0; capacity],
+            copied: 0,
+        };
+        let range = match GuestWriteRange::new(carrick_guest_mem::GuestVa(base), capacity) {
+            Some(range) => range,
+            None => return Ok(Ok(StepStatus::Fault)),
+        };
+        let permit = match memory.prepare_write(&[range]) {
+            Ok(permit) => permit,
+            Err(MemoryPrepareError::Fault(_)) => return Ok(Ok(StepStatus::Fault)),
+            Err(dependency) => return Ok(Err(dependency)),
+        };
+        let (status, published) = {
+            let mut guard = region.lock(object, &HostIpcWait)?;
+            let original_len = op.progress.len;
+            if op.kind == IpcOpKind::PipeRead {
+                op.progress.len = op.progress.written + capacity as u64;
+            }
+            let result = transfer(&mut guard, op, &mut PrefixCopy::new(&mut copy));
+            op.progress.len = original_len;
+            let (status, wakes) = result?;
+            (status, guard.publish(wakes))
+        };
+        if copy.copied != 0 {
+            permit.commit(&[&copy.bytes[..copy.copied]]);
+        } else {
+            drop(permit);
+        }
+        region.update_operation(token, *op)?;
+        if published.readers || published.writers {
+            services.wake(published);
+        }
+        match status {
+            StepStatus::Complete
+                if op.kind == IpcOpKind::PipeRead
+                    && copy.copied == capacity
+                    && capacity < available
+                    && !op.progress.is_complete() => {}
+            terminal if op.progress.written > 0 && !matches!(terminal, StepStatus::Fault) => {
+                // Another reader can drain the remaining bytes and the last
+                // writer can close while PREPARE releases the object lock.
+                // EOF then ends this read; it cannot erase its committed prefix.
+                return Ok(Ok(StepStatus::Complete));
+            }
+            other => return Ok(Ok(other)),
+        }
+    }
+}
+
 /// The host's user copies for one step. Touching guest memory may fault
 /// pages in and pause the address space, which must never happen under an
 /// IPC lock: copies in are served from a prefix read before the lock, and
@@ -397,6 +598,12 @@ struct HostCopy<'m, M: carrick_guest_mem::CurrentMmMemory> {
 impl<M: carrick_guest_mem::CurrentMmMemory> UserCopy for HostCopy<'_, M> {
     fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool {
         if !self.memory.guest_range_is_writable(dst_va, src.len()) {
+            carrick_observability::probes::guest_internal_write_fault(
+                dst_va,
+                src.len() as u64,
+                9,
+                "IPC handback destination leaf validation refused",
+            );
             return false;
         }
         self.pending.push((dst_va, src.to_vec()));
@@ -440,7 +647,15 @@ impl<M: carrick_guest_mem::CurrentMmMemory> HostCopy<'_, M> {
     fn land(&mut self) -> bool {
         let mut landed = true;
         for (va, bytes) in self.pending.drain(..) {
-            landed &= self.memory.write_bytes(va, &bytes).is_ok();
+            if let Err(error) = self.memory.write_bytes(va, &bytes) {
+                carrick_observability::probes::guest_internal_write_fault(
+                    va,
+                    bytes.len() as u64,
+                    10,
+                    &format!("IPC handback destination copyout refused: {error}"),
+                );
+                landed = false;
+            }
         }
         landed
     }
@@ -462,7 +677,7 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
     memory: &mut M,
     signal: Option<IpcCause>,
     wake: &impl IpcHostServices,
-) -> Result<IpcHostOutcome, IpcError> {
+) -> Result<IpcHostOutcome, IpcCompletionError> {
     wake.validate_region(region)?;
     let mut op = region.operation(&token)?;
     match op.handback {
@@ -482,14 +697,14 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
             });
         }
         IpcHandback::Continue => {}
-        IpcHandback::None => return Err(IpcError::Corrupt),
+        IpcHandback::None => return Err(IpcError::Corrupt.into()),
     }
     if op.mm != mm {
         // A stale or foreign address space never receives these bytes.
-        return Err(IpcError::Stale);
+        return Err(IpcError::Stale.into());
     }
     if let Some(cause) = signal {
-        return interrupt(region, token, cause, wake);
+        return Ok(interrupt(region, token, cause, wake)?);
     }
     if op.kind == IpcOpKind::EpollWait {
         // A parked zone epoll wait owns no progress: the host runs the
@@ -509,27 +724,39 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
         op.pin = pin.into_raw();
         flags.map_err(IpcError::Fd)?
     };
-    let mut user = HostCopy {
-        memory,
-        prefetch_va: 0,
-        prefetch: Vec::new(),
-        pending: Vec::new(),
+    let (status, landed) = if memory.user_memory_venue()
+        == carrick_guest_mem::UserMemoryVenue::Owner
+        && matches!(op.kind, IpcOpKind::PipeRead | IpcOpKind::EventFdRead)
+    {
+        match transfer_owner_read(region, &token, object, &mut op, memory, wake)? {
+            Ok(status) => (status, true),
+            Err(dependency) => return Err(IpcCompletionError::Memory { token, dependency }),
+        }
+    } else {
+        let mut user = HostCopy {
+            memory,
+            prefetch_va: 0,
+            prefetch: Vec::new(),
+            pending: Vec::new(),
+        };
+        if op.kind == IpcOpKind::PipeWrite {
+            let va = op.buf.0.wrapping_add(op.progress.written);
+            user.prefetch(va, (op.progress.remaining() as u64).min(HOST_STEP_BYTES));
+        }
+        let (status, published) = {
+            let mut guard = region.lock(object, &HostIpcWait)?;
+            let mut copy = PrefixCopy::new(&mut user);
+            let (status, wake_set) = transfer(&mut guard, &mut op, &mut copy)?;
+            (status, guard.publish(wake_set))
+        };
+        let landed = user.land();
+        region.update_operation(&token, op)?;
+        if published.readers || published.writers {
+            wake.wake(published);
+        }
+        (status, landed)
     };
-    if op.kind == IpcOpKind::PipeWrite {
-        let va = op.buf.0.wrapping_add(op.progress.written);
-        user.prefetch(va, (op.progress.remaining() as u64).min(HOST_STEP_BYTES));
-    }
-    let (status, published) = {
-        let mut guard = region.lock(object, &HostIpcWait)?;
-        let mut copy = PrefixCopy::new(&mut user);
-        let (status, wake_set) = transfer(&mut guard, &mut op, &mut copy)?;
-        (status, guard.publish(wake_set))
-    };
-    let landed = user.land();
     region.update_operation(&token, op)?;
-    if published.readers || published.writers {
-        wake.wake(published);
-    }
     let written = op.progress.written as i64;
     let outcome = |result: i64| IpcHostOutcome::Complete {
         result,

@@ -2729,6 +2729,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         va: u64,
         len: usize,
         intent: FrameCowWriteIntent,
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
     ) -> Result<(), MemoryError> {
         self.ensure_sparse_mmap_backing(va, len)?;
         let slot = self.mailbox_slot();
@@ -2746,7 +2747,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             suspended_el1_sp: self.suspended_el1_sp,
             required_invalidation: None,
         };
-        vm.ensure_frame_cow_write(va, len, intent, &mut flush)
+        vm.ensure_frame_cow_write(va, len, intent, admission, &mut flush)
             .map_err(|error| MemoryError::HostMap(format!("HVPatch frame COW: {error}")))
     }
 
@@ -3106,6 +3107,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         address: u64,
         offset: usize,
         total_len: usize,
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
     ) -> Result<(u64, Gpa, usize), MemoryError> {
         let offset_u64 = u64::try_from(offset).map_err(|_| MemoryError::OutOfBounds {
             address,
@@ -3119,12 +3121,24 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             })?;
         let page_left = (0x1000 - (va & 0xfff)) as usize;
         let len = (total_len - offset).min(page_left);
-        let ipa = self
-            .syscall_buffer_ipa(GuestVa(va), len)
-            .ok_or(MemoryError::OutOfBounds {
-                address,
-                length: total_len,
-            })?;
+        let ipa = match admission {
+            Some(admission)
+                if self.protections.owner() == Some(admission.owner())
+                    && admission.owner().mm().raw() == self.mm_generation
+                    && admission.contains(GuestVa(va), len) =>
+            {
+                self.page_tables
+                    .with_manager(|manager| manager.translate(va))
+                    .flatten()
+                    .map(Gpa)
+            }
+            Some(_) => None,
+            None => self.syscall_buffer_ipa(GuestVa(va), len),
+        }
+        .ok_or(MemoryError::OutOfBounds {
+            address,
+            length: total_len,
+        })?;
         Ok((va, ipa, len))
     }
 }
@@ -3315,6 +3329,62 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             carrick_el1_abi::PortalTransferIntent::UserRead,
         )
     }
+
+    fn write_owner_identity(
+        &self,
+        word: carrick_el1_abi::CarrickIdentityWrite,
+    ) -> Result<(), MemoryError> {
+        let handle = self.protections.owner().ok_or(MemoryError::Unsupported)?;
+        if handle.mm().raw() != self.mm_generation {
+            return Err(MemoryError::HostMap(
+                "identity stamp MM incarnation mismatch".into(),
+            ));
+        }
+        let ttbr0 = self
+            .transfer_service_loan()
+            .and_then(|loan| loan.target_ttbr0())
+            .map_err(|error| MemoryError::HostMap(error.to_string()))?;
+        let custody = self
+            .vm
+            .owner_transfer_custody()
+            .ok_or(MemoryError::Unsupported)?;
+        let region = carrick_el1_abi::get_el1_region_host_ptr();
+        if region == 0 {
+            return Err(MemoryError::Unsupported);
+        }
+        // SAFETY: the live engine retains the complete carrier ABI region.
+        let slots = unsafe {
+            &*((region + carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+                as *const carrick_el1_abi::MmPortalSlots)
+        };
+        let target = crate::user_transfer::TransferTarget::from_handle(handle, ttbr0);
+        let mut transfer = crate::user_transfer::OwnedUserTransfer::new(
+            target,
+            crate::user_transfer::UserTransfer::IdentityWrite(word),
+        )
+        .ok_or(MemoryError::Unsupported)?;
+        // A complete manifest word fits one leaf and requires exactly one
+        // selected transfer. Never turn missing control backing into supply
+        // or retry a partial/parked publication during child bootstrap.
+        use crate::user_transfer::TransferProgress;
+        match transfer
+            .advance(self, custody.as_ref(), slots)
+            .map_err(|error| MemoryError::HostMap(error.to_string()))?
+        {
+            TransferProgress::Complete => Ok(()),
+            TransferProgress::Retired(owner) => Err(MemoryError::OwnerRetired(owner)),
+            TransferProgress::Physical(wait) => Err(MemoryError::Physical(wait)),
+            TransferProgress::OwnerWait(wait) => Err(MemoryError::OwnerWait(wait)),
+            TransferProgress::Refused(errno) => Err(MemoryError::HostMap(format!(
+                "identity stamp refused: {errno:?}"
+            ))),
+            TransferProgress::Supply(_)
+            | TransferProgress::Suspended
+            | TransferProgress::Advanced => Err(MemoryError::HostMap(
+                "identity word publication did not complete".into(),
+            )),
+        }
+    }
     fn read_owner_bytes_with_intent(
         &self,
         address: u64,
@@ -3476,24 +3546,100 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         }
     }
     fn write_owner_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
-        let range = carrick_guest_mem::GuestWriteRange::new(GuestVa(address), bytes.len()).ok_or(
+        carrick_guest_mem::GuestWriteRange::new(GuestVa(address), bytes.len()).ok_or(
             MemoryError::OutOfBounds {
                 address,
                 length: bytes.len(),
             },
         )?;
-        let prepared = self.prepare_write(&[range]).map_err(|error| match error {
-            carrick_guest_mem::MemoryPrepareError::Limit(limit) => MemoryError::HostMap(format!(
-                "write requires bounded prepare before consumption: {limit:?}"
-            )),
-            carrick_guest_mem::MemoryPrepareError::Fault(error) => error,
-            carrick_guest_mem::MemoryPrepareError::Physical(wait) => MemoryError::Physical(wait),
-            carrick_guest_mem::MemoryPrepareError::OwnerWait(wait) => MemoryError::OwnerWait(wait),
-            carrick_guest_mem::MemoryPrepareError::Supply(supply) => {
-                MemoryError::Supply(Box::new(supply))
+        // The source bytes already exist in host memory. Prepare and commit one
+        // page at a time: the EL1 portal deliberately bounds a permit to one
+        // transfer chunk, while getdents64 and other completed outputs may be
+        // much larger than that permit.
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let va = address + offset as u64;
+            let len = (bytes.len() - offset).min(4096 - (va as usize & 4095));
+            let range = carrick_guest_mem::GuestWriteRange::new(GuestVa(va), len).ok_or(
+                MemoryError::OutOfBounds {
+                    address,
+                    length: bytes.len(),
+                },
+            )?;
+            let prepared = self.prepare_write(&[range]).map_err(|error| match error {
+                carrick_guest_mem::MemoryPrepareError::Limit(limit) => MemoryError::HostMap(
+                    format!("write requires bounded prepare before consumption: {limit:?}"),
+                ),
+                carrick_guest_mem::MemoryPrepareError::Fault(error) => error,
+                carrick_guest_mem::MemoryPrepareError::Retired(handle) => {
+                    MemoryError::OwnerRetired(handle)
+                }
+                carrick_guest_mem::MemoryPrepareError::Physical(wait) => {
+                    MemoryError::Physical(wait)
+                }
+                carrick_guest_mem::MemoryPrepareError::OwnerWait(wait) => {
+                    MemoryError::OwnerWait(wait)
+                }
+                carrick_guest_mem::MemoryPrepareError::Supply(supply) => {
+                    MemoryError::Supply(Box::new(supply))
+                }
+            })?;
+            prepared.commit(&[&bytes[offset..offset + len]]);
+            offset += len;
+        }
+        Ok(())
+    }
+
+    /// Copy Carrick-owned bytes through already-published stage-1 backing.
+    /// The caller separately proves either legacy backing authority or an
+    /// exact host reservation that excludes guest execution for the range.
+    fn write_existing_backing_unchecked(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
+    ) -> Result<(), MemoryError> {
+        let length = bytes.len();
+        let mut copied = 0usize;
+        while copied < length {
+            let report_fault = |phase, error: MemoryError| {
+                carrick_observability::probes::guest_internal_write_fault(
+                    address,
+                    length as u64,
+                    phase,
+                    &error.to_string(),
+                );
+                error
+            };
+            let (va, _, chunk_len) = self
+                .syscall_buffer_chunk(address, copied, length, admission)
+                .map_err(|error| report_fault(0, error))?;
+            self.ensure_frame_cow_write(
+                va,
+                chunk_len,
+                FrameCowWriteIntent::PrivilegedInternal,
+                admission,
+            )
+            .map_err(|error| report_fault(1, error))?;
+            // COW may have replaced the output; authenticate the new translation.
+            let (_, ipa, after_len) =
+                self.syscall_buffer_chunk(address, copied, length, admission)?;
+            if after_len < chunk_len {
+                return Err(MemoryError::OutOfBounds {
+                    address: va,
+                    length: chunk_len,
+                });
             }
-        })?;
-        prepared.commit(&[bytes]);
+            self.vm
+                .translated_write_unchecked(
+                    va,
+                    ipa.raw(),
+                    &bytes[copied..copied + chunk_len],
+                    admission,
+                )
+                .map_err(|error| report_fault(2, error))?;
+            copied += chunk_len;
+        }
         Ok(())
     }
 
@@ -3596,6 +3742,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 );
                 Err(MemoryPrepareError::Fault(error))
             }
+            Err(MemoryPrepareError::Retired(handle)) => Err(MemoryPrepareError::Retired(handle)),
             Err(MemoryPrepareError::Limit(limit)) => {
                 carrick_observability::probes::hvpatch_el1_host_write_prepare(
                     address, length, 7, 0,
@@ -3607,6 +3754,21 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
 }
 
 impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
+    fn write_carrick_identity(
+        &mut self,
+        base: carrick_el1_abi::IdentityControlBase,
+        word: carrick_el1_abi::CarrickIdentityWrite,
+    ) -> Result<(), MemoryError> {
+        if base.raw() != carrick_el1_abi::CARRICK_IDENTITY_PAGE_BASE {
+            return Err(MemoryError::Unsupported);
+        }
+        if self.protections.owner().is_some() {
+            self.write_owner_identity(word)
+        } else {
+            self.write_bytes(word.address(base), &word.bytes()[..word.len()])
+        }
+    }
+
     fn supply_memory(
         &self,
         request: carrick_guest_mem::MemorySupplyRequest,
@@ -3741,18 +3903,19 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         let mut out = vec![0u8; length];
         let mut copied = 0usize;
         while copied < length {
-            let (va, ipa, chunk_len) = match self.syscall_buffer_chunk(address, copied, length) {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    // `out` is already zero.
-                    let Some(zero) = self.fresh_zero_chunk(address, copied, length) else {
-                        self.trace_read_fault(address.wrapping_add(copied as u64), length, 1);
-                        return Err(error);
-                    };
-                    copied += zero;
-                    continue;
-                }
-            };
+            let (va, ipa, chunk_len) =
+                match self.syscall_buffer_chunk(address, copied, length, None) {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        // `out` is already zero.
+                        let Some(zero) = self.fresh_zero_chunk(address, copied, length) else {
+                            self.trace_read_fault(address.wrapping_add(copied as u64), length, 1);
+                            return Err(error);
+                        };
+                        copied += zero;
+                        continue;
+                    }
+                };
             let bytes = match self.vm.translated_read(va, ipa.raw(), chunk_len) {
                 Ok(bytes) => bytes,
                 Err(error) => {
@@ -3802,18 +3965,19 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         }
         let mut copied = 0usize;
         while copied < length {
-            let (va, ipa, chunk_len) = match self.syscall_buffer_chunk(address, copied, length) {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    let Some(zero) = self.fresh_zero_chunk(address, copied, length) else {
-                        self.trace_read_fault(address.wrapping_add(copied as u64), length, 1);
-                        return Err(error);
-                    };
-                    dst[copied..copied + zero].fill(0);
-                    copied += zero;
-                    continue;
-                }
-            };
+            let (va, ipa, chunk_len) =
+                match self.syscall_buffer_chunk(address, copied, length, None) {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        let Some(zero) = self.fresh_zero_chunk(address, copied, length) else {
+                            self.trace_read_fault(address.wrapping_add(copied as u64), length, 1);
+                            return Err(error);
+                        };
+                        dst[copied..copied + zero].fill(0);
+                        copied += zero;
+                        continue;
+                    }
+                };
             if let Err(error) =
                 self.vm
                     .translated_read_into(va, ipa.raw(), &mut dst[copied..copied + chunk_len])
@@ -3909,9 +4073,9 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         let mut copied = 0usize;
         while copied < length {
             let (va, ipa, chunk_len) = self
-                .syscall_buffer_chunk(address, copied, length)
+                .syscall_buffer_chunk(address, copied, length, None)
                 .map_err(|error| report_fault(10, error))?;
-            self.ensure_frame_cow_write(va, chunk_len, FrameCowWriteIntent::GuestVisible)
+            self.ensure_frame_cow_write(va, chunk_len, FrameCowWriteIntent::GuestVisible, None)
                 .map_err(|error| report_fault(11, error))?;
             self.vm
                 .translated_write(va, ipa.raw(), &bytes[copied..copied + chunk_len])
@@ -3931,29 +4095,22 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // default `write_bytes_unchecked` doesn't gate either). The translated IPA
         // resolves a `repoint_private` overlay to the private backing.
         self.commit_prepared_host_write(address, bytes.len(), false)?;
-        let length = bytes.len();
-        let mut copied = 0usize;
-        while copied < length {
-            let report_fault = |phase, error: MemoryError| {
-                carrick_observability::probes::guest_internal_write_fault(
-                    address,
-                    length as u64,
-                    phase,
-                    &error.to_string(),
-                );
-                error
-            };
-            let (va, ipa, chunk_len) = self
-                .syscall_buffer_chunk(address, copied, length)
-                .map_err(|error| report_fault(0, error))?;
-            self.ensure_frame_cow_write(va, chunk_len, FrameCowWriteIntent::PrivilegedInternal)
-                .map_err(|error| report_fault(1, error))?;
-            self.vm
-                .translated_write_unchecked(va, ipa.raw(), &bytes[copied..copied + chunk_len])
-                .map_err(|error| report_fault(2, error))?;
-            copied += chunk_len;
+        self.write_existing_backing_unchecked(address, bytes, None)
+    }
+
+    fn write_owner_reserved_bytes(
+        &mut self,
+        admission: &carrick_guest_mem::OwnerReservedWrite<'_>,
+        address: u64,
+        bytes: &[u8],
+    ) -> Result<(), MemoryError> {
+        if self.protections.owner() != Some(admission.owner())
+            || admission.owner().mm().raw() != self.mm_generation
+            || !admission.contains(GuestVa(address), bytes.len())
+        {
+            return Err(MemoryError::Unsupported);
         }
-        Ok(())
+        self.write_existing_backing_unchecked(address, bytes, Some(admission))
     }
 
     fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
@@ -3961,6 +4118,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             return false;
         };
         let mut cursor = address;
+        let owner_selected = self.protections.owner().is_some();
         while cursor < end {
             let len = (end - cursor).min(4096 - (cursor & 4095)) as usize;
             let live = self
@@ -3969,11 +4127,25 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             if !prevalidate_host_write_page(
                 live,
                 || {
-                    self.vm.guest_range_is_writable(cursor, len)
-                        && !self
-                            .vm
-                            .protections()
-                            .is_some_and(|p| p.range_write_denied(cursor, len))
+                    if owner_selected {
+                        // The legacy host range registry deliberately refuses
+                        // an admitted owner. Its prepared write already
+                        // authenticated the source; retain the live stage-1
+                        // permission ceiling for this follow-up check.
+                        live.is_some_and(|leaf| {
+                            !carrick_mmu_core::aarch64::terminal_descriptor_is_absent(leaf)
+                                && carrick_mmu_core::aarch64::terminal_descriptor_permits_host_buffer(
+                                    leaf,
+                                    carrick_mmu_core::aarch64::LeafAccess::Write,
+                                )
+                        })
+                    } else {
+                        self.vm.guest_range_is_writable(cursor, len)
+                            && !self
+                                .vm
+                                .protections()
+                                .is_some_and(|p| p.range_write_denied(cursor, len))
+                    }
                 },
                 || {
                     self.vm.frame_cow_authority().is_some_and(|authority| {
@@ -4000,6 +4172,38 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     }
 
     fn prepare_host_write(&mut self, address: u64, length: usize) -> Result<(), MemoryError> {
+        if self.protections.owner().is_some() {
+            carrick_guest_mem::GuestWriteRange::new(GuestVa(address), length)
+                .ok_or(MemoryError::OutOfBounds { address, length })?;
+            let mut offset = 0;
+            while offset < length {
+                let va = address + offset as u64;
+                let len = (length - offset).min(4096 - (va as usize & 4095));
+                let range = carrick_guest_mem::GuestWriteRange::new(GuestVa(va), len)
+                    .ok_or(MemoryError::OutOfBounds { address, length })?;
+                let prepared = self.prepare_write(&[range]).map_err(|error| match error {
+                    carrick_guest_mem::MemoryPrepareError::Limit(limit) => MemoryError::HostMap(
+                        format!("write requires bounded prepare before consumption: {limit:?}"),
+                    ),
+                    carrick_guest_mem::MemoryPrepareError::Fault(error) => error,
+                    carrick_guest_mem::MemoryPrepareError::Retired(handle) => {
+                        MemoryError::OwnerRetired(handle)
+                    }
+                    carrick_guest_mem::MemoryPrepareError::Physical(wait) => {
+                        MemoryError::Physical(wait)
+                    }
+                    carrick_guest_mem::MemoryPrepareError::OwnerWait(wait) => {
+                        MemoryError::OwnerWait(wait)
+                    }
+                    carrick_guest_mem::MemoryPrepareError::Supply(supply) => {
+                        MemoryError::Supply(Box::new(supply))
+                    }
+                })?;
+                drop(prepared);
+                offset += len;
+            }
+            return Ok(());
+        }
         self.commit_prepared_host_write(address, length, false)
     }
 
@@ -4018,7 +4222,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
 
     fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {
         self.commit_prepared_host_write(address, len, true).ok()?;
-        self.ensure_frame_cow_write(address, len, FrameCowWriteIntent::GuestVisible)
+        self.ensure_frame_cow_write(address, len, FrameCowWriteIntent::GuestVisible, None)
             .ok()?;
         self.vm.host_ptr_for_write(address, len)
     }
@@ -4126,7 +4330,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             // ordinary user-copy authority cannot replace it.
             return Err(MemoryError::Unsupported);
         }
-        self.ensure_frame_cow_write(address, len, FrameCowWriteIntent::BackingMaintenance)?;
+        self.ensure_frame_cow_write(address, len, FrameCowWriteIntent::BackingMaintenance, None)?;
         self.vm.zero_backing(address, len)
     }
 
@@ -4286,6 +4490,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         host_fd: std::os::fd::BorrowedFd<'_>,
         offset: u64,
         source: carrick_guest_mem::PrivateFileSource,
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
     ) -> Result<bool, MemoryError> {
         let eligible_range = self.process_asid.is_some()
             && self.vm.sparse_mmap_arena_enabled()
@@ -4315,8 +4520,15 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             suspended_el1_sp: self.suspended_el1_sp,
             required_invalidation: None,
         };
-        vm.materialize_private_file_backing(va, len, host_fd, offset, source, &mut flush)
-            .map_err(|error| MemoryError::HostMap(format!("HVPatch private file backing: {error}")))
+        vm.materialize_private_file_backing(
+            va,
+            len,
+            host_fd,
+            offset,
+            carrick_guest_mem::PrivateFilePublication { source, admission },
+            &mut flush,
+        )
+        .map_err(|error| MemoryError::HostMap(format!("HVPatch private file backing: {error}")))
     }
 
     fn defer_private_file_backed(
@@ -4995,6 +5207,17 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         self.vcpu.get_mut().prepare_register_resume()
     }
 
+    fn resume_signal_frame(
+        &mut self,
+        pending: Box<carrick_hal::sigframe::PendingSignalFrame>,
+    ) -> Result<(), TrapError> {
+        let (signum, handler) = (pending.signum(), pending.handler());
+        let info = pending.publish(self)?;
+        carrick_observability::probes::signal_inject(signum, info.saved_pc, info.new_sp, handler);
+        self.last_fault_esr = 0;
+        self.vcpu.get_mut().prepare_register_resume()
+    }
+
     fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
         // fpsimd_enabled MUST match inject_signal. Returns the SAVED SIGMASK — not
         // saved_pc — mirroring the per-backend impls.
@@ -5334,11 +5557,11 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.bind_frame_cow(authority, identity);
     }
 
-    fn service_owner_file_fault(
+    fn service_owner_fault(
         &mut self,
         mm_key: u64,
         request_generation: u64,
-    ) -> Result<Option<carrick_hal::OwnerFileFaultOutcome>, TrapError> {
+    ) -> Result<Option<carrick_hal::OwnerFaultOutcome>, TrapError> {
         let Some(slot_index) = self.vcpu.get_mut().mailbox_slot() else {
             return Ok(None);
         };
@@ -5358,9 +5581,10 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let Some(window) = slot.fault_selection(mm_key, request_generation) else {
             return Ok(None);
         };
-        if mm_key != self.mm_generation || window.host_backing.is_none() {
+        if mm_key != self.mm_generation {
+            let _ = slot.cancel_fault_selection(window, request_generation);
             return Err(TrapError::Hypervisor(
-                "owner file fault selection names another MM or source".into(),
+                "owner fault selection names another MM".into(),
             ));
         }
         let ttbr0 = self.vcpu.get_mut().get_sys_reg(SysReg::Ttbr0)?;
@@ -5384,11 +5608,15 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 if !slot.cancel_fault_selection(window, request_generation) {
                     return Err(TrapError::Hypervisor("owner EOF selection is stale".into()));
                 }
-                return Ok(Some(carrick_hal::OwnerFileFaultOutcome::BusFault));
+                return Ok(Some(carrick_hal::OwnerFaultOutcome::BusFault));
             }
-            other => other?,
+            Err(err) => {
+                let _ = slot.cancel_fault_selection(window, request_generation);
+                return Err(err);
+            }
+            Ok(prep) => prep,
         };
-        let mut grant = match prepared {
+        let grant = match prepared {
             crate::user_transfer::TransferPreparation::Grant(grant) => grant,
             crate::user_transfer::TransferPreparation::PeerResident => {
                 carrick_observability::probes::hvpatch_el1_file_fault_handoff(
@@ -5398,10 +5626,10 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 );
                 if !slot.cancel_fault_selection(window, request_generation) {
                     return Err(TrapError::Hypervisor(
-                        "owner file fault cancellation is stale".into(),
+                        "owner fault cancellation is stale".into(),
                     ));
                 }
-                return Ok(Some(carrick_hal::OwnerFileFaultOutcome::Resolved));
+                return Ok(Some(carrick_hal::OwnerFaultOutcome::Resolved));
             }
             crate::user_transfer::TransferPreparation::Pending(wait) => {
                 if !slot.cancel_fault_selection(window, request_generation) {
@@ -5409,7 +5637,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                         "owner pending fault selection is stale".into(),
                     ));
                 }
-                return Ok(Some(carrick_hal::OwnerFileFaultOutcome::Pending(wait)));
+                return Ok(Some(carrick_hal::OwnerFaultOutcome::Pending(wait)));
             }
             crate::user_transfer::TransferPreparation::Declined => {
                 carrick_observability::probes::hvpatch_el1_file_fault_handoff(
@@ -5419,15 +5647,16 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 );
                 if !slot.cancel_fault_selection(window, request_generation) {
                     return Err(TrapError::Hypervisor(
-                        "owner file fault cancellation is stale".into(),
+                        "owner fault cancellation is stale".into(),
                     ));
                 }
-                return Ok(Some(carrick_hal::OwnerFileFaultOutcome::Refused));
+                return Ok(Some(carrick_hal::OwnerFaultOutcome::Refused));
             }
         };
         if !slot.submit(window, grant.transaction()) {
+            let _ = slot.cancel_fault_selection(window, request_generation);
             return Err(TrapError::Hypervisor(
-                "owner file fault grant selection was displaced".into(),
+                "owner fault grant selection was displaced".into(),
             ));
         }
         carrick_observability::probes::hvpatch_el1_file_fault_handoff(window.fault_page, 0, 6);
@@ -5438,36 +5667,19 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             },
             &mut || false,
         );
-        if let Some(receipt) = slot.take_receipt(window, grant.transaction()) {
-            let refusal = match receipt.outcome {
-                carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(reason)
-                | carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::RolledBack(
-                    reason,
-                ) => reason as u32,
-                _ => 0,
-            };
-            let settled = grant.settle(&receipt)?;
-            carrick_observability::probes::hvpatch_el1_file_fault_handoff(
-                window.fault_page,
-                refusal,
-                if settled { 10 } else { 7 },
-            );
-            outcome?;
-            Ok(Some(if settled {
-                carrick_hal::OwnerFileFaultOutcome::Resolved
-            } else {
-                carrick_hal::OwnerFileFaultOutcome::Refused
-            }))
-        } else if slot.withdraw(window, grant.transaction()) {
-            carrick_observability::probes::hvpatch_el1_file_fault_handoff(window.fault_page, 0, 8);
-            outcome?;
-            Ok(Some(carrick_hal::OwnerFileFaultOutcome::Refused))
-        } else {
-            carrick_fatal::carrick_fatal!(
-                "aarch64::user_transfer",
-                "unsettled owner file fault retains physical custody"
-            );
-        }
+        let completed = finish_owner_fault_supply(grant, slot, window, target, outcome)?;
+        Ok(Some(match completed {
+            crate::user_transfer::SupplyProgress::Ready => carrick_hal::OwnerFaultOutcome::Resolved,
+            crate::user_transfer::SupplyProgress::Physical(wait) => {
+                carrick_hal::OwnerFaultOutcome::Pending(wait)
+            }
+            crate::user_transfer::SupplyProgress::Declined => {
+                carrick_hal::OwnerFaultOutcome::Refused
+            }
+            crate::user_transfer::SupplyProgress::OwnerWait(wait) => {
+                carrick_hal::OwnerFaultOutcome::OwnerWait(wait)
+            }
+        }))
     }
 
     fn prepare_el1_frame_grant(
@@ -8676,6 +8888,29 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     return Ok(transfer.into_bytes());
                 }
                 crate::user_transfer::TransferProgress::Advanced => {}
+                crate::user_transfer::TransferProgress::Supply(
+                    request @ carrick_guest_mem::MemorySupplyRequest::Cow(_),
+                ) => {
+                    // SELECT released its service loan and editor before
+                    // requesting physical stock. Supply the exact target,
+                    // then resume this cursor, including any copied prefix.
+                    // Child SETTID after FINISH is an ordinary owner write;
+                    // it must not invent another pending-fork capability.
+                    if !matches!(
+                        crate::user_transfer::supply(
+                            self,
+                            custody.as_ref(),
+                            slots,
+                            target,
+                            request,
+                        )?,
+                        crate::user_transfer::SupplyProgress::Ready
+                    ) {
+                        return Err(TrapError::Hypervisor(
+                            "owner parent COW supply refused".into(),
+                        ));
+                    }
+                }
                 crate::user_transfer::TransferProgress::Suspended
                 | crate::user_transfer::TransferProgress::OwnerWait(_)
                 | crate::user_transfer::TransferProgress::Retired(_)
@@ -8807,7 +9042,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 pending.completion(),
                 pending.selected(),
             )?;
-            let root = request.child_ttbr0 & 0x0000_ffff_ffff_f000;
             let layout = self
                 .page_tables
                 .with_manager(PageTableManager::layout)
@@ -8817,29 +9051,14 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             let resolver = physical.child_resolver();
             // SAFETY: physical preparation retains every table arena selected
             // by the owner; the resolver owns those exact allocations.
-            let manager = unsafe {
-                PageTableManager::new_live(
-                    root,
+            let authority = unsafe {
+                crate::fork::observe_owner_fork_tables(
+                    pending.completion(),
                     layout,
-                    fork.child_tables.len as usize,
-                    Arc::clone(&resolver),
+                    resolver,
+                    request.table_arena_source.take(),
                 )
-            }
-            .map_err(|error| {
-                TrapError::Hypervisor(format!("observe owner child tables: {error:?}"))
-            })?;
-            let authority = Stage1Authority::new_with_manager(Some(manager));
-            unsafe {
-                authority.bind_live_backing(resolver);
-            }
-            authority.select_guest_descriptor_owner().map_err(|error| {
-                TrapError::Hypervisor(format!("select owner child descriptor lane: {error:?}"))
-            })?;
-            if let Some(source) = request.table_arena_source.take() {
-                authority.install_source(source).map_err(|error| {
-                    TrapError::Hypervisor(format!("install owner child physical source: {error:?}"))
-                })?;
-            }
+            }?;
             let parent = self.vcpu.get_mut().snapshot()?;
             let mut snapshot = seed_sibling_snapshot(&parent, request.entry);
             snapshot.ttbr0 = request.child_ttbr0;
@@ -8906,6 +9125,45 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         effect: &mut dyn FnMut() -> bool,
     ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
         self.transfer_service_loan()?.run_user(frame, effect)
+    }
+}
+
+pub(crate) fn finish_owner_fault_supply(
+    mut grant: Box<dyn crate::user_transfer::TransferGrant>,
+    slot: &carrick_el1_abi::PortalGrantSlot,
+    window: carrick_el1_abi::PortalGrantWindow,
+    target: crate::user_transfer::TransferTarget,
+    outcome: Result<carrick_el1_abi::TrapFrame, TrapError>,
+) -> Result<crate::user_transfer::SupplyProgress, TrapError> {
+    use crate::user_transfer::SupplyProgress;
+    if let Some(receipt) = slot.take_receipt(window, grant.transaction()) {
+        let refusal = match receipt.outcome {
+            carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(reason)
+            | carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::RolledBack(reason) => {
+                reason as u32
+            }
+            _ => 0,
+        };
+        let settled = grant.settle(&receipt)?;
+        carrick_observability::probes::hvpatch_el1_file_fault_handoff(
+            window.fault_page,
+            refusal,
+            if settled { 10 } else { 7 },
+        );
+        outcome?;
+        Ok(if settled {
+            SupplyProgress::Ready
+        } else {
+            SupplyProgress::Declined
+        })
+    } else if slot.withdraw(window, grant.transaction()) {
+        carrick_observability::probes::hvpatch_el1_file_fault_handoff(window.fault_page, 0, 8);
+        crate::user_transfer::finish_unclaimed_supply(grant, target, outcome)
+    } else {
+        carrick_fatal::carrick_fatal!(
+            "aarch64::user_transfer",
+            "unsettled owner fault retains physical custody"
+        );
     }
 }
 

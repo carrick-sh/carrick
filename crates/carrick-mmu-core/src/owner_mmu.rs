@@ -8,6 +8,7 @@ use carrick_guest_arch::{FrameGpa, RootGpa, UserVa};
 pub struct OwnerTranslation {
     pub output: FrameGpa,
     pub executable: bool,
+    pub kernel_writable_nonexecutable: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwnerMmuRefusal {
@@ -61,6 +62,10 @@ pub trait OwnerForkMmu: OwnerMmu {
     fn control_needs_copy(va: UserVa, word: u64) -> bool;
     fn split(word: u64, level: usize, index: usize) -> Result<u64, OwnerMmuRefusal>;
     fn arm_private(word: u64, level: usize, va: UserVa) -> Result<u64, OwnerMmuRefusal>;
+    /// Arm an explicitly private synthetic leaf even when its EL0 mapping is read-only.
+    fn arm_synthetic_private(word: u64, level: usize, va: UserVa) -> Result<u64, OwnerMmuRefusal> {
+        Self::arm_private(word, level, va)
+    }
     fn needs_break_before_make(before: u64, after: u64, level: usize) -> bool;
 }
 
@@ -100,6 +105,8 @@ impl OwnerMmu for Aarch64Mmu {
                 return Ok(Some(OwnerTranslation {
                     output: FrameGpa::new((descriptor & PA & !mask) + (va.raw() & mask)),
                     executable: terminal_descriptor_permits_el0(descriptor, LeafAccess::Execute),
+                    kernel_writable_nonexecutable: descriptor & (3 << 6) == 0
+                        && descriptor & (1 << 54) != 0,
                 }));
             }
             table = descriptor & PA;
