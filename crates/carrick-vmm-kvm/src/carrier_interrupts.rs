@@ -115,11 +115,12 @@ pub struct ProgressObservation {
 /// One vCPU executes both contexts; no host scheduling or helper can make
 /// the second task progress. Both roots map the same data VA to private GPAs.
 pub fn witness(
+    frame_inventory: std::sync::Arc<dyn carrick_hal::PhysicalFrameInventory>,
     image: &Path,
     programs: [&[u8]; 2],
     boundary: KickBoundary,
 ) -> Result<ProgressObservation, TrapError> {
-    let mut carrier = Cpl0Carrier::boot_inner(image, programs, true)?;
+    let mut carrier = Cpl0Carrier::boot_inner(frame_inventory, image, programs, true)?;
     let ram = &carrier.custody.ram;
     if size_of::<ZoneTables<ParkedContextWords>>() > (PROGRESS_STATE - PROGRESS_ZONE) as usize
         || size_of::<ProgressState>() > (SECOND_ROOT - 0x170_0000) as usize

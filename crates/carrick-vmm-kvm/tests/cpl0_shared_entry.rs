@@ -3,6 +3,10 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::expect_used)]
 
+#[path = "common/physical_inventory.rs"]
+mod physical_inventory;
+use physical_inventory::physical_inventory;
+
 use carrick_mem::x86_initial_image::prepare_static_x86_elf;
 use carrick_vmm_kvm::cpl0_boot::{
     Cpl0Carrier, InitialProcessExit, InitialReservationLimits, InitialSyscallDisposition,
@@ -54,7 +58,8 @@ fn production_sigprocmask_uses_shared_lifecycle_family() {
     let image = prepare_static_x86_elf(&elf).expect("static x86 ELF");
     let extent =
         Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("bounded initial extent");
-    let mut carrier = Cpl0Carrier::boot_production(extent).expect("production KVM image");
+    let mut carrier =
+        Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM image");
     carrier
         .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
         .expect("initial guest MM");
@@ -102,7 +107,8 @@ fn production_cpl0_refuses_non_allowlisted_forwards_with_enosys() {
     let image = prepare_static_x86_elf(&elf).expect("static x86 ELF");
     let extent =
         Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("bounded initial extent");
-    let mut carrier = Cpl0Carrier::boot_production(extent).expect("production KVM image");
+    let mut carrier =
+        Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM image");
     carrier
         .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
         .expect("initial guest MM");

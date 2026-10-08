@@ -461,8 +461,8 @@ fn inherited_inventory_edges_authorize_only_selected_child_pages() {
     };
     use carrick_kernel::kernel::frame_inventory::FrameInventoryAuthority;
     use carrick_kernel::kernel::{MmId, ObjectIdRegistry};
-    let authority = FrameInventoryAuthority::new();
-    let ids = ObjectIdRegistry::new();
+    let authority = Arc::new(FrameInventoryAuthority::new());
+    let ids = Arc::new(ObjectIdRegistry::new());
     let parent_mm = ids.mm_id().unwrap();
     let child_mm = ids.mm_id().unwrap();
     let inventory_row = |mm: MmId, inherited: Option<FrameId>, gpa: u64| {
@@ -608,7 +608,11 @@ fn inherited_inventory_edges_authorize_only_selected_child_pages() {
         shared: false,
     };
     let edge = memory
-        .select_inherited_frames(contexts[0], selection, &authority)
+        .select_inherited_frames(
+            contexts[0],
+            selection,
+            &*authority.physical_projection(Arc::clone(&ids)),
+        )
         .unwrap()
         .remove(0);
     assert!(
@@ -621,7 +625,13 @@ fn inherited_inventory_edges_authorize_only_selected_child_pages() {
     );
     assert!(
         memory
-            .attach_inherited_frame(contexts[1], &edge, first, &child_receipt, &authority)
+            .attach_inherited_frame(
+                contexts[1],
+                &edge,
+                first,
+                &child_receipt,
+                &*authority.physical_projection(Arc::clone(&ids))
+            )
             .is_err()
     );
     let changed_parent = AddressContext {
@@ -636,7 +646,7 @@ fn inherited_inventory_edges_authorize_only_selected_child_pages() {
                 &edge,
                 child_identity,
                 &child_receipt,
-                &authority
+                &*authority.physical_projection(Arc::clone(&ids))
             )
             .is_err()
     );
@@ -648,7 +658,7 @@ fn inherited_inventory_edges_authorize_only_selected_child_pages() {
                 &edge,
                 child_identity,
                 &child_receipt,
-                &authority
+                &*authority.physical_projection(Arc::clone(&ids))
             )
             .is_err(),
         "private inheritance must reject writable parent and child aliases"
@@ -663,7 +673,7 @@ fn inherited_inventory_edges_authorize_only_selected_child_pages() {
                 len: PAGE,
                 shared: true,
             },
-            &authority,
+            &*authority.physical_projection(Arc::clone(&ids)),
         )
         .unwrap()
         .remove(0);
@@ -673,7 +683,7 @@ fn inherited_inventory_edges_authorize_only_selected_child_pages() {
             &shared,
             child_identity,
             &child_receipt,
-            &authority,
+            &*authority.physical_projection(Arc::clone(&ids)),
         )
         .unwrap();
     memory.remove_aliases(
@@ -703,7 +713,7 @@ fn inherited_inventory_edges_authorize_only_selected_child_pages() {
                         &edge,
                         child_identity,
                         &child_receipt,
-                        &authority
+                        &*authority.physical_projection(Arc::clone(&ids))
                     )
                     .is_err(),
                 "one read-only leaf cannot license the other writable alias"
@@ -716,7 +726,7 @@ fn inherited_inventory_edges_authorize_only_selected_child_pages() {
             &edge,
             child_identity,
             &child_receipt,
-            &authority,
+            &*authority.physical_projection(Arc::clone(&ids)),
         )
         .unwrap();
     assert!(
@@ -778,7 +788,7 @@ fn inherited_inventory_edges_authorize_only_selected_child_pages() {
                 &edge,
                 child_identity,
                 &child_receipt,
-                &authority
+                &*authority.physical_projection(Arc::clone(&ids))
             )
             .is_err()
     );
@@ -788,7 +798,13 @@ fn inherited_inventory_edges_authorize_only_selected_child_pages() {
     };
     assert!(
         memory
-            .attach_inherited_frame(stale, &edge, child_identity, &child_receipt, &authority)
+            .attach_inherited_frame(
+                stale,
+                &edge,
+                child_identity,
+                &child_receipt,
+                &*authority.physical_projection(Arc::clone(&ids))
+            )
             .is_err()
     );
     let mut transition = authority
@@ -809,7 +825,11 @@ fn inherited_inventory_edges_authorize_only_selected_child_pages() {
     authority.apply(parent_mm, transition.commit(())).unwrap();
     assert!(
         memory
-            .select_inherited_frames(contexts[0], selection, &authority)
+            .select_inherited_frames(
+                contexts[0],
+                selection,
+                &*authority.physical_projection(Arc::clone(&ids))
+            )
             .is_err(),
         "unchanged frame, mapping and GPA cannot authenticate an old owner generation"
     );
@@ -881,8 +901,8 @@ fn inherited_compound_inventory_authenticates_only_exact_live_owner_pages() {
         FrameEventCapacity, FrameInventoryEvent, FrameLength, MappingGeneration, MemPerms,
     };
     use carrick_kernel::kernel::{FrameInventoryAuthority, ObjectIdRegistry};
-    let authority = FrameInventoryAuthority::new();
-    let ids = ObjectIdRegistry::new();
+    let authority = Arc::new(FrameInventoryAuthority::new());
+    let ids = Arc::new(ObjectIdRegistry::new());
     let mm = ids.mm_id().unwrap();
     let other_mm = ids.mm_id().unwrap();
     let mut reservation = authority
@@ -924,19 +944,19 @@ fn inherited_compound_inventory_authenticates_only_exact_live_owner_pages() {
         inventory_revision: nz(receipt.revision()),
     };
     assert!(inventory_page_live(
-        &authority,
+        &*authority.physical_projection(Arc::clone(&ids)),
         nz(mm.raw()),
         identity,
         FrameGpa::new(0x801000)
     ));
     assert!(!inventory_page_live(
-        &authority,
+        &*authority.physical_projection(Arc::clone(&ids)),
         nz(other_mm.raw()),
         identity,
         FrameGpa::new(0x801000)
     ));
     assert!(!inventory_page_live(
-        &authority,
+        &*authority.physical_projection(Arc::clone(&ids)),
         nz(mm.raw()),
         BackingIdentity {
             owner_generation: nz(2),
@@ -945,13 +965,13 @@ fn inherited_compound_inventory_authenticates_only_exact_live_owner_pages() {
         FrameGpa::new(0x801000)
     ));
     assert!(!inventory_page_live(
-        &authority,
+        &*authority.physical_projection(Arc::clone(&ids)),
         nz(mm.raw()),
         identity,
         FrameGpa::new(0x804000)
     ));
     assert!(!inventory_page_live(
-        &authority,
+        &*authority.physical_projection(Arc::clone(&ids)),
         nz(mm.raw()),
         identity,
         FrameGpa::new(0x801001)

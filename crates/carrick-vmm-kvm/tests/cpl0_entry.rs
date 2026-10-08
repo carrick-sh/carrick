@@ -8,6 +8,10 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::needless_range_loop)]
 
+#[path = "common/physical_inventory.rs"]
+mod physical_inventory;
+use physical_inventory::physical_inventory;
+
 use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
 use carrick_mmu_core::x86::descriptor_txn::Access;
 use carrick_sched_core::{ParkedContextWords, SlotId, ThreadIdentity, ZoneTables};
@@ -93,7 +97,8 @@ fn exercise_shared_kernel_user_access(smap: bool) {
     // Both live tasks use distinct stack pages and task-local fixup records.
     let (a, expected_a) = user_access_program(0);
     let (b, expected_b) = user_access_program(1);
-    let mut carrier = Cpl0Carrier::boot(&image(), [&a, &b]).expect("real KVM + shared CPL0 image");
+    let mut carrier = Cpl0Carrier::boot(physical_inventory(), &image(), [&a, &b])
+        .expect("real KVM + shared CPL0 image");
     if smap {
         carrier.enable_smap().expect("guest SMAP capability");
     }
@@ -130,7 +135,8 @@ fn user_access_walks_the_second_live_root() {
     program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
     let mut carrier =
-        Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("KVM image");
+        Cpl0Carrier::boot_lifecycle(physical_inventory(), &image(), [&program, &program])
+            .expect("KVM image");
     assert_eq!(carrier.observe(1).expect("second-root user read").result, 0);
 }
 
@@ -145,7 +151,7 @@ fn production_cpl0_boot_retains_separate_supervisor_and_initial_extents() {
         + 4095)
         & !4095;
     for initial_bytes in [0x20_000, 0x40_000, 0x80_000] {
-        let carrier = Cpl0Carrier::boot_production(initial_bytes)
+        let carrier = Cpl0Carrier::boot_production(physical_inventory(), initial_bytes)
             .expect("production image on one KVM carrier VM");
         // Bootstrap RAM, dynamic metadata, allocator, supervisor region,
         // and the exact requested initial MM extent each retain one slot.
@@ -169,7 +175,8 @@ fn production_cpl0_boot_retains_separate_supervisor_and_initial_extents() {
 
 #[test]
 fn production_cpl0_boot_requires_smep_and_smap_on_both_cpus() {
-    let carrier = Cpl0Carrier::boot_production(0x20_000).expect("production KVM boot");
+    let carrier =
+        Cpl0Carrier::boot_production(physical_inventory(), 0x20_000).expect("production KVM boot");
     for slot in 0..2 {
         let cr4 = carrier.supervisor_cr4(slot).expect("stopped CPU state");
         assert_eq!(cr4 & ((1 << 20) | (1 << 21)), (1 << 20) | (1 << 21));
@@ -184,8 +191,8 @@ fn cpl0_supervisor_stub_is_rx_while_tables_and_idt_are_rw_nx() {
         pml4_base: 0x60_0000,
     };
     for carrier in [
-        Cpl0Carrier::boot(&image(), [&[], &[]]).expect("fixture KVM boot"),
-        Cpl0Carrier::boot_production(0x20_000).expect("production KVM boot"),
+        Cpl0Carrier::boot(physical_inventory(), &image(), [&[], &[]]).expect("fixture KVM boot"),
+        Cpl0Carrier::boot_production(physical_inventory(), 0x20_000).expect("production KVM boot"),
     ] {
         let idt = carrick_x86::fault_idt_base(layout);
         let stub = carrick_x86::fault_stub_base(layout);
@@ -222,7 +229,8 @@ fn cpl0_forward_port_returns_host_result_through_shared_entry() {
     program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
     program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
-    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    let mut carrier =
+        Cpl0Carrier::boot(physical_inventory(), &image(), [&program, &program]).expect("KVM image");
     let result = carrier
         .observe_with_forward(0, |frame| {
             assert_eq!(frame.rax, 8);
@@ -240,7 +248,8 @@ fn cpl0_rechecks_host_modified_return_frame_before_iret() {
     let mut program = vec![0x48, 0xb8];
     program.extend_from_slice(&8_u64.to_le_bytes()); // forwarded lseek
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
-    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    let mut carrier =
+        Cpl0Carrier::boot(physical_inventory(), &image(), [&program, &program]).expect("KVM image");
     let failure = carrier
         .observe_with_forward(0, |frame| {
             frame.rcx = 0x8000_0000_0000_0000; // noncanonical user RIP
@@ -357,7 +366,8 @@ fn production_image_rejects_fixture_syscalls() {
         carrick_mem::x86_initial_image::prepare_static_x86_elf(&elf).expect("native probe image");
     let extent =
         Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("probe initial extent");
-    let mut carrier = Cpl0Carrier::boot_production(extent).expect("production KVM image");
+    let mut carrier =
+        Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM image");
     carrier
         .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
         .expect("actual initial MM");
@@ -387,7 +397,8 @@ fn production_interrupt_boot_serves_an_ordinary_syscall() {
     let elf = production_probe_elf(&probe);
     let plan = carrick_mem::x86_initial_image::prepare_static_x86_elf(&elf).expect("probe ELF");
     let extent = Cpl0Carrier::initial_extent_bytes_for(&plan, &[], &[]).expect("initial extent");
-    let mut carrier = Cpl0Carrier::boot_production(extent).expect("production KVM image");
+    let mut carrier =
+        Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM image");
     carrier
         .load_guest_mm(&plan, &[], &[], InitialReservationLimits::UNLIMITED)
         .expect("initial MM");
@@ -426,7 +437,8 @@ fn shared_kernel_mmu_reports_live_cr3_root() {
     program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
     program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
-    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    let mut carrier =
+        Cpl0Carrier::boot(physical_inventory(), &image(), [&program, &program]).expect("KVM image");
     for task in 0..2 {
         let observed = carrier
             .observe(task)
@@ -443,7 +455,8 @@ fn shared_kernel_allocator_serves_two_live_cpl0_tasks() {
     program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
     program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
-    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    let mut carrier =
+        Cpl0Carrier::boot(physical_inventory(), &image(), [&program, &program]).expect("KVM image");
     for task in 0..2 {
         let observed = carrier.observe(task).expect("allocator and observation");
         assert_eq!(observed.result, 1);
@@ -467,7 +480,8 @@ fn shared_kernel_drain_receipt_requires_the_live_root() {
     };
     let good = program(0x60_0000);
     let stale = program(0x70_0000);
-    let mut carrier = Cpl0Carrier::boot(&image(), [&good, &stale]).expect("KVM image");
+    let mut carrier =
+        Cpl0Carrier::boot(physical_inventory(), &image(), [&good, &stale]).expect("KVM image");
     assert_eq!(
         carrier.observe(0).expect("live root receipt").result as u64,
         0x60_0000
@@ -482,7 +496,8 @@ fn shared_kernel_x86_descriptor_protects_a_user_page() {
     program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
     program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
-    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    let mut carrier =
+        Cpl0Carrier::boot(physical_inventory(), &image(), [&program, &program]).expect("KVM image");
     carrier.fixture_bind_descriptor_owner(0).unwrap();
     assert_eq!(
         carrier
@@ -506,7 +521,8 @@ fn shared_kernel_x86_prepares_then_publishes_a_user_page() {
     program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
     program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
-    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    let mut carrier =
+        Cpl0Carrier::boot(physical_inventory(), &image(), [&program, &program]).expect("KVM image");
     carrier.fixture_bind_descriptor_owner(0).unwrap();
     assert_eq!(
         carrier.observe(0).expect("descriptor publication").result,
@@ -527,7 +543,8 @@ fn shared_kernel_x86_fault_settles_prepared_grant_in_guest() {
     program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
     let mut carrier =
-        Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("KVM image");
+        Cpl0Carrier::boot_lifecycle(physical_inventory(), &image(), [&program, &program])
+            .expect("KVM image");
     assert_eq!(carrier.observe(0).expect("shared x86 fault path").result, 1);
     let leaf = carrier.fixture_user_leaf(0x3_3000).expect("faulted leaf");
     assert_eq!(leaf & (1 << 9), 0);
@@ -544,7 +561,8 @@ fn shared_kernel_x86_cow_copies_and_repoints_through_intent() {
     program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
     let mut carrier =
-        Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("KVM image");
+        Cpl0Carrier::boot_lifecycle(physical_inventory(), &image(), [&program, &program])
+            .expect("KVM image");
     assert_eq!(carrier.observe(0).expect("shared x86 COW path").result, 1);
     let leaf = carrier
         .fixture_user_leaf(0x3_4000)
@@ -562,7 +580,8 @@ fn shared_kernel_portal_window_uses_live_upper_direct_root() {
     program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
     program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
-    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    let mut carrier =
+        Cpl0Carrier::boot(physical_inventory(), &image(), [&program, &program]).expect("KVM image");
     assert_eq!(
         carrier.observe(0).expect("live portal table window").result,
         1
@@ -576,7 +595,8 @@ fn shared_kernel_fork_table_window_checks_each_granted_arena() {
     program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
     program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
-    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    let mut carrier =
+        Cpl0Carrier::boot(physical_inventory(), &image(), [&program, &program]).expect("KVM image");
     assert_eq!(carrier.observe(0).expect("fork table authority").result, 1);
 }
 
@@ -587,7 +607,8 @@ fn shared_kernel_retired_page_repoints_without_user_publication() {
     program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
     program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
-    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    let mut carrier =
+        Cpl0Carrier::boot(physical_inventory(), &image(), [&program, &program]).expect("KVM image");
     carrier.fixture_bind_descriptor_owner(0).unwrap();
     assert_eq!(carrier.observe(0).expect("owner retirement").result, 1);
     let leaf = carrier
@@ -604,7 +625,8 @@ fn assert_opaque_registrations(calls: [&[(u64, u64)]; 2]) {
     assert_eq!(calls[0].len(), calls[1].len());
     let a = program(calls[0]);
     let b = program(calls[1]);
-    let mut carrier = Cpl0Carrier::boot(&image(), [&a, &b]).expect("real KVM + CPL0 image");
+    let mut carrier =
+        Cpl0Carrier::boot(physical_inventory(), &image(), [&a, &b]).expect("real KVM + CPL0 image");
     let mut heads = [(0, 0); 2];
     let mut entries = [0; 2];
     let mut publications = [0; 2];
@@ -689,7 +711,8 @@ fn two_live_tasks_reject_length_with_high_bits_preserving_both_heads() {
 fn two_live_tasks_serve_robust_lists_without_host_forwards() {
     let a = program(&[(0xa000, 24), (0xa040, 24), (0xdead, 23), (0xdead, 0)]);
     let b = program(&[(0xb000, 24), (0xb040, 24), (0xbeef, 25), (0xbeef, u64::MAX)]);
-    let mut carrier = Cpl0Carrier::boot(&image(), [&a, &b]).expect("real KVM + CPL0 image");
+    let mut carrier =
+        Cpl0Carrier::boot(physical_inventory(), &image(), [&a, &b]).expect("real KVM + CPL0 image");
     let mut heads = [(0, 0); 2];
     let mut entries = [0; 2];
     let mut publications = [0; 2];
@@ -754,7 +777,8 @@ fn x4_linux_common_entry() {
         });
         let a = program(&calls[0]);
         let b = program(&calls[1]);
-        let mut carrier = Cpl0Carrier::boot(&image(), [&a, &b]).expect("X4 real KVM carrier");
+        let mut carrier = Cpl0Carrier::boot(physical_inventory(), &image(), [&a, &b])
+            .expect("X4 real KVM carrier");
         let bindings = core::array::from_fn::<_, 2, _>(|task| ExecutionBinding {
             task: EntryTaskKey::from_raw(41),
             generation: EntryGeneration::from_raw(100 + task as u64),
@@ -819,7 +843,8 @@ fn x4_linux_common_entry() {
             .unwrap();
         code[offset + 1..offset + 5].copy_from_slice(&native.to_le_bytes());
         let peer = program(&[(0xbeef, 24)]);
-        let mut carrier = Cpl0Carrier::boot(&image(), [&code, &peer]).unwrap();
+        let mut carrier =
+            Cpl0Carrier::boot(physical_inventory(), &image(), [&code, &peer]).unwrap();
         carrier.bind_execution(0, binding).unwrap();
         if native == 273 {
             carrier.unload_execution(0).unwrap();
@@ -859,7 +884,7 @@ fn x4_linux_common_entry() {
 fn entry_and_return_kicks_never_republish_or_recomplete() {
     let a = program(&[(0xa000, 24), (0xdead, 23)]);
     let b = program(&[(0xb000, 24), (0xbeef, 25)]);
-    let mut carrier = Cpl0Carrier::boot(&image(), [&a, &b]).unwrap();
+    let mut carrier = Cpl0Carrier::boot(physical_inventory(), &image(), [&a, &b]).unwrap();
     let mut heads = [(0, 0); 2];
     let mut entries = [0; 2];
     let mut publications = [0; 2];
@@ -903,7 +928,8 @@ fn forwarded_call_completes_before_pending_kick_work_exit() {
         .expect("native syscall in fixture");
     code[offset + 1..offset + 5].copy_from_slice(&8_u32.to_le_bytes()); // lseek forwards
     let peer = program(&[(0xbeef, 24)]);
-    let mut carrier = Cpl0Carrier::boot(&image(), [&code, &peer]).expect("real KVM image");
+    let mut carrier =
+        Cpl0Carrier::boot(physical_inventory(), &image(), [&code, &peer]).expect("real KVM image");
     carrier
         .inject_boundary_kicks(0)
         .expect("entry and return kicks");
@@ -924,7 +950,8 @@ fn forwarded_call_completes_before_pending_kick_work_exit() {
 fn x1_boot_shared_substrate() {
     let p = program(&[(0xa000, 24), (0xdead, 23)]);
     let dummy = &[0x0f, 0x0b];
-    let mut carrier = Cpl0Carrier::boot(&image(), [&p, dummy]).expect("real KVM + CPL0 image");
+    let mut carrier = Cpl0Carrier::boot(physical_inventory(), &image(), [&p, dummy])
+        .expect("real KVM + CPL0 image");
 
     // Shared substrate ZoneTables and AddressSpaces claims
     let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
@@ -1083,8 +1110,8 @@ fn transport_program(op: u64) -> Vec<u8> {
 fn shared_kernel_transport_yield_and_fatal() {
     let yield_prog = transport_program(0);
     let fatal_prog = transport_program(1);
-    let mut carrier =
-        Cpl0Carrier::boot(&image(), [&yield_prog, &fatal_prog]).expect("real KVM + CPL0 image");
+    let mut carrier = Cpl0Carrier::boot(physical_inventory(), &image(), [&yield_prog, &fatal_prog])
+        .expect("real KVM + CPL0 image");
     let obs = carrier.observe(0).expect("yield should resume and succeed");
     assert_eq!(obs.result, 0);
     assert_eq!(obs.host_yields, 1);
@@ -1116,7 +1143,8 @@ fn context_program() -> Vec<u8> {
 fn shared_kernel_context_stack_slot_and_thread_cpu() {
     let p0 = context_program();
     let p1 = context_program();
-    let mut carrier = Cpl0Carrier::boot(&image(), [&p0, &p1]).expect("real KVM + CPL0 image");
+    let mut carrier = Cpl0Carrier::boot(physical_inventory(), &image(), [&p0, &p1])
+        .expect("real KVM + CPL0 image");
     for task in 0..2 {
         let obs_stack = carrier.observe(task).expect("stack slot observation");
         assert_eq!(obs_stack.result, task as i64, "stack slot for task {task}");
@@ -1155,7 +1183,7 @@ fn interrupt_program() -> Vec<u8> {
 fn shared_kernel_interrupt_leaves() {
     let p0 = interrupt_program();
     let p1 = interrupt_program();
-    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&p0, &p1])
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(physical_inventory(), &image(), [&p0, &p1])
         .expect("real KVM + CPL0 image with interrupts");
     let obs_freq = carrier.observe(0).expect("frequency observation");
     assert!(obs_freq.result > 0, "frequency must be non-zero");
@@ -1201,8 +1229,9 @@ fn shared_kernel_frequency_uses_published_kvm_binding() {
     program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
     program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
-    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&program, &program])
-        .expect("real KVM + CPL0 image with interrupts");
+    let mut carrier =
+        Cpl0Carrier::boot_with_interrupts(physical_inventory(), &image(), [&program, &program])
+            .expect("real KVM + CPL0 image with interrupts");
     carrier
         .fixture_publish_tsc_hz(0, PUBLISHED_HZ)
         .expect("published CPU binding");
@@ -1229,8 +1258,9 @@ fn shared_kernel_peer_apic_queues_wake_for_runnable_cpu() {
     sender.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     sender.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
     let receiver = program(&[(0xaced, 24), (0xbeef, 24)]);
-    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&sender, &receiver])
-        .expect("two real KVM CPUs and shared CPL0 kernel");
+    let mut carrier =
+        Cpl0Carrier::boot_with_interrupts(physical_inventory(), &image(), [&sender, &receiver])
+            .expect("two real KVM CPUs and shared CPL0 kernel");
     assert_eq!(
         carrier.observe(1).expect("peer baseline completion").result,
         0
@@ -1265,8 +1295,9 @@ fn stopped_cpl3_cpu_receives_a_queued_host_kick() {
         0xeb, 0xf6, // jmp to the load
     ]);
     let load_rip = carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000 + program.len() as u64 - 10;
-    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&program, &program])
-        .expect("real KVM CPU with native interrupt gates");
+    let mut carrier =
+        Cpl0Carrier::boot_with_interrupts(physical_inventory(), &image(), [&program, &program])
+            .expect("real KVM CPU with native interrupt gates");
     assert_eq!(carrier.observe(1).expect("first user syscall").result, 0);
     carrier
         .fixture_stop_after_user_byte(1, 0x4_0000)
@@ -1310,8 +1341,9 @@ fn stopped_cpl3_cpu_drops_a_retired_translation_before_its_next_load() {
     reader.extend_from_slice(&0x4_0000_u64.to_le_bytes());
     reader.extend_from_slice(&[0xeb, 0xec]); // repeat the 20-byte load/store loop
 
-    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&editor, &reader])
-        .expect("two native KVM CPUs with one retained page-table root");
+    let mut carrier =
+        Cpl0Carrier::boot_with_interrupts(physical_inventory(), &image(), [&editor, &reader])
+            .expect("two native KVM CPUs with one retained page-table root");
     carrier.fixture_share_root(1, 0).expect("same MM root");
     carrier.fixture_write_backing_byte(0xd1_1000, 0x11).unwrap();
     assert_eq!(carrier.observe(0).expect("prepare old page").result, 1);
@@ -1368,8 +1400,9 @@ fn two_running_vcpus_drop_stale_translation_on_shootdown() {
     reader.extend_from_slice(&0x4_0000_u64.to_le_bytes());
     reader.extend_from_slice(&[0xeb, 0xec]); // repeat the 20-byte load/store loop
 
-    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&editor, &reader])
-        .expect("two native KVM CPUs with one retained page-table root");
+    let mut carrier =
+        Cpl0Carrier::boot_with_interrupts(physical_inventory(), &image(), [&editor, &reader])
+            .expect("two native KVM CPUs with one retained page-table root");
     carrier.fixture_share_root(1, 0).expect("same MM root");
     carrier.fixture_write_backing_byte(0xd1_1000, 0x11).unwrap();
     assert_eq!(carrier.observe(0).expect("prepare old page").result, 1);
@@ -1472,8 +1505,9 @@ fn two_running_vcpus_fault_before_shootdown_ipi_acknowledges_in_guest() {
     reader.extend_from_slice(&0x3_8000_u64.to_le_bytes());
     reader.extend_from_slice(&[0x0f, 0x0b]);
 
-    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&editor, &reader])
-        .expect("two native KVM CPUs with one retained page-table root");
+    let mut carrier =
+        Cpl0Carrier::boot_with_interrupts(physical_inventory(), &image(), [&editor, &reader])
+            .expect("two native KVM CPUs with one retained page-table root");
     carrier.fixture_share_root(1, 0).expect("same MM root");
     carrier.fixture_write_backing_byte(0xd1_1000, 0x11).unwrap();
     carrier.fixture_write_backing_byte(0x4_0008, 0).unwrap();
@@ -1533,8 +1567,9 @@ fn two_running_vcpus_stopped_with_debt_settles_on_reentry() {
     reader.extend_from_slice(&0x3_8000_u64.to_le_bytes());
     reader.extend_from_slice(&[0x0f, 0x0b]);
 
-    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&editor, &reader])
-        .expect("two native KVM CPUs with one retained page-table root");
+    let mut carrier =
+        Cpl0Carrier::boot_with_interrupts(physical_inventory(), &image(), [&editor, &reader])
+            .expect("two native KVM CPUs with one retained page-table root");
     carrier.fixture_share_root(1, 0).expect("same MM root");
     carrier.fixture_write_backing_byte(0xd1_1000, 0x11).unwrap();
     carrier.fixture_write_backing_byte(0x4_0008, 0).unwrap();
@@ -1614,8 +1649,9 @@ fn stopped_cpl0_cpu_drops_stale_translation_before_cpl0_access() {
     reader.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     reader.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
 
-    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&editor, &reader])
-        .expect("two native KVM CPUs with one retained page-table root");
+    let mut carrier =
+        Cpl0Carrier::boot_with_interrupts(physical_inventory(), &image(), [&editor, &reader])
+            .expect("two native KVM CPUs with one retained page-table root");
     carrier.fixture_share_root(1, 0).expect("same MM root");
     carrier.fixture_write_backing_byte(0xd1_1000, 0x11).unwrap();
     assert_eq!(carrier.observe(0).expect("prepare old page").result, 1);
@@ -1683,8 +1719,9 @@ fn shared_kernel_scheduler_routes_reschedule_to_peer_apic() {
     sender.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     sender.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
     let receiver = program(&[(0xaced, 24)]);
-    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&sender, &receiver])
-        .expect("two real KVM CPUs and shared CPL0 kernel");
+    let mut carrier =
+        Cpl0Carrier::boot_with_interrupts(physical_inventory(), &image(), [&sender, &receiver])
+            .expect("two real KVM CPUs and shared CPL0 kernel");
     assert_eq!(
         carrier.observe(1).expect("peer baseline completion").result,
         0
@@ -1713,8 +1750,9 @@ fn two_live_cpus_complete_mutual_root_shootdowns() {
     program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
     program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
-    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&program, &program])
-        .expect("two live KVM CPUs");
+    let mut carrier =
+        Cpl0Carrier::boot_with_interrupts(physical_inventory(), &image(), [&program, &program])
+            .expect("two live KVM CPUs");
     carrier.fixture_share_root(1, 0).expect("same MM root");
     let generations = carrier.fixture_observe_pair().unwrap_or_else(|error| {
         panic!(
@@ -1743,7 +1781,8 @@ fn shared_kernel_scheduler_ack_uses_spurious_sentinel() {
     program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
     let mut carrier =
-        Cpl0Carrier::boot_with_interrupts(&image(), [&program, &program]).expect("KVM image");
+        Cpl0Carrier::boot_with_interrupts(physical_inventory(), &image(), [&program, &program])
+            .expect("KVM image");
     assert_eq!(
         carrier
             .observe(0)

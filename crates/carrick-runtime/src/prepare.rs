@@ -1049,8 +1049,13 @@ impl PreparedRun {
             let extent_bytes = carrick_vmm_kvm::cpl0_boot::Cpl0Carrier::initial_extent_bytes_for(
                 &image, &argv, &env,
             )?;
-            let mut machine =
-                carrick_vmm_kvm::cpl0_boot::Cpl0Carrier::boot_production(extent_bytes)?;
+            let mut machine = carrick_vmm_kvm::cpl0_boot::Cpl0Carrier::boot_production(
+                // This per-VM facade owns only physical inventory/ID
+                // custody. CPL0 retains Linux process and MM semantics.
+                Arc::new(carrick_kernel::kernel::FrameInventoryAuthority::new())
+                    .physical_projection(Arc::new(carrick_kernel::kernel::ObjectIdRegistry::new())),
+                extent_bytes,
+            )?;
             let limits = carrick_vmm_kvm::cpl0_boot::InitialReservationLimits {
                 address: dispatcher.launch_resource_limit(carrick_abi::LinuxResource::As),
                 data: dispatcher.launch_resource_limit(carrick_abi::LinuxResource::Data),
