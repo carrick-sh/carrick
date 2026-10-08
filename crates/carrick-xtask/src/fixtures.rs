@@ -808,6 +808,7 @@ fn run_build(command: &mut Command) -> Result<()> {
 }
 
 pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
+    environment::reject_ambient_overrides()?;
     if std::env::consts::OS != "linux" {
         return Err(fail("fixtures build requires Linux; restore on cloudmac"));
     }
