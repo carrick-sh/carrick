@@ -65,6 +65,19 @@ Authority checks use operation/owner/lane ceilings and fresh compiler discovery.
 Moving unrelated source lines needs no inventory maintenance or remote capture.
 Run `just lint-domains` with the actual PR base in `CARRICK_AUTHORITY_BASE`.
 
+Cargo `custom-build` targets form a separate BuildTime authority boundary.
+The census follows their exact module and literal Rust inclusion edges, applies
+its restricted dialect, and counts build-program operations separately from
+runtime authority. A source file reachable from both a build program and
+production is a hard census error. Unresolved build inputs are errors too;
+there is no build-file exemption list. BuildTime ceilings only decrease.
+
+`just authority-discover OUTPUT` emits native compiler observations for diagnosis;
+spans are transient inputs, never accepted source identity. Explicit cross
+compiler discovery requires the selected BSD target, C compiler, C flags and
+archiver together. A cross discovery result proves compilation, not guest
+execution or native host execution.
+
 The checkout lock (`gate-worktree.lock`) records each gate-host process holding
 it in `holders/<pid>` with that process's start time. The acquiring SSH session
 keeps a remote keeper process alive until the driver releases or dies; work

@@ -1,6 +1,7 @@
 pub mod accept;
 pub mod asm_diff;
 mod atomic_file;
+mod authority_build;
 pub mod authority_debt;
 mod authority_dialect;
 mod authority_macro;
