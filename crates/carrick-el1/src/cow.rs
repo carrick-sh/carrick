@@ -392,8 +392,8 @@ fn x86_copy_page_alias<
 /// shared x86 descriptor transaction. The caller retains the exact-MM editor.
 ///
 /// # Safety
-/// `words` must retain the authenticated table mappings for `root` and
-/// acknowledge its descriptor drains. `root` must be the live CR3 root for
+/// The venue must retain authenticated table mappings and acknowledge their
+/// descriptor drains. Its root must be the live CR3 root for
 /// `mm_key`; the caller excludes other descriptor writers throughout.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub unsafe fn resolve_x86_guest_cow<
@@ -401,32 +401,21 @@ pub unsafe fn resolve_x86_guest_cow<
     C: FnMut(u64, u64),
     I: FnMut(),
 >(
-    words: &W,
-    root: u64,
+    venue: &carrick_core::mm::cow::GuestCowVenue<'_, X86CowMmu, W>,
     mm_key: u64,
     far: u64,
-    pool: &dyn carrick_el1_abi::CowGrantVenue,
-    residency: &carrick_el1_abi::FrameGrantResidencyTable,
     copy_page: C,
     invalidate: I,
 ) -> Result<GuestCowOutcome, CowError> {
     use carrick_guest_arch::{FrameGpa, RootGpa};
-    use carrick_mmu_core::aarch64::SubstrateGpa;
-    let root_gpa = RootGpa::page_aligned(FrameGpa::new(root)).ok_or(CowError::Refused)?;
+    let root_gpa =
+        RootGpa::page_aligned(FrameGpa::new(venue.root.raw())).ok_or(CowError::Refused)?;
     if crate::isa::x86::hardware_live_root().map_err(|_| CowError::Refused)? != root_gpa
         || mm_key == 0
     {
         return Err(CowError::Refused);
     }
-    let venue = carrick_core::mm::cow::GuestCowVenue::<X86CowMmu, _> {
-        words,
-        root: SubstrateGpa(root),
-        pool,
-        residency,
-        copy_window: carrick_core::mm::cow::CowCopyWindow::target(words, SubstrateGpa(root)),
-        publish_executable: None,
-    };
-    carrick_core::mm::cow::resolve_guest_cow(&venue, mm_key, far, copy_page, invalidate)
+    carrick_core::mm::cow::resolve_guest_cow(venue, mm_key, far, copy_page, invalidate)
 }
 
 #[cfg(test)]

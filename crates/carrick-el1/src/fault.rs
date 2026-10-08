@@ -466,20 +466,22 @@ impl<D: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords> CowResol
                 )
             }
         };
+        let venue = carrick_core::mm::cow::GuestCowVenue::<crate::cow::X86CowMmu, _> {
+            words: self.words,
+            root: carrick_mmu_core::aarch64::SubstrateGpa(root),
+            pool: self.pool,
+            residency: self.residency,
+            copy_window: carrick_core::mm::cow::CowCopyWindow::target(
+                self.words,
+                carrick_mmu_core::aarch64::SubstrateGpa(root),
+            ),
+            publish_executable: None,
+        };
         // SAFETY: dispatch_classified_fault holds this MM's exact editor.
         // resolve_x86_guest_cow authenticates the live CR3 and retained
         // supplied descriptor-word authority before reading or changing descriptors.
         let outcome = unsafe {
-            crate::cow::resolve_x86_guest_cow(
-                self.words,
-                root,
-                mm_key,
-                far,
-                self.pool,
-                self.residency,
-                copy_page,
-                invalidate,
-            )
+            crate::cow::resolve_x86_guest_cow(&venue, mm_key, far, copy_page, invalidate)
         };
         handle_cow_outcome(outcome, &mut self.completion)
     }
