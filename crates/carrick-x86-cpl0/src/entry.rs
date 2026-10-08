@@ -85,13 +85,35 @@ core::arch::global_asm!(
     "push r13",
     "push r14",
     "push r15",
-    "mov rdi, rsp",
+    // The complete frame already owns R12/R13. Keep its address and the
+    // aligned native xstate area in callee-preserved registers across Rust
+    // and stopped-host forwarding; no Rust may run after the final XRSTOR.
+    "mov r12, rsp",
+    "sub rsp, 896",
+    "and rsp, -64",
+    "mov r13, rsp",
+    // XSAVE does not initialize reserved header words. Reused stack bytes
+    // must not become an unsupported component or XRSTOR reserved-bit fault.
+    "xor eax, eax",
+    "mov qword ptr [rsp + 512], rax",
+    "mov qword ptr [rsp + 520], rax",
+    "mov qword ptr [rsp + 528], rax",
+    "mov qword ptr [rsp + 536], rax",
+    "mov qword ptr [rsp + 544], rax",
+    "mov qword ptr [rsp + 552], rax",
+    "mov qword ptr [rsp + 560], rax",
+    "mov qword ptr [rsp + 568], rax",
+    "mov eax, 7", "xor edx, edx", "xsave64 [rsp]",
+    "mov rdi, r12",
     "mov rsi, gs:[16]",
+    "mov rdx, r13",
     "call carrick_x86_enter",
     // A host forward may alter the retained frame after the entry check.
     // Validate once more after every early return and before SWAPGS/IRETQ.
-    "mov rdi, rsp",
+    "mov rdi, r12",
     "call carrick_x86_validate_return",
+    "mov eax, 7", "xor edx, edx", "xrstor64 [r13]",
+    "mov rsp, r12",
     "pop r15",
     "pop r14",
     "pop r13",
@@ -822,7 +844,11 @@ mod kernel {
     }
 
     #[unsafe(no_mangle)]
-    extern "C" fn carrick_x86_enter(frame: &mut NativeFrame, binding: &CpuBinding) {
+    extern "C" fn carrick_x86_enter(
+        frame: &mut NativeFrame,
+        binding: &CpuBinding,
+        _early_xstate: &mut carrick_el1::isa::x86::context::scheduler::XsaveArea,
+    ) {
         if !frame.valid_user_return() {
             doorbell(FATAL_PORT, frame);
             halt();
@@ -1589,6 +1615,7 @@ mod kernel {
                 doorbell(FATAL_PORT, frame);
                 halt();
             };
+            let incoming_record = lane.zone.slot(lane.lane.slot).current();
             match carrick_personality_linux::dispatch::dispatch(
                 call.canonical.raw(),
                 u64::MAX,
@@ -1596,15 +1623,32 @@ mod kernel {
             ) {
                 carrick_personality_linux::dispatch::CompletionRoute::Served => {}
                 carrick_personality_linux::dispatch::CompletionRoute::WithWork => {
-                    doorbell(WORK_PORT, frame);
+                    doorbell(WORK_PORT, lane.frame);
                 }
                 carrick_personality_linux::dispatch::CompletionRoute::Forward => {
-                    doorbell(FORWARD_PORT, frame);
+                    doorbell(FORWARD_PORT, lane.frame);
                 }
                 _ => {
-                    doorbell(FATAL_PORT, frame);
+                    doorbell(FATAL_PORT, lane.frame);
                     halt();
                 }
+            }
+            let selected_record = lane.zone.slot(lane.lane.slot).current();
+            if selected_record != incoming_record {
+                let selected = selected_record
+                    .map(|record| lane.zone.record_ref(record))
+                    .and_then(|reference| {
+                        lane.lane.contexts.iter()
+                            .find(|context| context.record == Some(reference))
+                    });
+                let Some(selected) = selected else {
+                    doorbell(FATAL_PORT, lane.frame);
+                    halt();
+                };
+                // The native lifecycle owner restored this exact selected
+                // context. Preserve its retained bytes, never resample after
+                // Rust has run and potentially touched vector registers.
+                _early_xstate.0.copy_from_slice(&selected.xsave.0);
             }
             true
         } else {
