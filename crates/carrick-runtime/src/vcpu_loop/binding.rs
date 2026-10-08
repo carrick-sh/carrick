@@ -6590,6 +6590,9 @@ pub(crate) fn write_hvpatch_child_output(fd: i32, mut bytes: &[u8]) -> std::io::
 mod tests {
     use super::super::tests::*;
     use super::*;
+    use crate::vcpu_loop::threads::{
+        enroll_persistent_process_member, finish_persistent_process_handles,
+    };
     use carrick_guest_mem::GuestMemory;
     use std::num::NonZeroU64;
     use std::time::{Duration, Instant};
