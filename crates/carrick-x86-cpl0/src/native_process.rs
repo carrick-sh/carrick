@@ -16,8 +16,8 @@ use carrick_el1::personality::native_process_runtime::{
 };
 use carrick_el1_abi::{
     BornInZoneSource, CurrentTask, KernelFaultVenues, Lifecycle, MmPortalSlots, PortalForkCustody,
-    PortalOperation, ReservationMm, ThreadControlSlot, ThreadLifecyclePage, X86_FORK_STOCK_PORT,
-    X86ForkStockExchange, X86ForkStockLoan, X86ForkStockRequest, X86ForkStockSettlement,
+    PortalOperation, ReservationMm, ThreadControlSlot, ThreadLifecyclePage, FORK_STOCK_PORT,
+    ForkStockExchange, ForkStockLoan, ForkStockRequest, ForkStockSettlement,
 };
 use carrick_guest_arch::{
     AddressContext, ContextGeneration, FrameGpa, KernelVa, MmGeneration, RootGpa, UserVa,
@@ -143,7 +143,7 @@ fn error(_: impl core::fmt::Debug) -> NativeProcessError {
 }
 
 pub(super) struct Prepared {
-    loan: X86ForkStockLoan,
+    loan: ForkStockLoan,
     child: UnpublishedEl1Child<X86Mmu>,
     words: InitialWords,
     address: Mm,
@@ -251,7 +251,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             .map_err(error)?;
             (operation, root.generation(), count, root.layout())
         };
-        let request = X86ForkStockRequest {
+        let request = ForkStockRequest {
             binding: carrick_el1::personality::common_entry::execution_binding(self.task),
             context: *parent,
             operation,
@@ -265,11 +265,11 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                 .ok_or(NativeProcessError::Exhausted)?
                 .max(4096),
         };
-        let mut exchange = X86ForkStockExchange::new(request).ok_or(NativeProcessError::Invalid)?;
+        let mut exchange = ForkStockExchange::new(request).ok_or(NativeProcessError::Invalid)?;
         // SAFETY: aligned exclusive supervisor stack record remains live
         // through stopped host authentication; DX is always the hardware port.
         unsafe {
-            core::arch::asm!("out dx, eax", in("dx") X86_FORK_STOCK_PORT, in("rax") &raw mut exchange, options(nostack));
+            core::arch::asm!("out dx, eax", in("dx") FORK_STOCK_PORT, in("rax") &raw mut exchange, options(nostack));
         }
         let loan = exchange
             .take(request)
@@ -517,7 +517,7 @@ fn settle(born: Box<Born>, worker: u32) -> Result<(), (NativeProcessError, Box<B
         return Err((NativeProcessError::Exhausted, born));
     }
     custody.extend(p.custody.iter().copied().map(PortalForkCustody::words));
-    let Some(mut exchange) = X86ForkStockSettlement::new(
+    let Some(mut exchange) = ForkStockSettlement::new(
         p.loan,
         p.child.completion(),
         KernelVa::new(custody.as_ptr() as u64),
@@ -528,7 +528,7 @@ fn settle(born: Box<Born>, worker: u32) -> Result<(), (NativeProcessError, Box<B
     // SAFETY: exact completion and original four-word custody records remain
     // owned across the stopped crossing; graph and MM editors were released.
     unsafe {
-        core::arch::asm!("out dx, eax", in("dx") X86_FORK_STOCK_PORT, in("rax") &raw mut exchange, options(nostack));
+        core::arch::asm!("out dx, eax", in("dx") FORK_STOCK_PORT, in("rax") &raw mut exchange, options(nostack));
     }
     if !matches!(exchange.take(p.loan), Some(Ok(()))) {
         return Err((NativeProcessError::Quarantined, born));

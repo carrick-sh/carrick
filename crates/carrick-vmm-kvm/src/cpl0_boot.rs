@@ -2258,7 +2258,7 @@ impl Cpl0Carrier {
         }
         match self.run_cpu(1)? {
             VcpuExit::IoOut {
-                port: carrick_el1_abi::X86_NATIVE_PEER_READY_PORT,
+                port: carrick_el1_abi::NATIVE_PEER_READY_PORT,
                 ..
             } => {
                 if self.cpus[1].get_gpr(X86Reg::Rax)? != 1 {
@@ -2346,7 +2346,7 @@ impl Cpl0Carrier {
                 if matches!(
                     exit,
                     VcpuExit::IoOut {
-                        port: carrick_el1_abi::X86_FORK_STOCK_PORT,
+                        port: carrick_el1_abi::FORK_STOCK_PORT,
                         ..
                     }
                 ) {
@@ -2364,7 +2364,7 @@ impl Cpl0Carrier {
                 if matches!(
                     exit,
                     VcpuExit::IoOut {
-                        port: carrick_el1_abi::X86_NATIVE_ROOT_EXIT_PORT,
+                        port: carrick_el1_abi::NATIVE_ROOT_EXIT_PORT,
                         ..
                     }
                 ) {

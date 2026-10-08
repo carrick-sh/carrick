@@ -192,10 +192,15 @@ fn add_grant_counter(counter: &mut u64, complete: &mut bool, amount: u64) {
 }
 
 impl El1FrameGrantLedger {
-    fn mark_grant(&mut self, base: u64, length: u64, mm: El1FrameGrantMm) -> Result<(), TrapError> {
+    pub(crate) fn mark_grant(
+        &mut self,
+        base: u64,
+        length: u64,
+        mm: El1FrameGrantMm,
+    ) -> Result<(), TrapError> {
         if length == 0
-            || !base.is_multiple_of(CowArmedRanges::COMPOUND_SIZE)
-            || !length.is_multiple_of(CowArmedRanges::COMPOUND_SIZE)
+            || !base.is_multiple_of(4096)
+            || !length.is_multiple_of(4096)
             || base.checked_add(length).is_none()
         {
             return Err(TrapError::Hypervisor(format!(
@@ -231,7 +236,13 @@ impl El1FrameGrantLedger {
         update(&mut self.stats);
     }
 
-    fn mark_return(&mut self, base: u64, length: u64, mm: El1FrameGrantMm, release_ipa: bool) {
+    pub(crate) fn mark_return(
+        &mut self,
+        base: u64,
+        length: u64,
+        mm: El1FrameGrantMm,
+        release_ipa: bool,
+    ) {
         if self.active.remove(&(base, length)) {
             self.returned.insert((base, length));
             self.update(mm, |stats| {
@@ -244,6 +255,16 @@ impl El1FrameGrantLedger {
         } else {
             self.update(mm, |stats| stats.complete = false);
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn snapshot(&self) -> El1FrameGrantStats {
+        self.stats.clone()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn snapshot_mm(&self, mm: El1FrameGrantMm) -> Option<El1FrameGrantStats> {
+        self.by_mm.get(&mm).cloned()
     }
 }
 

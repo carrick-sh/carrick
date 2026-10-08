@@ -35,12 +35,14 @@ carrick-abi = { path = "../carrick-abi" }
 carrick-aarch64 = { path = "../carrick-aarch64" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-hal = { path = "../carrick-hal" }
+carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-host = { path = "../carrick-host" }
 carrick-kernel-arena = { path = "../carrick-kernel-arena" }
 carrick-mem = { path = "../carrick-mem" }
 carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-observability = { path = "../carrick-observability" }
+carrick-sched-core = { path = "../carrick-sched-core" }
 carrick-signal-linux = { path = "../carrick-signal-linux" }
 carrick-timer-core = { path = "../carrick-timer-core" }
 carrick-thread = { path = "../carrick-thread" }

@@ -3,9 +3,10 @@
 use crate::host_mapping::{HostMappingKind, OwnedHostMapping};
 use carrick_el1_abi::{
     EL1_DYNAMIC_METADATA_BASE, EL1_DYNAMIC_METADATA_EXTENT_SIZE, EL1_DYNAMIC_METADATA_SIZE,
-    METADATA_GRANT_ERR_ALIGNMENT, METADATA_GRANT_ERR_DENIED, METADATA_GRANT_ERR_INVALID,
-    METADATA_GRANT_ERR_NOT_FOUND, METADATA_GRANT_OP_ALLOC, METADATA_GRANT_OP_FREE,
-    METADATA_GRANT_SUCCESS,
+    ForkStockExchange, ForkStockKind, ForkStockRefusal, ForkStockSettlement, GRANT_OP_FORK_STOCK,
+    GRANT_OP_ROOT_EXIT, METADATA_GRANT_ERR_ALIGNMENT, METADATA_GRANT_ERR_DENIED,
+    METADATA_GRANT_ERR_INVALID, METADATA_GRANT_ERR_NOT_FOUND, METADATA_GRANT_OP_ALLOC,
+    METADATA_GRANT_OP_FREE, METADATA_GRANT_SUCCESS, NativeRootExit,
 };
 use carrick_el1_abi::{
     MetadataExtent, MetadataExtentResolver, MetadataResolutionError, PinnedMetadataExtent,
@@ -614,9 +615,10 @@ fn request_has_live_vm(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn service_metadata_operation(
+pub(crate) fn service_metadata_operation(
     custody: &crate::trap::CarrierVmCustody,
     generation: Option<crate::trap::CarrierVmGeneration>,
+    cpu: carrick_guest_arch::CpuId,
     op: u64,
     arg1: u64,
     arg2: u64,
@@ -777,6 +779,140 @@ fn service_metadata_operation(
             BYTES_RETURNED.fetch_add(size as u64, Ordering::Relaxed);
         }
         Ok([status, 0, 0, 0])
+    } else if op == GRANT_OP_FORK_STOCK {
+        let record_gpa = arg1;
+        if !record_gpa.is_multiple_of(64) {
+            return Ok([METADATA_GRANT_ERR_ALIGNMENT, 0, 0, 0]);
+        }
+        let Ok(record_ptr) =
+            crate::fork_stock::ForkStockHostCustody::resolve_record_ptr::<u64>(custody, record_gpa)
+        else {
+            return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
+        };
+        let tag = unsafe { *record_ptr };
+
+        // Foreign or out-of-range guest-supplied CPU index is refused immediately.
+        if arg2 != 0 && arg2 != cpu.raw() as u64 {
+            match ForkStockKind::decode(tag) {
+                Some(ForkStockKind::Loan) => {
+                    let exchange = unsafe { &mut *record_ptr.cast::<ForkStockExchange>() };
+                    exchange.refuse(ForkStockRefusal::Stale);
+                }
+                Some(ForkStockKind::Commit | ForkStockKind::Abort) => {
+                    let settlement = unsafe { &mut *record_ptr.cast::<ForkStockSettlement>() };
+                    settlement.refuse(ForkStockRefusal::Stale);
+                }
+                None => {}
+            }
+            return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+        }
+
+        let execution = custody.fork_stock.lock().active_execution_for_cpu(cpu);
+
+        match ForkStockKind::decode(tag) {
+            Some(ForkStockKind::Loan) => {
+                let exchange = unsafe { &mut *record_ptr.cast::<ForkStockExchange>() };
+                let Some(execution) = execution else {
+                    exchange.refuse(ForkStockRefusal::Stale);
+                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+                };
+                let mut fork_stock = custody.fork_stock.lock();
+                let mut ledger = custody.el1_frame_grants.lock();
+                match fork_stock.service_loan(&mut ledger, execution, exchange) {
+                    Ok(_loan) => Ok([METADATA_GRANT_SUCCESS, 0, 0, 0]),
+                    Err(_refusal) => Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]),
+                }
+            }
+            Some(ForkStockKind::Commit | ForkStockKind::Abort) => {
+                let settlement = unsafe { &mut *record_ptr.cast::<ForkStockSettlement>() };
+                let Some(execution) = execution else {
+                    settlement.refuse(ForkStockRefusal::Stale);
+                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+                };
+                let is_resolvable = |pages: &[carrick_guest_arch::RootGpa]| -> bool {
+                    for page in pages {
+                        if crate::fork_stock::ForkStockHostCustody::resolve_record_ptr::<u8>(
+                            custody,
+                            page.address().raw(),
+                        )
+                        .is_err()
+                        {
+                            return false;
+                        }
+                    }
+                    true
+                };
+                let is_clean = |pages: &[carrick_guest_arch::RootGpa]| -> bool {
+                    for page in pages {
+                        match crate::fork_stock::ForkStockHostCustody::resolve_record_ptr::<u8>(
+                            custody,
+                            page.address().raw(),
+                        ) {
+                            Ok(ptr) => {
+                                let slice = unsafe { core::slice::from_raw_parts(ptr, 4096) };
+                                if slice.iter().any(|&b| b != 0) {
+                                    return false;
+                                }
+                            }
+                            Err(_) => return false,
+                        }
+                    }
+                    true
+                };
+                let mut fork_stock = custody.fork_stock.lock();
+                let mut ledger = custody.el1_frame_grants.lock();
+                match fork_stock.service_settlement(
+                    &mut ledger,
+                    execution,
+                    settlement,
+                    is_resolvable,
+                    is_clean,
+                ) {
+                    Ok(()) => Ok([METADATA_GRANT_SUCCESS, 0, 0, 0]),
+                    Err(e) => {
+                        let refusal = match e {
+                            crate::fork_stock::ForkStockServiceError::StaleExecution => {
+                                ForkStockRefusal::Stale
+                            }
+                            crate::fork_stock::ForkStockServiceError::NoPendingLoan
+                            | crate::fork_stock::ForkStockServiceError::LoanMismatch
+                            | crate::fork_stock::ForkStockServiceError::ExposedDirtyTable
+                            | crate::fork_stock::ForkStockServiceError::InvalidRecord
+                            | crate::fork_stock::ForkStockServiceError::MemoryAccessFailed => {
+                                ForkStockRefusal::Invalid
+                            }
+                        };
+                        settlement.refuse(refusal);
+                        Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0])
+                    }
+                }
+            }
+            None => Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]),
+        }
+    } else if op == GRANT_OP_ROOT_EXIT {
+        let record_gpa = arg1;
+        if !record_gpa.is_multiple_of(64) {
+            return Ok([METADATA_GRANT_ERR_ALIGNMENT, 0, 0, 0]);
+        }
+        let Ok(record_ptr) = crate::fork_stock::ForkStockHostCustody::resolve_record_ptr::<
+            NativeRootExit,
+        >(custody, record_gpa) else {
+            return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
+        };
+        // Foreign or out-of-range guest-supplied CPU index is refused immediately.
+        if arg2 != 0 && arg2 != cpu.raw() as u64 {
+            return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+        }
+        let root_exit = unsafe { &*record_ptr };
+        let execution = custody.fork_stock.lock().active_execution_for_cpu(cpu);
+        let Some(execution) = execution else {
+            return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+        };
+        let fork_stock = custody.fork_stock.lock();
+        match fork_stock.service_root_exit(execution, root_exit) {
+            Ok(status) => Ok([METADATA_GRANT_SUCCESS, status.raw() as u64, 0, 0]),
+            Err(_) => Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]),
+        }
     } else {
         Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0])
     }
@@ -961,6 +1097,7 @@ fn complete_metadata_request(
     let result = service_metadata_operation(
         custody,
         generation,
+        carrick_guest_arch::CpuId::new(0),
         request.op,
         request.arg1,
         request.arg2,
@@ -987,6 +1124,7 @@ fn complete_metadata_request(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn handle_metadata_grant_trap(
     vcpu: &mut applevisor::vcpu::Vcpu,
+    cpu: carrick_guest_arch::CpuId,
     custody: &crate::trap::CarrierVmCustody,
     generation: Option<crate::trap::CarrierVmGeneration>,
 ) -> Result<(), TrapError> {
@@ -1004,7 +1142,7 @@ pub(crate) fn handle_metadata_grant_trap(
     let arg3 = vcpu
         .get_reg(Reg::X3)
         .map_err(|e| TrapError::Hypervisor(format!("failed to read X3 for metadata grant: {e}")))?;
-    let result = service_metadata_operation(custody, generation, op, arg1, arg2, arg3)?;
+    let result = service_metadata_operation(custody, generation, cpu, op, arg1, arg2, arg3)?;
     vcpu.set_reg(Reg::X0, result[0])
         .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
     vcpu.set_reg(Reg::X1, result[1])
@@ -1327,6 +1465,7 @@ mod tests {
             service_metadata_operation(
                 &custody,
                 Some(generation),
+                carrick_guest_arch::CpuId::new(0),
                 METADATA_GRANT_OP_ALLOC,
                 u64::MAX,
                 0,

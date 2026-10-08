@@ -1973,13 +1973,13 @@ mod kernel {
                 CompletionRoute::Suspended => {
                     drop(_user_fault_gate);
                     if let Some(status) = root_exit {
-                        let exit = carrick_el1_abi::X86NativeRootExit::new(
+                        let exit = carrick_el1_abi::NativeRootExit::new(
                             carrick_el1::personality::common_entry::execution_binding(task), status,
                         ).unwrap_or_else(|| initial_boot::fatal_boot());
                         // SAFETY: shared retirement authenticated this physical VM completion.
                         unsafe {
                             core::arch::asm!("out dx, al",
-                                in("dx") carrick_el1_abi::X86_NATIVE_ROOT_EXIT_PORT,
+                                in("dx") carrick_el1_abi::NATIVE_ROOT_EXIT_PORT,
                                 in("rax") &exit as *const _ as u64,
                                 options(nostack, preserves_flags));
                         }

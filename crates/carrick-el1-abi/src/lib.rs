@@ -28,8 +28,8 @@ mod guest_mmu_publication;
 pub use guest_mmu_publication::*;
 mod x86_initial_boot;
 pub use x86_initial_boot::*;
-mod x86_fork_stock;
-pub use x86_fork_stock::*;
+mod fork_stock;
+pub use fork_stock::*;
 mod x86_prepare_stock;
 pub use x86_prepare_stock::*;
 mod delegated_notification;
@@ -260,6 +260,12 @@ pub const METADATA_GRANT_OP_ALLOC: u64 = 1;
 
 /// Operation code for returning an unused extent to the host (HVC #6).
 pub const METADATA_GRANT_OP_FREE: u64 = 2;
+
+/// Operation code for physical page-table stock loans and settlements (HVC #6).
+pub const GRANT_OP_FORK_STOCK: u64 = 3;
+
+/// Operation code for root container exit notification (HVC #6).
+pub const GRANT_OP_ROOT_EXIT: u64 = 4;
 
 /// Metadata grant hypercall outcome: successful extent allocation or return.
 pub const METADATA_GRANT_SUCCESS: u64 = 0;

@@ -10,9 +10,9 @@ use carrick_mmu_core::x86::owner_mmu::X86Mmu;
 
 const _: () = {
     let physical = [
-        carrick_el1_abi::X86_FORK_STOCK_PORT,
-        carrick_el1_abi::X86_NATIVE_ROOT_EXIT_PORT,
-        carrick_el1_abi::X86_NATIVE_PEER_READY_PORT,
+        carrick_el1_abi::FORK_STOCK_PORT,
+        carrick_el1_abi::NATIVE_ROOT_EXIT_PORT,
+        carrick_el1_abi::NATIVE_PEER_READY_PORT,
     ];
     let existing = [
         FAULT_DOORBELL_PORT,
@@ -251,7 +251,7 @@ fn reserve_table_stock(stock: &mut Vec<RootGpa>, required: usize) -> Option<Vec<
 }
 
 pub(super) struct PendingForkLoan {
-    loan: carrick_el1_abi::X86ForkStockLoan,
+    loan: carrick_el1_abi::ForkStockLoan,
     execution: GrantExecution,
     child_tables: Vec<RootGpa>,
     parent_tables: Vec<RootGpa>,
@@ -575,7 +575,7 @@ impl Cpl0HostCustody {
         let execution = self.physical_execution(lease)?;
         // SAFETY: the root exit record consists of eight fully initialized u64s.
         let (_, record) = unsafe {
-            self.read_stack_record::<carrick_el1_abi::X86NativeRootExit>(
+            self.read_stack_record::<carrick_el1_abi::NativeRootExit>(
                 lease,
                 execution.context,
                 lease.vcpu.get_gpr(X86Reg::Rax)?,
@@ -591,28 +591,27 @@ impl Cpl0HostCustody {
         &mut self,
         lease: &StoppedCpuLease<'_>,
     ) -> Result<(), TrapError> {
-        use carrick_el1_abi::{X86ForkLifecycleLoan, X86ForkStockExchange, X86ForkStockRefusal};
+        use carrick_el1_abi::{ForkLifecycleLoan, ForkStockExchange, ForkStockRefusal};
         use carrick_guest_arch::KernelVa;
         let execution = self.physical_execution(lease)?;
         let address = lease.vcpu.get_gpr(X86Reg::Rax)?;
         let (_, tag) = unsafe { self.read_stack_record::<u64>(lease, execution.context, address) }?;
-        match carrick_el1_abi::X86ForkStockKind::decode(tag) {
-            Some(carrick_el1_abi::X86ForkStockKind::Loan) => {}
+        match carrick_el1_abi::ForkStockKind::decode(tag) {
+            Some(carrick_el1_abi::ForkStockKind::Loan) => {}
             Some(
-                carrick_el1_abi::X86ForkStockKind::Commit
-                | carrick_el1_abi::X86ForkStockKind::Abort,
+                carrick_el1_abi::ForkStockKind::Commit | carrick_el1_abi::ForkStockKind::Abort,
             ) => {
                 return self.settle_fork_stock(lease, execution, address);
             }
             None => return Err(fail("physical fork stock unknown record tag")),
         }
         let physical =
-            self.stack_record_physical::<X86ForkStockExchange>(lease, execution.context, address)?;
+            self.stack_record_physical::<ForkStockExchange>(lease, execution.context, address)?;
         let bytes = self
             ._vm
-            .read(physical, size_of::<X86ForkStockExchange>())
+            .read(physical, size_of::<ForkStockExchange>())
             .map_err(|error| fail(error.to_string()))?;
-        let mut record = std::mem::MaybeUninit::<X86ForkStockExchange>::uninit();
+        let mut record = std::mem::MaybeUninit::<ForkStockExchange>::uninit();
         // SAFETY: this ABI record consists solely of u64 words, so every bit
         // pattern is valid. Local typed storage supplies the record alignment.
         unsafe {
@@ -631,15 +630,15 @@ impl Cpl0HostCustody {
             || request.context != execution.context
             || request.operation.carrier != self._vm.identity().nonzero()
         {
-            record.refuse(X86ForkStockRefusal::Stale);
+            record.refuse(ForkStockRefusal::Stale);
         } else if self.fork_pending[index].is_some() || !self.fork_lifecycle_available {
-            record.refuse(X86ForkStockRefusal::Capacity);
+            record.refuse(ForkStockRefusal::Capacity);
         } else if let Some((child_tables, parent_tables)) = take_fork_table_stock(
             &mut self.grant_tables,
             request.child_bytes,
             request.parent_bytes,
         ) {
-            let lifecycle = X86ForkLifecycleLoan::new(
+            let lifecycle = ForkLifecycleLoan::new(
                 KernelVa::new(METADATA_VA + 0x4000),
                 KernelVa::new(METADATA_VA + 0x5000),
             )
@@ -689,14 +688,14 @@ impl Cpl0HostCustody {
                 return Err(fail("physical fork stock reply changed"));
             }
         } else {
-            record.refuse(X86ForkStockRefusal::Capacity);
+            record.refuse(ForkStockRefusal::Capacity);
         }
         // SAFETY: expose only initialized u64 fields/padding in the copied ABI
         // record. The stopped CPU exclusively owns these validated stack bytes.
         let bytes = unsafe {
             std::slice::from_raw_parts(
                 (&raw const record).cast::<u8>(),
-                size_of::<X86ForkStockExchange>(),
+                size_of::<ForkStockExchange>(),
             )
         };
         self._vm
@@ -710,7 +709,7 @@ impl Cpl0HostCustody {
         execution: GrantExecution,
         address: u64,
     ) -> Result<(), TrapError> {
-        use carrick_el1_abi::{PortalForkCustody, X86ForkStockSettlement};
+        use carrick_el1_abi::{ForkStockSettlement, PortalForkCustody};
         let index = lease.cpu.raw() as usize;
         let pending = self.fork_pending[index]
             .as_ref()
@@ -720,7 +719,7 @@ impl Cpl0HostCustody {
         }
         let loan = pending.loan;
         let (physical, mut record) = unsafe {
-            self.read_stack_record::<X86ForkStockSettlement>(lease, execution.context, address)
+            self.read_stack_record::<ForkStockSettlement>(lease, execution.context, address)
         }?;
         if record.abort_matches(loan) {
             // A restored descriptor tree needs its own exact guest receipt;
@@ -932,7 +931,7 @@ impl Cpl0HostCustody {
         let bytes = unsafe {
             std::slice::from_raw_parts(
                 (&raw const record).cast::<u8>(),
-                size_of::<X86ForkStockSettlement>(),
+                size_of::<ForkStockSettlement>(),
             )
         };
         self._vm
@@ -1628,9 +1627,9 @@ mod custody_tests {
     #[test]
     fn production_physical_ports_do_not_alias_native_or_fixture_doorbells() {
         let physical = [
-            carrick_el1_abi::X86_FORK_STOCK_PORT,
-            carrick_el1_abi::X86_NATIVE_ROOT_EXIT_PORT,
-            carrick_el1_abi::X86_NATIVE_PEER_READY_PORT,
+            carrick_el1_abi::FORK_STOCK_PORT,
+            carrick_el1_abi::NATIVE_ROOT_EXIT_PORT,
+            carrick_el1_abi::NATIVE_PEER_READY_PORT,
         ];
         let existing = [
             FAULT_DOORBELL_PORT,
