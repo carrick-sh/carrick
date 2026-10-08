@@ -467,6 +467,7 @@ dependencies = [
  "carrick-personality-linux",
  "carrick-sched-core",
  "parking_lot",
+ "zerocopy",
 ]
 
 [[package]]
@@ -476,6 +477,7 @@ dependencies = [
  "carrick-guest-arch",
  "carrick-mmu-core",
  "carrick-sched-core",
+ "zerocopy",
 ]
 
 [[package]]
@@ -493,6 +495,8 @@ dependencies = [
  "carrick-mmu-core",
  "carrick-personality-linux",
  "carrick-sched-core",
+ "carrick-signal-core",
+ "carrick-test-support",
  "zerocopy",
 ]
 
@@ -1091,12 +1095,14 @@ dependencies = [
  "carrick-aarch64",
  "carrick-abi",
  "carrick-core",
+ "carrick-el1",
  "carrick-el1-abi",
  "carrick-fatal",
  "carrick-guest-arch",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",
+ "carrick-kernel",
  "carrick-mem",
  "carrick-mmu-core",
  "carrick-sched-core",
