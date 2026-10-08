@@ -57,7 +57,7 @@ use crate::linux_abi::LinuxErrno;
 use crate::memory::AddressSpace;
 use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
 use crate::trap::{SyscallTrap, TrapError};
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 use carrick_kernel::dispatch::CurrentMmMemory;
 use carrick_kernel::dispatch::routing::{MutationDispatchRoute, OrdinaryDispatchRoute};
 use carrick_kernel::dispatch::{
@@ -420,7 +420,7 @@ pub(crate) use wait_wake::{
 pub(crate) mod terminal;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use terminal::ForkCloseAttempt;
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
 pub(crate) use terminal::ProcessExitClaim;
 pub(crate) use terminal::{
     CloneAdmissionChangeSubscription, CloneAdmissionGate, CloneAdmissionPermit, CloneEnrollment,
