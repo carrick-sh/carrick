@@ -408,6 +408,9 @@ impl MemState {
         }
         let node = root.with_root(|model| Ok(model.node(page)))?;
         Ok(match node {
+            None if self.resident_fault_ranges.prot_for_page(page).is_some() => {
+                FirstTouchOwner::Host
+            }
             None => FirstTouchOwner::Unmapped,
             Some((mapping, incarnation))
                 if mapping.anonymous
