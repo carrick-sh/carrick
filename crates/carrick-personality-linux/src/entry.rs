@@ -18,10 +18,8 @@ pub fn decode_x86_64(native: u64, mut args: [u64; 6], stack: u64) -> CanonicalCa
     let canonical = if crate::abi::x86_64::lookup_native_x86_64(native).is_some() {
         carrick_syscall_abi::CARRICK_PRIVATE_X86_ARCH_PRCTL
     } else {
-        carrick_syscall_abi::syscall_x86_64::canonical_x86_64(
-            carrick_syscall_abi::NativeNr(native),
-        )
-        .map_or(u64::MAX, carrick_syscall_abi::CanonicalNr::raw)
+        carrick_syscall_abi::syscall_x86_64::canonical_x86_64(carrick_syscall_abi::NativeNr(native))
+            .map_or(u64::MAX, carrick_syscall_abi::CanonicalNr::raw)
     };
     if canonical == carrick_syscall_abi::CARRICK_PRIVATE_X86_POLL {
         args = crate::abi::x86_64::poll_arguments(args);

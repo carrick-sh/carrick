@@ -1116,18 +1116,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-x86/src/bringup_fns.rs:724 in `run_elf_service_loop`, the host result from `libc::getpid` determines the guest `set_tid_address` return value (the guest thread ID) in the M2 run-elf service loop.",
+    "rationale": "At crates/carrick-x86/src/bringup_fns.rs:723 in `run_elf_service_loop`, the host result from `libc::getpid` determines the guest `set_tid_address` return value (the guest thread ID) in the M2 run-elf service loop.",
     "review_id": "HA-000715",
     "source": {
-      "byte_end": 27953,
-      "byte_start": 27941,
+      "byte_end": 27916,
+      "byte_start": 27904,
       "column": 36,
       "column_end": 48,
       "column_start": 36,
       "file": "crates/carrick-x86/src/bringup_fns.rs",
-      "line": 724,
-      "line_end": 724,
-      "line_start": 724
+      "line": 723,
+      "line_end": 723,
+      "line_start": 723
     }
   },
   {
@@ -1406,18 +1406,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-x86/src/bringup_fns.rs:1202 in `sys_poll`, `libc::getrlimit` bounds the standalone VMM harness host pollfd allocation against the inherited host-descriptor capacity. The only callers are standalone VMM binaries/tests; carrick run uses the common kernel dispatcher and its virtual guest rlimit authority. See docs/perf-results/2026-10-04-kvm-m2-poll/README.md for the caller census.",
+    "rationale": "At crates/carrick-x86/src/bringup_fns.rs:1201 in `sys_poll`, `libc::getrlimit` bounds the standalone VMM harness host pollfd allocation against the inherited host-descriptor capacity. The only callers are standalone VMM binaries/tests; carrick run uses the common kernel dispatcher and its virtual guest rlimit authority. See docs/perf-results/2026-10-04-kvm-m2-poll/README.md for the caller census.",
     "review_id": "HA-000754",
     "source": {
-      "byte_end": 45052,
-      "byte_start": 45037,
+      "byte_end": 45015,
+      "byte_start": 45000,
       "column": 17,
       "column_end": 32,
       "column_start": 17,
       "file": "crates/carrick-x86/src/bringup_fns.rs",
-      "line": 1202,
-      "line_end": 1202,
-      "line_start": 1202
+      "line": 1201,
+      "line_end": 1201,
+      "line_start": 1201
     }
   },
   {
@@ -6620,18 +6620,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:1222 in `Cpl0Carrier::boot`, `std::fs::read` reads only the caller-selected CPL0 bootstrap ELF, whose segments and entry are validated before the fixture registers memory or runs either vCPU; no guest syscall argument or guest identity selects this host path.",
+    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:1229 in `Cpl0Carrier::boot`, `std::fs::read` reads only the caller-selected CPL0 bootstrap ELF, whose segments and entry are validated before the fixture registers memory or runs either vCPU; no guest syscall argument or guest identity selects this host path.",
     "review_id": "HA-000752",
     "source": {
-      "byte_end": 48280,
-      "byte_start": 48267,
+      "byte_end": 48564,
+      "byte_start": 48551,
       "column": 21,
       "column_end": 34,
       "column_start": 21,
       "file": "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
-      "line": 1222,
-      "line_end": 1222,
-      "line_start": 1222
+      "line": 1229,
+      "line_end": 1229,
+      "line_start": 1229
     }
   },
   {
@@ -16304,8 +16304,8 @@
     "rationale": "At crates/carrick-vmm-kvm/src/kvm.rs:211 in `print_kvm_stats_once`, `std::process::id` names only the current carrier in the `CARRICK_KVM_STATS` diagnostic line on stderr; no guest identity selects its host target.",
     "review_id": "HA-000747",
     "source": {
-      "byte_end": 7470,
-      "byte_start": 7454,
+      "byte_end": 7476,
+      "byte_start": 7460,
       "column": 9,
       "column_end": 25,
       "column_start": 9,
