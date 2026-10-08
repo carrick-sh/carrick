@@ -791,7 +791,9 @@ impl AddressSpaces {
         }
         let ttbr0 = entry.ttbr0.load(Ordering::Acquire);
         let ttbr1 = entry.ttbr1.load(Ordering::Acquire);
-        if ttbr0 == 0 || ttbr1 == 0 {
+        // Match ordinary grant authentication: a single-root address space
+        // has no secondary root, but retains its admitted primary root.
+        if ttbr0 == 0 {
             return None;
         }
         Some(ClosedChildEditor {
@@ -1023,6 +1025,37 @@ mod tests {
         );
         // An unpublished key drains nothing.
         assert_eq!(spaces.drain_vma_journal(77, |_| panic!()), 0);
+    }
+
+    #[test]
+    fn closed_child_accepts_the_same_single_root_as_live_grant() {
+        let spaces = AddressSpaces::new();
+        let child = spaces.publish_closed(77, 0x1000, 0).unwrap();
+        let editor = spaces
+            .try_begin_closed_child_edit(child, 77, NonZeroU64::MIN)
+            .expect("an admitted primary root does not require a secondary root");
+        assert_eq!((editor.grant().ttbr0, editor.grant().ttbr1), (0x1000, 0));
+        drop(editor);
+        assert_eq!(spaces.active_editor(child), None);
+        spaces.open(child);
+        assert_eq!(spaces.grant(child, 77).unwrap().ttbr0, 0x1000);
+        assert!(
+            spaces
+                .try_begin_closed_child_edit(child, 77, NonZeroU64::MIN)
+                .is_none()
+        );
+        spaces.close(child);
+        assert!(
+            spaces
+                .try_begin_closed_child_edit(child, 78, NonZeroU64::MIN)
+                .is_none()
+        );
+        let absent = spaces.publish_closed(79, 0, 0x2000).unwrap();
+        assert!(
+            spaces
+                .try_begin_closed_child_edit(absent, 79, NonZeroU64::MIN)
+                .is_none()
+        );
     }
 
     #[test]
