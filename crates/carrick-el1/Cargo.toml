@@ -13,6 +13,7 @@ carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-inotify-core = { path = "../carrick-inotify-core" }
 carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-sched-core = { path = "../carrick-sched-core" }
+carrick-signal-core = { path = "../carrick-signal-core" }
 zerocopy.workspace = true
 
 [features]
@@ -28,6 +29,7 @@ path = "src/entry.rs"
 path = "src/lib.rs"
 
 [dev-dependencies]
+carrick-test-support = { path = "../carrick-test-support" }
 carrick-core = { path = "../carrick-core", features = ["host-test"] }
 carrick-aarch64 = { path = "../carrick-aarch64" }
 carrick-hal = { path = "../carrick-hal" }

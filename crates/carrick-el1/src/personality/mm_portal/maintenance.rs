@@ -359,18 +359,10 @@ fn with_x86_backing_venue<R>(
         >,
     ) -> R,
 ) -> Result<R, MmError> {
-    let native = crate::isa::x86::portal_descriptor_words(target).map_err(|_| MmError::Stale)?;
-    let words: &dyn LiveDescriptorWords = &native;
-    let root = SubstrateGpa(target);
-    let venue = carrick_core::mm::cow::GuestCowVenue {
-        publish_executable: None,
-        words,
-        root,
-        pool: carrick_el1_abi::cow_grant_pool_guest(),
-        residency: carrick_el1_abi::frame_grant_residency_guest(),
-        copy_window: carrick_core::mm::cow::CowCopyWindow::target(words, root),
-    };
-    Ok(run(&venue))
+    // The CPL0 InitialWords authority is not available to this service yet.
+    // Refuse before constructing another descriptor window or an ARM pool.
+    let _ = (target, run);
+    Err(MmError::Core)
 }
 
 #[cfg(target_os = "none")]

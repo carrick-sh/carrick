@@ -1,5 +1,9 @@
 //! Exact execution identity presented at a native entry boundary.
-use carrick_sched_core::{RecordId, SlotId, ZoneTables};
+use carrick_sched_core::{RecordId, SlotId, ThreadCtx, ZoneTables};
+
+/// A scheduler-owned context image; entry custody never interprets its words.
+pub trait EntryContext: Copy + Send + Sync + zerocopy::FromZeros {}
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> EntryContext for C {}
 use core::ptr::NonNull;
 use core::sync::atomic::AtomicU64;
 
@@ -89,8 +93,8 @@ impl ExecutionBinding {
 
 /// Exact native scheduler region/slot; core authenticates its live record.
 #[derive(Clone, Copy)]
-pub struct BornInZoneSource<'a> {
-    pub zone: &'a ZoneTables,
+pub struct BornInZoneSource<'a, C: EntryContext = ThreadCtx> {
+    pub zone: &'a ZoneTables<C>,
     pub slot: SlotId,
 }
 
@@ -104,9 +108,9 @@ pub struct EntryRecordIncarnation(pub u64);
 
 /// Record provenance retained through one entry turn; never dereferenced from
 /// the token. Completion compares it with freshly authenticated native custody.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EntryRecordBinding {
-    pub owner: NonNull<ZoneTables>,
+#[derive(Clone, Copy, Debug)]
+pub struct EntryRecordBinding<C: EntryContext = ThreadCtx> {
+    pub owner: NonNull<ZoneTables<C>>,
     pub slot: SlotId,
     pub record: RecordId,
     pub generation: EntryRecordGeneration,
@@ -114,27 +118,27 @@ pub struct EntryRecordBinding {
 }
 
 /// Owns ordinary completion for one host-generation-bound entry.
-#[derive(Debug, Eq, PartialEq)]
-pub struct EntryCompletion<'a> {
+#[derive(Debug)]
+pub struct EntryCompletion<'a, C: EntryContext = ThreadCtx> {
     binding: ExecutionBinding,
-    scope: Option<EntryExecutionScope>,
-    owner_lifetime: core::marker::PhantomData<&'a ZoneTables>,
+    scope: Option<EntryExecutionScope<C>>,
+    owner_lifetime: core::marker::PhantomData<&'a ZoneTables<C>>,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EntryExecutionScope {
-    pub owner: NonNull<ZoneTables>,
+#[derive(Clone, Copy, Debug)]
+pub struct EntryExecutionScope<C: EntryContext = ThreadCtx> {
+    pub owner: NonNull<ZoneTables<C>>,
     pub slot: SlotId,
-    pub record: Option<EntryRecordBinding>,
+    pub record: Option<EntryRecordBinding<C>>,
 }
-impl<'a> EntryCompletion<'a> {
+impl<'a, C: EntryContext> EntryCompletion<'a, C> {
     /// # Safety
     /// The caller must authenticate an issued host execution generation and
     /// retain the exact MM/thread binding for this one entry completion. Any
     /// scope must name that same retained owner, slot and live record epoch.
     pub const unsafe fn from_admitted_binding(
         binding: ExecutionBinding,
-        scope: Option<EntryExecutionScope>,
-        _owner: Option<&'a ZoneTables>,
+        scope: Option<EntryExecutionScope<C>>,
+        _owner: Option<&'a ZoneTables<C>>,
     ) -> Self {
         Self {
             binding,
@@ -147,28 +151,28 @@ impl<'a> EntryCompletion<'a> {
     }
 }
 
-impl EntryCompletion<'_> {
-    pub const fn scope(&self) -> Option<EntryExecutionScope> {
+impl<C: EntryContext> EntryCompletion<'_, C> {
+    pub const fn scope(&self) -> Option<EntryExecutionScope<C>> {
         self.scope
     }
 }
 
 /// Owns one unadopted in-zone entry. This cannot be passed to ordinary host
 /// completion; its exact record owner/claim/incarnation must be reauthenticated.
-#[derive(Debug, Eq, PartialEq)]
-pub struct BornEntryCompletion<'a> {
+#[derive(Debug)]
+pub struct BornEntryCompletion<'a, C: EntryContext = ThreadCtx> {
     binding: ExecutionBinding,
-    record: EntryRecordBinding,
-    owner_lifetime: core::marker::PhantomData<&'a ZoneTables>,
+    record: EntryRecordBinding<C>,
+    owner_lifetime: core::marker::PhantomData<&'a ZoneTables<C>>,
 }
-impl<'a> BornEntryCompletion<'a> {
+impl<'a, C: EntryContext> BornEntryCompletion<'a, C> {
     /// # Safety
     /// The caller must authenticate an unadopted running record, its exact
     /// owner/slot/claim/incarnation, installed MM and all loaded identity words.
     pub const unsafe fn from_admitted_record(
         binding: ExecutionBinding,
-        record: EntryRecordBinding,
-        _owner: &'a ZoneTables,
+        record: EntryRecordBinding<C>,
+        _owner: &'a ZoneTables<C>,
     ) -> Self {
         Self {
             binding,
@@ -179,7 +183,7 @@ impl<'a> BornEntryCompletion<'a> {
     pub const fn binding(&self) -> ExecutionBinding {
         self.binding
     }
-    pub const fn record(&self) -> EntryRecordBinding {
+    pub const fn record(&self) -> EntryRecordBinding<C> {
         self.record
     }
 }
@@ -197,28 +201,57 @@ pub enum Served {
 /// Owned evidence of the initiating record's successful park or retirement.
 /// This is turn-local evidence, never a second continuation record.
 #[derive(Debug)]
-pub struct EntryHandoffReceipt {
+pub struct EntryHandoffReceipt<C: EntryContext = ThreadCtx> {
     binding: ExecutionBinding,
-    record: EntryRecordBinding,
+    record: EntryRecordBinding<C>,
 }
-impl EntryHandoffReceipt {
+impl<C: EntryContext> EntryHandoffReceipt<C> {
     /// # Safety
     /// The issuer authenticated the exact initiating binding/record before
     /// publishing its successful owned scheduler/wait transition. No context
     /// access may follow publication; this receipt is issued once for that turn.
     pub const unsafe fn from_published_transition(
         binding: ExecutionBinding,
-        record: EntryRecordBinding,
+        record: EntryRecordBinding<C>,
     ) -> Self {
         Self { binding, record }
     }
     pub const fn binding(&self) -> ExecutionBinding {
         self.binding
     }
-    pub const fn record(&self) -> EntryRecordBinding {
+    pub const fn record(&self) -> EntryRecordBinding<C> {
         self.record
     }
 }
+
+impl<C: EntryContext> PartialEq for EntryRecordBinding<C> {
+    fn eq(&self, other: &Self) -> bool {
+        self.owner == other.owner
+            && self.slot == other.slot
+            && self.record == other.record
+            && self.generation == other.generation
+            && self.incarnation == other.incarnation
+    }
+}
+impl<C: EntryContext> Eq for EntryRecordBinding<C> {}
+impl<C: EntryContext> PartialEq for EntryExecutionScope<C> {
+    fn eq(&self, other: &Self) -> bool {
+        self.owner == other.owner && self.slot == other.slot && self.record == other.record
+    }
+}
+impl<C: EntryContext> Eq for EntryExecutionScope<C> {}
+impl<C: EntryContext> PartialEq for EntryCompletion<'_, C> {
+    fn eq(&self, other: &Self) -> bool {
+        self.binding == other.binding && self.scope == other.scope
+    }
+}
+impl<C: EntryContext> Eq for EntryCompletion<'_, C> {}
+impl<C: EntryContext> PartialEq for BornEntryCompletion<'_, C> {
+    fn eq(&self, other: &Self) -> bool {
+        self.binding == other.binding && self.record == other.record
+    }
+}
+impl<C: EntryContext> Eq for BornEntryCompletion<'_, C> {}
 
 // Literal wire layout captured from 3fd7862be on a 64-bit host.
 // Keep these values fixed when moving the shared kernel implementation.

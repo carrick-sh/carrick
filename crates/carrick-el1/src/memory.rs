@@ -3,10 +3,12 @@
 #[path = "personality/reservations.rs"]
 pub mod reservations;
 
+use carrick_core::mm::reservation::ReservationGeometry;
 use carrick_el1_abi::{CurrentTask, TrapFrame};
 use carrick_mmu_core::aarch64::{
     GuestPermissionEdit, GuestPermissionEditError, GuestRetirementError,
 };
+use carrick_personality_linux::mm::LinuxReservationPolicy;
 #[cfg(test)]
 use carrick_sched_core::AddressSpaces;
 use carrick_sched_core::spaces::notification::SpaceAccess;
@@ -32,6 +34,8 @@ const MAP_FIXED_NOREPLACE: u64 = 0x100000;
 const EINVAL: i64 = 22;
 const ENOMEM: i64 = 12;
 const PAGE_SIZE: u64 = 4096;
+type ReservationModel<'a, G, C> =
+    carrick_core::mm::reservation::Reservations<'a, LinuxReservationPolicy, G, C>;
 
 /// Keep mmap protection outside EL1's vocabulary on the host decode route.
 /// The memflagmatrix oracle records ignored bits; mprotect is separate.
@@ -94,11 +98,11 @@ impl PendingReservationSyscall {
     /// Complete exactly once, on the saved originating frame after T2 completed
     /// descriptors and authenticated backing. Failed authentication keeps the
     /// pending proposal intact so its owner can explicitly refuse/settle it.
-    pub fn complete(
+    pub fn complete<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZeros>(
         &mut self,
         frame: &mut TrapFrame,
         current: &CurrentTask,
-        model: &mut reservations::Reservations<'_>,
+        model: &mut ReservationModel<'_, G, C>,
         completion: carrick_el1_abi::ReservationCompletion,
     ) -> Result<(), reservations::Refusal> {
         self.complete_as(frame, current, model, completion, None)
@@ -107,21 +111,24 @@ impl PendingReservationSyscall {
     /// venue retired: the root commits and journals the range as an owed
     /// return ([`reservations::Reservations::complete_deferring_return`]);
     /// its frames stay unreusable until the host's inventory receipt.
-    pub fn complete_deferring_return(
+    pub fn complete_deferring_return<
+        G: ReservationGeometry,
+        C: Copy + Send + Sync + zerocopy::FromZeros,
+    >(
         &mut self,
         frame: &mut TrapFrame,
         current: &CurrentTask,
-        model: &mut reservations::Reservations<'_>,
+        model: &mut ReservationModel<'_, G, C>,
         completion: carrick_el1_abi::ReservationCompletion,
         slot: reservations::ReturnSlot,
     ) -> Result<(), reservations::Refusal> {
         self.complete_as(frame, current, model, completion, Some(slot))
     }
-    fn complete_as(
+    fn complete_as<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZeros>(
         &mut self,
         frame: &mut TrapFrame,
         current: &CurrentTask,
-        model: &mut reservations::Reservations<'_>,
+        model: &mut ReservationModel<'_, G, C>,
         completion: carrick_el1_abi::ReservationCompletion,
         owed_return: Option<reservations::ReturnSlot>,
     ) -> Result<(), reservations::Refusal> {
@@ -146,11 +153,11 @@ impl PendingReservationSyscall {
     }
     /// Finish a clean backing/descriptor refusal on the originating thread.
     /// The service must roll back before invoking this method.
-    pub fn refuse(
+    pub fn refuse<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZeros>(
         &mut self,
         frame: &mut TrapFrame,
         current: &CurrentTask,
-        model: &mut reservations::Reservations<'_>,
+        model: &mut ReservationModel<'_, G, C>,
     ) -> Result<(), reservations::Refusal> {
         if !self.owns_frame(frame, current) {
             return Err(reservations::Refusal::Stale);
@@ -165,9 +172,9 @@ impl PendingReservationSyscall {
     }
     /// Cancel after service rollback when the originating thread is gone.
     /// Cancellation delivers no syscall result and increments no served count.
-    pub fn cancel(
+    pub fn cancel<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZeros>(
         self,
-        model: &mut reservations::Reservations<'_>,
+        model: &mut ReservationModel<'_, G, C>,
     ) -> Result<(), reservations::Refusal> {
         model.refuse(self.request)
     }
@@ -177,10 +184,13 @@ impl PendingReservationSyscall {
 /// exact-MM reservation guard. No descriptor operation occurs in this layer.
 /// T2 integration replaces the existing dispatch fallback with this decision,
 /// retaining `Work` until completion instead of forwarding the original SVC.
-pub fn decide_anonymous_syscall(
+pub fn decide_anonymous_syscall<
+    G: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
     frame: &TrapFrame,
     current: &CurrentTask,
-    model: &mut reservations::Reservations<'_>,
+    model: &mut ReservationModel<'_, G, C>,
 ) -> ReservationDisposition {
     use carrick_el1_abi::{ReservationProtection, ReservationRange};
     use reservations::{Decision, Placement, Refusal};
@@ -303,7 +313,7 @@ pub enum MunmapDisposition {
 pub trait AnonymousPermissionEditor {
     fn protect_and_invalidate(
         &mut self,
-        ttbr0: u64,
+        ttbr0: carrick_guest_arch::AddressSpaceRegister,
         edit: GuestPermissionEdit,
     ) -> Result<(), GuestPermissionEditError>;
 }
@@ -312,9 +322,9 @@ pub trait AnonymousPermissionEditor {
 pub trait AnonymousRetirementEditor {
     fn retire_and_invalidate(
         &mut self,
-        ttbr0: u64,
-        address: u64,
-        len: u64,
+        ttbr0: carrick_guest_arch::AddressSpaceRegister,
+        address: carrick_guest_arch::UserVa,
+        len: carrick_guest_arch::GuestLen,
     ) -> Result<(), GuestRetirementError>;
 }
 
@@ -325,9 +335,10 @@ pub struct HardwareAnonymousPermissionEditor;
 impl AnonymousPermissionEditor for HardwareAnonymousPermissionEditor {
     fn protect_and_invalidate(
         &mut self,
-        ttbr0: u64,
+        ttbr0: carrick_guest_arch::AddressSpaceRegister,
         edit: GuestPermissionEdit,
     ) -> Result<(), GuestPermissionEditError> {
+        let ttbr0 = ttbr0.raw();
         const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
         let physical_base = ttbr0 & TTBR_BADDR_MASK;
         let words =
@@ -355,10 +366,13 @@ pub struct HardwareAnonymousRetirementEditor;
 impl AnonymousRetirementEditor for HardwareAnonymousRetirementEditor {
     fn retire_and_invalidate(
         &mut self,
-        ttbr0: u64,
-        address: u64,
-        len: u64,
+        ttbr0: carrick_guest_arch::AddressSpaceRegister,
+        address: carrick_guest_arch::UserVa,
+        len: carrick_guest_arch::GuestLen,
     ) -> Result<(), GuestRetirementError> {
+        let ttbr0 = ttbr0.raw();
+        let address = address.raw();
+        let len = len.raw();
         const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
         let physical_base = ttbr0 & TTBR_BADDR_MASK;
         let words =
@@ -477,20 +491,73 @@ impl Stage1Backing {
     }
 }
 
-/// Classify `[va, va + len)` by walking the live graph rooted at `root`.
-/// `read` loads the descriptor word at a table PA, `None` outside the
-/// primary arena. Absent tables skip their whole span, so the walk is
-/// proportional to the populated terminals, not to `len`.
+use carrick_guest_arch::{AnonymousDescriptorDecode, FrameGpa, UserVa};
+
+pub struct ArmAnonymousDecode;
+impl AnonymousDescriptorDecode for ArmAnonymousDecode {
+    fn indices(va: UserVa) -> [usize; 4] {
+        carrick_mmu_core::aarch64::indices(va.raw())
+    }
+    fn next_table(descriptor: u64, level: usize) -> Option<FrameGpa> {
+        const VALID: u64 = 1;
+        const TABLE: u64 = 0b11;
+        const TABLE_PA: u64 = 0x0000_FFFF_FFFF_F000;
+        (level < 3 && descriptor & (VALID | TABLE) == VALID | TABLE)
+            .then_some(FrameGpa::new(descriptor & TABLE_PA))
+    }
+    fn private_state(descriptor: u64) -> carrick_mmu_core::aarch64::El1PrivateLeafState {
+        carrick_mmu_core::aarch64::el1_private_leaf_state(descriptor)
+    }
+}
+
+pub struct X86AnonymousDecode;
+impl AnonymousDescriptorDecode for X86AnonymousDecode {
+    fn indices(va: UserVa) -> [usize; 4] {
+        [39, 30, 21, 12].map(|shift| ((va.raw() >> shift) & 511) as usize)
+    }
+    fn next_table(descriptor: u64, level: usize) -> Option<FrameGpa> {
+        use carrick_mmu_core::x86::descriptor_txn::{ADDRESS, HUGE, PRESENT};
+        (level < 3 && descriptor & PRESENT != 0 && descriptor & HUGE == 0)
+            .then_some(FrameGpa::new(descriptor & ADDRESS))
+    }
+    fn private_state(descriptor: u64) -> carrick_mmu_core::aarch64::El1PrivateLeafState {
+        use carrick_mmu_core::aarch64::El1PrivateLeafState;
+        use carrick_mmu_core::x86::descriptor_txn::{ADDRESS, PREPARED, PRESENT, PRIVATE, RETIRED};
+        if descriptor & PRIVATE == 0 {
+            El1PrivateLeafState::Unowned
+        } else if descriptor & PRESENT != 0 {
+            El1PrivateLeafState::Resident
+        } else if descriptor & RETIRED != 0 {
+            El1PrivateLeafState::Retired
+        } else if descriptor & PREPARED != 0 && descriptor & ADDRESS != 0 {
+            El1PrivateLeafState::Prepared
+        } else {
+            El1PrivateLeafState::Malformed
+        }
+    }
+}
+
+/// ARM binding retained for existing callers of the shared classifier.
 pub fn classify_stage1_range(
     read: &dyn Fn(u64) -> Option<u64>,
     root: u64,
     va: u64,
     len: u64,
 ) -> Stage1Backing {
-    use carrick_mmu_core::aarch64::{El1PrivateLeafState, el1_private_leaf_state, indices};
-    const VALID: u64 = 1;
-    const TABLE: u64 = 0b11;
-    const TABLE_PA: u64 = 0x0000_FFFF_FFFF_F000;
+    classify_anonymous_range::<ArmAnonymousDecode>(read, root, va, len)
+}
+
+/// Classify `[va, va + len)` by walking the live graph rooted at `root`.
+/// `read` loads the descriptor word at a table PA, `None` outside the
+/// primary arena. Absent tables skip their whole span, so the walk is
+/// proportional to the populated terminals, not to `len`.
+pub fn classify_anonymous_range<A: AnonymousDescriptorDecode>(
+    read: &dyn Fn(u64) -> Option<u64>,
+    root: u64,
+    va: u64,
+    len: u64,
+) -> Stage1Backing {
+    use carrick_mmu_core::aarch64::El1PrivateLeafState;
     const SPANS: [u64; 4] = [1 << 39, 1 << 30, 1 << 21, PAGE_SIZE];
     let malformed = Stage1Backing::foreign(ForeignBacking::Malformed);
     let Some(end) = va.checked_add(len) else {
@@ -500,15 +567,15 @@ pub fn classify_stage1_range(
     let (mut private, mut resident) = (false, false);
     let mut cursor = va;
     while cursor < end {
-        let index = indices(cursor);
+        let index = A::indices(UserVa::new(cursor));
         let mut table = root;
         let mut level = 0;
         let descriptor = loop {
             let Some(descriptor) = read(table + index[level] as u64 * 8) else {
                 return malformed;
             };
-            if level < 3 && descriptor & (VALID | TABLE) == VALID | TABLE {
-                table = descriptor & TABLE_PA;
+            if let Some(next_table) = A::next_table(descriptor, level) {
+                table = next_table.raw();
                 level += 1;
                 continue;
             }
@@ -517,7 +584,7 @@ pub fn classify_stage1_range(
         let span = SPANS[level];
         let next = (cursor & !(span - 1)).saturating_add(span);
         if descriptor != 0 {
-            match el1_private_leaf_state(descriptor) {
+            match A::private_state(descriptor) {
                 El1PrivateLeafState::Prepared => private = true,
                 El1PrivateLeafState::Resident => {
                     private = true;
@@ -553,11 +620,30 @@ pub fn classify_stage1_range(
 }
 
 /// Exact-MM read of the live stage-1 graph behind the syscall policy.
+///
+/// A raw integer is not an authenticated root register or a user range.
+/// ```compile_fail
+/// use carrick_el1::memory::AnonymousBackingProbe;
+/// fn untyped<E: AnonymousBackingProbe>(editor: &mut E) {
+///     editor.backing(0_u64, 0_u64, 4096_u64);
+/// }
+/// ```
 pub trait AnonymousBackingProbe {
-    fn backing(&mut self, ttbr0: u64, va: u64, len: u64) -> Stage1Backing;
+    /// Bind the reservation owner's unique operation identity before edits.
+    fn bind_operation(&mut self, _sequence: carrick_el1_abi::ReservationSequence) {}
+    fn backing(
+        &mut self,
+        ttbr0: carrick_guest_arch::AddressSpaceRegister,
+        va: carrick_guest_arch::UserVa,
+        len: carrick_guest_arch::GuestLen,
+    ) -> Stage1Backing;
     /// `[start, end)` of the live first-touch grant of exactly `mm_key`
     /// that prepared `va`, if any: stock this MM may hand to a new mapping.
-    fn stock_span(&mut self, mm_key: u64, va: u64) -> Option<(u64, u64)>;
+    fn stock_span(
+        &mut self,
+        mm_key: carrick_el1_abi::ReservationMm,
+        va: carrick_guest_arch::UserVa,
+    ) -> Option<carrick_guest_arch::UserRange>;
 }
 
 /// Every descriptor step of a delegated anonymous transaction.
@@ -576,7 +662,15 @@ pub struct HardwareAnonymousEditor;
 
 #[cfg(target_os = "none")]
 impl AnonymousBackingProbe for HardwareAnonymousEditor {
-    fn backing(&mut self, ttbr0: u64, va: u64, len: u64) -> Stage1Backing {
+    fn backing(
+        &mut self,
+        ttbr0: carrick_guest_arch::AddressSpaceRegister,
+        va: carrick_guest_arch::UserVa,
+        len: carrick_guest_arch::GuestLen,
+    ) -> Stage1Backing {
+        let ttbr0 = ttbr0.raw();
+        let va = va.raw();
+        let len = len.raw();
         const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
         let root = ttbr0 & TTBR_BADDR_MASK;
         let primary = carrick_mmu_core::aarch64::descriptor_txn::TableWindow {
@@ -605,12 +699,18 @@ impl AnonymousBackingProbe for HardwareAnonymousEditor {
         classify_stage1_range(&read, root, va, len)
     }
 
-    fn stock_span(&mut self, mm_key: u64, va: u64) -> Option<(u64, u64)> {
-        let page = carrick_el1_abi::frame_grant_residency_guest().lookup(mm_key, va)?;
-        Some((
-            page.identity.semantic_base,
-            page.identity.semantic_base + page.identity.len,
-        ))
+    fn stock_span(
+        &mut self,
+        mm_key: carrick_el1_abi::ReservationMm,
+        va: carrick_guest_arch::UserVa,
+    ) -> Option<carrick_guest_arch::UserRange> {
+        let mm_key = mm_key.raw();
+        let va = va.raw();
+        let page = crate::isa::frame_grant_residency_guest().lookup(mm_key, va)?;
+        carrick_guest_arch::UserRange::checked(
+            carrick_guest_arch::UserVa::new(page.identity.semantic_base),
+            carrick_guest_arch::GuestLen::new(page.identity.len),
+        )
     }
 }
 
@@ -618,7 +718,7 @@ impl AnonymousBackingProbe for HardwareAnonymousEditor {
 impl AnonymousPermissionEditor for HardwareAnonymousEditor {
     fn protect_and_invalidate(
         &mut self,
-        ttbr0: u64,
+        ttbr0: carrick_guest_arch::AddressSpaceRegister,
         edit: GuestPermissionEdit,
     ) -> Result<(), GuestPermissionEditError> {
         HardwareAnonymousPermissionEditor.protect_and_invalidate(ttbr0, edit)
@@ -629,9 +729,9 @@ impl AnonymousPermissionEditor for HardwareAnonymousEditor {
 impl AnonymousRetirementEditor for HardwareAnonymousEditor {
     fn retire_and_invalidate(
         &mut self,
-        ttbr0: u64,
-        address: u64,
-        len: u64,
+        ttbr0: carrick_guest_arch::AddressSpaceRegister,
+        address: carrick_guest_arch::UserVa,
+        len: carrick_guest_arch::GuestLen,
     ) -> Result<(), GuestRetirementError> {
         HardwareAnonymousRetirementEditor.retire_and_invalidate(ttbr0, address, len)
     }
@@ -660,12 +760,16 @@ pub enum DelegatedAnonymous {
 /// retirement's frames are journaled as an owed return for the host's bulk
 /// receipt at its next boundary. Everything else refuses the proposal and
 /// forwards. The Linux entry owner publishes the completion/refusal counter.
-pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
+pub fn serve_delegated_anonymous<
+    E: AnonymousDescriptorEditor,
+    G: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
     frame: &mut TrapFrame,
     counters: &carrick_el1_abi::Counters,
     current: &CurrentTask,
-    spaces: SpaceAccess<'_>,
-    table: &reservations::SharedReservations,
+    spaces: SpaceAccess<'_, C>,
+    table: &carrick_core::mm::reservation::SharedReservations<LinuxReservationPolicy, G>,
     editor: &mut E,
 ) -> DelegatedAnonymous {
     let nr = frame.x[8];
@@ -695,13 +799,12 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
         ReservationDisposition::Work(pending) => pending,
     };
     let request = pending.request();
-    let refuse = |pending: PendingReservationSyscall,
-                  model: &mut reservations::Reservations<'_>,
-                  why: Leave| {
-        // The proposal is this guard's own; refusing it cannot be stale.
-        let _ = pending.cancel(model);
-        forward(why)
-    };
+    let refuse =
+        |pending: PendingReservationSyscall, model: &mut ReservationModel<'_, G, C>, why: Leave| {
+            // The proposal is this guard's own; refusing it cannot be stale.
+            let _ = pending.cancel(model);
+            forward(why)
+        };
     let (Some(grant), Some(owner)) = (spaces.grant(index, mm_key), NonZeroU64::new(frame.slot + 1))
     else {
         return refuse(pending, &mut model, Leave::NoGrant);
@@ -709,11 +812,16 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
     let Some(_editor_guard) = spaces.try_begin_edit(index, mm_key, owner) else {
         return refuse(pending, &mut model, Leave::EditorBusy);
     };
+    editor.bind_operation(request.sequence);
     let (va, len) = (request.range.start(), request.range.len());
     if request.operation == carrick_el1_abi::ReservationOperation::Move {
         return refuse(pending, &mut model, Leave::RootDeclined);
     }
-    let backing = editor.backing(grant.ttbr0, va, len);
+    let backing = editor.backing(
+        carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
+        carrick_guest_arch::UserVa::new(va),
+        carrick_guest_arch::GuestLen::new(len),
+    );
     // One editor call is one all-or-nothing step: a range whose backing is
     // split into several runs by holes goes to the host.
     let run = match backing.runs() {
@@ -731,8 +839,11 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
         && backing.summary == RangeBacking::Prepared
         && run.is_some_and(|(start, run_len)| {
             editor
-                .stock_span(mm_key, start)
-                .is_some_and(|(base, end)| base <= start && start + run_len <= end)
+                .stock_span(mm, carrick_guest_arch::UserVa::new(start))
+                .is_some_and(|span| {
+                    span.start().raw() <= start
+                        && start + run_len <= span.start().raw() + span.len().raw()
+                })
         })
         && {
             let mut nodes = 0usize;
@@ -768,7 +879,10 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
                 writable: request.protection.bits() & PROT_WRITE != 0,
                 executable: request.protection.bits() & PROT_EXEC != 0,
             };
-            match editor.protect_and_invalidate(grant.ttbr0, edit) {
+            match editor.protect_and_invalidate(
+                carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
+                edit,
+            ) {
                 Ok(()) => None,
                 Err(GuestPermissionEditError::RollbackFailed) => {
                     panic!("EL1 anonymous permission rollback failed")
@@ -787,11 +901,14 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
             let Ok(slot) = model.reserve_return(request.range) else {
                 return refuse(pending, &mut model, Leave::JournalFull);
             };
-            match editor.retire_and_invalidate(grant.ttbr0, start, run_len) {
+            match editor.retire_and_invalidate(
+                carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
+                carrick_guest_arch::UserVa::new(start),
+                carrick_guest_arch::GuestLen::new(run_len),
+            ) {
                 Ok(()) => {
                     #[cfg(target_os = "none")]
-                    carrick_el1_abi::frame_grant_residency_guest()
-                        .retire_overlapping(mm_key, va, len);
+                    crate::isa::frame_grant_residency_guest().retire_overlapping(mm_key, va, len);
                     Some(slot)
                 }
                 Err(GuestRetirementError::RollbackFailed) => {
@@ -847,11 +964,14 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
 /// The admitted root that owns syscall `nr` when it is a delegated MM's
 /// anonymous `brk`/`mmap`/`munmap`/`mprotect` (`None`: the MM keeps the
 /// paths it had before admission).
-pub fn delegated_anonymous_root(
+pub fn delegated_anonymous_root<
+    G: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
     nr: u64,
     current: &CurrentTask,
-    spaces: SpaceAccess<'_>,
-    table: &reservations::SharedReservations,
+    spaces: SpaceAccess<'_, C>,
+    table: &carrick_core::mm::reservation::SharedReservations<LinuxReservationPolicy, G>,
 ) -> Option<(
     carrick_el1_abi::ReservationMm,
     carrick_sched_core::spaces::SpaceIndex,
@@ -908,10 +1028,14 @@ pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
     let Some(_guard) = spaces.try_begin_edit(index, mm_key, owner) else {
         return MunmapDisposition::Forward;
     };
-    match editor.retire_and_invalidate(grant.ttbr0, address, len) {
+    match editor.retire_and_invalidate(
+        carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
+        carrick_guest_arch::UserVa::new(address),
+        carrick_guest_arch::GuestLen::new(len),
+    ) {
         Ok(()) => {
             #[cfg(target_os = "none")]
-            carrick_el1_abi::frame_grant_residency_guest().retire_overlapping(mm_key, address, len);
+            crate::isa::frame_grant_residency_guest().retire_overlapping(mm_key, address, len);
             MunmapDisposition::Retired
         }
         Err(GuestRetirementError::BadRange) => MunmapDisposition::Return(-EINVAL),
@@ -981,7 +1105,10 @@ pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
         writable: prot & PROT_WRITE != 0,
         executable: prot & PROT_EXEC != 0,
     };
-    match editor.protect_and_invalidate(grant.ttbr0, edit) {
+    match editor.protect_and_invalidate(
+        carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
+        edit,
+    ) {
         Ok(()) if journal_room => {
             // The host applies this, in order, before it next reads the
             // MM's VMA rows; no exit now.
@@ -1006,6 +1133,45 @@ pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn x86_private_classifier_regression() {
+        use carrick_mmu_core::x86::descriptor_txn::{PREPARED, PRESENT, PRIVATE, RETIRED};
+        let root = 0x1000;
+        for (leaf, expected) in [
+            (0x5000 | PRIVATE | PRESENT, RangeBacking::Private),
+            (0x5000 | PRIVATE | PREPARED, RangeBacking::Prepared),
+            (0x5000 | PRIVATE | RETIRED, RangeBacking::Retired),
+            (0x5000 | PRESENT, RangeBacking::Foreign),
+            (PRIVATE, RangeBacking::Foreign),
+            (0, RangeBacking::Empty),
+        ] {
+            let read = |pa| match pa {
+                0x1000 => Some(0x2000 | 7),
+                0x2000 => Some(0x3000 | 7),
+                0x3000 => Some(0x4000 | 7),
+                0x4000 => Some(leaf),
+                _ => None,
+            };
+            assert_eq!(
+                classify_anonymous_range::<X86AnonymousDecode>(&read, root, 0, 4096).summary,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn x86_classifier_skips_absent_subtrees() {
+        use core::cell::Cell;
+        let reads = Cell::new(0);
+        let read = |pa| {
+            reads.set(reads.get() + 1);
+            (pa == 0x1000).then_some(0)
+        };
+        let backing = classify_anonymous_range::<X86AnonymousDecode>(&read, 0x1000, 0, 1 << 39);
+        assert_eq!(backing.summary, RangeBacking::Empty);
+        assert_eq!(reads.get(), 1);
+    }
+
     use super::*;
 
     #[derive(Default)]
@@ -1017,9 +1183,10 @@ mod tests {
     impl AnonymousPermissionEditor for RecordingEditor {
         fn protect_and_invalidate(
             &mut self,
-            ttbr0: u64,
+            ttbr0: carrick_guest_arch::AddressSpaceRegister,
             edit: GuestPermissionEdit,
         ) -> Result<(), GuestPermissionEditError> {
+            let ttbr0 = ttbr0.raw();
             self.calls.push((ttbr0, edit));
             self.result.map_or(Ok(()), Err)
         }
@@ -1202,10 +1369,13 @@ mod tests {
     impl AnonymousRetirementEditor for RecordingRetirementEditor {
         fn retire_and_invalidate(
             &mut self,
-            ttbr0: u64,
-            address: u64,
-            len: u64,
+            ttbr0: carrick_guest_arch::AddressSpaceRegister,
+            address: carrick_guest_arch::UserVa,
+            len: carrick_guest_arch::GuestLen,
         ) -> Result<(), GuestRetirementError> {
+            let ttbr0 = ttbr0.raw();
+            let address = address.raw();
+            let len = len.raw();
             self.calls.push((ttbr0, address, len));
             self.result.map_or(Ok(()), Err)
         }
@@ -1357,6 +1527,7 @@ mod tests {
             /// Backed runs to report; `None`: the whole queried range.
             runs: Option<&'static [(u64, u64)]>,
             calls: Vec<Call>,
+            sequences: Vec<ReservationSequence>,
         }
         impl Editor {
             fn over(backing: RangeBacking) -> Self {
@@ -1366,11 +1537,23 @@ mod tests {
                     stock: None,
                     runs: None,
                     calls: Vec::new(),
+                    sequences: Vec::new(),
                 }
             }
         }
         impl AnonymousBackingProbe for Editor {
-            fn backing(&mut self, ttbr0: u64, va: u64, len: u64) -> Stage1Backing {
+            fn bind_operation(&mut self, sequence: ReservationSequence) {
+                self.sequences.push(sequence);
+            }
+            fn backing(
+                &mut self,
+                ttbr0: carrick_guest_arch::AddressSpaceRegister,
+                va: carrick_guest_arch::UserVa,
+                len: carrick_guest_arch::GuestLen,
+            ) -> Stage1Backing {
+                let ttbr0 = ttbr0.raw();
+                let va = va.raw();
+                let len = len.raw();
                 self.calls.push(Call::Probe(ttbr0, va, len));
                 match self.runs {
                     Some(runs) => Stage1Backing::with_runs(self.backing, runs),
@@ -1384,18 +1567,32 @@ mod tests {
                     None => Stage1Backing::of(self.backing),
                 }
             }
-            fn stock_span(&mut self, mm_key: u64, va: u64) -> Option<(u64, u64)> {
-                self.stock
+            fn stock_span(
+                &mut self,
+                mm_key: carrick_el1_abi::ReservationMm,
+                va: carrick_guest_arch::UserVa,
+            ) -> Option<carrick_guest_arch::UserRange> {
+                let mm_key = mm_key.raw();
+                let va = va.raw();
+                let raw_span = self
+                    .stock
                     .filter(|&(mm, start, end)| mm == mm_key && start <= va && va < end)
-                    .map(|(_, start, end)| (start, end))
+                    .map(|(_, start, end)| (start, end));
+                raw_span.and_then(|(start, end)| {
+                    carrick_guest_arch::UserRange::checked(
+                        carrick_guest_arch::UserVa::new(start),
+                        carrick_guest_arch::GuestLen::new(end.checked_sub(start)?),
+                    )
+                })
             }
         }
         impl AnonymousPermissionEditor for Editor {
             fn protect_and_invalidate(
                 &mut self,
-                ttbr0: u64,
+                ttbr0: carrick_guest_arch::AddressSpaceRegister,
                 edit: GuestPermissionEdit,
             ) -> Result<(), GuestPermissionEditError> {
+                let ttbr0 = ttbr0.raw();
                 self.calls.push(Call::Protect(ttbr0, edit));
                 self.protect.map_or(Ok(()), Err)
             }
@@ -1403,10 +1600,13 @@ mod tests {
         impl AnonymousRetirementEditor for Editor {
             fn retire_and_invalidate(
                 &mut self,
-                ttbr0: u64,
-                address: u64,
-                len: u64,
+                ttbr0: carrick_guest_arch::AddressSpaceRegister,
+                address: carrick_guest_arch::UserVa,
+                len: carrick_guest_arch::GuestLen,
             ) -> Result<(), GuestRetirementError> {
+                let ttbr0 = ttbr0.raw();
+                let address = address.raw();
+                let len = len.raw();
                 self.calls.push(Call::Retire(ttbr0, address, len));
                 Ok(())
             }
@@ -1469,6 +1669,30 @@ mod tests {
             let mut owed = Vec::new();
             model.observe_deferred_returns(&mut |entry| owed.push(entry));
             owed
+        }
+
+        #[test]
+        fn delegated_descriptor_steps_bind_distinct_owner_operations() {
+            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
+            let delegated = mm(&spaces, &table, 17, true);
+            let mut editor = Editor::over(RangeBacking::Empty);
+            for address in [ARENA, ARENA + 0x1000] {
+                assert_eq!(
+                    syscall(
+                        &delegated,
+                        &spaces,
+                        &table,
+                        &counters,
+                        &mut editor,
+                        SYS_MMAP,
+                        mmap_fixed(address, 0x1000)
+                    )
+                    .0,
+                    DelegatedAnonymous::Served
+                );
+            }
+            assert_eq!(editor.sequences.len(), 2);
+            assert!(editor.sequences[0].raw() < editor.sequences[1].raw());
         }
 
         #[test]
