@@ -4,7 +4,7 @@ use crate::ThreadCtx;
 use carrick_guest_arch::{AddressContext, RootGpa};
 
 /// Mask extracting the physical base address from an ARM TTBR0_EL1 register value
-/// (bits [47:12], page-aligned). Upper bits [63:48] store the ASID.
+/// (bits \[47:12\], page-aligned). Upper bits \[63:48\] store the ASID.
 pub const AARCH64_ROOT_ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
 
 /// The zero-valid AArch64 save area in a shared scheduler record.
