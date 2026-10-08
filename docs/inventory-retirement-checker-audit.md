@@ -1,6 +1,7 @@
 # Retired authority checker rule audit
 
-This audit compares the checkers on main (`8ebd6fe41693`) with PR 51.
+This audit compares the checkers on final main (`8f6e6bc08aea`) with PR 51.
+The checker rules are unchanged from the earlier `8ebd6fe41693` audit.
 The replacements consume working production source or live compiler diagnostics;
 accepted identities are operation / owner / lane counters, never source positions.
 COUNT means a monotone ceiling and DELETE-AT-ZERO. TYPE/BOUNDARY and zero rules
@@ -254,3 +255,60 @@ carrick-x86-cpl0:
 
 - `crates/carrick-x86-cpl0/src/entry.rs`
 - `crates/carrick-x86-cpl0/src/fixture.rs`
+
+## Final main rebase and discovery
+
+The one final rebase uses `8f6e6bc08aea90244b66a43192cf970462d33909`.
+Fresh Linux, FreeBSD and NetBSD compiler observations are re-derived by symbolic
+owner. Main adds three `global:env_var` BuildTime cohorts in
+`carrick_observability::build_program::main`: `CARGO_CFG_TARGET_ARCH`,
+`CARGO_CFG_TARGET_OS`, and `HOST`, each exactly one. This build program is
+byte-identical to main.
+
+Main's host/target USDT selection compiles the stub in the Linux-to-FreeBSD
+cross lane. Thus 22 probe owners lose one `std::process::id` crossing in each
+FreeBSD profile: 44 exact ceilings change 1 → 0. These zero cohorts remain for
+DELETE-AT-ZERO. Linux/NetBSD compiler counts are unchanged. Native macOS keeps
+its real provider; its previous symbolic counts remain pending the director's
+fresh discovery on the pushed landing candidate.
+
+| Final correction | Was | Now |
+|---|---:|---:|
+| `build_time` | 27 | 30 |
+| `host_substrate` | 1194 | 1150 |
+| `freebsd_cli` compiled crossings | 565 | 543 |
+| `freebsd_runtime` compiled crossings | 446 | 424 |
+| Head total | 5838 | 5797 |
+| Initial-main bootstrap total | 5842 | 5801 |
+| Retained cohorts | 4986 | 4989 |
+
+The four existing runtime environment-read reductions remain. Direct review of
+current main confirms those four source calls still exist, while no other
+runtime source authority operation changed since the prior bootstrap. Source
+counts and all executed compiler lanes are re-derived, not padded. The initial
+bootstrap provenance now binds exactly the final main SHA above.
+
+The 22 probe owners (each in both `freebsd_cli` and `freebsd_runtime`):
+
+- `carrick_observability::probes::real::execve_argv`
+- `carrick_observability::probes::real::fs_op`
+- `carrick_observability::probes::real::futex_route`
+- `carrick_observability::probes::real::futex_unexpected_errno`
+- `carrick_observability::probes::real::guest_exit`
+- `carrick_observability::probes::real::guest_image_base`
+- `carrick_observability::probes::real::host_jit_range`
+- `carrick_observability::probes::real::host_pipe_io`
+- `carrick_observability::probes::real::itimer_fire`
+- `carrick_observability::probes::real::native_tierd_exception`
+- `carrick_observability::probes::real::native_tierd_unsupported`
+- `carrick_observability::probes::real::native_x86_fault`
+- `carrick_observability::probes::real::native_x86_fault_history`
+- `carrick_observability::probes::real::native_x86_fault_stack`
+- `carrick_observability::probes::real::native_x86_pc`
+- `carrick_observability::probes::real::native_x86_resolve`
+- `carrick_observability::probes::real::native_x86_xstate`
+- `carrick_observability::probes::real::native_x86_xstate_edge`
+- `carrick_observability::probes::real::path_open`
+- `carrick_observability::probes::real::ulock_requeue`
+- `carrick_observability::probes::real::ulock_wait`
+- `carrick_observability::probes::real::ulock_wake`
