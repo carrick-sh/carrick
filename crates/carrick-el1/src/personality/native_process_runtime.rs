@@ -240,6 +240,19 @@ fn custody<'a, M: Clone>(resources: NativeResources<'a, M>) -> Custody<'a, M> {
     custody
 }
 impl<M> NativeResources<'_, M> {
+    fn matches_cpu_binding(&self, binding: ExecutionBinding) -> bool {
+        // The initial owned home is deliberately unpublished (Claim::Free)
+        // until its first park. The process row retains that record; claiming
+        // it OnCpu is not a prerequisite for charging its execution slice.
+        if self.zone.record_ref(self.record.id) != self.record {
+            return false;
+        }
+        let identity = self.zone.record(self.record.id).identity();
+        identity.tid == binding.task.raw()
+            && identity.generation == binding.generation.raw()
+            && identity.mm == binding.mm.raw()
+            && identity.serial == binding.thread_generation.raw()
+    }
     fn record_identity_mm(&self) -> u64 {
         self.zone.record(self.record.id).identity().mm
     }
@@ -459,34 +472,55 @@ impl<'a, M: Clone> NativeProcessRuntime<'a, M> {
             root_exit: None,
         })
     }
+    fn cpu_key(binding: ExecutionBinding) -> Result<TaskKey, NativeProcessError> {
+        Ok(TaskKey {
+            id: TaskId::from_abi_positive(
+                i32::try_from(binding.task.raw()).map_err(|_| NativeProcessError::Invalid)?,
+            )
+            .map_err(|_| NativeProcessError::Invalid)?,
+            serial: TaskSerial::from_raw_u64(binding.generation.raw())
+                .ok_or(NativeProcessError::Invalid)?,
+        })
+    }
     pub fn resume_cpu(
         &self,
-        key: TaskKey,
+        binding: ExecutionBinding,
         sample: CpuSample,
         mode: CpuMode,
     ) -> Result<(), NativeProcessError> {
-        self.graph
-            .lock()
+        let key = Self::cpu_key(binding)?;
+        let mut graph = self.graph.lock();
+        let row = graph
             .owner
             .task_mut(key)
-            .map_err(|_| NativeProcessError::Stale)?
-            .native_mut()
-            .resources_mut()
+            .map_err(|_| NativeProcessError::Stale)?;
+        let resources = row.native_mut().resources_mut();
+        if !resources.matches_cpu_binding(binding) {
+            return Err(NativeProcessError::Stale);
+        }
+        resources
             .cpu
             .resume(sample, mode)
             .map_err(|_| NativeProcessError::Invalid)
     }
     pub fn stop_cpu(
         &self,
-        key: TaskKey,
+        binding: ExecutionBinding,
         sample: CpuSample,
     ) -> Result<Option<CpuMode>, NativeProcessError> {
+        let Ok(key) = Self::cpu_key(binding) else {
+            return Ok(None);
+        };
         let mut graph = self.graph.lock();
         // A final exit has already charged and removed this exact incarnation.
         let Ok(row) = graph.owner.task_mut(key) else {
             return Ok(None);
         };
-        let cpu = &mut row.native_mut().resources_mut().cpu;
+        let resources = row.native_mut().resources_mut();
+        if !resources.matches_cpu_binding(binding) {
+            return Ok(None);
+        }
+        let cpu = &mut resources.cpu;
         let Some(mode) = cpu.running_mode() else {
             return Ok(None);
         };
@@ -592,7 +626,7 @@ impl<'a, M: Clone, S: NativeProcessService<'a, Mm = M>> NativeProcessEntry<'_, '
     }
     fn pause_cpu(&self) -> Result<(), NativeProcessError> {
         if let Some(sample) = self.service.cpu_sample() {
-            self.runtime.stop_cpu(self.key, sample)?;
+            self.runtime.stop_cpu(self.binding, sample)?;
         }
         Ok(())
     }
@@ -1452,6 +1486,21 @@ mod tests {
         };
         assert!(zone.slot(slot).current().is_none());
         let home = zone.slot(slot).host_record().unwrap();
+        assert_eq!(zone.record(home).claim(), carrick_sched_core::Claim::Free);
+        let binding = super::super::common_entry::execution_binding(&task);
+        let sample = |tick| CpuSample {
+            tick: carrick_guest_arch::CounterTick::new(tick),
+            frequency: carrick_guest_arch::CounterFrequency::new(
+                NonZeroU64::new(1_000_000).unwrap(),
+            ),
+        };
+        runtime
+            .resume_cpu(binding, sample(20), CpuMode::User)
+            .unwrap();
+        assert_eq!(
+            runtime.stop_cpu(binding, sample(27)).unwrap(),
+            Some(CpuMode::User)
+        );
         let mut entry = runtime
             .enter(source, &task, words(address), &mut service)
             .unwrap();
@@ -1610,14 +1659,31 @@ mod tests {
                 NonZeroU64::new(1_000_000).unwrap(),
             ),
         };
+        let cpu_binding = super::super::common_entry::execution_binding(&task);
         runtime
-            .resume_cpu(child, sample(10), CpuMode::User)
+            .resume_cpu(cpu_binding, sample(10), CpuMode::User)
             .unwrap();
-        runtime.stop_cpu(child, sample(17)).unwrap();
+        for foreign in [
+            ExecutionBinding {
+                mm: carrick_el1_abi::EntryMmKey::from_raw(address.mm.raw().get()),
+                ..cpu_binding
+            },
+            ExecutionBinding {
+                thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(999),
+                ..cpu_binding
+            },
+        ] {
+            assert_eq!(
+                runtime.stop_cpu(foreign, sample(11)).unwrap(),
+                None,
+                "an idle/foreign binding must not charge the live child"
+            );
+        }
+        runtime.stop_cpu(cpu_binding, sample(17)).unwrap();
         runtime
-            .resume_cpu(child, sample(10_000), CpuMode::System)
+            .resume_cpu(cpu_binding, sample(10_000), CpuMode::System)
             .unwrap();
-        runtime.stop_cpu(child, sample(10_003)).unwrap();
+        runtime.stop_cpu(cpu_binding, sample(10_003)).unwrap();
         {
             let mut child_entry = runtime
                 .enter(source, &task, child_words, &mut service)
