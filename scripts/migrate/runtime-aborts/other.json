@@ -227,7 +227,7 @@
       "file": "crates/carrick-host/src/guest_cpu.rs",
       "function": "adopted_child_wait",
       "ordinal_in_function": 1,
-      "fingerprint": "2784490e699e981310fdddeafc87ed4a07e7c1779a3d8b32d863ddd9872025af",
+      "fingerprint": "c6859ca1bd97510a78467a7235b835dcd13c5b893b1d076c4b3514dfc112384f",
       "verdict": "carrier_fault",
       "failure_domain": "host::adopted_child",
       "rationale": "Adopted-child record transition failed to quiesce before deadline during wait scan.",
