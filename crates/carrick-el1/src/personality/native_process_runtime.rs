@@ -248,7 +248,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         self.zone
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn admit_fresh_root(
+    pub fn admit_fresh_root<B: carrick_mmu_core::owner_mmu::OwnerForkMmu>(
         source: BornInZoneSource<'a, C>,
         current: &'a CurrentTask,
         page: &'a ThreadLifecyclePage,
@@ -298,7 +298,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .zone
             .spaces
             .grant(index, binding.mm.raw())
-            .is_none_or(|grant| grant.ttbr0 != address.root.address().raw())
+            .is_none_or(|grant| B::root(grant.ttbr0).ok() != Some(address.root))
         {
             return Err(NativeProcessError::Stale);
         }
@@ -1310,6 +1310,108 @@ mod tests {
             );
         }
     }
+    // This test adapter keeps the ARM save area ABI unchanged and retains its
+    // address binding separately. It exercises shared admission, not ARM resume.
+    #[derive(Clone, Copy, zerocopy::FromZeros)]
+    struct ArmBoundContext {
+        native: carrick_sched_core::ThreadCtx,
+        root: u64,
+        mm: u64,
+        generation: u64,
+    }
+    impl ProcessContext for ArmBoundContext {
+        fn authenticates(&self, address: AddressContext<RootGpa>) -> bool {
+            self.root == address.root.address().raw()
+                && self.mm == address.mm.raw().get()
+                && self.generation == address.generation.raw().get()
+        }
+        fn fork_child(self, _: AddressContext<RootGpa>) -> Self {
+            panic!("this admission-only fixture does not implement ARM fork")
+        }
+    }
+    #[test]
+    fn actual_shared_root_admission_accepts_arm_asid_and_rejects_stale_binding() {
+        for (arm, register, saved_generation, accepted) in [
+            (true, 0xabcd_0000_0000_1000, 1, true),
+            (true, 0xabcd_0000_0000_2000, 1, false),
+            (true, 0xabcd_0000_0000_1000, 2, false),
+            (false, 0x1000, 1, true),
+            (false, 0x2000, 1, false),
+            (false, 0x1000, 2, false),
+            (false, 0xabcd_0000_0000_1000, 1, false),
+            (false, 0x1001, 1, false),
+        ] {
+            let layout = std::alloc::Layout::new::<ZoneTables<ArmBoundContext>>();
+            // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+            let zone = unsafe {
+                let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ArmBoundContext>>();
+                assert!(!ptr.is_null());
+                Box::from_raw(ptr)
+            };
+            let page = Box::new(ThreadLifecyclePage::new());
+            let control = Box::new(ThreadControlSlot::new());
+            let task = CurrentTask::new();
+            task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+            task.mm.key.store(1, Ordering::Release);
+            task.mm.thread_generation.store(101, Ordering::Release);
+            task.publish_visible_pid(41);
+            task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+            let address = AddressContext {
+                root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+                mm: MmGeneration::new(NonZeroU64::MIN),
+                generation: ContextGeneration::new(NonZeroU64::MIN),
+            };
+            let slot = carrick_sched_core::SlotId::new(0);
+            let space = zone.spaces.publish_closed(1, register, 0).unwrap();
+            zone.spaces.open(space);
+            zone.drive(slot, 1);
+            zone.publish_slot(slot, 1, Some(0), 1);
+            zone.enter_guest(slot);
+            zone.install_space(slot, 1).unwrap();
+            zone.current_or_new(
+                slot,
+                ThreadIdentity {
+                    tid: 41,
+                    serial: 101,
+                    mm: 1,
+                    file_table: 5,
+                    generation: 11,
+                    affinity: 1,
+                    lifecycle_page: &*page as *const _ as u64,
+                    control_slot: &*control as *const _ as u64,
+                },
+            )
+            .unwrap();
+            let mut native = carrick_sched_core::ThreadCtx::ZERO;
+            native.x[0] = 99;
+            native.tpidr_el0 = 0x4567;
+            native.v[3] = u128::MAX;
+            let saved = ArmBoundContext {
+                native,
+                root: 0x1000,
+                mm: 1,
+                generation: saved_generation,
+            };
+            let source = BornInZoneSource { zone: &zone, slot };
+            let admitted = if arm {
+                NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::owner_mmu::Aarch64Mmu>(
+                    source, &task, &page, &control, address, address, saved,
+                )
+            } else {
+                NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                    source, &task, &page, &control, address, address, saved,
+                )
+            };
+            if accepted {
+                let runtime = admitted.expect("the ARM ASID is not part of the root GPA");
+                let graph = runtime.graph.lock();
+                let retained = graph.owner.task(graph.root_key).unwrap().context();
+                assert_eq!(retained.native, native);
+            } else {
+                assert!(matches!(admitted, Err(NativeProcessError::Stale)));
+            }
+        }
+    }
     #[test]
     fn actual_compact_root_can_exit_before_its_first_park() {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
@@ -1360,7 +1462,7 @@ mod tests {
         let source = BornInZoneSource { zone: &zone, slot };
         assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
         assert!(matches!(
-            NativeProcessRuntime::admit_fresh_root(
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,
@@ -1373,16 +1475,17 @@ mod tests {
         ));
         assert_eq!(page.live(), 2, "admission must not remove a live member");
         page.release_live(1).unwrap(); // fixture settles its bootstrap census
-        let runtime = NativeProcessRuntime::admit_fresh_root(
-            source,
-            &task,
-            &page,
-            &control,
-            address,
-            address,
-            words(address),
-        )
-        .unwrap();
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
         assert_eq!(page.live(), 1);
         let mut service = Physical {
             zone: &zone,
@@ -1464,16 +1567,17 @@ mod tests {
         let source = BornInZoneSource { zone: &zone, slot };
         assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
         page.release_live(1).unwrap(); // fixture settles its bootstrap census
-        let runtime = NativeProcessRuntime::admit_fresh_root(
-            source,
-            &task,
-            &page,
-            &control,
-            address,
-            address,
-            words(address),
-        )
-        .unwrap();
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
         assert_eq!(page.live(), 1);
         let mut service = Physical {
             zone: &zone,
