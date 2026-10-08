@@ -257,8 +257,9 @@ fn mounted_static_x86_two_live_mms_have_private_anonymous_leaves() {
     assert_eq!(
         observed.status.code(),
         Some(7),
-        "91 = fork refusal; 93 = mmap refusal; 94 = cross-MM/zero leaf; 95 = wait failure; stderr: {}",
-        String::from_utf8_lossy(&observed.stderr)
+        "91 = fork refusal; 93 = mmap refusal; 94 = cross-MM/zero leaf; 95 = wait failure; stderr: {}; report: {}",
+        String::from_utf8_lossy(&observed.stderr),
+        String::from_utf8_lossy(&observed.stdout)
     );
     let report: serde_json::Value =
         serde_json::from_slice(observed.stdout.strip_prefix(b"Q\n").expect("two-MM stdout"))

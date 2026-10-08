@@ -57,7 +57,7 @@ use crate::linux_abi::LinuxErrno;
 use crate::memory::AddressSpace;
 use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
 use crate::trap::{SyscallTrap, TrapError};
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 use carrick_kernel::dispatch::CurrentMmMemory;
 use carrick_kernel::dispatch::routing::{MutationDispatchRoute, OrdinaryDispatchRoute};
 use carrick_kernel::dispatch::{

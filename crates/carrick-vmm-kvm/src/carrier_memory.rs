@@ -22,6 +22,15 @@ impl std::fmt::Display for MemoryError {
     }
 }
 impl std::error::Error for MemoryError {}
+fn inherited_leaf_names(entry: u64, size: u64, gpa: FrameGpa) -> bool {
+    let state = entry & (PRESENT | PREPARED);
+    (state == PRESENT || state == PREPARED)
+        && entry & RETIRED == 0
+        && entry & USER != 0
+        && size == PAGE
+        && entry & ADDRESS == gpa.raw()
+}
+
 fn inventory_page_live(
     authority: &carrick_kernel::kernel::frame_inventory::FrameInventoryAuthority,
     mm: NonZeroU64,
@@ -31,17 +40,23 @@ fn inventory_page_live(
     let Some(mm) = carrick_kernel::kernel::MmId::from_raw_u64(mm.get()) else {
         return false;
     };
-    let Some(length) = NonZeroU64::new(PAGE) else {
-        return false;
-    };
-    authority.mapping_is_live_exact_generation(
+    let Some(row) = authority.live_mapping_row(
         mm,
         carrick_hal::MappingId::from_kernel_allocation(identity.mapping_id),
-        carrick_hal::FrameId::from_kernel_allocation(identity.frame_id),
-        carrick_hal::MappingGeneration::from_backend_counter(identity.owner_generation),
-        carrick_guest_mem::Gpa(gpa.raw()),
-        carrick_hal::FrameLength::from_mapping_extent(length),
-    )
+    ) else {
+        return false;
+    };
+    gpa.raw().is_multiple_of(PAGE)
+        && row.frame == carrick_hal::FrameId::from_kernel_allocation(identity.frame_id)
+        && row.generation
+            == carrick_hal::MappingGeneration::from_backend_counter(identity.owner_generation)
+        && gpa.raw() >= row.gpa.0
+        && gpa.raw().checked_add(PAGE).is_some_and(|end| {
+            row.gpa
+                .0
+                .checked_add(row.length.raw())
+                .is_some_and(|limit| end <= limit)
+        })
 }
 
 fn error(message: impl Into<String>) -> MemoryError {
@@ -172,8 +187,14 @@ pub struct InheritedFrameEdge {
     gpa: FrameGpa,
     identity: BackingIdentity,
     shared: bool,
+    resident: bool,
 }
 impl InheritedFrameEdge {
+    /// The selected source named a guest-committed PRESENT leaf. Prepared
+    /// storage is retained by the same edge without claiming first touch.
+    pub fn is_resident(&self) -> bool {
+        self.resident
+    }
     pub fn physical(&self) -> FrameGpa {
         self.gpa
     }
@@ -701,9 +722,10 @@ impl CarrierMemory {
             let slot = self
                 .locate(gpa, PAGE as usize)
                 .ok_or_else(|| error("inherited registration absent"))?;
-            if !self.leaf_names(parent, span, gpa)
-                || !inventory_page_live(authority, parent.mm.raw(), identity, gpa)
-            {
+            let resident = self
+                .named_leaf_resident(parent, span, gpa)
+                .ok_or_else(|| error("selected source does not name retained storage"))?;
+            if !inventory_page_live(authority, parent.mm.raw(), identity, gpa) {
                 return Err(error("selected source is not a live inventoried page"));
             }
             edges.push(InheritedFrameEdge {
@@ -713,6 +735,7 @@ impl CarrierMemory {
                 gpa,
                 identity,
                 shared,
+                resident,
             });
         }
         Ok(edges)
@@ -799,18 +822,23 @@ impl CarrierMemory {
         .is_ok_and(|(entry, size)| size == PAGE && entry & WRITE == 0)
     }
 
-    fn leaf_names(&self, context: AddressContext<RootGpa>, span: PageSpan, gpa: FrameGpa) -> bool {
-        read_terminal_descriptor(
+    fn named_leaf_resident(
+        &self,
+        context: AddressContext<RootGpa>,
+        span: PageSpan,
+        gpa: FrameGpa,
+    ) -> Option<bool> {
+        let (entry, size) = read_terminal_descriptor(
             &self.words(),
             context.root,
             carrick_guest_arch::UserVa::new(span.va),
         )
-        .is_ok_and(|(entry, size)| {
-            entry & PRESENT != 0
-                && entry & USER != 0
-                && size == PAGE
-                && entry & ADDRESS == gpa.raw()
-        })
+        .ok()?;
+        inherited_leaf_names(entry, size, gpa).then_some(entry & PRESENT != 0)
+    }
+
+    fn leaf_names(&self, context: AddressContext<RootGpa>, span: PageSpan, gpa: FrameGpa) -> bool {
+        self.named_leaf_resident(context, span, gpa).is_some()
     }
 
     fn contains(&self, output: FrameGpa, len: u64) -> bool {

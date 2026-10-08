@@ -1672,7 +1672,7 @@ mod child_tid_owner_tests {
         let threads = VcpuThreadRegistry::new();
         let mut owner = clear_state(&kernel, &root, registry.clone(), threads.clone());
         let receipt = kernel.try_claim_persistent_process_exit(root_tid).unwrap();
-        assert_eq!(receipt.claim, ProcessExitClaim::Owner);
+        assert_eq!(receipt.claim, super::terminal::ProcessExitClaim::Owner);
         // No runtime row, scheduler activation or member completion exists for
         // this born thread. The closed-admission graph census is its authority.
         owner.publish_persistent_sibling_stop(&kernel).unwrap();
