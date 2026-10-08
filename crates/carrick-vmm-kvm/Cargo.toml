@@ -19,10 +19,12 @@ path = "src/main.rs"
 workspace = true
 
 [build-dependencies]
-# build.rs derives the CPL0 image inputs from `cargo metadata` (cpl0_inputs.rs).
-serde_json.workspace = true
+# build.rs derives the CPL0 image inputs directly from local manifests.
+toml.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
+toml.workspace = true
 serde_json.workspace = true
 goblin.workspace = true
 
@@ -75,7 +77,7 @@ zerocopy.workspace = true
 
 # Test gate lanes (`just xtask test-lanes check`; carrick-xtask src/test_lanes.rs).
 # Every live target needs a real /dev/kvm on Linux x86_64: `just test-kvm`.
-# `cpl0_image_inputs` reads only sources and Cargo metadata, so it is VM-free.
+# `cpl0_image_inputs` reads only sources and manifests, so it is VM-free.
 [package.metadata.carrick.test-lanes]
 "*" = "kvm"
 cpl0_image_inputs = "host"
