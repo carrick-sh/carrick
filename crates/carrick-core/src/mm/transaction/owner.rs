@@ -877,7 +877,7 @@ pub fn serve_transfer<
             };
             match prepare_transfer(portal, request, words, slot) {
                 Ok(Some(permit)) => permit,
-                Ok(None) => {
+                Ok(None) | Err(MmError::Busy) => {
                     service.suspend_prepare(changed.map_or(
                         carrick_core_abi::PortalPrepareSuspension::SelectionChanged,
                         carrick_core_abi::PortalPrepareSuspension::Owner,

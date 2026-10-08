@@ -5447,3 +5447,73 @@ fn serial_host_prepared_grant_subsequent_page_authenticates_live_residency_witho
     );
     table.retire(slot, grant);
 }
+
+/// A first-touch observation during a held root (e.g. peer holding Root.locked
+/// or concurrent EL1 critical section) returns no plan / forwards instead of
+/// turning transient contention into a broken_root carrier fatal.
+#[test]
+fn delegated_first_touch_observation_under_held_root_returns_no_plan_without_aborting() {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let base = LINUX_MMAP_BASE + STOCK_WINDOW;
+    root.guest_mmap(
+        Placement::Fixed(base),
+        PAGE,
+        ReservationProtection::READ_WRITE,
+    )
+    .unwrap();
+
+    // Verify that prior to locking, observations succeed:
+    assert!(
+        dispatcher
+            .with_resident_fault_plan_for_test(base, |_| ())
+            .is_some(),
+        "resident fault plan succeeds when root is free"
+    );
+    assert!(
+        dispatcher
+            .with_resident_frame_grant_plan_for_test(base, PAGE, |_| ())
+            .is_some(),
+        "resident frame grant plan succeeds when root is free"
+    );
+    assert!(
+        dispatcher.host_untouched_page_permits(base, carrick_mmu_core::aarch64::LeafAccess::Read),
+        "host untouched page permits read when root is free"
+    );
+
+    // Lock the root to simulate concurrent contention / peer hold:
+    let held = root.lock();
+
+    // With the root held, first-touch observation must not abort with broken_root;
+    // it must return None so the fault forwards to the mutation path.
+    assert!(
+        dispatcher
+            .with_resident_fault_plan_for_test(base, |_| ())
+            .is_none(),
+        "resident fault plan under held root must return None rather than aborting"
+    );
+    assert!(
+        dispatcher
+            .with_resident_frame_grant_plan_for_test(base, PAGE, |_| ())
+            .is_none(),
+        "resident frame grant plan under held root must return None rather than aborting"
+    );
+    assert!(
+        dispatcher.first_touch_is_root_owned(base),
+        "first-touch under held root must still be recognized as root-owned"
+    );
+    assert!(
+        !dispatcher.host_untouched_page_permits(base, carrick_mmu_core::aarch64::LeafAccess::Read),
+        "first-touch read permit under held root must decline without observation"
+    );
+
+    drop(held);
+
+    // Once the root is released, observations succeed again:
+    assert!(
+        dispatcher
+            .with_resident_frame_grant_plan_for_test(base, PAGE, |_| ())
+            .is_some(),
+        "resident frame grant plan succeeds once root is released"
+    );
+}
