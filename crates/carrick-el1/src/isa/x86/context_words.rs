@@ -5,7 +5,11 @@ use carrick_guest_arch::{AddressContext, RootGpa};
 pub use carrick_sched_core::ParkedContextWords;
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-use super::scheduler;
+use super::{native, scheduler};
+#[cfg(all(test, not(target_os = "none")))]
+#[path = "../../../../carrick-x86/src/cpl0_entry.rs"]
+#[allow(dead_code)]
+mod native;
 #[cfg(all(test, not(target_os = "none")))]
 #[path = "../../../../carrick-x86/src/cpl0_scheduler.rs"]
 #[allow(dead_code)] // Host unit tests use only native context records.
@@ -22,6 +26,75 @@ pub fn into_native(
     scheduler::restore_native_context(words, expected).ok_or(ArchError::InvalidContext)
 }
 
+/// Convert a syscall return using TLS and XSAVE captured before entering Rust.
+/// SYSCALL already clobbered RCX and R11 with the return PC and flags. Keep
+/// those values in the GPR slots as well as the IRET tail; every other GPR
+/// follows the interrupt entry's push order, not NativeFrame's push order.
+pub fn from_syscall(
+    frame: &native::NativeFrame,
+    address: AddressContext<RootGpa>,
+    fs_base: u64,
+    user_gs_base: u64,
+    xsave: &scheduler::XsaveArea,
+) -> Result<scheduler::NativeContext, ArchError> {
+    if !frame.valid_user_return() {
+        return Err(ArchError::InvalidFrame);
+    }
+    Ok(scheduler::NativeContext {
+        frame: scheduler::InterruptFrame {
+            gpr: [
+                frame.r15, frame.r14, frame.r13, frame.r12, frame.rbp, frame.rbx, frame.r11,
+                frame.r10, frame.r9, frame.r8, frame.rax, frame.rcx, frame.rdx, frame.rsi,
+                frame.rdi,
+            ],
+            rip: frame.rcx,
+            cs: 0x23,
+            flags: frame.r11,
+            rsp: frame.rsp,
+            ss: 0x1b,
+        },
+        address,
+        fs_base,
+        gs_base: user_gs_base,
+        xsave: xsave.clone(),
+    })
+}
+
+/// Recover a syscall frame from its exact retained address owner.
+/// Arbitrary IRQ contexts must use InterruptFrame directly: their RCX/R11
+/// can differ from RIP/flags and cannot fit the syscall frame losslessly.
+pub fn syscall_frame_from_native(
+    context: &scheduler::NativeContext,
+    expected: AddressContext<RootGpa>,
+) -> Result<native::NativeFrame, ArchError> {
+    if context.address != expected
+        || !context.frame.valid_user_return()
+        || context.frame.gpr[6] != context.frame.flags
+        || context.frame.gpr[11] != context.frame.rip
+    {
+        return Err(ArchError::InvalidContext);
+    }
+    let gpr = &context.frame.gpr;
+    Ok(native::NativeFrame {
+        r15: gpr[0],
+        r14: gpr[1],
+        r13: gpr[2],
+        r12: gpr[3],
+        rbp: gpr[4],
+        rbx: gpr[5],
+        r9: gpr[8],
+        r8: gpr[9],
+        r10: gpr[7],
+        rdx: gpr[12],
+        rsi: gpr[13],
+        rdi: gpr[14],
+        rax: gpr[10],
+        rcx: context.frame.rip,
+        r11: context.frame.flags,
+        rsp: context.frame.rsp,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -33,6 +106,143 @@ mod tests {
     };
     use carrick_sched_core::{BoundedSpin, SlotId, ThreadIdentity, Waker, ZoneTables};
     use core::num::NonZeroU64;
+
+    fn syscall_fixture() -> (
+        native::NativeFrame,
+        AddressContext<RootGpa>,
+        scheduler::XsaveArea,
+    ) {
+        let frame = native::NativeFrame {
+            r15: 15,
+            r14: 14,
+            r13: 13,
+            r12: 12,
+            rbp: 6,
+            rbx: 3,
+            r9: 9,
+            r8: 8,
+            r10: 10,
+            rdx: 2,
+            rsi: 4,
+            rdi: 5,
+            rax: 1,
+            rcx: 0x1234,
+            r11: 0x302,
+            rsp: 0x8000,
+        };
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x6000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::new(11).unwrap()),
+            generation: ContextGeneration::new(NonZeroU64::new(7).unwrap()),
+        };
+        let mut xsave = scheduler::XsaveArea::ZERO;
+        for (index, byte) in xsave.0.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        (frame, address, xsave)
+    }
+
+    #[test]
+    fn syscall_conversion_preserves_register_order_tls_and_early_xsave() {
+        let (frame, address, xsave) = syscall_fixture();
+        let context = from_syscall(&frame, address, 0x4000, 0x5000, &xsave).unwrap();
+        let words = from_native(&context);
+        assert_eq!(
+            words.frame,
+            [
+                15, 14, 13, 12, 6, 3, 0x302, 10, 9, 8, 1, 0x1234, 2, 4, 5, 0x1234, 0x23, 0x302,
+                0x8000, 0x1b,
+            ]
+        );
+        assert_eq!((words.fs_base, words.gs_base), (0x4000, 0x5000));
+        assert_eq!(words.xsave, xsave.0);
+        let restored = into_native(words, address).unwrap();
+        let returned = syscall_frame_from_native(&restored, address).unwrap();
+        assert_eq!(
+            [
+                returned.r15,
+                returned.r14,
+                returned.r13,
+                returned.r12,
+                returned.rbp,
+                returned.rbx,
+                returned.r9,
+                returned.r8,
+                returned.r10,
+                returned.rdx,
+                returned.rsi,
+                returned.rdi,
+                returned.rax,
+                returned.rcx,
+                returned.r11,
+                returned.rsp,
+            ],
+            [
+                15, 14, 13, 12, 6, 3, 9, 8, 10, 2, 4, 5, 1, 0x1234, 0x302, 0x8000
+            ]
+        );
+        assert_eq!(restored.xsave.0, xsave.0);
+    }
+
+    #[test]
+    fn syscall_conversion_refuses_invalid_targets_and_non_syscall_state() {
+        let (frame, address, xsave) = syscall_fixture();
+        for invalid in [
+            native::NativeFrame { rcx: 0, ..frame },
+            native::NativeFrame {
+                rsp: 1 << 47,
+                ..frame
+            },
+            native::NativeFrame {
+                r11: 0x3002,
+                ..frame
+            },
+        ] {
+            assert!(matches!(
+                from_syscall(&invalid, address, 0, 0, &xsave),
+                Err(ArchError::InvalidFrame)
+            ));
+        }
+        let context = from_syscall(&frame, address, 0, 0, &xsave).unwrap();
+        for expected in [
+            AddressContext {
+                root: RootGpa::page_aligned(FrameGpa::new(0x7000)).unwrap(),
+                ..address
+            },
+            AddressContext {
+                mm: MmGeneration::new(NonZeroU64::new(12).unwrap()),
+                ..address
+            },
+            AddressContext {
+                generation: ContextGeneration::new(NonZeroU64::new(8).unwrap()),
+                ..address
+            },
+        ] {
+            assert!(matches!(
+                syscall_frame_from_native(&context, expected),
+                Err(ArchError::InvalidContext)
+            ));
+        }
+        for (word, value) in [(6, 99), (11, 99), (16, 8), (19, 16)] {
+            let mut words = from_native(&context);
+            words.frame[word] = value;
+            let invalid = scheduler::NativeContext {
+                frame: scheduler::InterruptFrame {
+                    gpr: words.frame[..15].try_into().unwrap(),
+                    rip: words.frame[15],
+                    cs: words.frame[16],
+                    flags: words.frame[17],
+                    rsp: words.frame[18],
+                    ss: words.frame[19],
+                },
+                ..context.clone()
+            };
+            assert!(matches!(
+                syscall_frame_from_native(&invalid, address),
+                Err(ArchError::InvalidContext)
+            ));
+        }
+    }
 
     fn deliver_x86_notification(
         _: &ZoneTables<ParkedContextWords>,
