@@ -330,3 +330,30 @@ Red-first: a schema-absent base with a different SHA was refused before dropping
 the SHA comparison. Regression tests also prove that two merged-tree lifecycle
 calls exceed a committed ceiling of one, and that a schema-bearing base refuses
 the bootstrap.
+
+## PR 85 landing rebase
+
+The landing base is `9cbe10d75a93dfeb37cb0a3d32026a332857ad7f`.
+Preserve main's shared SlotId, typed CPL0 forward boundary and contract surfaces;
+keep retired positional inventories deleted. Move main's fixture witness into
+parsed fixture source. Qualify AllowedHostCrossing's built-in derive providers:
+the restricted census first rejected their ambiguous glob-import scope.
+
+Fresh symbolic source export observes exactly two new shared carrier-fault
+cohorts, each one: `fatal:el1::prepare_child` and `fatal:el1::run_next`, owned by
+`carrick_el1::personality::lifecycle::<El1PendingFamilies<'a,F,C,U,G> as
+LifecycleNative<'a>>::prepare_child` and the corresponding `run_next` owner.
+These are the invariant sinks added by PR 85, not relaxed existing budgets.
+All other source and Linux/FreeBSD/NetBSD compiler cohorts are unchanged.
+
+| Counter | Before PR 85 | Landing |
+|---|---:|---:|
+| `fatal_carrier_fault` | 867 | 869 |
+| Head ceiling sum | 5797 | 5799 |
+| Initial-main bootstrap ceiling sum | 5801 | 5803 |
+| Retained cohorts | 4989 | 4991 |
+
+The recorded bootstrap source SHA describes this newly audited content;
+bootstrap acceptance remains schema-absent-only. The actual merged tree must
+satisfy the restricted dialect, exact ceilings and zero rules. Scanner logic,
+vocabulary and discovery output format are unchanged from `e2588bd4f`.
