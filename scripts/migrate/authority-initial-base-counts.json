@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "source_commit": "8ebd6fe4169313b4fa324d30d4306208ebf27326",
+  "source_commit": "8f6e6bc08aea90244b66a43192cf970462d33909",
   "platforms": [
     "linux",
     "macos",
@@ -77,6 +77,27 @@
         "family": "build_time",
         "operation": "global:env_var",
         "owner": "carrick_kernel::build_program::main::CARGO_CFG_TARGET_OS",
+        "lane": "build_time",
+        "ceiling": 1
+      },
+      {
+        "family": "build_time",
+        "operation": "global:env_var",
+        "owner": "carrick_observability::build_program::main::CARGO_CFG_TARGET_ARCH",
+        "lane": "build_time",
+        "ceiling": 1
+      },
+      {
+        "family": "build_time",
+        "operation": "global:env_var",
+        "owner": "carrick_observability::build_program::main::CARGO_CFG_TARGET_OS",
+        "lane": "build_time",
+        "ceiling": 1
+      },
+      {
+        "family": "build_time",
+        "operation": "global:env_var",
+        "owner": "carrick_observability::build_program::main::HOST",
         "lane": "build_time",
         "ceiling": 1
       },
@@ -27637,14 +27658,14 @@
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::execve_argv",
         "lane": "freebsd_cli",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::execve_argv",
         "lane": "freebsd_runtime",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
@@ -27686,14 +27707,14 @@
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::fs_op",
         "lane": "freebsd_cli",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::fs_op",
         "lane": "freebsd_runtime",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
@@ -27735,14 +27756,14 @@
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::futex_route",
         "lane": "freebsd_cli",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::futex_route",
         "lane": "freebsd_runtime",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
@@ -27784,14 +27805,14 @@
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::futex_unexpected_errno",
         "lane": "freebsd_cli",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::futex_unexpected_errno",
         "lane": "freebsd_runtime",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
@@ -27833,14 +27854,14 @@
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::guest_exit",
         "lane": "freebsd_cli",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::guest_exit",
         "lane": "freebsd_runtime",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
@@ -27882,14 +27903,14 @@
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::guest_image_base",
         "lane": "freebsd_cli",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::guest_image_base",
         "lane": "freebsd_runtime",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
@@ -28015,14 +28036,14 @@
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::host_jit_range",
         "lane": "freebsd_cli",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::host_jit_range",
         "lane": "freebsd_runtime",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
@@ -28064,14 +28085,14 @@
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::host_pipe_io",
         "lane": "freebsd_cli",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::host_pipe_io",
         "lane": "freebsd_runtime",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
@@ -28134,14 +28155,14 @@
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::itimer_fire",
         "lane": "freebsd_cli",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::itimer_fire",
         "lane": "freebsd_runtime",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
@@ -28183,14 +28204,14 @@
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::native_tierd_exception",
         "lane": "freebsd_cli",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::native_tierd_exception",
         "lane": "freebsd_runtime",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
@@ -28232,14 +28253,14 @@
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::native_tierd_unsupported",
         "lane": "freebsd_cli",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::native_tierd_unsupported",
         "lane": "freebsd_runtime",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
@@ -28281,14 +28302,14 @@
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::native_x86_fault",
         "lane": "freebsd_cli",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::native_x86_fault",
         "lane": "freebsd_runtime",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
@@ -28330,14 +28351,14 @@
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::native_x86_fault_history",
         "lane": "freebsd_cli",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::native_x86_fault_history",
         "lane": "freebsd_runtime",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
@@ -28379,14 +28400,14 @@
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::native_x86_fault_stack",
         "lane": "freebsd_cli",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::native_x86_fault_stack",
         "lane": "freebsd_runtime",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
@@ -28428,14 +28449,14 @@
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::native_x86_pc",
         "lane": "freebsd_cli",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::native_x86_pc",
         "lane": "freebsd_runtime",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
@@ -28477,14 +28498,14 @@
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::native_x86_resolve",
         "lane": "freebsd_cli",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::native_x86_resolve",
         "lane": "freebsd_runtime",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
@@ -28526,14 +28547,14 @@
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::native_x86_xstate",
         "lane": "freebsd_cli",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::native_x86_xstate",
         "lane": "freebsd_runtime",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
@@ -28575,14 +28596,14 @@
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::native_x86_xstate_edge",
         "lane": "freebsd_cli",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::native_x86_xstate_edge",
         "lane": "freebsd_runtime",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
@@ -28624,14 +28645,14 @@
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::path_open",
         "lane": "freebsd_cli",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::path_open",
         "lane": "freebsd_runtime",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
@@ -28673,14 +28694,14 @@
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::ulock_requeue",
         "lane": "freebsd_cli",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::ulock_requeue",
         "lane": "freebsd_runtime",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
@@ -28722,14 +28743,14 @@
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::ulock_wait",
         "lane": "freebsd_cli",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::ulock_wait",
         "lane": "freebsd_runtime",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
@@ -28771,14 +28792,14 @@
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::ulock_wake",
         "lane": "freebsd_cli",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
         "operation": "std::process::id",
         "owner": "carrick_observability::probes::real::ulock_wake",
         "lane": "freebsd_runtime",
-        "ceiling": 1
+        "ceiling": 0
       },
       {
         "family": "host_substrate",
