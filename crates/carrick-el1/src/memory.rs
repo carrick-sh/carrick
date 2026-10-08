@@ -835,7 +835,25 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
         }
     };
     match completed {
-        Ok(()) => DelegatedAnonymous::Served,
+        Ok(()) => {
+            if retired {
+                carrick_el1_abi::record_reservation_event(
+                    8,
+                    mm.raw(),
+                    model.incarnation().raw(),
+                    request.sequence.raw() as u32,
+                    request.range.start() as u32,
+                );
+                carrick_el1_abi::record_reservation_event(
+                    9,
+                    request.range.start(),
+                    request.range.end(),
+                    mm.raw() as u32,
+                    request.sequence.raw() as u32,
+                );
+            }
+            DelegatedAnonymous::Served
+        }
         // The descriptor edit is live but the root refused to commit it.
         Err(refusal) if retired => {
             let code = match refusal {
