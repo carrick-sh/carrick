@@ -39,6 +39,9 @@ pub unsafe extern "C" fn carrick_el1_syscall(frame: *mut carrick_el1_abi::TrapFr
         return carrick_el1_abi::Action::Forward as u64;
     }
     let frame_ref = unsafe { &mut *frame };
+    let counters_ref =
+        unsafe { &*(carrick_el1_abi::EL1_COUNTERS_BASE as *const carrick_el1_abi::Counters) };
+    carrick_el1_abi::register_reservation_events(&counters_ref.reservation_events);
     if frame_ref.esr == carrick_el1_abi::MM_PORTAL_MAINTENANCE_ESR {
         carrick_el1::personality::mm_portal::serve_backing_maintenance_hw(frame_ref);
         return carrick_el1_abi::Action::Served as u64;
@@ -71,8 +74,6 @@ pub unsafe extern "C" fn carrick_el1_syscall(frame: *mut carrick_el1_abi::TrapFr
         carrick_el1::fault::serve_host_drain_hw(frame_ref);
         return carrick_el1_abi::Action::Served as u64;
     }
-    let counters_ref =
-        unsafe { &*(carrick_el1_abi::EL1_COUNTERS_BASE as *const carrick_el1_abi::Counters) };
     let action = carrick_el1::dispatch_entry(frame_ref, counters_ref);
     carrick_el1::fault::drain_before_el0_hw(frame_ref, action) as u64
 }

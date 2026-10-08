@@ -158,6 +158,13 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
             let node = self.table.node(id, self.banks);
             let next = unsafe { (*node.data.get()).prepared.next };
             let tail_id = unsafe { (*node.data.get()).prepared.tail };
+            carrick_core_abi::record_reservation_event(
+                carrick_core_abi::PREPARED_REAP,
+                self.mm.raw(),
+                self.incarnation.raw(),
+                id,
+                tail_id,
+            );
             let tail = self.table.node(tail_id, self.banks);
             let previous = unsafe { (*tail.data.get()).words[6] as u32 };
             if previous == 0 {

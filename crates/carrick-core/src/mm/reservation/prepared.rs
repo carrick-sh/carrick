@@ -63,6 +63,13 @@ impl<'a, S: PreparedCopyNodes<'a>> ClaimedPreparedCopy<'a, S> {
             return false;
         }
         self.armed = false;
+        carrick_core_abi::record_reservation_event(
+            carrick_core_abi::PREPARED_SETTLED,
+            self.permit.operation.mm.raw(),
+            self.permit.operation.incarnation.get(),
+            self.permit.index,
+            unsafe { (*self.node.data.get()).prepared.tail },
+        );
         // Only settled nodes are queued. The guarded doubly-linked live list
         // retains root lifetime until this publication is visible and reaped.
         // SAFETY: the detached primary/tail remain owner-linked until popped.
