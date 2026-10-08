@@ -138,3 +138,30 @@ A separate static `mounted_static_x86_musl_poll_startup_dependency` proves
 This is another real startup dependency, not proof that it triggered the
 observed abort. The fixture retains `ARCH_SET_FS` and poll as independent
 bindings so startup progress can be verified without reaching thread workloads.
+
+## Native startup sequence and fault injection
+
+Native `strace -k` locates the first poll in the C `main` wrapper, before
+`el1_sched_x86::main`. Returning ENOSYS from that exact call reproduces the
+abort before any scenario runs:
+
+```sh
+strace -f -qq -k -e inject=poll:error=ENOSYS:when=1 -o /tmp/native-poll-abort.strace fixtures/embed-el1-sched/target/x86_64-unknown-linux-musl/release/el1-sched-x86 ipc-processes pipe 1 1
+```
+
+The observed native sequence is SET_FS, set_tid_address, poll on descriptors
+0/1/2 with events zero and timeout zero, block application signals, tkill self
+with SIGABRT, restore the mask, then SIGABRT termination. Native exit is 134.
+KVM refuses both abort-path tkill attempts, refuses the fallback SIGABRT action
+installation, and reaches musl's final hlt instead. Refusal bucket 512 is poll
+ordinal 7: `lookup_x86_64(7)` marks it Private, and `record_refusal` places all
+Private ordinals in that bucket. Counts alone were insufficient; the independent
+poll witness and native injection establish the dependency.
+
+Without injection the remaining pre-main setup queries/installs SIGPIPE,
+SIGSEGV and SIGBUS actions, queries/installs an alternate signal stack, maps
+12288 bytes with MAP_STACK, protects its first page, and unblocks RT1/RT2.
+The signal-stack calls originate in `std::rt::lang_start_internal`, before
+the scenario's first pipe and clone. Those dependencies need in-zone signal
+policy and descriptor authority; widening the host-crossing allowlist would
+not implement the guest contract.
