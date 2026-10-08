@@ -85,6 +85,9 @@ impl<
     ) -> Option<Result<carrick_signal_core::policy::Action, SyscallResult>> {
         self.process_venue()?.signal_action(signal, replacement)
     }
+    fn resume_signals(&mut self) -> Option<LifecycleOutcome> {
+        self.process_venue()?.resume_signals()
+    }
     fn thread_signal(
         &mut self,
         request: carrick_personality_linux::signal_syscalls::ThreadSignalRequest,

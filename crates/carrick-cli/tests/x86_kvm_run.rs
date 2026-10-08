@@ -881,3 +881,27 @@ fn mounted_static_x86_signal_self_abort_dependency() {
     );
     assert!(run.stdout.is_empty());
 }
+
+#[test]
+fn mounted_static_x86_signal_masked_abort_dependency() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("masked-abort");
+    compile_assembly("x86_signal_masked_abort.S", &elf);
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .unwrap();
+    assert_eq!(native.status.signal(), Some(6));
+    let run = run_mounted_binary(&elf, "masked-abort", false);
+    assert_eq!(
+        run.status.code(),
+        Some(134),
+        "stdout={:?} stderr={}",
+        run.stdout,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(run.stdout.is_empty());
+}

@@ -8,9 +8,26 @@ use carrick_sched_core::process::exit::{ExitSignalDisposition, ExitSignalSource,
 use carrick_sched_core::process::{LinuxSignal, TaskKey};
 use carrick_signal_core::SignalSet;
 use carrick_signal_core::policy::{
-    Action, ActionError, ActionInheritance, ActionTable, ChildEvent, ChildInterest, Disposition,
-    SigBlockMask, SighandSharing, Signal, child_decision,
+    Action, ActionError, ActionInheritance, ActionTable, ChildEvent, ChildInterest, Delivery,
+    Disposition, SigBlockMask, SighandSharing, Signal, child_decision, default_delivery,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeSignalError {
+    Stale,
+    Unsupported,
+}
+fn native_delivery(action: Action, signal: Signal) -> Result<Delivery, NativeSignalError> {
+    let delivery = match action.disposition {
+        Disposition::Ignore => Delivery::Ignore,
+        Disposition::Default => default_delivery(signal),
+        Disposition::Handler(_) => return Err(NativeSignalError::Unsupported),
+    };
+    match delivery {
+        Delivery::Stop | Delivery::Handler(_) => Err(NativeSignalError::Unsupported),
+        supported => Ok(supported),
+    }
+}
 
 /// The retained thread control authority supplies the live typed mask.
 pub trait BlockedMaskSource {
@@ -75,11 +92,79 @@ impl<T> NativeProcessSignals<T> {
         if key != self.key {
             return Err(SignalActionError::Stale);
         }
-        self.resources
-            .lock()
+        let mut resources = self.resources.lock();
+        let old = resources
             .actions
             .install(signal, action)
-            .map_err(SignalActionError::Action)
+            .map_err(SignalActionError::Action)?;
+        if action.disposition == Disposition::Ignore
+            || (action.disposition == Disposition::Default
+                && default_delivery(signal) == Delivery::Ignore)
+        {
+            resources
+                .inbox
+                .pending_mut()
+                .discard(SignalSet::EMPTY.with(signal));
+        }
+        Ok(old)
+    }
+    /// Admission and action inspection share the same lock as ignore discard.
+    /// Linux queues blocked ignored signals too; a later ignore installation
+    /// discards them. The caller's retained control owns the mask.
+    pub fn queue_self(
+        &self,
+        key: TaskKey,
+        signal: Signal,
+        mask: SigBlockMask,
+    ) -> Result<(), NativeSignalError> {
+        if key != self.key {
+            return Err(NativeSignalError::Stale);
+        }
+        let mut resources = self.resources.lock();
+        let delivery = native_delivery(resources.actions.action(signal), signal);
+        if !mask.contains(signal) {
+            match delivery? {
+                Delivery::Ignore | Delivery::Continue => return Ok(()),
+                Delivery::Terminate { .. } => {}
+                _ => return Err(NativeSignalError::Unsupported),
+            }
+        }
+        resources
+            .inbox
+            .enqueue_for(key, signal, None)
+            .map_err(|_| NativeSignalError::Stale)?;
+        Ok(())
+    }
+    /// Select/dequeue by the existing Linux pending policy. Unsupported native
+    /// handler/job-control delivery keeps the pending entry rather than losing it.
+    pub fn take_self(
+        &self,
+        key: TaskKey,
+        mask: SigBlockMask,
+    ) -> Result<Option<(Signal, Delivery)>, NativeSignalError> {
+        if key != self.key {
+            return Err(NativeSignalError::Stale);
+        }
+        let mut resources = self.resources.lock();
+        let selected = mask.select(resources.inbox.pending().present());
+        let Some(signal) = selected.lowest().and_then(Signal::from_number) else {
+            return Ok(None);
+        };
+        let delivery = native_delivery(resources.actions.action(signal), signal)?;
+        if delivery == Delivery::Ignore {
+            // Discard every instance of an ignored RT signal in one key visit.
+            resources
+                .inbox
+                .pending_mut()
+                .discard(SignalSet::EMPTY.with(signal));
+            return Ok(Some((signal, delivery)));
+        }
+        let entry = resources
+            .inbox
+            .pending_mut()
+            .take_in(selected)
+            .ok_or(NativeSignalError::Stale)?;
+        Ok(Some((entry.signal, delivery)))
     }
     pub fn action(&self, signal: Signal) -> Action {
         self.resources.lock().actions.action(signal)
@@ -173,6 +258,145 @@ mod tests {
         }
     }
     #[test]
+    fn ignore_installation_discards_pending_only_for_the_exact_owner() {
+        let first = key(41, 11);
+        let second = key(42, 12);
+        let left = NativeProcessSignals::<()>::fresh_root(first);
+        let right = NativeProcessSignals::<()>::fresh_root(second);
+        let signal = Signal::from_number(13).unwrap();
+        left.enqueue(first, signal, None).unwrap();
+        right.enqueue(second, signal, None).unwrap();
+        let ignored = Action {
+            disposition: Disposition::Ignore,
+            ..Action::default()
+        };
+        assert!(left.install_action(second, signal, ignored).is_err());
+        assert_eq!(left.pending_count(), 1);
+        left.install_action(first, signal, ignored).unwrap();
+        assert_eq!(left.pending_count(), 0);
+        assert_eq!(right.pending_count(), 1);
+        assert_eq!(right.action(signal), Action::default());
+    }
+
+    #[test]
+    fn blocked_self_signal_selection_and_coalescing_are_owner_local() {
+        for scale in [1, 8, 32] {
+            let first = key(41, 11);
+            let second = key(42, 12);
+            let left = NativeProcessSignals::<()>::fresh_root(first);
+            let right = NativeProcessSignals::<()>::fresh_root(second);
+            let signal = Signal::from_number(6).unwrap();
+            let blocked = SigBlockMask::blocking_all_of(SignalSet::EMPTY.with(signal));
+            for _ in 0..scale {
+                left.queue_self(first, signal, blocked).unwrap();
+                right.queue_self(second, signal, blocked).unwrap();
+            }
+            assert_eq!(left.pending_count(), 1);
+            assert_eq!(right.pending_count(), 1);
+            assert_eq!(left.take_self(first, blocked).unwrap(), None);
+            assert_eq!(
+                left.take_self(second, SigBlockMask::NONE),
+                Err(NativeSignalError::Stale)
+            );
+            assert_eq!(left.pending_count(), 1);
+            assert_eq!(
+                left.take_self(first, SigBlockMask::NONE).unwrap(),
+                Some((signal, Delivery::Terminate { core_dump: true }))
+            );
+            assert_eq!(left.pending_count(), 0);
+            assert_eq!(right.pending_count(), 1);
+        }
+    }
+
+    #[test]
+    fn blocked_ignored_signals_queue_but_reinstallation_discards_them() {
+        let owner = key(41, 11);
+        let signals = NativeProcessSignals::<()>::fresh_root(owner);
+        for (signal, action) in [
+            (
+                Signal::from_number(13).unwrap(),
+                Action {
+                    disposition: Disposition::Ignore,
+                    ..Action::default()
+                },
+            ),
+            (Signal::CHLD, Action::default()),
+        ] {
+            let blocked = SigBlockMask::blocking_all_of(SignalSet::EMPTY.with(signal));
+            signals.install_action(owner, signal, action).unwrap();
+            signals.queue_self(owner, signal, blocked).unwrap();
+            assert_eq!(signals.pending_count(), 1);
+            assert_eq!(signals.take_self(owner, blocked).unwrap(), None);
+            signals.install_action(owner, signal, action).unwrap();
+            assert_eq!(signals.pending_count(), 0);
+            signals.queue_self(owner, signal, blocked).unwrap();
+            assert_eq!(
+                signals.take_self(owner, SigBlockMask::NONE).unwrap(),
+                Some((signal, Delivery::Ignore))
+            );
+            assert_eq!(signals.pending_count(), 0);
+        }
+    }
+
+    #[test]
+    fn unblocking_ignored_realtime_population_discards_all_instances() {
+        let owner = key(41, 11);
+        let signal = Signal::from_number(40).unwrap();
+        for scale in [1, 8, 32] {
+            let signals = NativeProcessSignals::<()>::fresh_root(owner);
+            signals
+                .install_action(
+                    owner,
+                    signal,
+                    Action {
+                        disposition: Disposition::Ignore,
+                        ..Action::default()
+                    },
+                )
+                .unwrap();
+            let blocked = SigBlockMask::blocking_all_of(SignalSet::EMPTY.with(signal));
+            for _ in 0..scale {
+                signals.queue_self(owner, signal, blocked).unwrap();
+            }
+            assert_eq!(signals.pending_count(), scale);
+            assert_eq!(
+                signals.take_self(owner, SigBlockMask::NONE).unwrap(),
+                Some((signal, Delivery::Ignore))
+            );
+            assert_eq!(signals.pending_count(), 0);
+        }
+    }
+
+    #[test]
+    fn unsupported_native_handler_delivery_keeps_the_pending_entry() {
+        let owner = key(41, 11);
+        let signals = NativeProcessSignals::<()>::fresh_root(owner);
+        let signal = Signal::from_number(13).unwrap();
+        signals
+            .install_action(
+                owner,
+                signal,
+                Action {
+                    disposition: Disposition::Handler(HandlerAddress(0x400100)),
+                    ..Action::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            signals.queue_self(owner, signal, SigBlockMask::NONE),
+            Err(NativeSignalError::Unsupported)
+        );
+        assert_eq!(signals.pending_count(), 0);
+        let blocked = SigBlockMask::blocking_all_of(SignalSet::EMPTY.with(signal));
+        signals.queue_self(owner, signal, blocked).unwrap();
+        assert_eq!(
+            signals.take_self(owner, SigBlockMask::NONE),
+            Err(NativeSignalError::Unsupported)
+        );
+        assert_eq!(signals.pending_count(), 1);
+    }
+
+    #[test]
     fn retained_exit_handle_reads_later_action_and_actual_control_mask() {
         let key = key(41, 11);
         let signals = NativeProcessSignals::<()>::fresh_root(key);
@@ -232,7 +456,7 @@ mod tests {
         );
         child.enqueue(child_key, Signal::CHLD, None).unwrap();
         assert_eq!(child.pending_count(), 1);
-        assert_eq!(parent.pending_count(), 1);
+        assert_eq!(parent.pending_count(), 0);
     }
 
     #[test]
