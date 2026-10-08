@@ -175,24 +175,13 @@ fn take_fork_table_stock(
     Some((child_tables, parent_tables))
 }
 
-fn reserve_table_stock(
-    stock: &mut Vec<RootGpa>,
-    range: carrick_el1_abi::ReservationRange,
-) -> Option<Vec<RootGpa>> {
-    // A retained root already owns its PML4. Each intersected 2-MiB,
-    // 1-GiB and 512-GiB coverage can require one fresh lower table.
-    // Existing tables only reduce this conservative physical credit bound.
-    let last = range.end().checked_sub(1)?;
-    let count = [1_u64 << 21, 1_u64 << 30, 1_u64 << 39]
-        .into_iter()
-        .try_fold(0_u64, |sum, coverage| {
-            sum.checked_add(last / coverage - range.start() / coverage + 1)
-        })?;
-    let count = usize::try_from(count).ok()?;
-    if count > carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS || count > stock.len() {
+fn reserve_table_stock(stock: &mut Vec<RootGpa>, required: usize) -> Option<Vec<RootGpa>> {
+    if required > carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS
+        || required > stock.len()
+    {
         return None;
     }
-    Some(stock.drain(..count).collect())
+    Some(stock.drain(..required).collect())
 }
 
 pub(super) struct PendingForkLoan {
@@ -331,9 +320,10 @@ impl<'a> HostCowWake<'a> {
     }
 }
 struct CowPause<'a> {
-    access: SpaceAccess<'a, carrick_sched_core::ParkedContextWords>,
-    index: carrick_sched_core::SpaceIndex,
-    excluded: carrick_el1_abi::ExcludedEditor<'a>,
+    exclusion: carrick_sched_core::spaces::notification::SpaceExclusion<
+        'a,
+        carrick_sched_core::ParkedContextWords,
+    >,
 }
 impl<'a> CowPause<'a> {
     fn new(
@@ -342,30 +332,13 @@ impl<'a> CowPause<'a> {
     ) -> Result<Self, TrapError> {
         let spaces = access.table();
         let index = spaces.find(mm).ok_or_else(|| fail("owner COW space"))?;
-        spaces.raise(index);
-        // First raise blocks new editors. Refuse an existing editor rather
-        // than holding physical capacity while a peer must make progress.
-        if spaces.active_editor(index).is_some() {
-            access.lower(index);
-            return Err(fail("owner COW editor remains active at physical crossing"));
-        }
-        let excluded = spaces.raise_and_wait_for_editor(index, || {
-            carrick_fatal::carrick_fatal!(
-                "kvm.cow_editor_exclusion",
-                "guest editor admitted after the COW gate exclusion proof"
-            );
-        });
-        Ok(Self {
-            access,
-            index,
-            excluded,
-        })
+        let exclusion = access
+            .try_exclude_editor(index, mm)
+            .map_err(|reason| fail(format!("owner COW editor exclusion refused: {reason:?}")))?;
+        Ok(Self { exclusion })
     }
-}
-impl Drop for CowPause<'_> {
-    fn drop(&mut self) {
-        self.access.lower(self.index);
-        self.access.lower(self.index);
+    fn proof(&self) -> &carrick_el1_abi::ExcludedEditor<'_> {
+        self.exclusion.proof()
     }
 }
 
@@ -1113,7 +1086,7 @@ impl Cpl0HostCustody {
         }
         let receipt = self
             .cow_pool()?
-            .completions(&pause.excluded)
+            .completions(pause.proof())
             .find(|receipt| receipt.grant == pending.grant)
             .filter(|receipt| {
                 exact_cow_receipt(
@@ -1164,7 +1137,7 @@ impl Cpl0HostCustody {
             .publish(&txn, publication, &mut pending.inventory)
             .map_err(|error| fail(error.to_string()))?;
         pending.inventory.finish()?;
-        if !self.cow_pool()?.finish(&pause.excluded, &pending.grant) {
+        if !self.cow_pool()?.finish(pause.proof(), &pending.grant) {
             return Err(fail("owner COW completion changed after settlement"));
         }
         self.anonymous_private_pages = self
@@ -1346,21 +1319,13 @@ impl Cpl0HostCustody {
             .map_err(|error| fail(error.to_string()))?;
         let handle = handles[0];
         let grant = grants[0];
-        let owned_tables = match reserve_table_stock(&mut self.grant_tables, window.range) {
-            Some(tables) => tables,
-            None => {
-                // No descriptor submission occurred: the fresh physical loan
-                // is still unexposed and its inventory can be rolled back.
-                unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
-                    .map_err(|error| fail(error.to_string()))?;
-                return Err(fail("owner grant physical table credit exhausted"));
-            }
-        };
-        let tables: Vec<_> = owned_tables
+        let tables: Vec<_> = self
+            .grant_tables
             .iter()
+            .take(carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS)
             .map(|table| SubstrateGpa(table.address().raw()))
             .collect();
-        let txn = WireTxn {
+        let mut txn = WireTxn {
             id: DescriptorTxnId {
                 mm_key: mm,
                 generation: window.operation.sequence,
@@ -1383,6 +1348,60 @@ impl Cpl0HostCustody {
             },
             tables: TableGrants::new(&tables).ok_or_else(|| fail("owner table grant encoding"))?,
         };
+        let demand = (|| -> Result<usize, TrapError> {
+            let zone = retained_cow_zone(&self.ram)?;
+            let wake = HostCowWake::new(&self.ram, Arc::clone(&self._vm.vm().vm))?;
+            let delivery = |zone: &X86Cpl0Zone,
+                            waker: Waker,
+                            owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+                '_,
+                carrick_sched_core::ParkedContextWords,
+            >| wake.deliver(zone, waker, owned);
+            let pause = CowPause::new(
+                SpaceAccess::notified(SpaceReleaseVenue {
+                    zone,
+                    waker: Waker::Host,
+                    deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
+                        &delivery,
+                    ),
+                }),
+                mm.get(),
+            )?;
+            let planned = X86Mmu::project_grant(root.address().raw(), &txn, |native| {
+                self._vm.admit_guest_edit(native).map_err(|error| fail(error.to_string()))?;
+                carrick_mmu_core::x86::descriptor_txn::plan_descriptor_txn(&self._vm.words(), native, root)
+                    .map(|plan| plan.tables_linked)
+                    .map_err(|error| fail(format!("owner grant physical table plan refused: {error:?}; cpu={} mm={} root={:#x} window_va={:#x} window_len={:#x} available_tables={}", execution.cpu.raw(), mm, root.address().raw(), window.range.start(), len, tables.len())))
+            }).map_err(|error| fail(format!("owner grant table plan projection: {error:?}")));
+            drop(pause);
+            wake.finish()?;
+            planned?
+        })();
+        let required = match demand {
+            Ok(required) => required,
+            Err(error) => {
+                // Neither the read-only planner nor the release venue made
+                // this fresh backing guest-visible.
+                unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
+                    .map_err(|error| fail(error.to_string()))?;
+                return Err(error);
+            }
+        };
+        let owned_tables = match reserve_table_stock(&mut self.grant_tables, required) {
+            Some(owned) => owned,
+            None => {
+                unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
+                    .map_err(|error| fail(error.to_string()))?;
+                return Err(fail(format!(
+                    "owner grant physical table credit exhausted: cpu={} mm={} required={required} available={}",
+                    execution.cpu.raw(),
+                    mm,
+                    self.grant_tables.len()
+                )));
+            }
+        };
+        txn.tables = TableGrants::new(&tables[..required])
+            .ok_or_else(|| fail("owner exact table credit encoding"))?;
         let admission = X86Mmu::project_grant(root.address().raw(), &txn, |native| {
             self._vm.admit_guest_edit(native)
         });
@@ -1602,9 +1621,8 @@ mod custody_tests {
         let mut stock: Vec<_> = (1..=8)
             .map(|n| RootGpa::page_aligned(FrameGpa::new(n * 4096)).unwrap())
             .collect();
-        let range = carrick_el1_abi::ReservationRange::new(0x4000_0000, 0x4001_0000).unwrap();
-        let first = reserve_table_stock(&mut stock, range).unwrap();
-        let second = reserve_table_stock(&mut stock, range).unwrap();
+        let first = reserve_table_stock(&mut stock, 3).unwrap();
+        let second = reserve_table_stock(&mut stock, 3).unwrap();
         assert!(
             !second.is_empty(),
             "the second MM must own pending table credits"
@@ -1615,31 +1633,121 @@ mod custody_tests {
         assert!(first.iter().all(|frame| !second.contains(frame)));
     }
     #[test]
-    fn owner_table_credits_cover_boundaries_and_refuse_without_partial_loans() {
-        let pages = || {
-            (1..=8)
-                .map(|n| RootGpa::page_aligned(FrameGpa::new(n * 4096)).unwrap())
-                .collect::<Vec<_>>()
-        };
-        for (start, expected) in [(0x1f_f000, 4), (0x3fff_f000, 5), (0x7f_ffff_f000, 6)] {
-            let mut stock = pages();
-            let range = carrick_el1_abi::ReservationRange::new(start, start + 0x10000).unwrap();
-            assert_eq!(
-                reserve_table_stock(&mut stock, range).unwrap().len(),
-                expected
-            );
-            assert_eq!(stock.len(), 8 - expected);
+    fn owner_table_loans_use_shared_exact_root_plan_before_either_receipt() {
+        use carrick_mmu_core::live_descriptor_words::LiveDescriptorWords;
+        use carrick_mmu_core::x86::descriptor_txn::{DescriptorRefusal, plan_descriptor_txn};
+        struct ReadOnlyWords(std::collections::BTreeMap<u64, u64>);
+        impl LiveDescriptorWords for ReadOnlyWords {
+            fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
+                self.0
+                    .get(&pa)
+                    .copied()
+                    .ok_or(DescriptorRefusal::MissingTable)
+            }
+            fn compare_exchange(&self, _: u64, _: u64, _: u64) -> Result<bool, DescriptorRefusal> {
+                panic!("physical table query must not write")
+            }
+            fn store_unlinked(&self, _: u64, _: u64) -> Result<(), DescriptorRefusal> {
+                panic!("physical table query must not write")
+            }
+            fn publish_barrier(&self) {
+                panic!("physical table query must not publish")
+            }
+            fn invalidate_range(&self, _: u64, _: u64) {
+                panic!("physical table query must not invalidate")
+            }
         }
+        let page = |pa| RootGpa::page_aligned(FrameGpa::new(pa)).unwrap();
+        let mut words = ReadOnlyWords((0x1000..0xa000).step_by(8).map(|pa| (pa, 0)).collect());
+        // Both live roots already have a private PDPT, so each selected
+        // 64-KiB window requires only a PD and a PT.
+        words.0.insert(0x1000, 0x2000 | 7);
+        words.0.insert(0x3000, 0x4000 | 7);
         let range = carrick_el1_abi::ReservationRange::new(0x4000_0000, 0x4001_0000).unwrap();
-        let mut stock = pages();
-        stock.truncate(2);
+        let backing = carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
+            frame_id: NonZeroU64::MIN,
+            mapping_id: NonZeroU64::MIN,
+            owner_generation: NonZeroU64::MIN,
+            inventory_revision: NonZeroU64::MIN,
+        };
+        let mut stock = (0x5000..0xa000).step_by(4096).map(page).collect::<Vec<_>>();
+        let mut loans = Vec::new();
+        for (mm, root) in [(302, page(0x1000)), (304, page(0x3000))] {
+            let txn = DescriptorTxn {
+                id: DescriptorTxnId {
+                    mm_key: NonZeroU64::new(mm).unwrap(),
+                    generation: NonZeroU64::MIN,
+                },
+                root,
+                op: DescriptorOp::Prepare {
+                    span: PageSpan::new(range.start(), range.len()),
+                    output: FrameGpa::new(0x100000),
+                    permissions: Permissions {
+                        writable: true,
+                        executable: false,
+                        user: true,
+                    },
+                    resident: PageSpan::new(range.start(), 4096),
+                    backing,
+                },
+                tables: &stock,
+            };
+            let plan = plan_descriptor_txn(&words, &txn, root).unwrap();
+            assert_eq!(plan.tables_linked, 2);
+            assert!(plan.words_read <= stock.len() * 512 + 16 * 4 + 8);
+            assert!(matches!(
+                plan_descriptor_txn(&words, &txn, page(0x9000)),
+                Err(DescriptorRefusal::StaleRoot)
+            ));
+            let loan = reserve_table_stock(&mut stock, plan.tables_linked).unwrap();
+            assert_eq!(loan.len(), plan.tables_linked);
+            loans.push(loan);
+        }
+        assert_eq!(stock.len(), 1);
+        assert!(loans[0].iter().all(|page| !loans[1].contains(page)));
+        let invalid = [page(0xa000)];
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: NonZeroU64::new(302).unwrap(),
+                generation: NonZeroU64::MIN,
+            },
+            root: page(0x1000),
+            op: DescriptorOp::Unmap(PageSpan::new(range.start(), 4096)),
+            tables: &invalid,
+        };
+        assert!(matches!(
+            plan_descriptor_txn(&words, &txn, txn.root),
+            Err(DescriptorRefusal::MissingTable)
+        ));
+        words.0.insert(0x9000, 1);
+        let dirty = [page(0x9000)];
+        let dirty_txn = DescriptorTxn {
+            tables: &dirty,
+            ..txn
+        };
+        assert!(matches!(
+            plan_descriptor_txn(&words, &dirty_txn, dirty_txn.root),
+            Err(DescriptorRefusal::BadTableGrant)
+        ));
+    }
+    #[test]
+    fn owner_table_credits_refuse_without_partial_loans() {
+        let page = |n: u64| RootGpa::page_aligned(FrameGpa::new(n * 4096)).unwrap();
+        let mut stock = (1..=2).map(page).collect::<Vec<_>>();
         let before = stock.clone();
-        assert!(reserve_table_stock(&mut stock, range).is_none());
+        assert!(reserve_table_stock(&mut stock, 3).is_none());
         assert_eq!(stock, before);
-        let mut stock = pages();
+        let mut stock = (1..=16).map(page).collect::<Vec<_>>();
         let before = stock.clone();
-        let oversized = carrick_el1_abi::ReservationRange::new(0x4000_0000, 0x8000_0000).unwrap();
-        assert!(reserve_table_stock(&mut stock, oversized).is_none());
+        assert!(
+            reserve_table_stock(
+                &mut stock,
+                carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS + 1
+            )
+            .is_none()
+        );
+        assert_eq!(stock, before);
+        assert!(reserve_table_stock(&mut stock, 0).unwrap().is_empty());
         assert_eq!(stock, before);
     }
     #[test]
@@ -1714,10 +1822,10 @@ mod custody_tests {
         access.open(index);
         let before = calls.get();
         let pause = CowPause::new(access, 302).unwrap();
-        assert_eq!(zone.spaces.gate(index), 2);
+        assert_eq!(zone.spaces.gate(index), 1);
         drop(pause);
         assert_eq!(zone.spaces.gate(index), 0);
-        assert_eq!(calls.get(), before + 2);
+        assert_eq!(calls.get(), before + 1);
         let editor = access.try_begin_edit(index, 302, NonZeroU64::MIN).unwrap();
         assert!(CowPause::new(access, 302).is_err());
         assert_eq!(zone.spaces.gate(index), 0);
@@ -1750,7 +1858,7 @@ mod custody_tests {
         assert!(CowPause::new(access, 302).is_err());
         drop(editor);
         let pause = CowPause::new(access, 302).unwrap();
-        assert_eq!(pause.excluded.key(), 302);
+        assert_eq!(pause.proof().key(), 302);
         assert!(spaces.try_begin_edit(index, 302, NonZeroU64::MIN).is_none());
         drop(pause);
         assert!(spaces.try_begin_edit(index, 302, NonZeroU64::MIN).is_some());

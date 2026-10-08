@@ -556,6 +556,32 @@ pub struct SpaceAccess<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadC
     spaces: &'a super::AddressSpaces,
     venue: Option<SpaceReleaseVenue<'a, C>>,
 }
+/// Fallible host exclusion of one exact MM's guest editor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExclusionRefusal {
+    Stale,
+    Busy,
+}
+
+/// Owns one gate raise and its sourceful release until physical work finishes.
+pub struct SpaceExclusion<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
+    access: SpaceAccess<'a, C>,
+    index: SpaceIndex,
+    proof: super::ExcludedEditor<'a>,
+    release: Option<(SpaceReleaseVenue<'a, C>, SpaceNotificationLease<'a, C>)>,
+}
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> SpaceExclusion<'_, C> {
+    pub fn proof(&self) -> &super::ExcludedEditor<'_> {
+        &self.proof
+    }
+}
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for SpaceExclusion<'_, C> {
+    fn drop(&mut self) {
+        self.access
+            .release_gate_with_custody(self.index, false, self.release.take());
+    }
+}
+
 impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceAccess<'a, C> {
     /// Source-free tests retain the caller's exact parked context type.
     #[cfg(any(test, feature = "host-test"))]
@@ -577,6 +603,39 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceAccess<'a, C> {
     }
     pub fn table(self) -> &'a super::AddressSpaces {
         self.spaces
+    }
+    pub fn try_exclude_editor(
+        self,
+        index: SpaceIndex,
+        key: u64,
+    ) -> Result<SpaceExclusion<'a, C>, ExclusionRefusal> {
+        if key == 0 || self.spaces.key(index) != key {
+            return Err(ExclusionRefusal::Stale);
+        }
+        let release = if self.spaces.entry(index).notifications.attached() {
+            let venue = self.venue.ok_or(ExclusionRefusal::Stale)?;
+            let lease = venue
+                .zone
+                .editor_notification(index, key)
+                .ok_or(ExclusionRefusal::Stale)?;
+            Some((venue, lease))
+        } else {
+            None
+        };
+        self.spaces.raise(index);
+        let exclusion = SpaceExclusion {
+            access: self,
+            index,
+            proof: self.spaces.excluded(index),
+            release,
+        };
+        if self.spaces.key(index) != key {
+            return Err(ExclusionRefusal::Stale);
+        }
+        if self.spaces.active_editor(index).is_some() {
+            return Err(ExclusionRefusal::Busy);
+        }
+        Ok(exclusion)
     }
     /// Preserve the nested host pause count; the release revision precedes
     /// the atomic decrement, and delivery follows it.
@@ -602,6 +661,15 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceAccess<'a, C> {
         } else {
             None
         };
+        self.release_gate_with_custody(index, opening, release);
+    }
+    fn release_gate_with_custody(
+        self,
+        index: SpaceIndex,
+        opening: bool,
+        release: Option<(SpaceReleaseVenue<'a, C>, SpaceNotificationLease<'a, C>)>,
+    ) {
+        let entry = self.spaces.entry(index);
         if let Some((venue, lease)) = release {
             let completion = |effects: OwnedObjectWakeEffects<'_, C>| {
                 venue.deliver.invoke(venue.zone, venue.waker, effects)
@@ -1266,5 +1334,114 @@ mod tests {
         assert!(!zone.record(record).has_object_operation());
         drop(queue);
         entry.retire_entry(access(&zone).venue().unwrap());
+    }
+    #[test]
+    fn transient_editor_exclusion_refuses_without_waiting_and_reopens_gate() {
+        let zone = zone();
+        let index = zone.spaces.publish_closed(77, 0x1000, 0).unwrap();
+        let access = SpaceAccess::source_free(&zone.spaces);
+        access.open(index);
+        std::thread::scope(|scope| {
+            let (observed_tx, observed_rx) = std::sync::mpsc::sync_channel(1);
+            let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+            let spaces = &zone.spaces;
+            let worker = scope.spawn(move || {
+                super::super::editor_test_hook::install(move || {
+                    observed_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                });
+                SpaceAccess::source_free(spaces)
+                    .try_begin_edit(index, 77, NonZeroU64::MIN)
+                    .is_some()
+            });
+            observed_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                access.try_exclude_editor(index, 77)
+            }));
+            // Preserve cleanup even against the compiled old waiting body.
+            if result.is_err() {
+                access.lower(index);
+            }
+            let reopened = zone.spaces.gate(index) == 0;
+            resume_tx.send(()).unwrap();
+            let licensed = worker.join().unwrap();
+            assert!(
+                result.is_ok(),
+                "transient editor must return Busy rather than invoke a wait/fatal callback"
+            );
+            assert!(matches!(result.unwrap(), Err(ExclusionRefusal::Busy)));
+            assert!(reopened);
+            assert!(
+                licensed,
+                "refusal restored the gate before the real editor recheck"
+            );
+        });
+    }
+    #[test]
+    fn held_exclusion_proof_rejects_a_delayed_editor_and_releases_once() {
+        let zone = zone();
+        let index = zone.spaces.publish_closed(78, 0x2000, 0).unwrap();
+        let access = SpaceAccess::source_free(&zone.spaces);
+        access.open(index);
+        let exclusion = access.try_exclude_editor(index, 78).unwrap();
+        assert_eq!(exclusion.proof().key(), 78);
+        assert_eq!(zone.spaces.gate(index), 1);
+        std::thread::scope(|scope| {
+            let (observed_tx, observed_rx) = std::sync::mpsc::sync_channel(1);
+            let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+            let spaces = &zone.spaces;
+            let worker = scope.spawn(move || {
+                super::super::editor_test_hook::install(move || {
+                    observed_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                });
+                SpaceAccess::source_free(spaces)
+                    .try_begin_edit(index, 78, NonZeroU64::MIN)
+                    .is_some()
+            });
+            observed_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert!(zone.spaces.active_editor(index).is_some());
+            resume_tx.send(()).unwrap();
+            assert!(
+                !worker.join().unwrap(),
+                "held proof prevents editor admission after its delayed CAS"
+            );
+        });
+        assert!(zone.spaces.active_editor(index).is_none());
+        drop(exclusion);
+        assert_eq!(zone.spaces.gate(index), 0);
+        assert!(access.try_begin_edit(index, 78, NonZeroU64::MIN).is_some());
+    }
+    #[test]
+    fn exclusion_retains_notification_custody_through_source_closure() {
+        let zone = zone();
+        let entry = admitted(&zone);
+        let index = entry.index();
+        let access = access(&zone);
+        access.open(index);
+        let observer = entry.notifications(NonZeroU64::MIN).unwrap();
+        let before = observer.observe(SpaceWaitCause::Gate);
+        let exclusion = access.try_exclude_editor(index, 77).unwrap();
+        zone.spaces.close(index);
+        entry
+            .close_notifications(NonZeroU64::MIN, access.venue().unwrap())
+            .unwrap();
+        assert!(entry.notifications(NonZeroU64::MIN).is_err());
+        drop(exclusion);
+        assert_eq!(zone.spaces.gate(index), super::super::GATE_CLOSED);
+        assert_ne!(observer.observe(SpaceWaitCause::Gate), before);
+        assert!(matches!(
+            access.try_exclude_editor(index, 77),
+            Err(ExclusionRefusal::Stale)
+        ));
+        assert_eq!(zone.spaces.gate(index), super::super::GATE_CLOSED);
     }
 }
