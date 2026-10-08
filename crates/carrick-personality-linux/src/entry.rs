@@ -15,10 +15,22 @@ pub fn decode_x86_64(native: u64, mut args: [u64; 6], stack: u64) -> CanonicalCa
     if native == 56 {
         args.swap(3, 4);
     }
-    let canonical = carrick_syscall_abi::syscall_x86_64::canonical_x86_64(
-        carrick_syscall_abi::NativeNr(native),
-    )
-    .map_or(u64::MAX, carrick_syscall_abi::CanonicalNr::raw);
+    let canonical = if native == 57 {
+        // fork has no separate canonical syscall: normalize its no-argument
+        // ABI to the minimal process clone shape, preserving its native nr.
+        args = [
+            carrick_signal_core::policy::Signal::CHLD.number() as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        crate::lifecycle::SYS_CLONE as u64
+    } else {
+        carrick_syscall_abi::syscall_x86_64::canonical_x86_64(carrick_syscall_abi::NativeNr(native))
+            .map_or(u64::MAX, carrick_syscall_abi::CanonicalNr::raw)
+    };
     CanonicalCall {
         isa: GuestIsa::X86_64,
         canonical: CanonicalOrdinal::new(canonical),
@@ -76,6 +88,14 @@ pub const fn aarch64_child_vdso_identity(parent: u64, visible_tid: u32) -> u64 {
 #[cfg(test)]
 mod decode_tests {
     use super::decode_x86_64;
+
+    #[test]
+    fn x86_fork_normalizes_to_the_shared_clone_shape() {
+        let call = decode_x86_64(57, [91, 92, 93, 94, 95, 96], 0x8000);
+        assert_eq!(call.canonical.raw(), crate::lifecycle::SYS_CLONE as u64);
+        assert_eq!(call.args, [17, 0, 0, 0, 0, 0]);
+        assert_eq!(call.native.raw(), 57);
+    }
 
     #[test]
     fn ordinary_x86_file_call_uses_canonical_family_ordinal() {

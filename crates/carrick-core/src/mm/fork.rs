@@ -209,8 +209,11 @@ fn refusal_to_fork_error(e: Refusal) -> ForkError {
     }
 }
 
-impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> ForkChildRoot
-    for Reservations<'_, Policy, Geometry>
+impl<
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+> ForkChildRoot for Reservations<'_, Policy, Geometry, C>
 {
     fn incarnation(&self) -> u64 {
         self.incarnation().raw()
@@ -254,8 +257,12 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> ForkChildRoot
     }
 }
 
-impl<'b, Policy: ReservationPolicy, Geometry: ReservationGeometry>
-    ForkParentRoot<Reservations<'b, Policy, Geometry>> for Reservations<'_, Policy, Geometry>
+impl<
+    'b,
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+> ForkParentRoot<Reservations<'b, Policy, Geometry, C>> for Reservations<'_, Policy, Geometry, C>
 {
     fn incarnation(&self) -> u64 {
         self.incarnation().raw()
@@ -284,7 +291,7 @@ impl<'b, Policy: ReservationPolicy, Geometry: ReservationGeometry>
 
     fn clone_into(
         &mut self,
-        child: &mut Reservations<'b, Policy, Geometry>,
+        child: &mut Reservations<'b, Policy, Geometry, C>,
     ) -> Result<(), ForkError> {
         self.clone_into(child).map_err(refusal_to_fork_error)
     }
@@ -714,6 +721,9 @@ pub fn census_table<
     count.child = count.child.checked_add(512).ok_or(ForkError::NoMemory)?;
     count.live = count.live.checked_add(512).ok_or(ForkError::NoMemory)?;
     for index in 0..512 {
+        if level == 0 && B::is_shared_root_entry(index as usize) {
+            continue;
+        }
         census_entry::<B, P, W>(
             policy_provider,
             words,
@@ -815,6 +825,10 @@ pub fn copy_table<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
             return Err(ForkError::NoMemory);
         }
         scratch.reads.push((address, descriptor));
+        if cursor.level == 0 && B::is_shared_root_entry(index) {
+            scratch.child[cursor.child_offset + index] = descriptor;
+            continue;
+        }
         let va = cursor.base + ((index as u64) << SHIFTS[cursor.level]);
         let (parent, child) = copy_entry::<B, P, W>(
             policy_provider,

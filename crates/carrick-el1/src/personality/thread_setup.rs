@@ -26,10 +26,18 @@ impl LifecycleVenue for GuestLifecycleVenue {
     fn born_slot(&self, page: &ThreadLifecyclePage, entry: EntryRef) -> Option<&ThreadControlSlot> {
         let address = page.control_address(entry)?;
         let end = address.checked_add(core::mem::size_of::<ThreadControlSlot>() as u64)?;
-        if address < carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
-            || end
-                > carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
-                    + carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE
+        let base = {
+            #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+            {
+                carrick_el1_abi::X86_CPL0_DYNAMIC_METADATA_BASE
+            }
+            #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+            {
+                carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
+            }
+        };
+        if address < base
+            || end > base + carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE
             || !address.is_multiple_of(core::mem::align_of::<ThreadControlSlot>() as u64)
         {
             return None;

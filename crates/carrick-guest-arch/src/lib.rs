@@ -37,6 +37,20 @@ ordinal!(
     FatalCode
 );
 
+/// Native address-space register bits, including ARM ASID or x86 control
+/// bits. This is distinct from a physical root and conveys no MM authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct AddressSpaceRegister(u64);
+impl AddressSpaceRegister {
+    pub const fn from_register(raw: u64) -> Self {
+        Self(raw)
+    }
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 /// A vCPU slot (the syscall-mailbox slot index).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[repr(transparent)]
@@ -681,4 +695,24 @@ mod tests {
         );
         assert!(UserRange::checked(UserVa::new(0x1000), GuestLen::new(0)).is_some());
     }
+}
+
+/// The only EL1-private terminal states encoded by the software bits and
+/// descriptor validity. This is the authority gate for prepared backing,
+/// retirement, and host-buffer access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum El1PrivateLeafState {
+    Unowned,
+    Prepared,
+    Resident,
+    Retired,
+    Malformed,
+}
+
+/// Architecture decoding for the shared anonymous backing walk.
+/// Decoding conveys custody only; it does not authorize descriptor writes.
+pub trait AnonymousDescriptorDecode {
+    fn indices(va: UserVa) -> [usize; 4];
+    fn next_table(descriptor: u64, level: usize) -> Option<FrameGpa>;
+    fn private_state(descriptor: u64) -> El1PrivateLeafState;
 }

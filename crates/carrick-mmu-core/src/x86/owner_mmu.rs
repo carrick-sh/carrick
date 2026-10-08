@@ -7,10 +7,17 @@ use carrick_guest_arch::{
     RootGpa, UserRange, UserVa,
 };
 
+/// Dedicated MM-private supervisor branch for the two-page COW copy window.
+/// It is separate from retained image and kernel supervisor branches.
+pub const COW_COPY_ROOT_INDEX: usize = 508;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct X86Mmu;
 impl OwnerForkMmu for X86Mmu {
     const ADDRESS_MASK: u64 = ADDRESS;
+    fn is_shared_root_entry(index: usize) -> bool {
+        index >= 256 && index != COW_COPY_ROOT_INDEX
+    }
     fn control_window() -> Option<(UserVa, UserVa)> {
         None
     }
@@ -125,22 +132,66 @@ impl crate::owner_mmu::OwnerGrantMmu for X86Mmu {
         txn: &crate::aarch64::descriptor_txn::DescriptorTxn,
     ) -> crate::aarch64::descriptor_txn::DescriptorOutcome {
         use crate::aarch64::descriptor_txn::{
-            DescriptorApplied, DescriptorOp as WireOp, DescriptorOutcome as WireOutcome,
-            ReclaimedTables,
+            DescriptorApplied, DescriptorOutcome as WireOutcome, ReclaimedTables,
         };
+        let result = Self::project_grant(register, txn, |native| {
+            execute_descriptor_txn(words, native, native.root, &mut InlineJournal::new())
+        });
+        let receipt = match result {
+            Ok(receipt) => receipt,
+            Err(reason) => return WireOutcome::Refused(reason),
+        };
+        match receipt.outcome {
+            DescriptorOutcome::Applied {
+                stores,
+                tables_linked,
+            } => {
+                let (Ok(live_stores), Ok(tables_linked)) =
+                    (u32::try_from(stores), u8::try_from(tables_linked))
+                else {
+                    return WireOutcome::Indeterminate(DescriptorRefusal::BadEncoding);
+                };
+                WireOutcome::Applied(DescriptorApplied {
+                    pages: txn.op.span().len / PAGE,
+                    resident: match txn.op {
+                        crate::aarch64::descriptor_txn::DescriptorOp::Prepare {
+                            resident, ..
+                        } => resident,
+                        _ => return WireOutcome::Refused(DescriptorRefusal::BadEncoding),
+                    },
+                    tables_linked,
+                    reclaimed: ReclaimedTables::NONE,
+                    live_stores,
+                    flush_required: stores != 0,
+                })
+            }
+            DescriptorOutcome::Refused(reason) => WireOutcome::Refused(reason),
+            DescriptorOutcome::RolledBack(reason) => WireOutcome::RolledBack(reason),
+            DescriptorOutcome::Indeterminate(reason) => WireOutcome::Indeterminate(reason),
+        }
+    }
+}
+
+impl X86Mmu {
+    /// One projection for guest execution and host receipt authentication.
+    /// This does not select Linux mappings or grant descriptor-write authority.
+    pub fn project_grant<T>(
+        register: u64,
+        txn: &crate::aarch64::descriptor_txn::DescriptorTxn,
+        consume: impl FnOnce(&DescriptorTxn<'_>) -> T,
+    ) -> Result<T, DescriptorRefusal> {
+        use crate::aarch64::descriptor_txn::DescriptorOp as WireOp;
         let WireOp::Prepare {
             publication,
             resident,
             backing,
         } = txn.op
         else {
-            return WireOutcome::Refused(DescriptorRefusal::BadEncoding);
+            return Err(DescriptorRefusal::BadEncoding);
         };
-        let Ok(root) = Self::root(register) else {
-            return WireOutcome::Refused(DescriptorRefusal::StaleRoot);
-        };
+        let root = Self::root(register).map_err(|_| DescriptorRefusal::StaleRoot)?;
         if root.address().raw() != txn.root.raw() {
-            return WireOutcome::Refused(DescriptorRefusal::StaleRoot);
+            return Err(DescriptorRefusal::StaleRoot);
         }
         let tables: alloc::vec::Vec<_> = txn
             .tables
@@ -149,17 +200,17 @@ impl crate::owner_mmu::OwnerGrantMmu for X86Mmu {
             .map(|&pa| RootGpa::page_aligned(FrameGpa::new(pa)))
             .collect();
         let Some(tables) = tables.into_iter().collect::<Option<alloc::vec::Vec<_>>>() else {
-            return WireOutcome::Refused(DescriptorRefusal::BadTableGrant);
+            return Err(DescriptorRefusal::BadTableGrant);
         };
         let Some(range) =
             UserRange::checked(UserVa::new(publication.va), GuestLen::new(publication.len))
         else {
-            return WireOutcome::Refused(DescriptorRefusal::BadRange);
+            return Err(DescriptorRefusal::BadRange);
         };
         let Some(resident_range) =
             UserRange::checked(UserVa::new(resident.va), GuestLen::new(resident.len))
         else {
-            return WireOutcome::Refused(DescriptorRefusal::BadRange);
+            return Err(DescriptorRefusal::BadRange);
         };
         // SAFETY: apply_grant retains this exact-MM editor, and the authenticated
         // grant root and operation generation were checked before this call.
@@ -185,34 +236,9 @@ impl crate::owner_mmu::OwnerGrantMmu for X86Mmu {
             },
             &tables,
         ) else {
-            return WireOutcome::Refused(DescriptorRefusal::BadRange);
+            return Err(DescriptorRefusal::BadRange);
         };
-        let Ok(native) = DescriptorTxn::from_intent(&intent) else {
-            return WireOutcome::Refused(DescriptorRefusal::BadEncoding);
-        };
-        let receipt = execute_descriptor_txn(words, &native, root, &mut InlineJournal::new());
-        match receipt.outcome {
-            DescriptorOutcome::Applied {
-                stores,
-                tables_linked,
-            } => {
-                let (Ok(live_stores), Ok(tables_linked)) =
-                    (u32::try_from(stores), u8::try_from(tables_linked))
-                else {
-                    return WireOutcome::Indeterminate(DescriptorRefusal::BadEncoding);
-                };
-                WireOutcome::Applied(DescriptorApplied {
-                    pages: publication.len / PAGE,
-                    resident,
-                    tables_linked,
-                    reclaimed: ReclaimedTables::NONE,
-                    live_stores,
-                    flush_required: stores != 0,
-                })
-            }
-            DescriptorOutcome::Refused(reason) => WireOutcome::Refused(reason),
-            DescriptorOutcome::RolledBack(reason) => WireOutcome::RolledBack(reason),
-            DescriptorOutcome::Indeterminate(reason) => WireOutcome::Indeterminate(reason),
-        }
+        let native = DescriptorTxn::from_intent(&intent)?;
+        Ok(consume(&native))
     }
 }

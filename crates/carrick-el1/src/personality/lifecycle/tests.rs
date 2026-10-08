@@ -199,6 +199,7 @@ impl World {
             }),
             None,
             Some(&*self.venue),
+            None,
             |_| core::ptr::null_mut(),
         )
     }
@@ -300,6 +301,9 @@ fn serve_directly(w: &mut World, frame: &mut TrapFrame, user: &mut FaultingUser)
         }),
         ipc: None,
         lifecycle: Some(&*w.venue),
+        process: None::<&mut dyn carrick_personality_linux::lifecycle::ProcessNative>,
+        source: None,
+        anonymous: None,
         cache_lookup: |_| core::ptr::null_mut(),
         lifecycle_user: Some(user),
     };
@@ -1098,6 +1102,118 @@ impl UserCopy for FaultingUser {
 }
 
 #[test]
+fn process_native_hooks_require_every_execution_identity_component() {
+    struct Probe {
+        binding: carrick_el1_abi::ExecutionBinding,
+        calls: usize,
+    }
+    impl ProcessNative for Probe {
+        fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
+            self.binding
+        }
+        fn fork(&mut self) -> LifecycleOutcome {
+            self.calls += 1;
+            LifecycleOutcome::Returned {
+                result: SyscallResult::new(43),
+                work: false,
+            }
+        }
+        fn wait4(
+            &mut self,
+            pid: ProcessWaitPid,
+            status: UserVa,
+            options: LinuxWaitOptions,
+            rusage: UserVa,
+        ) -> LifecycleOutcome {
+            assert_eq!(pid.raw(), -1);
+            assert_eq!(status, UserVa::new(0x1000));
+            assert_eq!(options, LinuxWaitOptions::WNOHANG);
+            assert_eq!(rusage.raw(), 0);
+            self.calls += 1;
+            LifecycleOutcome::Returned {
+                result: SyscallResult::new(44),
+                work: false,
+            }
+        }
+        fn exit_group(&mut self, status: u8) -> LifecycleOutcome {
+            assert_eq!(status, 23);
+            self.calls += 1;
+            LifecycleOutcome::Returned {
+                result: SyscallResult::new(45),
+                work: false,
+            }
+        }
+    }
+    let mut world = World::new(LifecycleHatches::ON);
+    let expected = crate::personality::common_entry::execution_binding(world.task());
+    let mut bindings = [expected; 5];
+    bindings[1].task = carrick_el1_abi::EntryTaskKey::from_raw(99);
+    bindings[2].generation = carrick_el1_abi::EntryGeneration::from_raw(99);
+    bindings[3].mm = carrick_el1_abi::EntryMmKey::from_raw(99);
+    bindings[4].thread_generation = carrick_el1_abi::EntryThreadGeneration::from_raw(99);
+    for (index, binding) in bindings.into_iter().enumerate() {
+        let mut probe = Probe { binding, calls: 0 };
+        let mut frame = TrapFrame {
+            slot: SLOT_IDX as u64,
+            ..Default::default()
+        };
+        let names = InotifyNameCache::new();
+        let mut native = super::El1PendingFamilies {
+            handoff: None,
+            lifecycle_user: None,
+            frame: &mut frame,
+            counters: &world.counters,
+            current_tasks: &world.tasks,
+            fd_map: &[],
+            object_table: &[],
+            open_table: &[],
+            inotify_table: &[],
+            name_cache: &names,
+            zone: Some(Zone {
+                tables: &world.zone,
+                cpu: &mut world.cpu,
+                user: &HardwareUserWord,
+            }),
+            ipc: None,
+            lifecycle: Some(&*world.venue),
+            process: Some(&mut probe),
+            source: None,
+            anonymous: None,
+            cache_lookup: |_| core::ptr::null_mut(),
+        };
+        let results = [
+            LifecycleNative::process_fork(&mut native),
+            LifecycleNative::process_wait4(
+                &mut native,
+                ProcessWaitPid::from_syscall_argument(u64::MAX),
+                UserVa::new(0x1000),
+                LinuxWaitOptions::WNOHANG,
+                UserVa::new(0),
+            ),
+            LifecycleNative::process_exit_group(&mut native, 23),
+        ];
+        for (operation, result) in results.into_iter().enumerate() {
+            if index == 0 {
+                assert!(
+                    matches!(result, Some(LifecycleOutcome::Returned { result, work: false }) if result.raw() == 43 + operation as i64),
+                    "exact execution must reach its admitted process native venue"
+                );
+            } else {
+                assert!(
+                    result.is_none(),
+                    "a foreign execution must not reach process effects"
+                );
+            }
+        }
+        assert_eq!(probe.calls, if index == 0 { 3 } else { 0 });
+        assert_eq!(
+            crate::personality::common_entry::execution_binding(world.task()),
+            expected
+        );
+    }
+}
+
+#[test]
 fn x86_split_result_does_not_read_argument_zero() {
     use crate::personality::dispatch::{El1PendingFamilies, GuestDispatchFrame};
     use carrick_guest_arch::{CanonicalNr, NativeReturnWord, SyscallFrame};
@@ -1162,6 +1278,9 @@ fn x86_split_result_does_not_read_argument_zero() {
         zone: None::<Zone<'_, FakeCpu, HardwareUserWord>>,
         ipc: None,
         lifecycle: None,
+        process: None::<&mut dyn carrick_personality_linux::lifecycle::ProcessNative>,
+        source: None,
+        anonymous: None,
         cache_lookup: |_| core::ptr::null_mut(),
     };
     assert_eq!(LifecycleNative::result(&pending).raw(), 0x1234);

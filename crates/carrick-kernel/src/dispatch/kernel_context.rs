@@ -47,24 +47,42 @@ pub(crate) fn try_bootstrap_one_task_binding(
     host_signal: Arc<dyn carrick_hal::HostSignalBridge>,
 ) -> Result<(crate::kernel::KernelTaskBinding, crate::kernel::MmId), crate::run_result::RuntimeError>
 {
-    let observed_pid = i32::try_from(std::process::id()).unwrap_or(1);
+    try_bootstrap_launch_binding(host_signal, None)
+}
+
+pub(super) fn try_bootstrap_launch_binding(
+    host_signal: Arc<dyn carrick_hal::HostSignalBridge>,
+    container: Option<Arc<crate::kernel::Container>>,
+) -> Result<(crate::kernel::KernelTaskBinding, crate::kernel::MmId), crate::run_result::RuntimeError>
+{
+    let observed_pid = i32::try_from(std::process::id())
+        .map_err(|error| crate::run_result::RuntimeError::Configuration(error.to_string()))?;
     let registry_id = crate::thread::ThreadId::main_from_host_pid();
-    let bootstrap = crate::kernel::RootBootstrap::for_one_task_adapter(
-        observed_pid,
-        registry_id,
-        "one-task-dispatch-adapter".to_owned(),
-        host_signal,
-    )
+    let bootstrap = match container {
+        Some(container) => crate::kernel::RootBootstrap::for_prepared_launch(
+            observed_pid,
+            registry_id,
+            "cpl0-prepared-launch".to_owned(),
+            container,
+            host_signal,
+        ),
+        None => crate::kernel::RootBootstrap::for_one_task_adapter(
+            observed_pid,
+            registry_id,
+            "one-task-dispatch-adapter".to_owned(),
+            host_signal,
+        ),
+    }
     .map_err(|error| {
-        tracing::error!(%error, "cannot build mandatory one-task kernel adapter");
+        tracing::error!(%error, "cannot build initial kernel binding");
         crate::run_result::RuntimeError::CarrierFailed(format!(
-            "cannot build mandatory one-task kernel adapter: {error}"
+            "cannot build initial kernel binding: {error}"
         ))
     })?;
     let (_, context) = crate::kernel::Kernel::bootstrap_root(bootstrap).map_err(|error| {
-        tracing::error!(%error, "cannot bootstrap mandatory one-task kernel adapter");
+        tracing::error!(%error, "cannot bootstrap initial kernel binding");
         crate::run_result::RuntimeError::CarrierFailed(format!(
-            "cannot bootstrap mandatory one-task kernel adapter: {error}"
+            "cannot bootstrap initial kernel binding: {error}"
         ))
     })?;
     let mm_id = context.shared().mm().id();
@@ -154,6 +172,32 @@ impl SyscallDispatcher {
         let mut proc = self.proc.lock();
         proc.bind_hvpatch_identity(process.pid() as u32, namespace_pid);
         proc.hvpatch_process = Some(process);
+    }
+
+    /// Admit the actual prepared root's launch bytes and filesystem/file
+    /// custody before the one-way native identity export.
+    pub fn adopt_cpl0_boot_launch(
+        &self,
+        argv: Vec<String>,
+        env: Vec<Vec<u8>>,
+    ) -> Result<(), crate::kernel::boot_launch::BootExportError> {
+        let context = self
+            .capture_one_task_context()
+            .map_err(|_| crate::kernel::boot_launch::BootExportError::RootScope)?;
+        let binding = context.task_binding();
+        binding.kernel().adopt_boot_launch(
+            &binding,
+            crate::kernel::boot_launch::BootLaunchResources {
+                namespace: context.container(),
+                rootfs: Arc::clone(&self.fs.rootfs_vfs),
+                mounts: Arc::clone(&self.fs.vfs_mounts),
+                files: context.resources().files(),
+                fs_context: context.resources().fs_context(),
+                credentials: context.resources().credentials(),
+                argv,
+                env,
+            },
+        )
     }
 
     pub fn capture_kernel_context(
@@ -536,6 +580,180 @@ mod tests {
     use carrick_abi::LINUX_FD_CLOEXEC;
     use carrick_vfs::fs_backend::FsBackend;
     use parking_lot::RwLock;
+
+    #[test]
+    fn prepared_cpl0_dispatcher_boots_in_exact_launch_container() {
+        let network = Arc::new(crate::network::RuntimeNetwork::host_default());
+        let container = Arc::new(crate::kernel::Container::new_with_namespaces(
+            crate::kernel::LaunchContext::unmanaged(crate::kernel::RunId::new("cpl0-launch-test")),
+            network.model.clone(),
+            "cpl0-launch-hostname",
+        ));
+        let arena = Box::leak(Box::new(
+            carrick_kernel_arena::arena::KernelArena::create().expect("launch test arena"),
+        ));
+        let region =
+            crate::namespace::pid::NsSharedRegion::allocate(arena).expect("launch PID namespace");
+        container
+            .install_pid_ns(Arc::clone(&region))
+            .expect("install launch namespace");
+        let dispatcher = SyscallDispatcher::with_prepared_launch(
+            network,
+            None,
+            super::super::CarrierBridges::null(),
+            Arc::clone(&container),
+        )
+        .expect("prepared launch");
+        let context = dispatcher
+            .capture_one_task_context()
+            .expect("launch context");
+        assert!(Arc::ptr_eq(&container, &context.container()));
+        assert_eq!(
+            context.container().uts_ns().nodename(),
+            "cpl0-launch-hostname"
+        );
+        assert!(Arc::ptr_eq(
+            &region,
+            &context
+                .container()
+                .pid_region()
+                .expect("captured namespace")
+        ));
+        assert_eq!(dispatcher.identity_snapshot(&context).pid, 1);
+        let identity = context.task().identity();
+        assert_eq!(
+            context
+                .kernel()
+                .registry()
+                .process_group_to_namespace(container.id(), identity.process_group),
+            Some(1)
+        );
+        assert_eq!(
+            context
+                .kernel()
+                .registry()
+                .session_to_namespace(container.id(), identity.session),
+            Some(1)
+        );
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        struct VmOrigin(std::num::NonZeroU64);
+        impl crate::kernel::boot_launch::BootVmIdentity for VmOrigin {}
+        let vm = VmOrigin(std::num::NonZeroU64::new(9).unwrap());
+        let task = context.task().key();
+        let thread = context.thread().key();
+        let mm = context.shared().mm().id();
+        let files = context.resources().files();
+        let rootfs = Arc::clone(&dispatcher.fs.rootfs_vfs);
+        let mounts = Arc::clone(&dispatcher.fs.vfs_mounts);
+        let argv = vec!["/actual/program".into(), "argument".into()];
+        let env = vec![b"BYTES=\xff".to_vec()];
+        let initial_binding = context.task_binding();
+        assert!(matches!(
+            context.kernel().export_boot_launch(&initial_binding, vm),
+            Err(crate::kernel::boot_launch::BootExportError::Unadopted)
+        ));
+        assert!(context.exact_thread_is_live());
+        assert_eq!(context.kernel().boot_export_receipt().exports, 0);
+        dispatcher
+            .adopt_cpl0_boot_launch(argv.clone(), env.clone())
+            .unwrap();
+        let binding = context.task_binding();
+        let export = context.kernel().export_boot_launch(&binding, vm).unwrap();
+        assert_eq!(export.identity.task.local, task);
+        assert_eq!(export.identity.task.vm, vm);
+        assert_eq!(export.identity.thread.local, thread);
+        assert_eq!(export.identity.mm.local, mm);
+        assert_eq!(export.identity.mm.vm, vm);
+        assert_eq!(export.identity.revision, context.revision());
+        assert_eq!(export.identity.affinity, context.thread().affinity());
+        assert_eq!(export.serials.vm, vm);
+        assert_eq!(export.identity.namespace_pid.get(), 1);
+        assert_eq!(export.identity.namespace_tid.get(), 1);
+        assert_eq!(export.identity.namespace_process_group.get(), 1);
+        assert_eq!(export.identity.namespace_session.get(), 1);
+        assert_eq!(export.resources.argv(), argv);
+        assert_eq!(export.resources.env(), env);
+        assert!(Arc::ptr_eq(export.resources.namespace(), &container));
+        assert!(Arc::ptr_eq(export.resources.rootfs(), &rootfs));
+        assert!(Arc::ptr_eq(export.resources.mounts(), &mounts));
+        assert!(Arc::ptr_eq(&export.resources.files, &files));
+        // A retained caller cannot keep a second host process authority alive.
+        assert_eq!(context.kernel().registry().task_count(), 0);
+        assert_eq!(context.kernel().registry().process_group_count(), 0);
+        assert_eq!(context.kernel().registry().session_count(), 0);
+        let snapshot = context
+            .kernel()
+            .snapshot(std::time::Instant::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(snapshot.tasks.is_empty());
+        assert!(snapshot.threads.is_empty());
+        assert!(snapshot.mms.is_empty());
+        assert!(!context.exact_thread_is_live());
+        assert!(dispatcher.capture_one_task_context().is_err());
+        assert!(
+            dispatcher
+                .prepare_syscall(
+                    &context,
+                    super::super::SyscallRequest::new(172, crate::compat::SyscallArgs::new([0; 6])),
+                    &crate::compat::CompatReporter::default(),
+                )
+                .is_err()
+        );
+        assert!(container.pid_root().is_none());
+        assert_eq!(
+            context.kernel().ids().reserve_task().unwrap_err(),
+            crate::kernel::IdError::AuthorityTransferred
+        );
+        assert_eq!(
+            context.kernel().ids().reserve_thread().unwrap_err(),
+            crate::kernel::IdError::AuthorityTransferred
+        );
+        assert_eq!(
+            context.kernel().object_ids().task_serial(),
+            Err(crate::kernel::ObjectIdError::AuthorityTransferred)
+        );
+        assert_eq!(
+            context.kernel().object_ids().thread_serial(),
+            Err(crate::kernel::ObjectIdError::AuthorityTransferred)
+        );
+        assert_eq!(
+            context.kernel().object_ids().mm_id(),
+            Err(crate::kernel::ObjectIdError::AuthorityTransferred)
+        );
+        assert!(matches!(
+            context.kernel().export_boot_launch(&binding, vm),
+            Err(crate::kernel::boot_launch::BootExportError::AlreadyExported)
+        ));
+        let receipt = context.kernel().boot_export_receipt();
+        assert_eq!(receipt.exports, 1);
+        assert_eq!(receipt.refused, Some(1));
+        assert_eq!(receipt.semantic_refusals, Some(1));
+        assert_eq!(receipt.namespace_refusals, Some(2));
+        assert_eq!(receipt.object_refusals, Some(3));
+        let mut native_ids = export.namespaces.into_owner();
+        assert_eq!(native_ids.counts().task_claims, 1);
+        assert_eq!(native_ids.counts().thread_claims, 1);
+        assert_eq!(native_ids.counts().process_group_claims, 1);
+        assert_eq!(native_ids.counts().session_claims, 1);
+        assert_eq!(
+            native_ids
+                .reserve_next(carrick_sched_core::process::identity_allocator::ClaimKind::Task)
+                .unwrap()
+                .get(),
+            task.id.raw() + 1
+        );
+        assert!(
+            export
+                .serials
+                .local
+                .into_allocator()
+                .allocate()
+                .unwrap()
+                .get()
+                > thread.serial.raw()
+        );
+    }
 
     #[test]
     fn entering_hvpatch_lane_unpublishes_legacy_projection_only_once() {

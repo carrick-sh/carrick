@@ -301,6 +301,8 @@ pub struct InitialMmImage {
     pub address: AddressContext<RootGpa>,
     pub context: ParkedContextWords,
     pub stack_pointer: u64,
+    /// First byte beyond the highest ELF PT_LOAD page; Linux brk begins here.
+    pub initial_break: UserVa,
     pub publications: Vec<GuestMmuPublication>,
 }
 
@@ -408,6 +410,14 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
     }) {
         return Err(InitialMmError::InvalidRange);
     }
+    let initial_break = UserVa::new(
+        image
+            .regions
+            .iter()
+            .map(|region| region.start.raw() + region.len.raw())
+            .max()
+            .ok_or(InitialMmError::InvalidRange)?,
+    );
     let root = source
         .take_zeroed_table()
         .ok_or(InitialMmError::FrameUnavailable)?;
@@ -485,12 +495,20 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
             let intent = EditIntent::checked(
                 owner,
                 range,
-                EditOperation::Map {
-                    output: grant.frame,
-                    permissions: region.perms,
-                    size: EditLeafSize::Page,
-                    resident: true,
-                    backing: grant.backing,
+                match region.contents {
+                    RegionContents::Stack(_) => EditOperation::Prepare {
+                        output: grant.frame,
+                        permissions: region.perms,
+                        resident: range,
+                        backing: grant.backing,
+                    },
+                    RegionContents::Guest(_) => EditOperation::Map {
+                        output: grant.frame,
+                        permissions: region.perms,
+                        size: EditLeafSize::Page,
+                        resident: true,
+                        backing: grant.backing,
+                    },
                 },
                 &tables[used_tables..],
             )
@@ -512,6 +530,9 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
         mm: MmGeneration::new(mm_key),
         generation: ContextGeneration::new(generation),
     };
+    #[cfg(target_os = "none")]
+    super::x86::mmu::register_shared_supervisor_tables(words, source_root)
+        .map_err(|_| InitialMmError::DescriptorRefused)?;
     let mut frame = [0; 20];
     frame[15] = image.stack.entry;
     frame[16] = 0x23; // user 64-bit code selector in the CPL0 GDT
@@ -522,6 +543,7 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
         address,
         context: ParkedContextWords::from_parts(frame, address, 0, 0, [0; X86_XSAVE_BYTES]),
         stack_pointer: stack.rsp,
+        initial_break,
         publications,
     })
 }
@@ -717,7 +739,21 @@ mod tests {
             )
         }
         .unwrap();
+        let stack_leaf = translate_leaf(
+            &words,
+            loaded.address.root,
+            UserVa::new(loaded.stack_pointer),
+            Access::Write,
+            true,
+        )
+        .unwrap();
+        assert_ne!(
+            stack_leaf.descriptor & carrick_mmu_core::x86::descriptor_txn::PRIVATE,
+            0,
+            "the initial anonymous stack needs owner-private COW custody"
+        );
         assert_eq!(loaded.publications.len(), 3);
+        assert_eq!(loaded.initial_break.raw(), 0x403000);
         assert_eq!(loaded.context.frame[15], 0x400000);
         assert_eq!(loaded.context.frame[16], 0x23);
         assert_eq!(loaded.context.frame[17], 0x202);

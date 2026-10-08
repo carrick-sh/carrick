@@ -68,6 +68,65 @@ pub enum PortalForkCustody {
     },
 }
 
+impl PortalForkCustody {
+    /// The original four-word custody record shared by physical adapters.
+    pub fn words(self) -> [u64; 4] {
+        match self {
+            Self::Frame {
+                va,
+                ipa,
+                len,
+                shared,
+            } => [if shared { 4 } else { 1 }, va, ipa, len],
+            Self::StructuralCopy {
+                source_ipa,
+                destination_ipa,
+                len,
+                executable,
+            } => [
+                if executable { 5 } else { 3 },
+                source_ipa,
+                destination_ipa,
+                len,
+            ],
+            Self::HostBacking { handle, generation } => [2, handle.get(), generation.get(), 0],
+        }
+    }
+    pub fn decode(words: [u64; 4]) -> Option<Self> {
+        Some(match words[0] {
+            tag @ (1 | 4)
+                if words[3] != 0
+                    && words[1].checked_add(words[3]).is_some()
+                    && words[2].checked_add(words[3]).is_some() =>
+            {
+                Self::Frame {
+                    va: words[1],
+                    ipa: words[2],
+                    len: words[3],
+                    shared: tag == 4,
+                }
+            }
+            tag @ (3 | 5)
+                if words[3] != 0
+                    && words[1].checked_add(words[3]).is_some()
+                    && words[2].checked_add(words[3]).is_some() =>
+            {
+                Self::StructuralCopy {
+                    source_ipa: words[1],
+                    destination_ipa: words[2],
+                    len: words[3],
+                    executable: tag == 5,
+                }
+            }
+            2 if words[3] == 0 => Self::HostBacking {
+                handle: core::num::NonZeroU64::new(words[1])?,
+                generation: core::num::NonZeroU64::new(words[2])?,
+            },
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortalForkCompletion {
     pub request: PortalForkRequest,

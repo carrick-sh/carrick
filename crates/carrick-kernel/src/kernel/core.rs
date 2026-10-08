@@ -308,26 +308,16 @@ impl KernelTaskBinding {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-#[repr(transparent)]
-pub struct TaskRevision(u64);
+pub use carrick_sched_core::process::exit::TaskRevision;
 
-impl TaskRevision {
-    pub const INITIAL: Self = Self(1);
-
-    pub const fn next(self) -> Option<Self> {
-        match self.0.checked_add(1) {
-            Some(next) => Some(Self(next)),
-            None => None,
-        }
-    }
-
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KernelPopulationOrigin {
+    Host,
+    PreparedNativeLaunch,
 }
 
 pub struct RootBootstrap {
+    population_origin: KernelPopulationOrigin,
     task_id: TaskId,
     shared_futex: carrick_thread::platform_futex::SharedFutexTable,
     registry_id: ThreadId,
@@ -343,6 +333,26 @@ pub struct RootBootstrap {
 }
 
 impl RootBootstrap {
+    /// Prepare a private production kernel directly in the resolved launch
+    /// container, without constructing a reference-model namespace first.
+    pub fn for_prepared_launch(
+        observed_pid: i32,
+        registry_id: ThreadId,
+        diagnostic_name: String,
+        container: Arc<Container>,
+        host_signal: Arc<dyn HostSignalBridge>,
+    ) -> Result<Self, KernelError> {
+        Ok(Self {
+            population_origin: KernelPopulationOrigin::PreparedNativeLaunch,
+            task_id: TaskId::for_root_bootstrap(observed_pid)?,
+            shared_futex: carrick_thread::platform_futex::SharedFutexTable::new(),
+            registry_id,
+            mm_backend: None,
+            diagnostic_name,
+            container,
+            host_signal,
+        })
+    }
     /// Build an identity-only root for the in-crate reference model: the
     /// test-support constructor, on the Null (bridge-less) host-signal
     /// bridge. Product code uses [`Self::for_one_task_adapter`] or
@@ -407,6 +417,7 @@ impl RootBootstrap {
         // A reference-model kernel boots into the reference-model container.
         // Product bootstraps override this with `with_container`.
         Ok(Self {
+            population_origin: KernelPopulationOrigin::Host,
             task_id: TaskId::for_root_bootstrap(observed_pid)?,
             shared_futex: carrick_thread::platform_futex::SharedFutexTable::new(),
             registry_id,
@@ -508,6 +519,7 @@ impl std::fmt::Debug for ContainerRootPublicationBarriers {
 /// One backend-neutral Linux kernel instance.
 #[derive(Debug)]
 pub struct Kernel {
+    population_origin: KernelPopulationOrigin,
     #[cfg(all(debug_assertions, feature = "schedule-hooks"))]
     schedule_hooks: super::schedule::Hooks,
     ipc: Mutex<Option<Arc<crate::el1_ipc::HostIpc>>>,
@@ -515,6 +527,7 @@ pub struct Kernel {
     registry: Registry,
     ids: IdRegistry,
     object_ids: ObjectIdRegistry,
+    boot_launch: Mutex<super::boot_launch::BootLaunchAuthority>,
     frame_inventory: FrameInventoryAuthority,
     shared_futex: carrick_thread::platform_futex::SharedFutexTable,
     fd_ceiling: Arc<super::FdCeilingAuthority>,
@@ -1443,6 +1456,7 @@ impl Kernel {
         };
         let registry = Registry::new(
             RegistryState {
+                failure: core::marker::PhantomData,
                 epoch: 1,
                 container_inits: BTreeMap::from([(container.id(), task_key)]),
                 tasks: BTreeMap::from([(bootstrap.task_id, task_record)]),
@@ -1490,11 +1504,13 @@ impl Kernel {
         let (hvpatch_child_token_issuer, hvpatch_child_token_verifier) =
             carrick_hal::HvpatchChildTokenIssuer::new_pair();
         let kernel = Arc::new(Self {
+            population_origin: bootstrap.population_origin,
             domain: Arc::new(KernelDomain),
             host_signal: bootstrap.host_signal,
             registry,
             ids,
             object_ids,
+            boot_launch: Mutex::default(),
             frame_inventory: FrameInventoryAuthority::new(),
             shared_futex: bootstrap.shared_futex,
             fd_ceiling,
@@ -1539,6 +1555,238 @@ impl Kernel {
         );
         let context = KernelContext::capture(kernel.clone(), task, leader, TaskRevision::INITIAL);
         Ok((kernel, context))
+    }
+
+    pub(crate) fn adopt_boot_launch(
+        &self,
+        binding: &KernelTaskBinding,
+        resources: super::boot_launch::BootLaunchResources,
+    ) -> Result<(), super::boot_launch::BootExportError> {
+        use super::boot_launch::{BootExportError, BootLaunchState};
+        if self.population_origin != KernelPopulationOrigin::PreparedNativeLaunch
+            || !std::ptr::eq(self, binding.kernel().as_ref())
+        {
+            return Err(BootExportError::RootScope);
+        }
+        let mut launch = self.boot_launch.lock();
+        if !matches!(launch.state, BootLaunchState::Unadopted) {
+            launch.refused = launch.refused.saturating_add(1);
+            return Err(BootExportError::AlreadyAdopted);
+        }
+        let state = self.registry.settled().read();
+        let root = state
+            .tasks
+            .get(&binding.task.id)
+            .ok_or(BootExportError::RootScope)?;
+        if root.task.key() != binding.task || root.task.threads().len() != 1 {
+            return Err(BootExportError::RootScope);
+        }
+        let thread = root
+            .task
+            .threads()
+            .into_iter()
+            .next()
+            .ok_or(BootExportError::RootScope)?;
+        let actual = thread.resources();
+        if !Arc::ptr_eq(&root.task.container(), &resources.namespace)
+            || !Arc::ptr_eq(&actual.files(), &resources.files)
+            || !Arc::ptr_eq(&actual.fs_context(), &resources.fs_context)
+            || !Arc::ptr_eq(&actual.credentials(), &resources.credentials)
+        {
+            return Err(BootExportError::RootScope);
+        }
+        launch.state = BootLaunchState::Adopted(resources);
+        Ok(())
+    }
+
+    pub(crate) fn source_host_dispatch_available(&self) -> bool {
+        if self.population_origin == KernelPopulationOrigin::Host {
+            return true;
+        }
+        let mut launch = self.boot_launch.lock();
+        if matches!(launch.state, super::boot_launch::BootLaunchState::Exported) {
+            launch.semantic_refused = launch.semantic_refused.saturating_add(1);
+            return false;
+        }
+        true
+    }
+
+    pub fn boot_export_receipt(&self) -> super::boot_launch::BootExportReceipt {
+        let launch = self.boot_launch.lock();
+        super::boot_launch::BootExportReceipt {
+            exports: launch.exports,
+            refused: (launch.refused != u64::MAX).then_some(launch.refused),
+            semantic_refusals: (launch.semantic_refused != u64::MAX)
+                .then_some(launch.semantic_refused),
+            namespace_refusals: self.ids.transferred_refusals(),
+            object_refusals: self.object_ids.transferred_refusals(),
+        }
+    }
+
+    pub fn export_boot_launch<V: super::boot_launch::BootVmIdentity>(
+        &self,
+        binding: &KernelTaskBinding,
+        vm: V,
+    ) -> Result<super::boot_launch::BootLaunchExport<V>, super::boot_launch::BootExportError> {
+        use super::boot_launch::{
+            BootExportError, BootIdentity, BootLaunchExport, BootLaunchState, VmLocal,
+        };
+        use carrick_el1_abi::Lifecycle;
+        let mut launch = self.boot_launch.lock();
+        match launch.state {
+            BootLaunchState::Unadopted => return Err(BootExportError::Unadopted),
+            BootLaunchState::Exported => {
+                launch.refused = launch.refused.saturating_add(1);
+                return Err(BootExportError::AlreadyExported);
+            }
+            BootLaunchState::Adopted(_) => {}
+        }
+        if self.population_origin != KernelPopulationOrigin::PreparedNativeLaunch
+            || !std::ptr::eq(self, binding.kernel().as_ref())
+        {
+            return Err(BootExportError::RootScope);
+        }
+        let mut state = self.registry.settled().write();
+        let root = state
+            .tasks
+            .get(&binding.task.id)
+            .ok_or(BootExportError::RootScope)?;
+        let container = root.task.container();
+        if root.task.key() != binding.task
+            || state.tasks.len() != 1
+            || !state.zombies.is_empty()
+            || !state.retiring_tasks.is_empty()
+            || !state.reservations.is_empty()
+            || state.process_groups.len() != 1
+            || state.sessions.len() != 1
+            || container.pid_root() != Some(binding.task)
+            || container.pid_region().is_none()
+            || root.task.threads().len() != 1
+            || state.retired_threads.len() != 0
+            || self.containers.lock().len() != 1
+            || !self.pending_container_roots.lock().is_empty()
+            || self.ids.counts()
+                != (super::registry::IdRegistryCounts {
+                    reserved_numbers: 1,
+                    task_claims: 1,
+                    thread_claims: 1,
+                    process_group_claims: 1,
+                    session_claims: 1,
+                })
+        {
+            return Err(BootExportError::RootScope);
+        }
+        let thread = root
+            .task
+            .threads()
+            .into_iter()
+            .next()
+            .ok_or(BootExportError::RootScope)?;
+        let actual_resources = thread.resources();
+        let BootLaunchState::Adopted(resources) = &launch.state else {
+            return Err(BootExportError::Unadopted);
+        };
+        if !Arc::ptr_eq(&actual_resources.files(), &resources.files)
+            || !Arc::ptr_eq(&actual_resources.fs_context(), &resources.fs_context)
+            || !Arc::ptr_eq(&actual_resources.credentials(), &resources.credentials)
+        {
+            return Err(BootExportError::RootScope);
+        }
+        let identity = root.task.identity();
+        let group = state
+            .process_groups
+            .get(&identity.process_group)
+            .ok_or(BootExportError::RootScope)?;
+        let session = state
+            .sessions
+            .get(&identity.session)
+            .ok_or(BootExportError::RootScope)?;
+        let namespace_pid = container
+            .pid_region()
+            .and_then(|region| {
+                u32::try_from(binding.task.id.raw())
+                    .ok()
+                    .and_then(|id| region.host_to_ns(id))
+            })
+            .ok_or(BootExportError::RootScope)?;
+        let namespace_tid = crate::namespace::pid::ns_visible_thread_tid(&thread)
+            .ok_or(BootExportError::RootScope)?;
+        let visible = |raw| {
+            std::num::NonZeroU32::new(raw)
+                .map(carrick_sched_core::process::identity_allocator::VisibleIdentity::from_existing_member)
+                .ok_or(BootExportError::RootScope)
+        };
+        let identity = BootIdentity {
+            task: VmLocal {
+                vm,
+                local: root.task.key(),
+            },
+            thread: VmLocal {
+                vm,
+                local: thread.key(),
+            },
+            mm: VmLocal {
+                vm,
+                local: root.task.shared().mm().id(),
+            },
+            container: container.id(),
+            revision: root.revision,
+            affinity: thread.affinity(),
+            identity,
+            namespace: container
+                .pid_region()
+                .and_then(|region| region.visible_domain())
+                .ok_or(BootExportError::RootScope)?,
+            namespace_pid: visible(namespace_pid)?,
+            namespace_tid: visible(namespace_tid)?,
+            namespace_process_group: visible(group.namespace_id)?,
+            namespace_session: visible(session.namespace_id)?,
+            diagnostic_name: root.diagnostic_name.clone(),
+        };
+        if !self.object_ids.local_transfer_available() {
+            return Err(BootExportError::AllocatorTransferred);
+        }
+        // Exclude old host admission before removing its claims. This page is
+        // bootstrap custody, distinct from the receiving native lifecycle page.
+        let namespaces = self
+            .ids
+            .transfer_boot_root(binding.task.id)
+            .ok_or(BootExportError::RootScope)?;
+        root.task
+            .shared()
+            .pending_signals()
+            .lifecycle_lease()
+            .close();
+        let serials = self
+            .object_ids
+            .transfer_local_serials()
+            .ok_or(BootExportError::AllocatorTransferred)?;
+        let BootLaunchState::Adopted(resources) =
+            std::mem::replace(&mut launch.state, BootLaunchState::Exported)
+        else {
+            return Err(BootExportError::Unadopted);
+        };
+        // Old role tokens now release only the empty source. Remove every host
+        // population index and observation before exposing the owned export.
+        let _retired_bootstrap_thread = root.task.retire_thread(thread.key());
+        state.tasks.clear();
+        state.container_inits.clear();
+        state.process_groups.clear();
+        state.process_group_by_namespace.clear();
+        state.sessions.clear();
+        state.session_by_namespace.clear();
+        self.observations
+            .lock()
+            .retire_tasks(&BTreeSet::from([binding.task]));
+        self.containers.lock().remove(&container.id());
+        container.rollback_pid_root(binding.task);
+        launch.exports = 1;
+        Ok(BootLaunchExport {
+            identity,
+            namespaces,
+            serials: VmLocal { vm, local: serials },
+            resources,
+        })
     }
 
     pub fn set_work_scope(&self, scope: carrick_observability::work_meter::WorkScope) {
@@ -2802,19 +3050,50 @@ pub(super) struct RetiringTaskRecord {
     pub(super) observation: Zombie,
 }
 
+pub(super) type RegistryState = carrick_sched_core::process::registry::ProcessRegistry<
+    ContainerId,
+    TaskRecord,
+    ZombieRecord,
+    RetiringTaskRecord,
+    super::operations::TaskGraphReservation,
+    super::thread_retirement::RetiredThreads,
+    Arc<ProcessGroup>,
+    Arc<Session>,
+    HostRegistryFailure,
+>;
+
 #[derive(Debug)]
-pub(super) struct RegistryState {
-    pub(super) epoch: u64,
-    pub(super) container_inits: BTreeMap<ContainerId, TaskKey>,
-    pub(super) tasks: BTreeMap<TaskId, TaskRecord>,
-    pub(super) zombies: BTreeMap<TaskId, ZombieRecord>,
-    pub(super) retiring_tasks: BTreeMap<TaskId, RetiringTaskRecord>,
-    pub(super) process_groups: BTreeMap<ProcessGroupId, ProcessGroupRecord>,
-    pub(super) process_group_by_namespace: BTreeMap<(ContainerId, u32), ProcessGroupId>,
-    pub(super) reservations: BTreeMap<TaskId, super::operations::TaskGraphReservation>,
-    pub(super) retired_threads: super::thread_retirement::RetiredThreads,
-    pub(super) sessions: BTreeMap<SessionId, SessionRecord>,
-    pub(super) session_by_namespace: BTreeMap<(ContainerId, u32), SessionId>,
+pub(super) struct HostRegistryFailure;
+impl carrick_sched_core::process::registry::RegistryFailure for HostRegistryFailure {
+    fn fail(invariant: carrick_sched_core::process::registry::RegistryInvariant) -> ! {
+        use carrick_sched_core::process::registry::RegistryInvariant;
+        match invariant {
+            RegistryInvariant::BirthPayloadMismatch => carrick_fatal!(
+                "kernel::process_birth",
+                "process birth payload lost its admitted identity or registry custody"
+            ),
+            RegistryInvariant::EpochExhausted => carrick_fatal!(
+                "kernel::registry_epoch",
+                "Kernel RegistryState epoch counter overflow"
+            ),
+            RegistryInvariant::ProcessGroupCollision => carrick_fatal!(
+                "kernel::process_group_index",
+                "process-group publication collided in internal or container namespace index"
+            ),
+            RegistryInvariant::ProcessGroupIndexLost => carrick_fatal!(
+                "kernel::process_group_index",
+                "removing process-group did not remove matching container namespace index edge"
+            ),
+            RegistryInvariant::SessionCollision => carrick_fatal!(
+                "kernel::session_index",
+                "session publication collided in internal or container namespace index"
+            ),
+            RegistryInvariant::SessionIndexLost => carrick_fatal!(
+                "kernel::session_index",
+                "removing session did not remove matching container namespace index edge"
+            ),
+        }
+    }
 }
 
 fn fail_container_root(
@@ -2825,78 +3104,6 @@ fn fail_container_root(
         Err(KernelError::InjectedContainerRootFailure(boundary))
     } else {
         Ok(())
-    }
-}
-
-impl RegistryState {
-    pub(super) fn publish_epoch(&mut self) {
-        let Some(next) = self.epoch.checked_add(1) else {
-            carrick_fatal!(
-                "kernel::registry_epoch",
-                "Kernel RegistryState epoch counter overflow"
-            );
-        };
-        self.epoch = next;
-    }
-
-    pub(super) fn publish_process_group(&mut self, id: ProcessGroupId, record: ProcessGroupRecord) {
-        let namespace_key = (record.container, record.namespace_id);
-        if self.process_groups.contains_key(&id)
-            || self.process_group_by_namespace.contains_key(&namespace_key)
-        {
-            carrick_fatal!(
-                "kernel::process_group_index",
-                "process-group publication collided in internal or container namespace index"
-            );
-        }
-        self.process_group_by_namespace.insert(namespace_key, id);
-        self.process_groups.insert(id, record);
-    }
-
-    pub(super) fn remove_process_group(
-        &mut self,
-        id: ProcessGroupId,
-    ) -> Option<ProcessGroupRecord> {
-        let record = self.process_groups.remove(&id)?;
-        if self
-            .process_group_by_namespace
-            .remove(&(record.container, record.namespace_id))
-            != Some(id)
-        {
-            carrick_fatal!(
-                "kernel::process_group_index",
-                "removing process-group did not remove matching container namespace index edge"
-            );
-        }
-        Some(record)
-    }
-
-    pub(super) fn publish_session(&mut self, id: SessionId, record: SessionRecord) {
-        let namespace_key = (record.container, record.namespace_id);
-        if self.sessions.contains_key(&id) || self.session_by_namespace.contains_key(&namespace_key)
-        {
-            carrick_fatal!(
-                "kernel::session_index",
-                "session publication collided in internal or container namespace index"
-            );
-        }
-        self.session_by_namespace.insert(namespace_key, id);
-        self.sessions.insert(id, record);
-    }
-
-    pub(super) fn remove_session(&mut self, id: SessionId) -> Option<SessionRecord> {
-        let record = self.sessions.remove(&id)?;
-        if self
-            .session_by_namespace
-            .remove(&(record.container, record.namespace_id))
-            != Some(id)
-        {
-            carrick_fatal!(
-                "kernel::session_index",
-                "removing session did not remove matching container namespace index edge"
-            );
-        }
-        Some(record)
     }
 }
 
@@ -2930,25 +3137,10 @@ pub(super) struct RetiredThreadRecord {
     pub(super) _claim: ThreadClaim,
 }
 
-#[derive(Debug)]
-pub(super) struct ProcessGroupRecord {
-    pub(super) object: Arc<ProcessGroup>,
-    pub(super) members: BTreeSet<TaskKey>,
-    /// Namespace that owns this group name. Internal `ProcessGroupId` remains
-    /// the scheduler/kernel key; this pair is the guest-facing authority.
-    pub(super) container: ContainerId,
-    pub(super) namespace_id: u32,
-}
-
-#[derive(Debug)]
-pub(super) struct SessionRecord {
-    pub(super) object: Arc<Session>,
-    pub(super) process_groups: BTreeSet<ProcessGroupId>,
-    /// Namespace that owns this session name. Its lifetime is exactly this
-    /// record's lifetime, independent of the leader's task slot.
-    pub(super) container: ContainerId,
-    pub(super) namespace_id: u32,
-}
+pub(super) type ProcessGroupRecord =
+    carrick_sched_core::process::registry::ProcessGroupRecord<Arc<ProcessGroup>, ContainerId>;
+pub(super) type SessionRecord =
+    carrick_sched_core::process::registry::SessionRecord<Arc<Session>, ContainerId>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum KernelError {

@@ -532,7 +532,48 @@ pub struct CompatReport {
 pub struct ExecutionWitness {
     pub backend: String,
     pub guest_entries: u64,
+    /// All visits to the CPL0 host portal, including refused calls.
+    #[serde(default)]
+    pub portal_exits: u64,
     pub host_forwards: u64,
+    /// PRIVATE pages authenticated against live CPL0 descriptors at grant settlement.
+    #[serde(default)]
+    pub anonymous_private_pages: u64,
+    /// Historical anonymous grant evidence authenticated while each MM was live.
+    #[serde(default)]
+    pub anonymous_private_mms: Vec<AnonymousPrivateMm>,
+    #[serde(default)]
+    pub cross_mm_private_aliases: u64,
+    /// Grants observed while the other CPU was actually inside KVM_RUN.
+    #[serde(default)]
+    pub peer_active_private_grants: u64,
+    /// Real stage-2 physical services, counted separately from Linux host dispatch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub physical_crossing_families: Vec<ExecutionFamilyCount>,
+    /// Temporary host semantic scaffolding, counted by crossing family.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_forward_families: Vec<ExecutionFamilyCount>,
+    /// CPL0-owned or unclassified calls that did not enter host dispatch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guest_refusal_families: Vec<ExecutionFamilyCount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnonymousPrivateMm {
+    pub mm: u64,
+    pub root: u64,
+    pub incarnation: u64,
+    pub generation: u64,
+    pub private_pages: u64,
+    /// Actual caller CPUs observed at authenticated live grant settlement.
+    #[serde(default)]
+    pub cpu_mask: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionFamilyCount {
+    pub family: String,
+    pub count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -3966,21 +3966,27 @@ fn mem_authority_snapshot_honors_deadline_contention() {
     let dispatcher = std::sync::Arc::new(SyscallDispatcher::new());
     let source = dispatcher.vma_snapshot_source();
     let held = std::sync::Arc::clone(&dispatcher);
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let worker_barrier = std::sync::Arc::clone(&barrier);
+    let (entered_send, entered_receive) = std::sync::mpsc::sync_channel(1);
+    let (release_send, release_receive) = std::sync::mpsc::sync_channel(1);
+    let coordination_bound = std::time::Duration::from_secs(5);
     let worker = std::thread::spawn(move || {
         held.with_vma_dispatch_for_test(|_dispatch| {
-            worker_barrier.wait();
-            std::thread::sleep(std::time::Duration::from_millis(40));
+            entered_send
+                .send(())
+                .expect("publish held snapshot authority");
+            release_receive
+                .recv_timeout(coordination_bound)
+                .expect("snapshot completion releases authority");
         });
     });
-    barrier.wait();
+    entered_receive
+        .recv_timeout(coordination_bound)
+        .expect("snapshot authority acquired");
 
-    assert_eq!(
-        source.snapshot(std::time::Instant::now() + std::time::Duration::from_millis(5)),
-        Err(crate::kernel::SnapshotError::TimedOut)
-    );
+    let result = source.snapshot(std::time::Instant::now() + std::time::Duration::from_millis(5));
+    release_send.send(()).expect("release snapshot authority");
     worker.join().expect("authority lock worker");
+    assert_eq!(result, Err(crate::kernel::SnapshotError::TimedOut));
 }
 
 #[test]

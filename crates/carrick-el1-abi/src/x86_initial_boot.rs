@@ -3,13 +3,15 @@
 //! supervisor direct alias. No host pointer crosses this record.
 
 pub const X86_INITIAL_BOOT_MAGIC: u64 = u64::from_le_bytes(*b"CXRUN001");
-pub const X86_INITIAL_BOOT_VERSION: u32 = 1;
-pub const X86_INITIAL_BOOT_HEADER_GPA: u64 = 0x1e_0000;
+pub const X86_INITIAL_BOOT_VERSION: u32 = 3;
+pub const X86_INITIAL_BOOT_HEADER_GPA: u64 = 0x10_1000;
 pub const X86_INITIAL_BOOT_PORT: u16 = 0xc6;
-/// Shared scheduler tables within the production CPL0 metadata aperture.
-pub const X86_CPL0_ZONE_OFFSET: u64 = 0x40_0000;
 pub const X86_INITIAL_MAX_REGIONS: usize = 32;
 pub const X86_INITIAL_MAX_STRINGS: usize = 256;
+/// CPL0's retained metadata binds the neutral reservation and zone owners
+/// into one virtual region so root release authenticates the exact zone.
+pub const X86_CPL0_RESERVATIONS_OFFSET: u64 = 0x2_0000;
+pub const X86_CPL0_ZONE_OFFSET: u64 = 0x40_0000;
 
 pub const X86_INITIAL_BOOT_PENDING: u32 = 0;
 pub const X86_INITIAL_BOOT_LOADED: u32 = 1;
@@ -22,6 +24,7 @@ pub struct X86InitialBootHeader {
     pub version: u32,
     pub reserved: u32,
     pub entry_va: u64,
+    pub peer_entry_va: u64,
 }
 
 #[repr(C)]
@@ -55,6 +58,8 @@ pub struct X86InitialBootRequest {
     pub generation: u64,
     pub result_table_used: u32,
     pub result_data_used: u32,
+    /// Guest MM owner's first byte beyond the highest PT_LOAD page.
+    pub result_initial_break: u64,
 }
 
 #[repr(C)]
@@ -87,8 +92,8 @@ pub struct X86InitialBootGrant {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<X86InitialBootHeader>() == 24);
-    assert!(core::mem::size_of::<X86InitialBootRequest>() == 168);
+    assert!(core::mem::size_of::<X86InitialBootHeader>() == 32);
+    assert!(core::mem::size_of::<X86InitialBootRequest>() == 176);
     assert!(core::mem::align_of::<X86InitialBootRequest>() == 8);
     assert!(core::mem::offset_of!(X86InitialBootRequest, magic) == 0);
     assert!(core::mem::offset_of!(X86InitialBootRequest, region_count) == 12);

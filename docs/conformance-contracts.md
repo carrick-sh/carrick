@@ -583,6 +583,70 @@ clear/wake ordering and graph refusal. The signed anonymous and fork-COW
 comparison fixtures bind the terminal runtime path; broader pthread and exec
 acceptance remains open.
 
+`kernel.process.wait-owner` covers selection and consumption of a process's
+children by wait4/waitid. Linux authority is wait(2)'s clone-child partition,
+WNOWAIT observation, and consuming reap; wait4(2) supplies subtree CPU charging.
+The shared registry must authenticate exact task serials, preserve live and
+retiring children in a blocking wait, and sample the parent's wake generation
+in the scan that found no event. Revision or topology admission failure must
+leave the zombie, child edge and CPU ledger unchanged.
+
+Consuming reap returns the removed non-cloneable consumer payload alongside
+the semantic exit receipt, retaining exact numeric/native custody until the
+caller releases the result. `consuming_wait_retains_only_selected_owned_claim_until_result_release`
+proves two selected claims remain independent and release exactly once. The
+same selection consumes topology and charges CPU once, with no extra scan.
+The host drops its returned payload under the registry guard before observers.
+
+The VM-free binding is `carrick-sched-core::process::wait_tests`, exercised by
+`just test`. It covers two children, stale serials, observe/consume, ptrace
+stops outside the child class, reservations and revision exhaustion. At 1, 8,
+32 and 128 live children, with 512 unrelated processes present, unrelated
+identity/event reads are exactly zero. Child identity reads are bounded by
+`2*n`, and event reads by `n`, per scan; registry lookups follow only parent
+edges. Consuming read prechecks accept a non-Clone UID receipt, making receipt
+cloning unnecessary until the write admission. Host kernel-semantics suites
+exercise the same owner through the public wait APIs. Signed ARM and live
+CPL0 process bindings remain required; these inner-loop checks make no
+runtime-ratio or guest-instruction claim.
+
+`kernel.process.birth-owner` covers fork publication under retained exclusive
+registry custody. Exact caller and selected-parent serial/revision, child
+population collisions, group/session membership and immutable payload identity
+must be authenticated before irreversible claim publication. A valid exit
+participant reservation cannot license new process topology; already-admitted
+thread membership remains allowed. `process::birth::tests` binds these rules,
+including dropped admission, external peer roots, a genuine exit reservation
+red-first refusal and zero identity reads across 512 unrelated tasks.
+
+`kernel.process.exit-owner` covers reserved exit topology. Linux authority is
+exit(2), wait(2), PR_SET_CHILD_SUBREAPER and SIGCHLD's SIG_IGN/SA_NOCLDWAIT
+rules. The shared registry chooses exact-generation live ancestry, reparents
+both live and zombie children, and removes the exiting child edge for autoreap.
+Topology reservations retain one publication credit per live participant;
+admitted thread births and nonfinal exits may advance their revisions without
+closing those participants' membership gates. Dropping admission leaves their
+revision unchanged; publishing topology advances the current revision.
+
+The VM-free binding is `carrick-sched-core::process::exit_tests`, plus existing
+host exit/thread-reservation tests through the same owner. Selection visits
+only the exiting task, its ancestry, its children and its affected parents;
+it does not scan the registry population. Private prepared-plan fields keep
+adopter and child-set selection in the shared owner. Terminal zombie publication,
+exit-group member selection, reservation release and parent notification ordering
+use the same owner. Cancellation authority requires the exact opaque reservation
+incarnation; its parent permit is available only after cancelling those members.
+Notification selection authenticates the exact parent, then snapshots signal
+state outside the registry guard through the existing shared signal policy.
+
+The structural exit-effect test uses 0/1/8/32/128 own members and 512 unrelated
+processes: it visits each own member once, performs at most four identity reads
+for the exiting task, and performs zero unrelated identity/member reads. A full
+population-scan mutant fails this budget. An unrelated reservation is refused
+before exit begins, and a rebound reservation with the same numeric transaction
+cannot release old effects or be erased by old rollback. Signed ARM binding and
+the live CPL0 two-MM witness remain open; no runtime-ratio claim is made.
+
 ## X86 retained shootdown debt (`x86-shootdown-reentry`)
 
 Surface: shared-MM page retirement on two live x86 KVM CPUs. Architectural
@@ -612,3 +676,51 @@ The terminal fixture fault suffix emits one completion exit after unmasking
 KICK; production keeps its terminal halt and contains no fixture hold polling.
 No VM-free runner can witness real TLB contents. HVF signed execution and Docker
 are outside this x86 KVM binding; this lane uses `CARRICK_REQUIRE_KVM=1`.
+
+
+## Process entry native custody (`kernel.process.entry-owner`)
+
+CPL0 process calls use the existing Linux lifecycle dispatcher and completion
+owner. Before invoking native fork, wait4 or exit_group custody, the pending
+family must authenticate task, task generation, MM and thread generation.
+A mismatch invokes zero native effects. A matching entry invokes its one
+native operation; native custody returns a LifecycleOutcome, never publishes
+a second completion. Existing ARM consumers supply no process venue.
+
+The VM-free `process_native_hooks_require_every_execution_identity_component`
+test independently changes each binding component and checks all three hooks.
+The native hook absence is red before the bridge. The
+`x86_parked_context_roots_clone_through_shared_fork_owner` fixture inherits a
+real anonymous reservation through the existing shared fork traits with CPL0
+parked contexts and aligned, co-located reservation/zone storage. The previous
+ARM-only trait implementations are structural red; context parameterization
+preserves the ARM default. This is adapter and owner-custody evidence; CPU1
+execution and the live two-MM PRIVATE witness remain required.
+
+## X86 MM-private COW copy window (`kernel.mm.private-cow-window`)
+
+Linux private mappings preserve independent bytes across fork. A physical
+replacement at 8 GiB must be usable without a permanent supervisor data alias.
+Each MM owns one supervisor branch and two idle copy leaves. Fork clones that
+branch while retaining shared supervisor branches. Under the exact-MM editor,
+copy maps a read-only source and writable destination, both inaccessible to
+users, then restores both idle words and drains translations before release.
+A failed restoration is indeterminate and forbids backing reuse.
+
+The VM-free bindings are
+`x86_fork_clones_private_upper_branch_and_keeps_supervisor_sharing`,
+`x86_cow_maps_private_scratch_pair_for_high_physical_replacement`,
+and `private_copy_pair_has_bounded_work_and_restores_before_completion`.
+Provisioning takes three exclusive zero table grants, 1537 descriptor reads
+and three comparisons. Copy takes five descriptor reads, four comparisons
+and two fixed-span drains. Fork adds exactly 1536 census reads for the private
+branch. Admission authenticates all three actual table frames against the
+launch grants separately from user mapping transaction identities.
+
+The production KVM binding is
+`mounted_static_x86_two_live_mms_have_private_anonymous_leaves`: shared-owner
+fork, CPU1 child, CPL0 wait/exit, sixteen new PRIVATE pages in each MM, distinct
+roots and physical pages, and an active peer. Kernel-owned user-copy crossings
+carry their selected user address explicitly; hardware CR2 is not their demand.
+The existing five-second bound is unchanged. No ARM runtime or ratio claim is
+conferred by this x86 binding.

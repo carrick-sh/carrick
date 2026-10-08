@@ -450,6 +450,65 @@ mod fork_cow {
     }
 
     #[test]
+    fn x86_fork_clones_private_upper_branch_and_keeps_supervisor_sharing() {
+        use carrick_core::mm::fork::{ForkCensus, census_table};
+        let request = sample_request(1);
+        let words = TestMemory::new();
+        let root = 0x10_0000;
+        let flags = PRESENT | WRITE | NX;
+        let private = 0x50_0000 | flags;
+        let shared = 0x60_0000 | flags;
+        words.store(root + 508 * 8, private);
+        words.store(root + 511 * 8, shared);
+        words.store(0x50_0000, 0x50_1000 | flags);
+        words.store(0x50_1000, 0x50_2000 | flags);
+        let mut census = ForkCensus {
+            child: 0,
+            parent: 0,
+            live: 0,
+            custody: 0,
+        };
+        census_table::<X86Mmu, _, _>(&LinuxForkPolicy, &words, &[], root, 0, 0, &mut census)
+            .unwrap();
+        let mut scratch = ForkScratch::new(request, 0).unwrap();
+        copy_table::<X86Mmu, _, _>(
+            &LinuxForkPolicy,
+            &words,
+            request,
+            &mut scratch,
+            ForkTableCursor {
+                table: root,
+                level: 0,
+                base: 0,
+                child_offset: 0,
+            },
+        )
+        .unwrap();
+        assert_ne!(
+            scratch.child[508], private,
+            "an MM-private supervisor branch cannot retain the parent's table pointer"
+        );
+        assert_eq!(scratch.child[511], shared);
+        let mask = carrick_mmu_core::x86::descriptor_txn::ADDRESS;
+        let mut child = scratch.child[508];
+        for parent in [0x50_0000, 0x50_1000, 0x50_2000] {
+            assert_ne!(child & mask, parent);
+            assert_eq!(child & !mask, flags);
+            let offset = ((child & mask) - request.child_tables.base) as usize / 8;
+            child = scratch.child[offset];
+        }
+        assert_eq!(child, 0, "the inherited copy pair stays idle");
+        assert_eq!(words.load(root + 508 * 8).unwrap(), private);
+        assert!(scratch.edits.is_empty());
+        assert_eq!(census.child, 4 * 512);
+        assert_eq!(census.live, 4 * 512);
+        assert_eq!(census.parent, 0);
+        assert_eq!(census.custody, 0);
+        assert_eq!(scratch.child_used, census.child);
+        assert_eq!(scratch.reads.len(), census.live);
+    }
+
+    #[test]
     fn x2_shared_fork_cow() {
         let req = sample_request(5);
         let child_handle = sample_child_handle(20);
@@ -2056,3 +2115,6 @@ fn x4_shared_wait_records() {
     assert_eq!(observed_key.get(), Some(wait_key));
     assert!(r_zone.completion_enabled(wait_key));
 }
+
+#[path = "../src/mm/transaction/compact_context.rs"]
+mod compact_context;

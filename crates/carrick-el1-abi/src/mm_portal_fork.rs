@@ -133,37 +133,7 @@ impl PortalForkSlot {
         }
         let words: [u64; 4] =
             core::array::from_fn(|index| self.custody[index].load(Ordering::Relaxed));
-        let custody = match words[0] {
-            tag @ (1 | 4)
-                if words[3] != 0
-                    && words[1].checked_add(words[3]).is_some()
-                    && words[2].checked_add(words[3]).is_some() =>
-            {
-                PortalForkCustody::Frame {
-                    va: words[1],
-                    ipa: words[2],
-                    len: words[3],
-                    shared: tag == 4,
-                }
-            }
-            tag @ (3 | 5)
-                if words[3] != 0
-                    && words[1].checked_add(words[3]).is_some()
-                    && words[2].checked_add(words[3]).is_some() =>
-            {
-                PortalForkCustody::StructuralCopy {
-                    source_ipa: words[1],
-                    destination_ipa: words[2],
-                    len: words[3],
-                    executable: tag == 5,
-                }
-            }
-            2 if words[3] == 0 => PortalForkCustody::HostBacking {
-                handle: core::num::NonZeroU64::new(words[1])?,
-                generation: core::num::NonZeroU64::new(words[2])?,
-            },
-            _ => return None,
-        };
+        let custody = PortalForkCustody::decode(words)?;
         Some((
             self.load_request()?,
             self.custody_index.load(Ordering::Relaxed),
@@ -311,28 +281,7 @@ impl PortalForkService<'_> {
         if self.slot.state.load(Ordering::Acquire) != SERVICING {
             return false;
         }
-        let words = match custody {
-            PortalForkCustody::Frame {
-                va,
-                ipa,
-                len,
-                shared,
-            } => [if shared { 4 } else { 1 }, va, ipa, len],
-            PortalForkCustody::StructuralCopy {
-                source_ipa,
-                destination_ipa,
-                len,
-                executable,
-            } => [
-                if executable { 5 } else { 3 },
-                source_ipa,
-                destination_ipa,
-                len,
-            ],
-            PortalForkCustody::HostBacking { handle, generation } => {
-                [2, handle.get(), generation.get(), 0]
-            }
-        };
+        let words = custody.words();
         for (slot, word) in self.slot.custody.iter().zip(words) {
             slot.store(word, Ordering::Relaxed);
         }

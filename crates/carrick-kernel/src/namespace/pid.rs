@@ -16,8 +16,8 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use carrick_fatal::carrick_fatal;
 use carrick_kernel_arena::arena::{ArenaError, KernelArena};
@@ -75,10 +75,9 @@ pub struct NsSharedRegion {
     /// Set by whichever of `retire`/`Drop` released the slot first, so the
     /// other is a no-op and a reused slot is never released twice.
     released: AtomicBool,
-    /// One Linux PID/TID number domain per namespace. Allocation is
-    /// monotonic; dropping a preparation burns its number but publishes no
-    /// membership, which is both Linux-compatible and rollback-safe.
-    next_identity: AtomicU32,
+    /// Retains the exact allocator owning this namespace's visible cursor.
+    /// It owns numbering only; arena membership remains this adapter's job.
+    visible_owner: OnceLock<crate::kernel::IdRegistry>,
     /// Process-local accelerator for the authoritative shared records. A host
     /// fork inherits a private copy, so every hit is validated against the
     /// arena and every miss falls back to the shared table before caching.
@@ -188,7 +187,7 @@ impl NsSharedRegion {
             ns,
             claim,
             released: AtomicBool::new(false),
-            next_identity: AtomicU32::new(NS_INIT_PID + 1),
+            visible_owner: OnceLock::new(),
             indexes: Mutex::new(PidIndexes::default()),
             lifecycle: Mutex::new(()),
         }))
@@ -226,6 +225,7 @@ impl NsSharedRegion {
 
     pub(crate) fn reserve_identity(
         self: &Arc<Self>,
+        identities: &crate::kernel::IdRegistry,
         internal_id: u32,
         parent_internal_id: u32,
     ) -> Option<PreparedNamespaceIdentity> {
@@ -236,12 +236,15 @@ impl NsSharedRegion {
         if !self.claim_is_live() {
             return None;
         }
-        let visible_id = self
-            .next_identity
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                (current < i32::MAX as u32).then_some(current + 1)
-            })
-            .ok()?;
+        let owner = self.visible_owner.get_or_init(|| identities.clone());
+        if !owner.same_owner(identities) {
+            return None;
+        }
+        let domain = carrick_sched_core::process::identity_allocator::VisibleNamespace::new(
+            self.claim.ns_id,
+            std::num::NonZeroU32::new(self.claim.generation.raw())?,
+        );
+        let visible_id = identities.reserve_visible(domain)?.get();
         Some(PreparedNamespaceIdentity {
             region: Arc::clone(self),
             internal_id,
@@ -249,6 +252,20 @@ impl NsSharedRegion {
             parent_internal_id,
             active: None,
         })
+    }
+
+    pub(crate) fn visible_domain(
+        &self,
+    ) -> Option<carrick_sched_core::process::identity_allocator::VisibleNamespace> {
+        if !self.claim_is_live() {
+            return None;
+        }
+        Some(
+            carrick_sched_core::process::identity_allocator::VisibleNamespace::new(
+                self.claim.ns_id,
+                std::num::NonZeroU32::new(self.claim.generation.raw())?,
+            ),
+        )
     }
 
     /// This namespace's id — the `pid:[N]` inode and the member record tag.
@@ -351,10 +368,27 @@ impl NsSharedRegion {
         }
         self.retire_members();
         if !self.arena.layout().pid_namespaces.release(self.claim) {
+            if !self.claim_is_live() {
+                self.retire_visible_cursor();
+            }
             return false;
         }
+        self.retire_visible_cursor();
         self.released.store(true, Ordering::Release);
         true
+    }
+
+    fn retire_visible_cursor(&self) {
+        if let Some(owner) = self.visible_owner.get()
+            && let Some(incarnation) = std::num::NonZeroU32::new(self.claim.generation.raw())
+        {
+            owner.retire_visible_namespace(
+                carrick_sched_core::process::identity_allocator::VisibleNamespace::new(
+                    self.claim.ns_id,
+                    incarnation,
+                ),
+            );
+        }
     }
 
     /// Strip this namespace's identity from every record it tagged and release
@@ -1705,6 +1739,34 @@ mod tests {
     // the signed build. They are gated to run serially via a fresh region per
     // test would be ideal, but the region is a process-global; so each test
     // uses the global region after init and asserts on its own pids.
+
+    #[test]
+    fn stale_namespace_claim_does_not_retain_a_dead_visible_cursor() {
+        let region = test_region();
+        let ids = crate::kernel::IdRegistry::new();
+        drop(region.reserve_identity(&ids, 42, 41).unwrap());
+        assert_eq!(ids.visible_namespace_count(), 1);
+        assert!(region.arena.layout().pid_namespaces.release(region.claim));
+        assert!(!Arc::clone(&region).retire());
+        assert_eq!(ids.visible_namespace_count(), 0);
+        assert!(region.reserve_identity(&ids, 43, 41).is_none());
+    }
+
+    #[test]
+    fn visible_preparation_burns_numbers_and_refuses_foreign_allocator() {
+        let region = test_region();
+        let ids = crate::kernel::IdRegistry::new();
+        let first = region.reserve_identity(&ids, 42, 41).unwrap();
+        assert_eq!(first.visible_id(), 2);
+        drop(first);
+        let foreign = crate::kernel::IdRegistry::new();
+        assert!(region.reserve_identity(&foreign, 43, 41).is_none());
+        let second = region.reserve_identity(&ids, 43, 41).unwrap();
+        assert_eq!(second.visible_id(), 3);
+        drop(second);
+        assert!(Arc::clone(&region).retire());
+        assert!(region.reserve_identity(&ids, 44, 41).is_none());
+    }
 
     #[test]
     fn fill_member_preserves_generation_scoped_ptrace_state() {

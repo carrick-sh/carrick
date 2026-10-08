@@ -28,6 +28,10 @@ mod guest_mmu_publication;
 pub use guest_mmu_publication::*;
 mod x86_initial_boot;
 pub use x86_initial_boot::*;
+mod x86_fork_stock;
+pub use x86_fork_stock::*;
+mod x86_prepare_stock;
+pub use x86_prepare_stock::*;
 mod delegated_notification;
 pub use delegated_notification::*;
 mod mm_portal;
@@ -51,6 +55,8 @@ mod service_copy;
 pub use service_copy::*;
 mod internal_read;
 pub use internal_read::*;
+mod kernel_fault_venues;
+pub use kernel_fault_venues::*;
 
 use core::cell::UnsafeCell;
 
@@ -184,6 +190,9 @@ pub const X86_CPL0_INITIAL_EXTENT_VA: u64 = 0xffff_fffe_0000_0000;
 pub const X86_CPL0_INITIAL_EXTENT_GPA: u64 = 0x40_00000;
 pub const X86_CPL0_INITIAL_EXTENT_MAX_SIZE: u64 = 0x2000_0000;
 pub const X86_CPL0_REGION_BASE: u64 = 0xffff_ffff_c000_0000;
+/// MM-private temporary supervisor copy pair.
+pub const X86_CPL0_COW_COPY_BASE: u64 = carrick_mmu_core::x86::copy_window::COW_COPY_WINDOW_BASE;
+pub const X86_CPL0_COW_COPY_SIZE: u64 = carrick_mmu_core::x86::copy_window::COW_COPY_WINDOW_LEN;
 /// Retained CPL0 root arena reachable through the supervisor direct window.
 pub const X86_CPL0_TABLE_ARENA_BYTES: u64 = 448 * 4096;
 
@@ -202,9 +211,10 @@ const _: () = {
     // Every fixed x86 supervisor alias, including the full initial-image
     // capacity, must be disjoint. This is checked at compile time for both
     // guest and host builds so a new map cannot silently replace another PTE.
-    const WINDOWS: [(u64, u64); 8] = [
+    const WINDOWS: [(u64, u64); 9] = [
         (0xffff_ffff_8000_0000, 0x10_0000), // executable image
-        (X86_CPL0_DIRECT_VA, 0x0200_0000),  // bootstrap direct window
+        (X86_CPL0_COW_COPY_BASE, X86_CPL0_COW_COPY_SIZE),
+        (X86_CPL0_DIRECT_VA, 0x0200_0000), // bootstrap direct window
         (X86_CPL0_DYNAMIC_METADATA_BASE, 0x0400_0000),
         (
             X86_CPL0_BOOTSTRAP_METADATA_BASE,
@@ -755,6 +765,12 @@ pub use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 #[repr(transparent)]
 pub struct El1TaskId(u64);
 
+impl From<carrick_sched_core::process::TaskId> for El1TaskId {
+    fn from(id: carrick_sched_core::process::TaskId) -> Self {
+        Self::from_linux_tid(id.raw())
+    }
+}
+
 impl El1TaskId {
     /// No task bound to the slot.
     pub const NONE: Self = Self(0);
@@ -779,7 +795,7 @@ pub struct CurrentTask {
     pub linux: LinuxTaskState,
     pub mm: ExecutionMm,
     pub metadata: LinuxTaskMetadata,
-    _stride_padding: [u64; 6],
+    _stride_padding: [u64; 5],
 }
 
 pub const CURRENT_TASK_STRIDE_SHIFT: u32 = 7;
@@ -798,6 +814,7 @@ const _: () = {
     assert!(core::mem::offset_of!(CurrentTask, mm.thread_generation) == 56);
     assert!(core::mem::offset_of!(CurrentTask, metadata.lifecycle_page) == 64);
     assert!(core::mem::offset_of!(CurrentTask, metadata.control_slot) == 72);
+    assert!(core::mem::offset_of!(CurrentTask, metadata.visible_pid) == 80);
 };
 
 impl CurrentTask {
@@ -807,7 +824,7 @@ impl CurrentTask {
             linux: LinuxTaskState::new(),
             mm: ExecutionMm::new(),
             metadata: LinuxTaskMetadata::new(),
-            _stride_padding: [0; 6],
+            _stride_padding: [0; 5],
         }
     }
 
@@ -858,6 +875,17 @@ impl CurrentTask {
         self.metadata.lifecycle_page.store(page, Ordering::Release);
     }
 
+    /// The process leader's namespace PID, shared by every thread in its
+    /// process and cleared before a task slot is reused.
+    pub fn publish_visible_pid(&self, pid: u32) {
+        self.metadata.visible_pid.store(pid, Ordering::Release);
+    }
+
+    pub fn visible_pid(&self) -> Option<u32> {
+        let pid = self.metadata.visible_pid.load(Ordering::Acquire);
+        (pid != 0).then_some(pid)
+    }
+
     #[inline]
     pub fn clear(&self) {
         self.linux.file_table.store(0, Ordering::Release);
@@ -870,6 +898,7 @@ impl CurrentTask {
         self.mm.key.store(0, Ordering::Release);
         self.mm.thread_generation.store(0, Ordering::Release);
         self.publish_lifecycle(0, 0);
+        self.publish_visible_pid(0);
     }
 
     #[inline]
@@ -2221,12 +2250,6 @@ pub fn frame_grant_residency_host() -> Option<&'static FrameGrantResidencyTable>
     Some(unsafe {
         &*((ptr + EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize) as *const FrameGrantResidencyTable)
     })
-}
-
-#[cfg(target_os = "none")]
-pub fn frame_grant_residency_guest() -> &'static FrameGrantResidencyTable {
-    // SAFETY: the kernel-only EL1 region is installed before fault entry.
-    unsafe { &*(EL1_FRAME_GRANT_RESIDENCY_BASE as *const FrameGrantResidencyTable) }
 }
 
 /// Guest view of the shared metadata mailbox. Call only while executing in
@@ -4505,8 +4528,8 @@ mod layout_manifest {
         field!(CurrentTask, execution, ExecutionIdentity, 0, 16, 8);
         field!(CurrentTask, linux, LinuxTaskState, 16, 32, 8);
         field!(CurrentTask, mm, ExecutionMm, 48, 16, 8);
-        field!(CurrentTask, metadata, LinuxTaskMetadata, 64, 16, 8);
-        field!(CurrentTask, _stride_padding, [u64; 6], 80, 48, 8);
+        field!(CurrentTask, metadata, LinuxTaskMetadata, 64, 24, 8);
+        field!(CurrentTask, _stride_padding, [u64; 5], 88, 40, 8);
     }
 
     #[test]

@@ -80,6 +80,9 @@ impl SyscallDispatcher {
         reporter: &CompatReporter,
         lease: Option<&crate::kernel::objects::ThreadExecutionLease>,
     ) -> Result<DispatchOutcome, DispatchError> {
+        if !kernel.kernel().source_host_dispatch_available() {
+            return Err(DispatchError::SourceKernelAuthorityTransferred);
+        }
         // Tree-wide forward-progress beat for the deadlock watchdog.
         crate::deadlock_watchdog::tick();
         let request = syscall.request;
@@ -342,6 +345,9 @@ impl SyscallDispatcher {
         thread: ThreadCtx<'_>,
         mut route: R,
     ) -> Result<DispatchOutcome, DispatchError> {
+        if !kernel.kernel().source_host_dispatch_available() {
+            return Err(DispatchError::SourceKernelAuthorityTransferred);
+        }
         let request = syscall.request;
 
         // The calling MM's vDSO realtime word follows a guest `clock_settime`

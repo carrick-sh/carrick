@@ -18,7 +18,7 @@ pub fn panic_publication_detail() -> u64 {
     0
 }
 
-pub use carrick_core::mm::fault::{request_lazy_frames, root_admits_commit};
+pub use carrick_core::mm::fault::{request_lazy_frames, root_fault_admission};
 
 /// Decode an EL0 translation fault that can be satisfied by publishing fresh
 /// anonymous backing. Permission faults name an already-mapped page and must
@@ -62,6 +62,7 @@ enum FaultClass {
         grant_access: u64,
     },
     WritePermission,
+    Protection(LeafAccess),
     Other,
 }
 
@@ -85,7 +86,8 @@ fn x86_fault_class(fault: carrick_guest_arch::FaultInfo) -> FaultClass {
     }
     match (fault.present, fault.access) {
         (true, Access::Write) => FaultClass::WritePermission,
-        (true, _) => FaultClass::Other,
+        (true, Access::Read) => FaultClass::Protection(LeafAccess::Read),
+        (true, Access::Execute) => FaultClass::Protection(LeafAccess::Execute),
         (false, Access::Read) => FaultClass::Translation {
             access: LeafAccess::Read,
             grant_access: 1,
@@ -147,13 +149,17 @@ pub(crate) fn handle_cow_outcome(
     }
 }
 
-pub struct PreparedFaultPath<'a, P: PreparedPageResolver> {
+pub struct PreparedFaultPath<
+    'a, P: PreparedPageResolver,
+    G: carrick_core::mm::reservation::ReservationGeometry = crate::memory::reservations::NativeReservationGeometry,
+> {
     pub residency: &'a carrick_el1_abi::FrameGrantResidencyTable,
     pub resolver: &'a mut P,
     /// The shared reservation roots. A delegated MM's prepared backing may
     /// include first-touch stock over root holes: it is committed only where
     /// the root holds a node that permits the access.
-    pub roots: Option<&'a crate::memory::reservations::SharedReservations>,
+    pub roots: Option<&'a carrick_core::mm::reservation::SharedReservations<carrick_personality_linux::mm::LinuxReservationPolicy, G>>,
+    pub file_slots: Option<&'a carrick_el1_abi::MmPortalSlots>,
 }
 
 #[cfg(target_os = "none")]
@@ -224,36 +230,29 @@ impl PreparedPageResolver for HardwarePreparedResolver {
 /// CPL0 publication of a host-backed prepared leaf while the shared fault
 /// dispatcher holds this MM's exact guest editor.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub struct X86PreparedResolver {
+pub struct X86PreparedResolver<'a, W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords> {
     mm_key: NonZeroU64,
-    table_alias: carrick_guest_arch::KernelVa,
-    table_bytes: carrick_guest_arch::GuestLen,
+    words: &'a W,
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 static X86_EDIT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-impl X86PreparedResolver {
+impl<'a, W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords> X86PreparedResolver<'a, W> {
     /// # Safety
-    /// Use this resolver only inside `dispatch_x86_fault_with_prepared`, whose
-    /// exact-MM editor spans `commit_prepared` and receipt settlement. The
-    /// alias must retain writable supervisor mappings of the target arena.
-    pub unsafe fn under_editor(
-        mm_key: NonZeroU64,
-        table_alias: carrick_guest_arch::KernelVa,
-        table_bytes: carrick_guest_arch::GuestLen,
-    ) -> Self {
-        Self {
-            mm_key,
-            table_alias,
-            table_bytes,
-        }
+    /// The shared fault dispatcher must retain this MM's exact editor across
+    /// each operation. words retains the owner-admitted table window and
+    /// performs checked invalidation for its actual live address context.
+    pub unsafe fn under_editor(mm_key: NonZeroU64, words: &'a W) -> Self {
+        Self { mm_key, words }
     }
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-impl PreparedPageResolver for X86PreparedResolver {
+impl<W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords> PreparedPageResolver
+    for X86PreparedResolver<'_, W>
+{
     fn commit_prepared(
         &mut self,
         root_pa: u64,
@@ -262,22 +261,25 @@ impl PreparedPageResolver for X86PreparedResolver {
         access: LeafAccess,
     ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
         use carrick_guest_arch::{
-            Access, EditIntent, EditOperation, EditOwner, FrameGpa, GuestLen, MmuEditArch, RootGpa,
-            TableWindow, UserRange, UserVa,
+            EditIntent, EditOperation, EditOwner, FrameGpa, GuestLen, RootGpa, UserRange, UserVa,
         };
         use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
-        use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
-
+        use carrick_mmu_core::x86::descriptor_txn::{
+            Access, DescriptorOutcome, DescriptorTxn, InlineJournal, execute_descriptor_txn,
+            translate_leaf,
+        };
         let root = RootGpa::page_aligned(FrameGpa::new(root_pa))
             .ok_or(GuestPreparedCommitError::BadAddress)?;
-        let address = UserVa::new(va);
-        let range = UserRange::checked(address, GuestLen::new(4096))
+        if crate::isa::x86::hardware_live_root() != Ok(root) {
+            return Err(GuestPreparedCommitError::BadAddress);
+        }
+        let range = UserRange::checked(UserVa::new(va), GuestLen::new(4096))
             .ok_or(GuestPreparedCommitError::BadAddress)?;
         let expected = FrameGpa::new(expected_pa);
-        let fault_access = match access {
-            LeafAccess::Read => Access::Read,
-            LeafAccess::Write => Access::Write,
-            LeafAccess::Execute => Access::Execute,
+        let (fault_access, native_access) = match access {
+            LeafAccess::Read => (carrick_guest_arch::Access::Read, Access::Read),
+            LeafAccess::Write => (carrick_guest_arch::Access::Write, Access::Write),
+            LeafAccess::Execute => (carrick_guest_arch::Access::Execute, Access::Execute),
         };
         let sequence = X86_EDIT_SEQUENCE
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
@@ -286,14 +288,8 @@ impl PreparedPageResolver for X86PreparedResolver {
             .ok()
             .and_then(NonZeroU64::new)
             .ok_or(GuestPreparedCommitError::BadAddress)?;
-        // SAFETY: the constructor requires a retained supervisor alias; this
-        // resolver is invoked only while the shared dispatcher holds the
-        // exact editor of the authenticated root.
-        let tables =
-            unsafe { TableWindow::issue(root.address(), self.table_alias, self.table_bytes) }
-                .ok_or(GuestPreparedCommitError::TableOutsidePrimary)?;
-        // SAFETY: `under_editor` requires this resolver to run only under the
-        // exact-MM editor; the caller's grant names the current MM root.
+        // SAFETY: constructor and shared dispatch retain the exact editor;
+        // live_root above authenticates the executing hardware context.
         let owner = unsafe { EditOwner::issue(root, self.mm_key, sequence) };
         let intent = EditIntent::checked(
             owner,
@@ -305,56 +301,34 @@ impl PreparedPageResolver for X86PreparedResolver {
             &[],
         )
         .ok_or(GuestPreparedCommitError::BadAddress)?;
-        let mut arch = crate::isa::x86::Kernel::new(crate::isa::x86::X86Backend);
-        // SAFETY: exact editor and retained supervisor table alias are held
-        // through descriptor publication and the local drain receipt.
-        let receipt = unsafe { arch.execute_edit(intent, tables) };
-        match receipt {
-            Ok(receipt) => match receipt.outcome {
-                DescriptorOutcome::Applied { .. } => Ok(GuestPreparedCommit::Committed),
-                DescriptorOutcome::Refused(DescriptorRefusal::NotPrepared) => {
-                    // SAFETY: the same exact editor and table alias remain
-                    // held; the read-only walk authenticates the existing
-                    // user leaf before declaring the retry resident.
-                    let tables = unsafe {
-                        TableWindow::issue(root.address(), self.table_alias, self.table_bytes)
-                    }
-                    .ok_or(GuestPreparedCommitError::TableOutsidePrimary)?;
-                    if unsafe {
-                        crate::isa::x86::resident_leaf_matches(
-                            root,
-                            &tables,
-                            address,
-                            expected,
-                            fault_access,
-                        )
-                    }
-                    .unwrap_or(false)
-                    {
-                        Ok(GuestPreparedCommit::AlreadyResident)
-                    } else {
-                        Err(GuestPreparedCommitError::NotPrepared)
-                    }
+        let txn = DescriptorTxn::from_intent(&intent)
+            .map_err(|_| GuestPreparedCommitError::BadAddress)?;
+        let receipt = execute_descriptor_txn(self.words, &txn, root, &mut InlineJournal::new());
+        match receipt.outcome {
+            DescriptorOutcome::Applied { .. } => Ok(GuestPreparedCommit::Committed),
+            DescriptorOutcome::Refused(DescriptorRefusal::NotPrepared) => {
+                if translate_leaf(self.words, root, UserVa::new(va), native_access, true)
+                    .is_ok_and(|leaf| leaf.output == expected)
+                {
+                    Ok(GuestPreparedCommit::AlreadyResident)
+                } else {
+                    Err(GuestPreparedCommitError::NotPrepared)
                 }
-                DescriptorOutcome::Refused(DescriptorRefusal::WrongBacking) => {
-                    Err(GuestPreparedCommitError::WrongBacking)
-                }
-                DescriptorOutcome::Refused(DescriptorRefusal::PermissionDenied) => {
-                    Err(GuestPreparedCommitError::PermissionDenied)
-                }
-                DescriptorOutcome::Refused(DescriptorRefusal::MissingTable) => {
-                    Err(GuestPreparedCommitError::MissingTable)
-                }
-                DescriptorOutcome::Refused(DescriptorRefusal::TableOutsidePrimary) => {
-                    Err(GuestPreparedCommitError::TableOutsidePrimary)
-                }
-                DescriptorOutcome::Indeterminate(_) => {
-                    Err(GuestPreparedCommitError::RollbackFailed)
-                }
-                _ => Err(GuestPreparedCommitError::NotPrepared),
-            },
-            Err(crate::isa::ArchError::Busy) => Err(GuestPreparedCommitError::RollbackFailed),
-            Err(_) => Err(GuestPreparedCommitError::BadAddress),
+            }
+            DescriptorOutcome::Refused(DescriptorRefusal::WrongBacking) => {
+                Err(GuestPreparedCommitError::WrongBacking)
+            }
+            DescriptorOutcome::Refused(DescriptorRefusal::PermissionDenied) => {
+                Err(GuestPreparedCommitError::PermissionDenied)
+            }
+            DescriptorOutcome::Refused(DescriptorRefusal::MissingTable) => {
+                Err(GuestPreparedCommitError::MissingTable)
+            }
+            DescriptorOutcome::Refused(DescriptorRefusal::TableOutsidePrimary) => {
+                Err(GuestPreparedCommitError::TableOutsidePrimary)
+            }
+            DescriptorOutcome::Indeterminate(_) => Err(GuestPreparedCommitError::RollbackFailed),
+            _ => Err(GuestPreparedCommitError::NotPrepared),
         }
     }
 }
@@ -428,6 +402,7 @@ impl CowResolver for HardwareCowResolver {
     }
 
     fn editor_busy(&mut self) {
+        #[cfg(target_arch = "aarch64")]
         carrick_el1_abi::cow_grant_pool_guest()
             .note_declined(carrick_el1_abi::CowDecline::EditorBusy);
     }
@@ -437,14 +412,17 @@ impl CowResolver for HardwareCowResolver {
 /// shared pool and residency table; KVM fixtures can supply exact local
 /// records while exercising the production resolver.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub struct X86CowResolver<'a> {
+pub struct X86CowResolver<'a, W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords> {
+    pub words: &'a W,
     pub pool: &'a dyn carrick_el1_abi::CowGrantVenue,
     pub residency: &'a carrick_el1_abi::FrameGrantResidencyTable,
     pub completion: Option<carrick_el1_abi::CowGrantCompletion>,
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-impl CowResolver for X86CowResolver<'_> {
+impl<D: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords> CowResolver
+    for X86CowResolver<'_, D>
+{
     fn reconcile_parent_write<
         W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
     >(
@@ -470,7 +448,7 @@ impl CowResolver for X86CowResolver<'_> {
 
     fn resolve_cow_outcome(&mut self, root: u64, mm_key: u64, far: u64) -> CowResolution {
         let copy_page = |source: u64, destination: u64| {
-            // SAFETY: the x86 adapter verified both supervisor direct
+            // SAFETY: the x86 adapter verified both retained supervisor
             // translations for these distinct page frames.
             unsafe {
                 core::ptr::copy_nonoverlapping(source as *const u8, destination as *mut u8, 4096)
@@ -488,19 +466,22 @@ impl CowResolver for X86CowResolver<'_> {
                 )
             }
         };
+        let venue = carrick_core::mm::cow::GuestCowVenue::<crate::cow::X86CowMmu, _> {
+            words: self.words,
+            root: carrick_mmu_core::aarch64::SubstrateGpa(root),
+            pool: self.pool,
+            residency: self.residency,
+            copy_window: carrick_core::mm::cow::CowCopyWindow::target(
+                self.words,
+                carrick_mmu_core::aarch64::SubstrateGpa(root),
+            ),
+            publish_executable: None,
+        };
         // SAFETY: dispatch_classified_fault holds this MM's exact editor.
         // resolve_x86_guest_cow authenticates the live CR3 and retained
-        // supervisor table window before reading or changing descriptors.
+        // supplied descriptor-word authority before reading or changing descriptors.
         let outcome = unsafe {
-            crate::cow::resolve_x86_guest_cow(
-                root,
-                mm_key,
-                far,
-                self.pool,
-                self.residency,
-                copy_page,
-                invalidate,
-            )
+            crate::cow::resolve_x86_guest_cow(&venue, mm_key, far, copy_page, invalidate)
         };
         handle_cow_outcome(outcome, &mut self.completion)
     }
@@ -839,7 +820,7 @@ pub(crate) fn with_hardware_cow_venue<R>(
         words: &words,
         root: carrick_mmu_core::aarch64::SubstrateGpa(ttbr0 & TTBR_BADDR_MASK),
         pool: carrick_el1_abi::cow_grant_pool_guest(),
-        residency: carrick_el1_abi::frame_grant_residency_guest(),
+        residency: crate::isa::frame_grant_residency_guest(),
         copy_window,
     }))
 }
@@ -1116,10 +1097,13 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 own: mailbox,
                 peers: Some(carrick_el1_abi::frame_grant_mailboxes_guest()),
             },
-            Some(PreparedFaultPath {
-                residency: carrick_el1_abi::frame_grant_residency_guest(),
+            Some(PreparedFaultPath::<_> {
+                residency: crate::isa::frame_grant_residency_guest(),
                 resolver: &mut HardwarePreparedResolver,
                 roots: Some(crate::memory::reservations::shared_guest()),
+                file_slots: Some(unsafe {
+                    &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
+                }),
             }),
             &mut HardwareCowResolver {
                 service_slot: None,
@@ -1156,6 +1140,48 @@ pub struct GrantMailboxes<'a> {
 impl<'a> GrantMailboxes<'a> {
     pub fn own(own: &'a FrameGrantMailbox) -> Self {
         Self { own, peers: None }
+    }
+}
+
+/// A CPL0 fault can request physical supply without delegating leaf publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnerFaultSupplyOutcome {
+    Unavailable,
+    PolicyDeclined,
+    Selected,
+    CowSelected,
+}
+
+pub struct OwnerFaultSupply<'a> {
+    pub slots: &'a carrick_el1_abi::MmPortalSlots,
+    outcome: core::cell::Cell<OwnerFaultSupplyOutcome>,
+}
+impl<'a> OwnerFaultSupply<'a> {
+    pub fn new(slots: &'a carrick_el1_abi::MmPortalSlots) -> Self {
+        Self {
+            slots,
+            outcome: core::cell::Cell::new(OwnerFaultSupplyOutcome::Unavailable),
+        }
+    }
+    pub fn outcome(&self) -> OwnerFaultSupplyOutcome {
+        self.outcome.get()
+    }
+}
+#[derive(Clone, Copy)]
+pub enum FaultSupply<'a> {
+    Mailbox(GrantMailboxes<'a>),
+    Owner(&'a OwnerFaultSupply<'a>),
+}
+impl<'a> From<GrantMailboxes<'a>> for FaultSupply<'a> {
+    fn from(mailboxes: GrantMailboxes<'a>) -> Self {
+        Self::Mailbox(mailboxes)
+    }
+}
+impl FaultSupply<'_> {
+    fn decline(self) {
+        if let Self::Owner(owner) = self {
+            owner.outcome.set(OwnerFaultSupplyOutcome::PolicyDeclined);
+        }
     }
 }
 
@@ -1244,9 +1270,9 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         frame.far,
         arm_fault_class(frame.esr),
         counters,
-        current_tasks,
+        current_tasks.get(frame.slot as usize),
         spaces,
-        mailboxes,
+        mailboxes.into(),
         prepared,
         cow_resolver,
     )
@@ -1255,45 +1281,56 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
 /// Execute the same guest fault policy for a decoded CPL3 x86 page fault.
 /// The entry backend must have checked the fault's user origin before calling.
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_x86_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
-    slot: u64,
+pub fn dispatch_x86_fault_with_prepared<
+    'supply,
+    P: PreparedPageResolver,
+    C: CowResolver,
+    G: carrick_core::mm::reservation::ReservationGeometry,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    slot: carrick_guest_arch::CpuId,
     fault: carrick_guest_arch::FaultInfo,
     counters: &Counters,
-    current_tasks: &[CurrentTask],
-    spaces: SpaceAccess<'_>,
-    mailboxes: GrantMailboxes<'_>,
-    prepared: Option<PreparedFaultPath<'_, P>>,
+    current_task: &CurrentTask,
+    spaces: SpaceAccess<'_, Context>,
+    supply: impl Into<FaultSupply<'supply>>,
+    prepared: Option<PreparedFaultPath<'_, P, G>>,
     cow_resolver: &mut C,
 ) -> Action {
     dispatch_classified_fault(
-        slot,
+        u64::from(slot.raw()),
         fault.address.raw(),
         x86_fault_class(fault),
         counters,
-        current_tasks,
+        Some(current_task),
         spaces,
-        mailboxes,
+        supply.into(),
         prepared,
         cow_resolver,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch_classified_fault<P: PreparedPageResolver, C: CowResolver>(
+fn dispatch_classified_fault<
+    P: PreparedPageResolver,
+    C: CowResolver,
+    G: carrick_core::mm::reservation::ReservationGeometry,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
+>(
     slot: u64,
     far: u64,
     fault: FaultClass,
     counters: &Counters,
-    current_tasks: &[CurrentTask],
-    spaces: SpaceAccess<'_>,
-    mailboxes: GrantMailboxes<'_>,
-    mut prepared: Option<PreparedFaultPath<'_, P>>,
+    current_task: Option<&CurrentTask>,
+    spaces: SpaceAccess<'_, Context>,
+    supply: FaultSupply<'_>,
+    mut prepared: Option<PreparedFaultPath<'_, P, G>>,
     cow_resolver: &mut C,
 ) -> Action {
-    let mailbox = mailboxes.own;
+    use carrick_core::mm::fault::RootFaultAdmission;
     counters.fault_taken.fetch_add(1, Ordering::Relaxed);
     if fault == FaultClass::WritePermission {
-        let Some(task) = current_tasks.get(slot as usize) else {
+        let Some(task) = current_task else {
             return Action::Forward;
         };
         let mm_key = task.mm.key.load(Ordering::Acquire);
@@ -1306,6 +1343,23 @@ fn dispatch_classified_fault<P: PreparedPageResolver, C: CowResolver>(
         let Some(owner) = NonZeroU64::new(slot + 1) else {
             return Action::Forward;
         };
+        if let FaultSupply::Owner(_) = supply {
+            match root_fault_admission(
+                prepared.as_ref().and_then(|path| path.roots),
+                spaces,
+                slot as u32,
+                mm_key,
+                far & !4095,
+                LeafAccess::Write,
+            ) {
+                RootFaultAdmission::Allowed => {}
+                RootFaultAdmission::Declined => {
+                    supply.decline();
+                    return Action::Forward;
+                }
+                _ => return Action::Forward,
+            }
+        }
         // A closed gate (host pause or retirement) or another EL1 editor:
         // the host resolves this fault.
         // Sibling threads fault on the same forked MM together; each COW
@@ -1324,12 +1378,61 @@ fn dispatch_classified_fault<P: PreparedPageResolver, C: CowResolver>(
             cow_resolver.editor_busy();
             return Action::Forward;
         };
-        if cow_resolver.resolve_cow(grant.ttbr0, mm_key, far) {
-            return Action::Served;
+        match cow_resolver.resolve_cow_outcome(grant.ttbr0, mm_key, far) {
+            CowResolution::Resolved => return Action::Served,
+            CowResolution::Refused => return Action::Forward,
+            CowResolution::NeedsSupply => {
+                if let FaultSupply::Owner(owner) = supply {
+                    let selected = (|| {
+                        let roots = prepared.as_ref()?.roots?;
+                        let mm = carrick_el1_abi::ReservationMm::new(mm_key)?;
+                        let mut root =
+                            roots.lock_in(spaces, index.index(), mm, slot as u32).ok()?;
+                        let operation = carrick_el1_abi::PortalOperation {
+                            carrier: owner.slots.carrier()?,
+                            mm,
+                            incarnation: NonZeroU64::new(root.incarnation().raw())?,
+                            sequence: root.next_transfer_sequence().ok()?,
+                        };
+                        let window = carrick_core::mm::fault::select_cow_supply_window(
+                            &mut root,
+                            operation,
+                            carrick_guest_arch::UserVa::new(far),
+                            None,
+                        )
+                        .ok()?;
+                        drop(root);
+                        owner
+                            .slots
+                            .grant(slot as usize)?
+                            .publish_cow_fault_selection(operation.sequence.get(), window)
+                            .then_some(())
+                    })();
+                    if selected.is_some() {
+                        owner.outcome.set(OwnerFaultSupplyOutcome::CowSelected);
+                    }
+                }
+            }
         }
         return Action::Forward;
     }
 
+    if let FaultClass::Protection(access) = fault {
+        if let FaultSupply::Owner(_) = supply
+            && let Some(task) = current_task
+            && root_fault_admission(
+                prepared.as_ref().and_then(|path| path.roots),
+                spaces,
+                slot as u32,
+                task.mm.key.load(Ordering::Acquire),
+                far & !4095,
+                access,
+            ) == RootFaultAdmission::Declined
+        {
+            supply.decline();
+        }
+        return Action::Forward;
+    }
     let FaultClass::Translation {
         access: prepared_access,
         grant_access: access,
@@ -1337,7 +1440,7 @@ fn dispatch_classified_fault<P: PreparedPageResolver, C: CowResolver>(
     else {
         return Action::Forward;
     };
-    let Some(task) = current_tasks.get(slot as usize) else {
+    let Some(task) = current_task else {
         return Action::Forward;
     };
     let mm_key = task.mm.key.load(Ordering::Acquire);
@@ -1352,16 +1455,20 @@ fn dispatch_classified_fault<P: PreparedPageResolver, C: CowResolver>(
         // First-touch stock over a root hole is backing, not a mapping: the
         // host answers a touch the root does not map (SIGSEGV), and asks
         // for no grant.
-        if root_admits_commit(
+        match root_fault_admission(
             prepared.as_ref().and_then(|path| path.roots),
             spaces,
             slot as u32,
             mm_key,
             far & !4095,
             prepared_access,
-        ) == Some(false)
-        {
-            return Action::Forward;
+        ) {
+            RootFaultAdmission::Declined => {
+                supply.decline();
+                return Action::Forward;
+            }
+            RootFaultAdmission::Unavailable => return Action::Forward,
+            _ => {}
         }
         let Some(index) = spaces.find(mm_key) else {
             return Action::Forward;
@@ -1384,20 +1491,81 @@ fn dispatch_classified_fault<P: PreparedPageResolver, C: CowResolver>(
         ) {
             Ok(GuestPreparedCommit::Committed) => {
                 assert!(path.residency.record_commit(page));
-                consume_served_refusals(mailboxes, mm_key, far, access);
+                if let FaultSupply::Mailbox(mailboxes) = supply {
+                    consume_served_refusals(mailboxes, mm_key, far, access);
+                }
                 return Action::Served;
             }
             Ok(GuestPreparedCommit::AlreadyResident) => {
-                consume_served_refusals(mailboxes, mm_key, far, access);
+                if let FaultSupply::Mailbox(mailboxes) = supply {
+                    consume_served_refusals(mailboxes, mm_key, far, access);
+                }
                 return Action::Served;
             }
             Err(GuestPreparedCommitError::RollbackFailed) => {
                 panic!("EL1 prepared-page commit rollback failed")
             }
+            Err(_) if matches!(supply, FaultSupply::Owner(_)) => return Action::Forward,
             Err(_) => {}
         }
     }
 
+    if let FaultSupply::Owner(owner) = supply {
+        let selected = (|| {
+            let roots = prepared.as_ref()?.roots?;
+            let mm = carrick_el1_abi::ReservationMm::new(mm_key)?;
+            let index = spaces.find(mm_key)?;
+            let mut root = roots.lock_in(spaces, index.index(), mm, slot as u32).ok()?;
+            let mut window = match carrick_core::mm::fault::select_fault_window(
+                &mut root,
+                owner.slots.carrier()?,
+                carrick_guest_arch::UserVa::new(far),
+                carrick_guest_arch::GuestLen::new(carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE),
+                carrick_el1_abi::ReservationProtection::from_bits(access)?,
+            ) {
+                Ok(window) => window,
+                Err(
+                    crate::memory::reservations::Refusal::Hole
+                    | crate::memory::reservations::Refusal::Limit,
+                ) => {
+                    owner.outcome.set(OwnerFaultSupplyOutcome::PolicyDeclined);
+                    return None;
+                }
+                Err(_) => return None,
+            };
+            // Coalescing adjacent reservations does not erase existing PRIVATE
+            // or prepared custody. A bulk Prepare must never cover those pages.
+            // The retained residency owner includes prepared neighbors, too.
+            let residency = prepared.as_ref()?.residency;
+            if (window.range.start()..window.range.end())
+                .step_by(4096)
+                .any(|page| residency.lookup(mm_key, page).is_some())
+            {
+                window = carrick_core::mm::fault::select_fault_window(
+                    &mut root,
+                    owner.slots.carrier()?,
+                    carrick_guest_arch::UserVa::new(far),
+                    carrick_guest_arch::GuestLen::new(4096),
+                    carrick_el1_abi::ReservationProtection::from_bits(access)?,
+                )
+                .ok()?;
+            }
+            if window.host_backing.is_some() {
+                return None;
+            }
+            let slot = owner.slots.grant(slot as usize)?;
+            slot.publish_fault_selection(window.operation.sequence.get(), window)
+                .then_some(())
+        })();
+        if selected.is_some() {
+            owner.outcome.set(OwnerFaultSupplyOutcome::Selected);
+        }
+        return Action::Forward;
+    }
+    let FaultSupply::Mailbox(mailboxes) = supply else {
+        return Action::Forward;
+    };
+    let mailbox = mailboxes.own;
     // Only refusals cross back to EL1. Successful grants have already
     // published and released their slot on the host, even after migration.
     if consume_refusal(mailboxes, mm_key, far, access) {
@@ -1405,11 +1573,9 @@ fn dispatch_classified_fault<P: PreparedPageResolver, C: CowResolver>(
     }
 
     #[cfg(target_os = "none")]
-    if let Some(roots) = prepared.as_ref().and_then(|path| path.roots) {
-        let slots = unsafe {
-            &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
-        };
-        if (FileFaultVenue {
+    if let Some(roots) = prepared.as_ref().and_then(|path| path.roots)
+        && let Some(slots) = prepared.as_ref().and_then(|path| path.file_slots)
+        && (carrick_core::mm::fault::FileFaultVenue {
             roots,
             spaces,
             slots,
@@ -1417,9 +1583,8 @@ fn dispatch_classified_fault<P: PreparedPageResolver, C: CowResolver>(
             mailbox,
         })
         .publish(mm_key, far, access)
-        {
-            return Action::Forward;
-        }
+    {
+        return Action::Forward;
     }
     let _ = request_lazy_frames(mailbox, mm_key, far, access);
     Action::Forward
@@ -1509,10 +1674,11 @@ mod tests {
                 &tasks,
                 carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                 GrantMailboxes::own(&mailbox),
-                Some(PreparedFaultPath {
+                Some(PreparedFaultPath::<_> {
                     residency: &table,
                     resolver: &mut prepared,
                     roots: None,
+                    file_slots: None,
                 }),
                 &mut NoopCowResolver,
             ),
@@ -1550,20 +1716,74 @@ mod tests {
         let counters = Counters::default();
         assert_eq!(
             dispatch_x86_fault_with_prepared(
-                0,
+                carrick_guest_arch::CpuId::new(0),
                 FaultInfo {
                     address: UserVa::new(va),
                     access: Access::Read,
                     present: false,
                 },
                 &counters,
-                &tasks,
+                &tasks[0],
                 carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                 GrantMailboxes::own(&mailbox),
-                Some(PreparedFaultPath {
+                Some(PreparedFaultPath::<_> {
                     residency: &residency,
                     resolver: &mut prepared,
                     roots: None,
+                    file_slots: None,
+                }),
+                &mut NoopCowResolver,
+            ),
+            Action::Served
+        );
+        assert_eq!(prepared.calls, vec![(0x8800_0000, va, 0x9000_0000)]);
+        assert!(residency.is_guest_committed(mm, va));
+        assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
+        assert!(!mailbox.has_guest_work());
+    }
+
+    #[test]
+    fn x86_cpu1_fault_uses_bound_task_without_cpu0_padding() {
+        use carrick_guest_arch::{Access, FaultInfo, UserVa};
+        let mm = 91;
+        let va = 0x4000_1000;
+        let residency = carrick_el1_abi::FrameGrantResidencyTable::new();
+        residency
+            .publish(carrick_el1_abi::FrameGrantResidencyIdentity {
+                mm_key: mm,
+                semantic_base: va,
+                physical_ipa: 0x9000_0000,
+                len: 4096,
+                mapping_id: 11,
+                frame_id: 12,
+                owner_generation: 13,
+                inventory_revision: 14,
+            })
+            .unwrap();
+        let task = CurrentTask::new();
+        task.mm.key.store(mm, Ordering::Release);
+        let tasks = [task];
+        let spaces = published_space(mm, 0x8800_0000);
+        let mailbox = FrameGrantMailbox::new();
+        let mut prepared = RecordingPreparedResolver::default();
+        let counters = Counters::default();
+        assert_eq!(
+            dispatch_x86_fault_with_prepared(
+                carrick_guest_arch::CpuId::new(1),
+                FaultInfo {
+                    address: UserVa::new(va),
+                    access: Access::Read,
+                    present: false,
+                },
+                &counters,
+                &tasks[0],
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+                GrantMailboxes::own(&mailbox),
+                Some(PreparedFaultPath::<_> {
+                    residency: &residency,
+                    resolver: &mut prepared,
+                    roots: None,
+                    file_slots: None,
                 }),
                 &mut NoopCowResolver,
             ),
@@ -1700,10 +1920,11 @@ mod tests {
                 &tasks,
                 carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                 GrantMailboxes::own(&mailbox),
-                Some(PreparedFaultPath {
+                Some(PreparedFaultPath::<_> {
                     residency: &residency,
                     resolver: &mut prepared,
                     roots: Some(&roots),
+                    file_slots: None,
                 }),
                 &mut NoopCowResolver,
             );
@@ -1750,10 +1971,11 @@ mod tests {
                     &published_space(mm, 0x8800_0000)
                 ),
                 GrantMailboxes::own(&FrameGrantMailbox::new()),
-                Some(PreparedFaultPath {
+                Some(PreparedFaultPath::<_> {
                     residency: &table,
                     resolver: &mut RecordingPreparedResolver::default(),
                     roots: None,
+                    file_slots: None,
                 }),
                 &mut NoopCowResolver,
             ),
@@ -2028,10 +2250,11 @@ mod tests {
                         own: origin,
                         peers: Some(&boxes),
                     },
-                    Some(PreparedFaultPath {
+                    Some(PreparedFaultPath::<_> {
                         residency: &table,
                         resolver: &mut RecordingPreparedResolver::default(),
                         roots: None,
+                        file_slots: None,
                     }),
                     &mut NoopCowResolver,
                 ),
@@ -2065,10 +2288,11 @@ mod tests {
                         own,
                         peers: Some(&boxes),
                     },
-                    Some(PreparedFaultPath {
+                    Some(PreparedFaultPath::<_> {
                         residency: &table,
                         resolver: &mut RecordingPreparedResolver::default(),
                         roots: None,
+                        file_slots: None,
                     }),
                     &mut NoopCowResolver,
                 ),
@@ -2090,10 +2314,11 @@ mod tests {
                         own: origin,
                         peers: Some(&boxes),
                     },
-                    Some(PreparedFaultPath {
+                    Some(PreparedFaultPath::<_> {
                         residency: &table,
                         resolver: &mut RecordingPreparedResolver::default(),
                         roots: None,
+                        file_slots: None,
                     }),
                     &mut NoopCowResolver,
                 ),
@@ -2160,6 +2385,126 @@ mod tests {
             Action::Forward
         );
         assert!(!mailbox.has_guest_work());
+    }
+
+    #[test]
+    fn owner_cow_fault_preserves_validated_empty_pool_supply() {
+        use crate::personality::mm_portal::test_support::{IPA, ROOT, RW, Tables, VA};
+        use carrick_el1_abi::FrameGrantResidencyTable;
+        use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
+        struct EmptyCow<'a>(
+            &'a Tables,
+            &'a carrick_el1_abi::CowGrantPool,
+            &'a FrameGrantResidencyTable,
+        );
+        impl CowResolver for EmptyCow<'_> {
+            fn resolve_cow(&mut self, _: u64, _: u64, _: u64) -> bool {
+                panic!("typed COW outcome must survive fault dispatch")
+            }
+            fn resolve_cow_outcome(&mut self, ttbr: u64, mm: u64, va: u64) -> CowResolution {
+                let live = self.0.live(&CallerInvalidatesAsid);
+                let result = crate::cow::resolve_guest_cow(
+                    &crate::cow::GuestCowVenue {
+                        words: &live,
+                        root: carrick_mmu_core::aarch64::SubstrateGpa(ttbr),
+                        pool: self.1,
+                        residency: self.2,
+                        copy_window: crate::cow::CowCopyWindow::target(
+                            &live,
+                            carrick_mmu_core::aarch64::SubstrateGpa(ttbr),
+                        ),
+                        publish_executable: None,
+                    },
+                    mm,
+                    va,
+                    |_, _| panic!("empty pool must not copy"),
+                    || {},
+                );
+                assert_eq!(
+                    result,
+                    Ok(crate::cow::GuestCowOutcome::Declined(
+                        carrick_el1_abi::CowDecline::PoolEmpty
+                    ))
+                );
+                CowResolution::NeedsSupply
+            }
+        }
+        let mm = 77;
+        let spaces = published_space(mm, ROOT);
+        let roots = admitted_root(&spaces, mm, &[(VA, 4096, 3)]);
+        let tables = Tables::new(ROOT, IPA, 1);
+        tables.words[1536].store(
+            IPA | RW | (3 << 6) | (1 << 55) | (1 << 56) | (1 << 57),
+            Ordering::Release,
+        );
+        let pool = carrick_el1_abi::CowGrantPool::new();
+        let resident_ptr = unsafe {
+            std::alloc::alloc_zeroed(std::alloc::Layout::new::<FrameGrantResidencyTable>())
+        };
+        assert!(!resident_ptr.is_null());
+        let residency =
+            unsafe { std::boxed::Box::from_raw(resident_ptr.cast::<FrameGrantResidencyTable>()) };
+        let ptr = unsafe {
+            std::alloc::alloc_zeroed(std::alloc::Layout::new::<carrick_el1_abi::MmPortalSlots>())
+        };
+        assert!(!ptr.is_null());
+        let slots =
+            unsafe { std::boxed::Box::from_raw(ptr.cast::<carrick_el1_abi::MmPortalSlots>()) };
+        assert!(slots.bind_carrier(NonZeroU64::new(9).unwrap()));
+        let supply = OwnerFaultSupply::new(&slots);
+        let task = CurrentTask::new();
+        task.mm.key.store(mm, Ordering::Release);
+        assert_eq!(
+            dispatch_classified_fault(
+                0,
+                VA + 3,
+                FaultClass::WritePermission,
+                &Counters::default(),
+                Some(&task),
+                SpaceAccess::source_free(&spaces),
+                FaultSupply::Owner(&supply),
+                Some(PreparedFaultPath::<_> {
+                    residency: &residency,
+                    resolver: &mut NoopPreparedResolver,
+                    roots: Some(&roots),
+                    file_slots: None
+                }),
+                &mut EmptyCow(&tables, &pool, &residency)
+            ),
+            Action::Forward
+        );
+        assert_eq!(supply.outcome(), OwnerFaultSupplyOutcome::CowSelected);
+        let (_, window) = slots
+            .grant(0)
+            .unwrap()
+            .pending_cow_fault_selection(mm, VA + 3)
+            .unwrap();
+        assert_eq!(window.operation.mm.raw(), mm);
+        assert_eq!(window.operation.carrier.get(), 9);
+        let mut root = roots
+            .lock(
+                spaces.find(mm).unwrap().index(),
+                carrick_el1_abi::ReservationMm::new(mm).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(window.operation.incarnation.get(), root.incarnation().raw());
+        assert_eq!(window.generation, root.mapping(VA).unwrap().generation);
+        drop(root);
+        assert_eq!(window.range.start(), VA);
+        assert_eq!(window.range.len(), 4096);
+        assert!(window.host_backing.is_none());
+        assert!(
+            slots
+                .grant(0)
+                .unwrap()
+                .pending_fault_selection(mm, VA)
+                .is_none()
+        );
+        assert!(
+            spaces
+                .try_begin_edit(spaces.find(mm).unwrap(), mm, NonZeroU64::new(2).unwrap())
+                .is_some()
+        );
     }
 
     #[test]

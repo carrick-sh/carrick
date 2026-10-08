@@ -15,8 +15,29 @@ use carrick_personality_linux::entry::aarch64_child_vdso_identity;
 pub use carrick_personality_linux::lifecycle::*;
 pub use carrick_personality_linux::thread::{LifecycleThread, SYS_SET_ROBUST_LIST};
 
-impl<F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame> UserCopy
-    for El1PendingFamilies<'_, F, C, U, G>
+impl<
+    'a,
+    F: Fn(u32) -> *mut u8,
+    C: ThreadCpu,
+    U: UserWord,
+    G: GuestDispatchFrame,
+    Context: super::dispatch::DispatchContext,
+> El1PendingFamilies<'a, F, C, U, G, Context>
+{
+    fn process_venue(&mut self) -> Option<&mut (dyn ProcessNative<Context> + 'a)> {
+        let binding = LifecycleNative::binding(self)?;
+        let venue = self.process.as_deref_mut()?;
+        (venue.binding() == binding).then_some(venue)
+    }
+}
+
+impl<
+    F: Fn(u32) -> *mut u8,
+    C: ThreadCpu,
+    U: UserWord,
+    G: GuestDispatchFrame,
+    Context: super::dispatch::DispatchContext,
+> UserCopy for El1PendingFamilies<'_, F, C, U, G, Context>
 {
     fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool {
         #[cfg(test)]
@@ -48,9 +69,30 @@ impl<F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame> Us
     }
 }
 
-impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame>
-    LifecycleNative<'a> for El1PendingFamilies<'a, F, C, U, G>
+impl<
+    'a,
+    F: Fn(u32) -> *mut u8,
+    C: ThreadCpu,
+    U: UserWord,
+    G: GuestDispatchFrame,
+    Context: super::dispatch::DispatchContext,
+> LifecycleNative<'a> for El1PendingFamilies<'a, F, C, U, G, Context>
 {
+    fn process_fork(&mut self) -> Option<LifecycleOutcome> {
+        Some(self.process_venue()?.fork())
+    }
+    fn process_wait4(
+        &mut self,
+        pid: ProcessWaitPid,
+        status: UserVa,
+        options: LinuxWaitOptions,
+        rusage: UserVa,
+    ) -> Option<LifecycleOutcome> {
+        Some(self.process_venue()?.wait4(pid, status, options, rusage))
+    }
+    fn process_exit_group(&mut self, status: u8) -> Option<LifecycleOutcome> {
+        Some(self.process_venue()?.exit_group(status))
+    }
     fn arguments(&self) -> [u64; 6] {
         [
             self.frame.argument(0).unwrap_or(0),

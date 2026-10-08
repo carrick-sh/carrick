@@ -163,6 +163,22 @@ pub struct SpaceGrant {
     pub cow_owed: Option<u64>,
 }
 
+#[cfg(test)]
+pub(super) mod editor_test_hook {
+    std::thread_local! {
+        static AFTER_CAS: std::cell::RefCell<Option<std::boxed::Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+    pub fn install(hook: impl FnOnce() + 'static) {
+        AFTER_CAS.with(|slot| *slot.borrow_mut() = Some(std::boxed::Box::new(hook)));
+    }
+    pub fn run() {
+        let hook = AFTER_CAS.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 /// Exclusive guest EL1 mutation ownership for one published address space.
 /// Dropping the guard acknowledges a host pause or retirement waiting after
 /// it closed the entry's gate.
@@ -288,7 +304,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for SpaceEditor<'_, C> {
         );
         if let Some((venue, lease)) = self.release.as_ref().or(late_release.as_ref()) {
             let completion = |effects: crate::object_wait::OwnedObjectWakeEffects<'_, C>| {
-                (venue.deliver)(venue.zone, venue.waker, effects)
+                venue.deliver.invoke(venue.zone, venue.waker, effects)
             };
             let receipt = lease
                 .reserve(SpaceWaitCause::Editor)
@@ -723,6 +739,8 @@ impl AddressSpaces {
             index,
             key,
         };
+        #[cfg(test)]
+        editor_test_hook::run();
         if entry.key.load(Ordering::SeqCst) != key {
             return Err(EditAdmissionRefusal::Stale);
         }
@@ -791,7 +809,9 @@ impl AddressSpaces {
         }
         let ttbr0 = entry.ttbr0.load(Ordering::Acquire);
         let ttbr1 = entry.ttbr1.load(Ordering::Acquire);
-        if ttbr0 == 0 || ttbr1 == 0 {
+        // The primary root authenticates this space, as in `grant`.
+        // A single-root MM has no separate secondary root.
+        if ttbr0 == 0 {
             return None;
         }
         Some(ClosedChildEditor {
@@ -1232,7 +1252,7 @@ mod tests {
         let venue = SpaceReleaseVenue {
             zone: &zone,
             waker: crate::Waker::Host,
-            deliver,
+            deliver: crate::spaces::notification::SpaceWakeDelivery::Function(deliver),
         };
         let completion = |owned: crate::object_wait::OwnedObjectWakeEffects<'_>| {
             let _ = owned.deliver_handbacks(&mut |_| {});

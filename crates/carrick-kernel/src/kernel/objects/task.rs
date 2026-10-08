@@ -10,6 +10,9 @@ use std::sync::{Arc, Weak};
 use arc_swap::ArcSwap;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
+#[cfg(test)]
+use crate::kernel::ids::TaskId;
+
 use carrick_abi::keyring::{KeyRequestDefault, KeySerial};
 use carrick_abi::{LINUX_RLIM_INFINITY, LinuxResource, LinuxRlimit, SigSet};
 use carrick_fatal::carrick_fatal;
@@ -19,7 +22,7 @@ use crate::kernel::clone_plan::{CloneObjectMode, ClonePlan};
 use crate::kernel::container::Container;
 use crate::kernel::ids::{
     ChildExitSignal, LinuxSignal, LinuxTid, MmId, ObjectIdError, ObjectIdRegistry, ProcessGroupId,
-    SessionId, TaskId,
+    SessionId,
 };
 use crate::kernel::netns::{NetNs, NsProxy, UtsNs};
 use crate::kernel::objects::process::{TaskRusage, TaskShared};
@@ -146,11 +149,7 @@ impl ThreadResources {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TaskLifecycle {
-    Live,
-    Exiting,
-}
+pub use carrick_sched_core::process::TaskLifecycle;
 
 pub type TaskRef = Arc<Task>;
 
@@ -247,21 +246,7 @@ impl CoreNoteParticipants {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TaskIdentity {
-    pub process_group: ProcessGroupId,
-    pub session: SessionId,
-}
-
-impl TaskIdentity {
-    /// A fresh process group and session both led by `leader`.
-    pub fn led_by(leader: TaskId) -> Self {
-        Self {
-            process_group: ProcessGroupId::from_leader(leader),
-            session: SessionId::from_leader(leader),
-        }
-    }
-}
+pub use carrick_sched_core::process::TaskIdentity;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JobControlStopInvalidationGeneration(u64);
@@ -580,8 +565,7 @@ pub struct Task {
         Mutex<Option<Arc<dyn crate::kernel::thread_adoption::ThreadBirthAdoptionFactory>>>,
     revision_capacity: Arc<crate::kernel::revision_capacity::RevisionCapacity>,
     controls: super::thread_control::ThreadControlArena,
-    parent: Mutex<Option<TaskKey>>,
-    children: Mutex<BTreeSet<TaskKey>>,
+    relations: Mutex<carrick_sched_core::process::ProcessRelations>,
     /// Tasks this task traces (`PTRACE_TRACEME` children and `PTRACE_ATTACH`
     /// targets). A tracee's own `ptrace_tracer` stays authoritative; this set
     /// only lets the tracer's `wait` and exit find its tracees without a
@@ -836,8 +820,7 @@ impl Task {
                 key,
                 shared.pending_signals().lifecycle_lease(),
             ),
-            parent: Mutex::new(parent),
-            children: Mutex::new(BTreeSet::new()),
+            relations: Mutex::new(carrick_sched_core::process::ProcessRelations::new(parent)),
             ptrace_tracees: Mutex::new(BTreeSet::new()),
             exit_signal,
             identity: Mutex::new(identity),
@@ -1464,31 +1447,31 @@ impl Task {
     }
 
     pub(in crate::kernel) fn parent(&self) -> Option<TaskKey> {
-        *self.parent.lock()
+        self.relations.lock().parent()
     }
 
     pub(in crate::kernel) fn reparent(&self, parent: Option<TaskKey>) {
-        *self.parent.lock() = parent;
+        self.relations.lock().reparent(parent);
     }
 
     pub(in crate::kernel) fn add_child(&self, child: TaskKey) -> bool {
-        self.children.lock().insert(child)
+        self.relations.lock().add_child(child)
     }
 
     pub(in crate::kernel) fn remove_child(&self, child: TaskKey) -> bool {
-        self.children.lock().remove(&child)
+        self.relations.lock().remove_child(child)
     }
 
     pub(in crate::kernel) fn children(&self) -> Vec<TaskKey> {
-        self.children.lock().iter().copied().collect()
+        self.relations.lock().children().iter().copied().collect()
     }
 
     pub(in crate::kernel) fn children_set(&self) -> BTreeSet<TaskKey> {
-        self.children.lock().clone()
+        self.relations.lock().children().clone()
     }
 
     pub(in crate::kernel) fn publish_prepared_children(&self, children: BTreeSet<TaskKey>) {
-        *self.children.lock() = children;
+        self.relations.lock().publish_prepared_children(children);
     }
 
     pub(in crate::kernel) fn ptrace_tracer(&self) -> Option<TaskKey> {
@@ -2350,16 +2333,18 @@ impl Task {
         &self,
         deadline: std::time::Instant,
     ) -> Option<Option<TaskKey>> {
-        self.parent.try_lock_until(deadline).map(|parent| *parent)
+        self.relations
+            .try_lock_until(deadline)
+            .map(|relations| relations.parent())
     }
 
     pub(in crate::kernel) fn children_until(
         &self,
         deadline: std::time::Instant,
     ) -> Option<Vec<TaskKey>> {
-        self.children
+        self.relations
             .try_lock_until(deadline)
-            .map(|children| children.iter().copied().collect())
+            .map(|relations| relations.children().iter().copied().collect())
     }
 
     pub(in crate::kernel) fn identity_until(
