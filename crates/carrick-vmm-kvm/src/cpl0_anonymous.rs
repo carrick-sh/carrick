@@ -175,11 +175,24 @@ fn take_fork_table_stock(
     Some((child_tables, parent_tables))
 }
 
-fn reserve_table_stock(stock: &mut Vec<RootGpa>) -> Vec<RootGpa> {
-    let count = stock
-        .len()
-        .min(carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS);
-    stock.drain(..count).collect()
+fn reserve_table_stock(
+    stock: &mut Vec<RootGpa>,
+    range: carrick_el1_abi::ReservationRange,
+) -> Option<Vec<RootGpa>> {
+    // A retained root already owns its PML4. Each intersected 2-MiB,
+    // 1-GiB and 512-GiB coverage can require one fresh lower table.
+    // Existing tables only reduce this conservative physical credit bound.
+    let last = range.end().checked_sub(1)?;
+    let count = [1_u64 << 21, 1_u64 << 30, 1_u64 << 39]
+        .into_iter()
+        .try_fold(0_u64, |sum, coverage| {
+            sum.checked_add(last / coverage - range.start() / coverage + 1)
+        })?;
+    let count = usize::try_from(count).ok()?;
+    if count > carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS || count > stock.len() {
+        return None;
+    }
+    Some(stock.drain(..count).collect())
 }
 
 pub(super) struct PendingForkLoan {
@@ -1333,7 +1346,16 @@ impl Cpl0HostCustody {
             .map_err(|error| fail(error.to_string()))?;
         let handle = handles[0];
         let grant = grants[0];
-        let owned_tables = reserve_table_stock(&mut self.grant_tables);
+        let owned_tables = match reserve_table_stock(&mut self.grant_tables, window.range) {
+            Some(tables) => tables,
+            None => {
+                // No descriptor submission occurred: the fresh physical loan
+                // is still unexposed and its inventory can be rolled back.
+                unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
+                    .map_err(|error| fail(error.to_string()))?;
+                return Err(fail("owner grant physical table credit exhausted"));
+            }
+        };
         let tables: Vec<_> = owned_tables
             .iter()
             .map(|table| SubstrateGpa(table.address().raw()))
@@ -1577,13 +1599,48 @@ mod custody_tests {
     }
     #[test]
     fn owner_grants_reserve_disjoint_table_stock_before_receipt() {
-        let mut stock: Vec<_> = (1..=32)
+        let mut stock: Vec<_> = (1..=8)
             .map(|n| RootGpa::page_aligned(FrameGpa::new(n * 4096)).unwrap())
             .collect();
-        let first = reserve_table_stock(&mut stock);
-        let second = reserve_table_stock(&mut stock);
-        assert!(!first.is_empty());
+        let range = carrick_el1_abi::ReservationRange::new(0x4000_0000, 0x4001_0000).unwrap();
+        let first = reserve_table_stock(&mut stock, range).unwrap();
+        let second = reserve_table_stock(&mut stock, range).unwrap();
+        assert!(
+            !second.is_empty(),
+            "the second MM must own pending table credits"
+        );
+        assert_eq!(first.len(), 3);
+        assert_eq!(second.len(), 3);
+        assert_eq!(stock.len(), 2);
         assert!(first.iter().all(|frame| !second.contains(frame)));
+    }
+    #[test]
+    fn owner_table_credits_cover_boundaries_and_refuse_without_partial_loans() {
+        let pages = || {
+            (1..=8)
+                .map(|n| RootGpa::page_aligned(FrameGpa::new(n * 4096)).unwrap())
+                .collect::<Vec<_>>()
+        };
+        for (start, expected) in [(0x1f_f000, 4), (0x3fff_f000, 5), (0x7f_ffff_f000, 6)] {
+            let mut stock = pages();
+            let range = carrick_el1_abi::ReservationRange::new(start, start + 0x10000).unwrap();
+            assert_eq!(
+                reserve_table_stock(&mut stock, range).unwrap().len(),
+                expected
+            );
+            assert_eq!(stock.len(), 8 - expected);
+        }
+        let range = carrick_el1_abi::ReservationRange::new(0x4000_0000, 0x4001_0000).unwrap();
+        let mut stock = pages();
+        stock.truncate(2);
+        let before = stock.clone();
+        assert!(reserve_table_stock(&mut stock, range).is_none());
+        assert_eq!(stock, before);
+        let mut stock = pages();
+        let before = stock.clone();
+        let oversized = carrick_el1_abi::ReservationRange::new(0x4000_0000, 0x8000_0000).unwrap();
+        assert!(reserve_table_stock(&mut stock, oversized).is_none());
+        assert_eq!(stock, before);
     }
     #[test]
     fn fork_physical_stock_requires_exact_disjoint_contiguous_capacity() {
