@@ -33,7 +33,7 @@ impl CarrierCpuIo for KvmCpuIo {
         // Share the existing grouped KVM restore, including its pending-SYSRET
         // segment choice. No page-table owner exists here; diagnostic walks are
         // unknown, not evidence of live translation or authenticated ownership.
-        crate::kvm_x86_engine::restore_kvm_vcpu(
+        crate::vcpu_x86::restore_kvm_vcpu(
             &mut self.vcpu,
             self.layout,
             image,

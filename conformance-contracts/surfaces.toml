@@ -712,10 +712,6 @@ path = "crates/carrick-kernel/src/dispatch/net/lifecycle/connect_tests/loom_mode
 contracts = ["kernel.net.connect-wake-scope"]
 
 [[surfaces]]
-path = "crates/carrick-vmm-kvm/tests/live_vcpu_x86.rs"
-contracts = ["x86.run-elf.poll"]
-
-[[surfaces]]
 path = "crates/carrick-mem/src/x86_initial_image.rs"
 contracts = ["x86.mm.initial-image"]
 
@@ -796,7 +792,7 @@ contracts = ["core.entry.completion"]
 
 [[surfaces]]
 path = "crates/carrick-personality-linux/src/entry.rs"
-contracts = ["core.entry.completion"]
+contracts = ["core.entry.completion", "x86.canonical.poll"]
 
 [[surfaces]]
 path = "crates/carrick-syscall-abi/src/lib.rs"
@@ -844,7 +840,7 @@ contracts = ["core.entry.completion", "kernel.el1.futex-handoff"]
 
 [[surfaces]]
 path = "crates/carrick-personality-linux/tests/x86_wave2.rs"
-contracts = ["core.entry.completion"]
+contracts = ["core.entry.completion", "x86.canonical.poll"]
 
 [[surfaces]]
 path = "crates/carrick-personality-linux/tests/x86_wave2/common_entry.rs"
@@ -871,6 +867,10 @@ path = "crates/carrick-x86-cpl0/src/lib.rs"
 contracts = ["core.entry.completion"]
 
 [[surfaces]]
+path = "crates/carrick-vmm-kvm/src/vcpu_x86.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
 path = "crates/carrick-cli/tests/x86_kvm_run.rs"
 contracts = ["x86.carrier.cli-run"]
 
@@ -889,7 +889,7 @@ contracts = ["kernel.mm.user-va-ceiling"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/x8664_arch.rs"
-contracts = ["kernel.mm.user-va-ceiling"]
+contracts = ["kernel.mm.user-va-ceiling", "x86.canonical.poll"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/mem/mmap.rs"
@@ -898,3 +898,39 @@ contracts = ["kernel.mm.user-va-ceiling"]
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/mem/anonymous.rs"
 contracts = ["kernel.mm.user-va-ceiling"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/isa/x86/context_words.rs"
+contracts = ["x86.context.tls-base"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/isa/x86/context.rs"
+contracts = ["x86.context.tls-base"]
+
+[[surfaces]]
+path = "crates/carrick-cli/tests/fixtures/x86_arch_prctl.S"
+contracts = ["x86.context.tls-base"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/thread.rs"
+contracts = ["kernel.el1.thread-lifecycle"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/tests/x86_wave2/lifecycle.rs"
+contracts = ["kernel.el1.thread-lifecycle"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/personality/x86_native.rs"
+contracts = ["x86.context.tls-base"]
+
+[[surfaces]]
+path = "crates/carrick-syscall-abi/src/syscall_x86_64.rs"
+contracts = ["x86.canonical.poll"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/net.rs"
+contracts = ["x86.canonical.poll"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/continuation/tests.rs"
+contracts = ["x86.canonical.poll"]

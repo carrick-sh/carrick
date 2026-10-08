@@ -2286,8 +2286,18 @@ impl Cpl0Carrier {
                         let record = carrick_x86::FaultDoorbellRecord::from_u32_words(&words)?;
                         let reason = custody.binding(cpu_id).fault_reason.load(Ordering::Acquire);
                         if reason != 6 {
+                            let counters: &Counters = custody.metadata(COUNTERS_OFFSET);
+                            let refused: Vec<_> = counters
+                                .refused
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(ordinal, counter)| {
+                                    let count = counter.load(Ordering::Acquire);
+                                    (count != 0).then_some((ordinal, count))
+                                })
+                                .collect();
                             return Err(fail(format!(
-                                "kernel fault policy refused: reason {reason}, {record:?}"
+                                "kernel fault policy refused: reason {reason}, {record:?}; recent forwards {recent_forwards:?}; refused native ordinals {refused:?}"
                             )));
                         }
                         return Ok(ActorDecision::Finish(InitialProcessExit::Fault {
@@ -3665,11 +3675,48 @@ impl Cpl0Carrier {
     }
 
     pub fn inject_boundary_kicks(&mut self, index: usize) -> Result<(), TrapError> {
+        self.inject_entry_kick(index)?;
+        self.inject_return_kick(index)
+    }
+
+    pub fn inject_entry_kick(&mut self, index: usize) -> Result<(), TrapError> {
         if index >= 2 {
             return Err(fail("unknown CPL0 task"));
         }
         self.binding(index).entry_kick.store(1, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn inject_return_kick(&mut self, index: usize) -> Result<(), TrapError> {
+        if index >= 2 {
+            return Err(fail("unknown CPL0 task"));
+        }
         self.binding(index).return_kick.store(1, Ordering::Release);
+        Ok(())
+    }
+
+    /// Seed a stopped lifecycle fixture's mask and queued-signal summary.
+    pub fn fixture_lifecycle_signals(
+        &mut self,
+        index: usize,
+        blocked: BlockedMask,
+        pending: carrick_el1_abi::PendingSignals,
+    ) -> Result<(), TrapError> {
+        if index >= 2
+            || self
+                .binding(index)
+                .scheduler_witness
+                .load(Ordering::Acquire)
+                != carrick_x86::cpl0_lifecycle::LIFECYCLE_LANE
+                    + index as u64 * carrick_x86::cpl0_lifecycle::LIFECYCLE_STRIDE
+        {
+            return Err(fail("unknown lifecycle lane"));
+        }
+        let controls: &[ThreadControlSlot; 9] = self.metadata(0xb000 + index as u64 * 0x1000);
+        let _ = controls[0].store_blocked_then_read_pending(blocked, controls[0].pending());
+        let _ = controls[0]
+            .pending()
+            .post_then_read_blocked(pending, &controls[0]);
         Ok(())
     }
 

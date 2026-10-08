@@ -16,3 +16,6 @@ pub mod native_process_signals;
 pub mod process_owner;
 pub mod sched;
 pub mod thread_setup;
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub mod x86_native;

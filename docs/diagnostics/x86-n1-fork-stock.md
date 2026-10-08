@@ -116,3 +116,25 @@ Checks: fmt-check, focused clippy and pre-push clippy pass on the first
 milestone. `just lint-domains` fails on five pre-existing unreviewed native
 assembly sites in `context_resume.rs`, `native_execution.rs`, and
 `native_process.rs`; none is modified by the diagnostic bindings.
+
+## Native TLS merge and next startup blockers
+
+The director authorized merging `work/x86-legacy-retire` at `a344ea49a`.
+Conflict resolution keeps the native process bridge, fork normalization,
+generic context ownership and actor coordinator; x86 routing adds the existing
+native TLS/set-TID implementation. The decoded x86 poll thunk is retained.
+The rebuilt TLS dependency test passes on KVM. No new TLS implementation was
+introduced by this lane.
+
+All eight same-source scenarios remain RED after TLS: musl `abort` halts at
+`0x4521cc`, vector 13/error 0/CS 35/CR2 0, before scenario output. The existing
+recent-forward history is empty. Fatal diagnostics now expose that history
+and nonzero refusal counters; spawn-slope has native refusals `(13,1)`,
+`(200,2)`, `(512,1)` (overflow bucket). These counts do not prove syscall order
+or identify the ordinal in overflow. No shared lifecycle failure is established.
+
+A separate static `mounted_static_x86_musl_poll_startup_dependency` proves
+`poll([{fd=1, events=0}], 1, 0)` returns -38 on KVM, while native Linux completes.
+This is another real startup dependency, not proof that it triggered the
+observed abort. The fixture retains `ARCH_SET_FS` and poll as independent
+bindings so startup progress can be verified without reaching thread workloads.

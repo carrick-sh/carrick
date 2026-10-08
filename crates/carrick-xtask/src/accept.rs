@@ -1779,6 +1779,9 @@ mod tests {
                 "host-authority-linux",
             ]
         );
+        let kvm = steps.iter().find(|step| step.name == "kvm-tests").unwrap();
+        assert_eq!(kvm.program, "just");
+        assert_eq!(kvm.args, &["test-kvm"]);
         assert_eq!(
             profile_phase(AcceptProfile::LinuxPortable, AcceptPhase::All).unwrap(),
             AcceptPhase::Host

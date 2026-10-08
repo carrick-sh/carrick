@@ -20,8 +20,7 @@
 //! matching argument shape is a `Direct(canonical)`. Legacy x86_64-only
 //! syscalls whose arg shape differs from their asm-generic successor
 //! (`open` vs `openat`, `access` vs `faccessat`, `dup2` vs `dup3`, `readlink` vs `readlinkat`,
-//! `stat`/`fstat`/`lstat` vs `newfstatat`, `select` vs `pselect6`, `poll` is
-//! the lone exception below as musl calls it with timeout 0) are deliberately
+//! `stat`/`fstat`/`lstat` vs `newfstatat`, `select` vs `pselect6`) are deliberately
 //! LEFT OUT (→ `Unknown` → private unsupported sink → -ENOSYS); adding a naive `Direct` for them would
 //! silently mis-dispatch the wrong arg shape, which is worse than an honest
 //! ENOSYS. Those are either handled in `normalize_syscall` or listed in a
@@ -31,6 +30,80 @@
 //! `arch_prctl`=158 stays `native` (the backend services FS/GS base). The
 //! shared guest kernel routes fork(57) through a private canonical number;
 //! host backends still lower fork/vfork to clone before table lookup.
+
+/// Linux poll's signed 32-bit millisecond argument, decoded without guest
+/// memory access. `None` denotes ppoll's NULL timeout; `Some(ZERO)` remains
+/// a non-blocking wait. Positive values convert exactly to seconds/nanoseconds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PollTimeout(Option<core::time::Duration>);
+
+impl PollTimeout {
+    pub const fn from_register(raw: u64) -> Self {
+        let milliseconds = raw as i32;
+        if milliseconds < 0 {
+            Self(None)
+        } else {
+            Self(Some(core::time::Duration::from_millis(milliseconds as u64)))
+        }
+    }
+
+    pub const fn duration(self) -> Option<core::time::Duration> {
+        self.0
+    }
+}
+
+/// poll has three arguments and no signal-mask operation. The undefined
+/// trailing register values must not become ppoll's mask and size arguments.
+pub const fn poll_arguments(args: [u64; 6]) -> [u64; 6] {
+    [args[0], args[1], args[2], 0, 0, 0]
+}
+
+/// Linux x86_64 native arch_prctl ordinal, sourced from syscalls(2).
+pub const ARCH_PRCTL_X86_NR: u64 = 158;
+
+/// Canonical set_tid_address ordinal from the asm-generic Linux table.
+pub const SYS_SET_TID_ADDRESS: u64 = 96;
+
+/// The native operation designated by the shared syscall table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeX86Call {
+    ArchPrctl,
+}
+
+/// Classification comes from the same table used by the host dispatcher.
+pub fn lookup_native_x86_64(number: u64) -> Option<NativeX86Call> {
+    let entry = lookup_x86_64(number)?;
+    match (number, entry.remap) {
+        (ARCH_PRCTL_X86_NR, SyscallRemap::Native) => Some(NativeX86Call::ArchPrctl),
+        _ => None,
+    }
+}
+
+/// FS/GS and CPUID operations from arch_prctl(2). The syscall's operation
+/// argument is an int; high register bits are truncated like native Linux.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ArchPrctlOperation {
+    SetFs = 0x1002,
+    SetGs = 0x1001,
+    GetFs = 0x1003,
+    GetGs = 0x1004,
+    GetCpuid = 0x1011,
+    SetCpuid = 0x1012,
+}
+impl ArchPrctlOperation {
+    pub const fn decode(code: u64) -> Option<Self> {
+        match code as u32 {
+            code if code == Self::SetGs as u32 => Some(Self::SetGs),
+            code if code == Self::SetFs as u32 => Some(Self::SetFs),
+            code if code == Self::GetFs as u32 => Some(Self::GetFs),
+            code if code == Self::GetGs as u32 => Some(Self::GetGs),
+            code if code == Self::GetCpuid as u32 => Some(Self::GetCpuid),
+            code if code == Self::SetCpuid as u32 => Some(Self::SetCpuid),
+            _ => None,
+        }
+    }
+}
 
 /// How a guest-ISA syscall number reaches the canonical (aarch64/asm-generic)
 /// dispatcher. Defined in the guest-safe syscall ABI leaf and re-exported by
@@ -66,6 +139,14 @@ const fn direct(number: u64, name: &'static str, canonical: u64) -> X8664Syscall
         number,
         name,
         remap: SyscallRemap::Direct(crate::CanonicalNr(canonical)),
+    }
+}
+
+const fn private(number: u64, name: &'static str, canonical: crate::CanonicalNr) -> X8664Syscall {
+    X8664Syscall {
+        number,
+        name,
+        remap: SyscallRemap::Private(canonical),
     }
 }
 
@@ -127,13 +208,13 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // private dispatcher shim that writes LinuxX8664Stat.
     // x86_64=6 lstat: LEGACY. Normalized in x8664_arch::normalize_syscall to a
     // private dispatcher shim that writes LinuxX8664Stat with AT_SYMLINK_NOFOLLOW.
-    // x86_64=7 (syscalls(2)/filippo) → canonical ppoll=73.
-    // musl calls poll(fds, n, 0) at startup to probe fd validity (non-blocking).
-    // NOTE: poll(fds,n,timeout_ms) vs ppoll(fds,n,*timespec,*sigmask,size) is a
-    // DIFFERENT arg shape; this Direct is a known-imperfect bring-up convenience
-    // (the dispatcher's ppoll handler tolerates the musl startup probe). It is
-    // also listed in the deferred shim block for an eventual real translation.
-    direct(7, "poll", 73),
+    // poll's integer timeout reaches the SAME canonical ppoll handler through
+    // an explicit shape tag. It must never be read as a guest timespec pointer.
+    private(
+        7,
+        "poll",
+        crate::CanonicalNr(crate::CARRICK_PRIVATE_X86_POLL),
+    ),
     // x86_64=8 lseek → canonical lseek=62 (SAME name+shape: fd,off,whence)
     direct(8, "lseek", 62),
     // x86_64=9 (syscalls(2)/filippo) → canonical mmap=222
@@ -450,7 +531,7 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // x86_64=158 (syscalls(2)/filippo): arch_prctl is x86_64-private (sets FS/GS
     // base via ARCH_SET_FS / ARCH_SET_GS); the bhyve/KVM backend services it
     // natively (normalize_syscall returns SyscallNorm::ArchPrctl before lookup).
-    native(158, "arch_prctl"),
+    native(ARCH_PRCTL_X86_NR, "arch_prctl"),
     // x86_64=159 adjtimex → canonical adjtimex=171 (SAME name+shape)
     direct(159, "adjtimex", 171),
     // x86_64=160 setrlimit → canonical setrlimit=164 (SAME name+shape)
@@ -554,7 +635,7 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // x86_64=217 getdents64 → canonical getdents64=61 (SAME name+shape)
     direct(217, "getdents64", 61),
     // x86_64=218 (syscalls(2)/filippo) → canonical set_tid_address=96
-    direct(218, "set_tid_address", 96),
+    direct(218, "set_tid_address", SYS_SET_TID_ADDRESS),
     // x86_64=219 restart_syscall → canonical restart_syscall=128 (SAME name+shape)
     direct(219, "restart_syscall", 128),
     // x86_64=220 semtimedop → canonical semtimedop=192 (SAME name+shape)
@@ -855,18 +936,19 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     direct(453, "map_shadow_stack", 453),
     // x86_64=454 futex_wake → canonical futex_wake=454 (SAME number+shape)
     direct(454, "futex_wake", 454),
-    // ── DEFERRED: legacy x86_64-only syscalls left OUT (Unknown → -ENOSYS) ──────
+    // ── Legacy x86_64-only shapes absent from this shared table ───────────────
     //
     // Each has an asm-generic SUCCESSOR with a DIFFERENT name AND a different arg
     // shape; emitting a naive Direct(successor) would silently feed the wrong arg
     // layout to the canonical handler (worse than an honest ENOSYS). They need a
-    // per-syscall arg-translation shim in x8664_arch::normalize_syscall (deferred,
-    // oracle-gated). All numbers from syscalls(2)/filippo/OSDev.
+    // shape lowering. Several already have host-HAL shims, but the guest decoder
+    // does not invoke them. See docs/retirements/x86-legacy-syscall-audit.md
+    // for each current route and remaining binding gap. Numbers: syscalls(2).
     //
     //   2   open        → openat(56):     prepend AT_FDCWD; (path,flags,mode)→(dfd,path,flags,mode)
     //   23  select      → pselect6(72):   timeval→timespec; no sigmask arg
     //   33  dup2        → dup3(24):       dup2(fd,fd)=success no-op vs dup3 EINVAL; no flags arg
-    //   78  getdents    → getdents64(61): 32-bit linux_dirent vs 64-bit linux_dirent64
+    //   78  getdents    → getdents64(61): legacy linux_dirent record vs linux_dirent64
     //   82  rename      → renameat(38):   prepend AT_FDCWD to both paths
     //   83  mkdir       → mkdirat(34):    prepend AT_FDCWD
     //   84  rmdir       → unlinkat(35):   prepend AT_FDCWD; set AT_REMOVEDIR
@@ -886,8 +968,6 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     //   261 futimesat   → utimensat(88):  timeval[2]→timespec[2]
     //   282 signalfd    → signalfd4(74):  append flags=0
     //   284 eventfd     → eventfd2(19):   append flags=0
-    //   7   poll        → ppoll(73):      timeout_ms→*timespec; (the Direct above is
-    //                                     a bring-up convenience, NOT a faithful shim)
     //
     // Now shimmed in normalize_syscall (above): 34 pause → ppoll(NULL,0,NULL);
     // 37 alarm → private alarm shim; 111 getpgrp → getpgid(0); 232 epoll_wait →
@@ -922,6 +1002,45 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poll_uses_the_shared_ppoll_integer_timeout_route() {
+        assert_eq!(
+            canonical_x86_64(crate::NativeNr(7)),
+            Some(crate::CanonicalNr(crate::CARRICK_PRIVATE_X86_POLL)),
+            "poll's integer timeout must never be decoded as a ppoll pointer"
+        );
+    }
+
+    #[test]
+    fn poll_timeout_converts_signed_milliseconds_exactly() {
+        for (milliseconds, expected) in [
+            (-1_i32, None),
+            (0, Some((0, 0))),
+            (1, Some((0, 1_000_000))),
+            (i32::MAX, Some((2_147_483, 647_000_000))),
+        ] {
+            let timeout = PollTimeout::from_register(milliseconds as u32 as u64);
+            assert_eq!(
+                timeout.duration().map(|d| (d.as_secs(), d.subsec_nanos())),
+                expected,
+                "poll timeout {milliseconds} milliseconds"
+            );
+            assert_eq!(
+                PollTimeout::from_register(0xabcd_1234_0000_0000 | milliseconds as u32 as u64),
+                timeout,
+                "the argument is int, not the full register width"
+            );
+        }
+        assert_eq!(
+            PollTimeout::from_register(i32::MIN as u32 as u64).duration(),
+            None
+        );
+        assert_eq!(
+            poll_arguments([11, 12, 0, 14, 15, 16]),
+            [11, 12, 0, 0, 0, 0]
+        );
+    }
 
     #[test]
     fn write_remaps_to_canonical_64() {
@@ -1003,6 +1122,20 @@ mod tests {
 
     #[test]
     fn arch_prctl_is_native() {
+        let mut native_rows = X86_64_SYSCALLS
+            .iter()
+            .filter(|entry| entry.remap == SyscallRemap::Native);
+        assert_eq!(
+            native_rows.next().map(|entry| entry.number),
+            Some(ARCH_PRCTL_X86_NR)
+        );
+        assert_eq!(native_rows.next(), None);
+        assert_eq!(
+            lookup_native_x86_64(ARCH_PRCTL_X86_NR),
+            Some(NativeX86Call::ArchPrctl)
+        );
+        assert_eq!(lookup_native_x86_64(0), None);
+
         let e = lookup_x86_64(158).expect("arch_prctl must be in the table");
         assert_eq!(e.name, "arch_prctl");
         assert_eq!(e.remap, SyscallRemap::Native);
