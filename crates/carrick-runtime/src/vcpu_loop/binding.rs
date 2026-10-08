@@ -3032,6 +3032,15 @@ where
         use carrick_guest_mem::MemoryPrepareError;
         match error {
             MemoryPrepareError::Retired(handle) => {
+                let exact_owner = engine
+                    .user_memory_admission_authority()
+                    .and_then(|authority| authority.owner());
+                if exact_owner != Some(handle) {
+                    return Err(RuntimeError::Configuration(format!(
+                        "retired output owner differs from current memory authority: retired={handle:?} current={exact_owner:?}"
+                    ))
+                    .into());
+                }
                 if !self.kernel.process_exiting()
                     && !thread_should_finish_for_exec_replacement(
                         &self.state.registry,
