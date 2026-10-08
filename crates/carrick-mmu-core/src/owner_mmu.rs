@@ -39,6 +39,13 @@ pub trait OwnerMmu {
 /// inheritance, custody selection, admission and rollback stay in that owner.
 pub trait OwnerForkMmu: OwnerMmu {
     const ADDRESS_MASK: u64;
+    /// Supervisor root branches shared by this ISA's address spaces. Private
+    /// branches retain the normal child clone and exact census. The default
+    /// preserves the AArch64 walk of every root entry.
+    fn is_shared_root_entry(_index: usize) -> bool {
+        false
+    }
+
     /// Half-open ISA-private control window. None means no such mappings.
     fn control_window() -> Option<(UserVa, UserVa)>;
     fn is_control_alias(va: UserVa) -> bool;

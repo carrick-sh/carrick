@@ -18,6 +18,12 @@ use carrick_guest_arch::{
 pub struct X86Mmu;
 impl OwnerForkMmu for X86Mmu {
     const ADDRESS_MASK: u64 = ADDRESS;
+    fn is_shared_root_entry(index: usize) -> bool {
+        // Entry 508 retains MM-private supervisor copy tables. Other upper
+        // branches describe the shared supervisor image and transport.
+        index >= 256 && index != 508
+    }
+
     fn control_window() -> Option<(UserVa, UserVa)> {
         None
     }
