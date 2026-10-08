@@ -809,10 +809,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .task(key)
                     .ok()
                     .and_then(|row| row.native().resources().channel.clone())
+                    && !channels.iter().any(|other| Arc::ptr_eq(other, &channel))
                 {
-                    if !channels.iter().any(|other| Arc::ptr_eq(other, &channel)) {
-                        channels.push(channel);
-                    }
+                    channels.push(channel);
                 }
             }
             (target, channels)
