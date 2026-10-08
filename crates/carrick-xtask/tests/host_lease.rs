@@ -386,7 +386,10 @@ fn runner_death_with_admission(
                 if nested { "nested " } else { "" }
             );
             if let Some(checkout) = &checkout_lock {
-                let released = libc::flock(checkout.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB);
+                let (alive, released) = observe_exclusion(
+                    || is_process_alive(pid),
+                    || libc::flock(checkout.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB),
+                );
                 assert!(
                     released != 0 || !alive,
                     "checkout admission released while workload survives runner death"
@@ -732,23 +735,58 @@ fn fake_ps_refuses_load_and_override_records_parent_command() {
     );
 }
 
-// This seam models a release between observations without scheduler sleeps.
+// Acquire exclusion before observing liveness: a pre-acquisition observation
+// can become stale during correctly ordered cancellation and release. Each
+// independent lock needs its own subsequent liveness observation.
 fn observe_exclusion(alive: impl FnOnce() -> bool, flock: impl FnOnce() -> i32) -> (bool, i32) {
-    let live = alive();
-    (live, flock())
+    let release = flock();
+    (alive(), release)
 }
 
 #[test]
-fn release_between_observations_is_detected() {
-    let released = std::cell::Cell::new(false);
+fn death_before_release_does_not_report_live_workload() {
+    use std::os::fd::AsRawFd;
+    let lock = tempfile::NamedTempFile::new().unwrap();
+    let lease = HostLease::acquire_path(lock.path(), HostLeaseMode::Gate).unwrap();
+    let mut child = Command::new("/bin/cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = child.id() as libc::pid_t;
+    assert!(is_process_alive(pid));
+    let (alive, release) = observe_exclusion(
+        || is_process_alive(pid),
+        || {
+            // Deterministic interleaving: death is observed before exclusion
+            // is released, strictly between the two test observations.
+            child.kill().unwrap();
+            child.wait().unwrap();
+            drop(lease);
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }
+        },
+    );
+    assert_eq!(release, 0);
+    assert!(
+        !alive,
+        "correct death-before-release reported as live release"
+    );
+}
+
+#[test]
+fn live_workload_after_release_is_detected() {
+    let acquired = std::cell::Cell::new(false);
     let (alive, release) = observe_exclusion(
         || {
-            released.set(true);
+            assert!(acquired.get(), "liveness observed before lock acquisition");
             true
         },
-        || if released.get() { 0 } else { -1 },
+        || {
+            acquired.set(true);
+            0
+        },
     );
-    assert!(alive && release == 0, "missed release while workload alive");
+    assert!(alive && release == 0, "missed live workload after release");
 }
 
 #[cfg(target_os = "macos")]
