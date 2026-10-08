@@ -16,15 +16,18 @@ use carrick_sched_core::{AddressSpaces, SpaceEditor};
 use core::num::NonZeroU64;
 
 /// Native wake delivery and Linux wire encoding, with no MM owner state.
-pub trait OwnerVenue {
+pub trait OwnerVenue<
+    Context: Copy + Send + Sync + zerocopy::FromZeros = carrick_sched_core::ThreadCtx,
+>
+{
     fn space_access(
-        zone: &carrick_sched_core::ZoneTables,
+        zone: &carrick_sched_core::ZoneTables<Context>,
         slot: carrick_sched_core::SlotId,
-    ) -> carrick_sched_core::spaces::notification::SpaceAccess<'_>;
+    ) -> carrick_sched_core::spaces::notification::SpaceAccess<'_, Context>;
     fn deliver_completion(
-        zone: &carrick_sched_core::ZoneTables,
+        zone: &carrick_sched_core::ZoneTables<Context>,
         slot: carrick_sched_core::SlotId,
-        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, Context>,
     );
     fn encode_error(error: MmError) -> u32;
     fn cancelled_copy_code() -> u32;
@@ -47,31 +50,38 @@ pub struct MmPortal<
     P: PinnedMetadataExtent,
     Policy: ReservationPolicy,
     Geometry: ReservationGeometry,
-    Venue: OwnerVenue,
+    Venue: OwnerVenue<Context>,
     B: OwnerMmu = Aarch64Mmu,
+    Context: Copy + Send + Sync + zerocopy::FromZeros = carrick_sched_core::ThreadCtx,
 > {
     pub backend: core::marker::PhantomData<(B, Venue)>,
     pub carrier: NonZeroU64,
     pub roots: &'a SharedReservations<Policy, Geometry>,
     pub spaces: &'a AddressSpaces,
     pub nodes: Option<&'a ResolvedReservationNodes<P, Policy, Geometry>>,
-    pub zone: Option<&'a carrick_sched_core::ZoneTables>,
+    pub zone: Option<&'a carrick_sched_core::ZoneTables<Context>>,
     #[cfg(any(test, feature = "host-test"))]
     pub vma_visits: core::sync::atomic::AtomicUsize,
 }
 
 /// Authenticated before effects, while dropping the claim can restore LIVE.
 /// Publication cannot reject a prepared settlement afterward.
-enum PreparedDelivery<'a, Venue: OwnerVenue> {
+enum PreparedDelivery<
+    'a,
+    Venue: OwnerVenue<Context>,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
+> {
     Standalone,
     Scheduler {
         venue: core::marker::PhantomData<Venue>,
-        zone: &'a carrick_sched_core::ZoneTables,
+        zone: &'a carrick_sched_core::ZoneTables<Context>,
         key: carrick_sched_core::object_wait::ObjectWaitKey,
         waker: carrick_sched_core::SlotId,
     },
 }
-impl<Venue: OwnerVenue> PreparedDelivery<'_, Venue> {
+impl<Venue: OwnerVenue<Context>, Context: Copy + Send + Sync + zerocopy::FromZeros>
+    PreparedDelivery<'_, Venue, Context>
+{
     fn publish(self) {
         if let Self::Scheduler {
             zone, key, waker, ..
@@ -79,6 +89,7 @@ impl<Venue: OwnerVenue> PreparedDelivery<'_, Venue> {
         {
             let completion = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
                 '_,
+                Context,
             >| { Venue::deliver_completion(zone, waker, effects) };
             // SAFETY: this capability came from the exact claimed node's
             // retained PREPARE admission, before that claim was released.
@@ -104,8 +115,9 @@ impl<
     P: PinnedMetadataExtent,
     Policy: ReservationPolicy,
     Geometry: ReservationGeometry,
-    Venue: OwnerVenue,
-> MmPortal<'a, P, Policy, Geometry, Venue>
+    Venue: OwnerVenue<Context>,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
+> MmPortal<'a, P, Policy, Geometry, Venue, Aarch64Mmu, Context>
 {
     pub fn new(
         carrier: NonZeroU64,
@@ -125,7 +137,10 @@ impl<
         }
     }
     /// Select descriptor geometry without reconstructing owner state.
-    pub fn with_mmu<B: OwnerMmu>(self, _: B) -> MmPortal<'a, P, Policy, Geometry, Venue, B> {
+    pub fn with_mmu<B: OwnerMmu>(
+        self,
+        _: B,
+    ) -> MmPortal<'a, P, Policy, Geometry, Venue, B, Context> {
         MmPortal {
             backend: core::marker::PhantomData,
             carrier: self.carrier,
@@ -143,9 +158,10 @@ impl<
     P: PinnedMetadataExtent,
     Policy: ReservationPolicy,
     Geometry: ReservationGeometry,
-    Venue: OwnerVenue,
+    Venue: OwnerVenue<Context>,
     B: OwnerMmu,
-> MmPortal<'a, P, Policy, Geometry, Venue, B>
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
+> MmPortal<'a, P, Policy, Geometry, Venue, B, Context>
 {
     pub fn fork_mapping_count(
         &self,
@@ -161,12 +177,15 @@ impl<
         &self,
         mm: carrick_core_abi::ReservationMm,
         worker: u32,
-    ) -> Result<Reservations<'_, Policy, Geometry>, MmError> {
+    ) -> Result<Reservations<'_, Policy, Geometry, Context>, MmError> {
         self.root_any(mm, worker)
     }
 
     /// Add the production scheduler, using the same address-space authority.
-    pub fn with_zone(mut self, zone: &'a carrick_sched_core::ZoneTables) -> Result<Self, MmError> {
+    pub fn with_zone(
+        mut self,
+        zone: &'a carrick_sched_core::ZoneTables<Context>,
+    ) -> Result<Self, MmError> {
         if !core::ptr::eq(self.spaces, &zone.spaces) {
             return Err(MmError::Stale);
         }
@@ -195,7 +214,7 @@ impl<
         &self,
         claim: &ClaimedPreparedCopy<'_, Policy, Geometry>,
         slot: u32,
-    ) -> Result<PreparedDelivery<'_, Venue>, MmError> {
+    ) -> Result<PreparedDelivery<'_, Venue, Context>, MmError> {
         let Some(key) = claim.notification() else {
             return Ok(PreparedDelivery::Standalone);
         };
@@ -233,7 +252,7 @@ impl<
     pub fn space_access(
         &self,
         slot: u32,
-    ) -> Result<carrick_sched_core::spaces::notification::SpaceAccess<'_>, MmError> {
+    ) -> Result<carrick_sched_core::spaces::notification::SpaceAccess<'_, Context>, MmError> {
         if let Some(zone) = self.zone {
             let slot =
                 carrick_sched_core::SlotId::from_index(slot as usize).ok_or(MmError::Invalid)?;
@@ -241,7 +260,11 @@ impl<
         }
         #[cfg(any(test, feature = "host-test"))]
         {
-            Ok(carrick_sched_core::spaces::notification::SpaceAccess::source_free(self.spaces))
+            Ok(
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free_with_context(
+                    self.spaces,
+                ),
+            )
         }
         #[cfg(not(any(test, feature = "host-test")))]
         Err(MmError::Stale)
@@ -250,7 +273,7 @@ impl<
         &self,
         mm: ReservationMm,
         slot: u32,
-    ) -> Result<Reservations<'_, Policy, Geometry>, MmError> {
+    ) -> Result<Reservations<'_, Policy, Geometry, Context>, MmError> {
         let index = self.spaces.find(mm.raw()).ok_or(MmError::Stale)?.index();
         if let Some(venue) = self.space_access(slot)?.venue() {
             let roots = RootReleaseVenue::new(self.roots, venue)?;
@@ -262,8 +285,10 @@ impl<
         #[cfg(any(test, feature = "host-test"))]
         {
             match self.nodes {
-                Some(nodes) => Ok(self.roots.lock_el1_resolved(index, mm, nodes, slot)?),
-                None => Ok(self.roots.lock_el1(index, mm, slot)?),
+                Some(nodes) => Ok(self
+                    .roots
+                    .lock_el1_resolved_with_context(index, mm, nodes, slot)?),
+                None => Ok(self.roots.lock_el1_with_context(index, mm, slot)?),
             }
         }
         #[cfg(not(any(test, feature = "host-test")))]
@@ -273,7 +298,7 @@ impl<
         &self,
         mm: ReservationMm,
         slot: u32,
-    ) -> Result<Reservations<'_, Policy, Geometry>, MmError> {
+    ) -> Result<Reservations<'_, Policy, Geometry, Context>, MmError> {
         let index = self.spaces.find(mm.raw()).ok_or(MmError::Stale)?.index();
         if !self.roots.admitted(index, mm) {
             return Err(MmError::Stale);
@@ -379,7 +404,7 @@ impl<
         &self,
         handle: El1MmHandle,
         slot: u32,
-    ) -> Result<SpaceEditor<'_>, MmError> {
+    ) -> Result<SpaceEditor<'_, Context>, MmError> {
         use carrick_core_abi::PortalWaitCause;
         use carrick_sched_core::spaces::EditAdmissionRefusal;
         let editor = self.observe_wait(handle, PortalWaitCause::Editor)?;
@@ -403,7 +428,7 @@ impl<
         &self,
         handle: El1MmHandle,
         slot: u32,
-    ) -> Result<Reservations<'_, Policy, Geometry>, MmError> {
+    ) -> Result<Reservations<'_, Policy, Geometry, Context>, MmError> {
         let observed =
             self.observe_wait(handle, carrick_core_abi::PortalWaitCause::Reservations)?;
         let root = self.root(handle.mm(), slot).map_err(|error| match error {
@@ -663,7 +688,7 @@ impl<
         selected: SelectedChunk,
         words: &W,
         slot: u32,
-    ) -> Result<Option<ValidatedChunk<'_>>, MmError> {
+    ) -> Result<Option<ValidatedChunk<'_, Context>>, MmError> {
         if !selected.matches(continuation) {
             return Err(MmError::Stale);
         }
@@ -746,10 +771,11 @@ pub fn prepare_transfer<
     W: LiveDescriptorWords + ?Sized,
     Policy: ReservationPolicy,
     Geometry: ReservationGeometry,
-    Venue: OwnerVenue,
+    Venue: OwnerVenue<Context>,
     B: OwnerMmu,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
 >(
-    portal: &MmPortal<'_, P, Policy, Geometry, Venue, B>,
+    portal: &MmPortal<'_, P, Policy, Geometry, Venue, B, Context>,
     request: carrick_core_abi::PortalTransferRequest,
     words: &W,
     slot: u32,
@@ -790,10 +816,11 @@ pub fn serve_transfer<
     W: LiveDescriptorWords + ?Sized,
     Policy: ReservationPolicy,
     Geometry: ReservationGeometry,
-    Venue: OwnerVenue,
+    Venue: OwnerVenue<Context>,
     B: OwnerMmu,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
 >(
-    portal: &MmPortal<'_, P, Policy, Geometry, Venue, B>,
+    portal: &MmPortal<'_, P, Policy, Geometry, Venue, B, Context>,
     service: carrick_core_abi::PortalTransferService<'_>,
     words: &W,
     slot: u32,
@@ -875,10 +902,11 @@ pub fn settle_prepared_service<
     P: PinnedMetadataExtent,
     Policy: ReservationPolicy,
     Geometry: ReservationGeometry,
-    Venue: OwnerVenue,
+    Venue: OwnerVenue<Context>,
     B: OwnerMmu,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
 >(
-    portal: &MmPortal<'_, P, Policy, Geometry, Venue, B>,
+    portal: &MmPortal<'_, P, Policy, Geometry, Venue, B, Context>,
     service: carrick_core_abi::PortalTransferService<'_>,
     permit: carrick_core_abi::PortalPreparedPermit,
     slot: u32,
@@ -934,10 +962,11 @@ pub fn admit_service_root<
     P: PinnedMetadataExtent,
     Policy: ReservationPolicy,
     Geometry: ReservationGeometry,
-    Venue: OwnerVenue,
+    Venue: OwnerVenue<Context>,
     B: OwnerMmu,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
 >(
-    portal: &MmPortal<'_, P, Policy, Geometry, Venue, B>,
+    portal: &MmPortal<'_, P, Policy, Geometry, Venue, B, Context>,
     service: carrick_core_abi::PortalTransferService<'s>,
 ) -> Option<(
     carrick_core_abi::PortalTransferService<'s>,
