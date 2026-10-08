@@ -3889,8 +3889,8 @@
     "rationale": "At crates/carrick-vmm-kvm/build.rs:65 in `main`, `std::fs::copy` copies only the Cargo-built production CPL0 image into this build script OUT_DIR; no guest path or identity selects either host file.",
     "review_id": "HA-000759",
     "source": {
-      "byte_end": 2582,
-      "byte_start": 2569,
+      "byte_end": 2574,
+      "byte_start": 2561,
       "column": 9,
       "column_end": 22,
       "column_start": 9,
@@ -7512,7 +7512,7 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
-      "resource": "Cargo-derived local CPL0 package source directories, excluding target artifacts"
+      "resource": "manifest-derived local CPL0 package source directories, excluding target artifacts"
     },
     "expansion": null,
     "operation": "std::fs::read_dir",
@@ -7520,18 +7520,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/cpl0_inputs.rs:180 in `rust_files`, `std::fs::read_dir` reads only Cargo-derived local CPL0 package source directories, excluding target artifacts; this build-input census is rooted in the trusted checkout and Cargo metadata, with no guest pathname or syscall input.",
+    "rationale": "At crates/carrick-vmm-kvm/cpl0_inputs.rs:147 in `rust_files`, `std::fs::read_dir` reads only manifest-derived local CPL0 package source directories, excluding target artifacts; this build-input census is rooted in the trusted checkout and local manifest path declarations, with no guest pathname or syscall input.",
     "review_id": "HA-000760",
     "source": {
-      "byte_end": 6521,
-      "byte_start": 6504,
+      "byte_end": 6078,
+      "byte_start": 6061,
       "column": 23,
       "column_end": 40,
       "column_start": 23,
       "file": "crates/carrick-vmm-kvm/cpl0_inputs.rs",
-      "line": 180,
-      "line_end": 180,
-      "line_start": 180
+      "line": 147,
+      "line_end": 147,
+      "line_start": 147
     }
   },
   {
@@ -8412,7 +8412,7 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
-      "resource": "Rust source files in the Cargo-derived CPL0 build-input closure and their literal includes"
+      "resource": "Rust source files in the manifest-derived CPL0 build-input closure and their literal includes"
     },
     "expansion": null,
     "operation": "std::fs::read_to_string",
@@ -8420,18 +8420,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/cpl0_inputs.rs:96 in `derive`, `std::fs::read_to_string` reads only Rust source files in the Cargo-derived CPL0 build-input closure and their literal includes; this build-input census is rooted in the trusted checkout and Cargo metadata, with no guest pathname or syscall input.",
+    "rationale": "At crates/carrick-vmm-kvm/cpl0_inputs.rs:72 in `derive`, `std::fs::read_to_string` reads only Rust source files in the manifest-derived CPL0 build-input closure and their literal includes; this build-input census is rooted in the trusted checkout and local manifest path declarations, with no guest pathname or syscall input.",
     "review_id": "HA-000761",
     "source": {
-      "byte_end": 3675,
-      "byte_start": 3652,
+      "byte_end": 2902,
+      "byte_start": 2879,
       "column": 26,
       "column_end": 49,
       "column_start": 26,
       "file": "crates/carrick-vmm-kvm/cpl0_inputs.rs",
-      "line": 96,
-      "line_end": 96,
-      "line_start": 96
+      "line": 72,
+      "line_end": 72,
+      "line_start": 72
     }
   },
   {
@@ -18876,6 +18876,33 @@
       "line": 1456,
       "line_end": 1456,
       "line_start": 1456
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-READ-TO-STRING",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "checkout Cargo manifests in the local CPL0 normal/build path-dependency closure and its workspace manifest"
+    },
+    "expansion": null,
+    "operation": "std::fs::read_to_string",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vmm-kvm/cpl0_inputs.rs:142 in `read_manifest`, `std::fs::read_to_string` reads only the trusted checkout workspace manifest and local CPL0 dependency manifests for build-input discovery; no guest path or syscall input selects these files.",
+    "review_id": "HA-000763",
+    "source": {
+      "byte_end": 5835,
+      "byte_start": 5812,
+      "column": 9,
+      "column_end": 32,
+      "column_start": 9,
+      "file": "crates/carrick-vmm-kvm/cpl0_inputs.rs",
+      "line": 142,
+      "line_end": 142,
+      "line_start": 142
     }
   }
 ]
