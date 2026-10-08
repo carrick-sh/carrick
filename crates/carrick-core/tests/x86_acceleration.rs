@@ -1836,6 +1836,7 @@ fn retirement_receipt_fixture() {
     let transaction = KernelTransactionId::from_kernel_allocation(nz(97));
     let receipt = FrameInventoryRetirementReceipt::from_kernel_authority(
         FrameInventoryApplyReceipt::from_kernel_authority(
+            Default::default(),
             provenance,
             transaction,
             nz(11),

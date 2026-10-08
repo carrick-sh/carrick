@@ -13,9 +13,9 @@ use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::Gpa;
 use carrick_hal::{
     FrameEventCapacity, FrameId, FrameInventoryApplyReceipt, FrameInventoryBatch,
-    FrameInventoryBatchError, FrameInventoryCommit, FrameInventoryEvent, FrameInventoryProvenance,
-    FrameInventoryReservation, FrameInventoryRetirementReceipt, FrameLength, KernelTransactionId,
-    MappingGeneration, MappingId, MemPerms,
+    FrameInventoryBatchError, FrameInventoryCommit, FrameInventoryEvent, FrameInventoryOrigin,
+    FrameInventoryProvenance, FrameInventoryReservation, FrameInventoryRetirementReceipt,
+    FrameLength, KernelTransactionId, MappingGeneration, MappingId, MemPerms,
 };
 use parking_lot::Mutex;
 
@@ -61,6 +61,7 @@ pub struct FrameInventorySnapshot {
 
 #[derive(Debug, Default)]
 pub struct FrameInventoryAuthority {
+    origin: FrameInventoryOrigin,
     state: Mutex<InventoryState>,
     entropy: Mutex<ProvenanceEntropyBatch>,
 }
@@ -376,6 +377,7 @@ impl FrameInventoryAuthority {
         Ok((
             outcome,
             FrameInventoryApplyReceipt::from_kernel_authority(
+                self.origin.clone(),
                 provenance,
                 transaction,
                 mm,
@@ -393,6 +395,9 @@ impl FrameInventoryAuthority {
         &self,
         receipt: &FrameInventoryApplyReceipt,
     ) -> Result<(), FrameInventoryError> {
+        if !receipt.issued_by(&self.origin) {
+            return Err(FrameInventoryError::RollbackReceiptOriginMismatch);
+        }
         let mm = MmId::from_raw_u64(receipt.mm().get())
             .ok_or(FrameInventoryError::RollbackReceiptMmInvalid)?;
         let mut state = self.state.lock();
@@ -484,6 +489,7 @@ impl FrameInventoryAuthority {
             );
         });
         let receipt = FrameInventoryApplyReceipt::from_kernel_authority(
+            self.origin.clone(),
             provenance,
             transaction,
             mm,
@@ -1270,6 +1276,8 @@ pub enum FrameInventoryError {
     RevisionExhausted,
     #[error("unpublished frame inventory rollback receipt has an invalid mm")]
     RollbackReceiptMmInvalid,
+    #[error("unpublished frame inventory rollback receipt belongs to another inventory")]
+    RollbackReceiptOriginMismatch,
     #[error("unpublished frame inventory rollback receipt duplicates mapping {0:?}")]
     RollbackReceiptDuplicate(MappingId),
     #[error("unpublished frame inventory rollback receipt does not match mapping {0:?}")]
@@ -2877,5 +2885,67 @@ mod tests {
             vec![true, true, false, false, false, false, false, false]
         );
         assert_eq!(batch_counts, vec![Some(3), Some(1), Some(1), Some(1), None]);
+    }
+}
+
+#[cfg(test)]
+mod inventory_origin_tests {
+    use super::*;
+
+    fn publish_fixture(
+        inventory: &FrameInventoryAuthority,
+        ids: &ObjectIdRegistry,
+    ) -> FrameInventoryApplyReceipt {
+        let mut reservation = inventory
+            .reserve(ids, 1, 1, FrameEventCapacity::for_event_count(2).unwrap())
+            .unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation = MappingGeneration::from_backend_counter(NonZeroU64::MIN);
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa: Gpa(0x1000),
+                length: FrameLength::from_mapping_extent(NonZeroU64::new(4096).unwrap()),
+                permissions: MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        inventory
+            .apply_with_receipt(MmId::from_raw_u64(41).unwrap(), reservation.commit(()))
+            .unwrap()
+            .1
+    }
+
+    #[test]
+    fn physical_rollback_refuses_same_number_foreign_source_receipt() {
+        let first = FrameInventoryAuthority::new();
+        let second = FrameInventoryAuthority::new();
+        let first_receipt = publish_fixture(&first, &ObjectIdRegistry::new());
+        let second_receipt = publish_fixture(&second, &ObjectIdRegistry::new());
+        assert_eq!(first_receipt.mm(), second_receipt.mm());
+        assert_eq!(first_receipt.mapping_set(), second_receipt.mapping_set());
+        assert_eq!(
+            second.rollback_unpublished_apply(&first_receipt),
+            Err(FrameInventoryError::RollbackReceiptOriginMismatch)
+        );
+        assert_eq!(first.snapshot().mappings.len(), 1);
+        assert_eq!(second.snapshot().mappings.len(), 1);
+        first.rollback_unpublished_apply(&first_receipt).unwrap();
+        second.rollback_unpublished_apply(&second_receipt).unwrap();
     }
 }
