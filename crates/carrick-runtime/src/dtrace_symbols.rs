@@ -10,7 +10,6 @@ use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_ulong, c_void};
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use serde::{Deserialize as _, Serialize as _};
 use sha2::{Digest, Sha256};
 
 pub const KERNEL_SYMBOL_SCHEMA: &str = "carrick.kernel-symbols.v1";
