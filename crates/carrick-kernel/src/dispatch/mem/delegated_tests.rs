@@ -4379,6 +4379,45 @@ fn delegated_fork_materialized_drops_unconsumed_stock_provenance_only_in_child()
 }
 
 #[test]
+fn delegated_fork_keeps_host_owned_shared_aperture_first_touch() {
+    let dispatcher = SyscallDispatcher::new();
+    let _root = Root::admit(&dispatcher);
+    let addr = {
+        let authority = dispatcher.mem();
+        let mut mem = authority.lock();
+        mem.shared
+            .alloc(PAGE, crate::shared_aperture::BackingObject::SharedAnon)
+            .unwrap()
+    };
+    dispatcher.track_resident_fault_range(addr, PAGE, LinuxProtFlags::READ | LinuxProtFlags::WRITE);
+    let child = fork_child(&dispatcher);
+    assert!(child.fault_requires_mm_mutation(addr + 16));
+    let mem = child.mem();
+    let mem = mem.lock();
+    assert_eq!(mem.shared.live().len(), 1);
+    assert!(matches!(
+        mem.first_touch_owner(addr),
+        super::fault::FirstTouchOwner::Host
+    ));
+    assert_eq!(
+        mem.resident_fault_ranges.prot_for_page(addr),
+        Some(LinuxProtFlags::READ | LinuxProtFlags::WRITE),
+    );
+    drop(mem);
+    let _child_root = _root.publish_child(&child);
+    assert_eq!(
+        fork_commit(&dispatcher, &child),
+        Ok(El1Admission::Delegated),
+    );
+    let authority = child.mem();
+    let mem = authority.lock();
+    assert!(matches!(
+        mem.first_touch_owner(addr),
+        super::fault::FirstTouchOwner::Host
+    ));
+}
+
+#[test]
 fn delegated_fork_owner_refuses_stock_and_owed_returns_before_publication() {
     let dispatcher = SyscallDispatcher::new();
     let root = Root::admit(&dispatcher);

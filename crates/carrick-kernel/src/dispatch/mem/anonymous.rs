@@ -1319,6 +1319,13 @@ impl MemState {
                 .with_root(|model| Ok(model.generation()))
                 .unwrap_or_else(|refusal| broken_root("a fork identity", refusal));
             let mut child = MemState::new_with_layout(self.layout);
+            // The root forks reservation-owned anonymous rows. The shared
+            // aperture allocator and host first-touch arming are separate
+            // per-MM custody: a child must retain an untouched MAP_SHARED
+            // allocation even when the parent has no resident stage-1 leaf.
+            child.shared = self.shared.clone();
+            child.resident_tracked_ranges = self.resident_tracked_ranges.clone();
+            child.resident_fault_ranges = self.resident_fault_ranges.clone();
             child.host_backing_custody = Arc::clone(&self.host_backing_custody);
             child.host_backing_leases = self.host_backing_leases.clone();
             child.owner_rows_exclusive = true;
