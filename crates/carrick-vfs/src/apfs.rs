@@ -23,7 +23,6 @@
 //!     destroy instead of an `rm -rf` of millions of inodes.
 
 use std::path::{Path, PathBuf};
-use thiserror::Error as _;
 
 /// Default name of the carrick-owned APFS subvolume. Visible to the
 /// user under `/Volumes/<this>`; chosen to be obvious and unlikely to
