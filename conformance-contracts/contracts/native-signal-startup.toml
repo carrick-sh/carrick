@@ -7,7 +7,7 @@ semantic_authority = [
   "Native Linux executes the same bounded static x86 ELFs, checking exact action fields, masks, stacks, and errno",
 ]
 fixture = "carrick-personality-linux::x86_wave2::native_signal_startup_ordinals_have_guest_families; carrick-cli::x86_kvm_run::mounted_static_x86_signal_sigaction_dependency"
-scale_points = [1, 2]
+scale_points = [1, 8, 32]
 structural_budgets = []
 rationale = """
 No signal syscall may cross to the carrier host. NativeProcessSignals is the
@@ -19,7 +19,7 @@ Mask and stack state remain in the existing retained ThreadControlSlot.
 """
 
 [bindings]
-vm_free = "carrick-personality-linux::x86_wave2::native_signal_startup_ordinals_have_guest_families"
+vm_free = "carrick-personality-linux::x86_wave2::native_signal_startup_ordinals_have_guest_families; carrick-personality-linux::x86_wave2::native_signal_action_wire_preserves_stack_restorer_and_masks; carrick-el1::personality::native_process_signals::tests::{blocked_self_signal_selection_and_coalescing_are_owner_local,ignore_installation_discards_pending_only_for_the_exact_owner,unblocking_ignored_realtime_population_discards_all_instances}; carrick-el1::personality::native_process_runtime::tests::actual_compact_root_delivers_queued_self_signal_after_mask_restore"
 
 [bindings.unresolved]
 embed_structural = "Required-KVM static dependencies supply hardware evidence; signed ARM verification is director-owned."
