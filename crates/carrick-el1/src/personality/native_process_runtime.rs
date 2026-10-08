@@ -51,7 +51,13 @@ impl<'a> NativeLifecycleResources<'a> {
         self.controls.get(entry.index().checked_add(1)?)
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum NativeProcessError {
     Invalid,
     Stale,

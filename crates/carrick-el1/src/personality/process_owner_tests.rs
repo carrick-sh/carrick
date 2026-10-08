@@ -3,6 +3,7 @@
 use super::*;
 use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
 use carrick_sched_core::ParkedContextWords;
+use carrick_sched_core::process::exit::{ExitSignalDisposition, ExitSignalState};
 use carrick_sched_core::process::{LinuxSignal, TaskSerial, WaitChildClass, WaitTarget};
 use core::cell::{Cell, RefCell};
 use core::num::NonZeroU64;

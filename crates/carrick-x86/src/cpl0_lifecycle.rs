@@ -652,10 +652,9 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
     }
     #[cfg(target_os = "none")]
     fn process_fork(&mut self) -> Option<LifecycleOutcome> {
-        use crate::kernel::process;
-        if !process::process_mode()
+        if !crate::process::process_mode()
             || self.lane.slot.raw() != 0
-            || self.task.mm.key.load(Ordering::Acquire) != process::parent_mm()
+            || self.task.mm.key.load(Ordering::Acquire) != crate::process::parent_mm()
         {
             return None;
         }
@@ -669,7 +668,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             return refused();
         }
         let mut child = self.lane.parent;
-        child.tid = process::child_pid(child.tid);
+        child.tid = crate::process::child_pid(child.tid);
         let Some(serial) = child.serial.checked_add(1) else {
             return refused();
         };
@@ -678,7 +677,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             return refused();
         };
         child.generation = generation;
-        child.mm = process::child_mm();
+        child.mm = crate::process::child_mm();
         let Some(control) = child
             .control_slot
             .checked_add(core::mem::size_of::<ThreadControlSlot>() as u64)
@@ -692,7 +691,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         let Some(parent_root) = carrick_el1::isa::x86::hardware_live_root().ok() else {
             return refused();
         };
-        let Some(residency) = process::residency() else {
+        let Some(residency) = crate::process::residency() else {
             return refused();
         };
         let Some(record) = self.zone.alloc_record(child).ok() else {
@@ -701,26 +700,26 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         let reference = self.zone.record_ref(record);
         // Reserve scheduler capacity before the fork owner changes any MM,
         // COW grant or residency publication. The entry stays closed.
-        let Some(index) =
-            self.zone
-                .spaces
-                .publish_closed(child.mm, process::child_root().address().raw(), 0)
-        else {
+        let Some(index) = self.zone.spaces.publish_closed(
+            child.mm,
+            crate::process::child_root().address().raw(),
+            0,
+        ) else {
             self.zone.free_record(record);
             return refused();
         };
         committed(
-            process::publish_child_stack(residency, parent_root).then_some(()),
+            crate::process::publish_child_stack(residency, parent_root).then_some(()),
             LifecycleInvariant::ForkBacking,
         );
         let (child_root, publication) = committed(
-            process::fork_mm(parent_root),
+            crate::process::fork_mm(parent_root),
             LifecycleInvariant::ForkCommit,
         );
         committed(
             (publication.mm_key == self.lane.parent.mm
                 && publication.root_gpa == parent_root.address().raw()
-                && child_root == process::child_root())
+                && child_root == crate::process::child_root())
             .then_some(()),
             LifecycleInvariant::ForkPublication,
         );
@@ -748,10 +747,9 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         options: carrick_syscall_abi::LinuxWaitOptions,
         _rusage: UserVa,
     ) -> Option<LifecycleOutcome> {
-        use crate::kernel::process;
         use carrick_syscall_abi::LinuxWaitOptions;
-        if !process::process_mode()
-            || self.task.mm.key.load(Ordering::Acquire) != process::parent_mm()
+        if !crate::process::process_mode()
+            || self.task.mm.key.load(Ordering::Acquire) != crate::process::parent_mm()
         {
             return None;
         }
@@ -767,31 +765,32 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         if options.bits() & !LinuxWaitOptions::WAIT4_SUPPORTED.bits() != 0 {
             return returned(carrick_syscall_abi::LINUX_EINVAL.guest_retval()); // EINVAL
         }
-        let child_pid = process::child_pid(self.lane.parent.tid);
+        let child_pid = crate::process::child_pid(self.lane.parent.tid);
         if !matches!(i64::from(pid.raw()), -1 | 0) && i64::from(pid.raw()) != child_pid as i64
             || options.contains(LinuxWaitOptions::WCLONE)
                 && !options.contains(LinuxWaitOptions::WALL)
             || self.lane.contexts[1].record.is_none()
-            || process::child_exit().reaped()
+            || crate::process::child_exit().reaped()
         {
             return returned(carrick_syscall_abi::LINUX_ECHILD.guest_retval()); // ECHILD
         }
-        let Some(guard) = process::child_exit().lock(self.zone) else {
+        let Some(guard) = crate::process::child_exit().lock(self.zone) else {
             return returned(carrick_syscall_abi::LINUX_EAGAIN.guest_retval());
         };
-        if process::child_exit().reaped() {
+        if crate::process::child_exit().reaped() {
             return returned(carrick_syscall_abi::LINUX_ECHILD.guest_retval());
         }
-        let code = process::child_exit().exited_status();
+        let code = crate::process::child_exit().exited_status();
         if code.is_none() && options.contains(LinuxWaitOptions::WNOHANG) {
             return returned(0);
         }
-        let Some(outputs) = process::prepare_wait_outputs(self, status, UserVa::new(self.args[3]))
+        let Some(outputs) =
+            crate::process::prepare_wait_outputs(self, status, UserVa::new(self.args[3]))
         else {
             return returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval());
         };
         if let Some(code) = code {
-            let Some(child) = process::child_exit().reap(&guard, code) else {
+            let Some(child) = crate::process::child_exit().reap(&guard, code) else {
                 return returned(carrick_syscall_abi::LINUX_ECHILD.guest_retval());
             };
             outputs.complete(child);
@@ -834,7 +833,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         }
         self.frame.rax = child_pid;
         self.lane.contexts[0] = context;
-        process::publish_wait_outputs(outputs);
+        crate::process::publish_wait_outputs(outputs);
         self.handoff = Some(committed(
             carrick_core::entry::publish_handoff_park(
                 start,
@@ -854,18 +853,17 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
     }
     #[cfg(target_os = "none")]
     fn process_exit_group(&mut self, status: u8) -> Option<LifecycleOutcome> {
-        use crate::kernel::process;
-        if !process::process_mode()
-            || self.task.mm.key.load(Ordering::Acquire) != process::child_mm()
+        if !crate::process::process_mode()
+            || self.task.mm.key.load(Ordering::Acquire) != crate::process::child_mm()
         {
             return None;
         }
         let guard = committed(
-            process::child_exit().lock(self.zone),
+            crate::process::child_exit().lock(self.zone),
             LifecycleInvariant::ExitPublication,
         );
         committed(
-            process::child_exit()
+            crate::process::child_exit()
                 .publish_exit(&guard, status)
                 .then_some(()),
             LifecycleInvariant::ExitPublication,
@@ -875,7 +873,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             self.zone
                 .wake_placed(
                     &guard.bucket,
-                    process::parent_mm(),
+                    crate::process::parent_mm(),
                     CHILD_WAIT_KEY,
                     u32::MAX,
                     1,
@@ -890,10 +888,10 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         );
         if count != 0 {
             let child = committed(
-                process::child_exit().reap(&guard, status),
+                crate::process::child_exit().reap(&guard, status),
                 LifecycleInvariant::ExitReap,
             );
-            process::complete_published_wait_outputs(child);
+            crate::process::complete_published_wait_outputs(child);
             self.lane.wakes += u64::from(count);
         }
         drop(guard);

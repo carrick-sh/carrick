@@ -213,13 +213,7 @@ impl<
         // SAFETY: this exact new record is unpublished and exclusively owned by this birth.
         let ctx = unsafe { record.ctx_mut() };
         let Some(frame) = self.frame.arm_frame() else {
-            #[cfg(target_os = "none")]
-            crate::substrate::sched::hw::fatal_entry_binding();
-            #[cfg(not(target_os = "none"))]
-            carrick_fatal::carrick_fatal!(
-                "el1::prepare_child",
-                "child preparation admitted without an ARM native frame"
-            );
+            super::dispatch::invalid_completion();
         };
         zone.cpu.save(frame, ctx);
         ctx.x[0] = context.result.raw() as u64;
@@ -329,15 +323,7 @@ impl<
         let served = native_scheduler(zone, task, self.counters, slot, &mut self.handoff).run_next(
             match self.frame.arm_frame() {
                 Some(frame) => frame,
-                None => {
-                    #[cfg(target_os = "none")]
-                    crate::substrate::sched::hw::fatal_entry_binding();
-                    #[cfg(not(target_os = "none"))]
-                    carrick_fatal::carrick_fatal!(
-                        "el1::run_next",
-                        "scheduler admitted without an ARM native frame"
-                    )
-                }
+                None => super::dispatch::invalid_completion(),
             },
             timeout_result.raw() as u64,
         );
