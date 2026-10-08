@@ -2116,5 +2116,5 @@ fn x4_shared_wait_records() {
     assert!(r_zone.completion_enabled(wait_key));
 }
 
-#[path = "../src/mm/transaction/compact_context.rs"]
+#[path = "x86_acceleration/compact_context.rs"]
 mod compact_context;
