@@ -21,3 +21,11 @@ carrick-el1-abi = { path = "../../crates/carrick-el1-abi" }
 [profile.release]
 opt-level = 2
 panic = "abort"
+
+[features]
+x86-scenarios = []
+
+[[bin]]
+name = "el1-sched-x86"
+path = "src/x86_main.rs"
+required-features = ["x86-scenarios"]

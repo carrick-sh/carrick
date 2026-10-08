@@ -72,3 +72,47 @@ Captured artifact SHA-256 (debug CLI, unchanged production sources):
 `2f18d161c0ce64263449289137fb1d303d686d2a00a2552f6858f2080c8589aa`.
 LLDB fork-COW ELF SHA-256:
 `3b926833aee2c5a8721716219d6c3fc857bc68ef995e4954fa123d07043b5f5a`.
+
+## Same-source lifecycle and IPC bindings
+
+The `x86-scenarios` fixture feature builds `el1-sched-x86` from the original
+`threads.rs` and `ipc.rs` modules. Bounded peer/syscall helpers are extracted
+into `fixture_common.rs` for both ISAs. ARM compile-check passes. The fixture
+lockfile needed four missing path-closure dependency entries; no registry
+versions changed. The x86 builder selects static relocation and preserves
+frame pointers, so the ELF is EXEC rather than static PIE.
+
+Required-KVM test command:
+
+```sh
+CARRICK_REQUIRE_KVM=1 cargo test -p carrick-cli --no-default-features --features platform-linux --test x86_kvm_run mounted_static_x86_shared_ -- --nocapture --test-threads=1
+```
+
+All eight native runs pass. All eight KVM bindings are RED before scenario
+entry, with CLI exit 125: musl `__init_tls` executes its failure `hlt` at
+`0x4592a1` after `__init_tp` fails. Fault vector 13, error 0, CS 35, CR2 0.
+These are independent scenarios run serially for diagnosis; workload-internal
+thread populations and concurrency are unchanged.
+
+| Binding | Exact fixture arguments | Native | KVM |
+|---|---|---|---|
+| spawn slope | `thread-spawn-slope 8 2` | pass | TLS startup RED |
+| fork during clone | `fork-storm 1` | pass | TLS startup RED |
+| exit group | `exit-group-storm 1` | pass | TLS startup RED |
+| exec | `exec-storm 1` | pass | TLS startup RED |
+| mask storm | `mask-storm 32` | pass | TLS startup RED |
+| parked threads | `futex-flood 32` | pass | TLS startup RED |
+| pipe population | `ipc-processes pipe 1 128` | pass | TLS startup RED |
+| eventfd population | `ipc-processes eventfd 1 128` | pass | TLS startup RED |
+
+The smaller `mounted_static_x86_musl_tls_startup_dependency` ELF isolates
+`arch_prctl(ARCH_SET_FS, pointer)` and reads `%fs:0` after success. Native
+passes; KVM returns exact errno -38 (`ENOSYS`) and exit 96. Its eight stdout
+bytes encode little-endian i64 -38. No shared lifecycle failure is attributed.
+The director routed TLS to the existing `work/x86-legacy-retire` implementation;
+do not implement another native adapter.
+
+Checks: fmt-check, focused clippy and pre-push clippy pass on the first
+milestone. `just lint-domains` fails on five pre-existing unreviewed native
+assembly sites in `context_resume.rs`, `native_execution.rs`, and
+`native_process.rs`; none is modified by the diagnostic bindings.

@@ -485,6 +485,15 @@ fn compare_mounted_binary_with_native(
 }
 
 fn run_mounted_binary(elf: &std::path::Path, run_id: &str, json: bool) -> std::process::Output {
+    run_mounted_binary_with_args(elf, run_id, json, &[])
+}
+
+fn run_mounted_binary_with_args(
+    elf: &std::path::Path,
+    run_id: &str,
+    json: bool,
+    args: &[&str],
+) -> std::process::Output {
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("image.tar");
     std::fs::write(&archive, empty_image_archive()).unwrap();
@@ -520,6 +529,9 @@ fn run_mounted_binary(elf: &std::path::Path, run_id: &str, json: bool) -> std::p
         &format!("{}:/hello:ro", elf.display()),
         "x86-kvm-hello:latest",
     ]);
+    if !args.is_empty() {
+        command.arg("/hello").args(args);
+    }
     command
         .output()
         .expect("run mounted x86 Linux binary through carrick")
@@ -570,4 +582,99 @@ fn compare_cow_reduction(fixture: &str) {
         report["report"]["execution_witness"]["backend"],
         "kvm-x86-cpl0"
     );
+}
+
+fn compare_shared_scenario(args: &[&str], completion: &str) {
+    if skip_without_kvm() {
+        return;
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let manifest = root.join("fixtures/embed-el1-sched/Cargo.toml");
+    let build = Command::new("cargo")
+        .env(
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS",
+            "-C force-frame-pointers=yes -C relocation-model=static",
+        )
+        .args([
+            "build",
+            "--locked",
+            "--release",
+            "--target",
+            "x86_64-unknown-linux-musl",
+            "--features",
+            "x86-scenarios",
+            "--bin",
+            "el1-sched-x86",
+            "--manifest-path",
+        ])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let elf = root
+        .join("fixtures/embed-el1-sched/target/x86_64-unknown-linux-musl/release/el1-sched-x86");
+    let native = Command::new(&elf)
+        .args(args)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .unwrap();
+    assert_eq!(
+        native.status.code(),
+        Some(0),
+        "native: {} {}",
+        String::from_utf8_lossy(&native.stdout),
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert!(String::from_utf8_lossy(&native.stdout).contains(completion));
+    let run = run_mounted_binary_with_args(&elf, args[0], false, args);
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "KVM {}: stdout={} stderr={}",
+        args[0],
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains(completion));
+}
+#[test]
+fn mounted_static_x86_shared_thread_spawn_slope() {
+    compare_shared_scenario(&["thread-spawn-slope", "8", "2"], "ok=true");
+}
+#[test]
+fn mounted_static_x86_shared_lifecycle_exit_group() {
+    compare_shared_scenario(&["exit-group-storm", "1"], "ok=true");
+}
+#[test]
+fn mounted_static_x86_shared_lifecycle_exec() {
+    compare_shared_scenario(&["exec-storm", "1"], "ok=true");
+}
+#[test]
+fn mounted_static_x86_shared_fork_during_clone() {
+    compare_shared_scenario(&["fork-storm", "1"], "ok=true");
+}
+#[test]
+fn mounted_static_x86_shared_mask_storm() {
+    compare_shared_scenario(&["mask-storm", "32"], "ok=true");
+}
+#[test]
+fn mounted_static_x86_shared_parked_threads() {
+    compare_shared_scenario(&["futex-flood", "32"], "ok=true");
+}
+#[test]
+fn mounted_static_x86_shared_ipc_pipe() {
+    compare_shared_scenario(&["ipc-processes", "pipe", "1", "128"], "completed=128");
+}
+#[test]
+fn mounted_static_x86_shared_ipc_eventfd() {
+    compare_shared_scenario(&["ipc-processes", "eventfd", "1", "128"], "completed=128");
+}
+
+#[test]
+fn mounted_static_x86_musl_tls_startup_dependency() {
+    compare_mounted_assembly_with_native("x86_tls_startup.S", b"T\n");
 }
