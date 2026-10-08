@@ -146,6 +146,7 @@ fn production_x86_family_absences_forward_without_touching_user_memory() {
             None::<dispatch::Zone<'_, NoCpu, sched::HardwareUserWord>>,
             None,
             None,
+            None,
             |_| core::ptr::null_mut(),
         );
         assert_eq!(action, Action::Forward, "{family}");

@@ -329,8 +329,25 @@ fn serve_family<'a, C: EntryContext + 'a>(
                 }
             });
     }
+    let mut returned = None;
     let completion = match family {
-        Family::Anonymous(call) => pending.anonymous(call),
+        Family::Anonymous(call) => {
+            // A native venue can retain a separate operation frame. Transport
+            // its completed result through the same authenticated finish as
+            // lifecycle results; never replay or alter a switched context.
+            let original = pending.original_argument0();
+            let completion = pending.anonymous(call);
+            returned = match completion {
+                FamilyCompletion::Complete(value)
+                | FamilyCompletion::CompleteWithWork(value)
+                | FamilyCompletion::AccountedComplete(value)
+                | FamilyCompletion::CommitOwed(value) => {
+                    Some((SyscallResult::new(value), original))
+                }
+                _ => None,
+            };
+            completion
+        }
         Family::Read => pending.read(),
         Family::Write => pending.write(),
         Family::EpollWait => pending.epoll_wait(),
@@ -343,7 +360,10 @@ fn serve_family<'a, C: EntryContext + 'a>(
         Family::AllocatorControl => pending.allocator_control(),
         Family::Unported => FamilyCompletion::Forward,
     };
-    completion.into()
+    FamilyRun {
+        completion,
+        returned,
+    }
 }
 
 /// Route one AArch64 Linux ordinal. Family implementations are temporary

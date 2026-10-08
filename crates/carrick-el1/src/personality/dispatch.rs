@@ -1209,6 +1209,7 @@ mod tests {
             None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
             None,
             None,
+            None,
             |_| core::ptr::null_mut(),
         );
         assert_eq!(action, Action::Forward);
@@ -1270,7 +1271,7 @@ mod tests {
                     zone: None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
                     ipc: None,
                     lifecycle: Some(&venue),
-                    process: None,
+                    process: None::<&mut dyn carrick_personality_linux::lifecycle::ProcessNative>,
                     source: None,
                     anonymous: None,
                     cache_lookup: |_| core::ptr::null_mut(),
@@ -1446,7 +1447,9 @@ mod tests {
                             }),
                             ipc: None,
                             lifecycle: None,
-                            process: None,
+                            process: None::<
+                                &mut dyn carrick_personality_linux::lifecycle::ProcessNative,
+                            >,
                             source: None,
                             anonymous: None,
                             cache_lookup: |_| core::ptr::null_mut(),
