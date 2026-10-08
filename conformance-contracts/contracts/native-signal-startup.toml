@@ -1,0 +1,26 @@
+schema_version = 1
+id = "kernel.signal.native-startup"
+title = "Native process startup signals retain exact guest ownership"
+guest_surfaces = ["syscall:rt_sigaction", "syscall:rt_sigprocmask", "syscall:sigaltstack", "syscall:tkill", "syscall:tgkill"]
+semantic_authority = [
+  "sigaction(2), sigprocmask(2), sigaltstack(2), tkill(2): actions belong to the sighand, masks and alternate stacks to the thread; signal zero probes identity",
+  "Native Linux executes the same bounded static x86 ELFs, checking exact action fields, masks, stacks, and errno",
+]
+fixture = "carrick-personality-linux::x86_wave2::native_signal_startup_ordinals_have_guest_families; carrick-cli::x86_kvm_run::mounted_static_x86_signal_sigaction_dependency"
+scale_points = [1, 2]
+structural_budgets = []
+rationale = """
+No signal syscall may cross to the carrier host. NativeProcessSignals is the
+single action/inbox owner for an exact TaskKey; copy and lookup work is bounded
+by a fixed 32-byte action and 64 signal numbers, independent of task population.
+Caller thread identity and optional thread-group identity must match the live
+execution incarnation. A foreign target is ESRCH, not a host PID lookup.
+Mask and stack state remain in the existing retained ThreadControlSlot.
+"""
+
+[bindings]
+vm_free = "carrick-personality-linux::x86_wave2::native_signal_startup_ordinals_have_guest_families"
+
+[bindings.unresolved]
+embed_structural = "Required-KVM static dependencies supply hardware evidence; signed ARM verification is director-owned."
+docker = "Native Linux exact-ELF oracle is authorized; Docker is director-owned."

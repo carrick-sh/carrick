@@ -197,3 +197,15 @@ fn x5_linux_clone_exit() {
 fn registered_clear_tid_is_consumed_by_shared_exit() {
     lifecycle::registered_clear_tid_is_consumed_by_shared_exit();
 }
+
+#[test]
+fn native_signal_startup_ordinals_have_guest_families() {
+    use carrick_personality_linux::dispatch::{Family, route_aarch64};
+    for canonical in [134, 135, 132, 130, 131] {
+        assert_ne!(
+            route_aarch64(canonical, u64::MAX),
+            Family::Unported,
+            "canonical {canonical}"
+        );
+    }
+}

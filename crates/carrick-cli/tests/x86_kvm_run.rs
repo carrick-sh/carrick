@@ -832,3 +832,28 @@ fn mounted_static_x86_musl_tls_startup_dependency() {
 fn mounted_static_x86_musl_poll_startup_dependency() {
     compare_mounted_assembly_with_native("x86_poll_startup.S", b"P\n");
 }
+
+#[test]
+fn mounted_static_x86_signal_sigaction_dependency() {
+    compare_mounted_assembly_with_native("x86_signal_sigaction.S", b"S\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_sigprocmask_dependency() {
+    compare_mounted_assembly_with_native("x86_signal_sigprocmask.S", b"S\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_sigaltstack_dependency() {
+    compare_mounted_assembly_with_native("x86_signal_sigaltstack.S", b"S\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_tkill_dependency() {
+    compare_mounted_assembly_with_native("x86_signal_tkill.S", b"S\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_tgkill_dependency() {
+    compare_mounted_assembly_with_native("x86_signal_tgkill.S", b"S\n");
+}
