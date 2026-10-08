@@ -10,7 +10,7 @@ fn x86_process_calls_route_to_neutral_lifecycle_hooks() {
     for (native, expected) in [(61, LifecycleCall::Wait4), (231, LifecycleCall::ExitGroup)] {
         let entry = lookup_x86_64(native).expect("process syscall has a table entry");
         let canonical = match entry.remap {
-            SyscallRemap::Direct(canonical) => canonical,
+            SyscallRemap::Direct(canonical) => canonical.raw(),
             SyscallRemap::Private(canonical) => canonical.raw(),
             _ => panic!("process syscall must have a canonical route"),
         };

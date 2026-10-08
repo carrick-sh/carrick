@@ -278,6 +278,55 @@ fn x86_brk_enters_the_common_linux_anonymous_route() {
 }
 
 #[test]
+fn anonymous_result_is_not_installed_after_execution_changes() {
+    struct InvalidatingAnonymous<'a>(&'a AtomicU64);
+    impl PendingAnonymousVenue for InvalidatingAnonymous<'_> {
+        fn original_argument0(&self) -> u64 {
+            0x7000
+        }
+        fn task_state(&self) -> Option<&carrick_personality_linux::abi::entry::LinuxTaskState> {
+            None
+        }
+        fn delegated(&mut self) -> DelegatedStep {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            DelegatedStep::Served(SyscallResult::new(0x403000))
+        }
+        fn park_prepared(&mut self) -> Option<FamilyCompletion> {
+            None
+        }
+        fn permission(&mut self) -> PermissionStep {
+            PermissionStep::Forward
+        }
+        fn retirement(&mut self) -> RetirementStep {
+            RetirementStep::Forward
+        }
+        fn install_result(&mut self, _: SyscallResult) {
+            panic!("native result must use authenticated common finish")
+        }
+    }
+    let world = World::new(LifecycleHatches::ON);
+    let call =
+        carrick_personality_linux::entry::decode_x86_64(12, [0x7000, 0, 0, 0, 0, 0], 0x7fff0000);
+    let mut anonymous = InvalidatingAnonymous(&world.tasks[0].execution.generation);
+    let (route, result) =
+        serve_full::<carrick_sched_core::ThreadCtx>(&call, &world, &mut anonymous, None, None);
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion
+    );
+    assert_eq!(
+        result, 12,
+        "the completed value must not enter an unauthenticated return frame"
+    );
+    assert_eq!(world.counters.served[214].load(Ordering::Relaxed), 0);
+    assert_eq!(
+        world.counters.forwarded[214].load(Ordering::Relaxed),
+        0,
+        "an effect must not be forwarded for replay"
+    );
+}
+
+#[test]
 fn arm_process_calls_still_forward_without_native_hooks() {
     let world = World::new(LifecycleHatches::ON);
     for number in [94, 260] {
