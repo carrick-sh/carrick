@@ -292,14 +292,6 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         node.next_free
             .store(LIVE | generation.get(), Ordering::Release);
         self.set_prepared_live_head(id);
-        #[cfg(target_os = "macos")]
-        carrick_observability::probes::hvpatch_n1_reservation_custody(
-            5,
-            self.mm.raw(),
-            self.incarnation().raw(),
-            u64::from(id),
-            u64::from(tail),
-        );
         Ok(PortalPreparedPermit {
             index: id,
             generation,
