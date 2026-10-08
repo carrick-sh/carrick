@@ -1843,16 +1843,17 @@ mod tests {
             let source = BornInZoneSource { zone: &zone, slot };
             assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
             page.release_live(1).unwrap(); // fixture settles its bootstrap census
-            let runtime = NativeProcessRuntime::admit_fresh_root(
-                source,
-                &task,
-                &page,
-                &control,
-                address,
-                address,
-                words(address),
-            )
-            .unwrap();
+            let runtime =
+                NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                    source,
+                    &task,
+                    &page,
+                    &control,
+                    address,
+                    address,
+                    words(address),
+                )
+                .unwrap();
             assert_eq!(page.live(), 1);
             let mut service = Physical {
                 zone: &zone,
