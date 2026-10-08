@@ -270,6 +270,8 @@ fn mounted_static_x86_two_live_mms_have_private_anonymous_leaves() {
         .as_array()
         .expect("live-authenticated per-MM PRIVATE witnesses");
     assert_eq!(owners.len(), 2);
+    assert!(owners.iter().any(|owner| owner["cpu_mask"] == 1));
+    assert!(owners.iter().any(|owner| owner["cpu_mask"] == 2));
     assert_ne!(owners[0]["mm"], owners[1]["mm"]);
     assert_ne!(owners[0]["root"], owners[1]["root"]);
     for owner in owners {

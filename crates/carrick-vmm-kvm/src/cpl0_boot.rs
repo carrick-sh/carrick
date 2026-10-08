@@ -1003,6 +1003,7 @@ pub(crate) struct Cpl0HostCustody {
     object_ids: Arc<ObjectIdRegistry>,
     pub(crate) private_anonymous_witness: crate::cpl0_private_witness::PrivateAnonymousWitness,
     actual_run: Arc<[AtomicU32; 2]>,
+    kernel_pod_storage: Vec<anonymous_owner::KernelPodStorage>,
     initial_inventory: Option<InitialInventory>,
     peer_entry: Option<carrick_guest_arch::KernelVa>,
     grant_tables: Vec<RootGpa>,
@@ -2385,6 +2386,7 @@ impl Cpl0Carrier {
             WindowKind::Private,
         )
         .map_err(|e| fail(e.to_string()))?;
+        let kernel_pod_storage = anonymous_owner::retained_kernel_pod_storage(&plan.segments);
         let mut maps = Vec::new();
         for segment in &plan.segments {
             let end = segment
@@ -2981,6 +2983,7 @@ impl Cpl0Carrier {
                 object_ids,
                 private_anonymous_witness: Default::default(),
                 actual_run: Arc::new(std::array::from_fn(|_| AtomicU32::new(0))),
+                kernel_pod_storage,
                 initial_inventory: None,
                 peer_entry: None,
                 grant_tables: Vec::new(),
