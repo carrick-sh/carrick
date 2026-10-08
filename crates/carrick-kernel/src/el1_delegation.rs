@@ -1773,6 +1773,14 @@ pub(crate) fn owner_prepare_refusal_after(
         MemoryPrepareError::Fault(_) => {
             crate::dispatch::DispatchOutcome::errno(carrick_abi::LINUX_EFAULT)
         }
+        MemoryPrepareError::Retired(_) if committed > 0 => {
+            crate::dispatch::DispatchOutcome::Returned {
+                value: committed as i64,
+            }
+        }
+        MemoryPrepareError::Retired(_) => {
+            crate::dispatch::DispatchOutcome::errno(carrick_abi::LINUX_EFAULT)
+        }
         MemoryPrepareError::Limit(limit) => carrick_fatal!(
             "el1_delegation",
             "bounded owner copyout exceeded permit: {limit:?}"
