@@ -5,7 +5,7 @@ extern crate alloc;
 use super::{
     native_process_custody::{ProcessResources, ProcessWake, RetainedProcessCustody},
     native_process_entry::{self, ForkTryError, PreparedFork, WaitWork},
-    native_process_signals::{NativeExitSignals, NativeProcessSignals},
+    native_process_signals::{NativeExitSignals, NativeProcessSignals, NativeSignalError},
     process_owner::*,
 };
 use crate::lock::SpinLock;
@@ -1178,7 +1178,7 @@ impl<'a, M: Clone, S: NativeProcessService<'a, Mm = M>> ProcessNative<ParkedCont
         &mut self,
         request: carrick_personality_linux::signal_syscalls::ThreadSignalRequest,
     ) -> Option<LifecycleOutcome> {
-        use carrick_signal_core::policy::{Delivery, Disposition, default_delivery};
+        use carrick_signal_core::{SignalSet, policy::SigBlockMask};
         let (pid, tid, signals, mask) = {
             let graph = self.runtime.graph.lock();
             let row = match graph.owner.task(self.key) {
@@ -1199,27 +1199,66 @@ impl<'a, M: Clone, S: NativeProcessService<'a, Mm = M>> ProcessNative<ParkedCont
         let Some(signal) = request.signal() else {
             return Some(returned(0));
         };
-        let delivery = match signals.action(signal).disposition {
-            Disposition::Ignore => Delivery::Ignore,
-            Disposition::Default => default_delivery(signal),
-            Disposition::Handler(_) => return Some(returned(-95)),
-        };
-        match delivery {
-            Delivery::Ignore | Delivery::Continue => Some(returned(0)),
-            Delivery::Terminate { core_dump } if mask.0 & signal.bit() == 0 => {
-                // No host process signal: shared retirement publishes Linux wait status.
-                let wait = LinuxWaitStatus::from_wait_encoding(
-                    signal.number() | if core_dump { 128 } else { 0 },
-                );
-                Some(match self.exit_wait_status(wait) {
-                    Ok(outcome) => outcome,
-                    Err(error) => self.fail(error),
-                })
-            }
-            // Native handler-frame delivery and job-control transitions are not
-            // installed in this lane. Refuse explicitly rather than lose a signal.
-            _ => Some(returned(-95)),
+        let mask = SigBlockMask::blocking_all_of(SignalSet::from_bits(mask.0));
+        if let Err(error) = signals.queue_self(self.key, signal, mask) {
+            return Some(returned(match error {
+                NativeSignalError::Stale => -3,
+                NativeSignalError::Unsupported => -95,
+            }));
         }
+        self.resume_signals()
+    }
+    fn resume_signals(&mut self) -> Option<LifecycleOutcome> {
+        use carrick_signal_core::{
+            SignalSet,
+            policy::{Delivery, SigBlockMask},
+        };
+        let (signals, mask) = {
+            let graph = self.runtime.graph.lock();
+            let row = match graph.owner.task(self.key) {
+                Ok(row) => row,
+                Err(_) => return Some(returned(-3)),
+            };
+            let resources = row.native().resources();
+            (
+                resources.signals.clone(),
+                SigBlockMask::blocking_all_of(SignalSet::from_bits(resources.control.blocked().0)),
+            )
+        };
+        // At most 64 signal keys; default-ignored standard signals coalesce.
+        // Fatal delivery ends this turn, unsupported delivery retains its entry.
+        for _ in 0..64 {
+            let (signal, delivery) = match signals.take_self(self.key, mask) {
+                Ok(Some(delivery)) => delivery,
+                Ok(None) => return Some(returned(0)),
+                Err(error) => {
+                    return Some(returned(match error {
+                        NativeSignalError::Stale => -3,
+                        NativeSignalError::Unsupported => -95,
+                    }));
+                }
+            };
+            match delivery {
+                Delivery::Ignore | Delivery::Continue => {}
+                Delivery::Terminate { core_dump } => {
+                    let status = LinuxWaitStatus::from_wait_encoding(
+                        signal.number() | if core_dump { 128 } else { 0 },
+                    );
+                    return Some(match self.exit_wait_status(status) {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            // Failed retirement must not consume an admitted signal.
+                            if signals.enqueue(self.key, signal, None).is_err() {
+                                return Some(self.fail(NativeProcessError::Stale));
+                            }
+                            self.fail(error)
+                        }
+                    });
+                }
+                _ => return Some(returned(-95)),
+            }
+        }
+        Some(returned(0))
     }
     fn binding(&self) -> ExecutionBinding {
         self.binding
@@ -1376,13 +1415,17 @@ mod tests {
     }
     #[test]
     fn actual_compact_root_can_exit_before_its_first_park() {
-        exercise_root_exit(false);
+        exercise_root_exit(false, false);
     }
     #[test]
     fn actual_compact_root_owns_actions_and_self_signal_termination() {
-        exercise_root_exit(true);
+        exercise_root_exit(true, false);
     }
-    fn exercise_root_exit(signaled: bool) {
+    #[test]
+    fn actual_compact_root_delivers_queued_self_signal_after_mask_restore() {
+        exercise_root_exit(true, true);
+    }
+    fn exercise_root_exit(signaled: bool, blocked: bool) {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
         let zone = unsafe {
@@ -1490,16 +1533,29 @@ mod tests {
                 };
                 assert_eq!(result.raw(), expected);
             }
-            entry
-                .thread_signal(
-                    carrick_personality_linux::signal_syscalls::ThreadSignalRequest::decode(
-                        Some(41),
-                        41,
-                        6,
-                    )
-                    .unwrap(),
-                )
-                .unwrap()
+            let request = carrick_personality_linux::signal_syscalls::ThreadSignalRequest::decode(
+                Some(41),
+                41,
+                6,
+            )
+            .unwrap();
+            if blocked {
+                use carrick_personality_linux::abi::thread::BlockedMask;
+                let _ = control.store_blocked_then_read_pending(BlockedMask(32), control.pending());
+                let LifecycleOutcome::Returned { result, work } =
+                    entry.thread_signal(request).unwrap()
+                else {
+                    panic!("blocked signal retired");
+                };
+                assert_eq!(result.raw(), 0);
+                assert!(!work);
+                assert_eq!(page.live(), 1);
+                assert!(entry.take_root_exit().is_none());
+                let _ = control.store_blocked_then_read_pending(BlockedMask(0), control.pending());
+                entry.resume_signals().unwrap()
+            } else {
+                entry.thread_signal(request).unwrap()
+            }
         } else {
             entry.exit_group(9)
         };

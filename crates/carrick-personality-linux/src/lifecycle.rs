@@ -88,6 +88,9 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     ) -> Option<Result<carrick_signal_core::policy::Action, SyscallResult>> {
         None
     }
+    fn resume_signals(&mut self) -> Option<LifecycleOutcome> {
+        None
+    }
     fn thread_signal(
         &mut self,
         _request: crate::signal_syscalls::ThreadSignalRequest,
@@ -138,6 +141,9 @@ pub trait LifecycleNative<'a>: UserCopy {
         _signal: carrick_signal_core::policy::Signal,
         _replacement: Option<carrick_signal_core::policy::Action>,
     ) -> Option<Result<carrick_signal_core::policy::Action, SyscallResult>> {
+        None
+    }
+    fn resume_signals(&mut self) -> Option<LifecycleOutcome> {
         None
     }
     fn thread_signal(
@@ -383,6 +389,9 @@ pub fn invoke<'a>(
         }
         LifecycleCall::SigProcMask => {
             let work = serve_sigprocmask(args, thread, native)?;
+            if let Some(outcome) = native.resume_signals() {
+                return Some(outcome);
+            }
             Some(returned(SyscallResult::new(0), work))
         }
         LifecycleCall::SigAltStack => {
