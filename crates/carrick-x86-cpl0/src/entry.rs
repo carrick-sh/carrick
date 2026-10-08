@@ -386,6 +386,9 @@ mod user_fault_gate {
 
 #[cfg(target_os = "none")]
 mod kernel {
+    pub(super) fn irq_cpu_charge() -> impl Drop {
+        native_execution::KernelCharge::enter()
+    }
     mod initial_boot {
         include!("initial_boot.rs");
     }
@@ -412,6 +415,7 @@ mod kernel {
     /// One physical grant crossing for hardware faults and kernel user copies.
     /// RDI names the selected user page independently of the last hardware CR2.
     fn cross_owner_grant(cpu: carrick_guest_arch::CpuId, address: UserVa) {
+        let _charge = native_execution::CrossingCharge::pause();
         // SAFETY: this CPU owns the retained selection/completion slot. The
         // host authenticates CPU, MM, root and selected address before lending.
         unsafe {
@@ -577,6 +581,7 @@ mod kernel {
                 &*(binding.counters_address as *const Counters),
             )
         };
+        let _charge = native_execution::KernelCharge::enter();
         let Some(slot) = checked_scheduler_slot(carrick_guest_arch::CpuId::new(binding.cpu_slot))
         else {
             return 5;
@@ -848,6 +853,7 @@ mod kernel {
     }
 
     fn doorbell(port: u16, frame: &mut NativeFrame) {
+        let _charge = native_execution::CrossingCharge::pause();
         write_port(port, frame, admit_exit());
     }
 
@@ -1302,6 +1308,7 @@ mod kernel {
                     halt();
                 }
             }
+            if frame.rdx == 1 { native_execution::initial_resume(); }
             frame.rcx = loaded.context.frame[15];
             frame.rsp = loaded.context.frame[18];
             frame.r11 = loaded.context.frame[17];
@@ -2033,6 +2040,7 @@ mod kernel {
                 let words = native_execution::capture(frame, _early_xstate);
                 native_process::admit_root(words, source, task)
                     .unwrap_or_else(|_| initial_boot::fatal_boot());
+                native_execution::kernel_entry(task);
                 let mut service = native_process::Service::new(task, slot);
                 let route = {
                     let mut process = native_process::runtime().enter(source, task, words, &mut service)
@@ -2112,6 +2120,7 @@ mod kernel {
             doorbell(FATAL_PORT, frame);
             halt();
         }
+        native_execution::user_return();
     }
 
     pub fn halt() -> ! {

@@ -586,6 +586,19 @@ acceptance remains open.
 `kernel.process.wait-owner` covers selection and consumption of a process's
 children by wait4/waitid. Linux authority is wait(2)'s clone-child partition,
 WNOWAIT observation, and consuming reap; wait4(2) supplies subtree CPU charging.
+Native wait4 copies the owner's own-plus-reaped-descendant CPU totals into
+normalized 64-bit timevals before consuming a zombie. Rusage copy precedes
+status copy: an unwritable rusage leaves status and the child claim intact.
+Untracked resource counters remain zero; Linux's supported counters such as
+maxrss are not claimed implemented. Task-owned calibrated clock slices charge
+user/kernel execution separately and exclude parked time and physical host
+custody crossings. Each slice performs constant arithmetic without scanning
+other tasks. The shared accounting hooks are bound in CPL0; ARM binding remains
+future work. VM-free bindings are `process::cpu_accounting`, the native runtime
+fork/wait test, and the personality's owned rusage encoder. Live KVM bindings
+are the normalized-output, unwritable-output and CPU-burning-child cases in
+`cpl0_fork_e2e`; the burn case also bounds charged time by elapsed calibrated
+TSC time. Native Linux oracle receipt: `/tmp/x86-wait4-rusage-oracle.log`.
 The shared registry must authenticate exact task serials, preserve live and
 retiring children in a blocking wait, and sample the parent's wake generation
 in the scan that found no event. Revision or topology admission failure must

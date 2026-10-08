@@ -71,6 +71,7 @@ core::arch::global_asm!(
 
 #[unsafe(no_mangle)]
 extern "C" fn carrick_x86_receive_irq(vector: u32, frame: *const InterruptFrame) {
+    let _charge = crate::kernel::irq_cpu_charge();
     // SAFETY: the IRQ assembly passes its own complete saved register frame;
     // a user-origin frame includes the five IRET words validated below.
     let frame = unsafe { &*frame };

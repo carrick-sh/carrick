@@ -19,6 +19,7 @@ use carrick_personality_linux::{
     abi::entry::SyscallResult,
     lifecycle::{LifecycleOutcome, LinuxWaitOptions, ProcessNative, ProcessWaitPid},
 };
+use carrick_sched_core::process::cpu_accounting::{CpuMode, CpuSample, TaskCpuAccounting};
 use carrick_sched_core::process::{
     ChildExitSignal, LinuxWaitStatus, TaskId, TaskIdentity, TaskKey, TaskRusage, TaskSerial,
     WaitChildClass, WaitTarget,
@@ -100,11 +101,21 @@ pub trait NativeProcessService<'a> {
         prepared: Self::PreparedMm,
     ) -> Result<(), (NativeProcessError, Self::PreparedMm)>;
     fn settle_mm(&mut self, born: Self::Born) -> Result<(), (NativeProcessError, Self::Born)>;
+    /// Guest monotonic clock sample; VM-free services need no physical clock.
+    fn cpu_sample(&self) -> Option<CpuSample> {
+        None
+    }
     fn copy_status(
         &mut self,
         parent: &Self::Mm,
         address: UserVa,
         status: LinuxWaitStatus,
+    ) -> Result<(), NativeProcessError>;
+    fn copy_rusage(
+        &mut self,
+        parent: &Self::Mm,
+        address: UserVa,
+        usage: TaskRusage,
     ) -> Result<(), NativeProcessError>;
     fn quarantine_prepared(&mut self, prepared: Self::PreparedMm);
     /// Preserve both guest admission and MM preparation if rollback refuses.
@@ -155,7 +166,7 @@ pub struct NativeResources<'a, M> {
     signals: NativeProcessSignals<()>,
     _thread_claim: NativeClaim,
     channel: Option<Arc<WaitChannel>>,
-    usage: TaskRusage,
+    cpu: TaskCpuAccounting,
 }
 pub type NativeForkPreparation<'a, M, P> =
     PreparedFork<(), (), RetainedProcessCustody<NativeResources<'a, M>>, P>;
@@ -186,7 +197,7 @@ impl<'a, M: Clone> ProcessResources for NativeResources<'a, M> {
         self.signals.autoreaps_children()
     }
     fn own_rusage(&self) -> TaskRusage {
-        self.usage
+        self.cpu.usage()
     }
 }
 type Custody<'a, M> = RetainedProcessCustody<NativeResources<'a, M>>;
@@ -195,6 +206,7 @@ struct PendingWait {
     caller: TaskKey,
     query: WaitQuery,
     status: UserVa,
+    rusage: UserVa,
     precheck: WaitPrecheck,
     channel: Arc<WaitChannel>,
 }
@@ -361,7 +373,7 @@ impl<'a, M: Clone> NativeProcessRuntime<'a, M> {
             signals: NativeProcessSignals::fresh_root(key),
             _thread_claim: thread_claim,
             channel: None,
-            usage: TaskRusage::default(),
+            cpu: TaskCpuAccounting::default(),
         };
         let mut owner = Owner::new();
         owner
@@ -446,6 +458,40 @@ impl<'a, M: Clone> NativeProcessRuntime<'a, M> {
             handoff: None,
             root_exit: None,
         })
+    }
+    pub fn resume_cpu(
+        &self,
+        key: TaskKey,
+        sample: CpuSample,
+        mode: CpuMode,
+    ) -> Result<(), NativeProcessError> {
+        self.graph
+            .lock()
+            .owner
+            .task_mut(key)
+            .map_err(|_| NativeProcessError::Stale)?
+            .native_mut()
+            .resources_mut()
+            .cpu
+            .resume(sample, mode)
+            .map_err(|_| NativeProcessError::Invalid)
+    }
+    pub fn stop_cpu(
+        &self,
+        key: TaskKey,
+        sample: CpuSample,
+    ) -> Result<Option<CpuMode>, NativeProcessError> {
+        let mut graph = self.graph.lock();
+        // A final exit has already charged and removed this exact incarnation.
+        let Ok(row) = graph.owner.task_mut(key) else {
+            return Ok(None);
+        };
+        let cpu = &mut row.native_mut().resources_mut().cpu;
+        let Some(mode) = cpu.running_mode() else {
+            return Ok(None);
+        };
+        cpu.stop(sample).map_err(|_| NativeProcessError::Invalid)?;
+        Ok(Some(mode))
     }
     pub fn namespace_child_key(&self, caller: TaskKey, visible: u32) -> Option<TaskKey> {
         self.graph
@@ -544,10 +590,17 @@ impl<'a, M: Clone, S: NativeProcessService<'a, Mm = M>> NativeProcessEntry<'_, '
             job_control: WaitJobControl::NONE,
         })
     }
+    fn pause_cpu(&self) -> Result<(), NativeProcessError> {
+        if let Some(sample) = self.service.cpu_sample() {
+            self.runtime.stop_cpu(self.key, sample)?;
+        }
+        Ok(())
+    }
     fn wait_query(
         &mut self,
         query: WaitQuery,
         status: UserVa,
+        rusage: UserVa,
         nohang: bool,
     ) -> Result<LifecycleOutcome, NativeProcessError> {
         loop {
@@ -572,6 +625,15 @@ impl<'a, M: Clone, S: NativeProcessService<'a, Mm = M>> NativeProcessEntry<'_, '
             match selection {
                 WaitWork::Status(copy) => {
                     let copied = copy.copy_with(|zombie| {
+                        // Both typed copies precede zombie consumption. Prepare
+                        // rusage first so its EFAULT leaves status untouched.
+                        if rusage.raw() != 0 {
+                            self.service.copy_rusage(
+                                &mm,
+                                rusage,
+                                zombie.total_charge_to_reaper(),
+                            )?;
+                        }
                         if status.raw() == 0 {
                             Ok(())
                         } else {
@@ -599,6 +661,7 @@ impl<'a, M: Clone, S: NativeProcessService<'a, Mm = M>> NativeProcessEntry<'_, '
                     if nohang {
                         return Ok(returned(0));
                     }
+                    self.pause_cpu()?;
                     let zone = self.source.zone;
                     let record = zone
                         .slot(self.source.slot)
@@ -641,6 +704,7 @@ impl<'a, M: Clone, S: NativeProcessService<'a, Mm = M>> NativeProcessEntry<'_, '
                             caller: self.key,
                             query,
                             status,
+                            rusage,
                             precheck,
                             channel,
                         },
@@ -676,7 +740,7 @@ impl<'a, M: Clone, S: NativeProcessService<'a, Mm = M>> NativeProcessEntry<'_, '
             return Some(self.fail(NativeProcessError::Stale));
         }
         Some(
-            match self.wait_query(pending.query, pending.status, false) {
+            match self.wait_query(pending.query, pending.status, pending.rusage, false) {
                 Ok(outcome) => outcome,
                 Err(error) => self.fail(error),
             },
@@ -714,6 +778,7 @@ impl<'a, M: Clone, S: NativeProcessService<'a, Mm = M>> NativeProcessEntry<'_, '
         Ok(())
     }
     fn exit_owned(&mut self, status: u8) -> Result<LifecycleOutcome, NativeProcessError> {
+        self.pause_cpu()?;
         let root_exit = self.is_root_process();
         let wait_status = LinuxWaitStatus::from_wait_encoding(i32::from(status) << 8);
         let (page, control) = {
@@ -1066,7 +1131,7 @@ impl<'a, M: Clone, S: NativeProcessService<'a, Mm = M>> NativeProcessEntry<'_, '
             signals,
             _thread_claim: thread_claim,
             channel: None,
-            usage: TaskRusage::default(),
+            cpu: TaskCpuAccounting::default(),
         };
         let child = GuestTask::new(
             GuestTaskMetadata {
@@ -1168,14 +1233,16 @@ impl<'a, M: Clone, S: NativeProcessService<'a, Mm = M>> ProcessNative<ParkedCont
         _options: LinuxWaitOptions,
         _rusage: UserVa,
     ) -> LifecycleOutcome {
-        if _rusage.raw() != 0 {
-            return self.fail(NativeProcessError::Unsupported);
-        }
         let query = match self.query(_pid, _options) {
             Ok(query) => query,
             Err(error) => return self.fail(error),
         };
-        match self.wait_query(query, _status, _options.contains(LinuxWaitOptions::WNOHANG)) {
+        match self.wait_query(
+            query,
+            _status,
+            _rusage,
+            _options.contains(LinuxWaitOptions::WNOHANG),
+        ) {
             Ok(outcome) => outcome,
             Err(error) => self.fail(error),
         }
@@ -1198,6 +1265,7 @@ mod tests {
         page: &'a ThreadLifecyclePage,
         controls: &'a [ThreadControlSlot],
         copies: Vec<LinuxWaitStatus>,
+        usage_copies: Vec<TaskRusage>,
         refuse_copy: bool,
     }
     impl<'a> NativeProcessService<'a> for Physical<'a> {
@@ -1264,6 +1332,18 @@ mod tests {
                 return Err(NativeProcessError::Fault);
             };
             self.copies.push(status);
+            Ok(())
+        }
+        fn copy_rusage(
+            &mut self,
+            _: &Self::Mm,
+            _: UserVa,
+            usage: TaskRusage,
+        ) -> Result<(), NativeProcessError> {
+            if self.refuse_copy {
+                return Err(NativeProcessError::Fault);
+            }
+            self.usage_copies.push(usage);
             Ok(())
         }
         fn quarantine_prepared(&mut self, _: Self::PreparedMm) {
@@ -1367,6 +1447,7 @@ mod tests {
             page: &child_page,
             controls: &*child_controls,
             copies: Vec::new(),
+            usage_copies: Vec::new(),
             refuse_copy: false,
         };
         assert!(zone.slot(slot).current().is_none());
@@ -1457,6 +1538,7 @@ mod tests {
             page: &child_page,
             controls: &*child_controls,
             copies: Vec::new(),
+            usage_copies: Vec::new(),
             refuse_copy: false,
         };
         let parent = TaskKey {
@@ -1522,6 +1604,20 @@ mod tests {
             .store(child_identity.serial, Ordering::Release);
         task.publish_visible_pid(42);
         task.publish_lifecycle(child_identity.lifecycle_page, child_identity.control_slot);
+        let sample = |tick| CpuSample {
+            tick: carrick_guest_arch::CounterTick::new(tick),
+            frequency: carrick_guest_arch::CounterFrequency::new(
+                NonZeroU64::new(1_000_000).unwrap(),
+            ),
+        };
+        runtime
+            .resume_cpu(child, sample(10), CpuMode::User)
+            .unwrap();
+        runtime.stop_cpu(child, sample(17)).unwrap();
+        runtime
+            .resume_cpu(child, sample(10_000), CpuMode::System)
+            .unwrap();
+        runtime.stop_cpu(child, sample(10_003)).unwrap();
         {
             let mut child_entry = runtime
                 .enter(source, &task, child_words, &mut service)
@@ -1573,7 +1669,6 @@ mod tests {
             assert_eq!(result.raw(), NativeProcessError::Fault.errno());
             assert!(runtime.namespace_child_key(parent, 42).is_some());
         }
-        service.refuse_copy = false;
         let mut parent_entry = runtime
             .enter(source, &task, words(address), &mut service)
             .unwrap();
@@ -1583,19 +1678,27 @@ mod tests {
             LinuxWaitOptions::empty(),
             UserVa::new(0x9000),
         ) else {
-            panic!("rusage refusal")
+            panic!("rusage copy refusal")
         };
-        assert_eq!(result.raw(), NativeProcessError::Unsupported.errno());
+        assert_eq!(result.raw(), NativeProcessError::Fault.errno());
         assert!(runtime.namespace_child_key(parent, 42).is_some());
+        parent_entry.service.refuse_copy = false;
         let LifecycleOutcome::Returned { result, .. } = parent_entry.wait4(
             ProcessWaitPid::from_syscall_argument(42),
             UserVa::new(0x8000),
             LinuxWaitOptions::empty(),
-            UserVa::new(0),
+            UserVa::new(0x9000),
         ) else {
             panic!("reap return")
         };
         assert_eq!(result.raw(), 42);
+        assert_eq!(
+            parent_entry.service.usage_copies,
+            [TaskRusage {
+                user_time: core::time::Duration::from_micros(7),
+                system_time: core::time::Duration::from_micros(3),
+            }]
+        );
         assert!(runtime.namespace_child_key(parent, 42).is_none());
         assert!(parent_entry.take_root_exit().is_none());
         assert!(matches!(
