@@ -69,7 +69,7 @@ pub(super) fn admit_root(
         }
         _ => return Err(NativeProcessError::Invalid),
     }
-    let owner = NativeProcessRuntime::admit_fresh_root(
+    let owner = NativeProcessRuntime::admit_fresh_root::<X86Mmu>(
         source, task, page, control, address, address, words,
     )?;
     *retained = Some(Box::leak(Box::new(owner)));
