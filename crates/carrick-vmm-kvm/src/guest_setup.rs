@@ -338,7 +338,7 @@ pub struct GuestRam {
     protections: Arc<MemoryProtections>,
     /// Whether this `GuestRam` OWNS its window mmaps (and must `munmap` them on
     /// drop). `true` for the initial / fork-child / execve RAM. `false` for a
-    /// `clone(CLONE_THREAD)` sibling's view (see [`Self::from_shared_windows`]):
+    /// `clone(CLONE_THREAD)` sibling's view (see `Self::from_shared_windows`):
     /// a sibling shares the SAME host mmaps as the parent thread (threads share
     /// the address space, no fork), so it must NEVER `munmap` them — the parent
     /// engine owns them and frees them at process exit. Double-`munmap` (or a
@@ -885,7 +885,7 @@ impl GuestRam {
 
     /// Iterate every window as `(base, host, len)` for `KVM_SET_USER_MEMORY_REGION`
     /// registration, in slot order. Used by both bring-up and execve to publish
-    /// the windows onto a (fresh or live) VM via [`KvmVm::map_memory`].
+    /// the windows onto a (fresh or live) VM via `KvmVm::map_memory`.
     pub(crate) fn windows_for_kvm(&self) -> Vec<(u64, *mut u8, usize)> {
         // An alias window registers its KVM slot at `slot_gpa` (a low identity
         // hole), NOT `base` (its high guest VA); an ordinary window has base==gpa.
