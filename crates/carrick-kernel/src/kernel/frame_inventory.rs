@@ -597,6 +597,24 @@ impl FrameInventoryAuthority {
         Ok((outcome, next_revision, mm_empty_at_revision))
     }
 
+    /// One published row of the exact MM, read under its inventory owner lock.
+    pub fn live_mapping_row(&self, mm: MmId, mapping: MappingId) -> Option<MappingRow> {
+        let state = self.state.lock();
+        let entry = state
+            .mappings
+            .get(&mapping)
+            .filter(|entry| entry.mm == mm && entry.state == MappingState::Published)?;
+        Some(MappingRow {
+            mapping,
+            frame: entry.frame,
+            mm: entry.mm,
+            generation: entry.generation,
+            gpa: entry.gpa,
+            length: entry.length,
+            permissions: entry.permissions,
+        })
+    }
+
     pub fn snapshot(&self) -> FrameInventorySnapshot {
         snapshot_state(&self.state.lock(), None)
     }
@@ -1448,6 +1466,55 @@ mod tests {
                 generation: generation(1),
             })
             .expect("publish");
+    }
+
+    #[test]
+    fn live_mapping_point_row_refuses_foreign_mm_and_preserves_current_protection() {
+        let fixture = Fixture::new();
+        let mut selected = None;
+        let publish = fixture.batch(2, |transaction, reservation| {
+            let frame = reservation.claim_frame().unwrap();
+            let mapping = reservation.claim_mapping().unwrap();
+            selected = Some((frame, mapping));
+            prepare_publish(reservation, transaction, frame, mapping, 0x4000, 4096);
+        });
+        fixture.authority.apply(fixture.mm1, publish).unwrap();
+        let (frame, mapping) = selected.unwrap();
+        let row = fixture
+            .authority
+            .live_mapping_row(fixture.mm1, mapping)
+            .unwrap();
+        assert_eq!(row.frame, frame);
+        assert_eq!(row.permissions, perms(true));
+        assert!(
+            fixture
+                .authority
+                .live_mapping_row(fixture.mm2, mapping)
+                .is_none()
+        );
+        assert!(
+            fixture
+                .authority
+                .live_mapping_row(fixture.mm1, fixture.ids.mapping_id().unwrap())
+                .is_none()
+        );
+        let protect = fixture.batch(1, |transaction, reservation| {
+            reservation
+                .push(FrameInventoryEvent::ProtectMapping {
+                    transaction,
+                    mapping,
+                    generation: generation(2),
+                    permissions: perms(false),
+                })
+                .unwrap();
+        });
+        fixture.authority.apply(fixture.mm1, protect).unwrap();
+        let row = fixture
+            .authority
+            .live_mapping_row(fixture.mm1, mapping)
+            .unwrap();
+        assert_eq!(row.permissions, perms(false));
+        assert_eq!(row.generation, generation(2));
     }
 
     #[test]

@@ -307,10 +307,13 @@ pub fn retire_current<C: EntryContext>(
     record: carrick_sched_core::RecordId,
     spins: u32,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
-    if source.zone.slot(source.slot).current() != Some(record) {
-        return None;
-    }
     let start = prepare_handoff(binding, source, record)?;
+    if source.zone.slot(source.slot).current().is_none() {
+        return source
+            .zone
+            .release_host_home(source.slot, record)
+            .then(|| start.published());
+    }
     if source
         .zone
         .release_current(source.slot, record, &carrick_sched_core::BoundedSpin(spins))

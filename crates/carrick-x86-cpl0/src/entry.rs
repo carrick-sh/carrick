@@ -58,6 +58,7 @@ core::arch::global_asm!(
     ".long {version}",
     ".long 0",
     ".quad carrick_x86_initial_boot",
+    ".quad carrick_x86_peer_boot",
     version = const carrick_el1_abi::X86_INITIAL_BOOT_VERSION,
 );
 
@@ -373,10 +374,16 @@ mod kernel {
     mod anonymous {
         include!("anonymous.rs");
     }
+    mod native_process {
+        include!("native_process.rs");
+    }
+    mod native_execution {
+        include!("native_execution.rs");
+    }
     use super::adapter::*;
     use carrick_el1::lock::SpinLock;
     use carrick_el1::personality::common_entry::{
-        EntryOutcome, serve_canonical, serve_canonical_with_anonymous,
+        EntryOutcome, serve_canonical, serve_canonical_with_native,
     };
     use carrick_el1::personality::thread_setup::GuestLifecycleVenue;
     use carrick_el1_abi::{Counters, CurrentTask};
@@ -1864,6 +1871,7 @@ mod kernel {
             }
         });
         if !handled_by_fixture {
+            let mut root_exit = None;
             let outcome = if crate::fixture_image() {
                 serve_canonical(
                     &call,
@@ -1875,20 +1883,61 @@ mod kernel {
             } else {
                 let mut anonymous =
                     anonymous::X86AnonymousVenue::new(&call, task, binding.cpu_slot, frame.rcx);
-                serve_canonical_with_anonymous(
-                    &call,
-                    counters,
-                    task,
-                    &GuestLifecycleVenue,
-                    Some(&binding.publications),
-                    &mut anonymous,
-                )
+                let slot = checked_scheduler_slot(carrick_guest_arch::CpuId::new(binding.cpu_slot))
+                    .unwrap_or_else(|| initial_boot::fatal_boot());
+                let source = native_execution::source(slot);
+                let words = native_execution::capture(frame, _early_xstate);
+                native_process::admit_root(words, source, task)
+                    .unwrap_or_else(|_| initial_boot::fatal_boot());
+                let mut service = native_process::Service::new(task, slot);
+                let outcome = {
+                    let mut process = native_process::runtime()
+                        .enter(source, task, words, &mut service)
+                        .unwrap_or_else(|_| initial_boot::fatal_boot());
+                    let outcome = serve_canonical_with_native(
+                        &call,
+                        counters,
+                        task,
+                        &GuestLifecycleVenue,
+                        Some(&binding.publications),
+                        &mut anonymous,
+                        &mut process,
+                        source,
+                    );
+                    root_exit = process.take_root_exit();
+                    outcome
+                };
+                native_execution::migrate(slot);
+                outcome
             };
             match outcome {
                 EntryOutcome::Served { result } | EntryOutcome::ServedWithWork { result } => {
                     frame.rax = result.raw() as u64;
                 }
-                EntryOutcome::InvalidCompletion | EntryOutcome::Suspended => {
+                EntryOutcome::Suspended => {
+                    drop(_user_fault_gate);
+                    if let Some(status) = root_exit {
+                        let exit = carrick_el1_abi::X86NativeRootExit::new(
+                            carrick_el1::personality::common_entry::execution_binding(task),
+                            status,
+                        )
+                        .unwrap_or_else(|| initial_boot::fatal_boot());
+                        // SAFETY: authenticated shared retirement completed;
+                        // this is an opaque physical VM completion crossing.
+                        unsafe {
+                            core::arch::asm!("out dx, al",
+                            in("dx") carrick_el1_abi::X86_NATIVE_ROOT_EXIT_PORT,
+                            in("rax") &exit as *const _ as u64,
+                            options(nostack, preserves_flags));
+                        }
+                        halt();
+                    }
+                    let slot =
+                        checked_scheduler_slot(carrick_guest_arch::CpuId::new(binding.cpu_slot))
+                            .unwrap_or_else(|| initial_boot::fatal_boot());
+                    native_execution::schedule(slot);
+                }
+                EntryOutcome::InvalidCompletion => {
                     doorbell(FATAL_PORT, frame);
                     halt();
                 }

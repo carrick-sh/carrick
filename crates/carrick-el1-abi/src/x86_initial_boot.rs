@@ -3,7 +3,7 @@
 //! supervisor direct alias. No host pointer crosses this record.
 
 pub const X86_INITIAL_BOOT_MAGIC: u64 = u64::from_le_bytes(*b"CXRUN001");
-pub const X86_INITIAL_BOOT_VERSION: u32 = 2;
+pub const X86_INITIAL_BOOT_VERSION: u32 = 3;
 pub const X86_INITIAL_BOOT_HEADER_GPA: u64 = 0x1e_0000;
 pub const X86_INITIAL_BOOT_PORT: u16 = 0xc6;
 pub const X86_INITIAL_MAX_REGIONS: usize = 32;
@@ -24,6 +24,7 @@ pub struct X86InitialBootHeader {
     pub version: u32,
     pub reserved: u32,
     pub entry_va: u64,
+    pub peer_entry_va: u64,
 }
 
 #[repr(C)]
@@ -91,7 +92,7 @@ pub struct X86InitialBootGrant {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<X86InitialBootHeader>() == 24);
+    assert!(core::mem::size_of::<X86InitialBootHeader>() == 32);
     assert!(core::mem::size_of::<X86InitialBootRequest>() == 176);
     assert!(core::mem::align_of::<X86InitialBootRequest>() == 8);
     assert!(core::mem::offset_of!(X86InitialBootRequest, magic) == 0);
