@@ -27,10 +27,7 @@ use super::lifecycle::*;
 use super::outcome::*;
 use super::terminal::*;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use super::threads::{
-    PersistentProcessMemberPublication, enroll_persistent_process_member,
-    finish_persistent_process_handles,
-};
+use super::threads::{PersistentProcessMemberPublication, enroll_persistent_process_member};
 use super::threads::{VcpuThreadRegistry, publish_unexpected_executor_failure_retirement};
 use super::wait_wake::*;
 use super::*;
