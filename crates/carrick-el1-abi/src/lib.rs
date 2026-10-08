@@ -20,6 +20,10 @@
 
 #![no_std]
 
+/// Synthetic timekeeping page shared by the host mapper and EL1 fork policy.
+pub const LINUX_VVAR_BASE: u64 = 0x2E_0000_0000;
+pub const LINUX_VVAR_SIZE: u64 = 0x1000;
+
 mod cow_grants;
 pub use cow_grants::*;
 mod descriptor_txn;

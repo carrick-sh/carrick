@@ -1728,6 +1728,23 @@ fn fork_publication_metadata_pressure(reserve_child: bool, copy_nodes_available:
 }
 
 #[test]
+fn owner_fork_inherits_unreserved_vvar_as_private() {
+    use carrick_core::mm::fork::{Policy, policy};
+    use carrick_mmu_core::owner_mmu::Aarch64Mmu;
+    let va = carrick_mem::vdso::LINUX_VVAR_BASE;
+    let user_leaf = 1 << 6;
+    assert_eq!(
+        policy::<Aarch64Mmu, _>(&super::fork::LinuxForkPolicy, &[], va, 0x20_0000, user_leaf)
+            .unwrap(),
+        Policy::Mixed,
+    );
+    assert_eq!(
+        policy::<Aarch64Mmu, _>(&super::fork::LinuxForkPolicy, &[], va, 0x1000, user_leaf).unwrap(),
+        Policy::Private,
+    );
+}
+
+#[test]
 fn owner_fork_metadata_child_reserve_preserves_original_refusal() {
     fork_publication_metadata_pressure(false, 0);
 }
