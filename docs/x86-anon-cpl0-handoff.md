@@ -49,7 +49,11 @@ its validated patch is
 Only three macOS source spans and compiler-owned receipt provenance change;
 619 captured operations/profiles and all classifications are retained.
 The patched static check passes in `/tmp/x86-real-launch-static-recaptured.log`.
-Clean domain lint and the final metadata push remain to run.
+Clean `just lint-domains` passes in `/tmp/x86-real-launch-domains.log`:
+the macOS receipt agrees exactly, and the live Linux subset verifies 572
+reviewed rows. Final metadata push follows this receipt. The full KVM,
+host and kernel-semantics gates have not been rerun for this step; the
+focused production two-MM witness remains red and is not review-ready.
 
 No Docker, signed/HVF test or load generator was run.
 The pre-existing arena prefork red remains separately owned.
