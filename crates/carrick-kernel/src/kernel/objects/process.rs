@@ -19,9 +19,9 @@ use carrick_fatal::carrick_fatal;
 use crate::kernel::address::MmBackend;
 use crate::kernel::clone_plan::{CloneObjectMode, ClonePlan, CloneTaskMode};
 use crate::kernel::container::ContainerId;
-use crate::kernel::ids::{
-    ChildExitSignal, MmId, ObjectIdError, ObjectIdRegistry, ProcessGroupId, SessionId,
-};
+#[cfg(test)]
+use crate::kernel::ids::ChildExitSignal;
+use crate::kernel::ids::{MmId, ObjectIdError, ObjectIdRegistry};
 use crate::kernel::objects::signal::{Sighand, TaskPendingSignals};
 use crate::kernel::objects::{ObjectGraphError, ObjectRevision, Task, TaskKey, TaskRef};
 use crate::kernel::operations::KernelOperationError;
@@ -456,125 +456,56 @@ impl TaskShared {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(transparent)]
-pub struct LinuxWaitStatus(i32);
+pub use carrick_sched_core::process::{LinuxWaitStatus, TaskRusage};
 
-impl LinuxWaitStatus {
-    pub const fn from_wait_encoding(raw: i32) -> Self {
-        Self(raw)
-    }
+pub type Zombie = carrick_sched_core::process::Zombie<ContainerId, NsUid>;
 
-    pub const fn raw(self) -> i32 {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct TaskRusage {
-    pub user_time: Duration,
-    pub system_time: Duration,
-}
-
-/// Compact post-exit state. It contains no task-owned `Arc` and therefore
-/// cannot retain mm, files, signals, or runner state after teardown.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Zombie {
-    pub key: TaskKey,
-    /// PID the parent saw in its container PID namespace at exit. The live
-    /// namespace membership is released by a consuming wait, so the receipt
-    /// must retain this value for wait4/waitid rendering after reap.
-    pub namespace_pid: u32,
-    pub container: ContainerId,
-    pub parent: Option<TaskKey>,
-    pub process_group: ProcessGroupId,
-    pub session: SessionId,
-    /// Historical process-group id in this container's PID namespace. Unlike
-    /// the internal group key, this remains renderable after its leader PID
-    /// mapping and the final live group record have both disappeared.
-    pub namespace_process_group: u32,
-    /// Historical session id in this container's PID namespace.
-    pub namespace_session: u32,
-    pub status: LinuxWaitStatus,
-    /// The real uid this process held when it exited. Linux `waitid(2)` reports
-    /// this value in `siginfo_t.si_uid`, so it must survive task teardown.
-    pub ruid: NsUid,
-    /// The effective uid this process held when it exited. An unreaped process
-    /// is still addressable by `sched_*`/`setpriority`/`process_vm_*`, and
-    /// those calls apply the same ownership rule they apply to a live target,
-    /// so the answer has to survive the task object.
-    pub euid: NsUid,
-    pub rusage: TaskRusage,
-    /// What this task had itself accumulated from reaping its own children.
-    /// Kept separate for own-process diagnostics. Consuming waits return and
-    /// charge the combined subtree total.
-    pub children_rusage: TaskRusage,
-    /// Which `wait(2)` class this zombie belongs to (`__WCLONE`/`__WALL`).
-    pub exit_signal: ChildExitSignal,
-    pub diagnostic_name: String,
-}
-
-impl Zombie {
-    /// Capture the exiting task's two CPU ledgers at the moment it becomes a
-    /// zombie. Both are read from the kernel's own accounting: `rusage` is the
-    /// child's own CPU, and `children_rusage` is what it had accumulated from
-    /// reaping its own children. Linux charges a reaper BOTH, which is how
-    /// `tms_cutime` totals a whole process subtree.
-    pub fn from_task(
-        task: &Task,
-        status: LinuxWaitStatus,
-        diagnostic_name: String,
-        namespace_process_group: u32,
-        namespace_session: u32,
-    ) -> Self {
-        let (children_user_us, children_system_us) = task.children_cpu_us();
-        let credentials = task.process_credentials();
-        let internal_pid = u32::try_from(task.key().id.raw()).unwrap_or_else(|_| {
+pub fn capture_zombie(
+    task: &Task,
+    status: LinuxWaitStatus,
+    diagnostic_name: String,
+    namespace_process_group: u32,
+    namespace_session: u32,
+) -> Zombie {
+    let (children_user_us, children_system_us) = task.children_cpu_us();
+    let credentials = task.process_credentials();
+    let internal_pid = u32::try_from(task.key().id.raw()).unwrap_or_else(|_| {
+        carrick_fatal!(
+            "kernel::zombie_identity",
+            "exiting task internal identity outside PID namespace range"
+        );
+    });
+    let namespace_pid = match task.pid_ns_region() {
+        Some(region) => region.host_to_ns(internal_pid).unwrap_or_else(|| {
             carrick_fatal!(
                 "kernel::zombie_identity",
-                "exiting task internal identity outside PID namespace range"
+                "live namespace member disappeared before zombie captured visible PID"
             );
-        });
-        let namespace_pid = match task.pid_ns_region() {
-            Some(region) => region.host_to_ns(internal_pid).unwrap_or_else(|| {
-                carrick_fatal!(
-                    "kernel::zombie_identity",
-                    "live namespace member disappeared before zombie captured visible PID"
-                );
-            }),
-            None => internal_pid,
-        };
-        Self {
-            key: task.key(),
-            namespace_pid,
-            container: task.container().id(),
-            parent: task.parent(),
-            process_group: task.process_group(),
-            session: task.session(),
-            namespace_process_group,
-            namespace_session,
-            status,
-            ruid: credentials.ruid(),
-            euid: credentials.euid(),
-            rusage: TaskRusage {
-                user_time: Duration::from_micros(task.self_cpu_us()),
-                system_time: Duration::from_micros(task.self_system_cpu_us()),
-            },
-            children_rusage: TaskRusage {
-                user_time: Duration::from_micros(children_user_us),
-                system_time: Duration::from_micros(children_system_us),
-            },
-            exit_signal: task.exit_signal(),
-            diagnostic_name,
-        }
-    }
-
-    /// Everything a reaper must add to its own CHILDREN ledger for this child.
-    pub fn total_charge_to_reaper(&self) -> TaskRusage {
-        TaskRusage {
-            user_time: self.rusage.user_time + self.children_rusage.user_time,
-            system_time: self.rusage.system_time + self.children_rusage.system_time,
-        }
+        }),
+        None => internal_pid,
+    };
+    Zombie {
+        key: task.key(),
+        namespace_pid,
+        container: task.container().id(),
+        parent: task.parent(),
+        process_group: task.process_group(),
+        session: task.session(),
+        namespace_process_group,
+        namespace_session,
+        status,
+        ruid: credentials.ruid(),
+        euid: credentials.euid(),
+        rusage: TaskRusage {
+            user_time: Duration::from_micros(task.self_cpu_us()),
+            system_time: Duration::from_micros(task.self_system_cpu_us()),
+        },
+        children_rusage: TaskRusage {
+            user_time: Duration::from_micros(children_user_us),
+            system_time: Duration::from_micros(children_system_us),
+        },
+        exit_signal: task.exit_signal(),
+        diagnostic_name,
     }
 }
 
@@ -773,7 +704,7 @@ mod tests {
         let fixture = Fixture::new();
         let mm = fixture.task.shared().mm();
         let weak_mm = Arc::downgrade(&mm);
-        let zombie = Zombie::from_task(
+        let zombie = capture_zombie(
             &fixture.task,
             LinuxWaitStatus::from_wait_encoding(0),
             "fixture".to_string(),

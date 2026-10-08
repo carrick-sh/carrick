@@ -717,25 +717,7 @@ pub(in crate::kernel) fn remove_group_member(
     session_id: SessionId,
     task: TaskKey,
 ) {
-    let remove_group = if let Some(group) = state.process_groups.get_mut(&group_id) {
-        group.members.remove(&task);
-        group.members.is_empty()
-    } else {
-        false
-    };
-    if !remove_group {
-        return;
-    }
-    state.remove_process_group(group_id);
-    let remove_session = if let Some(session) = state.sessions.get_mut(&session_id) {
-        session.process_groups.remove(&group_id);
-        session.process_groups.is_empty()
-    } else {
-        false
-    };
-    if remove_session {
-        state.remove_session(session_id);
-    }
+    state.remove_group_member(group_id, session_id, task);
 }
 
 #[cfg(test)]
