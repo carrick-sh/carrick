@@ -495,6 +495,9 @@ impl OwnedUserTransfer {
             )) => {
                 return Ok(TransferProgress::Retired(handle));
             }
+            Err(carrick_guest_mem::MemoryPrepareError::Retired(handle)) => {
+                return Ok(TransferProgress::Retired(handle));
+            }
             Err(carrick_guest_mem::MemoryPrepareError::Fault(
                 carrick_guest_mem::MemoryError::OutOfBounds { .. },
             )) => {

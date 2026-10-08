@@ -3031,6 +3031,27 @@ where
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         use carrick_guest_mem::MemoryPrepareError;
         match error {
+            MemoryPrepareError::Retired(handle) => {
+                if !self.kernel.process_exiting()
+                    && !thread_should_finish_for_exec_replacement(
+                        &self.state.registry,
+                        self.state.this_tid,
+                    )
+                {
+                    return Err(RuntimeError::Configuration(format!(
+                        "live owner memory retired during output preparation: {handle:?}"
+                    ))
+                    .into());
+                }
+                self.state.capture_child_tid_clear()?;
+                self.state.handoff_child_tid_clear();
+                if !self.state.thread_exit_withdrawn {
+                    self.state
+                        .withdraw_persistent_terminal_owner_runtime(&self.kernel, engine);
+                    self.state.thread_exit_withdrawn = true;
+                }
+                Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)))
+            }
             MemoryPrepareError::OwnerWait(wait) => {
                 self.park_owner_memory_action(engine, control, action, wait)
             }

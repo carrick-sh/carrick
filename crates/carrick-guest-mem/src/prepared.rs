@@ -140,6 +140,8 @@ pub enum MemoryPrepareError {
     /// an invalid guest address and must not be lowered to EFAULT.
     Limit(PreparedWriteLimit),
     Fault(MemoryError),
+    /// The exact owner retired while this output was being prepared.
+    Retired(carrick_el1_abi::El1MmHandle),
     Physical(OwnedMemoryWait),
     OwnerWait(PortalOwnerWait),
     Supply(MemorySupplyRequest),

@@ -3571,6 +3571,9 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     format!("write requires bounded prepare before consumption: {limit:?}"),
                 ),
                 carrick_guest_mem::MemoryPrepareError::Fault(error) => error,
+                carrick_guest_mem::MemoryPrepareError::Retired(handle) => {
+                    MemoryError::OwnerRetired(handle)
+                }
                 carrick_guest_mem::MemoryPrepareError::Physical(wait) => {
                     MemoryError::Physical(wait)
                 }
@@ -3739,6 +3742,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 );
                 Err(MemoryPrepareError::Fault(error))
             }
+            Err(MemoryPrepareError::Retired(handle)) => Err(MemoryPrepareError::Retired(handle)),
             Err(MemoryPrepareError::Limit(limit)) => {
                 carrick_observability::probes::hvpatch_el1_host_write_prepare(
                     address, length, 7, 0,
@@ -4182,6 +4186,9 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                         format!("write requires bounded prepare before consumption: {limit:?}"),
                     ),
                     carrick_guest_mem::MemoryPrepareError::Fault(error) => error,
+                    carrick_guest_mem::MemoryPrepareError::Retired(handle) => {
+                        MemoryError::OwnerRetired(handle)
+                    }
                     carrick_guest_mem::MemoryPrepareError::Physical(wait) => {
                         MemoryError::Physical(wait)
                     }

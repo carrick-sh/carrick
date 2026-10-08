@@ -223,6 +223,9 @@ fn read_host_pipe_into_owner(
             Err(carrick_guest_mem::MemoryPrepareError::Fault(_)) => {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
+            Err(carrick_guest_mem::MemoryPrepareError::Retired(_)) => {
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
             Err(carrick_guest_mem::MemoryPrepareError::Limit(limit)) => {
                 return Err(super::outcome::DispatchError::MemoryPreparation(format!(
                     "one owner read chunk exceeds prepared range: {limit:?}"
