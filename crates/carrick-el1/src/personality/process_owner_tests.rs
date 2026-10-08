@@ -285,6 +285,7 @@ fn exit(owner: &mut Owner, task: TaskKey, adopter: Option<TaskKey>) -> Published
         .begin(LinuxWaitStatus::from_wait_encoding(5 << 8))
         .unwrap()
         .publish()
+        .unwrap()
 }
 fn query(target: WaitTarget) -> WaitQuery {
     WaitQuery {
@@ -581,6 +582,74 @@ fn dropping_reserved_exit_rolls_back_exact_reservation_without_state_change() {
         0
     );
 }
+#[test]
+fn early_error_after_exit_begin_preserves_live_graph_and_reservation_custody() {
+    let mut owner = owner();
+    let root = key(1, 1);
+    let exiting = key(2, 2);
+    let live = key(3, 3);
+    let dead = key(4, 4);
+    let releases = Rc::new(Cell::new(0));
+    birth(&mut owner, root, exiting, releases.clone());
+    birth(&mut owner, exiting, live, releases.clone());
+    birth(&mut owner, exiting, dead, releases.clone());
+    exit(&mut owner, dead, None)
+        .effects
+        .cancel_members(Member::cancel);
+    let snapshot: Vec<_> = [root, exiting, live]
+        .into_iter()
+        .map(|key| {
+            let row = owner.task(key).unwrap();
+            (
+                key,
+                row.parent(),
+                row.children().clone(),
+                row.revision(),
+                row.identity(),
+            )
+        })
+        .collect();
+    let dead_parent = owner.registry.zombies[&dead.id].receipt.parent;
+    let order = owner.task(exiting).unwrap().native().signals.order.clone();
+    let aborted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), ()> {
+        let _pending = owner
+            .prepare_exit(exiting, None)
+            .unwrap()
+            .reserve(Transaction(20))
+            .unwrap()
+            .begin(LinuxWaitStatus::from_wait_encoding(7 << 8))
+            .unwrap();
+        Err(())
+    }));
+    assert!(
+        matches!(aborted, Ok(Err(()))),
+        "unpublished exit abandonment invoked fail-stop"
+    );
+    assert!(owner.registry.reservations.is_empty());
+    assert!(owner.registry.retiring_tasks.is_empty());
+    assert_eq!(owner.registry.tasks.len(), 3);
+    assert_eq!(owner.registry.zombies.len(), 1);
+    assert_eq!(owner.registry.zombies[&dead.id].receipt.parent, dead_parent);
+    for (key, parent, children, revision, identity) in snapshot {
+        let row = owner.task(key).unwrap();
+        assert_eq!(row.lifecycle(), TaskLifecycle::Live);
+        assert_eq!(
+            (row.parent(), row.children(), row.revision(), row.identity()),
+            (parent, &children, revision, identity)
+        );
+        assert_eq!(row.native().budget.reserved.get(), 0);
+    }
+    assert_eq!(releases.get(), 0);
+    assert!(order.borrow().is_empty());
+    // A fresh admission proves that no stale participant or reservation gate
+    // survived the abandoned one, and only publication changes the graph.
+    exit(&mut owner, exiting, None)
+        .effects
+        .cancel_members(Member::cancel);
+    assert_eq!(owner.task(live).unwrap().parent(), Some(root));
+    assert_eq!(owner.registry.zombies[&dead.id].receipt.parent, Some(root));
+}
+
 #[test]
 fn adapter_exit_work_visits_exactly_own_members_and_no_unrelated_native_resources() {
     for count in [0, 1, 8, 32, 128] {
