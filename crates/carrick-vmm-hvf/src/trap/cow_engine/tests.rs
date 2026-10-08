@@ -5,6 +5,17 @@
 use std::path::Path;
 
 #[test]
+fn guest_owned_cow_has_no_legacy_protection_veto() {
+    use super::cow_legacy_protection_denied;
+
+    assert!(!cow_legacy_protection_denied(true, None));
+    assert!(!cow_legacy_protection_denied(true, Some(true)));
+    assert!(cow_legacy_protection_denied(false, None));
+    assert!(cow_legacy_protection_denied(false, Some(true)));
+    assert!(!cow_legacy_protection_denied(false, Some(false)));
+}
+
+#[test]
 fn host_cow_accounting_is_mm_scoped_and_survives_retirement() {
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let parent = crate::hvf_aarch64_engine::HostCowStats::default();

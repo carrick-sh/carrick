@@ -3390,11 +3390,12 @@ impl HvfTaskState {
             // An EL1-owned MM has no legacy host protection table. Its live
             // private terminal carries Linux write permission, so an absent
             // host table cannot veto the exact-leaf winner check below.
-            let write_denied = !guest_lane
-                && self
-                    .protections
+            let write_denied = cow_legacy_protection_denied(
+                guest_lane,
+                self.protections
                     .legacy()
-                    .is_none_or(|protections| protections.range_write_denied(fault_va, 1));
+                    .map(|protections| protections.range_write_denied(fault_va, 1)),
+            );
             let private_writable_mapping = mapping.is_some_and(|mapping| {
                 mapping.guest_writable && mapping.sharing == GuestMappingSharing::Private
             });
@@ -3470,9 +3471,12 @@ impl HvfTaskState {
             })?
             .guest_writable;
         if frame_cow_write_is_denied(
-            self.protections
-                .legacy()
-                .is_none_or(|protections| protections.range_write_denied(fault_va, 1)),
+            cow_legacy_protection_denied(
+                guest_lane,
+                self.protections
+                    .legacy()
+                    .map(|protections| protections.range_write_denied(fault_va, 1)),
+            ),
             source_guest_writable,
             intent,
         ) {
@@ -8094,6 +8098,12 @@ pub(crate) fn is_stage1_cow_write_fault(syndrome: u64) -> bool {
     matches!(exception_class, DATA_ABORT_LOWER_EL | 0x25)
         && syndrome & WRITE_NOT_READ != 0
         && matches!(fault_status, 0x0d..=0x0f)
+}
+
+/// A guest-owned MM has no legacy host protection authority. Its exact live
+/// descriptor and semantic mapping decide write permission instead.
+pub(crate) fn cow_legacy_protection_denied(guest_lane: bool, legacy_denied: Option<bool>) -> bool {
+    !guest_lane && legacy_denied.unwrap_or(true)
 }
 
 pub(crate) fn frame_cow_write_is_denied(
