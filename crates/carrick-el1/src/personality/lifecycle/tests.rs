@@ -241,6 +241,20 @@ fn gettid_uses_each_live_process_immutable_projection() {
 }
 
 #[test]
+fn getpid_uses_each_live_process_owner_published_projection() {
+    let mut first = World::new(LifecycleHatches::ON);
+    let mut second = World::new(LifecycleHatches::ON);
+    first.task().publish_visible_pid(41);
+    second.task().publish_visible_pid(73);
+    for (world, expected) in [(&mut first, 41), (&mut second, 73)] {
+        let (action, frame) = world.syscall(172, &[]);
+        assert_eq!(action, Action::Served);
+        assert_eq!(frame.x[0], expected);
+        assert_eq!(world.forwarded(172), 0);
+    }
+}
+
+#[test]
 fn exit_decline_census_names_the_authority_without_changing_it() {
     let mut world = World::new(LifecycleHatches::ON);
     let (action, _) = world.syscall(SYS_EXIT, &[0]);
@@ -1146,6 +1160,7 @@ fn process_native_hooks_require_every_execution_identity_component() {
     }
     let mut world = World::new(LifecycleHatches::ON);
     let expected = crate::personality::common_entry::execution_binding(world.task());
+    assert!(world.venue.leader_slot().publish_visible_tid(41));
     let mut bindings = [expected; 5];
     bindings[1].task = carrick_el1_abi::EntryTaskKey::from_raw(99);
     bindings[2].generation = carrick_el1_abi::EntryGeneration::from_raw(99);
@@ -1181,6 +1196,11 @@ fn process_native_hooks_require_every_execution_identity_component() {
             anonymous: None,
             cache_lookup: |_| core::ptr::null_mut(),
         };
+        assert_eq!(
+            LifecycleNative::visible_tid(&native),
+            if index == 0 { Some(41) } else { None },
+            "native process identity requires the exact execution binding"
+        );
         let results = [
             LifecycleNative::process_fork(&mut native),
             LifecycleNative::process_wait4(
