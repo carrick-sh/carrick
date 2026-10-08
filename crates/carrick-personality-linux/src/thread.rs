@@ -120,3 +120,32 @@ pub fn set_robust_list(
 pub const CHILD_TID_CLEAR: [u8; 4] = 0u32.to_le_bytes();
 pub const CHILD_TID_WAKE_MASK: u32 = u32::MAX;
 pub const CHILD_TID_WAKE_COUNT: u32 = 1;
+
+/// Register the calling thread's clear-child-tid word without touching user
+/// memory. The existing clone/exit authority owns the same control-slot word.
+pub fn set_tid_address(
+    thread: LifecycleThread<'_>,
+    binding: carrick_core_abi::ExecutionBinding,
+    address: carrick_guest_arch::UserVa,
+) -> Option<crate::entry::SyscallResult> {
+    if binding.mm.raw() == 0 || binding.thread_generation.raw() == 0 || !setup_open(thread.page) {
+        return None;
+    }
+    let tid = thread.slot.visible_tid()?;
+    if let Some(entry) = thread.slot.entry() {
+        let identity = thread.page.identity(entry)?;
+        if u64::from(identity.tid) != binding.task.raw()
+            || identity.thread_serial != binding.thread_generation.raw()
+            || identity.visible_tid != tid
+        {
+            return None;
+        }
+    } else if !binding.issued() || u64::from(tid) != binding.task.raw() {
+        // Host-born slots use the current Linux TID binding. Born-in-zone
+        // slots above authenticate the registry key and thread incarnation,
+        // independently of the Linux-visible TID returned to userspace.
+        return None;
+    }
+    thread.slot.set_clear_child_tid(address.raw());
+    Some(crate::entry::SyscallResult::new(i64::from(tid)))
+}

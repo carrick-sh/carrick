@@ -161,3 +161,55 @@ pub fn witness(op: u64) -> u64 {
         _ => u64::MAX,
     }
 }
+
+/// Current CPU's exact-task TLS authority. It owns no scheduler record;
+/// every access reauthenticates the live binding before reading or editing MSRs.
+pub struct TaskTls<'a> {
+    task: &'a carrick_el1_abi::CurrentTask,
+}
+
+pub fn task_tls(task: &carrick_el1_abi::CurrentTask) -> Result<TaskTls<'_>, ArchError> {
+    let tls = TaskTls { task };
+    tls.authenticate()?;
+    Ok(tls)
+}
+
+impl TaskTls<'_> {
+    fn authenticate(&self) -> Result<(), ArchError> {
+        if current_cpu_binding()
+            .is_none_or(|binding| binding.task_address != self.task as *const _ as u64)
+        {
+            return Err(ArchError::Unbound);
+        }
+        Ok(())
+    }
+
+    fn capture(&self) -> Result<ParkedContextWords, ArchError> {
+        self.authenticate()?;
+        // A private TLS projection, never a runnable scheduler context.
+        let mut words = ParkedContextWords::ZERO;
+        words.fs_base = scheduler::read_tls(scheduler::NativeTlsRegister::Fs);
+        words.gs_base = scheduler::read_tls(scheduler::NativeTlsRegister::UserGs);
+        Ok(words)
+    }
+
+    pub fn read(&self, register: context_words::TlsRegister) -> Result<UserVa, ArchError> {
+        Ok(context_words::tls_base(&self.capture()?, register))
+    }
+
+    pub fn write(
+        &self,
+        register: context_words::TlsRegister,
+        address: UserVa,
+    ) -> Result<(), ArchError> {
+        let mut words = self.capture()?;
+        context_words::set_tls_base(&mut words, register, address)?;
+        let native = match register {
+            context_words::TlsRegister::Fs => scheduler::NativeTlsRegister::Fs,
+            context_words::TlsRegister::Gs => scheduler::NativeTlsRegister::UserGs,
+        };
+        // UserGs edits KERNEL_GS_BASE after SWAPGS, retaining CPL0's GS binding.
+        scheduler::write_tls(native, context_words::tls_base(&words, register).raw());
+        Ok(())
+    }
+}

@@ -27,10 +27,15 @@ pub fn decode_x86_64(native: u64, mut args: [u64; 6], stack: u64) -> CanonicalCa
             0,
         ];
         crate::lifecycle::SYS_CLONE as u64
+    } else if crate::abi::x86_64::lookup_native_x86_64(native).is_some() {
+        carrick_syscall_abi::CARRICK_PRIVATE_X86_ARCH_PRCTL
     } else {
         carrick_syscall_abi::syscall_x86_64::canonical_x86_64(carrick_syscall_abi::NativeNr(native))
             .map_or(u64::MAX, carrick_syscall_abi::CanonicalNr::raw)
     };
+    if canonical == carrick_syscall_abi::CARRICK_PRIVATE_X86_POLL {
+        args = crate::abi::x86_64::poll_arguments(args);
+    }
     CanonicalCall {
         isa: GuestIsa::X86_64,
         canonical: CanonicalOrdinal::new(canonical),
@@ -75,6 +80,13 @@ pub fn decode_aarch64(native: u64, args: [u64; 6], stack: u64) -> CanonicalCall 
     }
 }
 
+// Private semantic tags retain private counter slots; a native ordinal
+// could name an unrelated call in the asm-generic-indexed counter arrays.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn native_diagnostic_ordinal(ordinal: u64) -> u64 {
+    carrick_syscall_abi::private_x86_counter_slot(carrick_syscall_abi::CanonicalNr(ordinal))
+        .map_or(ordinal, |slot| slot as u64)
+}
 /// AArch64 Linux vDSO wire identity: preserve the process half and replace
 /// the thread's visible tid only when that native vDSO binding is present.
 pub const fn aarch64_child_vdso_identity(parent: u64, visible_tid: u32) -> u64 {

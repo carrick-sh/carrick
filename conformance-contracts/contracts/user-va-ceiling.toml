@@ -16,8 +16,8 @@ vm_free = "carrick-kernel::dispatch::mem::tests (x86_mmap_crowded_lower_half_ref
 docker = "not applicable on x86-w1: native x86_64 Linux oracle is explicitly authorized; committed fixture oracle.json records source hash, native kernel and binary hash"
 
 [bindings.unresolved]
-kvm_live = "The static fixture executes on Linux/KVM: mmap(NULL) bounds match native, but MAP_FIXED returns errno 38 (ENOSYS) from carrick-x86::bringup_fns::run_elf_service_loop (is_fixed rejection). This existing standalone service loop does not call the shared dispatcher. Native oracle returns 0 at 2^47-8192 and 12 at 2^47-4096 and above. The shared-dispatcher live binding is unavailable until Linux/x86 HVPatch is supported."
-embed_structural = "conformance-next embed is HVF-only: TestContainer rejects Linux/Amd64 before guest execution. The director authorized running this static fixture on the existing KVM run-elf lane and natively on x86-w1 instead; neither standalone run-elf nor CPL0 smoke binds the shared dispatcher mmap path. VM-free tests prove the dispatcher placement and zero backend protection work."
+kvm_live = "Archived kvm-observation.json belongs to the retired standalone run-elf loop: fixed mappings returned ENOSYS (38), not the shared dispatcher result. The current production route is carrick run --platform linux/amd64 through shared CPL0. Its host dispatcher and mmap family binding remain PR #81 dependencies; no current live mmap parity is claimed."
+embed_structural = "conformance-next embed remains HVF-only. VM-free tests prove shared placement and zero backend protection work. Archived standalone KVM observations are historical evidence, not a runnable or accepted execution lane."
 embed_timing = "No runtime ratio measured; this change retains the gap-search algorithm."
 signed = "HVF signed ARM integration and final promotion remain director-owned; x86-w1 cannot run HVF."
 

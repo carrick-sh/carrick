@@ -8,9 +8,9 @@ license.workspace = true
 name = "carrick_vmm_kvm"
 path = "src/lib.rs"
 
-# The MVP `run-elf` entry point. Self-contained (no carrick-runtime dep), so it
-# links for aarch64-linux independently of the macOS dispatch layer. On non-Linux
-# hosts `main` is a stub (the lib is empty there), so the workspace still builds.
+# ARM MVP `run-elf` entry point, independent of the macOS dispatch layer.
+# The retired x86 entry refuses and names the production shared CPL0 command.
+# On non-Linux hosts the lib is empty and the executable reports unsupported.
 [[bin]]
 name = "carrick-vmm-kvm"
 path = "src/main.rs"
@@ -37,8 +37,7 @@ carrick-mem = { path = "../carrick-mem" }
 # Executable publication returns the neutral page-table error domain.
 carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-abi = { path = "../carrick-abi" }
-# The shared x86 engine scaffold (Stage 4-KVM): the KVM x86 lane is migrated onto
-# `X86EngineCore<KvmVmm>` instead of the hand-rolled `KvmX86TrapEngine`.
+# Shared x86 register snapshots, architectural contexts and CPL0 boot helpers.
 carrick-x86 = { path = "../carrick-x86" }
 # The shared aarch64 engine scaffold (Stage 2-KVM): the KVM aarch64 lane is
 # migrated onto `Aarch64EngineCore<KvmAarch64Vmm>` instead of the hand-rolled
@@ -75,8 +74,9 @@ zerocopy.workspace = true
 
 # Test gate lanes (`just xtask test-lanes check`; carrick-xtask src/test_lanes.rs).
 # Every live target needs a real /dev/kvm on Linux x86_64: `just test-kvm`.
-# `cpl0_image_inputs` reads only sources and Cargo metadata, so it is VM-free.
+# `cpl0_image_inputs` and the retired binary refusal contract are VM-free.
 [package.metadata.carrick.test-lanes]
 "*" = "kvm"
 cpl0_image_inputs = "host"
 cpl0_shared_entry = "kvm"
+retired_x86_entry = "host"

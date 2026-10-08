@@ -907,6 +907,89 @@ fn forwarded_call_completes_before_pending_kick_work_exit() {
 }
 
 #[test]
+fn entry_kick_then_forward_records_completion_before_work_exit() {
+    let mut p = program(&[(0xa000, 24)]);
+    let native = p
+        .windows(5)
+        .position(|op| op == [0xb8, 0x11, 0x01, 0, 0])
+        .unwrap();
+    p[native + 1..native + 5].copy_from_slice(&8_u32.to_le_bytes()); // lseek forwards
+    let mut carrier = Cpl0Carrier::boot(&image(), [&p, &p]).unwrap();
+    for task in 0..2 {
+        carrier.inject_entry_kick(task).unwrap();
+        let mut forwards = 0;
+        let observation = carrier
+            .observe_with_forward(task, |frame| {
+                assert_eq!(frame.rax, 8);
+                forwards += 1;
+                frame.rax = 0x1234;
+                Ok(())
+            })
+            .expect("forward completes before its work exit");
+        assert_eq!(forwards, 1);
+        assert_eq!(observation.result, 0x1234);
+        assert_eq!(observation.entries[task], 1);
+        assert_eq!(observation.completions[task], 1);
+        assert_eq!(observation.publications, [0; 2]);
+        assert_eq!(observation.kicks, task as u64 + 1);
+        assert_eq!(observation.work_exits, observation.kicks);
+        assert_eq!(observation.semantic_host_exits, observation.kicks);
+    }
+}
+
+#[test]
+fn return_kick_after_served_records_completion_before_work_exit() {
+    let p = program(&[(0xa000, 24)]);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&p, &p]).unwrap();
+    for task in 0..2 {
+        carrier.inject_return_kick(task).unwrap();
+        let observation = carrier
+            .observe(task)
+            .expect("late return kick after plain Served");
+        assert_eq!(observation.result, 0);
+        assert_eq!(observation.entries[task], 1);
+        assert_eq!(observation.completions[task], 1);
+        assert_eq!(observation.publications[task], 1);
+        assert_eq!(observation.kicks, task as u64 + 1);
+        assert_eq!(observation.work_exits, observation.kicks);
+        assert_eq!(observation.semantic_host_exits, 0);
+    }
+}
+
+#[test]
+fn sigprocmask_unblock_publishes_completion_before_work_exit() {
+    use carrick_el1_abi::{BlockedMask, PendingSignals};
+    use carrick_x86::cpl0_lifecycle::LIFECYCLE_DATA;
+    let mut p = vec![0x48, 0xbb]; // mapped signal set in the owning user MM
+    p.extend_from_slice(&LIFECYCLE_DATA.to_le_bytes());
+    p.extend_from_slice(&[0x48, 0xc7, 0x03, 0, 2, 0, 0, 0x48, 0x89, 0xde]); // SIGUSR1; rsi = rbx
+    p.extend_from_slice(&[
+        0xbf, 1, 0, 0, 0, // SIG_UNBLOCK
+        0x31, 0xd2, // oldset = NULL
+        0x41, 0xba, 8, 0, 0, 0, // sigsetsize = 8
+        0xb8, 14, 0, 0, 0, 0x0f, 0x05, // native rt_sigprocmask
+        0x48, 0x89, 0xc7, 0x48, 0xb8,
+    ]);
+    p.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    p.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier = Cpl0Carrier::boot_lifecycle(&image(), [&p, &p]).unwrap();
+    for task in 0..2 {
+        carrier
+            .fixture_lifecycle_signals(task, BlockedMask(1 << 9), PendingSignals(1 << 9))
+            .unwrap();
+        let observation = carrier
+            .observe(task)
+            .expect("shared sigmask completion publishes work");
+        assert_eq!(observation.result, 0);
+        assert_eq!(observation.entries[task], 1);
+        assert_eq!(observation.completions[task], 1);
+        assert_eq!(observation.kicks, 0);
+        assert_eq!(observation.work_exits, task as u64 + 1);
+        assert_eq!(observation.semantic_host_exits, 0);
+    }
+}
+
+#[test]
 fn x1_boot_shared_substrate() {
     let p = program(&[(0xa000, 24), (0xdead, 23)]);
     let dummy = &[0x0f, 0x0b];
