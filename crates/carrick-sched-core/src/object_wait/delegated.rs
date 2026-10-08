@@ -123,7 +123,7 @@ impl Drop for DelegatedLockRelease<'_, '_> {
     }
 }
 
-impl ZoneTables {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// Publish an indexed owner wake. Only typed delegated indices enter this
     /// distinct domain; the inode's exact generation remains the authority.
     pub fn mark_delegated_host_pending(&self, index: DelegatedFileWaitIndex) {

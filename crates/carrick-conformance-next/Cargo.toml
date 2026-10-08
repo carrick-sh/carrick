@@ -35,6 +35,7 @@ tokio.workspace = true
 carrick-xtask = { path = "../carrick-xtask" }
 
 [dev-dependencies]
+carrick-conformance = { path = "../carrick-conformance" }
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 carrick-xtask = { path = "../carrick-xtask" }
 libc.workspace = true
@@ -42,3 +43,8 @@ serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true
+
+# Test gate lanes (`just xtask test-lanes check`; carrick-xtask src/test_lanes.rs).
+# `test-integration` also runs the shard targets VM-free with guest cases skipped.
+[package.metadata.carrick.test-lanes]
+"*" = "signed-hvf"

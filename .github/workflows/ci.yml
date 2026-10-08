@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+    # ready_for_review reruns a draft's CI with the macOS jobs it deferred.
+    types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
@@ -21,6 +23,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Harden registry transport against intermittent network errors without retrying tests.
+  CARGO_HTTP_MULTIPLEXING: "false"   # avoid HTTP/2 framing failures against the crates.io index
+  CARGO_NET_RETRY: "10"              # transport retries for registry/download fetches only
   RUST_BACKTRACE: 1
   CARRICK_PROBE_COVERAGE_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
 
@@ -31,6 +36,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       heavy: ${{ steps.filter.outputs.heavy }}
+      macos: ${{ steps.filter.outputs.macos }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -44,6 +50,7 @@ jobs:
         env:
           CI_EVENT: ${{ github.event_name }}
           CI_BASE: ${{ github.event.pull_request.base.sha }}
+          CI_DRAFT: ${{ github.event.pull_request.draft }}
         run: just ci-changes
 
   # Independent checks keep reporting after an earlier check fails. No
@@ -70,9 +77,12 @@ jobs:
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: Install Semgrep
         if: ${{ !cancelled() }}
+        timeout-minutes: 12
         run: just ci-install-semgrep
       - name: Formatting
         if: ${{ !cancelled() }}
@@ -113,9 +123,12 @@ jobs:
       - name: Compiler cache fallback without sccache
         run: cargo test -p carrick-xtask --test build_cache
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: Install Linux C cross toolchain
         if: ${{ !cancelled() }}
+        timeout-minutes: 12
         run: just ci-install-linux-cross
       - name: Portable kernel compile (aarch64-linux lib, tests and semantics)
         if: ${{ !cancelled() }}
@@ -143,14 +156,16 @@ jobs:
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: Linux crate rustdoc (including Linux host and KVM modules)
         if: ${{ !cancelled() }}
         run: just doc
 
   macos-clippy:
     needs: changes
-    if: needs.changes.outputs.heavy == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -166,7 +181,9 @@ jobs:
         with:
           shared-key: macos-host
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: Clippy (no-panic gate)
         if: ${{ !cancelled() }}
         run: just clippy
@@ -176,7 +193,7 @@ jobs:
 
   macos-build:
     needs: changes
-    if: needs.changes.outputs.heavy == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -192,7 +209,9 @@ jobs:
         with:
           shared-key: macos-host
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: Workspace build
         if: ${{ !cancelled() }}
         run: just check --workspace
@@ -205,7 +224,7 @@ jobs:
 
   macos-unit:
     needs: changes
-    if: needs.changes.outputs.heavy == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -221,14 +240,16 @@ jobs:
         with:
           shared-key: macos-host
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: Unit tests (host fd headroom)
         if: ${{ !cancelled() }}
         run: just ci-macos-test test
 
   macos-integration:
     needs: changes
-    if: needs.changes.outputs.heavy == 'true'
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -244,7 +265,9 @@ jobs:
         with:
           shared-key: macos-host
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: Host integration tests (no HVF)
         if: ${{ !cancelled() }}
         run: just ci-macos-test test-integration
@@ -265,7 +288,9 @@ jobs:
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: aarch64 Linux cross-check and no-HVF closure
         if: ${{ !cancelled() }}
         run: just check-linux
@@ -311,7 +336,9 @@ jobs:
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: Kernel semantics natively on ARM Linux
         if: ${{ !cancelled() }}
         run: just test-kernel-semantics
@@ -336,9 +363,12 @@ jobs:
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: Install FreeBSD C cross toolchain
         if: ${{ !cancelled() }}
+        timeout-minutes: 12
         run: just ci-install-freebsd-cross
       - name: Cache FreeBSD sysroot
         id: fbsd-sysroot
@@ -375,7 +405,9 @@ jobs:
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: Cross-check NetBSD NVMM backend (including tests)
         if: ${{ !cancelled() }}
         run: just check-netbsd

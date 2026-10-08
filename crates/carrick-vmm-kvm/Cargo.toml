@@ -18,6 +18,13 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[build-dependencies]
+# build.rs derives the CPL0 image inputs from `cargo metadata` (cpl0_inputs.rs).
+serde_json.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
 [dependencies]
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-sched-core = { path = "../carrick-sched-core" }
@@ -51,12 +58,21 @@ carrick-signal-linux = { path = "../carrick-signal-linux" }
 # vs the macOS os_sync API). carrick-thread compiles on every host (leaf deps).
 carrick-thread = { path = "../carrick-thread" }
 libc.workspace = true
+getrandom.workspace = true
 
 # Linux-only KVM bindings: target-gated so the macOS workspace never resolves
 # them (kvm-ioctls/kvm-bindings are cfg(target_os = "linux") only).
 [target.'cfg(target_os = "linux")'.dependencies]
+carrick-core = { path = "../carrick-core" }
 carrick-host = { path = "../carrick-host" }
 kvm-ioctls = "0.22.1"
 kvm-bindings = "0.12.1"
 vmm-sys-util = "0.14.0"
 zerocopy.workspace = true
+
+# Test gate lanes (`just xtask test-lanes check`; carrick-xtask src/test_lanes.rs).
+# Every live target needs a real /dev/kvm on Linux x86_64: `just test-kvm`.
+# `cpl0_image_inputs` reads only sources and Cargo metadata, so it is VM-free.
+[package.metadata.carrick.test-lanes]
+"*" = "kvm"
+cpl0_image_inputs = "host"

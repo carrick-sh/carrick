@@ -21,6 +21,11 @@ pub trait OwnerVenue {
         zone: &carrick_sched_core::ZoneTables,
         slot: carrick_sched_core::SlotId,
     ) -> carrick_sched_core::spaces::notification::SpaceAccess<'_>;
+    fn deliver_completion(
+        zone: &carrick_sched_core::ZoneTables,
+        slot: carrick_sched_core::SlotId,
+        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+    );
     fn encode_error(error: MmError) -> u32;
     fn cancelled_copy_code() -> u32;
 }
@@ -57,23 +62,28 @@ pub struct MmPortal<
 
 /// Authenticated before effects, while dropping the claim can restore LIVE.
 /// Publication cannot reject a prepared settlement afterward.
-enum PreparedDelivery<'a> {
+enum PreparedDelivery<'a, Venue: OwnerVenue> {
     Standalone,
     Scheduler {
-        venue: carrick_sched_core::spaces::notification::SpaceReleaseVenue<'a>,
+        venue: core::marker::PhantomData<Venue>,
+        zone: &'a carrick_sched_core::ZoneTables,
         key: carrick_sched_core::object_wait::ObjectWaitKey,
+        waker: carrick_sched_core::SlotId,
     },
 }
-impl PreparedDelivery<'_> {
+impl<Venue: OwnerVenue> PreparedDelivery<'_, Venue> {
     fn publish(self) {
-        if let Self::Scheduler { venue, key } = self {
+        if let Self::Scheduler {
+            zone, key, waker, ..
+        } = self
+        {
             let completion = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
                 '_,
-            >| { (venue.deliver)(venue.zone, venue.waker, effects) };
+            >| { Venue::deliver_completion(zone, waker, effects) };
             // SAFETY: this capability came from the exact claimed node's
             // retained PREPARE admission, before that claim was released.
-            unsafe { venue.zone.retained_object_notification(key) }
-                .publish(venue.waker, &completion);
+            unsafe { zone.retained_object_notification(key) }
+                .publish(carrick_sched_core::Waker::El1 { slot: waker }, &completion);
         }
     }
 }
@@ -185,19 +195,19 @@ impl<
         &self,
         claim: &ClaimedPreparedCopy<'_, Policy, Geometry>,
         slot: u32,
-    ) -> Result<PreparedDelivery<'_>, MmError> {
+    ) -> Result<PreparedDelivery<'_, Venue>, MmError> {
         let Some(key) = claim.notification() else {
             return Ok(PreparedDelivery::Standalone);
         };
         let zone = self.zone.ok_or(MmError::Core)?;
-        let slot = carrick_sched_core::SlotId::from_index(slot as usize).ok_or(MmError::Invalid)?;
-        let venue = Venue::space_access(zone, slot)
-            .venue()
-            .ok_or(MmError::Core)?;
-        if !core::ptr::eq(venue.zone, zone) {
-            return Err(MmError::Stale);
-        }
-        Ok(PreparedDelivery::Scheduler { venue, key })
+        let waker =
+            carrick_sched_core::SlotId::from_index(slot as usize).ok_or(MmError::Invalid)?;
+        Ok(PreparedDelivery::Scheduler {
+            venue: core::marker::PhantomData,
+            zone,
+            key,
+            waker,
+        })
     }
     /// Release semantic custody by exact atomic identity. This does not
     /// acquire the root or descriptor editor, even while either is held.
@@ -436,15 +446,6 @@ impl<
             {
                 return Err(MmError::Fault);
             }
-        } else if continuation.intent == TransferIntent::CarrickIdentityWrite {
-            let base = Geometry::identity_control_base().ok_or(MmError::Fault)?;
-            if !CarrickIdentityWrite::authorizes(
-                base,
-                continuation.address().raw(),
-                continuation.len(),
-            ) {
-                return Err(MmError::Fault);
-            }
         } else {
             let mapping = root.mapping(va).ok_or(MmError::Fault)?;
             let access = match continuation.intent {
@@ -468,10 +469,7 @@ impl<
         continuation: &TransferContinuation,
         words: &W,
         venues: SelectionVenues<'_, R, C>,
-    ) -> Result<TransferStep, MmError>
-    where
-        B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
-    {
+    ) -> Result<TransferStep, MmError> {
         let SelectionVenues {
             prepared,
             cow,
@@ -506,15 +504,12 @@ impl<
             result => result?,
         };
         let access = match continuation.intent {
-            TransferIntent::UserWrite | TransferIntent::CarrickIdentityWrite => LeafAccess::Write,
+            TransferIntent::UserWrite => LeafAccess::Write,
             TransferIntent::ReadInstruction => LeafAccess::Execute,
             _ => LeafAccess::Read,
         };
         let root = B::root(grant.ttbr0).map_err(mmu_error)?;
         let mut leaf = match translated::<B, W>(words, root, va, access, continuation.intent) {
-            Err(MmError::Fault) if continuation.intent == TransferIntent::CarrickIdentityWrite => {
-                return Err(MmError::Fault);
-            }
             Err(MmError::Fault) if access == LeafAccess::Write => {
                 B::classify_cow(words, root, UserVa::new(va), cow.executable_publication())
                     .map_err(mmu_error)?;
@@ -577,21 +572,18 @@ impl<
             }
             result => result?,
         };
-        if leaf.is_none() && continuation.intent == TransferIntent::CarrickIdentityWrite {
-            return Err(MmError::Fault);
-        }
-        if leaf.is_none()
-            && let Some(page) = residency.lookup(mm, va)
-        {
-            if matches!(
-                prepared.commit_prepared(
-                    grant.ttbr0,
-                    PageSpan::containing(va).va,
-                    page.expected_ipa,
-                    access,
-                ),
-                Ok(GuestPreparedCommit::Committed | GuestPreparedCommit::AlreadyResident)
-            ) {
+        if leaf.is_none() {
+            if let Some(page) = residency.lookup(mm, va)
+                && matches!(
+                    prepared.commit_prepared(
+                        grant.ttbr0,
+                        PageSpan::containing(va).va,
+                        page.expected_ipa,
+                        access,
+                    ),
+                    Ok(GuestPreparedCommit::Committed | GuestPreparedCommit::AlreadyResident)
+                )
+            {
                 residency.record_commit(page);
             }
             leaf = translated::<B, W>(words, root, va, access, continuation.intent)?;
@@ -608,12 +600,17 @@ impl<
             if root.fork_pending() && !root.fork_write_authorized(continuation.fork_sequence()) {
                 return Err(MmError::Busy);
             }
-            let plan = crate::mm::fault::owner_fault_plan::<_, _, B, _>(
-                &mut root,
-                words,
-                crate::mm::fault::OwnerFaultResidency::new(residency, continuation.handle.mm()),
-                B::root(grant.ttbr0).map_err(mmu_error)?,
-                UserVa::new(va),
+            let target = if root
+                .mapping(va)
+                .is_some_and(|mapping| mapping.host_backing.is_some())
+            {
+                4096
+            } else {
+                carrick_core_abi::EL1_FRAME_GRANT_TARGET_SIZE
+            };
+            let plan = root.fork_transfer_fault_plan(
+                va,
+                target,
                 ReservationProtection::from_bits(bits).ok_or(MmError::Invalid)?,
                 continuation.fork_sequence(),
             )?;
@@ -648,7 +645,7 @@ impl<
                     root_generation: NonZeroU64::new(generation).ok_or(MmError::Stale)?,
                     offset: continuation.offset(),
                     ipa,
-                    executable: continuation.intent.is_write() && executable,
+                    executable: continuation.intent == TransferIntent::UserWrite && executable,
                 },
                 PortalByteRange::new(va, len).ok_or(MmError::Invalid)?,
                 continuation.fork_sequence(),
@@ -688,7 +685,7 @@ impl<
             result => result?,
         };
         let access = match continuation.intent {
-            TransferIntent::UserWrite | TransferIntent::CarrickIdentityWrite => LeafAccess::Write,
+            TransferIntent::UserWrite => LeafAccess::Write,
             TransferIntent::ReadInstruction => LeafAccess::Execute,
             _ => LeafAccess::Read,
         };
@@ -736,20 +733,10 @@ fn translated<B: OwnerMmu, W: LiveDescriptorWords + ?Sized>(
         root,
         UserVa::new(va),
         access,
-        !matches!(
-            intent,
-            TransferIntent::CarrickInternalRead | TransferIntent::CarrickIdentityWrite
-        ),
+        intent != TransferIntent::CarrickInternalRead,
     )
+    .map(|leaf| leaf.map(|leaf| (leaf.output.raw(), leaf.executable)))
     .map_err(mmu_error)
-    .and_then(|leaf| {
-        if intent == TransferIntent::CarrickIdentityWrite
-            && leaf.is_some_and(|leaf| !leaf.kernel_writable_nonexecutable)
-        {
-            return Err(MmError::Fault);
-        }
-        Ok(leaf.map(|leaf| (leaf.output.raw(), leaf.executable)))
-    })
 }
 
 /// PREPARE finishes all fault/supply work and authenticates physical custody

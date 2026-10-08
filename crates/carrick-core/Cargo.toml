@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Shared reservation, transfer, fork and COW owner algorithms."
+description = "Neutral MM, fork, COW, and wait/lifecycle substrate for Carrick."
 
 [features]
 default = []
@@ -16,14 +16,11 @@ carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-sched-core = { path = "../carrick-sched-core" }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-usdt.workspace = true
-
 [dev-dependencies]
+carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 parking_lot.workspace = true
 carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
-
 carrick-personality-linux = { path = "../carrick-personality-linux" }
 
 [lints]

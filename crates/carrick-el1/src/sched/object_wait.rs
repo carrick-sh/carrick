@@ -37,25 +37,19 @@ pub(crate) fn deliver_completion(
         {
             let target = zone.slot(slot).sgi_target();
             if target != 0 {
-                cpu.send_sgi(target | (u64::from(carrick_el1_abi::GIC_RESCHED_INTID) << 24));
-            }
-        }
-        if deferred && let Some(target_slot) = zone.find_any_idle().filter(|&slot| slot != venue) {
-            let target = zone.slot(target_slot).sgi_target();
-            if target != 0 {
-                cpu.send_sgi(target | (u64::from(carrick_el1_abi::GIC_RESCHED_INTID) << 24));
+                cpu.send_resched(slot, target);
             }
         }
         if effects.misplaced
             && let Some(slot) = own
             && let Some(task) = carrick_el1_abi::current_task_guest(usize::from(slot.raw()))
         {
-            task.mark_pending_host_work();
+            task.linux.mark_pending_host_work();
         }
         if (deferred || (effects.queued_own && own == Some(venue)))
             && let Some(task) = carrick_el1_abi::current_task_guest(usize::from(venue.raw()))
         {
-            task.mark_pending_host_work();
+            task.linux.mark_pending_host_work();
         }
     }
     #[cfg(not(target_os = "none"))]
@@ -140,10 +134,11 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
     /// nothing else on this vCPU: host work is pending here, and the host
     /// settles the parked thread at this boundary (its enrollment samples
     /// pending signals). All caller locks must be released.
-    pub fn leave_after_object_park(&mut self, parked: ObjectParked<'_>) -> Option<Served> {
+    pub fn leave_after_object_park(&mut self, mut parked: ObjectParked<'_>) -> Option<Served> {
         if !parked.matches(self.zone, self.slot) {
             return None;
         }
+        self.record_handoff(parked.take_receipt());
         self.counters.exit_reasons[carrick_el1_abi::El1ExitReason::IdleHostWork as usize]
             .fetch_add(1, Ordering::Relaxed);
         Some(Served::Idle)
@@ -154,12 +149,13 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
     pub fn resume_after_object_park(
         &mut self,
         frame: &mut TrapFrame,
-        parked: ObjectParked<'_>,
+        mut parked: ObjectParked<'_>,
         timeout_result: u64,
     ) -> Option<Served> {
         if !parked.matches(self.zone, self.slot) {
             return None;
         }
+        self.record_handoff(parked.take_receipt());
         Some(self.run_next(frame, timeout_result))
     }
 
@@ -196,7 +192,7 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
             self.program_timer(true);
         }
         if effects.misplaced {
-            self.task.mark_pending_host_work();
+            self.task.linux.mark_pending_host_work();
         }
     }
 }

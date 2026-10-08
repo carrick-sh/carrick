@@ -148,7 +148,7 @@ fixtures-publish SHA:
 fixtures-restore BUNDLE:
     {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- fixtures restore --bundle {{quote(BUNDLE)}}
 
-# Verify the exact-SHA fixture archive before restoration on the gate host.
+# Verify a fixture archive by input identity before restoration on the gate host.
 fixtures-verify BUNDLE:
     {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- fixtures verify --bundle {{quote(BUNDLE)}}
 
@@ -216,6 +216,9 @@ lint-domains-host:
 # Host-independent domain checks; live compiler capture runs separately.
 lint-domains-source:
     python3 scripts/conformance/check-next-strategy.py
+    # Every test target is in exactly one gate lane (Cargo metadata), derived
+    # lanes are consumed by their recipes, named-lane targets are named.
+    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-lanes check
     {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- probe-coverage
     {{_admit}} {{_cargo}} test -p carrick-xtask --test probe_coverage
     ./scripts/closure-assert-vmfree-schedule.sh
@@ -242,6 +245,11 @@ lint-domains-source:
     # before the offline personality-boundary graph check on fresh runners.
     {{_admit}} {{_cargo}} fetch --locked
     {{_admit}} {{_cargo}} metadata --locked --offline --all-features --format-version 1 > target/cargo-metadata.json
+    # Nested fixture workspaces (fixtures/*/Cargo.lock) sit outside the root
+    # workspace, so the --locked gates above never resolve them; without this
+    # step lock drift surfaced only at `just fixtures-publish`. No compile, so it
+    # costs a lock resolution per fixture.
+    ./scripts/check-fixture-lockfiles.sh
     {{_admit}} {{_cargo}} run -p carrick-conformance-contract --bin check-personality-boundary -- --root . --metadata-file target/cargo-metadata.json
     python3 -m unittest scripts/tests/test_check_contract_change.py
     python3 scripts/migrate/check-runtime-global-state.py --check
@@ -486,16 +494,16 @@ test-kernel-semantics *ARGS:
 
 # Host unit/integration tests that do NOT need the HVF runtime or Docker.
 test-mm-owner *ARGS:
-    {{_admit}} {{_cargo}} test --locked -p carrick-core -p carrick-core-abi --lib
-    {{_admit}} {{_cargo}} test --locked -p carrick-core --doc
-    {{_admit}} {{_cargo}} test --locked -p carrick-core --test owner_fault --test fork_inventory --test identity_stamp {{ARGS}}
-    {{_admit}} {{_cargo}} test --locked -p carrick-core --test x86_acceleration {{ARGS}}
+    cargo test --locked -p carrick-core -p carrick-core-abi --lib
+    cargo test --locked -p carrick-core --doc
+    cargo test --locked -p carrick-core --test x86_acceleration {{ARGS}}
 
 test *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     python3 -c 'import fcntl, os; [fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK) for fd in (0, 1, 2)]' 2>/dev/null || true
-    {{_admit}} {{_cargo}} test -p carrick-el1 --doc mm_portal
+    ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
+    cargo test -p carrick-el1 --doc mm_portal
     # Shared owner witnesses and X1 use host-owned descriptors; no VM/Docker.
     just --justfile {{justfile()}} test-mm-owner {{ARGS}}
     if [ "{{os()}}" = "macos" ]; then
@@ -521,18 +529,24 @@ test *ARGS:
         # those belong to a guest-capable lane (`just conformance*`,
         # `cargo test -p carrick-cli --test <name>`).
         {{_admit}} {{_cargo}} test --workspace --exclude carrick-runtime --exclude carrick-kernel --exclude carrick-cli --exclude carrick-host --exclude carrick-vfs --exclude carrick-vmm-hvf --lib --bins {{ARGS}}
-        # carrick-kernel-example's proof (`tests/fork_pipe_wait.rs`) is an
-        # integration target, and the `--lib --bins` line above never reaches
-        # a crate's `tests/` directory -- the same house trap the `--bins`
-        # note describes -- so it is named here. Its Linux tasks are host
-        # threads (no `libc::fork()` from the harness), so it needs no serial
-        # slot. One case deliberately costs its 5 s wait bound.
-        {{_admit}} {{_cargo}} test -p carrick-kernel-example --tests {{ARGS}}
-        # The contract registry's own tests (`tests/claims.rs` loads the live
-        # conformance-contracts/ tree) are integration targets too, so the
-        # `--lib --bins` line never ran them; name the crate.
-        {{_admit}} {{_cargo}} test -p carrick-conformance-contract --tests {{ARGS}}
-        {{_admit}} {{_cargo}} test -p carrick-xtask --test probe_coverage {{ARGS}}
+        # Integration targets (`tests/*.rs`) are invisible to `--lib --bins`;
+        # a test moved out of `src/` used to leave every gate silently. The
+        # host-lane selection is DERIVED from Cargo metadata: every test target
+        # not declared in another lane under `[package.metadata.carrick.test-lanes]`
+        # (carrick-xtask `test_lanes.rs`) runs here, and `lint-domains-source`
+        # runs `test-lanes check`, which fails on any target no gate runs.
+        selections="$({{_admit}} {{_cargo}} run -q --locked -p carrick-xtask -- test-lanes args --lane host)"
+        # Every selection runs; the recipe fails after the last one, naming each red.
+        red=()
+        while IFS= read -r selection; do
+            [ -n "$selection" ] || continue
+            {{_admit}} {{_cargo}} test --no-fail-fast $selection {{ARGS}} -- --skip serial_host </dev/null || red+=("$selection")
+            env RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test --no-fail-fast $selection {{ARGS}} serial_host </dev/null || red+=("$selection (serial_host)")
+        done <<< "$selections"
+        if [ "${#red[@]}" -ne 0 ]; then
+            printf 'test: red host-lane selection: %s\n' "${red[@]}" >&2
+            exit 1
+        fi
         # The authenticated jit-shape builders/parsers have measured >1 MiB
         # debug frames. Several tests need two in one body; libtest's ~2 MiB
         # default has repeatedly been tipped over by unrelated additions. Keep
@@ -571,6 +585,10 @@ test *ARGS:
         # tests probe closed fd numbers. Stage-1 rollback tests assert reuse from
         # the process-wide root-slot pool. Keep the crate serial for these reasons.
         env RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test -p carrick-runtime --lib {{ARGS}}
+        # The VM-free HVF trap surface (capabilities, mapping plan, ESR
+        # decoders, EL1 vector layout). Its VM-booting half is the signed
+        # `just test-hvf-trap-engine`; this target must never reach hv_vm_create.
+        {{_admit}} {{_cargo}} test -p carrick-runtime --test trap_hvf {{ARGS}}
         # carrick-vmm-hvf is serial for a THIRD reason, and it is structural
         # rather than a test-hygiene lapse: the carrier is process-global by
         # design, so its alias registry, replay mappings, global-frame owner
@@ -603,8 +621,56 @@ test *ARGS:
     # Runtime still has process-wide carrier lifecycle, root-slot pool, env and
     # host-fork tests; fixture-owned injections alone do not make it parallel-safe.
     env RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test -p carrick-runtime {{_platform_features}} --lib {{ARGS}}
-    {{_admit}} {{_cargo}} test -p carrick-conformance-contract --tests {{ARGS}}
-    {{_admit}} {{_cargo}} test -p carrick-xtask --test probe_coverage {{ARGS}}
+    # Derived host-lane integration targets, as on macOS; packages whose
+    # default features select platform-macos get this host's backend features.
+    selections="$({{_admit}} {{_cargo}} run -q --locked -p carrick-xtask -- test-lanes args --lane host --platform-features "{{_platform_features}}")"
+    # Every selection runs; the recipe fails after the last one, naming each red.
+    red=()
+    while IFS= read -r selection; do
+        [ -n "$selection" ] || continue
+        {{_admit}} {{_cargo}} test --no-fail-fast $selection {{ARGS}} -- --skip serial_host </dev/null || red+=("$selection")
+        env RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test --no-fail-fast $selection {{ARGS}} serial_host </dev/null || red+=("$selection (serial_host)")
+    done <<< "$selections"
+    if [ "${#red[@]}" -ne 0 ]; then
+        printf 'test: red host-lane selection: %s\n' "${red[@]}" >&2
+        exit 1
+    fi
+
+# Every KVM-lane test target (`kvm` in `[package.metadata.carrick.test-lanes]`,
+# derived by `carrick-xtask test-lanes`), plus carrick-vmm-kvm's own lib/bin
+# tests. Linux x86_64 with a usable /dev/kvm only: the recipe refuses anywhere
+# else, and exports CARRICK_REQUIRE_KVM=1 so a test that would skip on a
+# missing device or fixture fails instead. Run by `just accept --profile
+# linux-portable` (kvm-tests) and the KVM job in kernel-runtime.yml.
+test-kvm *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{os()}}" != "linux" ] || [ "{{arch()}}" != "x86_64" ]; then
+        echo "test-kvm: needs Linux x86_64 with /dev/kvm (this host: {{os()}}/{{arch()}})" >&2
+        exit 1
+    fi
+    if ! { [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; }; then
+        echo "test-kvm: /dev/kvm is missing or not read/write for $(id -un)" >&2
+        exit 1
+    fi
+    export CARRICK_REQUIRE_KVM=1
+    # live_vcpu_x86's M2 case runs this static musl fixture (needs the
+    # x86_64-unknown-linux-musl target; see docs/perf-results/2026-10-04-x86-kvm-lane-health.md).
+    RUSTFLAGS='-C linker=rust-lld -C linker-flavor=ld.lld -C relocation-model=static -C link-arg=--no-pie' \
+        {{_cargo}} build --release \
+        --manifest-path crates/carrick-vmm-bhyve/fixtures/hello-x86_64/Cargo.toml \
+        --target x86_64-unknown-linux-musl
+    {{_admit}} {{_cargo}} test --locked -p carrick-vmm-kvm --lib --bins {{ARGS}}
+    selections="$({{_admit}} {{_cargo}} run -q --locked -p carrick-xtask -- test-lanes args --lane kvm --platform-features "{{_platform_features}}")"
+    red=()
+    while IFS= read -r selection; do
+        [ -n "$selection" ] || continue
+        {{_admit}} {{_cargo}} test --locked --no-fail-fast $selection {{ARGS}} </dev/null || red+=("$selection")
+    done <<< "$selections"
+    if [ "${#red[@]}" -ne 0 ]; then
+        printf 'test-kvm: red kvm-lane selection: %s\n' "${red[@]}" >&2
+        exit 1
+    fi
 
 # Rustdoc gate: broken intra-doc links / unclosed-tag lints fail the build (matches CI).
 doc *ARGS:
@@ -888,6 +954,20 @@ test-embed *ARGS: build
 test-hvf *ARGS:
     ./scripts/test-signed.sh carrick-vmm-hvf {{ARGS}}
 
+# HVF trap-engine tests (`crates/carrick-vmm-hvf/tests/trap_engine_hvf.rs`):
+# bring up a real VM via `new_hvf_trap_engine`, load the staged root onto a
+# live persistent-executor vCPU (production's first executor load) and run
+# tiny guests through the mailbox vectors (EL1 getpid fast path, its
+# closed-gate and no-shim controls, unseeded gettid forwarding). They moved out of carrick-runtime's `trap_hvf`, which self-skipped
+# on HV_DENIED and so "passed" unsigned without running. Every test is
+# `#[ignore]`d (a bare `cargo test` never selects it) and panics on HV_DENIED;
+# scripts/test-signed.sh signs the package's test executables, runs the
+# `trap_engine_hvf_` set with `--ignored` (each test re-execs itself in a
+# fresh process: one VM per process), then runs the package's UNENTITLED
+# negative control (`unsigned_executable_maps_hv_denied_to_entitlement`).
+test-hvf-trap-engine:
+    ./scripts/test-signed.sh carrick-vmm-hvf trap_engine_hvf_ --ignored --nocapture
+
 # Guest-running tests of carrick-conformance-next from SIGNED cargo test executables.
 test-conformance-next *ARGS: build
     ./scripts/test-signed.sh carrick-conformance-next {{ARGS}}
@@ -915,6 +995,20 @@ build-fixture:
 # Build the static x86_64 musl M2 fixture (Mac-native: rustup + rust-lld, no C/Docker).
 build-x86-fixture:
     ./crates/carrick-vmm-bhyve/fixtures/hello-x86_64/build.sh
+
+# Build the freestanding CPL0 kernel image for x86_64 KVM tests.
+build-cpl0:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "$(uname -s):$(uname -m)" in
+        Linux:x86_64|Linux:amd64)
+            cargo build -p carrick-x86-cpl0 --release --target x86_64-unknown-none
+            ;;
+    esac
+
+# Run KVM VMM unit and integration tests, building the CPL0 image on x86_64 first.
+kvm-tests *ARGS: build-cpl0
+    cargo test -p carrick-vmm-kvm {{ARGS}}
 
 # L1 cross-check: our owned crates compile for aarch64-linux AND the
 # platform-linux closure links no HVF/applevisor (the C4-decouple proof).
@@ -1053,12 +1147,10 @@ ci-install-semgrep:
     echo "$RUNNER_TEMP/semgrep/bin" >> "${GITHUB_PATH:?}"
 
 ci-install-linux-cross:
-    sudo apt-get update
-    sudo apt-get install -y gcc-aarch64-linux-gnu
+    timeout 600 sh -c 'sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30 update && sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30 install -y gcc-aarch64-linux-gnu'
 
 ci-install-freebsd-cross:
-    sudo apt-get update
-    sudo apt-get install -y clang llvm
+    timeout 600 sh -c 'sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30 update && sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30 install -y clang llvm'
 
 # Keep the permanent archive: release mirrors eventually remove old sysroots.
 ci-freebsd-sysroot:
@@ -1102,8 +1194,16 @@ ci-changes:
             done < "$paths"
         fi
     fi
+    # Draft PRs defer the hosted macOS jobs: the macOS runner pool is small and
+    # shared with the merge queue. Marking the PR ready reruns them; merge_group
+    # and push runs always include them.
+    macos=true
+    if [[ "${CI_EVENT}" == pull_request && "${CI_DRAFT:-false}" == true ]]; then
+        macos=false
+    fi
     echo "heavy=$heavy" >> "${GITHUB_OUTPUT:?}"
-    echo "Run hosted checks: $heavy"
+    echo "macos=$macos" >> "${GITHUB_OUTPUT:?}"
+    echo "Run hosted checks: $heavy (macOS: $macos)"
 
 # Fail closed: GitHub considers skipped required jobs successful on their own.
 # ci-ok depends on every job; only the filter can license a docs-only PR skip.
@@ -1113,8 +1213,12 @@ ci-results:
     jq -e --arg event "${CI_EVENT:?}" '
       .changes.result == "success" and
       (length > 1) and
-      (if .changes.outputs.heavy == "true" then
+      (if .changes.outputs.heavy == "true" and .changes.outputs.macos == "true" then
          del(.changes) | all(.[]; .result == "success")
+       elif .changes.outputs.heavy == "true" and .changes.outputs.macos == "false" and $event == "pull_request" then
+         del(.changes)
+         | (with_entries(select(.key | startswith("macos-"))) | all(.[]; .result == "skipped"))
+           and (with_entries(select(.key | startswith("macos-") | not)) | all(.[]; .result == "success"))
        elif .changes.outputs.heavy == "false" and $event == "pull_request" then
          del(.changes) | all(.[]; .result == "skipped")
        else false end)

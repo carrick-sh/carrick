@@ -308,14 +308,17 @@ pub struct HostObjectWakeReport {
 /// Linear effect custody passed from a queue holder after unlocking. The
 /// delivery venue owns SGIs and any required host handback.
 #[must_use = "queue completion effects must be delivered after unlock"]
-pub struct OwnedObjectWakeEffects<'a> {
-    zone: &'a ZoneTables,
+pub struct OwnedObjectWakeEffects<
+    'a,
+    C: Copy + Send + Sync + zerocopy::FromZeros = crate::ThreadCtx,
+> {
+    zone: &'a ZoneTables<C>,
     key: ObjectWaitKey,
     waker: Waker,
     effects: WakeEffects,
     handed: u32,
 }
-impl OwnedObjectWakeEffects<'_> {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> OwnedObjectWakeEffects<'_, C> {
     pub(crate) fn missing_venue(self) {
         assert_eq!(
             self.zone
@@ -395,7 +398,7 @@ impl OwnedObjectWakeEffects<'_> {
         (self.waker, core::mem::take(&mut self.effects), deferred)
     }
 }
-impl Drop for OwnedObjectWakeEffects<'_> {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for OwnedObjectWakeEffects<'_, C> {
     fn drop(&mut self) {
         assert!(
             self.handed == 0 && self.effects == WakeEffects::default(),
@@ -409,21 +412,24 @@ impl Drop for OwnedObjectWakeEffects<'_> {
 /// Its Rust borrow excludes source retirement during derivation; a detached
 /// source requires the same exclusion from its owning shared object guard.
 #[must_use = "retain publication custody until object retirement"]
-pub struct ObjectNotificationSource<'a> {
-    ticket: ObjectNotificationTicket<'a>,
+pub struct ObjectNotificationSource<
+    'a,
+    C: Copy + Send + Sync + zerocopy::FromZeros = crate::ThreadCtx,
+> {
+    ticket: ObjectNotificationTicket<'a, C>,
 }
-impl<'a> ObjectNotificationSource<'a> {
+impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectNotificationSource<'a, C> {
     pub fn key(&self) -> ObjectWaitKey {
         self.ticket.key
     }
-    pub fn borrow(&self) -> BorrowedObjectNotificationSource<'_, 'a> {
+    pub fn borrow(&self) -> BorrowedObjectNotificationSource<'_, 'a, C> {
         BorrowedObjectNotificationSource {
             zone: self.ticket.zone,
             key: self.ticket.key,
             _source: core::marker::PhantomData,
         }
     }
-    pub fn reserve(&self) -> ObjectNotificationTicket<'a> {
+    pub fn reserve(&self) -> ObjectNotificationTicket<'a, C> {
         self.borrow().reserve()
     }
     /// Move this source's one admission into its owner-protected record.
@@ -435,25 +441,19 @@ impl<'a> ObjectNotificationSource<'a> {
 /// Borrowed derivation authority. Dropping a view never releases the durable
 /// source's admission. The scope borrow excludes retirement during reserve;
 /// each derived ticket thereafter owns its own independently counted custody.
-pub struct BorrowedObjectNotificationSource<'scope, 'zone> {
-    zone: &'zone ZoneTables,
+pub struct BorrowedObjectNotificationSource<
+    'scope,
+    'zone,
+    C: Copy + Send + Sync + zerocopy::FromZeros = crate::ThreadCtx,
+> {
+    zone: &'zone ZoneTables<C>,
     key: ObjectWaitKey,
     _source: core::marker::PhantomData<&'scope ()>,
 }
-impl<'scope, 'zone> BorrowedObjectNotificationSource<'scope, 'zone> {
-    pub(crate) fn from_live_admission(
-        zone: &'zone ZoneTables,
-        key: ObjectWaitKey,
-        _admission: &'scope crate::spaces::notification::SpaceNotificationLease<'zone>,
-    ) -> Self {
-        Self {
-            zone,
-            key,
-            _source: core::marker::PhantomData,
-        }
-    }
-
-    pub fn reserve(&self) -> ObjectNotificationTicket<'zone> {
+impl<'scope, 'zone, C: Copy + Send + Sync + zerocopy::FromZeros>
+    BorrowedObjectNotificationSource<'scope, 'zone, C>
+{
+    pub fn reserve(&self) -> ObjectNotificationTicket<'zone, C> {
         let queue = self.zone.object_queue(self.key.index as usize);
         // The borrowed source retains a publisher, excluding rebind while
         // deriving. No queue lock, retry loop, or owning source reconstruction.
@@ -475,15 +475,34 @@ impl<'scope, 'zone> BorrowedObjectNotificationSource<'scope, 'zone> {
     }
 }
 
+impl<'scope, 'zone, C: Copy + Send + Sync + zerocopy::FromZeros>
+    BorrowedObjectNotificationSource<'scope, 'zone, C>
+{
+    pub(crate) fn from_live_admission(
+        zone: &'zone ZoneTables<C>,
+        key: ObjectWaitKey,
+        _admission: &'scope crate::spaces::notification::SpaceNotificationLease<'zone, C>,
+    ) -> Self {
+        Self {
+            zone,
+            key,
+            _source: core::marker::PhantomData,
+        }
+    }
+}
+
 /// Linear notification custody; no source may be consumed before admission.
 #[must_use = "notification admission must be published, detached, or cancelled"]
-pub struct ObjectNotificationTicket<'a> {
-    zone: &'a ZoneTables,
+pub struct ObjectNotificationTicket<
+    'a,
+    C: Copy + Send + Sync + zerocopy::FromZeros = crate::ThreadCtx,
+> {
+    zone: &'a ZoneTables<C>,
     key: ObjectWaitKey,
     retained: bool,
 }
-impl<'a> ObjectNotificationTicket<'a> {
-    pub fn into_source(self) -> ObjectNotificationSource<'a> {
+impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectNotificationTicket<'a, C> {
+    pub fn into_source(self) -> ObjectNotificationSource<'a, C> {
         ObjectNotificationSource { ticket: self }
     }
     pub fn key(&self) -> ObjectWaitKey {
@@ -503,7 +522,7 @@ impl<'a> ObjectNotificationTicket<'a> {
         snapshot: ObjectWaitSnapshot,
         record: RecordId,
         operation: OperationToken,
-        completion: &dyn Fn(OwnedObjectWakeEffects),
+        completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
         still_blocked: impl FnOnce() -> bool,
     ) -> Result<(), (ObjectWaitError, OperationToken)> {
         if snapshot.key != self.key {
@@ -524,7 +543,7 @@ impl<'a> ObjectNotificationTicket<'a> {
         self,
         record: RecordId,
         operation: OperationToken,
-        completion: &dyn Fn(OwnedObjectWakeEffects),
+        completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
         before_link: impl FnOnce(),
     ) -> Result<(), (ObjectWaitError, OperationToken)> {
         self.defer_admission_with_hooks(record, operation, completion, before_link, || {})
@@ -533,7 +552,7 @@ impl<'a> ObjectNotificationTicket<'a> {
         self,
         record: RecordId,
         operation: OperationToken,
-        completion: &dyn Fn(OwnedObjectWakeEffects),
+        completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
         before_link: impl FnOnce(),
         after_link: impl FnOnce(),
     ) -> Result<(), (ObjectWaitError, OperationToken)> {
@@ -610,7 +629,7 @@ impl<'a> ObjectNotificationTicket<'a> {
         Ok(())
     }
     /// Never waits or retries. A current holder or this publisher owns delivery.
-    pub fn publish(self, waker: Waker, completion: &dyn Fn(OwnedObjectWakeEffects)) {
+    pub fn publish(self, waker: Waker, completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>)) {
         let revision = self.advance_revision(waker, completion);
         revision.publish();
     }
@@ -619,8 +638,8 @@ impl<'a> ObjectNotificationTicket<'a> {
     pub(crate) fn advance_revision<'c>(
         self,
         waker: Waker,
-        completion: &'c dyn Fn(OwnedObjectWakeEffects),
-    ) -> ObjectNotificationPublication<'a, 'c> {
+        completion: &'c dyn Fn(OwnedObjectWakeEffects<'_, C>),
+    ) -> ObjectNotificationPublication<'a, 'c, C> {
         let queue = self.zone.object_queue(self.key.index as usize);
         assert_eq!(
             queue.generation.load(Ordering::Acquire),
@@ -637,12 +656,16 @@ impl<'a> ObjectNotificationTicket<'a> {
     }
 }
 #[must_use = "publish the advanced producer revision after resource unlock"]
-pub(crate) struct ObjectNotificationPublication<'a, 'c> {
-    ticket: ObjectNotificationTicket<'a>,
+pub(crate) struct ObjectNotificationPublication<
+    'a,
+    'c,
+    C: Copy + Send + Sync + zerocopy::FromZeros = crate::ThreadCtx,
+> {
+    ticket: ObjectNotificationTicket<'a, C>,
     waker: Waker,
-    completion: &'c dyn Fn(OwnedObjectWakeEffects),
+    completion: &'c dyn Fn(OwnedObjectWakeEffects<'_, C>),
 }
-impl ObjectNotificationPublication<'_, '_> {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectNotificationPublication<'_, '_, C> {
     pub fn publish(mut self) {
         self.publish_inner();
     }
@@ -666,12 +689,14 @@ impl ObjectNotificationPublication<'_, '_> {
         self.ticket.zone.try_drain_object_pending(key, completion);
     }
 }
-impl Drop for ObjectNotificationPublication<'_, '_> {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop
+    for ObjectNotificationPublication<'_, '_, C>
+{
     fn drop(&mut self) {
         self.publish_inner();
     }
 }
-impl Drop for ObjectNotificationTicket<'_> {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for ObjectNotificationTicket<'_, C> {
     fn drop(&mut self) {
         if self.retained {
             self.zone
@@ -754,20 +779,22 @@ impl ObjectRecord {
 
 /// The queue guard also authenticates its zone, index and incarnation. It
 /// cannot be used with a different zone's queue by accident.
-pub struct ObjectWaitGuard<'a> {
-    zone: &'a ZoneTables,
+type ObjectWakeCompletion<'a, C> = &'a dyn Fn(OwnedObjectWakeEffects<'_, C>);
+
+pub struct ObjectWaitGuard<'a, C: Copy + Send + Sync + zerocopy::FromZeros = crate::ThreadCtx> {
+    zone: &'a ZoneTables<C>,
     key: ObjectWaitKey,
-    completion: Option<&'a dyn Fn(OwnedObjectWakeEffects)>,
+    completion: Option<ObjectWakeCompletion<'a, C>>,
 }
 
 // A host predicate may unwind before the record is parked. Keep the newly
 // linked operation private until both rechecks pass, and undo it on any exit.
-struct EnrollmentRollback<'g, 'z> {
-    queue: &'g ObjectWaitGuard<'z>,
+struct EnrollmentRollback<'g, 'z, C: Copy + Send + Sync + zerocopy::FromZeros = crate::ThreadCtx> {
+    queue: &'g ObjectWaitGuard<'z, C>,
     record: RecordId,
     armed: bool,
 }
-impl Drop for EnrollmentRollback<'_, '_> {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for EnrollmentRollback<'_, '_, C> {
     fn drop(&mut self) {
         if self.armed {
             self.queue.unlink(self.record);
@@ -781,12 +808,12 @@ impl Drop for EnrollmentRollback<'_, '_> {
     }
 }
 
-impl Drop for ObjectWaitGuard<'_> {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for ObjectWaitGuard<'_, C> {
     fn drop(&mut self) {
         self.release_with(|| {});
     }
 }
-impl ObjectWaitGuard<'_> {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
     fn release_with(&self, mut before_unlock: impl FnMut()) {
         let queue = self.queue();
         let Some(completion) = self.completion else {
@@ -872,7 +899,7 @@ impl ObjectWaitGuard<'_> {
     }
 }
 
-impl ObjectWaitGuard<'_> {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
     fn drain_completion(&self, waker: Waker, effects: &mut WakeEffects, handed: &mut u32) {
         let mut cursor = self.queue().head.load(Ordering::Relaxed);
         while let Some(record) = RecordId::from_raw(cursor) {
@@ -1239,7 +1266,7 @@ pub struct ObjectQueueCensus {
     pub locked: bool,
 }
 
-impl ZoneRecord {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
     /// This record's object-wait registration, if it has one or owns a
     /// pending object operation.
     pub fn object_wait_census(&self) -> Option<ObjectWaitCensus> {
@@ -1283,7 +1310,7 @@ impl ZoneRecord {
     }
 }
 
-impl ZoneTables {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     fn object_queue(&self, index: usize) -> &ObjectQueue {
         if index < ORIGINAL_OBJECT_WAIT_QUEUES {
             &self.object_waits[index]
@@ -1294,7 +1321,7 @@ impl ZoneTables {
         }
     }
 
-    fn completion_transfer(&self, id: RecordId) -> HostTransfer<'_> {
+    fn completion_transfer(&self, id: RecordId) -> HostTransfer<'_, C> {
         let claim = self.record(id).claim();
         assert!(
             matches!(claim, Claim::Transferring { .. }),
@@ -1307,16 +1334,10 @@ impl ZoneTables {
             seq,
         }
     }
-
-    /// Whether any completion handbacks are waiting to be drained by the host.
-    pub fn has_completion_handbacks(&self) -> bool {
-        self.completion_handbacks.has_pending()
-    }
-
     /// Called at a notified host boundary, never as a periodic poll.
     pub fn take_completion_handbacks(
         &self,
-        wait: &impl LockWait,
+        wait: &impl LockWait<C>,
         handed: &mut impl FnMut(RecordRef),
     ) {
         // Host boundary only. Producers never acquire this consumer lock.
@@ -1357,7 +1378,7 @@ impl ZoneTables {
     fn try_drain_object_pending(
         &self,
         key: ObjectWaitKey,
-        completion: &dyn Fn(OwnedObjectWakeEffects),
+        completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
     ) {
         let queue = self.object_queue(key.index as usize);
         let state = queue.lock.load(Ordering::SeqCst);
@@ -1383,8 +1404,8 @@ impl ZoneTables {
     fn lock_object_index(
         &self,
         key: ObjectWaitKey,
-        wait: &impl LockWait,
-    ) -> Option<ObjectWaitGuard<'_>> {
+        wait: &impl LockWait<C>,
+    ) -> Option<ObjectWaitGuard<'_, C>> {
         let queue = self.object_queue(key.index as usize);
         let mut attempt = 0;
         loop {
@@ -1412,7 +1433,7 @@ impl ZoneTables {
     pub fn bind_object_wait(
         &self,
         key: ObjectWaitKey,
-        wait: &impl LockWait,
+        wait: &impl LockWait<C>,
     ) -> Result<(), ObjectWaitError> {
         if self
             .object_queue(key.index as usize)
@@ -1442,8 +1463,8 @@ impl ZoneTables {
     pub fn bind_object_wait_with_completion(
         &self,
         key: ObjectWaitKey,
-        wait: &impl LockWait,
-        completion: &dyn Fn(OwnedObjectWakeEffects),
+        wait: &impl LockWait<C>,
+        completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
     ) -> Result<(), ObjectWaitError> {
         let guard = self.lock_completion_index(key, wait, completion)?;
         let queue = guard.queue();
@@ -1463,9 +1484,9 @@ impl ZoneTables {
     fn lock_completion_index<'a>(
         &'a self,
         key: ObjectWaitKey,
-        wait: &impl LockWait,
-        completion: &'a dyn Fn(OwnedObjectWakeEffects),
-    ) -> Result<ObjectWaitGuard<'a>, ObjectWaitError> {
+        wait: &impl LockWait<C>,
+        completion: &'a dyn Fn(OwnedObjectWakeEffects<'_, C>),
+    ) -> Result<ObjectWaitGuard<'a, C>, ObjectWaitError> {
         let queue = self.object_queue(key.index as usize);
         let mut attempt = 0;
         loop {
@@ -1508,9 +1529,9 @@ impl ZoneTables {
     pub fn object_wait_with_completion<'a>(
         &'a self,
         key: ObjectWaitKey,
-        wait: &impl LockWait,
-        completion: &'a dyn Fn(OwnedObjectWakeEffects),
-    ) -> Result<ObjectWaitGuard<'a>, ObjectWaitError> {
+        wait: &impl LockWait<C>,
+        completion: &'a dyn Fn(OwnedObjectWakeEffects<'_, C>),
+    ) -> Result<ObjectWaitGuard<'a, C>, ObjectWaitError> {
         let guard = self.lock_completion_index(key, wait, completion)?;
         if guard.queue().completion_mode.load(Ordering::Acquire) == 0
             || guard.key.generation != key.generation
@@ -1524,9 +1545,9 @@ impl ZoneTables {
     pub fn admit_object_notification<'a>(
         &'a self,
         key: ObjectWaitKey,
-        wait: &impl LockWait,
-        completion: &dyn Fn(OwnedObjectWakeEffects),
-    ) -> Result<ObjectNotificationTicket<'a>, ObjectWaitError> {
+        wait: &impl LockWait<C>,
+        completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
+    ) -> Result<ObjectNotificationTicket<'a, C>, ObjectWaitError> {
         if !self.completion_handbacks.initialize() {
             return Err(ObjectWaitError::Busy);
         }
@@ -1553,7 +1574,7 @@ impl ZoneTables {
     pub unsafe fn retained_object_notification(
         &self,
         key: ObjectWaitKey,
-    ) -> ObjectNotificationTicket<'_> {
+    ) -> ObjectNotificationTicket<'_, C> {
         ObjectNotificationTicket {
             zone: self,
             key,
@@ -1602,8 +1623,8 @@ impl ZoneTables {
     pub fn object_wait(
         &self,
         key: ObjectWaitKey,
-        wait: &impl LockWait,
-    ) -> Result<ObjectWaitGuard<'_>, ObjectWaitError> {
+        wait: &impl LockWait<C>,
+    ) -> Result<ObjectWaitGuard<'_, C>, ObjectWaitError> {
         if self.completion_enabled(key) {
             return Err(ObjectWaitError::Occupied);
         }
@@ -1663,7 +1684,7 @@ impl ZoneTables {
 
     /// The claim owner removes at most one object registration, by direct
     /// index and intrusive links, before consuming the operation token.
-    pub(super) fn unlink_object(&self, record: RecordId, wait: &impl LockWait) {
+    pub(super) fn unlink_object(&self, record: RecordId, wait: &impl LockWait<C>) {
         let rec = self.record(record);
         loop {
             let index = rec.object.queue.load(Ordering::Acquire);
@@ -1677,7 +1698,7 @@ impl ZoneTables {
                 return;
             };
             let completion =
-                |effects: OwnedObjectWakeEffects<'_>| wait.complete_object_wake(self, effects);
+                |effects: OwnedObjectWakeEffects<'_, C>| wait.complete_object_wake(self, effects);
             let result = if self.completion_enabled(key) {
                 self.object_wait_with_completion(key, wait, &completion)
             } else {

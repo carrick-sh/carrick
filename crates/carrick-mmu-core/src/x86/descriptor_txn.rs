@@ -1,10 +1,14 @@
 //! Four-level, 4 KiB x86 descriptor transactions. No MM or reservation ledger.
 pub use crate::aarch64::descriptor_txn::{
-    BackingIdentity, DescriptorJournal, DescriptorRefusal, DescriptorTxnId, InlineJournal,
-    JournalEntry, LiveDescriptorWords, PageSpan,
+    BackingIdentity, DescriptorJournal, DescriptorTxnId, InlineJournal, JournalEntry,
+    LiveDescriptorWords, PageSpan,
 };
+pub use crate::descriptor_refusal::DescriptorRefusal;
 use alloc::{collections::BTreeMap, vec::Vec};
-use carrick_guest_arch::{FrameGpa, RootGpa, UserVa};
+use carrick_guest_arch::{
+    Access as GuestAccess, EditBacking, EditCowAccess, EditIntent, EditLeafSize, EditOperation,
+    EditPermissions, FrameGpa, RootGpa, UserVa,
+};
 
 pub const PAGE: u64 = 4096;
 pub const PRESENT: u64 = 1;
@@ -14,6 +18,12 @@ pub const HUGE: u64 = 1 << 7;
 pub const PREPARED: u64 = 1 << 9;
 pub const COW: u64 = 1 << 10;
 pub const MAY_WRITE: u64 = 1 << 11;
+/// Owner-issued private leaf; host Map leaves never carry this bit.
+pub const PRIVATE: u64 = 1 << 52;
+/// Owner-issued execute ceiling, retained when Protect sets NX.
+pub const MAY_EXEC: u64 = 1 << 53;
+/// Invalid terminal retaining the old output until owner scrub settles it.
+pub const RETIRED: u64 = 1 << 8;
 pub const NX: u64 = 1 << 63;
 pub const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
 
@@ -67,6 +77,7 @@ pub enum DescriptorOp {
     Publish {
         span: PageSpan,
         expected: FrameGpa,
+        access: Access,
     },
     Protect {
         span: PageSpan,
@@ -79,6 +90,8 @@ pub enum DescriptorOp {
         new: FrameGpa,
         backing: BackingIdentity,
     },
+    /// Owner retirement retains an inaccessible physical predecessor for scrub.
+    Retire(PageSpan),
     Unmap(PageSpan),
     Coalesce {
         span: PageSpan,
@@ -95,6 +108,7 @@ impl DescriptorOp {
             | Self::CowRepoint { span, .. }
             | Self::Coalesce { span, .. }
             | Self::ArmCow(span)
+            | Self::Retire(span)
             | Self::Unmap(span) => span,
         }
     }
@@ -105,6 +119,109 @@ pub struct DescriptorTxn<'a> {
     pub root: RootGpa,
     pub op: DescriptorOp,
     pub tables: &'a [RootGpa],
+}
+
+impl<'a> DescriptorTxn<'a> {
+    /// Lower one exact-MM owner intent. Every unsupported Linux permission or
+    /// COW mode is rejected before planning any descriptor store.
+    pub fn from_intent(intent: &'a EditIntent<'_, RootGpa>) -> Result<Self, DescriptorRefusal> {
+        let owner = intent.owner();
+        let span = PageSpan::new(intent.range().start().raw(), intent.range().len().raw());
+        let permissions = |perms: EditPermissions| {
+            perms.readable.then_some(Permissions {
+                writable: perms.writable,
+                executable: perms.executable,
+                user: perms.user,
+            })
+        };
+        let backing = |value: EditBacking| BackingIdentity {
+            frame_id: value.frame_id,
+            mapping_id: value.mapping_id,
+            owner_generation: value.owner_generation,
+            inventory_revision: value.inventory_revision,
+        };
+        let size = |value: EditLeafSize| match value {
+            EditLeafSize::Page => LeafSize::Page,
+            EditLeafSize::Block2M => LeafSize::Block2M,
+            EditLeafSize::Block1G => LeafSize::Block1G,
+        };
+        let operation = match intent.operation() {
+            EditOperation::Prepare {
+                output,
+                permissions: requested,
+                resident,
+                backing: identity,
+            } => DescriptorOp::Prepare {
+                span,
+                output,
+                permissions: permissions(requested).ok_or(DescriptorRefusal::BadEncoding)?,
+                resident: PageSpan::new(resident.start().raw(), resident.len().raw()),
+                backing: backing(identity),
+            },
+            EditOperation::Map {
+                output,
+                permissions: requested,
+                size: leaf_size,
+                resident,
+                backing: identity,
+            } => DescriptorOp::Map {
+                span,
+                output,
+                permissions: permissions(requested).ok_or(DescriptorRefusal::BadEncoding)?,
+                size: size(leaf_size),
+                resident,
+                backing: backing(identity),
+            },
+            EditOperation::Publish { expected, access } => DescriptorOp::Publish {
+                span,
+                expected,
+                access: match access {
+                    GuestAccess::Read => Access::Read,
+                    GuestAccess::Write => Access::Write,
+                    GuestAccess::Execute => Access::Execute,
+                },
+            },
+            EditOperation::Protect {
+                permissions: requested,
+            } => DescriptorOp::Protect {
+                span,
+                permissions: permissions(requested).ok_or(DescriptorRefusal::BadEncoding)?,
+            },
+            EditOperation::ArmCow {
+                kernel_only: false,
+                executable: false,
+                adopt_private: false,
+                excluded_len,
+                ..
+            } if excluded_len.raw() == 0 => DescriptorOp::ArmCow(span),
+            EditOperation::CowRepoint {
+                old,
+                new,
+                backing: identity,
+                access: EditCowAccess::RecordedPrivate,
+            } => DescriptorOp::CowRepoint {
+                span,
+                old,
+                new,
+                backing: backing(identity),
+            },
+            EditOperation::Unmap => DescriptorOp::Retire(span),
+            EditOperation::Coalesce { size: leaf_size } => DescriptorOp::Coalesce {
+                span,
+                size: size(leaf_size),
+            },
+            _ => return Err(DescriptorRefusal::BadEncoding),
+        };
+        Ok(Self {
+            id: DescriptorTxnId {
+                mm_key: owner.mm_key(),
+                generation: owner.generation(),
+            },
+            root: owner.root(),
+            op: operation,
+            tables: intent.table_grants(),
+        })
+    }
 }
 #[derive(Clone, Debug)]
 pub struct DescriptorPlan {
@@ -132,6 +249,13 @@ pub struct DescriptorReceipt {
     pub id: DescriptorTxnId,
     pub outcome: DescriptorOutcome,
     digest: u64,
+}
+
+impl DescriptorReceipt {
+    /// Identity of the exact edit that produced this guest-owned receipt.
+    pub const fn edit_identity(&self) -> u64 {
+        self.digest
+    }
 }
 
 /// Plan under the exact-MM editor. Grants must be exclusively owned, unlinked
@@ -237,6 +361,21 @@ fn valid_span(span: PageSpan) -> bool {
             canonical(span.va) && canonical(end - 1) && ((span.va ^ (end - 1)) >> 47 == 0)
         })
 }
+/// A CPL0 leaf may grant user access only in the lower canonical half. The
+/// kernel image, metadata, stacks, and LAPIC live in the upper half. Check
+/// prepared leaves too, so a later Publish cannot reveal a mismatched leaf.
+pub fn check_leaf_privilege_matches_range(va: UserVa, entry: u64) -> Result<(), DescriptorRefusal> {
+    if !canonical(va.raw()) {
+        return Err(DescriptorRefusal::BadRange);
+    }
+    if entry & (PRESENT | PREPARED) != 0 {
+        let lower_half = va.raw() < (1 << 47);
+        if (entry & USER != 0) != lower_half {
+            return Err(DescriptorRefusal::PermissionDenied);
+        }
+    }
+    Ok(())
+}
 fn validate_output(output: FrameGpa, len: u64, alignment: u64) -> Result<(), DescriptorRefusal> {
     if !valid_pa(output.raw())
         || !output.raw().is_multiple_of(alignment)
@@ -271,9 +410,12 @@ const FLAGS: u64 = PRESENT
     | ACCESSED
     | DIRTY
     | HUGE
+    | RETIRED
     | PREPARED
     | COW
     | MAY_WRITE
+    | PRIVATE
+    | MAY_EXEC
     | NX;
 fn validate_entry(entry: u64, level: usize) -> Result<(), DescriptorRefusal> {
     if entry & !(ADDRESS | FLAGS) != 0 || (level == 0 && entry & HUGE != 0) {
@@ -285,7 +427,10 @@ fn validate_entry(entry: u64, level: usize) -> Result<(), DescriptorRefusal> {
     {
         return Err(DescriptorRefusal::Malformed);
     }
-    if level < 3 && entry & HUGE == 0 && entry & (PREPARED | COW | MAY_WRITE) != 0 {
+    if level < 3
+        && entry & HUGE == 0
+        && entry & (PREPARED | COW | MAY_WRITE | RETIRED | PRIVATE | MAY_EXEC) != 0
+    {
         return Err(DescriptorRefusal::Malformed);
     }
     Ok(())
@@ -399,7 +544,12 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
         validate_entry(entry, level)?;
         let bytes = level_bytes(level);
         let remaining = self.txn.op.span().len - offset;
-        if entry == 0 && matches!(self.txn.op, DescriptorOp::Unmap(_)) {
+        if entry == 0
+            && matches!(
+                self.txn.op,
+                DescriptorOp::Unmap(_) | DescriptorOp::Retire(_)
+            )
+        {
             return Ok(remaining.min(bytes - (va & (bytes - 1))));
         }
         let coarse = level > 0
@@ -410,6 +560,7 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
             && match self.txn.op {
                 DescriptorOp::Protect { .. }
                 | DescriptorOp::ArmCow(_)
+                | DescriptorOp::Retire(_)
                 | DescriptorOp::Unmap(_)
                 | DescriptorOp::Publish { .. } => true,
                 DescriptorOp::CowRepoint { new, .. } => (new.raw() + offset).is_multiple_of(bytes),
@@ -486,15 +637,28 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 };
                 (output.raw() + offset)
                     | permissions(p)
+                    | if matches!(self.txn.op, DescriptorOp::Prepare { .. }) {
+                        PRIVATE | if p.executable { MAY_EXEC } else { 0 }
+                    } else {
+                        0
+                    }
                     | if resident { PRESENT } else { PREPARED }
                     | if level < 3 { HUGE } else { 0 }
             }
-            DescriptorOp::Publish { expected, .. } => {
+            DescriptorOp::Publish {
+                expected, access, ..
+            } => {
                 if entry & PREPARED == 0 || entry & PRESENT != 0 {
                     return Err(DescriptorRefusal::NotPrepared);
                 }
                 if leaf_output(entry, level) != expected.raw() + offset {
                     return Err(DescriptorRefusal::WrongBacking);
+                }
+                if entry & USER == 0
+                    || matches!(access, Access::Write) && entry & WRITE == 0
+                    || matches!(access, Access::Execute) && entry & NX != 0
+                {
+                    return Err(DescriptorRefusal::PermissionDenied);
                 }
                 (entry | PRESENT) & !PREPARED
             }
@@ -502,24 +666,41 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 if entry & (PRESENT | PREPARED) == 0 {
                     return Err(DescriptorRefusal::MissingTable);
                 }
+                if entry & PRIVATE == 0 {
+                    return Err(DescriptorRefusal::NotPrivateAnonymous);
+                }
                 if entry & COW != 0 {
                     return Err(DescriptorRefusal::CowArmed);
                 }
-                entry & !(WRITE | USER | NX | MAY_WRITE) | permissions(p)
+                if p.writable && entry & MAY_WRITE == 0 || p.executable && entry & MAY_EXEC == 0 {
+                    return Err(DescriptorRefusal::PermissionWidening);
+                }
+                entry & !(WRITE | USER | NX) | (permissions(p) & (WRITE | USER | NX))
             }
             DescriptorOp::ArmCow(_) => arm_cow_terminal(entry)?,
             DescriptorOp::CowRepoint { old, new, .. } => {
-                if entry & COW == 0 || entry & MAY_WRITE == 0 {
-                    return Err(DescriptorRefusal::NotCowArmed);
-                }
                 if leaf_output(entry, level) != old.raw() + offset {
                     return Err(DescriptorRefusal::WrongBacking);
                 }
-                (entry & !(ADDRESS | COW)) | (new.raw() + offset) | WRITE
+                if entry & RETIRED != 0 && entry & (PRESENT | PREPARED) == 0 {
+                    (entry & !ADDRESS) | (new.raw() + offset)
+                } else {
+                    if entry & COW == 0 || entry & MAY_WRITE == 0 {
+                        return Err(DescriptorRefusal::NotCowArmed);
+                    }
+                    (entry & !(ADDRESS | COW)) | (new.raw() + offset) | WRITE
+                }
+            }
+            DescriptorOp::Retire(_) => {
+                if entry & (PRESENT | PREPARED) == 0 || entry & USER == 0 || entry & PRIVATE == 0 {
+                    return Err(DescriptorRefusal::NotPrivateAnonymous);
+                }
+                (entry & !(PRESENT | PREPARED | COW)) | RETIRED
             }
             DescriptorOp::Unmap(_) => 0,
             DescriptorOp::Coalesce { .. } => self.coalesced(entry, level)?,
         };
+        check_leaf_privilege_matches_range(UserVa::new(self.txn.op.span().va + offset), new)?;
         self.set(slot, new)
     }
     fn coalesced(&mut self, entry: u64, level: usize) -> Result<u64, DescriptorRefusal> {
@@ -563,6 +744,10 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
 }
 
 impl DescriptorTxn<'_> {
+    /// Stable identity checked by the host after this exact guest edit.
+    pub fn edit_identity(&self) -> u64 {
+        self.digest()
+    }
     /// Same receipt binding as ARM: identity alone does not bind an operation.
     pub fn digest(&self) -> u64 {
         let mix = |h: u64, w: u64| (h ^ w).wrapping_mul(0x9e37_79b9_7f4a_7c15);
@@ -603,13 +788,26 @@ impl DescriptorTxn<'_> {
                 hash = mix(hash, resident.len);
                 (8, output.raw(), PAGE, permissions(p), Some(backing))
             }
-            DescriptorOp::Publish { expected, .. } => (2, expected.raw(), 0, 0, None),
+            DescriptorOp::Publish {
+                expected, access, ..
+            } => (
+                2,
+                expected.raw(),
+                0,
+                match access {
+                    Access::Read => 1,
+                    Access::Write => 2,
+                    Access::Execute => 3,
+                },
+                None,
+            ),
             DescriptorOp::Protect { permissions: p, .. } => (3, 0, 0, permissions(p), None),
             DescriptorOp::ArmCow(_) => (4, 0, 0, 0, None),
             DescriptorOp::CowRepoint {
                 old, new, backing, ..
             } => (5, old.raw(), new.raw(), 0, Some(backing)),
             DescriptorOp::Unmap(_) => (6, 0, 0, 0, None),
+            DescriptorOp::Retire(_) => (9, 0, 0, 0, None),
             DescriptorOp::Coalesce { size, .. } => (7, size.bytes(), 0, 0, None),
         };
         for word in [kind, a, b, flags] {
@@ -763,6 +961,31 @@ pub struct TranslatedLeaf {
     pub descriptor: u64,
     pub size: u64,
 }
+
+/// Read one terminal word, including a prepared non-present leaf. This is
+/// observation only; it never grants backing or descriptor-write authority.
+pub fn read_terminal_descriptor<W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    root: RootGpa,
+    va: UserVa,
+) -> Result<(u64, u64), DescriptorRefusal> {
+    if !canonical(va.raw()) {
+        return Err(DescriptorRefusal::BadRange);
+    }
+    let mut table = root.address().raw();
+    for level in 0..4 {
+        let entry = words.load(table + ((va.raw() >> (39 - level * 9)) & 511) * 8)?;
+        validate_entry(entry, level)?;
+        if level == 3 || entry & HUGE != 0 {
+            return Ok((entry, level_bytes(level)));
+        }
+        if entry & PRESENT == 0 {
+            return Err(DescriptorRefusal::MissingTable);
+        }
+        table = entry & ADDRESS;
+    }
+    Err(DescriptorRefusal::MissingTable)
+}
 pub fn translate_leaf<W: LiveDescriptorWords + ?Sized>(
     words: &W,
     root: RootGpa,
@@ -813,6 +1036,64 @@ pub fn translate_leaf<W: LiveDescriptorWords + ?Sized>(
         table = entry & ADDRESS;
     }
     Err(FaultClass::Reserved)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CowClass {
+    Unmapped,
+    NotCowArmed,
+    NoWriteIntent,
+    AlreadyWritable,
+    ExecutableDenied,
+    Unreachable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CowRun {
+    pub va: u64,
+    pub old_ipa: FrameGpa,
+    pub len: u64,
+    pub compound_offset: u64,
+    pub executable: bool,
+}
+
+/// Classify one CPL3 COW write through the live PML4. The exact-MM editor
+/// remains held by the caller through the eventual copy and repoint.
+pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    root: RootGpa,
+    far: UserVa,
+    publish_executable: bool,
+) -> Result<CowRun, CowClass> {
+    let leaf =
+        translate_leaf(words, root, far, Access::Read, true).map_err(|reason| match reason {
+            FaultClass::NotPresent => CowClass::Unmapped,
+            _ => CowClass::Unreachable,
+        })?;
+    if leaf.size != PAGE {
+        return Err(CowClass::Unmapped);
+    }
+    if leaf.descriptor & WRITE != 0 {
+        return Err(CowClass::AlreadyWritable);
+    }
+    if leaf.descriptor & COW == 0 {
+        return Err(CowClass::NotCowArmed);
+    }
+    if leaf.descriptor & MAY_WRITE == 0 {
+        return Err(CowClass::NoWriteIntent);
+    }
+    if leaf.executable && !publish_executable {
+        return Err(CowClass::ExecutableDenied);
+    }
+    let old_ipa = FrameGpa::new(leaf.output.raw() & !(PAGE - 1));
+    Ok(CowRun {
+        va: far.raw() & !(PAGE - 1),
+        old_ipa,
+        len: PAGE,
+        // A host COW grant is one 16 KiB compound on both ISAs.
+        compound_offset: old_ipa.raw() & (16 * 1024 - 1),
+        executable: leaf.executable,
+    })
 }
 
 #[cfg(test)]

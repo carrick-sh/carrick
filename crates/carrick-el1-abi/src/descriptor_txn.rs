@@ -442,3 +442,61 @@ mod tests {
         assert_eq!(order[..served], [2, 4, 7, 9]);
     }
 }
+
+// Literal wire layout captured from 3fd7862be on a 64-bit host.
+// Keep these values fixed when moving the shared kernel implementation.
+#[cfg(test)]
+mod layout_manifest {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    macro_rules! field {
+        ($record:ty, $field:ident, $ty:ty, $offset:literal, $size:literal, $align:literal) => {
+            // Type-check the manifest's field type without constructing a record.
+            let _ = |record: &$record| {
+                let _: &$ty = &record.$field;
+            };
+            assert_eq!(
+                (
+                    offset_of!($record, $field),
+                    size_of::<$ty>(),
+                    align_of::<$ty>()
+                ),
+                ($offset, $size, $align),
+                concat!(stringify!($record), "::", stringify!($field))
+            );
+        };
+    }
+
+    #[test]
+    fn descriptor_txn_slots() {
+        assert_eq!(
+            (
+                size_of::<DescriptorTxnSlots>(),
+                align_of::<DescriptorTxnSlots>()
+            ),
+            (98368, 64)
+        );
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |DescriptorTxnSlots {
+                     submitted: _,
+                     slots: _,
+                 }: DescriptorTxnSlots| {};
+        field!(
+            DescriptorTxnSlots,
+            submitted,
+            [AtomicU64; SUMMARY_WORDS],
+            0,
+            32,
+            8
+        );
+        field!(
+            DescriptorTxnSlots,
+            slots,
+            [DescriptorTxnSlot; EL1_STACK_SLOTS as usize],
+            64,
+            98304,
+            64
+        );
+    }
+}

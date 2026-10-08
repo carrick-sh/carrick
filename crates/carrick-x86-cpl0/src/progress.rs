@@ -1,7 +1,7 @@
 //! Thin hardware witness: native context leaves around the existing shared
 //! scheduler's public claims/queues. No Linux wait or scheduling policy here.
 use crate::{interrupts, scheduler};
-use carrick_sched_core::{BoundedSpin, SlotId, WakeRecord, Waker, ZoneTables};
+use carrick_sched_core::{BoundedSpin, ParkedContextWords, SlotId, WakeRecord, Waker, ZoneTables};
 use scheduler::*;
 
 const SLOT: SlotId = SlotId::new(0);
@@ -71,24 +71,9 @@ fn state() -> &'static mut ProgressState {
     // SAFETY: single running fixture vCPU, IF=0 throughout every caller.
     unsafe { &mut *(PROGRESS_STATE as *mut ProgressState) }
 }
-fn zone() -> &'static ZoneTables {
+fn zone() -> &'static ZoneTables<ParkedContextWords> {
     // SAFETY: carrier-retained zero-initialized common records, supervisor only.
-    unsafe { &*(PROGRESS_ZONE as *const ZoneTables) }
-}
-fn read_msr(index: u32) -> u64 {
-    let low: u32;
-    let high: u32;
-    // SAFETY: qualified CPL0 FS/GS registers only.
-    unsafe {
-        core::arch::asm!("rdmsr", in("ecx") index, out("eax") low, out("edx") high, options(nostack))
-    };
-    u64::from(low) | (u64::from(high) << 32)
-}
-fn write_msr(index: u32, value: u64) {
-    // SAFETY: CPL0; bootstrap supplied canonical retained user TLS bases.
-    unsafe {
-        core::arch::asm!("wrmsr", in("ecx") index, in("eax") value as u32, in("edx") (value >> 32) as u32, options(nostack))
-    };
+    unsafe { &*(PROGRESS_ZONE as *const ZoneTables<ParkedContextWords>) }
 }
 fn control(port: u16) {
     // SAFETY: declared fixture control/observation, no semantic request.
@@ -101,17 +86,22 @@ fn stop(code: u64) -> ! {
     crate::kernel::halt()
 }
 
-fn install(task: &ContextBinding, maintenance: carrick_guest_arch::RootGpa) {
+fn install(task: &ContextBinding, maintenance: carrick_guest_arch::RootGpa) -> NativeContext {
     // SAFETY: both admitted fixture roots have identical supervisor mappings.
     unsafe { install_root(maintenance) };
     zone().release_space(SLOT);
     if !admit_context(zone(), SLOT, task) {
         stop(1);
     }
-    unsafe { install_root(task.context.address.root) };
-    write_msr(0xc000_0100, task.context.fs_base);
+    // SAFETY: admit_context authenticated this exact on-CPU record and this
+    // single fixture vCPU owns its claim until the next publication.
+    let words = unsafe { *zone().record(task.record.id).ctx_mut() };
+    let context = restore_native_context(words, task.address).unwrap_or_else(|| stop(13));
+    unsafe { install_root(context.address.root) };
+    write_tls(NativeTlsRegister::Fs, context.fs_base);
     // SWAPGS has already selected the kernel binding. The other base is user.
-    write_msr(0xc000_0102, task.context.gs_base);
+    write_tls(NativeTlsRegister::UserGs, context.gs_base);
+    context
 }
 
 #[repr(C)]
@@ -130,12 +120,12 @@ extern "C" fn carrick_progress_initialize() -> InitialReturn {
         .iter()
         .find(|task| task.record.id == record)
         .unwrap_or_else(|| stop(3));
-    install(task, state.maintenance_root);
+    state.active = install(task, state.maintenance_root);
     // The first task enters the existing common kernel before compute. The
     // timer starts only after that real syscall's return boundary.
     InitialReturn {
-        frame: &task.context.frame,
-        xsave: &task.context.xsave,
+        frame: &state.active.frame,
+        xsave: &state.active.xsave,
     }
 }
 
@@ -191,16 +181,22 @@ extern "C" fn carrick_progress_interrupt(
         .iter()
         .position(|task| task.record.id == record)
         .unwrap_or_else(|| stop(8));
-    let task = &mut state.tasks[index];
+    let task = &state.tasks[index];
     if !task.owned_on(zone(), SLOT) {
         stop(9);
     }
     let root: u64;
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) root, options(nostack)) };
-    task.context.frame = *frame;
-    task.context.fs_base = read_msr(0xc000_0100);
-    task.context.gs_base = read_msr(0xc000_0102);
-    task.context.xsave = state.scratch.clone();
+    if state.active.address != task.address {
+        stop(14);
+    }
+    state.active.frame = *frame;
+    state.active.fs_base = read_tls(NativeTlsRegister::Fs);
+    state.active.gs_base = read_tls(NativeTlsRegister::UserGs);
+    state.active.xsave = state.scratch.clone();
+    // SAFETY: the timer interrupted the unique on-CPU claim on this vCPU;
+    // the record remains ours until requeue publishes the next owner.
+    unsafe { *zone().record(record).ctx_mut() = park_native_context(&state.active) };
     let turn = state.turns as usize;
     if turn >= PROGRESS_TURNS {
         stop(10);
@@ -223,8 +219,8 @@ extern "C" fn carrick_progress_interrupt(
         .iter()
         .find(|task| task.record.id == next)
         .unwrap_or_else(|| stop(12));
-    install(task, state.maintenance_root);
-    *frame = task.context.frame;
+    state.active = install(task, state.maintenance_root);
+    *frame = state.active.frame;
     unsafe { interrupts::hardware::arm_timer(Some(interrupts::TimerTicks(100_000))) };
-    &task.context.xsave
+    &state.active.xsave
 }

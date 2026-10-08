@@ -47,6 +47,16 @@ struct OracleKey<'a> {
     /// Omitted for regression so its committed determinant bytes remain stable.
     #[serde(skip_serializing_if = "Option::is_none")]
     parser_profile: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oracle_backend: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kernel: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_digest: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rootfs_extractor: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rootfs_flags: Option<&'static [&'static str]>,
 }
 
 /// Docker execution identity used for duration evidence. Parsing policy is
@@ -62,6 +72,16 @@ struct OracleExecutionKey {
     bind_mounts: Vec<String>,
     env: Vec<String>,
     workdir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    oracle_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kernel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rootfs_extractor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rootfs_flags: Option<Vec<String>>,
 }
 
 fn oracle_execution_key(
@@ -82,6 +102,11 @@ fn oracle_execution_key(
             .map(|kv| format!("{}={}", kv.key, kv.val))
             .collect(),
         workdir: suite.workdir.clone(),
+        oracle_backend: None,
+        kernel: None,
+        image_digest: None,
+        rootfs_extractor: None,
+        rootfs_flags: None,
     }
 }
 
@@ -123,6 +148,15 @@ pub fn oracle_key_for_profile(
     platform: crate::lane::DockerPlatform,
     profile: ParserProfile,
 ) -> String {
+    oracle_key_with_identity(suite, platform, profile, None)
+}
+
+pub fn oracle_key_with_identity(
+    suite: &Suite,
+    platform: crate::lane::DockerPlatform,
+    profile: ParserProfile,
+    native: Option<(&str, &str)>,
+) -> String {
     let mut env: Vec<String> = Vec::new();
     for kv in suite.env.iter().chain(suite.env_docker.iter()) {
         env.push(format!("{}={}", kv.key, kv.val));
@@ -139,6 +173,11 @@ pub fn oracle_key_for_profile(
         verdict: suite.verdict,
         parser: parser_fingerprint(suite.verdict),
         parser_profile: profile.determinant(),
+        oracle_backend: native.map(|_| crate::native::BACKEND_ID),
+        kernel: native.map(|(kernel, _)| kernel),
+        image_digest: native.map(|(_, digest)| digest),
+        rootfs_extractor: native.map(|_| carrick_spec::OCI_NATIVE_EXTRACTOR_ID),
+        rootfs_flags: native.map(|_| carrick_spec::OCI_NATIVE_EXTRACTOR_FLAGS),
     };
     // These are plain owned/borrowed scalars and Vecs — serialization cannot
     // fail; the fallback only exists so a key is always produced.
@@ -176,6 +215,7 @@ pub struct OracleCache {
     timing_path: PathBuf,
     timing_by_key: BTreeMap<OracleExecutionKey, OracleTimingRecord>,
     timing_dirty: bool,
+    native: Option<(String, BTreeMap<String, String>)>,
 }
 
 impl OracleCache {
@@ -236,7 +276,86 @@ impl OracleCache {
             timing_path,
             timing_by_key,
             timing_dirty: false,
+            native: None,
         }
+    }
+
+    /// Native identity is mandatory for every selected image. This file can
+    /// never alias the committed Docker cache or its duration sidecar.
+    pub fn load_native(
+        path: &Path,
+        kernel: String,
+        images: BTreeMap<String, String>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            path.file_name()
+                .is_some_and(|name| name == "oracle-cache.native-amd64.jsonl"),
+            "native oracle rows require oracle-cache.native-amd64.jsonl"
+        );
+        anyhow::ensure!(
+            !images.is_empty() && images.values().all(|digest| digest.starts_with("sha256:")),
+            "native oracle requires image digests"
+        );
+        if let Ok(metadata) = std::fs::symlink_metadata(path) {
+            anyhow::ensure!(metadata.is_file(), "native cache must be a regular file");
+        }
+        let mut cache = Self::load(path);
+        cache.native = Some((kernel, images));
+        anyhow::ensure!(
+            cache
+                .by_key
+                .keys()
+                .all(|key| serde_json::from_str::<serde_json::Value>(key)
+                    .ok()
+                    .is_some_and(|value| value["oracle_backend"] == crate::native::BACKEND_ID)),
+            "non-native record in native cache"
+        );
+        Ok(cache)
+    }
+
+    fn determinant(
+        &self,
+        suite: &Suite,
+        platform: crate::lane::DockerPlatform,
+        profile: ParserProfile,
+    ) -> String {
+        let native = self.native.as_ref().map(|(kernel, images)| {
+            (
+                kernel.as_str(),
+                images
+                    .get(&suite.image)
+                    .map(String::as_str)
+                    .unwrap_or("missing-image-identity"),
+            )
+        });
+        match native {
+            Some(identity) => oracle_key_with_identity(suite, platform, profile, Some(identity)),
+            None => match profile {
+                ParserProfile::Regression => oracle_key(suite, platform),
+                ParserProfile::ClosureV3 => oracle_key_for_profile(suite, platform, profile),
+            },
+        }
+    }
+
+    fn execution_key(
+        &self,
+        suite: &Suite,
+        platform: crate::lane::DockerPlatform,
+    ) -> OracleExecutionKey {
+        let mut key = oracle_execution_key(suite, platform);
+        if let Some((kernel, images)) = &self.native {
+            key.oracle_backend = Some(crate::native::BACKEND_ID.into());
+            key.rootfs_extractor = Some(carrick_spec::OCI_NATIVE_EXTRACTOR_ID.into());
+            key.rootfs_flags = Some(
+                carrick_spec::OCI_NATIVE_EXTRACTOR_FLAGS
+                    .iter()
+                    .map(|flag| (*flag).into())
+                    .collect(),
+            );
+            key.kernel = Some(kernel.clone());
+            key.image_digest = images.get(&suite.image).cloned();
+        }
+        key
     }
 
     /// The cached docker result for this suite, if its determinant key is present.
@@ -258,10 +377,7 @@ impl OracleCache {
         platform: crate::lane::DockerPlatform,
         profile: ParserProfile,
     ) -> Option<SuiteResult> {
-        let key = match profile {
-            ParserProfile::Regression => oracle_key(suite, platform),
-            ParserProfile::ClosureV3 => oracle_key_for_profile(suite, platform, profile),
-        };
+        let key = self.determinant(suite, platform, profile);
         let mut result = self.by_key.get(&key)?.result.clone();
         if suite.verdict == VerdictKind::Gotest {
             let mut ids: BTreeMap<String, Outcome> = BTreeMap::new();
@@ -302,7 +418,7 @@ impl OracleCache {
     ) -> Option<u64> {
         let record = self
             .by_key
-            .get(&oracle_key_for_profile(suite, platform, profile))?;
+            .get(&self.determinant(suite, platform, profile))?;
         if profile == ParserProfile::ClosureV3 && !record.result.is_strict_closure_success() {
             return None;
         }
@@ -316,7 +432,7 @@ impl OracleCache {
         platform: crate::lane::DockerPlatform,
     ) -> Option<u64> {
         self.timing_by_key
-            .get(&oracle_execution_key(suite, platform))
+            .get(&self.execution_key(suite, platform))
             .map(|record| record.elapsed_ms)
     }
 
@@ -326,10 +442,13 @@ impl OracleCache {
         platform: crate::lane::DockerPlatform,
         elapsed_ms: Option<u64>,
     ) {
+        if !self.has_image_identity(suite) {
+            return;
+        }
         let Some(elapsed_ms) = elapsed_ms else {
             return;
         };
-        let key = oracle_execution_key(suite, platform);
+        let key = self.execution_key(suite, platform);
         let prior = self.timing_by_key.get(&key).map(|r| r.elapsed_ms);
         upsert_timing(&mut self.timing_by_key, &suite.name, key, elapsed_ms);
         if prior.is_none_or(|prior| elapsed_ms > prior) {
@@ -364,10 +483,10 @@ impl OracleCache {
         result: SuiteResult,
         elapsed_ms: Option<u64>,
     ) -> bool {
-        if !is_cacheable_for_profile(profile, &result) {
+        if !self.has_image_identity(suite) || !is_cacheable_for_profile(profile, &result) {
             return false;
         }
-        let key = oracle_key_for_profile(suite, platform, profile);
+        let key = self.determinant(suite, platform, profile);
         self.by_key.insert(
             key.clone(),
             OracleRecord {
@@ -379,6 +498,12 @@ impl OracleCache {
         );
         self.verdict_dirty = true;
         true
+    }
+
+    fn has_image_identity(&self, suite: &Suite) -> bool {
+        self.native
+            .as_ref()
+            .is_none_or(|(_, images)| images.contains_key(&suite.image))
     }
 
     /// Cache a fresh Docker result only when the process completed before its
@@ -457,7 +582,7 @@ impl OracleCache {
     ) -> bool {
         let removed = self
             .by_key
-            .remove(&oracle_key_for_profile(suite, platform, profile));
+            .remove(&self.determinant(suite, platform, profile));
         let Some(record) = removed else {
             return false;
         };

@@ -392,7 +392,7 @@ contracts = ["kernel.mm.syscall-code-write", "kernel.mm.backing-maintenance-look
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/fs/rw.rs"
-contracts = ["kernel.mm.syscall-code-write"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.fs.lseek-sparse"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/fs/tests.rs"
@@ -473,7 +473,7 @@ contracts = ["kernel.mm.pt-pause-drain-acknowledgement", "kernel.el1.stage1-publ
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/mem.rs"
-contracts = ["kernel.el1.stage1-publication"]
+contracts = ["kernel.el1.stage1-publication", "kernel.mm.user-va-ceiling"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/mem/fault.rs"
@@ -617,7 +617,7 @@ contracts = ["kernel.el1.guest-scheduler"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/aarch64_arch.rs"
-contracts = ["kernel.el1.guest-scheduler"]
+contracts = ["kernel.el1.guest-scheduler", "kernel.mm.user-va-ceiling"]
 
 [[surfaces]]
 path = "fixtures/embed-el1-sched/src/main.rs"
@@ -715,10 +715,62 @@ contracts = ["kernel.net.connect-wake-scope"]
 path = "crates/carrick-vmm-kvm/tests/live_vcpu_x86.rs"
 contracts = ["x86.run-elf.poll"]
 
+[[surfaces]]
+path = "crates/carrick-mem/src/x86_initial_image.rs"
+contracts = ["x86.mm.initial-image"]
+
+[[surfaces]]
+path = "crates/carrick-mem/tests/x86_initial_image.rs"
+contracts = ["x86.mm.initial-image"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/isa/x86/initial_mm.rs"
+contracts = ["x86.mm.initial-image"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-kvm/tests/cpl0_initial_mm.rs"
+contracts = ["x86.mm.initial-image"]
+
 # Fixture-only injection ownership for executor activation and rollback tests.
 [[surfaces]]
 path = "crates/carrick-runtime/src/test_hooks.rs"
 contracts = ["kernel.vcpu.vm-lifetime"]
+
+[[surfaces]]
+path = "crates/carrick-timer-core/src/gate.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-timer-core/src/itimer.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-timer-core/src/lib.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-hal/src/guest_timer_bridge.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-hal/src/posix_timer.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-hal/src/timer_delivery.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/itimer.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/timer_delivery.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/vcpu_kick.rs"
+contracts = ["kernel.timer.delivery-gate"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/personality/native_ownership_tests.rs"
@@ -731,3 +783,98 @@ contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents"
 [[surfaces]]
 path = "crates/carrick-el1/src/personality/mm_portal/tests.rs"
 contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents"]
+
+# Order 5 moves entry ownership once; pending family hooks retain their existing
+# semantic contracts alongside the shared admission/completion contract.
+[[surfaces]]
+path = "crates/carrick-core/src/entry.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-core-abi/src/entry.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/entry.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/abi/entry.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/abi/mod.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/dispatch.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/sched.rs"
+contracts = ["core.entry.completion", "kernel.el1.futex-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/lifecycle.rs"
+contracts = ["core.entry.completion", "kernel.el1.thread-lifecycle"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/pending_file.rs"
+contracts = ["core.entry.completion", "kernel.el1.files", "kernel.el1.inotify"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/pending_anonymous.rs"
+contracts = ["core.entry.completion", "kernel.el1.anonymous-reservations", "kernel.el1.anonymous-permissions", "kernel.el1.anonymous-munmap"]
+
+[[surfaces]]
+path = "crates/carrick-core/tests/entry_completion.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/tests/futex_policy.rs"
+contracts = ["core.entry.completion", "kernel.el1.futex-handoff"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/tests/x86_wave2.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/tests/x86_wave2/common_entry.rs"
+contracts = ["core.entry.completion", "kernel.el1.thread-lifecycle"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/tests/x86_wave2/dispatch.rs"
+contracts = ["core.entry.completion", "kernel.el1.files", "kernel.el1.inotify", "kernel.el1.anonymous-reservations"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-kvm/tests/cpl0_entry.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-cli/tests/x86_kvm_run.rs"
+contracts = ["x86.carrier.cli-run"]
+
+# Linux pending-signal policy and its unchanged VM-free owner contracts.
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/signal.rs"
+contracts = ["kernel.el1.signal-delivery-owner"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/tests/signal_policy_contract.rs"
+contracts = ["kernel.el1.signal-delivery-owner"]
+
+[[surfaces]]
+path = "crates/carrick-hal/src/guest_arch.rs"
+contracts = ["kernel.mm.user-va-ceiling"]
+
+[[surfaces]]
+path = "crates/carrick-hal/src/x8664_arch.rs"
+contracts = ["kernel.mm.user-va-ceiling"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/mem/mmap.rs"
+contracts = ["kernel.mm.user-va-ceiling"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/mem/anonymous.rs"
+contracts = ["kernel.mm.user-va-ceiling"]

@@ -195,6 +195,277 @@ pub fn resolve_guest_cow<
     )
 }
 
+/// CPL0's owner adapter reuses the common claim/copy/repoint/completion
+/// policy. Only the PML4 classification, direct-window access and intent
+/// execution differ from AArch64.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub struct X86CowMmu;
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+impl carrick_core::mm::cow::OwnerCowMmu for X86CowMmu {
+    const CARRIER_MAINT_ROOT_BASE: u64 = 0;
+    const DEFAULT_COW_COPY_BASE: u64 = carrick_el1_abi::X86_CPL0_DIRECT_VA;
+
+    fn classify_cow_write<
+        W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
+    >(
+        words: &W,
+        root: u64,
+        far: u64,
+        publish_executable: bool,
+    ) -> carrick_core::mm::cow::CowClassifyOutcome {
+        use carrick_core::mm::cow::{CowClassifyOutcome, GuestCowRun};
+        use carrick_guest_arch::{FrameGpa, RootGpa, UserVa};
+        use carrick_mmu_core::x86::descriptor_txn::{CowClass, classify_guest_cow_write};
+        let Some(root) = RootGpa::page_aligned(FrameGpa::new(root)) else {
+            return CowClassifyOutcome::Declined(carrick_el1_abi::CowDecline::Unreachable);
+        };
+        match classify_guest_cow_write(words, root, UserVa::new(far), publish_executable) {
+            Ok(run) => CowClassifyOutcome::Armed(GuestCowRun {
+                va: run.va,
+                len: run.len,
+                old_ipa: run.old_ipa.raw(),
+                compound_offset: run.compound_offset,
+                executable: run.executable,
+            }),
+            Err(CowClass::AlreadyWritable) => CowClassifyOutcome::AlreadyWritable,
+            Err(reason) => CowClassifyOutcome::Declined(match reason {
+                CowClass::Unmapped => carrick_el1_abi::CowDecline::Unmapped,
+                CowClass::NotCowArmed => carrick_el1_abi::CowDecline::NotCowArmed,
+                CowClass::NoWriteIntent => carrick_el1_abi::CowDecline::NoWriteIntent,
+                CowClass::ExecutableDenied => carrick_el1_abi::CowDecline::Executable,
+                CowClass::Unreachable => carrick_el1_abi::CowDecline::Unreachable,
+                CowClass::AlreadyWritable => carrick_el1_abi::CowDecline::Unreachable,
+            }),
+        }
+    }
+
+    fn plan_cow_repoint<
+        W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
+    >(
+        words: &W,
+        root: u64,
+        op: carrick_core::mm::cow::CowRepointOp,
+    ) -> bool {
+        use carrick_guest_arch::{FrameGpa, RootGpa};
+        use carrick_mmu_core::x86::descriptor_txn::{
+            DescriptorOp, DescriptorTxn, DescriptorTxnId, PageSpan, plan_descriptor_txn,
+        };
+        use core::num::NonZeroU64;
+        let Some(root) = RootGpa::page_aligned(FrameGpa::new(root)) else {
+            return false;
+        };
+        let (Some(mm_key), Some(generation)) =
+            (NonZeroU64::new(op.mm_key), NonZeroU64::new(op.grant_epoch))
+        else {
+            return false;
+        };
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId { mm_key, generation },
+            root,
+            op: DescriptorOp::CowRepoint {
+                span: PageSpan::new(op.va, op.len),
+                old: FrameGpa::new(op.old_ipa),
+                new: FrameGpa::new(op.new_ipa),
+                backing: op.backing,
+            },
+            tables: &[],
+        };
+        if plan_descriptor_txn(words, &txn, root).is_err() {
+            return false;
+        }
+        // The single upper-half direct window must already map every copy
+        // source and destination. No new alias or late mapping is authored.
+        for offset in (0..op.len).step_by(4096) {
+            if !x86_direct_page_matches(words, root, op.old_ipa + offset, false)
+                || !x86_direct_page_matches(words, root, op.new_ipa + offset, true)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn with_copy_aliases<
+        W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
+        F: FnMut(u64, u64),
+    >(
+        words: &W,
+        root: u64,
+        copy_base: u64,
+        source_ipa: u64,
+        destination_ipa: u64,
+        effect: &mut F,
+    ) -> Result<(), carrick_core::mm::cow::CowRepointOutcome> {
+        use carrick_core::mm::cow::CowRepointOutcome;
+        use carrick_guest_arch::{FrameGpa, RootGpa};
+        let Some(root) = RootGpa::page_aligned(FrameGpa::new(root)) else {
+            return Err(CowRepointOutcome::Refused);
+        };
+        if copy_base != carrick_el1_abi::X86_CPL0_DIRECT_VA
+            || !x86_direct_page_matches(words, root, source_ipa, false)
+            || !x86_direct_page_matches(words, root, destination_ipa, true)
+        {
+            return Err(CowRepointOutcome::Refused);
+        }
+        effect(copy_base + source_ipa, copy_base + destination_ipa);
+        Ok(())
+    }
+
+    fn execute_cow_repoint<
+        W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
+    >(
+        _words: &W,
+        root: u64,
+        op: carrick_core::mm::cow::CowRepointOp,
+    ) -> carrick_core::mm::cow::CowRepointOutcome {
+        use carrick_core::mm::cow::CowRepointOutcome;
+        use carrick_guest_arch::{
+            EditBacking, EditCowAccess, EditIntent, EditOperation, EditOwner, FrameGpa, GuestLen,
+            KernelVa, RootGpa, TableWindow, UserRange, UserVa,
+        };
+        use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
+        use core::num::NonZeroU64;
+        let (Some(root), Some(mm_key), Some(generation), Some(range)) = (
+            RootGpa::page_aligned(FrameGpa::new(root)),
+            NonZeroU64::new(op.mm_key),
+            NonZeroU64::new(op.grant_epoch),
+            UserRange::checked(UserVa::new(op.va), GuestLen::new(op.len)),
+        ) else {
+            return CowRepointOutcome::Refused;
+        };
+        let Some(mapped) = carrick_el1_abi::X86_CPL0_DIRECT_VA.checked_add(root.address().raw())
+        else {
+            return CowRepointOutcome::Refused;
+        };
+        // SAFETY: the common COW resolver runs under the exact-MM editor;
+        // CPL0's retained table arena has one upper supervisor direct window.
+        let Some(tables) = (unsafe {
+            TableWindow::issue(
+                root.address(),
+                KernelVa::new(mapped),
+                GuestLen::new(carrick_el1_abi::X86_CPL0_TABLE_ARENA_BYTES),
+            )
+        }) else {
+            return CowRepointOutcome::Refused;
+        };
+        // SAFETY: the caller's exact editor remains held through this native
+        // intent and its local invalidation receipt.
+        let owner = unsafe { EditOwner::issue(root, mm_key, generation) };
+        let Some(intent) = EditIntent::checked(
+            owner,
+            range,
+            EditOperation::CowRepoint {
+                old: FrameGpa::new(op.old_ipa),
+                new: FrameGpa::new(op.new_ipa),
+                backing: EditBacking {
+                    frame_id: op.backing.frame_id,
+                    mapping_id: op.backing.mapping_id,
+                    owner_generation: op.backing.owner_generation,
+                    inventory_revision: op.backing.inventory_revision,
+                },
+                access: EditCowAccess::RecordedPrivate,
+            },
+            &[],
+        ) else {
+            return CowRepointOutcome::Refused;
+        };
+        // SAFETY: the retained supervisor alias and exact editor outlive the
+        // descriptor transaction and its local drain.
+        match unsafe { crate::isa::x86::execute_native_edit_intent(intent, tables) } {
+            Ok(receipt) => match receipt.outcome {
+                DescriptorOutcome::Applied { .. } => CowRepointOutcome::Applied {
+                    // The native executor acknowledges the local drain before
+                    // it returns an Applied receipt.
+                    flush_required: false,
+                },
+                DescriptorOutcome::Refused(_) => CowRepointOutcome::Refused,
+                DescriptorOutcome::RolledBack(_) => CowRepointOutcome::RolledBack,
+                DescriptorOutcome::Indeterminate(_) => CowRepointOutcome::Indeterminate,
+            },
+            Err(_) => CowRepointOutcome::Refused,
+        }
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn x86_direct_page_matches<
+    W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
+>(
+    words: &W,
+    root: carrick_guest_arch::RootGpa,
+    ipa: u64,
+    writable: bool,
+) -> bool {
+    use carrick_guest_arch::{FrameGpa, UserVa};
+    use carrick_mmu_core::x86::descriptor_txn::{Access, translate};
+    let Some(va) = carrick_el1_abi::X86_CPL0_DIRECT_VA.checked_add(ipa) else {
+        return false;
+    };
+    translate(
+        words,
+        root,
+        UserVa::new(va),
+        if writable {
+            Access::Write
+        } else {
+            Access::Read
+        },
+        false,
+    ) == Ok(FrameGpa::new(ipa))
+}
+
+/// Resolve one CPL3 write fault with the common COW grant protocol and the
+/// native x86 descriptor intent. The caller retains the exact-MM editor.
+///
+/// # Safety
+/// `root` must be the live CR3 root for `mm_key`, and the retained table arena
+/// must be mapped at the single upper supervisor direct window throughout
+/// this operation. The caller excludes other descriptor writers.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub unsafe fn resolve_x86_guest_cow<C: FnMut(u64, u64), I: FnMut()>(
+    root: u64,
+    mm_key: u64,
+    far: u64,
+    pool: &dyn carrick_el1_abi::CowGrantVenue,
+    residency: &carrick_el1_abi::FrameGrantResidencyTable,
+    copy_page: C,
+    invalidate: I,
+) -> Result<GuestCowOutcome, CowError> {
+    use carrick_guest_arch::{FrameGpa, GuestLen, KernelVa, RootGpa, TableWindow};
+    use carrick_mmu_core::aarch64::SubstrateGpa;
+    use carrick_mmu_core::x86::descriptor_txn::DescriptorTxnId;
+    use core::num::NonZeroU64;
+    let root_gpa = RootGpa::page_aligned(FrameGpa::new(root)).ok_or(CowError::Refused)?;
+    let mapped = carrick_el1_abi::X86_CPL0_DIRECT_VA
+        .checked_add(root)
+        .ok_or(CowError::Refused)?;
+    // SAFETY: the caller retains the mapped table arena under its editor.
+    let tables = unsafe {
+        TableWindow::issue(
+            root_gpa.address(),
+            KernelVa::new(mapped),
+            GuestLen::new(carrick_el1_abi::X86_CPL0_TABLE_ARENA_BYTES),
+        )
+    }
+    .ok_or(CowError::Refused)?;
+    let id = DescriptorTxnId {
+        mm_key: NonZeroU64::new(mm_key).ok_or(CowError::Refused)?,
+        generation: NonZeroU64::MIN,
+    };
+    let words = crate::isa::x86::NativeDescriptorWords::checked(root_gpa, id, &tables)
+        .map_err(|_| CowError::Refused)?;
+    let venue = carrick_core::mm::cow::GuestCowVenue::<X86CowMmu, _> {
+        words: &words,
+        root: SubstrateGpa(root),
+        pool,
+        residency,
+        copy_window: carrick_core::mm::cow::CowCopyWindow::target(&words, SubstrateGpa(root)),
+        publish_executable: None,
+    };
+    carrick_core::mm::cow::resolve_guest_cow(&venue, mm_key, far, copy_page, invalidate)
+}
+
 #[cfg(test)]
 mod tests {
     //! The real descriptor executor and copy window over host memory: a
@@ -956,7 +1227,7 @@ mod tests {
 
     fn dispatch(spaces: &AddressSpaces, resolver: &mut ArenaResolver<'_>) -> Action {
         let task = CurrentTask::new();
-        task.zone_mm.store(MM, Ordering::Release);
+        task.mm.key.store(MM, Ordering::Release);
         let mut frame = TrapFrame {
             esr: (0x24 << 26) | (1 << 6) | 0x0f,
             far: VA + 0x10,
@@ -1124,7 +1395,7 @@ mod tests {
         };
 
         let task = CurrentTask::new();
-        task.zone_mm.store(MM, Ordering::Release);
+        task.mm.key.store(MM, Ordering::Release);
         let mut frame = TrapFrame {
             esr: (0x24 << 26) | (1 << 6) | 0x0f,
             far: VA + 0x10,

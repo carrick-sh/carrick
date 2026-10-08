@@ -1,7 +1,28 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 extern crate std;
+use carrick_el1_abi::Action;
+use carrick_el1_abi::Lifecycle;
 
 use super::*;
+use carrick_el1_abi::{
+    AltStack, BlockedMask, BornRecord, Counters, CurrentTask, El1TaskId, EntryState,
+    ThreadIdentity, TrapFrame,
+};
+use core::sync::atomic::Ordering;
+
+const CLONE_VM: u64 = 0x0000_0100;
+const CLONE_SYSVSEM: u64 = 0x0004_0000;
+const CLONE_SETTLS: u64 = 0x0008_0000;
+const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+
+const SIG_BLOCK: u64 = 0;
+const SIG_UNBLOCK: u64 = 1;
+const SIG_SETMASK: u64 = 2;
+const UNBLOCKABLE: u64 = 0x0004_0100;
+
+const SS_DISABLE: u32 = 2;
+
 use crate::personality::dispatch::{Zone, dispatch_syscall_with_lifecycle};
 use crate::personality::sched::{FakeCpu, HardwareUserWord, SYS_FUTEX};
 use carrick_el1_abi::{
@@ -83,7 +104,7 @@ impl Venue {
 
 impl LifecycleVenue for Venue {
     fn thread<'a>(&'a self, task: &'a CurrentTask) -> Option<LifecycleThread<'a>> {
-        let tid = task.task_id.load(Ordering::Relaxed);
+        let tid = task.execution.task.load(Ordering::Relaxed);
         let slot = if tid == self.leader {
             &self.slots[0]
         } else {
@@ -127,8 +148,9 @@ impl World {
         let tasks: [CurrentTask; 4] = core::array::from_fn(|_| CurrentTask::new());
         let task = &tasks[SLOT_IDX];
         task.set(El1TaskId::from_linux_tid(PARENT_TID as i32), 1, 5);
-        task.zone_mm.store(MM, Ordering::Relaxed);
-        task.thread_serial
+        task.mm.key.store(MM, Ordering::Relaxed);
+        task.mm
+            .thread_generation
             .store(PARENT_TID + 1000, Ordering::Relaxed);
         let mut cpu = FakeCpu::default();
         cpu.regs.sp_el0 = 0x2222_0000;
@@ -237,7 +259,7 @@ struct FaultingUser {
     deny_out: Vec<u64>,
 }
 
-impl UserCopy for FaultingUser {
+impl crate::file::UserCopy for FaultingUser {
     fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool {
         if self.deny_out.contains(&dst_va) {
             return false;
@@ -259,15 +281,51 @@ impl UserCopy for FaultingUser {
 
 fn serve_directly(w: &mut World, frame: &mut TrapFrame, user: &mut FaultingUser) -> Option<Action> {
     let task = &w.tasks[SLOT_IDX];
-    let sched = Sched {
-        zone: &w.zone,
-        slot: SLOT,
-        task,
-        cpu: &mut w.cpu,
-        user: &HardwareUserWord,
+    let name_cache = InotifyNameCache::new();
+    let ordinal = frame.x[8];
+    let mut native = super::El1PendingFamilies {
+        handoff: None,
+        frame,
         counters: &w.counters,
+        current_tasks: &w.tasks,
+        fd_map: &[],
+        object_table: &[],
+        open_table: &[],
+        inotify_table: &[],
+        name_cache: &name_cache,
+        zone: Some(Zone {
+            tables: &w.zone,
+            cpu: &mut w.cpu,
+            user: &HardwareUserWord,
+        }),
+        ipc: None,
+        lifecycle: Some(&*w.venue),
+        cache_lookup: |_| core::ptr::null_mut(),
+        lifecycle_user: Some(user),
     };
-    serve(frame, &w.counters, task, Some(sched), &*w.venue, user)
+    let carrick_personality_linux::dispatch::Family::Lifecycle(call) =
+        carrick_personality_linux::dispatch::route_aarch64(ordinal, u64::MAX)
+    else {
+        return None;
+    };
+    let outcome = invoke(call, &mut native);
+    let result = outcome.as_ref().map_or(
+        carrick_personality_linux::dispatch::FamilyCompletion::Forward,
+        lifecycle_effect,
+    );
+    if let Some(LifecycleOutcome::Returned { result, .. }) = outcome {
+        native.frame.x[0] = result.raw() as u64;
+    }
+    (result != carrick_personality_linux::dispatch::FamilyCompletion::Forward).then(|| {
+        use carrick_personality_linux::dispatch::{CompletionRoute, completion_route};
+        match completion_route(result, task.linux.has_pending_host_work()) {
+            CompletionRoute::Served => Action::Served,
+            CompletionRoute::WithWork => Action::ServedWithWork,
+            CompletionRoute::Suspended => Action::Idle,
+            CompletionRoute::Forward => Action::Forward,
+            CompletionRoute::InvalidCompletion => panic!("stale entry completion"),
+        }
+    })
 }
 
 fn clone_args(flags: u64, parent_tid: u64, child_tid: u64) -> [u64; 5] {
@@ -515,10 +573,27 @@ fn clone_tid_copy_faults_restore_the_preimages_and_forward() {
 const SIGUSR1_BIT: u64 = 1 << 9; // signal 10
 
 #[test]
+fn pending_host_work_gettid_forwards_without_completion() {
+    for scale in [1, 2, 8] {
+        let mut w = World::new(LifecycleHatches::ON);
+        assert!(w.venue.leader_slot().publish_visible_tid(41));
+        w.task().linux.mark_pending_host_work();
+        for _ in 0..scale {
+            let (action, frame) = w.syscall(SYS_GETTID, &[0xfeed]);
+            assert_eq!(action, Action::Forward);
+            assert_eq!(frame.x[0], 0xfeed);
+            assert_eq!(w.task().linux.served_with_work.load(Ordering::Acquire), 0);
+        }
+        assert_eq!(w.served(SYS_GETTID), 0);
+        assert_eq!(w.forwarded(SYS_GETTID), scale);
+    }
+}
+
+#[test]
 fn lifecycle_setup_completes_once_before_pending_host_work() {
     for nr in [SYS_RT_SIGPROCMASK, SYS_SIGALTSTACK, SYS_SET_ROBUST_LIST] {
         let mut w = World::new(LifecycleHatches::ON);
-        w.task().mark_pending_host_work();
+        w.task().linux.mark_pending_host_work();
         let args: &[u64] = match nr {
             SYS_RT_SIGPROCMASK => &[0, 0, 0, 8],
             SYS_SIGALTSTACK => &[0, 0],
@@ -553,7 +628,7 @@ fn sigprocmask_unblocking_a_pending_signal_serves_with_work() {
     assert_eq!(frame.x[0], 0);
     assert_eq!(*old, SIGUSR1_BIT | 1);
     assert_eq!(w.venue.leader_slot().blocked(), BlockedMask(1));
-    assert_eq!(w.task().served_with_work.load(Ordering::Relaxed), 1);
+    assert_eq!(w.task().linux.served_with_work.load(Ordering::Relaxed), 1);
     assert_eq!(w.served(SYS_RT_SIGPROCMASK), 1);
 }
 
@@ -579,7 +654,7 @@ fn sigprocmask_unblocking_a_process_pending_signal_serves_with_work() {
     assert_eq!(frame.x[0], 0);
     assert_eq!(*old, SIGUSR1_BIT | 1);
     assert_eq!(w.venue.leader_slot().blocked(), BlockedMask(1));
-    assert_eq!(w.task().served_with_work.load(Ordering::Relaxed), 1);
+    assert_eq!(w.task().linux.served_with_work.load(Ordering::Relaxed), 1);
     assert_eq!(w.served(SYS_RT_SIGPROCMASK), 1);
 }
 
@@ -725,7 +800,14 @@ fn run_sigprocmask_dekker_storm(process: bool) {
                 page: &venue.page,
                 slot: venue.leader_slot(),
             };
-            works.push(serve_sigprocmask(&frame, thread, &mut FaultingUser::default()).unwrap());
+            works.push(
+                serve_sigprocmask(
+                    frame.x[..6].try_into().unwrap(),
+                    thread,
+                    &mut FaultingUser::default(),
+                )
+                .unwrap(),
+            );
             end.wait();
             end.wait();
         }
@@ -846,7 +928,7 @@ fn clone_then_join(w: &mut World, word: &u32) -> TrapFrame {
     );
     assert_eq!(action, Action::Served);
     assert_eq!(
-        w.task().task_id.load(Ordering::Relaxed),
+        w.task().execution.task.load(Ordering::Relaxed),
         u64::from(CHILD_TID)
     );
     assert_eq!(frame.elr, CLONE_PC);
@@ -870,7 +952,7 @@ fn exit_of_a_born_thread_clears_cleartid_wakes_the_joiner_and_runs_it() {
     assert_eq!(w.served(SYS_EXIT), 1);
     assert_eq!(w.forwarded(SYS_EXIT), 0);
     // The joiner resumes after its futex wait, which returned 0.
-    assert_eq!(w.task().task_id.load(Ordering::Relaxed), PARENT_TID);
+    assert_eq!(w.task().execution.task.load(Ordering::Relaxed), PARENT_TID);
     assert_eq!(frame.elr, 0x5000);
     assert_eq!(frame.x[0], 0);
     let s = w.zone.slot(SLOT);
@@ -903,6 +985,11 @@ fn exit_keeps_a_migrated_host_job_while_the_other_process_exits_in_zone() {
     let record = hosted.zone.alloc_record(identity).unwrap();
     hosted.zone.requeue_preempted(SLOT, record);
     assert_eq!(hosted.zone.switch_in(SLOT), Some(record));
+    hosted
+        .task()
+        .execution
+        .generation
+        .store(identity.generation, Ordering::Release);
     assert_eq!(hosted.page().live(), 2);
     assert_eq!(peer.page().live(), 2);
 
@@ -952,7 +1039,7 @@ fn exit_forwards_unless_a_switched_in_non_last_thread_may_leave() {
             w.page().close_for_fork().unwrap();
         }),
         ("host work pending", |w| {
-            w.task().mark_pending_host_work();
+            w.task().linux.mark_pending_host_work();
         }),
     ];
     for (label, setup) in cases {
@@ -977,7 +1064,7 @@ fn exit_forwards_unless_a_switched_in_non_last_thread_may_leave() {
         assert_eq!(w.page().state(0).unwrap().1, EntryState::Born, "{label}");
         assert_eq!(w.page().live(), live, "{label}");
         assert_eq!(
-            w.task().task_id.load(Ordering::Relaxed),
+            w.task().execution.task.load(Ordering::Relaxed),
             u64::from(CHILD_TID)
         );
         assert!(w.zone.slot(SLOT).current().is_some(), "{label}");
@@ -999,4 +1086,13 @@ fn exit_forwards_unless_a_switched_in_non_last_thread_may_leave() {
     assert_eq!(action, Action::Forward);
     assert_eq!(*word, 9);
     assert_eq!(w.page().live(), 2);
+}
+
+impl UserCopy for FaultingUser {
+    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool {
+        crate::file::UserCopy::copy_in(self, dst, src.raw())
+    }
+    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool {
+        crate::file::UserCopy::copy_out(self, dst.raw(), src)
+    }
 }

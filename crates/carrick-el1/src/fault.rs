@@ -13,24 +13,9 @@ use core::num::NonZeroU64;
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering;
 
-#[cfg(target_os = "none")]
-static PANIC_RETIREMENT_DETAIL: AtomicU64 = AtomicU64::new(0);
-
-/// Diagnostic detail carried by the EL1 panic sentinel.
+/// The host now owns frame-grant publication; EL1 has no publication error.
 pub fn panic_publication_detail() -> u64 {
-    #[cfg(target_os = "none")]
-    {
-        PANIC_RETIREMENT_DETAIL.load(Ordering::Relaxed)
-    }
-    #[cfg(not(target_os = "none"))]
     0
-}
-
-pub fn set_panic_retirement_detail(detail: u64) {
-    #[cfg(target_os = "none")]
-    PANIC_RETIREMENT_DETAIL.store(detail, Ordering::Relaxed);
-    #[cfg(not(target_os = "none"))]
-    let _ = detail;
 }
 
 pub use carrick_core::mm::fault::{request_lazy_frames, root_admits_commit};
@@ -65,6 +50,54 @@ fn prepared_fault_access(esr: u64) -> Option<LeafAccess> {
         0x24 | 0x25 if esr & (1 << 6) != 0 => Some(LeafAccess::Write),
         0x24 | 0x25 => Some(LeafAccess::Read),
         _ => None,
+    }
+}
+
+/// The guest fault policy's input after the native entry leaf has classified
+/// its own fault encoding. No ISA syndrome is interpreted by the policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FaultClass {
+    Translation {
+        access: LeafAccess,
+        grant_access: u64,
+    },
+    WritePermission,
+    Other,
+}
+
+fn arm_fault_class(esr: u64) -> FaultClass {
+    if is_write_permission_fault(esr) {
+        return FaultClass::WritePermission;
+    }
+    match (prepared_fault_access(esr), frame_grant_access(esr)) {
+        (Some(access), Some(grant_access)) => FaultClass::Translation {
+            access,
+            grant_access,
+        },
+        _ => FaultClass::Other,
+    }
+}
+
+fn x86_fault_class(fault: carrick_guest_arch::FaultInfo) -> FaultClass {
+    use carrick_guest_arch::Access;
+    if fault.address.raw() >= (1 << 47) {
+        return FaultClass::Other;
+    }
+    match (fault.present, fault.access) {
+        (true, Access::Write) => FaultClass::WritePermission,
+        (true, _) => FaultClass::Other,
+        (false, Access::Read) => FaultClass::Translation {
+            access: LeafAccess::Read,
+            grant_access: 1,
+        },
+        (false, Access::Write) => FaultClass::Translation {
+            access: LeafAccess::Write,
+            grant_access: 2,
+        },
+        (false, Access::Execute) => FaultClass::Translation {
+            access: LeafAccess::Execute,
+            grant_access: 4,
+        },
     }
 }
 
@@ -126,16 +159,12 @@ pub struct PreparedFaultPath<'a, P: PreparedPageResolver> {
 #[cfg(target_os = "none")]
 pub struct HardwarePreparedResolver;
 
-#[cfg(target_os = "none")]
-fn hardware_live_ttbr() -> u64 {
-    let ttbr: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr, options(nomem, nostack));
-    }
-    ttbr
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub(crate) fn hardware_live_ttbr() -> u64 {
+    crate::isa::aarch64::hardware_live_ttbr()
 }
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 fn hardware_target_table_window(
     target: u64,
 ) -> Option<carrick_mmu_core::aarch64::descriptor_txn::TableWindow> {
@@ -144,9 +173,9 @@ fn hardware_target_table_window(
 
 /// Only the executing slot uses its pair, so local ASID-0 invalidation is
 /// sufficient and never flushes another executor's maintenance translations.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 struct ServiceCopyMaintenance;
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for ServiceCopyMaintenance {
     fn publish_barrier(&self) {
         unsafe {
@@ -164,7 +193,7 @@ impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for ServiceCopy
     }
 }
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl PreparedPageResolver for HardwarePreparedResolver {
     fn commit_prepared(
         &mut self,
@@ -192,14 +221,152 @@ impl PreparedPageResolver for HardwarePreparedResolver {
     }
 }
 
-#[cfg(target_os = "none")]
+/// CPL0 publication of a host-backed prepared leaf while the shared fault
+/// dispatcher holds this MM's exact guest editor.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub struct X86PreparedResolver {
+    mm_key: NonZeroU64,
+    table_alias: carrick_guest_arch::KernelVa,
+    table_bytes: carrick_guest_arch::GuestLen,
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+static X86_EDIT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+impl X86PreparedResolver {
+    /// # Safety
+    /// Use this resolver only inside `dispatch_x86_fault_with_prepared`, whose
+    /// exact-MM editor spans `commit_prepared` and receipt settlement. The
+    /// alias must retain writable supervisor mappings of the target arena.
+    pub unsafe fn under_editor(
+        mm_key: NonZeroU64,
+        table_alias: carrick_guest_arch::KernelVa,
+        table_bytes: carrick_guest_arch::GuestLen,
+    ) -> Self {
+        Self {
+            mm_key,
+            table_alias,
+            table_bytes,
+        }
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+impl PreparedPageResolver for X86PreparedResolver {
+    fn commit_prepared(
+        &mut self,
+        root_pa: u64,
+        va: u64,
+        expected_pa: u64,
+        access: LeafAccess,
+    ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
+        use carrick_guest_arch::{
+            Access, EditIntent, EditOperation, EditOwner, FrameGpa, GuestLen, MmuEditArch, RootGpa,
+            TableWindow, UserRange, UserVa,
+        };
+        use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+        use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
+
+        let root = RootGpa::page_aligned(FrameGpa::new(root_pa))
+            .ok_or(GuestPreparedCommitError::BadAddress)?;
+        let address = UserVa::new(va);
+        let range = UserRange::checked(address, GuestLen::new(4096))
+            .ok_or(GuestPreparedCommitError::BadAddress)?;
+        let expected = FrameGpa::new(expected_pa);
+        let fault_access = match access {
+            LeafAccess::Read => Access::Read,
+            LeafAccess::Write => Access::Write,
+            LeafAccess::Execute => Access::Execute,
+        };
+        let sequence = X86_EDIT_SEQUENCE
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .ok()
+            .and_then(NonZeroU64::new)
+            .ok_or(GuestPreparedCommitError::BadAddress)?;
+        // SAFETY: the constructor requires a retained supervisor alias; this
+        // resolver is invoked only while the shared dispatcher holds the
+        // exact editor of the authenticated root.
+        let tables =
+            unsafe { TableWindow::issue(root.address(), self.table_alias, self.table_bytes) }
+                .ok_or(GuestPreparedCommitError::TableOutsidePrimary)?;
+        // SAFETY: `under_editor` requires this resolver to run only under the
+        // exact-MM editor; the caller's grant names the current MM root.
+        let owner = unsafe { EditOwner::issue(root, self.mm_key, sequence) };
+        let intent = EditIntent::checked(
+            owner,
+            range,
+            EditOperation::Publish {
+                expected,
+                access: fault_access,
+            },
+            &[],
+        )
+        .ok_or(GuestPreparedCommitError::BadAddress)?;
+        let mut arch = crate::isa::x86::Kernel::new(crate::isa::x86::X86Backend);
+        // SAFETY: exact editor and retained supervisor table alias are held
+        // through descriptor publication and the local drain receipt.
+        let receipt = unsafe { arch.execute_edit(intent, tables) };
+        match receipt {
+            Ok(receipt) => match receipt.outcome {
+                DescriptorOutcome::Applied { .. } => Ok(GuestPreparedCommit::Committed),
+                DescriptorOutcome::Refused(DescriptorRefusal::NotPrepared) => {
+                    // SAFETY: the same exact editor and table alias remain
+                    // held; the read-only walk authenticates the existing
+                    // user leaf before declaring the retry resident.
+                    let tables = unsafe {
+                        TableWindow::issue(root.address(), self.table_alias, self.table_bytes)
+                    }
+                    .ok_or(GuestPreparedCommitError::TableOutsidePrimary)?;
+                    if unsafe {
+                        crate::isa::x86::resident_leaf_matches(
+                            root,
+                            &tables,
+                            address,
+                            expected,
+                            fault_access,
+                        )
+                    }
+                    .unwrap_or(false)
+                    {
+                        Ok(GuestPreparedCommit::AlreadyResident)
+                    } else {
+                        Err(GuestPreparedCommitError::NotPrepared)
+                    }
+                }
+                DescriptorOutcome::Refused(DescriptorRefusal::WrongBacking) => {
+                    Err(GuestPreparedCommitError::WrongBacking)
+                }
+                DescriptorOutcome::Refused(DescriptorRefusal::PermissionDenied) => {
+                    Err(GuestPreparedCommitError::PermissionDenied)
+                }
+                DescriptorOutcome::Refused(DescriptorRefusal::MissingTable) => {
+                    Err(GuestPreparedCommitError::MissingTable)
+                }
+                DescriptorOutcome::Refused(DescriptorRefusal::TableOutsidePrimary) => {
+                    Err(GuestPreparedCommitError::TableOutsidePrimary)
+                }
+                DescriptorOutcome::Indeterminate(_) => {
+                    Err(GuestPreparedCommitError::RollbackFailed)
+                }
+                _ => Err(GuestPreparedCommitError::NotPrepared),
+            },
+            Err(crate::isa::ArchError::Busy) => Err(GuestPreparedCommitError::RollbackFailed),
+            Err(_) => Err(GuestPreparedCommitError::BadAddress),
+        }
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub struct HardwareCowResolver {
     pub service_slot: Option<carrick_el1_abi::SlotId>,
     pub completion: Option<carrick_el1_abi::CowGrantCompletion>,
     pub publication: Option<&'static carrick_el1_abi::PortalExecutableSlot>,
 }
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl CowResolver for HardwareCowResolver {
     fn reconcile_parent_write<
         W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
@@ -266,6 +433,88 @@ impl CowResolver for HardwareCowResolver {
     }
 }
 
+/// CPL0 adapter for the same guest COW policy. The normal image uses the
+/// shared pool and residency table; KVM fixtures can supply exact local
+/// records while exercising the production resolver.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub struct X86CowResolver<'a> {
+    pub pool: &'a dyn carrick_el1_abi::CowGrantVenue,
+    pub residency: &'a carrick_el1_abi::FrameGrantResidencyTable,
+    pub completion: Option<carrick_el1_abi::CowGrantCompletion>,
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+impl CowResolver for X86CowResolver<'_> {
+    fn reconcile_parent_write<
+        W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
+    >(
+        &mut self,
+        slot: u32,
+        handle: carrick_el1_abi::El1MmHandle,
+        sequence: core::num::NonZeroU64,
+        completion: carrick_el1_abi::CowGrantCompletion,
+        words: &W,
+    ) -> Result<(), crate::personality::mm_portal::MmError> {
+        crate::personality::mm_portal::reconcile_pending_parent_write(
+            slot as usize,
+            handle,
+            sequence,
+            completion,
+            words,
+        )
+    }
+
+    fn resolve_cow(&mut self, root: u64, mm_key: u64, far: u64) -> bool {
+        self.resolve_cow_outcome(root, mm_key, far) == CowResolution::Resolved
+    }
+
+    fn resolve_cow_outcome(&mut self, root: u64, mm_key: u64, far: u64) -> CowResolution {
+        let copy_page = |source: u64, destination: u64| {
+            // SAFETY: the x86 adapter verified both supervisor direct
+            // translations for these distinct page frames.
+            unsafe {
+                core::ptr::copy_nonoverlapping(source as *const u8, destination as *mut u8, 4096)
+            }
+        };
+        let invalidate = || {
+            // A stale writable TLB entry can make a permission fault
+            // retryable even when the live leaf is already writable.
+            // SAFETY: INVLPG is local to this CPL0 CPU and the live root.
+            unsafe {
+                core::arch::asm!(
+                    "invlpg [{}]",
+                    in(reg) far & !4095,
+                    options(nostack, preserves_flags)
+                )
+            }
+        };
+        // SAFETY: dispatch_classified_fault holds this MM's exact editor.
+        // resolve_x86_guest_cow authenticates the live CR3 and retained
+        // supervisor table window before reading or changing descriptors.
+        let outcome = unsafe {
+            crate::cow::resolve_x86_guest_cow(
+                root,
+                mm_key,
+                far,
+                self.pool,
+                self.residency,
+                copy_page,
+                invalidate,
+            )
+        };
+        handle_cow_outcome(outcome, &mut self.completion)
+    }
+
+    fn take_cow_completion(&mut self) -> Option<carrick_el1_abi::CowGrantCompletion> {
+        self.completion.take()
+    }
+
+    fn editor_busy(&mut self) {
+        self.pool
+            .note_declined(carrick_el1_abi::CowDecline::EditorBusy);
+    }
+}
+
 /// EL1 execution of host-submitted live descriptor transactions.
 pub trait DescriptorTxnApplier {
     /// Claim and execute the submission in `slot` for `mm_key` against the
@@ -289,25 +538,22 @@ pub struct DescriptorTxnPath<'a, X: DescriptorTxnApplier> {
 #[cfg(target_os = "none")]
 const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub(crate) use crate::isa::arm_edit::El1TableMaintenance;
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) struct El1TableMaintenance {
     pub(crate) ttbr0: u64,
 }
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for El1TableMaintenance {
     fn publish_barrier(&self) {
-        // The reviewed ASID maintenance sequence begins with `dsb ishst`,
-        // which completes the unlinked table fills for every walker in the
-        // Inner Shareable domain before the following link store. Links are
-        // rare (hierarchy growth and splits), so the trailing TLBI is cheap.
         let mut cpu = crate::sched::HardwareCpu;
         crate::sched::ThreadCpu::invalidate_asid(&mut cpu, self.ttbr0);
     }
 
     fn invalidate_range(&self, _va: u64, _len: u64) {
-        // Break-before-make needs the broken translation gone from every PE
-        // before the replacement appears. The MM's whole ASID is a superset.
         let mut cpu = crate::sched::HardwareCpu;
         crate::sched::ThreadCpu::invalidate_asid(&mut cpu, self.ttbr0);
     }
@@ -418,7 +664,8 @@ pub fn serve_descriptor_txns<X: DescriptorTxnApplier>(
 ) -> Option<Action> {
     let mm_key = current_tasks
         .get(frame.slot as usize)?
-        .zone_mm
+        .mm
+        .key
         .load(Ordering::Acquire);
     if mm_key == 0 || path.slots.submitted_for(mm_key).next().is_none() {
         return None;
@@ -486,7 +733,7 @@ pub trait CowCopyWindow {
 
 /// Borrow the existing slot-scoped copy aliases for one bounded owner operation.
 /// The closure cannot carry table words or copy aliases across a host supply.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub(crate) fn with_hardware_cow_venue<R>(
     ttbr0: u64,
     service_slot: Option<carrick_el1_abi::SlotId>,
@@ -576,8 +823,13 @@ pub(crate) fn with_hardware_cow_venue<R>(
         publication.is_some_and(|slot| {
             slot.publish_with(
                 carrick_el1_abi::PortalExecutablePublication { grant, ipa, len },
-                || unsafe {
-                    core::arch::asm!("hvc #1", options(nostack));
+                || {
+                    #[cfg(target_arch = "aarch64")]
+                    unsafe {
+                        core::arch::asm!("hvc #1", options(nostack));
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    crate::isa::x86::yield_host_effect();
                 },
             )
         })
@@ -747,7 +999,7 @@ pub fn drain_before_el0<X: DescriptorTxnApplier>(
     let Some(task) = current_tasks.get(frame.slot as usize) else {
         return action;
     };
-    let mm_key = task.zone_mm.load(Ordering::Acquire);
+    let mm_key = task.mm.key.load(Ordering::Acquire);
     if mm_key == 0 || !slots.in_flight_for(mm_key) {
         return action;
     }
@@ -762,7 +1014,8 @@ pub fn drain_before_el0<X: DescriptorTxnApplier>(
     };
     match (outcome, action) {
         (DrainOutcome::Blocked, Action::Served | Action::ServedWithWork) if is_syscall(frame) => {
-            task.leave_served_with_work()
+            task.linux.record_completed_with_work();
+            Action::ServedWithWork
         }
         (DrainOutcome::Blocked, Action::Served) => Action::Forward,
         _ => action,
@@ -833,7 +1086,7 @@ pub fn serve_host_drain_hw(frame: &mut TrapFrame) {
 /// frames, consumes refusals, or resolves in-guest COW faults.
 /// Host builds retain the forward-only path.
 pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
-    #[cfg(target_os = "none")]
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
         let current_tasks = unsafe {
             &*(carrick_el1_abi::EL1_CURRENT_TASKS_BASE
@@ -874,6 +1127,14 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 completion: None,
             },
         )
+    }
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    {
+        // CPL0 enters through `dispatch_x86_fault_with_prepared` with its
+        // decoded #PF. This ARM TrapFrame entry has no x86 fault provenance.
+        let _ = frame;
+        counters.fault_taken.fetch_add(1, Ordering::Relaxed);
+        Action::Forward
     }
     #[cfg(not(target_os = "none"))]
     {
@@ -957,10 +1218,7 @@ fn consume_refusal(mailboxes: GrantMailboxes<'_>, mm_key: u64, far: u64, access:
 /// fault. Left in RESPONSE, a mailbox could never carry another request, and
 /// every later first touch on that vCPU slot, in any MM, would fall back to
 /// page-granular host service.
-fn consume_served_refusals(mailboxes: GrantMailboxes<'_>, mm_key: u64, far: u64, esr: u64) {
-    let Some(access) = frame_grant_access(esr) else {
-        return;
-    };
+fn consume_served_refusals(mailboxes: GrantMailboxes<'_>, mm_key: u64, far: u64, access: u64) {
     let release = |source: &FrameGrantMailbox| {
         if let Some(response) = source.response_covering_fault(mm_key, far, access) {
             release_refusal(source, mm_key, response.request.request_generation);
@@ -978,23 +1236,74 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
     current_tasks: &[CurrentTask],
     spaces: SpaceAccess<'_>,
     mailboxes: GrantMailboxes<'_>,
+    prepared: Option<PreparedFaultPath<'_, P>>,
+    cow_resolver: &mut C,
+) -> Action {
+    dispatch_classified_fault(
+        frame.slot,
+        frame.far,
+        arm_fault_class(frame.esr),
+        counters,
+        current_tasks,
+        spaces,
+        mailboxes,
+        prepared,
+        cow_resolver,
+    )
+}
+
+/// Execute the same guest fault policy for a decoded CPL3 x86 page fault.
+/// The entry backend must have checked the fault's user origin before calling.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_x86_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
+    slot: u64,
+    fault: carrick_guest_arch::FaultInfo,
+    counters: &Counters,
+    current_tasks: &[CurrentTask],
+    spaces: SpaceAccess<'_>,
+    mailboxes: GrantMailboxes<'_>,
+    prepared: Option<PreparedFaultPath<'_, P>>,
+    cow_resolver: &mut C,
+) -> Action {
+    dispatch_classified_fault(
+        slot,
+        fault.address.raw(),
+        x86_fault_class(fault),
+        counters,
+        current_tasks,
+        spaces,
+        mailboxes,
+        prepared,
+        cow_resolver,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_classified_fault<P: PreparedPageResolver, C: CowResolver>(
+    slot: u64,
+    far: u64,
+    fault: FaultClass,
+    counters: &Counters,
+    current_tasks: &[CurrentTask],
+    spaces: SpaceAccess<'_>,
+    mailboxes: GrantMailboxes<'_>,
     mut prepared: Option<PreparedFaultPath<'_, P>>,
     cow_resolver: &mut C,
 ) -> Action {
     let mailbox = mailboxes.own;
     counters.fault_taken.fetch_add(1, Ordering::Relaxed);
-    if is_write_permission_fault(frame.esr) {
-        let Some(task) = current_tasks.get(frame.slot as usize) else {
+    if fault == FaultClass::WritePermission {
+        let Some(task) = current_tasks.get(slot as usize) else {
             return Action::Forward;
         };
-        let mm_key = task.zone_mm.load(Ordering::Acquire);
+        let mm_key = task.mm.key.load(Ordering::Acquire);
         if mm_key == 0 {
             return Action::Forward;
         }
         let Some(index) = spaces.find(mm_key) else {
             return Action::Forward;
         };
-        let Some(owner) = NonZeroU64::new(frame.slot + 1) else {
+        let Some(owner) = NonZeroU64::new(slot + 1) else {
             return Action::Forward;
         };
         // A closed gate (host pause or retirement) or another EL1 editor:
@@ -1015,26 +1324,30 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
             cow_resolver.editor_busy();
             return Action::Forward;
         };
-        if cow_resolver.resolve_cow(grant.ttbr0, mm_key, frame.far) {
+        if cow_resolver.resolve_cow(grant.ttbr0, mm_key, far) {
             return Action::Served;
         }
         return Action::Forward;
     }
 
-    let Some(prepared_access) = prepared_fault_access(frame.esr) else {
+    let FaultClass::Translation {
+        access: prepared_access,
+        grant_access: access,
+    } = fault
+    else {
         return Action::Forward;
     };
-    let Some(task) = current_tasks.get(frame.slot as usize) else {
+    let Some(task) = current_tasks.get(slot as usize) else {
         return Action::Forward;
     };
-    let mm_key = task.zone_mm.load(Ordering::Acquire);
+    let mm_key = task.mm.key.load(Ordering::Acquire);
     if mm_key == 0 {
         return Action::Forward;
     }
 
     if let Some(page) = prepared
         .as_ref()
-        .and_then(|path| path.residency.lookup(mm_key, frame.far))
+        .and_then(|path| path.residency.lookup(mm_key, far))
     {
         // First-touch stock over a root hole is backing, not a mapping: the
         // host answers a touch the root does not map (SIGSEGV), and asks
@@ -1042,9 +1355,9 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         if root_admits_commit(
             prepared.as_ref().and_then(|path| path.roots),
             spaces,
-            frame.slot as u32,
+            slot as u32,
             mm_key,
-            frame.far & !4095,
+            far & !4095,
             prepared_access,
         ) == Some(false)
         {
@@ -1056,7 +1369,7 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         let Some(grant) = spaces.grant(index, mm_key) else {
             return Action::Forward;
         };
-        let Some(owner) = NonZeroU64::new(frame.slot + 1) else {
+        let Some(owner) = NonZeroU64::new(slot + 1) else {
             return Action::Forward;
         };
         let Some(_editor) = spaces.try_begin_edit(index, mm_key, owner) else {
@@ -1065,17 +1378,17 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         let path = prepared.as_mut().expect("prepared grant path");
         match path.resolver.commit_prepared(
             grant.ttbr0,
-            frame.far & !4095,
+            far & !4095,
             page.expected_ipa,
             prepared_access,
         ) {
             Ok(GuestPreparedCommit::Committed) => {
                 assert!(path.residency.record_commit(page));
-                consume_served_refusals(mailboxes, mm_key, frame.far, frame.esr);
+                consume_served_refusals(mailboxes, mm_key, far, access);
                 return Action::Served;
             }
             Ok(GuestPreparedCommit::AlreadyResident) => {
-                consume_served_refusals(mailboxes, mm_key, frame.far, frame.esr);
+                consume_served_refusals(mailboxes, mm_key, far, access);
                 return Action::Served;
             }
             Err(GuestPreparedCommitError::RollbackFailed) => {
@@ -1085,13 +1398,9 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         }
     }
 
-    let Some(access) = frame_grant_access(frame.esr) else {
-        return Action::Forward;
-    };
-
     // Only refusals cross back to EL1. Successful grants have already
     // published and released their slot on the host, even after migration.
-    if consume_refusal(mailboxes, mm_key, frame.far, access) {
+    if consume_refusal(mailboxes, mm_key, far, access) {
         return Action::Forward;
     }
 
@@ -1100,53 +1409,25 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         let slots = unsafe {
             &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
         };
-        let selected = (|| {
-            let grant = spaces.table().grant(spaces.find(mm_key)?, mm_key)?;
-            let table = hardware_target_table_window(grant.ttbr0)?;
-            let maintenance = El1TableMaintenance { ttbr0: grant.ttbr0 };
-            // SAFETY: the current target alias and retained pool expose only
-            // physical table words; the core acquires this MM's editor before
-            // authenticating the root and selecting the live supply window.
-            let words = unsafe {
-                carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords::new(
-                    table.words,
-                    table.physical_base,
-                    carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
-                    &maintenance,
-                )
-                .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
-            }
-            .ok()?;
-            Some(
-                (OwnerFaultVenue {
-                    roots,
-                    spaces,
-                    slots,
-                    residency: carrick_el1_abi::frame_grant_residency_guest(),
-                    worker: frame.slot as u32,
-                    mailbox,
-                })
-                .publish(
-                    carrick_mmu_core::owner_mmu::Aarch64Mmu,
-                    &words,
-                    mm_key,
-                    frame.far,
-                    access,
-                ),
-            )
-        })()
-        .unwrap_or(false);
-        if selected {
+        if (FileFaultVenue {
+            roots,
+            spaces,
+            slots,
+            worker: slot as u32,
+            mailbox,
+        })
+        .publish(mm_key, far, access)
+        {
             return Action::Forward;
         }
     }
-    let _ = request_lazy_frames(mailbox, mm_key, frame.far, access);
+    let _ = request_lazy_frames(mailbox, mm_key, far, access);
     Action::Forward
 }
 
-/// First-touch selects its live window and optional byte source in the core.
-/// The host supplies physical custody without deciding reservation policy.
-pub type OwnerFaultVenue<'a> = carrick_core::mm::fault::OwnerFaultVenue<
+/// File first-touch selects the source and access policy in the admitted root.
+/// The host sees only this exact owner window and retained handle byte service.
+pub type FileFaultVenue<'a> = carrick_core::mm::fault::FileFaultVenue<
     'a,
     carrick_personality_linux::mm::LinuxReservationPolicy,
     crate::memory::reservations::NativeReservationGeometry,
@@ -1215,7 +1496,7 @@ mod tests {
         // first fault, without a grant refusal and a second host fault.
         table.retire_overlapping(mm, base + 2 * 4096, 4096);
         let task = CurrentTask::new();
-        task.zone_mm.store(mm, Ordering::Release);
+        task.mm.key.store(mm, Ordering::Release);
         let tasks = [task];
         let spaces = published_space(mm, 0x8800_0000);
         let mailbox = FrameGrantMailbox::new();
@@ -1240,6 +1521,71 @@ mod tests {
         assert_eq!(prepared.calls, vec![(0x8800_0000, va, 0x9000_1000)]);
         assert!(table.is_guest_committed(mm, va));
         assert!(!mailbox.has_guest_work());
+    }
+
+    #[test]
+    fn x86_translation_fault_uses_shared_prepared_owner_path() {
+        use carrick_guest_arch::{Access, FaultInfo, UserVa};
+        let mm = 91;
+        let va = 0x4000_1000;
+        let residency = carrick_el1_abi::FrameGrantResidencyTable::new();
+        residency
+            .publish(carrick_el1_abi::FrameGrantResidencyIdentity {
+                mm_key: mm,
+                semantic_base: va,
+                physical_ipa: 0x9000_0000,
+                len: 4096,
+                mapping_id: 11,
+                frame_id: 12,
+                owner_generation: 13,
+                inventory_revision: 14,
+            })
+            .unwrap();
+        let task = CurrentTask::new();
+        task.mm.key.store(mm, Ordering::Release);
+        let tasks = [task];
+        let spaces = published_space(mm, 0x8800_0000);
+        let mailbox = FrameGrantMailbox::new();
+        let mut prepared = RecordingPreparedResolver::default();
+        let counters = Counters::default();
+        assert_eq!(
+            dispatch_x86_fault_with_prepared(
+                0,
+                FaultInfo {
+                    address: UserVa::new(va),
+                    access: Access::Read,
+                    present: false,
+                },
+                &counters,
+                &tasks,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+                GrantMailboxes::own(&mailbox),
+                Some(PreparedFaultPath {
+                    residency: &residency,
+                    resolver: &mut prepared,
+                    roots: None,
+                }),
+                &mut NoopCowResolver,
+            ),
+            Action::Served
+        );
+        assert_eq!(prepared.calls, vec![(0x8800_0000, va, 0x9000_0000)]);
+        assert!(residency.is_guest_committed(mm, va));
+        assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
+        assert!(!mailbox.has_guest_work());
+    }
+
+    #[test]
+    fn x86_kernel_half_fault_never_requests_guest_backing() {
+        use carrick_guest_arch::{Access, FaultInfo, UserVa};
+        assert_eq!(
+            x86_fault_class(FaultInfo {
+                address: UserVa::new(0xffff_ffff_9000_0000),
+                access: Access::Write,
+                present: false,
+            }),
+            FaultClass::Other
+        );
     }
 
     /// A zeroed shared reservation table with `mm`'s root admitted in its
@@ -1332,7 +1678,7 @@ mod tests {
             })
             .unwrap();
         let task = CurrentTask::new();
-        task.zone_mm.store(mm, Ordering::Release);
+        task.mm.key.store(mm, Ordering::Release);
         let tasks = [task];
         let read_translation_fault = |address| TrapFrame {
             esr: (0x24 << 26) | 0x07,
@@ -1389,7 +1735,7 @@ mod tests {
         };
         table.publish(identity).unwrap();
         let task = CurrentTask::new();
-        task.zone_mm.store(mm, Ordering::Release);
+        task.mm.key.store(mm, Ordering::Release);
         let mut frame = TrapFrame {
             esr: (0x20 << 26) | 0x07,
             far: va,
@@ -1456,7 +1802,7 @@ mod tests {
             let mm = 9;
             let tasks = [CurrentTask::new(), CurrentTask::new()];
             for task in &tasks {
-                task.zone_mm.store(mm, Ordering::Release);
+                task.mm.key.store(mm, Ordering::Release);
             }
             let spaces = published_space(mm, 0x8800_0000);
             let boxes = FrameGrantMailboxes::new();
@@ -1556,7 +1902,7 @@ mod tests {
     fn missing_guest_table_is_handled_before_commit_without_guest_handback() {
         use core::cell::Cell;
         let task = CurrentTask::new();
-        task.zone_mm.store(7, Ordering::Release);
+        task.mm.key.store(7, Ordering::Release);
         let tasks = [task];
         let spaces = published_space(7, 0x8800_0000);
         let mailbox = FrameGrantMailbox::new();
@@ -1614,7 +1960,7 @@ mod tests {
     fn refused_frame_grant_falls_back_without_republishing_in_the_same_dispatch() {
         let mm = 8;
         let task = CurrentTask::new();
-        task.zone_mm.store(mm, Ordering::Release);
+        task.mm.key.store(mm, Ordering::Release);
         let tasks = [task];
         let spaces = published_space(mm, (32_u64 << 48) | 0x8900_0000_0000);
         let mailbox = FrameGrantMailbox::new();
@@ -1663,9 +2009,9 @@ mod tests {
         let va = base + 0x5000;
         for migrated in [false, true] {
             let task = CurrentTask::new();
-            task.zone_mm.store(mm, Ordering::Release);
+            task.mm.key.store(mm, Ordering::Release);
             let tasks = [task, CurrentTask::new()];
-            tasks[1].zone_mm.store(mm, Ordering::Release);
+            tasks[1].mm.key.store(mm, Ordering::Release);
             let spaces = published_space(mm, 0x8800_0000);
             let boxes = FrameGrantMailboxes::new();
             let origin = boxes.slot(0).unwrap();
@@ -1764,7 +2110,7 @@ mod tests {
     fn permission_fault_never_requests_a_first_touch_frame_grant() {
         let mm = 82;
         let task = CurrentTask::new();
-        task.zone_mm.store(mm, Ordering::Release);
+        task.mm.key.store(mm, Ordering::Release);
         let tasks = [task];
         let spaces = published_space(mm, (35_u64 << 48) | 0x8c00_0000_0000);
         let mailbox = FrameGrantMailbox::new();
@@ -1793,7 +2139,7 @@ mod tests {
     #[test]
     fn non_translation_or_permission_fault_never_requests_a_grant() {
         let task = CurrentTask::new();
-        task.zone_mm.store(9, Ordering::Release);
+        task.mm.key.store(9, Ordering::Release);
         let tasks = [task];
         let spaces = published_space(9, (33_u64 << 48) | 0x8a00_0000_0000);
         let mailbox = FrameGrantMailbox::new();
@@ -1822,7 +2168,7 @@ mod tests {
         let ttbr0 = (36_u64 << 48) | 0x8d00_0000_0000;
         let fault = 0x4000_3000;
         let task = CurrentTask::new();
-        task.zone_mm.store(mm, Ordering::Release);
+        task.mm.key.store(mm, Ordering::Release);
         let tasks = [task];
         let spaces = published_space(mm, ttbr0);
         let mailbox = FrameGrantMailbox::new();
@@ -1855,7 +2201,7 @@ mod tests {
         let ttbr0 = (37_u64 << 48) | 0x8e00_0000_0000;
         let fault = 0x4000_4000;
         let task = CurrentTask::new();
-        task.zone_mm.store(mm, Ordering::Release);
+        task.mm.key.store(mm, Ordering::Release);
         let tasks = [task];
         let spaces = published_space(mm, ttbr0);
         let mailbox = FrameGrantMailbox::new();
@@ -2048,7 +2394,7 @@ mod tests {
             counters: &Counters,
         ) -> Action {
             let task = CurrentTask::new();
-            task.zone_mm.store(mm, Ordering::Release);
+            task.mm.key.store(mm, Ordering::Release);
             let mut frame = write_translation_fault(0, fault);
             dispatch_fault_with_descriptor_txns(
                 &mut frame,
@@ -2190,7 +2536,7 @@ mod tests {
 
         fn task(mm: u64) -> CurrentTask {
             let task = CurrentTask::new();
-            task.zone_mm.store(mm, Ordering::Release);
+            task.mm.key.store(mm, Ordering::Release);
             task
         }
 
@@ -2311,7 +2657,7 @@ mod tests {
                 Action::ServedWithWork
             );
             assert_eq!(
-                tasks[0].served_with_work.load(Ordering::Acquire),
+                tasks[0].linux.served_with_work.load(Ordering::Acquire),
                 1,
                 "the host must complete, not re-dispatch, the served call"
             );

@@ -1,0 +1,216 @@
+{
+  "schema_version": 1,
+  "kind": "focused-worker-verification",
+  "source_commit": "7d720ba614158bc55f0475605076a0f308f24dc5",
+  "comparison_base": "0f476ce7a",
+  "host": "x86-w2",
+  "artifact": {
+    "path": "target/x86_64-unknown-none/release/carrick-x86-cpl0",
+    "sha256": "ec8f072203c92b3f301ecc1371677d138701ffdc86cc1657b13c9abe85979f83",
+    "elf_build_id": null
+  },
+  "commands": [
+    {
+      "command": "cargo test --locked -p carrick-core --test x86_acceleration",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test --locked -p carrick-core -p carrick-core-abi -p carrick-personality-linux --lib",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test --locked -p carrick-mmu-core -p carrick-sched-core -p carrick-el1-abi --lib",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test --locked -p carrick-conformance-contract --lib personality_boundary",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test --locked -p carrick-personality-linux --lib abi::thread",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test --locked -p carrick-el1 --lib personality::lifecycle",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test --locked -p carrick-kernel --lib prepared_parent_exit_",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test --locked -p carrick-core --test x86_wave2 x5_lifecycle_publication -- --exact",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test --locked -p carrick-personality-linux --test x86_wave2 x5_linux_clone_exit -- --exact",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo build --locked -p carrick-x86-cpl0 --target x86_64-unknown-none --release",
+      "exit_code": 0
+    },
+    {
+      "command": "CARRICK_RUN_ID=x5-wave2-lifecycle cargo test --locked -p carrick-vmm-kvm --test cpl0_lifecycle x5_shared_clone_exit -- --exact --nocapture",
+      "exit_code": 0
+    },
+    {
+      "command": "CARRICK_RUN_ID=x5-wave2-lifecycle cargo test --locked -p carrick-vmm-kvm --test cpl0_entry",
+      "exit_code": 0
+    },
+    {
+      "command": "CARRICK_RUN_ID=x5-wave2-lifecycle cargo test --locked -p carrick-vmm-kvm --test cpl0_progress",
+      "exit_code": 0
+    },
+    {
+      "command": "just clippy",
+      "exit_code": 0
+    },
+    {
+      "command": "just fmt-check",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test --locked -p carrick-core --test entry_completion",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test --locked -p carrick-personality-linux --test x86_wave2",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo clippy --locked -p carrick-core -p carrick-core-abi -p carrick-personality-linux -p carrick-el1-abi -p carrick-el1 -p carrick-x86 -p carrick-x86-cpl0 -p carrick-vmm-kvm -p carrick-observability -p carrick-conformance-contract --all-targets -- -D warnings",
+      "exit_code": 0
+    },
+    {
+      "command": "python3 scripts/migrate/reconcile-line-pinned-inventories.py",
+      "exit_code": 0
+    },
+    {
+      "command": "for d in fixtures/*/; do (cd \"$d\" && cargo metadata --locked --offline --format-version 1 >/dev/null) || echo STALE \"$d\"; done",
+      "exit_code": 0,
+      "output": ""
+    },
+    {
+      "command": "just lint-domains",
+      "exit_code": 1,
+      "failure": "three independent Mac capture/projection self-tests"
+    },
+    {
+      "command": "just remote-recapture --ref 7d720ba614158bc55f0475605076a0f308f24dc5",
+      "exit_code": 1,
+      "failure": "cloudmac does not resolve; no remote contact"
+    }
+  ],
+  "arm_production_lines": {
+    "before": 33729,
+    "after": 31916,
+    "reduction": 1813
+  },
+  "kvm_x5": {
+    "births_per_mm": [
+      16,
+      64,
+      256
+    ],
+    "mm_count": 2,
+    "entries": [
+      96,
+      384,
+      1536
+    ],
+    "completions": [
+      96,
+      384,
+      1536
+    ],
+    "semantic_forwards": [
+      0,
+      0,
+      0
+    ]
+  },
+  "limits": [
+    "Not an acceptance receipt; no accept/remote-accept invoked.",
+    "ARM signed/macOS comparison remains director-owned.",
+    "Production execution-pool exhaustion and full adopted-job retirement remain unqualified.",
+    "Exploratory runtime Linux all-target Clippy yields the identical 117 baseline diagnostics.",
+    "Order 5 review advanced to 3207564aa; rebase target instruction pending.",
+    "Mac capture/projection mismatch requires authoritative recapture; cloudmac DNS unavailable on worker."
+  ],
+  "supplementary_lint_commands": [
+    {
+      "command": "python3 -m unittest scripts/tests/test_conformance_contract_policy.py",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo run --locked -p carrick-conformance-contract --bin check-contracts -- --root .",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo fetch --locked",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo metadata --locked --offline --all-features --format-version 1",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo run --locked -p carrick-conformance-contract --bin check-personality-boundary -- --root . --metadata-file target/cargo-metadata.json",
+      "exit_code": 1
+    },
+    {
+      "command": "python3 -m unittest scripts/tests/test_check_contract_change.py",
+      "exit_code": 0
+    },
+    {
+      "command": "python3 scripts/migrate/check-runtime-global-state.py --check",
+      "exit_code": 0
+    },
+    {
+      "command": "python3 scripts/migrate/check-runtime-aborts.py --check",
+      "exit_code": 0
+    },
+    {
+      "command": "python3 scripts/migrate/check-task-participant-witnesses.py --check",
+      "exit_code": 0
+    },
+    {
+      "command": "python3 scripts/migrate/check-mm-authority.py --check",
+      "exit_code": 0
+    },
+    {
+      "command": "python3 scripts/migrate/check-host-authority-transitions.py --static",
+      "exit_code": 2
+    },
+    {
+      "command": "python3 scripts/migrate/check-dispatch-lock-authority.py --check",
+      "exit_code": 0
+    },
+    {
+      "command": "python3 scripts/migrate/check-k1-file-authority-inventory.py",
+      "exit_code": 0
+    },
+    {
+      "command": "python3 scripts/migrate/check-k1-file-authority-taxonomy.py",
+      "exit_code": 0
+    },
+    {
+      "command": "python3 scripts/migrate/check-k1-burndown.py",
+      "exit_code": 0
+    },
+    {
+      "command": "python3 scripts/migrate/check-serial-host-tests.py",
+      "exit_code": 0
+    }
+  ],
+  "gate_result": "partial: full domain lint fails",
+  "baseline_boundary_diagnostics": {
+    "before": 9,
+    "after": 9,
+    "added": 0,
+    "removed": 0,
+    "authoritative": false,
+    "correction": "Cross-version scanner comparison cannot attribute baseline failures. Exact order-5 CI scanner passes; order-6 scanner adds PendingSignals prohibition and fails at 6bb08a88d. Superseded by signal-boundary correction."
+  }
+}

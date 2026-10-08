@@ -15,6 +15,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use carrick_el1_abi::Lifecycle;
 use core::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -72,10 +73,12 @@ impl Venue {
 
 impl LifecycleVenue for Venue {
     fn thread(&self, task: &CurrentTask) -> Option<LifecycleThread<'_>> {
-        (task.task_id.load(Ordering::Acquire) == self.parent_tid).then_some(LifecycleThread {
-            page: &self.page,
-            slot: &self.leader,
-        })
+        (task.execution.task.load(Ordering::Acquire) == self.parent_tid).then_some(
+            LifecycleThread {
+                page: &self.page,
+                slot: &self.leader,
+            },
+        )
     }
 
     fn born_slot(&self, page: &ThreadLifecyclePage, entry: EntryRef) -> Option<&ThreadControlSlot> {
@@ -155,16 +158,19 @@ fn admitted_thread_creation_owns_one_completion_at_1_8_32() {
             .map(|i| {
                 let task = CurrentTask::new();
                 task.set(El1TaskId::from_linux_tid(40 + i as i32), 1, 500 + i as u64);
-                task.zone_mm
+                task.mm
+                    .key
                     .store(if i % 2 == 0 { 71 } else { 83 }, Ordering::Release);
-                task.thread_serial.store(100 + i as u64, Ordering::Release);
+                task.mm
+                    .thread_generation
+                    .store(100 + i as u64, Ordering::Release);
                 task
             })
             .collect();
         let venues: Vec<_> = (0..n).map(|i| Venue::new(40 + i as u32)).collect();
         for (i, task) in tasks.iter().take(n).enumerate() {
             let slot = SlotId::from_index(i).unwrap();
-            let mm = task.zone_mm.load(Ordering::Acquire);
+            let mm = task.mm.key.load(Ordering::Acquire);
             zone.drive(slot, i as u64 + 1);
             zone.publish_slot(slot, mm, None, 0);
         }
@@ -219,10 +225,10 @@ fn admitted_thread_creation_owns_one_completion_at_1_8_32() {
                     assert_eq!(zone.slot(slot).queued(), 1);
                     let record = zone.runnable_head(slot).unwrap();
                     let identity = zone.record(record).identity();
-                    assert_eq!(identity.mm, tasks[i].zone_mm.load(Ordering::Acquire));
+                    assert_eq!(identity.mm, tasks[i].mm.key.load(Ordering::Acquire));
                     assert_eq!(
                         identity.file_table,
-                        tasks[i].file_table.load(Ordering::Acquire)
+                        tasks[i].linux.file_table.load(Ordering::Acquire)
                     );
                     let entry = (0..THREAD_POOL_ENTRIES)
                         .find(|&index| venue.page.state(index).unwrap().1 == EntryState::Born)
@@ -267,7 +273,7 @@ fn complete_creation_surface_census_counts_each_nonadmitted_forward_once() {
         let counters = Counters::default();
         let tasks = [CurrentTask::new(), CurrentTask::new()];
         for (task, mm) in tasks.iter().zip([71, 83]) {
-            task.zone_mm.store(mm, Ordering::Release);
+            task.mm.key.store(mm, Ordering::Release);
         }
         for nr in CREATION_IDS {
             for i in 0..n {

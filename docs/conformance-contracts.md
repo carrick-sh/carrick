@@ -304,37 +304,6 @@ excludes EL1 edits before reading the live owner again. VM-free binding:
 holds an EL1 root through classification of both a mapped page and a hole,
 then verifies that the hole remains unmapped after release.
 
-`kernel.el1.delegated-root-fork` also covers anonymous first-touch after a
-forked child replaces a mapping with `MAP_FIXED`. Linux authority: `fork(2)`
-and `mmap(2)` require fresh private anonymous bytes to start at zero without
-changing the parent. The admitted reservation and live descriptors select the
-supply window; it stays inside that reservation and excludes inherited
-prepared or resident neighbors. Host residency is not an admission authority.
-The VM-free binding
-`owner_fork_anonymous_first_touch_excludes_inherited_prepared_neighbors`
-retains the parent's exact root incarnation, reservation generations and
-descriptor image. Signed bindings remain
-`el1_delegated_root_concurrent_vma_ops` and
-`el1_delegated_root_map_fixed_over_cow_pages`; their serving and exit budgets
-remain part of correctness.
-The shared core bindings `aarch64_owner_fault_window_excludes_inherited_backing`
-and `x86_owner_fault_window_excludes_inherited_backing` require the same bounded
-selection rule over both descriptor geometries.
-
-`kernel.el1.anonymous-first-touch` also binds the native owner-fault
-completion's unclaimed grant wait. A concurrent owner editor is admission
-contention, not an inaccessible Linux mapping. Withdrawal releases speculative
-physical custody before carrying the exact owner, cause and revision to the
-existing notification queue; the fault mailbox clears only its own request.
-The continuation retains a fault origin, with no syscall return or restart,
-and ordinary saved CPU state. A reserved signal remains owned until immediate
-delivery at that fault boundary. VM-free bindings are
-`fault_owner_wait_releases_physical_custody_before_parking`,
-`owner_fault_wait_clears_only_its_exact_request_without_denial` and the three
-`fault_zone_capture_*` witnesses. This proves no new MMU execution, signed
-completion or cost ratio; the existing signed first-touch and fork bindings
-still require fresh exact-artifact confirmation, without changed budgets.
-
 `kernel.mm.copyout-owner-gate` covers a peer closing the MM gate between
 SELECT and PREPARE. The hardware preamble must observe the exact Gate
 producer before probing and return its owned suspension, never a raw
@@ -613,3 +582,33 @@ capture, clear, wake and terminal publication. `terminal_clear_loom` models
 clear/wake ordering and graph refusal. The signed anonymous and fork-COW
 comparison fixtures bind the terminal runtime path; broader pthread and exec
 acceptance remains open.
+
+## X86 retained shootdown debt (`x86-shootdown-reentry`)
+
+Surface: shared-MM page retirement on two live x86 KVM CPUs. Architectural
+translation coherence requires a CPU to drain its old non-global translations
+before using the edited address space. Carrick retains exact root/MM owner and
+request generation; a stopped CPU can owe a published generation, but cannot
+use that translation on reentry before native KICK settlement. A user #PF must
+settle already published debt before reporting its fault doorbell.
+
+The cheapest capable binding is the real KVM `cpl0_entry` fixture: the reader
+warms the retired leaf, then signals running admission while waiting on a
+fixture control byte. The selected hold releases that byte only after the
+editor's unmap reaches rendezvous. The reader faults on a never-mapped address,
+so neither forced ordering depends on incidental eviction of the warmed TLB.
+Hold IPI until the first fault word to force fault-entry settlement; hold
+publication until the complete record stops the reader to force reentry debt.
+The latter must owe exactly generation 2 after serving generation 1, and must
+serve generation 2 and increment the native KICK check once on reentry. The
+original two-running-CPU fixture checks either exact served settlement or this
+exact stopped debt followed by settlement. The retired-page load must fault.
+The existing stopped CPL3 and CPL0 fixtures additionally witness absence of
+stale bytes after reentry into either privilege level.
+
+Budget: two CPUs, one editor and one reader, no retry, at most 32 editor exits,
+fifteen fault words, and five seconds per guest interval and ordering hold.
+The terminal fixture fault suffix emits one completion exit after unmasking
+KICK; production keeps its terminal halt and contains no fixture hold polling.
+No VM-free runner can witness real TLB contents. HVF signed execution and Docker
+are outside this x86 KVM binding; this lane uses `CARRICK_REQUIRE_KVM=1`.

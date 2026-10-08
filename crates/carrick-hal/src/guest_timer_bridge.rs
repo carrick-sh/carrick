@@ -390,9 +390,15 @@ impl TimerFiring for KickerTimerFiring {
         let _ = std::thread::Builder::new()
             .name(format!("carrick-itimer-{which}"))
             .spawn(move || {
-                crate::timer_delivery::run_fallback(which, generation, spec, || {
-                    deliver(signum);
-                });
+                crate::timer_delivery::run_fallback(
+                    which,
+                    generation,
+                    spec,
+                    &crate::timer_delivery::GuestCpuSampler,
+                    || {
+                        deliver(signum);
+                    },
+                );
             });
     }
 

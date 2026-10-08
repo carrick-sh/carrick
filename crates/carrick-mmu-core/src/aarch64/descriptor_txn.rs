@@ -276,8 +276,8 @@ impl AliasAccess {
 }
 
 /// Access authority for an exact COW span. Tagged private leaves record their
-/// own write intent. Backend user maintenance additionally carries native
-/// per-page permission ceilings; recorded intent cannot widen those ceilings.
+/// own write intent. Other backend-owned user leaves carry the per-page write
+/// decisions already established by the exact-MM protection authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CowRepointAccess {
     /// Owner maintenance replaces backing without making a retired leaf valid.
@@ -903,76 +903,7 @@ impl DescriptorTxn {
     }
 }
 
-/// Why EL1 did not apply a transaction. Wire codes are stable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u32)]
-pub enum DescriptorRefusal {
-    BadRange = 1,
-    StaleRoot = 2,
-    TableOutsidePrimary = 3,
-    MissingTable = 4,
-    NotPrivateAnonymous = 5,
-    PermissionWidening = 6,
-    CowArmed = 7,
-    AlreadyValid = 8,
-    Occupied = 9,
-    Malformed = 10,
-    NotPrepared = 11,
-    WrongBacking = 12,
-    PermissionDenied = 13,
-    NotCowArmed = 14,
-    TablesExhausted = 15,
-    BadTableGrant = 16,
-    JournalCapacity = 17,
-    Contended = 18,
-    BadEncoding = 19,
-    WrongMm = 20,
-    ExcludedOutput = 21,
-    /// A reclaiming edit would empty more tables than its budget (or than
-    /// one receipt carries): the host must split the span.
-    ReclaimCapacity = 22,
-    /// The MM's tables lack the two preallocated EL1 COW copy-alias leaves,
-    /// so EL1 cannot copy the page without allocating (a provisioning
-    /// defect of that image, distinct from exhausted table grants).
-    CopyWindowAbsent = 23,
-    /// The operation's span names the Carrick-owned EL1 COW copy window
-    /// ([`copy_window::COW_COPY_WINDOW_BASE`]); only EL1's bounded copy may
-    /// write those leaves.
-    CarrickOwnedWindow = 24,
-}
-
-impl DescriptorRefusal {
-    #[must_use]
-    pub fn from_code(code: u32) -> Option<Self> {
-        Some(match code {
-            1 => Self::BadRange,
-            2 => Self::StaleRoot,
-            3 => Self::TableOutsidePrimary,
-            4 => Self::MissingTable,
-            5 => Self::NotPrivateAnonymous,
-            6 => Self::PermissionWidening,
-            7 => Self::CowArmed,
-            8 => Self::AlreadyValid,
-            9 => Self::Occupied,
-            10 => Self::Malformed,
-            11 => Self::NotPrepared,
-            12 => Self::WrongBacking,
-            13 => Self::PermissionDenied,
-            14 => Self::NotCowArmed,
-            15 => Self::TablesExhausted,
-            16 => Self::BadTableGrant,
-            17 => Self::JournalCapacity,
-            18 => Self::Contended,
-            19 => Self::BadEncoding,
-            20 => Self::WrongMm,
-            21 => Self::ExcludedOutput,
-            22 => Self::ReclaimCapacity,
-            23 => Self::CopyWindowAbsent,
-            24 => Self::CarrickOwnedWindow,
-            _ => return None,
-        })
-    }
-}
+pub use crate::descriptor_refusal::DescriptorRefusal;
 
 /// Exact effect of an applied transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2375,24 +2306,20 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                         writable_pages,
                         executable_pages,
                     } => {
-                        let wants_write = writable_pages & (1 << ((base - va) / PT_PAGE)) != 0;
                         let permits_execute =
                             executable_pages & (1 << ((base - va) / PT_PAGE)) != 0;
                         let mut repointed = (descriptor & !PA_MASK_4KIB) | output;
                         if !permits_execute {
                             repointed = (repointed | UXN) & !SW_EL1_MAY_EXEC;
                         }
-                        if !wants_write {
-                            repointed &= !SW_EL1_MAY_WRITE;
-                            if descriptor & (1 << 6) != 0 {
-                                repointed = (repointed & !AP_MASK) | AP_RO;
-                            }
-                        }
                         if descriptor & VALID == 0 {
+                            // Retired/prepared backing maintenance must leave
+                            // the page inaccessible until its later publication.
                             return Ok(repointed);
                         }
                         if descriptor & SW_EL1_PRIVATE == 0 {
-                            if wants_write && descriptor & (1 << 6) == 0 {
+                            let wants_write = writable_pages & (1 << ((base - va) / PT_PAGE)) != 0;
+                            if wants_write && descriptor & AP_MASK == AP_PRIV_RO {
                                 return Err(DescriptorRefusal::PermissionDenied);
                             }
                             return Ok(if wants_write {
@@ -2401,22 +2328,8 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                                 repointed
                             });
                         }
-                        if state != El1PrivateLeafState::Resident || !el1_cow(descriptor) {
-                            return Err(DescriptorRefusal::NotCowArmed);
-                        }
-                        // Native custody is a ceiling even for imported private
-                        // leaves. EL1's intent can restrict, never widen it.
-                        let private = repointed & !SW_EL1_COW;
-                        return Ok(
-                            if wants_write
-                                && descriptor & SW_EL1_MAY_WRITE != 0
-                                && descriptor & (1 << 6) != 0
-                            {
-                                (private & !AP_MASK) | AP_RW
-                            } else {
-                                private
-                            },
-                        );
+                        // Tagged pages belong to EL1's permission authority;
+                        // backend metadata must not override its recorded intent.
                     }
                     CowRepointAccess::RecordedPrivate => {}
                 }
@@ -4348,7 +4261,7 @@ mod tests {
             let attrs = [
                 (USER_PAGE_FLAGS & !AP_MASK) | AP_RO | NON_GLOBAL | UXN,
                 (USER_PAGE_FLAGS & !AP_MASK) | AP_RO | NON_GLOBAL | UXN,
-                ((USER_PAGE_FLAGS & !AP_MASK) | NON_GLOBAL | UXN) & !VALID,
+                ((USER_PAGE_FLAGS & !AP_MASK) | AP_PRIV_RO | NON_GLOBAL | UXN) & !VALID,
                 (USER_PAGE_FLAGS | NON_GLOBAL | UXN) & !VALID,
             ];
             for (index, flags) in attrs.iter().enumerate() {
@@ -4478,7 +4391,7 @@ mod tests {
                     DescriptorOp::CowRepoint {
                         access: CowRepointAccess::User {
                             writable_pages: 0b0011,
-                            executable_pages: 0b0011,
+                            executable_pages: 0b1111,
                         },
                         va: VA,
                         len: 2 * PT_PAGE,
@@ -4493,38 +4406,7 @@ mod tests {
         }
 
         #[test]
-        fn cow_native_readonly_vvar_caps_real_imported_leaf_permissions() {
-            let words = fixture(3);
-            // Exact retained N1 child leaf: private+COW, MAY_WRITE+MAY_EXEC,
-            // AP_RO but executable. Native vvar custody is read-only and NX.
-            let imported = 0x07a0_002e_0000_0fc3;
-            words.set(leaf_pa(VA), imported);
-            let destination = 0x009d_0000_0000;
-            applied(run(
-                &words,
-                DescriptorOp::CowRepoint {
-                    access: CowRepointAccess::User {
-                        writable_pages: 0,
-                        executable_pages: 0,
-                    },
-                    va: VA,
-                    len: PT_PAGE,
-                    old_ipa: SubstrateGpa(imported & PA_MASK_4KIB),
-                    new_ipa: SubstrateGpa(destination),
-                    backing: backing(80),
-                },
-                &TableGrants::NONE,
-            ));
-            let leaf = words.get(leaf_pa(VA));
-            assert_eq!(leaf & PA_MASK_4KIB, destination);
-            assert!(!el1_cow(leaf));
-            assert_eq!(leaf & AP_MASK, AP_RO, "native vvar must stay read-only");
-            assert_ne!(leaf & UXN, 0, "native vvar must stay non-executable");
-            assert_eq!(leaf & (SW_EL1_MAY_WRITE | SW_EL1_MAY_EXEC), 0);
-        }
-
-        #[test]
-        fn cow_tagged_write_intent_is_capped_by_native_readonly_authority() {
+        fn cow_tagged_write_intent_is_not_overridden_by_legacy_mask() {
             let words = fixture(3);
             words.set(
                 leaf_pa(VA),
@@ -4540,7 +4422,7 @@ mod tests {
                 DescriptorOp::CowRepoint {
                     access: CowRepointAccess::User {
                         writable_pages: 0,
-                        executable_pages: 0,
+                        executable_pages: 0b1111,
                     },
                     va: VA,
                     len: PT_PAGE,
@@ -4550,7 +4432,7 @@ mod tests {
                 },
                 &TableGrants::NONE,
             ));
-            assert!(!terminal_descriptor_permits_el0(
+            assert!(terminal_descriptor_permits_el0(
                 words.get(leaf_pa(VA)),
                 LeafAccess::Write
             ));
@@ -5335,5 +5217,138 @@ mod carrick_owned_window_tests {
             DescriptorRefusal::from_code(DescriptorRefusal::CarrickOwnedWindow as u32),
             Some(DescriptorRefusal::CarrickOwnedWindow)
         );
+    }
+}
+
+// Literal wire layout captured from 3fd7862be on a 64-bit host.
+// Keep these values fixed when moving the shared kernel implementation.
+#[cfg(test)]
+mod layout_manifest {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    macro_rules! field {
+        ($record:ty, $field:ident, $ty:ty, $offset:literal, $size:literal, $align:literal) => {
+            // Type-check the manifest's field type without constructing a record.
+            let _ = |record: &$record| {
+                let _: &$ty = &record.$field;
+            };
+            assert_eq!(
+                (
+                    offset_of!($record, $field),
+                    size_of::<$ty>(),
+                    align_of::<$ty>()
+                ),
+                ($offset, $size, $align),
+                concat!(stringify!($record), "::", stringify!($field))
+            );
+        };
+    }
+
+    #[test]
+    fn descriptor_txn_slot() {
+        assert_eq!(
+            (
+                size_of::<DescriptorTxnSlot>(),
+                align_of::<DescriptorTxnSlot>()
+            ),
+            (384, 64)
+        );
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |DescriptorTxnSlot {
+                     state: _,
+                     mm_key: _,
+                     generation: _,
+                     root: _,
+                     kind: _,
+                     payload: _,
+                     backing: _,
+                     tables_len: _,
+                     tables: _,
+                     receipt_digest: _,
+                     receipt_outcome: _,
+                     receipt_refusal: _,
+                     receipt_pages: _,
+                     receipt_resident_va: _,
+                     receipt_resident_len: _,
+                     receipt_tables_linked: _,
+                     receipt_live_stores: _,
+                     receipt_flush: _,
+                     receipt_reclaimed_len: _,
+                     receipt_reclaimed: _,
+                 }: DescriptorTxnSlot| {};
+        field!(DescriptorTxnSlot, state, AtomicU32, 0, 4, 4);
+        field!(DescriptorTxnSlot, mm_key, AtomicU64, 8, 8, 8);
+        field!(DescriptorTxnSlot, generation, AtomicU64, 16, 8, 8);
+        field!(DescriptorTxnSlot, root, AtomicU64, 24, 8, 8);
+        field!(DescriptorTxnSlot, kind, AtomicU64, 32, 8, 8);
+        field!(DescriptorTxnSlot, payload, [AtomicU64; 6], 40, 48, 8);
+        field!(DescriptorTxnSlot, backing, [AtomicU64; 4], 88, 32, 8);
+        field!(DescriptorTxnSlot, tables_len, AtomicU64, 120, 8, 8);
+        field!(
+            DescriptorTxnSlot,
+            tables,
+            [AtomicU64; MAX_TABLE_GRANTS],
+            128,
+            64,
+            8
+        );
+        field!(DescriptorTxnSlot, receipt_digest, AtomicU64, 192, 8, 8);
+        field!(DescriptorTxnSlot, receipt_outcome, AtomicU64, 200, 8, 8);
+        field!(DescriptorTxnSlot, receipt_refusal, AtomicU64, 208, 8, 8);
+        field!(DescriptorTxnSlot, receipt_pages, AtomicU64, 216, 8, 8);
+        field!(DescriptorTxnSlot, receipt_resident_va, AtomicU64, 224, 8, 8);
+        field!(
+            DescriptorTxnSlot,
+            receipt_resident_len,
+            AtomicU64,
+            232,
+            8,
+            8
+        );
+        field!(
+            DescriptorTxnSlot,
+            receipt_tables_linked,
+            AtomicU64,
+            240,
+            8,
+            8
+        );
+        field!(DescriptorTxnSlot, receipt_live_stores, AtomicU64, 248, 8, 8);
+        field!(DescriptorTxnSlot, receipt_flush, AtomicU64, 256, 8, 8);
+        field!(
+            DescriptorTxnSlot,
+            receipt_reclaimed_len,
+            AtomicU64,
+            264,
+            8,
+            8
+        );
+        field!(
+            DescriptorTxnSlot,
+            receipt_reclaimed,
+            [AtomicU64; MAX_RECLAIMED_TABLES],
+            272,
+            64,
+            8
+        );
+    }
+
+    #[test]
+    fn backing_identity() {
+        assert_eq!(
+            (size_of::<BackingIdentity>(), align_of::<BackingIdentity>()),
+            (32, 8)
+        );
+        let _ = |BackingIdentity {
+                     frame_id: _,
+                     mapping_id: _,
+                     owner_generation: _,
+                     inventory_revision: _,
+                 }: BackingIdentity| {};
+        field!(BackingIdentity, frame_id, NonZeroU64, 0, 8, 8);
+        field!(BackingIdentity, mapping_id, NonZeroU64, 8, 8, 8);
+        field!(BackingIdentity, owner_generation, NonZeroU64, 16, 8, 8);
+        field!(BackingIdentity, inventory_revision, NonZeroU64, 24, 8, 8);
     }
 }

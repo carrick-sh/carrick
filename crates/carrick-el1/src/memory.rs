@@ -70,12 +70,12 @@ struct ReservationOrigin {
 }
 impl ReservationOrigin {
     fn capture(current: &CurrentTask) -> Option<Self> {
-        let raw = current.task_id.load(Ordering::Acquire);
+        let raw = current.execution.task.load(Ordering::Acquire);
         let tid = i32::try_from(raw).ok().filter(|tid| *tid > 0)?;
         Some(Self {
             task: carrick_el1_abi::El1TaskId::from_linux_tid(tid),
-            serial: NonZeroU64::new(current.thread_serial.load(Ordering::Acquire))?,
-            mm: carrick_el1_abi::ReservationMm::new(current.zone_mm.load(Ordering::Acquire))?,
+            serial: NonZeroU64::new(current.mm.thread_generation.load(Ordering::Acquire))?,
+            mm: carrick_el1_abi::ReservationMm::new(current.mm.key.load(Ordering::Acquire))?,
         })
     }
 }
@@ -98,11 +98,10 @@ impl PendingReservationSyscall {
         &mut self,
         frame: &mut TrapFrame,
         current: &CurrentTask,
-        counters: &carrick_el1_abi::Counters,
         model: &mut reservations::Reservations<'_>,
         completion: carrick_el1_abi::ReservationCompletion,
     ) -> Result<(), reservations::Refusal> {
-        self.complete_as(frame, current, counters, model, completion, None)
+        self.complete_as(frame, current, model, completion, None)
     }
     /// [`Self::complete`] for a retirement whose stage-1 terminals the guest
     /// venue retired: the root commits and journals the range as an owed
@@ -112,18 +111,16 @@ impl PendingReservationSyscall {
         &mut self,
         frame: &mut TrapFrame,
         current: &CurrentTask,
-        counters: &carrick_el1_abi::Counters,
         model: &mut reservations::Reservations<'_>,
         completion: carrick_el1_abi::ReservationCompletion,
         slot: reservations::ReturnSlot,
     ) -> Result<(), reservations::Refusal> {
-        self.complete_as(frame, current, counters, model, completion, Some(slot))
+        self.complete_as(frame, current, model, completion, Some(slot))
     }
     fn complete_as(
         &mut self,
         frame: &mut TrapFrame,
         current: &CurrentTask,
-        counters: &carrick_el1_abi::Counters,
         model: &mut reservations::Reservations<'_>,
         completion: carrick_el1_abi::ReservationCompletion,
         owed_return: Option<reservations::ReturnSlot>,
@@ -139,7 +136,6 @@ impl PendingReservationSyscall {
             None => model.complete(completion)?,
         };
         frame.x[0] = result;
-        counters.served[self.syscall as usize].fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
     fn owns_frame(&self, frame: &TrapFrame, current: &CurrentTask) -> bool {
@@ -154,7 +150,6 @@ impl PendingReservationSyscall {
         &mut self,
         frame: &mut TrapFrame,
         current: &CurrentTask,
-        counters: &carrick_el1_abi::Counters,
         model: &mut reservations::Reservations<'_>,
     ) -> Result<(), reservations::Refusal> {
         if !self.owns_frame(frame, current) {
@@ -166,7 +161,6 @@ impl PendingReservationSyscall {
         } else {
             (-ENOMEM) as u64
         };
-        counters.served[self.syscall as usize].fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
     /// Cancel after service rollback when the originating thread is gone.
@@ -201,10 +195,9 @@ pub fn decide_anonymous_syscall(
         SYS_BRK => model.brk(frame.x[0]),
         SYS_MMAP => {
             let flags = frame.x[3];
-            let supported =
-                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_FIXED_NOREPLACE | MAP_STACK;
+            let supported = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_FIXED_NOREPLACE;
             if flags & (MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED) != MAP_ANONYMOUS | MAP_PRIVATE
-                || flags & (MAP_GROWSDOWN | MAP_HUGETLB) != 0
+                || flags & (MAP_GROWSDOWN | MAP_STACK | MAP_HUGETLB) != 0
                 || flags & !supported != 0
             {
                 return ReservationDisposition::Forward;
@@ -666,7 +659,7 @@ pub enum DelegatedAnonymous {
 /// range takes the permission or retirement editor step first, and a
 /// retirement's frames are journaled as an owed return for the host's bulk
 /// receipt at its next boundary. Everything else refuses the proposal and
-/// forwards. Counts served or forwarded exactly once.
+/// forwards. The Linux entry owner publishes the completion/refusal counter.
 pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
     frame: &mut TrapFrame,
     counters: &carrick_el1_abi::Counters,
@@ -681,7 +674,6 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
     };
     let mm_key = mm.raw();
     let forward = |why: carrick_el1_abi::AnonymousLeave| {
-        counters.forwarded[nr as usize].fetch_add(1, Ordering::Relaxed);
         counters.anonymous_leaves[why as usize].fetch_add(1, Ordering::Relaxed);
         DelegatedAnonymous::Forward
     };
@@ -690,26 +682,17 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
     let Ok(mut model) = table.lock_in(spaces, index.index(), mm, frame.slot as u32) else {
         return forward(Leave::RootBusy);
     };
-    let mut pending = match crate::personality::dispatch::dispatch_anonymous_with_reservations(
-        frame, counters, current, &mut model,
-    ) {
-        crate::personality::dispatch::AnonymousReservationRoute::Action(
-            carrick_el1_abi::Action::Served,
-        ) => return DelegatedAnonymous::Served,
-        // `forwarded[nr]` counted by the route.
-        crate::personality::dispatch::AnonymousReservationRoute::Action(_) => {
-            counters.anonymous_leaves[Leave::RootDeclined as usize].fetch_add(1, Ordering::Relaxed);
-            return DelegatedAnonymous::Forward;
+    let mut pending = match decide_anonymous_syscall(frame, current, &mut model) {
+        ReservationDisposition::Return(value) => {
+            frame.x[0] = value as u64;
+            return DelegatedAnonymous::Served;
         }
-        crate::personality::dispatch::AnonymousReservationRoute::Unavailable(
-            reservations::Refusal::PreparedConflict,
-        ) => {
+        ReservationDisposition::Forward => return forward(Leave::RootDeclined),
+        ReservationDisposition::Unavailable(reservations::Refusal::PreparedConflict) => {
             return DelegatedAnonymous::PreparedConflict;
         }
-        crate::personality::dispatch::AnonymousReservationRoute::Unavailable(_) => {
-            return forward(Leave::RootUnavailable);
-        }
-        crate::personality::dispatch::AnonymousReservationRoute::Work(pending) => pending,
+        ReservationDisposition::Unavailable(_) => return forward(Leave::RootUnavailable),
+        ReservationDisposition::Work(pending) => pending,
     };
     let request = pending.request();
     let refuse = |pending: PendingReservationSyscall,
@@ -839,17 +822,11 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
         )
     };
     let retired = owed_return.is_some();
-    let retirement_detail = if retired {
-        completion.map_or(7, |value| model.retirement_failure_detail(value))
-    } else {
-        0
-    };
     let completed = match (completion, owed_return) {
-        (Some(completion), Some(slot)) => pending
-            .complete_deferring_return(frame, current, counters, &mut model, completion, slot),
-        (Some(completion), None) => {
-            pending.complete(frame, current, counters, &mut model, completion)
+        (Some(completion), Some(slot)) => {
+            pending.complete_deferring_return(frame, current, &mut model, completion, slot)
         }
+        (Some(completion), None) => pending.complete(frame, current, &mut model, completion),
         (None, slot) => {
             if let Some(slot) = slot {
                 model.release_return(slot);
@@ -861,7 +838,6 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
         Ok(()) => DelegatedAnonymous::Served,
         // The descriptor edit is live but the root refused to commit it.
         Err(refusal) if retired => {
-            crate::fault::set_panic_retirement_detail(retirement_detail);
             panic!("EL1 anonymous retirement commit refused: {refusal:?}")
         }
         Err(_) => refuse(pending, &mut model, Leave::RootUnavailable),
@@ -883,7 +859,7 @@ pub fn delegated_anonymous_root(
     if !matches!(nr, SYS_BRK | SYS_MUNMAP | SYS_MMAP | SYS_MPROTECT) {
         return None;
     }
-    let mm_key = current.zone_mm.load(Ordering::Acquire);
+    let mm_key = current.mm.key.load(Ordering::Acquire);
     let mm = carrick_el1_abi::ReservationMm::new(mm_key)?;
     let index = spaces.find(mm_key)?;
     table.admitted(index.index(), mm).then_some((mm, index))
@@ -919,7 +895,7 @@ pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
     let Some(task) = current_tasks.get(frame.slot as usize) else {
         return MunmapDisposition::Forward;
     };
-    let mm_key = task.zone_mm.load(Ordering::Acquire);
+    let mm_key = task.mm.key.load(Ordering::Acquire);
     let Some(index) = spaces.find(mm_key) else {
         return MunmapDisposition::Forward;
     };
@@ -982,7 +958,7 @@ pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
     let Some(task) = current_tasks.get(frame.slot as usize) else {
         return MprotectDisposition::Forward;
     };
-    let mm_key = task.zone_mm.load(Ordering::Acquire);
+    let mm_key = task.mm.key.load(Ordering::Acquire);
     let Some(index) = spaces.find(mm_key) else {
         return MprotectDisposition::Forward;
     };
@@ -1053,7 +1029,7 @@ mod tests {
         let mm = 17;
         let ttbr0 = (9_u64 << 48) | 0x8800_0000_0000;
         let task = CurrentTask::new();
-        task.zone_mm.store(mm, Ordering::Release);
+        task.mm.key.store(mm, Ordering::Release);
         let spaces = AddressSpaces::new();
         let index = spaces.publish_closed(mm, ttbr0, ttbr0).unwrap();
         spaces.open(index);
@@ -1349,9 +1325,9 @@ mod tests {
                     .unwrap();
             }
             let task = CurrentTask::new();
-            task.task_id.store(key + 100, Ordering::Relaxed);
-            task.thread_serial.store(11, Ordering::Relaxed);
-            task.zone_mm.store(key, Ordering::Relaxed);
+            task.execution.task.store(key + 100, Ordering::Relaxed);
+            task.mm.thread_generation.store(11, Ordering::Relaxed);
+            task.mm.key.store(key, Ordering::Relaxed);
             Mm { key, ttbr0, task }
         }
         fn root<'a>(
@@ -1451,6 +1427,8 @@ mod tests {
             };
             frame.x[8] = nr;
             frame.x[..6].copy_from_slice(&args);
+            let served_before = counters.served[nr as usize].load(Ordering::Relaxed);
+            let forwarded_before = counters.forwarded[nr as usize].load(Ordering::Relaxed);
             let route = serve_delegated_anonymous(
                 &mut frame,
                 counters,
@@ -1459,6 +1437,27 @@ mod tests {
                 table,
                 editor,
             );
+            assert_eq!(
+                counters.served[nr as usize].load(Ordering::Relaxed),
+                served_before,
+                "resource primitive cannot publish entry completion"
+            );
+            assert_eq!(
+                counters.forwarded[nr as usize].load(Ordering::Relaxed),
+                forwarded_before,
+                "resource primitive cannot publish entry refusal"
+            );
+            // This fixture models the caller's Linux boundary after the actual
+            // resource primitive, keeping all historical final-count assertions.
+            let entry = carrick_personality_linux::dispatch::EntryCounters {
+                served: &counters.served,
+                forwarded: &counters.forwarded,
+            };
+            match route {
+                DelegatedAnonymous::Served => entry.served(nr),
+                DelegatedAnonymous::Forward => entry.forwarded(nr),
+                _ => {}
+            }
             (route, frame.x[0] as i64)
         }
         const RW: u64 = PROT_READ | PROT_WRITE;
@@ -1502,28 +1501,6 @@ mod tests {
             );
             assert_eq!(route, DelegatedAnonymous::Forward);
             assert!(editor.calls.is_empty());
-        }
-
-        #[test]
-        fn map_stack_uses_the_admitted_anonymous_root() {
-            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
-            let task = mm(&spaces, &table, 17, true);
-            let mut editor = Editor::over(RangeBacking::Empty);
-            let (route, address) = syscall(
-                &task,
-                &spaces,
-                &table,
-                &counters,
-                &mut editor,
-                SYS_MMAP,
-                [0, 0x21000, RW, ANON | MAP_STACK, u64::MAX, 0],
-            );
-            assert_eq!(route, DelegatedAnonymous::Served);
-            let mapping = root(&spaces, &table, &task)
-                .mapping(address as u64)
-                .expect("thread stack belongs to the guest anonymous root");
-            assert!(mapping.anonymous);
-            assert_eq!(mapping.protection, ReservationProtection::READ_WRITE);
         }
 
         #[test]

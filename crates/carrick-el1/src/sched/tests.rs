@@ -82,9 +82,10 @@ fn serve_on(
     // The host publishes the loaded thread's address space on the slot at
     // every load; EL1 places woken threads by it.
     if zone.slot(slot).mm() == 0 {
-        host_publish(zone, slot, task.zone_mm.load(Ordering::Relaxed), None, 0);
+        host_publish(zone, slot, task.mm.key.load(Ordering::Relaxed), None, 0);
     }
     Sched {
+        handoff: None,
         zone,
         slot,
         task,
@@ -111,8 +112,10 @@ const SWITCHED: Option<Served> = Some(Served::Returned { switched: true });
 fn task_for(tid: u64) -> CurrentTask {
     let task = CurrentTask::new();
     task.set(El1TaskId::from_linux_tid(tid as i32), 1, 5);
-    task.zone_mm.store(MM, Ordering::Relaxed);
-    task.thread_serial.store(tid + 1000, Ordering::Relaxed);
+    task.mm.key.store(MM, Ordering::Relaxed);
+    task.mm
+        .thread_generation
+        .store(tid + 1000, Ordering::Relaxed);
     task
 }
 
@@ -211,8 +214,8 @@ fn ping_pong(skip_fpsimd: bool) -> (TrapFrame, FakeCpu, TrapFrame, FakeCpu) {
     assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), SWITCHED);
     assert_eq!(frame.x[0], 0, "B's wait returns 0");
     assert_eq!(frame.elr, 0xB << 12);
-    assert_eq!(task.task_id.load(Ordering::Relaxed), 202);
-    assert_eq!(task.thread_serial.load(Ordering::Relaxed), 1202);
+    assert_eq!(task.execution.task.load(Ordering::Relaxed), 202);
+    assert_eq!(task.mm.thread_generation.load(Ordering::Relaxed), 1202);
     let a = zone.slot(SLOT).current();
     assert_eq!(a, Some(b), "B is the switched-in record");
 
@@ -225,7 +228,7 @@ fn ping_pong(skip_fpsimd: bool) -> (TrapFrame, FakeCpu, TrapFrame, FakeCpu) {
     assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), RETURNED);
     set_op(&mut frame, uaddr, FUTEX_WAIT_PRIVATE, 0);
     assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), SWITCHED);
-    assert_eq!(task.task_id.load(Ordering::Relaxed), 101);
+    assert_eq!(task.execution.task.load(Ordering::Relaxed), 101);
     (a_before_wait.0, a_before_wait.1, frame, cpu)
 }
 
@@ -246,7 +249,7 @@ fn host_request_during_repark(kind: Handback) {
                 carrick_el1_abi::HostClaim::El1Held { slot: SLOT }
             );
             // Model delivery of the claimant's kick after dispatch admission.
-            task.mark_pending_host_work();
+            task.linux.mark_pending_host_work();
             HardwareUserWord.read_u32(task, uaddr)
         }
         fn read_u64(&self, task: &CurrentTask, uaddr: u64) -> Option<u64> {
@@ -274,6 +277,7 @@ fn host_request_during_repark(kind: Handback) {
     set_op(&mut frame, uaddr, FUTEX_WAIT_PRIVATE, 0);
     let before = frame;
     let result = Sched {
+        handoff: None,
         zone: &zone,
         slot: SLOT,
         task: &task,
@@ -359,7 +363,7 @@ fn a_wait_with_nothing_runnable_idles_until_host_work() {
         serve_on(SLOT, &mut frame, &task, &zone, &mut cpu, counters),
         Some(Served::Idle)
     );
-    assert!(task.has_pending_host_work());
+    assert!(task.linux.has_pending_host_work());
     assert_eq!(
         counters.irq_taken[GIC_KICK_INTID as usize].load(Ordering::Relaxed),
         1
@@ -455,7 +459,7 @@ fn a_timed_wait_ends_in_guest_with_etimedout() {
     assert_eq!(frame.x[0] as i64, -110);
     assert_eq!(zone.slot(SLOT).host_record(), Some(home));
     assert_eq!(zone.counters.el1_timeouts.load(Ordering::Relaxed), 2);
-    assert_eq!(task.task_id.load(Ordering::Relaxed), 101);
+    assert_eq!(task.execution.task.load(Ordering::Relaxed), 101);
 }
 
 /// A switched-in thread's timed wait is forwarded (its deadline would
@@ -511,7 +515,7 @@ fn a_wake_hands_a_thread_to_the_idle_vcpu_it_belongs_to() {
         serve_on(OTHER, &mut frame_b, &task_b, &zone, &mut cpu_b, counters),
         Some(Served::Idle)
     );
-    task_b.clear_pending_host_work();
+    task_b.linux.clear_pending_host_work();
     // Pretend the kick never happened: OTHER is parked in WFI.
     assert!(!zone.enter_idle(OTHER, false));
     assert!(zone.enter_idle(OTHER, true));
@@ -543,6 +547,7 @@ fn a_wake_hands_a_thread_to_the_idle_vcpu_it_belongs_to() {
     // OTHER's idle loop takes the SGI and runs B.
     cpu_b.pending.push_back(GIC_RESCHED_INTID);
     let served = Sched {
+        handoff: None,
         zone: &zone,
         slot: OTHER,
         task: &task_b,
@@ -593,6 +598,7 @@ fn the_virtual_timer_preempts_a_compute_loop() {
     let a_running = (frame, cpu.regs.clone());
     let irq = |frame: &mut TrapFrame, cpu: &mut FakeCpu| {
         Sched {
+            handoff: None,
             zone: &zone,
             slot: SLOT,
             task: &task,
@@ -612,7 +618,7 @@ fn the_virtual_timer_preempts_a_compute_loop() {
     assert_eq!(frame.elr, 0xB << 12, "B runs");
     assert_eq!(frame.x[0], 0, "B's wait returns 0");
     assert_eq!(zone.slot(SLOT).current(), Some(b));
-    assert_eq!(task.task_id.load(Ordering::Relaxed), 202);
+    assert_eq!(task.execution.task.load(Ordering::Relaxed), 202);
     // B computes; the next slice end brings A back, untouched.
     cpu.regs.v[3] ^= 7;
     cpu.now += slice;
@@ -622,7 +628,7 @@ fn the_virtual_timer_preempts_a_compute_loop() {
         "A resumes exactly where it was preempted"
     );
     assert_eq!(cpu.regs, a_running.1);
-    assert_eq!(task.task_id.load(Ordering::Relaxed), 101);
+    assert_eq!(task.execution.task.load(Ordering::Relaxed), 101);
     assert_eq!(zone.slot(SLOT).current(), zone.slot(SLOT).host_record());
     assert_eq!(zone.counters.el1_preemptions.load(Ordering::Relaxed), 2);
     assert_eq!(
@@ -640,6 +646,7 @@ fn a_kick_taken_at_el0_forwards() {
     cpu.pending.push_back(GIC_KICK_INTID);
     let copy = frame;
     let action = Sched {
+        handoff: None,
         zone: &zone,
         slot: SLOT,
         task: &task,
@@ -649,7 +656,7 @@ fn a_kick_taken_at_el0_forwards() {
     }
     .serve_irq(&mut frame);
     assert_eq!(action, carrick_el1_abi::Action::Forward);
-    assert!(task.has_pending_host_work());
+    assert!(task.linux.has_pending_host_work());
     assert_eq!(frame, copy);
 }
 
@@ -711,7 +718,7 @@ fn threads_of_another_process_are_not_woken() {
     let word = AtomicU32::new(0);
     let uaddr = word.as_ptr() as u64;
     let task = task_for(101);
-    task.zone_mm.store(MM + 1, Ordering::Relaxed);
+    task.mm.key.store(MM + 1, Ordering::Relaxed);
     let b = host_park(&zone, 202, uaddr, thread_ctx(0xB, uaddr));
     let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAKE_PRIVATE, 1);
     assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), RETURNED);
@@ -838,7 +845,7 @@ fn queued_threads_do_not_send_other_syscalls_to_the_host() {
     assert_eq!(frame.x[0], 50);
     assert_eq!(counters.forwarded[62].load(Ordering::Relaxed), 0);
     // A pending host kick forwards even a servable futex call.
-    tasks[3].mark_pending_host_work();
+    tasks[3].linux.mark_pending_host_work();
     set_op(&mut frame, uaddr, FUTEX_WAIT_PRIVATE, 0);
     assert_eq!(run(&mut frame, &mut cpu), carrick_el1_abi::Action::Forward);
     let mut retirement = authority.try_host().unwrap().unwrap();
@@ -933,6 +940,7 @@ fn a_slice_ending_before_a_host_runnable_thread_leaves_for_the_host() {
     let slice = cpu.freq / 1000 * 2;
     let irq = |frame: &mut TrapFrame, cpu: &mut FakeCpu| {
         Sched {
+            handoff: None,
             zone: &zone,
             slot: SLOT,
             task: &task,
@@ -978,9 +986,10 @@ fn the_idle_entry_runs_a_queued_thread_or_leaves_for_the_host() {
     // The executor of SLOT has no thread: it enters idle (same address
     // space still installed).
     let idle_task = CurrentTask::new();
-    idle_task.zone_mm.store(MM, Ordering::Relaxed);
+    idle_task.mm.key.store(MM, Ordering::Relaxed);
     let entry = |frame: &mut TrapFrame, cpu: &mut FakeCpu, task: &CurrentTask| {
         Sched {
+            handoff: None,
             zone: &zone,
             slot: SLOT,
             task,
@@ -1016,7 +1025,7 @@ fn the_idle_entry_runs_a_queued_thread_or_leaves_for_the_host() {
     );
     assert_eq!(zone.runnable_head(SLOT), Some(service));
     // Host work pending: it leaves without looking.
-    idle_task.mark_pending_host_work();
+    idle_task.linux.mark_pending_host_work();
     assert_eq!(
         entry(&mut idle_frame, &mut idle_cpu, &idle_task),
         carrick_el1_abi::Action::Idle
@@ -1041,13 +1050,14 @@ fn an_idle_vcpu_steals_a_queued_thread() {
     host_publish(&zone, other, MM, Some(1), 0);
     zone.enter_guest(other);
     let idle_task = CurrentTask::new();
-    idle_task.zone_mm.store(MM, Ordering::Relaxed);
+    idle_task.mm.key.store(MM, Ordering::Relaxed);
     let mut idle_frame = TrapFrame {
         slot: u64::from(other.raw()),
         ..TrapFrame::default()
     };
     let mut idle_cpu = FakeCpu::default();
     let action = Sched {
+        handoff: None,
         zone: &zone,
         slot: other,
         task: &idle_task,
@@ -1171,10 +1181,13 @@ fn a_futex_wait_switches_the_vcpu_to_another_process_in_guest() {
     );
     assert_eq!(zone.installed_space(SLOT), OTHER_MM);
     assert_eq!(zone.slot(SLOT).mm(), MM, "the executor still has A loaded");
-    assert_eq!(task.zone_mm.load(Ordering::Relaxed), OTHER_MM);
-    assert_eq!(task.task_id.load(Ordering::Relaxed), 202);
-    assert_eq!(task.lifecycle_page.load(Ordering::Acquire), 0x40000);
-    assert_eq!(task.control_slot.load(Ordering::Acquire), 0x50000);
+    assert_eq!(task.mm.key.load(Ordering::Relaxed), OTHER_MM);
+    assert_eq!(task.execution.task.load(Ordering::Relaxed), 202);
+    assert_eq!(
+        task.metadata.lifecycle_page.load(Ordering::Acquire),
+        0x40000
+    );
+    assert_eq!(task.metadata.control_slot.load(Ordering::Acquire), 0x50000);
     assert_eq!(zone.counters.el1_space_switches.load(Ordering::Relaxed), 1);
 
     // A is woken from another vCPU of its process (here the host) onto its
@@ -1200,9 +1213,12 @@ fn a_futex_wait_switches_the_vcpu_to_another_process_in_guest() {
     assert_eq!(frame.elr, 0xA << 12, "A runs again");
     assert_eq!(cpu.ttbr, (TTBR_MM, TTBR_MM));
     assert_eq!(zone.installed_space(SLOT), MM);
-    assert_eq!(task.zone_mm.load(Ordering::Relaxed), MM);
-    assert_eq!(task.lifecycle_page.load(Ordering::Acquire), 0x10000);
-    assert_eq!(task.control_slot.load(Ordering::Acquire), 0x20000);
+    assert_eq!(task.mm.key.load(Ordering::Relaxed), MM);
+    assert_eq!(
+        task.metadata.lifecycle_page.load(Ordering::Acquire),
+        0x10000
+    );
+    assert_eq!(task.metadata.control_slot.load(Ordering::Acquire), 0x20000);
     assert_eq!(zone.counters.el1_space_switches.load(Ordering::Relaxed), 2);
     assert!(
         cpu.asid_invalidations.is_empty(),
@@ -1400,6 +1416,7 @@ fn el1_ipc_wait_cross_mm_resume_restores_arguments_and_owned_operation() {
     let a_pc = OperationResumePc::new(0x9000).unwrap();
     let counter = counters();
     let mut sched = Sched {
+        handoff: None,
         zone: &zone,
         slot: SLOT,
         task: &task,
@@ -1428,14 +1445,14 @@ fn el1_ipc_wait_cross_mm_resume_restores_arguments_and_owned_operation() {
     assert_eq!(frame.x, b_ctx.x);
     assert_eq!(frame.elr, b_ctx.pc);
     assert_eq!(sched.cpu.ttbr, (TTBR_OTHER, TTBR_OTHER));
-    assert_eq!(task.zone_mm.load(Ordering::Acquire), OTHER_MM);
-    task.zone_mm.store(MM, Ordering::Release);
+    assert_eq!(task.mm.key.load(Ordering::Acquire), OTHER_MM);
+    task.mm.key.store(MM, Ordering::Release);
     assert_eq!(
         sched.take_object_operation(),
         Err(carrick_sched_core::object_wait::ObjectWaitError::Stale)
     );
     assert!(zone.record(b).has_object_operation());
-    task.zone_mm.store(OTHER_MM, Ordering::Release);
+    task.mm.key.store(OTHER_MM, Ordering::Release);
     assert_eq!(
         sched.take_object_operation().unwrap(),
         OperationToken::new(202, 4)
@@ -1462,7 +1479,7 @@ fn el1_ipc_wait_cross_mm_resume_restores_arguments_and_owned_operation() {
     assert_eq!(frame.x, a_args);
     assert_eq!(frame.elr, 0x9000);
     assert_eq!(sched.cpu.ttbr, (TTBR_MM, TTBR_MM));
-    assert_eq!(task.task_id.load(Ordering::Acquire), 101);
+    assert_eq!(task.execution.task.load(Ordering::Acquire), 101);
     assert_eq!(
         sched.take_object_operation().unwrap(),
         OperationToken::new(101, 4)
@@ -1503,6 +1520,7 @@ fn el1_ipc_wait_cross_slot_wake_sends_sgi_after_queue_unlock() {
     let task = task_for(101);
     let mut cpu = FakeCpu::default();
     let mut sched = Sched {
+        handoff: None,
         zone: &zone,
         slot: SLOT,
         task: &task,
@@ -1524,7 +1542,7 @@ fn el1_ipc_wait_cross_slot_wake_sends_sgi_after_queue_unlock() {
         sched.cpu.sgis,
         [target | (u64::from(GIC_RESCHED_INTID) << 24)]
     );
-    assert!(!task.has_pending_host_work());
+    assert!(!task.linux.has_pending_host_work());
 }
 
 /// Fixed pre-extraction trace: save A, load B, save B, load A, then roots/timer/
@@ -1585,6 +1603,7 @@ fn fresh_record_park_refusal_does_not_leak_unpublished_record_on_occupied_timer_
     let (frame, mut cpu) = live(0xa, 0x4000, FUTEX_WAIT_PRIVATE, 0);
     let counter = counters();
     let mut sched = Sched {
+        handoff: None,
         zone: &zone,
         slot: SLOT,
         task: &task,

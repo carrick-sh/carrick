@@ -43,7 +43,7 @@ pub fn el1_inotify_add_watch<'a>(
         return Err(Action::Forward);
     }
 
-    let file_table = cur_task.file_table.load(Ordering::Acquire);
+    let file_table = cur_task.linux.file_table.load(Ordering::Acquire);
     if file_table == 0 {
         return Err(Action::Forward);
     }
@@ -124,7 +124,7 @@ pub fn el1_inotify_rm_watch<'a>(
     object_table: &'a [DelegatedFile],
     inotify_table: &[DelegatedInotify],
 ) -> Result<i64, Action> {
-    let file_table = cur_task.file_table.load(Ordering::Acquire);
+    let file_table = cur_task.linux.file_table.load(Ordering::Acquire);
     if file_table == 0 {
         return Err(Action::Forward);
     }
@@ -176,7 +176,7 @@ pub fn el1_inotify_read(
     inotify_table: &[DelegatedInotify],
     validator: &impl MemoryValidator,
 ) -> Result<i64, Action> {
-    let file_table = cur_task.file_table.load(Ordering::Acquire);
+    let file_table = cur_task.linux.file_table.load(Ordering::Acquire);
     if file_table == 0 {
         return Err(Action::Forward);
     }

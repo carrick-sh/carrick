@@ -37,6 +37,10 @@ rules:
           - pattern: libc::NOTE_EXTEND
           - pattern: libc::NOTE_ATTRIB
           - pattern: libc::NOTE_RENAME
+          # sparse seeks: NetBSD has no SEEK_DATA/SEEK_HOLE; use
+          # carrick_portable::lseek_sparse.
+          - pattern: libc::SEEK_DATA
+          - pattern: libc::SEEK_HOLE
           # Darwin-named constants with Linux equivalents
           - pattern: libc::CLOCK_UPTIME_RAW
           - pattern: libc::TCP_NOPUSH

@@ -42,14 +42,41 @@ rules:
         - /crates/carrick-el1/src/sched/hw.rs
         - /crates/carrick-el1/src/sched/aarch64_context.rs
         - /crates/carrick-el1/src/entry.rs
+        # ARM EL1 TTBR0/HVC leaves are guest instructions, moved intact from
+        # the former fault and portal callers into the neutral ISA boundary.
+        - /crates/carrick-el1/src/isa/aarch64.rs
+        # Reviewed target_os=none CPL0 ISA leaves in the shared kernel: the
+        # native stack/TSC reads and named UD2 fail-closed paths. These execute
+        # in the guest and have no host operation or semantic syscall escape.
+        - /crates/carrick-el1/src/isa/x86/context.rs
+        - /crates/carrick-el1/src/isa/x86/interrupt.rs
+        - /crates/carrick-el1/src/isa/x86/interrupts.rs
+        - /crates/carrick-el1/src/isa/x86/mmu.rs
+        - /crates/carrick-el1/src/isa/x86/transport.rs
+        - /crates/carrick-el1/src/isa/x86/user_access.rs
         # Reviewed x86 CPL0 hardware boundary: entry/return, port I/O and halt; no host operation.
         - /crates/carrick-x86-cpl0/src/entry.rs
+        # Native CPL0 IRQ gates save/restore GPR and XSAVE state, authenticate
+        # the xAPIC vector, then IRET or use the declared fatal port. These
+        # are guest CPU effects and cannot call a host operation.
+        - /crates/carrick-x86-cpl0/src/native_irq.rs
+        # CPL0 initial-image return uses IRET to enter EL0; the declared
+        # boot-completion port reports to the retained KVM carrier. No host
+        # syscall or undeclared port is reachable from this guest module.
+        - /crates/carrick-x86-cpl0/src/initial_boot.rs
         # Reviewed target_os=none CPL0 hardware leaves: native IRQ/IRET and
         # XSAVE, FS/GS MSRs, CR3, IF/HLT, declared fixture control port I/O.
         # No host instruction path or host semantic syscall dispatch.
         - /crates/carrick-x86-cpl0/src/progress.rs
         - /crates/carrick-x86/src/cpl0_scheduler.rs
         - /crates/carrick-x86/src/interrupts.rs
+        # Reviewed CPL0 KernelArch leaves. These instructions affect only the
+        # guest CPU (CR3/TLB, IRQ, context, and fail-closed UD2); no host syscall.
+        - /crates/carrick-el1/src/isa/x86/context.rs
+        - /crates/carrick-el1/src/isa/x86/interrupt.rs
+        - /crates/carrick-el1/src/isa/x86/mmu.rs
+        - /crates/carrick-el1/src/isa/x86/transport.rs
+        - /crates/carrick-el1/src/isa/x86/user_access.rs
         # Reviewed EL1 physical effects and exact live-root authentication;
         # six-site rationale: N1 assembly receipt in the native ownership plan.
         - /crates/carrick-el1/src/fault.rs

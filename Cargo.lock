@@ -333,6 +333,7 @@ name = "carrick-abi"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.11.1",
+ "carrick-syscall-abi",
  "serde",
  "zerocopy",
 ]
@@ -346,6 +347,7 @@ dependencies = [
  "base64 0.22.1",
  "bollard",
  "camino",
+ "carrick-conformance",
  "carrick-conformance-contract",
  "carrick-el1-abi",
  "carrick-embed",
@@ -393,12 +395,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "carrick-coordinator",
+ "carrick-kernel-arena",
+ "carrick-spec",
  "clap",
  "libc",
  "regex",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "toml",
 ]
 
@@ -422,6 +427,7 @@ name = "carrick-conformance-next"
 version = "0.1.0"
 dependencies = [
  "carrick-abi",
+ "carrick-conformance",
  "carrick-conformance-contract",
  "carrick-embed",
  "carrick-guest-mem",
@@ -452,6 +458,7 @@ dependencies = [
 name = "carrick-core"
 version = "0.1.0"
 dependencies = [
+ "carrick-conformance-contract",
  "carrick-core-abi",
  "carrick-el1",
  "carrick-el1-abi",
@@ -460,7 +467,6 @@ dependencies = [
  "carrick-personality-linux",
  "carrick-sched-core",
  "parking_lot",
- "usdt",
 ]
 
 [[package]]
@@ -479,6 +485,7 @@ dependencies = [
  "carrick-aarch64",
  "carrick-core",
  "carrick-el1-abi",
+ "carrick-fatal",
  "carrick-guest-arch",
  "carrick-hal",
  "carrick-inotify-core",
@@ -486,6 +493,7 @@ dependencies = [
  "carrick-mmu-core",
  "carrick-personality-linux",
  "carrick-sched-core",
+ "zerocopy",
 ]
 
 [[package]]
@@ -496,6 +504,7 @@ dependencies = [
  "carrick-fd-core",
  "carrick-inotify-core",
  "carrick-mmu-core",
+ "carrick-personality-linux",
  "carrick-pipe-core",
  "carrick-sched-core",
 ]
@@ -579,6 +588,9 @@ dependencies = [
 [[package]]
 name = "carrick-guest-arch"
 version = "0.1.0"
+dependencies = [
+ "zerocopy",
+]
 
 [[package]]
 name = "carrick-guest-mem"
@@ -603,6 +615,7 @@ dependencies = [
  "carrick-fatal",
  "carrick-guest-arch",
  "carrick-guest-mem",
+ "carrick-host",
  "carrick-mem",
  "carrick-mmu-core",
  "carrick-observability",
@@ -819,6 +832,12 @@ version = "0.1.0"
 dependencies = [
  "carrick-core",
  "carrick-core-abi",
+ "carrick-el1",
+ "carrick-el1-abi",
+ "carrick-guest-arch",
+ "carrick-sched-core",
+ "carrick-signal-core",
+ "carrick-x86",
 ]
 
 [[package]]
@@ -906,6 +925,10 @@ dependencies = [
 [[package]]
 name = "carrick-sched-core"
 version = "0.1.0"
+dependencies = [
+ "carrick-guest-arch",
+ "zerocopy",
+]
 
 [[package]]
 name = "carrick-signal-core"
@@ -934,6 +957,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "carrick-syscall-abi"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.11.1",
+ "serde",
 ]
 
 [[package]]
@@ -1054,6 +1085,7 @@ version = "0.1.0"
 dependencies = [
  "carrick-aarch64",
  "carrick-abi",
+ "carrick-core",
  "carrick-el1-abi",
  "carrick-fatal",
  "carrick-guest-arch",
@@ -1067,9 +1099,11 @@ dependencies = [
  "carrick-thread",
  "carrick-timer-core",
  "carrick-x86",
+ "getrandom 0.3.4",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
+ "serde_json",
  "vmm-sys-util",
  "zerocopy",
 ]
@@ -1097,11 +1131,15 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.11.1",
  "carrick-abi",
+ "carrick-core",
+ "carrick-core-abi",
+ "carrick-el1-abi",
  "carrick-guest-arch",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",
  "carrick-mem",
+ "carrick-personality-linux",
  "carrick-sched-core",
  "libc",
  "zerocopy",
@@ -1111,9 +1149,13 @@ dependencies = [
 name = "carrick-x86-cpl0"
 version = "0.1.0"
 dependencies = [
+ "carrick-core",
+ "carrick-core-abi",
  "carrick-el1",
  "carrick-el1-abi",
  "carrick-guest-arch",
+ "carrick-mmu-core",
+ "carrick-personality-linux",
  "carrick-sched-core",
 ]
 
@@ -1126,13 +1168,17 @@ dependencies = [
  "clap",
  "flate2",
  "libc",
+ "proc-macro2",
+ "quote",
  "serde",
  "serde_json",
  "sha2",
  "signal-hook",
+ "syn 2.0.117",
  "tar",
  "tempfile",
  "thiserror",
+ "toml",
  "yaml-rust2",
 ]
 

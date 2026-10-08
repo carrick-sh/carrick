@@ -25,4 +25,7 @@ toml = { workspace = true }
 regex = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 sha2.workspace = true
+tempfile.workspace = true
 carrick-coordinator = { path = "../carrick-coordinator" }
+carrick-spec = { path = "../carrick-spec" }
+carrick-kernel-arena = { path = "../carrick-kernel-arena" }

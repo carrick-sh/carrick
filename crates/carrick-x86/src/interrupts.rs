@@ -1,10 +1,14 @@
-//! CPL0 interrupt hardware, shared with the thin image. Intel SDM vol. 3:
-//! interrupt gates, xAPIC LVT timer/divider/EOI/ICR. One-shot ticks require no
-//! TSC-deadline feature on nested AMD KVM. Clock conversion stays with policy.
+//! Native interrupt constants and gate encoding for the host CPL0 loader.
 pub const TIMER_VECTOR: u8 = 0xe0;
 pub const KICK_VECTOR: u8 = 0xe1;
+pub const RESCHED_VECTOR: u8 = 0xe2;
+pub const SHOOTDOWN_VECTOR: u8 = 0xe3;
+pub const PAGE_FAULT_VECTOR: u8 = 14;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
+pub const IRQ_HEADER_GPA: u64 = 0x1d_0000;
+pub const IRQ_HEADER_MAGIC: u64 = 0x3151_5249_4c50_4358;
 pub const LAPIC_BASE: u64 = 0xfee0_0000;
+pub const LAPIC_VA: u64 = 0xffff_ffff_d000_0000;
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,82 +36,4 @@ impl InterruptMask {
 #[cfg(not(target_os = "none"))]
 pub fn interrupt_gate(entry: u64) -> [u8; 16] {
     crate::fault::interrupt_gate_bytes(entry)
-}
-
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub mod hardware {
-    use super::*;
-    /// # Safety
-    /// CPL0, mapped xAPIC page, bootstrap has enabled IA32_APIC_BASE in xAPIC
-    /// mode. The caller serializes access with interrupts masked.
-    unsafe fn write(offset: u64, value: u32) {
-        unsafe { core::ptr::write_volatile((LAPIC_BASE + offset) as *mut u32, value) };
-    }
-    /// # Safety
-    /// CPL0 only; the caller restores this mask on the same execution lane.
-    pub unsafe fn mask_interrupts() -> InterruptMask {
-        let flags: u64;
-        unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags) };
-        InterruptMask {
-            enabled: flags & (1 << 9) != 0,
-        }
-    }
-    /// # Safety
-    /// CPL0 only; no scheduler/queue lock may cross re-enabling interrupts.
-    pub unsafe fn restore_interrupts(mask: InterruptMask) {
-        if mask.enabled {
-            unsafe { core::arch::asm!("sti", options(nostack)) };
-        } else {
-            unsafe { core::arch::asm!("cli", options(nostack)) };
-        }
-    }
-    /// # Safety
-    /// CPL0, IF masked, no locks held. STI's interrupt shadow makes HLT
-    /// atomic with interrupt admission: an already pending kick cannot be
-    /// lost between queue inspection and parking. Returns with IF masked.
-    pub unsafe fn park_until_interrupt() {
-        unsafe { core::arch::asm!("sti", "hlt", "cli", options(nostack)) };
-    }
-    /// # Safety
-    /// Same hardware preconditions as `arm_timer`; vectors must be installed.
-    pub unsafe fn enable() {
-        unsafe {
-            write(0x80, 0);
-            write(0xf0, 0x100 | u32::from(SPURIOUS_VECTOR));
-        }
-    }
-    /// # Safety
-    /// A live CPL0 xAPIC with TIMER_VECTOR installed. One shot, divide by 16;
-    /// None masks/disarms without a host wait, timer thread or semantic exit.
-    pub unsafe fn arm_timer(ticks: Option<TimerTicks>) {
-        unsafe {
-            write(0x3e0, 3);
-            write(
-                0x320,
-                u32::from(TIMER_VECTOR) | if ticks.is_none() { 1 << 16 } else { 0 },
-            );
-            write(0x380, ticks.map_or(0, |ticks| ticks.0));
-        }
-    }
-    /// # Safety
-    /// Complete exactly the interrupt accepted by this CPU's handler.
-    pub unsafe fn end_interrupt() {
-        unsafe { write(0xb0, 0) };
-    }
-    /// # Safety
-    /// Caller has published wake ownership first. APIC destination names a
-    /// retained CPU, never a task/host PID. No interrupt-send busy polling.
-    pub unsafe fn send_wake(apic_id: ApicId) -> Result<(), IpiBusy> {
-        // A busy command is not a delivered wake. Return owned work to the
-        // caller instead of spinning with IF masked or dropping the command.
-        if unsafe { core::ptr::read_volatile((LAPIC_BASE + 0x300) as *const u32) } & (1 << 12) != 0
-        {
-            return Err(IpiBusy);
-        }
-        unsafe {
-            write(0x310, u32::from(apic_id.0) << 24);
-            write(0x300, u32::from(KICK_VECTOR));
-        }
-        Ok(())
-    }
 }

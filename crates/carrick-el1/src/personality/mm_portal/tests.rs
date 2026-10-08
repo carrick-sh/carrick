@@ -8,106 +8,6 @@ use carrick_el1_abi::{
 use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
 use carrick_sched_core::AddressSpaces;
 use core::sync::atomic::Ordering;
-
-#[test]
-fn prepared_copy_host_venue_preserves_host_completion_authority() {
-    use carrick_core::mm::transaction::{OwnerVenue, SelectionVenues};
-    use carrick_sched_core::spaces::notification::{SpaceAccess, SpaceReleaseVenue};
-    use carrick_sched_core::{SlotId, Waker, ZoneTables};
-    struct HostVenue;
-    fn deliver(
-        _: &ZoneTables,
-        waker: Waker,
-        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
-    ) {
-        let (actual, _, _) = effects.defer_handbacks();
-        assert_eq!(waker, Waker::Host);
-        assert_eq!(
-            actual,
-            Waker::Host,
-            "host completion has no guest execution slot"
-        );
-    }
-    impl OwnerVenue for HostVenue {
-        fn space_access(zone: &ZoneTables, _: SlotId) -> SpaceAccess<'_> {
-            SpaceAccess::notified(SpaceReleaseVenue {
-                zone,
-                waker: Waker::Host,
-                deliver,
-            })
-        }
-        fn encode_error(error: MmError) -> u32 {
-            error.errno()
-        }
-        fn cancelled_copy_code() -> u32 {
-            carrick_personality_linux::mm::cancelled_copy_errno()
-        }
-    }
-    for cancel in [false, true] {
-        let region = Region::new();
-        let zone = region.zone();
-        let mm = admit_notified(&region, 77, ROOT, 1, 0);
-        let view = nodes(&region);
-        let portal = carrick_core::mm::transaction::MmPortal::<
-            _,
-            carrick_personality_linux::mm::LinuxReservationPolicy,
-            crate::memory::reservations::NativeReservationGeometry,
-            HostVenue,
-        >::new(
-            NonZeroU64::new(1).unwrap(),
-            region.table(),
-            &zone.spaces,
-            &view,
-        )
-        .with_zone(zone)
-        .unwrap();
-        let tables = Tables::new(ROOT, IPA, 1);
-        let maintenance = CallerInvalidatesAsid;
-        let transfer = portal
-            .begin(
-                portal.admitted_handle(mm, 0).unwrap(),
-                GuestVa::new(VA),
-                4096,
-                TransferIntent::UserWrite,
-                0,
-            )
-            .unwrap();
-        let request = selected(
-            portal
-                .select(
-                    &transfer,
-                    &tables.live(&maintenance),
-                    SelectionVenues {
-                        prepared: &mut NoopPreparedResolver,
-                        cow: &mut NoopCowResolver,
-                        residency: &residency(),
-                        slot: 0,
-                    },
-                )
-                .unwrap(),
-        )
-        .request(TransferIntent::UserWrite, retained())
-        .unwrap();
-        let permit = prepare_transfer(&portal, request, &tables.live(&maintenance), 0)
-            .unwrap()
-            .unwrap();
-        if cancel {
-            portal.cancel_prepared(permit, request, 0).unwrap();
-        } else {
-            let wire = carrick_el1_abi::PortalTransferSlot::new();
-            let mut ticket = wire.submit_commit(request, permit, 4096).unwrap();
-            production::settle_prepared_service(&portal, wire.claim().unwrap(), permit, 0, || {
-                assert!(ticket.copy_requested(|_| true));
-            })
-            .unwrap();
-            assert_eq!(ticket.take_completion().unwrap().completed, 4096);
-        }
-        let recovered = prepare_transfer(&portal, request, &tables.live(&maintenance), 0)
-            .unwrap()
-            .unwrap();
-        portal.cancel_prepared(recovered, request, 0).unwrap();
-    }
-}
 #[test]
 fn transfer_fence_bounds_remap_to_one_chunk() {
     let region = Region::new();
@@ -489,151 +389,6 @@ fn stopped_lazy_transfer_reuses_fault_grant_mailbox() {
     // Simulate the existing host supply publishing the leaf, not a second allocator.
     tables.words[1536].store(IPA | RW, Ordering::Release);
     assert_eq!(selected(select(&portal, &transfer, &tables)).ipa, IPA);
-}
-
-#[test]
-fn identity_stamp_selects_private_control_in_two_live_mms() {
-    let region = Region::new();
-    let spaces = AddressSpaces::new();
-    let first = admit(&region, &spaces, 77, ROOT, 1, 0);
-    let second = admit(&region, &spaces, 78, ROOT + 0x100000, 1, 0);
-    let view = nodes(&region);
-    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
-    let first_tables = Tables::new(ROOT, IPA, 0);
-    let second_tables = Tables::new(ROOT + 0x100000, IPA + 0x4000, 0);
-    let word = carrick_el1_abi::CarrickIdentityWrite::ShimGate(0);
-    let address = word.address(
-        carrick_el1_abi::IdentityControlBase::new(carrick_el1_abi::CARRICK_IDENTITY_PAGE_BASE)
-            .unwrap(),
-    );
-    for (mm, tables, ipa) in [
-        (first, &first_tables, IPA),
-        (second, &second_tables, IPA + 0x4000),
-    ] {
-        tables.words[512 + ((address >> 30) & 511) as usize]
-            .store((tables.base + 8192) | 3, Ordering::Relaxed);
-        tables.words[1024 + ((address >> 21) & 511) as usize]
-            .store((tables.base + 12288) | 3, Ordering::Relaxed);
-        tables.words[1536 + ((address >> 12) & 511) as usize]
-            .store(ipa | (RW & !(1 << 6)), Ordering::Relaxed);
-        let handle = portal.admitted_handle(mm, 0).unwrap();
-        let user = portal
-            .begin(
-                handle,
-                GuestVa::new(address),
-                4,
-                TransferIntent::UserWrite,
-                0,
-            )
-            .unwrap();
-        let select_control = |transfer: &TransferContinuation| {
-            portal.select(
-                transfer,
-                &tables.live(&CallerInvalidatesAsid),
-                carrick_core::mm::transaction::SelectionVenues {
-                    prepared: &mut NoopPreparedResolver,
-                    cow: &mut NoopCowResolver,
-                    residency: &residency(),
-                    slot: 0,
-                },
-            )
-        };
-        assert!(matches!(select_control(&user), Err(MmError::Fault)));
-        let stamp = portal
-            .begin(
-                handle,
-                GuestVa::new(address),
-                4,
-                TransferIntent::CarrickIdentityWrite,
-                0,
-            )
-            .unwrap();
-        let chunk = selected(
-            select_control(&stamp).expect("private control stamp must select through its owner"),
-        );
-        assert_eq!(chunk.ipa, ipa + word.offset());
-        assert!(!chunk.executable);
-        assert_eq!(
-            tables.words[1536 + ((address >> 12) & 511) as usize].load(Ordering::Acquire)
-                & (3 << 6),
-            0
-        );
-        assert!(
-            portal
-                .revalidate(&stamp, chunk, &tables.live(&CallerInvalidatesAsid), 0)
-                .unwrap()
-                .is_some()
-        );
-        let leaf = &tables.words[1536 + ((address >> 12) & 511) as usize];
-        let original = leaf.load(Ordering::Acquire);
-        leaf.store(original + 0x10000, Ordering::Release);
-        assert!(
-            portal
-                .revalidate(&stamp, chunk, &tables.live(&CallerInvalidatesAsid), 0)
-                .unwrap()
-                .is_none(),
-            "same generation cannot authorize a changed physical output"
-        );
-        leaf.store(original, Ordering::Release);
-        for word in [
-            carrick_el1_abi::CarrickIdentityWrite::Pid(701),
-            carrick_el1_abi::CarrickIdentityWrite::SyscallCount(0),
-            carrick_el1_abi::CarrickIdentityWrite::ClockGate(1),
-        ] {
-            let transfer = portal
-                .begin(
-                    handle,
-                    GuestVa::new(
-                        word.address(
-                            carrick_el1_abi::IdentityControlBase::new(
-                                carrick_el1_abi::CARRICK_IDENTITY_PAGE_BASE,
-                            )
-                            .unwrap(),
-                        ),
-                    ),
-                    word.len() as u64,
-                    TransferIntent::CarrickIdentityWrite,
-                    0,
-                )
-                .unwrap();
-            let chunk = selected(select_control(&transfer).unwrap());
-            assert_eq!(chunk.ipa, ipa + word.offset());
-            assert_eq!(chunk.len, word.len() as u64);
-        }
-        for (address, len) in [
-            (address - 4, 8),
-            (address + 16, 4),
-            (VA, 4),
-            (
-                carrick_el1_abi::EL1_REGION_BASE + carrick_el1_abi::EL1_IMAGE_OFFSET,
-                4,
-            ),
-        ] {
-            let transfer = portal
-                .begin(
-                    handle,
-                    GuestVa::new(address),
-                    len,
-                    TransferIntent::CarrickIdentityWrite,
-                    0,
-                )
-                .unwrap();
-            assert!(matches!(select_control(&transfer), Err(MmError::Fault)));
-        }
-        for bad in [
-            0,
-            original | (1 << 6),
-            original | (1 << 7),
-            original & !(1 << 54),
-        ] {
-            leaf.store(bad, Ordering::Release);
-            assert!(
-                matches!(select_control(&stamp), Err(MmError::Fault)),
-                "missing, user-accessible, readonly or executable control cannot supply a stamp"
-            );
-        }
-        leaf.store(original, Ordering::Release);
-    }
 }
 
 #[test]
@@ -2016,8 +1771,7 @@ pub(crate) fn owner_fork_child_has_live_private_cow_and_parent_stays_unchanged_o
             .iter()
             .filter(|item| matches!(item, carrick_el1_abi::PortalForkCustody::Frame { .. }))
             .count(),
-        1,
-        "adjacent user frames share one custody receipt"
+        2
     );
     let original = parent_tables.words[1536].load(Ordering::Acquire);
     let mut unpublished = portal.publish_fork(plan, &words, 0).unwrap();
@@ -2255,8 +2009,8 @@ fn owner_fork_publishes_child_with_two_live_same_va_mms() {
             let plan = portal.prepare_fork(request, scratch, &words, 0).unwrap();
             assert_eq!(
                 plan.custody().len(),
-                5,
-                "one contiguous user-frame run plus four identity pages"
+                6,
+                "two user frames plus four identity pages, no carrier code or gaps"
             );
             for (index, selected) in plan.custody().iter().copied().enumerate() {
                 assert!(service.retain(index as u64, selected, || {
@@ -2351,173 +2105,6 @@ fn owner_fork_publishes_child_with_two_live_same_va_mms() {
 }
 
 #[test]
-fn owner_fork_anonymous_first_touch_excludes_inherited_prepared_neighbors() {
-    use carrick_mmu_core::aarch64::descriptor_txn::{
-        DescriptorOp, DescriptorOutcome, DescriptorTxn, DescriptorTxnId, PageSpan, TableGrants,
-    };
-    use carrick_mmu_core::aarch64::{El1PrivateLeafState, SubstrateGpa, el1_private_leaf_state};
-    // kernel.el1.delegated-root-fork: a fresh child MAP_FIXED mapping must
-    // select its own zero-fill window, without inheriting host residency or
-    // replacing prepared stock belonging to the neighboring reservation.
-    let region = Region::new();
-    let spaces = AddressSpaces::new();
-    let parent = admit(&region, &spaces, 77, ROOT, 4, 0);
-    let view = nodes(&region);
-    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
-    let parent_tables = Tables::new(ROOT, IPA, 4);
-    for page in 0..4 {
-        parent_tables.words[1536 + page].store(
-            ((IPA + page as u64 * 4096) | RW | (1 << 56) | (1 << 57)) & !1,
-            Ordering::Release,
-        );
-    }
-    let child = Tables::new(ROOT + 0x100000, 0, 0);
-    let supply = Tables::new(ROOT + 0x200000, 0, 0);
-    let request = fork_request(&region, &spaces, parent, 78, &child, &supply);
-    let arenas = [&parent_tables, &child, &supply];
-    let words = ForkWords {
-        arenas: &arenas,
-        loads: core::cell::Cell::new(0),
-    };
-    let plan = portal
-        .prepare_fork(
-            request,
-            ForkScratch::new(request, portal.fork_mapping_count(parent, 0).unwrap()).unwrap(),
-            &words,
-            0,
-        )
-        .unwrap();
-    portal
-        .publish_fork(plan, &words, 0)
-        .unwrap()
-        .commit(&portal, 0)
-        .unwrap();
-    spaces.open(spaces.find(78).unwrap());
-    let parent_identity = {
-        let mut root = region
-            .table()
-            .lock_el1_resolved(spaces.find(77).unwrap().index(), parent, &view, 0)
-            .unwrap();
-        (
-            root.incarnation(),
-            root.generation(),
-            root.mapping(VA).unwrap(),
-        )
-    };
-    let parent_descriptors: Vec<_> = parent_tables
-        .words
-        .iter()
-        .map(|word| word.load(Ordering::Acquire))
-        .collect();
-    let neighbor = child.words[1537].load(Ordering::Acquire);
-    assert_eq!(
-        el1_private_leaf_state(neighbor),
-        El1PrivateLeafState::Prepared
-    );
-    let retired = carrick_mmu_core::aarch64::descriptor_txn::execute_descriptor_txn(
-        &words,
-        SubstrateGpa(child.base),
-        &DescriptorTxn {
-            id: DescriptorTxnId {
-                mm_key: NonZeroU64::new(78).unwrap(),
-                generation: NonZeroU64::new(1).unwrap(),
-            },
-            root: SubstrateGpa(child.base),
-            op: DescriptorOp::Retire(PageSpan::new(VA, 4096)),
-            tables: TableGrants::NONE,
-        },
-        &mut carrick_mmu_core::aarch64::descriptor_txn::InlineJournal::new(),
-    );
-    assert!(matches!(retired.outcome, DescriptorOutcome::Applied(_)));
-    let fresh = {
-        use crate::memory::reservations::{Decision, Placement};
-        let mut root = region
-            .table()
-            .lock_el1_resolved(spaces.find(78).unwrap().index(), request.child_mm, &view, 0)
-            .unwrap();
-        for remap in [false, true] {
-            let decision = if remap {
-                root.mmap(
-                    Placement::Fixed(VA),
-                    4096,
-                    ReservationProtection::READ_WRITE,
-                )
-                .unwrap()
-            } else {
-                root.munmap(ReservationRange::new(VA, VA + 4096).unwrap())
-                    .unwrap()
-            };
-            let Decision::Work(request) = decision else {
-                panic!("child replacement must commit")
-            };
-            // SAFETY: the exact child leaf was retired above; no new physical
-            // backing is published until the owner first-touch request below.
-            root.complete(unsafe {
-                carrick_el1_abi::ReservationCompletion::after_descriptor_and_backing_commit(
-                    request,
-                    carrick_el1_abi::ReservationBackingReceipt {
-                        receipt: request.sequence.raw(),
-                        granted_bytes: 0,
-                        returned_bytes: 0,
-                    },
-                )
-                .unwrap()
-            })
-            .unwrap();
-        }
-        root.mapping(VA).unwrap()
-    };
-    let slots = Box::new(carrick_el1_abi::MmPortalSlots::new());
-    assert!(slots.bind_carrier(NonZeroU64::new(1).unwrap()));
-    let mailbox = FrameGrantMailbox::new();
-    assert!(
-        (crate::fault::OwnerFaultVenue {
-            roots: region.table(),
-            spaces: carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
-            slots: &slots,
-            residency: &residency(),
-            worker: 0,
-            mailbox: &mailbox,
-        })
-        .publish(carrick_mmu_core::owner_mmu::Aarch64Mmu, &words, 78, VA, 1),
-        "anonymous first-touch must use the admitted owner handoff"
-    );
-    let fault = mailbox.claim_request().unwrap();
-    let window = slots
-        .grant(0)
-        .unwrap()
-        .fault_selection(78, fault.request_generation)
-        .unwrap();
-    assert_eq!(window.operation.mm, request.child_mm);
-    assert_eq!(window.range, fresh.range);
-    assert_eq!(window.generation, fresh.generation);
-    assert_eq!(window.host_backing, None);
-    assert_eq!(fault.requested_len, 4096);
-    assert_eq!(child.words[1537].load(Ordering::Acquire), neighbor);
-    let mut root = region
-        .table()
-        .lock_el1_resolved(spaces.find(77).unwrap().index(), parent, &view, 0)
-        .unwrap();
-    assert_eq!(
-        (
-            root.incarnation(),
-            root.generation(),
-            root.mapping(VA).unwrap()
-        ),
-        parent_identity,
-        "parent descriptor authority must retain its exact incarnation and generations"
-    );
-    assert_eq!(
-        parent_tables
-            .words
-            .iter()
-            .map(|word| word.load(Ordering::Acquire))
-            .collect::<Vec<_>>(),
-        parent_descriptors
-    );
-}
-
-#[test]
 fn owner_fork_untouched_private_file_reads_source_and_child_write_stays_private() {
     use carrick_mmu_core::aarch64::descriptor_txn::{
         BackingIdentity, DescriptorOp, DescriptorOutcome, DescriptorTxn, DescriptorTxnId, PageSpan,
@@ -2583,15 +2170,14 @@ fn owner_fork_untouched_private_file_reads_source_and_child_write_stays_private(
     assert!(fault_slots.bind_carrier(NonZeroU64::new(1).unwrap()));
     let fault_mailbox = FrameGrantMailbox::new();
     assert!(
-        (crate::fault::OwnerFaultVenue {
+        (crate::fault::FileFaultVenue {
             roots: region.table(),
             spaces: carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
             slots: &fault_slots,
-            residency: &residency(),
             worker: 0,
             mailbox: &fault_mailbox
         })
-        .publish(carrick_mmu_core::owner_mmu::Aarch64Mmu, &words, 78, VA, 1)
+        .publish(78, VA, 1)
     );
     let fault_request = fault_mailbox.claim_request().unwrap();
     let fault_window = fault_slots
@@ -3310,8 +2896,7 @@ fn owner_fork_census_allocates_for_live_graph_not_physical_arena_capacity() {
             .iter()
             .filter(|item| matches!(item, carrick_el1_abi::PortalForkCustody::Frame { .. }))
             .count(),
-        1,
-        "adjacent user frames share one custody receipt"
+        2
     );
     let original = parent_tables.words[1536].load(Ordering::Acquire);
     let mut unpublished = portal.publish_fork(plan, &words, 0).unwrap();
@@ -3475,9 +3060,9 @@ fn prepared_copy_el1_edit_parks_then_commit_or_cancel_wakes_exact_saved_syscall(
             zone.enter_guest(slot);
             let task = CurrentTask::new();
             task.set(El1TaskId::from_linux_tid(101), 1, 5);
-            task.zone_mm.store(mm.raw(), Ordering::Release);
-            task.thread_serial.store(1101, Ordering::Release);
-            task.mark_pending_host_work(); // deterministic leave, no WFI.
+            task.mm.key.store(mm.raw(), Ordering::Release);
+            task.mm.thread_generation.store(1101, Ordering::Release);
+            task.linux.mark_pending_host_work(); // deterministic leave, no WFI.
             let counters = Counters::default();
             let mut cpu = FakeCpu::default();
             let mut frame = TrapFrame::default();
@@ -3492,6 +3077,7 @@ fn prepared_copy_el1_edit_parks_then_commit_or_cancel_wakes_exact_saved_syscall(
             let original = frame.x;
             let key = portal.prepared_wait_key(transfer.handle).unwrap();
             let mut sched = Sched {
+                handoff: None,
                 zone,
                 slot,
                 task: &task,
@@ -3761,9 +3347,9 @@ fn schedulerless_settlement_preserves_prepared_permit(cancel: bool) {
     zone.enter_guest(slot);
     let task = CurrentTask::new();
     task.set(El1TaskId::from_linux_tid(101), 1, 5);
-    task.zone_mm.store(mm.raw(), Ordering::Release);
-    task.thread_serial.store(1101, Ordering::Release);
-    task.mark_pending_host_work();
+    task.mm.key.store(mm.raw(), Ordering::Release);
+    task.mm.thread_generation.store(1101, Ordering::Release);
+    task.linux.mark_pending_host_work();
     let counters = Counters::default();
     let mut cpu = FakeCpu::default();
     let mut frame = TrapFrame::default();
@@ -3773,6 +3359,7 @@ fn schedulerless_settlement_preserves_prepared_permit(cancel: bool) {
     frame.elr = 0x1004;
     let original = frame.x;
     let mut sched = Sched {
+        handoff: None,
         zone,
         slot,
         task: &task,
@@ -4081,17 +3668,6 @@ fn owner_wait_enrollment_follows_only_its_real_release(
     } else {
         None
     };
-    let mut permits = Vec::new();
-    if cause == PortalWaitCause::Metadata {
-        let mut root = portal.root(mm, 1).unwrap();
-        loop {
-            match unsafe { root.prepare_copy_for_fixture(request, None) } {
-                Ok(permit) => permits.push(permit),
-                Err(crate::memory::reservations::Refusal::MetadataRequired) => break,
-                other => panic!("unexpected admission {other:?}"),
-            }
-        }
-    }
     let wire = carrick_el1_abi::PortalTransferSlot::new();
     let mut ticket = wire.submit_prepare(request).unwrap();
     if cause == PortalWaitCause::Gate {
@@ -4146,9 +3722,6 @@ fn owner_wait_enrollment_follows_only_its_real_release(
         if let Some(request) = pending {
             portal.root(mm, 1).unwrap().refuse(request).unwrap();
         }
-        if cause == PortalWaitCause::Metadata {
-            access.publish_metadata(entry.index());
-        }
     };
     if before {
         release(&mut editor, &mut root);
@@ -4185,9 +3758,6 @@ fn owner_wait_enrollment_follows_only_its_real_release(
         zone.take_completion_handbacks(&BoundedSpin(0), &mut |_| panic!("duplicate completion"));
     }
     zone.free_record(record);
-    for permit in permits {
-        portal.cancel_prepared(permit, request, 0).unwrap();
-    }
     if cause == PortalWaitCause::Gate {
         // Resume the original selection and operation after the real producer
         // released it; no host byte has been consumed while parked.
@@ -4212,114 +3782,15 @@ fn owner_wait_enrollment_follows_only_its_real_release(
 #[test]
 fn owner_wait_release_before_enrollment_never_parks_a_lost_edge() {
     use carrick_el1_abi::PortalWaitCause::*;
-    for cause in [Editor, Reservations, Gate, PendingEdit, Metadata] {
+    for cause in [Editor, Reservations, Gate, PendingEdit] {
         owner_wait_enrollment_follows_only_its_real_release(cause, true);
     }
 }
 #[test]
 fn owner_wait_unrelated_release_cannot_reschedule_and_real_release_delivers_once() {
     use carrick_el1_abi::PortalWaitCause::*;
-    for cause in [Editor, Reservations, Gate, PendingEdit, Metadata] {
+    for cause in [Editor, Reservations, Gate, PendingEdit] {
         owner_wait_enrollment_follows_only_its_real_release(cause, false);
-    }
-}
-
-#[test]
-fn owner_wait_metadata_provisioning_wakes_parked_waiter_and_resumes_prepare() {
-    use carrick_el1_abi::{PortalPrepareSuspension, PortalWaitCause};
-    use carrick_sched_core::object_wait::{OperationToken, OwnedObjectWakeEffects};
-    use carrick_sched_core::{BoundedSpin, Claim, ThreadIdentity};
-
-    let region = Region::new();
-    let zone = region.zone();
-    let mm = admit_notified(&region, 77, ROOT, 1, 0);
-    let view = nodes(&region);
-    let portal = MmPortal::new(
-        NonZeroU64::new(1).unwrap(),
-        region.table(),
-        &zone.spaces,
-        &view,
-    )
-    .with_zone(zone)
-    .unwrap();
-    let tables = Tables::new(ROOT, IPA, 1);
-    let handle = portal.admitted_handle(mm, 0).unwrap();
-    let transfer = portal
-        .begin(handle, GuestVa::new(VA), 4096, TransferIntent::UserWrite, 0)
-        .unwrap();
-    let request = selected(select(&portal, &transfer, &tables))
-        .request(TransferIntent::UserWrite, retained())
-        .unwrap();
-
-    let mut permits = Vec::new();
-    {
-        let mut root = portal.root(mm, 1).unwrap();
-        loop {
-            match unsafe { root.prepare_copy_for_fixture(request, None) } {
-                Ok(permit) => permits.push(permit),
-                Err(crate::memory::reservations::Refusal::MetadataRequired) => break,
-                other => panic!("unexpected admission {other:?}"),
-            }
-        }
-    }
-
-    let wire = carrick_el1_abi::PortalTransferSlot::new();
-    let mut ticket = wire.submit_prepare(request).unwrap();
-    serve_transfer(
-        &portal,
-        wire.claim().unwrap(),
-        &tables.live(&CallerInvalidatesAsid),
-        0,
-        || panic!("no consuming effect"),
-    )
-    .unwrap();
-
-    let Some(PortalPrepareSuspension::Owner(receipt)) = ticket.take_prepare_suspension() else {
-        panic!("exact owner wait required");
-    };
-    assert_eq!(receipt.cause(), PortalWaitCause::Metadata);
-
-    let slots = region.portal_slots();
-    assert!(slots.bind_carrier(handle.carrier()));
-    let enrollment = slots.authenticate_wait(zone, receipt).unwrap();
-
-    let record = zone
-        .alloc_record(ThreadIdentity {
-            tid: 101,
-            serial: 1001,
-            mm: mm.raw(),
-            file_table: 1,
-            generation: 1,
-            affinity: 0,
-            lifecycle_page: 0,
-            control_slot: 0,
-        })
-        .unwrap();
-    let operation = OperationToken::new(701, 11).unwrap();
-    let complete = |owned: OwnedObjectWakeEffects<'_>| {
-        let _ = owned.defer_handbacks();
-    };
-
-    enrollment.park_host(record, operation, &complete).unwrap();
-    assert!(matches!(zone.record(record).claim(), Claim::Parked { .. }));
-
-    // Provision new metadata capacity via add_bank.
-    region.add_bank();
-
-    let mut delivered = Vec::new();
-    zone.take_completion_handbacks(&BoundedSpin(0), &mut |record| delivered.push(record));
-    assert_eq!(delivered, [zone.record_ref(record)]);
-    assert!(zone.record(record).object_host_continuation());
-    assert_eq!(
-        unsafe { zone.record(record).take_object_operation() }
-            .unwrap()
-            .index(),
-        701
-    );
-    zone.free_record(record);
-
-    for permit in permits {
-        portal.cancel_prepared(permit, request, 0).unwrap();
     }
 }
 
