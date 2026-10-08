@@ -47,7 +47,7 @@ fn rename_open_descriptions_visits_only_matching_recorded_paths() {
         "rename visited {visited} unrelated descriptions"
     );
     let open = dispatcher.open_file(fd as i32).unwrap();
-    let description = open.description.read_for_io().unwrap();
+    let description = crate::kernel::FileDescription::read_for_io(&open.description).unwrap();
     assert!(matches!(
         &*description,
         OpenDescription::File { path, .. } if path == "/new/file"
@@ -80,7 +80,7 @@ fn rename_updates_description_when_recorded_fd_path_is_an_alias() {
 
     dispatcher.rename_open_paths("/real/file", "/real/renamed");
     let open = dispatcher.open_file(fd as i32).unwrap();
-    let description = open.description.read_for_io().unwrap();
+    let description = crate::kernel::FileDescription::read_for_io(&open.description).unwrap();
     assert!(matches!(
         &*description,
         OpenDescription::File { path, .. } if path == "/real/renamed"
@@ -93,7 +93,7 @@ fn rename_updates_description_when_recorded_fd_path_is_an_alias() {
     );
     drop(description);
     dispatcher.rename_open_paths("/real/renamed", "/real/again");
-    let description = open.description.read_for_io().unwrap();
+    let description = crate::kernel::FileDescription::read_for_io(&open.description).unwrap();
     assert!(matches!(
         &*description,
         OpenDescription::File { path, .. } if path == "/real/again"
@@ -2057,7 +2057,7 @@ fn lane_openat(
 fn lane_dir_is_trusted(dispatcher: &SyscallDispatcher, fd: i64) -> bool {
     let open_file = dispatcher.open_file(fd as i32).unwrap();
     matches!(
-        open_file.description.inspect().as_deref(),
+        crate::kernel::FileDescription::inspect(&open_file.description).as_deref(),
         Some(OpenDescription::Directory {
             trusted_host_dir: Some(_),
             ..
@@ -2164,7 +2164,8 @@ fn trusted_dirfd_lane_serves_walk_and_recurses() {
     assert!(file >= 0, "openat(sub, deep.txt): {file}");
     {
         let open_file = dispatcher.open_file(file as i32).unwrap();
-        let open = open_file.description.inspect().expect("open description");
+        let open = crate::kernel::FileDescription::inspect(&open_file.description)
+            .expect("open description");
         assert!(
             matches!(&*open, OpenDescription::HostFile { .. }),
             "lane-served regular file must be a HostFile, got {open:?}"
@@ -3039,7 +3040,7 @@ mod serial_host {
         assert!(!lane_dir_is_trusted(&dispatcher, dir));
         {
             let open_file = dispatcher.open_file(dir as i32).unwrap();
-            let open = open_file.description.inspect().unwrap();
+            let open = crate::kernel::FileDescription::inspect(&open_file.description).unwrap();
             let OpenDescription::Directory { listing, .. } = &*open else {
                 panic!("expected a directory description");
             };
@@ -3763,7 +3764,8 @@ fn trusted_dirfd_lane_falls_back_for_special_shapes() {
     assert!(fifo >= 0, "fifo openat: {fifo}");
     {
         let open_file = dispatcher.open_file(fifo as i32).unwrap();
-        let open = open_file.description.inspect().expect("open description");
+        let open = crate::kernel::FileDescription::inspect(&open_file.description)
+            .expect("open description");
         assert!(
             matches!(&*open, OpenDescription::HostPipe { .. }),
             "FIFO child must be a HostPipe, got {open:?}"
@@ -5702,7 +5704,8 @@ fn rlimit_fsize_straddling_regular_write_returns_only_the_limit_prefix() {
     let open = dispatcher
         .open_file(fd)
         .expect("created regular file remains open");
-    let description = open.description.inspect().expect("open description");
+    let description =
+        crate::kernel::FileDescription::inspect(&open.description).expect("open description");
     let OpenDescription::File { contents, .. } = &*description else {
         panic!("expected in-memory regular-file description");
     };
@@ -7198,7 +7201,7 @@ fn pipe_end_direction_matrix_and_fd_lifecycle_closure() {
         .expect("install bidirectional pipe");
     let bi_file = pair.dispatcher.open_file(bi_fd).expect("open file");
     assert!(matches!(
-        bi_file.description.inspect().as_deref(),
+        crate::kernel::FileDescription::inspect(&bi_file.description).as_deref(),
         Some(OpenDescription::HostPipe {
             bidirectional: true,
             ..

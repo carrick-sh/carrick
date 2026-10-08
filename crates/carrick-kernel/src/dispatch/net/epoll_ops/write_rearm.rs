@@ -66,7 +66,7 @@ impl IoRearm {
         };
         // A newly added watch can deliver an edge before I/O completes too.
         for owner in target.epoll_owners() {
-            let Some(mut open) = owner.write_for_io() else {
+            let Some(mut open) = crate::kernel::FileDescription::write_for_io(&owner) else {
                 continue;
             };
             let OpenDescription::Epoll {
@@ -132,7 +132,7 @@ impl IoRearm {
             return;
         };
         for owner in target.epoll_owners() {
-            let Some(mut open) = owner.write_for_io() else {
+            let Some(mut open) = crate::kernel::FileDescription::write_for_io(&owner) else {
                 continue;
             };
             let OpenDescription::Epoll {

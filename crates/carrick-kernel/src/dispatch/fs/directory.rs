@@ -181,7 +181,7 @@ impl<'a> FsView<'a> {
     /// the size is whatever the guest has written so far.
     fn materialize_anon_fd_to(&self, fd: i32, target: &str) -> Option<Result<(), LinuxErrno>> {
         let open_file = self.open_file(fd)?;
-        let desc = open_file.description.read_for_io()?;
+        let desc = crate::kernel::FileDescription::read_for_io(&open_file.description)?;
         let (bytes, mode) = match &*desc {
             // Real anonymous host inode (`--fs host` O_TMPFILE / memfd). The
             // metadata path is the synthetic "/__carrick_o_tmpfile" sentinel set
@@ -518,7 +518,7 @@ impl<'a> FsView<'a> {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let Some(mut open) = open_file.description.write_for_io() else {
+            let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             let OpenDescription::Directory {
@@ -692,7 +692,7 @@ impl<'a> FsView<'a> {
             } else if let Some(t) = proc_self_fd_number(&path, visible_self).and_then(|n| {
                 this.lookup_recorded_fd_open_path(n).or_else(|| {
                     this.open_file(n)
-                        .and_then(|f| f.description.inspect().and_then(|g| g.open_path().map(str::to_owned)))
+                        .and_then(|f| crate::kernel::FileDescription::inspect(&f.description).and_then(|g| g.open_path().map(str::to_owned)))
                 })
             }) {
                 // /proc/self/fd/N → the path fd N was opened at. Rosetta readlinks
@@ -706,7 +706,7 @@ impl<'a> FsView<'a> {
                     {
                         Some("anon_inode:[io_uring]".to_string())
                     } else {
-                        f.description.inspect().and_then(|g| g.readlink_target())
+                        crate::kernel::FileDescription::inspect(&f.description).and_then(|g| g.readlink_target())
                     }
                 })
             }) {

@@ -1856,7 +1856,8 @@ impl HostSocketAuthority {
     }
 
     pub(in crate::dispatch) fn set_ipv6_v6only(&self, enabled: bool) -> Result<(), LinuxErrno> {
-        let mut open = self.description.write_for_io().ok_or(super::LINUX_EBADF)?;
+        let mut open = crate::kernel::FileDescription::write_for_io(&self.description)
+            .ok_or(super::LINUX_EBADF)?;
         let OpenDescription::HostSocket {
             base,
             family,
@@ -1953,7 +1954,7 @@ impl<'guard> HostFileIo<'guard> {
 
 impl OpenFile {
     pub(in crate::dispatch) fn record_host_file_absolute_offset(&self, offset: i64) {
-        let Some(open) = self.description.read_for_io() else {
+        let Some(open) = crate::kernel::FileDescription::read_for_io(&self.description) else {
             return;
         };
         if let OpenDescription::HostFile { host_fd, .. } = &*open {
@@ -2409,7 +2410,8 @@ impl super::SyscallDispatcher {
         let (affected, visited) = file_table.rename_fd_open_paths(resolved_old, resolved_new);
         for fd in affected {
             if let Some(open_file) = open_files.get(&fd)
-                && let Some(mut desc) = open_file.description.write_for_io()
+                && let Some(mut desc) =
+                    crate::kernel::FileDescription::write_for_io(&open_file.description)
             {
                 desc.rename_path(resolved_old, resolved_new);
             }

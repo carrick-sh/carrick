@@ -286,7 +286,11 @@ impl SyscallDispatcher {
             Arc::clone(&self.host_signal),
         )?;
         let (kernel, context) = crate::kernel::Kernel::bootstrap_root(bootstrap)?;
-        let context = kernel.copy_file_table_for_host_fork(&context, &inherited_files)?;
+        let context = crate::kernel::Kernel::copy_file_table_for_host_fork(
+            &kernel,
+            &context,
+            &inherited_files,
+        )?;
         context
             .shared()
             .mm()

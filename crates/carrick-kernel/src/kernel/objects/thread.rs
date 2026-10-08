@@ -3162,7 +3162,7 @@ impl Thread {
         resources: Arc<ThreadResources>,
         caller: &ThreadRef,
     ) -> ThreadRef {
-        let seed = &ThreadSignalState::for_exec(&caller.signal_state());
+        let seed = &crate::kernel::ThreadSignalState::for_exec(&caller.signal_state());
         let thread = Arc::new(Thread {
             key,
             registry_id,

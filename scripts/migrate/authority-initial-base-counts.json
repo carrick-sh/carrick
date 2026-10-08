@@ -33025,6 +33025,13 @@
       {
         "family": "k1_create_install",
         "operation": "write_for_io",
+        "owner": "carrick_kernel::dispatch::net::lifecycle::NetView<'a>::reconnect_disconnected_inzone_stream",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_create_install",
+        "operation": "write_for_io",
         "owner": "carrick_kernel::dispatch::net::lifecycle::NetView<'a>::reset_host_stream_socket_for_disconnect",
         "lane": "shared",
         "ceiling": 1
@@ -33088,6 +33095,34 @@
       {
         "family": "k1_epoll_wait",
         "operation": "inspect",
+        "owner": "carrick_kernel::dispatch::format_time::timerfd_poll_source_from_lease",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_epoll_wait",
+        "operation": "inspect",
+        "owner": "carrick_kernel::dispatch::net::epoll_ops::NetView<'a>::description_epoll_effective_interest",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_epoll_wait",
+        "operation": "inspect",
+        "owner": "carrick_kernel::dispatch::net::epoll_ops::NetView<'a>::description_ipc_read_arrival",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_epoll_wait",
+        "operation": "inspect",
+        "owner": "carrick_kernel::dispatch::net::epoll_ops::NetView<'a>::description_read_avail_bytes",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_epoll_wait",
+        "operation": "inspect",
         "owner": "carrick_kernel::dispatch::net::epoll_ops::NetView<'a>::epoll_pwait_host_core",
         "lane": "shared",
         "ceiling": 2
@@ -33103,6 +33138,13 @@
         "family": "k1_epoll_wait",
         "operation": "inspect",
         "owner": "carrick_kernel::dispatch::net::epoll_ops::NetView<'a>::fd_supports_epoll_oob",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_epoll_wait",
+        "operation": "inspect",
+        "owner": "carrick_kernel::dispatch::net::epoll_ops::NetView<'a>::interest_is_connected_host_socket",
         "lane": "shared",
         "ceiling": 1
       },
@@ -33144,6 +33186,20 @@
       {
         "family": "k1_epoll_wait",
         "operation": "write_for_io",
+        "owner": "carrick_kernel::dispatch::net::epoll_ops::NetView<'a>::detach_description_from_all_epolls",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_epoll_wait",
+        "operation": "write_for_io",
+        "owner": "carrick_kernel::dispatch::net::epoll_ops::NetView<'a>::detach_epoll_owners",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_epoll_wait",
+        "operation": "write_for_io",
         "owner": "carrick_kernel::dispatch::net::epoll_ops::NetView<'a>::epoll_pwait_host_core",
         "lane": "shared",
         "ceiling": 3
@@ -33152,6 +33208,20 @@
         "family": "k1_epoll_wait",
         "operation": "write_for_io",
         "owner": "carrick_kernel::dispatch::net::epoll_ops::NetView<'a>::epoll_rearm_after_io",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_epoll_wait",
+        "operation": "write_for_io",
+        "owner": "carrick_kernel::dispatch::net::epoll_ops::write_rearm::IoRearm::complete_read",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_epoll_wait",
+        "operation": "write_for_io",
+        "owner": "carrick_kernel::dispatch::net::epoll_ops::write_rearm::IoRearm::complete_write",
         "lane": "shared",
         "ceiling": 1
       },
@@ -33194,6 +33264,76 @@
         "family": "k1_inspect_misc",
         "operation": "inspect",
         "owner": "carrick_kernel::dispatch::bpf::SyscallDispatcher::bpf_map_fd",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_inspect_misc",
+        "operation": "inspect",
+        "owner": "carrick_kernel::dispatch::fd_table::crate::kernel::FileDescription::distinct_open_path_snapshot",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_inspect_misc",
+        "operation": "inspect",
+        "owner": "carrick_kernel::dispatch::fd_table::crate::kernel::FileDescription::host_socket_authority",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_inspect_misc",
+        "operation": "inspect",
+        "owner": "carrick_kernel::dispatch::fd_table::crate::kernel::FileDescription::in_memory_pipe_endpoint",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_inspect_misc",
+        "operation": "inspect",
+        "owner": "carrick_kernel::dispatch::fd_table::crate::kernel::FileDescription::in_memory_tcp_at_mark",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_inspect_misc",
+        "operation": "inspect",
+        "owner": "carrick_kernel::dispatch::fd_table::crate::kernel::FileDescription::inspect_kind",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_inspect_misc",
+        "operation": "inspect",
+        "owner": "carrick_kernel::dispatch::fd_table::crate::kernel::FileDescription::is_empty_pipe_reader_with_writer",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_inspect_misc",
+        "operation": "inspect",
+        "owner": "carrick_kernel::dispatch::fd_table::crate::kernel::FileDescription::open_path_snapshot",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_inspect_misc",
+        "operation": "inspect",
+        "owner": "carrick_kernel::dispatch::fd_table::crate::kernel::FileDescription::pidfd_watch",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_inspect_misc",
+        "operation": "inspect",
+        "owner": "carrick_kernel::dispatch::fd_table::crate::kernel::FileDescription::retained_current_executable",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_inspect_misc",
+        "operation": "inspect",
+        "owner": "carrick_kernel::dispatch::fd_table::crate::kernel::FileDescription::retained_exec_source",
         "lane": "shared",
         "ceiling": 1
       },
@@ -33354,6 +33494,13 @@
       {
         "family": "k1_inspect_misc",
         "operation": "inspect",
+        "owner": "carrick_kernel::dispatch::host_io::OwnedHostFileCursor::capture_recalled",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_inspect_misc",
+        "operation": "inspect",
         "owner": "carrick_kernel::dispatch::mem::madvise::MemView<'a>::fadvise64",
         "lane": "shared",
         "ceiling": 1
@@ -33440,7 +33587,7 @@
         "operation": "inspect",
         "owner": "carrick_kernel::dispatch::net::lifecycle::NetView<'a>::connect",
         "lane": "shared",
-        "ceiling": 2
+        "ceiling": 3
       },
       {
         "family": "k1_inspect_misc",
@@ -33455,6 +33602,13 @@
         "owner": "carrick_kernel::dispatch::net::lifecycle::NetView<'a>::getsockname",
         "lane": "shared",
         "ceiling": 2
+      },
+      {
+        "family": "k1_inspect_misc",
+        "operation": "inspect",
+        "owner": "carrick_kernel::dispatch::net::lifecycle::NetView<'a>::reconnect_disconnected_inzone_stream",
+        "lane": "shared",
+        "ceiling": 1
       },
       {
         "family": "k1_inspect_misc",
@@ -33614,6 +33768,13 @@
         "family": "k1_inspect_misc",
         "operation": "read_for_io",
         "owner": "carrick_kernel::dispatch::fs::ioctl::FsView<'a>::ficlone_fs",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_inspect_misc",
+        "operation": "read_for_io",
+        "owner": "carrick_kernel::dispatch::fs::locks::retained_host_file_for_lock",
         "lane": "shared",
         "ceiling": 1
       },
@@ -33808,8 +33969,50 @@
       },
       {
         "family": "k1_lifecycle",
+        "operation": "copy_file_table_for_host_fork",
+        "owner": "carrick_kernel::dispatch::kernel_context::SyscallDispatcher::reset_one_task_kernel_binding_for_current_process",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_lifecycle",
+        "operation": "for_exec",
+        "owner": "carrick_kernel::kernel::objects::task::ThreadResources::for_exec",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_lifecycle",
+        "operation": "for_fork_copy",
+        "owner": "carrick_kernel::kernel::objects::task::ThreadResources::for_clone",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_lifecycle",
+        "operation": "for_fork_copy",
+        "owner": "carrick_kernel::kernel::operations::Kernel::copy_file_table_for_host_fork",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_lifecycle",
+        "operation": "for_fork_copy",
+        "owner": "carrick_kernel::kernel::operations::Kernel::unshare_file_table_for_close_range",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_lifecycle",
         "operation": "inspect",
         "owner": "carrick_kernel::dispatch::fs::ioctl::FsView<'a>::ficlone_errno",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_lifecycle",
+        "operation": "inspect",
+        "owner": "carrick_kernel::el1_delegation::detach_recalled_member",
         "lane": "shared",
         "ceiling": 1
       },
@@ -33887,6 +34090,20 @@
         "family": "k1_mapping_ring",
         "operation": "lock_closed_stdio",
         "owner": "carrick_kernel::dispatch::ioring::SyscallDispatcher::io_uring_run_op",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_mapping_ring",
+        "operation": "read_for_io",
+        "owner": "carrick_kernel::dispatch::mem::backing::MemView<'a>::discard_private_file_segment",
+        "lane": "shared",
+        "ceiling": 1
+      },
+      {
+        "family": "k1_mapping_ring",
+        "operation": "read_for_io",
+        "owner": "carrick_kernel::dispatch::mem::backing::MemView<'a>::snapshot_private_mmap_description",
         "lane": "shared",
         "ceiling": 1
       },

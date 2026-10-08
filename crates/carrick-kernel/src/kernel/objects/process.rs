@@ -398,9 +398,10 @@ impl TaskShared {
         };
         let sighand = match plan.sighand() {
             CloneObjectMode::Share => Arc::clone(&parent.sighand),
-            CloneObjectMode::Copy => {
-                Arc::new(Sighand::for_fork_copy(ids.sighand_id()?, &parent.sighand))
-            }
+            CloneObjectMode::Copy => Arc::new(crate::kernel::Sighand::for_fork_copy(
+                ids.sighand_id()?,
+                &parent.sighand,
+            )),
         };
         Ok(Self {
             mm,
@@ -434,7 +435,10 @@ impl TaskShared {
             mm,
             // Ignored dispositions survive; caught handlers reset to default.
             // K4 binds this model to the concrete signal backend.
-            sighand: Arc::new(Sighand::for_exec(ids.sighand_id()?, &caller.sighand)),
+            sighand: Arc::new(crate::kernel::Sighand::for_exec(
+                ids.sighand_id()?,
+                &caller.sighand,
+            )),
             pending_signals: Arc::clone(&caller.pending_signals),
         })
     }

@@ -408,7 +408,7 @@ impl<'a> FsView<'a> {
     /// macOS `sendfile(2)` can stream.
     pub(in crate::dispatch) fn regular_host_file_fd(&self, fd: i32) -> Option<HostFd> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read_for_io()?;
+        let open = crate::kernel::FileDescription::read_for_io(&open_file.description)?;
         match &*open {
             OpenDescription::HostFile { host_fd, .. } => Some(host_fd.view()),
             _ => None,
@@ -420,7 +420,7 @@ impl<'a> FsView<'a> {
     /// write-side callers must use this helper rather than `regular_host_file_fd`.
     pub(in crate::dispatch) fn regular_host_file_write_fd(&self, fd: i32) -> Option<HostFd> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read_for_io()?;
+        let open = crate::kernel::FileDescription::read_for_io(&open_file.description)?;
         match &*open {
             OpenDescription::HostFile {
                 host_fd,
@@ -435,7 +435,7 @@ impl<'a> FsView<'a> {
     /// `sendfile(2)` streams to.
     pub(in crate::dispatch) fn host_socket_fd(&self, fd: i32) -> Option<HostFd> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.inspect()?;
+        let open = crate::kernel::FileDescription::inspect(&open_file.description)?;
         match &*open {
             OpenDescription::HostSocket { host_fd, .. } => Some(host_fd.view()),
             _ => None,
@@ -448,7 +448,7 @@ impl<'a> FsView<'a> {
         fd: i32,
     ) -> Option<Arc<crate::inotify::InotifyState>> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.inspect()?;
+        let open = crate::kernel::FileDescription::inspect(&open_file.description)?;
         match &*open {
             OpenDescription::Inotify { state, .. } => Some(Arc::clone(state)),
             _ => None,
@@ -462,7 +462,7 @@ impl<'a> FsView<'a> {
         fd: i32,
     ) -> Option<Arc<crate::fanotify::FanotifyGroup>> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.inspect()?;
+        let open = crate::kernel::FileDescription::inspect(&open_file.description)?;
         match &*open {
             OpenDescription::Fanotify { group, .. } => Some(Arc::clone(group)),
             _ => None,
@@ -611,7 +611,7 @@ impl<'a> FsView<'a> {
             return;
         }
         let is_dir = {
-            let Some(open) = open_file.description.inspect() else {
+            let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description) else {
                 return;
             };
             match &*open {
@@ -760,7 +760,7 @@ impl<'a> FsView<'a> {
             return;
         }
         let is_dir = {
-            let Some(open) = open_file.description.inspect() else {
+            let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description) else {
                 return;
             };
             match &*open {
@@ -807,7 +807,7 @@ impl<'a> FsView<'a> {
             return;
         }
         let (events, is_dir) = {
-            let Some(open) = open_file.description.inspect() else {
+            let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description) else {
                 return;
             };
             let writable = match &*open {
@@ -901,7 +901,7 @@ impl<'a> FsView<'a> {
                 Err(LINUX_EBADF)
             };
         };
-        let Some(open) = open_file.description.inspect() else {
+        let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description) else {
             return Ok(false);
         };
         Ok(match &*open {
@@ -920,7 +920,7 @@ impl<'a> FsView<'a> {
     /// read end, else `None`. Lets `splice` drain a real host pipe.
     pub(in crate::dispatch) fn host_pipe_read_fd(&self, fd: i32) -> Option<HostFd> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.inspect()?;
+        let open = crate::kernel::FileDescription::inspect(&open_file.description)?;
         match &*open {
             OpenDescription::HostPipe {
                 host_fd,
@@ -941,7 +941,7 @@ impl<'a> FsView<'a> {
         want_read: bool,
     ) -> Option<(HostFd, u64)> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.inspect()?;
+        let open = crate::kernel::FileDescription::inspect(&open_file.description)?;
         match &*open {
             OpenDescription::HostPipe {
                 host_fd,
@@ -960,7 +960,7 @@ impl<'a> FsView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return Some(LINUX_EBADF);
         };
-        let open = open_file.description.inspect()?;
+        let open = crate::kernel::FileDescription::inspect(&open_file.description)?;
         match &*open {
             OpenDescription::PipeWriter { pipe, .. } => {
                 if pipe.snapshot().readers == 0 {

@@ -354,7 +354,7 @@ impl SyscallDispatcher {
                     LINUX_EBADF
                 }));
             };
-            let Some(description) = open_file.description.inspect() else {
+            let Some(description) = crate::kernel::FileDescription::inspect(&open_file.description) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             let OpenDescription::FsContext { state, .. } = &*description else {
@@ -433,7 +433,7 @@ impl SyscallDispatcher {
                     LINUX_EBADF
                 }));
             };
-            let Some(description) = open_file.description.inspect() else {
+            let Some(description) = crate::kernel::FileDescription::inspect(&open_file.description) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             if !matches!(&*description, OpenDescription::FsContext { .. }) {

@@ -51,7 +51,7 @@ impl<'a> FsView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return DispatchOutcome::errno(LINUX_EBADF);
         };
-        let Some(open) = open_file.description.read_for_io() else {
+        let Some(open) = crate::kernel::FileDescription::read_for_io(&open_file.description) else {
             return DispatchOutcome::errno(LINUX_EBADF);
         };
         match &*open {
@@ -291,18 +291,20 @@ impl<'a> FsView<'a> {
     ) -> DispatchOutcome {
         let (path, raw_host_fd) = self
             .open_file(fd)
-            .and_then(|of| match of.description.inspect().as_deref() {
-                Some(OpenDescription::HostFile {
-                    metadata, host_fd, ..
-                }) => Some((
-                    Some(metadata.path.to_string_lossy().into_owned()),
-                    Some(host_fd.raw()),
-                )),
-                Some(
-                    OpenDescription::File { metadata, .. }
-                    | OpenDescription::Directory { metadata, .. },
-                ) => Some((Some(metadata.path.to_string_lossy().into_owned()), None)),
-                _ => None,
+            .and_then(|of| {
+                match crate::kernel::FileDescription::inspect(&of.description).as_deref() {
+                    Some(OpenDescription::HostFile {
+                        metadata, host_fd, ..
+                    }) => Some((
+                        Some(metadata.path.to_string_lossy().into_owned()),
+                        Some(host_fd.raw()),
+                    )),
+                    Some(
+                        OpenDescription::File { metadata, .. }
+                        | OpenDescription::Directory { metadata, .. },
+                    ) => Some((Some(metadata.path.to_string_lossy().into_owned()), None)),
+                    _ => None,
+                }
             })
             .unwrap_or((None, None));
         if let Some(path) = path {
@@ -343,7 +345,7 @@ impl<'a> FsView<'a> {
             // directly, so fstat kept reporting the stale creation-time mode.
             let path = this
                 .open_file(fd.0)
-                .and_then(|of| match of.description.inspect().as_deref() {
+                .and_then(|of| match crate::kernel::FileDescription::inspect(&of.description).as_deref() {
                     Some(
                         OpenDescription::HostFile { metadata, .. }
                         | OpenDescription::File { metadata, .. }
@@ -370,7 +372,7 @@ impl<'a> FsView<'a> {
                 // open-time mode (LTP fchmod04/05). metadata.mode holds the
                 // permission bits; the type comes from `kind`.
                 if let Some(of) = this.open_file(fd.0) {
-                    if let Some(mut open) = of.description.write_for_io() {
+                    if let Some(mut open) = crate::kernel::FileDescription::write_for_io(&of.description) {
                         match &mut *open {
                             OpenDescription::Directory { metadata, .. }
                             | OpenDescription::File { metadata, .. } => {

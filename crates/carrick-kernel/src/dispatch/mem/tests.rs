@@ -1553,9 +1553,7 @@ fn shared_mmap_refreshes_an_independently_opened_vfs_inode() {
     );
     let mapper = dispatcher.open_file(MAPPER_FD).expect("mapper fd");
     assert_eq!(
-        match &*mapper
-            .description
-            .inspect()
+        match &*crate::kernel::FileDescription::inspect(&mapper.description)
             .expect("mapper open description")
         {
             OpenDescription::File { contents, .. } => contents.len().unwrap(),

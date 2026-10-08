@@ -2139,10 +2139,11 @@ impl SyscallDispatcher {
         // closing) — a dup'd fd sharing the Arc keeps the writer/pty alive.
         let last_ref = open_file.description.fd_ref_count() == 1;
         if !last_ref {
-            let classic_lock_release_fd = match open_file.description.inspect().as_deref() {
-                Some(OpenDescription::HostFile { host_fd, .. }) => Some(host_fd.raw()),
-                _ => None,
-            };
+            let classic_lock_release_fd =
+                match crate::kernel::FileDescription::inspect(&open_file.description).as_deref() {
+                    Some(OpenDescription::HostFile { host_fd, .. }) => Some(host_fd.raw()),
+                    _ => None,
+                };
             if let Some(host_fd) = classic_lock_release_fd {
                 let duped = unsafe { libc::dup(host_fd) };
                 if duped >= 0 {
@@ -2167,7 +2168,7 @@ impl SyscallDispatcher {
         let mut closing_fanotify = false;
         let mut closing_host_socket = false;
         if last_ref {
-            if let Some(open) = open_file.description.inspect() {
+            if let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description) {
                 // A reuseport membership must never outlive its socket: host fds
                 // are REUSED, so a stale entry would hand a later unrelated
                 // socket's traffic to this group. Removal is by host fd and is a
@@ -2240,7 +2241,7 @@ impl SyscallDispatcher {
             self.fs.inotify_registry.unregister_all(&state);
         }
         let is_inmem_stream = ::std::matches!(
-            open_file.description.inspect().as_deref(),
+            crate::kernel::FileDescription::inspect(&open_file.description).as_deref(),
             Some(
                 OpenDescription::PipeReader { .. }
                     | OpenDescription::PipeWriter { .. }

@@ -43,7 +43,8 @@ impl<'a> FsView<'a> {
             }
             XattrTarget::Fd(fd) => {
                 let open_file = self.open_file(fd.0).ok_or(LINUX_EBADF)?;
-                let open = open_file.description.inspect().ok_or(LINUX_ENOTSUP)?;
+                let open = crate::kernel::FileDescription::inspect(&open_file.description)
+                    .ok_or(LINUX_ENOTSUP)?;
                 match &*open {
                     OpenDescription::File { path, .. }
                     | OpenDescription::Directory { path, .. } => Ok(path.clone()),

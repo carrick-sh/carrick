@@ -145,7 +145,7 @@ impl<'a> FsView<'a> {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let Some(open) = open_file.description.inspect() else {
+            let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
             Ok(match &*open {

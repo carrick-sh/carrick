@@ -42,7 +42,7 @@ impl<'a> NetView<'a> {
     pub(in crate::dispatch) fn fd_is_netlink(&self, fd: i32) -> bool {
         self.open_file(fd).is_some_and(|of| {
             ::std::matches!(
-                of.description.inspect().as_deref(),
+                crate::kernel::FileDescription::inspect(&of.description).as_deref(),
                 Some(OpenDescription::Netlink { .. })
             )
         })
@@ -61,7 +61,7 @@ impl<'a> NetView<'a> {
             return DispatchOutcome::errno(LINUX_EBADF);
         };
         let reply = {
-            let Some(open) = open_file.description.inspect() else {
+            let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description) else {
                 return DispatchOutcome::errno(LINUX_ENOTSOCK);
             };
             let OpenDescription::Netlink { pid, .. } = &*open else {
@@ -77,7 +77,8 @@ impl<'a> NetView<'a> {
             let net_ns = self.caller_net_ns(context);
             build_netlink_reply_for_snapshot(request, dest_pid, &net_ns.view())
         };
-        if let Some(mut open) = open_file.description.write_for_io() {
+        if let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description)
+        {
             if let OpenDescription::Netlink {
                 recv_queue,
                 wait_queue,
@@ -128,7 +129,8 @@ impl<'a> NetView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return Vec::new();
         };
-        let Some(mut open) = open_file.description.write_for_io() else {
+        let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description)
+        else {
             return Vec::new();
         };
         let OpenDescription::Netlink { recv_queue, .. } = &mut *open else {
@@ -171,7 +173,8 @@ impl<'a> NetView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return Err(LINUX_EBADF);
         };
-        let Some(mut open) = open_file.description.write_for_io() else {
+        let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description)
+        else {
             return Err(LINUX_EBADF);
         };
         let OpenDescription::Netlink {

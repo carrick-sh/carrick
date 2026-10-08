@@ -60,5 +60,12 @@
   ],
   "source_string_include": [
     "include_str"
+  ],
+  "file_lifecycle": [
+    "for_fork_copy",
+    "for_exec",
+    "native_reexec_fd",
+    "restore_native_reexec_fd",
+    "copy_file_table_for_host_fork"
   ]
 }

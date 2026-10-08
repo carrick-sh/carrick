@@ -35,7 +35,8 @@ impl<'a> FsView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return Err(LINUX_EBADF);
         };
-        let path = match open_file.description.inspect().as_deref() {
+        let path = match crate::kernel::FileDescription::inspect(&open_file.description).as_deref()
+        {
             Some(OpenDescription::Directory { path, .. }) => path.clone(),
             _ => match self.lookup_recorded_fd_open_path(fd) {
                 Some(path) => path,

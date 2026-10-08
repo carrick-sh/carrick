@@ -1254,7 +1254,9 @@ impl<'a> MemView<'a> {
                 .map_err(|_| LINUX_ENOMEM)?;
             if valid_len != 0 {
                 let direct = {
-                    let open = description.description().read_for_io().ok_or(LINUX_EBADF)?;
+                    let open =
+                        crate::kernel::FileDescription::read_for_io(description.description())
+                            .ok_or(LINUX_EBADF)?;
                     if let Some(fd) = open.shared_alias_host_fd() {
                         let provenance = match &*open {
                             OpenDescription::HostFile { host_fd, .. } => {

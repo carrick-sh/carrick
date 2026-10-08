@@ -96,8 +96,8 @@ fn host_fd_matches_device(host_fd: i32, path: &str) -> bool {
 }
 
 fn fd_is_random_device(this: &FsView<'_>, fd: i32) -> bool {
-    this.open_file(fd).is_some_and(
-        |open_file| match open_file.description.inspect().as_deref() {
+    this.open_file(fd).is_some_and(|open_file| {
+        match crate::kernel::FileDescription::inspect(&open_file.description).as_deref() {
             Some(OpenDescription::HostPipe { host_fd, .. }) => {
                 host_fd_matches_device(host_fd.raw(), "/dev/random")
                     || host_fd_matches_device(host_fd.raw(), "/dev/urandom")
@@ -108,8 +108,8 @@ fn fd_is_random_device(this: &FsView<'_>, fd: i32) -> bool {
                     | carrick_vfs::SyntheticDeviceKind::Urandom
             ),
             _ => false,
-        },
-    )
+        }
+    })
 }
 
 fn fd_is_proc_maps(this: &FsView<'_>, fd: i32) -> bool {
@@ -502,7 +502,7 @@ impl<'a> FsView<'a> {
                 host_fd: slave_host_fd,
                 pty: Some(slave_role),
                 ..
-            }) = of.description.inspect().as_deref()
+            }) = crate::kernel::FileDescription::inspect(&of.description).as_deref()
                 && !slave_role.is_master
                 && slave_role.index == role.index
             {
@@ -526,7 +526,7 @@ impl<'a> FsView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return FicloneFs::Other;
         };
-        let Some(open) = open_file.description.read_for_io() else {
+        let Some(open) = crate::kernel::FileDescription::read_for_io(&open_file.description) else {
             return FicloneFs::Other;
         };
         match &*open {
@@ -615,7 +615,7 @@ impl<'a> FsView<'a> {
             let name = |fd: i32| {
                 self.open_file(fd)
                     .and_then(|of| {
-                        let g = of.description.inspect()?;
+                        let g = crate::kernel::FileDescription::inspect(&of.description)?;
                         Some(format!(
                             "{}:{}",
                             g.reexec_kind_name(),
@@ -1549,7 +1549,7 @@ impl<'a> FsView<'a> {
                     // pipe (`pipe2(2)` backing) forwards the ioctl to the real host fd so the
                     // guest sees the kernel's actual queued-byte count.
                     let available: i32 = match this.open_file(fd.0).as_ref() {
-                        Some(open_file) => match open_file.description.inspect().as_deref() {
+                        Some(open_file) => match crate::kernel::FileDescription::inspect(&open_file.description).as_deref() {
                             Some(OpenDescription::InMemorySocket { socket, .. }) => {
                                 if ioctl_request == LINUX_SIOCOUTQ {
                                     i32::try_from(socket.outq_bytes()).unwrap_or(i32::MAX)
@@ -1623,7 +1623,7 @@ impl<'a> FsView<'a> {
                             status_flags &= !LINUX_O_NONBLOCK;
                         }
                         common.set_status_flags(status_flags);
-                        let host_fd = match open_file.description.inspect().as_deref() {
+                        let host_fd = match crate::kernel::FileDescription::inspect(&open_file.description).as_deref() {
                             Some(
                                 OpenDescription::HostPipe { host_fd, .. }
                                 | OpenDescription::HostSocket { host_fd, .. }
@@ -1646,7 +1646,7 @@ impl<'a> FsView<'a> {
                     Err(errno) => DispatchOutcome::errno(errno),
                 },
                 LINUX_SIOCGIFNAME => match this.open_file(fd.0).as_ref() {
-                    Some(open_file) => match open_file.description.inspect().as_deref() {
+                    Some(open_file) => match crate::kernel::FileDescription::inspect(&open_file.description).as_deref() {
                         Some(OpenDescription::HostSocket { .. }) => {
                             let Ok(bytes) = cx.memory.read_bytes(arg + 16, 4) else {
                                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
@@ -1678,7 +1678,7 @@ impl<'a> FsView<'a> {
                     None => DispatchOutcome::errno(LINUX_ENOTTY),
                 },
                 LINUX_SIOCGIFINDEX => match this.open_file(fd.0).as_ref() {
-                    Some(open_file) => match open_file.description.inspect().as_deref() {
+                    Some(open_file) => match crate::kernel::FileDescription::inspect(&open_file.description).as_deref() {
                         Some(OpenDescription::HostSocket { .. }) => {
                             let Ok(bytes) = cx.memory.read_bytes(arg, 16) else {
                                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));

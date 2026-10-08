@@ -446,7 +446,7 @@ impl Kernel {
             self.object_ids(),
             mm,
         )?);
-        let resources = Arc::new(ThreadResources::for_exec(
+        let resources = Arc::new(crate::kernel::ThreadResources::for_exec(
             &context.resources,
             self.object_ids(),
         )?);

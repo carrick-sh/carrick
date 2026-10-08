@@ -1078,7 +1078,7 @@ impl Kernel {
             }
 
             let old_files = context.resources.files();
-            let files = Arc::new(FileTable::for_fork_copy(
+            let files = Arc::new(crate::kernel::FileTable::for_fork_copy(
                 self.object_ids().file_table_id()?,
                 inherited,
             ));
@@ -1139,7 +1139,7 @@ impl Kernel {
             }
 
             let old_files = context.resources.files();
-            let files = Arc::new(FileTable::for_fork_copy(
+            let files = Arc::new(crate::kernel::FileTable::for_fork_copy(
                 self.object_ids().file_table_id()?,
                 &old_files,
             ));

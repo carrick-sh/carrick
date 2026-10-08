@@ -1861,7 +1861,7 @@ impl<'a> SignalView<'a> {
                 let Some(open_file) = this.open_file(fd.0) else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
-                let Some(mut open) = open_file.description.write_for_io() else {
+                let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description) else {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 };
                 match &mut *open {

@@ -105,6 +105,7 @@ pub struct SourceCensus {
     unbound_files: std::collections::BTreeSet<String>,
     owners: BTreeMap<String, Vec<Owner>>,
     pub k1: Vec<ApiSite>,
+    inherent_methods: BTreeMap<String, BTreeSet<String>>,
     unknown_apis: Vec<String>,
     structural_errors: Vec<String>,
     test_ranges: BTreeMap<String, Vec<(LineColumn, LineColumn)>>,
@@ -249,6 +250,7 @@ enum AuthorityOperation {
     K1,
     DescriptionIo,
     DescriptionGuard,
+    FileLifecycle,
     Task,
     RawLock,
     SourceInclude,
@@ -1483,6 +1485,7 @@ impl SourceCensus {
                 let mut collector = AliasCollector {
                     aliases: &mut result.aliases,
                     projections: &mut result.projections,
+                    inherent_methods: &mut result.inherent_methods,
                     prefix: modules,
                 };
                 collector.visit_file(syntax);
@@ -1547,7 +1550,8 @@ impl SourceCensus {
                     implementation: None,
                     implementation_type: None,
                     current_owner: None,
-                    audited_input: false,
+                    bindings: BTreeMap::new(),
+                    generic_types: BTreeSet::new(),
                 };
                 scanner.visit_file(&syntax);
             }
@@ -1738,6 +1742,7 @@ impl SourceCensus {
 struct AliasCollector<'a> {
     aliases: &'a mut BTreeMap<String, Vec<syn::Type>>,
     projections: &'a mut BTreeMap<String, BTreeSet<String>>,
+    inherent_methods: &'a mut BTreeMap<String, BTreeSet<String>>,
     prefix: Vec<String>,
 }
 pub(super) fn implementation_name(item: &syn::ItemImpl) -> String {
@@ -1749,11 +1754,57 @@ pub(super) fn implementation_name(item: &syn::ItemImpl) -> String {
     }
 }
 impl<'ast> Visit<'ast> for AliasCollector<'_> {
+    fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+        if !test_only(&item.attrs) {
+            self.inherent_methods
+                .entry(format!(
+                    "{}::{}",
+                    self.prefix.join("::"),
+                    item.ident.unraw()
+                ))
+                .or_default();
+            visit::visit_item_struct(self, item);
+        }
+    }
+    fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+        if !test_only(&item.attrs) {
+            self.inherent_methods
+                .entry(format!(
+                    "{}::{}",
+                    self.prefix.join("::"),
+                    item.ident.unraw()
+                ))
+                .or_default();
+            visit::visit_item_enum(self, item);
+        }
+    }
     fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
         if test_only(&item.attrs) {
             return;
         }
         self.prefix.push(implementation_name(item));
+        // Unconditional inherent methods stop lookup before Deref/traits.
+        let conditional = |attrs: &[syn::Attribute]| {
+            attrs.iter().any(|attribute| {
+                attribute.path().is_ident("cfg") || attribute.path().is_ident("cfg_attr")
+            })
+        };
+        if item.trait_.is_none()
+            && item.generics.type_params().next().is_none()
+            && !conditional(&item.attrs)
+        {
+            for member in &item.items {
+                if let syn::ImplItem::Fn(method) = member
+                    && !test_only(&method.attrs)
+                    && !conditional(&method.attrs)
+                {
+                    self.inherent_methods
+                        .entry(self.prefix.join("::"))
+                        .or_default()
+                        .insert(method.sig.ident.unraw().to_string());
+                }
+            }
+        }
         if let Some((_, trait_path, _)) = &item.trait_ {
             let trait_name = trait_path
                 .segments
@@ -1898,6 +1949,77 @@ impl<'ast> Visit<'ast> for AliasCollector<'_> {
         );
     }
 }
+fn type_alias_keys(path: &syn::TypePath, scope: &str) -> (String, Vec<String>) {
+    let mut path_name = path
+        .path
+        .segments
+        .iter()
+        .map(|s| s.ident.unraw().to_string())
+        .collect::<Vec<_>>()
+        .join("::");
+    if let Some(qualified) = &path.qself {
+        let ty = semantic_tokens(&qualified.ty).replace(' ', "");
+        let trait_name = path
+            .path
+            .segments
+            .iter()
+            .take(qualified.position)
+            .map(|segment| segment.ident.unraw().to_string())
+            .collect::<Vec<_>>()
+            .join("::");
+        let associated = path
+            .path
+            .segments
+            .iter()
+            .skip(qualified.position)
+            .map(|segment| segment.ident.unraw().to_string())
+            .collect::<Vec<_>>()
+            .join("::");
+        path_name = if qualified.position == 0 {
+            format!("<{ty}>::{associated}")
+        } else {
+            format!("<{ty} as {trait_name}>::{associated}")
+        };
+    }
+    let mut prefix = scope.to_owned();
+    let mut keys = Vec::new();
+    loop {
+        keys.push(format!("{prefix}::{path_name}"));
+        let Some((parent, _)) = prefix.rsplit_once("::") else {
+            break;
+        };
+        prefix = parent.to_owned();
+    }
+    if path_name.starts_with("crate::") {
+        keys.push(format!(
+            "{}::{}",
+            scope.split("::").next().unwrap_or(scope),
+            path_name.trim_start_matches("crate::")
+        ));
+    }
+    if path_name.starts_with("self::") {
+        keys.push(format!(
+            "{}::{}",
+            scope,
+            path_name.trim_start_matches("self::")
+        ));
+    }
+    if let Some(relative) = path_name.strip_prefix("Self::") {
+        keys.push(format!("{}::{relative}", scope));
+    }
+    let mut relative = path_name.as_str();
+    let mut parent = scope;
+    while let Some(rest) = relative.strip_prefix("super::") {
+        parent = parent.rsplit_once("::").map_or(parent, |(outer, _)| outer);
+        relative = rest;
+    }
+    if relative != path_name {
+        keys.push(format!("{parent}::{relative}"));
+    }
+    keys.push(path_name.clone());
+    (path_name, keys)
+}
+
 fn authority_type(
     ty: &syn::Type,
     aliases: &BTreeMap<String, Vec<syn::Type>>,
@@ -1924,73 +2046,7 @@ fn authority_type(
                     self.protected = true;
                 }
             }
-            let mut path_name = path
-                .path
-                .segments
-                .iter()
-                .map(|s| s.ident.unraw().to_string())
-                .collect::<Vec<_>>()
-                .join("::");
-            if let Some(qualified) = &path.qself {
-                let ty = semantic_tokens(&qualified.ty).replace(' ', "");
-                let trait_name = path
-                    .path
-                    .segments
-                    .iter()
-                    .take(qualified.position)
-                    .map(|segment| segment.ident.unraw().to_string())
-                    .collect::<Vec<_>>()
-                    .join("::");
-                let associated = path
-                    .path
-                    .segments
-                    .iter()
-                    .skip(qualified.position)
-                    .map(|segment| segment.ident.unraw().to_string())
-                    .collect::<Vec<_>>()
-                    .join("::");
-                path_name = if qualified.position == 0 {
-                    format!("<{ty}>::{associated}")
-                } else {
-                    format!("<{ty} as {trait_name}>::{associated}")
-                };
-            }
-            let mut prefix = self.scope.to_owned();
-            let mut keys = Vec::new();
-            loop {
-                keys.push(format!("{prefix}::{path_name}"));
-                let Some((parent, _)) = prefix.rsplit_once("::") else {
-                    break;
-                };
-                prefix = parent.to_owned();
-            }
-            if path_name.starts_with("crate::") {
-                keys.push(format!(
-                    "{}::{}",
-                    self.scope.split("::").next().unwrap_or(self.scope),
-                    path_name.trim_start_matches("crate::")
-                ));
-            }
-            if path_name.starts_with("self::") {
-                keys.push(format!(
-                    "{}::{}",
-                    self.scope,
-                    path_name.trim_start_matches("self::")
-                ));
-            }
-            if let Some(relative) = path_name.strip_prefix("Self::") {
-                keys.push(format!("{}::{relative}", self.scope));
-            }
-            let mut relative = path_name.as_str();
-            let mut parent = self.scope;
-            while let Some(rest) = relative.strip_prefix("super::") {
-                parent = parent.rsplit_once("::").map_or(parent, |(outer, _)| outer);
-                relative = rest;
-            }
-            if relative != path_name {
-                keys.push(format!("{parent}::{relative}"));
-            }
-            keys.push(path_name.clone());
+            let (path_name, keys) = type_alias_keys(path, self.scope);
             let projection = path.qself.is_some()
                 || path_name.starts_with("Self::")
                 || self
@@ -2046,6 +2102,17 @@ fn authority_type(
     visitor.visit_type(ty);
     visitor.protected
 }
+// An unrelated receiver requires an unconditional inherent method proof.
+// An opaque binding is unresolved, never silently exempted from the census.
+#[derive(Clone, Default)]
+struct ReceiverAuthority {
+    description: bool,
+    file_table: bool,
+    kernel: bool,
+    inherent_methods: BTreeSet<String>,
+}
+type ReceiverBindings = BTreeMap<String, Option<ReceiverAuthority>>;
+
 struct Scanner<'a> {
     census: &'a mut SourceCensus,
     file: String,
@@ -2054,9 +2121,163 @@ struct Scanner<'a> {
     implementation: Option<String>,
     implementation_type: Option<syn::Type>,
     current_owner: Option<String>,
-    audited_input: bool,
+    bindings: ReceiverBindings,
+    generic_types: BTreeSet<String>,
 }
 impl Scanner<'_> {
+    fn receiver_authority(&self, ty: &syn::Type) -> ReceiverAuthority {
+        let scope = self.scope();
+        let protected = |names: &[&str]| {
+            authority_type(
+                ty,
+                &self.census.aliases,
+                &self.census.projections,
+                &scope,
+                &mut Vec::new(),
+                names,
+                false,
+            )
+        };
+        let mut result = ReceiverAuthority {
+            description: protected(&["FileDescription", "OpenDescriptionRef"]),
+            file_table: protected(&["FileTable"]),
+            kernel: protected(&["Kernel"]),
+            ..ReceiverAuthority::default()
+        };
+        let mut concrete = ty;
+        while let syn::Type::Reference(reference) = concrete {
+            concrete = &reference.elem;
+        }
+        if let syn::Type::Path(path) = concrete
+            && path.qself.is_none()
+            && path
+                .path
+                .segments
+                .iter()
+                .all(|segment| matches!(segment.arguments, syn::PathArguments::None))
+        {
+            let (_, keys) = type_alias_keys(path, &scope);
+            for key in keys {
+                if let Some(methods) = self.census.inherent_methods.get(&key) {
+                    result.inherent_methods = methods.clone();
+                    break;
+                }
+                if self.census.aliases.contains_key(&key) {
+                    // Do not inherit an outer type's exemption through a
+                    // nearer alias whose concrete receiver is unresolved.
+                    break;
+                }
+            }
+        }
+        result
+    }
+    fn parameter_bindings(&mut self, signature: &syn::Signature) -> ReceiverBindings {
+        let previous = std::mem::take(&mut self.bindings);
+        for input in &signature.inputs {
+            if let syn::FnArg::Typed(argument) = input {
+                if let syn::Pat::Ident(binding) = argument.pat.as_ref() {
+                    let authority = self.receiver_authority(&argument.ty);
+                    let mut generics = self.generic_types.clone();
+                    generics.extend(
+                        signature
+                            .generics
+                            .type_params()
+                            .map(|parameter| parameter.ident.unraw().to_string()),
+                    );
+                    struct Unresolved<'a> {
+                        generics: &'a BTreeSet<String>,
+                        aliases: &'a BTreeMap<String, Vec<syn::Type>>,
+                        scope: &'a str,
+                        seen: BTreeSet<String>,
+                        protected: bool,
+                        found: bool,
+                    }
+                    impl<'ast> Visit<'ast> for Unresolved<'_> {
+                        fn visit_type_impl_trait(&mut self, _: &'ast syn::TypeImplTrait) {
+                            self.found = true;
+                        }
+                        fn visit_type_trait_object(&mut self, _: &'ast syn::TypeTraitObject) {
+                            self.found = true;
+                        }
+                        fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+                            self.found |= self.protected && path.path.segments.iter().any(|segment| matches!(&segment.arguments, syn::PathArguments::AngleBracketed(arguments) if arguments.args.iter().any(|argument| matches!(argument, syn::GenericArgument::Type(_)))));
+                            self.found |= path.qself.is_some()
+                                || path.path.segments.first().is_some_and(|segment| {
+                                    self.generics.contains(&segment.ident.unraw().to_string())
+                                        || (segment.ident.unraw() == "Self"
+                                            && path.path.segments.len() > 1)
+                                });
+                            let (_, keys) = type_alias_keys(path, self.scope);
+                            for key in keys {
+                                if let Some(types) = self.aliases.get(&key) {
+                                    if !self.seen.insert(key.clone()) {
+                                        self.found = true;
+                                        continue;
+                                    }
+                                    for ty in types {
+                                        self.visit_type(ty);
+                                    }
+                                    self.seen.remove(&key);
+                                }
+                            }
+                            visit::visit_type_path(self, path);
+                        }
+                    }
+                    let scope = self.scope();
+                    let mut unresolved = Unresolved {
+                        generics: &generics,
+                        aliases: &self.census.aliases,
+                        scope: &scope,
+                        seen: BTreeSet::new(),
+                        protected: authority.description
+                            || authority.file_table
+                            || authority.kernel,
+                        found: false,
+                    };
+                    unresolved.visit_type(&argument.ty);
+                    let generic = unresolved.found;
+                    self.bindings.insert(
+                        binding.ident.unraw().to_string(),
+                        if generic { None } else { Some(authority) },
+                    );
+                }
+            } else if let Some(ty) = &self.implementation_type {
+                let authority = self.receiver_authority(ty);
+                self.bindings.insert(
+                    "self".into(),
+                    if self.generic_types.is_empty() {
+                        Some(authority)
+                    } else {
+                        None
+                    },
+                );
+            }
+        }
+        previous
+    }
+    fn description_receiver(&self, receiver: &syn::Expr) -> Option<ReceiverAuthority> {
+        match receiver {
+            syn::Expr::Reference(reference) => self.description_receiver(&reference.expr),
+            syn::Expr::Paren(paren) => self.description_receiver(&paren.expr),
+            syn::Expr::Group(group) => self.description_receiver(&group.expr),
+            syn::Expr::Path(path) if path.path.segments.len() == 1 => self
+                .bindings
+                .get(&path.path.segments[0].ident.unraw().to_string())
+                .cloned()
+                .flatten(),
+            _ => None,
+        }
+    }
+    fn shadow_pattern(&mut self, pattern: &syn::Pat) {
+        struct Bindings<'a>(&'a mut ReceiverBindings);
+        impl<'ast> Visit<'ast> for Bindings<'_> {
+            fn visit_pat_ident(&mut self, binding: &'ast syn::PatIdent) {
+                self.0.insert(binding.ident.unraw().to_string(), None);
+                visit::visit_pat_ident(self, binding);
+            }
+        }
+        Bindings(&mut self.bindings).visit_pat(pattern);
+    }
     fn owner(&mut self, name: &str, span: Span) -> String {
         let mut parts = vec![self.krate.clone()];
         parts.extend(self.modules.clone());
@@ -2094,6 +2315,7 @@ impl Scanner<'_> {
             AliasCollector {
                 aliases: &mut self.census.aliases,
                 projections: &mut self.census.projections,
+                inherent_methods: &mut self.census.inherent_methods,
                 prefix,
             }
             .visit_file(&syntax);
@@ -2150,16 +2372,16 @@ impl Scanner<'_> {
                 {
                     self.task_call(&method_name);
                 }
-                let description = index >= 2
-                    && matches!(&tokens[index - 2], TokenTree::Ident(i) if i.unraw() == "description");
-                if matches!(
-                    self.census.vocabulary.get(&method_name),
-                    Some(AuthorityOperation::K1 | AuthorityOperation::DescriptionIo)
-                ) || (description
-                    && self.census.vocabulary.get(&method_name)
-                        == Some(&AuthorityOperation::DescriptionGuard))
-                {
-                    self.call(&method_name, method.span());
+                match self.census.vocabulary.get(&method_name) {
+                    Some(AuthorityOperation::K1) => self.call(&method_name, method.span()),
+                    Some(
+                        AuthorityOperation::DescriptionIo
+                        | AuthorityOperation::DescriptionGuard
+                        | AuthorityOperation::FileLifecycle,
+                    ) => {
+                        self.census.unknown_apis.push(format!("{}:{}: unresolved authority receiver in opaque macro for {method_name}", self.file, method.span().start().line));
+                    }
+                    _ => {}
                 }
             }
             index += 1;
@@ -2271,6 +2493,13 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
             self.test_span(item.span());
             return;
         }
+        let previous_generics = std::mem::replace(
+            &mut self.generic_types,
+            item.generics
+                .type_params()
+                .map(|parameter| parameter.ident.unraw().to_string())
+                .collect(),
+        );
         let previous_type = self.implementation_type.replace((*item.self_ty).clone());
         let name = implementation_name(item);
         let previous = self.implementation.replace(name.clone());
@@ -2281,6 +2510,7 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         visit::visit_item_impl(self, item);
         self.implementation = previous;
         self.implementation_type = previous_type;
+        self.generic_types = previous_generics;
         self.current_owner = previous_owner;
     }
     fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
@@ -2307,7 +2537,9 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         }
         let owner = self.owner(&item.sig.ident.unraw().to_string(), item.span());
         let previous = self.current_owner.replace(owner);
+        let bindings = self.parameter_bindings(&item.sig);
         visit::visit_trait_item_fn(self, item);
+        self.bindings = bindings;
         self.current_owner = previous;
     }
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
@@ -2323,7 +2555,9 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         }
         let owner = self.owner(&item.sig.ident.unraw().to_string(), item.span());
         let previous = self.current_owner.replace(owner);
+        let bindings = self.parameter_bindings(&item.sig);
         visit::visit_item_fn(self, item);
+        self.bindings = bindings;
         self.current_owner = previous;
     }
     fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
@@ -2373,7 +2607,9 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
             }
         }
         let previous = self.current_owner.replace(owner);
+        let bindings = self.parameter_bindings(&item.sig);
         visit::visit_impl_item_fn(self, item);
+        self.bindings = bindings;
         self.current_owner = previous;
     }
     fn visit_item_foreign_mod(&mut self, item: &'ast syn::ItemForeignMod) {
@@ -2438,10 +2674,7 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
     }
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         if let Some(input) = super::authority_macro::parse(&mac.path, mac.tokens.clone()) {
-            let previous = self.audited_input;
-            self.audited_input = true;
             input.visit(self);
-            self.audited_input = previous;
         } else {
             self.macro_tokens(mac.tokens.clone());
         }
@@ -2464,26 +2697,101 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         }
         visit::visit_expr_call(self, call);
     }
+    fn visit_block(&mut self, block: &'ast syn::Block) {
+        let previous = self.bindings.clone();
+        visit::visit_block(self, block);
+        self.bindings = previous;
+    }
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        visit::visit_local(self, local);
+        if let syn::Pat::Ident(binding) = &local.pat {
+            let authority = local
+                .init
+                .as_ref()
+                .and_then(|init| self.description_receiver(&init.expr));
+            self.bindings
+                .insert(binding.ident.unraw().to_string(), authority);
+        } else {
+            self.shadow_pattern(&local.pat);
+        }
+    }
+    fn visit_expr_closure(&mut self, expression: &'ast syn::ExprClosure) {
+        let previous = self.bindings.clone();
+        for input in &expression.inputs {
+            self.shadow_pattern(input);
+        }
+        visit::visit_expr_closure(self, expression);
+        self.bindings = previous;
+    }
+    fn visit_expr_for_loop(&mut self, expression: &'ast syn::ExprForLoop) {
+        let previous = self.bindings.clone();
+        self.shadow_pattern(&expression.pat);
+        visit::visit_expr_for_loop(self, expression);
+        self.bindings = previous;
+    }
+    fn visit_expr_match(&mut self, expression: &'ast syn::ExprMatch) {
+        self.visit_expr(&expression.expr);
+        for arm in &expression.arms {
+            let previous = self.bindings.clone();
+            self.shadow_pattern(&arm.pat);
+            visit::visit_arm(self, arm);
+            self.bindings = previous;
+        }
+    }
+    fn visit_expr_if(&mut self, expression: &'ast syn::ExprIf) {
+        let previous = self.bindings.clone();
+        visit::visit_expr_if(self, expression);
+        self.bindings = previous;
+    }
+    fn visit_expr_while(&mut self, expression: &'ast syn::ExprWhile) {
+        let previous = self.bindings.clone();
+        visit::visit_expr_while(self, expression);
+        self.bindings = previous;
+    }
+    fn visit_expr_let(&mut self, expression: &'ast syn::ExprLet) {
+        self.visit_expr(&expression.expr);
+        self.shadow_pattern(&expression.pat);
+    }
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         let method = call.method.unraw().to_string();
         self.task_call(&method);
-        let description = match call.receiver.as_ref() {
-            syn::Expr::Field(field) => semantic_tokens(&field.member) == "description",
-            // Audited inputs used to be token-scanned: a local description
-            // receiver is an authority guard just like a description field.
-            syn::Expr::Path(path) if self.audited_input => path.path.is_ident("description"),
-            _ => false,
-        };
-        if self.census.vocabulary.get(&method) == Some(&AuthorityOperation::K1)
-            || (self.audited_input
-                && self.census.vocabulary.get(&method) == Some(&AuthorityOperation::DescriptionIo))
-            || (description
-                && matches!(
-                    self.census.vocabulary.get(&method),
-                    Some(AuthorityOperation::DescriptionIo | AuthorityOperation::DescriptionGuard)
-                ))
-        {
+        let kind = self.census.vocabulary.get(&method).copied();
+        if kind == Some(AuthorityOperation::K1) {
             self.call(&method, call.method.span());
+        } else if matches!(
+            kind,
+            Some(AuthorityOperation::DescriptionIo | AuthorityOperation::DescriptionGuard)
+        ) && call.args.is_empty()
+        {
+            match self.description_receiver(&call.receiver) {
+                Some(authority) if authority.description => self.call(&method, call.method.span()),
+                Some(authority) if authority.inherent_methods.contains(&method) => {}
+                _ => self.census.unknown_apis.push(format!(
+                    "{}:{}: unresolved authority receiver for {method}",
+                    self.file,
+                    call.method.span().start().line
+                )),
+            }
+        } else if kind == Some(AuthorityOperation::FileLifecycle) {
+            // Lifecycle receiver calls require an explicit FileTable/Kernel
+            // receiver. Other concrete receivers are not this authority.
+            match self.description_receiver(&call.receiver) {
+                Some(authority)
+                    if if method == "copy_file_table_for_host_fork" {
+                        authority.kernel
+                    } else {
+                        authority.file_table
+                    } =>
+                {
+                    self.call(&method, call.method.span())
+                }
+                Some(authority) if authority.inherent_methods.contains(&method) => {}
+                _ => self.census.unknown_apis.push(format!(
+                    "{}:{}: unresolved authority receiver for {method}",
+                    self.file,
+                    call.method.span().start().line
+                )),
+            }
         }
         visit::visit_expr_method_call(self, call);
     }
@@ -2504,17 +2812,36 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
             self.call("OpenDescriptionRef", path.span());
         } else if let Some(segment) = path.path.segments.last() {
             let operation = segment.ident.unraw().to_string();
-            if matches!(
-                self.census.vocabulary.get(&operation),
-                Some(AuthorityOperation::K1 | AuthorityOperation::DescriptionIo)
-            ) || (self.census.vocabulary.get(&operation)
-                == Some(&AuthorityOperation::DescriptionGuard)
-                && path
-                    .path
-                    .segments
-                    .iter()
-                    .any(|part| part.ident.unraw() == "FileDescription"))
-            {
+            let kind = self.census.vocabulary.get(&operation).copied();
+            let names: &[&str] = match kind {
+                Some(AuthorityOperation::FileLifecycle)
+                    if operation == "copy_file_table_for_host_fork" =>
+                {
+                    &["Kernel"]
+                }
+                Some(AuthorityOperation::FileLifecycle) => &["FileTable"],
+                Some(AuthorityOperation::DescriptionIo | AuthorityOperation::DescriptionGuard) => {
+                    &["FileDescription", "OpenDescriptionRef"]
+                }
+                _ => &[],
+            };
+            let mut receiver_path = path.path.clone();
+            receiver_path.segments.pop();
+            receiver_path.segments.pop_punct();
+            let protected_receiver = !receiver_path.segments.is_empty()
+                && authority_type(
+                    &syn::Type::Path(syn::TypePath {
+                        qself: path.qself.clone(),
+                        path: receiver_path,
+                    }),
+                    &self.census.aliases,
+                    &self.census.projections,
+                    &self.scope(),
+                    &mut Vec::new(),
+                    names,
+                    false,
+                );
+            if kind == Some(AuthorityOperation::K1) || (!names.is_empty() && protected_receiver) {
                 self.call(&operation, path.span());
             }
         }

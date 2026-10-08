@@ -827,7 +827,7 @@ mod overlay_dispatch_tests {
 
             let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
             {
-                let open = epoll_open.description.inspect().expect("open description");
+                let open = crate::kernel::FileDescription::inspect(&epoll_open.description).expect("open description");
                 let OpenDescription::Epoll { kqueue, .. } = &*open else {
                     panic!("epfd should be an epoll description");
                 };
@@ -1832,7 +1832,7 @@ mod overlay_dispatch_tests {
         // dispatch, so no consumption re-arm reaches the epoll interest.
         {
             let open = h.dispatcher.open_file(reader).expect("pipe reader");
-            let description = open.description.inspect().expect("reader description");
+            let description = crate::kernel::FileDescription::inspect(&open.description).expect("reader description");
             let OpenDescription::PipeReader { pipe, .. } = &*description else {
                 panic!("pipe2 read end must be a shared pipe reader");
             };
@@ -1955,9 +1955,7 @@ mod overlay_dispatch_tests {
             .epoll_rearm_after_io(&read_request, &read_outcome);
         {
             let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
-            let open = epoll_open
-                .description
-                .inspect()
+            let open = crate::kernel::FileDescription::inspect(&epoll_open.description)
                 .expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &*open else {
                 panic!("epfd should be an epoll description");
@@ -2473,9 +2471,7 @@ mod overlay_dispatch_tests {
         };
         let listener_latch = |h: &Harness| {
             let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
-            let open = epoll_open
-                .description
-                .inspect()
+            let open = crate::kernel::FileDescription::inspect(&epoll_open.description)
                 .expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &*open else {
                 panic!("epfd should be an epoll description");
@@ -2591,7 +2587,7 @@ mod overlay_dispatch_tests {
     }
 
     fn set_epoll_latch(epoll: &OpenFile, target: i32, ready: u32, read_avail: u64) {
-        let mut open = epoll.description.write_for_io().unwrap();
+        let mut open = crate::kernel::FileDescription::write_for_io(&epoll.description).unwrap();
         let OpenDescription::Epoll { interest, .. } = &mut *open else {
             panic!("epoll")
         };
@@ -2605,7 +2601,7 @@ mod overlay_dispatch_tests {
     }
 
     fn staged_slot_state(epoll: &OpenFile, target: i32) -> (u32, u64, bool, u64, u32, u64) {
-        let open = epoll.description.inspect().unwrap();
+        let open = crate::kernel::FileDescription::inspect(&epoll.description).unwrap();
         let OpenDescription::Epoll { interest, .. } = &*open else {
             panic!("epoll")
         };
@@ -2910,9 +2906,7 @@ mod overlay_dispatch_tests {
 
         let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
         {
-            let mut open = epoll_open
-                .description
-                .write_for_io()
+            let mut open = crate::kernel::FileDescription::write_for_io(&epoll_open.description)
                 .expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &mut *open else {
                 panic!("epfd should be an epoll description");
@@ -2927,9 +2921,7 @@ mod overlay_dispatch_tests {
         h.dispatcher
             .epoll_rearm_after_io(&write_request, &DispatchOutcome::Returned { value: 1 });
         {
-            let open = epoll_open
-                .description
-                .inspect()
+            let open = crate::kernel::FileDescription::inspect(&epoll_open.description)
                 .expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &*open else {
                 panic!("epfd should be an epoll description");
@@ -2946,9 +2938,7 @@ mod overlay_dispatch_tests {
             },
         );
         {
-            let open = epoll_open
-                .description
-                .inspect()
+            let open = crate::kernel::FileDescription::inspect(&epoll_open.description)
                 .expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &*open else {
                 panic!("epfd should be an epoll description");
@@ -3014,9 +3004,7 @@ mod overlay_dispatch_tests {
         assert_eq!(returned(h.call(57, [closing_dup as u64, 0, 0, 0, 0, 0])), 0);
         {
             let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
-            let open = epoll_open
-                .description
-                .inspect()
+            let open = crate::kernel::FileDescription::inspect(&epoll_open.description)
                 .expect("epoll open description");
             let OpenDescription::Epoll { interest, .. } = &*open else {
                 panic!("epfd should be an epoll description");
@@ -3036,7 +3024,7 @@ mod overlay_dispatch_tests {
 
         let delivered_guest_fd = {
             let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
-            let open = epoll_open.description.inspect().expect("open description");
+            let open = crate::kernel::FileDescription::inspect(&epoll_open.description).expect("open description");
             let OpenDescription::Epoll { kqueue, .. } = &*open else {
                 panic!("epfd should be an epoll description");
             };
@@ -3060,9 +3048,7 @@ mod overlay_dispatch_tests {
         );
         assert_eq!(returned(h.call(57, [survivor as u64, 0, 0, 0, 0, 0])), 0);
         let epoll_open = h.dispatcher.open_file(epfd as i32).expect("epoll fd");
-        let open = epoll_open
-            .description
-            .inspect()
+        let open = crate::kernel::FileDescription::inspect(&epoll_open.description)
             .expect("epoll open description");
         let OpenDescription::Epoll { interest, .. } = &*open else {
             panic!("epfd should be an epoll description");

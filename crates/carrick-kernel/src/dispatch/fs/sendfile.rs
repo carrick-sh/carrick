@@ -129,8 +129,7 @@ impl<'a> FsView<'a> {
     fn is_proc_executable_fd(&self, fd: i32) -> bool {
         self.open_file(fd)
             .and_then(|file| {
-                file.description
-                    .inspect()
+                crate::kernel::FileDescription::inspect(&file.description)
                     .map(|open| matches!(&*open, OpenDescription::ProcExecutable { .. }))
             })
             .unwrap_or(false)
@@ -138,7 +137,7 @@ impl<'a> FsView<'a> {
 
     fn host_fd_dev_ino(&self, fd: i32) -> Option<(i64, u64)> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read_for_io()?;
+        let open = crate::kernel::FileDescription::read_for_io(&open_file.description)?;
         if let OpenDescription::ProcExecutable { executable, .. } = &*open {
             return executable
                 .source()
@@ -162,7 +161,7 @@ impl<'a> FsView<'a> {
     #[cfg(target_os = "macos")]
     fn host_file_copy_info(&self, fd: i32) -> Option<HostFileCopyInfo> {
         let open_file = self.open_file(fd)?;
-        let open = open_file.description.read_for_io()?;
+        let open = crate::kernel::FileDescription::read_for_io(&open_file.description)?;
         let OpenDescription::HostFile {
             host_fd, writable, ..
         } = &*open
@@ -202,7 +201,7 @@ impl<'a> FsView<'a> {
         let Some(in_file) = self.open_file(in_fd) else {
             return Ok(Err(LINUX_EBADF));
         };
-        let Some(open) = in_file.description.read_for_io() else {
+        let Some(open) = crate::kernel::FileDescription::read_for_io(&in_file.description) else {
             return Ok(Err(LINUX_EINVAL));
         };
         match &*open {
@@ -254,7 +253,7 @@ impl<'a> FsView<'a> {
         let Some(in_file) = self.open_file(in_fd) else {
             return Err(LINUX_EBADF);
         };
-        let Some(open) = in_file.description.read_for_io() else {
+        let Some(open) = crate::kernel::FileDescription::read_for_io(&in_file.description) else {
             return Err(LINUX_EINVAL);
         };
         // HostFile / File: pread/read the requested window. Cap the buffer:
@@ -504,7 +503,7 @@ impl<'a> FsView<'a> {
             }
             if offset_address == 0 {
                 if let Some(open_file) = this.open_file(in_fd.0)
-                    && let Some(mut open) = open_file.description.write_for_io()
+                    && let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description)
                 {
                     match &mut *open {
                         OpenDescription::File {
@@ -626,7 +625,7 @@ impl<'a> FsView<'a> {
             } else {
                 let out_off = read_u64(memory, off_out_addr)?;
                 let host_fd = match this.open_file(out_fd.0).as_ref() {
-                    Some(of) => match of.description.read_for_io().as_deref() {
+                    Some(of) => match crate::kernel::FileDescription::read_for_io(&of.description).as_deref() {
                         Some(OpenDescription::HostFile {
                             host_fd,
                             writable: true,
@@ -666,7 +665,7 @@ impl<'a> FsView<'a> {
             let new_in = in_offset.saturating_add(written);
             if off_in_addr == 0 {
                 if let Some(of) = this.open_file(in_fd.0).as_ref()
-                    && let Some(mut open) = of.description.write_for_io()
+                    && let Some(mut open) = crate::kernel::FileDescription::write_for_io(&of.description)
                 {
                     match &mut *open {
                         OpenDescription::File { offset, .. }
