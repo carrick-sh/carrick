@@ -324,7 +324,6 @@ pub enum GuestProcessInvariant {
     ExitCustodyLost(TaskKey),
     ExitPublicationLost(TaskKey),
     ExitReleaseLost(TaskKey),
-    AbandonedExit(TaskKey),
 }
 pub trait GuestProcessFailure: RegistryFailure {
     fn fail_process(invariant: GuestProcessInvariant) -> !;
@@ -689,28 +688,75 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure> D
 impl<'a, C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
     GuestReservedExit<'a, C, U, N, F>
 {
-    /// Shared begin validates exact members and reservations before marking the
-    /// task exiting. Every following graph operation uses the retained guard.
+    /// Validate and retain exact member effects without publishing exit. The
+    /// retained reservation rolls back on early return until publish commits.
     pub fn begin(
-        mut self,
+        self,
         status: LinuxWaitStatus,
     ) -> Result<GuestPendingExit<'a, C, U, N, F>, GuestProcessError<N::Error>> {
         let registry = self
             .registry
-            .as_deref_mut()
+            .as_deref()
             .unwrap_or_else(|| F::fail_process(GuestProcessInvariant::ExitCustodyLost(self.task)));
         let topology = self
             .topology
-            .as_mut()
+            .as_ref()
             .unwrap_or_else(|| F::fail_process(GuestProcessInvariant::ExitCustodyLost(self.task)));
         let permit = self
             .permit
             .as_ref()
             .unwrap_or_else(|| F::fail_process(GuestProcessInvariant::ExitCustodyLost(self.task)));
+        let effects = registry
+            .prepare_exit_effects(self.task, topology, permit)
+            .map_err(GuestProcessError::Exit)?;
+        Ok(GuestPendingExit {
+            reserved: self,
+            status,
+            effects,
+        })
+    }
+}
+
+/// Exact uncommitted exit custody. Dropping this value releases its owned
+/// reservation; task state, child topology and numeric claims remain live.
+#[must_use = "publish the prepared exit or drop it to roll back admission"]
+pub struct GuestPendingExit<
+    'a,
+    C: Copy + Ord,
+    U: Clone,
+    N: NativeProcessCustody,
+    F: GuestProcessFailure,
+> {
+    reserved: GuestReservedExit<'a, C, U, N, F>,
+    status: LinuxWaitStatus,
+    effects: PendingExitEffects<N::Member, N::Resources, N::Transaction>,
+}
+impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
+    GuestPendingExit<'_, C, U, N, F>
+{
+    /// All fallible admission happens before publishing task state or topology.
+    /// Resources can leave this custody only after successful publication.
+    pub fn publish(mut self) -> Result<GuestPublishedExit<C, U, N>, GuestProcessError<N::Error>> {
+        let task = self.reserved.task;
+        let registry = self
+            .reserved
+            .registry
+            .as_deref_mut()
+            .unwrap_or_else(|| F::fail_process(GuestProcessInvariant::ExitCustodyLost(task)));
+        let topology = self
+            .reserved
+            .topology
+            .as_mut()
+            .unwrap_or_else(|| F::fail_process(GuestProcessInvariant::ExitCustodyLost(task)));
+        let permit = self
+            .reserved
+            .permit
+            .as_ref()
+            .unwrap_or_else(|| F::fail_process(GuestProcessInvariant::ExitCustodyLost(task)));
         let record = registry
             .tasks
-            .get(&self.task.id)
-            .ok_or(GuestProcessError::Unknown(self.task.id))?;
+            .get(&task.id)
+            .ok_or(GuestProcessError::Unknown(task.id))?;
         let identity = record.wait_identity();
         let observation = Zombie {
             key: record.metadata.key,
@@ -721,7 +767,7 @@ impl<'a, C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailur
             session: record.metadata.identity.session,
             namespace_process_group: record.metadata.namespace_process_group,
             namespace_session: record.metadata.namespace_session,
-            status,
+            status: self.status,
             ruid: record.metadata.ruid.clone(),
             euid: record.metadata.euid.clone(),
             rusage: record.native.own_rusage(),
@@ -729,16 +775,17 @@ impl<'a, C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailur
             exit_signal: record.metadata.exit_signal,
             diagnostic_name: record.metadata.diagnostic_name.clone(),
         };
-        let effects = registry
-            .begin_exit_effects(self.task, topology, permit)
+        registry
+            .begin_prepared_exit_effects(task, topology, permit, &self.effects)
             .map_err(GuestProcessError::Exit)?;
+        let adopter = topology.adopter();
         let record = registry
             .tasks
-            .remove(&self.task.id)
-            .unwrap_or_else(|| F::fail_process(GuestProcessInvariant::ExitCustodyLost(self.task)));
+            .remove(&task.id)
+            .unwrap_or_else(|| F::fail_process(GuestProcessInvariant::ExitCustodyLost(task)));
         registry.publish_exit_topology(topology);
         registry.retiring_tasks.insert(
-            self.task.id,
+            task.id,
             GuestRetiring {
                 identity,
                 context: record.context,
@@ -749,112 +796,40 @@ impl<'a, C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailur
             receipt: observation,
             claim: record.claim,
         };
-        // Taking every component disarms the not-begun reservation rollback.
-        let registry = self
-            .registry
-            .take()
-            .unwrap_or_else(|| F::fail_process(GuestProcessInvariant::ExitCustodyLost(self.task)));
-        let topology = self
-            .topology
-            .take()
-            .unwrap_or_else(|| F::fail_process(GuestProcessInvariant::ExitCustodyLost(self.task)));
-        let permit = self
-            .permit
-            .take()
-            .unwrap_or_else(|| F::fail_process(GuestProcessInvariant::ExitCustodyLost(self.task)));
-        Ok(GuestPendingExit {
-            registry: Some(registry),
-            task: self.task,
-            topology: Some(topology),
-            permit: Some(permit),
-            receipt: Some(receipt),
-            effects: Some(effects),
+        let identity = (receipt.receipt.process_group, receipt.receipt.session);
+        let publication = registry
+            .publish_exit_receipt(task, topology, receipt, identity.0, identity.1)
+            .unwrap_or_else(|_| F::fail_process(GuestProcessInvariant::ExitPublicationLost(task)));
+        let released = registry
+            .release_task_set(permit)
+            .unwrap_or_else(|_| F::fail_process(GuestProcessInvariant::ExitReleaseLost(task)));
+        let resources = self.effects.take_resources();
+        let effects = self
+            .effects
+            .after_release(released)
+            .unwrap_or_else(|_| F::fail_process(GuestProcessInvariant::ExitReleaseLost(task)));
+        self.reserved.registry = None;
+        Ok(GuestPublishedExit {
+            retiring: publication.retiring,
+            autoreaped_receipt: publication.autoreaped_receipt,
+            effects,
+            resources,
+            adopter,
         })
     }
 }
 
-/// Irreversible exit custody keeps the original topology, exact reservation,
-/// numeric claim and effects together; callers cannot cross-feed a new plan.
-/// Abandonment fails closed, rather than release a claim or leave a retiring row.
-#[must_use = "publish and release irreversible exit custody before native transfer"]
-pub struct GuestPendingExit<
-    'a,
-    C: Copy + Ord,
-    U: Clone,
-    N: NativeProcessCustody,
-    F: GuestProcessFailure,
-> {
-    registry: Option<&'a mut GuestRegistry<C, U, N, F>>,
-    task: TaskKey,
-    topology: Option<PreparedExitTopology<N::Credit>>,
-    permit: Option<ReservedTaskSet<N::Transaction>>,
-    receipt: Option<GuestZombie<C, U, N::Claim>>,
-    effects: Option<PendingExitEffects<N::Member, N::Resources, N::Transaction>>,
-}
-impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure> Drop
-    for GuestPendingExit<'_, C, U, N, F>
-{
-    fn drop(&mut self) {
-        if self.registry.is_some() {
-            F::fail_process(GuestProcessInvariant::AbandonedExit(self.task));
-        }
-    }
-}
-impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
-    GuestPendingExit<'_, C, U, N, F>
-{
-    pub fn take_resources(&mut self) -> Option<N::Resources> {
-        self.effects
-            .as_mut()
-            .and_then(PendingExitEffects::take_resources)
-    }
-    /// Terminal receipt and exact release are shared decisions. Native member
-    /// cancellation is returned as ReadyExitEffects and runs outside the guard.
-    pub fn publish(mut self) -> GuestPublishedExit<C, U, N> {
-        let registry = self
-            .registry
-            .as_deref_mut()
-            .unwrap_or_else(|| F::fail_process(GuestProcessInvariant::ExitCustodyLost(self.task)));
-        let topology = self
-            .topology
-            .as_ref()
-            .unwrap_or_else(|| F::fail_process(GuestProcessInvariant::ExitCustodyLost(self.task)));
-        let permit = self
-            .permit
-            .as_ref()
-            .unwrap_or_else(|| F::fail_process(GuestProcessInvariant::ExitCustodyLost(self.task)));
-        let receipt = self
-            .receipt
-            .take()
-            .unwrap_or_else(|| F::fail_process(GuestProcessInvariant::ExitCustodyLost(self.task)));
-        let identity = (receipt.receipt.process_group, receipt.receipt.session);
-        let publication = registry
-            .publish_exit_receipt(self.task, topology, receipt, identity.0, identity.1)
-            .unwrap_or_else(|_| {
-                F::fail_process(GuestProcessInvariant::ExitPublicationLost(self.task))
-            });
-        let released = registry
-            .release_task_set(permit)
-            .unwrap_or_else(|_| F::fail_process(GuestProcessInvariant::ExitReleaseLost(self.task)));
-        let effects = self
-            .effects
-            .take()
-            .unwrap_or_else(|| F::fail_process(GuestProcessInvariant::ExitCustodyLost(self.task)))
-            .after_release(released)
-            .unwrap_or_else(|_| F::fail_process(GuestProcessInvariant::ExitReleaseLost(self.task)));
-        // Successful receipt/release disarms irreversible-custody abandonment.
-        self.registry = None;
-        GuestPublishedExit {
-            retiring: publication.retiring,
-            autoreaped_receipt: publication.autoreaped_receipt,
-            effects,
-        }
-    }
-}
 pub struct GuestPublishedExit<C, U, N: NativeProcessCustody> {
     pub retiring: GuestRetiring<N>,
     pub autoreaped_receipt: Option<GuestZombie<C, U, N::Claim>>,
     pub effects: ReadyExitEffects<N::Member>,
+    pub adopter: Option<TaskKey>,
+    resources: Option<N::Resources>,
+}
+impl<C, U, N: NativeProcessCustody> GuestPublishedExit<C, U, N> {
+    pub fn take_resources(&mut self) -> Option<N::Resources> {
+        self.resources.take()
+    }
 }
 
 #[cfg(test)]
