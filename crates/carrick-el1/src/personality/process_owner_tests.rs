@@ -813,7 +813,11 @@ fn copied_wait_status_must_not_reap_a_newly_ready_other_child() {
     let observed_key = observed.zombie().key;
     let copied = observed.copy_with(|_| Ok::<_, ()>(())).unwrap();
     let _ = exit(&mut owner, first, None);
-    let consumed = copied.consume(&mut owner).unwrap();
+    let super::super::native_process_entry::CopiedWaitOutcome::Consumed(consumed) =
+        copied.consume(&mut owner).unwrap()
+    else {
+        panic!("authorized reap")
+    };
     let WaitSelection::Exited(consumed) = consumed.selection else {
         panic!("zombie")
     };
@@ -824,6 +828,80 @@ fn copied_wait_status_must_not_reap_a_newly_ready_other_child() {
             .unwrap(),
         WaitSelection::Exited(_)
     ));
+}
+
+#[test]
+fn competing_reap_keeps_original_any_and_group_query() {
+    use super::super::native_process_entry::{CopiedWaitOutcome, WaitWork, scan_wait};
+    for target in [
+        WaitTarget::Any,
+        WaitTarget::ProcessGroup(TaskIdentity::led_by(key(1, 1).id).process_group),
+    ] {
+        for replacement_ready in [false, true] {
+            let mut owner = owner();
+            let parent = key(1, 1);
+            let selected = key(2, 2);
+            let remaining = key(3, 3);
+            let releases = Rc::new(Cell::new(0));
+            birth(&mut owner, parent, selected, Rc::new(Cell::new(0)));
+            birth(&mut owner, parent, remaining, releases.clone());
+            let _ = exit(&mut owner, selected, None);
+            let WaitWork::Status(observed) = scan_wait(&owner, parent, query(target)).unwrap()
+            else {
+                panic!("zombie")
+            };
+            let copied = observed
+                .copy_with(|zombie| {
+                    assert_eq!(zombie.key, selected);
+                    Ok::<_, ()>(())
+                })
+                .unwrap();
+            drop(
+                owner
+                    .consume_wait(parent, query(WaitTarget::Exact(selected)))
+                    .unwrap(),
+            );
+            if replacement_ready {
+                let _ = exit(&mut owner, remaining, None);
+            }
+            let CopiedWaitOutcome::Rescan(selection) = copied.consume(&mut owner).unwrap() else {
+                panic!("original query must be rescanned")
+            };
+            if replacement_ready {
+                let WaitWork::Status(replacement) = selection else {
+                    panic!("fresh status copy required")
+                };
+                assert_eq!(replacement.zombie().key, remaining);
+                assert_eq!(releases.get(), 0);
+                assert!(matches!(
+                    owner
+                        .scan_wait(parent, query(WaitTarget::Exact(remaining)))
+                        .unwrap(),
+                    WaitSelection::Exited(_)
+                ));
+                let copied = replacement
+                    .copy_with(|zombie| {
+                        assert_eq!(zombie.key, remaining);
+                        Ok::<_, ()>(())
+                    })
+                    .unwrap();
+                let CopiedWaitOutcome::Consumed(consumed) = copied.consume(&mut owner).unwrap()
+                else {
+                    panic!("fresh authorization")
+                };
+                assert!(
+                    matches!(consumed.selection, WaitSelection::Exited(ref zombie) if zombie.key == remaining)
+                );
+                drop(consumed);
+                assert_eq!(releases.get(), 1);
+            } else {
+                assert!(matches!(
+                    selection,
+                    WaitWork::Other(WaitSelection::StillRunning(_))
+                ));
+            }
+        }
+    }
 }
 
 #[test]
@@ -1086,7 +1164,11 @@ fn entry_adapter_uses_retained_primitive_custody_through_fork_exit_wait() {
             Ok::<_, ()>(())
         })
         .unwrap();
-    let consumed = copied.consume(&mut owner).unwrap();
+    let super::super::native_process_entry::CopiedWaitOutcome::Consumed(consumed) =
+        copied.consume(&mut owner).unwrap()
+    else {
+        panic!("authorized reap")
+    };
     assert_eq!(releases.get(), 0);
     drop(consumed);
     assert_eq!(releases.get(), 1);
