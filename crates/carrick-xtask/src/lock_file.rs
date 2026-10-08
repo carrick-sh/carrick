@@ -4,7 +4,13 @@ use std::ops::{Deref, DerefMut};
 
 pub(crate) struct OwnedFileLock {
     file: File,
-    owner: u32,
+    release: ReleaseAuthority,
+}
+
+enum ReleaseAuthority {
+    AcquiringProcess(u32),
+    #[cfg(target_os = "macos")]
+    LastCustodian,
 }
 
 impl OwnedFileLock {
@@ -12,8 +18,15 @@ impl OwnedFileLock {
     pub(crate) fn from_locked(file: File) -> Self {
         Self {
             file,
-            owner: std::process::id(),
+            release: ReleaseAuthority::AcquiringProcess(std::process::id()),
         }
+    }
+}
+
+impl OwnedFileLock {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn retain_until_last_close(&mut self) {
+        self.release = ReleaseAuthority::LastCustodian;
     }
 }
 
@@ -35,7 +48,8 @@ impl Drop for OwnedFileLock {
         // close alone leaves flock held by an unrelated pre-exec fork's copy.
         // Only the acquiring process may unlock the shared description: a
         // fork child dropping its inherited guard must not revoke the parent.
-        if std::process::id() == self.owner {
+        if matches!(self.release, ReleaseAuthority::AcquiringProcess(owner) if std::process::id() == owner)
+        {
             let _ = self.file.unlock();
         }
     }

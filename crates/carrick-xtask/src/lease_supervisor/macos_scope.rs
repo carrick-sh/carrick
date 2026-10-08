@@ -4,7 +4,7 @@
 //! Process start time is rechecked before signaling. The final proc_pidinfo to
 //! kill window remains: Darwin's PID-only kill is not an atomic incarnation API.
 
-use super::ProcessIncarnation;
+use super::{CleanupDeadline, ProcessIncarnation};
 use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -35,11 +35,17 @@ struct PipeFdInfo {
     pipe: PipeInfo,
 }
 
-fn pipe_info(pid: libc::pid_t, fd: libc::c_int) -> io::Result<PipeFdInfo> {
+fn pipe_info(
+    pid: libc::pid_t,
+    fd: libc::c_int,
+    deadline: &CleanupDeadline,
+) -> io::Result<PipeFdInfo> {
     let mut info = std::mem::MaybeUninit::<PipeFdInfo>::zeroed();
     let size = size_of::<PipeFdInfo>() as libc::c_int;
     // SAFETY: matching sys/proc_info.h pipe_fdinfo output, valid buffer size.
-    let got = unsafe { libc::proc_pidfdinfo(pid, fd, 6, info.as_mut_ptr().cast(), size) };
+    let got = native_observation(deadline, || unsafe {
+        libc::proc_pidfdinfo(pid, fd, 6, info.as_mut_ptr().cast(), size)
+    });
     if got != size {
         return Err(io::Error::last_os_error());
     }
@@ -51,17 +57,19 @@ pub(super) struct PipeWriter(u64);
 
 impl PipeWriter {
     pub(super) fn from_reader(fd: libc::c_int) -> io::Result<Self> {
+        let deadline = CleanupDeadline(std::time::Instant::now() + super::CLEANUP_LIMIT);
         Ok(Self(
-            pipe_info(std::process::id() as libc::pid_t, fd)?
+            pipe_info(std::process::id() as libc::pid_t, fd, &deadline)?
                 .pipe
                 .peer_handle,
         ))
     }
 
-    fn owns_writer(&self, pid: libc::pid_t) -> bool {
+    fn owns_writer(&self, pid: libc::pid_t, deadline: &CleanupDeadline) -> bool {
         // SAFETY: libproc size query with no output buffer.
-        let size =
-            unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+        let size = native_observation(deadline, || unsafe {
+            libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0)
+        });
         if size <= 0 {
             return false;
         }
@@ -79,7 +87,7 @@ impl PipeWriter {
                 Err(_) => return false,
             };
             // SAFETY: owned, correctly sized descriptor-info output storage.
-            let got = unsafe {
+            let got = native_observation(deadline, || unsafe {
                 libc::proc_pidinfo(
                     pid,
                     libc::PROC_PIDLISTFDS,
@@ -87,7 +95,7 @@ impl PipeWriter {
                     fds.as_mut_ptr().cast(),
                     bytes,
                 )
-            };
+            });
             if got <= 0 {
                 return false;
             }
@@ -99,7 +107,8 @@ impl PipeWriter {
                 .iter()
                 .any(|fd| {
                     fd.proc_fdtype == libc::PROX_FDTYPE_PIPE as u32
-                        && pipe_info(pid, fd.proc_fd).is_ok_and(|info| info.pipe.handle == self.0)
+                        && pipe_info(pid, fd.proc_fd, deadline)
+                            .is_ok_and(|info| info.pipe.handle == self.0)
                 });
         }
     }
@@ -113,22 +122,24 @@ impl PipeWriter {
         loop {
             deadline.remaining()?;
             let mut changed = false;
-            for pid in all_pids()? {
+            for pid in all_pids(deadline)? {
                 deadline.remaining()?;
-                if pid <= 0 || (unsafe { libc::getsid(pid) } != session && !self.owns_writer(pid)) {
+                if pid <= 0
+                    || (unsafe { libc::getsid(pid) } != session && !self.owns_writer(pid, deadline))
+                {
                     continue;
                 }
-                let Some(info) = process_info(pid)? else {
+                let Some(info) = process_info(pid, deadline)? else {
                     continue;
                 };
                 let identity = info.identity;
                 // SAFETY: native session query. Pipe identity covers setsid
                 // while at least one scope descriptor remains open.
                 if pid > 0
-                    && (unsafe { libc::getsid(pid) } == session || self.owns_writer(pid))
+                    && (unsafe { libc::getsid(pid) } == session || self.owns_writer(pid, deadline))
                     && let std::collections::btree_map::Entry::Vacant(entry) =
                         members.entry(identity)
-                    && let Some(process) = ProcessWatch::new(identity)?
+                    && let Some(process) = ProcessWatch::new(identity, deadline)?
                 {
                     entry.insert(process);
                     changed = true;
@@ -157,10 +168,11 @@ pub(super) struct ProcessWatch {
     identity: ProcessIncarnation,
     queue: Option<OwnedFd>,
     permission_reported: bool,
+    deadline: CleanupDeadline,
 }
 
 impl ProcessWatch {
-    fn new(identity: ProcessIncarnation) -> io::Result<Option<Self>> {
+    fn new(identity: ProcessIncarnation, deadline: &CleanupDeadline) -> io::Result<Option<Self>> {
         // SAFETY: uniquely owned kqueue; process exit events bind to the
         // registered process, rather than a later occupant of its numeric PID.
         let fd = unsafe { libc::kqueue() };
@@ -176,9 +188,9 @@ impl ProcessWatch {
         event.filter = libc::EVFILT_PROC;
         event.flags = libc::EV_ADD | libc::EV_ENABLE;
         event.fflags = libc::NOTE_EXIT;
-        let queue = if unsafe {
+        let queue = if native_observation(deadline, || unsafe {
             libc::kevent(fd, &event, 1, std::ptr::null_mut(), 0, std::ptr::null())
-        } < 0
+        }) < 0
         {
             let error = io::Error::last_os_error();
             if !matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::EPERM)) {
@@ -190,26 +202,31 @@ impl ProcessWatch {
         } else {
             Some(queue)
         };
-        if !identity.present(observe(identity.pid)?) {
+        if !identity.present(observe(identity.pid, deadline)?) {
             return Ok(None);
         }
         Ok(Some(Self {
             identity,
             queue,
             permission_reported: false,
+            deadline: *deadline,
         }))
     }
 
     fn cancel(&mut self) -> io::Result<()> {
-        let result = self.identity.signal(libc::SIGKILL, observe, |pid, signal| {
-            // SAFETY: incarnation checked immediately before this PID-only
-            // call. The documented final query-to-kill window remains.
-            if unsafe { libc::kill(pid, signal) } == 0 {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            }
-        });
+        let result = self.identity.signal(
+            libc::SIGKILL,
+            |pid| observe(pid, &self.deadline),
+            |pid, signal| {
+                // SAFETY: incarnation checked immediately before this PID-only
+                // call. The documented final query-to-kill window remains.
+                if unsafe { libc::kill(pid, signal) } == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            },
+        );
         match result {
             Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
                 if !self.permission_reported {
@@ -227,13 +244,14 @@ impl ProcessWatch {
     }
 
     fn exited(&self) -> io::Result<bool> {
+        let deadline = &self.deadline;
         if let Some(queue) = &self.queue {
             let mut event = unsafe { std::mem::zeroed::<libc::kevent>() };
             let timeout = libc::timespec {
                 tv_sec: 0,
                 tv_nsec: 0,
             };
-            let result = unsafe {
+            let result = native_observation(deadline, || unsafe {
                 libc::kevent(
                     queue.as_raw_fd(),
                     std::ptr::null(),
@@ -242,7 +260,7 @@ impl ProcessWatch {
                     1,
                     &timeout,
                 )
-            };
+            });
             if result < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -250,7 +268,7 @@ impl ProcessWatch {
                 return Ok(true);
             }
         }
-        let Some(info) = process_info(self.identity.pid)? else {
+        let Some(info) = process_info(self.identity.pid, deadline)? else {
             return Ok(true);
         };
         Ok(!self.identity.present(Some(info.identity)) || info.status == libc::SZOMB)
@@ -258,7 +276,9 @@ impl ProcessWatch {
 
     pub(super) fn reaped(&self) -> io::Result<bool> {
         // A replacement is never waited upon or signaled with kill(pid, 0).
-        Ok(!self.identity.present(observe(self.identity.pid)?))
+        Ok(!self
+            .identity
+            .present(observe(self.identity.pid, &self.deadline)?))
     }
 }
 
@@ -267,8 +287,8 @@ struct NativeProcessInfo {
     status: u32,
 }
 
-fn observe(pid: libc::pid_t) -> io::Result<Option<ProcessIncarnation>> {
-    Ok(process_info(pid)?.map(|info| info.identity))
+fn observe(pid: libc::pid_t, deadline: &CleanupDeadline) -> io::Result<Option<ProcessIncarnation>> {
+    Ok(process_info(pid, deadline)?.map(|info| info.identity))
 }
 
 // Native proc_info_private.h API layout (56 bytes), absent from libc. Unlike
@@ -299,12 +319,14 @@ struct ShortInfo {
 }
 const _: () = assert!(size_of::<ShortInfo>() == 64);
 
-fn unique_info(pid: libc::pid_t) -> io::Result<Option<UniqueInfo>> {
+fn unique_info(pid: libc::pid_t, deadline: &CleanupDeadline) -> io::Result<Option<UniqueInfo>> {
     let mut info = std::mem::MaybeUninit::<UniqueInfo>::zeroed();
     let size = size_of::<UniqueInfo>() as libc::c_int;
     // SAFETY: matching native PROC_PIDUNIQIDENTIFIERINFO (17) ABI output.
     // arg=1 includes zombies: exit alone must not certify completed reaping.
-    let got = unsafe { libc::proc_pidinfo(pid, 17, 1, info.as_mut_ptr().cast(), size) };
+    let got = native_observation(deadline, || unsafe {
+        libc::proc_pidinfo(pid, 17, 1, info.as_mut_ptr().cast(), size)
+    });
     if got == size {
         return Ok(Some(unsafe { info.assume_init() }));
     }
@@ -315,17 +337,20 @@ fn unique_info(pid: libc::pid_t) -> io::Result<Option<UniqueInfo>> {
     Err(error)
 }
 
-fn process_info(pid: libc::pid_t) -> io::Result<Option<NativeProcessInfo>> {
+fn process_info(
+    pid: libc::pid_t,
+    deadline: &CleanupDeadline,
+) -> io::Result<Option<NativeProcessInfo>> {
     if pid <= 0 {
         return Ok(None);
     }
-    let Some(unique) = unique_info(pid)? else {
+    let Some(unique) = unique_info(pid, deadline)? else {
         return Ok(None);
     };
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
     // SAFETY: correctly sized native process-info output.
-    let got = unsafe {
+    let got = native_observation(deadline, || unsafe {
         libc::proc_pidinfo(
             pid,
             libc::PROC_PIDTBSDINFO,
@@ -333,7 +358,7 @@ fn process_info(pid: libc::pid_t) -> io::Result<Option<NativeProcessInfo>> {
             info.as_mut_ptr().cast(),
             size,
         )
-    };
+    });
     let (start, status) = if got == size {
         // SAFETY: full matching native output initialized by libproc.
         let info = unsafe { info.assume_init() };
@@ -352,7 +377,7 @@ fn process_info(pid: libc::pid_t) -> io::Result<Option<NativeProcessInfo>> {
         let mut info = std::mem::MaybeUninit::<ShortInfo>::zeroed();
         let size = size_of::<ShortInfo>() as libc::c_int;
         // SAFETY: UID-independent native status query for privileged helpers.
-        let got = unsafe {
+        let got = native_observation(deadline, || unsafe {
             libc::proc_pidinfo(
                 pid,
                 13, // PROC_PIDT_SHORTBSDINFO
@@ -360,7 +385,7 @@ fn process_info(pid: libc::pid_t) -> io::Result<Option<NativeProcessInfo>> {
                 info.as_mut_ptr().cast(),
                 size,
             )
-        };
+        });
         if got != size {
             let error = io::Error::last_os_error();
             if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) {
@@ -371,7 +396,7 @@ fn process_info(pid: libc::pid_t) -> io::Result<Option<NativeProcessInfo>> {
         (None, unsafe { info.assume_init() }.status)
     };
     // Metadata must belong to the same kernel incarnation across the queries.
-    if unique_info(pid)?.is_none_or(|current| current.unique_id != unique.unique_id) {
+    if unique_info(pid, deadline)?.is_none_or(|current| current.unique_id != unique.unique_id) {
         return Ok(None);
     }
     Ok(Some(NativeProcessInfo {
@@ -384,9 +409,11 @@ fn process_info(pid: libc::pid_t) -> io::Result<Option<NativeProcessInfo>> {
     }))
 }
 
-fn all_pids() -> io::Result<Vec<libc::pid_t>> {
+fn all_pids(deadline: &CleanupDeadline) -> io::Result<Vec<libc::pid_t>> {
     // SAFETY: PROC_ALL_PIDS count query, then correctly sized pid output.
-    let size = unsafe { libc::proc_listpids(1, 0, std::ptr::null_mut(), 0) };
+    let size = native_observation(deadline, || unsafe {
+        libc::proc_listpids(1, 0, std::ptr::null_mut(), 0)
+    });
     if size < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -395,7 +422,9 @@ fn all_pids() -> io::Result<Vec<libc::pid_t>> {
         let mut pids = vec![0; capacity];
         let bytes = i32::try_from(capacity * size_of::<libc::pid_t>())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let got = unsafe { libc::proc_listpids(1, 0, pids.as_mut_ptr().cast(), bytes) };
+        let got = native_observation(deadline, || unsafe {
+            libc::proc_listpids(1, 0, pids.as_mut_ptr().cast(), bytes)
+        });
         if got < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -418,8 +447,14 @@ mod tests {
             .stdout(Stdio::null())
             .spawn()
             .unwrap();
-        let identity = super::observe(child.id() as libc::pid_t).unwrap().unwrap();
-        let process = super::ProcessWatch::new(identity).unwrap().unwrap();
+        let observation_deadline =
+            super::CleanupDeadline(std::time::Instant::now() + super::super::CLEANUP_LIMIT);
+        let identity = super::observe(child.id() as libc::pid_t, &observation_deadline)
+            .unwrap()
+            .unwrap();
+        let process = super::ProcessWatch::new(identity, &observation_deadline)
+            .unwrap()
+            .unwrap();
         drop(child.stdin.take());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !process.exited().unwrap() {
@@ -442,9 +477,78 @@ mod tests {
         // Read-only qualification against root-owned launchd. No signal is
         // sent; its incarnation must remain observable to cleanup after EPERM.
         assert!(
-            super::observe(1)
-                .expect("privileged exit observation denied")
-                .is_some()
+            super::observe(
+                1,
+                &super::CleanupDeadline(std::time::Instant::now() + super::super::CLEANUP_LIMIT)
+            )
+            .expect("privileged exit observation denied")
+            .is_some()
+        );
+    }
+}
+
+// Native observations may be interrupted by SIGCHLD during cancellation.
+fn native_observation(
+    deadline: &CleanupDeadline,
+    mut call: impl FnMut() -> libc::c_int,
+) -> libc::c_int {
+    loop {
+        if deadline.remaining().is_err() {
+            unsafe {
+                *libc::__error() = libc::ETIMEDOUT;
+            }
+            return -1;
+        }
+        // Clear stale errno: successful zero-event/count observations must
+        // never be confused with a previously interrupted syscall.
+        unsafe {
+            *libc::__error() = 0;
+        }
+        let result = call();
+        if result <= 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return result;
+    }
+}
+
+#[cfg(test)]
+mod interrupted_observation_tests {
+    #[test]
+    fn expired_observation_deadline_cannot_resume_native_call() {
+        let deadline = super::CleanupDeadline(std::time::Instant::now());
+        let mut called = false;
+        let result = super::native_observation(&deadline, || {
+            called = true;
+            1
+        });
+        assert_eq!(result, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ETIMEDOUT)
+        );
+        assert!(!called);
+    }
+
+    #[test]
+    fn interrupted_exit_observation_keeps_completion_authority() {
+        let deadline =
+            &super::CleanupDeadline(std::time::Instant::now() + super::super::CLEANUP_LIMIT);
+        let mut interrupted = true;
+        let result = super::native_observation(deadline, || {
+            if interrupted {
+                interrupted = false;
+                unsafe {
+                    *libc::__error() = libc::EINTR;
+                }
+                -1
+            } else {
+                1 // An exit event, rather than failed cleanup/release.
+            }
+        });
+        assert_eq!(
+            result, 1,
+            "interrupted observation abandoned exit authority"
         );
     }
 }

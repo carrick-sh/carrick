@@ -61,7 +61,7 @@ fn fork_without_exec_fixture() {
                 }
             }
             libc::write(ready[1], (&count as *const u32).cast(), 4);
-            if detached {
+            if detached || close_scope {
                 loop {
                     libc::pause();
                 }
@@ -78,10 +78,11 @@ fn fork_without_exec_fixture() {
         std::fs::write(
             std::env::var_os("CARRICK_LEASE_READY").unwrap(),
             format!(
-                "{pid} {count} {} {} {}",
+                "{pid} {count} {} {} {} {}",
                 std::process::id(),
                 libc::getppid(),
-                std::env::var("CARRICK_LEASE_SUPERVISOR").unwrap_or_else(|_| "0".into())
+                std::env::var("CARRICK_LEASE_SUPERVISOR").unwrap_or_else(|_| "0".into()),
+                std::env::var("CARRICK_LEASE_GUARDIAN").unwrap_or_else(|_| "0".into())
             ),
         )
         .unwrap();
@@ -132,23 +133,77 @@ fn worktree_runner_death_cancels_detached_closed_scope_workload() {
 
 #[test]
 fn supervisor_sigterm_cancels_before_releasing_exclusion() {
-    runner_death_preserves_exclusion(true, false, false, Some(libc::SIGTERM));
+    runner_death_preserves_exclusion(
+        true,
+        false,
+        false,
+        Some(HolderSignal::Supervisor(libc::SIGTERM)),
+    );
 }
 
 #[test]
 fn supervisor_sigint_cancels_before_releasing_exclusion() {
-    runner_death_preserves_exclusion(true, false, false, Some(libc::SIGINT));
+    runner_death_preserves_exclusion(
+        true,
+        false,
+        false,
+        Some(HolderSignal::Supervisor(libc::SIGINT)),
+    );
 }
 
 #[test]
 fn supervisor_sighup_cancels_before_releasing_exclusion() {
-    runner_death_preserves_exclusion(true, false, false, Some(libc::SIGHUP));
+    runner_death_preserves_exclusion(
+        true,
+        false,
+        false,
+        Some(HolderSignal::Supervisor(libc::SIGHUP)),
+    );
 }
 
 #[test]
+#[cfg(target_os = "macos")]
+fn supervisor_sigkill_cancels_detached_nested_workload_before_release() {
+    runner_death_preserves_exclusion(
+        true,
+        true,
+        false,
+        Some(HolderSignal::Supervisor(libc::SIGKILL)),
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn supervisor_sigkill_cancels_closed_scope_session_member_before_release() {
+    runner_death_preserves_exclusion(
+        true,
+        false,
+        true,
+        Some(HolderSignal::Supervisor(libc::SIGKILL)),
+    );
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
 #[ignore = "known exclusion limit: SIGKILL destroys the sole flock owner"]
 fn supervisor_sigkill_cannot_preserve_exclusion() {
-    runner_death_preserves_exclusion(true, false, false, Some(libc::SIGKILL));
+    runner_death_preserves_exclusion(
+        true,
+        false,
+        false,
+        Some(HolderSignal::Supervisor(libc::SIGKILL)),
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn guardian_sigkill_cancels_detached_nested_workload_before_release() {
+    runner_death_preserves_exclusion(
+        true,
+        true,
+        false,
+        Some(HolderSignal::Guardian(libc::SIGKILL)),
+    );
 }
 
 #[test]
@@ -160,12 +215,19 @@ fn detached_closed_scope_descendant_is_cancelled() {
     runner_death_preserves_exclusion(true, true, true, None);
 }
 
+#[derive(Clone, Copy)]
+enum HolderSignal {
+    Supervisor(libc::c_int),
+    #[cfg(target_os = "macos")]
+    Guardian(libc::c_int),
+}
+
 #[cfg(test)]
 fn runner_death_preserves_exclusion(
     nested: bool,
     detached: bool,
     close_scope: bool,
-    supervisor_signal: Option<libc::c_int>,
+    supervisor_signal: Option<HolderSignal>,
 ) {
     runner_death_with_admission(false, nested, detached, close_scope, supervisor_signal);
 }
@@ -176,7 +238,7 @@ fn runner_death_with_admission(
     nested: bool,
     detached: bool,
     close_scope: bool,
-    supervisor_signal: Option<libc::c_int>,
+    supervisor_signal: Option<HolderSignal>,
 ) {
     use std::os::fd::AsRawFd;
     // Linux subreaper configuration is process-wide; serialize that fixture
@@ -213,6 +275,8 @@ fn runner_death_with_admission(
         helper: Option<libc::pid_t>,
         fork: Option<libc::pid_t>,
         parents: Vec<libc::pid_t>,
+        #[cfg(target_os = "macos")]
+        guardian: Option<libc::pid_t>,
     }
     impl Drop for Cleanup {
         fn drop(&mut self) {
@@ -308,14 +372,20 @@ fn runner_death_with_admission(
         helper: None,
         fork: None,
         parents: Vec::new(),
+        #[cfg(target_os = "macos")]
+        guardian: None,
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let (pid, count) = loop {
         let data = std::fs::read_to_string(ready.path()).unwrap();
         let fields: Vec<_> = data.split_whitespace().collect();
-        if fields.len() == 5 {
+        if fields.len() == 6 {
             holder.helper = Some(fields[2].parse().unwrap());
-            holder.parents = fields[3..].iter().map(|p| p.parse().unwrap()).collect();
+            #[cfg(target_os = "macos")]
+            if matches!(supervisor_signal, Some(HolderSignal::Guardian(_))) {
+                holder.guardian = Some(fields[5].parse().unwrap());
+            }
+            holder.parents = fields[3..5].iter().map(|p| p.parse().unwrap()).collect();
             break (
                 fields[0].parse::<libc::pid_t>().unwrap(),
                 fields[1].parse::<u32>().unwrap(),
@@ -332,6 +402,8 @@ fn runner_death_with_admission(
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
     holder.fork = Some(pid);
+    #[cfg(target_os = "macos")]
+    let incarnation = process_start(pid).expect("live fixture incarnation");
     let checkout_lock = admitted.then(|| {
         let generation: serde_json::Value = serde_json::from_slice(
             &std::fs::read(repository.path().join(".git/carrick-checkout-generation")).unwrap(),
@@ -365,7 +437,12 @@ fn runner_death_with_admission(
         }
         if let Some(signal) = supervisor_signal {
             // Readiness records the actual flock owner's PID, not the proxy.
-            assert_eq!(libc::kill(*holder.parents.last().unwrap(), signal), 0);
+            let (target, signal) = match signal {
+                HolderSignal::Supervisor(signal) => (*holder.parents.last().unwrap(), signal),
+                #[cfg(target_os = "macos")]
+                HolderSignal::Guardian(signal) => (holder.guardian.unwrap(), signal),
+            };
+            assert_eq!(libc::kill(target, signal), 0);
         } else {
             holder.child.kill().unwrap();
         }
@@ -377,7 +454,24 @@ fn runner_death_with_admission(
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let (alive, release) = observe_exclusion(
-                || is_process_alive(pid),
+                || {
+                    #[cfg(target_os = "macos")]
+                    {
+                        let snapshot = process_snapshot(pid);
+                        if snapshot.is_some_and(|info| info.status != libc::SZOMB) {
+                            assert_eq!(
+                                snapshot.map(|info| info.start),
+                                Some(incarnation),
+                                "workload PID reused"
+                            );
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    is_process_alive(pid)
+                },
                 || libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB),
             );
             assert!(
@@ -578,7 +672,7 @@ fn cancellation_preserves_another_checkout_with_identical_command() {
         loop {
             let data = std::fs::read_to_string(ready).unwrap();
             let fields: Vec<_> = data.split_whitespace().collect();
-            if fields.len() == 5 {
+            if fields.len() == 6 {
                 assert_eq!(fields[1], "0", "fixture inherited flock");
                 fixture.pids = [fields[0], fields[2], fields[3], fields[4]]
                     .iter()
@@ -790,28 +884,62 @@ fn live_workload_after_release_is_detected() {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct ProcessSnapshot {
+    start: (u64, u64),
+    status: u32,
+}
+
+#[cfg(target_os = "macos")]
 fn is_process_alive(pid: libc::pid_t) -> bool {
+    process_snapshot(pid).is_some_and(|info| info.status != libc::SZOMB)
+}
+
+#[cfg(target_os = "macos")]
+fn process_start(pid: libc::pid_t) -> Option<(u64, u64)> {
+    process_snapshot(pid).map(|info| info.start)
+}
+
+#[cfg(test)]
+#[cfg(target_os = "macos")]
+fn process_snapshot(pid: libc::pid_t) -> Option<ProcessSnapshot> {
     if pid <= 0 {
-        return false;
+        return None;
     }
-    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: correctly sized proc_bsdinfo output buffer.
-    // arg=1 includes zombies so we can distinguish dead zombies from live processes.
-    let got = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            1,
-            info.as_mut_ptr().cast(),
-            size,
-        )
-    };
-    if got == size {
-        let info = unsafe { info.assume_init() };
-        info.pbi_status != libc::SZOMB
-    } else {
-        false
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // Include zombies. Identity and liveness come from the same native
+        // snapshot, so exit between two queries cannot masquerade as PID reuse.
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                1,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if got == size {
+            let info = unsafe { info.assume_init() };
+            return Some(ProcessSnapshot {
+                start: (info.pbi_start_tvsec, info.pbi_start_tvusec),
+                status: info.pbi_status,
+            });
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native liveness observation interrupted past deadline"
+            );
+            continue;
+        }
+        if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) {
+            return None;
+        }
+        panic!("cannot observe workload incarnation: {error}");
     }
 }
 

@@ -152,7 +152,9 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
   gate/Docker lease. Runner death and supervisor TERM/INT/HUP cancel supervised
   work before successful release. Cleanup errors or its single five-second
   deadline fail the run explicitly and release, rather than wedge the host.
-  SIGKILL of the sole supervisor releases flock immediately;
+  macOS supervisor and guardian share custody: either retains flock across
+  the other's SIGKILL and performs cleanup; killing both releases immediately.
+  Linux retains the sole-supervisor SIGKILL limit;
   Darwin descendants that detach and close every scope fd escape. Darwin checks
   process start time before each signal, with a residual query-to-kill reuse
   window. These limits and the containment follow-up are explicit in
