@@ -103,6 +103,15 @@ class Matrix(NamedTuple):
     profiles: dict[str, Profile]
 
 
+class CrossToolchain(NamedTuple):
+    """Explicit metadata-only BSD cross compilation, never native coverage."""
+
+    target: str
+    cc: str
+    cflags: str
+    ar: str
+
+
 class ExecutionContext(NamedTuple):
     """Isolated Cargo discovery roots for one census invocation."""
 
@@ -479,9 +488,16 @@ def select_profiles(
     matrix: Matrix,
     selector: str | None,
     current_host: str | None = None,
+    *, cross_target: str | None = None,
 ) -> list[str]:
     """Select a nonempty current-host subset, preserving matrix order."""
     host = current_host or current_host_id()
+    if cross_target is not None and (
+        host != "linux"
+        or cross_target not in (HOST_TRIPLES["freebsd"], HOST_TRIPLES["netbsd"])
+        or selector is None
+    ):
+        raise InventoryError("cross discovery requires explicit BSD profiles on Linux")
     if selector is None:
         selected = [
             profile.id
@@ -513,11 +529,12 @@ def select_profiles(
     unavailable = [
         profile_id
         for profile_id in selected
-        if matrix.profiles[profile_id].host != host
+        if (matrix.profiles[profile_id].host_triple != cross_target
+            if cross_target else matrix.profiles[profile_id].host != host)
     ]
     if unavailable:
         raise InventoryError(
-            f"profiles unavailable on current host {host}: {sorted(unavailable)}"
+            f"profiles unavailable on current host {host} / target {cross_target}: {sorted(unavailable)}"
         )
     return selected
 
@@ -708,6 +725,7 @@ def run_profile(
     *,
     root: Path = ROOT,
     current_host: str | None = None,
+    cross: CrossToolchain | None = None,
     _execution: ExecutionContext | None = None,
 ) -> list[dict[str, object]]:
     """Compile one available product profile and parse its Cargo JSON stream."""
@@ -718,10 +736,18 @@ def run_profile(
                 runner=runner,
                 root=root,
                 current_host=current_host,
+                cross=cross,
                 _execution=execution,
             )
     host = current_host or current_host_id()
-    if profile.host != host:
+    if cross is not None and (
+        host != "linux"
+        or cross.target not in (HOST_TRIPLES["freebsd"], HOST_TRIPLES["netbsd"])
+        or profile.host_triple != cross.target
+        or not cross.cc or not cross.cflags or not cross.ar
+    ):
+        raise InventoryError("invalid explicit BSD cross toolchain/profile")
+    if cross is None and profile.host != host:
         raise InventoryError(
             f"profile {profile.id} is unavailable on current host {host}"
         )
@@ -731,6 +757,11 @@ def run_profile(
         _execution.toolchain_channel,
         target_dir=_execution.target_root / profile.id,
     )
+    if cross is not None:
+        suffix = cross.target.replace("-", "_")
+        environment[f"CC_{suffix}"] = cross.cc
+        environment[f"CFLAGS_{suffix}"] = cross.cflags
+        environment[f"AR_{suffix}"] = cross.ar
     environment["CLIPPY_CONF_DIR"] = str(Path(root).resolve(strict=True))
     result = _completed_text(
         _profile_command(profile, _execution),
@@ -1294,6 +1325,7 @@ def run_census(
     root: Path = ROOT,
     state_root: Path | None = None,
     current_host: str | None = None,
+    cross: CrossToolchain | None = None,
 ) -> dict[str, object]:
     """Run a selected local subset and return pure normalized receipt data."""
     selected_ids = list(profile_ids)
@@ -1318,7 +1350,7 @@ def run_census(
             matrix,
             runner=runner,
             root=Path(root),
-            required_host_triple=next(iter(required_triples)),
+            required_host_triple=HOST_TRIPLES["linux"] if cross else next(iter(required_triples)),
             _execution=execution,
         )
         batches = []
@@ -1328,6 +1360,7 @@ def run_census(
                 runner=runner,
                 root=Path(root),
                 current_host=current_host,
+                cross=cross,
                 _execution=execution,
             )
             batches.append(
@@ -1341,6 +1374,7 @@ def run_census(
     ]
     return {
         "toolchain": identities,
+        **({"cross_target": cross.target} if cross else {}),
         "executed_profiles": selected_ids,
         "pending_profiles": pending,
         "rows": rows,
@@ -1352,6 +1386,10 @@ def main(argv: Sequence[str]) -> int:
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--profiles")
     parser.add_argument("--static", action="store_true")
+    parser.add_argument("--cross-target")
+    parser.add_argument("--cross-cc")
+    parser.add_argument("--cross-cflags")
+    parser.add_argument("--cross-ar")
     args = parser.parse_args(argv)
     try:
         root = args.root.resolve(strict=True)
@@ -1361,8 +1399,14 @@ def main(argv: Sequence[str]) -> int:
         if args.static:
             print("host-authority catalog and nine-profile matrix validated; no live coverage claimed")
             return 0
-        selected = select_profiles(matrix, args.profiles)
-        result = run_census(matrix, selected, catalog, root=root)
+        cross = None
+        cross_values = (args.cross_target, args.cross_cc, args.cross_cflags, args.cross_ar)
+        if any(cross_values):
+            if not all(cross_values):
+                raise InventoryError("cross discovery requires target, cc, cflags and ar")
+            cross = CrossToolchain(*cross_values)
+        selected = select_profiles(matrix, args.profiles, cross_target=args.cross_target)
+        result = run_census(matrix, selected, catalog, root=root, cross=cross)
         # Source positions are transient diagnostic information only. The Rust
         # consumer resolves owners and counts them, then discards these rows.
         print(json.dumps(result))

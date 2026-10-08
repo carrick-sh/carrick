@@ -1352,6 +1352,48 @@ class MatrixOrchestrationTest(unittest.TestCase):
         with self.assertRaisesRegex(self.host_authority.InventoryError, "unavailable"):
             self.host_authority.select_profiles(matrix, "linux-*", "macos")
 
+    def test_cross_census_binds_target_and_explicit_c_toolchain(self):
+        matrix = self.load()
+        runner = FakeRunner()
+        runner.rustc_version = runner.rustc_version.replace(
+            "aarch64-apple-darwin", "x86_64-unknown-linux-gnu"
+        )
+        cross = self.host_authority.CrossToolchain(
+            "x86_64-unknown-freebsd", "clang", "--sysroot=/checked", "llvm-ar"
+        )
+        result = self.host_authority.run_census(
+            matrix, ["freebsd-cli"], FIXTURE_CATALOG, runner=runner,
+            root=ROOT, current_host="linux", cross=cross,
+        )
+        self.assertEqual(result["cross_target"], cross.target)
+        argv, kwargs = runner.calls[-1]
+        self.assertEqual(argv[argv.index("--target") + 1], cross.target)
+        self.assertEqual(kwargs["env"]["CC_x86_64_unknown_freebsd"], "clang")
+        self.assertEqual(kwargs["env"]["CFLAGS_x86_64_unknown_freebsd"], "--sysroot=/checked")
+        self.assertEqual(kwargs["env"]["AR_x86_64_unknown_freebsd"], "llvm-ar")
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "cross"):
+            self.host_authority.run_profile(
+                matrix.profiles["netbsd-cli"], runner=runner,
+                root=ROOT, current_host="linux", cross=cross,
+            )
+
+    def test_cross_profile_selection_requires_exact_supported_target(self):
+        matrix = self.load()
+        self.assertEqual(
+            self.host_authority.select_profiles(
+                matrix, "freebsd-*", "linux", cross_target="x86_64-unknown-freebsd"
+            ),
+            ["freebsd-cli", "freebsd-runtime"],
+        )
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "target"):
+            self.host_authority.select_profiles(
+                matrix, "netbsd-*", "linux", cross_target="x86_64-unknown-freebsd"
+            )
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "cross"):
+            self.host_authority.select_profiles(
+                matrix, None, "linux", cross_target="aarch64-apple-darwin"
+            )
+
     def test_census_uses_fake_catalog_and_records_pending_profiles(self):
         matrix = self.load()
         runner = FakeRunner(json.dumps(diagnostic()) + "\n")
