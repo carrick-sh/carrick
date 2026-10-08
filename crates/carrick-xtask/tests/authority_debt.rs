@@ -3159,21 +3159,7 @@ fn receiver_alias_cannot_hide_description_operations() {
                 format!("fn poll(open_file: &OpenFile) {{ {receiver}.{operation}(); }}"),
             )
             .unwrap();
-            match load_census(root.path()) {
-                Ok(census) => assert_eq!(
-                    census
-                        .k1
-                        .iter()
-                        .filter(|site| site.operation == operation)
-                        .count(),
-                    1,
-                    "{receiver}.{operation}"
-                ),
-                Err(error) => assert!(
-                    error.to_string().contains("unresolved authority receiver"),
-                    "{error}"
-                ),
-            }
+            assert_dialect_rejection(root.path(), "unresolved authority receiver");
         }
     }
 }
@@ -3182,20 +3168,7 @@ fn receiver_alias_cannot_hide_description_operations() {
 fn helper_chain_cannot_hide_description_operations() {
     let root = source_fixture();
     write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), "fn description(file: &OpenFile) -> &FileDescription { &file.description } fn poll(file: &OpenFile) { description(file).inspect(); }").unwrap();
-    match load_census(root.path()) {
-        Ok(census) => assert_eq!(
-            census
-                .k1
-                .iter()
-                .filter(|site| site.operation == "inspect")
-                .count(),
-            1
-        ),
-        Err(error) => assert!(
-            error.to_string().contains("unresolved authority receiver"),
-            "{error}"
-        ),
-    }
+    assert_dialect_rejection(root.path(), "unresolved authority receiver");
 }
 
 #[test]
@@ -3203,6 +3176,34 @@ fn unrelated_same_name_description_methods_are_not_authority() {
     let root = source_fixture();
     write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), "struct Other; impl Other { fn inspect(&self) {} fn read_for_io(&self) {} fn write_for_io(&self) {} } fn poll(other: &Other) { other.inspect(); other.read_for_io(); other.write_for_io(); crate::Other::inspect(other); crate::Other::read_for_io(other); crate::Other::write_for_io(other); }").unwrap();
     assert!(load_census(root.path()).unwrap().k1.is_empty());
+}
+
+#[test]
+fn unrelated_trait_description_methods_are_not_authority() {
+    for declarations in [
+        "trait Inspect { fn inspect(&self); fn read_for_io(&self); fn write_for_io(&self); } impl Inspect for Other { fn inspect(&self) {} fn read_for_io(&self) {} fn write_for_io(&self) {} }",
+        "impl Inspect for Other { fn inspect(&self) {} fn read_for_io(&self) {} fn write_for_io(&self) {} } trait Inspect { fn inspect(&self); fn read_for_io(&self); fn write_for_io(&self); }",
+    ] {
+        let root = source_fixture();
+        write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), format!("struct Other; {declarations} fn poll(o: &Other) {{ o.inspect(); o.read_for_io(); o.write_for_io(); }}")).unwrap();
+        assert!(load_census(root.path()).unwrap().k1.is_empty());
+    }
+}
+
+#[test]
+fn authority_or_conditional_trait_dispatch_remains_unresolved() {
+    for declarations in [
+        "trait Inspect { fn inspect(&self) -> &FileDescription; } impl Inspect for Other { fn inspect(&self) -> &FileDescription { todo!() } }",
+        "trait Inspect { fn inspect(&self); } #[cfg(feature = \"optional\")] impl Inspect for Other { fn inspect(&self) {} }",
+    ] {
+        let root = source_fixture();
+        write_source(
+            root.path().join("crates/carrick-kernel/src/lib.rs"),
+            format!("struct Other; {declarations} fn poll(o: &Other) {{ o.inspect(); }}"),
+        )
+        .unwrap();
+        assert_dialect_rejection(root.path(), "unresolved authority receiver");
+    }
 }
 
 #[test]

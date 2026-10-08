@@ -106,6 +106,8 @@ pub struct SourceCensus {
     owners: BTreeMap<String, Vec<Owner>>,
     pub k1: Vec<ApiSite>,
     inherent_methods: BTreeMap<String, BTreeSet<String>>,
+    unrelated_traits: BTreeMap<String, BTreeSet<String>>,
+    trait_implementations: BTreeMap<String, Vec<(syn::TypePath, String)>>,
     unknown_apis: Vec<String>,
     structural_errors: Vec<String>,
     test_ranges: BTreeMap<String, Vec<(LineColumn, LineColumn)>>,
@@ -1486,6 +1488,8 @@ impl SourceCensus {
                     aliases: &mut result.aliases,
                     projections: &mut result.projections,
                     inherent_methods: &mut result.inherent_methods,
+                    unrelated_traits: &mut result.unrelated_traits,
+                    trait_implementations: &mut result.trait_implementations,
                     prefix: modules,
                 };
                 collector.visit_file(syntax);
@@ -1743,6 +1747,8 @@ struct AliasCollector<'a> {
     aliases: &'a mut BTreeMap<String, Vec<syn::Type>>,
     projections: &'a mut BTreeMap<String, BTreeSet<String>>,
     inherent_methods: &'a mut BTreeMap<String, BTreeSet<String>>,
+    unrelated_traits: &'a mut BTreeMap<String, BTreeSet<String>>,
+    trait_implementations: &'a mut BTreeMap<String, Vec<(syn::TypePath, String)>>,
     prefix: Vec<String>,
 }
 pub(super) fn implementation_name(item: &syn::ItemImpl) -> String {
@@ -1754,6 +1760,57 @@ pub(super) fn implementation_name(item: &syn::ItemImpl) -> String {
     }
 }
 impl<'ast> Visit<'ast> for AliasCollector<'_> {
+    fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+        if test_only(&item.attrs) {
+            return;
+        }
+        // A closed, unconditional local trait with only receiver methods and
+        // unit results cannot expose description/table authority.
+        // Associated types, generic or inherited contracts stay unresolved.
+        let unconditional = |attrs: &[syn::Attribute]| {
+            !attrs
+                .iter()
+                .any(|a| a.path().is_ident("cfg") || a.path().is_ident("cfg_attr"))
+        };
+        let unit_result = |output: &syn::ReturnType| match output {
+            syn::ReturnType::Default => true,
+            syn::ReturnType::Type(_, ty) => {
+                matches!(ty.as_ref(), syn::Type::Tuple(tuple) if tuple.elems.is_empty())
+            }
+        };
+        let mut methods = BTreeSet::new();
+        let closed = !matches!(
+            item.ident.unraw().to_string().as_str(),
+            "FileDescription" | "OpenDescriptionRef" | "FileTable" | "Kernel"
+        ) && item.generics.params.is_empty()
+            && item.supertraits.is_empty()
+            && unconditional(&item.attrs)
+            && item.items.iter().all(|member| {
+                let syn::TraitItem::Fn(method) = member else {
+                    return false;
+                };
+                unconditional(&method.attrs)
+                    && !test_only(&method.attrs)
+                    && method.sig.generics.params.is_empty()
+                    && method.sig.inputs.len() == 1
+                    && matches!(method.sig.inputs.first(), Some(syn::FnArg::Receiver(_)))
+                    && unit_result(&method.sig.output)
+            });
+        if closed {
+            methods.extend(item.items.iter().filter_map(|member| match member {
+                syn::TraitItem::Fn(method) => Some(method.sig.ident.unraw().to_string()),
+                _ => None,
+            }));
+        }
+        self.unrelated_traits.insert(
+            format!("{}::{}", self.prefix.join("::"), item.ident.unraw()),
+            methods,
+        );
+        self.prefix.push(item.ident.unraw().to_string());
+        visit::visit_item_trait(self, item);
+        self.prefix.pop();
+    }
+
     fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
         if !test_only(&item.attrs) {
             self.inherent_methods
@@ -1804,6 +1861,27 @@ impl<'ast> Visit<'ast> for AliasCollector<'_> {
                         .insert(method.sig.ident.unraw().to_string());
                 }
             }
+        }
+        if let Some((_, trait_path, _)) = &item.trait_
+            && item.generics.params.is_empty()
+            && !conditional(&item.attrs)
+            && matches!(item.self_ty.as_ref(), syn::Type::Path(path) if path.qself.is_none() && path.path.segments.iter().all(|segment| matches!(segment.arguments, syn::PathArguments::None)))
+        {
+            let scope = self.prefix[..self.prefix.len() - 1].join("::");
+            let receiver = format!(
+                "{scope}::{}",
+                semantic_tokens(&item.self_ty).replace(' ', "")
+            );
+            self.trait_implementations
+                .entry(receiver)
+                .or_default()
+                .push((
+                    syn::TypePath {
+                        qself: None,
+                        path: trait_path.clone(),
+                    },
+                    scope,
+                ));
         }
         if let Some((_, trait_path, _)) = &item.trait_ {
             let trait_name = trait_path
@@ -2102,7 +2180,7 @@ fn authority_type(
     visitor.visit_type(ty);
     visitor.protected
 }
-// An unrelated receiver requires an unconditional inherent method proof.
+// An unrelated receiver requires an unconditional concrete method proof.
 // An opaque binding is unresolved, never silently exempted from the census.
 #[derive(Clone, Default)]
 struct ReceiverAuthority {
@@ -2160,6 +2238,28 @@ impl Scanner<'_> {
             for key in keys {
                 if let Some(methods) = self.census.inherent_methods.get(&key) {
                     result.inherent_methods = methods.clone();
+                    if !result.description
+                        && !result.file_table
+                        && !result.kernel
+                        && let Some(implementations) = self.census.trait_implementations.get(&key)
+                    {
+                        for (trait_path, trait_scope) in implementations {
+                            let (_, trait_keys) = type_alias_keys(trait_path, trait_scope);
+                            for trait_key in trait_keys {
+                                if let Some(trait_methods) =
+                                    self.census.unrelated_traits.get(&trait_key)
+                                {
+                                    result
+                                        .inherent_methods
+                                        .extend(trait_methods.iter().cloned());
+                                    break;
+                                }
+                                if self.census.aliases.contains_key(&trait_key) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     break;
                 }
                 if self.census.aliases.contains_key(&key) {
@@ -2316,6 +2416,8 @@ impl Scanner<'_> {
                 aliases: &mut self.census.aliases,
                 projections: &mut self.census.projections,
                 inherent_methods: &mut self.census.inherent_methods,
+                unrelated_traits: &mut self.census.unrelated_traits,
+                trait_implementations: &mut self.census.trait_implementations,
                 prefix,
             }
             .visit_file(&syntax);
