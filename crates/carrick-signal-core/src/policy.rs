@@ -126,6 +126,7 @@ pub fn handler_return(
 /// Named policy flags, translated from SA_* by the ABI adapter.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ActionFlags {
+    pub on_stack: bool,
     pub reset_hand: bool,
     pub nodefer: bool,
     pub restart: bool,

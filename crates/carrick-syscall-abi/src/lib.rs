@@ -302,3 +302,5 @@ impl LinuxWaitOptions {
 
 /// Linux 64-bit rusage contains two timevals and fourteen signed counters.
 pub const LINUX_RUSAGE_BYTES: usize = 144;
+
+pub mod signal;

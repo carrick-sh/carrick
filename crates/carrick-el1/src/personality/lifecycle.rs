@@ -78,6 +78,19 @@ impl<
     Context: super::dispatch::DispatchContext,
 > LifecycleNative<'a> for El1PendingFamilies<'a, F, C, U, G, Context>
 {
+    fn signal_action(
+        &mut self,
+        signal: carrick_signal_core::policy::Signal,
+        replacement: Option<carrick_signal_core::policy::Action>,
+    ) -> Option<Result<carrick_signal_core::policy::Action, SyscallResult>> {
+        self.process_venue()?.signal_action(signal, replacement)
+    }
+    fn thread_signal(
+        &mut self,
+        request: carrick_personality_linux::signal_syscalls::ThreadSignalRequest,
+    ) -> Option<LifecycleOutcome> {
+        self.process_venue()?.thread_signal(request)
+    }
     fn process_fork(&mut self) -> Option<LifecycleOutcome> {
         Some(self.process_venue()?.fork())
     }

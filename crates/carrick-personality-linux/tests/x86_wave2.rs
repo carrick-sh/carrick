@@ -209,3 +209,52 @@ fn native_signal_startup_ordinals_have_guest_families() {
         );
     }
 }
+
+#[test]
+fn native_signal_action_wire_preserves_stack_restorer_and_masks() {
+    use carrick_personality_linux::signal_syscalls::{decode_action, encode_action};
+    use carrick_signal_core::policy::{Disposition, HandlerAddress};
+    let mut bytes = [0; 32];
+    for (chunk, word) in
+        bytes
+            .chunks_exact_mut(8)
+            .zip([0x400100_u64, 0xdc000007, 0x400200, 0x41100])
+    {
+        chunk.copy_from_slice(&word.to_le_bytes());
+    }
+    let action = decode_action(&bytes);
+    assert_eq!(
+        action.disposition,
+        Disposition::Handler(HandlerAddress(0x400100))
+    );
+    assert!(action.flags.on_stack);
+    assert!(action.flags.restart);
+    assert!(action.flags.siginfo);
+    assert!(action.flags.nodefer);
+    assert!(action.flags.reset_hand);
+    assert!(action.flags.no_child_wait);
+    assert!(action.flags.no_child_stop);
+    assert_eq!(action.mask.bits(), 0x1000);
+    bytes[24..].copy_from_slice(&0x1000_u64.to_le_bytes());
+    assert_eq!(encode_action(action), bytes);
+}
+
+#[test]
+fn native_signal_command_completion_preserves_guest_wait_encoding() {
+    use carrick_personality_linux::signal_syscalls::command_exit_code;
+    use carrick_sched_core::process::LinuxWaitStatus;
+    for (raw, expected) in [
+        (0, Some(0)),
+        (255 << 8, Some(255)),
+        (6, Some(134)),
+        (6 | 128, Some(134)),
+        (9, Some(137)),
+        (-1, None),
+        (0x7f, None),
+        (0xffff, None),
+    ] {
+        let status = LinuxWaitStatus::from_wait_encoding(raw);
+        assert_eq!(command_exit_code(status), expected);
+        assert_eq!(status.raw(), raw);
+    }
+}
