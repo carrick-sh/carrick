@@ -2585,6 +2585,24 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.prepare_el1_frame_grant(request)
     }
 
+    fn el1_frame_grant_vacant_span(
+        &self,
+        start: u64,
+        len: u64,
+        fault: u64,
+    ) -> Result<Option<(u64, u64)>, TrapError> {
+        let authority = self
+            .state
+            .task
+            .mm_access_authority()
+            .page_tables_authority();
+        let span = authority
+            .with_manager(|manager| manager.unbacked_span_containing(start, len, fault))
+            .ok_or_else(|| TrapError::Hypervisor("guest stage-1 image absent".to_owned()))?
+            .map_err(|error| TrapError::Hypervisor(format!("guest grant vacant span: {error}")))?;
+        Ok(span.map(|span| (span.start, span.end - span.start)))
+    }
+
     fn roll_back_el1_frame_grant(
         &mut self,
         grant: carrick_hal::threaded::El1FrameGrantRollback,

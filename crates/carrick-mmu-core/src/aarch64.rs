@@ -5762,6 +5762,43 @@ impl PageTableManager {
         Ok(spans)
     }
 
+    /// The maximal vacant part of a proposed first-touch grant containing
+    /// `fault`. Fork may inherit resident terminals without host residency
+    /// facts; a new grant must never replace one of those child-owned leaves.
+    pub fn unbacked_span_containing(
+        &self,
+        va: u64,
+        len: u64,
+        fault: u64,
+    ) -> Result<Option<core::ops::Range<u64>>, PageTableError> {
+        let end = va.checked_add(len).ok_or(PageTableError::BadAddress)?;
+        if len == 0
+            || !va.is_multiple_of(PT_PAGE)
+            || !len.is_multiple_of(PT_PAGE)
+            || fault < va
+            || fault >= end
+        {
+            return Err(PageTableError::BadAddress);
+        }
+        let spans = self.backed_terminal_spans(
+            va,
+            usize::try_from(len).map_err(|_| PageTableError::BadAddress)?,
+        )?;
+        let mut start = va;
+        let mut limit = end;
+        for span in spans {
+            if span.end <= fault {
+                start = span.end;
+            } else if span.start <= fault {
+                return Ok(None);
+            } else {
+                limit = span.start;
+                break;
+            }
+        }
+        Ok(Some(start..limit))
+    }
+
     /// Remove EL1-private authority from an invalid file BUS tail. The output
     /// remains recorded for the owning stage-2 lease, but no EL1 permission or
     /// prepared-backing decision may use it after the file fault is published.
@@ -12625,6 +12662,40 @@ mod tests {
             .unwrap();
         assert_eq!(mgr.translate(va + 2 * PT_PAGE), Some(ipa + 2 * PT_PAGE));
         assert_eq!(mgr.translate(va + 3 * PT_PAGE), None);
+    }
+
+    #[test]
+    fn fork_child_bulk_grant_stops_at_inherited_terminal() {
+        let mut mgr = manager();
+        let va = LINUX_HIGH_VA_THRESHOLD;
+        let ipa = LINUX_ALIAS_IPA_BASE + 0x20_0000;
+        mgr.publish_private_pages(
+            GuestLeafPublication {
+                va: va + 2 * PT_PAGE,
+                ipa,
+                len: PT_PAGE,
+                writable: true,
+                executable: false,
+            },
+            va + 2 * PT_PAGE,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            mgr.unbacked_span_containing(va, 4 * PT_PAGE, va + PT_PAGE)
+                .unwrap(),
+            Some(va..va + 2 * PT_PAGE),
+        );
+        assert_eq!(
+            mgr.unbacked_span_containing(va, 4 * PT_PAGE, va + 2 * PT_PAGE)
+                .unwrap(),
+            None,
+        );
+        assert_eq!(
+            mgr.unbacked_span_containing(va, 4 * PT_PAGE, va + 3 * PT_PAGE)
+                .unwrap(),
+            Some(va + 3 * PT_PAGE..va + 4 * PT_PAGE),
+        );
     }
 
     fn live_arena_bytes(resolver: &MockLiveResolver) -> Vec<u8> {

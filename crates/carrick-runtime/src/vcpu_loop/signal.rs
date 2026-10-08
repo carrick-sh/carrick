@@ -1424,6 +1424,19 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     claim.decline();
                     break 'bulk_grant;
                 };
+                let Some((vacant_start, vacant_len)) = engine.el1_frame_grant_vacant_span(
+                    plan.start(),
+                    plan.len(),
+                    plan.fault_page(),
+                )?
+                else {
+                    claim.decline();
+                    break 'bulk_grant;
+                };
+                let Some(plan) = plan.clamp_to_vacant(vacant_start, vacant_len) else {
+                    claim.decline();
+                    break 'bulk_grant;
+                };
                 let prot = plan.prot();
                 crate::probes::hvpatch_el1_frame_grant_plan(
                     request.fault_va,

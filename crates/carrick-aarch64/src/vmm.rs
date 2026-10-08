@@ -977,6 +977,15 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         Ok(None)
     }
 
+    fn el1_frame_grant_vacant_span(
+        &self,
+        start: u64,
+        len: u64,
+        _fault: u64,
+    ) -> Result<Option<(u64, u64)>, TrapError> {
+        Ok(Some((start, len)))
+    }
+
     /// Undo exactly what [`Self::prepare_el1_frame_grant`] published for a
     /// grant whose leaves were never exposed. `Ok(false)`: the span no
     /// longer holds that grant's backing; nothing changed.
