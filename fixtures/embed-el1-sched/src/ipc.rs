@@ -34,8 +34,9 @@ impl Channel {
         assert_eq!(
             count,
             8,
-            "receive fd={} errno={}",
+            "receive fd={} buf={:p} errno={}",
             self.read,
+            bytes.as_ptr(),
             std::io::Error::last_os_error()
         );
         u64::from_ne_bytes(bytes)
