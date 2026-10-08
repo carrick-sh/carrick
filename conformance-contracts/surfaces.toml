@@ -898,3 +898,159 @@ contracts = ["kernel.mm.user-va-ceiling"]
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/mem/anonymous.rs"
 contracts = ["kernel.mm.user-va-ceiling"]
+
+# Native process custody and Linux identity/exit/wait policy retain the shared lifecycle contracts.
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/boot_launch.rs"
+contracts = ["kernel.el1.thread-lifecycle"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/personality/native_process_signals.rs"
+contracts = ["kernel.el1.thread-lifecycle", "kernel.el1.signal-delivery-owner"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/personality/native_process_entry.rs"
+contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.wait.process-group", "kernel.wait.child-rusage"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/personality/native_process_runtime.rs"
+contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.wait.process-group", "kernel.wait.child-rusage"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/personality/native_process_custody.rs"
+contracts = ["kernel.el1.thread-lifecycle"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/personality/process_owner.rs"
+contracts = ["kernel.el1.thread-lifecycle", "kernel.wait.process-group", "kernel.wait.child-rusage"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/personality/process_owner_tests.rs"
+contracts = ["kernel.el1.thread-lifecycle", "kernel.wait.process-group", "kernel.wait.child-rusage"]
+
+[[surfaces]]
+path = "crates/carrick-sched-core/src/process.rs"
+contracts = ["kernel.el1.thread-lifecycle", "kernel.wait.process-group", "kernel.wait.child-rusage"]
+
+[[surfaces]]
+path = "crates/carrick-sched-core/src/process/identity_allocator.rs"
+contracts = ["kernel.el1.thread-lifecycle"]
+
+[[surfaces]]
+path = "crates/carrick-sched-core/src/process/registry.rs"
+contracts = ["kernel.el1.thread-lifecycle", "kernel.wait.process-group", "kernel.wait.child-rusage"]
+
+[[surfaces]]
+path = "crates/carrick-sched-core/src/process/birth.rs"
+contracts = ["kernel.el1.thread-lifecycle"]
+
+[[surfaces]]
+path = "crates/carrick-sched-core/src/process/exit.rs"
+contracts = ["kernel.el1.thread-lifecycle", "kernel.wait.process-group", "kernel.wait.child-rusage"]
+
+[[surfaces]]
+path = "crates/carrick-sched-core/src/process/exit_tests.rs"
+contracts = ["kernel.el1.thread-lifecycle", "kernel.wait.process-group", "kernel.wait.child-rusage"]
+
+[[surfaces]]
+path = "crates/carrick-sched-core/src/process/wait.rs"
+contracts = ["kernel.wait.process-group", "kernel.wait.child-rusage"]
+
+[[surfaces]]
+path = "crates/carrick-sched-core/src/process/wait_tests.rs"
+contracts = ["kernel.wait.process-group", "kernel.wait.child-rusage"]
+
+[[surfaces]]
+path = "crates/carrick-syscall-abi/src/errno.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-x86-cpl0/src/native_process.rs"
+contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage"]
+
+[[surfaces]]
+path = "crates/carrick-x86-cpl0/src/native_execution.rs"
+contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/isa/x86/context_resume.rs"
+contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-kvm/src/cpl0_actors.rs"
+contracts = ["kernel.mm.address-space-occupancy"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/tests/x86_process_route.rs"
+contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion"]
+
+# Native MM adapters supply descriptor and physical custody venues to the existing owner.
+
+[[surfaces]]
+path = "crates/carrick-mmu-core/src/live_descriptor_words.rs"
+contracts = ["kernel.el1.mm-exclusive-owner"]
+
+[[surfaces]]
+path = "crates/carrick-mmu-core/src/x86/copy_window.rs"
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/isa/x86/live_context.rs"
+contracts = ["kernel.el1.mm-exclusive-owner"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/isa/x86/fork_mm.rs"
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
+
+[[surfaces]]
+path = "crates/carrick-core/src/mm/fork/reservation.rs"
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
+
+[[surfaces]]
+path = "crates/carrick-el1-abi/src/x86_fork_stock.rs"
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
+
+[[surfaces]]
+path = "crates/carrick-el1-abi/src/x86_prepare_stock.rs"
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents"]
+
+[[surfaces]]
+path = "crates/carrick-el1-abi/src/kernel_fault_venues.rs"
+contracts = ["kernel.el1.mm-exclusive-owner"]
+
+[[surfaces]]
+path = "crates/carrick-x86-cpl0/src/process.rs"
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
+
+[[surfaces]]
+path = "crates/carrick-x86-cpl0/src/anonymous.rs"
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents", "kernel.el1.anonymous-reservations"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-kvm/src/cpl0_anonymous.rs"
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents", "kernel.el1.anonymous-reservations"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-kvm/src/cpl0_private_witness.rs"
+contracts = ["kernel.el1.mm-exclusive-owner"]
+
+[[surfaces]]
+path = "crates/carrick-core/tests/x86_acceleration.rs"
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.mm.address-space-occupancy"]
+
+[[surfaces]]
+path = "crates/carrick-core/tests/x86_acceleration/fork_cow.rs"
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
+
+[[surfaces]]
+path = "crates/carrick-core/tests/x86_acceleration/compact_context.rs"
+contracts = ["kernel.el1.mm-exclusive-owner"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-kvm/tests/cpl0_fork_e2e.rs"
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.el1.thread-lifecycle"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-kvm/src/carrier_memory/tests.rs"
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents"]
