@@ -324,6 +324,7 @@ fn physical_alias_unlink_visits_only_touched_edges_at_three_populations() {
                 Alias {
                     slot: handle.slot,
                     span,
+                    inherited: None,
                 },
             );
         }
@@ -451,4 +452,404 @@ fn two_live_vms_reject_each_others_local_mm_backing_capabilities() {
     second.write(FrameGpa::new(0x1000), b"B").unwrap();
     assert_eq!(first.read(FrameGpa::new(0x1000), 1).unwrap(), b"A");
     assert_eq!(second.read(FrameGpa::new(0x1000), 1).unwrap(), b"B");
+}
+
+#[test]
+fn inherited_inventory_edges_authorize_only_selected_child_pages() {
+    use carrick_hal::{
+        FrameEventCapacity, FrameId, FrameInventoryEvent, FrameLength, MappingGeneration, MemPerms,
+    };
+    use carrick_kernel::kernel::frame_inventory::FrameInventoryAuthority;
+    use carrick_kernel::kernel::{MmId, ObjectIdRegistry};
+    let authority = FrameInventoryAuthority::new();
+    let ids = ObjectIdRegistry::new();
+    let parent_mm = ids.mm_id().unwrap();
+    let child_mm = ids.mm_id().unwrap();
+    let inventory_row = |mm: MmId, inherited: Option<FrameId>, gpa: u64| {
+        let mut reservation = authority
+            .reserve(
+                &ids,
+                usize::from(inherited.is_none()),
+                1,
+                FrameEventCapacity::for_event_count(2).unwrap(),
+            )
+            .unwrap();
+        let transaction = reservation.transaction();
+        let frame = inherited.unwrap_or_else(|| reservation.claim_frame().unwrap());
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation = MappingGeneration::from_backend_counter(nz(1));
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa: carrick_guest_mem::Gpa(gpa),
+                length: FrameLength::from_mapping_extent(nz(PAGE)),
+                permissions: MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        let (_, receipt) = authority
+            .apply_with_receipt(mm, reservation.commit(()))
+            .unwrap();
+        (
+            BackingIdentity {
+                frame_id: nz(frame.raw()),
+                mapping_id: nz(mapping.raw()),
+                owner_generation: nz(1),
+                inventory_revision: nz(receipt.revision()),
+            },
+            receipt,
+        )
+    };
+    let (first, _) = inventory_row(parent_mm, None, 0x800000);
+    let (adjacent, _) = inventory_row(parent_mm, None, 0x801000);
+    let (child_identity, child_receipt) = inventory_row(
+        child_mm,
+        Some(FrameId::from_kernel_allocation(first.frame_id)),
+        0x800000,
+    );
+    let (child_adjacent, _) = inventory_row(
+        child_mm,
+        Some(FrameId::from_kernel_allocation(adjacent.frame_id)),
+        0x801000,
+    );
+    let mut memory = CarrierMemory::create().unwrap();
+    memory.install(&[backing(0x1000, 0x8000, 90)]).unwrap();
+    let data = memory.install(&[backing(0x800000, 0x2000, 91)]).unwrap()[0];
+    memory
+        .bind_frame_identities(
+            data,
+            &[
+                (FrameGpa::new(0x800000), first),
+                (FrameGpa::new(0x801000), adjacent),
+            ],
+        )
+        .unwrap();
+    let contexts = [parent_mm, child_mm].map(|mm| AddressContext {
+        root: root(if mm == parent_mm { 0x1000 } else { 0x5000 }),
+        mm: MmGeneration::new(nz(mm.raw())),
+        generation: ContextGeneration::new(nz(1)),
+    });
+    for context in contexts {
+        memory.install_root(context.mm.raw(), context).unwrap();
+    }
+    let map = |context: AddressContext<RootGpa>, va, gpa, identity| DescriptorTxn {
+        id: DescriptorTxnId {
+            mm_key: context.mm.raw(),
+            generation: nz(1),
+        },
+        root: context.root,
+        tables: &[],
+        op: DescriptorOp::Map {
+            span: PageSpan::new(va, PAGE),
+            output: FrameGpa::new(gpa),
+            permissions: Permissions {
+                writable: true,
+                executable: false,
+                user: true,
+            },
+            size: LeafSize::Page,
+            resident: true,
+            backing: identity,
+        },
+    };
+    let mut inventory = Inventory {
+        live: true,
+        fail_publish: false,
+        fail_commit: false,
+        fail_rollback: false,
+    };
+    for (index, context) in contexts.into_iter().enumerate() {
+        let tables = if index == 0 {
+            [root(0x2000), root(0x3000), root(0x4000)]
+        } else {
+            [root(0x6000), root(0x7000), root(0x8000)]
+        };
+        let mut txn = map(context, 0x4000, 0x800000, first);
+        txn.op = DescriptorOp::Prepare {
+            span: PageSpan::new(0x4000, PAGE),
+            output: FrameGpa::new(0x800000),
+            permissions: Permissions {
+                writable: true,
+                executable: false,
+                user: true,
+            },
+            resident: PageSpan::new(0x4000, PAGE),
+            backing: first,
+        };
+        txn.tables = &tables;
+        let receipt = execute_descriptor_txn(
+            &memory.words(),
+            &txn,
+            context.root,
+            &mut InlineJournal::new(),
+        );
+        let publication = GuestMmuPublication::from_x86_receipt(&txn, &receipt).unwrap();
+        if index == 0 {
+            memory.publish(&txn, publication, &mut inventory).unwrap();
+        }
+    }
+    let selection = carrick_el1_abi::PortalForkCustody::Frame {
+        va: 0x4000,
+        ipa: 0x800000,
+        len: PAGE,
+        shared: false,
+    };
+    let edge = memory
+        .select_inherited_frames(contexts[0], selection, &authority)
+        .unwrap()
+        .remove(0);
+    assert!(
+        memory
+            .authenticate(
+                contexts[1].mm.raw(),
+                map(contexts[1], 0x4000, 0x800000, child_identity).op
+            )
+            .is_err()
+    );
+    assert!(
+        memory
+            .attach_inherited_frame(contexts[1], &edge, first, &child_receipt, &authority)
+            .is_err()
+    );
+    let changed_parent = AddressContext {
+        generation: ContextGeneration::new(nz(2)),
+        ..contexts[0]
+    };
+    memory.roots.insert(contexts[0].mm.raw(), changed_parent);
+    assert!(
+        memory
+            .attach_inherited_frame(
+                contexts[1],
+                &edge,
+                child_identity,
+                &child_receipt,
+                &authority
+            )
+            .is_err()
+    );
+    memory.roots.insert(contexts[0].mm.raw(), contexts[0]);
+    assert!(
+        memory
+            .attach_inherited_frame(
+                contexts[1],
+                &edge,
+                child_identity,
+                &child_receipt,
+                &authority
+            )
+            .is_err(),
+        "private inheritance must reject writable parent and child aliases"
+    );
+    assert_eq!(memory.slots[&data.slot].alias_count, 1);
+    let shared = memory
+        .select_inherited_frames(
+            contexts[0],
+            carrick_el1_abi::PortalForkCustody::Frame {
+                va: 0x4000,
+                ipa: 0x800000,
+                len: PAGE,
+                shared: true,
+            },
+            &authority,
+        )
+        .unwrap()
+        .remove(0);
+    memory
+        .attach_inherited_frame(
+            contexts[1],
+            &shared,
+            child_identity,
+            &child_receipt,
+            &authority,
+        )
+        .unwrap();
+    memory.remove_aliases(
+        contexts[1].mm.raw(),
+        PageSpan::new(0x4000, PAGE),
+        contexts[1],
+    );
+    for context in contexts {
+        // The stopped fixture executes the guest's permission publication.
+        // Physical attachment must observe it, never author these stores.
+        let txn = DescriptorTxn {
+            op: DescriptorOp::ArmCow(PageSpan::new(0x4000, PAGE)),
+            ..map(context, 0x4000, 0x800000, first)
+        };
+        let receipt = execute_descriptor_txn(
+            &memory.words(),
+            &txn,
+            context.root,
+            &mut InlineJournal::new(),
+        );
+        assert!(GuestMmuPublication::from_x86_receipt(&txn, &receipt).is_some());
+        if context == contexts[0] {
+            assert!(
+                memory
+                    .attach_inherited_frame(
+                        contexts[1],
+                        &edge,
+                        child_identity,
+                        &child_receipt,
+                        &authority
+                    )
+                    .is_err(),
+                "one read-only leaf cannot license the other writable alias"
+            );
+        }
+    }
+    memory
+        .attach_inherited_frame(
+            contexts[1],
+            &edge,
+            child_identity,
+            &child_receipt,
+            &authority,
+        )
+        .unwrap();
+    assert!(
+        memory
+            .authenticate(
+                contexts[1].mm.raw(),
+                map(contexts[1], 0x4000, 0x800000, child_identity).op
+            )
+            .is_ok()
+    );
+    assert!(
+        memory
+            .authenticate(
+                contexts[1].mm.raw(),
+                map(contexts[1], 0x5000, 0x801000, adjacent).op
+            )
+            .is_err()
+    );
+    let prepare = |va, gpa, identity| DescriptorTxn {
+        op: DescriptorOp::Prepare {
+            span: PageSpan::new(va, PAGE),
+            output: FrameGpa::new(gpa),
+            permissions: Permissions {
+                writable: true,
+                executable: false,
+                user: true,
+            },
+            resident: PageSpan::new(va, PAGE),
+            backing: identity,
+        },
+        ..map(contexts[1], va, gpa, identity)
+    };
+    assert!(
+        memory
+            .admit_guest_edit(&prepare(0x4000, 0x800000, child_identity))
+            .is_ok()
+    );
+    assert!(
+        memory
+            .admit_guest_edit(&prepare(0x4000, 0x800000, first))
+            .is_err()
+    );
+    assert!(
+        memory
+            .admit_guest_edit(&prepare(0x5000, 0x801000, child_adjacent))
+            .is_err(),
+        "a valid child inventory row cannot authorize an unselected adjacent page"
+    );
+    assert_eq!(
+        memory.slot_count(),
+        2,
+        "inheritance must not allocate a memslot"
+    );
+    assert_eq!(memory.slots[&data.slot].alias_count, 2);
+    assert!(
+        memory
+            .attach_inherited_frame(
+                contexts[1],
+                &edge,
+                child_identity,
+                &child_receipt,
+                &authority
+            )
+            .is_err()
+    );
+    let stale = AddressContext {
+        generation: ContextGeneration::new(nz(2)),
+        ..contexts[1]
+    };
+    assert!(
+        memory
+            .attach_inherited_frame(stale, &edge, child_identity, &child_receipt, &authority)
+            .is_err()
+    );
+    let mut transition = authority
+        .reserve(&ids, 0, 0, FrameEventCapacity::for_event_count(1).unwrap())
+        .unwrap();
+    transition
+        .push(FrameInventoryEvent::ProtectMapping {
+            transaction: transition.transaction(),
+            mapping: carrick_hal::MappingId::from_kernel_allocation(first.mapping_id),
+            generation: MappingGeneration::from_backend_counter(nz(2)),
+            permissions: MemPerms {
+                read: true,
+                write: false,
+                exec: false,
+            },
+        })
+        .unwrap();
+    authority.apply(parent_mm, transition.commit(())).unwrap();
+    assert!(
+        memory
+            .select_inherited_frames(contexts[0], selection, &authority)
+            .is_err(),
+        "unchanged frame, mapping and GPA cannot authenticate an old owner generation"
+    );
+    memory.remove_aliases(
+        contexts[0].mm.raw(),
+        PageSpan::new(0x4000, PAGE),
+        contexts[0],
+    );
+    assert_eq!(
+        memory.slots[&data.slot].alias_count, 1,
+        "child retains physical custody after parent unlink"
+    );
+    let mut drain = TestDrain {
+        calls: 0,
+        fail: false,
+    };
+    let mut retirement = Retirement {
+        failed: false,
+        live: true,
+    };
+    assert!(memory.revoke(data, &mut drain, &mut retirement).is_err());
+    assert!(
+        retirement.live,
+        "child alias must prevent physical inventory retirement"
+    );
+    assert_eq!(drain.calls, 0);
+    memory.remove_aliases(
+        contexts[1].mm.raw(),
+        PageSpan::new(0x4000, PAGE),
+        contexts[1],
+    );
+    assert!(
+        memory
+            .authenticate(
+                contexts[1].mm.raw(),
+                map(contexts[1], 0x4000, 0x800000, child_identity).op
+            )
+            .is_err()
+    );
+    memory.revoke(data, &mut drain, &mut retirement).unwrap();
+    assert!(!retirement.live);
+    assert_eq!(drain.calls, 2);
 }
