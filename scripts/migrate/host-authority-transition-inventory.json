@@ -13363,7 +13363,7 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/kernel_context.rs:58 in `try_bootstrap_launch_binding`, the observed carrier PID seeds the initial Kernel internal task identity. Prepared CPL0 launches bind the real Container and its private namespace PID1; the legacy adapter still exposes a host-derived identity. Preserve forbidden_semantic: the CPL0 one-way export and counted post-export refusal remain unimplemented.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/kernel_context.rs:58 in `try_bootstrap_launch_binding`, `std::process::id` supplies the observed carrier PID that seeds the initial Kernel internal task identity. Prepared CPL0 launches bind the real Container and its private namespace PID1; the legacy adapter still exposes a host-derived identity. Preserve forbidden_semantic: the CPL0 one-way export and counted post-export refusal remain unimplemented.",
     "review_id": "HA-000495",
     "source": {
       "byte_end": 2153,
