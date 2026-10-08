@@ -623,6 +623,77 @@ mod tests {
         }
     }
 
+    #[test]
+    fn arm_cow_repoint_executes_against_supplied_descriptor_words() {
+        use carrick_core::mm::cow::{CowRepointOp, CowRepointOutcome, OwnerCowMmu};
+        use carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal;
+
+        struct Observed<'a> {
+            inner: PrimaryTableWords<'a, Maintenance>,
+            loads: Cell<usize>,
+            exchanges: Cell<usize>,
+        }
+        impl LiveDescriptorWords for Observed<'_> {
+            fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
+                self.loads.set(self.loads.get() + 1);
+                self.inner.load(pa)
+            }
+            fn compare_exchange(
+                &self,
+                pa: u64,
+                old: u64,
+                new: u64,
+            ) -> Result<bool, DescriptorRefusal> {
+                self.exchanges.set(self.exchanges.get() + 1);
+                self.inner.compare_exchange(pa, old, new)
+            }
+            fn store_unlinked(&self, pa: u64, value: u64) -> Result<(), DescriptorRefusal> {
+                self.inner.store_unlinked(pa, value)
+            }
+            fn publish_barrier(&self) {
+                self.inner.publish_barrier();
+            }
+            fn invalidate_range(&self, va: u64, len: u64) {
+                self.inner.invalidate_range(va, len);
+            }
+        }
+
+        let (arena, _) = forked(false);
+        let words = Observed {
+            inner: arena.words(),
+            loads: Cell::new(0),
+            exchanges: Cell::new(0),
+        };
+        let outcome = Aarch64CowMmu::execute_cow_repoint(
+            &words,
+            ROOT,
+            CowRepointOp {
+                mm_key: MM,
+                grant_epoch: 1,
+                va: VA,
+                len: PAGE,
+                old_ipa: OLD,
+                new_ipa: GRANT,
+                backing: backing(),
+            },
+        );
+        assert_eq!(
+            outcome,
+            CowRepointOutcome::Applied {
+                flush_required: true
+            }
+        );
+        assert!(
+            words.loads.get() > 0,
+            "supplied words must authenticate the leaf"
+        );
+        assert!(
+            words.exchanges.get() > 0,
+            "supplied words must publish the repoint"
+        );
+        assert_eq!(arena.leaf(VA) & PA, GRANT);
+    }
+
     fn armed(ipa: u64, may_write: bool) -> u64 {
         ipa | 3
             | AF
