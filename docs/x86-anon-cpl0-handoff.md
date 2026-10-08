@@ -1,5 +1,33 @@
 # x86 anonymous CPL0 handoff (partial, 2026-10-07)
 
+## Allocation handoff component (2026-10-08)
+
+The local serial cursor now transfers through an owned, non-Clone token.
+Its source remains terminal after allocation, cursor imports and repeated
+transfer attempts; refused calls are counted and overflow is unknown,
+never a wrapped receipt. The staged transfer with the old allocation body
+revived the source and reused serial1 (`/tmp/x86-serial-transfer-red.log`).
+The shared scheduler suite passes 170 tests in
+`/tmp/x86-serial-transfer-suite-green.log`, including a retained peer's 64
+refusals, imported floors, exhaustion and overflow. The peer test's first
+compile failure borrowed a non-Sync receiver; it is retained in
+`/tmp/x86-serial-transfer-suite.log`, not semantic red evidence.
+
+ObjectIdRegistry revokes its own host MM admission while transferring the
+local cursor. A read lease keeps admitted carrier MM allocations ahead of
+transfer settlement. Carrier MM IDs and global file-description IDs are
+neither moved nor frozen. The red MM test still allocated through the
+carrier after local transfer (`/tmp/x86-object-transfer-red.log`); all five
+ID tests now pass (`/tmp/x86-object-transfer-green.log`). Full clippy passes
+in `/tmp/x86-object-transfer-clippy.log`; focused lock and K1 checks pass.
+
+This is an allocation component, not the completed boot crossing. Kernel
+launch export, namespace claim/cursor transfer, resource adoption and
+production seed binding are still open. Production still has task41 and
+fork exit91; CPU1, native wait/exit and two-MM private inheritance remain
+unbound. Continue wiring the one typed, counted launch export; do not
+claim that a production Kernel is frozen or that this lane is review-ready.
+
 ## Main integration checkpoint (2026-10-08)
 
 The director's final integration decision is merge, never rebase this lane.
