@@ -24,6 +24,10 @@ fn http_fixture() -> (String, std::thread::JoinHandle<String>) {
                 Err(error) => panic!("fixture accept: {error}"),
             }
         };
+        // BSD accept(2) copies O_NONBLOCK from the listener, so without this
+        // a read before curl's request arrives fails with EAGAIN instead of
+        // waiting for the read timeout below.
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
