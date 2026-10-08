@@ -1416,7 +1416,7 @@ fn round4_macro_and_main_scanners_share_the_authority_vocabulary() {
             if ["k1", "description_io", "description_guard"].contains(&kind.as_str()) {
                 write_source(
                     &path,
-                    format!("fn access(slot: &FileSlot) {{ slot.description.{operation}(); }}"),
+                    if kind == "k1" { format!("fn access(slot: &FileSlot) {{ slot.description.{operation}(); }}") } else { format!("fn access(slot: &FileSlot) {{ crate::kernel::FileDescription::{operation}(&slot.description); }}") },
                 )
                 .unwrap();
                 let census = load_census(root.path()).unwrap();
@@ -2976,7 +2976,7 @@ fn round8_data_names_do_not_become_task_operations() {
 #[test]
 fn round8_audited_macro_preserves_description_io_call_counts() {
     let root = source_fixture();
-    write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), "fn poll() { ::std::vec![description.write_for_io(), open_file.description.write_for_io()]; }").unwrap();
+    write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), "fn poll() { ::std::vec![crate::kernel::FileDescription::write_for_io(&description), crate::kernel::FileDescription::write_for_io(&open_file.description)]; }").unwrap();
     let census = load_census(root.path()).unwrap();
     assert_eq!(census.k1.len(), 2);
     assert!(
@@ -2995,7 +2995,7 @@ fn round8_audited_macro_preserves_description_guard_call_counts() {
     let root = source_fixture();
     write_source(
         root.path().join("crates/carrick-kernel/src/lib.rs"),
-        "fn poll() { let _ = ::std::matches!(description.inspect(), Some(_)); ::std::vec![description.inspect(), open_file.description.try_inspect()]; }",
+        "fn poll() { let _ = ::std::matches!(crate::kernel::FileDescription::inspect(&description), Some(_)); ::std::vec![crate::kernel::FileDescription::inspect(&description), crate::kernel::FileDescription::try_inspect(&open_file.description)]; }",
     ).unwrap();
     let census = load_census(root.path()).unwrap();
     assert_eq!(census.k1.len(), 3);
@@ -3143,4 +3143,162 @@ fn build_program_compiler_authority_requires_a_separate_ceiling() {
     policy.counters[0].ceiling = 1;
     policy.counters[0].family = Family::HostBacking;
     assert!(verify_host(&result, &policy, &census).is_err());
+}
+
+#[test]
+fn receiver_alias_cannot_hide_description_operations() {
+    for receiver in [
+        "let d = open_file.description; d",
+        "let d = &open_file.description; d",
+        "let d = &open_file.description; let e = d; e",
+    ] {
+        for operation in ["read_for_io", "write_for_io", "inspect", "try_inspect"] {
+            let root = source_fixture();
+            write_source(
+                root.path().join("crates/carrick-kernel/src/lib.rs"),
+                format!("fn poll(open_file: &OpenFile) {{ {receiver}.{operation}(); }}"),
+            )
+            .unwrap();
+            match load_census(root.path()) {
+                Ok(census) => assert_eq!(
+                    census
+                        .k1
+                        .iter()
+                        .filter(|site| site.operation == operation)
+                        .count(),
+                    1,
+                    "{receiver}.{operation}"
+                ),
+                Err(error) => assert!(
+                    error.to_string().contains("unresolved authority receiver"),
+                    "{error}"
+                ),
+            }
+        }
+    }
+}
+
+#[test]
+fn helper_chain_cannot_hide_description_operations() {
+    let root = source_fixture();
+    write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), "fn description(file: &OpenFile) -> &FileDescription { &file.description } fn poll(file: &OpenFile) { description(file).inspect(); }").unwrap();
+    match load_census(root.path()) {
+        Ok(census) => assert_eq!(
+            census
+                .k1
+                .iter()
+                .filter(|site| site.operation == "inspect")
+                .count(),
+            1
+        ),
+        Err(error) => assert!(
+            error.to_string().contains("unresolved authority receiver"),
+            "{error}"
+        ),
+    }
+}
+
+#[test]
+fn unrelated_same_name_description_methods_are_not_authority() {
+    let root = source_fixture();
+    write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), "struct Other; impl Other { fn inspect(&self) {} fn read_for_io(&self) {} fn write_for_io(&self) {} } fn poll(other: &Other) { other.inspect(); other.read_for_io(); other.write_for_io(); crate::Other::inspect(other); crate::Other::read_for_io(other); crate::Other::write_for_io(other); }").unwrap();
+    assert!(load_census(root.path()).unwrap().k1.is_empty());
+}
+
+#[test]
+fn added_file_table_lifecycle_caller_exceeds_exact_ceiling() {
+    let root = source_fixture();
+    write_source(
+        root.path().join("crates/carrick-kernel/src/lib.rs"),
+        "fn poll(parent: &FileTable) { crate::kernel::FileTable::for_fork_copy(id(), parent); }",
+    )
+    .unwrap();
+    let census = load_census(root.path()).unwrap();
+    assert_eq!(
+        census
+            .k1
+            .iter()
+            .filter(|site| site.operation == "for_fork_copy")
+            .count(),
+        1
+    );
+    let base = AuthorityDebtCeilings {
+        schema: 1,
+        counters: vec![Counter {
+            family: Family::K1Lifecycle,
+            operation: "for_fork_copy".into(),
+            owner: "carrick_kernel::poll".into(),
+            lane: Lane::Shared,
+            ceiling: 0,
+        }],
+    };
+    assert!(
+        carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &base)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds ceiling 0")
+    );
+}
+
+#[test]
+fn lifecycle_census_distinguishes_file_table_from_unrelated_types() {
+    for operation in [
+        "for_fork_copy",
+        "for_exec",
+        "native_reexec_fd",
+        "restore_native_reexec_fd",
+        "copy_file_table_for_host_fork",
+    ] {
+        let root = source_fixture();
+        let authority = if operation == "copy_file_table_for_host_fork" {
+            "Kernel"
+        } else {
+            "FileTable"
+        };
+        write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), format!("fn poll(other: &Other) {{ crate::kernel::{authority}::{operation}(); crate::Other::{operation}(); other.{operation}(); }}")).unwrap();
+        let census = load_census(root.path()).unwrap();
+        assert_eq!(
+            census
+                .k1
+                .iter()
+                .filter(|site| site.operation == operation)
+                .count(),
+            1,
+            "{operation}"
+        );
+    }
+}
+
+#[test]
+fn lexical_shadows_cannot_inherit_an_unrelated_receiver_exemption() {
+    for body in [
+        "if let Some(other) = value { other.inspect(); }",
+        "for other in values { other.inspect(); }",
+        "let f = |other| other.inspect();",
+        "match value { Some(other) => other.inspect(), _ => () }",
+    ] {
+        let root = source_fixture();
+        write_source(
+            root.path().join("crates/carrick-kernel/src/lib.rs"),
+            format!("fn poll(other: &Other) {{ {body} }}"),
+        )
+        .unwrap();
+        assert_dialect_rejection(root.path(), "unresolved authority receiver");
+    }
+}
+
+#[test]
+fn description_field_spelling_and_opaque_parameter_types_do_not_prove_authority() {
+    for source in [
+        "fn poll(other: &Other) { other.description.inspect(); }",
+        "fn poll(other: &impl Inspect) { other.inspect(); }",
+        "fn poll(other: &dyn Inspect) { other.inspect(); }",
+        "type Opaque = dyn Inspect; fn poll(other: &Opaque) { other.inspect(); }",
+        "fn poll<T: Inspect>(other: &T) { other.inspect(); }",
+        "impl<T: Inspect> Holder<T> { fn poll(other: &T) { other.inspect(); } }",
+    ] {
+        let root = source_fixture();
+        write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), source).unwrap();
+        assert_dialect_rejection(root.path(), "unresolved authority receiver");
+    }
 }
