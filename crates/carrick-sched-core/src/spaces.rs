@@ -33,6 +33,7 @@
 //! single page-table editor word before mutating live descriptors.
 
 pub mod notification;
+use crate::ThreadCtx;
 use notification::{NotificationSource, SpaceNotificationLease, SpaceReleaseVenue, SpaceWaitCause};
 
 use core::num::NonZeroU64;
@@ -165,22 +166,22 @@ pub struct SpaceGrant {
 /// Exclusive guest EL1 mutation ownership for one published address space.
 /// Dropping the guard acknowledges a host pause or retirement waiting after
 /// it closed the entry's gate.
-pub struct SpaceEditor<'a> {
+pub struct SpaceEditor<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     entry: &'a SpaceEntry,
     owner: NonZeroU64,
-    release: Option<(SpaceReleaseVenue<'a>, SpaceNotificationLease<'a>)>,
-    venue: Option<SpaceReleaseVenue<'a>>,
+    release: Option<(SpaceReleaseVenue<'a, C>, SpaceNotificationLease<'a, C>)>,
+    venue: Option<SpaceReleaseVenue<'a, C>>,
     index: SpaceIndex,
     key: u64,
 }
 
 /// Exclusive initialization of a published, closed fork child. This guard
 /// never opens the runnable gate; task publication is a separate operation.
-pub struct ClosedChildEditor<'a> {
-    editor: SpaceEditor<'a>,
+pub struct ClosedChildEditor<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
+    editor: SpaceEditor<'a, C>,
     grant: SpaceGrant,
 }
-impl ClosedChildEditor<'_> {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> ClosedChildEditor<'_, C> {
     pub fn grant(&self) -> SpaceGrant {
         self.grant
     }
@@ -213,7 +214,7 @@ impl ExcludedEditor<'_> {
     }
 }
 
-impl<'a> SpaceEditor<'a> {
+impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceEditor<'a, C> {
     pub fn mmap_next(&self) -> u64 {
         self.entry.mmap_next.load(Ordering::Acquire)
     }
@@ -257,7 +258,7 @@ impl<'a> SpaceEditor<'a> {
     }
 }
 
-impl SpaceEditor<'_> {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> SpaceEditor<'_, C> {
     fn release_editor(&self) {
         let released = self.entry.active_editor.compare_exchange(
             self.owner.get(),
@@ -268,7 +269,7 @@ impl SpaceEditor<'_> {
         assert_eq!(released, Ok(self.owner.get()));
     }
 }
-impl Drop for SpaceEditor<'_> {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for SpaceEditor<'_, C> {
     fn drop(&mut self) {
         let needs_late_release = self.release.is_none() && self.entry.notifications.attached();
         let late_release = needs_late_release
@@ -286,13 +287,13 @@ impl Drop for SpaceEditor<'_> {
             "held admitted editor requires exact source release"
         );
         if let Some((venue, lease)) = self.release.as_ref().or(late_release.as_ref()) {
-            self.release_editor();
-            let completion = |effects: crate::object_wait::OwnedObjectWakeEffects<'_>| {
+            let completion = |effects: crate::object_wait::OwnedObjectWakeEffects<'_, C>| {
                 (venue.deliver)(venue.zone, venue.waker, effects)
             };
             let receipt = lease
                 .reserve(SpaceWaitCause::Editor)
                 .advance_revision(venue.waker, &completion);
+            self.release_editor();
             receipt.publish();
         } else {
             self.release_editor();
@@ -632,24 +633,24 @@ impl AddressSpaces {
         key: u64,
         owner: NonZeroU64,
     ) -> Option<SpaceEditor<'_>> {
-        self.try_begin_edit_with_venue(index, key, owner, None)
+        self.try_begin_edit_with_venue::<ThreadCtx>(index, key, owner, None)
     }
-    pub fn try_begin_edit_with_venue<'a>(
+    pub fn try_begin_edit_with_venue<'a, C: Copy + Send + Sync + zerocopy::FromZeros>(
         &'a self,
         index: SpaceIndex,
         key: u64,
         owner: NonZeroU64,
-        venue: Option<SpaceReleaseVenue<'a>>,
-    ) -> Option<SpaceEditor<'a>> {
+        venue: Option<SpaceReleaseVenue<'a, C>>,
+    ) -> Option<SpaceEditor<'a, C>> {
         self.try_begin_edit_cause(index, key, owner, venue).ok()
     }
-    pub fn try_begin_edit_cause<'a>(
+    pub fn try_begin_edit_cause<'a, C: Copy + Send + Sync + zerocopy::FromZeros>(
         &'a self,
         index: SpaceIndex,
         key: u64,
         owner: NonZeroU64,
-        venue: Option<SpaceReleaseVenue<'a>>,
-    ) -> Result<SpaceEditor<'a>, EditAdmissionRefusal> {
+        venue: Option<SpaceReleaseVenue<'a, C>>,
+    ) -> Result<SpaceEditor<'a, C>, EditAdmissionRefusal> {
         self.try_begin_edit_mode(index, key, owner, venue, false)
     }
 
@@ -657,13 +658,13 @@ impl AddressSpaces {
     /// This does not install a runnable root or lower the host's exclusion.
     /// The caller authenticates the exact pending operation before any effect;
     /// the host must not settle physical grants until this borrow returns.
-    pub fn try_begin_maintenance_edit<'a>(
+    pub fn try_begin_maintenance_edit<'a, C: Copy + Send + Sync + zerocopy::FromZeros>(
         &'a self,
         index: SpaceIndex,
         key: u64,
         owner: NonZeroU64,
-        venue: Option<SpaceReleaseVenue<'a>>,
-    ) -> Result<SpaceEditor<'a>, EditAdmissionRefusal> {
+        venue: Option<SpaceReleaseVenue<'a, C>>,
+    ) -> Result<SpaceEditor<'a, C>, EditAdmissionRefusal> {
         self.try_begin_edit_mode(index, key, owner, venue, true)
     }
 
@@ -680,14 +681,14 @@ impl AddressSpaces {
             .then_some(root)
     }
 
-    fn try_begin_edit_mode<'a>(
+    fn try_begin_edit_mode<'a, C: Copy + Send + Sync + zerocopy::FromZeros>(
         &'a self,
         index: SpaceIndex,
         key: u64,
         owner: NonZeroU64,
-        venue: Option<SpaceReleaseVenue<'a>>,
+        venue: Option<SpaceReleaseVenue<'a, C>>,
         maintenance: bool,
-    ) -> Result<SpaceEditor<'a>, EditAdmissionRefusal> {
+    ) -> Result<SpaceEditor<'a, C>, EditAdmissionRefusal> {
         let entry = self.entry(index);
         assert!(
             !entry.notifications.attached() || venue.is_some(),
@@ -744,15 +745,18 @@ impl AddressSpaces {
         key: u64,
         owner: NonZeroU64,
     ) -> Option<ClosedChildEditor<'_>> {
-        self.try_begin_closed_child_edit_with_venue(index, key, owner, None)
+        self.try_begin_closed_child_edit_with_venue::<ThreadCtx>(index, key, owner, None)
     }
-    pub fn try_begin_closed_child_edit_with_venue<'a>(
+    pub fn try_begin_closed_child_edit_with_venue<
+        'a,
+        C: Copy + Send + Sync + zerocopy::FromZeros,
+    >(
         &'a self,
         index: SpaceIndex,
         key: u64,
         owner: NonZeroU64,
-        venue: Option<SpaceReleaseVenue<'a>>,
-    ) -> Option<ClosedChildEditor<'a>> {
+        venue: Option<SpaceReleaseVenue<'a, C>>,
+    ) -> Option<ClosedChildEditor<'a, C>> {
         let entry = self.entry(index);
         assert!(
             !entry.notifications.attached() || venue.is_some(),

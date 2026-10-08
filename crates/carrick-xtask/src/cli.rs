@@ -20,6 +20,8 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    #[command(about = "Compare guest asm source between two git revisions")]
+    AsmDiff(crate::asm_diff::AsmDiffArgs),
     #[command(about = "Display repository information as JSON")]
     Info,
 
@@ -90,6 +92,12 @@ pub enum Commands {
         about = "Recapture moved host-authority positions on the gate Mac and return a patch"
     )]
     RemoteRecapture(crate::remote_recapture::RemoteRecaptureArgs),
+
+    #[command(
+        name = "test-lanes",
+        about = "Derive each test target's gate lane from Cargo metadata and check coverage"
+    )]
+    TestLanes(crate::test_lanes::TestLanesArgs),
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -132,6 +140,8 @@ pub struct RepoInfo {
 
 #[derive(Debug, Error)]
 pub enum CliError {
+    #[error("asm diff: {0}")]
+    AsmDiff(#[from] crate::asm_diff::AsmDiffError),
     #[error("ci-scaler: {0}")]
     CiScaler(#[from] crate::ci_scaler::ScalerError),
     #[error("worktree gc: {0}")]
@@ -181,6 +191,8 @@ pub enum CliError {
     RemoteAccept(#[from] crate::remote_accept::RemoteAcceptError),
     #[error("remote recapture error: {0}")]
     RemoteRecapture(#[from] crate::remote_recapture::RecaptureError),
+    #[error("test lanes: {0}")]
+    TestLanes(#[from] crate::test_lanes::TestLanesError),
 }
 
 pub fn resolve_repo_info(root: Option<&Path>) -> Result<RepoInfo, CliError> {
@@ -289,6 +301,11 @@ where
         }
     }
     match cli.command {
+        Commands::AsmDiff(args) => {
+            let info = resolve_repo_info(cli.root.as_deref())?;
+            crate::asm_diff::run(&info.repository_root, args, writer)?;
+            Ok(())
+        }
         Commands::CiScaler(args) => {
             crate::ci_scaler::run(args)?;
             Ok(())
@@ -410,6 +427,11 @@ where
         }
         Commands::RemoteRecapture(args) => {
             crate::remote_recapture::run(cli.root.as_deref(), args)?;
+            Ok(())
+        }
+        Commands::TestLanes(args) => {
+            let info = resolve_repo_info(cli.root.as_deref())?;
+            crate::test_lanes::run(&info.repository_root, args, writer)?;
             Ok(())
         }
     }

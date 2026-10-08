@@ -95,11 +95,26 @@ pub fn publish_current_task(slot: usize, task_id: El1TaskId, generation: u64, fi
     }
     let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-    current_task.pending_host_work.store(0, Ordering::Relaxed);
-    current_task.served_with_work.store(0, Ordering::Relaxed);
-    current_task.task_id.store(task_id.raw(), Ordering::Relaxed);
-    current_task.file_table.store(file_table, Ordering::Relaxed);
-    current_task.generation.store(generation, Ordering::Release);
+    current_task
+        .linux
+        .pending_host_work
+        .store(0, Ordering::Relaxed);
+    current_task
+        .linux
+        .served_with_work
+        .store(0, Ordering::Relaxed);
+    current_task
+        .execution
+        .task
+        .store(task_id.raw(), Ordering::Relaxed);
+    current_task
+        .linux
+        .file_table
+        .store(file_table, Ordering::Relaxed);
+    current_task
+        .execution
+        .generation
+        .store(generation, Ordering::Release);
 }
 
 /// The record for `slot` is a cache of the loaded thread's identity; every
@@ -118,8 +133,8 @@ pub fn revalidate_current_task(slot: usize, task_id: El1TaskId, file_table: u64)
     let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
     // SAFETY: the record lives in the EL1 region; only atomics are touched.
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-    let recorded_tid = current_task.task_id.load(Ordering::Acquire);
-    let recorded_table = current_task.file_table.load(Ordering::Acquire);
+    let recorded_tid = current_task.execution.task.load(Ordering::Acquire);
+    let recorded_table = current_task.linux.file_table.load(Ordering::Acquire);
     if recorded_tid == task_id.raw() && recorded_table == file_table {
         return false;
     }
@@ -130,8 +145,14 @@ pub fn revalidate_current_task(slot: usize, task_id: El1TaskId, file_table: u64)
         task_id.raw(),
         file_table,
     );
-    current_task.task_id.store(task_id.raw(), Ordering::Relaxed);
-    current_task.file_table.store(file_table, Ordering::Release);
+    current_task
+        .execution
+        .task
+        .store(task_id.raw(), Ordering::Relaxed);
+    current_task
+        .linux
+        .file_table
+        .store(file_table, Ordering::Release);
     REVALIDATED_RECORDS.fetch_add(1, Ordering::Relaxed);
     true
 }

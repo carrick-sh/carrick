@@ -344,7 +344,6 @@ pub trait ReservationGeometry {
     const BOOTSTRAP_BASE: u64;
     const BOOTSTRAP_SIZE: u64;
     fn authorizes_internal_read(address: u64, len: u64) -> bool;
-    fn identity_control_base() -> Option<crate::IdentityControlBase>;
 }
 
 /// The Linux client interprets the neutral node; core owns its storage and work.

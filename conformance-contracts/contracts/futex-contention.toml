@@ -12,6 +12,16 @@ scale_points = [1, 8, 32, 128]
 rationale = "Blocking futex operations must park without redispatch and wake with work proportional to the affected waiter set."
 
 [bindings]
+# Supplemental VM-free witness in crates/carrick-thread/src/thread.rs:
+# carrick-thread::thread::tests::futex_halt_poll_nonzero_delays_parking_until_window_expires
+# uses FutexParkHooks through FutexTable::wait_prepared_with_poll_clock to
+# control only the halt-poll clock and observe parking registration. It proves
+# zero parked waiters before the nonzero window's exact deadline, then exactly
+# one registration and one counted wake at expiry, with no host sleep or
+# elapsed-time threshold. Production still supplies Instant::now.
+# This single-waiter witness does not prove contention scaling, continuation
+# budgets, guest execution, or Docker runtime ratios; the bindings below retain
+# those obligations.
 vm_free = "carrick-kernel-example::futex_contention_contract"
 embed = "carrick-embed::futex_contention_contract"
 docker = "probe:futexpingpong"

@@ -1,0 +1,10 @@
+{
+  "lane": "production KvmLocal carrick run --platform linux/amd64 with mounted static fixture",
+  "source_sha256": "d61eadda58ac9f6fa279c339a0c62ec5eb6ef2de48947d1798606c098a082a76",
+  "probe_binary_sha256": "76132cf66f2d303b7cba8395d341a9b09d5fa3cb9da8efbaccf38f94a9bdeb4c",
+  "runner_binary_sha256": "2a2785822699e20a4e24492161cacb882cadd14680e0691eb9c8b8876b4f841a",
+  "exit_code": 125,
+  "stdout": "",
+  "stderr": "carrick: unsupported in this backend: hvpatch requires macOS/AArch64 host and AArch64 guest; got host=Linux/Amd64 guest=Amd64\n",
+  "comparison": "UNAVAILABLE: execution-plan admission refuses Linux/Amd64 before guest execution; no shared-dispatcher live verdict"
+}

@@ -109,6 +109,10 @@ def _is_product_source(path: PurePosixPath) -> bool:
     )
 
 REVIEWED_OPERATOR_LIMITS = {
+    # Native-oracle rootfs export is an explicit operator command. Its only
+    # spawns are the sudo extractor and two exact staging-cleanup branches;
+    # run_cli and guest execution remain forbidden process-creation surfaces.
+    (PurePosixPath("crates/carrick-cli/src/commands.rs"), "export_native_rootfs", "process_command"): 3,
     (PurePosixPath("crates/carrick-cli/src/apfs_operator.rs"), "run_diskutil", "process_command"): 1,
     (PurePosixPath("crates/carrick-cli/src/debug.rs"), "run_lldb_deadline", "process_command"): 1,
     (PurePosixPath("crates/carrick-cli/src/debug.rs"), "run_lldb_attach", "process_command"): 1,

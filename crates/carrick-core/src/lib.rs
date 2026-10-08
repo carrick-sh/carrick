@@ -2,11 +2,11 @@
 #![no_std]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 extern crate alloc;
+pub use carrick_core_abi::Served;
+pub mod entry;
 pub mod lifecycle;
 pub mod mm;
-#[cfg(target_os = "macos")]
-mod n1_diagnostics;
 pub mod wait;
 
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 extern crate std;

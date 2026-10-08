@@ -14,6 +14,12 @@ use carrick_el1_abi::{
     EL1_OBJECT_TABLE_BASE, EL1_OPEN_FILE_TABLE_BASE, EL1_STACK_SLOTS, EL1_ZONE_BASE,
     FD_MAP_CAPACITY, MAX_DELEGATED_INOTIFY,
 };
+use carrick_personality_linux::abi::entry::{LinuxTaskState, SyscallResult};
+use carrick_personality_linux::dispatch::{EntryCounters, LifecycleWorkCounters};
+use carrick_personality_linux::dispatch::{FamilyCompletion, PendingFamilies};
+#[cfg(target_os = "none")]
+use carrick_personality_linux::pending_anonymous::{DelegatedStep, PermissionStep, RetirementStep};
+use carrick_personality_linux::pending_file::PendingFileVenue;
 use core::sync::atomic::Ordering;
 
 /// T2's SVC integration point. A Work result is an owned continuation, not a
@@ -30,22 +36,34 @@ pub fn dispatch_anonymous_with_reservations(
     current: &CurrentTask,
     model: &mut memory::reservations::Reservations<'_>,
 ) -> AnonymousReservationRoute {
-    match memory::decide_anonymous_syscall(frame, current, model) {
-        memory::ReservationDisposition::Forward => {
-            if let Some(counter) = counters.forwarded.get(frame.x[8] as usize) {
-                counter.fetch_add(1, Ordering::Relaxed);
-            }
-            AnonymousReservationRoute::Action(Action::Forward)
+    use carrick_personality_linux::dispatch::ReservationDecision;
+    let decision = match memory::decide_anonymous_syscall(frame, current, model) {
+        memory::ReservationDisposition::Forward => ReservationDecision::Forward,
+        memory::ReservationDisposition::Return(value) => ReservationDecision::Return(value),
+        memory::ReservationDisposition::Work(work) => ReservationDecision::Work(work),
+        memory::ReservationDisposition::Unavailable(reason) => {
+            ReservationDecision::Unavailable(reason)
         }
-        memory::ReservationDisposition::Return(result) => {
-            frame.x[0] = result as u64;
-            counters.served[frame.x[8] as usize].fetch_add(1, Ordering::Relaxed);
+    };
+    let entry = EntryCounters {
+        served: &counters.served,
+        forwarded: &counters.forwarded,
+    };
+    let route = carrick_personality_linux::dispatch::dispatch_anonymous(decision, |served| {
+        if served {
+            entry.served(frame.x[8]);
+        } else {
+            entry.forwarded(frame.x[8]);
+        }
+    });
+    match route {
+        ReservationDecision::Forward => AnonymousReservationRoute::Action(Action::Forward),
+        ReservationDecision::Return(value) => {
+            frame.x[0] = value as u64;
             AnonymousReservationRoute::Action(Action::Served)
         }
-        memory::ReservationDisposition::Work(pending) => AnonymousReservationRoute::Work(pending),
-        memory::ReservationDisposition::Unavailable(reason) => {
-            AnonymousReservationRoute::Unavailable(reason)
-        }
+        ReservationDecision::Work(work) => AnonymousReservationRoute::Work(work),
+        ReservationDecision::Unavailable(reason) => AnonymousReservationRoute::Unavailable(reason),
     }
 }
 
@@ -157,6 +175,7 @@ where
         return Action::Forward;
     };
     let mut sched = sched::Sched {
+        handoff: None,
         zone: zone.tables,
         slot,
         task,
@@ -256,18 +275,18 @@ where
 /// published for this venue ([`lifecycle::LifecycleVenue`]): thread clone
 /// and exit and the per-thread setup calls are served in EL1.
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_syscall_with_lifecycle<F, C, U>(
-    frame: &mut TrapFrame,
-    counters: &Counters,
-    current_tasks: &[CurrentTask],
-    fd_map: &[FdMapSlot],
-    object_table: &[DelegatedFile],
-    open_table: &[DelegatedOpenFile],
-    inotify_table: &[DelegatedInotify],
-    name_cache: &InotifyNameCache,
-    mut zone: Option<Zone<'_, C, U>>,
-    ipc: Option<&ipc::IpcVenue<'_>>,
-    lifecycle: Option<&dyn lifecycle::LifecycleVenue>,
+pub fn dispatch_syscall_with_lifecycle<'a, F, C, U>(
+    frame: &'a mut TrapFrame,
+    counters: &'a Counters,
+    current_tasks: &'a [CurrentTask],
+    fd_map: &'a [FdMapSlot],
+    object_table: &'a [DelegatedFile],
+    open_table: &'a [DelegatedOpenFile],
+    inotify_table: &'a [DelegatedInotify],
+    name_cache: &'a InotifyNameCache,
+    zone: Option<Zone<'a, C, U>>,
+    ipc: Option<&'a ipc::IpcVenue<'a>>,
+    lifecycle: Option<&'a dyn lifecycle::LifecycleVenue>,
     cache_lookup: F,
 ) -> Action
 where
@@ -275,570 +294,504 @@ where
     C: sched::ThreadCpu,
     U: sched::UserWord,
 {
-    let slot = frame.slot as usize;
-    let cur_task = current_tasks.get(slot);
-    let nr = frame.x[8] as usize;
-
-    #[cfg(target_os = "none")]
-    if matches!(nr, 214 | 215 | 216 | 222 | 226)
-        && let (Some(zone), Some(task), Some(zslot)) =
-            (zone.as_mut(), cur_task, SlotId::from_index(slot))
-    {
-        let mut sched = sched::Sched {
-            zone: zone.tables,
-            slot: zslot,
-            task,
-            cpu: &mut *zone.cpu,
-            user: zone.user,
-            counters,
-        };
-        if let Some(served) = super::mm_portal::park_prepared_edit(
-            &mut sched,
-            frame,
-            memory::reservations::shared_guest(),
-        ) {
-            return match served {
-                sched::Served::Returned { .. } => Action::Served,
-                sched::Served::Idle => Action::Idle,
-            };
+    let ordinal = frame.x[8];
+    let mut pending = El1PendingFamilies {
+        handoff: None,
+        #[cfg(test)]
+        lifecycle_user: None,
+        frame,
+        counters,
+        current_tasks,
+        fd_map,
+        object_table,
+        open_table,
+        inotify_table,
+        name_cache,
+        zone,
+        ipc,
+        lifecycle,
+        cache_lookup,
+    };
+    let control = if cfg!(feature = "allocator-test-control") {
+        carrick_el1_abi::SYS_CARRICK_EL1_CONTROL
+    } else {
+        u64::MAX
+    };
+    match carrick_personality_linux::dispatch::dispatch(ordinal, control, &mut pending) {
+        carrick_personality_linux::dispatch::CompletionRoute::Served => Action::Served,
+        carrick_personality_linux::dispatch::CompletionRoute::WithWork => Action::ServedWithWork,
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended => Action::Idle,
+        carrick_personality_linux::dispatch::CompletionRoute::Forward => Action::Forward,
+        carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion => {
+            invalid_completion()
         }
     }
+}
 
-    // Entry check: with host work pending (a kick, a signal, an owed
-    // wake), forward without serving -- except the calls the IPC adapter
-    // takes:
-    // - the slot's switched-in record owns a pending object operation. Its
-    //   thread is re-issuing the SVC to resume that operation, which only
-    //   the adapter may take (before any fd lookup); forwarding would let
-    //   the host run the call afresh while the record kept the operation
-    //   for the thread's next read or write.
-    // - a pipe or eventfd read/write that completes right now. Forwarding
-    //   it only moves a transfer EL1 can finish to the host (one served
-    //   read lost per fork in el1_ipc_two_processes_blocking).
-    // - an epoll_pwait on a zone epoll, for the same reason: Linux reports
-    //   ready events even with a signal pending, and a wait that would block
-    //   parks and leaves as below.
-    // A call that completes leaves with the pending work (`ServedWithWork`),
-    // so the host delivers a signal after the call returns, as Linux does
-    // for one pending at entry; a call that would block parks in the zone
-    // and the vCPU leaves at once (`Idle`), so the host settles the parked
-    // thread and a pending signal interrupts it before it sleeps. Nothing
-    // else is served past pending work. Nonblocking lifecycle setup may also
-    // complete on its authoritative slot, then leave ServedWithWork; clone
-    // and exit remain excluded from this exception.
-    let host_work = cur_task.is_some_and(CurrentTask::has_pending_host_work);
-    let record_lifecycle_host_work = || match nr {
-        lifecycle::SYS_EXIT => counters
-            .record_lifecycle_decline(carrick_el1_abi::LifecycleDecline::ExitDispatchHostWork),
-        lifecycle::SYS_CLONE => counters
-            .record_lifecycle_decline(carrick_el1_abi::LifecycleDecline::CloneDispatchHostWork),
-        _ => {}
-    };
-    let resumes_operation = zone.as_ref().is_some_and(|zone| {
-        SlotId::from_index(slot)
-            .and_then(|slot| zone.tables.slot(slot).current())
-            .is_some_and(|record| zone.tables.record(record).has_object_operation())
-    });
-    let ipc_transfer =
-        matches!(nr, ipc::SYS_READ | ipc::SYS_WRITE | ipc::SYS_EPOLL_PWAIT) && ipc.is_some();
-    let lifecycle_setup = lifecycle.is_some()
-        && matches!(
-            nr,
-            lifecycle::SYS_RT_SIGPROCMASK
-                | lifecycle::SYS_SIGALTSTACK
-                | lifecycle::SYS_SET_ROBUST_LIST
-        );
-    if host_work && !resumes_operation && !ipc_transfer && !lifecycle_setup {
-        record_lifecycle_host_work();
-        if nr < 512 {
-            counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
+/// A completed effect must never be forwarded for syscall replay when its
+/// exact binding failed authentication. This is native fail-stop transport.
+fn invalid_completion() -> ! {
+    #[cfg(target_os = "none")]
+    crate::substrate::sched::hw::fatal_entry_binding();
+    #[cfg(not(target_os = "none"))]
+    carrick_fatal::carrick_fatal!(
+        "el1::entry_completion",
+        "entry completion lost its exact execution binding"
+    )
+}
+
+pub struct El1PendingFamilies<'a, F, C: sched::ThreadCpu, U: sched::UserWord> {
+    pub(super) handoff: Option<carrick_el1_abi::EntryHandoffReceipt>,
+    #[cfg(test)]
+    pub(super) lifecycle_user: Option<&'a mut dyn file::UserCopy>,
+    pub(super) frame: &'a mut TrapFrame,
+    pub(super) counters: &'a Counters,
+    pub(super) current_tasks: &'a [CurrentTask],
+    pub(super) fd_map: &'a [FdMapSlot],
+    pub(super) object_table: &'a [DelegatedFile],
+    pub(super) open_table: &'a [DelegatedOpenFile],
+    pub(super) inotify_table: &'a [DelegatedInotify],
+    pub(super) name_cache: &'a InotifyNameCache,
+    pub(super) zone: Option<Zone<'a, C, U>>,
+    pub(super) ipc: Option<&'a ipc::IpcVenue<'a>>,
+    pub(super) lifecycle: Option<&'a dyn lifecycle::LifecycleVenue>,
+    pub(super) cache_lookup: F,
+}
+impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFamilies<'a>
+    for El1PendingFamilies<'a, F, C, U>
+{
+    fn take_handoff_receipt(&mut self) -> Option<carrick_el1_abi::EntryHandoffReceipt> {
+        self.handoff.take()
+    }
+    fn binding(&self) -> Option<carrick_el1_abi::ExecutionBinding> {
+        self.task().map(super::common_entry::execution_binding)
+    }
+    fn record_source(&self) -> Option<carrick_el1_abi::BornInZoneSource<'a>> {
+        Some(carrick_el1_abi::BornInZoneSource {
+            zone: self.zone.as_ref()?.tables,
+            slot: SlotId::from_index(self.frame.slot as usize)?,
+        })
+    }
+    #[cfg(target_os = "none")]
+    fn anonymous_venue(
+        &mut self,
+    ) -> Option<&mut dyn carrick_personality_linux::pending_anonymous::PendingAnonymousVenue> {
+        Some(self)
+    }
+    fn file_venue(&mut self) -> Option<&mut dyn PendingFileVenue> {
+        Some(self)
+    }
+    fn task_state(&self) -> Option<&LinuxTaskState> {
+        self.task().map(|task| &task.linux)
+    }
+    fn entry_counters(&self) -> Option<EntryCounters<'_>> {
+        Some(EntryCounters {
+            served: &self.counters.served,
+            forwarded: &self.counters.forwarded,
+        })
+    }
+    fn read(&mut self) -> FamilyCompletion {
+        self.ipc_transfer()
+    }
+    fn write(&mut self) -> FamilyCompletion {
+        self.ipc_transfer()
+    }
+    fn epoll_wait(&mut self) -> FamilyCompletion {
+        self.ipc_transfer()
+    }
+    fn original_argument0(&self) -> u64 {
+        self.frame.x[0]
+    }
+    fn install_result(&mut self, result: SyscallResult) {
+        self.frame.x[0] = result.raw() as u64;
+    }
+    fn lifecycle_native(
+        &mut self,
+    ) -> Option<&mut dyn carrick_personality_linux::lifecycle::LifecycleNative<'a>> {
+        self.lifecycle?;
+        self.current_tasks.get(self.frame.slot as usize)?;
+        Some(self)
+    }
+    fn futex(&mut self) -> FamilyCompletion {
+        let frame = &mut *self.frame;
+        let counters = self.counters;
+        let zone = &mut self.zone;
+        let current_tasks = self.current_tasks;
+        let slot = frame.slot as usize;
+        let cur_task = current_tasks.get(slot);
+        if let (Some(zone), Some(task), Some(zslot)) =
+            (zone.as_mut(), cur_task, SlotId::from_index(slot))
+        {
+            let orig_x0 = frame.x[0];
+            let mut sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
+            let disposition = sched
+                .serve_futex(frame)
+                .map_or(ipc::IpcServed::Forward, ipc::IpcServed::from);
+            return carrick_personality_linux::dispatch::transfer_effect(
+                &task.linux,
+                orig_x0,
+                frame.x[0] as i64,
+                disposition,
+            );
         }
+
+        FamilyCompletion::Forward
+    }
+    #[cfg(feature = "allocator-test-control")]
+    fn allocator_control(&mut self) -> FamilyCompletion {
+        let frame = &mut *self.frame;
+        let counters = self.counters;
+        let zone = &mut self.zone;
+        let current_tasks = self.current_tasks;
+        let slot = frame.slot as usize;
+        let cur_task = current_tasks.get(slot);
+
+        let orig_x0 = frame.x[0];
         #[cfg(target_os = "none")]
-        if let (Some(zone), Some(task)) = (zone.as_ref(), cur_task)
+        let saved = *frame;
+        // Consume the record-owned metadata wait before executing this
+        // control transaction again; IPC cannot construct this token.
+        if let (Some(zone), Some(task), Some(zslot)) =
+            (zone.as_mut(), cur_task, SlotId::from_index(slot))
+        {
+            let sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
+            if let Ok(Some(operation)) = sched.take_object_operation()
+                && operation.metadata_generation().is_none()
+            {
+                return FamilyCompletion::Handback;
+            }
+        }
+        let res = match frame.x[0] {
+            1 => crate::alloc::run_guest_allocator_test(frame.x[1], frame.x[2]),
+            _ => 1,
+        };
+        if res == carrick_el1_abi::METADATA_GRANT_PENDING {
+            #[cfg(target_os = "none")]
+            if let (Some(zone), Some(task), Some(zslot)) =
+                (zone.as_mut(), cur_task, SlotId::from_index(slot))
+            {
+                let mailbox = carrick_el1_abi::metadata_mailbox_guest();
+                let generation = mailbox.request_generation();
+                let mut sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
+                if let (Some(key), Some(operation), Some(resume)) = (
+                    carrick_sched_core::object_wait::ObjectWaitKey::metadata_request(generation),
+                    carrick_sched_core::object_wait::OperationToken::metadata_request(generation),
+                    crate::substrate::sched::object_wait::OperationResumePc::new(
+                        saved.elr.wrapping_sub(4),
+                    ),
+                ) && let Ok(snapshot) = sched.observe_object(key)
+                    && matches!(
+                        mailbox.state.load(Ordering::Acquire),
+                        carrick_el1_abi::METADATA_MAILBOX_REQUESTED
+                            | carrick_el1_abi::METADATA_MAILBOX_HOST_WORKING
+                    )
+                    && mailbox.request_generation() == generation
+                    && let Ok(parked) =
+                        sched.park_object(&saved, key, snapshot, resume, operation, None)
+                {
+                    let _ = sched.leave_after_object_park(parked);
+                    return FamilyCompletion::AccountedSuspended;
+                }
+            }
+        }
+        frame.x[0] = res;
+        carrick_personality_linux::dispatch::allocator_effect(
+            cur_task.map(|task| &task.linux),
+            orig_x0,
+            SyscallResult::new(res as i64),
+        )
+    }
+
+    fn resumes_operation(&self) -> bool {
+        self.zone.as_ref().is_some_and(|zone| {
+            SlotId::from_index(self.frame.slot as usize)
+                .and_then(|slot| zone.tables.slot(slot).current())
+                .is_some_and(|record| zone.tables.record(record).has_object_operation())
+        })
+    }
+    fn ipc_available(&self) -> bool {
+        self.ipc.is_some()
+    }
+    fn lifecycle_available(&self) -> bool {
+        self.lifecycle.is_some()
+    }
+    fn lifecycle_work_counters(&self) -> Option<LifecycleWorkCounters<'_>> {
+        Some(LifecycleWorkCounters {
+            exit: &self.counters.lifecycle_declines
+                [carrick_el1_abi::LifecycleDecline::ExitDispatchHostWork as usize],
+            clone: &self.counters.lifecycle_declines
+                [carrick_el1_abi::LifecycleDecline::CloneDispatchHostWork as usize],
+        })
+    }
+    fn anonymous_declined_for_work(&self, _ordinal: u64) {
+        #[cfg(target_os = "none")]
+        if let (Some(zone), Some(task)) = (self.zone.as_ref(), self.task())
             && memory::delegated_anonymous_root(
-                nr as u64,
+                _ordinal,
                 task,
                 crate::substrate::sched::object_wait::space_access(
                     zone.tables,
-                    SlotId::new(slot as u8),
+                    SlotId::new(self.frame.slot as u8),
                 ),
                 memory::reservations::shared_guest(),
             )
             .is_some()
         {
-            counters.anonymous_leaves[carrick_el1_abi::AnonymousLeave::PendingHostWork as usize]
+            self.counters.anonymous_leaves
+                [carrick_el1_abi::AnonymousLeave::PendingHostWork as usize]
                 .fetch_add(1, Ordering::Relaxed);
         }
-        return Action::Forward;
     }
-
-    // A delegated MM's anonymous memory has one owner, its admitted
-    // reservation root: brk/mmap/munmap/mprotect are its transactions, the
-    // descriptor editors only their descriptor step. No admitted root: the
-    // MM keeps the paths below unchanged.
-    #[cfg(target_os = "none")]
-    if matches!(nr, 214 | 215 | 222 | 226)
-        && let (Some(zone), Some(task)) = (zone.as_mut(), cur_task)
-    {
-        let orig_x0 = frame.x[0];
+}
+#[cfg(target_os = "none")]
+impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord>
+    carrick_personality_linux::pending_anonymous::PendingAnonymousVenue
+    for El1PendingFamilies<'_, F, C, U>
+{
+    fn original_argument0(&self) -> u64 {
+        self.frame.x[0]
+    }
+    fn task_state(&self) -> Option<&LinuxTaskState> {
+        self.task().map(|task| &task.linux)
+    }
+    fn delegated(&mut self) -> DelegatedStep {
+        let (Some(zone), Some(task)) = (
+            self.zone.as_ref(),
+            self.current_tasks.get(self.frame.slot as usize),
+        ) else {
+            return DelegatedStep::NotDelegated;
+        };
+        let access = crate::substrate::sched::object_wait::space_access(
+            zone.tables,
+            SlotId::new(self.frame.slot as u8),
+        );
         match memory::serve_delegated_anonymous(
-            frame,
-            counters,
+            self.frame,
+            self.counters,
             task,
-            crate::substrate::sched::object_wait::space_access(
-                zone.tables,
-                SlotId::new(slot as u8),
-            ),
+            access,
             memory::reservations::shared_guest(),
             &mut memory::HardwareAnonymousEditor,
         ) {
-            memory::DelegatedAnonymous::PreparedConflict => {
-                // An admission raced the earlier predicate check. No syscall
-                // effect has occurred; enroll against the new owner epoch.
-                let Some(zslot) = SlotId::from_index(slot) else {
-                    return Action::Forward;
-                };
-                let mut sched = sched::Sched {
-                    zone: zone.tables,
-                    slot: zslot,
-                    task,
-                    cpu: &mut *zone.cpu,
-                    user: zone.user,
-                    counters,
-                };
-                return match super::mm_portal::park_prepared_edit(
-                    &mut sched,
-                    frame,
-                    memory::reservations::shared_guest(),
-                ) {
-                    Some(sched::Served::Returned { .. }) => Action::Served,
-                    Some(sched::Served::Idle) => Action::Idle,
-                    None => Action::Forward,
-                };
-            }
-            memory::DelegatedAnonymous::NotDelegated => {}
+            memory::DelegatedAnonymous::PreparedConflict => DelegatedStep::PreparedConflict,
+            memory::DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,
             memory::DelegatedAnonymous::Served => {
-                task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                return Action::Served;
+                DelegatedStep::Served(SyscallResult::new(self.frame.x[0] as i64))
             }
-            memory::DelegatedAnonymous::Forward => return Action::Forward,
+            memory::DelegatedAnonymous::Forward => DelegatedStep::Forward,
         }
     }
-
-    #[cfg(target_os = "none")]
-    if nr == 226
-        && let Some(zone) = zone.as_ref()
-    {
-        let orig_x0 = frame.x[0];
-        let mut editor = memory::HardwareAnonymousPermissionEditor;
-        match memory::try_serve_mprotect(
-            frame,
-            current_tasks,
-            crate::substrate::sched::object_wait::space_access(
-                zone.tables,
-                SlotId::new(slot as u8),
+    fn park_prepared(&mut self) -> Option<FamilyCompletion> {
+        let slot = SlotId::from_index(self.frame.slot as usize)?;
+        let task = self.current_tasks.get(self.frame.slot as usize)?;
+        let zone = self.zone.as_mut()?;
+        let mut sched = native_scheduler(zone, task, self.counters, slot, &mut self.handoff);
+        let served = super::mm_portal::park_prepared_edit(
+            &mut sched,
+            self.frame,
+            memory::reservations::shared_guest(),
+        )?;
+        Some(
+            carrick_personality_linux::dispatch::accounted_scheduler_effect(
+                served,
+                self.frame.x[0] as i64,
             ),
-            &mut editor,
-        ) {
-            memory::MprotectDisposition::Forward => {}
-            // The edit is in the guest tables and in the space's VMA journal
-            // (or refused): the host applies the journal before it next reads
-            // the MM's rows, so nothing is owed now.
-            memory::MprotectDisposition::Return(result) => {
-                frame.x[0] = result as u64;
-                counters.served[nr].fetch_add(1, Ordering::Relaxed);
-                return Action::Served;
-            }
-            // Journal full: back-pressure. The tables changed but the edit is
-            // not recorded; hand the call to the host, which drains the
-            // journal and commits this edit through the ordinary route.
-            memory::MprotectDisposition::ReturnWithWork => {
-                frame.x[0] = 0;
-                counters.served[nr].fetch_add(1, Ordering::Relaxed);
-                if let Some(task) = cur_task {
-                    return task.leave_commit_owed(orig_x0);
-                }
-                return Action::Served;
-            }
-        }
+        )
     }
-
-    #[cfg(target_os = "none")]
-    if nr == 215
-        && let Some(zone) = zone.as_ref()
-    {
-        let orig_x0 = frame.x[0];
-        let mut editor = memory::HardwareAnonymousRetirementEditor;
-        match memory::try_serve_munmap(
-            frame,
-            current_tasks,
-            crate::substrate::sched::object_wait::space_access(
-                zone.tables,
-                SlotId::new(slot as u8),
-            ),
-            &mut editor,
-        ) {
-            memory::MunmapDisposition::Forward => {}
-            memory::MunmapDisposition::Return(result) => {
-                frame.x[0] = result as u64;
-                counters.served[nr].fetch_add(1, Ordering::Relaxed);
-                return Action::Served;
-            }
-            memory::MunmapDisposition::Retired => {
-                frame.x[0] = 0;
-                counters.served[nr].fetch_add(1, Ordering::Relaxed);
-                if let Some(task) = cur_task {
-                    return task.leave_commit_owed(orig_x0);
-                }
-            }
-        }
-    }
-
-    // Pipe and eventfd read/write on the shared IPC objects, and
-    // epoll_pwait on a zone epoll, served (and blocked) in EL1; host-backed
-    // descriptions fall through unchanged.
-    if matches!(nr, ipc::SYS_READ | ipc::SYS_WRITE | ipc::SYS_EPOLL_PWAIT)
-        && let (Some(venue), Some(zone), Some(task), Some(zslot)) =
-            (ipc, zone.as_mut(), cur_task, SlotId::from_index(slot))
-    {
-        let orig_x0 = frame.x[0];
-        let mut sched = sched::Sched {
-            zone: zone.tables,
-            slot: zslot,
-            task,
-            cpu: &mut *zone.cpu,
-            user: zone.user,
-            counters,
+    fn permission(&mut self) -> PermissionStep {
+        let Some(zone) = self.zone.as_ref() else {
+            return PermissionStep::Forward;
         };
-        let mut user = file::ValidatedCopy {
-            task,
-            validator: &file::HardwareValidator,
-        };
-        match ipc::serve_ipc(&mut sched, frame, venue, &mut user) {
-            ipc::IpcServed::Forward => {}
-            ipc::IpcServed::Returned { switched } => {
-                counters.served[nr].fetch_add(1, Ordering::Relaxed);
-                if !switched {
-                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                }
-                if task.has_pending_host_work() {
-                    return task.leave_served_with_work();
-                }
-                return Action::Served;
-            }
-            ipc::IpcServed::Idle => {
-                counters.served[nr].fetch_add(1, Ordering::Relaxed);
-                return Action::Idle;
-            }
-            ipc::IpcServed::Handback => {
-                counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
-                return Action::Forward;
-            }
-        }
-    }
-    // The adapter declined a call admitted past pending host work (a
-    // host-backed description, an unpublished table): the host runs it.
-    if host_work && !lifecycle_setup {
-        record_lifecycle_host_work();
-        if nr < 512 {
-            counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
-        }
-        return Action::Forward;
-    }
-
-    // Thread clone/exit and the per-thread setup calls, on the lifecycle
-    // page and control slots the host published.
-    if let (Some(venue), Some(task)) = (lifecycle, cur_task)
-        && lifecycle::is_lifecycle_syscall(nr)
-    {
-        let sched = match (zone.as_mut(), SlotId::from_index(slot)) {
-            (Some(zone), Some(zslot)) => Some(sched::Sched {
-                zone: zone.tables,
-                slot: zslot,
-                task,
-                cpu: &mut *zone.cpu,
-                user: zone.user,
-                counters,
-            }),
-            _ => None,
-        };
-        let mut user = file::ValidatedCopy {
-            task,
-            validator: &file::HardwareValidator,
-        };
-        if let Some(action) = lifecycle::serve(frame, counters, task, sched, venue, &mut user) {
-            return action;
-        }
-    }
-
-    // Threads queued on this vCPU wait for the running one to block in a
-    // served futex wait or for its slice to end (EL1 plan 1d: other
-    // syscalls are served or forwarded as usual; 1b forwarded them all so
-    // the host could run the queued threads).
-    let file_access = match zone.as_ref() {
-        Some(zone) => crate::substrate::file_notification::FileAccess::notified(
+        let access = crate::substrate::sched::object_wait::space_access(
             zone.tables,
-            SlotId::new(slot as u8),
-        ),
-        None => {
-            #[cfg(any(test, feature = "host-test"))]
-            {
-                crate::substrate::file_notification::FileAccess::SourceFreeModel
+            SlotId::new(self.frame.slot as u8),
+        );
+        match memory::try_serve_mprotect(
+            self.frame,
+            self.current_tasks,
+            access,
+            &mut memory::HardwareAnonymousPermissionEditor,
+        ) {
+            memory::MprotectDisposition::Forward => PermissionStep::Forward,
+            memory::MprotectDisposition::Return(result) => {
+                PermissionStep::Return(SyscallResult::new(result))
             }
-            #[cfg(not(any(test, feature = "host-test")))]
-            {
-                crate::substrate::file_notification::FileAccess::Unavailable
-            }
+            memory::MprotectDisposition::ReturnWithWork => PermissionStep::CommitOwed,
         }
-    };
-    if let (Some(zone), Some(task), Some(zslot)) =
-        (zone.as_mut(), cur_task, SlotId::from_index(slot))
-        && sched::is_served_futex_op(frame)
-    {
-        let orig_x0 = frame.x[0];
-        let mut sched = sched::Sched {
-            zone: zone.tables,
-            slot: zslot,
-            task,
-            cpu: &mut *zone.cpu,
-            user: zone.user,
-            counters,
+    }
+    fn retirement(&mut self) -> RetirementStep {
+        let Some(zone) = self.zone.as_ref() else {
+            return RetirementStep::Forward;
         };
-        match sched.serve_futex(frame) {
-            Some(sched::Served::Returned { switched }) => {
-                counters.served[sched::SYS_FUTEX].fetch_add(1, Ordering::Relaxed);
-                // After a switch the frame is the switched-in thread's,
-                // whose own futex argument the switch recorded.
-                if !switched {
-                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                }
-                if task.has_pending_host_work() {
-                    return task.leave_served_with_work();
-                }
-                return Action::Served;
+        let access = crate::substrate::sched::object_wait::space_access(
+            zone.tables,
+            SlotId::new(self.frame.slot as u8),
+        );
+        match memory::try_serve_munmap(
+            self.frame,
+            self.current_tasks,
+            access,
+            &mut memory::HardwareAnonymousRetirementEditor,
+        ) {
+            memory::MunmapDisposition::Forward => RetirementStep::Forward,
+            memory::MunmapDisposition::Return(result) => {
+                RetirementStep::Return(SyscallResult::new(result))
             }
-            Some(sched::Served::Idle) => {
-                counters.served[sched::SYS_FUTEX].fetch_add(1, Ordering::Relaxed);
-                return Action::Idle;
-            }
-            None => {}
+            memory::MunmapDisposition::Retired => RetirementStep::Retired,
         }
     }
-
-    match nr {
-        27 => {
-            let orig_x0 = frame.x[0];
-            if let Some(task) = cur_task {
-                let validator = file::HardwareValidator;
-                if let Ok(res) = inotify::el1_inotify_add_watch(
-                    file_access,
-                    frame.x[0] as i32,
-                    frame.x[1],
-                    frame.x[2] as u32,
-                    task,
-                    fd_map,
-                    object_table,
-                    inotify_table,
-                    name_cache,
-                    &validator,
-                ) {
-                    frame.x[0] = res as u64;
-                    counters.served[27].fetch_add(1, Ordering::Relaxed);
-                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                    if task.has_pending_host_work() {
-                        return task.leave_served_with_work();
-                    }
-                    return Action::Served;
-                }
-            }
-        }
-        28 => {
-            let orig_x0 = frame.x[0];
-            if let Some(task) = cur_task
-                && let Ok(res) = inotify::el1_inotify_rm_watch(
-                    file_access,
-                    frame.x[0] as i32,
-                    frame.x[1] as i32,
-                    task,
-                    fd_map,
-                    object_table,
-                    inotify_table,
-                )
-            {
-                frame.x[0] = res as u64;
-                counters.served[28].fetch_add(1, Ordering::Relaxed);
-                task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                claim_owed_inotify_wake(task, inotify_table);
-                if task.has_pending_host_work() {
-                    return task.leave_served_with_work();
-                }
-                return Action::Served;
-            }
-        }
-        63 => {
-            let orig_x0 = frame.x[0];
-            let res = try_serve_file_syscall(
-                file_access,
-                frame,
-                nr,
-                current_tasks,
-                fd_map,
-                object_table,
-                open_table,
-                inotify_table,
-                &cache_lookup,
-            )
-            .or_else(|| {
-                if let Some(task) = cur_task {
-                    let validator = file::HardwareValidator;
-                    inotify::el1_inotify_read(
-                        frame.x[0] as i32,
-                        frame.x[1],
-                        frame.x[2] as usize,
-                        task,
-                        fd_map,
-                        inotify_table,
-                        &validator,
-                    )
-                    .ok()
-                } else {
-                    None
-                }
-            });
-            if let Some(res) = res {
-                frame.x[0] = res as u64;
-                counters.served[63].fetch_add(1, Ordering::Relaxed);
-                if let Some(task) = cur_task {
-                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                    claim_owed_inotify_wake(task, inotify_table);
-                    if task.has_pending_host_work() {
-                        return task.leave_served_with_work();
-                    }
-                }
-                return Action::Served;
-            }
-        }
-        62 | 64 | 67 | 68 => {
-            let orig_x0 = frame.x[0];
-            if let Some(res) = try_serve_file_syscall(
-                file_access,
-                frame,
-                nr,
-                current_tasks,
-                fd_map,
-                object_table,
-                open_table,
-                inotify_table,
-                &cache_lookup,
-            ) {
-                frame.x[0] = res as u64;
-                if nr < 512 {
-                    counters.served[nr].fetch_add(1, Ordering::Relaxed);
-                }
-                if let Some(task) = cur_task {
-                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                    if matches!(nr, 63 | 64 | 67 | 68) {
-                        claim_owed_inotify_wake(task, inotify_table);
-                    }
-                    if task.has_pending_host_work() {
-                        return task.leave_served_with_work();
-                    }
-                }
-                return Action::Served;
-            }
-        }
-        #[cfg(feature = "allocator-test-control")]
-        _ if (nr as u64) == carrick_el1_abi::SYS_CARRICK_EL1_CONTROL => {
-            let orig_x0 = frame.x[0];
-            #[cfg(target_os = "none")]
-            let saved = *frame;
-            // Consume the record-owned metadata wait before executing this
-            // control transaction again; IPC cannot construct this token.
-            if let (Some(zone), Some(task), Some(zslot)) =
-                (zone.as_mut(), cur_task, SlotId::from_index(slot))
-            {
-                let sched = sched::Sched {
-                    zone: zone.tables,
-                    slot: zslot,
-                    task,
-                    cpu: &mut *zone.cpu,
-                    user: zone.user,
-                    counters,
-                };
-                if let Ok(Some(operation)) = sched.take_object_operation()
-                    && operation.metadata_generation().is_none()
-                {
-                    return Action::Forward;
-                }
-            }
-            let res = match frame.x[0] {
-                1 => crate::alloc::run_guest_allocator_test(frame.x[1], frame.x[2]),
-                _ => 1,
-            };
-            if res == carrick_el1_abi::METADATA_GRANT_PENDING {
-                #[cfg(target_os = "none")]
-                if let (Some(zone), Some(task), Some(zslot)) =
-                    (zone.as_mut(), cur_task, SlotId::from_index(slot))
-                {
-                    let mailbox = carrick_el1_abi::metadata_mailbox_guest();
-                    let generation = mailbox.request_generation();
-                    let mut sched = sched::Sched {
-                        zone: zone.tables,
-                        slot: zslot,
-                        task,
-                        cpu: &mut *zone.cpu,
-                        user: zone.user,
-                        counters,
-                    };
-                    if let (Some(key), Some(operation), Some(resume)) = (
-                        carrick_sched_core::object_wait::ObjectWaitKey::metadata_request(
-                            generation,
-                        ),
-                        carrick_sched_core::object_wait::OperationToken::metadata_request(
-                            generation,
-                        ),
-                        crate::substrate::sched::object_wait::OperationResumePc::new(
-                            saved.elr.wrapping_sub(4),
-                        ),
-                    ) && let Ok(snapshot) = sched.observe_object(key)
-                        && matches!(
-                            mailbox.state.load(Ordering::Acquire),
-                            carrick_el1_abi::METADATA_MAILBOX_REQUESTED
-                                | carrick_el1_abi::METADATA_MAILBOX_HOST_WORKING
-                        )
-                        && mailbox.request_generation() == generation
-                        && let Ok(parked) =
-                            sched.park_object(&saved, key, snapshot, resume, operation, None)
-                    {
-                        let _ = sched.leave_after_object_park(parked);
-                        return Action::Idle;
-                    }
-                }
-            }
-            frame.x[0] = res;
-            if let Some(task) = cur_task
-                && task.has_pending_host_work()
-            {
-                task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                return task.leave_served_with_work();
-            }
-            return Action::Served;
-        }
-        _ => {}
+    fn install_result(&mut self, result: SyscallResult) {
+        self.frame.x[0] = result.raw() as u64;
     }
-
-    if nr < 512 {
-        counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
-    }
-    Action::Forward
 }
 
-/// An in-guest enqueue that owes a host waiter a wake cannot deliver it
-/// from EL1: return through the host boundary, which delivers it.
-#[inline]
-fn claim_owed_inotify_wake(task: &CurrentTask, inotify_table: &[DelegatedInotify]) {
-    if inotify_table.iter().any(DelegatedInotify::wake_is_owed) {
-        task.mark_pending_host_work();
+pub(super) fn native_scheduler<'s, C: sched::ThreadCpu, U: sched::UserWord>(
+    zone: &'s mut Zone<'_, C, U>,
+    task: &'s CurrentTask,
+    counters: &'s Counters,
+    slot: SlotId,
+    handoff: &'s mut Option<carrick_el1_abi::EntryHandoffReceipt>,
+) -> sched::Sched<'s, C, U> {
+    sched::Sched {
+        handoff: Some(handoff),
+        zone: zone.tables,
+        slot,
+        task,
+        cpu: &mut *zone.cpu,
+        user: zone.user,
+        counters,
+    }
+}
+
+impl<F, C: sched::ThreadCpu, U: sched::UserWord> El1PendingFamilies<'_, F, C, U> {
+    fn ipc_transfer(&mut self) -> FamilyCompletion {
+        let frame = &mut *self.frame;
+        let counters = self.counters;
+        let zone = &mut self.zone;
+        let current_tasks = self.current_tasks;
+        let ipc = &self.ipc;
+        let slot = frame.slot as usize;
+        let cur_task = current_tasks.get(slot);
+        if let (Some(venue), Some(zone), Some(task), Some(zslot)) =
+            (ipc, zone.as_mut(), cur_task, SlotId::from_index(slot))
+        {
+            let orig_x0 = frame.x[0];
+            let mut sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
+            let mut user = file::ValidatedCopy {
+                task,
+                validator: &file::HardwareValidator,
+            };
+            let disposition = ipc::serve_ipc(&mut sched, frame, venue, &mut user);
+            return carrick_personality_linux::dispatch::transfer_effect(
+                &task.linux,
+                orig_x0,
+                frame.x[0] as i64,
+                disposition,
+            );
+        }
+
+        FamilyCompletion::Forward
+    }
+    fn task(&self) -> Option<&CurrentTask> {
+        self.current_tasks.get(self.frame.slot as usize)
+    }
+}
+
+impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFileVenue
+    for El1PendingFamilies<'_, F, C, U>
+{
+    fn ordinal(&self) -> u64 {
+        self.frame.x[8]
+    }
+    fn inotify_add(&mut self) -> Option<i64> {
+        self.task().and_then(|task| {
+            inotify::el1_inotify_add_watch(
+                self.file_access(),
+                self.frame.x[0] as i32,
+                self.frame.x[1],
+                self.frame.x[2] as u32,
+                task,
+                self.fd_map,
+                self.object_table,
+                self.inotify_table,
+                self.name_cache,
+                &file::HardwareValidator,
+            )
+            .ok()
+        })
+    }
+    fn inotify_remove(&mut self) -> Option<i64> {
+        self.task().and_then(|task| {
+            inotify::el1_inotify_rm_watch(
+                self.file_access(),
+                self.frame.x[0] as i32,
+                self.frame.x[1] as i32,
+                task,
+                self.fd_map,
+                self.object_table,
+                self.inotify_table,
+            )
+            .ok()
+        })
+    }
+    fn original_argument0(&self) -> u64 {
+        self.frame.x[0]
+    }
+    fn task_state(&self) -> Option<&LinuxTaskState> {
+        self.task().map(|task| &task.linux)
+    }
+    fn file_operation(&mut self) -> Option<i64> {
+        try_serve_file_syscall(
+            self.file_access(),
+            self.frame,
+            self.frame.x[8] as usize,
+            self.current_tasks,
+            self.fd_map,
+            self.object_table,
+            self.open_table,
+            self.inotify_table,
+            &self.cache_lookup,
+        )
+    }
+    fn inotify_read(&mut self) -> Option<i64> {
+        inotify::el1_inotify_read(
+            self.frame.x[0] as i32,
+            self.frame.x[1],
+            self.frame.x[2] as usize,
+            self.task()?,
+            self.fd_map,
+            self.inotify_table,
+            &file::HardwareValidator,
+        )
+        .ok()
+    }
+    fn wake_is_owed(&self) -> bool {
+        self.inotify_table
+            .iter()
+            .any(DelegatedInotify::wake_is_owed)
+    }
+    fn install_result(&mut self, result: SyscallResult) {
+        self.frame.x[0] = result.raw() as u64;
+    }
+}
+impl<F, C: sched::ThreadCpu, U: sched::UserWord> El1PendingFamilies<'_, F, C, U> {
+    fn file_access(&self) -> crate::substrate::file_notification::FileAccess<'_> {
+        match self.zone.as_ref() {
+            Some(zone) => crate::substrate::file_notification::FileAccess::notified(
+                zone.tables,
+                SlotId::new(self.frame.slot as u8),
+            ),
+            None => {
+                #[cfg(any(test, feature = "host-test"))]
+                {
+                    crate::substrate::file_notification::FileAccess::SourceFreeModel
+                }
+                #[cfg(not(any(test, feature = "host-test")))]
+                {
+                    crate::substrate::file_notification::FileAccess::Unavailable
+                }
+            }
+        }
     }
 }
 
@@ -859,7 +812,7 @@ where
 {
     let slot = frame.slot as usize;
     let cur_task = current_tasks.get(slot)?;
-    let file_table = cur_task.file_table.load(Ordering::Acquire);
+    let file_table = cur_task.linux.file_table.load(Ordering::Acquire);
     if file_table == 0 {
         return None;
     }
@@ -1047,58 +1000,246 @@ mod tests {
     use core::sync::atomic::Ordering;
 
     #[test]
-    fn anonymous_reservation_routing_counts_two_mm_fallback_without_effects() {
-        // Exercise the production dispatcher, not dispatch_syscall's host-only
-        // fallback. Both live tasks deliberately use the same guest addresses.
-        for rounds in [1, 8, 64] {
-            let counters = Counters::default();
-            let tasks = [CurrentTask::new(), CurrentTask::new()];
-            for (slot, task) in tasks.iter().enumerate() {
-                task.set(
-                    carrick_el1_abi::El1TaskId::from_linux_tid(slot as i32 + 1),
-                    1,
-                    slot as u64 + 1,
-                );
-                task.zone_mm.store(slot as u64 + 17, Ordering::Release);
+    fn invalid_lifecycle_entry_does_not_publish_result_or_original_argument() {
+        use super::super::thread_setup::{LifecycleThread, LifecycleVenue};
+        use carrick_el1_abi::{LifecycleHatches, ThreadControlSlot, ThreadLifecyclePage};
+        struct Venue {
+            page: ThreadLifecyclePage,
+            control: ThreadControlSlot,
+        }
+        impl LifecycleVenue for Venue {
+            fn thread<'a>(&'a self, task: &'a CurrentTask) -> Option<LifecycleThread<'a>> {
+                task.execution.generation.store(12, Ordering::Release);
+                Some(LifecycleThread {
+                    page: &self.page,
+                    slot: &self.control,
+                })
             }
-            for _ in 0..rounds {
-                for slot in 0..tasks.len() {
-                    for nr in [214, 222] {
-                        let mut frame = TrapFrame {
-                            slot: slot as u64,
-                            ..TrapFrame::default()
-                        };
-                        frame.x[..6].copy_from_slice(&[
-                            0x60_0000_0000,
-                            0x3000,
-                            3,
-                            0x22,
-                            u64::MAX,
-                            0,
-                        ]);
-                        frame.x[8] = nr;
-                        let original = frame.x;
-                        let action = dispatch_syscall_with_regions(
-                            &mut frame,
-                            &counters,
-                            &tasks,
-                            &[],
-                            &[],
-                            &[],
-                            &[],
-                            &InotifyNameCache::new(),
-                            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
-                            |_| core::ptr::null_mut(),
+            fn born_slot(
+                &self,
+                _: &ThreadLifecyclePage,
+                _: carrick_el1_abi::EntryRef,
+            ) -> Option<&ThreadControlSlot> {
+                None
+            }
+        }
+        for scale in [1, 2, 8] {
+            for _ in 0..scale {
+                let venue = Venue {
+                    page: ThreadLifecyclePage::with_hatches(LifecycleHatches::ON),
+                    control: ThreadControlSlot::new(),
+                };
+                assert!(venue.control.publish_visible_tid(41));
+                let tasks = [CurrentTask::new()];
+                tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+                tasks[0].linux.orig_arg0.store(77, Ordering::Relaxed);
+                let counters = Counters::default();
+                let mut frame = TrapFrame::default();
+                frame.x[0] = 0xfeed;
+                frame.x[8] = 178;
+                let mut pending = El1PendingFamilies {
+                    handoff: None,
+                    #[cfg(test)]
+                    lifecycle_user: None,
+                    frame: &mut frame,
+                    counters: &counters,
+                    current_tasks: &tasks,
+                    fd_map: &[],
+                    object_table: &[],
+                    open_table: &[],
+                    inotify_table: &[],
+                    name_cache: &InotifyNameCache::new(),
+                    zone: None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
+                    ipc: None,
+                    lifecycle: Some(&venue),
+                    cache_lookup: |_| core::ptr::null_mut(),
+                };
+                assert_eq!(
+                    carrick_personality_linux::dispatch::dispatch(178, u64::MAX, &mut pending),
+                    carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion
+                );
+                assert_eq!(frame.x[0], 0xfeed);
+                assert_eq!(tasks[0].linux.orig_arg0.load(Ordering::Relaxed), 77);
+                assert_eq!(counters.served[178].load(Ordering::Relaxed), 0);
+                assert_eq!(tasks[0].linux.served_with_work.load(Ordering::Acquire), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn stale_futex_handoffs_refuse_the_initiating_entry() {
+        use carrick_el1_abi::{Claim, ThreadIdentity};
+        use carrick_personality_linux::dispatch::CompletionRoute;
+        use carrick_sched_core::{BoundedSpin, ExecutionSlot};
+        struct StaleUser<'a> {
+            zone: &'a ZoneTables,
+            record: carrick_sched_core::RecordId,
+            identity: ThreadIdentity,
+            mutation: u8,
+        }
+        impl sched::UserWord for StaleUser<'_> {
+            fn read_u32(&self, task: &CurrentTask, _: u64) -> Option<u32> {
+                let slot = SlotId::new(0);
+                match self.mutation {
+                    0 => task.execution.generation.store(12, Ordering::Release),
+                    1 => {
+                        let mm = self.identity.mm;
+                        let address = (0x2000..0x2400)
+                            .step_by(4)
+                            .find(|address| {
+                                ZoneTables::bucket_of(mm, *address)
+                                    != ZoneTables::bucket_of(mm, 0x1000)
+                            })
+                            .unwrap();
+                        let guard = self
+                            .zone
+                            .lock(ZoneTables::bucket_of(mm, address), &BoundedSpin(1024))
+                            .unwrap();
+                        let sequence = self.zone.next_seq(self.record);
+                        self.zone
+                            .enqueue(&guard, self.record, sequence, mm, address, u32::MAX, 0)
+                            .unwrap();
+                        assert!(
+                            self.zone
+                                .publish_guest_park(&guard, slot, self.record, sequence)
                         );
-                        assert_eq!(action, Action::Forward);
-                        assert_eq!(frame.x, original, "forwarding cannot consume arguments");
-                        assert_eq!(tasks[slot].served_with_work.load(Ordering::Acquire), 0);
+                        self.zone.clear_current(slot);
+                        let mut effects = carrick_sched_core::WakeEffects::default();
+                        assert_eq!(
+                            self.zone
+                                .wake_placed(
+                                    &guard,
+                                    mm,
+                                    address,
+                                    u32::MAX,
+                                    1,
+                                    carrick_sched_core::Waker::El1 { slot },
+                                    &mut [],
+                                    &mut effects
+                                )
+                                .unwrap(),
+                            1
+                        );
+                        drop(guard);
+                        assert!(self.zone.switch_in(slot).is_some());
+                    }
+                    _ => {
+                        self.zone.clear_current(slot);
+                        self.zone.free_record(self.record);
+                        let replacement = self.zone.alloc_record(self.identity).unwrap();
+                        self.zone.requeue_preempted(slot, replacement);
+                        assert!(self.zone.switch_in(slot).is_some());
                     }
                 }
+                // Bound native idle; no fake family outcome or continuation.
+                task.linux.mark_pending_host_work();
+                Some(0)
             }
-            for nr in [214, 222] {
-                assert_eq!(counters.forwarded[nr].load(Ordering::Relaxed), 2 * rounds);
-                assert_eq!(counters.served[nr].load(Ordering::Relaxed), 0);
+            fn read_u64(&self, _: &CurrentTask, _: u64) -> Option<u64> {
+                None
+            }
+        }
+        for scale in [1, 2, 8] {
+            for mutation in 0..3 {
+                for switched in [false, true] {
+                    for _ in 0..scale {
+                        let layout = std::alloc::Layout::new::<ZoneTables>();
+                        // SAFETY: ZoneTables permits zero initialization, using
+                        // its exact alignment/size; Box owns the allocation.
+                        let zone = unsafe {
+                            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
+                            assert!(!ptr.is_null());
+                            std::boxed::Box::from_raw(ptr)
+                        };
+                        let slot = SlotId::new(0);
+                        zone.drive(slot, 3);
+                        zone.publish_slot(slot, 7, None, 0);
+                        let here = ExecutionSlot::zone(slot);
+                        zone.occupancy.vacate_any(here);
+                        assert!(zone.occupancy.replace(here, 0, 7));
+                        zone.enter_guest(slot);
+                        let space = zone.spaces.publish_closed(7, 0x7000, 0x7000).unwrap();
+                        zone.spaces.open(space);
+                        assert!(zone.install_space(slot, 7).is_some());
+                        let identity = ThreadIdentity {
+                            tid: 41,
+                            serial: 1041,
+                            mm: 7,
+                            file_table: 5,
+                            generation: if mutation == 0 { 11 } else { 0 },
+                            affinity: 0,
+                            lifecycle_page: 0x1000,
+                            control_slot: 0x2000,
+                        };
+                        let record = zone.alloc_record(identity).unwrap();
+                        zone.requeue_preempted(slot, record);
+                        assert_eq!(zone.switch_in(slot), Some(record));
+                        assert!(matches!(zone.record(record).claim(), Claim::OnCpu { .. }));
+                        if switched {
+                            let successor = zone
+                                .alloc_record(ThreadIdentity {
+                                    tid: 42,
+                                    serial: 1042,
+                                    generation: 12,
+                                    ..identity
+                                })
+                                .unwrap();
+                            zone.requeue_preempted(slot, successor);
+                        }
+                        let tasks = [CurrentTask::new()];
+                        tasks[0].set(
+                            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+                            identity.generation,
+                            5,
+                        );
+                        tasks[0].mm.key.store(7, Ordering::Release);
+                        tasks[0].mm.thread_generation.store(1041, Ordering::Release);
+                        let counters = Counters::default();
+                        let mut cpu = sched::FakeCpu::default();
+                        let user = StaleUser {
+                            zone: &zone,
+                            record,
+                            identity,
+                            mutation,
+                        };
+                        let mut frame = TrapFrame::default();
+                        frame.x[..6].copy_from_slice(&[0x1000, 128, 0, 0, 0, 0]);
+                        frame.x[8] = 98;
+                        frame.elr = 0x4000;
+                        let mut pending = El1PendingFamilies {
+                            handoff: None,
+                            #[cfg(test)]
+                            lifecycle_user: None,
+                            frame: &mut frame,
+                            counters: &counters,
+                            current_tasks: &tasks,
+                            fd_map: &[],
+                            object_table: &[],
+                            open_table: &[],
+                            inotify_table: &[],
+                            name_cache: &InotifyNameCache::new(),
+                            zone: Some(Zone {
+                                tables: &zone,
+                                cpu: &mut cpu,
+                                user: &user,
+                            }),
+                            ipc: None,
+                            lifecycle: None,
+                            cache_lookup: |_| core::ptr::null_mut(),
+                        };
+                        assert_eq!(
+                            carrick_personality_linux::dispatch::dispatch(
+                                98,
+                                u64::MAX,
+                                &mut pending
+                            ),
+                            CompletionRoute::InvalidCompletion,
+                            "mutation={mutation} switched={switched}"
+                        );
+                        assert_eq!(counters.served[98].load(Ordering::Relaxed), 0);
+                        assert_eq!(tasks[0].linux.served_with_work.load(Ordering::Acquire), 0);
+                    }
+                }
             }
         }
     }
@@ -1171,718 +1312,6 @@ mod tests {
         });
 
         assert_eq!(counters.forwarded[64].load(Ordering::Relaxed), 8000);
-    }
-
-    #[test]
-    fn test_dispatch_syscall_with_regions_served() {
-        let counters = Counters::default();
-        let tasks = [CurrentTask::new()];
-        tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100); // slot 0: task_id 1, generation 1, file_table 100
-
-        let fd_map = [FdMapSlot::new()];
-        fd_map[0].set(100, 3, 1, 42); // file_table 100, fd 3 -> handle 1, incarnation 42
-
-        let object_table = [DelegatedFile::new()];
-        let open_table = [DelegatedOpenFile::new()];
-        open_table[0]
-            .state
-            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-        open_table[0].inode_handle.store(1, Ordering::Relaxed);
-        object_table[0]
-            .state
-            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-        object_table[0].generation.store(42, Ordering::Relaxed);
-        open_table[0].generation.store(42, Ordering::Relaxed);
-        open_table[0].inode_generation.store(42, Ordering::Relaxed);
-        object_table[0].size.store(100, Ordering::Relaxed);
-        open_table[0].offset.store(10, Ordering::Relaxed);
-        open_table[0]
-            .flags
-            .store(carrick_el1_abi::DELEGATED_FLAG_READABLE, Ordering::Relaxed);
-
-        let mut frame = TrapFrame::default();
-        frame.x[0] = 3; // fd
-        frame.x[1] = 50; // offset
-        frame.x[2] = 0; // SEEK_SET
-        frame.x[8] = 62; // lseek
-
-        let inotify_table = [DelegatedInotify::new()];
-        let name_cache = InotifyNameCache::new();
-
-        let action = dispatch_syscall_with_regions(
-            &mut frame,
-            &counters,
-            &tasks,
-            &fd_map,
-            &object_table,
-            &open_table,
-            &inotify_table,
-            &name_cache,
-            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
-            |_| core::ptr::null_mut(),
-        );
-
-        assert_eq!(action, Action::Served);
-        assert_eq!(frame.x[0], 50);
-        assert_eq!(counters.served[62].load(Ordering::Relaxed), 1);
-        assert_eq!(counters.forwarded[62].load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn test_dispatch_syscall_with_regions_entry_pending_work() {
-        let counters = Counters::default();
-        let tasks = [CurrentTask::new()];
-        tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100);
-        tasks[0].mark_pending_host_work(); // pending host work set at entry
-
-        let fd_map = [FdMapSlot::new()];
-        fd_map[0].set(100, 3, 1, 42);
-
-        let object_table = [DelegatedFile::new()];
-        let open_table = [DelegatedOpenFile::new()];
-        open_table[0]
-            .state
-            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-        open_table[0].inode_handle.store(1, Ordering::Relaxed);
-        object_table[0]
-            .state
-            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-        object_table[0].generation.store(42, Ordering::Relaxed);
-        open_table[0].generation.store(42, Ordering::Relaxed);
-        open_table[0].inode_generation.store(42, Ordering::Relaxed);
-        object_table[0].size.store(100, Ordering::Relaxed);
-        open_table[0].offset.store(10, Ordering::Relaxed);
-
-        let inotify_table = [DelegatedInotify::new()];
-        let name_cache = InotifyNameCache::new();
-
-        let mut frame = TrapFrame::default();
-        frame.x[0] = 3;
-        frame.x[1] = 50;
-        frame.x[2] = 0;
-        frame.x[8] = 62; // lseek
-
-        let action = dispatch_syscall_with_regions(
-            &mut frame,
-            &counters,
-            &tasks,
-            &fd_map,
-            &object_table,
-            &open_table,
-            &inotify_table,
-            &name_cache,
-            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
-            |_| core::ptr::null_mut(),
-        );
-
-        // Entry check: must forward immediately without modifying file state
-        assert_eq!(action, Action::Forward);
-        assert_eq!(open_table[0].offset.load(Ordering::Relaxed), 10);
-        assert_eq!(counters.served[62].load(Ordering::Relaxed), 0);
-        assert_eq!(counters.forwarded[62].load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn test_dispatch_syscall_with_regions_exit_pending_work() {
-        let counters = Counters::default();
-        let tasks = [CurrentTask::new()];
-        tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100);
-
-        let fd_map = [FdMapSlot::new()];
-        fd_map[0].set(100, 3, 1, 42);
-
-        let object_table = [DelegatedFile::new()];
-        let open_table = [DelegatedOpenFile::new()];
-        open_table[0]
-            .state
-            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-        open_table[0].inode_handle.store(1, Ordering::Relaxed);
-        object_table[0]
-            .state
-            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-        object_table[0].generation.store(42, Ordering::Relaxed);
-        open_table[0].generation.store(42, Ordering::Relaxed);
-        open_table[0].inode_generation.store(42, Ordering::Relaxed);
-        object_table[0].size.store(100, Ordering::Relaxed);
-        open_table[0].offset.store(10, Ordering::Relaxed);
-        open_table[0]
-            .flags
-            .store(carrick_el1_abi::DELEGATED_FLAG_READABLE, Ordering::Relaxed);
-
-        let inotify_table = [DelegatedInotify::new()];
-        let name_cache = InotifyNameCache::new();
-
-        let mut frame = TrapFrame::default();
-        frame.x[0] = 3;
-        frame.x[1] = 50;
-        frame.x[2] = 0;
-        frame.x[8] = 62; // lseek
-
-        // Simulate host marking pending work while/right before syscall exit
-        tasks[0].mark_pending_host_work();
-
-        // At entry, pending_host_work is already set, so it forwards
-        let action = dispatch_syscall_with_regions(
-            &mut frame,
-            &counters,
-            &tasks,
-            &fd_map,
-            &object_table,
-            &open_table,
-            &inotify_table,
-            &name_cache,
-            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
-            |_| core::ptr::null_mut(),
-        );
-        assert_eq!(action, Action::Forward);
-
-        // Now test exit check: pending_host_work starts clear, then gets set during operation
-        tasks[0].clear_pending_host_work();
-        let mut frame2 = TrapFrame::default();
-        frame2.x[0] = 3;
-        frame2.x[1] = 50;
-        frame2.x[2] = 0;
-        frame2.x[8] = 62;
-
-        let action2 = dispatch_syscall_with_regions(
-            &mut frame2,
-            &counters,
-            &tasks,
-            &fd_map,
-            &object_table,
-            &open_table,
-            &inotify_table,
-            &name_cache,
-            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
-            |_| core::ptr::null_mut(),
-        );
-        assert_eq!(action2, Action::Served);
-        assert_eq!(frame2.x[0], 50);
-
-        // Exit check test: operation succeeds, but host marked pending work during the operation.
-        tasks[0].clear_pending_host_work();
-        tasks[0].served_with_work.store(0, Ordering::Relaxed);
-        let mut buf = [0u8; 16];
-        let mut cache_mem = [0u8; 4096];
-        let cache_ptr = cache_mem.as_mut_ptr();
-        let task_ref = &tasks[0];
-        open_table[0]
-            .flags
-            .store(carrick_el1_abi::DELEGATED_FLAG_WRITABLE, Ordering::Relaxed);
-        open_table[0].offset.store(0, Ordering::Relaxed);
-
-        let mut frame_write = TrapFrame::default();
-        frame_write.x[0] = 3; // fd
-        frame_write.x[1] = buf.as_mut_ptr() as u64; // buf
-        frame_write.x[2] = 16; // count
-        frame_write.x[8] = 64; // SYS_write
-
-        let action_write = dispatch_syscall_with_regions(
-            &mut frame_write,
-            &counters,
-            &tasks,
-            &fd_map,
-            &object_table,
-            &open_table,
-            &inotify_table,
-            &name_cache,
-            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
-            move |_| {
-                // Host marks pending work during write operation
-                task_ref.mark_pending_host_work();
-                cache_ptr
-            },
-        );
-
-        assert_eq!(action_write, Action::ServedWithWork);
-        assert_eq!(frame_write.x[0], 16);
-        assert_eq!(tasks[0].served_with_work.load(Ordering::Relaxed), 1);
-        assert_eq!(counters.served[64].load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn test_stale_handle_interleaving_forwards() {
-        let counters = Counters::default();
-        let tasks = [CurrentTask::new()];
-        tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100); // task_id 1, generation 1, file_table 100
-
-        let fd_map = [FdMapSlot::new()];
-        // Initially: table 100, fd 3 -> handle 1, incarnation 10
-        fd_map[0].set(100, 3, 1, 10);
-
-        let object_table = [DelegatedFile::new()];
-        let open_table = [DelegatedOpenFile::new()];
-        open_table[0]
-            .state
-            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-        open_table[0].inode_handle.store(1, Ordering::Relaxed);
-        // Suppose between fd_map_lookup and try_lock / re-validation,
-        // the handle is recalled, freed, and re-delegated to another file with incarnation 11!
-        object_table[0]
-            .state
-            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-        object_table[0].generation.store(11, Ordering::Relaxed); // new incarnation!
-        // The open file still names the inode incarnation it joined (10).
-        open_table[0].generation.store(10, Ordering::Relaxed);
-        open_table[0].inode_generation.store(10, Ordering::Relaxed);
-        object_table[0].size.store(100, Ordering::Relaxed);
-        open_table[0].offset.store(10, Ordering::Relaxed);
-        open_table[0]
-            .flags
-            .store(carrick_el1_abi::DELEGATED_FLAG_READABLE, Ordering::Relaxed);
-
-        let inotify_table = [DelegatedInotify::new()];
-        let name_cache = InotifyNameCache::new();
-
-        let mut frame = TrapFrame::default();
-        frame.x[0] = 3; // fd 3
-        frame.x[1] = 50;
-        frame.x[2] = 0;
-        frame.x[8] = 62; // lseek
-
-        let action = dispatch_syscall_with_regions(
-            &mut frame,
-            &counters,
-            &tasks,
-            &fd_map,
-            &object_table,
-            &open_table,
-            &inotify_table,
-            &name_cache,
-            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
-            |_| core::ptr::null_mut(),
-        );
-
-        // Must detect incarnation mismatch and FORWARD, not serve against the new object!
-        assert_eq!(action, Action::Forward);
-        assert_eq!(counters.served[62].load(Ordering::Relaxed), 0);
-        assert_eq!(counters.forwarded[62].load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn test_thread_sleep_survives_task_generation_bump() {
-        let counters = Counters::default();
-        let tasks = [CurrentTask::new()];
-        // Task has been switched out multiple times, so its scheduling generation is 5
-        tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 5, 100);
-
-        let fd_map = [FdMapSlot::new()];
-        fd_map[0].set(100, 3, 1, 42); // incarnation 42
-
-        let object_table = [DelegatedFile::new()];
-        let open_table = [DelegatedOpenFile::new()];
-        open_table[0]
-            .state
-            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-        open_table[0].inode_handle.store(1, Ordering::Relaxed);
-        object_table[0]
-            .state
-            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-        object_table[0].generation.store(42, Ordering::Relaxed);
-        open_table[0].generation.store(42, Ordering::Relaxed);
-        open_table[0].inode_generation.store(42, Ordering::Relaxed); // object incarnation 42
-        object_table[0].size.store(100, Ordering::Relaxed);
-        open_table[0].offset.store(10, Ordering::Relaxed);
-        open_table[0]
-            .flags
-            .store(carrick_el1_abi::DELEGATED_FLAG_READABLE, Ordering::Relaxed);
-
-        let inotify_table = [DelegatedInotify::new()];
-        let name_cache = InotifyNameCache::new();
-
-        let mut frame = TrapFrame::default();
-        frame.x[0] = 3;
-        frame.x[1] = 50;
-        frame.x[2] = 0;
-        frame.x[8] = 62; // lseek
-
-        // Syscall must succeed even though task.generation (5) != object.generation (42)
-        let action = dispatch_syscall_with_regions(
-            &mut frame,
-            &counters,
-            &tasks,
-            &fd_map,
-            &object_table,
-            &open_table,
-            &inotify_table,
-            &name_cache,
-            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
-            |_| core::ptr::null_mut(),
-        );
-
-        assert_eq!(action, Action::Served);
-        assert_eq!(frame.x[0], 50);
-        assert_eq!(counters.served[62].load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn test_in_guest_read_queues_in_access_and_owes_an_observed_waiter_a_wake() {
-        use carrick_el1_abi::{FD_HANDLE_INOTIFY_TAG, hash_path};
-
-        let counters = Counters::default();
-        let tasks = [CurrentTask::new()];
-        tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100);
-
-        let fd_map = [FdMapSlot::new(), FdMapSlot::new()];
-        fd_map[0].set(100, 3, 1, 42); // fd 3 -> delegated file handle 1
-        fd_map[1].set(100, 4, FD_HANDLE_INOTIFY_TAG | 1, 42); // fd 4 -> delegated inotify handle 1
-
-        let object_table = [DelegatedFile::new()];
-        let open_table = [DelegatedOpenFile::new()];
-        open_table[0]
-            .state
-            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-        open_table[0].inode_handle.store(1, Ordering::Relaxed);
-        object_table[0]
-            .state
-            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-        object_table[0].generation.store(42, Ordering::Relaxed);
-        open_table[0].generation.store(42, Ordering::Relaxed);
-        open_table[0].inode_generation.store(42, Ordering::Relaxed);
-        object_table[0].size.store(100, Ordering::Relaxed);
-        open_table[0].offset.store(0, Ordering::Relaxed);
-        open_table[0].flags.store(
-            carrick_el1_abi::DELEGATED_FLAG_READABLE | carrick_el1_abi::DELEGATED_FLAG_WRITABLE,
-            Ordering::Relaxed,
-        );
-
-        let inotify_table = [DelegatedInotify::new()];
-        inotify_table[0]
-            .state
-            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-        inotify_table[0].generation.store(42, Ordering::Relaxed);
-        inotify_table[0]
-            .flags
-            .store(inotify::O_NONBLOCK, Ordering::Relaxed);
-
-        let name_cache = InotifyNameCache::new();
-        let path = b"test.txt";
-        let path_hash = hash_path(path);
-        name_cache.insert(100, name_cache.cwd_generation(), path, path_hash, 1);
-
-        let mut path_str = *b"test.txt\0";
-        let mut frame_add = TrapFrame::default();
-        frame_add.x[0] = 4; // inotify fd
-        frame_add.x[1] = path_str.as_mut_ptr() as u64; // pathname
-        frame_add.x[2] = 0x01; // IN_ACCESS
-        frame_add.x[8] = 27; // inotify_add_watch
-
-        let mut cache_mem = [0u8; 4096];
-        let cache_ptr = cache_mem.as_mut_ptr();
-
-        let action = dispatch_syscall_with_regions(
-            &mut frame_add,
-            &counters,
-            &tasks,
-            &fd_map,
-            &object_table,
-            &open_table,
-            &inotify_table,
-            &name_cache,
-            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
-            |_| cache_ptr,
-        );
-        assert_eq!(action, Action::Served);
-        let wd = frame_add.x[0] as i32;
-        assert_eq!(wd, 1);
-        assert_eq!(counters.served[27].load(Ordering::Relaxed), 1);
-        assert!(object_table[0].has_marks());
-
-        // A host thread waits on the (empty) instance.
-        inotify_table[0].host_observed.store(1, Ordering::SeqCst);
-
-        // A read of the watched file, served in-guest, queues IN_ACCESS and
-        // returns through the host boundary to deliver the owed wake.
-        let mut read_buf = [0u8; 16];
-        let mut frame_read = TrapFrame::default();
-        frame_read.x[0] = 3; // file fd
-        frame_read.x[1] = read_buf.as_mut_ptr() as u64;
-        frame_read.x[2] = 16;
-        frame_read.x[8] = 63; // read
-
-        let action = dispatch_syscall_with_regions(
-            &mut frame_read,
-            &counters,
-            &tasks,
-            &fd_map,
-            &object_table,
-            &open_table,
-            &inotify_table,
-            &name_cache,
-            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
-            |_| cache_ptr,
-        );
-        assert_eq!(action, Action::ServedWithWork);
-        assert_eq!(frame_read.x[0], 16);
-        assert!(inotify_table[0].wake_is_owed());
-        let mut records = [0u8; 64];
-        assert_eq!(inotify_table[0].drain_into(&mut records), Ok(16));
-        assert_eq!(
-            u32::from_ne_bytes([records[4], records[5], records[6], records[7]]),
-            0x01
-        );
-    }
-
-    #[test]
-    fn test_two_open_files_share_one_inode_with_independent_offsets() {
-        let counters = Counters::default();
-        let tasks = [CurrentTask::new()];
-        tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100);
-        let fd_map = [FdMapSlot::new(), FdMapSlot::new()];
-        fd_map[0].set(100, 3, 1, 7); // fd 3 -> open file 1
-        fd_map[1].set(100, 4, 2, 8); // fd 4 -> open file 2
-        let object_table = [DelegatedFile::new()];
-        object_table[0]
-            .state
-            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-        object_table[0].generation.store(42, Ordering::Relaxed);
-        let open_table = [DelegatedOpenFile::new(), DelegatedOpenFile::new()];
-        for (i, generation) in [(0usize, 7u64), (1, 8)] {
-            open_table[i]
-                .state
-                .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-            open_table[i]
-                .generation
-                .store(generation, Ordering::Relaxed);
-            open_table[i].inode_handle.store(1, Ordering::Relaxed);
-            open_table[i].inode_generation.store(42, Ordering::Relaxed);
-            open_table[i].flags.store(
-                carrick_el1_abi::DELEGATED_FLAG_READABLE | carrick_el1_abi::DELEGATED_FLAG_WRITABLE,
-                Ordering::Relaxed,
-            );
-        }
-        let inotify_table = [DelegatedInotify::new()];
-        let name_cache = InotifyNameCache::new();
-        let mut cache_mem = [0u8; 4096];
-        let cache_ptr = cache_mem.as_mut_ptr();
-        let run = |fd: u64, nr: u64, a1: u64, a2: u64| {
-            let mut frame = TrapFrame::default();
-            frame.x[0] = fd;
-            frame.x[1] = a1;
-            frame.x[2] = a2;
-            frame.x[8] = nr;
-            let action = dispatch_syscall_with_regions(
-                &mut frame,
-                &counters,
-                &tasks,
-                &fd_map,
-                &object_table,
-                &open_table,
-                &inotify_table,
-                &name_cache,
-                None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
-                |_| cache_ptr,
-            );
-            assert_eq!(action, Action::Served, "fd {fd} nr {nr}");
-            frame.x[0] as i64
-        };
-        let mut hello = *b"hello";
-        assert_eq!(run(3, 64, hello.as_mut_ptr() as u64, 5), 5); // write via fd 3
-        let mut out = [0u8; 5];
-        // fd 4 has its own offset (0) and sees fd 3's bytes.
-        assert_eq!(run(4, 63, out.as_mut_ptr() as u64, 5), 5);
-        assert_eq!(&out, b"hello");
-        assert_eq!(open_table[0].offset.load(Ordering::Relaxed), 5);
-        assert_eq!(open_table[1].offset.load(Ordering::Relaxed), 5);
-        assert_eq!(run(3, 62, 1, 0), 1); // lseek fd 3 to 1 leaves fd 4 at 5
-        assert_eq!(open_table[1].offset.load(Ordering::Relaxed), 5);
-        assert_eq!(object_table[0].size.load(Ordering::Relaxed), 5);
-    }
-
-    #[test]
-    fn test_inotify_add_watch_write_rm_watch_read_served() {
-        use carrick_el1_abi::{FD_HANDLE_INOTIFY_TAG, hash_path};
-
-        let counters = Counters::default();
-        let tasks = [CurrentTask::new()];
-        tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100);
-
-        let fd_map = [FdMapSlot::new(), FdMapSlot::new()];
-        fd_map[0].set(100, 3, 1, 42); // fd 3 -> delegated file handle 1
-        fd_map[1].set(100, 4, FD_HANDLE_INOTIFY_TAG | 1, 42); // fd 4 -> delegated inotify handle 1
-
-        let object_table = [DelegatedFile::new()];
-        let open_table = [DelegatedOpenFile::new()];
-        open_table[0]
-            .state
-            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-        open_table[0].inode_handle.store(1, Ordering::Relaxed);
-        object_table[0]
-            .state
-            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-        object_table[0].generation.store(42, Ordering::Relaxed);
-        open_table[0].generation.store(42, Ordering::Relaxed);
-        open_table[0].inode_generation.store(42, Ordering::Relaxed);
-        object_table[0].size.store(100, Ordering::Relaxed);
-        open_table[0].offset.store(0, Ordering::Relaxed);
-        open_table[0].flags.store(
-            carrick_el1_abi::DELEGATED_FLAG_READABLE | carrick_el1_abi::DELEGATED_FLAG_WRITABLE,
-            Ordering::Relaxed,
-        );
-
-        let inotify_table = [DelegatedInotify::new()];
-        inotify_table[0]
-            .state
-            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-        inotify_table[0].generation.store(42, Ordering::Relaxed);
-        inotify_table[0]
-            .flags
-            .store(inotify::O_NONBLOCK, Ordering::Relaxed);
-
-        let name_cache = InotifyNameCache::new();
-        let path = b"test.txt";
-        let path_hash = hash_path(path);
-        name_cache.insert(100, name_cache.cwd_generation(), path, path_hash, 1);
-
-        let mut path_str = *b"test.txt\0";
-        let mut frame_add = TrapFrame::default();
-        frame_add.x[0] = 4; // inotify fd
-        frame_add.x[1] = path_str.as_mut_ptr() as u64; // pathname
-        frame_add.x[2] = 0x02; // IN_MODIFY
-        frame_add.x[8] = 27; // inotify_add_watch
-
-        let mut cache_mem = [0u8; 4096];
-        let cache_ptr = cache_mem.as_mut_ptr();
-
-        // 1. inotify_add_watch should be served at EL1
-        let action = dispatch_syscall_with_regions(
-            &mut frame_add,
-            &counters,
-            &tasks,
-            &fd_map,
-            &object_table,
-            &open_table,
-            &inotify_table,
-            &name_cache,
-            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
-            |_| cache_ptr,
-        );
-        assert_eq!(action, Action::Served);
-        let wd = frame_add.x[0] as i32;
-        assert_eq!(wd, 1);
-        assert_eq!(counters.served[27].load(Ordering::Relaxed), 1);
-        assert!(object_table[0].has_marks());
-
-        // 2. write to file should be served at EL1 and enqueue IN_MODIFY
-        let mut write_buf = [0x55u8; 16];
-        let mut frame_write = TrapFrame::default();
-        frame_write.x[0] = 3; // file fd
-        frame_write.x[1] = write_buf.as_mut_ptr() as u64;
-        frame_write.x[2] = 16;
-        frame_write.x[8] = 64; // write
-
-        let action = dispatch_syscall_with_regions(
-            &mut frame_write,
-            &counters,
-            &tasks,
-            &fd_map,
-            &object_table,
-            &open_table,
-            &inotify_table,
-            &name_cache,
-            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
-            |_| cache_ptr,
-        );
-        assert_eq!(action, Action::Served);
-        assert_eq!(frame_write.x[0], 16);
-        assert_eq!(counters.served[64].load(Ordering::Relaxed), 1);
-        assert!(inotify_table[0].has_records());
-
-        // 3. inotify_rm_watch should be served at EL1 and enqueue IN_IGNORED
-        let mut frame_rm = TrapFrame::default();
-        frame_rm.x[0] = 4; // inotify fd
-        frame_rm.x[1] = wd as u64;
-        frame_rm.x[8] = 28; // inotify_rm_watch
-
-        let action = dispatch_syscall_with_regions(
-            &mut frame_rm,
-            &counters,
-            &tasks,
-            &fd_map,
-            &object_table,
-            &open_table,
-            &inotify_table,
-            &name_cache,
-            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
-            |_| cache_ptr,
-        );
-        assert_eq!(action, Action::Served);
-        assert_eq!(frame_rm.x[0], 0);
-        assert_eq!(counters.served[28].load(Ordering::Relaxed), 1);
-        assert!(!object_table[0].has_marks());
-        assert_eq!(inotify_table[0].queued_bytes.load(Ordering::Relaxed), 32); // IN_MODIFY + IN_IGNORED
-
-        // 4. read from inotify fd should be served at EL1 and drain 2 events (32 bytes)
-        let mut read_buf = [0u8; 64];
-        let mut frame_read = TrapFrame::default();
-        frame_read.x[0] = 4; // inotify fd
-        frame_read.x[1] = read_buf.as_mut_ptr() as u64;
-        frame_read.x[2] = 64;
-        frame_read.x[8] = 63; // read
-
-        let action = dispatch_syscall_with_regions(
-            &mut frame_read,
-            &counters,
-            &tasks,
-            &fd_map,
-            &object_table,
-            &open_table,
-            &inotify_table,
-            &name_cache,
-            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
-            |_| cache_ptr,
-        );
-        assert_eq!(action, Action::Served);
-        assert_eq!(frame_read.x[0], 32);
-        assert_eq!(counters.served[63].load(Ordering::Relaxed), 1);
-        assert!(!inotify_table[0].has_records());
-    }
-
-    #[test]
-    fn test_inotify_cache_miss_forwards() {
-        let counters = Counters::default();
-        let tasks = [CurrentTask::new()];
-        tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100);
-
-        let fd_map = [FdMapSlot::new()];
-        fd_map[0].set(100, 4, carrick_el1_abi::FD_HANDLE_INOTIFY_TAG | 1, 42);
-
-        let object_table = [DelegatedFile::new()];
-        let open_table = [DelegatedOpenFile::new()];
-        open_table[0]
-            .state
-            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-        open_table[0].inode_handle.store(1, Ordering::Relaxed);
-        let inotify_table = [DelegatedInotify::new()];
-        inotify_table[0]
-            .state
-            .store(DELEGATED_STATE_GUEST, Ordering::Relaxed);
-
-        let name_cache = InotifyNameCache::new(); // empty name cache -> miss!
-
-        let mut path_str = *b"unknown.txt\0";
-        let mut frame = TrapFrame::default();
-        frame.x[0] = 4;
-        frame.x[1] = path_str.as_mut_ptr() as u64;
-        frame.x[2] = 0x02; // IN_MODIFY
-        frame.x[8] = 27; // inotify_add_watch
-
-        let action = dispatch_syscall_with_regions(
-            &mut frame,
-            &counters,
-            &tasks,
-            &fd_map,
-            &object_table,
-            &open_table,
-            &inotify_table,
-            &name_cache,
-            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
-            |_| core::ptr::null_mut(),
-        );
-
-        assert_eq!(action, Action::Forward);
-        assert_eq!(counters.forwarded[27].load(Ordering::Relaxed), 1);
-        assert_eq!(counters.served[27].load(Ordering::Relaxed), 0);
     }
 
     #[test]

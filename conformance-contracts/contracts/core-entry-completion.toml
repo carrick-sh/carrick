@@ -1,0 +1,51 @@
+schema_version = 1
+id = "core.entry.completion"
+title = "A native entry has one exact-generation completion owner"
+guest_surfaces = ["syscall:set_robust_list", "syscall:restart", "vmm:kvm", "vmm:hvf"]
+semantic_authority = [
+  "man 2 set_robust_list",
+  "Linux syscall ABI: an unimplemented native ordinal is refused without effects",
+  "Linux signal/restart ordering: a completed syscall with pending return work is not dispatched again",
+]
+fixture = "carrick-personality-linux:x86_wave2::x4_linux_common_entry"
+scale_points = [1, 2, 8]
+rationale = """
+The ISA adapter retains the native frame and return convention while the Linux
+personality decodes the native ordinal and arguments. Admission captures the
+exact task, execution generation, MM and thread generation in one non-copying
+completion token. Completion authenticates that complete binding. In-zone Born
+entries use a distinct lifetime-bound token that authenticates the exact OnCpu
+record/claim/incarnation and installed MM without fabricating host adoption.
+A switched or parked turn authenticates its initiating execution binding and
+exact scheduler record epoch against an owned receipt issued by the successful
+existing park/retirement transition, then consumes its entry token. The existing
+wait record retains the continuation. Stale handoff cannot publish completion
+or work. Lifecycle results and original arguments publish only after successful
+authentication in the Linux owner. Pending
+return work marks the admitted call complete exactly once; it cannot send the
+same syscall through a semantic host dispatcher. Unknown native ordinals are
+counted refusals with zero Linux-side publication.
+"""
+
+[bindings]
+vm_free = "carrick-personality-linux::x86_wave2::x4_linux_common_entry"
+
+[bindings.unresolved]
+embed_structural = "The x86 production binding is carrick-vmm-kvm::cpl0_entry::x4_linux_common_entry; the unchanged-ARM signed embed binding is director-owned."
+docker = "Native Linux oracle qualification remains director-owned; this extraction preserves the existing set_robust_list result mapping."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "kernel_dispatches"
+base = 0
+per_unit = 1
+layers = ["vm-free"]
+rationale = "Each admitted syscall publishes exactly one semantic completion; refusals publish none."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "kernel_redispatches"
+base = 0
+per_unit = 0
+layers = ["vm-free"]
+rationale = "Pending work changes the return route, never the syscall's semantic owner."

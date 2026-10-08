@@ -1,4 +1,5 @@
 pub mod accept;
+pub mod asm_diff;
 mod atomic_file;
 pub mod ci_scaler;
 pub mod cli;
@@ -15,7 +16,9 @@ pub mod probe_inventory;
 pub mod provision;
 mod prune_fs;
 pub mod remote_accept;
+pub mod remote_lock;
 pub mod remote_recapture;
 mod target_prune;
+pub mod test_lanes;
 pub mod worktree_admission;
 pub mod worktree_gc;

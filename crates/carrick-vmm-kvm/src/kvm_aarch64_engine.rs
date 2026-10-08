@@ -28,10 +28,10 @@ use carrick_aarch64::{
 };
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::zero_range_chunked;
-use carrick_guest_mem::{Gpa, GuestVa, HostVa, MemoryError, SharedFutexLocation};
+use carrick_guest_mem::{Gpa, HostVa, MemoryError, SharedFutexLocation};
 use carrick_hal::{
-    GuestEntryRegs, GuestVmBackend, HostAliasBacking, HostAliasSharing, HvVcpu, HvVm, MemPerms,
-    OsError, Reg, SysReg, TrapError, VcpuExit, VcpuRegistry,
+    GuestEntryRegs, GuestVmBackend, HostAliasBacking, HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg,
+    TrapError, VcpuExit, VcpuRegistry,
 };
 use carrick_mem::memory::AddressSpace;
 

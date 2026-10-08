@@ -14,8 +14,12 @@ pub unsafe fn validate_selection<'a>(
     if !selected.matches(continuation) {
         return Err(TransferError::Stale);
     }
-    let current =
-        output.map(|(ipa, executable)| (ipa, continuation.intent.is_write() && executable));
+    let current = output.map(|(ipa, executable)| {
+        (
+            ipa,
+            continuation.intent == carrick_core_abi::PortalTransferIntent::UserWrite && executable,
+        )
+    });
     if generation != selected.generation || current != Some((selected.ipa, selected.executable)) {
         return Ok(None);
     }

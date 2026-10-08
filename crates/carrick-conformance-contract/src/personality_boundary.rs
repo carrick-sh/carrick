@@ -98,6 +98,35 @@ pub const FORBIDDEN_ERRNO_SYMBOLS: &[&str] = &[
     "EDOM",
     "ERANGE",
     "LinuxErrno",
+    "LinuxCloneFlags",
+    "BlockedMask",
+    "PendingSignals",
+    "AltStack",
+    "RobustListHead",
+    "clone_flags",
+    "blocked_mask",
+    "clear_child_tid",
+    "visible_tid",
+    "robust_head",
+    "sigset_bits",
+    "eventfd_flags",
+    "epoll_events",
+    "SIG_BLOCK",
+    "SIG_UNBLOCK",
+    "SIG_SETMASK",
+    "SIGKILL",
+    "SIGSTOP",
+    "FD_CLOEXEC",
+    "O_CLOEXEC",
+    "EFD_SEMAPHORE",
+    "EFD_NONBLOCK",
+    "EFD_CLOEXEC",
+    "EPOLLIN",
+    "EPOLLOUT",
+    "EPOLLERR",
+    "EPOLLHUP",
+    "EPOLLET",
+    "EPOLLONESHOT",
 ];
 
 #[derive(Debug, Error)]
@@ -1163,10 +1192,12 @@ impl<'a> SourceCheckerVisitor<'a> {
             return;
         }
         resolved.extend_from_slice(rest);
-        if !resolved
-            .first()
-            .is_some_and(|p| matches!(p.as_str(), "substrate" | "alloc" | "lock" | "rust_alloc"))
-        {
+        if !resolved.first().is_some_and(|p| {
+            matches!(
+                p.as_str(),
+                "substrate" | "alloc" | "lock" | "rust_alloc" | "isa"
+            )
+        }) {
             let start = span.start();
             self.violations.push(SourceViolation {
                 substrate_crate: self.substrate_crate.to_string(), file_path: self.file_path.to_path_buf(),
@@ -1211,6 +1242,7 @@ impl<'a> SourceCheckerVisitor<'a> {
         }
         let name = ident.to_string();
         if self.forbidden_symbols.contains(&name)
+            || name.starts_with("CLONE_")
             || name.starts_with("LINUX_")
             || name.starts_with("SYS_")
             || name == "carrick_abi"
@@ -1295,6 +1327,7 @@ impl<'a> SourceCheckerVisitor<'a> {
                 proc_macro2::TokenTree::Ident(ident) => {
                     let name = ident.to_string();
                     if self.forbidden_symbols.contains(&name)
+                        || name.starts_with("CLONE_")
                         || name.starts_with("LINUX_")
                         || name.starts_with("SYS_")
                         || name == "carrick_abi"
@@ -1742,6 +1775,39 @@ mod tests {
     }
 
     #[test]
+    fn el1_isa_leaf_is_neutral_but_cannot_import_personality() {
+        let fixture = Fixture::new("src/isa/native.rs", "use super::ArchError;");
+        let path = fixture
+            .root
+            .path()
+            .join("crates/carrick-sched-core/src/isa/native.rs");
+        let mut report = CrateAuditReport::default();
+        audit_source_file_tree(
+            "carrick-el1",
+            &path,
+            0,
+            &BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut report,
+        )
+        .unwrap();
+        assert!(report.source_violations.is_empty());
+
+        fs::write(&path, "use crate::personality::sched;").unwrap();
+        let mut report = CrateAuditReport::default();
+        audit_source_file_tree(
+            "carrick-el1",
+            &path,
+            0,
+            &BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut report,
+        )
+        .unwrap();
+        assert!(!report.source_violations.is_empty());
+    }
+
+    #[test]
     fn el1_substrate_rejects_personality_imports_and_root_facades() {
         for code in [
             "use crate::personality::sched as linux;",
@@ -1763,6 +1829,28 @@ mod tests {
             )
             .unwrap();
             assert!(!report.source_violations.is_empty(), "accepted {code}");
+        }
+    }
+
+    #[test]
+    fn policy_payloads_are_rejected_in_core() {
+        for code in [
+            "pub const CLONE_VM:u64=0x100;",
+            "pub trait Hook { fn clone_flags(&self)->u64; }",
+            "pub struct Opaque { pub blocked_mask:u64 }",
+            "pub struct Opaque { pub eventfd_flags:u32, pub epoll_events:u32 }",
+            "pub const SIG_SETMASK:u64=2;",
+            "pub const EFAULT:i64=14;",
+            "pub const FD_CLOEXEC:u32=1;",
+            "pub const EFD_SEMAPHORE:u32=1;",
+            "pub const EPOLLET:u32=1<<31;",
+            "macro_rules! clone_policy { () => { CLONE_THREAD }; }",
+        ] {
+            let f = Fixture::new("src/lib.rs", code);
+            assert!(
+                matches!(f.check(), Err(BoundaryError::Violations { .. })),
+                "accepted {code}"
+            );
         }
     }
 
@@ -2097,6 +2185,24 @@ mod tests {
         }
     }
     #[test]
+    fn image_build_tracks_neutral_owner_inputs() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let build = fs::read_to_string(repo.join("crates/carrick-el1-image/build.rs")).unwrap();
+        for dependency in [
+            "carrick-core",
+            "carrick-core-abi",
+            "carrick-personality-linux",
+        ] {
+            for input in ["src", "Cargo.toml"] {
+                let declaration = format!("cargo:rerun-if-changed=../{dependency}/{input}");
+                assert!(
+                    build.contains(&declaration),
+                    "image can retain stale {dependency}/{input}"
+                );
+            }
+        }
+    }
+    #[test]
     fn grant_pool_and_capacity_have_one_neutral_owner() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let old_pool =
@@ -2277,24 +2383,6 @@ mod tests {
         assert!(owner.contains("pub struct LeaseGate"));
         assert!(owner.contains("pub fn drain_publication"));
     }
-    #[test]
-    fn image_build_tracks_neutral_owner_inputs() {
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let build = fs::read_to_string(repo.join("crates/carrick-el1-image/build.rs")).unwrap();
-        for dependency in [
-            "carrick-core",
-            "carrick-core-abi",
-            "carrick-personality-linux",
-        ] {
-            for input in ["src", "Cargo.toml"] {
-                let declaration = format!("cargo:rerun-if-changed=../{dependency}/{input}");
-                assert!(
-                    build.contains(&declaration),
-                    "image can retain stale {dependency}/{input}"
-                );
-            }
-        }
-    }
 
     #[test]
     fn wait_records_and_edit_coordination_have_one_neutral_owner() {
@@ -2359,5 +2447,34 @@ mod tests {
         let core_abi_manifest =
             fs::read_to_string(repo.join("crates/carrick-core-abi/Cargo.toml")).unwrap();
         assert!(!core_abi_manifest.contains("carrick-el1"));
+    }
+    #[test]
+    fn order6_lifecycle_has_one_shared_owner() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let pending =
+            fs::read_to_string(repo.join("crates/carrick-personality-linux/src/dispatch.rs"))
+                .unwrap();
+        assert!(
+            !pending.contains("fn lifecycle(&mut self"),
+            "order 6 must remove lifecycle from PendingFamilies"
+        );
+        let abi = fs::read_to_string(repo.join("crates/carrick-el1-abi/src/thread_lifecycle.rs"))
+            .unwrap();
+        assert!(
+            !abi.contains("pub struct ThreadControlSlot {"),
+            "Linux sidecars must leave ARM ABI"
+        );
+        let arm = fs::read_to_string(repo.join("crates/carrick-el1/src/personality/lifecycle.rs"))
+            .unwrap();
+        for body in [
+            "fn serve_clone",
+            "fn serve_exit",
+            "fn serve_sigprocmask",
+            "fn serve_sigaltstack",
+        ] {
+            assert!(!arm.contains(body), "displaced ARM policy: {body}");
+        }
+        let core = fs::read_to_string(repo.join("crates/carrick-core/src/lifecycle.rs")).unwrap();
+        assert!(core.contains("pub trait Lifecycle"));
     }
 }

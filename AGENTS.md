@@ -44,7 +44,9 @@ with **`HV_DENIED` (`0xfae94007`)**.
   [`scripts/test-signed.sh`](scripts/test-signed.sh) (signs via
   [`scripts/lib/post-link-sign.sh`](scripts/lib/post-link-sign.sh), serial,
   unentitled negative control). `HV_DENIED` there is a FAILURE
-  (`EmbedError::Entitlement`), never a skip — don't copy `trap_hvf.rs`'s skip.
+  (`EmbedError::Entitlement`), never a skip. Any test that boots a VM is
+  `#[ignore]`d and run only by a signed recipe (e.g. `just test-hvf-trap-engine`);
+  never skip on a failed `hv_vm_create`.
 - **Never use `lld`** — strips `__DATA,__dof_carrick` → USDT empty →
   `carrick trace` fires zero events. Keep Apple `ld64`; verify
   `otool -l target/release/carrick | grep dof`.
@@ -81,7 +83,7 @@ with **`HV_DENIED` (`0xfae94007`)**.
 | `just test-embed [ARGS]` 🔏 | Signed `carrick-embed` guest tests (see Rule 0). Opt-in (HVF + `ubuntu:24.04`), **not** in `just ci`. |
 | `just matrix` | Re-render [`docs/support-matrix.md`](docs/support-matrix.md). |
 | `just check-matrix` | Drift gate: matrix == fresh render of `baseline.jsonl` (deterministic, no run). |
-| `cargo test -p carrick-vmm-kvm --test cpl0_entry` | x86 CPL0 entry smoke (Linux x86_64, real `/dev/kvm`, built `carrick-x86-cpl0` image). |
+| `just test-kvm` | Every `kvm`-lane test target (Linux x86_64, real `/dev/kvm`, `CARRICK_REQUIRE_KVM=1`: no skips). Lanes live in `[package.metadata.carrick.test-lanes]`; `test-lanes check` (in `lint-domains`) fails on a test target no gate runs. |
 | `just install-hooks` | Install git hooks (once per clone). |
 | `just accept [ARGS]` | Run host and/or signed landing gate (no Docker). |
 | `just accept --profile linux-portable` | Linux host gate + receipt; signed phase rejected. |
@@ -231,13 +233,17 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
   (in `lint-domains`) enforces it.
 - **Red-first:** `git checkout <pre-fix> -- <file>`, rebuild signed, DIFF;
   restore, MATCH; record false lines in the commit. Passing immediately proves
-  nothing. Scoped `just test-embed <filter>` / `test-signed.sh` runs may use an
-  exact-HEAD fixture bundle with unrelated dirty host sources: verification
-  checks the fixtures' resolved Cargo path-dependency inputs and records
-  `input_identity` in the receipt. Changed fixture inputs still require their
-  own committed variant and rebuilt bundle. Acceptance independently requires
-  no tracked or untracked changes (gitignored outputs excluded), and remains
-  exact-SHA; see [`docs/signed-fixtures.md`](docs/signed-fixtures.md#scoped-tests-and-red-first-work).
+  nothing. Fixture bundles are admitted by **input identity** (fixture sources,
+  their unfiltered Cargo path-dependency closure and lockfiles, every checkout
+  file the compiler's dep-info recorded, compiler pin, builders), not by
+  commit: unrelated commits and dirty host sources keep a restored bundle
+  valid for scoped `just test-embed <filter>` / `test-signed.sh` runs.
+  Changed fixture inputs refuse it and need their own committed variant and
+  rebuilt bundle. Checkout build scripts/proc-macros and linker scripts are
+  forbidden in fixture graphs; registry build code needs an entry in
+  `fixtures/reviewed-build-code.json`. Acceptance independently requires
+  no tracked or untracked changes (gitignored outputs excluded); receipts bind
+  exact HEAD, the working tree and the input identity; see [`docs/signed-fixtures.md`](docs/signed-fixtures.md#input-identity).
 - **Report errno NUMBERS** (`seek_data_negative_errno = errno`) — Linux said
   ENXIO where EINVAL was assumed; ESPIPE for `pwrite` on either pipe end, not
   EBADF.

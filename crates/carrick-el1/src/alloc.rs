@@ -21,6 +21,13 @@ fn current_el1_slot() -> Option<usize> {
     Some((offset / carrick_el1_abi::EL1_STACK_SIZE) as usize)
 }
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn current_el1_slot() -> Option<usize> {
+    // The CPL0 image has a retained bootstrap extent but does not yet map the
+    // ARM mailbox/zone aperture used for dynamic metadata grants.
+    None
+}
+
 /// Safe thread-safe wrapper around `MetadataAllocatorCore` with IRQ save/restore spinlock.
 pub struct MetadataStorage {
     lock: SpinLock<MetadataAllocatorCore>,
@@ -41,6 +48,17 @@ impl Default for MetadataStorage {
     }
 }
 
+fn bootstrap_metadata_base() -> u64 {
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    {
+        carrick_el1_abi::X86_CPL0_BOOTSTRAP_METADATA_BASE
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    {
+        carrick_el1_abi::EL1_BOOTSTRAP_METADATA_BASE
+    }
+}
+
 impl MetadataStorage {
     pub const fn new() -> Self {
         Self {
@@ -53,7 +71,7 @@ impl MetadataStorage {
         let mut core = self.lock.lock();
         if core.diagnostics().active_extents == 0 {
             let _ = core.admit_extent(
-                carrick_el1_abi::EL1_BOOTSTRAP_METADATA_BASE,
+                bootstrap_metadata_base(),
                 carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE as usize,
                 ExtentKind::Bootstrap,
             );
@@ -80,7 +98,7 @@ impl MetadataStorage {
     #[cfg(target_os = "none")]
     fn mark_pending_host_work(slot: usize) {
         if let Some(task) = carrick_el1_abi::current_task_guest(slot) {
-            task.mark_pending_host_work();
+            task.linux.mark_pending_host_work();
         }
     }
 
@@ -234,7 +252,7 @@ impl MetadataStorage {
         #[cfg(target_os = "none")]
         if core.diagnostics().active_extents == 0 {
             let _ = core.admit_extent(
-                carrick_el1_abi::EL1_BOOTSTRAP_METADATA_BASE,
+                bootstrap_metadata_base(),
                 carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE as usize,
                 ExtentKind::Bootstrap,
             );

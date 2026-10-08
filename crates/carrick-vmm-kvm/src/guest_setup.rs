@@ -3,20 +3,22 @@
 //! tiny EL1 vector whose lower-EL-sync slot STORES TO A SENTINEL gpa (the MMIO
 //! trap vehicle) instead of HVF's `hvc #2`, and program the system registers
 //! WITHOUT the Apple-Silicon FEAT_PAN3 / PSTATE.PAN=1 workaround.
-// On x86_64, the aarch64-specific items (EL1 vector builders, bring_up,
-// program_sysregs, BroughtUp) are cfg-gated.  Suppress dead_code/unused-import
-// warnings on x86_64 to keep `cargo clippy -- -D warnings` clean.
-#![cfg_attr(not(target_arch = "aarch64"), allow(dead_code, unused_imports))]
-use std::os::fd::AsRawFd;
+//!
+//! The aarch64 bring-up (EL1 vector builders, `bring_up`, `program_sysregs`,
+//! `BroughtUp`, the trap engine's alias/protection/exec-reset helpers) and the
+//! x86_64 fork/vfork VM rebuild are each `cfg`-gated to the architecture that
+//! calls them; the window/slot model in between is shared.
 use std::sync::{Arc, RwLock};
 
-use carrick_hal::{
-    HostAliasBacking, HostAliasSharing, HvVcpu, HvVm, MemPerms, OsError, Reg, SysReg,
-};
+use carrick_hal::{HostAliasBacking, HostAliasSharing, HvVm, MemPerms, OsError};
+#[cfg(target_arch = "aarch64")]
+use carrick_hal::{HvVcpu, Reg, SysReg};
+use carrick_mem::memory::LINUX_EL1_VECTORS_SIZE;
+#[cfg(target_arch = "aarch64")]
 use carrick_mem::memory::{
     AddressSpace, LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_MAINT_BASE, LINUX_EL1_VECTORS_BASE,
-    LINUX_EL1_VECTORS_SIZE, LINUX_NULL_GUARD_END, LINUX_PAGE_TABLES_BASE,
-    stage1_identity_page_tables, va_in_shared_aperture,
+    LINUX_NULL_GUARD_END, LINUX_PAGE_TABLES_BASE, stage1_identity_page_tables,
+    va_in_shared_aperture,
 };
 use carrick_mem::protections::MemoryProtections;
 
@@ -75,9 +77,11 @@ pub const MAINT_SENTINEL_GPA: u64 = 0x52_0000_0000; // 328 GiB
 /// exactly `LINUX_ALIAS_IPA_SIZE`), and maps VA -> that GPA in stage-1. HVF, with
 /// its own per-region `hv_vm_map`, uses the dispatcher's low IPA directly; this is
 /// the KVM-specific stage-2 glue.
+#[cfg(target_arch = "aarch64")]
 pub(crate) const KVM_ALIAS_GPA_BASE: u64 = 0xA0_0000_0000; // 640 GiB
 /// Size of the KVM alias-GPA arena. Matches `LINUX_ALIAS_IPA_SIZE` (64 GiB) so the
 /// VA->GPA delta always lands in-arena; ends at 704 GiB, well below the stack.
+#[cfg(target_arch = "aarch64")]
 pub(crate) const KVM_ALIAS_GPA_SIZE: u64 = 0x10_0000_0000; // 64 GiB
 
 /// KVM memory-slot alignment. `KVM_SET_USER_MEMORY_REGION` requires the
@@ -87,6 +91,7 @@ pub(crate) const KVM_ALIAS_GPA_SIZE: u64 = 0x10_0000_0000; // 64 GiB
 /// up — harmless extra lazy backing.
 const KVM_SLOT_ALIGN: u64 = 0x10000;
 
+#[cfg(target_arch = "aarch64")]
 fn align_down_slot(addr: u64) -> u64 {
     addr & !(KVM_SLOT_ALIGN - 1)
 }
@@ -105,6 +110,7 @@ fn align_up_slot(addr: u64) -> Result<u64, OsError> {
 /// zero under `MAP_NORESERVE` — correct, since the parent never touched them
 /// either). On `mincore` failure, fall back to copying the bounded `scan` prefix
 /// in full (correct, just less sparse). Mirrors HVF's `clone_region_for_child`.
+#[cfg(target_arch = "x86_64")]
 fn copy_resident_pages(src: *const u8, dst: *mut u8, scan: usize, total: usize) {
     if scan == 0 {
         return;
@@ -428,6 +434,7 @@ impl GuestRam {
     }
 
     /// Borrow the PROT_NONE set for the shared `GuestMemory::protections()` gate.
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn protections_ref(&self) -> &MemoryProtections {
         &self.protections
     }
@@ -435,6 +442,7 @@ impl GuestRam {
     /// Whether [gpa, gpa+len) overlaps any PROT_NONE range (so a syscall buffer
     /// there must fault with EFAULT). Delegates to the SHARED, process-wide
     /// [`MemoryProtections`] so a sibling thread's `mprotect` is visible here.
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn range_no_access(&self, gpa: u64, len: usize) -> bool {
         self.protections.range_no_access(gpa, len)
     }
@@ -442,6 +450,7 @@ impl GuestRam {
     /// Record (`no_access=true`) or clear (`false`) a PROT_NONE range on the
     /// SHARED bookkeeping (interior-mutable, so `&self`): the change is observed
     /// by every sibling vCPU thread's syscall-path access checks.
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn set_no_access(&self, gpa: u64, len: usize, no_access: bool) {
         self.protections.set_no_access(gpa, len, no_access);
     }
@@ -645,75 +654,19 @@ impl GuestRam {
             })
     }
 
-    /// Project each window into the neutral [`carrick_guest_mem::region::GuestMemoryRegion`]
-    /// keyed on `WindowDesc::base` (the SAME value `locate` keys on — the guest-VA
-    /// the host syscall path uses, NOT `slot_gpa`). Yielded BY VALUE so the gate
-    /// can iterate without allocating; the `slot_gpa` <1 TiB-alias handling stays
-    /// glue (it never enters the projection — `base` is always the lookup key).
-    fn safe_access_projected(
-        &self,
-        va: u64,
-        ipa: u64,
-        len: usize,
-    ) -> Result<*mut u8, carrick_guest_mem::region::GuestAccessError> {
-        let windows = self.windows.read().unwrap_or_else(|e| e.into_inner());
-        carrick_guest_mem::region::safe_guest_access_translated_in(
-            |g, l| self.protections.range_no_access(g, l),
-            windows
-                .iter()
-                .map(|w| carrick_guest_mem::region::GuestMemoryRegion {
-                    base: w.base,
-                    len: w.len,
-                    host_addr: w.host as *mut u8,
-                }),
-            va,
-            ipa,
-            len,
-        )
-    }
-
-    /// The COMBINED syscall-buffer gate: the PROT_NONE check THEN the single-
-    /// region whole-range lookup, via the neutral
-    /// [`carrick_guest_mem::region::safe_guest_access_translated_in`] (the
-    /// recurrence guard shared with HVF/bhyve). Returns the host pointer to the
-    /// buffer, or a [`carrick_guest_mem::region::GuestAccessError`] the caller
-    /// maps to its `MemoryError`. Zero-alloc: windows are projected on the fly.
-    /// The PROT_NONE predicate delegates to the shared, process-wide
-    /// [`MemoryProtections`] so a sibling thread's `mprotect` is observed here.
+    /// The syscall-buffer backing lookup, WITHOUT the PROT_NONE gate — the
+    /// shared default `GuestMemory::read_bytes`/`write_bytes` already ran it on
+    /// the guest VA. Keeps the NULL-guard (a backing fact) + the IPA-translated
+    /// single-region lookup via the neutral
+    /// [`carrick_guest_mem::region::safe_guest_access_translated_in`]. This is
+    /// the backing-only path the `*_raw` trait methods call.
     ///
-    /// The PROT_NONE check and the window lookup use SEPARATE addresses: `va`
-    /// (the guest's syscall pointer) for the PROT_NONE gate, and `ipa` (its
-    /// stage-1 translation) for the backing lookup. For an identity VA the caller
-    /// passes `ipa == va` and this is byte-identical to the pre-translation gate.
-    /// For a `repoint_private` overlay (or a high-VA alias) `ipa != va`, so the
-    /// copy lands in the PRIVATE overlay backing the guest's OWN loads/stores hit
-    /// — while `mprotect(PROT_NONE)`, which records the guest VA, still faults
-    /// EFAULT (it's keyed on `va`, NOT the translated `ipa`).
-    pub(crate) fn safe_access_translated(
-        &self,
-        va: u64,
-        ipa: u64,
-        len: usize,
-    ) -> Result<*mut u8, carrick_guest_mem::region::GuestAccessError> {
-        // The stage-1 tables leave VA 0..LINUX_NULL_GUARD_END UNMAPPED (the
-        // null guard = Linux's default vm.mmap_min_addr): the guest's OWN NULL
-        // deref faults. The host syscall path must agree — KVM's flat low
-        // identity window DOES back GPA 0, so without this gate a NULL syscall
-        // buffer silently reads/writes that backing instead of EFAULTing (LTP
-        // pipe05: pipe(NULL) must fail EFAULT). HVF gets this structurally
-        // from its discrete per-region windows (no region covers VA 0).
-        // Zero-length accesses stay exempt, matching HVF's `read_bytes`
-        // zero-length short-circuit (`read(fd, NULL, 0)` returns 0 on Linux).
-        if len > 0 && va < LINUX_NULL_GUARD_END {
-            return Err(carrick_guest_mem::region::GuestAccessError::OutOfBounds);
-        }
-        self.safe_access_projected(va, ipa, len)
-    }
-
-    /// Like [`safe_access_translated`](Self::safe_access_translated) but WITHOUT the PROT_NONE gate — the shared
-    /// default `GuestMemory::read_bytes`/`write_bytes` already ran it on the guest
-    /// VA. Keeps the NULL-guard (a backing fact) + the IPA-translated single-region
-    /// lookup. This is the backing-only path the `*_raw` trait methods call.
+    /// The stage-1 tables leave VA 0..LINUX_NULL_GUARD_END UNMAPPED (Linux's
+    /// default vm.mmap_min_addr), but KVM's flat low identity window DOES back
+    /// GPA 0, so without the NULL guard a NULL syscall buffer would silently
+    /// read/write that backing instead of EFAULTing (LTP pipe05). Zero-length
+    /// accesses stay exempt (`read(fd, NULL, 0)` returns 0 on Linux).
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn safe_access_translated_raw(
         &self,
         va: u64,
@@ -770,6 +723,7 @@ impl GuestRam {
     /// `MAP_SHARED` aperture re-registers the SAME (inherited) host pages, so its
     /// writes stay coherent across the fork. The vCPU is returned UNPROGRAMMED;
     /// the caller restores the parent's `Aarch64VcpuSnapshot` onto it.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn rebuild_vm_for_child(&self) -> Result<(KvmVm, KvmVcpu), OsError> {
         let mut vm = KvmVm::create_empty()?;
         let windows = self.windows.read().unwrap_or_else(|e| e.into_inner());
@@ -832,6 +786,7 @@ impl GuestRam {
     /// would FAULT IN every byte of every window — committing the whole multi-GB
     /// arena → OOM-`SIGKILL` (the exact failure this gates against). This mirrors
     /// the HVF child-snapshot `clone_region_for_child`.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn prepare_vfork_shadows(
         &self,
         arena_high_water: u64,
@@ -900,6 +855,7 @@ impl GuestRam {
     /// windows keep their inherited host page (already fork-coherent). The shadows
     /// are owned by the parent's `VforkShadows`; the child must NOT munmap them —
     /// it detaches on execve (a fresh VM) or `_exit` (process death).
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn rebuild_vm_for_child_vfork(
         &self,
         shadows: &VforkShadows,
@@ -934,6 +890,7 @@ impl GuestRam {
     /// shadow) are copied — a full copy-back would fault in every untouched arena
     /// page in the PARENT, re-introducing the OOM. Idempotent against an empty
     /// `VforkShadows` (pipe-failure degrade path).
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn finish_vfork_parent(&self, shadows: VforkShadows) {
         for s in &shadows.shadows {
             // Copy back only the shadow's resident pages (what the child wrote).
@@ -967,6 +924,7 @@ impl GuestRam {
     /// Diagnostic: describe why an access at `[gpa, gpa+len)` would (not) resolve
     /// — the located window or the nearest windows, plus no_access state. Gated
     /// callers only (CARRICK_MEM_DEBUG); allocates, so never on the hot path.
+    #[cfg(target_arch = "aarch64")]
     pub(crate) fn debug_access(&self, gpa: u64, len: usize) -> String {
         let located = self.locate(gpa, len).is_some();
         let no_access = self.range_no_access(gpa, len);
@@ -1058,6 +1016,7 @@ pub struct BroughtUp {
 
 /// The low window covers the user image's low segments AND the kernel region
 /// (EL0 trampoline / EL1 vectors / stage-1 page tables) at 180 GiB.
+#[cfg(target_arch = "aarch64")]
 const KERNEL_HOLE_END: u64 = 0x2D_0020_0000; // LINUX_KERNEL_REGION_BASE + 2 MiB
 
 impl GuestRam {
@@ -1249,6 +1208,7 @@ pub(crate) struct WindowDesc {
 /// (COW-private) window backing; `shadow` is the `MAP_SHARED` mapping the child
 /// registers its KVM slot over. The window is identified by `(base, slot_gpa)`
 /// (the same key the rebuild registration uses).
+#[cfg(target_arch = "x86_64")]
 pub(crate) struct VforkShadow {
     base: u64,
     slot_gpa: Option<u64>,
@@ -1260,10 +1220,12 @@ pub(crate) struct VforkShadow {
 /// The set of `vfork(2)` shadows a vfork parent prepared pre-`libc::fork`. Carried
 /// across the fork (the child consults it in `rebuild_vm_for_child_vfork`; the
 /// parent reconciles + releases it in `finish_vfork_parent`).
+#[cfg(target_arch = "x86_64")]
 pub(crate) struct VforkShadows {
     shadows: Vec<VforkShadow>,
 }
 
+#[cfg(target_arch = "x86_64")]
 impl VforkShadows {
     /// Whether any window has a shadow (false on the pipe-failure degrade path).
     pub(crate) fn is_empty(&self) -> bool {

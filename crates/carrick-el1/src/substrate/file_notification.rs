@@ -30,7 +30,7 @@ impl<'a> FileAccess<'a> {
                 };
                 #[cfg(target_os = "none")]
                 if let Some(task) = carrick_el1_abi::current_task_guest(usize::from(slot.raw())) {
-                    task.mark_pending_host_work();
+                    task.linux.mark_pending_host_work();
                 }
                 #[cfg(not(target_os = "none"))]
                 let _ = slot;

@@ -78,3 +78,7 @@ tar.workspace = true
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dev-dependencies]
 carrick-vmm-hvf = { path = "../carrick-vmm-hvf", features = ["metadata-grant-test-support"] }
+
+# Test gate lanes (`just xtask test-lanes check`; carrick-xtask src/test_lanes.rs).
+[package.metadata.carrick.test-lanes]
+"*" = "signed-hvf"

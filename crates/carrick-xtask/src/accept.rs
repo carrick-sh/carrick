@@ -298,8 +298,10 @@ pub const LINUX_PORTABLE_STEPS: &[StepSpec] = &[
     },
     StepSpec {
         name: "kvm-tests",
-        program: "cargo",
-        args: &["test", "-p", "carrick-vmm-kvm"],
+        // Every `kvm`-lane test target (derived from Cargo metadata), with
+        // CARRICK_REQUIRE_KVM=1 so a missing /dev/kvm or fixture fails.
+        program: "just",
+        args: &["test-kvm"],
         env: &[],
         log_name: "03-kvm-tests.log",
     },
@@ -310,6 +312,10 @@ pub const LINUX_PORTABLE_STEPS: &[StepSpec] = &[
             "clippy",
             "-p",
             "carrick-cli",
+            // Selected explicitly so its unit-test target is linted under the
+            // Linux feature closure; as a mere dependency only its lib is.
+            "-p",
+            "carrick-runtime",
             "-p",
             "carrick-xtask",
             "-p",
@@ -811,7 +817,7 @@ pub fn verify_signed_fixtures(
     verify_clean_checkout(root)?;
     crate::fixtures::verify_installed_receipt(root).map_err(|error| {
         AcceptError::Failed(format!(
-            "signed fixture provenance: {error}; restore an exact-HEAD bundle with xtask fixtures restore --manifest <path>"
+            "signed fixture provenance: {error}; restore a bundle whose fixture input identity matches this checkout with xtask fixtures restore --manifest <path>"
         ))
     })
 }
@@ -1813,6 +1819,12 @@ mod tests {
             .find(|step| step.name == "clippy-linux")
             .unwrap();
         assert!(clippy.args.contains(&"--no-default-features"));
+        assert!(
+            clippy
+                .args
+                .windows(2)
+                .any(|pair| pair == ["-p", "carrick-runtime"])
+        );
         assert!(
             clippy
                 .args

@@ -40,7 +40,7 @@ impl InventoryTransaction for FixtureInventory {
     fn publish(&mut self) -> Result<(), MemoryError> {
         Ok(())
     }
-    fn commit(&mut self, _: &DescriptorReceipt) -> Result<(), MemoryError> {
+    fn commit(&mut self, _: &GuestMmuPublication) -> Result<(), MemoryError> {
         Ok(())
     }
     fn rollback(&mut self) -> Result<(), MemoryError> {
@@ -107,6 +107,48 @@ impl MemoryWitness {
                 .initialize(pa as usize, bytes)
                 .map_err(|e| carrick_hal::TrapError::Hypervisor(e.to_string()))
         }))?;
+        // The fault tables are physically retained in the system extent, but
+        // every CPL0 reference uses its one upper supervisor direct window.
+        for index in 0..2 {
+            let tss =
+                carrick_x86::fault_slot_gpa(carrick_x86::fault_tss_base(LAYOUT), index as u64)
+                    .map_err(|e| error(e.to_string()))?;
+            let stack =
+                carrick_x86::fault_slot_gpa(carrick_x86::fault_stack_base(LAYOUT), index as u64)
+                    .map_err(|e| error(e.to_string()))?;
+            system.initialize(
+                tss as usize + 4,
+                &(carrick_el1_abi::X86_CPL0_DIRECT_VA + stack + 4096).to_le_bytes(),
+            )?;
+            system.initialize(
+                tss as usize + 36,
+                &(carrick_el1_abi::X86_CPL0_DIRECT_VA + 0xf0_0000 + (index as u64 + 1) * 4096)
+                    .to_le_bytes(),
+            )?;
+            let idt =
+                carrick_x86::fault_slot_gpa(carrick_x86::fault_idt_base(LAYOUT), index as u64)
+                    .map_err(|e| error(e.to_string()))?;
+            system.initialize(idt as usize + 8 * 16 + 4, &[1])?;
+            for vector in 0..256_u64 {
+                let gate_pa = idt + vector * 16;
+                let ptr = system
+                    .ptr(gate_pa, 16)
+                    .ok_or_else(|| error("IDT backing"))?;
+                // SAFETY: the unpublished system extent exclusively owns the
+                // initialized IDT bytes until all gates are rebased.
+                let gate = unsafe { core::slice::from_raw_parts(ptr, 16) };
+                if gate[5] & 0x80 == 0 {
+                    continue;
+                }
+                let low = u16::from_le_bytes([gate[0], gate[1]]) as u64;
+                let mid = u16::from_le_bytes([gate[6], gate[7]]) as u64;
+                let high = u32::from_le_bytes([gate[8], gate[9], gate[10], gate[11]]) as u64;
+                let entry = carrick_el1_abi::X86_CPL0_DIRECT_VA + low + (mid << 16) + (high << 32);
+                system.initialize(gate_pa as usize, &(entry as u16).to_le_bytes())?;
+                system.initialize(gate_pa as usize + 6, &((entry >> 16) as u16).to_le_bytes())?;
+                system.initialize(gate_pa as usize + 8, &((entry >> 32) as u32).to_le_bytes())?;
+            }
+        }
         for (i, program) in programs.iter().enumerate() {
             if program.len() > PAGE as usize {
                 return Err(error("memory witness code exceeds one page"));
@@ -140,7 +182,10 @@ impl MemoryWitness {
             memory.attach_shared(mm, &shared)?;
             for (span, output, size, permissions) in [
                 (
-                    PageSpan::new(0x200000, 14 * 1024 * 1024),
+                    PageSpan::new(
+                        carrick_el1_abi::X86_CPL0_DIRECT_VA + 0x200000,
+                        14 * 1024 * 1024,
+                    ),
                     0x200000,
                     LeafSize::Block2M,
                     Permissions {
@@ -193,10 +238,18 @@ impl MemoryWitness {
         for (i, cpu) in [&mut a, &mut b].into_iter().enumerate() {
             let mut layout = LAYOUT;
             layout.pml4_base = contexts[i].root.address().raw();
+            layout.trampoline_base += carrick_el1_abi::X86_CPL0_DIRECT_VA;
             hw(carrick_x86::program_longmode_entry(
                 cpu, layout, CODE_VA, 0x30ff0,
             ))?;
             hw(carrick_x86::program_fault_segments(cpu, LAYOUT, i as u64))?;
+            let mut system = cpu.fd().get_sregs().map_err(|e| error(e.to_string()))?;
+            system.gdt.base += carrick_el1_abi::X86_CPL0_DIRECT_VA;
+            system.idt.base += carrick_el1_abi::X86_CPL0_DIRECT_VA;
+            system.tr.base += carrick_el1_abi::X86_CPL0_DIRECT_VA;
+            cpu.fd()
+                .set_sregs(&system)
+                .map_err(|e| error(e.to_string()))?;
         }
         Ok(Self {
             cpus: [a, b],
@@ -245,6 +298,31 @@ impl MemoryWitness {
         };
         self.edit(index, op)
     }
+    /// Publish a private anonymous owner grant with a resident data page.
+    /// Protect and Retire require this provenance; a host Map is distinct.
+    pub fn prepare_private(
+        &mut self,
+        index: usize,
+        va: u64,
+        handle: BackingHandle,
+    ) -> Result<(), MemoryError> {
+        let record = self.memory.record(handle)?;
+        let span = PageSpan::new(va, PAGE);
+        self.edit(
+            index,
+            DescriptorOp::Prepare {
+                span,
+                output: record.backing.extent.base,
+                permissions: Permissions {
+                    writable: true,
+                    executable: false,
+                    user: true,
+                },
+                resident: span,
+                backing: record.backing.identity,
+            },
+        )
+    }
     pub fn edit(&mut self, index: usize, op: DescriptorOp) -> Result<(), MemoryError> {
         let context = *self
             .contexts
@@ -267,6 +345,7 @@ impl MemoryWitness {
             DescriptorOp::Publish {
                 span: PageSpan::new(DATA_VA, PAGE),
                 expected: output,
+                access: Access::Read,
             },
         )
     }
@@ -398,10 +477,26 @@ fn publish_fixture(
         op,
         tables: &grants,
     };
-    let (receipt, _) = memory.publish(&txn, &[], &mut FixtureInventory)?;
-    if let DescriptorOutcome::Applied { tables_linked, .. } = receipt.outcome {
-        *next += tables_linked as u64 * PAGE;
-    }
+    memory.admit_guest_edit(&txn)?;
+    let mut inventory = FixtureInventory;
+    memory.prepare(&[], &mut inventory)?;
+    // This test-only venue models the guest's descriptor effect before the
+    // carrier consumes its publication. Production CarrierMemory never calls
+    // the descriptor executor or writes a guest PTE.
+    let receipt = execute_descriptor_txn(
+        &memory.words(),
+        &txn,
+        context.root,
+        &mut InlineJournal::new(),
+    );
+    let publication = GuestMmuPublication::from_x86_receipt(&txn, &receipt).ok_or_else(|| {
+        error(format!(
+            "fixture guest descriptor edit {:?}: {:?}",
+            txn.op, receipt.outcome
+        ))
+    })?;
+    memory.publish(&txn, publication, &mut inventory)?;
+    *next += u64::from(publication.tables_linked) * PAGE;
     Ok(())
 }
 struct Cpl0Drain<'a> {
@@ -439,7 +534,10 @@ unsafe impl TranslationDrain for Cpl0Drain<'_> {
             cpu.fd()
                 .set_sregs(&system)
                 .map_err(|e| error(e.to_string()))?;
-            hw(cpu.set_gpr(X86Reg::Rip, DRAIN_CODE))?;
+            hw(cpu.set_gpr(
+                X86Reg::Rip,
+                carrick_el1_abi::X86_CPL0_DIRECT_VA + DRAIN_CODE,
+            ))?;
             let watchdog = Watchdog::start();
             let exit = HvVcpu::run(cpu).map_err(|e| error(e.to_string()))?;
             if watchdog.expired()

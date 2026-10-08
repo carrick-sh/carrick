@@ -6,7 +6,7 @@
 #[cfg(target_os = "none")]
 use super::ThreadCpu;
 use super::UserWord;
-#[cfg(any(test, target_os = "none"))]
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 mod aarch64_context;
 #[cfg(test)]
 pub(super) use aarch64_context::{load_frame, save_frame};
@@ -19,13 +19,13 @@ use carrick_el1_abi::{ThreadCtx, TrapFrame};
 pub struct HardwareUserWord;
 
 impl UserWord for HardwareUserWord {
-    #[cfg(target_os = "none")]
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     fn read_u32(&self, task: &CurrentTask, uaddr: u64) -> Option<u32> {
         use crate::substrate::file::MemoryValidator;
         if crate::substrate::file::HardwareValidator.readable_bytes(uaddr, 4) < 4 {
             return None;
         }
-        let fixup_ptr = &task.fixup_pc as *const _ as *const u64;
+        let fixup_ptr = &task.linux.fixup_pc as *const _ as *const u64;
         let mut ok: u64 = 1;
         let value: u64;
         // SAFETY: a fault on the user word is intercepted by the EL1 fixup,
@@ -53,6 +53,11 @@ impl UserWord for HardwareUserWord {
         (ok != 0).then_some(value as u32)
     }
 
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    fn read_u32(&self, task: &CurrentTask, uaddr: u64) -> Option<u32> {
+        crate::isa::x86::user_access::read_u32(task, uaddr)
+    }
+
     #[cfg(not(target_os = "none"))]
     fn read_u32(&self, _task: &CurrentTask, uaddr: u64) -> Option<u32> {
         // Host builds (unit tests): the "user" word is host memory.
@@ -60,13 +65,13 @@ impl UserWord for HardwareUserWord {
         Some(unsafe { core::ptr::read_volatile(uaddr as *const u32) })
     }
 
-    #[cfg(target_os = "none")]
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     fn read_u64(&self, task: &CurrentTask, uaddr: u64) -> Option<u64> {
         use crate::substrate::file::MemoryValidator;
         if crate::substrate::file::HardwareValidator.readable_bytes(uaddr, 8) < 8 {
             return None;
         }
-        let fixup_ptr = &task.fixup_pc as *const _ as *const u64;
+        let fixup_ptr = &task.linux.fixup_pc as *const _ as *const u64;
         let mut ok: u64 = 1;
         let value: u64;
         // SAFETY: a fault on the user word is intercepted by the EL1 fixup,
@@ -94,6 +99,11 @@ impl UserWord for HardwareUserWord {
         (ok != 0).then_some(value)
     }
 
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    fn read_u64(&self, task: &CurrentTask, uaddr: u64) -> Option<u64> {
+        crate::isa::x86::user_access::read_u64(task, uaddr)
+    }
+
     #[cfg(not(target_os = "none"))]
     fn read_u64(&self, _task: &CurrentTask, uaddr: u64) -> Option<u64> {
         // SAFETY: tests pass the address of a live, aligned u64.
@@ -106,7 +116,7 @@ impl UserWord for HardwareUserWord {
 #[cfg(target_os = "none")]
 pub struct HardwareCpu;
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl ThreadCpu for HardwareCpu {
     fn save(&mut self, frame: &TrapFrame, ctx: &mut ThreadCtx) {
         aarch64_context::save(frame, ctx);
@@ -239,6 +249,112 @@ impl ThreadCpu for HardwareCpu {
     }
 }
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+impl ThreadCpu for HardwareCpu {
+    // This ARM TrapFrame/ThreadCtx interface is reached only by the EL1
+    // AArch64 entry. CPL0 switches through ZoneRecord<ParkedContextWords>
+    // and an authenticated CR3 in cpl0_lifecycle. Reaching these leaves on
+    // x86 is an invalid entry-lane mix, never a successful context switch.
+    fn save(&mut self, _frame: &TrapFrame, _ctx: &mut ThreadCtx) {
+        crate::isa::x86::fatal_entry_binding()
+    }
+    fn load(&mut self, _frame: &mut TrapFrame, _ctx: &ThreadCtx) {
+        crate::isa::x86::fatal_entry_binding()
+    }
+    fn set_translation(&mut self, _ttbr0: u64, _ttbr1: u64) {
+        crate::isa::x86::fatal_entry_binding()
+    }
+    fn invalidate_asid(&mut self, _ttbr0: u64) {
+        crate::isa::x86::fatal_entry_binding()
+    }
+    fn now(&self) -> u64 {
+        let (lo, hi): (u32, u32);
+        // SAFETY: RDTSC reads the native monotonic counter.
+        unsafe {
+            core::arch::asm!(
+                "rdtsc",
+                out("eax") lo,
+                out("edx") hi,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        (u64::from(hi) << 32) | u64::from(lo)
+    }
+    fn freq(&self) -> u64 {
+        crate::isa::x86::interrupt::tsc_frequency()
+            .map_or_else(|| crate::isa::x86::fatal_entry_binding(), |f| f.get())
+    }
+    fn set_timer(&mut self, cval: Option<u64>) {
+        use carrick_guest_arch::InterruptBackend;
+        let deadline =
+            cval.map(|c| carrick_guest_arch::Deadline(carrick_guest_arch::CounterTick::new(c)));
+        if <crate::isa::x86::X86Backend as InterruptBackend>::arm_timer(
+            &mut crate::isa::x86::X86Backend,
+            deadline,
+        )
+        .is_err()
+        {
+            crate::isa::x86::fatal_entry_binding();
+        }
+    }
+    fn send_sgi(&mut self, _sgi1r: u64) {
+        // An ARM ICC_SGI1R word has no x86 destination interpretation.
+        crate::isa::x86::fatal_entry_binding();
+    }
+    fn send_resched(&mut self, slot: carrick_sched_core::SlotId, _target: u64) {
+        if crate::isa::x86::interrupt::send_resched(slot).is_err() {
+            crate::isa::x86::fatal_entry_binding();
+        }
+    }
+    fn ack_irq(&mut self) -> u32 {
+        use carrick_guest_arch::InterruptBackend;
+        let ack = <crate::isa::x86::X86Backend as InterruptBackend>::ack_interrupt(
+            &mut crate::isa::x86::X86Backend,
+        )
+        .unwrap_or_else(|_| crate::isa::x86::fatal_entry_binding());
+        match ack.map(|ack| ack.hardware) {
+            None => carrick_el1_abi::GIC_SPURIOUS_INTID,
+            Some(vector) if vector == u32::from(crate::isa::x86::interrupts::TIMER_VECTOR) => {
+                carrick_el1_abi::GIC_VTIMER_INTID
+            }
+            Some(vector) if vector == u32::from(crate::isa::x86::interrupts::KICK_VECTOR) => {
+                carrick_el1_abi::GIC_KICK_INTID
+            }
+            Some(vector) if vector == u32::from(crate::isa::x86::interrupts::RESCHED_VECTOR) => {
+                carrick_el1_abi::GIC_RESCHED_INTID
+            }
+            Some(_) => crate::isa::x86::fatal_entry_binding(),
+        }
+    }
+    fn end_irq(&mut self, intid: u32) {
+        use carrick_guest_arch::InterruptBackend;
+        let ack = carrick_guest_arch::InterruptAck {
+            reason: carrick_guest_arch::InterruptReason::External,
+            hardware: intid,
+        };
+        if <crate::isa::x86::X86Backend as InterruptBackend>::end_interrupt(
+            &mut crate::isa::x86::X86Backend,
+            ack,
+        )
+        .is_err()
+        {
+            crate::isa::x86::fatal_entry_binding();
+        }
+    }
+    fn wait_for_interrupt(&mut self) {
+        // SAFETY: parks until interrupt.
+        unsafe { crate::isa::x86::interrupts::hardware::park_until_interrupt() };
+    }
+    fn spin(&mut self) {
+        core::hint::spin_loop();
+    }
+    fn own_sgi_target(&self) -> u64 {
+        crate::isa::x86::context::current_thread_cpu()
+            .and_then(|slot| slot.checked_add(1))
+            .unwrap_or_else(|| crate::isa::x86::fatal_entry_binding())
+    }
+}
+
 /// Read the current stack pointer at EL1.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline(always)]
@@ -250,13 +366,26 @@ pub fn read_current_sp() -> u64 {
     sp
 }
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[inline(always)]
+pub fn read_current_sp() -> u64 {
+    let sp: u64;
+    // SAFETY: CPL0 reads the current stack pointer.
+    unsafe {
+        core::arch::asm!("mov {0}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    sp
+}
+
 /// Guard structure capturing saved DAIF interrupt flags.
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub struct IrqGuard {
     #[allow(dead_code)]
     pub saved_daif: u64,
 }
 
 #[inline(always)]
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub fn disable_irq_save() -> IrqGuard {
     let daif: u64;
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -276,6 +405,7 @@ pub fn disable_irq_save() -> IrqGuard {
 }
 
 #[inline(always)]
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub fn restore_irq(guard: IrqGuard) {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     unsafe {
@@ -289,4 +419,52 @@ pub fn restore_irq(guard: IrqGuard) {
     {
         let _ = guard;
     }
+}
+
+/// RFLAGS.IF captured before entering a CPL0 metadata critical section.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub struct IrqGuard {
+    flags: u64,
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[inline(always)]
+pub fn disable_irq_save() -> IrqGuard {
+    let flags: u64;
+    // SAFETY: CPL0 owns RFLAGS.IF; saving it before CLI protects the metadata
+    // lock against interrupt reentry on the executing vCPU.
+    unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags) };
+    IrqGuard { flags }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[inline(always)]
+pub fn restore_irq(guard: IrqGuard) {
+    if guard.flags & (1 << 9) != 0 {
+        // SAFETY: this guard captured enabled interrupts before the lock;
+        // callers invoke restore only after dropping the metadata lock.
+        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+    }
+}
+
+/// Non-returning native fatal transport after an entry loses its exact binding.
+/// Guest syscall replay or a return through another task is forbidden.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub(crate) fn fatal_entry_binding() -> ! {
+    // SAFETY: this runs at EL1. HVC #3 is the image's fatal boundary, with
+    // the established panic sentinel and no guest return/result publication.
+    unsafe {
+        core::arch::asm!("hvc #3",
+            in("x0") carrick_el1_abi::PANIC_SENTINEL,
+            in("x1") 0u64, in("x2") 0u64, in("x3") 0u64,
+            options(nostack));
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn fatal_entry_binding() -> ! {
+    crate::isa::x86::fatal_entry_binding()
 }

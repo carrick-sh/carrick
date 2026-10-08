@@ -28,7 +28,7 @@ pub(crate) unsafe fn copy_to_user_guarded(
 ) -> bool {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
-        let fixup_ptr = &cur_task.fixup_pc as *const _ as *const u64;
+        let fixup_ptr = &cur_task.linux.fixup_pc as *const _ as *const u64;
         let mut success: u64 = 1;
         unsafe {
             core::arch::asm!(
@@ -59,7 +59,7 @@ pub(crate) unsafe fn copy_to_user_guarded(
         }
         success != 0
     }
-    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    #[cfg(not(target_os = "none"))]
     {
         let _ = cur_task;
         #[cfg(test)]
@@ -70,6 +70,12 @@ pub(crate) unsafe fn copy_to_user_guarded(
             core::ptr::copy_nonoverlapping(src, dest, len);
         }
         true
+    }
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    {
+        // SAFETY: `dest` is the guarded user operand and `src` is retained
+        // kernel memory for the duration of the copy.
+        unsafe { crate::isa::x86::user_access::copy(cur_task, dest, src, len, dest as u64, true) }
     }
 }
 
@@ -89,7 +95,7 @@ pub(crate) unsafe fn copy_from_user_guarded(
 ) -> bool {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
-        let fixup_ptr = &cur_task.fixup_pc as *const _ as *const u64;
+        let fixup_ptr = &cur_task.linux.fixup_pc as *const _ as *const u64;
         let mut success: u64 = 1;
         unsafe {
             core::arch::asm!(
@@ -120,7 +126,7 @@ pub(crate) unsafe fn copy_from_user_guarded(
         }
         success != 0
     }
-    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    #[cfg(not(target_os = "none"))]
     {
         let _ = cur_task;
         #[cfg(test)]
@@ -131,6 +137,12 @@ pub(crate) unsafe fn copy_from_user_guarded(
             core::ptr::copy_nonoverlapping(src, dest, len);
         }
         true
+    }
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    {
+        // SAFETY: `src` is the guarded user operand and `dest` is retained
+        // kernel memory for the duration of the copy.
+        unsafe { crate::isa::x86::user_access::copy(cur_task, dest, src, len, src as u64, false) }
     }
 }
 
@@ -160,7 +172,7 @@ impl MemoryValidator for HardwareValidator {
 #[cfg(target_os = "none")]
 pub struct HardwareValidator;
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl MemoryValidator for HardwareValidator {
     fn writable_bytes(&self, user_va: u64, len: usize) -> usize {
         if len == 0 {
@@ -218,6 +230,16 @@ impl MemoryValidator for HardwareValidator {
             checked += core::cmp::min(len - checked, page_remaining);
         }
         checked
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+impl MemoryValidator for HardwareValidator {
+    fn writable_bytes(&self, user_va: u64, len: usize) -> usize {
+        crate::isa::x86::user_access::accessible_bytes(user_va, len, true)
+    }
+    fn readable_bytes(&self, user_va: u64, len: usize) -> usize {
+        crate::isa::x86::user_access::accessible_bytes(user_va, len, false)
     }
 }
 

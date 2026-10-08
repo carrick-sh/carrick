@@ -42,3 +42,7 @@ carrick-host-bsd = { path = "../carrick-host-bsd" }
 carrick-timer-core = { path = "../carrick-timer-core" }
 carrick-signal-linux = { path = "../carrick-signal-linux" }
 libc.workspace = true
+
+# Test gate lanes (`just xtask test-lanes check`; carrick-xtask src/test_lanes.rs).
+[package.metadata.carrick.test-lanes]
+"*" = { lane = "manual", reason = "needs a NetBSD x86_64 host with /dev/nvmm as root; no runner or recipe provides one" }

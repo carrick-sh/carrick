@@ -6,21 +6,304 @@
 //! zero semantic host forwards. Control observation/kicks are separate.
 //! Missing KVM or an image is a failure; no Docker, retries or timing claims.
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::needless_range_loop)]
 
 use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
-use carrick_sched_core::{SlotId, ThreadIdentity, ZoneTables};
+use carrick_mmu_core::x86::descriptor_txn::Access;
+use carrick_sched_core::{ParkedContextWords, SlotId, ThreadIdentity, ZoneTables};
 use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
-use carrick_x86::cpl0_entry::OBSERVE_NATIVE;
+use carrick_x86::cpl0_entry::{
+    OBSERVE_ALLOCATOR, OBSERVE_DESCRIPTOR_PREPARE_PUBLISH, OBSERVE_DESCRIPTOR_PROTECT,
+    OBSERVE_FORK_TABLE_WINDOW, OBSERVE_INITIAL_MM, OBSERVE_MMU_DRAIN, OBSERVE_MMU_ROOT,
+    OBSERVE_NATIVE, OBSERVE_PORTAL_WINDOW, OBSERVE_RETIRE_REPOINT, OBSERVE_SHARED_COW_FAULT,
+    OBSERVE_SHARED_PREPARED_FAULT,
+};
 use carrick_x86::cpl0_scheduler::{
-    ContextBinding, InterruptFrame, NativeContext, XsaveArea, admit_context,
+    ContextBinding, InterruptFrame, NativeContext, XsaveArea, admit_context, park_native_context,
+    restore_native_context,
 };
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 
+fn user_access_program(index: u64) -> (Vec<u8>, Vec<i64>) {
+    let mapped = 0x3_1000 + index * 0x1_0000;
+    let code = 0x1_0000 + index * 0x1000;
+    let unmapped_edge = mapped + 0xff8;
+    let mut bytes = Vec::new();
+    let calls = [
+        (mapped, 2_u64, 0_i64),
+        (mapped, 0, 0x51ab_cdef_1234_5678_i64),
+        (mapped, 1, 0x51ab_cdef_1234_5678_i64),
+        (mapped, 8, 0x51ab_cdef_1234_5678_i64), // typed chunk copy-in
+        (mapped, 9, 0),                         // typed chunk copy-out
+        (mapped, 0, 0x6ace_b00c_1234_5678_i64),
+        (mapped, 10, 0), // wrong MM incarnation consumes no kernel bytes
+        (mapped, 14, 0), // changed thread generation also refuses
+        (mapped, 12, 0), // unsupported word width is typed InvalidWidth
+        (mapped, 13, 0), // foreign task cannot validate this live CR3
+        (mapped, 3, 0x1234_5678_i64),
+        (mapped, 4, 16),
+        (mapped, 5, 16),
+        (code, 4, 16),
+        (code, 5, 0),
+        (0xffff_ffff_8000_0000, 4, 0), // mapped supervisor image is outside user range
+        (0xffff_ffff_8000_0000, 0, -14),
+        (0xffff_ffff_8000_0000, 1, -14),
+        (0xffff_ffff_8000_0000, 2, -14),
+        (0x0000_7fff_ffff_fffc, 0, -14), // eight-byte word crosses the ceiling
+        (0x0000_7fff_ffff_fffc, 4, 0),   // validation rejects whole crossed range
+        (u64::MAX - 3, 1, -14),          // wrapped copy cannot alias kernel
+        (u64::MAX - 3, 8, -14),          // typed transfer refuses wrapped range
+        (unmapped_edge, 4, 8),           // prefix ends at the unmapped next page
+        (unmapped_edge, 5, 8),
+        (unmapped_edge + 4, 1, -14), // preflight refuses a cross-page copy-in
+        (unmapped_edge + 4, 2, -14), // preflight refuses a cross-page copy-out
+        (0x7_0000, 0, -14),
+        (0x7_0000, 11, 0), // mapped trait returns typed fault, not zero data
+        (0x7_0000, 1, -14),
+        (0x7_0000, 2, -14),
+        (0x7_0000, 6, -14), // execute the #PF recovery path after bypassing preflight
+        (0x7_0000, 7, -14),
+        (0x7_0000, 4, 0),
+        (0x7_0000, 5, 0),
+    ];
+    for (address, mode, _) in calls {
+        bytes.extend_from_slice(&[0x48, 0xbf]); // mov rdi, user VA
+        bytes.extend_from_slice(&address.to_le_bytes());
+        bytes.extend_from_slice(&[0x48, 0xbe]); // mov rsi, operation
+        bytes.extend_from_slice(&mode.to_le_bytes());
+        bytes.extend_from_slice(&[0x48, 0xb8]);
+        bytes.extend_from_slice(&0xffff_ffff_ffff_ff10_u64.to_le_bytes());
+        bytes.extend_from_slice(&[0x0f, 0x05]); // syscall into shared kernel witness
+        bytes.extend_from_slice(&[0x48, 0x89, 0xc7, 0x48, 0xb8]);
+        bytes.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+        bytes.extend_from_slice(&[0x0f, 0x05]);
+    }
+    bytes.extend_from_slice(&[0x0f, 0x0b]);
+    (
+        bytes,
+        calls.into_iter().map(|(_, _, expected)| expected).collect(),
+    )
+}
+
+fn exercise_shared_kernel_user_access(smap: bool) {
+    // Before the user-access leaf was bound, the first mapped call hit UD2.
+    // Both live tasks use distinct stack pages and task-local fixup records.
+    let (a, expected_a) = user_access_program(0);
+    let (b, expected_b) = user_access_program(1);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&a, &b]).expect("real KVM + shared CPL0 image");
+    if smap {
+        carrier.enable_smap().expect("guest SMAP capability");
+    }
+    for (round, (expected_a, expected_b)) in expected_a.into_iter().zip(expected_b).enumerate() {
+        for (task, expected) in [(0, expected_a), (1, expected_b)] {
+            assert_eq!(
+                carrier.observe(task).expect("bounded user access").result,
+                expected,
+                "task {task}, round {round}"
+            );
+        }
+    }
+}
+
+#[test]
+fn shared_kernel_user_access_recovers_from_bad_va() {
+    exercise_shared_kernel_user_access(false);
+}
+
+#[test]
+fn shared_kernel_user_access_restores_smap_ac() {
+    exercise_shared_kernel_user_access(true);
+}
+
+#[test]
+fn user_access_walks_the_second_live_root() {
+    let mut program = vec![0x48, 0xbf]; // mov rdi, user data VA
+    program.extend_from_slice(&carrick_x86::cpl0_scheduler::PROGRESS_DATA.to_le_bytes());
+    program.extend_from_slice(&[0x48, 0xbe]); // mov rsi, read_u64 operation
+    program.extend_from_slice(&0_u64.to_le_bytes());
+    program.extend_from_slice(&[0x48, 0xb8]); // mov rax, user-access witness
+    program.extend_from_slice(&0xffff_ffff_ffff_ff10_u64.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier =
+        Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("KVM image");
+    assert_eq!(carrier.observe(1).expect("second-root user read").result, 0);
+}
+
 fn image() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/x86_64-unknown-none/release/carrick-x86-cpl0")
+    PathBuf::from(env!("CARRICK_X86_CPL0_FIXTURE_IMAGE"))
+}
+
+#[test]
+fn production_cpl0_boot_retains_separate_supervisor_and_initial_extents() {
+    for initial_bytes in [0x20_000, 0x40_000, 0x80_000] {
+        let carrier = Cpl0Carrier::boot_production(initial_bytes)
+            .expect("production image on one KVM carrier VM");
+        // Bootstrap RAM, allocator metadata, supervisor region, initial MM.
+        assert_eq!(carrier.physical_slot_count(), 4);
+        assert_eq!(
+            carrier.retained_bytes(),
+            16 * 1024 * 1024 + 0x90_0000 + 64 * 1024 * 1024 + initial_bytes
+        );
+        assert!(
+            carrier
+                .fixture_user_leaf(carrick_vmm_kvm::cpl0_boot::USER_CODE)
+                .is_err(),
+            "production boot must leave user memory to the guest MM owner"
+        );
+    }
+}
+
+#[test]
+fn production_cpl0_boot_requires_smep_and_smap_on_both_cpus() {
+    let carrier = Cpl0Carrier::boot_production(0x20_000).expect("production KVM boot");
+    for slot in 0..2 {
+        let cr4 = carrier.supervisor_cr4(slot).expect("stopped CPU state");
+        assert_eq!(cr4 & ((1 << 20) | (1 << 21)), (1 << 20) | (1 << 21));
+    }
+}
+
+#[test]
+fn cpl0_supervisor_stub_is_rx_while_tables_and_idt_are_rw_nx() {
+    let layout = carrick_x86::BringupLayout {
+        trampoline_base: 0x10_0000,
+        gdt_base: 0x50_0000,
+        pml4_base: 0x60_0000,
+    };
+    for carrier in [
+        Cpl0Carrier::boot(&image(), [&[], &[]]).expect("fixture KVM boot"),
+        Cpl0Carrier::boot_production(0x20_000).expect("production KVM boot"),
+    ] {
+        let idt = carrick_x86::fault_idt_base(layout);
+        let stub = carrick_x86::fault_stub_base(layout);
+        let tss = carrick_x86::fault_tss_base(layout);
+        for data in [layout.pml4_base, idt, tss] {
+            assert!(
+                carrier
+                    .bootstrap_supervisor_access(data, Access::Write)
+                    .expect("data page")
+            );
+            assert!(
+                !carrier
+                    .bootstrap_supervisor_access(data, Access::Execute)
+                    .expect("NX data")
+            );
+        }
+        assert!(
+            carrier
+                .bootstrap_supervisor_access(stub, Access::Execute)
+                .expect("stub code")
+        );
+        assert!(
+            !carrier
+                .bootstrap_supervisor_access(stub, Access::Write)
+                .expect("RX stub")
+        );
+    }
+}
+
+#[test]
+fn cpl0_forward_port_returns_host_result_through_shared_entry() {
+    let mut program = vec![0x48, 0xb8];
+    program.extend_from_slice(&39u64.to_le_bytes()); // getpid, forwarded
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    let result = carrier
+        .observe_with_forward(0, |frame| {
+            assert_eq!(frame.rax, 39);
+            frame.rax = 42;
+            Ok(())
+        })
+        .expect("forwarded syscall returns to EL0");
+    assert_eq!(result.result, 42);
+    assert_eq!(result.semantic_host_exits, 1);
+    assert_eq!(result.completions[0], 1);
+}
+
+#[test]
+fn cpl0_rechecks_host_modified_return_frame_before_iret() {
+    let mut program = vec![0x48, 0xb8];
+    program.extend_from_slice(&39_u64.to_le_bytes()); // forwarded getpid
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    let failure = carrier
+        .observe_with_forward(0, |frame| {
+            frame.rcx = 0x8000_0000_0000_0000; // noncanonical user RIP
+            frame.rax = 42;
+            Ok(())
+        })
+        .expect_err("invalid host-modified return must fail closed");
+    assert!(
+        format!("{failure:?}").contains("CPL0 fatal exit"),
+        "invalid return requires a typed fatal exit: {failure:?}"
+    );
+}
+
+#[test]
+fn production_image_rejects_fixture_syscalls() {
+    let production = PathBuf::from(env!("CARRICK_X86_CPL0_IMAGE"));
+    let bytes = std::fs::read(&production).expect("production CPL0 image built");
+    let plan =
+        carrick_mem::elf::plan_elf_load_bytes_for(&bytes, 62).expect("production CPL0 load image");
+    for syscall in [
+        0xffff_ffff_ffff_ff10_u64,
+        0xffff_ffff_ffff_ff20,
+        0xffff_ffff_ffff_ff30,
+        0xffff_ffff_ffff_ff40,
+        OBSERVE_NATIVE,
+        OBSERVE_MMU_ROOT,
+        OBSERVE_ALLOCATOR,
+        OBSERVE_MMU_DRAIN,
+        OBSERVE_DESCRIPTOR_PROTECT,
+        OBSERVE_DESCRIPTOR_PREPARE_PUBLISH,
+        OBSERVE_SHARED_PREPARED_FAULT,
+        OBSERVE_SHARED_COW_FAULT,
+        OBSERVE_PORTAL_WINDOW,
+        OBSERVE_FORK_TABLE_WINDOW,
+        OBSERVE_RETIRE_REPOINT,
+        OBSERVE_INITIAL_MM,
+    ] {
+        assert!(
+            !plan.segments.iter().any(|segment| {
+                let start = segment.file_offset as usize;
+                let end = start + segment.file_size as usize;
+                bytes[start..end]
+                    .windows(8)
+                    .any(|window| window == syscall.to_le_bytes())
+            }),
+            "production image contains fixture syscall {syscall:#x}"
+        );
+    }
+    let probe = transport_program(0);
+    let mut carrier =
+        Cpl0Carrier::boot(&production, [&probe, &probe]).expect("production image on real KVM");
+    let err = carrier
+        .observe(0)
+        .expect_err("synthetic syscall must not dispatch");
+    assert!(
+        err.to_string().contains("unported CPL0 native call"),
+        "{err}"
+    );
+}
+
+#[test]
+fn production_interrupt_boot_serves_an_ordinary_syscall() {
+    let production = PathBuf::from(env!("CARRICK_X86_CPL0_IMAGE"));
+    let first = program(&[(0x2345, 24)]);
+    let mut carrier =
+        Cpl0Carrier::boot_with_interrupts(&production, [&first, &first]).expect("KVM image");
+    let err = carrier
+        .observe(0)
+        .expect_err("production observer call must forward after the ordinary syscall");
+    assert!(
+        err.to_string().contains("unported CPL0 native call"),
+        "{err}"
+    );
+    assert_eq!(carrier.robust_list_head(0).expect("task head"), 0x2345);
 }
 
 fn program(calls: &[(u64, u64)]) -> Vec<u8> {
@@ -43,6 +326,185 @@ fn program(calls: &[(u64, u64)]) -> Vec<u8> {
     bytes
 }
 
+#[test]
+fn shared_kernel_mmu_reports_live_cr3_root() {
+    let mut program = vec![0x48, 0xb8]; // mov rax, fixture MMU observation
+    program.extend_from_slice(&OBSERVE_MMU_ROOT.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    for task in 0..2 {
+        let observed = carrier
+            .observe(task)
+            .expect("MMU root read and observation");
+        assert_eq!(observed.result as u64, 0x60_0000);
+        assert_eq!(observed.semantic_host_exits, 0);
+    }
+}
+
+#[test]
+fn shared_kernel_allocator_serves_two_live_cpl0_tasks() {
+    let mut program = vec![0x48, 0xb8];
+    program.extend_from_slice(&OBSERVE_ALLOCATOR.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    for task in 0..2 {
+        let observed = carrier.observe(task).expect("allocator and observation");
+        assert_eq!(observed.result, 1);
+        assert_eq!(observed.semantic_host_exits, 0);
+    }
+}
+
+#[test]
+fn shared_kernel_drain_receipt_requires_the_live_root() {
+    let program = |root: u64| {
+        let mut bytes = vec![0x48, 0xbf]; // mov rdi, user page
+        bytes.extend_from_slice(&0x3_0000_u64.to_le_bytes());
+        bytes.extend_from_slice(&[0x48, 0xbe]); // mov rsi, requested root
+        bytes.extend_from_slice(&root.to_le_bytes());
+        bytes.extend_from_slice(&[0x48, 0xb8]);
+        bytes.extend_from_slice(&OBSERVE_MMU_DRAIN.to_le_bytes());
+        bytes.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+        bytes.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+        bytes.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+        bytes
+    };
+    let good = program(0x60_0000);
+    let stale = program(0x70_0000);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&good, &stale]).expect("KVM image");
+    assert_eq!(
+        carrier.observe(0).expect("live root receipt").result as u64,
+        0x60_0000
+    );
+    assert_eq!(carrier.observe(1).expect("stale root refused").result, -1);
+}
+
+#[test]
+fn shared_kernel_x86_descriptor_protects_a_user_page() {
+    let mut program = vec![0x48, 0xb8];
+    program.extend_from_slice(&OBSERVE_DESCRIPTOR_PROTECT.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    carrier.fixture_bind_descriptor_owner(0).unwrap();
+    assert_eq!(
+        carrier
+            .observe(0)
+            .expect("descriptor edit and observation")
+            .result,
+        1
+    );
+    let leaf = carrier
+        .fixture_user_leaf(0x3_6000)
+        .expect("4 KiB user leaf");
+    assert_ne!(leaf & 1, 0, "mapping remains present");
+    assert_eq!(leaf & 2, 0, "RW is cleared by the shared-kernel edit");
+    assert_ne!(leaf & (1 << 63), 0, "NX is set by the shared-kernel edit");
+}
+
+#[test]
+fn shared_kernel_x86_prepares_then_publishes_a_user_page() {
+    let mut program = vec![0x48, 0xb8];
+    program.extend_from_slice(&OBSERVE_DESCRIPTOR_PREPARE_PUBLISH.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    carrier.fixture_bind_descriptor_owner(0).unwrap();
+    assert_eq!(
+        carrier.observe(0).expect("descriptor publication").result,
+        1
+    );
+    let leaf = carrier.fixture_user_leaf(0x3_2000).expect("new user leaf");
+    assert_eq!(leaf & (1 << 9), 0, "prepared state has been cleared");
+    assert_ne!(leaf & 1, 0, "leaf is present after publication");
+    assert_ne!(leaf & 4, 0, "leaf permits user access");
+    assert_eq!(leaf & 0x000f_ffff_ffff_f000, 0x9_0000);
+}
+
+#[test]
+fn shared_kernel_x86_fault_settles_prepared_grant_in_guest() {
+    let mut program = vec![0x48, 0xb8];
+    program.extend_from_slice(&OBSERVE_SHARED_PREPARED_FAULT.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier =
+        Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("KVM image");
+    assert_eq!(carrier.observe(0).expect("shared x86 fault path").result, 1);
+    let leaf = carrier.fixture_user_leaf(0x3_3000).expect("faulted leaf");
+    assert_eq!(leaf & (1 << 9), 0);
+    assert_ne!(leaf & 1, 0);
+    assert_ne!(leaf & 4, 0);
+    assert_eq!(leaf & 0x000f_ffff_ffff_f000, 0x9_1000);
+}
+
+#[test]
+fn shared_kernel_x86_cow_copies_and_repoints_through_intent() {
+    let mut program = vec![0x48, 0xb8];
+    program.extend_from_slice(&OBSERVE_SHARED_COW_FAULT.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier =
+        Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("KVM image");
+    assert_eq!(carrier.observe(0).expect("shared x86 COW path").result, 1);
+    let leaf = carrier
+        .fixture_user_leaf(0x3_4000)
+        .expect("repointed user leaf");
+    assert_ne!(leaf & 1, 0);
+    assert_ne!(leaf & 2, 0, "replacement is writable");
+    assert_eq!(leaf & (1 << 10), 0, "COW flag is cleared");
+    assert_eq!(leaf & 0x000f_ffff_ffff_f000, 0xd1_5000);
+}
+
+#[test]
+fn shared_kernel_portal_window_uses_live_upper_direct_root() {
+    let mut program = vec![0x48, 0xb8];
+    program.extend_from_slice(&OBSERVE_PORTAL_WINDOW.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    assert_eq!(
+        carrier.observe(0).expect("live portal table window").result,
+        1
+    );
+}
+
+#[test]
+fn shared_kernel_fork_table_window_checks_each_granted_arena() {
+    let mut program = vec![0x48, 0xb8];
+    program.extend_from_slice(&OBSERVE_FORK_TABLE_WINDOW.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    assert_eq!(carrier.observe(0).expect("fork table authority").result, 1);
+}
+
+#[test]
+fn shared_kernel_retired_page_repoints_without_user_publication() {
+    let mut program = vec![0x48, 0xb8];
+    program.extend_from_slice(&OBSERVE_RETIRE_REPOINT.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    carrier.fixture_bind_descriptor_owner(0).unwrap();
+    assert_eq!(carrier.observe(0).expect("owner retirement").result, 1);
+    let leaf = carrier
+        .fixture_user_leaf_raw(0x3_7000)
+        .expect("retired leaf");
+    assert_eq!(leaf & 0x000f_ffff_ffff_f000, 0xd1_5000);
+    assert_eq!(leaf & ((1 << 0) | (1 << 9)), 0, "still inaccessible");
+    assert_ne!(leaf & (1 << 8), 0, "retired predecessor preserved");
+}
+
 // Observe each task in turn while both lifecycle slots remain live. Registration
 // must store even NULL, unmapped and noncanonical heads without accessing them.
 fn assert_opaque_registrations(calls: [&[(u64, u64)]; 2]) {
@@ -53,10 +515,9 @@ fn assert_opaque_registrations(calls: [&[(u64, u64)]; 2]) {
     let mut heads = [(0, 0); 2];
     let mut entries = [0; 2];
     let mut publications = [0; 2];
-    for (round, (&(head_a, len_a), &(head_b, len_b))) in
-        calls[0].iter().zip(calls[1].iter()).enumerate()
-    {
-        for (task, (head, len)) in [(0, (head_a, len_a)), (1, (head_b, len_b))] {
+    for round in 0..calls[0].len() {
+        for (task, task_calls) in calls.iter().enumerate() {
+            let (head, len) = task_calls[round];
             let observation = carrier.observe(task).expect("bounded native entry/return");
             if len == 24 {
                 heads[task] = (head, 24);
@@ -183,6 +644,97 @@ fn two_live_tasks_serve_robust_lists_without_host_forwards() {
 }
 
 #[test]
+fn x4_linux_common_entry() {
+    use carrick_el1_abi::{
+        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+    };
+    for scale in [1_u64, 2, 8] {
+        let calls: [Vec<(u64, u64)>; 2] = core::array::from_fn(|task| {
+            (0..2 * scale)
+                .map(|round| {
+                    (
+                        0x0000_1234_0000_a000 + task as u64 * 0x1000 + round * 0x40,
+                        if round % 2 == 0 { 24 } else { 0x1_0000_0018 },
+                    )
+                })
+                .collect()
+        });
+        let a = program(&calls[0]);
+        let b = program(&calls[1]);
+        let mut carrier = Cpl0Carrier::boot(&image(), [&a, &b]).expect("X4 real KVM carrier");
+        let bindings = core::array::from_fn::<_, 2, _>(|task| ExecutionBinding {
+            task: EntryTaskKey::from_raw(41),
+            generation: EntryGeneration::from_raw(100 + task as u64),
+            mm: EntryMmKey::from_raw(77 + task as u64),
+            thread_generation: EntryThreadGeneration::from_raw(101 + task as u64),
+        });
+        for (task, binding) in bindings.into_iter().enumerate() {
+            carrier.bind_execution(task, binding).unwrap();
+        }
+        let mut heads = [(0, 0); 2];
+        let mut entries = [0; 2];
+        let mut publications = [0; 2];
+        for round in 0..2 * scale {
+            for task in 0..2 {
+                carrier.inject_boundary_kicks(task).unwrap();
+                let observed = carrier
+                    .observe(task)
+                    .expect("X4 bounded entry and native return");
+                entries[task] += 1;
+                if round % 2 == 0 {
+                    heads[task] = (calls[task][round as usize].0, 24);
+                    publications[task] += 1;
+                }
+                assert_eq!(observed.result, if round % 2 == 0 { 0 } else { -22 });
+                assert_eq!(observed.heads, heads);
+                assert_eq!(observed.entries, entries);
+                assert_eq!(
+                    observed.completions, entries,
+                    "one shared completion per native syscall"
+                );
+                assert_eq!(observed.publications, publications);
+                assert_eq!(observed.served, entries[0] + entries[1]);
+                assert_eq!(observed.forwarded, 0);
+                assert_eq!(observed.semantic_host_exits, 0, "no host Linux serving");
+                assert_eq!(observed.kicks, 2 * (entries[0] + entries[1]));
+                assert_eq!(observed.work_exits, entries[0] + entries[1]);
+                assert_eq!(observed.captured_stack, 0x3_1fe8 + task as u64 * 0x1_0000);
+                assert_eq!(observed.returned_stack, observed.captured_stack);
+                assert_eq!(observed.preserved_rbx, calls[task][round as usize].0);
+                assert_eq!(carrier.entry_state().bindings, bindings);
+            }
+        }
+    }
+    // Native numbers are not canonical ARM ordinals. Refusals never call a
+    // family or receive a synthetic host result; inspect the stopped owner.
+    for native in [39_u32, 99, 273] {
+        let mut code = program(&[(0xdead, 24)]);
+        let needle = [0xb8, 0x11, 0x01, 0, 0, 0x0f, 0x05];
+        let offset = code
+            .windows(needle.len())
+            .position(|bytes| bytes == needle)
+            .unwrap();
+        code[offset + 1..offset + 5].copy_from_slice(&native.to_le_bytes());
+        let peer = program(&[(0xbeef, 24)]);
+        let mut carrier = Cpl0Carrier::boot(&image(), [&code, &peer]).unwrap();
+        if native == 273 {
+            carrier.unload_execution(0).unwrap();
+        }
+        assert!(carrier.observe(0).is_err());
+        let stopped = carrier.entry_state();
+        assert_eq!(stopped.entries, [1, 0]);
+        assert_eq!(stopped.publications, [0, 0]);
+        assert_eq!(stopped.completions, [0, 0]);
+        assert_eq!(stopped.heads, [(0, 0); 2]);
+        assert_eq!(stopped.served, 0);
+        assert_eq!(
+            stopped.host_forwards, 1,
+            "one explicit refusal, no host emulation"
+        );
+    }
+}
+
+#[test]
 fn entry_and_return_kicks_never_republish_or_recomplete() {
     let a = program(&[(0xa000, 24), (0xdead, 23)]);
     let b = program(&[(0xb000, 24), (0xbeef, 25)]);
@@ -227,9 +779,9 @@ fn x1_boot_shared_substrate() {
     let mut carrier = Cpl0Carrier::boot(&image(), [&p, dummy]).expect("real KVM + CPL0 image");
 
     // Shared substrate ZoneTables and AddressSpaces claims
-    let layout = std::alloc::Layout::new::<ZoneTables>();
+    let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
     let zone = unsafe {
-        let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
+        let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
         assert!(!ptr.is_null());
         Box::from_raw(ptr)
     };
@@ -255,30 +807,34 @@ fn x1_boot_shared_substrate() {
             ..Default::default()
         })
         .unwrap();
+    let address = AddressContext {
+        root,
+        mm: MmGeneration::new(NonZeroU64::new(mm).unwrap()),
+        generation: ContextGeneration::new(NonZeroU64::new(1).unwrap()),
+    };
+    let native = NativeContext {
+        frame: InterruptFrame {
+            gpr: [0; 15],
+            rip: carrick_vmm_kvm::cpl0_boot::USER_CODE,
+            cs: 0x23,
+            flags: 0x202,
+            rsp: 0x3_1ff0,
+            ss: 0x1b,
+        },
+        address,
+        fs_base: 0x1000,
+        gs_base: 0x2000,
+        xsave: XsaveArea::ZERO,
+    };
+    // SAFETY: this new record remains host-owned until requeue.
+    unsafe { *zone.record(record).ctx_mut() = park_native_context(&native) };
     zone.requeue_preempted(slot, record);
     let on_cpu = zone.switch_in(slot).unwrap();
     assert_eq!(on_cpu, record);
 
     let binding = ContextBinding {
         record: zone.record_ref(record),
-        context: NativeContext {
-            frame: InterruptFrame {
-                gpr: [0; 15],
-                rip: carrick_vmm_kvm::cpl0_boot::USER_CODE,
-                cs: 0x23,
-                flags: 0x202,
-                rsp: 0x3_1ff0,
-                ss: 0x1b,
-            },
-            address: AddressContext {
-                root,
-                mm: MmGeneration::new(NonZeroU64::new(mm).unwrap()),
-                generation: ContextGeneration::new(NonZeroU64::new(1).unwrap()),
-            },
-            fs_base: 0x1000,
-            gs_base: 0x2000,
-            xsave: XsaveArea::ZERO,
-        },
+        address,
     };
 
     // 1. Admit context under shared ZoneTables and AddressSpaces claims
@@ -306,14 +862,17 @@ fn x1_boot_shared_substrate() {
     assert_eq!(obs1.returned_stack, 0x3_1fe8);
     assert_eq!(obs1.preserved_rbx, 0xa000);
     assert_eq!(obs2.preserved_rbx, 0xdead);
-    assert_eq!(binding.context.fs_base, 0x1000);
-    assert_eq!(binding.context.gs_base, 0x2000);
+    // SAFETY: test fixture uniquely owns the zone table and no guest CPU is running.
+    let words = unsafe { *zone.record(record).ctx_mut() };
+    let restored = restore_native_context(words, binding.address).expect("restored native context");
+    assert_eq!(restored.fs_base, 0x1000);
+    assert_eq!(restored.gs_base, 0x2000);
 
     // 4. Reject recycled record / root identity (zone-record reuse/admission error detection)
     // Recycled record incarnation defect
     let mut stale = ContextBinding {
         record: binding.record,
-        context: binding.context.clone(),
+        address: binding.address,
     };
     stale.record.incarnation += 1;
     assert!(
@@ -324,9 +883,9 @@ fn x1_boot_shared_substrate() {
     // Wrong root identity defect
     let mut wrong_root = ContextBinding {
         record: binding.record,
-        context: binding.context.clone(),
+        address: binding.address,
     };
-    wrong_root.context.address.root = RootGpa::page_aligned(FrameGpa::new(0x70_0000)).unwrap();
+    wrong_root.address.root = RootGpa::page_aligned(FrameGpa::new(0x70_0000)).unwrap();
     assert!(
         !admit_context(&zone, slot, &wrong_root),
         "mismatched root must be rejected"
@@ -336,9 +895,9 @@ fn x1_boot_shared_substrate() {
     // Wrong MM identity defect
     let mut wrong_mm = ContextBinding {
         record: binding.record,
-        context: binding.context.clone(),
+        address: binding.address,
     };
-    wrong_mm.context.address.mm = MmGeneration::new(NonZeroU64::new(99).unwrap());
+    wrong_mm.address.mm = MmGeneration::new(NonZeroU64::new(99).unwrap());
     assert!(
         !admit_context(&zone, slot, &wrong_mm),
         "wrong MM must be rejected"
@@ -354,5 +913,694 @@ fn x1_boot_shared_substrate() {
     assert!(
         !admit_context(&zone, slot, &binding),
         "closed space must be rejected"
+    );
+}
+
+fn transport_program(op: u64) -> Vec<u8> {
+    const TRANSPORT_WITNESS: u64 = 0xffff_ffff_ffff_ff20;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x48, 0xbf]); // mov rdi, op
+    bytes.extend_from_slice(&op.to_le_bytes());
+    bytes.extend_from_slice(&[0x48, 0xb8]); // mov rax, TRANSPORT_WITNESS
+    bytes.extend_from_slice(&TRANSPORT_WITNESS.to_le_bytes());
+    bytes.extend_from_slice(&[0x0f, 0x05]); // syscall into shared kernel witness
+    bytes.extend_from_slice(&[0x48, 0x89, 0xc7, 0x48, 0xb8]); // mov rdi, rax; mov rax, OBSERVE_NATIVE
+    bytes.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    bytes.extend_from_slice(&[0x0f, 0x05]);
+    bytes.extend_from_slice(&[0x0f, 0x0b]);
+    bytes
+}
+
+#[test]
+fn shared_kernel_transport_yield_and_fatal() {
+    let yield_prog = transport_program(0);
+    let fatal_prog = transport_program(1);
+    let mut carrier =
+        Cpl0Carrier::boot(&image(), [&yield_prog, &fatal_prog]).expect("real KVM + CPL0 image");
+    let obs = carrier.observe(0).expect("yield should resume and succeed");
+    assert_eq!(obs.result, 0);
+    assert_eq!(obs.host_yields, 1);
+    let fatal_err = carrier.observe(1).expect_err("fatal must exit with error");
+    assert!(
+        fatal_err.to_string().contains("CPL0 fatal exit"),
+        "expected fatal exit, got {fatal_err}"
+    );
+}
+
+fn context_program() -> Vec<u8> {
+    const CONTEXT_WITNESS: u64 = 0xffff_ffff_ffff_ff30;
+    let mut bytes = Vec::new();
+    for op in [0_u64, 1_u64] {
+        bytes.extend_from_slice(&[0x48, 0xbf]); // mov rdi, op
+        bytes.extend_from_slice(&op.to_le_bytes());
+        bytes.extend_from_slice(&[0x48, 0xb8]); // mov rax, CONTEXT_WITNESS
+        bytes.extend_from_slice(&CONTEXT_WITNESS.to_le_bytes());
+        bytes.extend_from_slice(&[0x0f, 0x05]); // syscall into shared kernel witness
+        bytes.extend_from_slice(&[0x48, 0x89, 0xc7, 0x48, 0xb8]); // mov rdi, rax; mov rax, OBSERVE_NATIVE
+        bytes.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+        bytes.extend_from_slice(&[0x0f, 0x05]);
+    }
+    bytes.extend_from_slice(&[0x0f, 0x0b]);
+    bytes
+}
+
+#[test]
+fn shared_kernel_context_stack_slot_and_thread_cpu() {
+    let p0 = context_program();
+    let p1 = context_program();
+    let mut carrier = Cpl0Carrier::boot(&image(), [&p0, &p1]).expect("real KVM + CPL0 image");
+    for task in 0..2 {
+        let obs_stack = carrier.observe(task).expect("stack slot observation");
+        assert_eq!(obs_stack.result, task as i64, "stack slot for task {task}");
+        let obs_cpu = carrier.observe(task).expect("thread cpu observation");
+        assert_eq!(obs_cpu.result, task as i64, "thread cpu for task {task}");
+    }
+}
+
+fn interrupt_program() -> Vec<u8> {
+    const INTERRUPT_WITNESS: u64 = 0xffff_ffff_ffff_ff40;
+    let mut bytes = Vec::new();
+    for (op, arg) in [
+        (0_u64, 0_u64),       // frequency
+        (1_u64, 0_u64),       // arm_timer(None)
+        (1_u64, 100_000_u64), // arm_timer(Some(100_000))
+        (3_u64, 0_u64),       // ack_interrupt (no interrupt pending => 0)
+        (2_u64, 1_u64),       // send_wake to CPU 1 => 0
+        (2_u64, 2_u64),       // no published CPU slot 2: refuse wake
+    ] {
+        bytes.extend_from_slice(&[0x48, 0xbe]); // mov rsi, arg
+        bytes.extend_from_slice(&arg.to_le_bytes());
+        bytes.extend_from_slice(&[0x48, 0xbf]); // mov rdi, op
+        bytes.extend_from_slice(&op.to_le_bytes());
+        bytes.extend_from_slice(&[0x48, 0xb8]); // mov rax, INTERRUPT_WITNESS
+        bytes.extend_from_slice(&INTERRUPT_WITNESS.to_le_bytes());
+        bytes.extend_from_slice(&[0x0f, 0x05]); // syscall into shared kernel witness
+        bytes.extend_from_slice(&[0x48, 0x89, 0xc7, 0x48, 0xb8]); // mov rdi, rax; mov rax, OBSERVE_NATIVE
+        bytes.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+        bytes.extend_from_slice(&[0x0f, 0x05]);
+    }
+    bytes.extend_from_slice(&[0x0f, 0x0b]); // ud2
+    bytes
+}
+
+#[test]
+fn shared_kernel_interrupt_leaves() {
+    let p0 = interrupt_program();
+    let p1 = interrupt_program();
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&p0, &p1])
+        .expect("real KVM + CPL0 image with interrupts");
+    let obs_freq = carrier.observe(0).expect("frequency observation");
+    assert!(obs_freq.result > 0, "frequency must be non-zero");
+    let obs_disarm = carrier.observe(0).expect("disarm timer observation");
+    assert_eq!(obs_disarm.result, 0, "disarm timer succeeded");
+    let obs_arm = carrier.observe(0).expect("arm timer observation");
+    assert_eq!(obs_arm.result, 0, "arm timer succeeded");
+    if carrier.has_tsc_deadline(0).expect("installed CPUID") {
+        assert_eq!(
+            carrier
+                .lapic_register(0, 0x320)
+                .expect("stopped local timer")
+                & (3 << 17),
+            1 << 18,
+            "TSC deadline mode must use absolute TSC units"
+        );
+    } else {
+        assert_eq!(
+            carrier
+                .lapic_register(0, 0x3e0)
+                .expect("stopped timer divider")
+                & 0b1111,
+            0b1011,
+            "calibrated APIC timer uses the measured undivided rate"
+        );
+    }
+    let obs_ack = carrier.observe(0).expect("ack interrupt observation");
+    assert_eq!(obs_ack.result, 0, "no pending interrupt acked");
+    let obs_wake = carrier.observe(0).expect("send wake observation");
+    assert_eq!(obs_wake.result, 0, "send wake to CPU 1 succeeded");
+    let obs_unknown = carrier.observe(0).expect("unknown-slot wake observation");
+    assert_eq!(obs_unknown.result, -1, "unknown CPU slot must be refused");
+}
+
+#[test]
+fn shared_kernel_frequency_uses_published_kvm_binding() {
+    const INTERRUPT_WITNESS: u64 = 0xffff_ffff_ffff_ff40;
+    const PUBLISHED_HZ: u64 = 1_234_567_890;
+    let mut program = vec![0x48, 0xbf]; // mov rdi, frequency operation
+    program.extend_from_slice(&0_u64.to_le_bytes());
+    program.extend_from_slice(&[0x48, 0xb8]); // mov rax, interrupt witness
+    program.extend_from_slice(&INTERRUPT_WITNESS.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&program, &program])
+        .expect("real KVM + CPL0 image with interrupts");
+    carrier
+        .fixture_publish_tsc_hz(0, PUBLISHED_HZ)
+        .expect("published CPU binding");
+    carrier
+        .fixture_publish_cpuid_tsc_hz(0, 2_000_000_000)
+        .expect("distinct architectural CPUID clock");
+    assert_eq!(
+        carrier.observe(0).expect("shared kernel frequency").result,
+        PUBLISHED_HZ as i64,
+        "the exact carrier-published KVM binding is authoritative"
+    );
+}
+
+#[test]
+fn shared_kernel_peer_apic_queues_wake_for_runnable_cpu() {
+    const INTERRUPT_WITNESS: u64 = 0xffff_ffff_ffff_ff40;
+    let mut sender = vec![0x48, 0xbe]; // mov rsi, target scheduler slot
+    sender.extend_from_slice(&1_u64.to_le_bytes());
+    sender.extend_from_slice(&[0x48, 0xbf]); // mov rdi, send-wake witness operation
+    sender.extend_from_slice(&2_u64.to_le_bytes());
+    sender.extend_from_slice(&[0x48, 0xb8]);
+    sender.extend_from_slice(&INTERRUPT_WITNESS.to_le_bytes());
+    sender.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    sender.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    sender.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let receiver = program(&[(0xaced, 24), (0xbeef, 24)]);
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&sender, &receiver])
+        .expect("two real KVM CPUs and shared CPL0 kernel");
+    assert_eq!(
+        carrier.observe(1).expect("peer baseline completion").result,
+        0
+    );
+    assert_eq!(carrier.observe(0).expect("sender completion").result, 0);
+    assert_ne!(
+        carrier.lapic_register(1, 0x270).expect("peer IRR") & (1 << 1),
+        0,
+        "the peer APIC must queue the native wake vector: sender ICR low={:#x} high={:#x}, peer ISR={:#x}, peer SVR={:#x}",
+        carrier.lapic_register(0, 0x300).expect("sender ICR low"),
+        carrier.lapic_register(0, 0x310).expect("sender ICR high"),
+        carrier.lapic_register(1, 0x170).expect("peer ISR"),
+        carrier.lapic_register(1, 0xf0).expect("peer SVR")
+    );
+    assert_eq!(
+        carrier
+            .observe(1)
+            .expect("peer must run after reschedule IPI")
+            .result,
+        0
+    );
+}
+
+#[test]
+fn stopped_cpl3_cpu_receives_a_queued_host_kick() {
+    let mut program = vec![0x31, 0xff, 0x48, 0xb8]; // zero result; mov rax, OBSERVE_NATIVE
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05]); // first syscall stops on CONTROL_PORT
+    program.extend_from_slice(&[
+        0xc6, 0x04, 0x25, 0x00, 0x00, 0x04, 0x00, 0x01, // mov byte [0x40000], 1
+        0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x04, 0x00, // mov rax, [0x40000]
+        0xeb, 0xf6, // jmp to the load
+    ]);
+    let load_rip = carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000 + program.len() as u64 - 10;
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&program, &program])
+        .expect("real KVM CPU with native interrupt gates");
+    assert_eq!(carrier.observe(1).expect("first user syscall").result, 0);
+    carrier
+        .fixture_stop_after_user_byte(1, 0x4_0000)
+        .expect("stop CPU 1 while its user loop runs");
+    carrier
+        .fixture_stop_before_user_rip(1, load_rip)
+        .expect("next user instruction is the loop load");
+    assert_eq!(carrier.fixture_pending_irqs(1).unwrap(), 0);
+    carrier
+        .queue_resume_kick(1)
+        .expect("queue KICK on stopped CPL3 CPU");
+    carrier
+        .fixture_run_until_pending_kick(1)
+        .expect("guest KICK handler before continued user loop");
+    assert_ne!(
+        carrier
+            .fixture_pending_irqs(1)
+            .expect("retained IRQ reason")
+            & 2,
+        0,
+        "guest KICK handler must run before the first syscall result"
+    );
+}
+
+#[test]
+fn stopped_cpl3_cpu_drops_a_retired_translation_before_its_next_load() {
+    let mut editor = Vec::new();
+    for phase in [2_u64, 3] {
+        editor.extend_from_slice(&[0x48, 0xbf]); // mov rdi, phase
+        editor.extend_from_slice(&phase.to_le_bytes());
+        editor.extend_from_slice(&[0x48, 0xb8]); // mov rax, fixture edit
+        editor.extend_from_slice(&OBSERVE_RETIRE_REPOINT.to_le_bytes());
+        editor.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+        editor.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+        editor.extend_from_slice(&[0x0f, 0x05]);
+    }
+    editor.extend_from_slice(&[0x0f, 0x0b]);
+    let mut reader = vec![0xa0]; // mov al, [0x37000]
+    reader.extend_from_slice(&0x3_7000_u64.to_le_bytes());
+    reader.push(0xa2); // mov [0x40000], al
+    reader.extend_from_slice(&0x4_0000_u64.to_le_bytes());
+    reader.extend_from_slice(&[0xeb, 0xec]); // repeat the 20-byte load/store loop
+
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&editor, &reader])
+        .expect("two native KVM CPUs with one retained page-table root");
+    carrier.fixture_share_root(1, 0).expect("same MM root");
+    carrier.fixture_write_backing_byte(0xd1_1000, 0x11).unwrap();
+    assert_eq!(carrier.observe(0).expect("prepare old page").result, 1);
+    carrier
+        .fixture_stop_after_user_value(1, 0x4_0000, 0x11)
+        .expect("reader warmed its old translation");
+    carrier
+        .fixture_stop_before_user_rip(1, carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000)
+        .expect("next user instruction is the stale-page load");
+    let checks_before = carrier.fixture_kick_generation_checks(1).unwrap();
+    carrier.fixture_write_backing_byte(0x4_0000, 0).unwrap();
+    assert_eq!(carrier.observe(0).expect("retire old page").result, 1);
+    let [(root, generation, ack), _] = carrier.fixture_shootdown_state();
+    assert_eq!(root, 0x60_0000, "retirement must name the shared root");
+    assert_eq!(carrier.fixture_shootdown_owner(0).unwrap(), (1, 1));
+    assert_ne!(generation, 0, "retirement must publish a generation");
+    assert!(ack[1] < generation, "stopped CPU must still owe its drain");
+    assert!(carrier.fixture_shootdown_served(0, 1).unwrap() < generation);
+    assert_eq!(
+        carrier.fixture_kick_generation_checks(1).unwrap(),
+        checks_before
+    );
+    carrier
+        .fixture_run_until_user_fault(1, carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000, 0x3_7000)
+        .expect("first resumed load faults on the retired page");
+    assert_ne!(carrier.fixture_pending_irqs(1).unwrap() & 2, 0);
+    assert!(
+        carrier.fixture_shootdown_state()[0].2[1] >= generation,
+        "KICK must acknowledge the retirement before the first user load"
+    );
+    assert_eq!(carrier.fixture_shootdown_served(0, 1).unwrap(), generation);
+    assert_eq!(
+        carrier.fixture_kick_generation_checks(1).unwrap(),
+        checks_before + 1
+    );
+}
+
+#[test]
+fn two_running_vcpus_drop_stale_translation_on_shootdown() {
+    let mut editor = Vec::new();
+    for phase in [2_u64, 3] {
+        editor.extend_from_slice(&[0x48, 0xbf]); // mov rdi, phase
+        editor.extend_from_slice(&phase.to_le_bytes());
+        editor.extend_from_slice(&[0x48, 0xb8]); // mov rax, fixture edit
+        editor.extend_from_slice(&OBSERVE_RETIRE_REPOINT.to_le_bytes());
+        editor.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+        editor.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+        editor.extend_from_slice(&[0x0f, 0x05]);
+    }
+    editor.extend_from_slice(&[0x0f, 0x0b]);
+    let mut reader = vec![0xa0]; // mov al, [0x37000]
+    reader.extend_from_slice(&0x3_7000_u64.to_le_bytes());
+    reader.push(0xa2); // mov [0x40000], al
+    reader.extend_from_slice(&0x4_0000_u64.to_le_bytes());
+    reader.extend_from_slice(&[0xeb, 0xec]); // repeat the 20-byte load/store loop
+
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&editor, &reader])
+        .expect("two native KVM CPUs with one retained page-table root");
+    carrier.fixture_share_root(1, 0).expect("same MM root");
+    carrier.fixture_write_backing_byte(0xd1_1000, 0x11).unwrap();
+    assert_eq!(carrier.observe(0).expect("prepare old page").result, 1);
+    carrier
+        .fixture_stop_after_user_value(1, 0x4_0000, 0x11)
+        .expect("reader warmed its old translation");
+    carrier
+        .fixture_stop_before_user_rip(1, carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000)
+        .expect("reader stopped before user rip");
+    let checks_before = carrier.fixture_kick_generation_checks(1).unwrap();
+    carrier.fixture_write_backing_byte(0x4_0000, 0).unwrap();
+    let result = carrier
+        .fixture_two_running_cpus_shootdown_fault(
+            0,
+            1,
+            carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000,
+            0x3_7000,
+        )
+        .expect("concurrent shootdown and user fault");
+    assert_eq!(result, 1, "editor completed retirement");
+    let [(root, generation, ack), _] = carrier.fixture_shootdown_state();
+    assert_eq!(root, 0x60_0000, "retirement must name the shared root");
+    assert_ne!(generation, 0, "retirement must publish a generation");
+    if ack[1] >= generation {
+        assert_eq!(carrier.fixture_shootdown_served(0, 1).unwrap(), generation);
+        assert_eq!(
+            carrier.fixture_kick_generation_checks(1).unwrap(),
+            checks_before,
+            "running CPU served shootdown via IPI, not KICK"
+        );
+    } else {
+        assert_eq!(
+            ack[1],
+            generation - 1,
+            "stopped CPU must owe exactly the retired generation: ack[1]={}, generation={}",
+            ack[1],
+            generation
+        );
+        assert_eq!(
+            carrier.fixture_shootdown_served(0, 1).unwrap(),
+            generation - 1,
+            "stopped CPU served must reflect debt"
+        );
+        assert_eq!(
+            carrier.fixture_kick_generation_checks(1).unwrap(),
+            checks_before,
+            "stopped CPU has not received reentry KICK yet"
+        );
+        carrier
+            .fixture_resume_stopped_cpu(1)
+            .expect("reentered stopped CPU settles debt");
+        let [(_, _, resumed_ack), _] = carrier.fixture_shootdown_state();
+        assert!(
+            resumed_ack[1] >= generation,
+            "stopped CPU must settle debt on reentry before user access: ack[1]={}, generation={}",
+            resumed_ack[1],
+            generation
+        );
+        assert_eq!(
+            carrier.fixture_shootdown_served(0, 1).unwrap(),
+            generation,
+            "stopped CPU must serve generation on reentry"
+        );
+        assert_eq!(
+            carrier.fixture_kick_generation_checks(1).unwrap(),
+            checks_before + 1,
+            "reentry KICK must increment kick checks"
+        );
+    }
+}
+
+#[test]
+fn two_running_vcpus_fault_before_shootdown_ipi_acknowledges_in_guest() {
+    let mut editor = Vec::new();
+    for phase in [2_u64, 3] {
+        editor.extend_from_slice(&[0x48, 0xbf]); // mov rdi, phase
+        editor.extend_from_slice(&phase.to_le_bytes());
+        editor.extend_from_slice(&[0x48, 0xb8]); // mov rax, fixture edit
+        editor.extend_from_slice(&OBSERVE_RETIRE_REPOINT.to_le_bytes());
+        editor.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+        editor.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+        editor.extend_from_slice(&[0x0f, 0x05]);
+    }
+    editor.extend_from_slice(&[0x0f, 0x0b]);
+    // Warm the retired leaf, then signal running admission on every gate loop.
+    // The editor releases this gate only at the selected rendezvous hold.
+    // Fault on a never-mapped address, independently of TLB eviction.
+    let mut reader = vec![0xa0];
+    reader.extend_from_slice(&0x3_7000_u64.to_le_bytes());
+    reader.extend_from_slice(&[0x88, 0xc3]); // retain the actual warmed byte in bl
+    reader.push(0xa2);
+    reader.extend_from_slice(&0x4_0000_u64.to_le_bytes());
+    reader.extend_from_slice(&[0x88, 0xd8, 0xa2]); // republish the actual byte, never a constant
+    reader.extend_from_slice(&0x4_0000_u64.to_le_bytes());
+    reader.push(0xa0);
+    reader.extend_from_slice(&0x4_0008_u64.to_le_bytes());
+    reader.extend_from_slice(&[0x84, 0xc0, 0x74, 0xe8]);
+    let fault_rip = carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000 + reader.len() as u64;
+    reader.push(0xa0);
+    reader.extend_from_slice(&0x3_8000_u64.to_le_bytes());
+    reader.extend_from_slice(&[0x0f, 0x0b]);
+
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&editor, &reader])
+        .expect("two native KVM CPUs with one retained page-table root");
+    carrier.fixture_share_root(1, 0).expect("same MM root");
+    carrier.fixture_write_backing_byte(0xd1_1000, 0x11).unwrap();
+    carrier.fixture_write_backing_byte(0x4_0008, 0).unwrap();
+    assert_eq!(carrier.observe(0).expect("prepare old page").result, 1);
+    carrier
+        .fixture_stop_after_user_value(1, 0x4_0000, 0x11)
+        .expect("reader warmed its old translation");
+    let checks_before = carrier.fixture_kick_generation_checks(1).unwrap();
+    carrier.fixture_write_backing_byte(0x4_0000, 0).unwrap();
+    let result = carrier
+        .fixture_two_running_cpus_shootdown_fault_held_ipi(0, 1, fault_rip, 0x3_8000)
+        .expect("concurrent shootdown and user fault with held IPI");
+    assert_eq!(result, 1, "editor completed retirement");
+    let [(root, generation, ack), _] = carrier.fixture_shootdown_state();
+    assert_eq!(root, 0x60_0000, "retirement must name the shared root");
+    assert_ne!(generation, 0, "retirement must publish a generation");
+    assert!(
+        ack[1] >= generation,
+        "running CPU must acknowledge shootdown"
+    );
+    assert_eq!(carrier.fixture_shootdown_served(0, 1).unwrap(), generation);
+    assert_eq!(
+        carrier.fixture_kick_generation_checks(1).unwrap(),
+        checks_before,
+        "running CPU served shootdown via IPI, not KICK"
+    );
+}
+
+#[test]
+fn two_running_vcpus_stopped_with_debt_settles_on_reentry() {
+    let mut editor = Vec::new();
+    for phase in [2_u64, 3] {
+        editor.extend_from_slice(&[0x48, 0xbf]); // mov rdi, phase
+        editor.extend_from_slice(&phase.to_le_bytes());
+        editor.extend_from_slice(&[0x48, 0xb8]); // mov rax, fixture edit
+        editor.extend_from_slice(&OBSERVE_RETIRE_REPOINT.to_le_bytes());
+        editor.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+        editor.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+        editor.extend_from_slice(&[0x0f, 0x05]);
+    }
+    editor.extend_from_slice(&[0x0f, 0x0b]);
+    // Warm the retired leaf, then signal running admission on every gate loop.
+    // The editor releases this gate only at the selected rendezvous hold.
+    // Fault on a never-mapped address, independently of TLB eviction.
+    let mut reader = vec![0xa0];
+    reader.extend_from_slice(&0x3_7000_u64.to_le_bytes());
+    reader.extend_from_slice(&[0x88, 0xc3]); // retain the actual warmed byte in bl
+    reader.push(0xa2);
+    reader.extend_from_slice(&0x4_0000_u64.to_le_bytes());
+    reader.extend_from_slice(&[0x88, 0xd8, 0xa2]); // republish the actual byte, never a constant
+    reader.extend_from_slice(&0x4_0000_u64.to_le_bytes());
+    reader.push(0xa0);
+    reader.extend_from_slice(&0x4_0008_u64.to_le_bytes());
+    reader.extend_from_slice(&[0x84, 0xc0, 0x74, 0xe8]);
+    let fault_rip = carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000 + reader.len() as u64;
+    reader.push(0xa0);
+    reader.extend_from_slice(&0x3_8000_u64.to_le_bytes());
+    reader.extend_from_slice(&[0x0f, 0x0b]);
+
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&editor, &reader])
+        .expect("two native KVM CPUs with one retained page-table root");
+    carrier.fixture_share_root(1, 0).expect("same MM root");
+    carrier.fixture_write_backing_byte(0xd1_1000, 0x11).unwrap();
+    carrier.fixture_write_backing_byte(0x4_0008, 0).unwrap();
+    assert_eq!(carrier.observe(0).expect("prepare old page").result, 1);
+    carrier
+        .fixture_stop_after_user_value(1, 0x4_0000, 0x11)
+        .expect("reader warmed its old translation");
+    let checks_before = carrier.fixture_kick_generation_checks(1).unwrap();
+    carrier.fixture_write_backing_byte(0x4_0000, 0).unwrap();
+    let result = carrier
+        .fixture_two_running_cpus_shootdown_fault_held_publish(0, 1, fault_rip, 0x3_8000)
+        .expect("concurrent shootdown with publication held until reader faults");
+    assert_eq!(result, 1, "editor completed retirement");
+    let [(root, generation, ack), _] = carrier.fixture_shootdown_state();
+    assert_eq!(root, 0x60_0000, "retirement must name the shared root");
+    assert_ne!(generation, 0, "retirement must publish a generation");
+    assert_eq!(
+        ack[1],
+        generation - 1,
+        "stopped reader must legitimately owe the retired generation: ack[1]={}, generation={}",
+        ack[1],
+        generation
+    );
+    assert_eq!(
+        carrier.fixture_shootdown_served(0, 1).unwrap(),
+        generation - 1,
+        "stopped reader served must reflect debt"
+    );
+    assert_eq!(
+        carrier.fixture_kick_generation_checks(1).unwrap(),
+        checks_before,
+        "stopped reader has not received reentry KICK yet"
+    );
+    carrier
+        .fixture_resume_stopped_cpu(1)
+        .expect("reentered stopped CPU settles debt");
+    let [(_, _, resumed_ack), _] = carrier.fixture_shootdown_state();
+    assert!(
+        resumed_ack[1] >= generation,
+        "stopped CPU must settle debt on reentry: ack[1]={}, generation={}",
+        resumed_ack[1],
+        generation
+    );
+    assert_eq!(
+        carrier.fixture_shootdown_served(0, 1).unwrap(),
+        generation,
+        "stopped CPU must serve generation on reentry"
+    );
+    assert_eq!(
+        carrier.fixture_kick_generation_checks(1).unwrap(),
+        checks_before + 1,
+        "reentry KICK must increment kick checks"
+    );
+}
+
+#[test]
+fn stopped_cpl0_cpu_drops_stale_translation_before_cpl0_access() {
+    let mut editor = Vec::new();
+    for phase in [2_u64, 3] {
+        editor.extend_from_slice(&[0x48, 0xbf]); // mov rdi, phase
+        editor.extend_from_slice(&phase.to_le_bytes());
+        editor.extend_from_slice(&[0x48, 0xb8]); // mov rax, fixture edit
+        editor.extend_from_slice(&OBSERVE_RETIRE_REPOINT.to_le_bytes());
+        editor.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+        editor.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+        editor.extend_from_slice(&[0x0f, 0x05]);
+    }
+    editor.extend_from_slice(&[0x0f, 0x0b]);
+
+    let mut reader = vec![0x48, 0xbf]; // mov rdi, 0x3_7000
+    reader.extend_from_slice(&0x3_7000_u64.to_le_bytes());
+    reader.extend_from_slice(&[0x48, 0xb8]); // mov rax, OBSERVE_CPL0_UACCESS_SHOOTDOWN
+    reader
+        .extend_from_slice(&carrick_x86::cpl0_entry::OBSERVE_CPL0_UACCESS_SHOOTDOWN.to_le_bytes());
+    reader.extend_from_slice(&[0x0f, 0x05]); // syscall -> warms TLB, stops on FORWARD_PORT, resumes, reads again, stops on second FORWARD_PORT
+    reader.extend_from_slice(&[0x48, 0x89, 0xc7, 0x48, 0xb8]); // mov rdi, rax; mov rax, OBSERVE_NATIVE
+    reader.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    reader.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&editor, &reader])
+        .expect("two native KVM CPUs with one retained page-table root");
+    carrier.fixture_share_root(1, 0).expect("same MM root");
+    carrier.fixture_write_backing_byte(0xd1_1000, 0x11).unwrap();
+    assert_eq!(carrier.observe(0).expect("prepare old page").result, 1);
+
+    let frame1 = carrier
+        .fixture_run_until_forward(1)
+        .expect("reader stopped on first FORWARD_PORT in CPL0");
+    assert_eq!(
+        frame1.rbx, 0x11,
+        "reader must hold proven warm translation reading 0x11 before stop"
+    );
+
+    assert_eq!(carrier.observe(0).expect("retire old page").result, 1);
+    let [(root, generation, ack), _] = carrier.fixture_shootdown_state();
+    assert_eq!(root, 0x60_0000);
+    assert_ne!(generation, 0);
+    assert!(
+        ack[1] < generation,
+        "stopped CPU in CPL0 must not prematurely acknowledge"
+    );
+    assert!(
+        carrier.fixture_shootdown_served(0, 1).unwrap() < generation,
+        "stopped CPU in CPL0 must still owe its drain"
+    );
+    assert!(
+        carrier.fixture_last_seen_generation(1).unwrap() < generation,
+        "stopped CPU in CPL0 must not have reloaded CR3 for new generation yet"
+    );
+    carrier.fixture_write_backing_byte(0xd1_1000, 0x22).unwrap();
+
+    let frame2 = carrier
+        .fixture_run_until_forward(1)
+        .expect("resumed CPL0 user access stopped on second FORWARD_PORT");
+    assert_eq!(
+        frame2.rax as i64, -14,
+        "resumed CPL0 user access must fault on unmapped page, not read stale TLB"
+    );
+    let [(_, generation, ack), _] = carrier.fixture_shootdown_state();
+    assert!(
+        ack[1] >= generation,
+        "shootdown must be acknowledged after CPL0 settlement"
+    );
+    assert_eq!(
+        carrier.fixture_shootdown_served(0, 1).unwrap(),
+        generation,
+        "shootdown must be served after CPL0 settlement"
+    );
+    assert_eq!(
+        carrier.fixture_last_seen_generation(1).unwrap(),
+        generation,
+        "CR3 must be reloaded after CPL0 settlement"
+    );
+}
+
+#[test]
+fn shared_kernel_scheduler_routes_reschedule_to_peer_apic() {
+    const INTERRUPT_WITNESS: u64 = 0xffff_ffff_ffff_ff40;
+    let mut sender = vec![0x48, 0xbe]; // mov rsi, peer scheduler slot
+    sender.extend_from_slice(&1_u64.to_le_bytes());
+    sender.extend_from_slice(&[0x48, 0xbf]); // mov rdi, scheduler reschedule witness
+    sender.extend_from_slice(&4_u64.to_le_bytes());
+    sender.extend_from_slice(&[0x48, 0xb8]);
+    sender.extend_from_slice(&INTERRUPT_WITNESS.to_le_bytes());
+    sender.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    sender.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    sender.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let receiver = program(&[(0xaced, 24)]);
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&sender, &receiver])
+        .expect("two real KVM CPUs and shared CPL0 kernel");
+    assert_eq!(
+        carrier.observe(1).expect("peer baseline completion").result,
+        0
+    );
+    assert_eq!(
+        carrier
+            .observe(0)
+            .expect("scheduler send completion")
+            .result,
+        0
+    );
+    assert_ne!(
+        carrier.lapic_register(1, 0x270).expect("peer IRR") & (1 << 2),
+        0,
+        "native reschedule vector must be queued on the peer APIC"
+    );
+}
+
+#[test]
+fn two_live_cpus_complete_mutual_root_shootdowns() {
+    const INTERRUPT_WITNESS: u64 = 0xffff_ffff_ffff_ff40;
+    let mut program = vec![0x48, 0xbf]; // mov rdi, rendezvous witness op
+    program.extend_from_slice(&6_u64.to_le_bytes());
+    program.extend_from_slice(&[0x48, 0xb8]); // mov rax, INTERRUPT_WITNESS
+    program.extend_from_slice(&INTERRUPT_WITNESS.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&program, &program])
+        .expect("two live KVM CPUs");
+    carrier.fixture_share_root(1, 0).expect("same MM root");
+    let generations = carrier.fixture_observe_pair().unwrap_or_else(|error| {
+        panic!(
+            "mutual rendezvous: {error}; state={:?}",
+            carrier.fixture_shootdown_state()
+        )
+    });
+    assert!(
+        generations
+            .into_iter()
+            .all(|generation| generation > 0 && generation < 100),
+        "generations={generations:?}; state={:?}",
+        carrier.fixture_shootdown_state()
+    );
+    assert_ne!(generations[0], generations[1]);
+}
+
+#[test]
+fn shared_kernel_scheduler_ack_uses_spurious_sentinel() {
+    const INTERRUPT_WITNESS: u64 = 0xffff_ffff_ffff_ff40;
+    let mut program = vec![0x48, 0xbf]; // mov rdi, scheduler ack witness
+    program.extend_from_slice(&5_u64.to_le_bytes());
+    program.extend_from_slice(&[0x48, 0xb8]);
+    program.extend_from_slice(&INTERRUPT_WITNESS.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier =
+        Cpl0Carrier::boot_with_interrupts(&image(), [&program, &program]).expect("KVM image");
+    assert_eq!(
+        carrier
+            .observe(0)
+            .expect("scheduler interrupt acknowledgment")
+            .result,
+        i64::from(carrick_el1_abi::GIC_SPURIOUS_INTID)
     );
 }

@@ -259,7 +259,7 @@ impl RunOutput {
     }
 }
 
-pub(crate) fn raw_dir() -> PathBuf {
+pub fn raw_dir() -> PathBuf {
     PathBuf::from("target/conformance/raw")
 }
 
@@ -322,7 +322,7 @@ pub fn run_carrick(
     {
         cmd.env("CARRICK_INSECURE_REGISTRIES", host);
     }
-    let cleanup = CarrickCleanup::from_lane(lane);
+    let cleanup = ExecutionCleanup::from_lane(lane);
     // Lane-scaled deadline: nested-KVM runs get a stretched budget (the gate
     // asserts correctness parity with docker, not speed parity); docker
     // oracles below keep the unscaled suite budget.
@@ -423,29 +423,116 @@ pub fn run_docker(
     out
 }
 
+/// Run in a private writable root; the cached OCI extraction is never mutated.
+pub fn run_native(
+    suite: &Suite,
+    run_id: &str,
+    lower: &crate::native::NativeRootfs,
+) -> anyhow::Result<RunOutput> {
+    let scratch = tempfile::tempdir()?;
+    let root = scratch.path().join("root");
+    std::fs::create_dir(&root)?;
+    let result = (|| -> anyhow::Result<RunOutput> {
+        let copied = Command::new("sudo")
+            .args(["-n", "cp", "-a", "--reflink=auto", "--"])
+            .arg(lower.root.join("."))
+            .arg(&root)
+            .status()?;
+        anyhow::ensure!(copied.success(), "cannot copy native rootfs");
+        for dir in ["proc", "dev", "tmp"] {
+            let path = root.join(dir);
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => anyhow::ensure!(
+                    metadata.file_type().is_dir(),
+                    "native rootfs {dir} must be a real directory"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if let Some(probe) = &lower.probe_binary {
+            let prepared = Command::new("sudo")
+                .args(["-n", "mkdir", "-p", "--"])
+                .arg(root.join("tmp"))
+                .status()?;
+            anyhow::ensure!(prepared.success(), "cannot prepare probe rootfs");
+            let copied = Command::new("sudo")
+                .args(["-n", "cp", "--"])
+                .arg(probe)
+                .arg(root.join("tmp/p"))
+                .status()?;
+            anyhow::ensure!(copied.success(), "cannot inject identical probe ELF");
+        }
+        let rootfs = crate::native::NativeRootfs {
+            root: root.clone(),
+            ..lower.clone()
+        };
+        let argv = crate::argv::native_argv(suite, &rootfs)?;
+        let mut cmd = Command::new(&argv[0]); // nosemgrep
+        cmd.args(&argv[1..]);
+        let deadline = CarrickDeadline {
+            declared_s: suite.timeout_s,
+            effective_s: suite.timeout_s,
+            origin: DeadlineOrigin::Declared,
+        };
+        let output = run_one(
+            cmd,
+            argv,
+            deadline,
+            run_id,
+            Engine::Native,
+            Some(ExecutionCleanup::NativeInit(
+                scratch.path().join("init.stat"),
+            )),
+        )?;
+        anyhow::ensure!(
+            std::fs::read(scratch.path().join("init-ready"))
+                .ok()
+                .as_deref()
+                == Some(b"ready\n"),
+            "native image init did not enter its chroot; /bin/sh and its loader are required"
+        );
+        Ok(output)
+    })();
+    // Workloads run as namespace root and can create root-owned directories.
+    // This exact scratch is ours; never delete the shared lower or another run.
+    let cleaned = Command::new("sudo")
+        .args(["-n", "rm", "-rf", "--"])
+        .arg(&root)
+        .status()?;
+    anyhow::ensure!(
+        cleaned.success(),
+        "native rootfs cleanup failed: {}",
+        root.display()
+    );
+    result
+}
+
 #[derive(Clone, Copy)]
 enum Engine {
     Carrick,
     Docker,
+    Native,
 }
 
 #[derive(Clone)]
-enum CarrickCleanup {
+enum ExecutionCleanup {
     Hvf,
     KvmLima(crate::lane::LimaConfig),
     KvmLocal,
     BhyveLocal,
     NvmmLocal,
+    NativeInit(PathBuf),
 }
 
-impl CarrickCleanup {
+impl ExecutionCleanup {
     fn from_lane(lane: &crate::lane::Lane) -> Self {
         match lane {
-            crate::lane::Lane::Hvf => CarrickCleanup::Hvf,
-            crate::lane::Lane::Kvm(cfg) => CarrickCleanup::KvmLima(cfg.clone()),
-            crate::lane::Lane::KvmLocal(_) => CarrickCleanup::KvmLocal,
-            crate::lane::Lane::BhyveLocal(_) => CarrickCleanup::BhyveLocal,
-            crate::lane::Lane::NvmmLocal(_) => CarrickCleanup::NvmmLocal,
+            crate::lane::Lane::Hvf => ExecutionCleanup::Hvf,
+            crate::lane::Lane::Kvm(cfg) => ExecutionCleanup::KvmLima(cfg.clone()),
+            crate::lane::Lane::KvmLocal(_) => ExecutionCleanup::KvmLocal,
+            crate::lane::Lane::BhyveLocal(_) => ExecutionCleanup::BhyveLocal,
+            crate::lane::Lane::NvmmLocal(_) => ExecutionCleanup::NvmmLocal,
         }
     }
 }
@@ -456,7 +543,7 @@ fn run_one(
     deadline_budget: CarrickDeadline,
     run_id: &str,
     engine: Engine,
-    cleanup: Option<CarrickCleanup>,
+    cleanup: Option<ExecutionCleanup>,
 ) -> anyhow::Result<RunOutput> {
     std::fs::create_dir_all(raw_dir())?;
     let stdout_path = raw_dir().join(format!("{run_id}.out"));
@@ -505,7 +592,10 @@ fn run_one(
                     if let Some(evidence) = timeout_evidence.as_ref() {
                         report_deadline_receipt(run_id, deadline_budget, evidence);
                     }
-                    let _ = kill_scoped(pid, run_id, engine, cleanup.as_ref());
+                    let killed = kill_scoped(pid, run_id, engine, cleanup.as_ref());
+                    if matches!(engine, Engine::Native) {
+                        killed?;
+                    }
                     // Reap whatever is left.
                     let _ = child.wait();
                     break -1;
@@ -788,14 +878,20 @@ fn kill_scoped(
     pid: i32,
     run_id: &str,
     engine: Engine,
-    cleanup: Option<&CarrickCleanup>,
+    cleanup: Option<&ExecutionCleanup>,
 ) -> anyhow::Result<()> {
+    if matches!(engine, Engine::Native) {
+        let Some(ExecutionCleanup::NativeInit(record)) = cleanup else {
+            anyhow::bail!("native cleanup requires namespace init authority");
+        };
+        return crate::native::kill_init(record);
+    }
     // Group kill of the direct child tree (cheap, scoped to our spawned pid).
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
     }
     match (engine, cleanup) {
-        (Engine::Carrick, Some(CarrickCleanup::KvmLima(cfg))) => {
+        (Engine::Carrick, Some(ExecutionCleanup::KvmLima(cfg))) => {
             // KVM lane: the group kill above only reached the MAC side (limactl/
             // ssh); the carrick tree lives in the GUEST and carrick escapes its
             // process group there (it manages guest pgids), so reap it with a
@@ -822,7 +918,11 @@ fn kill_scoped(
         }
         (
             Engine::Carrick,
-            Some(CarrickCleanup::KvmLocal | CarrickCleanup::BhyveLocal | CarrickCleanup::NvmmLocal),
+            Some(
+                ExecutionCleanup::KvmLocal
+                | ExecutionCleanup::BhyveLocal
+                | ExecutionCleanup::NvmmLocal,
+            ),
         ) => {
             // Local Linux/KVM, FreeBSD/bhyve, NetBSD/NVMM: a guest may have
             // escaped its process group (setsid/setpgid), so kill by name, not
@@ -842,13 +942,19 @@ fn kill_scoped(
                     .status();
             }
         }
-        (Engine::Carrick, Some(CarrickCleanup::Hvf) | None) => {
+        (Engine::Carrick, Some(ExecutionCleanup::Hvf) | None) => {
             // Belt for a guest that escaped its group (setpgid/setsid): the
             // SCOPED kill.sh matches only `carrick:<run-id>` and refuses a
             // global reap. Direct execution handles ordinary same-user guests;
             // sudo -n is a fallback for hosts with privileged wrappers. The
             // helper's exact zero-residue receipt is required either way.
             run_hvf_cleanup(run_id)?;
+        }
+        (Engine::Carrick, Some(ExecutionCleanup::NativeInit(_))) => {
+            anyhow::bail!("native init authority cannot clean up a Carrick run");
+        }
+        (Engine::Native, _) => {
+            anyhow::bail!("native cleanup must use its namespace init authority");
         }
         (Engine::Docker, _) => {
             let container = run_id.to_string();

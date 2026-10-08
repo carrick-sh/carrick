@@ -76,8 +76,19 @@ evidence, profile, operation or rationale prose change. Only source coordinates
 and the matching leading rationale location can move. Generated files on the
 Mac are restored before the checkout lock is released. Transfer failures never
 publish a validated patch. If the execution SSH connection fails, the checkout
-lock stays held until the remote completion marker permits the shared stale-lock
-recovery to reclaim it; a disconnect cannot prove compiler work stopped.
+lock stays held: the remote launch shell joined it as a holder, and a disconnect
+cannot prove compiler work stopped.
+
+The checkout lock (`gate-worktree.lock`) records each gate-host process holding
+it in `holders/<pid>` with that process's start time. The acquiring SSH session
+keeps a remote keeper process alive until the driver releases or dies; work
+that outlives the driver (the detached accept job, the recapture shell) joins
+as a holder while a live holder sponsors it. A later acquirer reclaims the lock
+only when every recorded holder process is gone and the holder set did not
+change while it looked, and appends the recovered run-id to
+`gate-worktree.lock.recoveries`. A lock without holder records is reclaimed
+only through its run's published `exit` file; otherwise it is reported and
+left for a human.
 Recapture is inventory maintenance, not an acceptance
 receipt; run the acceptance gates on the resulting commit.
 
@@ -569,3 +580,92 @@ last descriptor closes. No external network endpoint is involved. The initial
 native musl/GNU qualification and exact image/binary identities are recorded in
 `target/conformance/fix-forward-20260909/packet-v3-review/`. Missing packet socket
 privilege is a fixture error, never a reason to bless a skipped or failing oracle.
+
+## Native x86 Linux oracle (stage 1)
+
+`--oracle native --lane kvm-local` runs the Linux side on the same native
+x86_64 Linux host, without a Docker client or daemon. Other lanes, operating
+systems and host ISAs are rejected before execution. Carrick and native oracle
+phases remain separate. Both sides use `seccomp=unconfined`; the native runner
+refuses an inherited host seccomp filter.
+
+```sh
+cargo build --release -p carrick-cli --no-default-features --features platform-linux
+cargo run -p carrick-conformance -- --lane kvm-local --oracle native \
+  --suite ltp-mmap01 --oracle-fill --oracle-fill-profile regression
+cargo run -p carrick-conformance -- --lane kvm-local --oracle native \
+  --tier smoke --require-cached-oracle
+```
+
+Native execution requires passwordless `sudo`, util-linux `unshare`, GNU
+`chroot`/`cp`, and mount permissions. Each command runs in fresh mount, PID,
+UTS and IPC namespaces. The image command execs as PID 1 inside the chroot, with private procfs,
+devpts and shared-memory tmpfs, and only the standard null/zero/random devices.
+Init owns a fresh session with positive namespace pgrp/sid. Timeout cleanup
+authenticates init by host PID and start ticks, kills only init, and lets
+unshare/sudo reap it before reaping the direct child; namespace exit kills
+remaining descendants. Each invocation copies the immutable root with
+`cp -a --reflink=auto`; workloads cannot mutate the cached lower.
+
+`carrick rootfs export IMAGE --platform linux/amd64` materializes an image
+once per digest and extractor version and emits its immutable path, digest,
+image environment, command, entrypoint and working directory as JSON. It uses
+the VFS's contained OCI layer merger with native numeric ownership, modes, archive mtimes and
+special-node publication, rather than the carrier-readable metadata projection.
+Extraction fails on unsupported extended metadata or denied node creation.
+The image must provide `/bin/sh` and its loader for the PID-1 init. Admission
+uses a host-side descriptor acknowledgement that is closed before the workload;
+a missing init is refused instead of being cached as a Linux command failure.
+Stage 1 rejects non-root image users, bind mounts, Docker privilege/capability
+flags, tty options and unsupported security options. These are explicit
+unsupported envelopes, never substituted or cached as Linux results.
+
+Native suite results go exclusively to
+`scripts/conformance/oracle-cache.native-amd64.jsonl`. Their keys add
+`native-unshare-v1`, kernel major/minor, image digest, extractor identity and
+extractor flags. Docker keys and committed cache bytes stay unchanged,
+including historical parser fingerprints that already miss the current parser.
+Native duration evidence also has a separate sidecar.
+
+For static probe blessing, build the requested x86_64 musl binaries locally
+and run the existing ignored blessing target with an explicit selection:
+
+```sh
+CARRICK_PROBE_ORACLE=native CARRICK_PROBE_LANE=amd64 \
+CARRICK_PROBE_LIBC=musl CARRICK_PROBE_FILTER=mmapzerofill,mmapmunmap \
+  cargo test -p carrick-cli --no-default-features --features platform-linux \
+  --test conformance -- --ignored bless_probe_oracle --nocapture
+```
+
+The identical ELF executes under the native namespace/chroot envelope; musl
+requires no image. Probe captures retain the existing harness's waiting PID-1
+shell inside that root, so the tested ELF runs as its child. GNU blessing resolves the amd64 probe image and uses its
+loader, not host libc. Native outputs live in `probe-oracle/amd64native-{musl,gnu}`
+with `PROVENANCE.json` recording full kernel release, distro, namespace flags,
+extractor policy, init policy and source-hash scheme. Static roots include the
+host shell and loader closure, whose file hashes are recorded and checked;
+the tested static ELF does not link against those libraries. Native source hashes include the probe,
+shared helper library, Cargo manifest and lockfile. Both probe-cache readers
+reject a different full kernel release. Partial re-blessing across a kernel
+change is refused so untouched entries cannot inherit new provenance.
+
+`--shard i/N` uses 1-based indices. It sorts longest-first using the committed,
+unchanged `oracle-cache.timings.jsonl`, uses one second for unknown cases, breaks
+case ties by name and load ties by shard index. It writes a `.header.json`
+sidecar containing HEAD, Carrick SHA-256, full kernel release, manifest and
+selection hashes, lane, oracle backend, timing hash, native image digest inventory hash and the complete partition.
+Default shard result paths are distinct; `--jsonl` can name an explicit path.
+
+```sh
+cargo run -p carrick-conformance -- --lane kvm-local --oracle native \
+  --tier smoke --shard 1/4 --jsonl target/conformance/shard-1.jsonl
+cargo run -p carrick-conformance -- --merge-shards \
+  target/conformance/shard-{1,2,3,4}.jsonl \
+  --jsonl target/conformance/merged.jsonl
+```
+
+Merge refuses mismatched headers, repeated shard indices or cases, unexpected
+cases and missing cases/files. Shards cannot bless a shared baseline, claim HVF
+closure, or combine with the oracle-fill maintenance command. This host-only
+oracle infrastructure does not establish Carrick x86 guest-execution parity;
+that remains a separate runtime binding and gate.

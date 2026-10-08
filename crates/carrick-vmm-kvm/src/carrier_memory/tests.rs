@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)]
 use super::*;
 use carrick_guest_arch::{ContextGeneration, MmGeneration};
+use carrick_hal::{HvVcpu, VcpuExit};
 fn nz(n: u64) -> NonZeroU64 {
     NonZeroU64::new(n).unwrap()
 }
@@ -17,6 +18,107 @@ fn backing(pa: u64, len: usize, tag: u64) -> PreparedBacking {
             inventory_revision: nz(tag),
         },
     }
+}
+
+#[test]
+fn three_vcpus_observe_one_carrier_backing_in_order() {
+    let mut machine = CarrierMachine::create_stopped(3).unwrap();
+    let mut extent = BackingExtent::private(FrameGpa::new(0), PAGE as usize).unwrap();
+    // Real-mode MOV AL, [0x100]; OUT 0xe9, AL; HLT. Each KVM_RUN must
+    // observe the same retained host page through its own vCPU in this VM.
+    extent
+        .initialize(0, &[0xa0, 0x00, 0x01, 0xe6, 0xe9, 0xf4])
+        .unwrap();
+    extent.initialize(0x100, b"A").unwrap();
+    let backing = PreparedBacking {
+        extent: Arc::new(extent),
+        identity: BackingIdentity {
+            frame_id: nz(1),
+            mapping_id: nz(1),
+            owner_generation: nz(1),
+            inventory_revision: nz(1),
+        },
+    };
+    machine.memory_mut().install(&[backing]).unwrap();
+    assert_eq!(machine.memory_mut().slot_count(), 1);
+    for index in 0..machine.vcpu_count() {
+        let cpu = machine.cpu_mut(index).unwrap();
+        let mut sregs = cpu.fd().get_sregs().unwrap();
+        sregs.cs.base = 0;
+        sregs.cs.selector = 0;
+        sregs.ds.base = 0;
+        sregs.ds.selector = 0;
+        cpu.fd().set_sregs(&sregs).unwrap();
+        let mut regs = cpu.fd().get_regs().unwrap();
+        regs.rip = 0;
+        regs.rflags = 2;
+        cpu.fd().set_regs(&regs).unwrap();
+        let exit = HvVcpu::run(cpu).unwrap();
+        assert!(
+            matches!(&exit, VcpuExit::IoOut { port: 0xe9, data } if data == &[b'A' + index as u8]),
+            "vCPU {index} did not read the current shared GPA byte"
+        );
+        machine
+            .memory_mut()
+            .write(FrameGpa::new(0x100), &[b'B' + index as u8])
+            .unwrap();
+    }
+    assert_eq!(machine.memory_mut().retained_bytes(), PAGE as usize);
+}
+
+#[test]
+fn carrier_publication_requires_an_already_applied_guest_edit() {
+    let mut memory = CarrierMemory::create().unwrap();
+    memory.install(&[backing(0x1000, 0x4000, 1)]).unwrap();
+    let context = AddressContext {
+        root: root(0x1000),
+        mm: MmGeneration::new(nz(1)),
+        generation: ContextGeneration::new(nz(1)),
+    };
+    memory.install_root(nz(1), context).unwrap();
+    let data = backing(0x800000, 4096, 2);
+    let txn = DescriptorTxn {
+        id: DescriptorTxnId {
+            mm_key: nz(1),
+            generation: nz(1),
+        },
+        root: context.root,
+        tables: &[root(0x2000), root(0x3000), root(0x4000)],
+        op: DescriptorOp::Map {
+            span: PageSpan::new(0x4000, PAGE),
+            output: FrameGpa::new(0x800000),
+            permissions: Permissions {
+                writable: true,
+                executable: false,
+                user: true,
+            },
+            size: LeafSize::Page,
+            resident: true,
+            backing: data.identity,
+        },
+    };
+    let mut inventory = Inventory {
+        live: false,
+        fail_publish: false,
+        fail_commit: false,
+        fail_rollback: false,
+    };
+    memory.prepare(&[data], &mut inventory).unwrap();
+    let forged = GuestMmuPublication {
+        revision: GuestMmuPublication::REVISION,
+        outcome: GuestMmuPublication::APPLIED,
+        mm_key: 1,
+        root_gpa: 0x1000,
+        generation: 1,
+        edit_identity: txn.edit_identity(),
+        span_va: 0x4000,
+        span_len: PAGE,
+        live_stores: 4,
+        tables_linked: 3,
+    };
+    assert!(memory.publish(&txn, forged, &mut inventory).is_err());
+    assert!(memory.is_quarantined());
+    assert_eq!(memory.words().load(0x1000).unwrap(), 0);
 }
 #[test]
 fn failed_second_memslot_install_restores_custody_and_reuses_slot_zero() {
@@ -53,7 +155,7 @@ impl InventoryTransaction for Inventory {
             Ok(())
         }
     }
-    fn commit(&mut self, _: &DescriptorReceipt) -> Result<(), MemoryError> {
+    fn commit(&mut self, _: &GuestMmuPublication) -> Result<(), MemoryError> {
         if self.fail_commit {
             Err(error("injected inventory commit failure"))
         } else {
@@ -70,7 +172,7 @@ impl InventoryTransaction for Inventory {
     }
 }
 #[test]
-fn inventory_failure_restores_descriptors_slots_and_inventory_as_one_unit() {
+fn inventory_failure_before_guest_edit_rolls_back_and_after_edit_quarantines() {
     for fail_commit in [false, true] {
         let mut memory = CarrierMemory::create().unwrap();
         memory.install(&[backing(0x1000, 0x4000, 1)]).unwrap();
@@ -109,11 +211,29 @@ fn inventory_failure_restores_descriptors_slots_and_inventory_as_one_unit() {
             fail_commit,
             fail_rollback: false,
         };
-        assert!(memory.publish(&txn, &[data], &mut inventory).is_err());
-        assert!(!inventory.live);
-        assert_eq!(memory.slot_count(), 1);
-        assert_eq!(memory.read(FrameGpa::new(0x1000), 0x4000).unwrap(), before);
-        assert!(memory.read(FrameGpa::new(0x800000), 1).is_err());
+        if !fail_commit {
+            assert!(memory.prepare(&[data], &mut inventory).is_err());
+            assert!(!inventory.live);
+            assert_eq!(memory.slot_count(), 1);
+            assert_eq!(memory.read(FrameGpa::new(0x1000), 0x4000).unwrap(), before);
+            assert!(memory.read(FrameGpa::new(0x800000), 1).is_err());
+        } else {
+            memory.prepare(&[data], &mut inventory).unwrap();
+            // Fixture-only guest executor: CarrierMemory::publish must consume
+            // the result without authoring or undoing a descriptor.
+            let receipt = execute_descriptor_txn(
+                &memory.words(),
+                &txn,
+                context.root,
+                &mut InlineJournal::new(),
+            );
+            let publication = GuestMmuPublication::from_x86_receipt(&txn, &receipt).unwrap();
+            assert!(memory.publish(&txn, publication, &mut inventory).is_err());
+            assert!(memory.is_quarantined());
+            assert!(inventory.live);
+            assert_eq!(memory.slot_count(), 2);
+            assert_ne!(memory.words().load(0x1000).unwrap(), 0);
+        }
     }
 }
 #[test]
@@ -127,34 +247,13 @@ fn inventory_rollback_failure_quarantines_and_retains_registered_bytes() {
     };
     memory.install_root(nz(1), context).unwrap();
     let data = backing(0x800000, 4096, 2);
-    let tables = [root(0x2000), root(0x3000), root(0x4000)];
-    let txn = DescriptorTxn {
-        id: DescriptorTxnId {
-            mm_key: nz(1),
-            generation: nz(1),
-        },
-        root: context.root,
-        tables: &tables,
-        op: DescriptorOp::Map {
-            span: PageSpan::new(0x4000, PAGE),
-            output: FrameGpa::new(0x800000),
-            permissions: Permissions {
-                writable: true,
-                executable: false,
-                user: true,
-            },
-            size: LeafSize::Page,
-            resident: true,
-            backing: data.identity,
-        },
-    };
     let mut inventory = Inventory {
         live: false,
         fail_publish: true,
         fail_commit: false,
         fail_rollback: true,
     };
-    assert!(memory.publish(&txn, &[data], &mut inventory).is_err());
+    assert!(memory.prepare(&[data], &mut inventory).is_err());
     assert!(memory.is_quarantined());
     assert_eq!(memory.slot_count(), 2);
     assert!(memory.install(&[backing(0x900000, 4096, 3)]).is_err());

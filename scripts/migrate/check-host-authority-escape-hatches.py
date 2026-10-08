@@ -65,13 +65,36 @@ ASSEMBLY_BOUNDARIES = frozenset(
         PurePosixPath("crates/carrick-el1/src/personality/mm_portal/production.rs"),
         PurePosixPath("crates/carrick-el1/src/sched/hw.rs"),
         PurePosixPath("crates/carrick-el1/src/sched/aarch64_context.rs"),
+        # ARM EL1 TTBR0/HVC instructions moved intact into the ISA leaf.
+        PurePosixPath("crates/carrick-el1/src/isa/aarch64.rs"),
+        # Reviewed CPL0-only ISA leaves: stack/TSC instructions and named
+        # UD2 fail-closed paths, with no host or Linux policy operation.
+        PurePosixPath("crates/carrick-el1/src/isa/x86/context.rs"),
+        PurePosixPath("crates/carrick-el1/src/isa/x86/interrupt.rs"),
+        PurePosixPath("crates/carrick-el1/src/isa/x86/interrupts.rs"),
+        PurePosixPath("crates/carrick-el1/src/isa/x86/mmu.rs"),
+        PurePosixPath("crates/carrick-el1/src/isa/x86/transport.rs"),
+        PurePosixPath("crates/carrick-el1/src/isa/x86/user_access.rs"),
         # Reviewed x86 CPL0 hardware boundary: entry/return, port I/O and halt; no host operation.
         PurePosixPath("crates/carrick-x86-cpl0/src/entry.rs"),
+        # Native IRQ entry saves registers and xstate, validates the local
+        # xAPIC vector, then IRETs or uses the declared guest fatal port.
+        PurePosixPath("crates/carrick-x86-cpl0/src/native_irq.rs"),
+        # CPL0 initial-image IRET and the declared KVM carrier completion
+        # port execute only in the guest; no host syscall or other port.
+        PurePosixPath("crates/carrick-x86-cpl0/src/initial_boot.rs"),
         # CPL0-only native IRQ/IRET, XSAVE, FS/GS MSRs, CR3 and IF/HLT
         # leaves. Their target_os=none guards exclude all host execution.
         PurePosixPath("crates/carrick-x86-cpl0/src/progress.rs"),
         PurePosixPath("crates/carrick-x86/src/cpl0_scheduler.rs"),
         PurePosixPath("crates/carrick-x86/src/interrupts.rs"),
+        # CPL0-only KernelArch instruction leaves: CPU-local register, TLB,
+        # IRQ and fail-closed traps; none issue host syscalls.
+        PurePosixPath("crates/carrick-el1/src/isa/x86/context.rs"),
+        PurePosixPath("crates/carrick-el1/src/isa/x86/interrupt.rs"),
+        PurePosixPath("crates/carrick-el1/src/isa/x86/mmu.rs"),
+        PurePosixPath("crates/carrick-el1/src/isa/x86/transport.rs"),
+        PurePosixPath("crates/carrick-el1/src/isa/x86/user_access.rs"),
     }
 )
 

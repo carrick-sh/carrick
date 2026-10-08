@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
 pub fn pack(manifest: &Path, output: &Path) -> Result<PathBuf> {
-    let identity = inspect_bundle(manifest, None)?;
+    let identity = inspect_bundle(manifest)?;
     let bundle = manifest
         .parent()
         .ok_or_else(|| fail("manifest has no parent"))?;
@@ -47,7 +47,7 @@ pub fn pack(manifest: &Path, output: &Path) -> Result<PathBuf> {
     // Packing validates transport and object bytes without a receiver checkout.
     // Admission below additionally validates scoped inputs and build policy.
     let unpacked = unpack(temp.path())?;
-    inspect_bundle(&unpacked.manifest, Some(&identity.source_head))?;
+    inspect_bundle(&unpacked.manifest)?;
     let artifact = destination.join(format!("{}.tar.gz", String::from(digest)));
     if artifact.exists() {
         if hash_file(&artifact)? != hash_file(temp.path())? {

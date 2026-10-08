@@ -1,0 +1,24 @@
+schema_version = 1
+id = "core.lifecycle.publication"
+title = "Birth and retirement retain exact pool incarnation and rollback custody"
+guest_surfaces = ["kernel:thread-ledger", "syscall:clone", "syscall:exit"]
+semantic_authority = ["Neutral publication contract: reserve before initialize; publish or rollback the exact incarnation; retiring membership cannot consume the caller-selected terminal floor", "man 2 clone / man 2 exit: personality retains Linux-visible thread membership policy"]
+fixture = "carrick-core:x86_wave2::x5_lifecycle_publication"
+scale_points = [16, 64, 256]
+rationale = "The production Lifecycle owner uses exact generation CAS transitions. A noncopyable exit admission restores Published when publication wins the race, retains Born otherwise, and notifies the retained ledger only on committed retirement. Reuse rejects predecessor generations. The measurement window is claim through complete_birth, publish/exit/drop rollback, begin_exit/commit and reap, including the rollback state assertion; reserve, initialization and unrelated peer observations are outside it. The frozen window acquires exactly 13 retained pool cells per birth, independent of historical births."
+
+[bindings]
+vm_free = "carrick-core::x86_wave2::x5_lifecycle_publication"
+
+[bindings.unresolved]
+embed_structural = "Director-owned ARM signed lifecycle packet and production executor-pool exhaustion remain required."
+docker = "No Docker on the worker; existing Linux policy is preserved by AL mappings and witnesses."
+production = "carrick-core::lifecycle::Lifecycle; Linux retained ThreadLifecyclePage implements storage access; ARM native hooks and bounded x86 CPL0 native hooks invoke the same production owner."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "lifecycle_entry_visits"
+base = 0
+per_unit = 13
+layers = ["vm-free"]
+rationale = "Exactly 13 retained entry accesses per completed birth/retirement operation window, measured by the production storage binding at 16/64/256 reuse scales."

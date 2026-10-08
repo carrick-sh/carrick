@@ -1,32 +1,35 @@
 //! Carrick guest EL1 image: neutral mechanisms and Linux personality.
 //!
-//! ISA selection: the AArch64 EL1 image and host builds compile every
-//! module. The x86_64 CPL0 image (`target_os = "none"`, `x86_64`) compiles
-//! only the frame-independent personality modules; the others still embed
-//! AArch64 frames, system registers or the EL1 allocator.
+//! One kernel body is compiled into the AArch64 EL1 and x86_64 CPL0 images.
 #![cfg_attr(target_os = "none", no_std)]
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[cfg(target_os = "none")]
 extern crate alloc as rust_alloc;
-#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub mod alloc;
-#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub mod cow;
-#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub mod fault;
-#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+pub mod isa;
 pub mod lock;
-#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub mod memory;
 pub mod personality;
-#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub mod substrate;
-#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub use fault::dispatch_fault;
-#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub use personality::dispatch::*;
-#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub use personality::{file, inotify, sched};
 
 #[cfg(test)]
 #[path = "personality/native_ownership_tests.rs"]
 mod native_ownership_tests;
+#[cfg(test)]
+#[path = "isa/x86/context_words.rs"]
+mod x86_context_words_tests;
+#[cfg(test)]
+#[path = "isa/x86/initial_mm.rs"]
+mod x86_initial_mm_tests;
+#[cfg(test)]
+#[path = "isa/x86/interrupts.rs"]
+#[allow(dead_code)]
+mod x86_interrupt_timer_tests;
+
+#[cfg(test)]
+#[path = "isa/x86/user_tables.rs"]
+mod x86_user_tables_tests;

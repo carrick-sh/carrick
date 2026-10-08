@@ -26,6 +26,7 @@ carrick-abi = { path = "../carrick-abi" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-fatal.workspace = true
 carrick-guest-mem = { path = "../carrick-guest-mem" }
+carrick-host = { path = "../carrick-host" }
 carrick-mem = { path = "../carrick-mem" }
 carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-observability = { path = "../carrick-observability" }

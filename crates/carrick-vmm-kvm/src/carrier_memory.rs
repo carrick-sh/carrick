@@ -2,9 +2,11 @@
 //! Dedicated bounded KVM slots project extents, never one slot per page/MM.
 //! This preparation has no public vCPU/run handle. The accepted N1 editor must
 //! enclose publication and physical rollback; M5 will bind execution admission.
-use crate::KvmVm;
 use crate::guest_setup::{GuestRam, WindowKind};
+use crate::{KvmVcpu, KvmVm};
+use carrick_el1_abi::GuestMmuPublication;
 use carrick_guest_arch::{AddressContext, FrameGpa, RootGpa};
+use carrick_hal::HvVm;
 use carrick_mmu_core::x86::descriptor_txn::*;
 use kvm_bindings::kvm_userspace_memory_region;
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,7 +30,7 @@ fn error(message: impl Into<String>) -> MemoryError {
 /// carrier-wide shared-zero source exists. Bytes are mutable only before Arc
 /// custody or through the exclusively stopped carrier.
 pub struct BackingExtent {
-    ram: GuestRam,
+    ram: Arc<GuestRam>,
     base: FrameGpa,
     len: usize,
 }
@@ -47,7 +49,11 @@ impl BackingExtent {
         let mut ram = GuestRam::new();
         ram.add_window(base.raw(), len, WindowKind::Private)
             .map_err(|e| error(e.to_string()))?;
-        Ok(Self { ram, base, len })
+        Ok(Self {
+            ram: Arc::new(ram),
+            base,
+            len,
+        })
     }
     pub fn initialize(&mut self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError> {
         if offset
@@ -56,11 +62,31 @@ impl BackingExtent {
         {
             return Err(error("extent initialization bounds"));
         }
-        self.ram
+        Arc::get_mut(&mut self.ram)
+            .ok_or_else(|| error("extent already shared"))?
             .write_gpa(self.base.raw() + offset as u64, bytes)
             .map_err(|e| error(e.to_string()))
     }
+    fn retained_window(ram: Arc<GuestRam>, base: u64, len: usize) -> Result<Self, MemoryError> {
+        if !ram
+            .windows_for_kvm()
+            .iter()
+            .any(|(gpa, _, size)| *gpa == base && *size == len)
+        {
+            return Err(error("bootstrap window is not retained"));
+        }
+        Ok(Self {
+            ram,
+            base: FrameGpa::new(base),
+            len,
+        })
+    }
     fn ptr(&self, pa: u64, len: usize) -> Option<*mut u8> {
+        if pa < self.base.raw()
+            || pa.checked_add(len as u64)? > self.base.raw().checked_add(self.len as u64)?
+        {
+            return None;
+        }
         self.ram.host_ptr(pa, len)
     }
 }
@@ -98,6 +124,7 @@ struct Alias {
 struct Slot {
     handle: BackingHandle,
     backing: PreparedBacking,
+    bootstrap: bool,
     alias_count: usize,
     allowed: Vec<NonZeroU64>,
     drains: Vec<AddressContext<RootGpa>>,
@@ -111,7 +138,7 @@ struct Slot {
 /// restore physical or inventory custody quarantines the carrier.
 pub trait InventoryTransaction {
     fn publish(&mut self) -> Result<(), MemoryError>;
-    fn commit(&mut self, receipt: &DescriptorReceipt) -> Result<(), MemoryError>;
+    fn commit(&mut self, publication: &GuestMmuPublication) -> Result<(), MemoryError>;
     fn rollback(&mut self) -> Result<(), MemoryError>;
 }
 /// N1's physical inventory retirement, settled only AFTER exact context drain
@@ -155,7 +182,84 @@ pub struct CarrierMemory {
     #[cfg(test)]
     fail_install: Option<usize>,
 }
+
+/// One KVM VM and its retained physical backing for a bounded set of vCPUs.
+/// vCPU handles drop before the memory owner and its VM. All CPUs issued by
+/// this owner see the same slot namespace; no standalone CPU can be attached.
+pub struct CarrierMachine {
+    cpus: Vec<KvmVcpu>,
+    memory: CarrierMemory,
+}
+
+impl CarrierMachine {
+    pub fn create_stopped(vcpu_count: usize) -> Result<Self, MemoryError> {
+        Self::from_memory(CarrierMemory::create()?, vcpu_count)
+    }
+
+    pub(crate) fn from_memory(
+        mut memory: CarrierMemory,
+        vcpu_count: usize,
+    ) -> Result<Self, MemoryError> {
+        if vcpu_count == 0 {
+            return Err(error("carrier requires at least one vCPU"));
+        }
+        let mut cpus = Vec::new();
+        for _ in 0..vcpu_count {
+            cpus.push(memory.vm.add_vcpu().map_err(|e| error(e.to_string()))?);
+        }
+        Ok(Self { cpus, memory })
+    }
+
+    pub fn vcpu_count(&self) -> usize {
+        self.cpus.len()
+    }
+
+    pub fn memory_mut(&mut self) -> &mut CarrierMemory {
+        &mut self.memory
+    }
+
+    pub fn cpu_mut(&mut self, index: usize) -> Option<&mut KvmVcpu> {
+        self.cpus.get_mut(index)
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<KvmVcpu>, CarrierMemory) {
+        (self.cpus, self.memory)
+    }
+}
+
 impl CarrierMemory {
+    pub(crate) fn vm(&self) -> &KvmVm {
+        &self.vm
+    }
+
+    /// Bootstrap windows are fixed supervisor and initial-task backing. They
+    /// use the same slot allocator as later owner-issued guest MM extents.
+    pub(crate) fn install_bootstrap(&mut self, ram: Arc<GuestRam>) -> Result<(), MemoryError> {
+        let mut backings = Vec::new();
+        for (index, (base, _, len)) in ram.windows_for_kvm().into_iter().enumerate() {
+            let serial = NonZeroU64::new(index as u64 + 1)
+                .ok_or_else(|| error("bootstrap backing serial exhausted"))?;
+            backings.push(PreparedBacking {
+                extent: Arc::new(BackingExtent::retained_window(Arc::clone(&ram), base, len)?),
+                identity: BackingIdentity {
+                    frame_id: serial,
+                    mapping_id: serial,
+                    owner_generation: serial,
+                    inventory_revision: serial,
+                },
+            });
+        }
+        let handles = self.install(&backings)?;
+        for handle in handles {
+            let slot = self
+                .slots
+                .get_mut(&handle.slot)
+                .ok_or_else(|| error("bootstrap slot disappeared"))?;
+            slot.bootstrap = true;
+        }
+        Ok(())
+    }
+
     pub fn create() -> Result<Self, MemoryError> {
         let vm = KvmVm::create_empty().map_err(|e| error(e.to_string()))?;
         let limit = vm.carrier_slot_limit().map_err(|e| error(e.to_string()))?;
@@ -276,6 +380,7 @@ impl CarrierMemory {
                 Slot {
                     handle,
                     backing: b.clone(),
+                    bootstrap: false,
                     alias_count: 0,
                     allowed: Vec::new(),
                     drains: Vec::new(),
@@ -321,6 +426,9 @@ impl CarrierMemory {
     }
     pub fn share(&self, handle: BackingHandle) -> Result<SharedFrameEdge, MemoryError> {
         let slot = self.record(handle)?;
+        if slot.bootstrap {
+            return Err(error("bootstrap backing cannot be shared as guest data"));
+        }
         Ok(SharedFrameEdge {
             handle,
             identity: slot.backing.identity,
@@ -361,6 +469,9 @@ impl CarrierMemory {
         let (output, identity) = match op {
             DescriptorOp::Map {
                 output, backing, ..
+            }
+            | DescriptorOp::Prepare {
+                output, backing, ..
             } => (output, backing),
             DescriptorOp::CowRepoint { new, backing, .. } => (new, backing),
             _ => return Ok(None),
@@ -368,7 +479,8 @@ impl CarrierMemory {
         let slot = self
             .locate(output, op.span().len as usize)
             .ok_or_else(|| error("unbacked descriptor output"))?;
-        if slot.backing.identity != identity
+        if slot.bootstrap
+            || slot.backing.identity != identity
             || (!slot.allowed.is_empty() && !slot.allowed.contains(&mm))
         {
             return Err(error(
@@ -377,87 +489,125 @@ impl CarrierMemory {
         }
         Ok(Some(slot.handle.slot))
     }
-    /// Descriptors, memslots, and N1's inventory settle together. The caller
-    /// holds the accepted exact-MM editor and entry exclusion until this returns
-    /// and completes the queued CPL0 drain. COW bytes are copied by N1 before
-    /// this hardware repoint, never by a second private COW policy here.
-    pub fn publish<I: InventoryTransaction>(
-        &mut self,
-        txn: &DescriptorTxn<'_>,
-        backings: &[PreparedBacking],
-        inventory: &mut I,
-    ) -> Result<(DescriptorReceipt, Vec<BackingHandle>), MemoryError> {
+    /// Validate the root, table grants and physical output before the guest
+    /// may execute an edit. No descriptor or inventory state changes here.
+    pub fn admit_guest_edit(&self, txn: &DescriptorTxn<'_>) -> Result<(), MemoryError> {
         self.admit()?;
         let context = self
             .root(txn.id.mm_key)
             .filter(|c| c.root == txn.root)
             .ok_or_else(|| error("stale carrier MM/root"))?;
-        // Like the ARM primary-table window, grants share the retained root
-        // arena. This keeps stage-1 hierarchy custody tied to a live root and
-        // prevents a data-slot revoke from tearing out reachable table pages.
         let arena = self
             .locate(context.root.address(), PAGE as usize)
             .ok_or_else(|| error("unbacked carrier root arena"))?
             .handle;
-        if txn.tables.iter().any(|g| {
-            self.locate(g.address(), PAGE as usize)
+        if txn.tables.iter().any(|grant| {
+            self.locate(grant.address(), PAGE as usize)
                 .is_none_or(|slot| slot.handle != arena)
         }) {
-            return Err(error("table grant outside the retained root arena"));
+            return Err(error("table grant outside retained root arena"));
         }
-        let plan = plan_descriptor_txn(&self.words(), txn, context.root)
-            .map_err(|e| error(format!("descriptor plan: {e:?}")))?;
+        self.authenticate(txn.id.mm_key, txn.op)?;
+        Ok(())
+    }
+    /// Publish physical backing and inventory before the guest can make a
+    /// present descriptor. A failed preparation rolls both back without ever
+    /// entering the guest editor.
+    pub fn prepare<I: InventoryTransaction>(
+        &mut self,
+        backings: &[PreparedBacking],
+        inventory: &mut I,
+    ) -> Result<Vec<BackingHandle>, MemoryError> {
         let handles = self.install(backings)?;
-        let target = match self.authenticate(txn.id.mm_key, txn.op) {
-            Ok(index) => index,
-            Err(reason) => {
-                self.rollback_slots(&handles)?;
-                return Err(reason);
-            }
-        };
         if let Err(reason) = inventory.publish() {
             self.rollback_inventory(inventory)?;
             self.rollback_slots(&handles)?;
             return Err(reason);
         }
-        let receipt = apply_descriptor_plan(&self.words(), &plan, &mut InlineJournal::new());
-        if !matches!(receipt.outcome, DescriptorOutcome::Applied { .. }) {
-            if matches!(receipt.outcome, DescriptorOutcome::Indeterminate(_)) {
-                self.quarantined = true;
-                return Err(error("indeterminate descriptor rollback; backing retained"));
-            }
-            self.rollback_inventory(inventory)?;
-            self.rollback_slots(&handles)?;
-            return Err(error(format!(
-                "descriptor publication: {:?}",
-                receipt.outcome
-            )));
+        Ok(handles)
+    }
+
+    /// Cancel a preparation that never reached a guest edit. Any edit refusal
+    /// after stores requires the guest's own rollback receipt or quarantine.
+    ///
+    /// # Safety
+    /// The caller holds exact-MM entry exclusion and proves that no guest
+    /// descriptor has named any handle in this preparation.
+    pub unsafe fn cancel_prepared<I: InventoryTransaction>(
+        &mut self,
+        handles: &[BackingHandle],
+        inventory: &mut I,
+    ) -> Result<(), MemoryError> {
+        self.admit()?;
+        if handles
+            .iter()
+            .any(|handle| !self.record(*handle).is_ok_and(|slot| slot.alias_count == 0))
+        {
+            return Err(error("prepared backing already has guest aliases"));
         }
-        if let Err(reason) = inventory.commit(&receipt) {
-            if !matches!(
-                rollback_descriptor_plan(&self.words(), &plan),
-                DescriptorOutcome::RolledBack(_)
-            ) {
-                self.quarantined = true;
-                return Err(error("indeterminate descriptor undo; backing retained"));
-            }
-            self.rollback_inventory(inventory)?;
-            self.rollback_slots(&handles)?;
+        self.rollback_inventory(inventory)?;
+        self.rollback_slots(handles)
+    }
+
+    /// Consume a guest-owned publication after the exact-MM edit and local
+    /// drain. The caller keeps the editor and entry exclusion until this
+    /// record, N1 inventory and subsequent cross-CPU drain have settled.
+    /// This method never plans, applies or undoes a guest descriptor.
+    pub fn publish<I: InventoryTransaction>(
+        &mut self,
+        txn: &DescriptorTxn<'_>,
+        publication: GuestMmuPublication,
+        inventory: &mut I,
+    ) -> Result<GuestMmuPublication, MemoryError> {
+        self.admit()?;
+        if let Err(reason) = self.admit_guest_edit(txn) {
+            self.quarantined = true;
             return Err(reason);
+        }
+        let context = self
+            .root(txn.id.mm_key)
+            .filter(|c| c.root == txn.root)
+            .ok_or_else(|| error("stale carrier MM/root"))?;
+        // The guest may already have made its leaf present. Any mismatch now
+        // quarantines the carrier and retains all backing; the host has no
+        // authority to author an undo descriptor.
+        if !publication.matches_x86_txn(txn) || !self.guest_postcondition(txn) {
+            self.quarantined = true;
+            return Err(error(
+                "guest MMU publication does not match live descriptors",
+            ));
+        }
+        let target = match self.authenticate(txn.id.mm_key, txn.op) {
+            Ok(index) => index,
+            Err(reason) => {
+                self.quarantined = true;
+                return Err(reason);
+            }
+        };
+        if let Err(reason) = inventory.commit(&publication) {
+            self.quarantined = true;
+            return Err(error(format!(
+                "inventory commit after guest edit: {reason}"
+            )));
         }
         // Track physical alias edges, not reservations or Linux VMA policy.
         // An old slot may not be revoked while any descriptor still names it.
+        // A retired terminal is inaccessible but still names its predecessor
+        // for owner scrub. Keep that physical edge until repoint or unlink.
         if matches!(
             txn.op,
             DescriptorOp::Unmap(_) | DescriptorOp::CowRepoint { .. }
         ) {
             self.remove_aliases(txn.id.mm_key, txn.op.span(), context);
+            if self.quarantined {
+                return Err(error("guest alias publication became indeterminate"));
+            }
         }
         if let Some(index) = target {
-            let slot = self
-                .slots
-                .get_mut(&index)
-                .ok_or_else(|| error("missing authenticated slot"))?;
+            let Some(slot) = self.slots.get_mut(&index) else {
+                self.quarantined = true;
+                return Err(error("missing authenticated slot after guest edit"));
+            };
             if slot.allowed.is_empty() {
                 slot.allowed.push(txn.id.mm_key);
             }
@@ -470,7 +620,113 @@ impl CarrierMemory {
                 },
             );
         }
-        Ok((receipt, handles))
+        Ok(publication)
+    }
+
+    /// Read the terminal graph after the guest edit. Only bounded terminal
+    /// leaves in the edited span are visited; unrelated branches cost nothing.
+    fn guest_postcondition(&self, txn: &DescriptorTxn<'_>) -> bool {
+        let span = txn.op.span();
+        let Some(end) = span.end() else {
+            return false;
+        };
+        let words = self.words();
+        let mut va = span.va;
+        while va < end {
+            let terminal =
+                read_terminal_descriptor(&words, txn.root, carrick_guest_arch::UserVa::new(va));
+            let (entry, size) = match terminal {
+                Ok(value) => value,
+                Err(DescriptorRefusal::MissingTable)
+                    if matches!(txn.op, DescriptorOp::Unmap(_) | DescriptorOp::Retire(_)) =>
+                {
+                    (0, PAGE)
+                }
+                Err(_) => return false,
+            };
+            let physical = entry & ADDRESS;
+            let expected_base = match txn.op {
+                DescriptorOp::Map { output, .. } | DescriptorOp::Prepare { output, .. } => {
+                    Some(output.raw())
+                }
+                DescriptorOp::Publish { expected, .. } => Some(expected.raw()),
+                DescriptorOp::CowRepoint { new, .. } => Some(new.raw()),
+                _ => None,
+            };
+            if let Some(base) = expected_base {
+                let Some(expected) = base.checked_add(va - span.va) else {
+                    return false;
+                };
+                if physical != expected {
+                    return false;
+                }
+            }
+            let valid = match txn.op {
+                DescriptorOp::Map {
+                    resident,
+                    permissions,
+                    ..
+                } => {
+                    (entry & PRESENT != 0) == resident
+                        && (entry & PREPARED != 0) != resident
+                        && entry & (PRIVATE | MAY_EXEC) == 0
+                        && (entry & MAY_WRITE != 0) == permissions.writable
+                        && Self::matches_permissions(entry, permissions)
+                }
+                DescriptorOp::Prepare {
+                    resident,
+                    permissions,
+                    ..
+                } => {
+                    let live = resident.contains(va);
+                    (entry & PRESENT != 0) == live
+                        && (entry & PREPARED != 0) != live
+                        && entry & PRIVATE != 0
+                        && (entry & MAY_WRITE != 0) == permissions.writable
+                        && (entry & MAY_EXEC != 0) == permissions.executable
+                        && Self::matches_permissions(entry, permissions)
+                }
+                DescriptorOp::Publish { .. } => entry & PRESENT != 0 && entry & PREPARED == 0,
+                DescriptorOp::Protect { permissions, .. } => {
+                    entry & (PRESENT | PREPARED) != 0
+                        && entry & PRIVATE != 0
+                        && (!permissions.writable || entry & MAY_WRITE != 0)
+                        && (!permissions.executable || entry & MAY_EXEC != 0)
+                        && Self::matches_permissions(entry, permissions)
+                }
+                DescriptorOp::ArmCow(_) => {
+                    entry & (COW | MAY_WRITE) == (COW | MAY_WRITE) && entry & WRITE == 0
+                }
+                DescriptorOp::CowRepoint { .. } => {
+                    entry & PRESENT != 0 && entry & WRITE != 0 && entry & COW == 0
+                        || entry & (PRESENT | PREPARED | RETIRED) == RETIRED && entry & ADDRESS != 0
+                }
+                DescriptorOp::Unmap(_) => entry & (PRESENT | PREPARED) == 0,
+                DescriptorOp::Retire(_) => {
+                    entry == 0
+                        || entry & (PRESENT | PREPARED | RETIRED) == RETIRED
+                            && entry & PRIVATE != 0
+                            && entry & ADDRESS != 0
+                }
+                DescriptorOp::Coalesce { size: expected, .. } => {
+                    entry & PRESENT != 0 && size == expected.bytes()
+                }
+            };
+            if !valid {
+                return false;
+            }
+            let Some(next) = va.checked_add(size - (va & (size - 1))) else {
+                return false;
+            };
+            va = next.min(end);
+        }
+        true
+    }
+
+    fn matches_permissions(entry: u64, permissions: Permissions) -> bool {
+        (entry & USER != 0) == permissions.user
+            && (entry & WRITE != 0) == permissions.writable
+            && (entry & NX == 0) == permissions.executable
     }
     fn rollback_inventory<I: InventoryTransaction>(
         &mut self,

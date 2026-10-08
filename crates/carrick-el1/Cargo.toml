@@ -13,6 +13,7 @@ carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-inotify-core = { path = "../carrick-inotify-core" }
 carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-sched-core = { path = "../carrick-sched-core" }
+zerocopy.workspace = true
 
 [features]
 default = []
@@ -32,3 +33,6 @@ carrick-aarch64 = { path = "../carrick-aarch64" }
 carrick-hal = { path = "../carrick-hal" }
 carrick-sched-core = { path = "../carrick-sched-core", features = ["host-test"] }
 carrick-mem = { path = "../carrick-mem" }
+
+[target.'cfg(not(target_os = "none"))'.dependencies]
+carrick-fatal = { path = "../carrick-fatal" }

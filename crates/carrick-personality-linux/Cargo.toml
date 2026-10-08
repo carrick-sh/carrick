@@ -7,6 +7,15 @@ license.workspace = true
 [dependencies]
 carrick-core = { path = "../carrick-core" }
 carrick-core-abi = { path = "../carrick-core-abi" }
+carrick-guest-arch = { path = "../carrick-guest-arch" }
+
+carrick-sched-core = { path = "../carrick-sched-core" }
+carrick-signal-core = { path = "../carrick-signal-core" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+carrick-x86 = { path = "../carrick-x86" }
+carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
+carrick-el1-abi = { path = "../carrick-el1-abi" }

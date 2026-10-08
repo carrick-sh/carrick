@@ -440,14 +440,6 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
                 }
                 self.set_admitted(index, false);
                 root.key.store(mm.raw(), Ordering::Release);
-                #[cfg(target_os = "macos")]
-                crate::n1_diagnostics::reservation_custody(
-                    0,
-                    mm.raw(),
-                    root.epoch.load(Ordering::Relaxed) + 1,
-                    index as u64,
-                    0,
-                );
                 Ok(())
             }
         })();
@@ -680,25 +672,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
             return Err(Refusal::Busy);
         }
         if index != 0 {
-            let link = self.node(index, banks).next_free.load(Ordering::Acquire);
-            if link & (3 << 62) != 0 {
-                // Another allocator may have popped this head and marked it
-                // active after our head load. Validate the tagged head before
-                // treating the observation as a custody violation.
-                if self
-                    .free
-                    .compare_exchange(head, head, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-                {
-                    return Err(Refusal::Busy);
-                }
-                assert_eq!(
-                    link & (3 << 62),
-                    0,
-                    "live reservation node reached the free head: {index}"
-                );
-            }
-            let next = link as u32;
+            let next = self.node(index, banks).next_free.load(Ordering::Relaxed) as u32;
             let generation = (head >> 32)
                 .checked_add(1)
                 .filter(|v| *v <= u32::MAX as u64)
@@ -707,52 +681,21 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
             self.free
                 .compare_exchange(head, tag | next as u64, Ordering::AcqRel, Ordering::Relaxed)
                 .map_err(|_| Refusal::Busy)?;
-            self.node(index, banks)
-                .next_free
-                .store(1 << 63, Ordering::Release);
             return Ok(index);
         }
         self.allocated
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
                 (n < capacity).then_some(n + 1)
             })
-            .map(|n| {
-                let index = n + 1;
-                self.node(index, banks)
-                    .next_free
-                    .store(1 << 63, Ordering::Release);
-                index
-            })
+            .map(|n| n + 1)
             .map_err(|_| Refusal::MetadataRequired)
     }
 
-    #[track_caller]
     fn release(&self, index: u32, banks: Option<&dyn storage::NodeBanks>) {
         if index == 0 {
             return;
         }
         let node = self.node(index, banks);
-        let marker = node.next_free.load(Ordering::Acquire);
-        #[cfg(test)]
-        if self.layout_hash.load(Ordering::Acquire) == 0 {
-            // The isolated VM-free test borrows the otherwise unused prepared
-            // sequence as a two-caller barrier while the layout is disabled.
-            self.prepared_sequence.fetch_add(1, Ordering::AcqRel);
-            while self.prepared_sequence.load(Ordering::Acquire) < 2 {
-                core::hint::spin_loop();
-            }
-        }
-        assert_ne!(
-            marker & (3 << 62),
-            0,
-            "reservation node returned twice: {index}"
-        );
-        assert!(
-            node.next_free
-                .compare_exchange(marker, 0, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok(),
-            "reservation node return lost custody: {index}"
-        );
         // Return uses a lock-free stack. Failed CAS reflects another completed
         // return, not polling for a guest/host event while holding a worker.
         let mut head = self.free.load(Ordering::Acquire);
@@ -768,13 +711,6 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
                 Err(actual) => head = actual,
             }
         }
-    }
-
-    fn release_reserved(&self, index: u32, banks: Option<&dyn storage::NodeBanks>) {
-        self.node(index, banks)
-            .next_free
-            .store(1 << 63, Ordering::Release);
-        self.release(index, banks);
     }
 }
 
@@ -1814,14 +1750,14 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         });
         Ok(Decision::Work(request))
     }
-    /// One node from the shared pool. A failed free-list CAS means another
-    /// allocator completed a pop. Finish the lock-free operation on either
-    /// venue; no root release can wake a PREPARE that mistakes this collision
-    /// for an owner refusal. Empty capacity still returns MetadataRequired.
+    /// One node from the shared pool. A lost free-list race means another
+    /// allocation completed: a host guard retries it (lock-free progress,
+    /// no wait on any event), EL1 answers `Busy` and forwards. Only an
+    /// empty pool ends a host pop (`MetadataRequired`).
     fn pool_node(&self) -> Result<u32, Refusal> {
         loop {
             match self.table.allocate(self.banks, self.node_capacity) {
-                Err(Refusal::Busy) => core::hint::spin_loop(),
+                Err(Refusal::Busy) if self.host_holder => core::hint::spin_loop(),
                 result => return result,
             }
         }
@@ -1850,23 +1786,12 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
     }
     /// Return a node: refill this root's host reserve first, then the
     /// shared pool.
-    #[track_caller]
     fn free_node(&mut self, id: u32) {
         if id == 0 {
             return;
         }
         if self.host_venue && self.state().host_reserved < HOST_RESERVE {
             let head = self.state().host_reserve_head;
-            let marker = self
-                .table
-                .node(id, self.banks)
-                .next_free
-                .swap(0, Ordering::AcqRel);
-            assert_ne!(
-                marker & (3 << 62),
-                0,
-                "reservation node returned twice to host reserve: {id}"
-            );
             self.table
                 .node(id, self.banks)
                 .next_free
@@ -1895,10 +1820,6 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
             .load(Ordering::Relaxed);
         self.state_mut().host_reserve_head = next as u32;
         self.state_mut().host_reserved -= 1;
-        self.table
-            .node(head, self.banks)
-            .next_free
-            .store(1 << 63, Ordering::Release);
         Ok(head)
     }
     /// [`Self::allocate_spares`] for a host-venue commit ([`Self::host_node`]).
@@ -1963,7 +1884,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
                 .load(Ordering::Relaxed);
             self.state_mut().host_reserve_head = next as u32;
             self.state_mut().host_reserved -= 1;
-            self.table.release_reserved(head, self.banks);
+            self.table.release(head, self.banks);
         }
     }
     /// Where [`Self::mmap`] places `len` bytes, without proposing anything.
@@ -2177,9 +2098,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         }
         Ok(())
     }
-    /// Host-served `mprotect` of a retained private file node. The host has
-    /// no VMA row for this owner-backed source, so its source and fork policy
-    /// must survive the permission edit in the reservation tree.
+    /// Edit a retained private file mapping whose source is owned by the host.
     pub fn set_backed_file_protection(
         &mut self,
         range: ReservationRange,
@@ -2469,39 +2388,6 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
             entry.sequence.store(sequence, Ordering::Relaxed);
         }
         Ok(result)
-    }
-    /// Diagnostic classification after a refused retirement commit. Read-only:
-    /// the caller must not treat this observation as permission to retry an
-    /// already applied descriptor edit.
-    pub fn retirement_failure_detail(&mut self, completion: ReservationCompletion) -> u64 {
-        let Some(pending) = self.state().pending else {
-            return 1;
-        };
-        let request = pending.request;
-        if !matches!(
-            request.operation,
-            ReservationOperation::Retire | ReservationOperation::Prepare
-        ) {
-            return 2;
-        }
-        if !completion.authenticates(request)
-            || request.mm != self.mm
-            || request.generation != self.generation()
-        {
-            return 3;
-        }
-        if ReservationNodeFlags::from_bits(pending.flags).is_none() {
-            return 4;
-        }
-        let needed = request
-            .source
-            .map_or(0, |source| self.splits_needed(source))
-            + self.splits_needed(request.range)
-            + usize::from(request.operation != ReservationOperation::Retire);
-        if Spares(pending.nodes).available() < needed {
-            return 5;
-        }
-        6 // A later tree edit or generation commit refused the proposal.
     }
     pub fn refuse(&mut self, request: ReservationRequest) -> Result<(), Refusal> {
         let pending = self.state().pending.ok_or(Refusal::Stale)?;
@@ -2985,14 +2871,6 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
             .epoch
             .store(self.state().generation.raw(), Ordering::Relaxed);
         self.table.set_admitted(self.index(), false);
-        #[cfg(target_os = "macos")]
-        crate::n1_diagnostics::reservation_custody(
-            1,
-            self.mm.raw(),
-            self.incarnation().raw(),
-            self.index() as u64,
-            0,
-        );
         self.root.key.store(0, Ordering::Release);
         Ok(())
     }
@@ -3196,11 +3074,11 @@ mod tests {
         }
     }
 
-    /// A lost free-list CAS is progress by another allocator, not an owner
-    /// refusal. Both venues must finish this lock-free pop: PREPARE has no
-    /// release producer for an unrelated allocator's transient collision.
+    /// A lost free-list race (another allocation won the CAS) is not an
+    /// answer a host guard may give: it retries the pop. EL1 declines with
+    /// its one attempt and forwards.
     #[test]
-    fn both_venues_complete_a_pool_pop_after_lost_cas() {
+    fn a_host_pool_pop_retries_a_lost_race_and_el1_declines() {
         let table = table();
         let mm = ReservationMm::new(61).unwrap();
         table.publish(0, mm, layout()).unwrap();
@@ -3218,68 +3096,12 @@ mod tests {
         drop(host);
         LOSE_POPS.with(|lose| lose.set(1));
         let guest = table.lock_el1(0, mm, 4).unwrap();
-        assert!(
-            guest.pool_node().is_ok(),
-            "EL1 must complete a contended pop"
+        assert_eq!(
+            guest.pool_node(),
+            Err(Refusal::Busy),
+            "EL1 takes one attempt"
         );
         LOSE_POPS.with(|lose| lose.set(0));
-    }
-
-    #[test]
-    fn returning_one_node_twice_cannot_link_it_into_the_pool_again() {
-        let table = table();
-        let mm = ReservationMm::new(62).unwrap();
-        table.publish(0, mm, layout()).unwrap();
-        let mut model = table.lock(0, mm).unwrap();
-        let node = model.pool_node().unwrap();
-        model.free_node(node);
-        let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            model.free_node(node);
-        }));
-        assert!(second.is_err(), "the same node was returned twice");
-    }
-
-    #[test]
-    fn a_live_node_at_the_free_head_cannot_be_allocated_again() {
-        let table = table();
-        let mm = ReservationMm::new(63).unwrap();
-        table.publish(0, mm, layout()).unwrap();
-        let model = table.lock(0, mm).unwrap();
-        let node = model.pool_node().unwrap();
-        table.free.store(u64::from(node), Ordering::Release);
-        let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model.pool_node()));
-        assert!(second.is_err(), "an active node was allocated twice");
-    }
-
-    #[test]
-    fn concurrent_returns_claim_one_node_once() {
-        let table = table();
-        let mm = ReservationMm::new(64).unwrap();
-        table.publish(0, mm, layout()).unwrap();
-        let model = table.lock(0, mm).unwrap();
-        let node = model.pool_node().unwrap();
-        drop(model);
-        table.layout_hash.store(0, Ordering::Release);
-        let successes = std::thread::scope(|scope| {
-            let first = scope.spawn(|| {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    table.release(node, None);
-                }))
-                .is_ok()
-            });
-            let second = scope.spawn(|| {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    table.release(node, None);
-                }))
-                .is_ok()
-            });
-            u32::from(first.join().unwrap()) + u32::from(second.join().unwrap())
-        });
-        table
-            .layout_hash
-            .store(SharedReservations::LAYOUT_HASH, Ordering::Release);
-        table.prepared_sequence.store(0, Ordering::Release);
-        assert_eq!(successes, 1, "two returns claimed one live node");
     }
 
     thread_local! {

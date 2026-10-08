@@ -36,6 +36,11 @@ pub trait ThreadCpu {
     fn set_timer(&mut self, cval: Option<u64>);
     /// Write `ICC_SGI1R_EL1` (after making prior stores visible).
     fn send_sgi(&mut self, sgi1r: u64);
+    /// Publish a scheduler reschedule to one issued CPU slot. `target` is the
+    /// architecture's stored route; ARM retains its exact SGI encoding.
+    fn send_resched(&mut self, _slot: SlotId, target: u64) {
+        self.send_sgi(target | (u64::from(GIC_RESCHED_INTID) << 24));
+    }
     /// Acknowledge the highest-priority pending interrupt (`ICC_IAR1_EL1`);
     /// [`GIC_SPURIOUS_INTID`] when none is pending.
     fn ack_irq(&mut self) -> u32;
@@ -72,39 +77,36 @@ pub const fn sgi_target_of(mpidr: u64) -> u64 {
 /// host-loaded thread) or EL1 did after a switch.
 fn identity_of(task: &CurrentTask, affinity: u64) -> ThreadIdentity {
     ThreadIdentity {
-        tid: task.task_id.load(Ordering::Relaxed),
-        serial: task.thread_serial.load(Ordering::Relaxed),
-        mm: task.zone_mm.load(Ordering::Relaxed),
-        file_table: task.file_table.load(Ordering::Relaxed),
-        generation: task.generation.load(Ordering::Relaxed),
+        tid: task.execution.task.load(Ordering::Relaxed),
+        serial: task.mm.thread_generation.load(Ordering::Relaxed),
+        mm: task.mm.key.load(Ordering::Relaxed),
+        file_table: task.linux.file_table.load(Ordering::Relaxed),
+        generation: task.execution.generation.load(Ordering::Relaxed),
         affinity,
-        lifecycle_page: task.lifecycle_page.load(Ordering::Acquire),
-        control_slot: task.control_slot.load(Ordering::Acquire),
+        lifecycle_page: task.metadata.lifecycle_page.load(Ordering::Acquire),
+        control_slot: task.metadata.control_slot.load(Ordering::Acquire),
     }
 }
 
 /// Publish the switched-in thread as the slot's running task (its process
 /// too: EL1 may have switched the vCPU to another address space).
 fn publish_identity(task: &CurrentTask, id: ThreadIdentity) {
-    task.task_id.store(id.tid, Ordering::Relaxed);
-    task.thread_serial.store(id.serial, Ordering::Relaxed);
-    task.file_table.store(id.file_table, Ordering::Relaxed);
-    task.zone_mm.store(id.mm, Ordering::Relaxed);
+    task.execution.task.store(id.tid, Ordering::Relaxed);
+    task.mm
+        .thread_generation
+        .store(id.serial, Ordering::Relaxed);
+    task.linux
+        .file_table
+        .store(id.file_table, Ordering::Relaxed);
+    task.mm.key.store(id.mm, Ordering::Relaxed);
     task.publish_lifecycle(id.lifecycle_page, id.control_slot);
-    task.generation.store(id.generation, Ordering::Release);
+    task.execution
+        .generation
+        .store(id.generation, Ordering::Release);
 }
 
 /// How a futex syscall EL1 served ended.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Served {
-    /// The syscall returned; with `switched`, the caller parked and the vCPU
-    /// now runs another thread: the frame and the slot's task record are
-    /// that thread's.
-    Returned { switched: bool },
-    /// The caller parked, nothing was runnable, and host work arrived while
-    /// the vCPU idled: it leaves through the host with no thread on it.
-    Idle,
-}
+pub use carrick_core::Served;
 
 /// What the in-guest scheduler works with on one vCPU slot.
 pub struct Sched<'a, C: ThreadCpu, U: UserWord> {
@@ -114,6 +116,7 @@ pub struct Sched<'a, C: ThreadCpu, U: UserWord> {
     pub cpu: &'a mut C,
     pub user: &'a U,
     pub counters: &'a Counters,
+    pub handoff: Option<&'a mut Option<carrick_el1_abi::EntryHandoffReceipt>>,
 }
 
 /// What [`Sched::take_irqs`] acknowledged.
@@ -125,6 +128,11 @@ pub struct IrqsTaken {
 }
 
 impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
+    pub(crate) fn record_handoff(&mut self, receipt: Option<carrick_el1_abi::EntryHandoffReceipt>) {
+        if let Some(destination) = self.handoff.as_deref_mut() {
+            *destination = receipt;
+        }
+    }
     fn current_record(&self) -> Result<carrick_el1_abi::RecordId, carrick_sched_core::Exhausted> {
         let record = self.zone.current_or_new(
             self.slot,
@@ -175,7 +183,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         if effects.misplaced {
             // A woken thread sits here but may not run here: the exit this
             // causes hands it to the host, which places it.
-            self.task.mark_pending_host_work();
+            self.task.linux.mark_pending_host_work();
         }
         if effects.queued_own {
             self.program_timer(true);
@@ -222,6 +230,17 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             }
             return None;
         }
+        let Some(start) = carrick_core::entry::prepare_handoff(
+            carrick_core::entry::binding(&self.task.execution, &self.task.mm),
+            carrick_el1_abi::BornInZoneSource { zone, slot },
+            record,
+        ) else {
+            drop(guard);
+            if fresh {
+                zone.discard_unpublished(slot, record);
+            }
+            return None;
+        };
         // SAFETY: this vCPU runs the thread `record` holds (a fresh home
         // record, or the switched-in `OnCpu` one); nobody else may touch it
         // until the park below is published.
@@ -248,7 +267,12 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             return None;
         }
         zone.set_deadline(record, deadline.unwrap_or(0));
-        if !zone.publish_guest_park(&guard, slot, record, seq) {
+        let receipt = carrick_core::entry::publish_handoff_park(
+            start,
+            &guard,
+            carrick_el1_abi::EntryRecordGeneration(seq),
+        );
+        if receipt.is_none() {
             drop(guard);
             if fresh {
                 zone.discard_unpublished(slot, record);
@@ -256,6 +280,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             return None;
         }
         drop(guard);
+        self.record_handoff(receipt);
         zone.clear_current(slot);
         zone.counters.el1_parks.fetch_add(1, Ordering::Relaxed);
         Some(self.run_next(frame, timeout_result))
@@ -317,7 +342,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         // SAFETY: switch_in_full made the record OnCpu on this slot.
         let ctx = unsafe { rec.ctx_mut() };
         self.cpu.load(frame, ctx);
-        self.task.orig_arg0.store(ctx.x[0], Ordering::Relaxed);
+        self.task.linux.orig_arg0.store(ctx.x[0], Ordering::Relaxed);
         if let Some(result) = switched.result {
             frame.x[0] = result;
         }
@@ -399,7 +424,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         let spin_until = self.cpu.now().saturating_add(self.ticks(IDLE_SPIN_NS));
         loop {
             self.take_irqs();
-            if self.task.has_pending_host_work() || self.zone.has_completion_handbacks() {
+            if self.task.linux.has_pending_host_work() {
                 self.counters.exit_reasons[El1ExitReason::IdleHostWork as usize]
                     .fetch_add(1, Ordering::Relaxed);
                 zone.leave_idle(slot);
@@ -453,7 +478,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             }
             match intid {
                 GIC_KICK_INTID => {
-                    self.task.mark_pending_host_work();
+                    self.task.linux.mark_pending_host_work();
                     taken.kick = true;
                 }
                 GIC_VTIMER_INTID => {
@@ -476,12 +501,12 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         timeout_result: u64,
     ) -> carrick_el1_abi::Action {
         self.take_irqs();
-        if self.task.has_pending_host_work() || self.zone.has_completion_handbacks() {
+        if self.task.linux.has_pending_host_work() {
             self.counters.exit_reasons[El1ExitReason::InterruptHostWork as usize]
                 .fetch_add(1, Ordering::Relaxed);
             return carrick_el1_abi::Action::Forward;
         }
-        if self.task.zone_mm.load(Ordering::Acquire) == 0 {
+        if self.task.mm.key.load(Ordering::Acquire) == 0 {
             return carrick_el1_abi::Action::Served;
         }
         let (zone, slot) = (self.zone, self.slot);
@@ -533,7 +558,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         timeout_result: u64,
     ) -> carrick_el1_abi::Action {
         self.take_irqs();
-        if self.task.has_pending_host_work() || self.zone.has_completion_handbacks() {
+        if self.task.linux.has_pending_host_work() {
             self.counters.exit_reasons[El1ExitReason::IdleEntryHostWork as usize]
                 .fetch_add(1, Ordering::Relaxed);
             return carrick_el1_abi::Action::Idle;
@@ -634,8 +659,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             if target == 0 {
                 continue;
             }
-            self.cpu
-                .send_sgi(target | (u64::from(GIC_RESCHED_INTID) << 24));
+            self.cpu.send_resched(slot, target);
             self.zone.counters.el1_sgis.fetch_add(1, Ordering::Relaxed);
         }
     }
