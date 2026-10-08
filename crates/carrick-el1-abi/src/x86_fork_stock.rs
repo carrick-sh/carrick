@@ -4,7 +4,7 @@ use crate::{
     ExecutionBinding, PortalForkRequest, PortalForkTableArena, PortalOperation,
     ReservationGeneration, ReservationMm,
 };
-use carrick_guest_arch::{AddressContext, KernelVa, RootGpa};
+use carrick_guest_arch::{AddressContext, FrameGpa, KernelVa, RootGpa};
 use core::num::NonZeroU64;
 
 pub const X86_FORK_STOCK_PORT: u16 = 0xd2;
@@ -29,32 +29,83 @@ impl X86ForkStockKind {
     }
 }
 
+/// Exact retained physical metadata and its supervisor-only virtual alias.
+/// Construction checks geometry; the stopped physical owner licenses the span
+/// through the authenticated request/loan identity, never through a VA alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct X86ForkMetadataSpan {
+    physical: FrameGpa,
+    alias: KernelVa,
+    len: u64,
+}
+impl X86ForkMetadataSpan {
+    pub fn new(physical: FrameGpa, alias: KernelVa, len: u64) -> Option<Self> {
+        let physical_end = physical.raw().checked_add(len)?;
+        let alias_end = alias.raw().checked_add(len)?;
+        (len != 0
+            && len.is_multiple_of(4096)
+            && physical.raw().is_multiple_of(4096)
+            && physical_end <= 1 << 52
+            && alias.raw() >= 0xffff_8000_0000_0000
+            && alias.raw().is_multiple_of(4096)
+            && alias_end > alias.raw())
+        .then_some(Self {
+            physical,
+            alias,
+            len,
+        })
+    }
+    pub const fn physical(self) -> FrameGpa {
+        self.physical
+    }
+    pub const fn alias(self) -> KernelVa {
+        self.alias
+    }
+    pub const fn len(self) -> u64 {
+        self.len
+    }
+    pub const fn is_empty(self) -> bool {
+        false
+    }
+    pub fn contains(self, address: KernelVa, len: u64) -> bool {
+        len != 0
+            && address.raw() >= self.alias.raw()
+            && address
+                .raw()
+                .checked_add(len)
+                .is_some_and(|end| end <= self.alias.raw() + self.len)
+    }
+    pub fn physical_at(self, address: KernelVa, len: u64) -> Option<FrameGpa> {
+        self.contains(address, len)
+            .then(|| FrameGpa::new(self.physical.raw() + (address.raw() - self.alias.raw())))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct X86ForkLifecycleLoan {
     pub page: KernelVa,
     pub controls: KernelVa,
+    pub span: X86ForkMetadataSpan,
 }
 impl X86ForkLifecycleLoan {
-    pub fn new(page: KernelVa, controls: KernelVa) -> Option<Self> {
-        let base = crate::X86_CPL0_DYNAMIC_METADATA_BASE;
-        let limit = base.checked_add(crate::EL1_DYNAMIC_METADATA_SIZE)?;
-        let page_end = page
-            .raw()
-            .checked_add(core::mem::size_of::<crate::ThreadLifecyclePage>() as u64)?;
-        let controls_end = controls.raw().checked_add(
-            core::mem::size_of::<crate::ThreadControlSlot>() as u64
-                * (crate::THREAD_POOL_ENTRIES as u64 + 1),
-        )?;
-        (page.raw() >= base
-            && page_end <= limit
+    pub fn new(span: X86ForkMetadataSpan, page: KernelVa, controls: KernelVa) -> Option<Self> {
+        let page_len = core::mem::size_of::<crate::ThreadLifecyclePage>() as u64;
+        let controls_len = core::mem::size_of::<crate::ThreadControlSlot>() as u64
+            * (crate::THREAD_POOL_ENTRIES as u64 + 1);
+        let page_end = page.raw().checked_add(page_len)?;
+        let controls_end = controls.raw().checked_add(controls_len)?;
+        (span.contains(page, page_len)
             && page.raw().is_multiple_of(16384)
-            && controls.raw() >= base
-            && controls_end <= limit
+            && span.contains(controls, controls_len)
             && controls
                 .raw()
                 .is_multiple_of(core::mem::align_of::<crate::ThreadControlSlot>() as u64)
             && (page_end <= controls.raw() || controls_end <= page.raw()))
-        .then_some(Self { page, controls })
+        .then_some(Self {
+            page,
+            controls,
+            span,
+        })
     }
 }
 
@@ -125,9 +176,9 @@ pub struct X86ForkStockLoan {
 pub struct X86ForkStockExchange {
     tag: u64,
     request: [u64; 15],
-    response: [u64; 6],
+    response: [u64; 9],
     status: u64,
-    _reserved: u64,
+    _reserved: [u64; 6],
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum X86ForkStockRefusal {
@@ -140,7 +191,7 @@ impl X86ForkStockExchange {
     pub fn new(request: X86ForkStockRequest) -> Option<Self> {
         request.valid().then_some(Self {
             tag: X86ForkStockKind::Loan.word(),
-            _reserved: 0,
+            _reserved: [0; 6],
             request: [
                 request.binding.task.raw(),
                 request.binding.generation.raw(),
@@ -158,14 +209,15 @@ impl X86ForkStockExchange {
                 request.child_bytes,
                 request.parent_bytes,
             ],
-            response: [0; 6],
+            response: [0; 9],
             status: 0,
         })
     }
     pub fn request(&self) -> Option<X86ForkStockRequest> {
         use crate::{EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration};
         use carrick_guest_arch::{ContextGeneration, FrameGpa, MmGeneration};
-        if X86ForkStockKind::decode(self.tag) != Some(X86ForkStockKind::Loan) || self._reserved != 0
+        if X86ForkStockKind::decode(self.tag) != Some(X86ForkStockKind::Loan)
+            || self._reserved != [0; 6]
         {
             return None;
         }
@@ -220,6 +272,9 @@ impl X86ForkStockExchange {
             id.get(),
             lifecycle.page.raw(),
             lifecycle.controls.raw(),
+            lifecycle.span.physical().raw(),
+            lifecycle.span.alias().raw(),
+            lifecycle.span.len(),
         ];
         self.status = 1;
         true
@@ -251,6 +306,11 @@ impl X86ForkStockExchange {
                 self.response[2],
                 NonZeroU64::new(self.response[3])?,
                 X86ForkLifecycleLoan::new(
+                    X86ForkMetadataSpan::new(
+                        FrameGpa::new(self.response[6]),
+                        KernelVa::new(self.response[7]),
+                        self.response[8],
+                    )?,
                     KernelVa::new(self.response[4]),
                     KernelVa::new(self.response[5]),
                 )?,
@@ -449,20 +509,30 @@ impl X86ForkStockSettlement {
     }
 }
 const _: () = {
-    assert!(core::mem::size_of::<X86ForkStockExchange>() == 24 * 8);
+    assert!(core::mem::size_of::<X86ForkStockExchange>() == 32 * 8);
     assert!(core::mem::size_of::<X86ForkStockSettlement>() == 16 * 8);
 };
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use crate::{EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration};
     use carrick_guest_arch::{ContextGeneration, FrameGpa, MmGeneration};
     fn lifecycle() -> X86ForkLifecycleLoan {
         let base = crate::X86_CPL0_DYNAMIC_METADATA_BASE;
-        X86ForkLifecycleLoan::new(KernelVa::new(base + 0x4000), KernelVa::new(base + 0x5000))
-            .unwrap()
+        let span = X86ForkMetadataSpan::new(
+            FrameGpa::new(0xc0_4000),
+            KernelVa::new(base + 0x4000),
+            0x4000,
+        )
+        .unwrap();
+        X86ForkLifecycleLoan::new(
+            span,
+            KernelVa::new(base + 0x4000),
+            KernelVa::new(base + 0x5000),
+        )
+        .unwrap()
     }
     fn request() -> X86ForkStockRequest {
         X86ForkStockRequest {
@@ -489,6 +559,26 @@ mod tests {
             parent_bytes: 4096,
         }
     }
+    #[test]
+    fn lifecycle_loan_can_use_an_exact_span_outside_boot_metadata() {
+        let alias = 0xffff_fe80_0000_0000;
+        let span =
+            X86ForkMetadataSpan::new(FrameGpa::new(0x10_0000_0000), KernelVa::new(alias), 8192)
+                .unwrap();
+        let loan =
+            X86ForkLifecycleLoan::new(span, KernelVa::new(alias), KernelVa::new(alias + 4096))
+                .expect("per-fork lifecycle custody must not be confined to the bootstrap gap");
+        assert_eq!(
+            loan.span.physical_at(loan.controls, 64),
+            Some(FrameGpa::new(0x10_0000_1000))
+        );
+        assert!(
+            X86ForkLifecycleLoan::new(span, KernelVa::new(alias + 16384), loan.controls).is_none()
+        );
+        assert!(X86ForkLifecycleLoan::new(span, loan.page, KernelVa::new(alias + 8192)).is_none());
+        assert!(X86ForkLifecycleLoan::new(span, loan.page, loan.page).is_none());
+    }
+
     #[test]
     fn native_root_exit_refuses_foreign_execution_and_non_exit_status() {
         use carrick_sched_core::process::LinuxWaitStatus;
