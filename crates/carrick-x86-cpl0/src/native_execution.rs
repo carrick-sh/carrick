@@ -106,11 +106,11 @@ pub(super) fn schedule(slot: SlotId) -> ! {
                         carrick_personality_linux::lifecycle::LifecycleOutcome::Returned {
                             result,
                             ..
-                        } => words.frame[10] = result.raw() as u64,
+                        } => words.set_syscall_return(result.raw() as u64),
                         _ => initial_boot::fatal_boot(),
                     }
                 } else if let Some(result) = selected.result {
-                    words.frame[10] = result;
+                    words.set_syscall_return(result);
                 }
             }
             // SAFETY: the shared claim is OnCpu on this exact slot; every

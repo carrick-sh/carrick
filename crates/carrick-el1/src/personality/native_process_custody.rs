@@ -4,7 +4,7 @@ extern crate alloc;
 use super::process_owner::NativeProcessCustody;
 use alloc::{sync::Arc, vec::Vec};
 use carrick_sched_core::process::{
-    TaskRusage,
+    ProcessContext, TaskRusage,
     exit::{ExitMember, ExitSignalSource, TaskRevision},
     wait::{TaskWakeGeneration, WaitJobControl},
 };
@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// Native handles supplied by the execution lane. These accesses do not choose
 /// graph participants or implement Linux wait, exit, or signal policy.
 pub trait ProcessResources {
-    type Context: Copy;
+    type Context: ProcessContext;
     type Claim;
     type Event;
     type Transaction: Copy + Eq;
