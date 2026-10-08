@@ -1,5 +1,11 @@
+use carrick_sched_core::process::identity_allocator::{
+    SerialAllocator, TransferredSerialAllocator,
+};
+pub use carrick_sched_core::process::{
+    ChildExitSignal, InvalidLinuxId, InvalidLinuxSignal, LinuxSignal, ProcessGroupId, SessionId,
+    TaskId, TaskSerial,
+};
 use std::num::{NonZeroI32, NonZeroU64};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use carrick_hal::{FrameId, KernelTransactionId, MappingId};
 
@@ -7,7 +13,7 @@ use carrick_hal::{FrameId, KernelTransactionId, MappingId};
 /// KernelContext has selected a table. A process-global monotonic source keeps
 /// their stable identities collision-free across every Kernel generation and
 /// independently copied table without recapturing registry state.
-static NEXT_FILE_DESCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_FILE_DESCRIPTION_ID: SerialAllocator = SerialAllocator::new();
 
 macro_rules! linux_i32_id {
     ($name:ident) => {
@@ -57,10 +63,7 @@ macro_rules! serial_id {
     };
 }
 
-linux_i32_id!(TaskId);
 linux_i32_id!(LinuxTid);
-linux_i32_id!(ProcessGroupId);
-linux_i32_id!(SessionId);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
@@ -79,87 +82,6 @@ impl FileSlotNumber {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[repr(transparent)]
-pub struct LinuxSignal(NonZeroI32);
-
-impl LinuxSignal {
-    pub fn for_signal_number(raw: i32) -> Result<Self, InvalidLinuxSignal> {
-        let value = NonZeroI32::new(raw).ok_or(InvalidLinuxSignal::OutOfRange(raw))?;
-        if !(1..=64).contains(&raw) {
-            return Err(InvalidLinuxSignal::OutOfRange(raw));
-        }
-        Ok(Self(value))
-    }
-
-    pub const fn raw(self) -> i32 {
-        self.0.get()
-    }
-
-    /// Whether this is a POSIX realtime signal (`SIGRTMIN..=SIGRTMAX`, 32..=64
-    /// on Linux/aarch64).
-    ///
-    /// The distinction is not cosmetic: realtime signals QUEUE — every send is
-    /// delivered, with its own siginfo, in send order — while a standard signal
-    /// collapses to one pending bit no matter how many times it is sent. The
-    /// pending queue picks `enqueue_realtime` vs `enqueue_standard` from this,
-    /// so a wrong answer silently drops or duplicates deliveries.
-    ///
-    /// This is THE authority for the question; callers holding a raw signum go
-    /// through [`Self::for_signal_number`] rather than re-testing the range.
-    pub const fn is_realtime(self) -> bool {
-        self.0.get() >= 32
-    }
-
-    /// `SIGCHLD` (17 on Linux/aarch64): the exit signal an ordinary `fork`
-    /// child delivers, and the one `wait(2)` selects by default.
-    pub const SIGCHLD: Self = Self(NonZeroI32::new(17).unwrap());
-}
-
-/// The signal a task delivers to its parent when it terminates -- the
-/// `CSIGNAL` byte of `clone(2)` flags or `clone3(2)`'s `exit_signal`.
-///
-/// This is task state because Linux `wait(2)` partitions children on it: a
-/// child whose exit signal is anything other than `SIGCHLD` -- a different
-/// signal or none at all -- is a "clone child", visible only to a wait that
-/// passes `__WCLONE` or `__WALL`. A plain `waitpid` on such a child is
-/// `ECHILD`, not a reap (wait(2), "__WCLONE").
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ChildExitSignal {
-    /// Exit signal 0: the parent is not signalled at all.
-    None,
-    Signal(LinuxSignal),
-}
-
-impl ChildExitSignal {
-    pub const SIGCHLD: Self = Self::Signal(LinuxSignal::SIGCHLD);
-
-    /// The exit signal a clone request carries. The dispatch layer has
-    /// already lowered an out-of-range `CSIGNAL` byte to 0, so anything
-    /// other than a valid signal number means "no signal".
-    pub fn for_clone_request(raw: u32) -> Self {
-        i32::try_from(raw)
-            .ok()
-            .and_then(|raw| LinuxSignal::for_signal_number(raw).ok())
-            .map_or(Self::None, Self::Signal)
-    }
-
-    /// Whether `wait(2)` treats this child as a "clone child".
-    pub fn is_clone_child(self) -> bool {
-        self != Self::SIGCHLD
-    }
-
-    /// The raw signal number, 0 for none -- the value `clone3`'s
-    /// `exit_signal` field carries.
-    pub fn raw(self) -> i32 {
-        match self {
-            Self::None => 0,
-            Self::Signal(signal) => signal.raw(),
-        }
-    }
-}
-
-serial_id!(TaskSerial);
 serial_id!(ThreadSerial);
 serial_id!(MmId);
 serial_id!(FileTableId);
@@ -174,16 +96,6 @@ impl MmId {
     }
 }
 
-impl TaskId {
-    pub(crate) const fn from_registry_allocation(raw: NonZeroI32) -> Self {
-        Self(raw)
-    }
-
-    pub fn for_root_bootstrap(raw: i32) -> Result<Self, InvalidLinuxId> {
-        Self::from_abi_positive(raw)
-    }
-}
-
 impl LinuxTid {
     pub(crate) const fn from_registry_allocation(raw: NonZeroI32) -> Self {
         Self(raw)
@@ -192,34 +104,8 @@ impl LinuxTid {
     /// The initial thread of a thread group has the same numeric identity as
     /// its task/TGID, but remains a distinct semantic domain.
     pub const fn for_task_leader(task: TaskId) -> Self {
-        Self(task.0)
+        Self(task.nonzero())
     }
-}
-
-impl ProcessGroupId {
-    pub fn from_leader(leader: TaskId) -> Self {
-        Self(leader.0)
-    }
-}
-
-impl SessionId {
-    pub fn from_leader(leader: TaskId) -> Self {
-        Self(leader.0)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum InvalidLinuxId {
-    #[error("Linux identity zero is reserved")]
-    Zero,
-    #[error("Linux identity {0} is negative")]
-    Negative(i32),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum InvalidLinuxSignal {
-    #[error("Linux signal number {0} is outside 1..=64")]
-    OutOfRange(i32),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -232,7 +118,14 @@ static CARRIER_MM_IDS: ObjectIdRegistry = ObjectIdRegistry::new();
 /// Monotonic source for object identities that are never reused by one kernel.
 #[derive(Debug)]
 pub struct ObjectIdRegistry {
-    next: AtomicU64,
+    allocator: SerialAllocator,
+    host_mm: parking_lot::RwLock<HostMmIdentityAuthority>,
+}
+
+#[derive(Debug)]
+enum HostMmIdentityAuthority {
+    Available,
+    Transferred,
 }
 
 impl Default for ObjectIdRegistry {
@@ -244,23 +137,40 @@ impl Default for ObjectIdRegistry {
 impl ObjectIdRegistry {
     pub const fn new() -> Self {
         Self {
-            next: AtomicU64::new(1),
+            allocator: SerialAllocator::new(),
+            host_mm: parking_lot::RwLock::new(HostMmIdentityAuthority::Available),
         }
+    }
+
+    /// Revoke this kernel's MM admission and move only its local serial cursor.
+    /// The carrier MM source and file-description source are separate owners.
+    pub(in crate::kernel) fn transfer_local_serials(&self) -> Option<TransferredSerialAllocator> {
+        let mut authority = self.host_mm.write();
+        *authority = HostMmIdentityAuthority::Transferred;
+        self.allocator.transfer()
+    }
+
+    pub(in crate::kernel) fn local_transfer_available(&self) -> bool {
+        !self.allocator.is_transferred()
+    }
+
+    pub fn transferred_refusals(&self) -> Option<u64> {
+        self.allocator.refused_attempts()
     }
 
     #[cfg(test)]
     pub(in crate::kernel) fn exhaust_for_test(&self) {
-        self.next.store(u64::MAX, Ordering::Relaxed);
+        self.allocator.advance_to(NonZeroU64::MAX);
     }
 
     fn allocate(&self) -> Result<NonZeroU64, ObjectIdError> {
-        let raw = self
-            .next
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_| ObjectIdError::Exhausted)?;
-        NonZeroU64::new(raw).ok_or(ObjectIdError::Exhausted)
+        self.allocator.allocate().ok_or_else(|| {
+            if self.allocator.is_transferred() {
+                ObjectIdError::AuthorityTransferred
+            } else {
+                ObjectIdError::Exhausted
+            }
+        })
     }
 
     pub fn task_serial(&self) -> Result<TaskSerial, ObjectIdError> {
@@ -278,6 +188,13 @@ impl ObjectIdRegistry {
     /// counter gave two containers' first MMs the same key, so a pause of
     /// one counted the other's vCPUs (the concurrent container gate).
     pub fn mm_id(&self) -> Result<MmId, ObjectIdError> {
+        let authority = self.host_mm.read();
+        if matches!(*authority, HostMmIdentityAuthority::Transferred) {
+            // The moved serial source also owns the refusal receipt. Its
+            // terminal state cannot allocate or be reopened by imports.
+            let _ = self.allocator.allocate();
+            return Err(ObjectIdError::AuthorityTransferred);
+        }
         CARRIER_MM_IDS
             .allocate()
             .map(MmId::from_registry_allocation)
@@ -321,23 +238,22 @@ impl ObjectIdRegistry {
 pub enum ObjectIdError {
     #[error("kernel object identity space exhausted")]
     Exhausted,
+    #[error("kernel identity authority was transferred to the native owner")]
+    AuthorityTransferred,
 }
 
 #[allow(dead_code)]
 pub(crate) fn restore_file_description_id(raw: u64) -> Result<FileDescriptionId, ObjectIdError> {
     let value = NonZeroU64::new(raw).ok_or(ObjectIdError::Exhausted)?;
-    let next = raw.checked_add(1).ok_or(ObjectIdError::Exhausted)?;
-    NEXT_FILE_DESCRIPTION_ID.fetch_max(next, Ordering::Relaxed);
+    NEXT_FILE_DESCRIPTION_ID
+        .advance_past(value)
+        .ok_or(ObjectIdError::Exhausted)?;
     Ok(FileDescriptionId::from_registry_allocation(value))
 }
 
 pub(crate) fn allocate_file_description_id() -> Result<FileDescriptionId, ObjectIdError> {
-    let raw = NEXT_FILE_DESCRIPTION_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_add(1)
-        })
-        .map_err(|_| ObjectIdError::Exhausted)?;
-    NonZeroU64::new(raw)
+    NEXT_FILE_DESCRIPTION_ID
+        .allocate()
         .map(FileDescriptionId::from_registry_allocation)
         .ok_or(ObjectIdError::Exhausted)
 }
@@ -397,5 +313,31 @@ mod tests {
         // MM ids come from one carrier-wide source: another kernel's never
         // equals this one's.
         assert_ne!(mm, other_kernel_mm);
+    }
+    #[test]
+    fn transferred_object_owner_refuses_mm_without_freezing_carrier() {
+        let source = ObjectIdRegistry::new();
+        let _initial_mm = source.mm_id().expect("initial owned MM");
+        let first = source.task_serial().expect("source task serial");
+        let native = source
+            .transfer_local_serials()
+            .expect("one transfer")
+            .into_allocator();
+        assert_eq!(
+            native.allocate().expect("native cursor").get(),
+            first.raw() + 1
+        );
+        assert_eq!(
+            source.task_serial(),
+            Err(ObjectIdError::AuthorityTransferred)
+        );
+        assert_eq!(source.mm_id(), Err(ObjectIdError::AuthorityTransferred));
+        assert_eq!(source.mm_id(), Err(ObjectIdError::AuthorityTransferred));
+        assert!(source.transfer_local_serials().is_none());
+        assert_eq!(source.transferred_refusals(), Some(4));
+        let other = ObjectIdRegistry::new();
+        assert!(other.mm_id().is_ok());
+        assert!(other.file_description_id().is_ok());
+        assert_eq!(other.transferred_refusals(), Some(0));
     }
 }

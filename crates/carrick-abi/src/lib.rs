@@ -2071,6 +2071,9 @@ pub struct LinuxRusage {
     pub ru_nivcsw: i64,
 }
 
+const _: () =
+    assert!(core::mem::size_of::<LinuxRusage>() == carrick_syscall_abi::LINUX_RUSAGE_BYTES);
+
 impl LinuxRusage {
     pub const fn zeroed() -> Self {
         Self {
@@ -3766,65 +3769,7 @@ impl From<NsGid> for u32 {
     }
 }
 
-/// A POSITIVE Linux errno (the `LINUX_E*` domain). The guest-visible retval is
-/// its single negation — made in exactly ONE place
-/// ([`LinuxErrno::guest_retval`]) so a pre-negated value can never be
-/// double-negated and a positive errno can never leak as a "success" retval.
-/// Debug builds assert the 1..=4095 kernel errno range at construction.
-/// Serializes transparently as the positive errno number (a serde newtype
-/// struct is its inner value on the wire), so reporter/JSON output is
-/// unchanged by the typing.
-#[derive(
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::cmp::PartialEq,
-    ::core::cmp::Eq,
-    ::core::fmt::Debug,
-    ::serde::Serialize,
-)]
-pub struct LinuxErrno(i32);
-
-impl LinuxErrno {
-    /// Wrap a positive errno constant/translation result. `const` so the
-    /// `LINUX_E*` table is a set of typed constants (usable in const items and
-    /// match patterns) with zero per-site wrapping.
-    #[inline]
-    #[track_caller]
-    pub const fn new(errno: i32) -> Self {
-        // `RangeInclusive::contains` and format captures are not const;
-        // spell the range check out so the assert works in const fn.
-        debug_assert!(
-            errno >= 1 && errno <= 4095,
-            "errno outside the kernel's 1..=4095 range"
-        );
-        LinuxErrno(errno)
-    }
-
-    /// The positive errno value (reporting, siginfo, comparisons).
-    #[inline]
-    pub const fn get(self) -> i32 {
-        self.0
-    }
-
-    /// THE negation choke point: the raw retval the guest receives.
-    #[inline]
-    pub const fn guest_retval(self) -> i64 {
-        -(self.0 as i64)
-    }
-
-    /// Recover the errno from a guest retval in the kernel's errno window,
-    /// `None` for any other value (a legitimate negative return is NOT an
-    /// errno). Replaces the ad-hoc `(-ret) as u32` re-derivations.
-    #[inline]
-    #[allow(clippy::manual_range_contains)] // `RangeInclusive::contains` is not const.
-    pub const fn from_guest_retval(ret: i64) -> Option<LinuxErrno> {
-        if ret >= -4095 && ret <= -1 {
-            Some(LinuxErrno(-ret as i32))
-        } else {
-            None
-        }
-    }
-}
+pub use carrick_syscall_abi::{LINUX_EAGAIN, LINUX_ECHILD, LINUX_EFAULT, LINUX_EINVAL, LinuxErrno};
 
 // ===== ABI constants moved from dispatch.rs (Goal #3, pub set) =====
 pub const LINUX_EPERM: LinuxErrno = LinuxErrno::new(1);
@@ -3833,8 +3778,6 @@ pub const LINUX_ESRCH: LinuxErrno = LinuxErrno::new(3);
 /// No such device or address — e.g. `open("/dev/tty")` with no controlling tty.
 pub const LINUX_ENXIO: LinuxErrno = LinuxErrno::new(6);
 pub const LINUX_EBADF: LinuxErrno = LinuxErrno::new(9);
-pub const LINUX_ECHILD: LinuxErrno = LinuxErrno::new(10);
-pub const LINUX_EAGAIN: LinuxErrno = LinuxErrno::new(11);
 pub const LINUX_EINTR: LinuxErrno = LinuxErrno::new(4);
 /// Non-blocking `connect(2)` in progress / already in progress / completed.
 pub const LINUX_EINPROGRESS: LinuxErrno = LinuxErrno::new(115);
@@ -3842,7 +3785,6 @@ pub const LINUX_EALREADY: LinuxErrno = LinuxErrno::new(114);
 pub const LINUX_EISCONN: LinuxErrno = LinuxErrno::new(106);
 pub const LINUX_ENOMEM: LinuxErrno = LinuxErrno::new(12);
 pub const LINUX_EACCES: LinuxErrno = LinuxErrno::new(13);
-pub const LINUX_EFAULT: LinuxErrno = LinuxErrno::new(14);
 pub const LINUX_EEXIST: LinuxErrno = LinuxErrno::new(17);
 pub const LINUX_EPIPE: LinuxErrno = LinuxErrno::new(32);
 pub const LINUX_ESPIPE: LinuxErrno = LinuxErrno::new(29);
@@ -3874,7 +3816,6 @@ pub const LINUX_FALLOC_FL_SUPPORTED: u64 = LINUX_FALLOC_FL_KEEP_SIZE
     | LINUX_FALLOC_FL_UNSHARE_RANGE;
 pub const LINUX_ENOTDIR: LinuxErrno = LinuxErrno::new(20);
 pub const LINUX_EISDIR: LinuxErrno = LinuxErrno::new(21);
-pub const LINUX_EINVAL: LinuxErrno = LinuxErrno::new(22);
 pub const LINUX_ENOTTY: LinuxErrno = LinuxErrno::new(25);
 pub const LINUX_EFBIG: LinuxErrno = LinuxErrno::new(27);
 pub const LINUX_ERANGE: LinuxErrno = LinuxErrno::new(34);

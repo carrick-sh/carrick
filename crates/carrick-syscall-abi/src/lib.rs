@@ -3,7 +3,9 @@
 
 use bitflags::bitflags;
 
+mod errno;
 pub mod syscall_x86_64;
+pub use errno::{LINUX_EAGAIN, LINUX_ECHILD, LINUX_EFAULT, LINUX_EINVAL, LinuxErrno};
 
 /// Canonical numbers served by the shared guest lifecycle owner.
 pub mod nr {
@@ -275,3 +277,6 @@ impl LinuxWaitOptions {
     /// set is EINVAL for `wait4`.
     pub const WAIT4_SUPPORTED: Self = Self::from_bits_retain(LINUX_WAIT4_SUPPORTED_FLAGS);
 }
+
+/// Linux 64-bit rusage contains two timevals and fourteen signed counters.
+pub const LINUX_RUSAGE_BYTES: usize = 144;
