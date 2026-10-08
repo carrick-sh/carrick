@@ -481,7 +481,10 @@ fn arch_prctl_uses_shared_admission_and_completion_with_pending_work() {
     }
     impl<'a> PendingFamilies<'a> for NativePending<'a> {
         fn binding(&self) -> Option<carrick_core_abi::ExecutionBinding> {
-            let generation = self.world.tasks[1].execution.generation.load(Ordering::Acquire);
+            let generation = self.world.tasks[1]
+                .execution
+                .generation
+                .load(Ordering::Acquire);
             if generation == 0 {
                 None
             } else {
