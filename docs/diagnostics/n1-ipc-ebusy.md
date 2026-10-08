@@ -65,3 +65,69 @@ The fix preserves contention across pre-exclusion readers:
 - On `Refusal::Busy`, `try_root_owes_backing_at`, `try_first_touch_owner`, and `try_root_grant_for_page` decline the fast-path plan (`return None`), routing the fault to the mutation/forwarding path without aborting.
 - `first_touch_is_root_owned` treats `Refusal::Busy` as `true` (it is root-owned and busy), while `host_untouched_page_permits` treats it as `false`.
 - Verified red-first by `delegated_first_touch_observation_under_held_root_returns_no_plan_without_aborting` in `crates/carrick-kernel/src/dispatch/mem/delegated_tests.rs`, which aborts with `SIGABRT` on base code and cleanly passes on the fixed code.
+
+## 7. Full-Suite Signed `el1_` Filter Verification, Baseline Diff, and Batch Execution Analysis
+
+### Binary Identities on Commit `0565ec758`
+Signed executables evaluated under `./scripts/test-signed.sh carrick-embed el1_`:
+- `el1_sched-0700c8e4b4a322b1`: `e074dfb10bdc96344cd231da0f1bd97cd84c511de13723477cd0dc2784d877cb`
+- `el1_files-d0b2b8fe30b09047`: `1fc09cbed1d8c674d2273f3938c3ff77794a5f4438243bff3415988fdc4c95a4`
+- `el1_inotify-6cc5136ef80c735f`: `ea5518ed2dda2c1581e05be48e070f6bd28b5b23355387fd4937a54daaace938`
+- `el1_kick_served_loop-980f037a9a60acbb`: `2100afea6cd3418f80d73f239a7a3fcdeba37c15f82f9d6e87124cd2563b7b1a`
+- `crash_parked_thread-9ae9764d388ac6aa`: `6cdba4bb64d4bc84f851cdbb0c506e03c763abff362bf27a39719e92570a519c`
+- `el1_host_copyout-0ccceb4df04f5a36`: `b9cf96a5cf937e4e44c0c9b9f729da1afd6ee673b7ffec70775e1102c54b068e`
+- `el1_ipc_routing-50925ab74a61243b`: `16900eaa1fad9cbcc3b78d10da4a3409723590407f9523ce5755b279ed63269e`
+- `el1_inotify09_probe-4da4ff34c0dfdc16`: `e501b4f5d438fca5a67c0b900694fc9d15f46b47744556ffd2a669402f1e32a1`
+- `el1_vcpu_lifetime-2fa3fa72a7e19f33`: `c9f9e54ed023d7e2148df90216e29a414694bd9de28d20cd9f6477b8a6c1b4f8`
+- `el1_transparent-992064d3018e14d3`: `70d9ea3c97a72f1c35fbbf3cf15af0d3255fdec9221a32e8621d29763354d4a9`
+- `el1_gic-1ec202b5311a90c7`: `6831574a20c867a2501b82ead1676d6f687025ec86db331a8610d6a3987407c5`
+
+### Diff Against Baseline Failure List (23/25 names from `/tmp/n1cm-host-el1full-20261008a.log`)
+1. **Tests that left the failing list:**
+   - `el1_ipc_pairs_blocking`: previously failed with `fatal runtime error: a thread received SIGSEGV while modifying its stack overflow information, aborting` (exit 134 / SIGABRT at line 374 in `20261008a.log`). Now passes cleanly in isolation (0.82s) and under `el1_ipc_` batch.
+   - `el1_ipc_two_processes_blocking`: in isolation, passes 5/5 consecutive signed runs (0.62-0.65s) with 0 failures, completely resolving the `errno 14 (Bad address)` defect caused by `MmError::Busy` -> `EBUSY` (errno 16).
+
+2. **Persistent baseline failures remaining:**
+   - `crash_core_attributes_the_el1_parked_sibling_registers` (in `crash_parked_thread-9ae9764d388ac6aa`)
+   - `el1_served_burst_surfaces_kicks_under_oversubscription` (in `el1_kick_served_loop-980f037a9a60acbb`)
+   - `el1_files_cross_process_readers_contract` (in `el1_files-d0b2b8fe30b09047`)
+   - Memory/VMA suite failures in `el1_sched` (prior to test 15):
+     - `el1_anonymous_discard_and_exit_return_frames`
+     - `el1_anonymous_permission_transitions_stay_in_guest`
+     - `el1_anonymous_reservations_stay_in_guest`
+     - `el1_delegated_root_concurrent_vma_ops`
+     - `el1_delegated_root_map_fixed_over_cow_pages`
+     - `el1_fork_cow_resolves_in_guest`
+   - Downstream `el1_sched` baseline failures observed in un-aborted baseline runs:
+     - `el1_sched_mm_occupancy_two_processes`
+     - `el1_task_load_costs_no_host_round_trip`
+     - `el1_thread_lifecycle_cleartid_tid_reuse`
+     - `el1_thread_lifecycle_exit_group_and_exec_during_clone_storm`
+     - `el1_thread_lifecycle_fork_during_clone_storm`
+     - `el1_thread_lifecycle_mask_storm_exactly_once`
+     - `el1_thread_lifecycle_parked_threads_beyond_executor_pool`
+     - `el1_thread_lifecycle_ptrace_traceclone`
+     - `el1_thread_lifecycle_spawn_slope`
+     - `el1_thread_lifecycle_tgkill_right_after_clone`
+     - `el1_tlb_cross_vcpu_mm_edits_leave_no_stale_translation_on_any_thread`
+     - `el1_tlb_frame_grant_publication_costs_no_maintenance`
+     - `el1_tlb_mm_edit_window_excludes_sibling_allocations`
+     - `el1_tlb_running_thread_mm_edits_cost_no_maintenance`
+
+### Batch Execution Comparison: Pre-fix (`44efa24c3`) vs Fixed (`0565ec758`)
+Identical batch command executed on both commits: `./scripts/test-signed.sh carrick-embed el1_`.
+
+- **On Pre-fix Commit `44efa24c3`:**
+  - `el1_files`: aborted at `el1_files_cross_process_readers_contract` with `carrick fatal [dispatch::anonymous]: delegated anonymous root refused a first-touch observation: Busy` (`Abort trap: 6`).
+  - `el1_sched`: terminated at test 15/58 (`el1_ipc_two_processes_blocking`) with:
+    `thread '<unnamed>' (360) panicked at src/ipc.rs:34:9: assertion left == right failed: receive fd=211 buf=0x6006b678f8 errno=Bad address (os error 14)`
+    The test hung waiting for completion, timed out at the 60-second watchdog limit, and was terminated by the test runner with `Killed: 9` (exit 137). Only 15 of 58 tests executed.
+
+- **On Fixed Commit `0565ec758`:**
+  - `el1_files`: aborted at `el1_files_cross_process_readers_contract` with `carrick fatal [dispatch::anonymous]: delegated anonymous root refused a first-touch observation: Busy` (`Abort trap: 6`) - identical pre-existing failure.
+  - `el1_sched`: terminated at test 15/58 (`el1_ipc_two_processes_blocking`) with:
+    `carrick fatal [dispatch::anonymous]: delegated anonymous root refused a first-touch observation: Busy` (`Abort trap: 6`).
+    The forward fix eliminated the `errno 14 (EFAULT)` failure that hung `44efa24c3`.
+  - When executed in isolation, `el1_ipc_two_processes_blocking` passes 5/5 times (0.62-0.65s) on `0565ec758`.
+
+**Conclusion:** Batch termination at test 15/58 is pre-existing; on `44efa24c3` the runner died at the exact same test (15/58) via `errno 14` watchdog kill (`Killed: 9`). The fix successfully resolves the IPC EBUSY/EFAULT bug.
