@@ -28,8 +28,7 @@ use carrick_kernel_arena::arena::{ArenaError, KernelArena};
 use carrick_kernel_arena::domains::{HostPid, ProcessGeneration};
 use carrick_kernel_arena::process::{
     FLAG_ADOPTED, FLAG_ALIVE, ProcessRecord, ProcessRecordRef, ProcessRecordTransitionAction,
-    ProcessRecordTransitionError, ProcessSection, RecordState, VirtualPtraceControl,
-    VirtualPtraceState,
+    ProcessRecordTransitionError, ProcessSection, VirtualPtraceControl, VirtualPtraceState,
 };
 
 /// Per-vCPU accumulated guest execution nanoseconds, one atomic slot per vCPU
@@ -411,12 +410,11 @@ fn record_generation(record: &ProcessRecord) -> Option<ProcessGeneration> {
 }
 
 fn find_child_record(pid: u32) -> Option<ProcessRecordRef> {
-    for (index, record) in process_records().iter().enumerate() {
-        if record_pid(record) != pid || record_is_tid_entry(record) {
-            continue;
-        }
-        if let Some(generation) = record_generation(record) {
-            return Some(ProcessRecordRef { index, generation });
+    for index in 0..process_records().len() {
+        if let Some((r, true)) = process_section().read_at(index, |record| {
+            record.host_pid().map(|host| host.raw()) == Some(pid) && !record_is_tid_entry(record)
+        }) {
+            return Some(r);
         }
     }
     None
@@ -430,6 +428,43 @@ fn record_for_ref(r: ProcessRecordRef) -> Option<&'static ProcessRecord> {
 
 fn child_record(pid: u32) -> Option<&'static ProcessRecord> {
     find_child_record(pid).and_then(record_for_ref)
+}
+
+fn read_child<T>(pid: u32, read: impl for<'a> FnOnce(&'a ProcessRecord) -> T) -> Option<T> {
+    process_section()
+        .read_record(find_child_record(pid)?, |record| {
+            (record.host_pid().map(|host| host.raw()) == Some(pid)).then(|| read(record))
+        })
+        .ok()
+        .flatten()
+}
+
+#[derive(Clone, Copy)]
+struct ChildSnapshot {
+    pid: u32,
+    parent: u32,
+    adopted: bool,
+    exit_ready: bool,
+    stop_pending: bool,
+}
+
+fn child_snapshots() -> impl Iterator<Item = (ProcessRecordRef, ChildSnapshot)> {
+    (0..process_records().len()).filter_map(|index| {
+        let (r, snapshot) = process_section().read_at(index, |record| {
+            if !record.state().is_live() {
+                return None;
+            }
+            let pid = record.host_pid()?.raw();
+            (!record_is_tid_entry(record)).then(|| ChildSnapshot {
+                pid,
+                parent: record_parent_pid(record),
+                adopted: adopted_flag(record),
+                exit_ready: record_exit_ready(record),
+                stop_pending: record_has_ptrace_stop_pending(record),
+            })
+        })?;
+        snapshot.map(|snapshot| (r, snapshot))
+    })
 }
 
 fn claim_child_record(pid: u32, fill: impl FnOnce(&ProcessRecord)) -> ProcessRecordRef {
@@ -558,16 +593,6 @@ fn release_child_record(r: ProcessRecordRef) {
     process_section().release(r);
 }
 
-fn iter_child_records() -> impl Iterator<Item = &'static ProcessRecord> {
-    process_records().iter().filter(|record| {
-        matches!(record.state(), RecordState::Live { .. }) && !record_is_tid_entry(record)
-    })
-}
-
-fn record_host_pid(record: &ProcessRecord) -> u32 {
-    record.host_pid.load(Ordering::Acquire)
-}
-
 fn record_parent_pid(record: &ProcessRecord) -> u32 {
     record.parent_host_pid.load(Ordering::Acquire)
 }
@@ -662,14 +687,17 @@ fn store_exit_ready(record: &ProcessRecord, ready: bool) {
 
 /// Reparent every live child of `parent_pid` to its recorded nearest subreaper.
 pub fn adopt_children_of(parent_pid: u32) {
-    for record in iter_child_records() {
-        if record_parent_pid(record) == parent_pid {
-            let subreaper = record_subreaper_pid(record);
-            if subreaper != 0 {
-                record.parent_host_pid.store(subreaper, Ordering::Release);
-                set_adopted(record, true);
+    for (r, snapshot) in child_snapshots() {
+        let _ = process_section().with_record_transition(r, HostPid::new(snapshot.pid), |record| {
+            if record_parent_pid(record) == parent_pid {
+                let subreaper = record_subreaper_pid(record);
+                if subreaper != 0 {
+                    record.parent_host_pid.store(subreaper, Ordering::Release);
+                    set_adopted(record, true);
+                }
             }
-        }
+            ((), ProcessRecordTransitionAction::Preserve)
+        });
     }
 }
 
@@ -680,10 +708,12 @@ pub fn adopted_parent_for_self() -> Option<u32> {
 
 /// Adopted parent to notify when `pid` exits, if any.
 pub fn adopted_parent_for(pid: u32) -> Option<u32> {
-    let record = child_record(pid)?;
-    adopted_flag(record)
-        .then(|| record_parent_pid(record))
-        .filter(|p| *p != 0)
+    read_child(pid, |record| {
+        adopted_flag(record)
+            .then(|| record_parent_pid(record))
+            .filter(|p| *p != 0)
+    })
+    .flatten()
 }
 
 /// Mark the current process as having an unreported ptrace signal stop.
@@ -733,12 +763,18 @@ fn virtual_ptrace_record(
 )> {
     let r = find_child_record(pid)?;
     let record = record_for_ref(r)?;
-    let control = record_virtual_ptrace_control(record)?;
-    (record_pid(record) == pid
-        && record_parent_pid(record) == tracer_pid
-        && control.tracer_pid() == tracer_pid
-        && control.generation() == r.generation)
-        .then_some((r, record, control))
+    let control = process_section()
+        .read_record(r, |record| {
+            let control = record_virtual_ptrace_control(record)?;
+            (record_pid(record) == pid
+                && record_parent_pid(record) == tracer_pid
+                && control.tracer_pid() == tracer_pid
+                && control.generation() == r.generation)
+                .then_some(control)
+        })
+        .ok()
+        .flatten()?;
+    Some((r, record, control))
 }
 
 /// Capability for one exact, reported Linux ptrace stop.
@@ -780,13 +816,17 @@ fn virtual_ptrace_record_for_stop(
     }
     let record = record_for_ref(stop.record)?;
     let expected = VirtualPtraceControl::traced(stop.tracer_pid, stop.record.generation, state)?;
-    let stop_word = record_ptrace_stop_word(record);
-    (record_pid(record) == stop.tracee_pid
-        && record_parent_pid(record) == stop.tracer_pid
-        && ptrace_stop_word_sequence(stop_word) == stop.sequence
-        && ptrace_stop_word_signal(stop_word) == stop.linux_signum as u64
-        && record_virtual_ptrace_control(record) == Some(expected))
-    .then_some(record)
+    let valid = process_section()
+        .read_record(stop.record, |record| {
+            let stop_word = record_ptrace_stop_word(record);
+            record_pid(record) == stop.tracee_pid
+                && record_parent_pid(record) == stop.tracer_pid
+                && ptrace_stop_word_sequence(stop_word) == stop.sequence
+                && ptrace_stop_word_signal(stop_word) == stop.linux_signum as u64
+                && record_virtual_ptrace_control(record) == Some(expected)
+        })
+        .ok()?;
+    valid.then_some(record)
 }
 
 /// Whether the current process still has an active virtual ptrace owner.
@@ -1071,28 +1111,36 @@ pub fn detach_child_virtual_ptrace(stop: VirtualPtraceStop) -> bool {
 
 /// Clear and return the pending ptrace signal-stop marker once wait4 reports it.
 pub fn take_child_ptrace_stop_signal(pid: u32) -> Option<i32> {
-    let record = child_record(pid)?;
-    let mut current = record_ptrace_stop_word(record);
-    loop {
-        if ptrace_stop_word_sequence(current) != 0 {
-            // Virtual stops are immutable capabilities consumed through
-            // `report_child_virtual_ptrace_stop`, never through this legacy
-            // host-ptrace marker API.
-            return None;
-        }
-        let signum = i32::try_from(ptrace_stop_word_signal(current))
-            .ok()
-            .filter(|signum| *signum != 0)?;
-        match record.ptrace_stop_signal.compare_exchange_weak(
-            current,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return Some(signum),
-            Err(actual) => current = actual,
-        }
-    }
+    let r = find_child_record(pid)?;
+    process_section()
+        .with_record_transition(r, HostPid::new(pid), |record| {
+            let value = (|| {
+                let mut current = record_ptrace_stop_word(record);
+                loop {
+                    if ptrace_stop_word_sequence(current) != 0 {
+                        // Virtual stops are immutable capabilities consumed through
+                        // `report_child_virtual_ptrace_stop`, never through this legacy
+                        // host-ptrace marker API.
+                        return None;
+                    }
+                    let signum = i32::try_from(ptrace_stop_word_signal(current))
+                        .ok()
+                        .filter(|signum| *signum != 0)?;
+                    match record.ptrace_stop_signal.compare_exchange_weak(
+                        current,
+                        0,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return Some(signum),
+                        Err(actual) => current = actual,
+                    }
+                }
+            })();
+            (value, ProcessRecordTransitionAction::Preserve)
+        })
+        .ok()
+        .and_then(|(value, _)| value)
 }
 
 /// Clear the pending ptrace signal-stop marker once wait4 reports it.
@@ -1102,7 +1150,7 @@ pub fn clear_child_ptrace_stop_pending(pid: u32) {
 
 /// Whether `pid` has an unreported ptrace signal-delivery stop.
 pub fn child_has_ptrace_stop_pending(pid: u32) -> bool {
-    child_record(pid).is_some_and(record_has_ptrace_stop_pending)
+    read_child(pid, record_has_ptrace_stop_pending).unwrap_or(false)
 }
 
 fn record_has_ptrace_stop_pending(record: &ProcessRecord) -> bool {
@@ -1120,18 +1168,9 @@ fn record_has_ptrace_stop_pending(record: &ProcessRecord) -> bool {
 /// Whether any direct, non-adopted child of `waiter_pid` has an unreported
 /// ptrace signal-delivery stop.
 pub fn direct_child_ptrace_stop_pending(waiter_pid: u32) -> bool {
-    for record in iter_child_records() {
-        if adopted_flag(record) {
-            continue;
-        }
-        if record_parent_pid(record) != waiter_pid {
-            continue;
-        }
-        if record_has_ptrace_stop_pending(record) {
-            return true;
-        }
-    }
-    false
+    child_snapshots().any(|(_, snapshot)| {
+        !snapshot.adopted && snapshot.parent == waiter_pid && snapshot.stop_pending
+    })
 }
 
 /// Publish an exiting child's total guest CPU (nanoseconds) for its parent to
@@ -1223,7 +1262,8 @@ pub fn adopted_child_wait(waiter_pid: u32, target_pid: i32) -> Option<AdoptedChi
                 record_ref,
                 HostPid::new(pid),
                 |record| {
-                    if !adopted_flag(record)
+                    if record_is_tid_entry(record)
+                        || !adopted_flag(record)
                         || record_parent_pid(record) != waiter_pid
                         || (target_pid > 0 && pid != target_pid as u32)
                     {
@@ -1308,23 +1348,13 @@ pub fn reap_adopted_child(waiter_pid: u32, target_pid: i32) -> Option<(u32, i32,
 /// an exit status. `target_pid <= 0` means any adopted child, matching wait4's
 /// any-child/process-group sentinel handling at this layer.
 pub fn pending_adopted_child(waiter_pid: u32, target_pid: i32) -> Option<u32> {
-    for record in iter_child_records() {
-        let pid = record_host_pid(record);
-        if !adopted_flag(record) {
-            continue;
-        }
-        if record_parent_pid(record) != waiter_pid {
-            continue;
-        }
-        if target_pid > 0 && pid != target_pid as u32 {
-            continue;
-        }
-        if record_exit_ready(record) {
-            continue;
-        }
-        return Some(pid);
-    }
-    None
+    child_snapshots().find_map(|(_, snapshot)| {
+        (snapshot.adopted
+            && snapshot.parent == waiter_pid
+            && (target_pid <= 0 || snapshot.pid == target_pid as u32)
+            && !snapshot.exit_ready)
+            .then_some(snapshot.pid)
+    })
 }
 
 /// Park target for a blocking `wait4(-1)`.
@@ -1355,17 +1385,11 @@ pub fn wait_any_park_pid(waiter_pid: u32) -> Option<i32> {
 /// the host parent, so the host kernel cannot deliver their exit to this waiter.
 /// Those stay on the adopted-child table path.
 pub fn direct_children_for_wait(waiter_pid: u32) -> Vec<u32> {
-    let mut children = Vec::new();
-    for record in iter_child_records() {
-        if adopted_flag(record) {
-            continue;
-        }
-        if record_parent_pid(record) != waiter_pid {
-            continue;
-        }
-        children.push(record_host_pid(record));
-    }
-    children
+    child_snapshots()
+        .filter_map(|(_, snapshot)| {
+            (!snapshot.adopted && snapshot.parent == waiter_pid).then_some(snapshot.pid)
+        })
+        .collect()
 }
 
 /// Drain a child's published guest CPU nanoseconds (0 if none).
@@ -1413,6 +1437,27 @@ mod tests {
     use std::sync::Mutex;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn child_read_rejects_reuse_after_identity_read() {
+        let _guard = TEST_LOCK.lock().expect("lock");
+        let pid = 987654;
+        let r = claim_child_record(pid, |record| {
+            record.parent_host_pid.store(99, Ordering::Relaxed);
+            record.ns_pid.store(88, Ordering::Relaxed);
+        });
+        let observed = read_child(pid, |record| {
+            let ns = record_ns_pid(record);
+            release_child_record(r);
+            let new = claim_child_record(pid, |record| {
+                record.parent_host_pid.store(199, Ordering::Relaxed);
+            });
+            assert_ne!(r.generation, new.generation);
+            (ns, record_parent_pid(record))
+        });
+        assert_eq!(observed, None);
+        release_child_record(find_child_record(pid).expect("replacement"));
+    }
 
     #[test]
     fn exact_run_receipt_excludes_wrapper_bookkeeping() {
