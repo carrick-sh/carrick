@@ -691,6 +691,24 @@ impl KvmVcpu {
         })
     }
 
+    /// Consume a pending KVM_EXIT_IO completion without entering the guest.
+    /// The saved RIP must be read only after this step, before installing a
+    /// different task image on the same physical vCPU.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn complete_pending_io_exit(&mut self) -> Result<(), OsError> {
+        self.fd_mut().set_kvm_immediate_exit(1);
+        let result = HvVcpu::run(self);
+        self.fd_mut().set_kvm_immediate_exit(0);
+        match result {
+            Ok(VcpuExit::Kicked) => Ok(()),
+            Ok(_) => Err(os_err(
+                "complete pending I/O exit",
+                "guest entered or exited on another boundary",
+            )),
+            Err(error) => Err(os_err("complete pending I/O exit", error)),
+        }
+    }
+
     /// Close this vCPU fd on drop instead of parking it for reuse.
     ///
     /// Normal sibling-thread exit parks vCPU fds because KVM vCPU ids are finite
