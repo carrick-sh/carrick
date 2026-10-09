@@ -30,6 +30,7 @@ pub enum Family {
     AllocatorControl,
     SignalReturn,
     Poll,
+    Descriptor,
     Unported,
 }
 
@@ -165,6 +166,9 @@ impl EntryCounters<'_> {
 pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadCtx> {
     /// The native ABI and current venue jointly admit the poll family.
     fn may_serve_poll(&self) -> bool {
+        false
+    }
+    fn may_serve_descriptor(&self) -> bool {
         false
     }
     fn take_handoff_receipt(&mut self) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
@@ -341,6 +345,9 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     fn poll(&mut self) -> FamilyCompletion {
         FamilyCompletion::Forward
     }
+    fn descriptor(&mut self) -> FamilyCompletion {
+        FamilyCompletion::Forward
+    }
 }
 
 /// The sole ordinal routing decision and family completion owner.
@@ -418,6 +425,20 @@ fn serve_family<'a, C: EntryContext + 'a>(
         Family::Poll => {
             let original = pending.original_argument0();
             let completion = pending.poll();
+            returned = match completion {
+                FamilyCompletion::Complete(value)
+                | FamilyCompletion::CompleteWithWork(value)
+                | FamilyCompletion::AccountedComplete(value)
+                | FamilyCompletion::CommitOwed(value) => {
+                    Some((SyscallResult::new(value), original))
+                }
+                _ => None,
+            };
+            completion
+        }
+        Family::Descriptor => {
+            let original = pending.original_argument0();
+            let completion = pending.descriptor();
             returned = match completion {
                 FamilyCompletion::Complete(value)
                 | FamilyCompletion::CompleteWithWork(value)
@@ -665,7 +686,12 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
     pending: &mut dyn PendingFamilies<'a, C>,
 ) -> CompletionRoute {
     let original_argument0 = pending.original_argument0();
-    let family = if ordinal == carrick_syscall_abi::nr::PPOLL.raw() {
+    let family = if pending.may_serve_descriptor() && matches!(ordinal, 23 | 24 | 57)
+        || (pending.may_serve_descriptor()
+            && ordinal == carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2)
+    {
+        Family::Descriptor
+    } else if ordinal == carrick_syscall_abi::nr::PPOLL.raw() {
         if pending.may_serve_poll() { Family::Poll } else { Family::Unported }
     } else {
         route_aarch64(ordinal, control)

@@ -1627,6 +1627,10 @@ impl<'a> FsView<'a> {
         }
     }
 
+    pub(super) fn captured_stdio_is_writable(&self) -> bool {
+        matches!(self.io.route(), StdioRoute::Captured)
+    }
+
     /// Write ALL of `bytes` to an inherited stdio host fd (`StdioSink::Inherit`: the user's tty/pipe),
     /// looping until the whole buffer is queued. The dup2'd stdio pty slave can
     /// be O_NONBLOCK — a line editor that sets stdin non-blocking flips the
