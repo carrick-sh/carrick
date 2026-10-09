@@ -1,5 +1,4 @@
 use std::fmt::Debug;
-use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -9,20 +8,7 @@ use carrick_hal::MappingId;
 const AARCH64_STAGE1_ROOT_ALIGNMENT: u64 = 4096;
 const AARCH64_TTBR0_ROOT_MASK: u64 = (1_u64 << 48) - 1;
 
-/// Nonzero AArch64 stage-1 address-space identifier.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[repr(transparent)]
-pub struct Asid(NonZeroU16);
-
-impl Asid {
-    pub const fn from_registry_allocation(raw: NonZeroU16) -> Self {
-        Self(raw)
-    }
-
-    pub const fn raw(self) -> u16 {
-        self.0.get()
-    }
-}
+pub use carrick_hal::asid::Asid;
 
 /// Validated AArch64 4 KiB-granule stage-1 root guest-physical address.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -271,6 +257,8 @@ pub enum Stage1RootError {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU16;
+
     use super::*;
 
     fn asid(raw: u16) -> Asid {

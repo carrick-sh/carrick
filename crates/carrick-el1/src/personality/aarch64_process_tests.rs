@@ -96,7 +96,9 @@ impl ForkStockCrossing for TestStockCrossing {
                 )
                 .unwrap();
                 let id = NonZeroU64::new(100 + loans as u64).unwrap();
-                let asid = 41 + loans as u16;
+                let asid = carrick_guest_arch::Asid::from_registry_allocation(
+                    core::num::NonZeroU16::new(41 + loans as u16).unwrap(),
+                );
                 let kernel_control_ipa = 0x20_0000;
                 if !exchange.grant(
                     child_base,
@@ -104,7 +106,7 @@ impl ForkStockCrossing for TestStockCrossing {
                     kernel_control_ipa,
                     id,
                     lifecycle,
-                    asid,
+                    Some(asid),
                 ) {
                     return Err(NativeProcessError::Invalid);
                 }
@@ -114,7 +116,7 @@ impl ForkStockCrossing for TestStockCrossing {
                     kernel_control_ipa,
                     id,
                     lifecycle,
-                    asid,
+                    Some(asid),
                 );
                 Ok(())
             }
@@ -180,8 +182,12 @@ struct Fixture {
     control: &'static ThreadControlSlot,
 }
 
+fn asid(raw: u16) -> carrick_guest_arch::Asid {
+    carrick_guest_arch::Asid::from_registry_allocation(core::num::NonZeroU16::new(raw).unwrap())
+}
+
 impl Fixture {
-    fn new(root_gpa: u64, asid: u16) -> Self {
+    fn new(root_gpa: u64, asid: carrick_guest_arch::Asid) -> Self {
         let region_box = Box::new(crate::personality::mm_portal::test_support::Region::new());
         let region = Box::leak(region_box);
         let zone: &'static ZoneTables<Aarch64ParkedContext> = unsafe {
@@ -209,7 +215,7 @@ impl Fixture {
         };
 
         let slot = SlotId::new(0);
-        let ttbr0 = (u64::from(asid) << 48) | root_gpa;
+        let ttbr0 = (u64::from(asid.raw()) << 48) | root_gpa;
         let space = zone.spaces.publish_closed(1, ttbr0, ttbr0).unwrap();
         zone.spaces.open(space);
         zone.drive(slot, 1);
@@ -285,7 +291,7 @@ impl Fixture {
 /// Red-first Test 1: child gets distinct root and x0 = 0.
 #[test]
 fn test_fork_child_gets_distinct_root_and_x0_zero() {
-    let fixture = Fixture::new(0x10000, 1);
+    let fixture = Fixture::new(0x10000, asid(1));
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
@@ -361,7 +367,7 @@ fn test_fork_child_gets_distinct_root_and_x0_zero() {
 /// Red-first Test 2: private pages are COW-armed in both parent and child.
 #[test]
 fn test_fork_private_pages_cow_armed_in_both() {
-    let fixture = Fixture::new(0x10000, 1);
+    let fixture = Fixture::new(0x10000, asid(1));
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
@@ -448,7 +454,7 @@ fn activate(
 /// Red-first Test 3: wait4 consumes the zombie exactly once with exact status copied.
 #[test]
 fn test_wait4_consumes_zombie_once_with_exact_status() {
-    let fixture = Fixture::new(0x10000, 1);
+    let fixture = Fixture::new(0x10000, asid(1));
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
@@ -585,7 +591,7 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
 /// Red-first Test 4: stock loan is requested and settled once.
 #[test]
 fn test_stock_loan_requested_and_settled_once() {
-    let fixture = Fixture::new(0x10000, 1);
+    let fixture = Fixture::new(0x10000, asid(1));
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
@@ -633,7 +639,7 @@ fn test_stock_loan_requested_and_settled_once() {
 /// Red-first Test 5: abort after a stock loan returns every page exactly once.
 #[test]
 fn test_abort_after_stock_loan_returns_every_page_once() {
-    let fixture = Fixture::new(0x10000, 1);
+    let fixture = Fixture::new(0x10000, asid(1));
     let words = fixture.tables.live(&fixture.maintenance);
     let initial_stock = [
         0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,

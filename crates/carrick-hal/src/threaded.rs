@@ -3140,6 +3140,11 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
         None
     }
 
+    /// Exact carrier ASID allocator for stage-1 address spaces.
+    fn carrier_asid_allocator(&self) -> Option<crate::asid::AsidAllocator> {
+        None
+    }
+
     /// Independent read-only view of the carrier's existing host-owner
     /// directory. HVPatch binds it into the kernel COW proof issuer; foreign-MM
     /// transports never provide or replace this endpoint.
