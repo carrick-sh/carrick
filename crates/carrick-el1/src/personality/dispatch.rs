@@ -227,19 +227,26 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                     let mut saved = carrick_el1_abi::Aarch64ParkedContext::ZERO;
                     sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
                     let ttbr0 = crate::isa::aarch64::hardware_live_ttbr();
-                    if let Ok((runtime, address, words)) = super::aarch64_process::admit_entry(
+                    let admission = super::aarch64_process::admit_entry(
                         source,
                         task,
                         saved.native,
                         ttbr0,
                         zone.record(record).incarnation(),
-                    ) {
+                    );
+                    if let Ok((runtime, address, words)) = admission {
                         let mut service =
                             match super::aarch64_process::Aarch64NativeProcessService::new(
                                 task, slot,
                             ) {
                                 Ok(service) => service,
-                                Err(_) => return refuse_owner_process_call(frame, counters),
+                                Err(_) => {
+                                    return refuse_owner_process_call(
+                                        frame,
+                                        counters,
+                                        carrick_el1_abi::ProcessRefusal::Service,
+                                    );
+                                }
                             };
                         let action = {
                             let mut process = match runtime.enter_registered(
@@ -251,7 +258,13 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                                 &mut service,
                             ) {
                                 Ok(process) => process,
-                                Err(_) => return refuse_owner_process_call(frame, counters),
+                                Err(_) => {
+                                    return refuse_owner_process_call(
+                                        frame,
+                                        counters,
+                                        carrick_el1_abi::ProcessRefusal::RegisteredEntry,
+                                    );
+                                }
                             };
                             let route = dispatch_syscall_with_native(
                                 frame,
@@ -288,19 +301,33 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                             )
                             .is_err()
                         {
-                            return refuse_owner_process_call(frame, counters);
+                            return refuse_owner_process_call(
+                                frame,
+                                counters,
+                                carrick_el1_abi::ProcessRefusal::RootExit,
+                            );
                         }
                         return match action.0 {
                             carrick_personality_linux::dispatch::CompletionRoute::Served => Action::Served,
                             carrick_personality_linux::dispatch::CompletionRoute::WithWork => Action::ServedWithWork,
                             carrick_personality_linux::dispatch::CompletionRoute::Suspended => Action::Idle,
-                            carrick_personality_linux::dispatch::CompletionRoute::Forward => refuse_owner_process_call(frame, counters),
+                            carrick_personality_linux::dispatch::CompletionRoute::Forward => refuse_owner_process_call(frame, counters, carrick_el1_abi::ProcessRefusal::Forwarded),
                             carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion => invalid_completion(NativeInvariant::EntryBinding),
                         };
+                    } else {
+                        return refuse_owner_process_call(
+                            frame,
+                            counters,
+                            carrick_el1_abi::ProcessRefusal::Admission,
+                        );
                     }
                 }
             }
-            return refuse_owner_process_call(frame, counters);
+            return refuse_owner_process_call(
+                frame,
+                counters,
+                carrick_el1_abi::ProcessRefusal::MissingEntry,
+            );
         }
         dispatch_syscall_with_ipc(
             frame,
@@ -349,9 +376,14 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
 
 #[cfg(target_os = "none")]
 #[cfg(target_arch = "aarch64")]
-fn refuse_owner_process_call(frame: &mut TrapFrame, counters: &Counters) -> Action {
+fn refuse_owner_process_call(
+    frame: &mut TrapFrame,
+    counters: &Counters,
+    reason: carrick_el1_abi::ProcessRefusal,
+) -> Action {
     let nr = frame.x[8] as usize;
     frame.x[0] = (-38_i64) as u64;
+    counters.process_refusals[reason as usize].fetch_add(1, Ordering::Relaxed);
     if nr < 512 {
         counters.served[nr].fetch_add(1, Ordering::Relaxed);
     }
