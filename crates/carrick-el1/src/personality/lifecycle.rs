@@ -5,8 +5,8 @@ pub use super::thread_setup::{GuestLifecycleVenue, LifecycleVenue, guest_venue};
 use crate::file::UserCopy as ArmUserCopy;
 use carrick_el1_abi::EntryMmKey;
 use carrick_el1_abi::{
-    Claim, EntryRef, LifecycleDecline, RecordRef, ThreadControlSlot, ThreadCtx, ThreadIdentity,
-    ThreadLifecyclePage,
+    Aarch64ParkedContext, Claim, EntryRef, LifecycleDecline, RecordRef, ThreadControlSlot,
+    ThreadIdentity, ThreadLifecyclePage,
 };
 use carrick_guest_arch::UserVa;
 use carrick_personality_linux::abi::entry::LinuxTaskState;
@@ -210,9 +210,9 @@ impl<
             return Some(sp);
         }
         let zone = self.zone.as_mut()?;
-        let mut scratch = ThreadCtx::ZERO;
+        let mut scratch = Aarch64ParkedContext::ZERO;
         zone.cpu.save(self.frame.arm_frame()?, &mut scratch);
-        Some(UserVa::new(scratch.sp_el0))
+        Some(UserVa::new(scratch.native.sp_el0))
     }
     fn affinity(&self) -> Option<u64> {
         let zone = self.zone.as_ref()?.tables;
@@ -259,12 +259,13 @@ impl<
             );
         };
         zone.cpu.save(frame, ctx);
-        ctx.x[0] = context.result.raw() as u64;
-        ctx.sp_el0 = context.stack.raw();
+        ctx.native.x[0] = context.result.raw() as u64;
+        ctx.native.sp_el0 = context.stack.raw();
         if let Some(tls) = context.tls {
-            ctx.tpidr_el0 = tls.raw();
+            ctx.native.tpidr_el0 = tls.raw();
         }
-        ctx.tpidrro_el0 = aarch64_child_vdso_identity(ctx.tpidrro_el0, context.visible_tid);
+        ctx.native.tpidrro_el0 =
+            aarch64_child_vdso_identity(ctx.native.tpidrro_el0, context.visible_tid);
     }
     fn enqueue_born(&mut self, record: RecordRef) {
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {

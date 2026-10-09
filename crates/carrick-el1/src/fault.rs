@@ -640,7 +640,7 @@ impl DescriptorTxnApplier for HardwareDescriptorTxnApplier {
 pub fn serve_descriptor_txns<X: DescriptorTxnApplier>(
     frame: &TrapFrame,
     current_tasks: &[CurrentTask],
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     path: &mut DescriptorTxnPath<'_, X>,
 ) -> Option<Action> {
     let mm_key = current_tasks
@@ -674,7 +674,7 @@ pub fn dispatch_fault_with_descriptor_txns<P, C, X>(
     frame: &mut TrapFrame,
     counters: &Counters,
     current_tasks: &[CurrentTask],
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     mut txns: Option<DescriptorTxnPath<'_, X>>,
     mailboxes: GrantMailboxes<'_>,
     prepared: Option<PreparedFaultPath<'_, P>>,
@@ -831,7 +831,7 @@ pub(crate) fn with_hardware_cow_venue<R>(
 pub fn copy_granted_cow_page<W, C>(
     words: &W,
     grant: carrick_mmu_core::aarch64::descriptor_txn::CowCopyGrant,
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     owner: NonZeroU64,
     window: &mut C,
 ) -> Result<
@@ -892,7 +892,7 @@ pub enum DrainOutcome {
 /// settled or resumed EL0 on the report would run against stale
 /// translations.
 pub fn drain_mm_descriptor_txns<X: DescriptorTxnApplier>(
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     slots: &carrick_el1_abi::DescriptorTxnSlots,
     mm_key: u64,
     ttbr0: u64,
@@ -916,7 +916,7 @@ pub fn drain_mm_descriptor_txns<X: DescriptorTxnApplier>(
 /// One attempt of [`drain_mm_descriptor_txns`]. `None`: another EL1 editor
 /// holds the MM while some of its submissions are still in flight; retry.
 fn try_drain_mm_descriptor_txns<X: DescriptorTxnApplier>(
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     slots: &carrick_el1_abi::DescriptorTxnSlots,
     mm_key: u64,
     ttbr0: u64,
@@ -968,7 +968,7 @@ pub fn drain_before_el0<X: DescriptorTxnApplier>(
     frame: &TrapFrame,
     action: Action,
     current_tasks: &[CurrentTask],
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     slots: &carrick_el1_abi::DescriptorTxnSlots,
     applier: &mut X,
 ) -> Action {
@@ -1007,7 +1007,7 @@ pub fn drain_before_el0<X: DescriptorTxnApplier>(
 /// Answers in `frame.x[0]`: applied count, plus the blocked bit.
 pub fn serve_host_drain<X: DescriptorTxnApplier>(
     frame: &mut TrapFrame,
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     slots: &carrick_el1_abi::DescriptorTxnSlots,
     applier: &mut X,
 ) {
@@ -1192,7 +1192,7 @@ pub fn dispatch_fault_with_regions<C: CowResolver>(
     frame: &mut TrapFrame,
     counters: &Counters,
     current_tasks: &[CurrentTask],
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     mailboxes: GrantMailboxes<'_>,
     cow_resolver: &mut C,
 ) -> Action {
@@ -1260,7 +1260,7 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
     frame: &mut TrapFrame,
     counters: &Counters,
     current_tasks: &[CurrentTask],
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     mailboxes: GrantMailboxes<'_>,
     prepared: Option<PreparedFaultPath<'_, P>>,
     cow_resolver: &mut C,

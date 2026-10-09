@@ -8,19 +8,19 @@
 use crate::substrate::sched::{
     EL1_ZONE_LOCK_SPINS, Sched, Served, ThreadCpu, UserWord, identity_of,
 };
-use carrick_el1_abi::{SlotId, TrapFrame};
+use carrick_el1_abi::{Aarch64ParkedContext, SlotId, TrapFrame};
 use carrick_sched_core::object_wait::{
     ObjectWaitError, ObjectWaitKey, ObjectWaitSnapshot, ObjectWakeReport, OperationToken,
 };
-use carrick_sched_core::{RecordId, WakeEffects, ZoneTables};
+use carrick_sched_core::{RecordId, WakeEffects};
 use core::sync::atomic::Ordering;
 
 /// Required completion venue for EL1-held queues. Detached handbacks use
 /// the carrier boundary; SGIs and pending work are delivered after unlock.
-pub(crate) fn deliver_completion(
-    zone: &ZoneTables,
+pub(crate) fn deliver_completion<C: carrick_el1_abi::EntryContext>(
+    zone: &carrick_sched_core::ZoneTables<C>,
     venue: SlotId,
-    owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects,
+    owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>,
 ) {
     let (waker, effects, deferred) = owned.defer_handbacks();
     #[cfg(target_os = "none")]
@@ -65,9 +65,10 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
         &self,
         key: ObjectWaitKey,
     ) -> Result<ObjectWaitSnapshot, ObjectWaitError> {
-        let completion = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
-            deliver_completion(self.zone, self.slot, effects)
-        };
+        let completion = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            Aarch64ParkedContext,
+        >| { deliver_completion(self.zone, self.slot, effects) };
         carrick_core::wait::observe_object(self.zone, self.slot, key, &completion)
     }
 
@@ -100,12 +101,13 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
         resume: OperationResumePc,
         operation: OperationToken,
         deadline: Option<u64>,
-    ) -> Result<ObjectParked<'a>, (ObjectWaitError, OperationToken)> {
+    ) -> Result<ObjectParked<'a, Aarch64ParkedContext>, (ObjectWaitError, OperationToken)> {
         let zone = self.zone;
         let slot = self.slot;
-        let completion = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
-            deliver_completion(zone, slot, effects)
-        };
+        let completion = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            Aarch64ParkedContext,
+        >| { deliver_completion(zone, slot, effects) };
         let request =
             carrick_core::wait::ObjectParkRequest::new(key, snapshot, operation, deadline);
         carrick_core::wait::park_object_record(
@@ -124,7 +126,7 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
                 // home record. Only this CPU owns its context until publish below.
                 let ctx = unsafe { zone.record(record).ctx_mut() };
                 self.cpu.save(frame, ctx);
-                ctx.pc = resume.raw();
+                ctx.native.pc = resume.raw();
                 Ok((record, fresh))
             },
         )
@@ -134,7 +136,10 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
     /// nothing else on this vCPU: host work is pending here, and the host
     /// settles the parked thread at this boundary (its enrollment samples
     /// pending signals). All caller locks must be released.
-    pub fn leave_after_object_park(&mut self, mut parked: ObjectParked<'_>) -> Option<Served> {
+    pub fn leave_after_object_park(
+        &mut self,
+        mut parked: ObjectParked<'_, Aarch64ParkedContext>,
+    ) -> Option<Served> {
         if !parked.matches(self.zone, self.slot) {
             return None;
         }
@@ -149,7 +154,7 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
     pub fn resume_after_object_park(
         &mut self,
         frame: &mut TrapFrame,
-        mut parked: ObjectParked<'_>,
+        mut parked: ObjectParked<'_, Aarch64ParkedContext>,
         timeout_result: u64,
     ) -> Option<Served> {
         if !parked.matches(self.zone, self.slot) {
@@ -198,14 +203,14 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
 }
 
 /// Bind release authority at the actual zone-bearing guest entrypoint.
-pub fn space_access(
-    zone: &carrick_sched_core::ZoneTables,
+pub fn space_access<C: carrick_el1_abi::EntryContext>(
+    zone: &carrick_sched_core::ZoneTables<C>,
     slot: carrick_sched_core::SlotId,
-) -> carrick_sched_core::spaces::notification::SpaceAccess<'_> {
-    fn deliver(
-        zone: &carrick_sched_core::ZoneTables,
+) -> carrick_sched_core::spaces::notification::SpaceAccess<'_, C> {
+    fn deliver<C: carrick_el1_abi::EntryContext>(
+        zone: &carrick_sched_core::ZoneTables<C>,
         waker: carrick_sched_core::Waker,
-        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>,
     ) {
         assert!(matches!(waker, carrick_sched_core::Waker::El1 { .. }));
         if let carrick_sched_core::Waker::El1 { slot } = waker {

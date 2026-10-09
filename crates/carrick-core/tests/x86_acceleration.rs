@@ -1891,7 +1891,7 @@ fn retirement_receipt_fixture() {
 
 struct TestLockWait;
 
-impl carrick_sched_core::LockWait for TestLockWait {
+impl<C: carrick_core_abi::EntryContext> carrick_sched_core::LockWait<C> for TestLockWait {
     fn wait(&self, _attempt: u32) -> bool {
         core::hint::spin_loop();
         true
@@ -2093,7 +2093,10 @@ fn x4_shared_wait_records() {
     drop(root);
 
     let delivered = std::sync::atomic::AtomicBool::new(false);
-    let comp = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
+    let comp = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+        '_,
+        carrick_el1_abi::Aarch64ParkedContext,
+    >| {
         let _ = effects;
         delivered.store(true, std::sync::atomic::Ordering::SeqCst);
     };
