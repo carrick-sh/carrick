@@ -76,3 +76,49 @@ fn arm_ring_first_strict_refusal_witness() {
 fn arm_ring_first_hatch_disabled_forward_witness() {
     witness(false);
 }
+
+fn libc_witness(policy: carrick_embed::ArmRingFirst) {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    // Ubuntu dash is dynamically linked against glibc. Its subshell and wait
+    // exercise process fallback as well as ld.so's file-backed libc mappings.
+    let result = common::run_or_fail(
+        ContainerBuilder::from_image(common::SMOKE_IMAGE)
+            .arm_ring_first(policy)
+            .pull_policy(PullPolicy::Missing)
+            .command([
+                "/bin/dash",
+                "-c",
+                "(exit 23) & child=$!; wait \"$child\"; status=$?; [ \"$status\" = 23 ] || exit 91; printf 'glibc fork wait 23\\n'",
+            ])
+            .run_blocking(),
+    );
+    assert!(
+        result.success(),
+        "exit={} stdout={} stderr={}",
+        result.exit_code,
+        result.stdout_utf8(),
+        result.stderr_utf8()
+    );
+    assert_eq!(result.stdout_utf8(), "glibc fork wait 23\n");
+    let counters = read_el1_counters().expect("EL1 counters populated");
+    for ordinal in [222, 220, 260] {
+        let forwarded = counters.forwarded[ordinal].load(Ordering::Relaxed);
+        let refused = counters.refused[ordinal].load(Ordering::Relaxed);
+        println!(
+            "ring-first libc policy={policy:?} ordinal={ordinal} refused={refused} forwarded={forwarded}"
+        );
+        assert_eq!(refused, 0);
+        assert!(forwarded > 0, "ld.so mmap, shell clone and wait4 must run");
+    }
+}
+
+#[test]
+fn arm_ring_first_strict_glibc_fork_wait_witness() {
+    libc_witness(carrick_embed::ArmRingFirst::Strict);
+}
+
+#[test]
+fn arm_ring_first_opt_out_glibc_fork_wait_witness() {
+    libc_witness(carrick_embed::ArmRingFirst::OptOut);
+}

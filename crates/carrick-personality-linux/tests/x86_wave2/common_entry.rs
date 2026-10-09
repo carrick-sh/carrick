@@ -594,7 +594,7 @@ pub(super) fn x4_linux_common_entry() {
                     }
                 )
                 .0,
-                Action::Forward
+                Action::ServedWithWork
             );
             assert_eq!(w.heads(), before);
         }
@@ -612,7 +612,7 @@ pub(super) fn x4_linux_common_entry() {
         ] {
             let original = word.load(Ordering::Acquire);
             word.store(original + 1, Ordering::Release);
-            assert_eq!(w.robust(0, 0xdead, 24).0, Action::Forward);
+            assert_eq!(w.robust(0, 0xdead, 24).0, Action::ServedWithWork);
             assert_eq!(w.heads(), before);
             word.store(original, Ordering::Release);
         }

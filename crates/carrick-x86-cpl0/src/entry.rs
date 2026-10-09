@@ -394,6 +394,7 @@ mod kernel {
         fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
             carrick_personality_linux::crossing::HostCrossingSet::X86
         }
+
         fn arm_frame(&mut self) -> Option<&mut carrick_el1_abi::TrapFrame> { None }
         fn arm_frame_ref(&self) -> Option<&carrick_el1_abi::TrapFrame> { None }
         fn arm_scheduler(&self) -> bool { false }
@@ -1936,19 +1937,9 @@ mod kernel {
                 CompletionRoute::InvalidCompletion => {
                     doorbell(FATAL_PORT, frame); halt();
                 }
-                CompletionRoute::Forward => {
-                    let decision = evaluate_host_crossing(
-                        HostCrossingSet::X86,
-                        true,
-                        Some(call.canonical),
-                        Some(call.native.raw()),
-                        Some(&counters.refused),
-                        |ret| frame.rax = ret as u64,
-                    );
-                    if decision == HostCrossingDecision::Forward {
-                        doorbell(FORWARD_PORT, frame);
-                    }
-                }
+                // The shared Linux completion owner already admitted an unported
+                // crossing, or preserved a family fallback/handback transport.
+                CompletionRoute::Forward => doorbell(FORWARD_PORT, frame),
             }
         }
         binding.completions.fetch_add(1, Ordering::Relaxed);
