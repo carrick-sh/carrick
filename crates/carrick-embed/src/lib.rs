@@ -87,6 +87,7 @@ pub mod vfs;
 pub(crate) static CARRIER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub use builder::{Container, ContainerBuilder, StdioConfig};
+pub use carrick_kernel::dispatch::PipedOutput;
 pub use carrier::Carrier;
 pub use contracts::{
     fork_filetable_contract, fork_mappings_contract, fork_stage1_image_contract,

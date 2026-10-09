@@ -22,7 +22,7 @@ use super::{PersistentTaskBinding, TaskBindingDirectory, TaskBindingResolver, Ta
 use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
 use carrick_kernel::compat::{CompatReporter, SyscallArgs};
 use carrick_kernel::dispatch::{
-    DispatchOutcome, FdWaitCompletion, SyscallDispatcher, SyscallRequest, WaitFds,
+    DispatchOutcome, FdWaitCompletion, StdioReadiness, SyscallDispatcher, SyscallRequest, WaitFds,
 };
 use carrick_kernel::kernel::continuation::{
     BlockedContinuation, ContinuationCapture, RestartClass, fold_continuation_completion,
@@ -208,25 +208,23 @@ impl KvmPersistentExecutor {
     fn sample_host_readiness(
         venue: &mut carrick_vmm_kvm::cpl0_boot::ForwardVenue<'_>,
         request: HostReadinessRequest,
-        captured_stdio: bool,
+        dispatcher: &SyscallDispatcher,
     ) -> Result<HostReadinessStep, TrapError> {
         venue.with_host_readiness_entries(request.address, request.count, |entries| {
             let mut pollfds: Vec<libc::pollfd> = entries
                 .iter()
                 .map(|entry| libc::pollfd {
-                    fd: if captured_stdio && entry.binding.stdio_fd().is_some_and(|fd| fd > 0) {
-                        -1
-                    } else {
-                        entry
+                    fd: match entry
+                        .binding
+                        .stdio_fd()
+                        .and_then(|fd| dispatcher.stdio_readiness(fd))
+                    {
+                        Some(StdioReadiness::AlwaysWritable) => -1,
+                        Some(StdioReadiness::Host(fd)) => fd.raw(),
+                        None => entry
                             .binding
-                            .stdio_fd()
-                            .or_else(|| {
-                                entry
-                                    .binding
-                                    .host_fd()
-                                    .map(carrick_el1_abi::HostBoundFd::raw)
-                            })
-                            .unwrap_or(-1)
+                            .host_fd()
+                            .map_or(-1, carrick_el1_abi::HostBoundFd::raw),
                     },
                     events: entry.events,
                     revents: 0,
@@ -242,9 +240,12 @@ impl KvmPersistentExecutor {
             }
             let mut ready = 0i64;
             for (entry, pollfd) in entries.iter_mut().zip(&pollfds) {
-                entry.revents = if captured_stdio
-                    && pollfd.fd < 0
-                    && entry.binding.stdio_fd().is_some_and(|fd| fd > 0)
+                entry.revents = if pollfd.fd < 0
+                    && entry
+                        .binding
+                        .stdio_fd()
+                        .and_then(|fd| dispatcher.stdio_readiness(fd))
+                        == Some(StdioReadiness::AlwaysWritable)
                 {
                     entry.events & libc::POLLOUT
                 } else {
@@ -460,7 +461,7 @@ impl PersistentExecutor for KvmPersistentExecutor {
                                     match Self::sample_host_readiness(
                                         venue,
                                         readiness,
-                                        dispatcher.captured_stdio_is_writable(),
+                                        &dispatcher,
                                     )? {
                                         HostReadinessStep::Ready(value) => {
                                             Ok(DispatchOutcome::Returned { value })
@@ -636,7 +637,7 @@ impl PersistentExecutor for KvmPersistentExecutor {
                                 return match Self::sample_host_readiness(
                                     venue,
                                     readiness,
-                                    dispatcher.captured_stdio_is_writable(),
+                                    &dispatcher,
                                 )? {
                                     HostReadinessStep::Ready(value) => {
                                         Ok(ForwardDecision::Immediate(
