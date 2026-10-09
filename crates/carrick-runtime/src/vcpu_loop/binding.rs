@@ -501,6 +501,7 @@ pub(crate) struct ProductionHvpatchLoopJob<E: ThreadedEngine> {
     pub(super) slot_wait: Option<carrick_kernel::kernel::SlotVacancySubscription>,
     pub(super) terminal_settlement: HvpatchExternalTerminalSettlement,
     pub(super) terminal_result: Option<Result<VcpuLoopOutcome, RuntimeError>>,
+    pub(super) executor_failure_cause: Option<String>,
     pub(super) completion: continuation::LogicalJobCompletion,
     pub(super) traps: usize,
     pub(super) budget_floor: usize,
@@ -516,6 +517,7 @@ pub(crate) struct ProductionHvpatchLoopJob<E: ThreadedEngine> {
 }
 
 pub(crate) trait ProductionHvpatchLoopPoll: Send {
+    fn note_executor_failure(&mut self, cause: String);
     fn pt_quiesce(&self) -> Arc<crate::fork_quiesce::PtQuiesce>;
     fn fork_quiesce(&self) -> Arc<crate::fork_quiesce::ForkQuiesce>;
 
@@ -5298,6 +5300,11 @@ impl<E: ThreadedEngine + 'static> ProductionHvpatchLoopPoll for ProductionHvpatc
 where
     E::SiblingSpec: 'static,
 {
+    fn note_executor_failure(&mut self, cause: String) {
+        if self.executor_failure_cause.is_none() {
+            self.executor_failure_cause = Some(cause);
+        }
+    }
     fn pt_quiesce(&self) -> Arc<crate::fork_quiesce::PtQuiesce> {
         self.kernel.pt_quiesce()
     }
@@ -5498,6 +5505,11 @@ where
             }
         }
 
+        if self.terminal_result.is_none()
+            && let Some(cause) = self.executor_failure_cause.take()
+        {
+            self.terminal_result = Some(Err(RuntimeError::CarrierFailed(cause)));
+        }
         self.publish_terminal_result();
         continuation::ExecutorFailureSettlement::PublishCurrent
     }
@@ -5727,6 +5739,11 @@ impl<E: 'static> HvpatchLoopJob<E> {
 }
 
 impl<E: 'static> continuation::PersistentQuantumJob for HvpatchLoopJob<E> {
+    fn note_executor_failure(&mut self, cause: String) {
+        if let Some(production) = self.production.as_mut() {
+            production.note_executor_failure(cause);
+        }
+    }
     fn poll_quantum_with_engine(
         &mut self,
         engine: &mut dyn std::any::Any,
@@ -6102,6 +6119,7 @@ where
         slot_wait: None,
         terminal_settlement: terminal_settlement.clone(),
         terminal_result: None,
+        executor_failure_cause: None,
         completion: completion.clone(),
         traps: 0,
         budget_floor: 0,
@@ -7204,6 +7222,7 @@ mod tests {
             slot_wait: None,
             terminal_settlement: root_settlement,
             terminal_result: None,
+            executor_failure_cause: None,
             completion: root_completion.clone(),
             traps: 0,
             budget_floor: 0,
