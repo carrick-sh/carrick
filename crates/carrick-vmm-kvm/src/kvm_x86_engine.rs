@@ -688,7 +688,14 @@ pub(crate) fn restore_kvm_vcpu(
     let user_ss = user_base.wrapping_add(8);
     let user_cs = user_base.wrapping_add(16);
     let at_sysret = s.rip == layout.trampoline_base + 2;
-    let (cs_ar, cs_selector, ss_ar, ss_selector) = if at_sysret {
+    // A worker may restore a task stopped at a CPL0 physical or forwarded
+    // doorbell, not only at the shared SYSRET trampoline. Re-enter its actual
+    // privilege level; entering the retained supervisor image with user CS
+    // triple-faults and resets the CPU before the next typed exit.
+    let in_supervisor_image = s.rip
+        >= carrick_hal::guest_arch::UserVaCeiling::for_abi(carrick_abi::LinuxGuestAbi::X86_64)
+            .exclusive_end();
+    let (cs_ar, cs_selector, ss_ar, ss_selector) = if at_sysret || in_supervisor_image {
         (segs.kernel_cs_ar, kernel_cs, segs.kernel_data_ar, kernel_ss)
     } else {
         (segs.cs_ar, user_cs, segs.data_ar, user_ss)

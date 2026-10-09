@@ -902,6 +902,7 @@ dependencies = [
  "carrick-vmm-hvf",
  "carrick-vmm-kvm",
  "carrick-vmm-nvmm",
+ "carrick-x86",
  "clap",
  "fd-lock",
  "flate2",
