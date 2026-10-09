@@ -877,9 +877,9 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             }
         }
         asid_load.mark_resident().map_err(|error| {
-            self.current
-                .as_mut()
-                .map(|engine| engine.discard_prepared_home());
+            if let Some(engine) = self.current.as_mut() {
+                engine.discard_prepared_home();
+            }
             self.clear_live_current_task();
             TrapError::Hypervisor(format!("HVPatch ASID residence commit failed: {error}"))
         })?;
