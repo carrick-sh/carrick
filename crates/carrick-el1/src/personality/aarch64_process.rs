@@ -94,7 +94,7 @@ fn fork_failure(stage: carrick_el1_abi::NativeForkFailureStage) {
 pub fn admit_entry(
     source: BornInZoneSource<'static, Aarch64ParkedContext>,
     task: &'static CurrentTask,
-    native: carrick_sched_core::ThreadCtx,
+    native: &carrick_sched_core::ThreadCtx,
     ttbr0: u64,
     record_incarnation: u64,
 ) -> Result<(Arc<Runtime>, Mm, Box<Aarch64ParkedContext>), NativeProcessError> {
@@ -123,7 +123,7 @@ pub fn admit_entry(
         observed
     };
     let words = Box::new(Aarch64ParkedContext::from_register(
-        native,
+        *native,
         ttbr0,
         address.mm.raw().get(),
         address.generation.raw().get(),
