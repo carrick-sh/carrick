@@ -4,7 +4,6 @@ use super::{InitialWords, anonymous};
 use crate::rust_alloc::{boxed::Box, sync::Arc, vec::Vec};
 use carrick_core::mm::fork::{ForkCensus, ForkScratch, census_table};
 use carrick_core::mm::transaction::{MmPortal, OwnerVenue, SelectionVenues, TransferStep};
-use carrick_el1::lock::SpinLock;
 use carrick_el1::memory::reservations::{
     X86Cpl0ReservationGeometry, X86Cpl0Zone, shared_x86_cpl0_guest,
 };
@@ -16,7 +15,7 @@ use carrick_el1::personality::native_process_runtime::{
 };
 use carrick_el1_abi::{
     BornInZoneSource, CurrentTask, KernelFaultVenues, Lifecycle, MmPortalSlots, PortalForkCustody,
-    PortalOperation, ReservationMm, ThreadControlSlot, ThreadLifecyclePage, FORK_STOCK_PORT,
+    PortalOperation, ReservationMm, ThreadControlSlot, ThreadLifecyclePage, FORK_STOCK_PORT, NATIVE_CHILD_RETIRE_PORT, NativeChildRetire,
     ForkStockExchange, ForkStockLoan, ForkStockRequest, ForkStockSettlement,
 };
 use carrick_guest_arch::{
@@ -32,7 +31,6 @@ pub(super) type Mm = AddressContext<RootGpa>;
 type Runtime = NativeProcessRuntime<'static, Mm, ParkedContextWords>;
 static REGISTRY: NativeProcessRegistry<'static, Mm, ParkedContextWords> =
     NativeProcessRegistry::new();
-static RETIRED: SpinLock<Vec<Mm>> = SpinLock::new(Vec::new());
 
 pub(super) fn registry() -> &'static NativeProcessRegistry<'static, Mm, ParkedContextWords> {
     &REGISTRY
@@ -563,7 +561,35 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         fatal();
     }
     fn retire_mm(&mut self, mm: Mm) {
-        RETIRED.lock().push(mm);
+        // The root uses the terminal root-exit crossing after graph exit.
+        // Only fork-born children own lifecycle and table stock to quarantine.
+        if self.task.visible_pid() == Some(1) {
+            return;
+        }
+        let source = super::native_execution::source(self.slot);
+        // Fork stock is only ever loaned by a carrier that also published
+        // its maintenance root; a child cannot exist without both.
+        if mm.mm.raw().get() != self.task.mm.key.load(Ordering::Acquire)
+            || carrick_el1::isa::x86::hardware_live_root().ok() != Some(mm.root)
+            || source.zone.spaces.idle_ttbr() == 0
+        {
+            fatal();
+        }
+        let binding = carrick_el1::personality::common_entry::execution_binding(self.task);
+        let Some(retire) = NativeChildRetire::new(binding, mm) else {
+            fatal();
+        };
+        // SAFETY: the aligned record stays on this CPU's supervisor stack
+        // through the stopped host crossing, which authenticates the live
+        // binding and root before quarantining the child's stock.
+        unsafe {
+            core::arch::asm!("out dx, eax", in("dx") NATIVE_CHILD_RETIRE_PORT, in("rax") &raw const retire, options(nostack));
+        }
+        // Absence is published only after CR3 left the retired root; the
+        // host drains this MM's quarantine on a later stopped crossing.
+        if !super::native_execution::leave_space(source) {
+            fatal();
+        }
     }
     fn wake_effects(&mut self, effects: WakeEffects) {
         deliver_wakes(effects);

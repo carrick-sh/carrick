@@ -15,12 +15,12 @@
 //! - `CarrierVmCustody` stage-2 records resolve guest records and pages.
 
 use carrick_el1_abi::{
-    ForkLifecycleLoan, ForkStockExchange, ForkStockLoan, ForkStockRefusal, ForkStockSettlement,
-    NativeChildRetire, NativeRootExit, ReservationMm,
+    ForkStockExchange, ForkStockLoan, ForkStockRefusal, ForkStockSettlement, NativeChildRetire,
+    NativeRootExit, ReservationMm,
 };
-use carrick_guest_arch::{FrameGpa, KernelVa, RootGpa};
+use carrick_guest_arch::{FrameGpa, RootGpa};
 use carrick_hal::asid::{AsidAllocator, AsidGeneration};
-use carrick_hal::fork_stock::{ForkStock, ForkTableLedger};
+use carrick_hal::fork_stock::{ForkStock, ForkTableLedger, LIFECYCLE_SLOT_STRIDE, lifecycle_slots};
 use carrick_sched_core::process::LinuxWaitStatus;
 use core::num::NonZeroU64;
 
@@ -98,16 +98,9 @@ impl ForkStockHostCustody {
         if !valid(lifecycle_base) || !valid(table_base) || lifecycle_base == table_base {
             return Err(ForkStockServiceError::InvalidRecord);
         }
-        let lifecycles = ((lifecycle_base + 0x4000)..(lifecycle_base + extent))
-            .step_by(0x4000)
-            .map(|page| {
-                ForkLifecycleLoan::new_for_base(
-                    aperture,
-                    KernelVa::new(page),
-                    KernelVa::new(page + 0x1000),
-                )
-            })
-            .collect::<Option<Vec<_>>>()
+        // The first slot of the extent stays unused, as before.
+        let slots = extent / LIFECYCLE_SLOT_STRIDE - 1;
+        let lifecycles = lifecycle_slots(aperture, lifecycle_base + LIFECYCLE_SLOT_STRIDE, slots)
             .ok_or(ForkStockServiceError::InvalidRecord)?;
         let tables = (table_base..table_base + extent)
             .step_by(4096)
@@ -224,13 +217,16 @@ impl ForkStockHostCustody {
 impl ForkStockHostCustody {
     /// Seed table pages with the default ARM lifecycle record.
     pub(crate) fn seed_for_tests(&mut self, tables: Vec<RootGpa>) {
-        self.seed_with_for_tests(tables, vec![ForkLifecycleLoan::ARM_DEFAULT]);
+        self.seed_with_for_tests(
+            tables,
+            vec![carrick_el1_abi::ForkLifecycleLoan::ARM_DEFAULT],
+        );
     }
 
     pub(crate) fn seed_with_for_tests(
         &mut self,
         tables: Vec<RootGpa>,
-        lifecycles: Vec<ForkLifecycleLoan>,
+        lifecycles: Vec<carrick_el1_abi::ForkLifecycleLoan>,
     ) {
         assert_eq!(self.stock.install(tables, lifecycles), Ok(()));
     }

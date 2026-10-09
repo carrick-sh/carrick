@@ -61,13 +61,34 @@ pub(super) fn migrate(slot: SlotId) {
     }
 }
 
+/// Leave the installed process root for the carrier's maintenance root, then
+/// publish the slot's absence. In that order, an MM no slot names is an MM
+/// whose tables no CPU walks: its quarantined fork stock may be reclaimed.
+/// The carrier publishes the maintenance root together with its fork stock;
+/// without either (false) nothing is ever reclaimed, so absence alone is safe.
+pub(super) fn leave_space(source: BornInZoneSource<'static, ParkedContextWords>) -> bool {
+    let maintenance = source.zone.spaces.idle_ttbr();
+    if maintenance != 0 {
+        let Some(root) =
+            carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(maintenance))
+        else {
+            initial_boot::fatal_boot();
+        };
+        if x86::interrupt::install_maintenance_root(root).is_err() {
+            initial_boot::fatal_boot();
+        }
+    }
+    source.zone.release_space(source.slot);
+    maintenance != 0
+}
+
 /// Run a queued record or sleep under the shared queue's lost-wakeup guard.
 /// A guest wait releases its record and installed-space membership before
 /// this function selects another runnable task or enters architectural HLT.
 pub(super) fn schedule(slot: SlotId) -> ! {
     let source = source(slot);
     let current = task();
-    source.zone.release_space(slot);
+    leave_space(source);
     loop {
         if let Some(selected) = source.zone.switch_in_full(slot) {
             source.zone.leave_idle(slot);

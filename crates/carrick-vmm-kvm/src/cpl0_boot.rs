@@ -91,6 +91,30 @@ const IST_STACK_BASE: u64 = 0xf0_0000;
 const IMAGE_VA: u64 = 0xffff_ffff_8000_0000;
 const IMAGE_GPA: u64 = 0x10_0000;
 const METADATA_VA: u64 = X86_CPL0_DYNAMIC_METADATA_BASE;
+// Fork lifecycle stock: each 16 KiB slot holds a lifecycle page and, 4 KiB
+// above it, the thread control slots. More records than CPUs keep a parent's
+// fork from racing a reaped child that has not yet left its slot.
+const FORK_LIFECYCLE_OFFSET: u64 = 0x8_8000;
+const FORK_LIFECYCLE_STRIDE: u64 = carrick_hal::fork_stock::LIFECYCLE_SLOT_STRIDE;
+const FORK_LIFECYCLE_SLOTS: u64 = 8;
+const _: () = {
+    assert!(
+        carrick_el1_abi::X86_CPL0_RESERVATIONS_OFFSET + size_of::<X86Cpl0Reservations>() as u64
+            <= FORK_LIFECYCLE_OFFSET
+    );
+    assert!(FORK_LIFECYCLE_OFFSET.is_multiple_of(0x4000));
+    assert!(
+        carrick_hal::fork_stock::LIFECYCLE_CONTROLS_OFFSET
+            + (carrick_el1_abi::THREAD_POOL_ENTRIES as u64 + 1)
+                * size_of::<ThreadControlSlot>() as u64
+            <= FORK_LIFECYCLE_STRIDE
+    );
+    assert!(
+        size_of::<ThreadLifecyclePage>() as u64
+            <= carrick_hal::fork_stock::LIFECYCLE_CONTROLS_OFFSET
+    );
+    assert!(FORK_LIFECYCLE_OFFSET + FORK_LIFECYCLE_SLOTS * FORK_LIFECYCLE_STRIDE <= META_LEN);
+};
 pub const USER_CODE: u64 = 0x1_0000;
 pub(crate) use carrick_x86::cpl0_entry::DIRECT_VA;
 // Startup stocks one initial MM and its first fork child's private COW branch.
@@ -1045,11 +1069,9 @@ pub(crate) struct Cpl0HostCustody {
     initial_rollback_fault: Option<Arc<AtomicBool>>,
     peer_entry: Option<carrick_guest_arch::KernelVa>,
     peer_admission: InitialPeerAdmission,
-    grant_tables: Vec<RootGpa>,
     prepare_table_stock: Option<anonymous_owner::PrepareTableStock>,
-    fork_pending: [Option<anonymous_owner::PendingForkLoan>; 2],
-    fork_next_loan: u64,
-    fork_lifecycle_available: bool,
+    /// The ISA-neutral fork stock, loans and child quarantine.
+    fork_stock: carrick_hal::fork_stock::ForkStock<carrick_hal::fork_stock::UntaggedRoots>,
     anonymous_next_gpa: FrameGpa,
     anonymous_pending: [Option<anonymous_owner::PendingGrant>; 2],
     owner_grant_crossings: u64,
@@ -2026,15 +2048,16 @@ impl Cpl0Carrier {
             )?;
             inventory.finish()?;
             self.custody.bind_grant_portal()?;
-            for grant in grants
+            let unused = grants
                 .get(reply.result_table_used as usize..table_grants)
                 .ok_or_else(|| fail("initial unused table grants"))?
-            {
-                self.custody.grant_tables.push(
+                .iter()
+                .map(|grant| {
                     RootGpa::page_aligned(FrameGpa::new(grant.gpa))
-                        .ok_or_else(|| fail("initial unused table alignment"))?,
-                );
-            }
+                        .ok_or_else(|| fail("initial unused table alignment"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.custody.install_fork_stock(root, unused)?;
             let stock_bytes = self
                 .custody
                 ._vm
@@ -2354,6 +2377,24 @@ impl Cpl0Carrier {
                 if matches!(
                     exit,
                     VcpuExit::IoOut {
+                        port: carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
+                        ..
+                    }
+                ) {
+                    custody.owner_grant_crossings = custody
+                        .owner_grant_crossings
+                        .checked_add(1)
+                        .ok_or_else(|| fail("physical crossing counter exhausted"))?;
+                    let lease = StoppedCpuLease {
+                        cpu: cpu_id,
+                        vcpu: cpu,
+                    };
+                    custody.service_child_retire(&lease)?;
+                    return Ok(ActorDecision::Resume);
+                }
+                if matches!(
+                    exit,
+                    VcpuExit::IoOut {
                         port: carrick_el1_abi::NATIVE_ROOT_EXIT_PORT,
                         ..
                     }
@@ -2492,6 +2533,12 @@ impl Cpl0Carrier {
     /// checked at the stopped guest's applied owner-grant completion.
     pub fn anonymous_private_pages(&self) -> u64 {
         self.custody.private_anonymous_witness.private_pages()
+    }
+
+    /// Shared fork-stock counters: loans, counted capacity refusals (each
+    /// lowered to `EAGAIN` by the guest), quarantined and returned children.
+    pub fn fork_stock_counters(&self) -> carrick_hal::fork_stock::ForkStockCounters {
+        self.custody.fork_stock_counters()
     }
 
     pub fn physical_crossing_counts(&self) -> [(PhysicalCrossingFamily, u64); 2] {
@@ -3191,6 +3238,11 @@ impl Cpl0Carrier {
                 }
             }
         }
+        let fork_stock = carrick_hal::fork_stock::ForkStock::new(
+            vm.identity().nonzero(),
+            KERNEL_REGION_GPA,
+            carrick_hal::fork_stock::UntaggedRoots,
+        );
         let metadata_base = NonNull::new(
             ram.host_ptr(META_GPA, META_LEN as usize)
                 .ok_or_else(|| fail("retained metadata backing"))?,
@@ -3211,11 +3263,8 @@ impl Cpl0Carrier {
                 initial_rollback_fault: None,
                 peer_entry: None,
                 peer_admission: InitialPeerAdmission::Cold,
-                grant_tables: Vec::new(),
                 prepare_table_stock: None,
-                fork_pending: std::array::from_fn(|_| None),
-                fork_next_loan: 1,
-                fork_lifecycle_available: true,
+                fork_stock,
                 anonymous_next_gpa: FrameGpa::new(0x2_0000_0000),
                 anonymous_pending: [None, None],
                 owner_grant_crossings: 0,
