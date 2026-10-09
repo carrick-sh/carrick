@@ -3467,11 +3467,15 @@ fn el1_fork_cow_resolves_in_guest() {
     let warmup = run_fixture(&carrier, &["fork-cow", "1", "1"], Duration::from_secs(120));
     assert!(
         warmup.result.success(),
-        "warm-up fork failed: {}; owner process refusal stages={:?}",
+        "warm-up fork failed: {}; owner process refusal stages={:?}; first native fork failure={:?}",
         describe(&warmup),
         read_el1_counters().map(|c| c
             .process_refusals
-            .map(|n| n.load(std::sync::atomic::Ordering::Relaxed)))
+            .map(|n| n.load(std::sync::atomic::Ordering::Relaxed))),
+        read_el1_counters().and_then(|c| carrick_el1_abi::NativeForkFailureStage::from_raw(
+            c.first_native_fork_failure
+                .load(std::sync::atomic::Ordering::Relaxed)
+        ))
     );
     assert!(
         carrick_embed::host_cow_snapshot().complete,
