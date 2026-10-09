@@ -96,7 +96,132 @@ pub struct GuestTask<C, U, N: NativeProcessCustody> {
     pub child_subreaper: bool,
     pub has_execed: bool,
     pub comm: [u8; 16],
+    pub threads: GuestThreads,
 }
+
+#[derive(Clone)]
+pub struct GuestThreadState {
+    pub tid: u32,
+    pub credentials: TaskCredentials,
+    pub comm: [u8; 16],
+}
+
+#[derive(Clone)]
+pub struct GuestThreads {
+    pub threads: Vec<GuestThreadState>,
+}
+
+impl GuestThreads {
+    #[inline(never)]
+    pub fn new(leader_tid: u32) -> Self {
+        Self {
+            threads: alloc::vec![GuestThreadState {
+                tid: leader_tid,
+                credentials: TaskCredentials::ROOT,
+                comm: [0u8; 16],
+            }],
+        }
+    }
+
+    #[inline(never)]
+    pub fn has_thread(&self, tid: u32) -> bool {
+        self.threads.iter().any(|t| t.tid == tid)
+    }
+
+    #[inline(never)]
+    pub fn credentials_for<'a>(
+        &'a self,
+        tid: u32,
+        fallback: &'a TaskCredentials,
+    ) -> &'a TaskCredentials {
+        self.threads
+            .iter()
+            .find(|t| t.tid == tid)
+            .map(|t| &t.credentials)
+            .unwrap_or(fallback)
+    }
+
+    #[inline(never)]
+    pub fn credentials_for_mut(
+        &mut self,
+        tid: u32,
+        default_creds: &TaskCredentials,
+        default_comm: [u8; 16],
+    ) -> &mut TaskCredentials {
+        if !self.has_thread(tid) {
+            self.threads.push(GuestThreadState {
+                tid,
+                credentials: default_creds.clone(),
+                comm: default_comm,
+            });
+        }
+        &mut self
+            .threads
+            .iter_mut()
+            .find(|t| t.tid == tid)
+            .unwrap()
+            .credentials
+    }
+
+    #[inline(never)]
+    pub fn comm_for<'a>(&'a self, tid: u32, fallback: &'a [u8; 16]) -> &'a [u8; 16] {
+        self.threads
+            .iter()
+            .find(|t| t.tid == tid)
+            .map(|t| &t.comm)
+            .unwrap_or(fallback)
+    }
+
+    #[inline(never)]
+    pub fn comm_for_mut(
+        &mut self,
+        tid: u32,
+        default_creds: &TaskCredentials,
+        default_comm: [u8; 16],
+    ) -> &mut [u8; 16] {
+        if !self.has_thread(tid) {
+            self.threads.push(GuestThreadState {
+                tid,
+                credentials: default_creds.clone(),
+                comm: default_comm,
+            });
+        }
+        &mut self.threads.iter_mut().find(|t| t.tid == tid).unwrap().comm
+    }
+
+    #[inline(never)]
+    pub fn spawn_thread(
+        &mut self,
+        caller_tid: u32,
+        child_tid: u32,
+        fallback_creds: &TaskCredentials,
+        fallback_comm: &[u8; 16],
+    ) {
+        let creds = self.credentials_for(caller_tid, fallback_creds).clone();
+        let comm = *self.comm_for(caller_tid, fallback_comm);
+        if let Some(entry) = self.threads.iter_mut().find(|t| t.tid == child_tid) {
+            entry.credentials = creds;
+            entry.comm = comm;
+        } else {
+            self.threads.push(GuestThreadState {
+                tid: child_tid,
+                credentials: creds,
+                comm,
+            });
+        }
+    }
+
+    #[inline(never)]
+    pub fn reset_single(&mut self, tid: u32, creds: TaskCredentials, comm: [u8; 16]) {
+        self.threads.clear();
+        self.threads.push(GuestThreadState {
+            tid,
+            credentials: creds,
+            comm,
+        });
+    }
+}
+
 impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
     pub fn new(
         metadata: GuestTaskMetadata<C, U>,
@@ -105,6 +230,7 @@ impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
         native: N,
         claim: N::Claim,
     ) -> Self {
+        let leader_tid = metadata.namespace_pid;
         Self {
             metadata,
             relations: ProcessRelations::new(parent),
@@ -126,7 +252,40 @@ impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
             child_subreaper: false,
             has_execed: false,
             comm: [0u8; 16],
+            threads: GuestThreads::new(leader_tid),
         }
+    }
+    #[inline]
+    pub fn init_leader(&mut self, tid: u32, creds: TaskCredentials, comm: [u8; 16]) {
+        self.credentials = creds.clone();
+        self.comm = comm;
+        self.threads.reset_single(tid, creds, comm);
+    }
+    #[inline]
+    pub fn has_thread(&self, tid: u32) -> bool {
+        self.threads.has_thread(tid)
+    }
+    #[inline]
+    pub fn credentials_for(&self, tid: u32) -> &TaskCredentials {
+        self.threads.credentials_for(tid, &self.credentials)
+    }
+    #[inline]
+    pub fn credentials_for_mut(&mut self, tid: u32) -> &mut TaskCredentials {
+        self.threads
+            .credentials_for_mut(tid, &self.credentials, self.comm)
+    }
+    #[inline]
+    pub fn comm_for(&self, tid: u32) -> &[u8; 16] {
+        self.threads.comm_for(tid, &self.comm)
+    }
+    #[inline]
+    pub fn comm_for_mut(&mut self, tid: u32) -> &mut [u8; 16] {
+        self.threads.comm_for_mut(tid, &self.credentials, self.comm)
+    }
+    #[inline]
+    pub fn spawn_thread(&mut self, caller_tid: u32, child_tid: u32) {
+        self.threads
+            .spawn_thread(caller_tid, child_tid, &self.credentials, &self.comm);
     }
     pub fn key(&self) -> TaskKey {
         self.metadata.key
