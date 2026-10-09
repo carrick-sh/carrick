@@ -45,12 +45,15 @@ a five-second SIGCHLD descriptor wait followed by one WNOHANG reap.
 
 ## Independent-review corrections (2026-10-09)
 
-The allowlist is applied only to genuinely unported calls. Typed family
+ARM applies the allowlist to genuinely unported calls, including when work
+is pending. x86 applies its eight-crossing set to every forwarding completion. Typed family
 fallbacks (including file-backed/shared/stack memory, permission/retirement
 refusals, inotify contention and unsupported futex operations) retain their
-current carrier authority. Owed host work leaves through `WithWork`, preserving
-original-argument replay, including retained handbacks. Plain handback and
-signal return are completion transports. ARM clone/fork/wait and terminal
+current carrier authority. An effect-free ARM Forward with owed host work leaves through `WithWork`,
+using the entry-saved original argument. Refused unported calls publish owed
+work as Completed with counted ENOSYS. Handback and AccountedForward retain
+Forward transport; x86 keeps Forward because its WORK_PORT does not replay.
+Signal return is a completion transport subject to the x86 crossing set. ARM clone/fork/wait and terminal
 calls retain carrier fallback until Step 5 owns them in-ring.
 
 The production frame chooses its ISA set. x86 is strict and never invokes the

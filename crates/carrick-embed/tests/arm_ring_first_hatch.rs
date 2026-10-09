@@ -125,3 +125,89 @@ fn arm_ring_first_strict_glibc_fork_wait_witness() {
 fn arm_ring_first_opt_out_glibc_fork_wait_witness() {
     libc_witness(carrick_embed::ArmRingFirst::OptOut);
 }
+
+fn loader_witness(strict: bool) {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let path = common::repo_root().join("fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-gnu/release/carrick-linux-aarch64-ring-first-glibc");
+    assert!(path.is_file(), "published GNU fixture is required");
+    let result = common::run_or_fail(
+        ContainerBuilder::from_image(common::SMOKE_IMAGE)
+            .arm_ring_first(if strict {
+                carrick_embed::ArmRingFirst::Strict
+            } else {
+                carrick_embed::ArmRingFirst::OptOut
+            })
+            .pull_policy(PullPolicy::Missing)
+            .command(["/p/carrick-linux-aarch64-ring-first-glibc", "--loader-only"])
+            .mount_readonly(
+                path.parent().expect("fixture directory").to_string_lossy(),
+                "/p",
+            )
+            .run_blocking(),
+    );
+    assert!(
+        result.success(),
+        "exit={} stdout={} stderr={}",
+        result.exit_code,
+        result.stdout_utf8(),
+        result.stderr_utf8()
+    );
+    assert_eq!(
+        result.stdout_utf8(),
+        if strict {
+            "glibc loader strict\n"
+        } else {
+            "glibc loader forward\n"
+        }
+    );
+    let counters = read_el1_counters().expect("EL1 counters populated");
+    for ordinal in [56, 63, 64, 94, 172, 174, 222] {
+        println!(
+            "ring-first loader strict={strict} ordinal={ordinal} refused={} served={} forwarded={}",
+            counters.refused[ordinal].load(Ordering::Relaxed),
+            counters.served[ordinal].load(Ordering::Relaxed),
+            counters.forwarded[ordinal].load(Ordering::Relaxed)
+        );
+    }
+    assert_eq!(
+        counters.refused[174].load(Ordering::Relaxed),
+        u64::from(strict)
+    );
+    assert_eq!(
+        counters.forwarded[174].load(Ordering::Relaxed),
+        u64::from(!strict)
+    );
+    for ordinal in [56, 63, 64, 94, 172, 222] {
+        assert_eq!(counters.refused[ordinal].load(Ordering::Relaxed), 0);
+        assert!(
+            counters.forwarded[ordinal].load(Ordering::Relaxed)
+                + counters.served[ordinal].load(Ordering::Relaxed)
+                > 0,
+            "loader/ordinary call {ordinal} must complete"
+        );
+    }
+    assert!(
+        counters.forwarded[222].load(Ordering::Relaxed) > 0,
+        "ld.so must forward file-backed mappings"
+    );
+    assert_eq!(counters.forwarded[94].load(Ordering::Relaxed), 1);
+    for ordinal in [220, 260] {
+        assert_eq!(
+            counters.forwarded[ordinal].load(Ordering::Relaxed),
+            0,
+            "loader-only must not create or reap a child"
+        );
+        assert_eq!(counters.refused[ordinal].load(Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn arm_ring_first_strict_glibc_loader_witness() {
+    loader_witness(true);
+}
+
+#[test]
+fn arm_ring_first_opt_out_glibc_loader_witness() {
+    loader_witness(false);
+}
