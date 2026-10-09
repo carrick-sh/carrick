@@ -1354,6 +1354,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             task.spawn_thread(caller_tid, child_tid);
         }
     }
+    fn thread_exited(&mut self, tid: u32) {
+        self.thread_exited(tid);
+    }
     fn set_calling_tid(&mut self, tid: u32) {
         self.calling_tid = tid;
     }
@@ -1365,6 +1368,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     NativeProcessEntry<'_, 'a, M, C, S>
 {
+    #[inline(never)]
+    pub fn thread_exited(&mut self, tid: u32) {
+        let mut graph = self.runtime.graph.lock();
+        if let Ok(task) = graph.owner.task_mut(self.key) {
+            task.remove_thread(tid);
+        }
+    }
     #[inline(never)]
     pub fn exec_completed(&mut self, path: &[u8]) -> Result<(), NativeProcessError> {
         let leader_pid = {
@@ -3237,5 +3247,93 @@ mod tests {
         let p_task = graph.owner.task(parent_key).unwrap();
         assert_eq!(p_task.threads.threads.len(), 1);
         assert_eq!(p_task.has_execed, true);
+    }
+
+    #[test]
+    fn thread_exit_removes_thread_state_and_stays_bounded() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let child_page = Box::new(ThreadLifecyclePage::new());
+        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        }));
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        let key = TaskKey {
+            id: TaskId::from_abi_positive(41).unwrap(),
+            serial: TaskSerial::from_raw_u64(11).unwrap(),
+        };
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &*child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+        };
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+
+        // Spawn 100 short-lived threads and exit them.
+        for i in 0..100 {
+            let tid = 1000 + i;
+            entry.thread_spawned(41, tid);
+            entry.thread_exited(tid);
+        }
+
+        drop(entry);
+        let graph = runtime.graph.lock();
+        let t = graph.owner.task(key).unwrap();
+        // The list must stay bounded to just the leader thread.
+        assert_eq!(t.threads.threads.len(), 1);
+        assert_eq!(t.has_thread(1050), false);
     }
 }
