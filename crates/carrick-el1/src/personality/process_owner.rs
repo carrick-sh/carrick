@@ -212,6 +212,11 @@ impl GuestThreads {
     }
 
     #[inline(never)]
+    pub fn remove_thread(&mut self, tid: u32) {
+        self.threads.retain(|t| t.tid != tid);
+    }
+
+    #[inline(never)]
     pub fn reset_single(&mut self, tid: u32, creds: TaskCredentials, comm: [u8; 16]) {
         self.threads.clear();
         self.threads.push(GuestThreadState {
@@ -321,6 +326,12 @@ impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
     pub fn spawn_thread(&mut self, caller_tid: u32, child_tid: u32) {
         self.threads
             .spawn_thread(caller_tid, child_tid, &self.credentials, &self.comm);
+    }
+    #[inline]
+    pub fn remove_thread(&mut self, tid: u32) {
+        if tid != self.metadata.namespace_pid {
+            self.threads.remove_thread(tid);
+        }
     }
     pub fn key(&self) -> TaskKey {
         self.metadata.key
