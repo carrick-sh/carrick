@@ -433,6 +433,10 @@ pub struct NativeRootExit {
 impl NativeRootExit {
     pub const MAGIC: u64 = 0x4352_524f_4f54_4558;
 
+    fn terminal_status(raw: u64) -> bool {
+        raw & !0xff00 == 0 || (raw & !0xff == 0 && (1..=64).contains(&(raw & 0x7f)))
+    }
+
     pub fn new(
         binding: ExecutionBinding,
         status: carrick_sched_core::process::LinuxWaitStatus,
@@ -441,7 +445,7 @@ impl NativeRootExit {
             || binding.mm.raw() == 0
             || binding.thread_generation.raw() == 0
             || status.raw() < 0
-            || status.raw() & !0xff00 != 0
+            || !Self::terminal_status(status.raw() as u64)
         {
             return None;
         }
@@ -471,7 +475,7 @@ impl NativeRootExit {
                 expected.mm.raw(),
                 expected.thread_generation.raw(),
             ]
-            || self.words[5] & !0xff00 != 0
+            || !Self::terminal_status(self.words[5])
             || self.words[6..] != [0; 2]
         {
             return None;
@@ -726,7 +730,7 @@ mod tests {
     }
 
     #[test]
-    fn native_root_exit_refuses_foreign_execution_and_non_exit_status() {
+    fn native_root_exit_refuses_foreign_execution_and_nonterminal_status() {
         use carrick_sched_core::process::LinuxWaitStatus;
         let binding = request().binding;
         let status = LinuxWaitStatus::from_wait_encoding(37 << 8);
@@ -738,7 +742,15 @@ mod tests {
         let mut foreign = binding;
         foreign.mm = EntryMmKey::from_raw(binding.mm.raw() + 1);
         assert!(record.status_for(foreign).is_none());
-        assert!(NativeRootExit::new(binding, LinuxWaitStatus::from_wait_encoding(9)).is_none());
+        let killed = LinuxWaitStatus::signaled(9, false);
+        assert_eq!(
+            NativeRootExit::new(binding, killed)
+                .unwrap()
+                .status_for(binding),
+            Some(killed)
+        );
+        assert!(NativeRootExit::new(binding, LinuxWaitStatus::stopped(19)).is_none());
+        assert!(NativeRootExit::new(binding, LinuxWaitStatus::continued()).is_none());
     }
 
     #[test]

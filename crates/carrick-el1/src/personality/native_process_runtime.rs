@@ -2395,6 +2395,22 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     carrick_personality_linux::signal::ProcessSignals for NativeProcessEntry<'_, 'a, M, C, S>
 {
+    fn force_sigsegv(
+        &mut self,
+        tid: u32,
+        blocked: carrick_signal_core::policy::SigBlockMask,
+    ) -> Result<(), i32> {
+        let graph = self.runtime.graph.lock();
+        let row = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_personality_linux::abi::signal::LINUX_ESRCH.get())?;
+        row.native()
+            .resources()
+            .signals()
+            .force_sigsegv(tid, blocked);
+        Ok(())
+    }
     fn rt_sigaction(
         &mut self,
         signum: i32,

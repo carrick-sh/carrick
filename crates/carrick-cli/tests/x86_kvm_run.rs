@@ -634,3 +634,13 @@ fn run_mounted_binary(elf: &std::path::Path, run_id: &str, json: bool) -> std::p
         .output()
         .expect("run mounted x86 Linux binary through carrick")
 }
+
+#[test]
+fn mounted_static_x86_signal_return_flags_match_native() {
+    compare_mounted_assembly_with_native("x86_signal_return_flags.S", b"HK\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_return_badframe_matches_native() {
+    compare_mounted_fault_with_native("x86_signal_return_badframe.S");
+}

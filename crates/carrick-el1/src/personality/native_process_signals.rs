@@ -94,6 +94,26 @@ impl<T> NativeProcessSignals<T> {
             action
         }
     }
+    pub fn force_sigsegv(&self, tid: u32, blocked: SigBlockMask) {
+        let mut resources = self.resources.lock();
+        let signal = Signal::SEGV;
+        if blocked.contains(signal)
+            || resources.actions.action(signal).disposition == Disposition::Ignore
+        {
+            let _ = resources.actions.install(signal, Action::default());
+        }
+        if let Some((_, pending)) = resources
+            .thread_pending
+            .iter_mut()
+            .find(|(id, _)| *id == tid)
+        {
+            pending.enqueue(signal, None);
+        } else {
+            let mut pending = PendingSignals::default();
+            pending.enqueue(signal, None);
+            resources.thread_pending.push((tid, pending));
+        }
+    }
     pub fn action(&self, signal: Signal) -> Action {
         self.resources.lock().actions.action(signal)
     }

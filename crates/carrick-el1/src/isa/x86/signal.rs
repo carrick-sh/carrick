@@ -292,11 +292,20 @@ impl SignalBackend for X86Backend {
             return Err(ArchError::InvalidFrame);
         };
 
-        // Restore registers
+        let flags = carrick_sched_core::signal_return_flags(frame.r11, uc.uc_mcontext.eflags);
+        if !carrick_sched_core::valid_user_return_words(
+            uc.uc_mcontext.rip,
+            uc.uc_mcontext.rsp,
+            flags,
+        ) {
+            return Err(ArchError::InvalidFrame);
+        }
+
+        // Publish only after all guest-controlled resume words have passed validation.
         frame.r8 = uc.uc_mcontext.r8;
         frame.r9 = uc.uc_mcontext.r9;
         frame.r10 = uc.uc_mcontext.r10;
-        frame.r11 = uc.uc_mcontext.eflags;
+        frame.r11 = flags;
         frame.r12 = uc.uc_mcontext.r12;
         frame.r13 = uc.uc_mcontext.r13;
         frame.r14 = uc.uc_mcontext.r14;
