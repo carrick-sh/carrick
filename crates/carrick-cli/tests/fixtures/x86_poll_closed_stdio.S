@@ -14,13 +14,13 @@ _start:
     mov $5, %rsi
     syscall
     cmp $5, %rax
-    jne fail
+    jne fail_dup
 
     mov $SYS_close, %rax
     mov $1, %rdi
     syscall
     test %rax, %rax
-    jne fail
+    jne fail_close
 
     sub $16, %rsp
     movl $5, 0(%rsp)
@@ -35,11 +35,11 @@ _start:
     xor %rdx, %rdx
     syscall
     cmp $2, %rax
-    jne fail
+    jne fail_poll_count
     testw $POLLOUT, 6(%rsp)
-    jz fail
+    jz fail_poll_write
     cmpw $POLLNVAL, 14(%rsp)
-    jne fail
+    jne fail_poll_closed
 
     mov $SYS_write, %rax
     mov $5, %rdi
@@ -47,11 +47,34 @@ _start:
     mov $2, %rdx
     syscall
     cmp $2, %rax
-    jne fail
+    jne fail_write
+    mov $SYS_close, %rax
+    mov $5, %rdi
+    syscall
+    test %rax, %rax
+    jne fail_release
     mov $7, %rdi
     jmp exit
-fail:
-    mov $99, %rdi
+fail_dup:
+    mov $91, %rdi
+    jmp exit
+fail_close:
+    mov $92, %rdi
+    jmp exit
+fail_poll_count:
+    mov $93, %rdi
+    jmp exit
+fail_poll_write:
+    mov $94, %rdi
+    jmp exit
+fail_poll_closed:
+    mov $95, %rdi
+    jmp exit
+fail_write:
+    mov $96, %rdi
+    jmp exit
+fail_release:
+    mov $97, %rdi
 exit:
     mov $SYS_exit_group, %rax
     syscall

@@ -1105,6 +1105,11 @@ pub(crate) fn watch_addr() -> Option<u64> {
 }
 
 impl SyscallDispatcher {
+    /// Captured stdout/stderr append to the run's in-memory sink and have no
+    /// carrier fd whose readiness could represent them.
+    pub fn captured_stdio_is_writable(&self) -> bool {
+        self.fs_view().captured_stdio_is_writable()
+    }
     fn mm_authority(&self) -> arc_swap::Guard<Arc<DispatchMmAuthority>> {
         self.mm_binding.current.load()
     }

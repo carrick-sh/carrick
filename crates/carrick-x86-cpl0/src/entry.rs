@@ -399,6 +399,21 @@ mod kernel {
             carrick_personality_linux::crossing::HostCrossingSet::X86
         }
 
+        fn may_serve_descriptor(&self) -> bool {
+            matches!(self.call.native.raw(), 3 | 32 | 33 | 292)
+        }
+        fn release_host_object(&mut self, binding: carrick_el1_abi::HostObjectBinding, handle: u32, incarnation: u64) -> bool {
+            let saved = (self.frame.rax, self.frame.rdi, self.frame.rsi, self.frame.rdx, self.frame.rcx);
+            self.frame.rax = carrick_el1_abi::HostObjectReleaseCrossing::NUMBER;
+            self.frame.rdi = binding.encoded() as u64;
+            self.frame.rsi = handle as u64;
+            self.frame.rdx = incarnation;
+            self.frame.rcx = carrick_el1_abi::HostObjectReleaseCrossing::FRAME_TAG;
+            doorbell(FORWARD_PORT, self.frame);
+            let acknowledged = self.frame.rax == 0;
+            (self.frame.rax, self.frame.rdi, self.frame.rsi, self.frame.rdx, self.frame.rcx) = saved;
+            acknowledged
+        }
         fn may_serve_poll(&self) -> bool {
             self.call.native.raw() == carrick_syscall_abi::syscall_x86_64::X86_POLL.raw()
         }
@@ -429,7 +444,16 @@ mod kernel {
     }
 
     static EMPTY_NAME_CACHE: InotifyNameCache = InotifyNameCache::new();
-    pub(crate) static FD_MAP: [FdMapSlot; 64] = [const { FdMapSlot::new() }; 64];
+    pub(crate) fn fd_map() -> &'static [FdMapSlot; carrick_el1_abi::FD_MAP_CAPACITY] {
+        // The KVM carrier maps the shared kernel region supervisor-only at
+        // X86_CPL0_REGION_BASE. The fd map is owned by that mapped region,
+        // exactly as it is on ARM, rather than by the image's static data.
+        unsafe {
+            &*((carrick_el1_abi::X86_CPL0_REGION_BASE
+                + carrick_el1_abi::EL1_FD_MAP_OFFSET)
+                as *const [FdMapSlot; carrick_el1_abi::FD_MAP_CAPACITY])
+        }
+    }
     pub(crate) static OPEN_TABLE: [DelegatedOpenFile; 16] = [const { DelegatedOpenFile::new() }; 16];
     pub(crate) static OBJECT_TABLE: [DelegatedFile; 16] = [const { DelegatedFile::new() }; 16];
 
@@ -1926,7 +1950,7 @@ mod kernel {
                     };
                     let route = dispatch::dispatch_syscall_with_native(
                         &mut native, counters, core::slice::from_ref(task),
-                        &FD_MAP, &OBJECT_TABLE, &OPEN_TABLE, &[], &EMPTY_NAME_CACHE,
+                        fd_map(), &OBJECT_TABLE, &OPEN_TABLE, &[], &EMPTY_NAME_CACHE,
                         None::<dispatch::Zone<'_, sched::HardwareCpu, sched::HardwareUserWord>>,
                         None, Some(&GuestLifecycleVenue), Some(&mut process),
                         Some(source), Some(&mut anonymous), cache_lookup,
@@ -1963,8 +1987,33 @@ mod kernel {
                     doorbell(FATAL_PORT, frame); halt();
                 }
                 CompletionRoute::Forward => {
-                    // The shared personality evaluated the x86 crossing set.
-                    doorbell(FORWARD_PORT, frame);
+                    let mut handled_in_ring = false;
+                    if call.native.raw() == 1 {
+                        let table = task.linux.file_table.load(Ordering::Acquire).max(1);
+                        let guest_fd = call.args[0] as i32;
+                        if let Some((handle, _)) = carrick_el1_abi::fd_map_lookup(fd_map(), table, guest_fd)
+                            && let Some(binding) = OPEN_TABLE.get(handle as usize - 1).and_then(DelegatedOpenFile::host_object)
+                            && binding.stdio_fd() != Some(guest_fd)
+                        {
+                            let saved = (frame.rax, frame.rdi, frame.rcx);
+                            frame.rax = carrick_el1_abi::HostObjectWriteCrossing::NUMBER;
+                            frame.rdi = binding.encoded() as u64;
+                            frame.rcx = carrick_el1_abi::HostObjectWriteCrossing::FRAME_TAG;
+                            doorbell(FORWARD_PORT, frame);
+                            let result = frame.rax;
+                            (frame.rdi, frame.rcx) = (saved.1, saved.2);
+                            frame.rax = result;
+                            handled_in_ring = true;
+                        }
+                        if !handled_in_ring && carrick_el1::personality::file_table::is_closed_stdio_tombstone(fd_map(), table, guest_fd) {
+                            frame.rax = (-9_i64) as u64;
+                            handled_in_ring = true;
+                        }
+                    }
+                    if !handled_in_ring {
+                        // The shared personality evaluated the x86 crossing set.
+                        doorbell(FORWARD_PORT, frame);
+                    }
                 }
             }
         }

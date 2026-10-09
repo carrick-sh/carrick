@@ -16,11 +16,206 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
+use crate::lock::SpinLock;
 use carrick_el1_abi::{
     DELEGATED_FLAG_READABLE, DELEGATED_FLAG_WRITABLE, DELEGATED_STATE_GUEST, DelegatedFile,
-    DelegatedOpenFile, FD_MAP_CAPACITY, FdMapSlot, HostBoundFd, HostReadinessEntry, fd_map_lookup,
+    DelegatedOpenFile, FD_MAP_CAPACITY, FdMapSlot, HostBoundFd, HostObjectBinding,
+    HostReadinessEntry, fd_map_lookup,
 };
 use carrick_sched_core::{SlotId, ZoneTables};
+
+// Descriptor mutations and poll snapshots share one short in-ring critical
+// section. No host crossing or blocking wait is made while it is held.
+static FD_MAP_LOCK: SpinLock<()> = SpinLock::new(());
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReleasedDescription {
+    pub handle: u32,
+    pub incarnation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuestDescriptorChange {
+    pub fd: i32,
+    pub release: Option<ReleasedDescription>,
+}
+
+pub const GUEST_FD_CLOEXEC: u32 = 1;
+
+fn last_reference(fd_map: &[FdMapSlot], description: ReleasedDescription) -> bool {
+    !fd_map.iter().take(FD_MAP_CAPACITY).any(|slot| {
+        slot.incarnation.load(Ordering::Acquire) == description.incarnation
+            && slot.handle.load(Ordering::Relaxed) == description.handle
+    })
+}
+
+fn tombstone_index(fd_map: &[FdMapSlot], file_table: u64, fd: i32) -> Option<usize> {
+    if fd < 0 {
+        return None;
+    }
+    fd_map.iter().take(FD_MAP_CAPACITY).position(|slot| {
+        slot.incarnation.load(Ordering::Acquire) == 1
+            && slot.file_table.load(Ordering::Relaxed) == file_table
+            && slot.fd.load(Ordering::Relaxed) == fd as u32
+            && slot.handle.load(Ordering::Relaxed) == 0
+    })
+}
+
+pub fn is_closed_stdio_tombstone(fd_map: &[FdMapSlot], file_table: u64, fd: i32) -> bool {
+    (0..=2).contains(&fd) && tombstone_index(fd_map, file_table, fd).is_some()
+}
+
+/// Remove one guest descriptor; only the last reference yields a host-object
+/// release obligation. The host never owns the guest descriptor number.
+pub fn close_host_binding(
+    fd_map: &[FdMapSlot],
+    file_table: u64,
+    fd: i32,
+) -> Option<GuestDescriptorChange> {
+    let _guard = FD_MAP_LOCK.lock();
+    let (handle, index) = fd_map_lookup(fd_map, file_table, fd)?;
+    if handle == 0 {
+        return None;
+    }
+    let incarnation = fd_map[index].incarnation.load(Ordering::Acquire);
+    fd_map[index].clear();
+    if (0..=2).contains(&fd) {
+        // Preserve an explicit close of bare stdio. A later descriptor lookup
+        // can distinguish it from a table not yet admitted by the carrier.
+        if fd_map[index].try_claim() {
+            fd_map[index].set(file_table, fd as u32, 0, 1);
+        }
+    }
+    let description = ReleasedDescription {
+        handle,
+        incarnation,
+    };
+    Some(GuestDescriptorChange {
+        fd,
+        release: last_reference(fd_map, description).then_some(description),
+    })
+}
+
+/// Linux dup2 on an in-ring host-bound description. A live target is replaced
+/// under the descriptor lock, preserving the source description and clearing
+/// the new descriptor's close-on-exec flag.
+pub fn dup2_host_binding(
+    fd_map: &[FdMapSlot],
+    file_table: u64,
+    old_fd: i32,
+    new_fd: i32,
+    cloexec: bool,
+) -> Option<GuestDescriptorChange> {
+    if new_fd < 0 {
+        return None;
+    }
+    let _guard = FD_MAP_LOCK.lock();
+    let (handle, source_index) = fd_map_lookup(fd_map, file_table, old_fd)?;
+    if handle == 0 {
+        return None;
+    }
+    if old_fd == new_fd {
+        if cloexec {
+            return None;
+        }
+        return Some(GuestDescriptorChange {
+            fd: new_fd,
+            release: None,
+        });
+    }
+    let incarnation = fd_map[source_index].incarnation.load(Ordering::Acquire);
+    let tombstone = tombstone_index(fd_map, file_table, new_fd);
+    if let Some(index) = tombstone {
+        fd_map[index].clear();
+    }
+    let target = fd_map_lookup(fd_map, file_table, new_fd);
+    let release = target.and_then(|(old_handle, index)| {
+        let old_incarnation = fd_map[index].incarnation.load(Ordering::Acquire);
+        fd_map[index].clear();
+        let old = ReleasedDescription {
+            handle: old_handle,
+            incarnation: old_incarnation,
+        };
+        (old_handle != 0 && last_reference(fd_map, old)).then_some(old)
+    });
+    let slot = if let Some((_, index)) = target {
+        let slot = &fd_map[index];
+        if !slot.try_claim() {
+            return None;
+        }
+        slot
+    } else if let Some(index) = tombstone {
+        let slot = &fd_map[index];
+        if !slot.try_claim() {
+            return None;
+        }
+        slot
+    } else {
+        fd_map
+            .iter()
+            .take(FD_MAP_CAPACITY)
+            .find(|slot| slot.try_claim())?
+    };
+    slot.set_with_flags(
+        file_table,
+        new_fd as u32,
+        handle,
+        incarnation,
+        u32::from(cloexec) * GUEST_FD_CLOEXEC,
+    );
+    Some(GuestDescriptorChange {
+        fd: new_fd,
+        release,
+    })
+}
+
+/// Choose the first unused descriptor at or above `min_fd`, sharing the same
+/// open description. The caller enforces the task's RLIMIT_NOFILE ceiling.
+pub fn dup_host_binding(
+    fd_map: &[FdMapSlot],
+    file_table: u64,
+    old_fd: i32,
+    min_fd: i32,
+    max_fd: i32,
+    cloexec: bool,
+) -> Option<GuestDescriptorChange> {
+    if min_fd < 0 || max_fd <= min_fd {
+        return None;
+    }
+    let _guard = FD_MAP_LOCK.lock();
+    let (handle, source_index) = fd_map_lookup(fd_map, file_table, old_fd)?;
+    if handle == 0 {
+        return None;
+    }
+    let incarnation = fd_map[source_index].incarnation.load(Ordering::Acquire);
+    let new_fd = (min_fd..max_fd).find(|fd| fd_map_lookup(fd_map, file_table, *fd).is_none())?;
+    let tombstone = tombstone_index(fd_map, file_table, new_fd);
+    if let Some(index) = tombstone {
+        fd_map[index].clear();
+    }
+    let slot = if let Some(index) = tombstone {
+        &fd_map[index]
+    } else {
+        fd_map
+            .iter()
+            .take(FD_MAP_CAPACITY)
+            .find(|slot| slot.incarnation.load(Ordering::Acquire) == 0)?
+    };
+    if !slot.try_claim() {
+        return None;
+    }
+    slot.set_with_flags(
+        file_table,
+        new_fd as u32,
+        handle,
+        incarnation,
+        u32::from(cloexec) * GUEST_FD_CLOEXEC,
+    );
+    Some(GuestDescriptorChange {
+        fd: new_fd,
+        release: None,
+    })
+}
 
 /// Bounded Linux `struct pollfd`.
 #[repr(C)]
@@ -60,12 +255,15 @@ pub fn admit_stdio(
     if file_table == 0 {
         return;
     }
+    let _guard = FD_MAP_LOCK.lock();
     for (fd, &open) in open_mask.iter().enumerate() {
         if !open {
             continue;
         }
-        let Some(host_fd) = HostBoundFd::new(fd as i32) else {
-            continue;
+        let binding = match fd {
+            0 => HostObjectBinding::STDIN,
+            1 => HostObjectBinding::STDOUT,
+            _ => HostObjectBinding::STDERR,
         };
         let ufd = fd as u32;
         if fd_map_lookup(fd_map, file_table, fd as i32).is_some() {
@@ -92,7 +290,7 @@ pub fn admit_stdio(
             open_file.inode_handle.store(handle, Ordering::Relaxed);
             open_file.inode_generation.store(1, Ordering::Relaxed);
             open_file.offset.store(0, Ordering::Relaxed);
-            open_file.bind_host_fd(host_fd);
+            open_file.bind_host_object(binding);
             open_file
                 .state
                 .store(DELEGATED_STATE_GUEST, Ordering::Release);
@@ -118,6 +316,7 @@ pub fn admit_host_fd(
     if file_table == 0 || guest_fd < 0 {
         return None;
     }
+    let _guard = FD_MAP_LOCK.lock();
     let ufd = guest_fd as u32;
     if fd_map_lookup(fd_map, file_table, guest_fd).is_some() {
         return None;
@@ -167,6 +366,7 @@ pub fn fork_fd_map(fd_map: &[FdMapSlot], parent_table: u64, child_table: u64) ->
     if parent_table == 0 || child_table == 0 || parent_table == child_table {
         return false;
     }
+    let _guard = FD_MAP_LOCK.lock();
     if fd_map.iter().take(FD_MAP_CAPACITY).any(|slot| {
         slot.incarnation.load(Ordering::Acquire) != 0
             && slot.file_table.load(Ordering::Relaxed) == child_table
@@ -182,7 +382,8 @@ pub fn fork_fd_map(fd_map: &[FdMapSlot], parent_table: u64, child_table: u64) ->
         {
             let fd = slot.fd.load(Ordering::Relaxed);
             let handle = slot.handle.load(Ordering::Relaxed);
-            copies.push((fd, handle, inc));
+            let flags = slot.fd_flags.load(Ordering::Relaxed);
+            copies.push((fd, handle, inc, flags));
         }
     }
     let mut claimed = Vec::new();
@@ -201,8 +402,8 @@ pub fn fork_fd_map(fd_map: &[FdMapSlot], parent_table: u64, child_table: u64) ->
             return false;
         }
     }
-    for ((fd, handle, inc), index) in copies.into_iter().zip(claimed) {
-        fd_map[index].set(child_table, fd, handle, inc);
+    for ((fd, handle, inc, flags), index) in copies.into_iter().zip(claimed) {
+        fd_map[index].set_with_flags(child_table, fd, handle, inc, flags);
     }
     true
 }
@@ -212,6 +413,7 @@ pub fn retire_fd_map(fd_map: &[FdMapSlot], file_table: u64) {
     if file_table == 0 {
         return;
     }
+    let _guard = FD_MAP_LOCK.lock();
     for slot in fd_map.iter().take(FD_MAP_CAPACITY) {
         if slot.file_table.load(Ordering::Acquire) == file_table
             && slot.incarnation.load(Ordering::Acquire) != 0
@@ -231,6 +433,7 @@ pub fn host_readiness_entries(
     file_table: u64,
     pollfds: &[PollFd],
 ) -> Option<Vec<HostReadinessEntry>> {
+    let _guard = FD_MAP_LOCK.lock();
     let mut host_entries = Vec::new();
     for (index, entry) in pollfds.iter().enumerate() {
         if entry.fd < 0 {
@@ -240,14 +443,17 @@ pub fn host_readiness_entries(
             continue;
         };
         if handle == 0 {
-            return None;
+            continue;
         }
-        let host_fd = open_table
+        let binding = open_table
             .get((handle - 1) as usize)
             .filter(|open| open.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST)
-            .and_then(DelegatedOpenFile::host_fd)?;
+            .and_then(|open| {
+                open.host_object()
+                    .or_else(|| open.host_fd().map(HostObjectBinding::from_host_fd))
+            })?;
         host_entries.push(HostReadinessEntry {
-            host_fd,
+            binding,
             events: entry.events,
             revents: 0,
             poll_index: index as u32,
@@ -326,6 +532,7 @@ pub fn resolve_poll_with_host_readiness(
     pollfds: &mut [PollFd],
     host_entries: Option<&[HostReadinessEntry]>,
 ) -> i32 {
+    let _guard = FD_MAP_LOCK.lock();
     let mut ready_count = 0;
     let mut host_cursor = host_entries.unwrap_or(&[]).iter().peekable();
     for (index, entry) in pollfds.iter_mut().enumerate() {
@@ -349,8 +556,10 @@ pub fn resolve_poll_with_host_readiness(
                     0
                 } else {
                     open_file
-                        .host_fd()
-                        .map_or(0, |host_fd| query_host_readiness(host_fd.raw(), flags))
+                        .host_object()
+                        .and_then(|binding| binding.stdio_fd())
+                        .or_else(|| open_file.host_fd().map(HostBoundFd::raw))
+                        .map_or(0, |host_fd| query_host_readiness(host_fd, flags))
                 };
                 let mut revents = entry.events & readiness;
                 revents |= readiness & (LINUX_POLLERR | LINUX_POLLHUP | LINUX_POLLNVAL);
@@ -508,9 +717,22 @@ mod tests {
         let (fd_map, open_table, object_table) = setup_tables();
         admit_stdio(&fd_map, &open_table, &object_table, 10, [true, true, true]);
         let original = fd_map_lookup(&fd_map, 10, 1).unwrap().0;
-        assert_eq!(dup2_host_binding(&fd_map, 10, 1, 5), Some(5));
+        assert_eq!(
+            dup2_host_binding(&fd_map, 10, 1, 5, false),
+            Some(GuestDescriptorChange {
+                fd: 5,
+                release: None
+            })
+        );
         assert_eq!(fd_map_lookup(&fd_map, 10, 5).unwrap().0, original);
-        assert_eq!(close_host_binding(&fd_map, 10, 1), Some(false));
+        assert_eq!(
+            close_host_binding(&fd_map, 10, 1),
+            Some(GuestDescriptorChange {
+                fd: 1,
+                release: None
+            })
+        );
+        assert!(is_closed_stdio_tombstone(&fd_map, 10, 1));
         assert_eq!(fd_map_lookup(&fd_map, 10, 1), None);
         assert_eq!(fd_map_lookup(&fd_map, 10, 5).unwrap().0, original);
         let mut entries = [
@@ -526,7 +748,7 @@ mod tests {
             },
         ];
         let readiness = [HostReadinessEntry {
-            host_fd: HostBoundFd::new(1).unwrap(),
+            binding: HostObjectBinding::STDOUT,
             events: LINUX_POLLOUT,
             revents: LINUX_POLLOUT,
             poll_index: 0,
@@ -543,6 +765,48 @@ mod tests {
         assert_eq!(ready, 2);
         assert_eq!(entries[0].revents, LINUX_POLLOUT);
         assert_eq!(entries[1].revents, LINUX_POLLNVAL);
+        assert_eq!(
+            close_host_binding(&fd_map, 10, 5),
+            Some(GuestDescriptorChange {
+                fd: 5,
+                release: Some(ReleasedDescription {
+                    handle: original,
+                    incarnation: 1,
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn dup3_cloexec_is_per_descriptor_and_fork_inherits_it() {
+        let (fd_map, open_table, object_table) = setup_tables();
+        admit_stdio(
+            &fd_map,
+            &open_table,
+            &object_table,
+            10,
+            [false, true, false],
+        );
+        assert_eq!(dup2_host_binding(&fd_map, 10, 1, 1, true), None);
+        assert_eq!(dup2_host_binding(&fd_map, 10, 1, 5, true).unwrap().fd, 5);
+        let (_, index) = fd_map_lookup(&fd_map, 10, 5).unwrap();
+        assert_eq!(
+            fd_map[index].fd_flags.load(Ordering::Acquire),
+            GUEST_FD_CLOEXEC
+        );
+        let (_, original_index) = fd_map_lookup(&fd_map, 10, 1).unwrap();
+        assert_eq!(fd_map[original_index].fd_flags.load(Ordering::Acquire), 0);
+        assert!(fork_fd_map(&fd_map, 10, 11));
+        let (_, child_index) = fd_map_lookup(&fd_map, 11, 5).unwrap();
+        assert_eq!(
+            fd_map[child_index].fd_flags.load(Ordering::Acquire),
+            GUEST_FD_CLOEXEC
+        );
+        assert_eq!(
+            dup2_host_binding(&fd_map, 11, 1, 5, false).unwrap().release,
+            None
+        );
+        assert_eq!(fd_map[child_index].fd_flags.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -898,9 +1162,9 @@ mod tests {
         ];
         let mut entries = host_readiness_entries(&fd_map, &open_table, 10, &fds).unwrap();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].host_fd.raw(), 0);
+        assert_eq!(entries[0].binding.host_fd().map(HostBoundFd::raw), Some(0));
         assert_eq!(entries[0].poll_index, 0);
-        assert_eq!(entries[1].host_fd.raw(), 0);
+        assert_eq!(entries[1].binding.host_fd().map(HostBoundFd::raw), Some(0));
         assert_eq!(entries[1].poll_index, 2);
         entries[0].revents = LINUX_POLLIN;
         entries[1].revents = LINUX_POLLIN;

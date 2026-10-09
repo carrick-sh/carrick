@@ -497,6 +497,7 @@ dependencies = [
  "carrick-personality-linux",
  "carrick-sched-core",
  "carrick-signal-core",
+ "carrick-syscall-abi",
  "carrick-test-support",
  "libc",
  "zerocopy",

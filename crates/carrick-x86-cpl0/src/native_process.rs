@@ -75,7 +75,7 @@ pub(super) fn admit_root(
     *retained = Some(Box::leak(Box::new(owner)));
     let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
     carrick_el1::personality::file_table::admit_stdio(
-        &super::FD_MAP,
+        super::fd_map(),
         &super::OPEN_TABLE,
         &super::OBJECT_TABLE,
         file_table,
@@ -520,12 +520,12 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         issued
     }
     fn fork_fd_table(&mut self, parent_table: u64, child_table: u64) -> Result<(), NativeProcessError> {
-        carrick_el1::personality::file_table::fork_fd_map(&super::FD_MAP, parent_table, child_table)
+        carrick_el1::personality::file_table::fork_fd_map(super::fd_map(), parent_table, child_table)
             .then_some(())
             .ok_or(NativeProcessError::Exhausted)
     }
     fn retire_fd_table(&mut self, table: u64) {
-        carrick_el1::personality::file_table::retire_fd_map(&super::FD_MAP, table);
+        carrick_el1::personality::file_table::retire_fd_map(super::fd_map(), table);
     }
 }
 

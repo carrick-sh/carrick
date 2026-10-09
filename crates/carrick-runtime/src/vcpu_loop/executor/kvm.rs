@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 
+use carrick_guest_mem::GuestMemory;
 use carrick_hal::TrapError;
 use carrick_hal::guest_arch_binding::{GuestArchBinding, core_arch::TaskIdentity};
 use carrick_hal::threaded::GuestCpuState;
@@ -46,6 +47,7 @@ pub(crate) struct KvmPersistentExecutorFactory {
     stats: Arc<KvmForwardStats>,
     scheduler: Arc<Scheduler>,
     first_forward_hook: Arc<Mutex<Option<KvmFirstForwardHook>>>,
+    host_objects: Arc<Mutex<[u32; 3]>>,
 }
 
 pub type KvmFirstForwardHook =
@@ -111,6 +113,7 @@ impl KvmPersistentExecutorFactory {
             stats,
             scheduler,
             first_forward_hook: Arc::new(Mutex::new(None)),
+            host_objects: Arc::new(Mutex::new([1; 3])),
         }
     }
 
@@ -150,6 +153,7 @@ impl PersistentExecutorFactory for KvmPersistentExecutorFactory {
             loaded_generation: None,
             completion_sent: false,
             first_forward_hook: Arc::clone(&self.first_forward_hook),
+            host_objects: Arc::clone(&self.host_objects),
             idle_kick: carrick_vmm_kvm::KvmKickHandle::for_current_thread(),
         })
     }
@@ -170,6 +174,7 @@ pub(crate) struct KvmPersistentExecutor {
     loaded_generation: Option<ExecutionGeneration>,
     completion_sent: bool,
     first_forward_hook: Arc<Mutex<Option<KvmFirstForwardHook>>>,
+    host_objects: Arc<Mutex<[u32; 3]>>,
 }
 
 struct RetainedForward {
@@ -203,12 +208,26 @@ impl KvmPersistentExecutor {
     fn sample_host_readiness(
         venue: &mut carrick_vmm_kvm::cpl0_boot::ForwardVenue<'_>,
         request: HostReadinessRequest,
+        captured_stdio: bool,
     ) -> Result<HostReadinessStep, TrapError> {
         venue.with_host_readiness_entries(request.address, request.count, |entries| {
             let mut pollfds: Vec<libc::pollfd> = entries
                 .iter()
                 .map(|entry| libc::pollfd {
-                    fd: entry.host_fd.raw(),
+                    fd: if captured_stdio && entry.binding.stdio_fd().is_some_and(|fd| fd > 0) {
+                        -1
+                    } else {
+                        entry
+                            .binding
+                            .stdio_fd()
+                            .or_else(|| {
+                                entry
+                                    .binding
+                                    .host_fd()
+                                    .map(carrick_el1_abi::HostBoundFd::raw)
+                            })
+                            .unwrap_or(-1)
+                    },
                     events: entry.events,
                     revents: 0,
                 })
@@ -223,14 +242,25 @@ impl KvmPersistentExecutor {
             }
             let mut ready = 0i64;
             for (entry, pollfd) in entries.iter_mut().zip(&pollfds) {
-                entry.revents = pollfd.revents;
-                ready += i64::from(pollfd.revents != 0);
+                entry.revents = if captured_stdio
+                    && pollfd.fd < 0
+                    && entry.binding.stdio_fd().is_some_and(|fd| fd > 0)
+                {
+                    entry.events & libc::POLLOUT
+                } else {
+                    pollfd.revents
+                };
+                ready += i64::from(entry.revents != 0);
             }
             if ready > 0 {
                 Ok(HostReadinessStep::Ready(ready))
             } else {
                 Ok(HostReadinessStep::Wait(
-                    pollfds.into_iter().map(|fd| (fd.fd, fd.events)).collect(),
+                    pollfds
+                        .into_iter()
+                        .filter(|fd| fd.fd >= 0)
+                        .map(|fd| (fd.fd, fd.events))
+                        .collect(),
                 ))
             }
         })?
@@ -406,7 +436,11 @@ impl PersistentExecutor for KvmPersistentExecutor {
                                         Ok(DispatchOutcome::Returned { value })
                                     }
                                     ContinuationCompletion::Redispatch => {
-                                        match Self::sample_host_readiness(venue, readiness)? {
+                                        match Self::sample_host_readiness(
+                                            venue,
+                                            readiness,
+                                            dispatcher.captured_stdio_is_writable(),
+                                        )? {
                                             HostReadinessStep::Ready(value) => {
                                                 Ok(DispatchOutcome::Returned { value })
                                             }
@@ -513,6 +547,70 @@ impl PersistentExecutor for KvmPersistentExecutor {
                         .map_err(|_| TrapError::Hypervisor("KVM dispatcher poisoned".into()))?;
                     let (decision, token) =
                         self.physical.capture_forward(task, |venue, frame| {
+                            if frame.rax == carrick_el1_abi::HostObjectReleaseCrossing::NUMBER
+                                && frame.rcx
+                                    == carrick_el1_abi::HostObjectReleaseCrossing::FRAME_TAG
+                            {
+                                let binding = carrick_el1_abi::HostObjectBinding::from_encoded(
+                                    frame.rdi as u32,
+                                )
+                                .filter(|_| frame.rdi <= u64::from(u32::MAX))
+                                .and_then(carrick_el1_abi::HostObjectBinding::stdio_fd)
+                                .ok_or_else(|| {
+                                    TrapError::Hypervisor(
+                                        "invalid host object release binding".into(),
+                                    )
+                                })?;
+                                if frame.rsi != binding as u64 + 1 || frame.rdx != 1 {
+                                    return Err(TrapError::Hypervisor(
+                                        "host object release identity mismatch".into(),
+                                    ));
+                                }
+                                let mut refs = self.host_objects.lock().map_err(|_| {
+                                    TrapError::Hypervisor(
+                                        "host object release owner poisoned".into(),
+                                    )
+                                })?;
+                                let count = &mut refs[binding as usize];
+                                *count = count.checked_sub(1).ok_or_else(|| {
+                                    TrapError::Hypervisor("duplicate host object release".into())
+                                })?;
+                                return Ok(ForwardDecision::Immediate(
+                                    InitialSyscallDisposition::Return(0),
+                                ));
+                            }
+                            if frame.rax == carrick_el1_abi::HostObjectWriteCrossing::NUMBER
+                                && frame.rcx == carrick_el1_abi::HostObjectWriteCrossing::FRAME_TAG
+                            {
+                                let binding = carrick_el1_abi::HostObjectBinding::from_encoded(
+                                    frame.rdi as u32,
+                                )
+                                .filter(|_| frame.rdi <= u64::from(u32::MAX))
+                                .and_then(carrick_el1_abi::HostObjectBinding::stdio_fd)
+                                .filter(|fd| *fd == 1 || *fd == 2)
+                                .ok_or_else(|| {
+                                    TrapError::Hypervisor(
+                                        "invalid host object write binding".into(),
+                                    )
+                                })?;
+                                let length = usize::try_from(frame.rdx).map_err(|_| {
+                                    TrapError::Hypervisor(
+                                        "host object write length overflow".into(),
+                                    )
+                                })?;
+                                let bytes = venue.read_bytes_prefix(frame.rsi, length).map_err(
+                                    |error| {
+                                        TrapError::Hypervisor(format!(
+                                            "host object write copy: {error}"
+                                        ))
+                                    },
+                                )?;
+                                return Ok(ForwardDecision::Immediate(
+                                    InitialSyscallDisposition::Return(
+                                        dispatcher.forward_stdio_bytes(binding, &bytes),
+                                    ),
+                                ));
+                            }
                             if frame.rax == carrick_el1_abi::HostReadinessCrossing::NUMBER
                                 && carrick_el1_abi::HostReadinessCrossing::is_crossing(frame.rcx)
                             {
@@ -533,7 +631,11 @@ impl PersistentExecutor for KvmPersistentExecutor {
                                     .record(crate::prepare::InitialForwardClass::Host(
                                         "readiness",
                                     ))?;
-                                return match Self::sample_host_readiness(venue, readiness)? {
+                                return match Self::sample_host_readiness(
+                                    venue,
+                                    readiness,
+                                    dispatcher.captured_stdio_is_writable(),
+                                )? {
                                     HostReadinessStep::Ready(value) => {
                                         Ok(ForwardDecision::Immediate(
                                             InitialSyscallDisposition::Return(value),

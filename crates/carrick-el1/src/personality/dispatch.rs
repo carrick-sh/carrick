@@ -40,6 +40,17 @@ pub trait GuestDispatchFrame: SyscallFrame {
     fn may_serve_poll(&self) -> bool {
         false
     }
+    fn may_serve_descriptor(&self) -> bool {
+        false
+    }
+    fn release_host_object(
+        &mut self,
+        _binding: carrick_el1_abi::HostObjectBinding,
+        _handle: u32,
+        _incarnation: u64,
+    ) -> bool {
+        false
+    }
     fn arm_frame(&mut self) -> Option<&mut TrapFrame>;
     fn arm_frame_ref(&self) -> Option<&TrapFrame>;
     fn arm_scheduler(&self) -> bool;
@@ -574,6 +585,9 @@ impl<
     fn may_serve_poll(&self) -> bool {
         self.frame.may_serve_poll()
     }
+    fn may_serve_descriptor(&self) -> bool {
+        self.frame.may_serve_descriptor()
+    }
     fn take_handoff_receipt(&mut self) -> Option<carrick_el1_abi::EntryHandoffReceipt<Context>> {
         self.process
             .as_deref_mut()
@@ -765,6 +779,51 @@ impl<
             }
             FamilyCompletion::Complete(ready as i64)
         }
+    }
+    fn descriptor(&mut self) -> FamilyCompletion {
+        let Some(task) = self.task() else {
+            return FamilyCompletion::Forward;
+        };
+        let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
+        let ordinal = self.frame.canonical_ordinal().raw();
+        let old = self.frame.argument(0).unwrap_or(0) as i32;
+        let result = match ordinal {
+            23 => super::file_table::dup_host_binding(self.fd_map, file_table, old, 0, 1024, false),
+            24 => {
+                let new = self.frame.argument(1).unwrap_or(0) as i32;
+                let flags = self.frame.argument(2).unwrap_or(0);
+                if flags & !0x80000 != 0 || old == new {
+                    return FamilyCompletion::Complete(-22);
+                }
+                super::file_table::dup2_host_binding(self.fd_map, file_table, old, new, flags != 0)
+            }
+            nr if nr == carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2 => {
+                let new = self.frame.argument(1).unwrap_or(0) as i32;
+                super::file_table::dup2_host_binding(self.fd_map, file_table, old, new, false)
+            }
+            57 => super::file_table::close_host_binding(self.fd_map, file_table, old),
+            _ => return FamilyCompletion::Forward,
+        };
+        let Some(change) = result else {
+            return FamilyCompletion::Complete(-9);
+        };
+        if let Some(release) = change.release {
+            let binding = self
+                .open_table
+                .get(release.handle as usize - 1)
+                .and_then(DelegatedOpenFile::host_object);
+            if !binding.is_some_and(|binding| {
+                self.frame
+                    .release_host_object(binding, release.handle, release.incarnation)
+            }) {
+                return FamilyCompletion::Forward;
+            }
+        }
+        FamilyCompletion::Complete(if ordinal == 57 {
+            0
+        } else {
+            i64::from(change.fd)
+        })
     }
     fn original_argument0(&self) -> u64 {
         self.frame.argument(0).unwrap_or(0)
