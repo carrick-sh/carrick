@@ -466,7 +466,10 @@ impl MemState {
         // Host residency facts now describe the incarnations just admitted
         // (a fork child's inherited facts already name them).
         for &(start, end) in owned {
-            for piece in self.root_first_touch_pieces(start, end) {
+            let pieces = self
+                .try_root_first_touch_pieces(start, end)
+                .unwrap_or_else(|refusal| broken_root("seal delegated pieces", refusal));
+            for piece in pieces {
                 self.resident
                     .hand_over(piece.range, super::ResidencyOwner::Host, piece.owner());
             }
@@ -1264,7 +1267,9 @@ impl MemState {
         let root = delegated.root.clone();
         // Captured before the demotion retires their incarnations: the
         // residency facts to hand over name them.
-        let pieces = self.root_first_touch_pieces(start, end);
+        let pieces = self
+            .try_root_first_touch_pieces(start, end)
+            .unwrap_or_else(|refusal| broken_root("demote root pieces", refusal));
         let mut demoted = Vec::new();
         root.with_root(|model| {
             model.observe_range(reservation_range(start, end)?, &mut |mapping| {
