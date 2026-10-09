@@ -287,6 +287,9 @@ pub const GRANT_OP_FORK_STOCK: u64 = 3;
 /// Operation code for root container exit notification (HVC #6).
 pub const GRANT_OP_ROOT_EXIT: u64 = 4;
 
+/// Operation code for quarantining a retired child MM (HVC #6).
+pub const GRANT_OP_CHILD_RETIRE: u64 = 5;
+
 /// Metadata grant hypercall outcome: successful extent allocation or return.
 pub const METADATA_GRANT_SUCCESS: u64 = 0;
 

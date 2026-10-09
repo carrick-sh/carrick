@@ -16,7 +16,7 @@ use carrick_guest_arch::{AddressContext, Asid, KernelVa, RootGpa};
 use core::num::NonZeroU64;
 
 #[allow(unused_imports)]
-pub use crate::{GRANT_OP_FORK_STOCK, GRANT_OP_ROOT_EXIT};
+pub use crate::{GRANT_OP_CHILD_RETIRE, GRANT_OP_FORK_STOCK, GRANT_OP_ROOT_EXIT};
 
 /// x86 synchronous I/O port for physical fork stock loans and settlements.
 pub const FORK_STOCK_PORT: u16 = 0xd2;
@@ -489,6 +489,47 @@ impl NativeRootExit {
 
     pub fn from_raw_words(words: [u64; 8]) -> Self {
         Self { words }
+    }
+}
+
+/// A child process has left the shared owner graph. Its physical table pages
+/// enter quarantine until no live slot owns the MM and its ASID is flushed.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub struct NativeChildRetire {
+    pub words: [u64; 8],
+}
+
+impl NativeChildRetire {
+    pub const MAGIC: u64 = 0x4352_4348_5245_5449;
+
+    pub fn new(binding: ExecutionBinding, context: AddressContext<RootGpa>) -> Option<Self> {
+        (binding.issued() && binding.mm.raw() == context.mm.raw().get()).then_some(Self {
+            words: [
+                Self::MAGIC,
+                binding.task.raw(),
+                binding.generation.raw(),
+                binding.mm.raw(),
+                binding.thread_generation.raw(),
+                context.root.address().raw(),
+                context.generation.raw().get(),
+                0,
+            ],
+        })
+    }
+
+    pub fn matches(&self, binding: ExecutionBinding, context: AddressContext<RootGpa>) -> bool {
+        self.words
+            == [
+                Self::MAGIC,
+                binding.task.raw(),
+                binding.generation.raw(),
+                binding.mm.raw(),
+                binding.thread_generation.raw(),
+                context.root.address().raw(),
+                context.generation.raw().get(),
+                0,
+            ]
     }
 }
 

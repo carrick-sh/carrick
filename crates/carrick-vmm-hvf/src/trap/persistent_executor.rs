@@ -962,6 +962,7 @@ impl HvfVmState {
             &mut self.mappings,
             custody,
         )?);
+        crate::metadata_grant::provision_boot_fork_stock(&carrier_mappings.custody)?;
 
         let spec = PersistentExecutorSpec {
             vm: (*self._vm).clone(),
