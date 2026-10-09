@@ -1375,24 +1375,9 @@ where
                     )));
                 }
             };
-        // A restart decision is only MEANINGFUL when this resume itself
-        // evaluated a signal (the Signal/ReservedSignal event path, which
-        // weighs SA_RESTART against the continuation's family and progress).
-        // A Ready->Redispatch resume carries the default NoRestart, and
-        // stashing that as Some(..) VETOED the syscall-boundary restart
-        // predicates for whatever the REDISPATCHED syscall did next: wait4
-        // re-dispatched after a task wake, hit the pre-park deliverable-signal
-        // gate, returned EINTR — and the stale Some(NoRestart) overrode the
-        // all-true SA_RESTART predicates, surfacing EINTR to a guest whose
-        // handler asked for restart (waitrestart scenario A).
-        self.continuation_restart = match result.completion {
-            carrick_kernel::kernel::continuation::ContinuationCompletion::Redispatch
-            | carrick_kernel::kernel::continuation::ContinuationCompletion::RedispatchWithPartial(
-                _,
-            ) => None,
-            _ => Some(result.restart()),
-        };
-        self.reserved_signal = result.take_reserved_signal();
+        let effects = result.take_resume_effects();
+        self.continuation_restart = effects.restart;
+        self.reserved_signal = effects.reserved_signal;
 
         carrick_kernel::kernel::continuation::fold_continuation_completion(
             result.completion,
