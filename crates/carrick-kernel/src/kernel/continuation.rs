@@ -2821,7 +2821,26 @@ pub struct ContinuationResult {
     reserved_signal: Option<ReservedSignal>,
 }
 
+/// Signal and restart effects consumed once by the execution lane after a
+/// continuation resumes. Redispatch leaves the next syscall's own restart
+/// predicates in control.
+pub struct ContinuationResumeEffects {
+    pub restart: Option<RestartDecision>,
+    pub reserved_signal: Option<ReservedSignal>,
+}
+
 impl ContinuationResult {
+    pub fn take_resume_effects(&mut self) -> ContinuationResumeEffects {
+        let restart = match self.completion {
+            ContinuationCompletion::Redispatch
+            | ContinuationCompletion::RedispatchWithPartial(_) => None,
+            _ => Some(self.restart),
+        };
+        ContinuationResumeEffects {
+            restart,
+            reserved_signal: self.reserved_signal.take(),
+        }
+    }
     pub const fn restart(&self) -> RestartDecision {
         self.restart
     }
