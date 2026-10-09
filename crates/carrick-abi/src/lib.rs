@@ -99,6 +99,8 @@
 //! stream with explicit padding fields; the zerocopy derives let the dispatcher
 //! reinterpret guest bytes as these types without an unaligned-read UB hazard.
 
+#![no_std]
+
 pub use carrick_syscall_abi::*;
 
 use ::zerocopy::{Immutable, IntoBytes};

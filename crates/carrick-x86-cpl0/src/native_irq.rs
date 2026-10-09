@@ -50,6 +50,7 @@ core::arch::global_asm!(
     "sub rsp, 896",
     "and rsp, -64",
     "mov r13d, edi",
+    "cld", "xor eax, eax", "mov rdi, rsp", "mov ecx, 104", "rep stosq",
     "mov rdi, rsp",
     "call carrick_x86_save_extended_state",
     "mov edi, r13d",
