@@ -165,7 +165,7 @@ impl core::fmt::Debug for Prepared<'_> {
 }
 
 pub struct Born<'a> {
-    pub prepared: Prepared<'a>,
+    pub prepared: Box<Prepared<'a>>,
 }
 
 impl core::fmt::Debug for Born<'_> {
@@ -441,7 +441,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     for Aarch64NativeProcessService<'a, X>
 {
     type Mm = Mm;
-    type PreparedMm = Prepared<'a>;
+    type PreparedMm = Box<Prepared<'a>>;
     type Born = Box<Born<'a>>;
 
     fn prepare_mm(
@@ -566,9 +566,12 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 .ok_or(NativeProcessError::Exhausted)?
                 .max(4096),
         };
-        let mut exchange = ForkStockExchange::new(request).ok_or(NativeProcessError::Invalid)?;
-        self.crossing
-            .cross_fork_stock(&raw mut exchange as *mut _ as u64, u64::from(self.worker()))?;
+        let mut exchange =
+            Box::new(ForkStockExchange::new(request).ok_or(NativeProcessError::Invalid)?);
+        self.crossing.cross_fork_stock(
+            &raw mut *exchange as *mut _ as u64,
+            u64::from(self.worker()),
+        )?;
         let loan = exchange
             .take(request)
             .ok_or(NativeProcessError::Stale)?
@@ -663,14 +666,14 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             .ok_or(NativeProcessError::Stale)?,
             generation: ContextGeneration::new(completion.child.incarnation()),
         };
-        Ok(Prepared {
+        Ok(Box::new(Prepared {
             loan,
             child,
             words: live,
             address,
             ttbr0,
             custody,
-        })
+        }))
     }
 
     fn prepared_mm(&self, prepared: &Self::PreparedMm) -> Self::Mm {

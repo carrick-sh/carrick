@@ -286,7 +286,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                                 }),
                                 ipc::guest_venue(frame.slot as u32).as_ref(),
                                 lifecycle::guest_venue(),
-                                Some(&mut process),
+                                Some(&mut *process),
                                 Some(source),
                                 None,
                                 |handle| {
