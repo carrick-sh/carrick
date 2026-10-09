@@ -381,6 +381,33 @@ impl PersistentCarrierMappings {
                 authority.mappings.len()
             )));
         }
+        if let Some(el1) = authority
+            .mappings
+            .iter()
+            .find(|mapping| mapping.start == carrick_mem::memory::LINUX_EL1_KERNEL_BASE)
+        {
+            let generation = authority.custody.live_generation().ok_or_else(|| {
+                TrapError::Hypervisor("EL1 region has no live carrier generation".to_owned())
+            })?;
+            authority
+                .custody
+                .register_stage2_record(CarrierStage2RecordSpec {
+                    vm_generation: generation,
+                    ipa: el1.physical_ipa,
+                    len: el1.physical_size,
+                    host_addr: el1.host_addr as usize,
+                    mapped: true,
+                    backend_map_installed: true,
+                    release_ipa: false,
+                    perms: u64::from(el1.perms),
+                    logical_owner: None,
+                })
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "register fixed EL1 region in carrier stage-2 table: {error:?}"
+                    ))
+                })?;
+        }
         Ok(authority)
     }
 
