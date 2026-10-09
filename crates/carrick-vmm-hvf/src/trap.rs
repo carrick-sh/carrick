@@ -346,14 +346,12 @@ pub fn el1_frame_grant_unreturned() -> Vec<String> {
 pub fn fork_stock_returned() -> u64 {
     let carrier = persistent_carrier_cell().lock();
     match carrier.as_ref() {
-        Some(PersistentCarrierCellEntry::Published(carrier)) => {
-            carrier
-                .carrier_foreign_mm_transport
-                .custody
-                .fork_stock
-                .lock()
-                .returned_children
-        }
+        Some(PersistentCarrierCellEntry::Published(carrier)) => carrier
+            .carrier_foreign_mm_transport
+            .custody
+            .fork_stock
+            .lock()
+            .returned_children(),
         _ => 0,
     }
 }
