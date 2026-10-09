@@ -141,28 +141,6 @@ pub fn run_prepared_kvm_pool(
     dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
     max_traps: usize,
 ) -> Result<PreparedKvmPoolOutcome, RuntimeError> {
-    run_prepared_kvm_pool_inner(machine, root_context, dispatcher, max_traps, None)
-}
-
-#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
-pub fn run_prepared_kvm_pool_with_first_forward_hook(
-    machine: carrick_vmm_kvm::cpl0_boot::Cpl0Carrier,
-    root_context: carrick_kernel::kernel::KernelContext,
-    dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
-    max_traps: usize,
-    hook: crate::vcpu_loop::executor::kvm::KvmFirstForwardHook,
-) -> Result<PreparedKvmPoolOutcome, RuntimeError> {
-    run_prepared_kvm_pool_inner(machine, root_context, dispatcher, max_traps, Some(hook))
-}
-
-#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
-fn run_prepared_kvm_pool_inner(
-    machine: carrick_vmm_kvm::cpl0_boot::Cpl0Carrier,
-    root_context: carrick_kernel::kernel::KernelContext,
-    dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
-    max_traps: usize,
-    first_forward_hook: Option<crate::vcpu_loop::executor::kvm::KvmFirstForwardHook>,
-) -> Result<PreparedKvmPoolOutcome, RuntimeError> {
     use crate::vcpu_loop::executor::{self, PersistentTaskBinding};
     use carrick_hal::threaded::GuestCpuState;
     use carrick_kernel::kernel::objects::MigratableTaskState;
@@ -213,9 +191,6 @@ fn run_prepared_kvm_pool_inner(
         Arc::clone(&stats),
         Arc::clone(&scheduler),
     ));
-    if let Some(hook) = first_forward_hook {
-        factory.install_first_forward_hook(hook)?;
-    }
     let pool = executor::ExecutorPool::start(
         executor::ExecutorPoolConfig {
             bound_workers: 2,

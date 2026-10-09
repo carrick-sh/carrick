@@ -46,12 +46,8 @@ pub(crate) struct KvmPersistentExecutorFactory {
     max_exits: usize,
     stats: Arc<KvmForwardStats>,
     scheduler: Arc<Scheduler>,
-    first_forward_hook: Arc<Mutex<Option<KvmFirstForwardHook>>>,
     host_objects: Arc<Mutex<[u32; 3]>>,
 }
-
-pub type KvmFirstForwardHook =
-    Box<dyn FnOnce(&mut ProductionCpuLease) -> Result<(), TrapError> + Send>;
 
 #[derive(Debug, PartialEq, Eq)]
 enum KvmResumeEffect {
@@ -177,25 +173,8 @@ impl KvmPersistentExecutorFactory {
             max_exits,
             stats,
             scheduler,
-            first_forward_hook: Arc::new(Mutex::new(None)),
             host_objects: Arc::new(Mutex::new([1; 3])),
         }
-    }
-
-    pub(crate) fn install_first_forward_hook(
-        &self,
-        hook: KvmFirstForwardHook,
-    ) -> Result<(), TrapError> {
-        let mut slot = self
-            .first_forward_hook
-            .lock()
-            .map_err(|_| TrapError::Hypervisor("KVM fixture hook poisoned".into()))?;
-        if slot.replace(hook).is_some() {
-            return Err(TrapError::Hypervisor(
-                "KVM fixture hook already installed".into(),
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -217,7 +196,6 @@ impl PersistentExecutorFactory for KvmPersistentExecutorFactory {
             task: None,
             loaded_generation: None,
             completion_sent: false,
-            first_forward_hook: Arc::clone(&self.first_forward_hook),
             host_objects: Arc::clone(&self.host_objects),
             idle_kick: carrick_vmm_kvm::KvmKickHandle::for_current_thread(),
         })
@@ -238,7 +216,6 @@ pub(crate) struct KvmPersistentExecutor {
     task: Option<TaskIdentity>,
     loaded_generation: Option<ExecutionGeneration>,
     completion_sent: bool,
-    first_forward_hook: Arc<Mutex<Option<KvmFirstForwardHook>>>,
     host_objects: Arc<Mutex<[u32; 3]>>,
 }
 
@@ -849,16 +826,6 @@ impl PersistentExecutor for KvmPersistentExecutor {
                                 )),
                             }
                         })?;
-                    {
-                        let hook = self
-                            .first_forward_hook
-                            .lock()
-                            .map_err(|_| TrapError::Hypervisor("KVM fixture hook poisoned".into()))?
-                            .take();
-                        if let Some(hook) = hook {
-                            hook(&mut self.physical)?;
-                        }
-                    }
                     drop(dispatcher);
                     match decision {
                         ForwardDecision::Blocked(request, outcome) => {

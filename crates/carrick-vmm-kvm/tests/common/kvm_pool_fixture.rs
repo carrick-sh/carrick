@@ -28,42 +28,6 @@ pub fn try_run_pool_fixture_with(
     carrick_runtime::prepare::PreparedKvmPoolOutcome,
     carrick_kernel::run_result::RuntimeError,
 > {
-    try_run_pool_fixture_inner(elf, max_exits, configure, None)
-}
-
-#[allow(dead_code)] // Only the fault fixture installs an exact mid-forward injection.
-pub fn try_run_pool_fixture_with_first_forward_hook(
-    elf: &[u8],
-    max_exits: usize,
-    hook: Box<
-        dyn FnOnce(
-                &mut carrick_vmm_kvm::cpl0_boot::ProductionCpuLease,
-            ) -> Result<(), carrick_hal::TrapError>
-            + Send,
-    >,
-) -> Result<
-    carrick_runtime::prepare::PreparedKvmPoolOutcome,
-    carrick_kernel::run_result::RuntimeError,
-> {
-    try_run_pool_fixture_inner(elf, max_exits, |_| {}, Some(hook))
-}
-
-fn try_run_pool_fixture_inner(
-    elf: &[u8],
-    max_exits: usize,
-    configure: impl FnOnce(&mut Cpl0Carrier),
-    hook: Option<
-        Box<
-            dyn FnOnce(
-                    &mut carrick_vmm_kvm::cpl0_boot::ProductionCpuLease,
-                ) -> Result<(), carrick_hal::TrapError>
-                + Send,
-        >,
-    >,
-) -> Result<
-    carrick_runtime::prepare::PreparedKvmPoolOutcome,
-    carrick_kernel::run_result::RuntimeError,
-> {
     let image = prepare_static_x86_elf(elf).expect("static x86 ELF");
     let extent =
         Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("bounded initial extent");
@@ -92,11 +56,5 @@ fn try_run_pool_fixture_inner(
         .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
         .expect("initial guest MM");
     configure(&mut carrier);
-    if let Some(hook) = hook {
-        carrick_runtime::prepare::run_prepared_kvm_pool_with_first_forward_hook(
-            carrier, root, dispatcher, max_exits, hook,
-        )
-    } else {
-        carrick_runtime::prepare::run_prepared_kvm_pool(carrier, root, dispatcher, max_exits)
-    }
+    carrick_runtime::prepare::run_prepared_kvm_pool(carrier, root, dispatcher, max_exits)
 }
