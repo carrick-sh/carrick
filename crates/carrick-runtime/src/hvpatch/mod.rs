@@ -1069,7 +1069,9 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
     })? & TTBR_ROOT_MASK;
     let identity = root_bootstrap_identity(std::process::id())?;
     let pid = identity.pid;
-    let asids = engine.carrier_asid_allocator().unwrap_or_default();
+    let asids = engine.carrier_asid_allocator().ok_or_else(|| {
+        RuntimeError::Configuration("backend missing carrier ASID allocator for HVPatch".to_owned())
+    })?;
     let (table, mm_backend) = MmResources::new_root(stage1_root, asids)
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
     let table = std::sync::Arc::new(table);
