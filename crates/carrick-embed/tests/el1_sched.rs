@@ -355,7 +355,25 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
         })));
         captured = Some(bytes);
     }
-    let mut result = common::run_or_fail(builder.run_blocking());
+    let mut result = common::run_or_fail(builder.run_blocking().map_err(|error| {
+        let refusals = read_el1_counters().map(|counters| {
+            counters
+                .process_refusals
+                .map(|count| count.load(std::sync::atomic::Ordering::Relaxed))
+        });
+        let process_calls = read_el1_counters().map(|counters| {
+            [220usize, 260, 93, 94].map(|number| {
+                (
+                    counters.served[number].load(std::sync::atomic::Ordering::Relaxed),
+                    counters.forwarded[number].load(std::sync::atomic::Ordering::Relaxed),
+                )
+            })
+        });
+        panic!(
+            "EL1 fixture failed before result publication: {error}; process_refusals={refusals:?}; process_calls[clone,wait4,exit,exit_group]={process_calls:?}; metadata={:?}",
+            carrick_runtime::metadata_grant_stats()
+        )
+    }));
     if let Some(bytes) = captured {
         result.stdout = std::mem::take(&mut *bytes.lock().unwrap());
     }

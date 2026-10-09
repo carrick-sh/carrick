@@ -4129,6 +4129,7 @@ where
                         }
                     }
                 }
+                engine.commit_prepared_home()?;
                 // The first load of an address space that guest EL1 could
                 // install itself publishes it (its roots, its gate following
                 // this MM's fence), so EL1 can switch a vCPU running another
@@ -4750,6 +4751,20 @@ where
         // welded loop's `continue`.
         let frame = match next {
             Ok(Some(frame)) => frame,
+            Err(TrapError::NativeRootExit { status }) => {
+                // The EL1 owner already committed the process exit. Enter the
+                // physical terminal path so the executor binding and sibling
+                // jobs retire before the root result is published.
+                let code = (status.raw() >> 8) & 0xff;
+                let outcome = VcpuLoopOutcome::ProcessExit(Box::new(assemble_run_result(
+                    &self.kernel,
+                    code,
+                    None,
+                    self.traps,
+                    false,
+                )));
+                return Ok(self.enter_terminal_with_outcome(engine, outcome));
+            }
             Ok(None) => {
                 if let Some(slot) = engine.mailbox_slot() {
                     let _ = carrick_kernel::el1_delegation::settle_el1_boundary_for(
@@ -5920,7 +5935,14 @@ impl VcpuLoopLaunch {
                 if matches!(outcome, Err(RuntimeError::KernelAborted { .. })) {
                     return outcome;
                 }
-                wait_for_physical_job_retirement(&completion)?;
+                if let Err(retirement_error) = wait_for_physical_job_retirement(&completion) {
+                    return match outcome {
+                        Err(original) => Err(RuntimeError::CarrierFailed(format!(
+                            "{original}; {retirement_error}"
+                        ))),
+                        Ok(_) => Err(retirement_error),
+                    };
+                }
                 match &outcome {
                     Ok(_) => process_retirement.wait()?,
                     Err(_) => process_retirement.wait_if_exit_started_or_published()?,

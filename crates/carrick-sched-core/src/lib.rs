@@ -1103,6 +1103,42 @@ pub struct ZoneTables<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     delegated_host_pending: [AtomicU64; object_wait::DELEGATED_FILE_WAIT_QUEUES.div_ceil(64)],
 }
 
+/// Exact host-loaded home awaiting MM occupancy. Dropping an uncommitted
+/// preparation returns its record; EL1 never sees that record as a home.
+#[must_use = "commit after MM occupancy or drop to roll back"]
+pub struct PreparedHome<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
+    zone: &'a ZoneTables<C>,
+    slot: SlotId,
+    record: Option<RecordId>,
+}
+
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> PreparedHome<'_, C> {
+    pub fn commit(mut self) -> Option<RecordId> {
+        let record = self.record?;
+        if !self.zone.loaded_home_is_ready(self.slot, record) {
+            return None;
+        }
+        self.zone
+            .record(record)
+            .home
+            .store(self.slot.plus_one(), Ordering::Release);
+        self.zone
+            .slot(self.slot)
+            .host_record
+            .store(record.raw(), Ordering::Release);
+        self.record = None;
+        Some(record)
+    }
+}
+
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for PreparedHome<'_, C> {
+    fn drop(&mut self) {
+        if let Some(record) = self.record.take() {
+            self.zone.discard_unpublished(self.slot, record);
+        }
+    }
+}
+
 /// How a bucket lock waits: EL1 gives up after a bounded spin (and forwards
 /// the syscall); the host keeps trying, yielding its CPU.
 pub trait LockWait<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
@@ -2745,9 +2781,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         }
     }
 
-    /// Publish the host-loaded task's exact home before its first guest
-    /// instruction, including when that task has never parked in the zone.
-    pub fn publish_loaded_home(&self, slot: SlotId, identity: ThreadIdentity) -> Option<RecordId> {
+    /// Prepare a home during backend load. The record stays invisible to EL1
+    /// until the executor publishes the matching MM occupancy and commits it.
+    pub fn prepare_loaded_home(
+        &self,
+        slot: SlotId,
+        identity: ThreadIdentity,
+    ) -> Option<PreparedHome<'_, C>> {
         if identity.tid == 0
             || identity.serial == 0
             || identity.generation == 0
@@ -2755,15 +2795,25 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             || identity.lifecycle_page == 0
             || identity.control_slot == 0
             || self.slot(slot).mm() != identity.mm
-            || self.installed_space(slot) != identity.mm
             || self.slot(slot).current().is_some()
+            || self.slot(slot).host_record().is_some()
         {
             return None;
         }
-        if let Some(record) = self.slot(slot).host_record() {
-            return (self.record(record).identity() == identity).then_some(record);
-        }
-        self.current_or_new(slot, identity).ok()
+        let record = self.alloc_record(identity).ok()?;
+        Some(PreparedHome {
+            zone: self,
+            slot,
+            record: Some(record),
+        })
+    }
+
+    /// Confirm the exact prepared host home is installed before publication.
+    fn loaded_home_is_ready(&self, slot: SlotId, record: RecordId) -> bool {
+        self.slot(slot).host_record().is_none()
+            && self.slot(slot).current().is_none()
+            && self.slot(slot).mm() == self.record(record).identity().mm
+            && self.installed_space(slot) == self.record(record).identity().mm
     }
 
     /// EL1: undo [`Self::current_or_new`] for a new home record that was
