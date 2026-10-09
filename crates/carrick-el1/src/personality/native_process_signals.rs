@@ -86,6 +86,14 @@ impl<T> NativeProcessSignals<T> {
             .install(signal, action)
             .map_err(SignalActionError::Action)
     }
+    pub fn forced_action(&self, signal: Signal, blocked: SigBlockMask) -> Action {
+        let action = self.action(signal);
+        if blocked.contains(signal) || action.disposition == Disposition::Ignore {
+            Action::default()
+        } else {
+            action
+        }
+    }
     pub fn action(&self, signal: Signal) -> Action {
         self.resources.lock().actions.action(signal)
     }
@@ -237,6 +245,38 @@ mod tests {
             serial: TaskSerial::from_raw_u64(serial).unwrap(),
         }
     }
+    #[test]
+    fn blocked_or_ignored_synchronous_segv_forces_default() {
+        let task = key(41, 11);
+        let signals = NativeProcessSignals::<()>::fresh_root(task);
+        let caught = Action {
+            disposition: Disposition::Handler(HandlerAddress(0x400000)),
+            ..Action::default()
+        };
+        signals.install_action(task, Signal::SEGV, caught).unwrap();
+        let blocked = SigBlockMask::blocking_all_of(SignalSet::EMPTY.with(Signal::SEGV));
+        assert_eq!(
+            signals.forced_action(Signal::SEGV, blocked).disposition,
+            Disposition::Default
+        );
+        signals
+            .install_action(
+                task,
+                Signal::SEGV,
+                Action {
+                    disposition: Disposition::Ignore,
+                    ..Action::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            signals
+                .forced_action(Signal::SEGV, SigBlockMask::NONE)
+                .disposition,
+            Disposition::Default
+        );
+    }
+
     #[test]
     fn retained_exit_handle_reads_later_action_and_actual_control_mask() {
         let key = key(41, 11);
