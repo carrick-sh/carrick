@@ -1530,18 +1530,25 @@ fn next_runnable<F: PersistentExecutor>(
             // publish/recheck/kick handshake as the EL1-zone path below.
             // Most backends return Unsupported and take the host queue.
             kick.set_guest_idle(true);
+            if let Err(error) = backend.arm_guest_idle() {
+                kick.set_guest_idle(false);
+                return Err(NextError::Fatal(error.to_string()));
+            }
             match scheduler.try_take(registration) {
                 Ok(Some(running)) => {
+                    backend.disarm_guest_idle();
                     kick.set_guest_idle(false);
                     return Ok(Some(running));
                 }
                 Ok(None) => {}
                 Err(error) => {
+                    backend.disarm_guest_idle();
                     kick.set_guest_idle(false);
                     return Err(error.into());
                 }
             }
             let waited = backend.wait_in_guest();
+            backend.disarm_guest_idle();
             kick.set_guest_idle(false);
             if matches!(
                 waited.map_err(|error| NextError::Fatal(error.to_string()))?,

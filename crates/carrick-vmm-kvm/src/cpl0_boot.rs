@@ -1062,6 +1062,9 @@ pub struct ProductionForwardFrame {
 }
 
 impl ProductionCpuLease {
+    pub fn arm_idle_kick(&mut self, kick: &KvmKickHandle) -> Result<(), TrapError> {
+        self.cpu.arm_idle_kick(kick)
+    }
     /// Fixture fault injection at a stopped forwarded-call boundary.
     pub fn invalidate_user_fault_counters_venue(&mut self) -> Result<(), TrapError> {
         let mut custody = self

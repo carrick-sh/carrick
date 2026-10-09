@@ -149,12 +149,14 @@ impl PersistentExecutorFactory for KvmPersistentExecutorFactory {
             task: None,
             completion_sent: false,
             first_forward_hook: Arc::clone(&self.first_forward_hook),
+            idle_kick: carrick_vmm_kvm::KvmKickHandle::for_current_thread(),
         })
     }
 }
 
 pub(crate) struct KvmPersistentExecutor {
     physical: ProductionCpuLease,
+    idle_kick: carrick_vmm_kvm::KvmKickHandle,
     dispatcher: Arc<Mutex<SyscallDispatcher>>,
     reporter: Arc<CompatReporter>,
     completed: mpsc::Sender<Result<InitialProcessExit, String>>,
@@ -688,7 +690,7 @@ impl PersistentExecutor for KvmPersistentExecutor {
             .physical_slot()
             .ok_or_else(|| TrapError::Hypervisor("KVM executor has no physical slot".into()))?;
         ExactHardwareKick::new(
-            Box::new(carrick_vmm_kvm::KvmKickHandle::for_current_thread()),
+            Box::new(self.idle_kick.clone()),
             u64::from(slot.raw()),
             super::current_owner_thread_port(),
         )
@@ -758,6 +760,21 @@ impl PersistentExecutor for KvmPersistentExecutor {
     }
     fn destroy(mut self) -> Result<(), TrapError> {
         self.audit_boundary()
+    }
+
+    fn arm_guest_idle(&mut self) -> Result<(), TrapError> {
+        if self
+            .physical
+            .physical_slot()
+            .is_some_and(|slot| slot.raw() == 1)
+        {
+            self.physical.arm_idle_kick(&self.idle_kick)?;
+        }
+        Ok(())
+    }
+
+    fn disarm_guest_idle(&mut self) {
+        self.idle_kick.disarm_idle_run();
     }
 
     fn wait_in_guest(&mut self) -> Result<GuestIdleExit, TrapError> {

@@ -523,6 +523,14 @@ pub(crate) trait PersistentExecutor: 'static {
         Ok(())
     }
 
+    /// Prepare a physical idle run before the final scheduler recheck. Backends
+    /// without an idle vCPU have nothing to arm.
+    fn arm_guest_idle(&mut self) -> Result<(), TrapError> {
+        Ok(())
+    }
+
+    fn disarm_guest_idle(&mut self) {}
+
     /// Wait for work in the guest (EL1 plan 1d): with no task loaded, run
     /// this executor's vCPU in the EL1 scheduler until it leaves for the
     /// host. `Unsupported`: the backend has no guest scheduler; the executor
