@@ -1061,7 +1061,150 @@ pub struct ProductionForwardFrame {
     frame: NativeFrame,
 }
 
+/// Bytes still reachable from a stopped task's CPL0 RSP. The physical stack
+/// may be reused after the task releases its executor; its call chain belongs
+/// to the task until it is reloaded on the same physical slot.
+pub struct KernelStackSnapshot {
+    slot: carrick_guest_arch::CpuId,
+    start: u64,
+    end: u64,
+    bytes: Box<[u8]>,
+}
+
+impl KernelStackSnapshot {
+    /// # Safety
+    /// `source` must point to a stopped, readable mapping of `[base, end)`.
+    unsafe fn capture(
+        source: *const u8,
+        base: u64,
+        end: u64,
+        rsp: u64,
+        slot: carrick_guest_arch::CpuId,
+    ) -> Result<Self, TrapError> {
+        if rsp < base {
+            return Err(fail("CPL0 RSP below private stack"));
+        }
+        let len = usize::try_from(
+            end.checked_sub(rsp)
+                .ok_or_else(|| fail("CPL0 RSP beyond stack"))?,
+        )
+        .map_err(|_| fail("CPL0 stack length overflow"))?;
+        if len == 0 || len > 0x1_0000 {
+            return Err(fail("CPL0 RSP outside private stack"));
+        }
+        let offset = usize::try_from(rsp - base).map_err(|_| fail("CPL0 stack offset overflow"))?;
+        let mut bytes = vec![0u8; len];
+        // SAFETY: caller guarantees stopped guest memory; `bytes` is an owned
+        // allocation, never a mutable reference into guest RAM.
+        unsafe { std::ptr::copy_nonoverlapping(source.add(offset), bytes.as_mut_ptr(), len) };
+        Ok(Self {
+            slot,
+            start: rsp,
+            end,
+            bytes: bytes.into_boxed_slice(),
+        })
+    }
+
+    /// # Safety
+    /// `destination` must point to the same stopped writable stack mapping.
+    unsafe fn restore(
+        &self,
+        destination: *mut u8,
+        base: u64,
+        end: u64,
+        slot: carrick_guest_arch::CpuId,
+    ) -> Result<(), TrapError> {
+        if self.slot != slot || self.end != end || self.start < base {
+            return Err(fail("CPL0 stack restoration binding changed"));
+        }
+        let offset = usize::try_from(self.start - base)
+            .map_err(|_| fail("CPL0 stack restoration offset overflow"))?;
+        let extent = usize::try_from(
+            end.checked_sub(base)
+                .ok_or_else(|| fail("CPL0 stack extent underflow"))?,
+        )
+        .map_err(|_| fail("CPL0 stack extent overflow"))?;
+        if offset.checked_add(self.bytes.len()) != Some(extent) {
+            return Err(fail("CPL0 stack restoration extent changed"));
+        }
+        // SAFETY: caller guarantees stopped guest memory and exact binding.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.bytes.as_ptr(),
+                destination.add(offset),
+                self.bytes.len(),
+            )
+        };
+        Ok(())
+    }
+}
+
 impl ProductionCpuLease {
+    pub fn save_kernel_stack(
+        &mut self,
+        task: carrick_guest_arch::TaskIdentity,
+    ) -> Result<Option<KernelStackSnapshot>, TrapError> {
+        let slot = self
+            .physical_slot()
+            .ok_or_else(|| fail("production CPU has no physical slot"))?;
+        let custody = self
+            ._custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        self.cpu.with_stopped_vcpu(task, |vcpu| {
+            let rsp = vcpu.get_gpr(X86Reg::Rsp)?;
+            if rsp < DIRECT_VA {
+                return Ok(None);
+            }
+            let end = custody
+                .binding(slot)
+                .kernel_stack
+                .checked_add(16)
+                .ok_or_else(|| fail("CPL0 stack top overflow"))?;
+            let base = end
+                .checked_sub(0x1_0000)
+                .ok_or_else(|| fail("CPL0 stack base underflow"))?;
+            let source = custody
+                .ram
+                .host_ptr(base - DIRECT_VA, 0x1_0000)
+                .ok_or_else(|| fail("CPL0 stack backing absent"))?;
+            // SAFETY: this exact task and CPU are stopped, and the backing
+            // spans the verified private stack.
+            unsafe { KernelStackSnapshot::capture(source, base, end, rsp, slot).map(Some) }
+        })
+    }
+
+    pub fn restore_kernel_stack(
+        &mut self,
+        task: carrick_guest_arch::TaskIdentity,
+        snapshot: &KernelStackSnapshot,
+    ) -> Result<(), TrapError> {
+        let slot = self
+            .physical_slot()
+            .ok_or_else(|| fail("production CPU has no physical slot"))?;
+        let custody = self
+            ._custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        self.cpu.with_stopped_vcpu(task, |_vcpu| {
+            let end = custody
+                .binding(slot)
+                .kernel_stack
+                .checked_add(16)
+                .ok_or_else(|| fail("CPL0 stack top overflow"))?;
+            let base = end
+                .checked_sub(0x1_0000)
+                .ok_or_else(|| fail("CPL0 stack base underflow"))?;
+            let destination = custody
+                .ram
+                .host_ptr(base - DIRECT_VA, 0x1_0000)
+                .ok_or_else(|| fail("CPL0 stack backing absent"))?;
+            // SAFETY: the exact task is loaded but stopped, and the snapshot
+            // authenticates the physical stack before copying.
+            unsafe { snapshot.restore(destination, base, end, slot) }
+        })
+    }
+
     pub fn arm_idle_kick(&mut self, kick: &KvmKickHandle) -> Result<(), TrapError> {
         self.cpu.arm_idle_kick(kick)
     }
@@ -5039,6 +5182,40 @@ mod watchdog_tests {
         watchdog.during_guest(|| ());
         std::thread::sleep(Duration::from_millis(300));
         assert!(!watchdog.expired());
+    }
+}
+
+#[cfg(test)]
+mod kernel_stack_tests {
+    use super::*;
+
+    #[test]
+    fn a_saved_task_restores_its_entire_live_cpl0_call_chain() {
+        let mut stack = vec![0u8; 256];
+        for (index, byte) in stack.iter_mut().enumerate().skip(128) {
+            *byte = index as u8;
+        }
+        let original = stack.clone();
+        let slot = carrick_guest_arch::CpuId::new(0);
+        let saved =
+            unsafe { KernelStackSnapshot::capture(stack.as_ptr(), 0x1000, 0x1100, 0x1080, slot) }
+                .expect("valid CPL0 stack");
+        stack.fill(0xa5);
+        unsafe { saved.restore(stack.as_mut_ptr(), 0x1000, 0x1100, slot) }
+            .expect("same physical stack");
+        assert_eq!(&stack[128..], &original[128..]);
+        assert!(stack[..128].iter().all(|byte| *byte == 0xa5));
+        assert!(
+            unsafe {
+                saved.restore(
+                    stack.as_mut_ptr(),
+                    0x1000,
+                    0x1100,
+                    carrick_guest_arch::CpuId::new(1),
+                )
+            }
+            .is_err()
+        );
     }
 }
 
