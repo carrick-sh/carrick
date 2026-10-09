@@ -813,6 +813,7 @@ fn retire_open_file(region_ptr: usize, handle: u32) {
     }
     let record = open_file_object(region_ptr, handle);
     record.state.store(DELEGATED_STATE_DEAD, Ordering::Release);
+    record.clear_host_fd();
     record.inode_handle.store(0, Ordering::Release);
     ALLOCATED_OPEN_FILES.lock()[handle as usize - 1] = false;
 }
