@@ -75,6 +75,20 @@ pub fn registry() -> &'static NativeProcessRegistry<'static, Mm, Aarch64ParkedCo
     &REGISTRY
 }
 
+fn fork_progress(stage: carrick_el1_abi::NativeForkProgress) {
+    #[cfg(target_os = "none")]
+    carrick_el1_abi::record_native_fork_progress(stage);
+    #[cfg(not(target_os = "none"))]
+    let _ = stage;
+}
+
+fn fork_failure(stage: carrick_el1_abi::NativeForkFailureStage) {
+    #[cfg(target_os = "none")]
+    carrick_el1_abi::record_native_fork_failure(stage);
+    #[cfg(not(target_os = "none"))]
+    let _ = stage;
+}
+
 /// Admit only an exact published leader or thread-group member. The root
 /// address is checked by the shared owner against the zone's live MM grant.
 pub fn admit_entry(
@@ -115,6 +129,9 @@ pub fn admit_entry(
         address.generation.raw().get(),
     );
     if let Ok(runtime) = REGISTRY.for_entry(source, task, address) {
+        if task.visible_pid() != Some(1) {
+            fork_progress(carrick_el1_abi::NativeForkProgress::ChildEntered);
+        }
         return Ok((runtime, address, words));
     }
     if control.entry().is_some() {
@@ -447,6 +464,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                     ttbr0,
                     ttbr0,
                     &CURRENT_MM_MAINTENANCE,
+                    None,
                 )
                 .map_err(|_| NativeProcessError::Stale)?;
                 PreparedWords::Owned(Box::new(words))
@@ -554,6 +572,29 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             .take(request)
             .ok_or(NativeProcessError::Stale)?
             .map_err(|_| NativeProcessError::Exhausted)?;
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        let live = if self.words.is_none() {
+            let child_window =
+                carrick_el1_abi::fork_stock_table_window(loan.request.child_tables.base)
+                    .ok_or(NativeProcessError::Stale)?;
+            let parent_window =
+                carrick_el1_abi::fork_stock_table_window(loan.request.parent_tables.base)
+                    .ok_or(NativeProcessError::Stale)?;
+            if child_window.physical_base != parent_window.physical_base {
+                return Err(NativeProcessError::Stale);
+            }
+            let ttbr0 = crate::isa::aarch64::hardware_live_ttbr();
+            let words = super::mm_portal::production::current_mm_words(
+                ttbr0,
+                ttbr0,
+                &CURRENT_MM_MAINTENANCE,
+                Some(loan.request.child_tables.base),
+            )
+            .map_err(|_| NativeProcessError::Stale)?;
+            PreparedWords::Owned(Box::new(words))
+        } else {
+            live
+        };
         if loan.lifecycle.page.raw() == self.task.metadata.lifecycle_page.load(Ordering::Acquire) {
             return Err(NativeProcessError::Stale);
         }
@@ -603,6 +644,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             .try_reserve_exact(plan.custody().len())
             .map_err(|_| NativeProcessError::Exhausted)?;
         custody.extend_from_slice(plan.custody());
+        fork_progress(carrick_el1_abi::NativeForkProgress::Prepare);
         let child = match owner.publish_fork(plan, &*live, self.worker()) {
             Ok(child) => child,
             Err(e) => {
@@ -610,6 +652,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 return Err(err(publish_error_stage(e), e));
             }
         };
+        fork_progress(carrick_el1_abi::NativeForkProgress::Publish);
         let completion = child.completion();
         let address = AddressContext {
             mm: child_mm,
@@ -659,7 +702,10 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 .map_err(|e| err(carrick_el1_abi::NativeForkFailureStage::Commit, e))
         });
         match result {
-            Ok(_) => Ok(Box::new(Born { prepared })),
+            Ok(_) => {
+                fork_progress(carrick_el1_abi::NativeForkProgress::Commit);
+                Ok(Box::new(Born { prepared }))
+            }
             Err(e) => Err((e, prepared)),
         }
     }
@@ -690,6 +736,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         let p = &born.prepared;
         let mut custody = Vec::new();
         if custody.try_reserve_exact(p.custody.len()).is_err() {
+            fork_failure(carrick_el1_abi::NativeForkFailureStage::SettleCustody);
             return Err((NativeProcessError::Exhausted, born));
         }
         custody.extend(p.custody.iter().copied().map(PortalForkCustody::words));
@@ -699,22 +746,29 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             KernelVa::new(custody.as_ptr() as u64),
             custody.len() as u64,
         ) else {
+            fork_failure(carrick_el1_abi::NativeForkFailureStage::SettleRecord);
             return Err((NativeProcessError::Stale, born));
         };
         if let Err(e) = self.crossing.cross_fork_stock(
             &raw mut settlement as *mut _ as u64,
             u64::from(self.worker()),
         ) {
+            fork_failure(carrick_el1_abi::NativeForkFailureStage::SettleCrossing);
             return Err((e, born));
         }
         if !matches!(settlement.take(p.loan), Some(Ok(()))) {
+            fork_failure(carrick_el1_abi::NativeForkFailureStage::SettleReply);
             return Err((NativeProcessError::Quarantined, born));
         }
         let owner = match self.portal() {
             Ok(owner) => owner,
-            Err(error) => return Err((error, born)),
+            Err(error) => {
+                fork_failure(carrick_el1_abi::NativeForkFailureStage::SettlePortal);
+                return Err((error, born));
+            }
         };
         let Some(index) = owner.spaces.find(p.address.mm.raw().get()) else {
+            fork_failure(carrick_el1_abi::NativeForkFailureStage::SettleSpace);
             return Err((NativeProcessError::Stale, born));
         };
         let access = match owner.space_access(self.worker()) {
@@ -727,6 +781,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             }
         };
         access.open(index);
+        fork_progress(carrick_el1_abi::NativeForkProgress::Settle);
         Ok(())
     }
 
@@ -799,6 +854,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         {
             fatal();
         }
+        fork_progress(carrick_el1_abi::NativeForkProgress::ChildRetired);
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
             let live = crate::isa::aarch64::hardware_live_ttbr();

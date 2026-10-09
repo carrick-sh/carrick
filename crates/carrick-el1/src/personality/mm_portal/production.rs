@@ -71,6 +71,7 @@ pub(crate) fn current_mm_words<
     live_ttbr: u64,
     target_ttbr: u64,
     maintenance: &'a M,
+    stock_root: Option<u64>,
 ) -> Result<
     carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords<'a, M>,
     carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal,
@@ -78,16 +79,24 @@ pub(crate) fn current_mm_words<
     use carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords;
     let table = carrick_el1_abi::service_target_table_window(live_ttbr, target_ttbr)
         .ok_or(carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::BadRange)?;
-    // SAFETY: the admitted current-MM table window and retained pool remain
-    // mapped for the owner's edit; the original grant path used this venue.
+    // SAFETY: the admitted current-MM table window and retained table pool
+    // remain mapped for the owner's edit. A supplied stock root is taken from
+    // an authenticated live loan; its entire boot-reserved extent is mapped.
     unsafe {
-        PrimaryTableWords::new(
+        let words = PrimaryTableWords::new(
             table.words,
             table.physical_base,
             carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
             maintenance,
         )
-        .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
+        .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))?;
+        if let Some(root) = stock_root {
+            let window = carrick_el1_abi::fork_stock_table_window(root)
+                .ok_or(carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::BadRange)?;
+            words.with_window(window)
+        } else {
+            Ok(words)
+        }
     }
 }
 #[cfg(target_os = "none")]
@@ -445,7 +454,7 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         ttbr0: target.grant().ttbr0,
     };
     #[cfg(target_arch = "aarch64")]
-    let Ok(words) = current_mm_words(ttbr, target.grant().ttbr0, &maintenance) else {
+    let Ok(words) = current_mm_words(ttbr, target.grant().ttbr0, &maintenance, None) else {
         return;
     };
     let root = target.grant().ttbr0;

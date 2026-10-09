@@ -1737,6 +1737,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         _ => return Err(NativeProcessError::NoChild),
                     };
                     drop(consumed);
+                    arm_fork_progress(carrick_el1_abi::NativeForkProgress::WaitReturned);
                     return Ok(returned(result));
                 }
                 WaitWork::Other(WaitSelection::NoChild) => return Err(NativeProcessError::NoChild),
@@ -3098,6 +3099,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .release_birth(&published.reservation)
             .is_err()
         {
+            arm_fork_failure(carrick_el1_abi::NativeForkFailureStage::ReleaseBirth);
             self.service.quarantine_born(published.born);
             return Err(NativeProcessError::Quarantined);
         }
@@ -3118,9 +3120,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         record: self.source.zone.record_ref(record),
                     },
                 )
-                .map_err(|_| NativeProcessError::Quarantined)?;
+                .map_err(|_| {
+                    arm_fork_failure(carrick_el1_abi::NativeForkFailureStage::RegisterChild);
+                    NativeProcessError::Quarantined
+                })?;
         }
+        arm_fork_progress(carrick_el1_abi::NativeForkProgress::ChildRegistered);
         self.source.zone.requeue_preempted(self.source.slot, record);
+        arm_fork_progress(carrick_el1_abi::NativeForkProgress::ParentResumed);
         Ok(visible.get())
     }
 }
@@ -3161,6 +3168,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         _options: LinuxWaitOptions,
         _rusage: UserVa,
     ) -> LifecycleOutcome {
+        arm_fork_progress(carrick_el1_abi::NativeForkProgress::WaitEntered);
         if _rusage.raw() != 0 {
             return self.fail(NativeProcessError::Unsupported);
         }
