@@ -221,6 +221,10 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     fn ring_first_strict(&self) -> bool {
         false
     }
+    /// Captured guest-native ordinal; absent frames count in the unknown bucket.
+    fn native_number(&self) -> Option<carrick_syscall_abi::NativeNr> {
+        None
+    }
     /// Access to the refusal counters array, if available.
     fn refused_counters(&self) -> Option<&'a [core::sync::atomic::AtomicU64]> {
         None
@@ -559,9 +563,9 @@ fn finish<'a, C: EntryContext + 'a>(
             crossing_set,
             ring_first_strict,
             Some(canonical),
-            Some(ordinal),
+            pending.native_number(),
             counters,
-            |ret| pending.install_result(SyscallResult::new(ret)),
+            |ret| pending.install_result(ret),
         );
         if decision == crate::crossing::HostCrossingDecision::Refused {
             return CompletionRoute::Served;
@@ -618,9 +622,9 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
                 set,
                 strict,
                 Some(carrick_syscall_abi::CanonicalNr::new(ordinal)),
-                Some(ordinal),
+                pending.native_number(),
                 counters,
-                |ret| pending.install_result(SyscallResult::new(ret)),
+                |ret| pending.install_result(ret),
             );
             if decision == crate::crossing::HostCrossingDecision::Refused {
                 return CompletionRoute::Served;
@@ -699,6 +703,7 @@ mod ring_first_tests {
     // carrier, just as in x86's crossing set, until native custody serves it.
     struct CarrierOwned<'a> {
         result: i64,
+        native: carrick_syscall_abi::NativeNr,
         admitted: bool,
         work: bool,
         handback: bool,
@@ -716,6 +721,9 @@ mod ring_first_tests {
                 mm: EntryMmKey::from_raw(1),
                 thread_generation: EntryThreadGeneration::from_raw(1),
             })
+        }
+        fn native_number(&self) -> Option<carrick_syscall_abi::NativeNr> {
+            Some(self.native)
         }
         fn host_work(&self) -> bool {
             self.work
@@ -751,6 +759,7 @@ mod ring_first_tests {
     fn failed_entry_admission_cannot_bypass_crossing_policy() {
         let refused = [const { AtomicU64::new(0) }; 513];
         let mut pending = CarrierOwned {
+            native: carrick_syscall_abi::NativeNr(174),
             admitted: false,
             result: 42,
             work: false,
@@ -782,6 +791,7 @@ mod ring_first_tests {
         ] {
             let refused = [const { AtomicU64::new(0) }; 513];
             let mut pending = CarrierOwned {
+                native: carrick_syscall_abi::NativeNr(ordinal),
                 admitted: true,
                 result: 42,
                 work,
@@ -804,6 +814,7 @@ mod ring_first_tests {
         for ordinal in [93, 94] {
             let refused = [const { AtomicU64::new(0) }; 513];
             let mut pending = CarrierOwned {
+                native: carrick_syscall_abi::NativeNr(ordinal),
                 admitted: true,
                 result: 42,
                 work: false,

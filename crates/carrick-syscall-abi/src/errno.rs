@@ -55,3 +55,5 @@ pub const LINUX_ECHILD: LinuxErrno = LinuxErrno::new(10);
 pub const LINUX_EAGAIN: LinuxErrno = LinuxErrno::new(11);
 pub const LINUX_EFAULT: LinuxErrno = LinuxErrno::new(14);
 pub const LINUX_EINVAL: LinuxErrno = LinuxErrno::new(22);
+
+pub const LINUX_ENOSYS: LinuxErrno = LinuxErrno::new(38);

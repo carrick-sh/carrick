@@ -404,6 +404,7 @@ mod kernel {
         fn user_sp(&self) -> Option<UserVa> { Some(self.call.stack) }
     }
     impl dispatch::GuestDispatchFrame for NativeDispatch<'_> {
+        fn native_number(&self) -> carrick_guest_arch::NativeOrdinal { self.call.native }
         fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
             carrick_personality_linux::crossing::HostCrossingSet::X86
         }
@@ -1849,7 +1850,7 @@ mod kernel {
                 None,
                 None,
                 Some(&counters.refused),
-                |ret| frame.rax = ret as u64,
+                |ret| frame.rax = ret.raw() as u64,
             );
             binding.completions.fetch_add(1, Ordering::Relaxed);
             fixture_stmt! { if binding.scheduler_witness.load(Ordering::Acquire)
