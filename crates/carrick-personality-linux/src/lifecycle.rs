@@ -143,7 +143,7 @@ pub struct ThreadBirth<'a, 'b> {
     pub claim: &'b mut Option<carrick_core::lifecycle::ClaimedEntry>,
     pub born: BornRecord,
     pub record: RecordRef,
-    pub caller_tid: u32,
+    pub caller_tid: Option<u32>,
     pub child_tid: u32,
 }
 
@@ -618,6 +618,7 @@ fn serve_clone<'a>(
         return None;
     }
     let binding = native.binding()?;
+    let caller_tid = native.visible_tid().or_else(|| thread.slot.visible_tid());
     let mm = binding.mm.raw();
     if mm == 0 {
         return None;
@@ -702,7 +703,6 @@ fn serve_clone<'a>(
         clear_child_tid,
         blocked,
     };
-    let caller_tid = thread.slot.visible_tid().unwrap_or(0);
     let mut claim = Some(claimed);
     if let Err(error) = native.publish_born(ThreadBirth {
         page,

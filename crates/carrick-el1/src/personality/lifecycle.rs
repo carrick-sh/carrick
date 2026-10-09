@@ -98,8 +98,8 @@ impl<
         let result = if let Some(venue) = process.as_deref_mut() {
             if Some(venue.binding()) != LifecycleNative::binding(self) {
                 Err(carrick_personality_linux::identity::ESRCH)
-            } else {
-                venue.thread_spawned(birth.caller_tid, birth.child_tid, &mut || {
+            } else if let Some(caller_tid) = birth.caller_tid {
+                venue.thread_spawned(caller_tid, birth.child_tid, &mut || {
                     birth
                         .page
                         .record_born(
@@ -113,6 +113,8 @@ impl<
                     self.enqueue_born(birth.record);
                     Ok(())
                 })
+            } else {
+                Err(carrick_personality_linux::identity::ESRCH)
             }
         } else {
             birth
@@ -162,7 +164,11 @@ impl<
         if process.binding() != binding {
             return None;
         }
-        self.thread()?.slot.visible_tid()
+        self.thread()?.slot.visible_tid().or_else(|| {
+            self.current_tasks
+                .get(self.frame.task_index())?
+                .visible_pid()
+        })
     }
     fn task_state(&self) -> Option<&'a LinuxTaskState> {
         self.current_tasks
