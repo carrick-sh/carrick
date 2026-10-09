@@ -9,27 +9,6 @@ use std::sync::atomic::Ordering;
 
 fn witness(strict: bool) {
     let _guard = common::guest_lock();
-    let previous = std::env::var_os("CARRICK_ARM_RING_FIRST");
-    // Restore the caller's environment even if an assertion fails.
-    struct Restore(Option<std::ffi::OsString>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.0 {
-                    Some(value) => std::env::set_var("CARRICK_ARM_RING_FIRST", value),
-                    None => std::env::remove_var("CARRICK_ARM_RING_FIRST"),
-                }
-            }
-        }
-    }
-    let _restore = Restore(previous);
-    unsafe {
-        if strict {
-            std::env::remove_var("CARRICK_ARM_RING_FIRST");
-        } else {
-            std::env::set_var("CARRICK_ARM_RING_FIRST", "0");
-        }
-    }
     reset_el1_counters();
     let path = common::repo_root().join(
         "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-ring-first",
@@ -41,6 +20,11 @@ fn witness(strict: bool) {
     );
     let result = common::run_or_fail(
         ContainerBuilder::from_image(common::SMOKE_IMAGE)
+            .arm_ring_first(if strict {
+                carrick_embed::ArmRingFirst::Strict
+            } else {
+                carrick_embed::ArmRingFirst::OptOut
+            })
             .pull_policy(PullPolicy::Missing)
             .command(["/p/carrick-linux-aarch64-ring-first"])
             .mount_readonly(

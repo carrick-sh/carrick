@@ -116,6 +116,8 @@ pub struct RunRequest {
     /// imports nothing, so a library host never leaks its environment into a
     /// guest by accident. The engine never reads `std::env` itself.
     pub host_env: Option<Vec<(String, String)>>,
+    /// Explicit embed policy; otherwise resolved from the frontend snapshot.
+    pub arm_ring_first: Option<carrick_spec::ArmRingFirst>,
     pub mounts: Vec<Mount>,
     pub workdir: Option<String>,
     pub user: Option<String>,
@@ -180,6 +182,7 @@ impl Default for RunRequest {
             args: Vec::new(),
             env_overrides: Vec::new(),
             host_env: None,
+            arm_ring_first: None,
             mounts: Vec::new(),
             workdir: None,
             user: None,
@@ -541,7 +544,15 @@ pub fn resolve_run_spec(req: RunRequest, image: ResolvedImage) -> Result<Resolve
     };
     let seccomp_policy = resolve_seccomp_policy(base_seccomp_policy, &req.security_opts)?;
 
+    let arm_ring_first = req.arm_ring_first.unwrap_or_else(|| {
+        carrick_spec::ArmRingFirst::from_setting(req.host_env.as_ref().and_then(|env| {
+            env.iter()
+                .find(|(key, _)| key == "CARRICK_ARM_RING_FIRST")
+                .map(|(_, value)| value.as_str())
+        }))
+    });
     let spec = RunSpec {
+        arm_ring_first,
         process: ProcessSpec {
             executable,
             argv,
@@ -809,6 +820,7 @@ mod tests {
     /// namespace spec, `seccomp=unconfined` opting out.
     fn parity_expected() -> RunSpec {
         RunSpec {
+            arm_ring_first: Default::default(),
             process: ProcessSpec {
                 executable: "/bin/ls".to_string(),
                 argv: vec!["/bin/ls".to_string(), "-l".to_string()],
@@ -1279,6 +1291,28 @@ mod tests {
         );
         assert!(d.bridge_namespace_id.is_none());
         assert!(d.image_ref.is_empty() && d.args.is_empty());
+    }
+
+    #[test]
+    fn arm_ring_first_resolves_snapshot_and_explicit_policy() {
+        use carrick_spec::ArmRingFirst::{OptOut, Strict};
+        for (setting, explicit, expected) in [
+            (None, None, Strict),
+            (Some("0"), None, OptOut),
+            (Some("false"), None, Strict),
+            (Some("0"), Some(Strict), Strict),
+            (None, Some(OptOut), OptOut),
+        ] {
+            let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
+            let mut req = base_req(None);
+            req.host_env =
+                setting.map(|value| vec![("CARRICK_ARM_RING_FIRST".into(), value.into())]);
+            req.arm_ring_first = explicit;
+            assert_eq!(
+                spec_of(req, image).expect("resolve").arm_ring_first,
+                expected
+            );
+        }
     }
 
     #[test]
