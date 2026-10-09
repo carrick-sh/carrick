@@ -978,6 +978,7 @@ pub(crate) fn service_metadata_operation(
                 Some(ForkStockKind::Loan) => {
                     let exchange = unsafe { &mut *record_ptr.cast::<ForkStockExchange>() };
                     exchange.refuse(ForkStockRefusal::Stale);
+                    return Ok([METADATA_GRANT_ERR_DENIED, exchange.response[0], 0, 0]);
                 }
                 Some(ForkStockKind::Commit | ForkStockKind::Abort) => {
                     let settlement = unsafe { &mut *record_ptr.cast::<ForkStockSettlement>() };
@@ -997,13 +998,13 @@ pub(crate) fn service_metadata_operation(
                 let exchange = unsafe { &mut *record_ptr.cast::<ForkStockExchange>() };
                 let Some(execution) = execution else {
                     exchange.refuse(ForkStockRefusal::Stale);
-                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+                    return Ok([METADATA_GRANT_ERR_DENIED, exchange.response[0], 0, 0]);
                 };
                 let mut fork_stock = custody.fork_stock.lock();
                 let mut ledger = custody.el1_frame_grants.lock();
                 match fork_stock.service_loan(&mut ledger, execution, exchange) {
                     Ok(_loan) => Ok([METADATA_GRANT_SUCCESS, 0, 0, 0]),
-                    Err(_refusal) => Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]),
+                    Err(_refusal) => Ok([METADATA_GRANT_ERR_DENIED, exchange.response[0], 0, 0]),
                 }
             }
             Some(ForkStockKind::Commit | ForkStockKind::Abort) => {

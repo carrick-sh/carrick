@@ -1461,7 +1461,7 @@ mod tests {
         .expect("dispatched refusal");
         assert_eq!(
             result,
-            [carrick_el1_abi::METADATA_GRANT_ERR_DENIED, 0, 0, 0]
+            [carrick_el1_abi::METADATA_GRANT_ERR_DENIED, 2, 0, 0]
         );
         let exchange = unsafe { &mut *(record_page.0.as_mut_ptr() as *mut ForkStockExchange) };
         assert_eq!(exchange.take(req), Some(Err(ForkStockRefusal::Stale)));
@@ -1488,14 +1488,39 @@ mod tests {
         .expect("dispatched refusal");
         assert_eq!(
             result,
-            [carrick_el1_abi::METADATA_GRANT_ERR_DENIED, 0, 0, 0]
+            [carrick_el1_abi::METADATA_GRANT_ERR_DENIED, 2, 0, 0]
         );
         let exchange = unsafe { &mut *(record_page.0.as_mut_ptr() as *mut ForkStockExchange) };
         assert_eq!(exchange.take(req), Some(Err(ForkStockRefusal::Stale)));
         assert_eq!(custody.el1_frame_grants.lock().snapshot(), initial_ledger);
         assert_eq!(custody.fork_stock.lock().grant_tables.len(), 8);
 
-        // Case 3: Misaligned GPA -> METADATA_GRANT_ERR_ALIGNMENT, ledger unchanged
+        // Case 3: An authenticated request with no lifecycle stock reports
+        // the first typed capacity refusal through the trap result.
+        custody.fork_stock.lock().lifecycle_stock.clear();
+        let exchange = ForkStockExchange::new(req).unwrap();
+        unsafe {
+            (record_page.0.as_mut_ptr() as *mut ForkStockExchange).write(exchange);
+        }
+        let result = crate::metadata_grant::service_metadata_operation(
+            &custody,
+            Some(generation),
+            exec.cpu,
+            Some(exec),
+            carrick_el1_abi::GRANT_OP_FORK_STOCK,
+            record_ipa,
+            0,
+            0,
+        )
+        .expect("dispatched capacity refusal");
+        assert_eq!(
+            result,
+            [carrick_el1_abi::METADATA_GRANT_ERR_DENIED, 3, 0, 0]
+        );
+        let exchange = unsafe { &mut *(record_page.0.as_mut_ptr() as *mut ForkStockExchange) };
+        assert_eq!(exchange.take(req), Some(Err(ForkStockRefusal::Capacity)));
+
+        // Case 4: Misaligned GPA -> METADATA_GRANT_ERR_ALIGNMENT, ledger unchanged
         let result = crate::metadata_grant::service_metadata_operation(
             &custody,
             Some(generation),
@@ -1513,7 +1538,7 @@ mod tests {
         );
         assert_eq!(custody.el1_frame_grants.lock().snapshot(), initial_ledger);
 
-        // Case 4: Unmapped GPA -> METADATA_GRANT_ERR_INVALID, ledger unchanged
+        // Case 5: Unmapped GPA -> METADATA_GRANT_ERR_INVALID, ledger unchanged
         let result = crate::metadata_grant::service_metadata_operation(
             &custody,
             Some(generation),
