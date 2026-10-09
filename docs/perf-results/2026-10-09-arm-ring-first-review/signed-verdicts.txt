@@ -1,0 +1,39 @@
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/arm_ring_first_hatch-49046773201fdb39 arm_ring_first_ --nocapture
+
+running 4 tests
+test arm_ring_first_hatch_disabled_forward_witness ... ring-first strict=false getuid refused=0 forwarded=1 exit_group refused=0 forwarded=1 clock_gettime forwarded=0
+ok
+test arm_ring_first_opt_out_glibc_fork_wait_witness ... 
+thread 'arm_ring_first_opt_out_glibc_fork_wait_witness' (134900888) panicked at crates/carrick-embed/tests/common/mod.rs:158:21:
+container run failed: runtime failure: filesystem backend error: failed to run ELF from dispatcher: unsupported in this backend: HVPatch process child panicked (1 failed): first: trap engine failed: hypervisor operation failed: HVPatch COW compound IPA 0x2e00000000 has no exact inventory coverage
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test arm_ring_first_strict_glibc_fork_wait_witness ... 
+thread 'arm_ring_first_strict_glibc_fork_wait_witness' (134901540) panicked at crates/carrick-embed/tests/common/mod.rs:158:21:
+container run failed: runtime failure: filesystem backend error: failed to run ELF from dispatcher: unsupported in this backend: HVPatch process child panicked (1 failed): first: trap engine failed: hypervisor operation failed: HVPatch COW compound IPA 0x2e00000000 has no exact inventory coverage
+FAILED
+test arm_ring_first_strict_refusal_witness ... ring-first strict=true getuid refused=1 forwarded=0 exit_group refused=0 forwarded=1 clock_gettime forwarded=0
+ok
+
+failures:
+
+failures:
+    arm_ring_first_opt_out_glibc_fork_wait_witness
+    arm_ring_first_strict_glibc_fork_wait_witness
+
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.13s
+
+test-signed: FAIL /Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/arm_ring_first_hatch-49046773201fdb39
+/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/entitlement_negative-5ab05077e3c45bd1.noent.56975: replacing existing signature
+test-signed: negative control on /Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/entitlement_negative-5ab05077e3c45bd1.noent.56975
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+test-signed: FAILED (carrick-embed)
+remaining carrick procs (run-id ring-switch-review-20261009-637fb416c-1) = 0
+remaining carrick procs (run-id ring-switch-review-20261009-637fb416c-1-cli) = 0
+error: recipe `test-embed` failed on line 824 with exit code 1
+remaining carrick procs (run-id ring-switch-review-20261009-637fb416c-1) = 0
