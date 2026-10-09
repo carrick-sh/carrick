@@ -1,7 +1,13 @@
 # ARM ring-first independent review follow-up
 
-Current product/fixture checkpoint: `585e9b936ac5709d31ba9a5f1d2b6ab26fc310ab`.
-Current signed host witness: `ff633691b4b55670a3b9f0815010b123b7937f36`.
+Current product/fixture checkpoint: `ec8279a7235eb7044fbebd1b59d021c7fcf22a5f`.
+This final correction gates owed-work replay on strict policy. OptOut
+retains plain Forward for mmap, futex, clone and wait4 family declines;
+`opt-out-transport-red-first.txt` records the failing and passing regression.
+The director confirmed `x86_kvm_run` on `bad35bc69` matches origin/main.
+Refused x86 family declines now increment only refused[native], no longer
+also forwarded[canonical]; refusal counting is unchanged.
+Previous signed host witness: `ff633691b4b55670a3b9f0815010b123b7937f36`.
 Raw and GNU loader-only witnesses PASS under both policies; fork/wait retains
 the director-attributed main COW inventory defect. N1-N3 corrections and all
 focused native gates pass. PR #132 is ready for independent re-review; the
