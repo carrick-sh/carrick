@@ -56,15 +56,10 @@ impl ProcessSignals for Native {
     fn rt_sigpending(&self, _: SigBlockMask) -> u64 {
         0
     }
-    fn kill(&mut self, _: i32, _: i32, _: Option<carrick_abi::LinuxSiginfo>) -> Result<(), i32> {
+    fn kill(&mut self, _: i32, _: i32, _: SignalInfo) -> Result<(), i32> {
         Err(22)
     }
-    fn tkill(
-        &mut self,
-        _: SignalThreadSelector,
-        _: i32,
-        _: Option<carrick_abi::LinuxSiginfo>,
-    ) -> Result<(), i32> {
+    fn tkill(&mut self, _: SignalThreadSelector, _: i32, _: SignalInfo) -> Result<(), i32> {
         Err(22)
     }
     fn tgkill(
@@ -72,7 +67,7 @@ impl ProcessSignals for Native {
         _: SignalThreadSelector,
         _: SignalThreadSelector,
         _: i32,
-        _: Option<carrick_abi::LinuxSiginfo>,
+        _: SignalInfo,
     ) -> Result<(), i32> {
         Err(22)
     }

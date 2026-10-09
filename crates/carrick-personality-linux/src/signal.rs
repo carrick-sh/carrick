@@ -269,6 +269,41 @@ impl SignalThreadSelector {
     }
 }
 
+/// Generated sender metadata cannot be confused with a user-supplied queue
+/// record. Only queued records need the rt_sigqueueinfo forging restriction.
+#[derive(Clone, Copy)]
+pub enum SignalInfo {
+    Generated(Option<crate::abi::signal::LinuxSiginfo>),
+    Queued(crate::abi::signal::LinuxSiginfo),
+}
+#[derive(Clone, Copy)]
+pub enum SignalTargetScope {
+    CallingProcess,
+    OtherProcess,
+}
+impl SignalInfo {
+    /// rt_sigqueueinfo(2): only the calling process may receive forged
+    /// kernel/ordinary-send codes. Generated kill/tgkill metadata is distinct.
+    pub fn check_target(
+        self,
+        scope: SignalTargetScope,
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
+        if let Self::Queued(info) = self
+            && matches!(scope, SignalTargetScope::OtherProcess)
+            && (info.si_code >= 0 || info.si_code == carrick_abi::LINUX_SI_TKILL)
+        {
+            return Err(carrick_abi::LINUX_EPERM);
+        }
+        Ok(())
+    }
+    pub fn payload(self) -> Option<crate::abi::signal::LinuxSiginfo> {
+        match self {
+            Self::Generated(info) => info,
+            Self::Queued(info) => Some(info),
+        }
+    }
+}
+
 pub trait ProcessSignals {
     fn force_sigsegv(
         &mut self,
@@ -283,26 +318,16 @@ pub trait ProcessSignals {
 
     fn rt_sigpending(&self, blocked: carrick_signal_core::policy::SigBlockMask) -> u64;
 
-    fn kill(
-        &mut self,
-        pid: i32,
-        sig: i32,
-        info: Option<crate::abi::signal::LinuxSiginfo>,
-    ) -> Result<(), i32>;
+    fn kill(&mut self, pid: i32, sig: i32, info: SignalInfo) -> Result<(), i32>;
 
-    fn tkill(
-        &mut self,
-        tid: SignalThreadSelector,
-        sig: i32,
-        info: Option<crate::abi::signal::LinuxSiginfo>,
-    ) -> Result<(), i32>;
+    fn tkill(&mut self, tid: SignalThreadSelector, sig: i32, info: SignalInfo) -> Result<(), i32>;
 
     fn tgkill(
         &mut self,
         tgid: SignalThreadSelector,
         tid: SignalThreadSelector,
         sig: i32,
-        info: Option<crate::abi::signal::LinuxSiginfo>,
+        info: SignalInfo,
     ) -> Result<(), i32>;
 
     fn rt_sigtimedwait(
@@ -539,7 +564,7 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 None
             };
             let signals = native.process_signals()?;
-            match signals.kill(pid, sig, info) {
+            match signals.kill(pid, sig, SignalInfo::Generated(info)) {
                 Ok(()) => returned(0, false),
                 Err(e) => returned(
                     carrick_syscall_abi::LinuxErrno::new(e).guest_retval(),
@@ -564,7 +589,7 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 None
             };
             let signals = native.process_signals()?;
-            match signals.tkill(tid, sig, info) {
+            match signals.tkill(tid, sig, SignalInfo::Generated(info)) {
                 Ok(()) => returned(0, false),
                 Err(e) => returned(
                     carrick_syscall_abi::LinuxErrno::new(e).guest_retval(),
@@ -593,7 +618,7 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 None
             };
             let signals = native.process_signals()?;
-            match signals.tgkill(tgid, tid, sig, info) {
+            match signals.tgkill(tgid, tid, sig, SignalInfo::Generated(info)) {
                 Ok(()) => returned(0, false),
                 Err(e) => returned(
                     carrick_syscall_abi::LinuxErrno::new(e).guest_retval(),
@@ -616,7 +641,7 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 return returned(LINUX_EFAULT.guest_retval(), false);
             };
             let signals = native.process_signals()?;
-            match signals.kill(tgid, sig, Some(*info)) {
+            match signals.kill(tgid, sig, SignalInfo::Queued(*info)) {
                 Ok(()) => returned(0, false),
                 Err(e) => returned(
                     carrick_syscall_abi::LinuxErrno::new(e).guest_retval(),
@@ -640,7 +665,7 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 return returned(LINUX_EFAULT.guest_retval(), false);
             };
             let signals = native.process_signals()?;
-            match signals.tgkill(tgid, tid, sig, Some(*info)) {
+            match signals.tgkill(tgid, tid, sig, SignalInfo::Queued(*info)) {
                 Ok(()) => returned(0, false),
                 Err(e) => returned(
                     carrick_syscall_abi::LinuxErrno::new(e).guest_retval(),
