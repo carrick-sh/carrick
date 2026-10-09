@@ -9,7 +9,7 @@ use super::{
     process_owner::*,
 };
 use crate::lock::SpinLock;
-use alloc::{collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec};
 use carrick_el1_abi::{
     BornInZoneSource, CurrentTask, EntryHandoffReceipt, EntryIdentity, EntryRef, ExecutionBinding,
     Lifecycle, ThreadControlSlot, ThreadLifecyclePage,
@@ -1631,7 +1631,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             channel: None,
             usage: TaskRusage::default(),
         };
-        let child = GuestTask::new(
+        let child = Box::new(GuestTask::new(
             GuestTaskMetadata {
                 key: child_key,
                 container: (),
@@ -1648,15 +1648,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             child_words,
             custody(resources),
             claim,
-        );
-        let prep = PreparedFork::from_reserved(
+        ));
+        let prep = Box::new(PreparedFork::from_reserved(
             snapshot,
             snapshot,
             child,
             prepared,
             BirthAttachment::Parent,
             permit,
-        );
+        ));
         let result = {
             let mut graph = self.runtime.graph.lock();
             prep.try_publish_with(&mut graph.owner, |prepared| {

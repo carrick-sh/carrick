@@ -75,7 +75,7 @@ pub fn scan_wait<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProce
 pub struct PreparedFork<C, U, N: NativeProcessCustody, M> {
     caller: BirthSnapshot,
     parent: BirthSnapshot,
-    child: GuestTask<C, U, N>,
+    child: Box<GuestTask<C, U, N>>,
     mm: M,
     attachment: BirthAttachment,
     permit: ReservedTaskSet<N::Transaction>,
@@ -137,7 +137,7 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, M> PreparedFork<C, U, N, 
             Ok((caller, parent, permit)) => Ok(Self {
                 caller,
                 parent,
-                child,
+                child: Box::new(child),
                 mm,
                 attachment,
                 permit,
@@ -152,14 +152,14 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, M> PreparedFork<C, U, N, 
         if !owner.rollback_birth(&self.permit) {
             return Err(Box::new(self));
         }
-        Ok((self.child, self.mm))
+        Ok((*self.child, self.mm))
     }
     /// Retain an already owned shared reservation while attaching the caller's
     /// prepared MM and child. Shared admission authenticates all fields.
     pub fn from_reserved(
         caller: BirthSnapshot,
         parent: BirthSnapshot,
-        child: GuestTask<C, U, N>,
+        child: Box<GuestTask<C, U, N>>,
         mm: M,
         attachment: BirthAttachment,
         permit: ReservedTaskSet<N::Transaction>,
@@ -176,7 +176,7 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, M> PreparedFork<C, U, N, 
     /// A refused guest-MM publication leaves the exact child and preparation
     /// owned, with the process unpublished and its reservation still retained.
     pub fn try_publish_with<F: GuestProcessFailure, B, E>(
-        mut self,
+        mut self: Box<Self>,
         owner: &mut GuestProcessOwner<C, U, N, F>,
         commit_mm: impl FnOnce(M) -> Result<B, (E, M)>,
     ) -> ForkTryResult<C, U, N, M, B, E> {
@@ -188,17 +188,17 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, M> PreparedFork<C, U, N, 
             Some(&self.permit),
         ) {
             Ok(admission) => admission,
-            Err(error) => return Err(ForkTryError::Admission(error, Box::new(self))),
+            Err(error) => return Err(ForkTryError::Admission(error, self)),
         };
         let born = match commit_mm(self.mm) {
             Ok(born) => born,
             Err((error, mm)) => {
                 self.mm = mm;
                 drop(admission);
-                return Err(ForkTryError::Commit(error, Box::new(self)));
+                return Err(ForkTryError::Commit(error, self));
             }
         };
-        admission.publish(self.child);
+        admission.publish(*self.child);
         Ok(PublishedFork {
             reservation: self.permit,
             born,
@@ -222,7 +222,7 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, M> PreparedFork<C, U, N, 
             Err(error) => return Err(Box::new((error, self))),
         };
         let born = commit_mm(self.mm);
-        admission.publish(self.child);
+        admission.publish(*self.child);
         Ok(PublishedFork {
             reservation: self.permit,
             born,
