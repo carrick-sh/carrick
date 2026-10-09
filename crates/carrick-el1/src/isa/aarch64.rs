@@ -537,6 +537,9 @@ impl carrick_guest_arch::SignalBackend for Aarch64Backend {
             return Err(ArchError::InvalidFrame);
         };
 
+        if !super::signal_resume_is_el0(sigframe.saved_spsr) {
+            return Err(ArchError::InvalidFrame);
+        }
         frame.x = sigframe.saved_x;
         frame.elr = sigframe.saved_pc;
         frame.spsr = sigframe.saved_spsr;
