@@ -23,7 +23,8 @@ workspace = true
 toml.workspace = true
 
 [dev-dependencies]
-carrick-kernel = { path = "../carrick-kernel" }
+carrick-runtime = { path = "../carrick-runtime", default-features = false, features = ["platform-linux", "syscall-shim", "test-support"] }
+carrick-kernel = { path = "../carrick-kernel", features = ["test-support"] }
 static_assertions = "1"
 tempfile.workspace = true
 toml.workspace = true

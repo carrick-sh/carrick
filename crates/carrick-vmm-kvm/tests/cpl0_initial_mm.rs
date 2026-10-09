@@ -6,13 +6,14 @@
 mod physical_inventory;
 use physical_inventory::physical_inventory;
 
-use carrick_guest_mem::GuestMemory;
 use carrick_mem::x86_initial_image::prepare_static_x86_elf;
-use carrick_vmm_kvm::cpl0_boot::{
-    Cpl0Carrier, GuestExitStatus, InitialReservationLimits, InitialSyscallDisposition,
-    InitialTaskBinding,
-};
+use carrick_vmm_kvm::cpl0_boot::{Cpl0Carrier, InitialReservationLimits, InitialTaskBinding};
+#[path = "common/kvm_pool_fixture.rs"]
+mod kvm_pool_fixture;
 use carrick_x86::cpl0_entry::OBSERVE_INITIAL_MM;
+use kvm_pool_fixture::{
+    run_pool_fixture, run_pool_fixture_with, try_run_pool_fixture_with_first_forward_hook,
+};
 use std::path::PathBuf;
 
 const ELF_X86_64_MACHINE: u16 = 62;
@@ -173,64 +174,21 @@ fn initial_write_returns_prefix_or_efault_without_aborting_carrier() {
         (0x7_0000, 32, 242, 0), // -EFAULT = -14, low exit byte 242
     ] {
         let elf = write_then_exit_elf(pointer, count);
-        let image = prepare_static_x86_elf(&elf).expect("static write ELF");
-        let extent =
-            Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("initial grant extent");
-        let mut carrier = Cpl0Carrier::boot_production(physical_inventory(), extent)
-            .expect("production KVM boot");
-        carrier
-            .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
-            .expect("shared MM owner");
-        let mut observed_bytes = 0;
-        let outcome = carrier
-            .run_initial_process(8, |machine, frame| match frame.rax {
-                nr if nr == u64::from(X86_SYS_WRITE) => {
-                    match machine.read_bytes_prefix(frame.rsi, frame.rdx as usize) {
-                        Ok(bytes) => {
-                            observed_bytes += bytes.len();
-                            Ok(InitialSyscallDisposition::Return(bytes.len() as i64))
-                        }
-                        Err(_) => Ok(InitialSyscallDisposition::Refused(
-                            carrick_abi::LINUX_EFAULT,
-                        )),
-                    }
-                }
-                nr if nr == u64::from(X86_SYS_EXIT_GROUP) => Ok(InitialSyscallDisposition::Exit(
-                    GuestExitStatus::from_linux_code(frame.rdi as i32),
-                )),
-                _ => Ok(InitialSyscallDisposition::Refused(
-                    carrick_abi::LINUX_ENOSYS,
-                )),
-            })
-            .expect("bounded initial process completion");
-        assert!(matches!(outcome,
-            carrick_vmm_kvm::cpl0_boot::InitialProcessExit::Exited { code, .. }
-            if code == expected_exit));
-        assert_eq!(observed_bytes, expected_bytes);
+        let outcome = run_pool_fixture(&elf, 8);
+        assert_eq!(outcome.run.exit_code, expected_exit);
+        assert_eq!(outcome.run.stdout.len(), expected_bytes);
     }
 }
 
 #[test]
-fn explicit_initial_process_cancel_stops_without_a_deadline() {
+fn explicit_initial_process_kick_preempts_and_resumes_under_pool() {
     let elf = tiny_elf();
-    let image = prepare_static_x86_elf(&elf).expect("static ELF");
-    let extent =
-        Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("initial grant extent");
-    let mut carrier =
-        Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM boot");
-    carrier
-        .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
-        .expect("shared MM owner");
-    carrier
-        .fixture_cancel_next_run(0)
-        .expect("cancel stopped vCPU");
-    let error = carrier
-        .run_initial_process(8, |_, _| Ok(InitialSyscallDisposition::Return(0)))
-        .expect_err("cancel must interrupt KVM_RUN");
-    assert!(
-        error.to_string().contains("initial process cancelled"),
-        "{error}"
-    );
+    let outcome = run_pool_fixture_with(&elf, 8, |carrier| {
+        carrier
+            .fixture_cancel_next_run(0)
+            .expect("cancel stopped vCPU");
+    });
+    assert_eq!(outcome.run.exit_code, 7);
 }
 
 #[test]
@@ -303,33 +261,14 @@ fn production_boot_binds_both_kvm_local_apics() {
 fn production_irq_entry_retains_each_native_vector_from_live_user_mode() {
     for (vector, bit) in [(0xe0, 1), (0xe1, 2), (0xe2, 4), (0xe3, 8)] {
         let elf = tiny_elf();
-        let image = prepare_static_x86_elf(&elf).expect("static ELF");
-        let extent =
-            Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("initial grant extent");
-        let mut carrier = Cpl0Carrier::boot_production(physical_inventory(), extent)
-            .expect("production KVM boot");
-        carrier
-            .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
-            .expect("shared MM owner");
-        carrier
-            .fixture_inject_irq(0, vector)
-            .expect("native IRQ edge into stopped vCPU");
-        let outcome = carrier
-            .run_initial_process(8, |_, frame| {
-                Ok(InitialSyscallDisposition::Exit(
-                    GuestExitStatus::from_linux_code(frame.rdi as i32),
-                ))
-            })
-            .expect("user task returns after native IRQ");
-        assert!(
-            matches!(
-                outcome,
-                carrick_vmm_kvm::cpl0_boot::InitialProcessExit::Exited { code: 7, .. }
-            ),
-            "vector {vector:#x}: {outcome:?}"
-        );
+        let outcome = run_pool_fixture_with(&elf, 8, |carrier| {
+            carrier
+                .fixture_inject_irq(0, vector)
+                .expect("native IRQ edge into stopped vCPU");
+        });
+        assert_eq!(outcome.run.exit_code, 7, "vector {vector:#x}");
         assert_eq!(
-            carrier.fixture_pending_irqs(0).expect("IRQ mailbox") & bit,
+            outcome.physical.fixture_pending_irqs(0).unwrap() & bit,
             bit,
             "vector {vector:#x}"
         );
@@ -379,19 +318,10 @@ fn production_initial_mm_admits_one_shared_reservation_root() {
 #[test]
 fn production_user_page_fault_forwards_the_original_user_frame() {
     let elf = production_fault_elf();
-    let plan = prepare_static_x86_elf(&elf).expect("static fault ELF");
-    let extent = Cpl0Carrier::initial_extent_bytes_for(&plan, &[], &[]).expect("extent");
-    let mut carrier =
-        Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM");
-    carrier
-        .load_guest_mm(&plan, &[], &[], InitialReservationLimits::UNLIMITED)
-        .expect("production initial MM");
-    let outcome = carrier
-        .run_initial_process(32, |_, _| Ok(InitialSyscallDisposition::Return(0)))
-        .expect("typed user fault");
-    let carrick_vmm_kvm::cpl0_boot::InitialProcessExit::Fault { record, exits } = outcome else {
-        panic!("expected fault: {outcome:?}");
-    };
+    let outcome = run_pool_fixture(&elf, 32);
+    let record = outcome.fault_record.expect("typed user fault");
+    let exits = outcome.run.traps;
+    assert_eq!(outcome.run.terminating_signal, Some(libc::SIGSEGV));
     assert_eq!(record.vector, 14);
     assert_eq!(record.cs & 3, 3);
     assert_eq!(record.error_code & 7, 6);
@@ -400,7 +330,7 @@ fn production_user_page_fault_forwards_the_original_user_frame() {
     assert_eq!(record.saved_rax, 0xdead000);
     assert_eq!(record.linux_signal(), Some((libc::SIGSEGV, 1)));
     assert_eq!(
-        carrier.user_fault_state(0).expect("fault custody"),
+        outcome.physical.user_fault_state(0).expect("fault custody"),
         (1, 0xdead000, 6, 0x4000b0 + 26, 6)
     );
     assert_eq!(exits, 2);
@@ -421,36 +351,19 @@ fn production_fault_elf() -> Vec<u8> {
 }
 
 #[test]
-fn nested_kernel_fault_preserves_outer_diagnostics_and_refuses() {
+fn nested_kernel_fault_refuses_after_invalidated_counters_venue() {
     let elf = production_fault_elf();
-    let plan = prepare_static_x86_elf(&elf).expect("fault ELF");
-    let extent = Cpl0Carrier::initial_extent_bytes_for(&plan, &[], &[]).expect("extent");
-    let mut carrier =
-        Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM");
-    carrier
-        .load_guest_mm(&plan, &[], &[], InitialReservationLimits::UNLIMITED)
-        .expect("initial MM");
-    // Stop at the syscall crossing, before any fault-record word can be
-    // consumed. A global exit budget also counts peer IRQ/HLT events and
-    // cannot license a deterministic injection point on two active CPUs.
-    carrier
-        .run_initial_process(32, |_, _| {
-            Ok(InitialSyscallDisposition::Exit(
-                GuestExitStatus::from_linux_code(0),
-            ))
-        })
-        .expect("stopped at first syscall");
-    carrier
-        .invalidate_user_fault_counters_venue()
-        .expect("inject kernel venue fault");
-    let error = carrier
-        .run_initial_process(32, |_, _| Ok(InitialSyscallDisposition::Return(0)))
-        .expect_err("nested kernel refusal");
-    assert!(error.to_string().contains("port 0xcc"), "{error:?}");
-    let (active, address, error, pc, reason) =
-        carrier.user_fault_state(0).expect("retained diagnostics");
-    assert_eq!(
-        (active, address, error, pc, reason),
-        (1, 0xdead000, 6, 0x4000b0 + 26, 8)
+    let error = try_run_pool_fixture_with_first_forward_hook(
+        &elf,
+        32,
+        Box::new(|cpu| cpu.invalidate_user_fault_counters_venue()),
+    )
+    .err()
+    .expect("nested kernel refusal");
+    assert!(
+        error
+            .to_string()
+            .contains("port 0xcc; outer fault active 1, address 0xdead000, reason 8"),
+        "{error:?}"
     );
 }
