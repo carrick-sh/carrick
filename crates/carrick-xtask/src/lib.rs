@@ -9,6 +9,7 @@ pub mod authority_source;
 pub mod ci_scaler;
 pub mod cli;
 pub mod command;
+pub mod el1_stack;
 pub mod fixtures;
 pub mod host_lease;
 pub mod host_load;

@@ -158,7 +158,7 @@ pub struct Prepared<'a> {
 pub struct PreparedStart<'a> {
     loan: Box<ForkStockLoan>,
     words: PreparedWords<'a>,
-    plan: Option<PreparedOwnerFork<Aarch64Mmu>>,
+    plan: Option<Box<PreparedOwnerFork<Aarch64Mmu>>>,
     child: Option<UnpublishedEl1Child<Aarch64Mmu>>,
     index: SpaceIndex,
     child_mm: MmGeneration,
@@ -668,7 +668,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         Ok(Box::new(PreparedStart {
             loan,
             words: live,
-            plan: Some(plan),
+            plan: Some(Box::new(plan)),
             child: None,
             index,
             child_mm,
@@ -683,7 +683,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     ) -> Result<Self::PreparedMmPublished, NativeProcessError> {
         let plan = start.plan.take().ok_or(NativeProcessError::Stale)?;
         let owner = self.portal()?;
-        let child = match owner.publish_fork(plan, &*start.words, self.worker()) {
+        let child = match owner.publish_fork_boxed(plan, &*start.words, self.worker()) {
             Ok(child) => child,
             Err(e) => {
                 owner.spaces.free(start.index);

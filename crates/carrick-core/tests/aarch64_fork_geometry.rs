@@ -456,7 +456,7 @@ fn test_arm_translation_regime_facts() {
     assert_eq!(KERNEL_CONTROL_BASE, 180 << 30);
     assert_eq!(KERNEL_CONTROL_SPAN, 1 << 21);
     assert_eq!(STAGE1_TABLES_ALIAS_BASE, KERNEL_CONTROL_BASE + 0x2_0000);
-    assert_eq!(STAGE1_TABLES_PRIMARY_SIZE, 0x1C_0000);
+    assert_eq!(STAGE1_TABLES_PRIMARY_SIZE, 0x1B_C000);
     assert_eq!(IDENTITY_PAGE_BASE, KERNEL_CONTROL_BASE + 0x1E_4000);
     assert_eq!(IDENTITY_PAGE_SIZE, 0x4000);
     assert_eq!(Aarch64Mmu::ADDRESS_MASK, 0x0000_ffff_ffff_f000);

@@ -1821,6 +1821,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 resources.file_table,
             )
         };
+        let parent_identity = Box::new(parent_identity);
         let prepared_start = match self
             .service
             .prepare_mm_start(&parent_mm, self.words, child_mm)

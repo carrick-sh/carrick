@@ -54,6 +54,7 @@ build *ARGS:
     set -euo pipefail
     just --justfile {{justfile()}} check-disk
     if [ "{{os()}}" = "macos" ]; then
+        just --justfile {{justfile()}} check-el1-stack
         exec ./scripts/build-signed.sh {{ARGS}}
     fi
     exec {{_admit}} {{_cargo}} build --release -p carrick-cli {{_platform_features}} {{ARGS}}
@@ -202,6 +203,14 @@ clippy *ARGS:
 # pending; a partial local pass is not matrix completeness.
 lint-domains: lint-domains-source
     cargo run --locked -p carrick-xtask -- authority-debt
+    # The release EL1 image is only built on the macOS reference lane.
+    if [ "{{os()}}" = "macos" ]; then just check-el1-stack; fi
+
+# Emit compiler stack sizes for the exact release EL1 image and follow linked
+# calls through the owner fork path. This is an unsigned compile-only gate.
+check-el1-stack:
+    RUSTC_BOOTSTRAP=1 RUSTFLAGS='-Z emit-stack-sizes' {{_cargo}} build --locked -p carrick-el1 --target aarch64-unknown-none-softfloat --release --target-dir target/el1-stack-audit
+    {{_cargo}} run --locked -p carrick-xtask -- el1-stack --image target/el1-stack-audit/aarch64-unknown-none-softfloat/release/carrick-el1
 
 # Emit exact compiler diagnostics for the selected native host profiles.
 # Output is transient; accepted authority identity uses symbolic cohorts only.
