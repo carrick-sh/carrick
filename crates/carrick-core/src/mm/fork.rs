@@ -136,7 +136,10 @@ impl ForkScratch {
         mappings
             .try_reserve_exact(metadata_capacity)
             .map_err(|_| ForkError::NoMemory)?;
-        child.resize(512, 0);
+        // Census supplies the exact bounded table stock. Initialize it before
+        // descriptor recursion so allocation never nests under copy_table.
+        child.resize(child_len, 0);
+        parent.resize(parent_len, 0);
         Ok(Self {
             child,
             parent,
@@ -170,7 +173,6 @@ impl ForkScratch {
             return Err(ForkError::NoMemory);
         };
         self.child_used = next;
-        self.child.resize(self.child_used, 0);
         Ok(offset)
     }
 
@@ -185,7 +187,6 @@ impl ForkScratch {
             return Err(ForkError::NoMemory);
         };
         self.parent_used = next;
-        self.parent.resize(self.parent_used, 0);
         Ok(offset)
     }
 
