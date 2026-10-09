@@ -55,6 +55,7 @@ core::arch::global_asm!(
     "call carrick_x86_save_extended_state",
     "mov edi, r13d",
     "mov rsi, r12",
+    "mov rdx, rsp",
     "call carrick_x86_receive_irq",
     "mov rdi, rsp",
     "call carrick_x86_restore_extended_state",
@@ -98,10 +99,10 @@ core::arch::global_asm!(
 );
 
 #[unsafe(no_mangle)]
-extern "C" fn carrick_x86_receive_irq(vector: u32, frame: *const InterruptFrame) {
+extern "C" fn carrick_x86_receive_irq(vector: u32, frame: *mut InterruptFrame, xsave: *mut carrick_el1::isa::x86::context::scheduler::XsaveArea) {
     // SAFETY: the IRQ assembly passes its own complete saved register frame;
     // a user-origin frame includes the five IRET words validated below.
-    let frame = unsafe { &*frame };
+    let frame = unsafe { &mut *frame };
     if (frame.cs & 3 == 3 && !frame.valid_user_return())
         || (frame.cs & 3 == 0 && frame.cs != 8)
         || u8::try_from(vector)
@@ -127,6 +128,10 @@ extern "C" fn carrick_x86_receive_irq(vector: u32, frame: *const InterruptFrame)
                 carrick_el1::isa::x86::context::current_cpu_binding().unwrap_or_else(|| crate::kernel::halt()).cpu_slot as usize
             ).unwrap_or_else(|| crate::kernel::halt())
         );
+    }
+    if frame.cs & 3 == 3 {
+        // SAFETY: the IRQ assembly owns this aligned early XSAVE area.
+        crate::signal_irq_return(frame, unsafe { &mut *xsave });
     }
     if frame.cs & 3 == 3 && interrupt::check_user_return_generation().is_err() {
         unsafe {

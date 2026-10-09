@@ -76,7 +76,7 @@ impl X86Backend {
         rtsigframe.uc.uc_mcontext.r8 = frame.r8;
         rtsigframe.uc.uc_mcontext.r9 = frame.r9;
         rtsigframe.uc.uc_mcontext.r10 = frame.r10;
-        rtsigframe.uc.uc_mcontext.r11 = frame.r11;
+        rtsigframe.uc.uc_mcontext.r11 = frame.user_r11;
         rtsigframe.uc.uc_mcontext.r12 = frame.r12;
         rtsigframe.uc.uc_mcontext.r13 = frame.r13;
         rtsigframe.uc.uc_mcontext.r14 = frame.r14;
@@ -87,7 +87,7 @@ impl X86Backend {
         rtsigframe.uc.uc_mcontext.rbx = frame.rbx;
         rtsigframe.uc.uc_mcontext.rdx = frame.rdx;
         rtsigframe.uc.uc_mcontext.rax = frame.rax;
-        rtsigframe.uc.uc_mcontext.rcx = frame.rcx;
+        rtsigframe.uc.uc_mcontext.rcx = frame.user_rcx;
         rtsigframe.uc.uc_mcontext.rsp = resume.stack.raw();
         rtsigframe.uc.uc_mcontext.rip = resume.pc.raw(); // saved RIP from syscall entry
         rtsigframe.uc.uc_mcontext.eflags = resume.flags.raw(); // saved RFLAGS from syscall entry
@@ -243,6 +243,7 @@ impl SignalBackend for X86Backend {
         frame.r9 = uc.uc_mcontext.r9;
         frame.r10 = uc.uc_mcontext.r10;
         frame.r11 = flags;
+        frame.user_r11 = uc.uc_mcontext.r11;
         frame.r12 = uc.uc_mcontext.r12;
         frame.r13 = uc.uc_mcontext.r13;
         frame.r14 = uc.uc_mcontext.r14;
@@ -254,6 +255,7 @@ impl SignalBackend for X86Backend {
         frame.rdx = uc.uc_mcontext.rdx;
         frame.rax = uc.uc_mcontext.rax;
         frame.rcx = uc.uc_mcontext.rip;
+        frame.user_rcx = uc.uc_mcontext.rcx;
         frame.rsp = uc.uc_mcontext.rsp;
 
         Ok(uc.uc_sigmask)
