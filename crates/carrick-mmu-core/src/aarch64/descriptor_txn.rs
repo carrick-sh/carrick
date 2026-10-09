@@ -1638,11 +1638,11 @@ pub struct TableWindow {
 }
 
 /// The EL1-reachable stage-1 tables as aligned arrays of atomics: the MM's
-/// primary arena and, optionally, a second window over every other arena
-/// (EL1's view of the carrier's table pool).
+/// primary arena and two retained windows: the table pool and carrier-owned
+/// fork stock in dynamic metadata.
 pub struct PrimaryTableWords<'m, M: TableMaintenance + ?Sized> {
     primary: TableWindow,
-    extra: Option<TableWindow>,
+    extra: [Option<TableWindow>; 2],
     maintenance: &'m M,
 }
 
@@ -1667,7 +1667,7 @@ impl<'m, M: TableMaintenance + ?Sized> PrimaryTableWords<'m, M> {
         Self::check(primary)?;
         Ok(Self {
             primary,
-            extra: None,
+            extra: [None, None],
             maintenance,
         })
     }
@@ -1679,7 +1679,12 @@ impl<'m, M: TableMaintenance + ?Sized> PrimaryTableWords<'m, M> {
     /// The same contract as [`Self::new`] holds for `window`.
     pub unsafe fn with_window(mut self, window: TableWindow) -> Result<Self, DescriptorRefusal> {
         Self::check(window)?;
-        self.extra = Some(window);
+        let slot = self
+            .extra
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(DescriptorRefusal::BadRange)?;
+        *slot = Some(window);
         Ok(self)
     }
 
@@ -1711,8 +1716,9 @@ impl<'m, M: TableMaintenance + ?Sized> PrimaryTableWords<'m, M> {
         Self::word_in(&self.primary, pa)
             .or_else(|| {
                 self.extra
-                    .as_ref()
-                    .and_then(|window| Self::word_in(window, pa))
+                    .iter()
+                    .flatten()
+                    .find_map(|window| Self::word_in(window, pa))
             })
             .ok_or(DescriptorRefusal::TableOutsidePrimary)
     }
