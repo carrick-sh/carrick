@@ -265,6 +265,23 @@ pub const EL1_DYNAMIC_METADATA_SIZE: u64 = 0x0400_0000;
 /// Standard quantum size of a dynamic metadata extent granted by the host (512 KiB).
 pub use carrick_core_abi::EL1_DYNAMIC_METADATA_EXTENT_SIZE;
 
+/// The exact mapped boot-stock extent containing a loaned table root.
+pub fn fork_stock_table_window(
+    loaned_root: u64,
+) -> Option<carrick_mmu_core::aarch64::descriptor_txn::TableWindow> {
+    let offset = loaned_root.checked_sub(EL1_DYNAMIC_METADATA_BASE)?;
+    if offset >= EL1_DYNAMIC_METADATA_SIZE {
+        return None;
+    }
+    let extent = EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64;
+    let base = EL1_DYNAMIC_METADATA_BASE + offset / extent * extent;
+    Some(carrick_mmu_core::aarch64::descriptor_txn::TableWindow {
+        words: base as *mut core::sync::atomic::AtomicU64,
+        physical_base: base,
+        byte_len: EL1_DYNAMIC_METADATA_EXTENT_SIZE,
+    })
+}
+
 /// Operation code for requesting an extent grant from the host (HVC #6).
 pub const METADATA_GRANT_OP_ALLOC: u64 = 1;
 
@@ -2092,6 +2109,14 @@ pub enum NativeForkFailureStage {
     PublishReservation = 51,
     PublishWait = 52,
     PublishUnsupportedExecutableCow = 53,
+    ReleaseBirth = 54,
+    SettleCustody = 55,
+    SettleRecord = 56,
+    SettleCrossing = 57,
+    SettleReply = 58,
+    SettlePortal = 59,
+    SettleSpace = 60,
+    RegisterChild = 61,
 }
 
 impl NativeForkFailureStage {
@@ -2150,9 +2175,45 @@ impl NativeForkFailureStage {
             51 => Self::PublishReservation,
             52 => Self::PublishWait,
             53 => Self::PublishUnsupportedExecutableCow,
+            54 => Self::ReleaseBirth,
+            55 => Self::SettleCustody,
+            56 => Self::SettleRecord,
+            57 => Self::SettleCrossing,
+            58 => Self::SettleReply,
+            59 => Self::SettlePortal,
+            60 => Self::SettleSpace,
+            61 => Self::RegisterChild,
             _ => return None,
         })
     }
+}
+
+/// Completed ARM fork milestones. Counts preserve progress across multiple
+/// children, including a child that exits before its parent resumes.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+#[repr(usize)]
+pub enum NativeForkProgress {
+    Prepare = 0,
+    Publish = 1,
+    Commit = 2,
+    Settle = 3,
+    ChildRegistered = 4,
+    ParentResumed = 5,
+    ChildEntered = 6,
+    WaitEntered = 7,
+    WaitReturned = 8,
+    ChildExit = 9,
+    ChildRetired = 10,
+}
+
+impl NativeForkProgress {
+    pub const COUNT: usize = 11;
 }
 
 /// Per-syscall accounting counters maintained by the EL1 kernel in the shared aperture.
@@ -2185,6 +2246,8 @@ pub struct Counters {
     pub process_refusals: [AtomicU64; ProcessRefusal::COUNT],
     /// First typed ARM fork service failure, retained across a carrier run.
     pub first_native_fork_failure: AtomicU64,
+    /// Completed milestones of owner-served ARM forks.
+    pub native_fork_progress: [AtomicU64; NativeForkProgress::COUNT],
 }
 
 impl Counters {
@@ -2201,6 +2264,7 @@ impl Counters {
             refused: [const { AtomicU64::new(0) }; 513],
             process_refusals: [const { AtomicU64::new(0) }; ProcessRefusal::COUNT],
             first_native_fork_failure: AtomicU64::new(0),
+            native_fork_progress: [const { AtomicU64::new(0) }; NativeForkProgress::COUNT],
         }
     }
 
@@ -2256,6 +2320,13 @@ impl Counters {
             self.first_native_fork_failure.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
+        for (target, source) in snapshot
+            .native_fork_progress
+            .iter()
+            .zip(&self.native_fork_progress)
+        {
+            target.store(source.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
         snapshot
     }
 
@@ -2271,13 +2342,26 @@ impl Counters {
             Ordering::Acquire,
         );
     }
+
+    pub fn record_native_fork_progress(&self, stage: NativeForkProgress) {
+        self.native_fork_progress[stage as usize].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(target_os = "none")]
+fn native_fork_counters() -> &'static Counters {
+    // SAFETY: EL1 maps the shared counters aperture for every carrier vCPU.
+    unsafe { &*(EL1_COUNTERS_BASE as *const Counters) }
 }
 
 #[cfg(target_os = "none")]
 pub fn record_native_fork_failure(stage: NativeForkFailureStage) {
-    // SAFETY: EL1 maps the shared counters aperture for every carrier vCPU.
-    let counters = unsafe { &*(EL1_COUNTERS_BASE as *const Counters) };
-    counters.record_first_native_fork_failure(stage);
+    native_fork_counters().record_first_native_fork_failure(stage);
+}
+
+#[cfg(target_os = "none")]
+pub fn record_native_fork_progress(stage: NativeForkProgress) {
+    native_fork_counters().record_native_fork_progress(stage);
 }
 
 const _: () = assert!(core::mem::size_of::<Counters>() as u64 <= EL1_COUNTERS_SIZE);
@@ -3600,9 +3684,9 @@ const _: () = {
     );
 };
 #[cfg(target_arch = "aarch64")]
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x3dbe_2b67_88b7_1f8c);
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0xc109_9eb6_2f22_9cc4);
 #[cfg(not(target_arch = "aarch64"))]
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0xfcac_b81b_35cf_8448);
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x4c32_dfa3_5da9_7580);
 
 #[cfg(test)]
 mod tests {
@@ -3616,6 +3700,22 @@ mod tests {
             aperture_end <= EL1_SERVICE_COPY_TABLE_OFFSET
                 || service_end <= EL1_APERTURE_CONTROL_OFFSET,
             "strict control aliases the service-copy L3 descriptors"
+        );
+    }
+
+    #[test]
+    fn fork_stock_window_is_one_backed_extent() {
+        let first =
+            super::EL1_DYNAMIC_METADATA_BASE + super::EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64;
+        let window = super::fork_stock_table_window(first + 4096).unwrap();
+        assert_eq!(window.physical_base, first);
+        assert_eq!(window.byte_len, super::EL1_DYNAMIC_METADATA_EXTENT_SIZE);
+        assert!(super::fork_stock_table_window(super::EL1_DYNAMIC_METADATA_BASE - 4096).is_none());
+        assert!(
+            super::fork_stock_table_window(
+                super::EL1_DYNAMIC_METADATA_BASE + super::EL1_DYNAMIC_METADATA_SIZE
+            )
+            .is_none()
         );
     }
 
@@ -3754,12 +3854,13 @@ mod tests {
                 + AnonymousLeave::COUNT
                 + 513
                 + ProcessRefusal::COUNT
-                + 1)
+                + 1
+                + NativeForkProgress::COUNT)
                 * 8
         );
         assert_eq!(
             core::mem::offset_of!(Counters, first_native_fork_failure),
-            core::mem::size_of::<Counters>() - 8
+            core::mem::size_of::<Counters>() - (NativeForkProgress::COUNT + 1) * 8
         );
         assert_eq!(core::mem::offset_of!(Counters, served), 0);
         assert_eq!(core::mem::offset_of!(Counters, forwarded), 512 * 8);
