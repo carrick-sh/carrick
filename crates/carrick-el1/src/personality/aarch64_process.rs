@@ -616,7 +616,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         &mut self,
         mm: &Self::Mm,
         address: UserVa,
-        info: &carrick_abi::LinuxSiginfo,
+        info: &carrick_syscall_abi::LinuxSiginfo,
     ) -> Result<(), NativeProcessError> {
         // SAFETY: this canonical initialized ABI record owns all wire bytes.
         let bytes = unsafe {

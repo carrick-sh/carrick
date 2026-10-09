@@ -292,7 +292,7 @@ impl SignalRequest {
         }
         carrick_signal_core::policy::Signal::from_number(number)
             .map(Self::Deliver)
-            .ok_or(carrick_abi::LINUX_EINVAL)
+            .ok_or(carrick_syscall_abi::LINUX_EINVAL)
     }
     pub const fn signal(self) -> Option<carrick_signal_core::policy::Signal> {
         match self {
@@ -341,9 +341,9 @@ impl SignalInfo {
     ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
         if let Self::Queued(info) = self
             && matches!(scope, SignalTargetScope::OtherProcess)
-            && (info.si_code >= 0 || info.si_code == carrick_abi::LINUX_SI_TKILL)
+            && (info.si_code >= 0 || info.si_code == carrick_syscall_abi::LINUX_SI_TKILL)
         {
-            return Err(carrick_abi::LINUX_EPERM);
+            return Err(carrick_syscall_abi::LINUX_EPERM);
         }
         Ok(())
     }
@@ -497,15 +497,15 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                     ),
                 };
                 let flags = carrick_signal_core::policy::ActionFlags {
-                    on_stack: newact.sa_flags & carrick_abi::LINUX_SA_ONSTACK != 0,
-                    reset_hand: newact.sa_flags & carrick_abi::LINUX_SA_RESETHAND != 0,
-                    nodefer: newact.sa_flags & carrick_abi::LINUX_SA_NODEFER != 0,
-                    restart: newact.sa_flags & carrick_abi::LINUX_SA_RESTART != 0,
-                    siginfo: newact.sa_flags & carrick_abi::LINUX_SA_SIGINFO != 0,
-                    no_child_wait: newact.sa_flags & carrick_abi::LINUX_SA_NOCLDWAIT != 0,
-                    no_child_stop: newact.sa_flags & carrick_abi::LINUX_SA_NOCLDSTOP != 0,
+                    on_stack: newact.sa_flags & carrick_syscall_abi::LINUX_SA_ONSTACK != 0,
+                    reset_hand: newact.sa_flags & carrick_syscall_abi::LINUX_SA_RESETHAND != 0,
+                    nodefer: newact.sa_flags & carrick_syscall_abi::LINUX_SA_NODEFER != 0,
+                    restart: newact.sa_flags & carrick_syscall_abi::LINUX_SA_RESTART != 0,
+                    siginfo: newact.sa_flags & carrick_syscall_abi::LINUX_SA_SIGINFO != 0,
+                    no_child_wait: newact.sa_flags & carrick_syscall_abi::LINUX_SA_NOCLDWAIT != 0,
+                    no_child_stop: newact.sa_flags & carrick_syscall_abi::LINUX_SA_NOCLDSTOP != 0,
                 };
-                let restorer = if newact.sa_flags & carrick_abi::LINUX_SA_RESTORER != 0 {
+                let restorer = if newact.sa_flags & carrick_syscall_abi::LINUX_SA_RESTORER != 0 {
                     Some(carrick_signal_core::policy::RestorerAddress(
                         newact.sa_restorer,
                     ))
@@ -546,32 +546,32 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 };
                 let mut flags = 0u64;
                 if current.flags.on_stack {
-                    flags |= carrick_abi::LINUX_SA_ONSTACK;
+                    flags |= carrick_syscall_abi::LINUX_SA_ONSTACK;
                 }
                 if current.flags.siginfo {
-                    flags |= carrick_abi::LINUX_SA_SIGINFO; // SA_SIGINFO
+                    flags |= carrick_syscall_abi::LINUX_SA_SIGINFO; // SA_SIGINFO
                 }
                 if current.flags.nodefer {
-                    flags |= carrick_abi::LINUX_SA_NODEFER; // SA_NODEFER
+                    flags |= carrick_syscall_abi::LINUX_SA_NODEFER; // SA_NODEFER
                 }
                 if current.flags.reset_hand {
-                    flags |= carrick_abi::LINUX_SA_RESETHAND; // SA_RESETHAND
+                    flags |= carrick_syscall_abi::LINUX_SA_RESETHAND; // SA_RESETHAND
                 }
                 if current.flags.restart {
-                    flags |= carrick_abi::LINUX_SA_RESTART; // SA_RESTART
+                    flags |= carrick_syscall_abi::LINUX_SA_RESTART; // SA_RESTART
                 }
                 if current.flags.no_child_stop {
-                    flags |= carrick_abi::LINUX_SA_NOCLDSTOP; // SA_NOCLDSTOP
+                    flags |= carrick_syscall_abi::LINUX_SA_NOCLDSTOP; // SA_NOCLDSTOP
                 }
                 if current.flags.no_child_wait {
-                    flags |= carrick_abi::LINUX_SA_NOCLDWAIT; // SA_NOCLDWAIT
+                    flags |= carrick_syscall_abi::LINUX_SA_NOCLDWAIT; // SA_NOCLDWAIT
                 }
                 if let Some(restorer) = current.restorer {
-                    flags |= carrick_abi::LINUX_SA_RESTORER; // SA_RESTORER
+                    flags |= carrick_syscall_abi::LINUX_SA_RESTORER; // SA_RESTORER
                     oldact.sa_restorer = restorer.0;
                 }
                 if current.flags.on_stack {
-                    flags |= carrick_abi::LINUX_SA_ONSTACK;
+                    flags |= carrick_syscall_abi::LINUX_SA_ONSTACK;
                 }
                 oldact.sa_flags = flags;
                 oldact.sa_mask = [current.mask.bits()];
@@ -841,13 +841,16 @@ pub fn delivery_stack(
     stack: crate::abi::thread::AltStack,
     interrupted_sp: carrick_guest_arch::UserVa,
     on_stack: bool,
-) -> Option<(carrick_guest_arch::UserVa, carrick_abi::LinuxSignalStack)> {
+) -> Option<(
+    carrick_guest_arch::UserVa,
+    carrick_syscall_abi::LinuxSignalStack,
+)> {
     if stack.is_disabled() {
         return Some((
             interrupted_sp,
-            carrick_abi::LinuxSignalStack {
-                ss_flags: carrick_abi::LINUX_SS_DISABLE as i32,
-                ..carrick_abi::LinuxSignalStack::empty()
+            carrick_syscall_abi::LinuxSignalStack {
+                ss_flags: carrick_syscall_abi::LINUX_SS_DISABLE as i32,
+                ..carrick_syscall_abi::LinuxSignalStack::empty()
             },
         ));
     }
@@ -855,11 +858,11 @@ pub fn delivery_stack(
     let already_on = interrupted_sp.raw() >= stack.sp && interrupted_sp.raw() < top;
     let flags = stack.flags
         | if already_on {
-            carrick_abi::LINUX_SS_ONSTACK as u32
+            carrick_syscall_abi::LINUX_SS_ONSTACK as u32
         } else {
             0
         };
-    let record = carrick_abi::LinuxSignalStack {
+    let record = carrick_syscall_abi::LinuxSignalStack {
         ss_sp: stack.sp,
         ss_flags: flags as i32,
         _pad0: 0,

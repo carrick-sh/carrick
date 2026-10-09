@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 bitflags.workspace = true
+zerocopy.workspace = true
 serde = { version = "1.0.228", default-features = false, features = ["derive"] }
 
 [lints]
