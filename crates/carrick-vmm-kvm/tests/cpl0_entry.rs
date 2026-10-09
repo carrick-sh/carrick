@@ -15,9 +15,9 @@ use physical_inventory::physical_inventory;
 use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
 use carrick_mmu_core::x86::descriptor_txn::Access;
 use carrick_sched_core::{ParkedContextWords, SlotId, ThreadIdentity, ZoneTables};
-use carrick_vmm_kvm::cpl0_boot::{
-    Cpl0Carrier, InitialProcessExit, InitialReservationLimits, InitialSyscallDisposition,
-};
+use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
+#[path = "common/kvm_pool_fixture.rs"]
+mod kvm_pool_fixture;
 use carrick_x86::cpl0_entry::{
     OBSERVE_ALLOCATOR, OBSERVE_DESCRIPTOR_PREPARE_PUBLISH, OBSERVE_DESCRIPTOR_PROTECT,
     OBSERVE_FORK_TABLE_WINDOW, OBSERVE_MMU_DRAIN, OBSERVE_MMU_ROOT, OBSERVE_NATIVE,
@@ -28,6 +28,7 @@ use carrick_x86::cpl0_scheduler::{
     ContextBinding, InterruptFrame, NativeContext, XsaveArea, admit_context, park_native_context,
     restore_native_context,
 };
+use kvm_pool_fixture::run_pool_fixture;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 
@@ -362,28 +363,14 @@ fn production_image_rejects_fixture_syscalls() {
         0xe7, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b,
     ]);
     let elf = production_probe_elf(&probe);
-    let image =
-        carrick_mem::x86_initial_image::prepare_static_x86_elf(&elf).expect("native probe image");
-    let extent =
-        Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("probe initial extent");
-    let mut carrier =
-        Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM image");
-    carrier
-        .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
-        .expect("actual initial MM");
-    let exit = carrier
-        .run_initial_process(8, |_, _| Ok(InitialSyscallDisposition::Return(-1)))
-        .expect("synthetic refusal and native root exit");
-    assert!(matches!(exit, InitialProcessExit::Exited { code: 7, .. }));
-    assert_eq!(carrier.initial_execution_witness().1, 0);
-    assert_eq!(carrier.refusal_overflow_count(), 1);
+    let outcome = run_pool_fixture(&elf, 8);
+    assert_eq!(outcome.run.exit_code, 7);
+    assert_eq!(outcome.physical.initial_execution_witness().unwrap().1, 0);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 1);
 }
 
 #[test]
 fn production_interrupt_boot_serves_an_ordinary_syscall() {
-    use carrick_vmm_kvm::cpl0_boot::{
-        InitialProcessExit, InitialReservationLimits, InitialSyscallDisposition,
-    };
     // Production entry requires an admitted initial MM and scheduler record.
     // Keep the ordinary syscall and refusal checks on that real launch path.
     let mut probe = vec![
@@ -395,19 +382,10 @@ fn production_interrupt_boot_serves_an_ordinary_syscall() {
         0x0f, 0x05, 0x0f, 0x0b, 0xbf, 9, 0, 0, 0, 0xb8, 0xe7, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b,
     ]);
     let elf = production_probe_elf(&probe);
-    let plan = carrick_mem::x86_initial_image::prepare_static_x86_elf(&elf).expect("probe ELF");
-    let extent = Cpl0Carrier::initial_extent_bytes_for(&plan, &[], &[]).expect("initial extent");
-    let mut carrier =
-        Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM image");
-    carrier
-        .load_guest_mm(&plan, &[], &[], InitialReservationLimits::UNLIMITED)
-        .expect("initial MM");
-    let exit = carrier
-        .run_initial_process(8, |_, _| Ok(InitialSyscallDisposition::Return(-1)))
-        .expect("native syscall, refusal and exit");
-    assert!(matches!(exit, InitialProcessExit::Exited { code: 7, .. }));
-    assert_eq!(carrier.refusal_overflow_count(), 1);
-    assert_eq!(carrier.robust_list_head(0).expect("task head"), 0x2345);
+    let outcome = run_pool_fixture(&elf, 8);
+    assert_eq!(outcome.run.exit_code, 7);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 1);
+    assert_eq!(outcome.physical.robust_list_head(0).unwrap(), 0x2345);
 }
 
 fn program(calls: &[(u64, u64)]) -> Vec<u8> {

@@ -161,6 +161,224 @@ mod initial_x86_forward_tests {
 
 pub struct Runtime;
 
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+pub struct PreparedKvmPoolOutcome {
+    pub run: RunResult,
+    pub physical: Arc<carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory>,
+    pub fault_record: Option<carrick_x86::FaultDoorbellRecord>,
+}
+
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+pub fn run_prepared_kvm_pool(
+    machine: carrick_vmm_kvm::cpl0_boot::Cpl0Carrier,
+    root_context: carrick_kernel::kernel::KernelContext,
+    dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
+    max_traps: usize,
+) -> Result<PreparedKvmPoolOutcome, RuntimeError> {
+    run_prepared_kvm_pool_inner(machine, root_context, dispatcher, max_traps, None)
+}
+
+#[cfg(all(
+    feature = "platform-linux",
+    feature = "test-support",
+    target_arch = "x86_64"
+))]
+pub fn run_prepared_kvm_pool_with_first_forward_hook(
+    machine: carrick_vmm_kvm::cpl0_boot::Cpl0Carrier,
+    root_context: carrick_kernel::kernel::KernelContext,
+    dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
+    max_traps: usize,
+    hook: Box<
+        dyn FnOnce(
+                &mut carrick_vmm_kvm::cpl0_boot::ProductionCpuLease,
+            ) -> Result<(), carrick_hal::TrapError>
+            + Send,
+    >,
+) -> Result<PreparedKvmPoolOutcome, RuntimeError> {
+    run_prepared_kvm_pool_inner(machine, root_context, dispatcher, max_traps, Some(hook))
+}
+
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+fn run_prepared_kvm_pool_inner(
+    machine: carrick_vmm_kvm::cpl0_boot::Cpl0Carrier,
+    root_context: carrick_kernel::kernel::KernelContext,
+    dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
+    max_traps: usize,
+    first_forward_hook: Option<crate::vcpu_loop::executor::kvm::KvmFirstForwardHook>,
+) -> Result<PreparedKvmPoolOutcome, RuntimeError> {
+    #[cfg(not(feature = "test-support"))]
+    let _ = first_forward_hook;
+    use crate::vcpu_loop::executor::{self, PersistentTaskBinding};
+    use carrick_hal::threaded::GuestCpuState;
+    use carrick_kernel::kernel::objects::MigratableTaskState;
+    use carrick_kernel::kernel::scheduler::{CpuAffinity, GuestCpuId, GuestCpuPolicy};
+    let parts = machine.into_worker_parts(max_traps)?;
+    let (root_cpu, physical) = parts.into_factory();
+    let physical = Arc::new(physical);
+    let reporter = Arc::new(carrick_kernel::compat::CompatReporter::default());
+    let stats = Arc::new(executor::kvm::KvmForwardStats::default());
+    let dispatcher = Arc::new(std::sync::Mutex::new(dispatcher));
+    root_context
+        .thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+    let scheduler = Arc::new(carrick_kernel::kernel::Scheduler::new_with_policy(
+        Arc::clone(root_context.kernel()),
+        Arc::new(GuestCpuPolicy::new(2)),
+    ));
+    let state = MigratableTaskState {
+        cpu: GuestCpuState::X86_64V1(Arc::new(root_cpu.state().clone())),
+        mm: root_context.shared().mm().id(),
+        asid_generation: root_cpu.state().asid_generation(),
+    };
+    let generation = scheduler
+        .publish_initial_task_state_gated(root_context.thread(), state.clone())
+        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+    let binding = Arc::new(executor::kvm::KvmTaskBinding::new(
+        &root_context,
+        &state,
+        root_cpu.binding(),
+        generation,
+    )?);
+    let directory = Arc::new(executor::kvm::KvmTaskBindingDirectory::default());
+    let dormant = directory.prepare_submission(
+        &scheduler,
+        executor::TaskSubmissionShape::Root,
+        None,
+        Arc::clone(root_context.thread()),
+        generation,
+        Arc::clone(&binding),
+    )?;
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    let factory = Arc::new(executor::kvm::KvmPersistentExecutorFactory::new(
+        Arc::clone(&physical),
+        Arc::clone(&dispatcher),
+        Arc::clone(&reporter),
+        completed_tx,
+        max_traps,
+        Arc::clone(&stats),
+        Arc::clone(&scheduler),
+    ));
+    #[cfg(feature = "test-support")]
+    if let Some(hook) = first_forward_hook {
+        factory.install_first_forward_hook(hook)?;
+    }
+    let pool = executor::ExecutorPool::start(
+        executor::ExecutorPoolConfig {
+            bound_workers: 2,
+            spare_executors: 0,
+            vcpu_ceiling: 2,
+            reserve: 0,
+        },
+        Arc::clone(&scheduler),
+        Arc::clone(&factory),
+        Arc::clone(&directory),
+        executor::ExecutorBoundaryAudit,
+    )
+    .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+    let start_gate = root_context
+        .thread()
+        .take_opened_start_gate(generation)
+        .ok_or_else(|| RuntimeError::Configuration("KVM root start gate absent".into()))?;
+    let proof = executor::TaskActivationProof::validate(
+        &root_context,
+        &state,
+        generation,
+        binding.load_identity(),
+        start_gate,
+    )?;
+    dormant.activate(&scheduler, Arc::clone(root_context.thread()), proof)?;
+    drop(factory);
+    let completion = completed_rx.recv();
+    let shutdown = pool.shutdown();
+    let outcome = completion
+        .map_err(|error| RuntimeError::Configuration(format!("KVM executor completion: {error}")))?
+        .map_err(RuntimeError::Configuration)?;
+    shutdown.map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+    let (guest_entries, portal_exits) = physical.initial_execution_witness()?;
+    let physical_crossing_families: Vec<_> = physical
+        .physical_crossing_counts()?
+        .into_iter()
+        .filter(|(_, count)| *count != 0)
+        .map(|(family, count)| crate::compat::ExecutionFamilyCount {
+            family: family.as_str().to_owned(),
+            count,
+        })
+        .collect();
+    let physical_exits: u64 = physical_crossing_families.iter().map(|row| row.count).sum();
+    let count_family = |families: std::collections::BTreeMap<&'static str, u64>| {
+        families
+            .into_iter()
+            .map(|(family, count)| crate::compat::ExecutionFamilyCount {
+                family: family.to_owned(),
+                count,
+            })
+            .collect()
+    };
+    let (forward_families, refusal_families) = stats.snapshot()?;
+    let host_forwards = forward_families.values().sum();
+    let mut report = reporter.snapshot();
+    report.execution_witness = Some(crate::compat::ExecutionWitness {
+        backend: "kvm-x86-cpl0".to_owned(),
+        guest_entries,
+        portal_exits: portal_exits + physical_exits,
+        host_forwards,
+        anonymous_private_pages: physical.anonymous_private_pages()?,
+        anonymous_private_mms: physical
+            .anonymous_private_mms()?
+            .into_iter()
+            .map(|row| carrick_observability::compat::AnonymousPrivateMm {
+                mm: row.mm,
+                root: row.root,
+                incarnation: row.incarnation,
+                generation: row.generation,
+                private_pages: row.private_pages,
+                cpu_mask: row.cpu_mask,
+            })
+            .collect(),
+        cross_mm_private_aliases: physical.cross_mm_private_aliases()?,
+        peer_active_private_grants: physical.peer_active_private_grants()?,
+        physical_crossing_families,
+        host_forward_families: count_family(forward_families),
+        guest_refusal_families: count_family(refusal_families),
+    });
+    let (exit_code, terminating_signal, traps, fault_record) = match outcome {
+        carrick_vmm_kvm::cpl0_boot::InitialProcessExit::Exited { code, exits } => {
+            (code, None, exits, None)
+        }
+        carrick_vmm_kvm::cpl0_boot::InitialProcessExit::Fault { record, exits } => {
+            if record.cs & 3 != 3 {
+                return Err(RuntimeError::Unsupported(format!(
+                    "CPL0 kernel fault: {record:?}"
+                )));
+            }
+            let (signal, _) = record.linux_signal().ok_or_else(|| {
+                RuntimeError::Unsupported(format!("unclassified x86 user fault: {record:?}"))
+            })?;
+            (128 + signal, Some(signal), exits, Some(record))
+        }
+    };
+    let (stdout, stderr) = {
+        let dispatcher = dispatcher
+            .lock()
+            .map_err(|_| RuntimeError::Configuration("KVM dispatcher poisoned".into()))?;
+        (dispatcher.stdout(), dispatcher.stderr())
+    };
+    Ok(PreparedKvmPoolOutcome {
+        run: RunResult {
+            exit_code,
+            terminating_signal,
+            stdout,
+            stderr,
+            traps,
+            report,
+            trap_limit_hit: false,
+            terminal_reason: None,
+        },
+        physical,
+        fault_record,
+    })
+}
+
 /// Everything `prepare` resolves before it touches the filesystem: page
 /// geometry, the host resolver snapshot, the network lease and
 /// the verbatim environment. Owns the [`LaunchContext`].
@@ -1092,171 +1310,8 @@ impl PreparedRun {
                 data: dispatcher.launch_resource_limit(carrick_abi::LinuxResource::Data),
             };
             machine.load_guest_mm(&image, &argv, &env, limits)?;
-            use crate::vcpu_loop::executor::{self, PersistentTaskBinding};
-            use carrick_hal::threaded::GuestCpuState;
-            use carrick_kernel::kernel::objects::MigratableTaskState;
-            use carrick_kernel::kernel::scheduler::{CpuAffinity, GuestCpuId, GuestCpuPolicy};
-            let parts = machine.into_worker_parts(max_traps)?;
-            let (root_cpu, physical) = parts.into_factory();
-            let physical = Arc::new(physical);
-            let reporter = Arc::new(carrick_kernel::compat::CompatReporter::default());
-            let stats = Arc::new(executor::kvm::KvmForwardStats::default());
-            let dispatcher = Arc::new(std::sync::Mutex::new(dispatcher));
-            root_context
-                .thread()
-                .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
-            let scheduler = Arc::new(carrick_kernel::kernel::Scheduler::new_with_policy(
-                Arc::clone(root_context.kernel()),
-                Arc::new(GuestCpuPolicy::new(2)),
-            ));
-            let state = MigratableTaskState {
-                cpu: GuestCpuState::X86_64V1(Arc::new(root_cpu.state().clone())),
-                mm: root_context.shared().mm().id(),
-                asid_generation: root_cpu.state().asid_generation(),
-            };
-            let generation = scheduler
-                .publish_initial_task_state_gated(root_context.thread(), state.clone())
-                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-            let binding = Arc::new(executor::kvm::KvmTaskBinding::new(
-                &root_context,
-                &state,
-                root_cpu.binding(),
-                generation,
-            )?);
-            let directory = Arc::new(executor::kvm::KvmTaskBindingDirectory::default());
-            let dormant = directory.prepare_submission(
-                &scheduler,
-                executor::TaskSubmissionShape::Root,
-                None,
-                Arc::clone(root_context.thread()),
-                generation,
-                Arc::clone(&binding),
-            )?;
-            let (completed_tx, completed_rx) = std::sync::mpsc::channel();
-            let factory = Arc::new(executor::kvm::KvmPersistentExecutorFactory::new(
-                Arc::clone(&physical),
-                Arc::clone(&dispatcher),
-                Arc::clone(&reporter),
-                completed_tx,
-                max_traps,
-                Arc::clone(&stats),
-                Arc::clone(&scheduler),
-            ));
-            let pool = executor::ExecutorPool::start(
-                executor::ExecutorPoolConfig {
-                    bound_workers: 2,
-                    spare_executors: 0,
-                    vcpu_ceiling: 2,
-                    reserve: 0,
-                },
-                Arc::clone(&scheduler),
-                Arc::clone(&factory),
-                Arc::clone(&directory),
-                executor::ExecutorBoundaryAudit,
-            )
-            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-            let start_gate = root_context
-                .thread()
-                .take_opened_start_gate(generation)
-                .ok_or_else(|| RuntimeError::Configuration("KVM root start gate absent".into()))?;
-            let proof = executor::TaskActivationProof::validate(
-                &root_context,
-                &state,
-                generation,
-                binding.load_identity(),
-                start_gate,
-            )?;
-            dormant.activate(&scheduler, Arc::clone(root_context.thread()), proof)?;
-            drop(factory);
-            let completion = completed_rx.recv();
-            let shutdown = pool.shutdown();
-            let outcome = completion
-                .map_err(|error| {
-                    RuntimeError::Configuration(format!("KVM executor completion: {error}"))
-                })?
-                .map_err(RuntimeError::Configuration)?;
-            shutdown.map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-            let (guest_entries, portal_exits) = physical.initial_execution_witness()?;
-            let physical_crossing_families: Vec<_> = physical
-                .physical_crossing_counts()?
-                .into_iter()
-                .filter(|(_, count)| *count != 0)
-                .map(|(family, count)| crate::compat::ExecutionFamilyCount {
-                    family: family.as_str().to_owned(),
-                    count,
-                })
-                .collect();
-            let physical_exits: u64 = physical_crossing_families.iter().map(|row| row.count).sum();
-            let count_family = |families: std::collections::BTreeMap<&'static str, u64>| {
-                families
-                    .into_iter()
-                    .map(|(family, count)| crate::compat::ExecutionFamilyCount {
-                        family: family.to_owned(),
-                        count,
-                    })
-                    .collect()
-            };
-            let (forward_families, refusal_families) = stats.snapshot()?;
-            let host_forwards = forward_families.values().sum();
-            let mut report = reporter.snapshot();
-            report.execution_witness = Some(crate::compat::ExecutionWitness {
-                backend: "kvm-x86-cpl0".to_owned(),
-                guest_entries,
-                portal_exits: portal_exits + physical_exits,
-                host_forwards,
-                anonymous_private_pages: physical.anonymous_private_pages()?,
-                anonymous_private_mms: physical
-                    .anonymous_private_mms()?
-                    .into_iter()
-                    .map(|row| carrick_observability::compat::AnonymousPrivateMm {
-                        mm: row.mm,
-                        root: row.root,
-                        incarnation: row.incarnation,
-                        generation: row.generation,
-                        private_pages: row.private_pages,
-                        cpu_mask: row.cpu_mask,
-                    })
-                    .collect(),
-                cross_mm_private_aliases: physical.cross_mm_private_aliases()?,
-                peer_active_private_grants: physical.peer_active_private_grants()?,
-                physical_crossing_families,
-                host_forward_families: count_family(forward_families),
-                guest_refusal_families: count_family(refusal_families),
-            });
-            let (exit_code, terminating_signal, traps) = match outcome {
-                carrick_vmm_kvm::cpl0_boot::InitialProcessExit::Exited { code, exits } => {
-                    (code, None, exits)
-                }
-                carrick_vmm_kvm::cpl0_boot::InitialProcessExit::Fault { record, exits } => {
-                    if record.cs & 3 != 3 {
-                        return Err(RuntimeError::Unsupported(format!(
-                            "CPL0 kernel fault: {record:?}"
-                        )));
-                    }
-                    let (signal, _) = record.linux_signal().ok_or_else(|| {
-                        RuntimeError::Unsupported(format!(
-                            "unclassified x86 user fault: {record:?}"
-                        ))
-                    })?;
-                    (128 + signal, Some(signal), exits)
-                }
-            };
-            let (stdout, stderr) = {
-                let dispatcher = dispatcher
-                    .lock()
-                    .map_err(|_| RuntimeError::Configuration("KVM dispatcher poisoned".into()))?;
-                (dispatcher.stdout(), dispatcher.stderr())
-            };
-            Ok(RunResult {
-                exit_code,
-                terminating_signal,
-                stdout,
-                stderr,
-                traps,
-                report,
-                trap_limit_hit: false,
-                terminal_reason: None,
-            })
+            run_prepared_kvm_pool(machine, root_context, dispatcher, max_traps)
+                .map(|outcome| outcome.run)
         } else {
             Err(RuntimeError::Unsupported(format!(
                 "Linux execution backend {backend:?} is not available"
