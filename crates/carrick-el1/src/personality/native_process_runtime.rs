@@ -120,6 +120,11 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     fn quarantine_born(&mut self, born: Self::Born);
     fn retire_mm(&mut self, mm: Self::Mm);
     fn wake_effects(&mut self, effects: WakeEffects);
+    /// ARM keeps the parent's shared file table; a separately owned x86
+    /// table takes a graph-issued identity for the new process.
+    fn child_file_table(&self, parent_table: u64, _issued: u64) -> u64 {
+        parent_table
+    }
     fn fork_fd_table(&mut self, _parent_table: u64, _child_table: u64) {}
 }
 pub struct NativeClaim {
@@ -357,7 +362,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                         .generation
                         .raw()
                         .max(binding.thread_generation.raw())
-                        .max(binding.mm.raw()),
+                        .max(binding.mm.raw())
+                        .max(identity.file_table),
                 )
                 .ok_or(NativeProcessError::Invalid)?,
             )
@@ -1088,7 +1094,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(error);
             }
         };
-        let child_file_table = parent_file_table.wrapping_add(1);
+        let child_file_table = self
+            .service
+            .child_file_table(parent_file_table, child_key.serial.raw());
         self.service
             .fork_fd_table(parent_file_table, child_file_table);
         let thread = ThreadIdentity {
@@ -1689,6 +1697,10 @@ mod tests {
         zone.install_space(slot, child_address.mm.raw().get())
             .unwrap();
         let child_identity = zone.record(child_record.id).identity();
+        assert_eq!(
+            child_identity.file_table, 5,
+            "ARM fork inherits the shared file table"
+        );
         task.set(
             carrick_el1_abi::El1TaskId::from_linux_tid(child.id.raw()),
             child.serial.raw(),

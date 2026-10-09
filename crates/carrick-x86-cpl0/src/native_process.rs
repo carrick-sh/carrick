@@ -516,6 +516,9 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
     fn wake_effects(&mut self, effects: WakeEffects) {
         deliver_wakes(effects);
     }
+    fn child_file_table(&self, _parent_table: u64, issued: u64) -> u64 {
+        issued
+    }
     fn fork_fd_table(&mut self, parent_table: u64, child_table: u64) {
         carrick_el1::personality::file_table::fork_fd_map(&super::FD_MAP, parent_table, child_table);
     }
