@@ -10,9 +10,11 @@ use super::UserWord;
 mod aarch64_context;
 #[cfg(test)]
 pub(super) use aarch64_context::{load_frame, save_frame};
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+use carrick_el1_abi::Aarch64ParkedContext;
 use carrick_el1_abi::CurrentTask;
 #[cfg(target_os = "none")]
-use carrick_el1_abi::{Aarch64ParkedContext, TrapFrame};
+use carrick_el1_abi::TrapFrame;
 
 /// EL1's user-word reader: stage-1 permission check, then one fixup-guarded
 /// unprivileged 32-bit load (single-copy atomic for an aligned word).
@@ -255,10 +257,10 @@ impl ThreadCpu for HardwareCpu {
     // AArch64 entry. CPL0 switches through ZoneRecord<ParkedContextWords>
     // and an authenticated CR3 in cpl0_lifecycle. Reaching these leaves on
     // x86 is an invalid entry-lane mix, never a successful context switch.
-    fn save(&mut self, _frame: &TrapFrame, _ctx: &mut Aarch64ParkedContext) {
+    fn save(&mut self, _frame: &TrapFrame, _ctx: &mut carrick_el1_abi::ZoneContext) {
         crate::isa::x86::fatal_entry_binding()
     }
-    fn load(&mut self, _frame: &mut TrapFrame, _ctx: &Aarch64ParkedContext) {
+    fn load(&mut self, _frame: &mut TrapFrame, _ctx: &carrick_el1_abi::ZoneContext) {
         crate::isa::x86::fatal_entry_binding()
     }
     fn set_translation(&mut self, _ttbr0: u64, _ttbr1: u64) {

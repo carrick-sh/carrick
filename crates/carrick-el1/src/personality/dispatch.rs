@@ -210,9 +210,12 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
         };
         let name_cache = unsafe { &*(EL1_NAME_CACHE_BASE as *const InotifyNameCache) };
         let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
+        #[cfg(target_arch = "aarch64")]
         let slot = SlotId::from_index(frame.slot as usize);
+        #[cfg(target_arch = "aarch64")]
         let process_call = matches!(frame.x[8], 260 | 94 | 95 | 58 | 435)
             || (frame.x[8] == 220 && frame.x[0] & 0x0001_0000 == 0);
+        #[cfg(target_arch = "aarch64")]
         if process_call {
             if let (Some(slot), Some(task)) = (slot, current_tasks.get(frame.slot as usize)) {
                 let source = carrick_el1_abi::BornInZoneSource { zone, slot };
@@ -345,6 +348,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
 }
 
 #[cfg(target_os = "none")]
+#[cfg(target_arch = "aarch64")]
 fn refuse_owner_process_call(frame: &mut TrapFrame, counters: &Counters) -> Action {
     let nr = frame.x[8] as usize;
     frame.x[0] = (-38_i64) as u64;
@@ -572,7 +576,7 @@ pub trait DispatchContext: carrick_el1_abi::EntryContext {
         slot: SlotId,
     ) -> Option<carrick_el1_abi::BornInZoneSource<'_, Self>>;
     fn arm_receipt(
-        receipt: carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::Aarch64ParkedContext>,
+        receipt: carrick_el1_abi::EntryHandoffReceipt<carrick_el1_abi::ZoneContext>,
     ) -> Option<carrick_el1_abi::EntryHandoffReceipt<Self>>;
 }
 impl DispatchContext for carrick_sched_core::ThreadCtx {
@@ -583,7 +587,7 @@ impl DispatchContext for carrick_sched_core::ThreadCtx {
         None
     }
     fn arm_receipt(
-        receipt: carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::Aarch64ParkedContext>,
+        receipt: carrick_el1_abi::EntryHandoffReceipt<carrick_el1_abi::ZoneContext>,
     ) -> Option<carrick_el1_abi::EntryHandoffReceipt<Self>> {
         let _ = receipt;
         None
@@ -597,11 +601,12 @@ impl DispatchContext for carrick_sched_core::ParkedContextWords {
         None
     }
     fn arm_receipt(
-        _: carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::Aarch64ParkedContext>,
+        _: carrick_el1_abi::EntryHandoffReceipt<carrick_el1_abi::ZoneContext>,
     ) -> Option<carrick_el1_abi::EntryHandoffReceipt<Self>> {
         None
     }
 }
+#[cfg(target_arch = "aarch64")]
 impl DispatchContext for carrick_sched_core::Aarch64ParkedContext {
     fn arm_source(
         zone: &ZoneTables,
@@ -610,7 +615,7 @@ impl DispatchContext for carrick_sched_core::Aarch64ParkedContext {
         Some(carrick_el1_abi::BornInZoneSource { zone, slot })
     }
     fn arm_receipt(
-        receipt: carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::Aarch64ParkedContext>,
+        receipt: carrick_el1_abi::EntryHandoffReceipt<carrick_el1_abi::ZoneContext>,
     ) -> Option<carrick_el1_abi::EntryHandoffReceipt<Self>> {
         Some(receipt)
     }
@@ -730,8 +735,7 @@ pub struct El1PendingFamilies<
     G: GuestDispatchFrame = TrapFrame,
     Context: DispatchContext = carrick_sched_core::ThreadCtx,
 > {
-    pub(super) handoff:
-        Option<carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::Aarch64ParkedContext>>,
+    pub(super) handoff: Option<carrick_el1_abi::EntryHandoffReceipt<carrick_el1_abi::ZoneContext>>,
     #[cfg(test)]
     pub(super) lifecycle_user: Option<&'a mut dyn file::UserCopy>,
     pub(super) frame: &'a mut G,
@@ -1392,9 +1396,7 @@ pub(super) fn native_scheduler<'s, C: sched::ThreadCpu, U: sched::UserWord>(
     task: &'s CurrentTask,
     counters: &'s Counters,
     slot: SlotId,
-    handoff: &'s mut Option<
-        carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::Aarch64ParkedContext>,
-    >,
+    handoff: &'s mut Option<carrick_el1_abi::EntryHandoffReceipt<carrick_el1_abi::ZoneContext>>,
 ) -> sched::Sched<'s, C, U> {
     sched::Sched {
         handoff: Some(handoff),

@@ -1832,7 +1832,10 @@ fn fork_cow(forks: usize, pages: usize) -> i32 {
 
         let pid = unsafe { libc::fork() };
         if pid < 0 {
-            println!("fork failed round={round}");
+            println!(
+                "fork failed round={round} errno={:?}",
+                std::io::Error::last_os_error().raw_os_error()
+            );
             unsafe {
                 libc::close(p2c[0]);
                 libc::close(p2c[1]);

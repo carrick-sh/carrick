@@ -1,13 +1,30 @@
 //! Context switching, wait enrollment, timer expiration and CPU hardware.
 use carrick_el1_abi::{
-    Aarch64ParkedContext, Counters, CurrentTask, El1ExitReason, GIC_KICK_INTID, GIC_RESCHED_INTID,
-    GIC_SPURIOUS_INTID, GIC_VTIMER_INTID, SlotId, ThreadIdentity, TrapFrame, Waker, ZoneTables,
+    Counters, CurrentTask, El1ExitReason, GIC_KICK_INTID, GIC_RESCHED_INTID, GIC_SPURIOUS_INTID,
+    GIC_VTIMER_INTID, SlotId, ThreadIdentity, TrapFrame, Waker, ZoneContext, ZoneTables,
 };
 use carrick_sched_core::{BoundedSpin, IDLE_SPIN_NS, PREEMPT_SLICE_NS, SwitchedIn, WakeEffects};
 use core::sync::atomic::Ordering;
 
 /// Bucket-lock spins before EL1 gives up and forwards.
 pub(crate) const EL1_ZONE_LOCK_SPINS: u32 = 1024;
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn native_context(ctx: &ZoneContext) -> &carrick_el1_abi::ThreadCtx {
+    &ctx.native
+}
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) fn native_context(ctx: &ZoneContext) -> &carrick_el1_abi::ThreadCtx {
+    ctx
+}
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn native_context_mut(ctx: &mut ZoneContext) -> &mut carrick_el1_abi::ThreadCtx {
+    &mut ctx.native
+}
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) fn native_context_mut(ctx: &mut ZoneContext) -> &mut carrick_el1_abi::ThreadCtx {
+    ctx
+}
 
 /// The earliest the virtual timer is armed from now: a deadline that could
 /// not be served (a busy lock, a full run queue) is retried after this.
@@ -19,9 +36,9 @@ pub mod object_wait;
 /// The CPU state and the per-vCPU hardware the in-guest scheduler uses.
 pub trait ThreadCpu {
     /// Save the running thread's `frame` and live state into `ctx`.
-    fn save(&mut self, frame: &TrapFrame, ctx: &mut Aarch64ParkedContext);
+    fn save(&mut self, frame: &TrapFrame, ctx: &mut ZoneContext);
     /// Make `ctx` the running thread: fill `frame` and load live state.
-    fn load(&mut self, frame: &mut TrapFrame, ctx: &Aarch64ParkedContext);
+    fn load(&mut self, frame: &mut TrapFrame, ctx: &ZoneContext);
     /// Install translation roots (`TTBR0_EL1`, `TTBR1_EL1`), effective for
     /// everything after the call.
     fn set_translation(&mut self, ttbr0: u64, ttbr1: u64);
@@ -116,7 +133,7 @@ pub struct Sched<'a, C: ThreadCpu, U: UserWord> {
     pub cpu: &'a mut C,
     pub user: &'a U,
     pub counters: &'a Counters,
-    pub handoff: Option<&'a mut Option<carrick_el1_abi::EntryHandoffReceipt<Aarch64ParkedContext>>>,
+    pub handoff: Option<&'a mut Option<carrick_el1_abi::EntryHandoffReceipt<ZoneContext>>>,
 }
 
 /// What [`Sched::take_irqs`] acknowledged.
@@ -130,7 +147,7 @@ pub struct IrqsTaken {
 impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     pub(crate) fn record_handoff(
         &mut self,
-        receipt: Option<carrick_el1_abi::EntryHandoffReceipt<Aarch64ParkedContext>>,
+        receipt: Option<carrick_el1_abi::EntryHandoffReceipt<ZoneContext>>,
     ) {
         if let Some(destination) = self.handoff.as_deref_mut() {
             *destination = receipt;
@@ -348,7 +365,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         self.task
             .linux
             .orig_arg0
-            .store(ctx.native.x[0], Ordering::Relaxed);
+            .store(native_context(ctx).x[0], Ordering::Relaxed);
         if let Some(result) = switched.result {
             frame.x[0] = result;
         }
@@ -742,8 +759,8 @@ impl Default for FakeCpu {
 
 #[cfg(test)]
 impl ThreadCpu for FakeCpu {
-    fn save(&mut self, frame: &TrapFrame, ctx: &mut Aarch64ParkedContext) {
-        let ctx = &mut ctx.native;
+    fn save(&mut self, frame: &TrapFrame, ctx: &mut ZoneContext) {
+        let ctx = native_context_mut(ctx);
         hw::save_frame(frame, ctx);
         ctx.sp_el0 = self.regs.sp_el0;
         ctx.tpidr_el0 = self.regs.tpidr_el0;
@@ -756,8 +773,8 @@ impl ThreadCpu for FakeCpu {
         }
     }
 
-    fn load(&mut self, frame: &mut TrapFrame, ctx: &Aarch64ParkedContext) {
-        let ctx = &ctx.native;
+    fn load(&mut self, frame: &mut TrapFrame, ctx: &ZoneContext) {
+        let ctx = native_context(ctx);
         hw::load_frame(frame, ctx);
         self.regs.sp_el0 = ctx.sp_el0;
         self.regs.tpidr_el0 = ctx.tpidr_el0;
