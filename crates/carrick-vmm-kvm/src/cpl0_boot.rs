@@ -38,8 +38,8 @@ use carrick_hal::{HvVcpu, TrapError, VcpuExit, VcpuKick};
 use carrick_kernel::kernel::{FrameInventoryAuthority, MmId, ObjectIdRegistry};
 use carrick_mem::pml4::{Pml4MapSpec, pml4_tables};
 use carrick_mmu_core::x86::descriptor_txn::{
-    Access, BackingIdentity, DescriptorOp, DescriptorTxn, DescriptorTxnId, LeafSize, PageSpan,
-    Permissions, translate_leaf,
+    Access, BackingIdentity, DescriptorOp, DescriptorTxn, DescriptorTxnId, PageSpan, Permissions,
+    translate_leaf,
 };
 use carrick_sched_core::spaces::notification::{SpaceAccess, SpaceReleaseVenue};
 use carrick_sched_core::{SlotId, Waker};
@@ -1994,25 +1994,15 @@ impl Cpl0Carrier {
                         generation,
                     },
                     root,
-                    op: if image.regions.iter().any(|region| {
-                        region.start <= publication.span_va && publication.span_va < region.end
-                    }) {
-                        DescriptorOp::Map {
-                            span: PageSpan::new(publication.span_va, 4096),
-                            output,
-                            permissions: perms,
-                            size: LeafSize::Page,
-                            resident: true,
-                            backing: identity,
-                        }
-                    } else {
-                        DescriptorOp::Prepare {
-                            span: PageSpan::new(publication.span_va, 4096),
-                            output,
-                            permissions: perms,
-                            resident: PageSpan::new(publication.span_va, 4096),
-                            backing: identity,
-                        }
+                    // The unpublished builder owns private frames for both
+                    // PT_LOAD segments and the initial anonymous stack. Keep
+                    // the exact publication operation aligned with that owner.
+                    op: DescriptorOp::Prepare {
+                        span: PageSpan::new(publication.span_va, 4096),
+                        output,
+                        permissions: perms,
+                        resident: PageSpan::new(publication.span_va, 4096),
+                        backing: identity,
                     },
                     tables: tables
                         .get(used_tables..)
