@@ -1,0 +1,142 @@
+[ringswitch-required-isa-red.log]
+   Compiling carrick-el1-image v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-el1-image)
+   Compiling carrick-personality-linux v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-personality-linux)
+   Compiling carrick-el1-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-el1-abi)
+   Compiling carrick-guest-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-guest-mem)
+   Compiling carrick-el1 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-el1)
+   Compiling carrick-host v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-host)
+   Compiling carrick-observability v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-observability)
+   Compiling carrick-mem v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-mem)
+   Compiling carrick-hal v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-hal)
+   Compiling carrick-x86 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-x86)
+error[E0046]: not all trait items implemented, missing: `crossing_set`
+    --> crates/carrick-x86/src/cpl0_lifecycle.rs:1013:1
+     |
+1013 | impl<'a> PendingFamilies<'a> for NativeLane<'a> {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `crossing_set` in implementation
+     |
+     = help: implement the missing item: `fn crossing_set(&self) -> HostCrossingSet { todo!() }`
+
+For more information about this error, try `rustc --explain E0046`.
+error: could not compile `carrick-x86` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+
+[ringswitch-terminal-red.log]
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.75s
+     Running unittests src/lib.rs (target/debug/deps/carrick_personality_linux-ef062da23f06c993)
+
+running 1 test
+test dispatch::ring_first_tests::strict_arm_terminal_calls_without_process_owner_cross_to_carrier ... FAILED
+
+failures:
+
+---- dispatch::ring_first_tests::strict_arm_terminal_calls_without_process_owner_cross_to_carrier stdout ----
+
+thread 'dispatch::ring_first_tests::strict_arm_terminal_calls_without_process_owner_cross_to_carrier' (132020095) panicked at crates/carrick-personality-linux/src/dispatch.rs:680:13:
+assertion `left == right` failed
+  left: Served
+ right: Forward
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    dispatch::ring_first_tests::strict_arm_terminal_calls_without_process_owner_cross_to_carrier
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 33 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-personality-linux --lib`
+
+[ringswitch-aperture-red.log]
+   Compiling carrick-personality-linux v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-personality-linux)
+   Compiling carrick-el1-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-el1-abi)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.69s
+     Running unittests src/lib.rs (target/debug/deps/carrick_el1_abi-3991132def0a4e54)
+
+running 1 test
+test tests::aperture_control_is_disjoint_from_service_copy_descriptors ... FAILED
+
+failures:
+
+---- tests::aperture_control_is_disjoint_from_service_copy_descriptors stdout ----
+
+thread 'tests::aperture_control_is_disjoint_from_service_copy_descriptors' (132011993) panicked at crates/carrick-el1-abi/src/lib.rs:3363:9:
+strict control aliases the service-copy L3 descriptors
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::aperture_control_is_disjoint_from_service_copy_descriptors
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 124 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-el1-abi --lib`
+
+[ringswitch-personality.log]
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[ringswitch-abi.log]
+test result: ok. 125 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[ringswitch-el1.log]
+test result: ok. 318 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+
+[ringswitch-hatch.log]
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 758 filtered out; finished in 0.00s
+
+[ringswitch-kernel-semantics.log]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+test result: ok. 4 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.14s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 8 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.20s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 88 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+[ringswitch-clippy.log]
+    Checking carrick-embed v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-embed)
+    Checking carrick-cli v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 55.38s
+
+[ringswitch-fmt-check.log]
+   Compiling carrick-xtask v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-xtask)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.69s
+     Running `target/debug/carrick-xtask worktree-run -- cargo --config 'build.rustc-wrapper="/opt/homebrew/bin/sccache"' fmt --all -- --check`
+
+[ringswitch-witness-check.log]
+    Checking carrick-engine v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-engine)
+    Checking carrick-embed v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-embed)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 27.20s
+
+[ringswitch-fixture-check.log]
+    Checking carrick-linux-aarch64-hello v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/fixtures/linux-aarch64-hello)
+    Finished `release` profile [optimized] target(s) in 0.02s
+

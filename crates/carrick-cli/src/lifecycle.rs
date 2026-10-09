@@ -742,6 +742,7 @@ fn rebuild_request_from_state(state: &ContainerState) -> LaunchRequest {
             // A bare `-e KEY` persisted in `env` re-imports from THIS process's
             // environment at relaunch, exactly as before.
             host_env: Some(crate::runtime_util::host_env_snapshot()),
+            arm_ring_first: None,
             mounts: c.mounts.clone(),
             workdir: c.workdir.clone(),
             user: c.user.clone(),

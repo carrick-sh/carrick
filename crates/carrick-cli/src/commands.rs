@@ -3164,6 +3164,7 @@ fn build_launch_request(
             args: command,
             env_overrides,
             host_env: Some(crate::runtime_util::host_env_snapshot()),
+            arm_ring_first: None,
             mounts,
             workdir: run_args.workdir.clone(),
             user: run_args.user.clone(),

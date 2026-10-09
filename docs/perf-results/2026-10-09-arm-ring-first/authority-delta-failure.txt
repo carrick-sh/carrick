@@ -1,0 +1,16 @@
+Ran 20 tests in 10.607s
+
+OK
+# Generic scalar rules here; symbol-bound task rules and mandatory owner
+# discovery run in authority-debt --source-only below.
+python3 scripts/migrate/check-task-participant-witnesses.py --check
+task participant witness gate: ok (339 Rust leaves)
+python3 scripts/migrate/check-mm-authority.py --check
+mm authority gate: ok (489 Rust leaves)
+python3 scripts/migrate/check-host-authority-transitions.py --static
+host-authority catalog and nine-profile matrix validated; no live coverage claimed
+cargo run --locked -p carrick-xtask -- authority-debt --source-only
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s
+     Running `target/debug/carrick-xtask authority-debt --source-only`
+carrick-xtask: authority debt: unknown family/owner cohort in head: Key { family: GlobalConfigDebug, operation: "global:env_var_os", owner: "carrick_vmm_hvf::hatch::ArmRingFirstHatch::is_strict::CARRICK_ARM_RING_FIRST", lane: Hvf }
+error: recipe `lint-domains-source` failed on line 259 with exit code 1
