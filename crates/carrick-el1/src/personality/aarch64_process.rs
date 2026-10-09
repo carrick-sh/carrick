@@ -6,7 +6,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use carrick_core::mm::fork::{ForkCensus, ForkScratch, census_table};
+use carrick_core::mm::fork::{ForkCensus, ForkScratch, PreparedOwnerFork, census_table};
 use carrick_core::mm::transaction::OwnerVenue;
 use carrick_el1_abi::{
     BornInZoneSource, CurrentTask, ForkStockExchange, ForkStockLoan, ForkStockRequest,
@@ -21,7 +21,7 @@ use carrick_mmu_core::owner_mmu::Aarch64Mmu;
 use carrick_personality_linux::mm::{LinuxReservationPolicy, MmErrorLinux};
 use carrick_sched_core::process::LinuxWaitStatus;
 use carrick_sched_core::{
-    AARCH64_ROOT_ADDRESS_MASK, Aarch64ParkedContext, WakeEffects, ZoneTables,
+    AARCH64_ROOT_ADDRESS_MASK, Aarch64ParkedContext, SpaceIndex, WakeEffects, ZoneTables,
 };
 use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
@@ -152,6 +152,18 @@ pub struct Prepared<'a> {
     pub address: Mm,
     pub ttbr0: u64,
     pub custody: Vec<PortalForkCustody>,
+}
+/// Retained fork plan between census/stock preparation and guest-MM
+/// publication. The first phase's stack frame is gone before publication.
+pub struct PreparedStart<'a> {
+    loan: ForkStockLoan,
+    words: PreparedWords<'a>,
+    plan: Option<PreparedOwnerFork<Aarch64Mmu>>,
+    child: Option<UnpublishedEl1Child<Aarch64Mmu>>,
+    index: SpaceIndex,
+    child_mm: MmGeneration,
+    ttbr0: u64,
+    custody: Vec<PortalForkCustody>,
 }
 
 impl core::fmt::Debug for Prepared<'_> {
@@ -441,15 +453,17 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     for Aarch64NativeProcessService<'a, X>
 {
     type Mm = Mm;
+    type PreparedMmStart = Box<PreparedStart<'a>>;
+    type PreparedMmPublished = Box<PreparedStart<'a>>;
     type PreparedMm = Box<Prepared<'a>>;
     type Born = Box<Born<'a>>;
 
-    fn prepare_mm(
+    fn prepare_mm_start(
         &mut self,
         parent: &Self::Mm,
         words: Aarch64ParkedContext,
         child_mm: MmGeneration,
-    ) -> Result<Self::PreparedMm, NativeProcessError> {
+    ) -> Result<Self::PreparedMmStart, NativeProcessError> {
         if !words.authenticates(*parent) {
             return Err(NativeProcessError::Stale);
         }
@@ -649,14 +663,54 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             .map_err(|_| NativeProcessError::Exhausted)?;
         custody.extend_from_slice(plan.custody());
         fork_progress(carrick_el1_abi::NativeForkProgress::Prepare);
-        let child = match owner.publish_fork(plan, &*live, self.worker()) {
+        Ok(Box::new(PreparedStart {
+            loan,
+            words: live,
+            plan: Some(plan),
+            child: None,
+            index,
+            child_mm,
+            ttbr0,
+            custody,
+        }))
+    }
+
+    fn prepare_mm_publish(
+        &mut self,
+        mut start: Self::PreparedMmStart,
+    ) -> Result<Self::PreparedMmPublished, NativeProcessError> {
+        let plan = start.plan.take().ok_or(NativeProcessError::Stale)?;
+        let owner = self.portal()?;
+        let child = match owner.publish_fork(plan, &*start.words, self.worker()) {
             Ok(child) => child,
             Err(e) => {
-                owner.spaces.free(index);
+                owner.spaces.free(start.index);
                 return Err(err(publish_error_stage(e), e));
             }
         };
+        start.child = Some(child);
         fork_progress(carrick_el1_abi::NativeForkProgress::Publish);
+        Ok(start)
+    }
+
+    fn prepare_mm_finish(
+        &mut self,
+        published: Self::PreparedMmPublished,
+    ) -> Result<Self::PreparedMm, NativeProcessError> {
+        let PreparedStart {
+            loan,
+            words,
+            plan,
+            child,
+            index: _,
+            child_mm,
+            ttbr0,
+            custody,
+        } = *published;
+        if plan.is_some() {
+            return Err(NativeProcessError::Stale);
+        }
+        let child = child.ok_or(NativeProcessError::Stale)?;
         let completion = child.completion();
         let address = AddressContext {
             mm: child_mm,
@@ -669,7 +723,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         Ok(Box::new(Prepared {
             loan,
             child,
-            words: live,
+            words,
             address,
             ttbr0,
             custody,
