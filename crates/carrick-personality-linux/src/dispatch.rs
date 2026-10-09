@@ -569,10 +569,11 @@ fn finish<'a, C: EntryContext + 'a>(
             return CompletionRoute::Served;
         }
     }
-    // Only an effect-free ARM decline can use the host replay boundary.
+    // Only an effect-free strict ARM decline can use the host replay boundary.
     // Handback retains its operation; AccountedForward has already run its
     // family. The x86 WORK_PORT has no replay transport.
-    let replay = pending.host_work()
+    let replay = pending.ring_first_strict()
+        && pending.host_work()
         && pending.crossing_set() == crate::crossing::HostCrossingSet::Aarch64
         && result == FamilyCompletion::Forward;
     let route = if replay {
@@ -724,6 +725,7 @@ mod ring_first_tests {
     struct CarrierOwned<'a> {
         set: HostCrossingSet,
         mutate_forward: bool,
+        strict: bool,
         state: crate::abi::entry::LinuxTaskState,
         result: i64,
         native: carrick_syscall_abi::NativeNr,
@@ -775,7 +777,7 @@ mod ring_first_tests {
             self.set
         }
         fn ring_first_strict(&self) -> bool {
-            true
+            self.strict
         }
         fn refused_counters(&self) -> Option<&'a [AtomicU64]> {
             Some(self.refused)
@@ -797,6 +799,7 @@ mod ring_first_tests {
         let mut pending = CarrierOwned {
             set: HostCrossingSet::Aarch64,
             mutate_forward: false,
+            strict: true,
             state: crate::abi::entry::LinuxTaskState::new(),
             native: carrick_syscall_abi::NativeNr(174),
             admitted: false,
@@ -835,6 +838,7 @@ mod ring_first_tests {
             let mut pending = CarrierOwned {
                 set: HostCrossingSet::Aarch64,
                 mutate_forward: false,
+                strict: true,
                 state: crate::abi::entry::LinuxTaskState::new(),
                 native: carrick_syscall_abi::NativeNr(ordinal),
                 admitted: true,
@@ -878,6 +882,7 @@ mod ring_first_tests {
             let mut pending = CarrierOwned {
                 set,
                 mutate_forward: false,
+                strict: true,
                 state: crate::abi::entry::LinuxTaskState::new(),
                 native: carrick_syscall_abi::NativeNr(0),
                 admitted: true,
@@ -907,11 +912,44 @@ mod ring_first_tests {
     }
 
     #[test]
+    fn opt_out_arm_family_declines_with_work_keep_plain_forward() {
+        for ordinal in [222, 98, 220, 260] {
+            let refused = [const { AtomicU64::new(0) }; 513];
+            let mut pending = CarrierOwned {
+                set: HostCrossingSet::Aarch64,
+                mutate_forward: false,
+                strict: false,
+                state: crate::abi::entry::LinuxTaskState::new(),
+                native: carrick_syscall_abi::NativeNr(ordinal),
+                admitted: true,
+                result: 42,
+                work: true,
+                handback: false,
+                refused: &refused,
+                forwarded: [const { AtomicU64::new(0) }; 512],
+            };
+            assert_eq!(
+                dispatch(ordinal, u64::MAX, &mut pending),
+                CompletionRoute::Forward,
+                "ordinal={ordinal} opt-out must retain main's transport"
+            );
+            assert_eq!(pending.state.take_served_boundary(), None);
+            assert_eq!(
+                pending.forwarded[ordinal as usize].load(Ordering::Relaxed),
+                1
+            );
+            assert_eq!(pending.refused[ordinal as usize].load(Ordering::Relaxed), 0);
+            assert_eq!(pending.result, 42);
+        }
+    }
+
+    #[test]
     fn no_effect_arm_forward_replays_saved_argument_not_mutated_frame() {
         let refused = [const { AtomicU64::new(0) }; 513];
         let mut pending = CarrierOwned {
             set: HostCrossingSet::Aarch64,
             mutate_forward: true,
+            strict: true,
             state: crate::abi::entry::LinuxTaskState::new(),
             native: carrick_syscall_abi::NativeNr(98),
             admitted: true,
@@ -939,6 +977,7 @@ mod ring_first_tests {
             let mut pending = CarrierOwned {
                 set: HostCrossingSet::Aarch64,
                 mutate_forward: false,
+                strict: true,
                 state: crate::abi::entry::LinuxTaskState::new(),
                 native: carrick_syscall_abi::NativeNr(ordinal),
                 admitted: true,

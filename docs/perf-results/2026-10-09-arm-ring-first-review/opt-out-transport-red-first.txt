@@ -1,0 +1,4 @@
+Command: cargo test -p carrick-personality-linux opt_out_arm_family_declines_with_work_keep_plain_forward
+Before fix: FAILED, ordinal=222 left WithWork right Forward.
+After fix: cargo test -p carrick-personality-linux PASS (42 unit, 48 integration).
+Regression covers mmap (222), futex (98), clone (220), wait4 (260), pending host work, OptOut: Forward, no served/replay boundary, forwarded=1, refused=0, argument unchanged.
