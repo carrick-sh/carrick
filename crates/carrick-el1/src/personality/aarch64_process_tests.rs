@@ -168,6 +168,10 @@ impl ForkStockCrossing for TestStockCrossing {
     fn cross_root_exit(&self, _record_gpa: u64, _cpu: u64) -> Result<(), NativeProcessError> {
         Ok(())
     }
+
+    fn cross_child_retire(&self, _record_gpa: u64, _cpu: u64) -> Result<(), NativeProcessError> {
+        Ok(())
+    }
 }
 
 struct Fixture {
