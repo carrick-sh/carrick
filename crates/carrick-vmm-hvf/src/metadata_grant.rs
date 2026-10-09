@@ -3,10 +3,11 @@
 use crate::host_mapping::{HostMappingKind, OwnedHostMapping};
 use carrick_el1_abi::{
     EL1_DYNAMIC_METADATA_BASE, EL1_DYNAMIC_METADATA_EXTENT_SIZE, EL1_DYNAMIC_METADATA_SIZE,
-    ForkStockExchange, ForkStockKind, ForkStockRefusal, ForkStockSettlement, GRANT_OP_FORK_STOCK,
-    GRANT_OP_ROOT_EXIT, METADATA_GRANT_ERR_ALIGNMENT, METADATA_GRANT_ERR_DENIED,
-    METADATA_GRANT_ERR_INVALID, METADATA_GRANT_ERR_NOT_FOUND, METADATA_GRANT_OP_ALLOC,
-    METADATA_GRANT_OP_FREE, METADATA_GRANT_SUCCESS, NativeRootExit,
+    ForkStockExchange, ForkStockKind, ForkStockRefusal, ForkStockSettlement, GRANT_OP_CHILD_RETIRE,
+    GRANT_OP_FORK_STOCK, GRANT_OP_ROOT_EXIT, METADATA_GRANT_ERR_ALIGNMENT,
+    METADATA_GRANT_ERR_DENIED, METADATA_GRANT_ERR_INVALID, METADATA_GRANT_ERR_NOT_FOUND,
+    METADATA_GRANT_OP_ALLOC, METADATA_GRANT_OP_FREE, METADATA_GRANT_SUCCESS, NativeChildRetire,
+    NativeRootExit,
 };
 use carrick_el1_abi::{
     MetadataExtent, MetadataExtentResolver, MetadataResolutionError, PinnedMetadataExtent,
@@ -15,6 +16,56 @@ use carrick_hal::TrapError;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Authenticate a physical fork-stock crossing against the thread currently
+/// installed in the shared zone. EL1 may switch from parent to child without
+/// a host boundary, so a binding captured when the executor loaded is stale.
+fn live_fork_execution(
+    cpu: carrick_guest_arch::CpuId,
+    ttbr0: u64,
+) -> Option<crate::fork_stock::GrantExecution> {
+    use carrick_core_abi::{
+        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+    };
+    use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
+    use std::num::NonZeroU64;
+
+    let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
+    let zone = carrick_el1_abi::zone_tables()?;
+    let record = zone
+        .slot(slot)
+        .current()
+        .or_else(|| zone.slot(slot).host_record())?;
+    let identity = zone.record(record).identity();
+    if identity.tid == 0 || identity.mm == 0 || zone.slot(slot).mm() != identity.mm {
+        return None;
+    }
+    let root = RootGpa::page_aligned(FrameGpa::new(
+        ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK,
+    ))?;
+    let context = AddressContext {
+        root,
+        mm: MmGeneration::new(NonZeroU64::new(identity.mm)?),
+        generation: ContextGeneration::new(NonZeroU64::new(zone.record_ref(record).incarnation)?),
+    };
+    let binding = ExecutionBinding {
+        task: EntryTaskKey::from_raw(identity.tid),
+        generation: EntryGeneration::from_raw(identity.generation),
+        mm: EntryMmKey::from_raw(identity.mm),
+        thread_generation: EntryThreadGeneration::from_raw(identity.serial),
+    };
+    binding
+        .issued()
+        .then(|| crate::fork_stock::GrantExecution::new(cpu, binding, context))
+}
+
+fn native_record_on_cpu_stack(record_gpa: u64, cpu: carrick_guest_arch::CpuId) -> bool {
+    let Some(offset) = record_gpa.checked_sub(carrick_el1_abi::EL1_STACKS_BASE) else {
+        return true;
+    };
+    let arena = carrick_el1_abi::EL1_STACK_SIZE * carrick_el1_abi::EL1_STACK_SLOTS;
+    offset >= arena || offset / carrick_el1_abi::EL1_STACK_SIZE == u64::from(cpu.raw())
+}
 
 pub const MAX_DYNAMIC_EXTENT_SLOTS: usize = 128;
 
@@ -615,10 +666,110 @@ fn request_has_live_vm(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn drain_fork_quarantine(
+    custody: &crate::trap::CarrierVmCustody,
+    execution: crate::fork_stock::GrantExecution,
+) -> Result<(), TrapError> {
+    let safe_to_reclaim = |mm: u64| {
+        let Some(zone) = carrick_el1_abi::zone_tables() else {
+            return false;
+        };
+        (0..carrick_el1_abi::EL1_STACK_SLOTS as usize).all(|index| {
+            carrick_guest_arch::SlotId::from_index(index)
+                .is_some_and(|slot| zone.installed_space(slot) != mm)
+        })
+    };
+    let clear_tables = |pages: &[carrick_guest_arch::RootGpa]| {
+        pages.iter().all(|page| {
+            let Ok(ptr) = crate::fork_stock::ForkStockHostCustody::resolve_record_ptr::<[u8; 4096]>(
+                custody,
+                page.address().raw(),
+            ) else {
+                return false;
+            };
+            // The owner retired this MM, its broadcast TLBI finished before
+            // occupancy release, and carrier custody retains this stage-2 page.
+            unsafe { (&mut *ptr).fill(0) };
+            true
+        })
+    };
+    custody
+        .fork_stock
+        .lock()
+        .reclaim_retired(
+            &mut custody.el1_frame_grants.lock(),
+            execution.binding.mm.raw(),
+            safe_to_reclaim,
+            clear_tables,
+        )
+        .map_err(|error| {
+            TrapError::Hypervisor(format!(
+                "retired fork stock could not be reclaimed: {error:?}"
+            ))
+        })?;
+    Ok(())
+}
+
+/// Reserve carrier-owned metadata extents before any EL1 process can request
+/// fork stock. Lifecycle records and physical table pages have disjoint stock.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn provision_boot_fork_stock(
+    custody: &crate::trap::CarrierVmCustody,
+) -> Result<(), TrapError> {
+    let generation = custody.live_generation().ok_or_else(|| {
+        TrapError::Hypervisor("fork stock has no live carrier generation".to_owned())
+    })?;
+    let reply = service_metadata_operation(
+        custody,
+        Some(generation),
+        carrick_guest_arch::CpuId::new(0),
+        None,
+        METADATA_GRANT_OP_ALLOC,
+        EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64,
+        0,
+        0,
+    )?;
+    if reply[0] != METADATA_GRANT_SUCCESS || reply[2] != EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64 {
+        return Err(TrapError::Hypervisor(format!(
+            "carrier fork stock allocation refused: {reply:?}"
+        )));
+    }
+    let lifecycle_base = reply[1];
+    let tables = service_metadata_operation(
+        custody,
+        Some(generation),
+        carrick_guest_arch::CpuId::new(0),
+        None,
+        METADATA_GRANT_OP_ALLOC,
+        EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64,
+        0,
+        0,
+    )?;
+    if tables[0] != METADATA_GRANT_SUCCESS
+        || tables[2] != EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64
+        || tables[1] == lifecycle_base
+    {
+        return Err(TrapError::Hypervisor(format!(
+            "carrier fork table stock allocation refused: {tables:?}"
+        )));
+    }
+    custody
+        .fork_stock
+        .lock()
+        .install_boot_stock(lifecycle_base, tables[1])
+        .map_err(|error| TrapError::Hypervisor(format!("carrier fork stock invalid: {error:?}")))?;
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+// The four HVC argument registers are kept explicit beside the trapped CPU
+// and its authenticated execution; combining them would hide wire polarity.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn service_metadata_operation(
     custody: &crate::trap::CarrierVmCustody,
     generation: Option<crate::trap::CarrierVmGeneration>,
     cpu: carrick_guest_arch::CpuId,
+    execution: Option<crate::fork_stock::GrantExecution>,
     op: u64,
     arg1: u64,
     arg2: u64,
@@ -781,6 +932,9 @@ pub(crate) fn service_metadata_operation(
         Ok([status, 0, 0, 0])
     } else if op == GRANT_OP_FORK_STOCK {
         let record_gpa = arg1;
+        if !native_record_on_cpu_stack(record_gpa, cpu) {
+            return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+        }
         if !record_gpa.is_multiple_of(64) {
             return Ok([METADATA_GRANT_ERR_ALIGNMENT, 0, 0, 0]);
         }
@@ -807,7 +961,9 @@ pub(crate) fn service_metadata_operation(
             return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
         }
 
-        let execution = custody.fork_stock.lock().active_execution_for_cpu(cpu);
+        if let Some(execution) = execution {
+            drain_fork_quarantine(custody, execution)?;
+        }
 
         match ForkStockKind::decode(tag) {
             Some(ForkStockKind::Loan) => {
@@ -892,6 +1048,12 @@ pub(crate) fn service_metadata_operation(
         }
     } else if op == GRANT_OP_ROOT_EXIT {
         let record_gpa = arg1;
+        if arg3 != 0 {
+            return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
+        }
+        if !native_record_on_cpu_stack(record_gpa, cpu) {
+            return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+        }
         if !record_gpa.is_multiple_of(64) {
             return Ok([METADATA_GRANT_ERR_ALIGNMENT, 0, 0, 0]);
         }
@@ -905,13 +1067,39 @@ pub(crate) fn service_metadata_operation(
             return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
         }
         let root_exit = unsafe { &*record_ptr };
-        let execution = custody.fork_stock.lock().active_execution_for_cpu(cpu);
         let Some(execution) = execution else {
             return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
         };
         let mut fork_stock = custody.fork_stock.lock();
         match fork_stock.service_root_exit(execution, root_exit) {
             Ok(status) => Ok([METADATA_GRANT_SUCCESS, status.raw() as u64, 0, 0]),
+            Err(_) => Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]),
+        }
+    } else if op == GRANT_OP_CHILD_RETIRE {
+        if arg3 != 0 || !native_record_on_cpu_stack(arg1, cpu) {
+            return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+        }
+        if !arg1.is_multiple_of(64) {
+            return Ok([METADATA_GRANT_ERR_ALIGNMENT, 0, 0, 0]);
+        }
+        if arg2 != 0 && arg2 != cpu.raw() as u64 {
+            return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+        }
+        let Ok(record_ptr) = crate::fork_stock::ForkStockHostCustody::resolve_record_ptr::<
+            NativeChildRetire,
+        >(custody, arg1) else {
+            return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
+        };
+        let Some(execution) = execution else {
+            return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+        };
+        let retire = unsafe { &*record_ptr };
+        match custody
+            .fork_stock
+            .lock()
+            .service_child_retire(execution, retire)
+        {
+            Ok(()) => Ok([METADATA_GRANT_SUCCESS, 0, 0, 0]),
             Err(_) => Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]),
         }
     } else {
@@ -1099,6 +1287,7 @@ fn complete_metadata_request(
         custody,
         generation,
         carrick_guest_arch::CpuId::new(0),
+        None,
         request.op,
         request.arg1,
         request.arg2,
@@ -1129,7 +1318,7 @@ pub(crate) fn handle_metadata_grant_trap(
     custody: &crate::trap::CarrierVmCustody,
     generation: Option<crate::trap::CarrierVmGeneration>,
 ) -> Result<MetadataTrapOutcome, TrapError> {
-    use applevisor::vcpu::Reg;
+    use applevisor::vcpu::{Reg, SysReg};
     INLINE_HVC_TRAPS.fetch_add(1, Ordering::Relaxed);
     let op = vcpu
         .get_reg(Reg::X0)
@@ -1143,7 +1332,26 @@ pub(crate) fn handle_metadata_grant_trap(
     let arg3 = vcpu
         .get_reg(Reg::X3)
         .map_err(|e| TrapError::Hypervisor(format!("failed to read X3 for metadata grant: {e}")))?;
-    let result = service_metadata_operation(custody, generation, cpu, op, arg1, arg2, arg3)?;
+    let process_crossing = matches!(
+        op,
+        GRANT_OP_FORK_STOCK | GRANT_OP_ROOT_EXIT | GRANT_OP_CHILD_RETIRE
+    );
+    let active = if process_crossing {
+        let ttbr0 = vcpu.get_sys_reg(SysReg::TTBR0_EL1).map_err(|e| {
+            TrapError::Hypervisor(format!("failed to read TTBR0 for fork-stock grant: {e}"))
+        })?;
+        live_fork_execution(cpu, ttbr0)
+    } else {
+        None
+    };
+    let result = service_metadata_operation(custody, generation, cpu, active, op, arg1, arg2, arg3);
+    let result = result?;
+    if process_crossing && result[0] != METADATA_GRANT_SUCCESS {
+        return Err(TrapError::Hypervisor(format!(
+            "native process crossing denied: op={op} status={} cpu={cpu:?} arg1={arg1:#x} arg2={arg2:#x} arg3={arg3:#x} execution={active:?}",
+            result[0],
+        )));
+    }
     vcpu.set_reg(Reg::X0, result[0])
         .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
     vcpu.set_reg(Reg::X1, result[1])
@@ -1513,6 +1721,7 @@ mod tests {
                 &custody,
                 Some(generation),
                 carrick_guest_arch::CpuId::new(0),
+                None,
                 METADATA_GRANT_OP_ALLOC,
                 u64::MAX,
                 0,
