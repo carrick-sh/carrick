@@ -125,7 +125,14 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     fn child_file_table(&self, parent_table: u64, _issued: u64) -> u64 {
         parent_table
     }
-    fn fork_fd_table(&mut self, _parent_table: u64, _child_table: u64) {}
+    fn fork_fd_table(
+        &mut self,
+        _parent_table: u64,
+        _child_table: u64,
+    ) -> Result<(), NativeProcessError> {
+        Ok(())
+    }
+    fn retire_fd_table(&mut self, _table: u64) {}
 }
 pub struct NativeClaim {
     namespace: Arc<SpinLock<NamespaceState>>,
@@ -777,7 +784,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     fn exit_owned(&mut self, status: u8) -> Result<LifecycleOutcome, NativeProcessError> {
         let root_exit = self.is_root_process();
         let wait_status = LinuxWaitStatus::from_wait_encoding(i32::from(status) << 8);
-        let (page, control) = {
+        let (page, control, file_table) = {
             let graph = self.runtime.graph.lock();
             let resources = graph
                 .owner
@@ -788,7 +795,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             if resources.page.live() != 1 {
                 return Err(NativeProcessError::Unsupported);
             }
-            (resources.page, resources.control)
+            (resources.page, resources.control, resources.file_table)
         };
         let transaction = self
             .runtime
@@ -880,6 +887,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if let Some(mm) = resources {
             self.service.retire_mm(mm)
         }
+        self.service.retire_fd_table(file_table);
         drop(published.retiring);
         drop(published.autoreaped_receipt);
         if root_exit {
@@ -1097,8 +1105,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let child_file_table = self
             .service
             .child_file_table(parent_file_table, child_key.serial.raw());
-        self.service
-            .fork_fd_table(parent_file_table, child_file_table);
         let thread = ThreadIdentity {
             tid: child_key.id.raw() as u64,
             serial: thread_serial.get(),
@@ -1119,6 +1125,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(NativeProcessError::Exhausted);
             }
         };
+        if let Err(error) = self
+            .service
+            .fork_fd_table(parent_file_table, child_file_table)
+        {
+            self.source.zone.free_record(record);
+            self.runtime.graph.lock().owner.rollback_birth(&permit);
+            if let Err((_, p)) = self.service.abort_mm(prepared) {
+                self.service.quarantine_prepared(p)
+            };
+            return Err(error);
+        }
         let child_words = self.words.fork_child(address);
         // SAFETY: this exact newly allocated record remains Free and unpublished.
         unsafe { *self.source.zone.record(record).ctx_mut() = child_words };
@@ -1183,6 +1200,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     Ok((child, prepared)) => {
                         self.source.zone.free_record(record);
                         drop(child);
+                        self.service.retire_fd_table(child_file_table);
                         if let Err((_, p)) = self.service.abort_mm(prepared) {
                             self.service.quarantine_prepared(p)
                         }

@@ -71,11 +71,7 @@ pub fn admit_stdio(
         if fd_map_lookup(fd_map, file_table, fd as i32).is_some() {
             continue;
         }
-        let Some(slot) = fd_map
-            .iter()
-            .take(FD_MAP_CAPACITY)
-            .find(|s| s.incarnation.load(Ordering::Acquire) == 0)
-        else {
+        let Some(slot) = fd_map.iter().take(FD_MAP_CAPACITY).find(|s| s.try_claim()) else {
             continue;
         };
         let handle = (fd + 1) as u32;
@@ -102,6 +98,8 @@ pub fn admit_stdio(
                 .store(DELEGATED_STATE_GUEST, Ordering::Release);
 
             slot.set(file_table, ufd, handle, 1);
+        } else {
+            slot.clear();
         }
     }
 }
@@ -127,13 +125,20 @@ pub fn admit_host_fd(
     let slot = fd_map
         .iter()
         .take(FD_MAP_CAPACITY)
-        .find(|s| s.incarnation.load(Ordering::Acquire) == 0)?;
+        .find(|s| s.try_claim())?;
 
-    let (idx, open_file) = open_table
+    let Some((idx, open_file)) = open_table
         .iter()
         .enumerate()
-        .find(|(_, o)| o.state.load(Ordering::Acquire) == 0)?;
-    let obj = object_table.get(idx)?;
+        .find(|(_, o)| o.state.load(Ordering::Acquire) == 0)
+    else {
+        slot.clear();
+        return None;
+    };
+    let Some(obj) = object_table.get(idx) else {
+        slot.clear();
+        return None;
+    };
 
     let handle = (idx + 1) as u32;
     obj.inode.set(0, 0);
@@ -158,31 +163,60 @@ pub fn admit_host_fd(
 ///
 /// Copies `parent_table` descriptor slots in `fd_map` to `child_table`, sharing
 /// the exact same open description (`handle`).
-pub fn fork_fd_map(fd_map: &[FdMapSlot], parent_table: u64, child_table: u64) {
+pub fn fork_fd_map(fd_map: &[FdMapSlot], parent_table: u64, child_table: u64) -> bool {
     if parent_table == 0 || child_table == 0 || parent_table == child_table {
-        return;
+        return false;
     }
-    let mut copies = [None; 64];
-    let mut count = 0;
+    if fd_map.iter().take(FD_MAP_CAPACITY).any(|slot| {
+        slot.incarnation.load(Ordering::Acquire) != 0
+            && slot.file_table.load(Ordering::Relaxed) == child_table
+    }) {
+        return false;
+    }
+    let mut copies = Vec::new();
     for slot in fd_map.iter().take(FD_MAP_CAPACITY) {
         let inc = slot.incarnation.load(Ordering::Acquire);
-        if inc != 0 && slot.file_table.load(Ordering::Relaxed) == parent_table {
+        if inc != 0
+            && inc != FdMapSlot::CLAIMED
+            && slot.file_table.load(Ordering::Relaxed) == parent_table
+        {
             let fd = slot.fd.load(Ordering::Relaxed);
             let handle = slot.handle.load(Ordering::Relaxed);
-            if count < copies.len() {
-                copies[count] = Some((fd, handle, inc));
-                count += 1;
-            }
+            copies.push((fd, handle, inc));
         }
     }
-    for item in copies.iter().flatten() {
-        let (fd, handle, inc) = *item;
-        if let Some(free_slot) = fd_map
+    let mut claimed = Vec::new();
+    for _ in &copies {
+        if let Some((index, _)) = fd_map
             .iter()
             .take(FD_MAP_CAPACITY)
-            .find(|s| s.incarnation.load(Ordering::Acquire) == 0)
+            .enumerate()
+            .find(|(_, slot)| slot.try_claim())
         {
-            free_slot.set(child_table, fd, handle, inc);
+            claimed.push(index);
+        } else {
+            for index in claimed {
+                fd_map[index].clear();
+            }
+            return false;
+        }
+    }
+    for ((fd, handle, inc), index) in copies.into_iter().zip(claimed) {
+        fd_map[index].set(child_table, fd, handle, inc);
+    }
+    true
+}
+
+/// Retire only the exact table's published descriptors after exit or rollback.
+pub fn retire_fd_map(fd_map: &[FdMapSlot], file_table: u64) {
+    if file_table == 0 {
+        return;
+    }
+    for slot in fd_map.iter().take(FD_MAP_CAPACITY) {
+        if slot.file_table.load(Ordering::Acquire) == file_table
+            && slot.incarnation.load(Ordering::Acquire) != 0
+        {
+            slot.clear();
         }
     }
 }
@@ -653,6 +687,35 @@ mod tests {
         assert_eq!(fd_map_lookup(&fd_map, child, 1), None);
         // Parent still has it
         assert!(fd_map_lookup(&fd_map, parent, 1).is_some());
+    }
+
+    #[test]
+    fn exhausted_fork_does_not_publish_a_partial_child_table() {
+        let (fd_map, open_table, object_table) = setup_tables();
+        admit_stdio(&fd_map, &open_table, &object_table, 10, [true, true, true]);
+        for (fd, slot) in fd_map.iter().enumerate().skip(3).take(FD_MAP_CAPACITY - 5) {
+            slot.set(99, fd as u32, 1, 1);
+        }
+        fork_fd_map(&fd_map, 10, 20);
+        for fd in 0..3 {
+            assert_eq!(fd_map_lookup(&fd_map, 20, fd), None);
+        }
+    }
+
+    #[test]
+    fn exited_child_tables_return_all_fd_map_capacity() {
+        let (fd_map, open_table, object_table) = setup_tables();
+        admit_stdio(&fd_map, &open_table, &object_table, 10, [true, true, true]);
+        for child in 20..100 {
+            assert!(fork_fd_map(&fd_map, 10, child));
+            for fd in 0..3 {
+                assert!(fd_map_lookup(&fd_map, child, fd).is_some());
+            }
+            retire_fd_map(&fd_map, child);
+            for fd in 0..3 {
+                assert_eq!(fd_map_lookup(&fd_map, child, fd), None);
+            }
+        }
     }
 
     #[test]
