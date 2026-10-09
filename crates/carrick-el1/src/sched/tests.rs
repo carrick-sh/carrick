@@ -1594,7 +1594,7 @@ fn arm_fake_backend_context_trace_is_unchanged() {
 }
 
 #[test]
-fn fresh_record_park_refusal_does_not_leak_unpublished_record_on_occupied_timer_or_guard_error() {
+fn concurrent_timer_park_and_guard_refusal_preserve_record_ownership() {
     use super::object_wait::OperationResumePc;
     use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken};
 
@@ -1617,31 +1617,19 @@ fn fresh_record_park_refusal_does_not_leak_unpublished_record_on_occupied_timer_
     assert!(zone.slot(SLOT).current().is_none());
     assert!(zone.slot(SLOT).host_record().is_none());
 
-    // 1. Occupied timer with deadline
+    // An unrelated deadline does not occupy the shared timer.
     let dummy = zone.alloc_record(identity(999)).unwrap();
     let seq = zone.next_seq(dummy);
     zone.set_deadline(dummy, 10000);
     zone.arm_timer(SLOT, dummy, seq).unwrap();
     zone.publish_park(dummy, seq);
-    assert!(!sched.may_time_park());
+    assert!(sched.may_time_park());
 
     let key = ObjectWaitKey::new(1, 1).unwrap();
     zone.bind_object_wait(key, &HostWait).unwrap();
     let snapshot = sched.observe_object(key).unwrap();
     let resume = OperationResumePc::new(0x8000).unwrap();
     let op = OperationToken::new(101, 1).unwrap();
-
-    let err = sched.park_object(&frame, key, snapshot, resume, op, Some(5000));
-    assert!(err.is_err());
-    assert_eq!(
-        zone.slot(SLOT).host_record(),
-        None,
-        "occupied timer must not leak fresh record"
-    );
-
-    // Disarm timer for part 2
-    assert!(zone.take_foreign_timer(SLOT).is_some());
-    assert!(sched.may_time_park());
 
     // 2. Guard acquisition error (stale/unbound key)
     let stale_key = ObjectWaitKey::new(2, 99).unwrap();
@@ -1653,4 +1641,11 @@ fn fresh_record_park_refusal_does_not_leak_unpublished_record_on_occupied_timer_
         None,
         "guard error must not leak fresh record"
     );
+    let parked = sched
+        .park_object(&frame, key, snapshot, resume, op, Some(5000))
+        .unwrap();
+    assert!(parked.matches(&zone, SLOT));
+    assert_eq!(zone.timer_deadline(SLOT), Some(5000));
+    assert_eq!(zone.expire_timer(SLOT, 5000, 0), Ok(true));
+    assert_eq!(zone.timer_deadline(SLOT), Some(10000));
 }
