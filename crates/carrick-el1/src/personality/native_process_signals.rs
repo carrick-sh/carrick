@@ -82,11 +82,27 @@ impl<T> NativeProcessSignals<T> {
         if key != self.key {
             return Err(SignalActionError::Stale);
         }
-        self.resources
-            .lock()
+        let mut resources = self.resources.lock();
+        let old = resources
             .actions
             .install(signal, action)
-            .map_err(SignalActionError::Action)
+            .map_err(SignalActionError::Action)?;
+        if action.disposition == Disposition::Ignore {
+            let selected = SignalSet::EMPTY.with(signal);
+            resources.inbox.pending_mut().discard(selected);
+            let SignalResources {
+                thread_pending,
+                forced_segv,
+                ..
+            } = &mut *resources;
+            for (record, pending) in thread_pending.iter_mut() {
+                if signal != Signal::SEGV || !forced_segv.contains(record) {
+                    pending.discard(selected);
+                }
+            }
+            thread_pending.retain(|(_, pending)| !pending.is_empty());
+        }
+        Ok(old)
     }
     pub fn forced_action(&self, signal: Signal, blocked: SigBlockMask) -> Action {
         let mut resources = self.resources.lock();
@@ -347,6 +363,36 @@ mod tests {
         }
     }
     #[test]
+    fn installing_ignore_discards_process_and_thread_pending() {
+        let task = key(41, 11);
+        let signals = NativeProcessSignals::<u32>::fresh_root(task);
+        let record = carrick_sched_core::RecordRef {
+            id: carrick_sched_core::RecordId::from_raw(1).unwrap(),
+            incarnation: 7,
+        };
+        let usr1 = Signal::from_number(10).unwrap();
+        signals.enqueue(task, usr1, Some(41)).unwrap();
+        signals.enqueue_thread(record, usr1, Some(42));
+        signals
+            .install_action(
+                task,
+                usr1,
+                Action {
+                    disposition: Disposition::Ignore,
+                    ..Action::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(signals.pending_set(record), SignalSet::EMPTY);
+        signals.enqueue(task, usr1, Some(43)).unwrap();
+        assert_eq!(
+            signals.take_timedwait(record, SignalSet::EMPTY.with(usr1)),
+            Some((usr1, Some(43))),
+            "blocked ignored signals remain waitable"
+        );
+    }
+
+    #[test]
     fn recycled_record_cannot_consume_another_thread_incarnations_signal() {
         let signals = NativeProcessSignals::<u32>::fresh_root(key(41, 11));
         let old = carrick_sched_core::RecordRef {
@@ -491,7 +537,11 @@ mod tests {
         );
         child.enqueue(child_key, Signal::CHLD, None).unwrap();
         assert_eq!(child.pending_count(), 1);
-        assert_eq!(parent.pending_count(), 1);
+        assert_eq!(
+            parent.pending_count(),
+            0,
+            "SIG_IGN discards only parent's pending queue"
+        );
     }
 
     #[test]
