@@ -61,6 +61,22 @@ pub enum ForkCapacityFailure {
     Custody,
 }
 
+/// The first fallible publication phase reached after fork preparation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForkPublishStage {
+    RevalidateWords,
+    AuthenticateParent,
+    CheckReadiness,
+    ReserveCertificate,
+    StoreChildTables,
+    StoreParentTables,
+    EditParent,
+    SetChildOrigin,
+    CloneReservations,
+    PublishParent,
+    PublishChild,
+}
+
 impl ForkScratch {
     pub fn new(request: PortalForkRequest, metadata_capacity: usize) -> Result<Self, ForkError> {
         if !request.valid() {
@@ -371,12 +387,15 @@ impl<B: OwnerForkMmu> PreparedOwnerFork<B> {
         mut parent: P,
         mut child: C,
         child_handle: El1MmHandle,
+        stage: &mut ForkPublishStage,
     ) -> Result<UnpublishedChild<B>, ForkError> {
+        *stage = ForkPublishStage::RevalidateWords;
         for (pa, before) in &self.scratch.reads {
             if words.load(*pa).map_err(|_| ForkError::Core)? != *before {
                 return Err(ForkError::Stale);
             }
         }
+        *stage = ForkPublishStage::AuthenticateParent;
         if self.request.parent_generation.raw() >= u64::MAX - 1 {
             return Err(ForkError::Stale);
         }
@@ -386,10 +405,13 @@ impl<B: OwnerForkMmu> PreparedOwnerFork<B> {
         {
             return Err(ForkError::Stale);
         }
+        *stage = ForkPublishStage::CheckReadiness;
         if !parent.fork_ready() || child.is_admitted() {
             return Err(ForkError::Busy);
         }
+        *stage = ForkPublishStage::ReserveCertificate;
         parent.reserve_fork_certificate(self.request)?;
+        *stage = ForkPublishStage::StoreChildTables;
         for (index, word) in self.scratch.child[..self.scratch.child_used]
             .iter()
             .enumerate()
@@ -398,6 +420,7 @@ impl<B: OwnerForkMmu> PreparedOwnerFork<B> {
                 .store_unlinked(self.request.child_tables.base + index as u64 * 8, *word)
                 .map_err(|_| ForkError::Core)?;
         }
+        *stage = ForkPublishStage::StoreParentTables;
         for (index, word) in self.scratch.parent[..self.scratch.parent_used]
             .iter()
             .enumerate()
@@ -407,6 +430,7 @@ impl<B: OwnerForkMmu> PreparedOwnerFork<B> {
                 .map_err(|_| ForkError::Core)?;
         }
         words.publish_barrier();
+        *stage = ForkPublishStage::EditParent;
         for (applied, edit) in self.scratch.edits.iter().enumerate() {
             let changed = if edit.bbm_len != 0 {
                 match words.compare_exchange(edit.pa, edit.before, 0) {
@@ -447,15 +471,18 @@ impl<B: OwnerForkMmu> PreparedOwnerFork<B> {
                 return Err(error);
             }
         }
+        *stage = ForkPublishStage::SetChildOrigin;
         if let Err(error) = child.set_fork_origin(self.request) {
             rollback(words, &self.scratch.edits)?;
             return Err(error);
         }
+        *stage = ForkPublishStage::CloneReservations;
         if let Err(error) = parent.clone_into(&mut child) {
             child.clear_fork_origin();
             rollback(words, &self.scratch.edits)?;
             return Err(error);
         }
+        *stage = ForkPublishStage::PublishParent;
         let parent_generation = match parent.publish_fork_parent(self.request) {
             Ok(generation) => generation,
             Err(error) => {
@@ -464,6 +491,7 @@ impl<B: OwnerForkMmu> PreparedOwnerFork<B> {
                 return Err(error);
             }
         };
+        *stage = ForkPublishStage::PublishChild;
         if let Err(error) = child.publish_fork_child(self.request) {
             child.clear_fork_origin();
             rollback(words, &self.scratch.edits)?;
@@ -961,6 +989,9 @@ pub fn copy_entry<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
             .map_err(|_| ForkError::Core)?
             .raw();
             if !request.child_tables.contains(output) {
+                if !B::omit_unloaned_control_alias() {
+                    return Err(ForkError::NoMemory);
+                }
                 // The parent may map the whole stage-1 alias window while the
                 // child's loan covers only the table pages counted by census.
                 // Leave the unused alias absent; publishing the parent's word

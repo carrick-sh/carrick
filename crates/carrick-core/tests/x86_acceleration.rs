@@ -234,8 +234,8 @@ fn x1_shared_mm_owner() {
 
 mod fork_cow {
     use carrick_core::mm::fork::{
-        ForkChildRoot, ForkError, ForkParentRoot, ForkReceiptError, ForkScratch, ForkTableCursor,
-        Mapping, PreparedOwnerFork, copy_table, validate_fork_completion,
+        ForkChildRoot, ForkError, ForkParentRoot, ForkPublishStage, ForkReceiptError, ForkScratch,
+        ForkTableCursor, Mapping, PreparedOwnerFork, copy_table, validate_fork_completion,
     };
     use carrick_el1_abi::{
         CowGrant, CowGrantCompletion, CowGrantPurpose, El1MmHandle, PortalForkCompletion,
@@ -687,8 +687,15 @@ mod fork_cow {
             authorized: true,
             finished: false,
         };
+        let mut publish_stage = ForkPublishStage::RevalidateWords;
         let mut unpublished = prepared
-            .publish(&mem, parent_root.clone(), child_root.clone(), child_handle)
+            .publish(
+                &mem,
+                parent_root.clone(),
+                child_root.clone(),
+                child_handle,
+                &mut publish_stage,
+            )
             .unwrap();
 
         // Verify publish applied the COW edits to live memory
