@@ -1,0 +1,28 @@
+schema_version = 1
+id = "kernel.el1.arm-ring-first-crossing"
+title = "ARM refusal preserves terminal carrier delivery and service-copy descriptors"
+guest_surfaces = ["syscall:getuid", "syscall:getpid", "syscall:clock_gettime", "syscall:exit", "syscall:exit_group", "vmm:hvf"]
+semantic_authority = ["man 2 _exit", "man 2 exit_group", "docs/design/arm-ring-first-flip.md"]
+fixture = "fixtures/linux-aarch64-hello/src/ring_first.rs"
+scale_points = [1]
+structural_budgets = []
+rationale = """
+The owner accepts ENOSYS for unported guest authority calls under the strict
+ARM switch. A refused getuid has exactly one refusal and zero forwarded calls;
+with the exact =0 hatch it has zero refusals and one forwarded call. Terminal
+calls must preserve their status and forward once when no in-ring process
+owner serves them, as on x86. The signed witness also checks getpid and the
+host clock, and bounds its descriptor readiness wait to five seconds. It has
+no libc or runtime startup. No workload timing ratio is claimed. Aperture
+control geometry is compile-time disjoint from service-copy descriptors and
+the MM portal, and included in the image layout hash. The aligned VM-free
+hatch fixture toggles control with slot-zero idle descriptors populated and
+reclaims the exact slot after every setting.
+"""
+
+[bindings]
+vm_free = "carrick-personality-linux::dispatch::ring_first_tests::strict_arm_terminal_calls_without_process_owner_cross_to_carrier; carrick-el1-abi::tests::aperture_control_is_disjoint_from_service_copy_descriptors; carrick-vmm-hvf::hatch::tests::aperture_configuration_preserves_service_copy_slot_zero"
+embed = "carrick-embed::arm_ring_first_strict_refusal_witness; carrick-embed::arm_ring_first_hatch_disabled_forward_witness"
+
+[bindings.unresolved]
+docker = "Strict ENOSYS is the explicit owner policy, not Linux syscall coverage. Docker execution is prohibited in this scoped task; Linux terminal semantics come from the syscall specifications."

@@ -89,3 +89,7 @@ path = "src/discard_fork_threads.rs"
 [[bin]]
 name = "carrick-linux-aarch64-crash-parked-thread"
 path = "src/crash_parked_thread.rs"
+
+[[bin]]
+name = "carrick-linux-aarch64-ring-first"
+path = "src/ring_first.rs"
