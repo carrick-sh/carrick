@@ -218,6 +218,13 @@ const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 /// The low byte: the child's exit signal. A thread has none.
 const CSIGNAL: u64 = 0xff;
 
+/// Process-shaped clone calls must enter the process owner even when their
+/// flags are not yet supported. The owner can refuse them without allowing a
+/// second lifecycle implementation to create a task.
+pub const fn is_process_clone(flags: u64) -> bool {
+    flags & CLONE_THREAD == 0
+}
+
 /// Every flag a libc or Go thread creation passes.
 const THREAD_CLONE_REQUIRED: u64 =
     CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM;
