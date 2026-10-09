@@ -336,24 +336,13 @@ The opt-out hatch is governed by a single environment variable:
 CARRICK_ARM_RING_FIRST=0
 ```
 - **Default value:** `1` (enabled / strict allowlist).
-- **Hatch definition location:** [`crates/carrick-vmm-hvf/src/vcpu_loop/mod.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-vmm-hvf/src/vcpu_loop/mod.rs) and communicated to EL1 via the shared aperture control word.
-
-```rust
-/// Single owner of the ARM ring-first flip opt-out policy.
-pub struct ArmRingFirstHatch;
-
-impl ArmRingFirstHatch {
-    /// Returns true if ARM EL1 enforces the strict forward allowlist (default: true).
-    /// Disabled only when CARRICK_ARM_RING_FIRST=0.
-    #[inline]
-    pub fn is_strict() -> bool {
-        match std::env::var_os("CARRICK_ARM_RING_FIRST") {
-            Some(val) => val != "0",
-            None => true,
-        }
-    }
-}
-```
+- **Resolution:** the CLI's existing host-environment snapshot is consumed in
+  `carrick-engine::resolve_run_spec`; only the exact `0` selects opt-out.
+- **Typed policy:** `ArmRingFirst::{Strict, OptOut}` is carried by the run spec,
+  frozen embed container, prepared run and boot image. Embed callers use
+  `ContainerBuilder::arm_ring_first` directly.
+- **Aperture writer:** `crates/carrick-vmm-hvf/src/hatch.rs` receives the typed
+  option; it never reads process environment.
 
 ### 5.2 Aperture Control Word Communication
 Because bare-metal EL1 does not access host environment variables directly, the host carrier sets a flag in the shared aperture control word during VM initialization:
@@ -363,9 +352,7 @@ Because bare-metal EL1 does not access host environment variables directly, the 
   ```
 - During boot in `carrick-vmm-hvf`:
   ```rust
-  if ArmRingFirstHatch::is_strict() {
-      aperture.control.fetch_or(APERTURE_CONTROL_ARM_RING_FIRST_STRICT, Ordering::Release);
-  }
+  ArmRingFirstHatch::configure_aperture(aperture, image.arm_ring_first());
   ```
 - EL1 entry tests this bit: if cleared, EL1 bypasses refusal and forwards unhandled syscalls to the host carrier.
 
@@ -376,24 +363,34 @@ Setting `CARRICK_ARM_RING_FIRST=0`:
 3. Allows bisecting and debugging whether an unexpected guest failure is caused by the strict allowlist refusal vs a real kernel bug.
 
 ### 5.4 Test Matrix for Both Settings
-1. **Personality Unit Tests (`carrick-personality-linux`):**
-   - Test `arm_dispatch_allowlist_strict`: Asserts that `getresuid` (148) returns `CompletionRoute::Served` with result `-38` (`-ENOSYS`) and increments `counters.refused[148]`.
-   - Test `arm_dispatch_allowlist_hatch_disabled`: Asserts that when the strict flag is false, `getresuid` (148) returns `CompletionRoute::Forward` and `counters.refused[148]` remains 0.
-2. **Embed Integration Test (`crates/carrick-embed/tests/arm_ring_first_hatch.rs`):**
-   - Runs a compiled AArch64 guest binary invoking `getresuid`.
-   - Run 1 (strict / default): Validates guest gets `ENOSYS`, host dispatcher is not called, aperture `counters.refused[148] == 1`.
-   - Run 2 (`CARRICK_ARM_RING_FIRST=0`): Validates guest gets host return value, aperture `counters.refused[148] == 0`.
+
+The VM-free crossing tests enforce the exact ARM and x86 sets and counted
+refusal semantics. `strict_arm_terminal_calls_without_process_owner_cross_to_carrier`
+proves that declined terminal calls preserve status and forward once.
+Configuration tests prove snapshot parsing, explicit override, builder freeze
+and boot-region preservation without reading or changing process environment.
+
+The registered raw fixture `carrick-linux-aarch64-ring-first` invokes getuid
+(174), getpid, clock_gettime, bounded five-second ppoll readiness, write and
+exit_group. The signed filter is `just test-embed arm_ring_first_ --nocapture`:
+
+- `arm_ring_first_strict_refusal_witness`: getuid returns ENOSYS, with one
+  refusal and zero forwarded calls.
+- `arm_ring_first_hatch_disabled_forward_witness`: the typed opt-out restores
+  getuid's host return, with zero refusals and one forwarded call.
+- Both settings require zero terminal refusals and one exit_group forward;
+  an unexpectedly returning terminal syscall traps rather than spinning.
 
 ---
 
 ## 6. Ordered Implementation Plan
 
 ### 6.1 Phase A: Switch, Shared Allowlist, and Counters (PR 1)
-*Goal: Minimal, tight PR to land immediately after Step 5 wiring.*
+*Goal: Minimal switch PR, with declined terminal calls eligible to cross until their in-ring owner serves them.*
 
 1. **Shared Allowlist Definition:**
    - Create `crates/carrick-personality-linux/src/crossing.rs`.
-   - Define `AllowedHostCrossing` with `from_native_aarch64(nr: u64)` matching the 100 allowlisted host crossings and 16 temporary forward crossings.
+   - Define `AllowedHostCrossing` with `from_native_aarch64(nr: u64)` matching the 100 allowlisted host crossings, 16 temporary forward crossings and two declined terminal notifications.
    - Refactor `crates/carrick-x86-cpl0/src/entry.rs` to reuse this shared enum for x86.
 2. **ARM EL1 Refusal Hook:**
    - In [`crates/carrick-personality-linux/src/dispatch.rs:507`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L507), intercept `CompletionRoute::Forward`.
@@ -405,7 +402,7 @@ Setting `CARRICK_ARM_RING_FIRST=0`:
    - Add `ArmRingFirstHatch` in `carrick-vmm-hvf` and populate aperture control flag at startup.
 5. **Verification & Testing:**
    - Unit tests in `carrick-personality-linux`.
-   - Run signed embed test `just test-embed arm_ring_first_hatch`.
+   - Run signed embed test `just test-embed arm_ring_first_`.
 
 ### 6.2 Phase B: Per-Family Deletions & FD Table Landing (PRs 2 to N)
 1. **PR 2 (Host Identity & IPC Cleanup):**
