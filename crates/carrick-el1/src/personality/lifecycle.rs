@@ -377,9 +377,16 @@ impl<
         thread.slot.set_clear_child_tid(address);
         true
     }
-    fn robust_list(&self) -> Option<(u64, u32)> {
-        let thread = self.thread()?;
-        Some(thread.slot.robust_list())
+    fn robust_list_for(&self, tid: i32) -> Result<(u64, u32), i64> {
+        let thread = self
+            .thread()
+            .ok_or(carrick_personality_linux::identity::ESRCH)?;
+        let cur_tid = thread.slot.visible_tid().unwrap_or(0);
+        if tid == 0 || tid as u32 == cur_tid {
+            Ok(thread.slot.robust_list())
+        } else {
+            Err(carrick_personality_linux::identity::ESRCH)
+        }
     }
     fn process_identity(
         &mut self,

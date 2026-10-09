@@ -71,14 +71,15 @@ impl LinuxUtsname {
         copy_cstr(&mut self.domainname, name);
     }
 
-    pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: LinuxUtsname is #[repr(C)] containing only [u8; 65] arrays.
-        unsafe {
-            core::slice::from_raw_parts(
-                (self as *const Self) as *const u8,
-                core::mem::size_of::<Self>(),
-            )
-        }
+    pub fn to_bytes(&self) -> [u8; 390] {
+        let mut buf = [0u8; 390];
+        buf[0..65].copy_from_slice(&self.sysname);
+        buf[65..130].copy_from_slice(&self.nodename);
+        buf[130..195].copy_from_slice(&self.release);
+        buf[195..260].copy_from_slice(&self.version);
+        buf[260..325].copy_from_slice(&self.machine);
+        buf[325..390].copy_from_slice(&self.domainname);
+        buf
     }
 }
 
@@ -125,14 +126,26 @@ impl LinuxSysinfo {
         }
     }
 
-    pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: LinuxSysinfo is #[repr(C, packed)] Plain Old Data.
-        unsafe {
-            core::slice::from_raw_parts(
-                (self as *const Self) as *const u8,
-                core::mem::size_of::<Self>(),
-            )
-        }
+    pub fn to_bytes(&self) -> [u8; 112] {
+        let mut buf = [0u8; 112];
+        buf[0..8].copy_from_slice(&self.uptime.to_ne_bytes());
+        buf[8..16].copy_from_slice(&self.loads[0].to_ne_bytes());
+        buf[16..24].copy_from_slice(&self.loads[1].to_ne_bytes());
+        buf[24..32].copy_from_slice(&self.loads[2].to_ne_bytes());
+        buf[32..40].copy_from_slice(&self.totalram.to_ne_bytes());
+        buf[40..48].copy_from_slice(&self.freeram.to_ne_bytes());
+        buf[48..56].copy_from_slice(&self.sharedram.to_ne_bytes());
+        buf[56..64].copy_from_slice(&self.bufferram.to_ne_bytes());
+        buf[64..72].copy_from_slice(&self.totalswap.to_ne_bytes());
+        buf[72..80].copy_from_slice(&self.freeswap.to_ne_bytes());
+        buf[80..82].copy_from_slice(&self.procs.to_ne_bytes());
+        buf[82..84].copy_from_slice(&self.pad.to_ne_bytes());
+        buf[84..88].copy_from_slice(&self._pad_align);
+        buf[88..96].copy_from_slice(&self.totalhigh.to_ne_bytes());
+        buf[96..104].copy_from_slice(&self.freehigh.to_ne_bytes());
+        buf[104..108].copy_from_slice(&self.mem_unit.to_ne_bytes());
+        buf[108..112].copy_from_slice(&self._f);
+        buf
     }
 }
 
@@ -192,14 +205,27 @@ impl LinuxRusage {
         }
     }
 
-    pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: LinuxRusage is #[repr(C)] Plain Old Data.
-        unsafe {
-            core::slice::from_raw_parts(
-                (self as *const Self) as *const u8,
-                core::mem::size_of::<Self>(),
-            )
-        }
+    pub fn to_bytes(&self) -> [u8; carrick_syscall_abi::LINUX_RUSAGE_BYTES] {
+        let mut buf = [0u8; carrick_syscall_abi::LINUX_RUSAGE_BYTES];
+        buf[0..8].copy_from_slice(&self.ru_utime.tv_sec.to_ne_bytes());
+        buf[8..16].copy_from_slice(&self.ru_utime.tv_usec.to_ne_bytes());
+        buf[16..24].copy_from_slice(&self.ru_stime.tv_sec.to_ne_bytes());
+        buf[24..32].copy_from_slice(&self.ru_stime.tv_usec.to_ne_bytes());
+        buf[32..40].copy_from_slice(&self.ru_maxrss.to_ne_bytes());
+        buf[40..48].copy_from_slice(&self.ru_ixrss.to_ne_bytes());
+        buf[48..56].copy_from_slice(&self.ru_idrss.to_ne_bytes());
+        buf[56..64].copy_from_slice(&self.ru_isrss.to_ne_bytes());
+        buf[64..72].copy_from_slice(&self.ru_minflt.to_ne_bytes());
+        buf[72..80].copy_from_slice(&self.ru_majflt.to_ne_bytes());
+        buf[80..88].copy_from_slice(&self.ru_nswap.to_ne_bytes());
+        buf[88..96].copy_from_slice(&self.ru_inblock.to_ne_bytes());
+        buf[96..104].copy_from_slice(&self.ru_oublock.to_ne_bytes());
+        buf[104..112].copy_from_slice(&self.ru_msgsnd.to_ne_bytes());
+        buf[112..120].copy_from_slice(&self.ru_msgrcv.to_ne_bytes());
+        buf[120..128].copy_from_slice(&self.ru_nsignals.to_ne_bytes());
+        buf[128..136].copy_from_slice(&self.ru_nvcsw.to_ne_bytes());
+        buf[136..144].copy_from_slice(&self.ru_nivcsw.to_ne_bytes());
+        buf
     }
 }
 
@@ -218,7 +244,9 @@ pub enum SysinfoCall {
 
 pub trait ProcessSysinfoVenue {
     fn get_uts(&self) -> LinuxUtsname;
+    fn can_set_hostname(&self) -> Result<(), i64>;
     fn set_hostname(&mut self, name: &[u8]) -> Result<(), i64>;
+    fn can_set_domainname(&self) -> Result<(), i64>;
     fn set_domainname(&mut self, name: &[u8]) -> Result<(), i64>;
     fn get_rlimit(&self, resource: usize) -> Result<LinuxRlimit, i64>;
     fn set_rlimit(&mut self, resource: usize, limit: LinuxRlimit) -> Result<(), i64>;
@@ -250,7 +278,7 @@ pub fn invoke<'a>(call: SysinfoCall, native: &mut dyn SysinfoNative<'a>) -> Opti
                 let venue = native.process_sysinfo()?;
                 venue.get_uts()
             };
-            if !native.copy_out(ptr, uts.as_bytes()) {
+            if !native.copy_out(ptr, &uts.to_bytes()) {
                 return Some(SyscallResult::new(EFAULT));
             }
             Some(SyscallResult::new(0))
@@ -260,6 +288,16 @@ pub fn invoke<'a>(call: SysinfoCall, native: &mut dyn SysinfoNative<'a>) -> Opti
             let len = args[1] as usize;
             if len > 64 {
                 return Some(SyscallResult::new(EINVAL));
+            }
+            {
+                let venue = native.process_sysinfo()?;
+                if let Err(e) = venue.can_set_hostname() {
+                    return Some(SyscallResult::new(e));
+                }
+                if len == 0 {
+                    let _ = venue.set_hostname(&[]);
+                    return Some(SyscallResult::new(0));
+                }
             }
             if ptr.raw() == 0 {
                 return Some(SyscallResult::new(EFAULT));
@@ -279,6 +317,16 @@ pub fn invoke<'a>(call: SysinfoCall, native: &mut dyn SysinfoNative<'a>) -> Opti
             let len = args[1] as usize;
             if len > 64 {
                 return Some(SyscallResult::new(EINVAL));
+            }
+            {
+                let venue = native.process_sysinfo()?;
+                if let Err(e) = venue.can_set_domainname() {
+                    return Some(SyscallResult::new(e));
+                }
+                if len == 0 {
+                    let _ = venue.set_domainname(&[]);
+                    return Some(SyscallResult::new(0));
+                }
             }
             if ptr.raw() == 0 {
                 return Some(SyscallResult::new(EFAULT));
@@ -393,7 +441,7 @@ pub fn invoke<'a>(call: SysinfoCall, native: &mut dyn SysinfoNative<'a>) -> Opti
                     Err(e) => return Some(SyscallResult::new(e)),
                 }
             };
-            if !native.copy_out(ptr, rusage.as_bytes()) {
+            if !native.copy_out(ptr, &rusage.to_bytes()) {
                 return Some(SyscallResult::new(EFAULT));
             }
             Some(SyscallResult::new(0))
@@ -407,10 +455,201 @@ pub fn invoke<'a>(call: SysinfoCall, native: &mut dyn SysinfoNative<'a>) -> Opti
                 let venue = native.process_sysinfo()?;
                 venue.sysinfo()
             };
-            if !native.copy_out(ptr, info.as_bytes()) {
+            if !native.copy_out(ptr, &info.to_bytes()) {
                 return Some(SyscallResult::new(EFAULT));
             }
             Some(SyscallResult::new(0))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::collections::BTreeMap;
+
+    struct MockNative {
+        args: [u64; 6],
+        memory: BTreeMap<u64, u8>,
+        venue: MockVenue,
+    }
+
+    impl MockNative {
+        fn new() -> Self {
+            Self {
+                args: [0; 6],
+                memory: BTreeMap::new(),
+                venue: MockVenue::default(),
+            }
+        }
+    }
+
+    impl UserCopy for MockNative {
+        fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool {
+            let addr = src.raw();
+            for (i, byte) in dst.iter_mut().enumerate() {
+                if let Some(&b) = self.memory.get(&(addr + i as u64)) {
+                    *byte = b;
+                } else {
+                    return false;
+                }
+            }
+            true
+        }
+
+        fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool {
+            let addr = dst.raw();
+            for (i, &byte) in src.iter().enumerate() {
+                self.memory.insert(addr + i as u64, byte);
+            }
+            true
+        }
+    }
+
+    impl<'a> SysinfoNative<'a> for MockNative {
+        fn arguments(&self) -> [u64; 6] {
+            self.args
+        }
+        fn process_sysinfo(&mut self) -> Option<&mut dyn ProcessSysinfoVenue> {
+            Some(&mut self.venue)
+        }
+    }
+
+    struct MockVenue {
+        uts: Option<LinuxUtsname>,
+        hostname: alloc::vec::Vec<u8>,
+        domainname: alloc::vec::Vec<u8>,
+        can_set_host_error: Option<i64>,
+        can_set_domain_error: Option<i64>,
+        rlimits: [LinuxRlimit; 16],
+    }
+
+    impl Default for MockVenue {
+        fn default() -> Self {
+            Self {
+                uts: None,
+                hostname: alloc::vec::Vec::new(),
+                domainname: alloc::vec::Vec::new(),
+                can_set_host_error: None,
+                can_set_domain_error: None,
+                rlimits: [LinuxRlimit {
+                    rlim_cur: LinuxRlimit::INFINITY,
+                    rlim_max: LinuxRlimit::INFINITY,
+                }; 16],
+            }
+        }
+    }
+
+    impl ProcessSysinfoVenue for MockVenue {
+        fn get_uts(&self) -> LinuxUtsname {
+            self.uts.unwrap_or_else(LinuxUtsname::carrick_x86_64)
+        }
+        fn can_set_hostname(&self) -> Result<(), i64> {
+            if let Some(e) = self.can_set_host_error {
+                return Err(e);
+            }
+            Ok(())
+        }
+        fn set_hostname(&mut self, name: &[u8]) -> Result<(), i64> {
+            self.hostname = name.to_vec();
+            Ok(())
+        }
+        fn can_set_domainname(&self) -> Result<(), i64> {
+            if let Some(e) = self.can_set_domain_error {
+                return Err(e);
+            }
+            Ok(())
+        }
+        fn set_domainname(&mut self, name: &[u8]) -> Result<(), i64> {
+            self.domainname = name.to_vec();
+            Ok(())
+        }
+        fn get_rlimit(&self, resource: usize) -> Result<LinuxRlimit, i64> {
+            if resource >= 16 {
+                return Err(EINVAL);
+            }
+            Ok(self.rlimits[resource])
+        }
+        fn set_rlimit(&mut self, resource: usize, limit: LinuxRlimit) -> Result<(), i64> {
+            if resource >= 16 {
+                return Err(EINVAL);
+            }
+            self.rlimits[resource] = limit;
+            Ok(())
+        }
+        fn prlimit64(
+            &mut self,
+            _pid: i32,
+            resource: usize,
+            new_limit: Option<LinuxRlimit>,
+        ) -> Result<LinuxRlimit, i64> {
+            if resource >= 16 {
+                return Err(EINVAL);
+            }
+            let old = self.rlimits[resource];
+            if let Some(new) = new_limit {
+                self.rlimits[resource] = new;
+            }
+            Ok(old)
+        }
+        fn umask(&mut self, mask: u32) -> u32 {
+            mask
+        }
+        fn sysinfo(&self) -> LinuxSysinfo {
+            LinuxSysinfo::default_info()
+        }
+        fn getrusage(&self, _who: i32) -> Result<LinuxRusage, i64> {
+            Ok(LinuxRusage::zeroed())
+        }
+    }
+
+    #[test]
+    fn sethostname_checks_permission_before_copy_in() {
+        let mut mock = MockNative::new();
+        mock.venue.can_set_host_error = Some(EPERM);
+        mock.args[0] = 0xdead_beef; // unmapped memory
+        mock.args[1] = 5;
+        let res = invoke(SysinfoCall::SetHostname, &mut mock).unwrap();
+        assert_eq!(res.raw(), EPERM);
+    }
+
+    #[test]
+    fn sethostname_len_zero_with_null_succeeds() {
+        let mut mock = MockNative::new();
+        mock.args[0] = 0; // NULL pointer
+        mock.args[1] = 0; // len == 0
+        let res = invoke(SysinfoCall::SetHostname, &mut mock).unwrap();
+        assert_eq!(res.raw(), 0);
+        assert_eq!(mock.venue.hostname, b"");
+    }
+
+    #[test]
+    fn setdomainname_len_zero_with_null_succeeds() {
+        let mut mock = MockNative::new();
+        mock.args[0] = 0; // NULL pointer
+        mock.args[1] = 0; // len == 0
+        let res = invoke(SysinfoCall::SetDomainname, &mut mock).unwrap();
+        assert_eq!(res.raw(), 0);
+        assert_eq!(mock.venue.domainname, b"");
+    }
+
+    #[test]
+    fn sethostname_len_exceeds_64_returns_einval() {
+        let mut mock = MockNative::new();
+        mock.args[0] = 0x1000;
+        mock.args[1] = 65;
+        let res = invoke(SysinfoCall::SetHostname, &mut mock).unwrap();
+        assert_eq!(res.raw(), EINVAL);
+    }
+
+    #[test]
+    fn uname_copies_uts_record() {
+        let mut mock = MockNative::new();
+        mock.args[0] = 0x1000;
+        let res = invoke(SysinfoCall::Uname, &mut mock).unwrap();
+        assert_eq!(res.raw(), 0);
+        // Verify sysname starts with "Linux\0"
+        let sysname: alloc::vec::Vec<u8> = (0..6).map(|i| mock.memory[&(0x1000 + i)]).collect();
+        assert_eq!(&sysname, b"Linux\0");
     }
 }

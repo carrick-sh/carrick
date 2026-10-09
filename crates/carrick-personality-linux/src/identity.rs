@@ -5,6 +5,7 @@ use carrick_guest_arch::UserVa;
 
 pub const EPERM: i64 = -1;
 pub const ESRCH: i64 = -3;
+pub const EACCES: i64 = -13;
 pub const EFAULT: i64 = -14;
 pub const EINVAL: i64 = -22;
 
@@ -22,8 +23,9 @@ pub const LINUX_PR_SET_CHILD_SUBREAPER: u64 = 36;
 pub const LINUX_PR_GET_CHILD_SUBREAPER: u64 = 37;
 pub const LINUX_PR_SET_NO_NEW_PRIVS: u64 = 38;
 pub const LINUX_PR_GET_NO_NEW_PRIVS: u64 = 39;
+pub const LINUX_NGROUPS_MAX: usize = 65536;
 
-use carrick_syscall_abi::LinuxCapabilitySet;
+pub use carrick_syscall_abi::LinuxCapabilitySet;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaskCapabilities {
@@ -82,7 +84,9 @@ pub trait ProcessIdentityVenue {
     fn set_gid(&mut self, gid: u32) -> Result<(), i64>;
     fn set_fsuid(&mut self, fsuid: u32) -> u32;
     fn set_fsgid(&mut self, fsgid: u32) -> u32;
-    fn get_groups(&self, out: &mut [u32]) -> Result<usize, i64>;
+    fn can_set_groups(&self) -> Result<(), i64>;
+    fn get_groups_count(&self) -> usize;
+    fn get_groups(&self, out: &mut alloc::vec::Vec<u32>);
     fn set_groups(&mut self, groups: &[u32]) -> Result<(), i64>;
     fn capget(&self, pid: i32) -> Result<TaskCapabilities, i64>;
     fn capset(&mut self, pid: i32, caps: TaskCapabilities) -> Result<(), i64>;
@@ -93,7 +97,7 @@ pub trait ProcessIdentityVenue {
     fn set_sid(&mut self) -> Result<u32, i64>;
     fn personality(&mut self, persona: u64) -> u64;
     fn prctl_get_name(&self, buf: &mut [u8; 16]);
-    fn prctl_set_name(&mut self, name: &[u8]);
+    fn prctl_set_name(&mut self, name: &[u8; 16]);
     fn prctl_get_pdeathsig(&self) -> u8;
     fn prctl_set_pdeathsig(&mut self, sig: u8) -> Result<(), i64>;
     fn prctl_get_dumpable(&self) -> u32;
@@ -108,7 +112,7 @@ pub trait IdentityNative<'a>: UserCopy {
     fn arguments(&self) -> [u64; 6];
     fn visible_tid(&self) -> Option<u32>;
     fn set_clear_child_tid(&mut self, address: u64) -> bool;
-    fn robust_list(&self) -> Option<(u64, u32)>;
+    fn robust_list_for(&self, tid: i32) -> Result<(u64, u32), i64>;
     fn process_identity(&mut self) -> Option<&mut dyn ProcessIdentityVenue>;
 }
 
@@ -133,15 +137,24 @@ pub fn invoke<'a>(
             let pid = args[0] as i32;
             let head_ptr = UserVa::new(args[1]);
             let len_ptr = UserVa::new(args[2]);
-            let (head, len) = native.robust_list().unwrap_or((0, 0));
-            if pid != 0 && pid as u32 != native.visible_tid().unwrap_or(0) {
-                return Some(SyscallResult::new(ESRCH));
-            }
-            if !native.copy_out(head_ptr, &head.to_ne_bytes()) {
+
+            // Validate both output pointers before writing anything
+            let mut test_head = [0u8; 8];
+            let mut test_len = [0u8; 8];
+            if !native.copy_in(&mut test_head, head_ptr) || !native.copy_in(&mut test_len, len_ptr)
+            {
                 return Some(SyscallResult::new(EFAULT));
             }
+
+            let (head, len) = match native.robust_list_for(pid) {
+                Ok(pair) => pair,
+                Err(e) => return Some(SyscallResult::new(e)),
+            };
+
             let len_u64 = len as u64;
-            if !native.copy_out(len_ptr, &len_u64.to_ne_bytes()) {
+            if !native.copy_out(head_ptr, &head.to_ne_bytes())
+                || !native.copy_out(len_ptr, &len_u64.to_ne_bytes())
+            {
                 return Some(SyscallResult::new(EFAULT));
             }
             Some(SyscallResult::new(0))
@@ -263,48 +276,49 @@ pub fn invoke<'a>(
         IdentityCall::GetGroups => {
             let size = args[0] as usize;
             let list_ptr = UserVa::new(args[1]);
-            let mut groups = [0u32; 64];
-            let count = {
-                let venue = native.process_identity()?;
-                match venue.get_groups(&mut groups) {
-                    Ok(c) => c,
-                    Err(e) => return Some(SyscallResult::new(e)),
-                }
-            };
+            let venue = native.process_identity()?;
+            let count = venue.get_groups_count();
             if size == 0 {
                 return Some(SyscallResult::new(count as i64));
             }
             if size < count {
                 return Some(SyscallResult::new(EINVAL));
             }
-            let byte_len = count * 4;
-            // SAFETY: groups is aligned and populated up to count.
-            let bytes =
-                unsafe { core::slice::from_raw_parts(groups.as_ptr() as *const u8, byte_len) };
-            if !native.copy_out(list_ptr, bytes) {
-                return Some(SyscallResult::new(EFAULT));
+            let mut groups = alloc::vec::Vec::new();
+            venue.get_groups(&mut groups);
+            let mut cur_addr = list_ptr.raw();
+            for &gid in groups.iter().take(count) {
+                if !native.copy_out(UserVa::new(cur_addr), &gid.to_ne_bytes()) {
+                    return Some(SyscallResult::new(EFAULT));
+                }
+                cur_addr = cur_addr.wrapping_add(4);
             }
             Some(SyscallResult::new(count as i64))
         }
         IdentityCall::SetGroups => {
             let size = args[0] as usize;
-            if size > 64 {
+            if size > LINUX_NGROUPS_MAX {
                 return Some(SyscallResult::new(EINVAL));
             }
-            let list_ptr = UserVa::new(args[1]);
-            let mut groups = [0u32; 64];
-            if size > 0 {
-                let byte_len = size * 4;
-                // SAFETY: groups has capacity 64, byte_len <= 256.
-                let bytes = unsafe {
-                    core::slice::from_raw_parts_mut(groups.as_mut_ptr() as *mut u8, byte_len)
-                };
-                if !native.copy_in(bytes, list_ptr) {
-                    return Some(SyscallResult::new(EFAULT));
+            {
+                let venue = native.process_identity()?;
+                if let Err(e) = venue.can_set_groups() {
+                    return Some(SyscallResult::new(e));
                 }
             }
+            let list_ptr = UserVa::new(args[1]);
+            let mut groups = alloc::vec::Vec::with_capacity(size);
+            let mut cur_addr = list_ptr.raw();
+            for _ in 0..size {
+                let mut bytes = [0u8; 4];
+                if !native.copy_in(&mut bytes, UserVa::new(cur_addr)) {
+                    return Some(SyscallResult::new(EFAULT));
+                }
+                groups.push(u32::from_ne_bytes(bytes));
+                cur_addr = cur_addr.wrapping_add(4);
+            }
             let venue = native.process_identity()?;
-            match venue.set_groups(&groups[..size]) {
+            match venue.set_groups(&groups) {
                 Ok(()) => Some(SyscallResult::new(0)),
                 Err(e) => Some(SyscallResult::new(e)),
             }
@@ -488,8 +502,17 @@ pub fn invoke<'a>(
             match option {
                 LINUX_PR_SET_NAME => {
                     let mut name = [0u8; 16];
-                    if !native.copy_in(&mut name, UserVa::new(arg2)) {
-                        return Some(SyscallResult::new(EFAULT));
+                    let mut cur_addr = arg2;
+                    for slot in name.iter_mut() {
+                        let mut b = [0u8; 1];
+                        if !native.copy_in(&mut b, UserVa::new(cur_addr)) {
+                            return Some(SyscallResult::new(EFAULT));
+                        }
+                        *slot = b[0];
+                        if b[0] == 0 {
+                            break;
+                        }
+                        cur_addr = cur_addr.wrapping_add(1);
                     }
                     let venue = native.process_identity()?;
                     venue.prctl_set_name(&name);
@@ -582,8 +605,338 @@ pub fn invoke<'a>(
                     }
                     Some(SyscallResult::new(0))
                 }
-                _ => Some(SyscallResult::new(EINVAL)),
+                _ => None,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::collections::BTreeMap;
+
+    struct MockNative {
+        args: [u64; 6],
+        tid: u32,
+        clear_child_tid: u64,
+        robust_head: u64,
+        robust_len: u32,
+        memory: BTreeMap<u64, u8>,
+        venue: MockVenue,
+    }
+
+    impl MockNative {
+        fn new() -> Self {
+            Self {
+                args: [0; 6],
+                tid: 100,
+                clear_child_tid: 0,
+                robust_head: 0x5000,
+                robust_len: 24,
+                memory: BTreeMap::new(),
+                venue: MockVenue::default(),
+            }
+        }
+    }
+
+    impl UserCopy for MockNative {
+        fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool {
+            let addr = src.raw();
+            for (i, byte) in dst.iter_mut().enumerate() {
+                if let Some(&b) = self.memory.get(&(addr + i as u64)) {
+                    *byte = b;
+                } else {
+                    return false;
+                }
+            }
+            true
+        }
+
+        fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool {
+            let addr = dst.raw();
+            for (i, &byte) in src.iter().enumerate() {
+                self.memory.insert(addr + i as u64, byte);
+            }
+            true
+        }
+    }
+
+    impl<'a> IdentityNative<'a> for MockNative {
+        fn arguments(&self) -> [u64; 6] {
+            self.args
+        }
+        fn visible_tid(&self) -> Option<u32> {
+            Some(self.tid)
+        }
+        fn set_clear_child_tid(&mut self, address: u64) -> bool {
+            self.clear_child_tid = address;
+            true
+        }
+        fn robust_list_for(&self, tid: i32) -> Result<(u64, u32), i64> {
+            if tid == 0 || tid as u32 == self.tid {
+                Ok((self.robust_head, self.robust_len))
+            } else {
+                Err(ESRCH)
+            }
+        }
+        fn process_identity(&mut self) -> Option<&mut dyn ProcessIdentityVenue> {
+            Some(&mut self.venue)
+        }
+    }
+
+    #[derive(Default)]
+    struct MockVenue {
+        uids: (u32, u32, u32, u32),
+        gids: (u32, u32, u32, u32),
+        groups: alloc::vec::Vec<u32>,
+        caps: Option<TaskCapabilities>,
+        ppid: u32,
+        pgid: u32,
+        sid: u32,
+        personality: u64,
+        comm: [u8; 16],
+        pdeathsig: u8,
+        dumpable: u32,
+        no_new_privs: bool,
+        child_subreaper: bool,
+        can_set_groups_error: Option<i64>,
+    }
+
+    impl ProcessIdentityVenue for MockVenue {
+        fn get_uids(&self) -> (u32, u32, u32, u32) {
+            self.uids
+        }
+        fn get_gids(&self) -> (u32, u32, u32, u32) {
+            self.gids
+        }
+        fn set_resuid(
+            &mut self,
+            r: Option<u32>,
+            e: Option<u32>,
+            s: Option<u32>,
+        ) -> Result<(), i64> {
+            if let Some(r) = r {
+                self.uids.0 = r;
+            }
+            if let Some(e) = e {
+                self.uids.1 = e;
+            }
+            if let Some(s) = s {
+                self.uids.2 = s;
+            }
+            Ok(())
+        }
+        fn set_resgid(
+            &mut self,
+            r: Option<u32>,
+            e: Option<u32>,
+            s: Option<u32>,
+        ) -> Result<(), i64> {
+            if let Some(r) = r {
+                self.gids.0 = r;
+            }
+            if let Some(e) = e {
+                self.gids.1 = e;
+            }
+            if let Some(s) = s {
+                self.gids.2 = s;
+            }
+            Ok(())
+        }
+        fn set_reuid(&mut self, r: Option<u32>, e: Option<u32>) -> Result<(), i64> {
+            if let Some(r) = r {
+                self.uids.0 = r;
+            }
+            if let Some(e) = e {
+                self.uids.1 = e;
+            }
+            Ok(())
+        }
+        fn set_regid(&mut self, r: Option<u32>, e: Option<u32>) -> Result<(), i64> {
+            if let Some(r) = r {
+                self.gids.0 = r;
+            }
+            if let Some(e) = e {
+                self.gids.1 = e;
+            }
+            Ok(())
+        }
+        fn set_uid(&mut self, uid: u32) -> Result<(), i64> {
+            if uid == u32::MAX {
+                return Err(EINVAL);
+            }
+            self.uids.1 = uid;
+            Ok(())
+        }
+        fn set_gid(&mut self, gid: u32) -> Result<(), i64> {
+            if gid == u32::MAX {
+                return Err(EINVAL);
+            }
+            self.gids.1 = gid;
+            Ok(())
+        }
+        fn set_fsuid(&mut self, fsuid: u32) -> u32 {
+            let prev = self.uids.3;
+            if fsuid != u32::MAX {
+                self.uids.3 = fsuid;
+            }
+            prev
+        }
+        fn set_fsgid(&mut self, fsgid: u32) -> u32 {
+            let prev = self.gids.3;
+            if fsgid != u32::MAX {
+                self.gids.3 = fsgid;
+            }
+            prev
+        }
+        fn can_set_groups(&self) -> Result<(), i64> {
+            if let Some(err) = self.can_set_groups_error {
+                return Err(err);
+            }
+            Ok(())
+        }
+        fn get_groups_count(&self) -> usize {
+            self.groups.len()
+        }
+        fn get_groups(&self, out: &mut alloc::vec::Vec<u32>) {
+            out.clear();
+            out.extend_from_slice(&self.groups);
+        }
+        fn set_groups(&mut self, groups: &[u32]) -> Result<(), i64> {
+            self.groups = groups.to_vec();
+            Ok(())
+        }
+        fn capget(&self, _pid: i32) -> Result<TaskCapabilities, i64> {
+            Ok(self.caps.unwrap_or(TaskCapabilities::FULL))
+        }
+        fn capset(&mut self, _pid: i32, caps: TaskCapabilities) -> Result<(), i64> {
+            self.caps = Some(caps);
+            Ok(())
+        }
+        fn get_ppid(&self) -> u32 {
+            self.ppid
+        }
+        fn get_pgid(&self, _pid: i32) -> Result<u32, i64> {
+            Ok(self.pgid)
+        }
+        fn set_pgid(&mut self, _pid: i32, pgid: i32) -> Result<(), i64> {
+            if pgid < 0 {
+                return Err(EINVAL);
+            }
+            self.pgid = pgid as u32;
+            Ok(())
+        }
+        fn get_sid(&self, _pid: i32) -> Result<u32, i64> {
+            Ok(self.sid)
+        }
+        fn set_sid(&mut self) -> Result<u32, i64> {
+            Ok(self.sid)
+        }
+        fn personality(&mut self, p: u64) -> u64 {
+            let old = self.personality;
+            if p != 0xffff_ffff {
+                self.personality = p;
+            }
+            old
+        }
+        fn prctl_get_name(&self, buf: &mut [u8; 16]) {
+            *buf = self.comm;
+        }
+        fn prctl_set_name(&mut self, name: &[u8; 16]) {
+            self.comm = *name;
+        }
+        fn prctl_get_pdeathsig(&self) -> u8 {
+            self.pdeathsig
+        }
+        fn prctl_set_pdeathsig(&mut self, sig: u8) -> Result<(), i64> {
+            self.pdeathsig = sig;
+            Ok(())
+        }
+        fn prctl_get_dumpable(&self) -> u32 {
+            self.dumpable
+        }
+        fn prctl_set_dumpable(&mut self, d: u32) -> Result<(), i64> {
+            self.dumpable = d;
+            Ok(())
+        }
+        fn prctl_get_no_new_privs(&self) -> bool {
+            self.no_new_privs
+        }
+        fn prctl_set_no_new_privs(&mut self, n: bool) -> Result<(), i64> {
+            self.no_new_privs = n;
+            Ok(())
+        }
+        fn prctl_get_child_subreaper(&self) -> bool {
+            self.child_subreaper
+        }
+        fn prctl_set_child_subreaper(&mut self, s: bool) {
+            self.child_subreaper = s;
+        }
+    }
+
+    #[test]
+    fn prctl_unmodelled_option_returns_none() {
+        let mut mock = MockNative::new();
+        mock.args[0] = 999; // unknown option
+        assert_eq!(invoke(IdentityCall::Prctl, &mut mock), None);
+    }
+
+    #[test]
+    fn prctl_set_name_bounded_copy_stops_at_nul() {
+        let mut mock = MockNative::new();
+        mock.args[0] = LINUX_PR_SET_NAME;
+        mock.args[1] = 0x1000;
+        // Place "test\0" in memory at 0x1000, and leave 0x1005 unmapped
+        mock.memory.insert(0x1000, b't');
+        mock.memory.insert(0x1001, b'e');
+        mock.memory.insert(0x1002, b's');
+        mock.memory.insert(0x1003, b't');
+        mock.memory.insert(0x1004, 0);
+
+        let res = invoke(IdentityCall::Prctl, &mut mock).unwrap();
+        assert_eq!(res.raw(), 0);
+        assert_eq!(&mock.venue.comm[..5], b"test\0");
+        assert_eq!(&mock.venue.comm[5..], &[0; 11]);
+    }
+
+    #[test]
+    fn setgroups_checks_permission_before_copy_in() {
+        let mut mock = MockNative::new();
+        mock.venue.can_set_groups_error = Some(EPERM);
+        mock.args[0] = 2;
+        mock.args[1] = 0xdead_beef; // unmapped memory!
+        let res = invoke(IdentityCall::SetGroups, &mut mock).unwrap();
+        assert_eq!(res.raw(), EPERM);
+    }
+
+    #[test]
+    fn setgroups_exceeds_max_returns_einval() {
+        let mut mock = MockNative::new();
+        mock.args[0] = (LINUX_NGROUPS_MAX + 1) as u64;
+        mock.args[1] = 0x1000;
+        let res = invoke(IdentityCall::SetGroups, &mut mock).unwrap();
+        assert_eq!(res.raw(), EINVAL);
+    }
+
+    #[test]
+    fn setfsuid_minus_one_returns_previous_and_leaves_unchanged() {
+        let mut mock = MockNative::new();
+        mock.venue.uids.3 = 1000;
+        mock.args[0] = u32::MAX as u64; // (uid_t)-1
+        let res = invoke(IdentityCall::SetFsUid, &mut mock).unwrap();
+        assert_eq!(res.raw(), 1000);
+        assert_eq!(mock.venue.uids.3, 1000);
+    }
+
+    #[test]
+    fn get_robust_list_validates_pointers() {
+        let mut mock = MockNative::new();
+        mock.args[0] = 0; // current thread
+        mock.args[1] = 0x1000; // head ptr
+        mock.args[2] = 0x2000; // len ptr
+        // len ptr unmapped -> EFAULT
+        let res = invoke(IdentityCall::GetRobustList, &mut mock).unwrap();
+        assert_eq!(res.raw(), EFAULT);
     }
 }
