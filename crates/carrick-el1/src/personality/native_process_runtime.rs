@@ -1326,9 +1326,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn set_calling_tid(&mut self, tid: u32) {
         self.calling_tid = tid;
     }
-    fn exec_completed(&mut self, path: &[u8]) -> Result<(), i64> {
-        self.exec_completed(path).map_err(|e| e.errno())
-    }
+
     #[inline(never)]
     fn has_thread(&self, tid: u32) -> bool {
         let graph = self.runtime.graph.lock();
@@ -1375,39 +1373,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             task.remove_thread(tid);
         }
     }
-    #[inline(never)]
-    pub fn exec_completed(&mut self, path: &[u8]) -> Result<(), NativeProcessError> {
-        let leader_pid = {
-            let mut graph = self.runtime.graph.lock();
-            let caller_tid = self.calling_tid;
-            let task = graph
-                .owner
-                .task_mut(self.key)
-                .map_err(|_| NativeProcessError::Stale)?;
-            let leader_pid = task.metadata().namespace_pid;
-            let (creds, comm, comm_len) = task
-                .threads
-                .exec_completed(caller_tid, leader_pid, path)
-                .map_err(|_| NativeProcessError::Stale)?;
-            task.has_execed = true;
-            task.metadata_mut().ruid = creds.ruid;
-            task.metadata_mut().euid = creds.euid;
-            task.metadata_mut().diagnostic_name.clear();
-            if let Ok(s) = core::str::from_utf8(&comm[..comm_len]) {
-                task.metadata_mut().diagnostic_name.push_str(s);
-            }
-            leader_pid
-        };
 
-        self.calling_tid = leader_pid;
-
-        if let Some(slot) = self.slot {
-            slot.publish_visible_tid(leader_pid);
-            slot.set_clear_child_tid(0);
-            slot.set_robust_list(0, 0);
-        }
-        Ok(())
-    }
     #[inline(never)]
     fn update_calling_creds(
         &mut self,
@@ -2078,6 +2044,17 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
     clippy::drop_non_drop
 )]
 mod tests {
+    #[test]
+    fn unsupported_exec_has_no_completion_surface() {
+        let source = include_str!("native_process_runtime.rs");
+        let production = source.split("mod tests {").next().unwrap();
+        assert!(!production.contains(concat!("fn exec", "_completed(")));
+        assert!(
+            include_str!("../../../../docs/design/arm-ring-first-flip.md")
+                .contains("shared-owner-exec-completion")
+        );
+    }
+
     use super::*;
     use carrick_guest_arch::{ContextGeneration, FrameGpa};
     use carrick_sched_core::ParkedContextWords;
@@ -2996,218 +2973,6 @@ mod tests {
         );
         let child_comm = child_task.comm_for(child_pid).unwrap();
         assert_eq!(&child_comm[..7], b"worker\0");
-    }
-
-    #[test]
-    fn exec_integration_setpgid_eacces_and_thread2_setuid_persists() {
-        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
-        let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
-        };
-        let page = Box::new(ThreadLifecyclePage::new());
-        let control = Box::new(ThreadControlSlot::new());
-        let child_page = Box::new(ThreadLifecyclePage::new());
-        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
-            ThreadControlSlot::new()
-        }));
-        let task = CurrentTask::new();
-        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
-        task.mm.key.store(1, Ordering::Release);
-        task.mm.thread_generation.store(101, Ordering::Release);
-        task.publish_visible_pid(41);
-        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
-        let address = AddressContext {
-            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
-            mm: MmGeneration::new(NonZeroU64::MIN),
-            generation: ContextGeneration::new(NonZeroU64::MIN),
-        };
-        let slot = carrick_sched_core::SlotId::new(0);
-        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
-        zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
-        zone.enter_guest(slot);
-        zone.install_space(slot, 1).unwrap();
-        zone.current_or_new(
-            slot,
-            ThreadIdentity {
-                tid: 41,
-                serial: 101,
-                mm: 1,
-                file_table: 5,
-                generation: 11,
-                affinity: 1,
-                lifecycle_page: &*page as *const _ as u64,
-                control_slot: &*control as *const _ as u64,
-            },
-        )
-        .unwrap();
-        let source = BornInZoneSource { zone: &zone, slot };
-        let runtime =
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
-                source,
-                &task,
-                &page,
-                &control,
-                address,
-                address,
-                words(address),
-            )
-            .unwrap();
-        let mut service = Physical {
-            zone: &zone,
-            page: &child_page,
-            controls: &*child_controls,
-            copies: Vec::new(),
-            refuse_copy: false,
-        };
-        let mut entry = runtime
-            .enter(source, &task, words(address), &mut service)
-            .unwrap();
-        use carrick_personality_linux::identity::ProcessIdentityVenue;
-
-        // 1. Two-process test for setpgid EACCES after exec
-        // Fork child process from leader (41)
-        entry.set_calling_tid(41);
-        let child_pid = entry.fork_owned().expect("fork child succeeds") as i32;
-
-        // Before child execs, parent setpgid on child succeeds
-        assert_eq!(entry.set_pgid(child_pid, child_pid), Ok(()));
-        drop(entry);
-
-        // Child execs: child process enters and calls exec_completed(b"/bin/test")
-        let parent_key = TaskKey {
-            id: TaskId::from_abi_positive(41).unwrap(),
-            serial: TaskSerial::from_raw_u64(11).unwrap(),
-        };
-        let parent_record = runtime
-            .graph
-            .lock()
-            .owner
-            .task(parent_key)
-            .unwrap()
-            .native()
-            .resources()
-            .record;
-        zone.requeue_preempted(slot, parent_record.id);
-        let child_key = {
-            let graph = runtime.graph.lock();
-            graph
-                .owner
-                .find_task_by_pid(child_pid as u32)
-                .unwrap()
-                .key()
-        };
-        let (child_address, child_words, child_record) = {
-            let graph = runtime.graph.lock();
-            let row = graph.owner.task(child_key).unwrap();
-            (
-                row.native().resources().address,
-                *row.context(),
-                row.native().resources().record,
-            )
-        };
-        assert_eq!(zone.switch_in_full(slot).unwrap().record, child_record.id);
-        zone.install_space(slot, child_address.mm.raw().get())
-            .unwrap();
-        let child_identity = zone.record(child_record.id).identity();
-        task.set(
-            carrick_el1_abi::El1TaskId::from_linux_tid(child_key.id.raw()),
-            child_key.serial.raw(),
-            child_identity.file_table,
-        );
-        task.mm
-            .key
-            .store(child_address.mm.raw().get(), Ordering::Release);
-        task.mm
-            .thread_generation
-            .store(child_identity.serial, Ordering::Release);
-        task.publish_visible_pid(child_pid as u32);
-        task.publish_lifecycle(child_identity.lifecycle_page, child_identity.control_slot);
-
-        {
-            let mut child_entry = runtime
-                .enter(source, &task, child_words, &mut service)
-                .unwrap();
-            child_entry.set_slot_for_test(&child_controls[0]);
-            let slot = child_entry.slot.unwrap();
-            slot.set_clear_child_tid(0xdead);
-            slot.set_robust_list(0xbeef, 24);
-            assert_eq!(slot.clear_child_tid(), 0xdead);
-            assert_eq!(slot.robust_list(), (0xbeef, 24));
-            child_entry.exec_completed(b"/bin/test").unwrap();
-            assert_eq!(slot.clear_child_tid(), 0);
-            assert_eq!(slot.robust_list(), (0, 0));
-        }
-
-        // Switch back to parent
-        let parent_record = runtime
-            .graph
-            .lock()
-            .owner
-            .task(parent_key)
-            .unwrap()
-            .native()
-            .resources()
-            .record;
-        zone.requeue_preempted(slot, child_record.id);
-        assert_eq!(zone.switch_in_full(slot).unwrap().record, parent_record.id);
-        zone.install_space(slot, address.mm.raw().get()).unwrap();
-        let parent_identity = zone.record(parent_record.id).identity();
-        task.set(
-            carrick_el1_abi::El1TaskId::from_linux_tid(41),
-            11,
-            parent_identity.file_table,
-        );
-        task.mm.key.store(address.mm.raw().get(), Ordering::Release);
-        task.mm
-            .thread_generation
-            .store(parent_identity.serial, Ordering::Release);
-        task.publish_visible_pid(41);
-        task.publish_lifecycle(parent_identity.lifecycle_page, parent_identity.control_slot);
-
-        let mut parent_entry = runtime
-            .enter(source, &task, words(address), &mut service)
-            .unwrap();
-
-        // After child execs, parent setpgid on child returns EACCES
-        assert_eq!(
-            parent_entry.set_pgid(child_pid, child_pid),
-            Err(carrick_personality_linux::identity::EACCES)
-        );
-
-        // 2. Thread-2 setuid(1000) then execve -> getuid() == 1000
-        parent_entry.thread_spawned(41, 42);
-        parent_entry.set_calling_tid(42);
-        parent_entry.set_uid(1000).unwrap();
-        assert_eq!(parent_entry.get_uids().0, 1000);
-        parent_entry.exec_completed(b"/usr/bin/worker").unwrap();
-
-        // After exec, getuid() == 1000
-        assert_eq!(parent_entry.get_uids().0, 1000);
-        let mut comm = [0u8; 16];
-        parent_entry.prctl_get_name(&mut comm);
-        assert_eq!(&comm[..7], b"worker\0");
-
-        // Non-root exec clears permitted and effective capabilities
-        let caps = parent_entry.capget(0).unwrap();
-        assert_eq!(
-            caps.effective,
-            carrick_sched_core::process::LinuxCapabilitySet::empty()
-        );
-        assert_eq!(
-            caps.permitted,
-            carrick_sched_core::process::LinuxCapabilitySet::empty()
-        );
-
-        // Per-thread list is collapsed to single surviving thread
-        drop(parent_entry);
-        let graph = runtime.graph.lock();
-        let p_task = graph.owner.task(parent_key).unwrap();
-        assert_eq!(p_task.threads.threads.len(), 1);
-        assert_eq!(p_task.has_execed, true);
     }
 
     #[test]
