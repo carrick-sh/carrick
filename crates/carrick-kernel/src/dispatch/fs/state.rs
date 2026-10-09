@@ -926,6 +926,42 @@ mod stdio_sink_tests {
     use crate::compat::{CompatReporter, SyscallArgs};
     use std::sync::Arc;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn piped_stdout_with_full_host_pipe_has_no_pollout() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let mut fds = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) },
+            0
+        );
+        // SAFETY: pipe2 just returned two distinct owned descriptors.
+        let reader = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let writer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let bytes = [0u8; 4096];
+        loop {
+            let written = unsafe { libc::write(fds[1], bytes.as_ptr().cast(), bytes.len()) };
+            if written < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EAGAIN)
+                );
+                break;
+            }
+            assert_eq!(written as usize, bytes.len());
+        }
+        let _reader = reader;
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher.set_stdio_sink(StdioSink::Piped {
+            stdout: Box::new(std::fs::File::from(writer)),
+            stderr: Box::new(std::io::sink()),
+        });
+        assert_eq!(
+            dispatcher.bare_stdio_poll_ready_events(1, crate::linux_abi::LINUX_POLLOUT),
+            0
+        );
+    }
+
     /// A `Write` that records into a shared buffer so the test can read back
     /// what the guest's write(2) delivered.
     struct Recorder(Arc<Mutex<Vec<u8>>>);
