@@ -226,6 +226,7 @@ pub struct NativeRecordBinding<M, C: ProcessContext> {
     pub mm: M,
     pub address: AddressContext<RootGpa>,
     pub words: C,
+    pub record: RecordRef,
 }
 fn custody<'a, M: Clone, C: ProcessContext>(
     resources: NativeResources<'a, M, C>,
@@ -477,7 +478,26 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             mm: resources.mm.clone(),
             address: resources.address,
             words: *row.context(),
+            record: resources.record,
         })
+    }
+    pub fn task_binding(&self, key: TaskKey) -> Option<NativeRecordBinding<M, C>> {
+        let graph = self.graph.lock();
+        let row = graph.owner.task(key).ok()?;
+        let resources = row.native().resources();
+        Some(NativeRecordBinding {
+            key,
+            visible_pid: row.metadata().namespace_pid,
+            mm: resources.mm.clone(),
+            address: resources.address,
+            words: *row.context(),
+            record: resources.record,
+        })
+    }
+    pub fn task_parent(&self, key: TaskKey) -> Option<Option<TaskKey>> {
+        let graph = self.graph.lock();
+        let row = graph.owner.task(key).ok()?;
+        Some(row.parent())
     }
 }
 pub struct NativeProcessEntry<

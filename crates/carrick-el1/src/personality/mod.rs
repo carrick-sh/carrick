@@ -2,6 +2,9 @@
 //!
 //! The same modules compile into both guest images; native operations are
 //! supplied by the selected architecture backend.
+pub mod aarch64_process;
+#[cfg(test)]
+mod aarch64_process_tests;
 pub mod common_entry;
 pub mod dispatch;
 pub mod file;

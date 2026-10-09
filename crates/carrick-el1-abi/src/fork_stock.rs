@@ -94,9 +94,36 @@ impl ForkLifecycleLoan {
                     .is_multiple_of(core::mem::align_of::<crate::ThreadControlSlot>() as u64)
                 && (page_end <= controls.raw() || controls_end <= page.raw())
         };
-        (is_valid_for(crate::X86_CPL0_DYNAMIC_METADATA_BASE)
-            || is_valid_for(crate::EL1_DYNAMIC_METADATA_BASE))
-        .then_some(Self { page, controls })
+        #[cfg(not(target_os = "none"))]
+        let is_valid_host = || -> bool {
+            let Some(page_end) = page
+                .raw()
+                .checked_add(core::mem::size_of::<crate::ThreadLifecyclePage>() as u64)
+            else {
+                return false;
+            };
+            let Some(controls_end) = controls.raw().checked_add(
+                core::mem::size_of::<crate::ThreadControlSlot>() as u64
+                    * (crate::THREAD_POOL_ENTRIES as u64 + 1),
+            ) else {
+                return false;
+            };
+            page.raw() >= 0x1_0000
+                && page.raw().is_multiple_of(16384)
+                && controls.raw() >= 0x1_0000
+                && controls
+                    .raw()
+                    .is_multiple_of(core::mem::align_of::<crate::ThreadControlSlot>() as u64)
+                && (page_end <= controls.raw() || controls_end <= page.raw())
+        };
+        #[allow(unused_mut)]
+        let mut valid = is_valid_for(crate::X86_CPL0_DYNAMIC_METADATA_BASE)
+            || is_valid_for(crate::EL1_DYNAMIC_METADATA_BASE);
+        #[cfg(not(target_os = "none"))]
+        {
+            valid = valid || is_valid_host();
+        }
+        valid.then_some(Self { page, controls })
     }
 
     /// Explicit constructor checking bounds against a designated metadata base.
@@ -154,6 +181,7 @@ impl ForkStockRequest {
         kernel_control_ipa: u64,
         loan: NonZeroU64,
         lifecycle: ForkLifecycleLoan,
+        asid: u16,
     ) -> Option<ForkStockLoan> {
         if !self.valid() {
             return None;
@@ -175,6 +203,7 @@ impl ForkStockRequest {
             id: loan,
             request,
             lifecycle,
+            asid,
         })
     }
 }
@@ -184,6 +213,7 @@ pub struct ForkStockLoan {
     pub id: NonZeroU64,
     pub request: PortalForkRequest,
     pub lifecycle: ForkLifecycleLoan,
+    pub asid: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -236,7 +266,10 @@ impl ForkStockExchange {
     pub fn request(&self) -> Option<ForkStockRequest> {
         use crate::{EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration};
         use carrick_guest_arch::{ContextGeneration, FrameGpa, MmGeneration};
-        if ForkStockKind::decode(self.tag) != Some(ForkStockKind::Loan) || self._reserved != 0 {
+        if ForkStockKind::decode(self.tag) != Some(ForkStockKind::Loan) {
+            return None;
+        }
+        if self.status == 0 && self._reserved != 0 {
             return None;
         }
         let w = self.request;
@@ -273,12 +306,20 @@ impl ForkStockExchange {
         kernel_control_ipa: u64,
         id: NonZeroU64,
         lifecycle: ForkLifecycleLoan,
+        asid: u16,
     ) -> bool {
         if self.status != 0
             || self
                 .request()
                 .and_then(|request| {
-                    request.admit_loan(child_base, parent_base, kernel_control_ipa, id, lifecycle)
+                    request.admit_loan(
+                        child_base,
+                        parent_base,
+                        kernel_control_ipa,
+                        id,
+                        lifecycle,
+                        asid,
+                    )
                 })
                 .is_none()
         {
@@ -292,6 +333,7 @@ impl ForkStockExchange {
             lifecycle.page.raw(),
             lifecycle.controls.raw(),
         ];
+        self._reserved = u64::from(asid);
         self.status = 1;
         true
     }
@@ -306,6 +348,7 @@ impl ForkStockExchange {
             ForkStockRefusal::Capacity => 3,
             ForkStockRefusal::Inventory => 4,
         };
+        self._reserved = 0;
         self.status = 2;
         true
     }
@@ -318,16 +361,20 @@ impl ForkStockExchange {
             return None;
         }
         let result = match self.status {
-            1 => Ok(expected.admit_loan(
-                self.response[0],
-                self.response[1],
-                self.response[2],
-                NonZeroU64::new(self.response[3])?,
-                ForkLifecycleLoan::new(
-                    KernelVa::new(self.response[4]),
-                    KernelVa::new(self.response[5]),
-                )?,
-            )?),
+            1 => {
+                let asid = u16::try_from(self._reserved).ok()?;
+                Ok(expected.admit_loan(
+                    self.response[0],
+                    self.response[1],
+                    self.response[2],
+                    NonZeroU64::new(self.response[3])?,
+                    ForkLifecycleLoan::new(
+                        KernelVa::new(self.response[4]),
+                        KernelVa::new(self.response[5]),
+                    )?,
+                    asid,
+                )?)
+            }
             2 => Err(match self.response[0] {
                 1 => ForkStockRefusal::Invalid,
                 2 => ForkStockRefusal::Stale,
@@ -698,6 +745,7 @@ mod tests {
                 0x100000000,
                 NonZeroU64::MIN,
                 lifecycle_arm(),
+                0,
             )
             .unwrap();
         let completion = crate::PortalForkCompletion {
@@ -753,6 +801,7 @@ mod tests {
                 0x100000000,
                 NonZeroU64::MIN,
                 lifecycle_arm(),
+                0,
             )
             .unwrap();
         assert_eq!(loan.request.operation, request.operation);
@@ -766,7 +815,8 @@ mod tests {
                     0x21000,
                     0x100000000,
                     NonZeroU64::MIN,
-                    lifecycle_arm()
+                    lifecycle_arm(),
+                    0,
                 )
                 .is_none()
         );
@@ -777,7 +827,8 @@ mod tests {
                     0x30000,
                     0x100000000,
                     NonZeroU64::MIN,
-                    lifecycle_arm()
+                    lifecycle_arm(),
+                    0,
                 )
                 .is_none()
         );
@@ -817,7 +868,8 @@ mod tests {
             0x30000,
             0x100000000,
             NonZeroU64::MIN,
-            lifecycle_arm()
+            lifecycle_arm(),
+            0,
         ));
         assert_eq!(exchange.request(), Some(request));
         let mut other = request;
@@ -833,7 +885,8 @@ mod tests {
             0x50000,
             0x100000000,
             NonZeroU64::MIN,
-            lifecycle_arm()
+            lifecycle_arm(),
+            0,
         ));
         let mut refused = ForkStockExchange::new(request).unwrap();
         assert!(refused.refuse(ForkStockRefusal::Capacity));
@@ -973,7 +1026,7 @@ mod tests {
         // Grant response
         let lifecycle = lifecycle_x86();
         let loan_id = NonZeroU64::new(42).unwrap();
-        assert!(exchange.grant(0x20000, 0x30000, 0x100000000, loan_id, lifecycle));
+        assert!(exchange.grant(0x20000, 0x30000, 0x100000000, loan_id, lifecycle, 0));
         let granted_bytes = unsafe {
             core::slice::from_raw_parts(
                 (&raw const exchange).cast::<u8>(),
@@ -1023,7 +1076,7 @@ mod tests {
 
         // 3. Settlement wire layout
         let loan = req
-            .admit_loan(0x20000, 0x30000, 0x100000000, loan_id, lifecycle)
+            .admit_loan(0x20000, 0x30000, 0x100000000, loan_id, lifecycle, 0)
             .unwrap();
         let completion = crate::PortalForkCompletion {
             request: loan.request,
