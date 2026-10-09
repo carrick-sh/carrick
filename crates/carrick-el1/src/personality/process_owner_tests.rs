@@ -1201,7 +1201,7 @@ fn failed_mm_commit_keeps_unpublished_child_preparation_and_exact_reservation() 
         Ok(prep) => prep,
         Err(_) => panic!("prepare"),
     };
-    let ForkTryError::Commit(error, prep) = prep
+    let ForkTryError::Commit(error, prep) = Box::new(prep)
         .try_publish_with(&mut owner, |mm| Err::<(), _>((14, mm)))
         .err()
         .unwrap()
