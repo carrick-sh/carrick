@@ -108,6 +108,7 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     ) -> Result<Self::PreparedMm, NativeProcessError>;
     fn prepared_mm(&self, prepared: &Self::PreparedMm) -> Self::Mm;
     fn prepared_context(&self, prepared: &Self::PreparedMm) -> AddressContext<RootGpa>;
+    fn fork_child_context(&self, parent: C, prepared: &Self::PreparedMm) -> C;
     fn child_lifecycle(&self, prepared: &Self::PreparedMm) -> NativeLifecycleResources<'a>;
     fn commit_mm(
         &mut self,
@@ -1596,9 +1597,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(NativeProcessError::Exhausted);
             }
         };
-        let child_words = self.words.fork_child(address);
+        let child_words = self.service.fork_child_context(self.words, &prepared);
         // SAFETY: this exact newly allocated record remains Free and unpublished.
-        unsafe { *self.source.zone.record(record).ctx_mut() = child_words };
+        unsafe {
+            *self.source.zone.record(record).ctx_mut() = child_words;
+            // The parent still owns its running record. Publish the exact
+            // admitted image before either record can be scheduled again.
+            let parent_record = self
+                .source
+                .zone
+                .slot(self.source.slot)
+                .current()
+                .or_else(|| self.source.zone.slot(self.source.slot).host_record())
+                .ok_or(NativeProcessError::Stale)?;
+            *self.source.zone.record(parent_record).ctx_mut() = self.words;
+        };
         let resources = NativeResources {
             zone: self.source.zone,
             record: self.source.zone.record_ref(record),
@@ -1804,6 +1817,13 @@ mod tests {
         }
         fn prepared_context(&self, p: &Self::PreparedMm) -> AddressContext<RootGpa> {
             *p
+        }
+        fn fork_child_context(
+            &self,
+            parent: ParkedContextWords,
+            p: &Self::PreparedMm,
+        ) -> ParkedContextWords {
+            parent.fork_child(*p)
         }
         fn child_lifecycle(&self, _: &Self::PreparedMm) -> NativeLifecycleResources<'a> {
             NativeLifecycleResources {

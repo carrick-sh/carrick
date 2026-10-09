@@ -150,6 +150,7 @@ pub struct Prepared<'a> {
     pub child: UnpublishedEl1Child<Aarch64Mmu>,
     pub words: PreparedWords<'a>,
     pub address: Mm,
+    pub ttbr0: u64,
     pub custody: Vec<PortalForkCustody>,
 }
 
@@ -667,6 +668,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             child,
             words: live,
             address,
+            ttbr0,
             custody,
         })
     }
@@ -677,6 +679,14 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
 
     fn prepared_context(&self, prepared: &Self::PreparedMm) -> AddressContext<RootGpa> {
         prepared.address
+    }
+
+    fn fork_child_context(
+        &self,
+        parent: Aarch64ParkedContext,
+        prepared: &Self::PreparedMm,
+    ) -> Aarch64ParkedContext {
+        parent.fork_child_with_register(prepared.address, prepared.ttbr0)
     }
 
     fn child_lifecycle(&self, prepared: &Self::PreparedMm) -> NativeLifecycleResources<'a> {

@@ -81,6 +81,12 @@ impl Aarch64ParkedContext {
         self
     }
 
+    pub fn fork_child_with_register(self, address: AddressContext<RootGpa>, register: u64) -> Self {
+        let mut child = self.fork_child(address);
+        child.root = register;
+        child
+    }
+
     pub fn set_syscall_return(&mut self, value: u64) {
         self.native.x[0] = value;
     }
