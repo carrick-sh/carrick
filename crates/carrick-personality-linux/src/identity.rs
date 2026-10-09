@@ -139,20 +139,16 @@ pub fn invoke<'a>(
             let head_ptr = UserVa::new(args[1]);
             let len_ptr = UserVa::new(args[2]);
 
-            // Validate both output pointers before writing anything
-            let mut test_head = [0u8; 8];
-            let mut test_len = [0u8; 8];
-            if !native.copy_in(&mut test_head, head_ptr) || !native.copy_in(&mut test_len, len_ptr)
-            {
-                return Some(SyscallResult::new(EFAULT));
-            }
-
             let (head, len) = match native.robust_list_for(pid) {
                 Ok(pair) => pair,
                 Err(e) => return Some(SyscallResult::new(e)),
             };
 
-            let len_u64 = len as u64;
+            let len_u64 = if len == 0 {
+                crate::thread::ROBUST_LIST_HEAD_SIZE as u64
+            } else {
+                len as u64
+            };
             if !native.copy_out(head_ptr, &head.to_ne_bytes())
                 || !native.copy_out(len_ptr, &len_u64.to_ne_bytes())
             {
@@ -624,6 +620,10 @@ mod tests {
         clear_child_tid: u64,
         robust_head: u64,
         robust_len: u32,
+        robust_list_error: Option<i64>,
+        other_threads: BTreeMap<u32, (u64, u32)>,
+        write_only: alloc::collections::BTreeSet<u64>,
+        unmapped: alloc::collections::BTreeSet<u64>,
         memory: BTreeMap<u64, u8>,
         venue: MockVenue,
     }
@@ -636,6 +636,10 @@ mod tests {
                 clear_child_tid: 0,
                 robust_head: 0x5000,
                 robust_len: 24,
+                robust_list_error: None,
+                other_threads: BTreeMap::new(),
+                write_only: alloc::collections::BTreeSet::new(),
+                unmapped: alloc::collections::BTreeSet::new(),
                 memory: BTreeMap::new(),
                 venue: MockVenue::default(),
             }
@@ -646,7 +650,11 @@ mod tests {
         fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool {
             let addr = src.raw();
             for (i, byte) in dst.iter_mut().enumerate() {
-                if let Some(&b) = self.memory.get(&(addr + i as u64)) {
+                let target = addr + i as u64;
+                if self.write_only.contains(&target) || self.unmapped.contains(&target) {
+                    return false;
+                }
+                if let Some(&b) = self.memory.get(&target) {
                     *byte = b;
                 } else {
                     return false;
@@ -658,7 +666,11 @@ mod tests {
         fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool {
             let addr = dst.raw();
             for (i, &byte) in src.iter().enumerate() {
-                self.memory.insert(addr + i as u64, byte);
+                let target = addr + i as u64;
+                if self.unmapped.contains(&target) {
+                    return false;
+                }
+                self.memory.insert(target, byte);
             }
             true
         }
@@ -678,6 +690,10 @@ mod tests {
         fn robust_list_for(&self, tid: i32) -> Result<(u64, u32), i64> {
             if tid == 0 || tid as u32 == self.tid {
                 Ok((self.robust_head, self.robust_len))
+            } else if let Some(&pair) = self.other_threads.get(&(tid as u32)) {
+                Ok(pair)
+            } else if let Some(err) = self.robust_list_error {
+                Err(err)
             } else {
                 Err(ESRCH)
             }
@@ -952,8 +968,49 @@ mod tests {
         mock.args[0] = 0; // current thread
         mock.args[1] = 0x1000; // head ptr
         mock.args[2] = 0x2000; // len ptr
-        // len ptr unmapped -> EFAULT
+        mock.unmapped.insert(0x2000); // len ptr unmapped -> EFAULT
         let res = invoke(IdentityCall::GetRobustList, &mut mock).unwrap();
         assert_eq!(res.raw(), EFAULT);
+    }
+
+    #[test]
+    fn get_robust_list_permission_check_before_pointer_fault() {
+        let mut mock = MockNative::new();
+        mock.robust_list_error = Some(EPERM);
+        mock.args[0] = 1; // pid 1 (init / another process)
+        mock.args[1] = 0; // null head ptr
+        mock.args[2] = 0; // null len ptr
+        let res = invoke(IdentityCall::GetRobustList, &mut mock).unwrap();
+        assert_eq!(res.raw(), EPERM);
+    }
+
+    #[test]
+    fn get_robust_list_write_only_pointers_succeed() {
+        let mut mock = MockNative::new();
+        mock.args[0] = 0; // self
+        mock.args[1] = 0x1000;
+        mock.args[2] = 0x2000;
+        // mark 0x1000..0x1008 and 0x2000..0x2008 as write-only
+        for i in 0..8 {
+            mock.write_only.insert(0x1000 + i);
+            mock.write_only.insert(0x2000 + i);
+        }
+        let res = invoke(IdentityCall::GetRobustList, &mut mock).unwrap();
+        assert_eq!(res.raw(), 0);
+    }
+
+    #[test]
+    fn get_robust_list_sibling_thread_in_thread_group_succeeds() {
+        let mut mock = MockNative::new();
+        mock.other_threads.insert(101, (0xbeef_0000, 24));
+        mock.args[0] = 101; // sibling tid
+        mock.args[1] = 0x1000;
+        mock.args[2] = 0x2000;
+        let res = invoke(IdentityCall::GetRobustList, &mut mock).unwrap();
+        assert_eq!(res.raw(), 0);
+        let head = u64::from_ne_bytes(core::array::from_fn(|i| mock.memory[&(0x1000 + i as u64)]));
+        let len = u64::from_ne_bytes(core::array::from_fn(|i| mock.memory[&(0x2000 + i as u64)]));
+        assert_eq!(head, 0xbeef_0000);
+        assert_eq!(len, 24);
     }
 }

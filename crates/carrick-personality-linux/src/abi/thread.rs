@@ -757,6 +757,23 @@ impl ThreadLifecyclePage {
         })
     }
 
+    #[inline(never)]
+    pub fn entry_ref_for_visible_tid(&self, visible_tid: u32) -> Option<EntryRef> {
+        if visible_tid == 0 {
+            return None;
+        }
+        for (index, entry) in self.entries.iter().enumerate() {
+            let (generation, state) = unpack(entry.state.load(Ordering::Acquire));
+            if matches!(state, EntryState::Vacant | EntryState::Stocking) {
+                continue;
+            }
+            if entry.visible_tid.load(Ordering::Relaxed) == visible_tid {
+                return Some(EntryRef::new(index as u32, generation));
+            }
+        }
+        None
+    }
+
     /// Born record of a `Born`, `Published`, `ExitedInZone` or `Reaped`
     /// incarnation. `None` for any other state or a stale reference.
     pub fn born_record(&self, r: EntryRef) -> Option<BornRecord> {
