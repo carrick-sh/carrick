@@ -365,7 +365,6 @@ impl<
                 Some(ForkCapacityFailure::ParentTables) => Stage::PrepareParentCapacity,
                 Some(ForkCapacityFailure::Edits) => Stage::PrepareEditCapacity,
                 Some(ForkCapacityFailure::Custody) => Stage::PrepareCustodyCapacity,
-                Some(ForkCapacityFailure::ControlArena) => Stage::PrepareControlArenaCapacity,
                 None => Stage::PrepareUnclassifiedCapacity,
             };
             carrick_el1_abi::record_native_fork_failure(stage);

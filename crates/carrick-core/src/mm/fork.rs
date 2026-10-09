@@ -59,7 +59,6 @@ pub enum ForkCapacityFailure {
     ParentTables,
     Edits,
     Custody,
-    ControlArena,
 }
 
 impl ForkScratch {
@@ -962,8 +961,11 @@ pub fn copy_entry<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
             .map_err(|_| ForkError::Core)?
             .raw();
             if !request.child_tables.contains(output) {
-                scratch.capacity_failure = Some(ForkCapacityFailure::ControlArena);
-                return Err(ForkError::NoMemory);
+                // The parent may map the whole stage-1 alias window while the
+                // child's loan covers only the table pages counted by census.
+                // Leave the unused alias absent; publishing the parent's word
+                // would grant the child access to tables it does not own.
+                return Ok((descriptor, 0));
             }
             return Ok((descriptor, (descriptor & !B::ADDRESS_MASK) | output));
         }
