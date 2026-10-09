@@ -2171,7 +2171,7 @@ fn host_request_wins_against_enrolled_guest_park() {
         );
         assert!(!zone.publish_guest_park(&guard, SLOT, record, seq));
         assert_eq!(zone.record(record).entry_count(), 0);
-        assert!(zone.slot(SLOT).timer().is_none());
+        assert!(zone.timer_owner(SLOT).is_none());
         assert_eq!(zone.slot(SLOT).current(), Some(record));
         drop(guard);
         assert_eq!(

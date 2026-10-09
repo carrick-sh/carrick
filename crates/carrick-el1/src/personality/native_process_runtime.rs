@@ -1219,18 +1219,27 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if channel.generation.generation() != observed {
             return Ok(false);
         }
-        if deadline.is_some() && !zone.timer_free(self.source.slot) {
+        if deadline.is_some() && !zone.timer_admission_available(self.source.slot) {
             return Err(NativeProcessError::Busy);
         }
         let sequence = zone.next_seq(record);
         zone.set_deadline(record, deadline.map_or(0, |deadline| deadline.0.raw()));
         if let Some(deadline) = deadline {
-            self.service.arm_signal_timer(deadline)?;
+            // Program the same shared timer to the earliest owned deadline.
+            let earliest = zone
+                .timer_deadline(self.source.slot)
+                .map_or(deadline.0.raw(), |owned| owned.min(deadline.0.raw()));
+            self.service.arm_signal_timer(carrick_guest_arch::Deadline(
+                carrick_guest_arch::CounterTick::new(earliest),
+            ))?;
             zone.arm_timer(self.source.slot, record, sequence)
                 .map_err(|_| NativeProcessError::Busy)?;
         }
         zone.enqueue(&guard, record, sequence, channel.mm, address, u32::MAX, 0)
-            .map_err(|_| NativeProcessError::Exhausted)?;
+            .map_err(|_| {
+                zone.cancel_timer_admission(self.record);
+                NativeProcessError::Exhausted
+            })?;
         // SAFETY: this exact record is still authenticated OnCpu under its bucket guard.
         unsafe { *zone.record(record).ctx_mut() = self.words };
         self.runtime.graph.lock().signal_waits.insert(

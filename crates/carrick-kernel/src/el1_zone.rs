@@ -273,11 +273,10 @@ pub fn hand_back_foreign_timer(slot: SlotId) {
     let Some(zone) = zone() else {
         return;
     };
-    let Some(foreign) = zone.take_foreign_timer(slot) else {
-        return;
-    };
-    if let HostClaim::Claimed = claim(foreign.record, Some(foreign.seq), Handback::Control) {
-        hand_back(&[foreign.record]);
+    while let Some(foreign) = zone.take_foreign_timer(slot) {
+        if let HostClaim::Claimed = claim(foreign.record, Some(foreign.seq), Handback::Control) {
+            hand_back(&[foreign.record]);
+        }
     }
 }
 

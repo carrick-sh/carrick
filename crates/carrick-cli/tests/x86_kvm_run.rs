@@ -750,3 +750,8 @@ fn mounted_static_x86_signal_chld_exit_matches_native() {
 fn mounted_static_x86_signal_chld_killed_matches_native() {
     compare_mounted_assembly_with_native("x86_signal_chld_killed.S", b"D\n");
 }
+
+#[test]
+fn mounted_static_x86_signal_concurrent_timeouts_match_native() {
+    compare_mounted_assembly_with_native("x86_signal_wait_concurrent.S", b"T\n");
+}
