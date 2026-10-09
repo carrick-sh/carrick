@@ -1840,44 +1840,89 @@ impl<'a> MemView<'a> {
         // range only: the cost is the range's own pages and rows, never the
         // rest of the MM.
         let end = address.checked_add(pages.checked_mul(page_size)?)?;
-        let root_pieces = mem.root_first_touch_pieces(address, end);
         let first_dynamic = mem.dynamic_maps.partition_point(|map| map.end <= address);
         let dynamic = &mem.dynamic_maps[first_dynamic..];
-        let (mut next_dynamic, mut next_root) = (0usize, 0usize);
         let mut out = Vec::with_capacity(usize::try_from(pages).ok()?);
-        for index in 0..pages {
-            let page = address.checked_add(index.checked_mul(page_size)?)?;
-            while dynamic.get(next_dynamic).is_some_and(|map| map.end <= page) {
-                next_dynamic += 1;
+        match mem.try_root_first_touch_pieces(address, end) {
+            Ok(root_pieces) => {
+                let (mut next_dynamic, mut next_root) = (0usize, 0usize);
+                for index in 0..pages {
+                    let page = address.checked_add(index.checked_mul(page_size)?)?;
+                    while dynamic.get(next_dynamic).is_some_and(|map| map.end <= page) {
+                        next_dynamic += 1;
+                    }
+                    while root_pieces
+                        .get(next_root)
+                        .is_some_and(|piece| piece.range.end().raw() <= page)
+                    {
+                        next_root += 1;
+                    }
+                    let root_piece = root_pieces
+                        .get(next_root)
+                        .filter(|piece| piece.range.start().raw() <= page);
+                    let in_dynamic = dynamic
+                        .get(next_dynamic)
+                        .is_some_and(|map| map.start <= page)
+                        || root_piece.is_some();
+                    let owner = root_piece.map_or(ResidencyOwner::Host, |piece| piece.owner());
+                    let resident = if in_dynamic {
+                        mem.resident.contains(page, owner)
+                            || guest_residency
+                                .is_some_and(|table| table.is_guest_committed(mm_key, page))
+                            || zero_reads
+                                .iter()
+                                .any(|r| r.start.raw() <= page && page < r.end.raw())
+                            || live_residency
+                                .as_ref()
+                                .and_then(|vector| vector.get(index as usize))
+                                .is_some_and(|byte| byte & 1 != 0)
+                    } else {
+                        true
+                    };
+                    out.push(u8::from(resident));
+                }
             }
-            while root_pieces
-                .get(next_root)
-                .is_some_and(|piece| piece.range.end().raw() <= page)
-            {
-                next_root += 1;
+            Err(carrick_el1_abi::Refusal::Busy) => {
+                // The root is momentarily held. Compute exact residency under
+                // owner exclusion without guessing: post-exec anonymous mappings
+                // occupy the mmap arena outside the heap, so pages there or in
+                // dynamic_maps are dynamic, and their residency is derived from
+                // the host-side committed resident facts, guest residency table,
+                // zero-read records, or live hardware residency.
+                let mmap_base = mem.layout.mmap_base;
+                let mmap_end = mmap_base.saturating_add(mem.layout.mmap_size);
+                let heap_base = mem.layout.heap_base;
+                let heap_end = heap_base.saturating_add(mem.layout.heap_size);
+                let mut next_dynamic = 0usize;
+                for index in 0..pages {
+                    let page = address.checked_add(index.checked_mul(page_size)?)?;
+                    while dynamic.get(next_dynamic).is_some_and(|map| map.end <= page) {
+                        next_dynamic += 1;
+                    }
+                    let in_dynamic = dynamic
+                        .get(next_dynamic)
+                        .is_some_and(|map| map.start <= page)
+                        || (page >= mmap_base
+                            && page < mmap_end
+                            && (page < heap_base || page >= heap_end));
+                    let resident = if in_dynamic {
+                        mem.resident.is_resident(page)
+                            || guest_residency
+                                .is_some_and(|table| table.is_guest_committed(mm_key, page))
+                            || zero_reads
+                                .iter()
+                                .any(|r| r.start.raw() <= page && page < r.end.raw())
+                            || live_residency
+                                .as_ref()
+                                .and_then(|vector| vector.get(index as usize))
+                                .is_some_and(|byte| byte & 1 != 0)
+                    } else {
+                        true
+                    };
+                    out.push(u8::from(resident));
+                }
             }
-            let root_piece = root_pieces
-                .get(next_root)
-                .filter(|piece| piece.range.start().raw() <= page);
-            let in_dynamic = dynamic
-                .get(next_dynamic)
-                .is_some_and(|map| map.start <= page)
-                || root_piece.is_some();
-            let owner = root_piece.map_or(ResidencyOwner::Host, |piece| piece.owner());
-            let resident = if in_dynamic {
-                mem.resident.contains(page, owner)
-                    || guest_residency.is_some_and(|table| table.is_guest_committed(mm_key, page))
-                    || zero_reads
-                        .iter()
-                        .any(|r| r.start.raw() <= page && page < r.end.raw())
-                    || live_residency
-                        .as_ref()
-                        .and_then(|vector| vector.get(index as usize))
-                        .is_some_and(|byte| byte & 1 != 0)
-            } else {
-                true
-            };
-            out.push(u8::from(resident));
+            Err(refusal) => anonymous::broken_root("mincore residency pieces", refusal),
         }
         Some(out)
     }

@@ -628,9 +628,10 @@ impl<'a> MemView<'a> {
                 }
             }
             let pages = length.div_ceil(page_size);
-            let bytes = this
-                .mincore_residency_vector(memory, address.0, pages, page_size)
-                .unwrap_or_else(|| vec![1u8; pages as usize]);
+            let Some(bytes) = this.mincore_residency_vector(memory, address.0, pages, page_size)
+            else {
+                return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
+            };
             memory.write_bytes(vec.0, &bytes)?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
