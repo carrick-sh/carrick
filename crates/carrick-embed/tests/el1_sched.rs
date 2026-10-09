@@ -348,11 +348,13 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
         && let Some(dir) = std::env::var_os("CARRICK_TLB_ACK_CAPTURE_DIR")
     {
         let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        builder = builder.stdout(carrick_embed::StdioConfig::Piped(Box::new(TlbAckCapture {
-            bytes: bytes.clone(),
-            dir: std::path::PathBuf::from(dir).join(common::run_id()),
-            fired: false,
-        })));
+        builder = builder.stdout(carrick_embed::StdioConfig::Piped(
+            carrick_kernel::dispatch::PipedOutput::memory(Box::new(TlbAckCapture {
+                bytes: bytes.clone(),
+                dir: std::path::PathBuf::from(dir).join(common::run_id()),
+                fired: false,
+            })),
+        ));
         captured = Some(bytes);
     }
     let mut result = common::run_or_fail(builder.run_blocking());

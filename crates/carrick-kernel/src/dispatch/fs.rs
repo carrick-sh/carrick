@@ -1566,14 +1566,11 @@ impl<'a> FsView<'a> {
                     cx.kernel,
                     super::net::WriteRearm::new(target),
                 )?;
-                self.with_host_wait(cx, move || {
-                    let mut writer = writer.lock();
-                    match std::io::Write::write_all(&mut *writer, &bytes) {
-                        Ok(()) => DispatchOutcome::returned_len_or_errno(bytes.len()),
-                        Err(error) => DispatchOutcome::errno(crate::host_to_linux_errno(
-                            error.raw_os_error().unwrap_or(libc::EIO),
-                        )),
-                    }
+                self.with_host_wait(cx, move || match writer.write_all(&bytes) {
+                    Ok(()) => DispatchOutcome::returned_len_or_errno(bytes.len()),
+                    Err(error) => DispatchOutcome::errno(crate::host_to_linux_errno(
+                        error.raw_os_error().unwrap_or(libc::EIO),
+                    )),
                 })
             }
         }
@@ -1614,10 +1611,7 @@ impl<'a> FsView<'a> {
                     2 => stderr,
                     _ => return DispatchOutcome::errno(LINUX_EBADF),
                 };
-                let mut writer = writer.lock();
-                // UFCS: `std::io::Write` is not imported anywhere in this file
-                // (no `use std::io` at all) and one call does not earn one.
-                match std::io::Write::write_all(&mut *writer, bytes) {
+                match writer.write_all(bytes) {
                     Ok(()) => DispatchOutcome::returned_len_or_errno(bytes.len()),
                     Err(error) => DispatchOutcome::errno(crate::host_to_linux_errno(
                         error.raw_os_error().unwrap_or(libc::EIO),
@@ -1627,8 +1621,8 @@ impl<'a> FsView<'a> {
         }
     }
 
-    pub(super) fn captured_stdio_is_writable(&self) -> bool {
-        matches!(self.io.route(), StdioRoute::Captured)
+    pub(super) fn stdio_readiness(&self, fd: i32) -> Option<state::StdioReadiness> {
+        self.io.stdio_readiness(fd)
     }
 
     /// Write ALL of `bytes` to an inherited stdio host fd (`StdioSink::Inherit`: the user's tty/pipe),

@@ -866,8 +866,12 @@ fn piped_delivers_stdout_and_stderr_to_caller_writers() {
             .image_store(store.clone())
             .pull_policy(PullPolicy::Missing)
             .command(["/bin/sh", "-c", "echo hello world; echo to-stderr 1>&2"])
-            .stdout(StdioConfig::Piped(Box::new(out.clone())))
-            .stderr(StdioConfig::Piped(Box::new(err.clone())))
+            .stdout(StdioConfig::Piped(
+                carrick_kernel::dispatch::PipedOutput::memory(Box::new(out.clone())),
+            ))
+            .stderr(StdioConfig::Piped(
+                carrick_kernel::dispatch::PipedOutput::memory(Box::new(err.clone())),
+            ))
             .run_blocking(),
     );
     assert_clean_exit(&result);

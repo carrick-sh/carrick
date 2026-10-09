@@ -442,14 +442,90 @@ pub enum StdioSink {
     /// stream), exactly as a full pipe would. Writer errors come back to the
     /// guest as the host errno translated to Linux (EPIPE stays EPIPE).
     Piped {
-        stdout: Box<dyn std::io::Write + Send>,
-        stderr: Box<dyn std::io::Write + Send>,
+        stdout: PipedOutput,
+        stderr: PipedOutput,
     },
+}
+
+/// The readiness source for one caller-owned output stream. The descriptor is
+/// retained with the writer, so a readiness wait cannot outlive its source.
+pub struct PipedOutput {
+    writer: Mutex<Box<dyn std::io::Write + Send>>,
+    readiness: PipedReadiness,
+}
+
+enum PipedReadiness {
+    Memory,
+    Host {
+        handle: carrick_el1_abi::HostBoundFd,
+        _owner: std::os::fd::OwnedFd,
+    },
+    Inherited(carrick_el1_abi::HostBoundFd),
+}
+
+/// Readiness of a stdio route, with the carrier descriptor domain kept typed.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
+pub enum StdioReadiness {
+    AlwaysWritable,
+    Host(carrick_el1_abi::HostBoundFd),
+}
+
+impl PipedOutput {
+    pub fn memory(writer: Box<dyn std::io::Write + Send>) -> Self {
+        Self {
+            writer: Mutex::new(writer),
+            readiness: PipedReadiness::Memory,
+        }
+    }
+
+    pub fn host<W: std::io::Write + std::os::fd::AsFd + Send + 'static>(
+        writer: W,
+    ) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        let readiness = writer.as_fd().try_clone_to_owned()?;
+        let handle = carrick_el1_abi::HostBoundFd::new(readiness.as_raw_fd())
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        Ok(Self {
+            writer: Mutex::new(Box::new(writer)),
+            readiness: PipedReadiness::Host {
+                handle,
+                _owner: readiness,
+            },
+        })
+    }
+
+    pub fn inherited(
+        writer: Box<dyn std::io::Write + Send>,
+        fd: carrick_el1_abi::HostBoundFd,
+    ) -> Self {
+        Self {
+            writer: Mutex::new(writer),
+            readiness: PipedReadiness::Inherited(fd),
+        }
+    }
+
+    fn readiness(&self) -> StdioReadiness {
+        match &self.readiness {
+            PipedReadiness::Memory => StdioReadiness::AlwaysWritable,
+            PipedReadiness::Host { handle, .. } => StdioReadiness::Host(*handle),
+            PipedReadiness::Inherited(fd) => StdioReadiness::Host(*fd),
+        }
+    }
+
+    pub fn write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
+        std::io::Write::write_all(&mut *self.writer.lock(), bytes)
+    }
 }
 
 /// Shared writer for one piped stream: the same `Arc` is cloned into every
 /// logical child so the whole process tree drains into one caller writer.
-pub(in crate::dispatch) type SharedWriter = Arc<Mutex<Box<dyn std::io::Write + Send>>>;
+pub(in crate::dispatch) type SharedWriter = Arc<PipedOutput>;
 
 /// The dispatcher-side form of [`StdioSink`]: cheap to clone (only `Arc`s), so
 /// a write reads the route once and drops the lock BEFORE the possibly
@@ -470,8 +546,8 @@ impl From<StdioSink> for StdioRoute {
             StdioSink::Captured => StdioRoute::Captured,
             StdioSink::Inherit => StdioRoute::Inherit,
             StdioSink::Piped { stdout, stderr } => StdioRoute::Piped {
-                stdout: Arc::new(Mutex::new(stdout)),
-                stderr: Arc::new(Mutex::new(stderr)),
+                stdout: Arc::new(stdout),
+                stderr: Arc::new(stderr),
             },
         }
     }
@@ -509,6 +585,22 @@ impl RuntimeIo {
     /// a guest `F_SETFL` on stdio must reach the host descriptor).
     pub(in crate::dispatch) fn inherits_host_stdio(&self) -> bool {
         ::std::matches!(*self.route.lock(), StdioRoute::Inherit)
+    }
+
+    pub(in crate::dispatch) fn stdio_readiness(&self, fd: i32) -> Option<StdioReadiness> {
+        match fd {
+            0 => carrick_el1_abi::HostBoundFd::new(0).map(StdioReadiness::Host),
+            1 | 2 => match self.route() {
+                StdioRoute::Captured => Some(StdioReadiness::AlwaysWritable),
+                StdioRoute::Inherit => {
+                    carrick_el1_abi::HostBoundFd::new(fd).map(StdioReadiness::Host)
+                }
+                StdioRoute::Piped { stdout, stderr } => {
+                    Some(if fd == 1 { stdout } else { stderr }.readiness())
+                }
+            },
+            _ => None,
+        }
     }
 
     pub(in crate::dispatch) fn fork_clone(&self) -> Self {
@@ -951,10 +1043,18 @@ mod stdio_sink_tests {
             assert_eq!(written as usize, bytes.len());
         }
         let _reader = reader;
-        let mut dispatcher = SyscallDispatcher::new();
+        use std::os::fd::AsRawFd;
+        let mut native = libc::pollfd {
+            fd: writer.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut native, 1, 0) }, 0);
+        assert_eq!(native.revents, 0);
+        let dispatcher = SyscallDispatcher::new();
         dispatcher.set_stdio_sink(StdioSink::Piped {
-            stdout: Box::new(std::fs::File::from(writer)),
-            stderr: Box::new(std::io::sink()),
+            stdout: PipedOutput::host(std::fs::File::from(writer)).unwrap(),
+            stderr: PipedOutput::memory(Box::new(std::io::sink())),
         });
         assert_eq!(
             dispatcher.bare_stdio_poll_ready_events(1, crate::linux_abi::LINUX_POLLOUT),
@@ -1001,8 +1101,8 @@ mod stdio_sink_tests {
         let err = Arc::new(Mutex::new(Vec::new()));
         let mut dispatcher = SyscallDispatcher::new();
         dispatcher.set_stdio_sink(StdioSink::Piped {
-            stdout: Box::new(Recorder(Arc::clone(&out))),
-            stderr: Box::new(Recorder(Arc::clone(&err))),
+            stdout: PipedOutput::memory(Box::new(Recorder(Arc::clone(&out)))),
+            stderr: PipedOutput::memory(Box::new(Recorder(Arc::clone(&err)))),
         });
 
         assert_eq!(
@@ -1047,8 +1147,8 @@ mod stdio_sink_tests {
         }
         let mut dispatcher = SyscallDispatcher::new();
         dispatcher.set_stdio_sink(StdioSink::Piped {
-            stdout: Box::new(Broken),
-            stderr: Box::new(std::io::sink()),
+            stdout: PipedOutput::memory(Box::new(Broken)),
+            stderr: PipedOutput::memory(Box::new(std::io::sink())),
         });
         assert_eq!(
             write_fd(&mut dispatcher, 1, b"x"),
@@ -1061,8 +1161,8 @@ mod stdio_sink_tests {
         let out = Arc::new(Mutex::new(Vec::new()));
         let parent = RuntimeIo::new();
         parent.set_sink(StdioSink::Piped {
-            stdout: Box::new(Recorder(Arc::clone(&out))),
-            stderr: Box::new(std::io::sink()),
+            stdout: PipedOutput::memory(Box::new(Recorder(Arc::clone(&out)))),
+            stderr: PipedOutput::memory(Box::new(std::io::sink())),
         });
         let child = parent.fork_clone();
         let StdioRoute::Piped { stdout, .. } = child.route() else {
@@ -1070,7 +1170,7 @@ mod stdio_sink_tests {
         };
         // UFCS: `std::io::Write` is not in scope in this module (nor via the
         // `dispatch` glob), and a trait import just for one call is noise.
-        std::io::Write::write_all(&mut *stdout.lock(), b"child").unwrap();
+        stdout.write_all(b"child").unwrap();
         assert_eq!(&*out.lock(), b"child");
     }
 
@@ -1097,8 +1197,8 @@ mod stdio_sink_tests {
         let err = Arc::new(Mutex::new(Vec::new()));
         let parent = SyscallDispatcher::new();
         parent.set_stdio_sink(StdioSink::Piped {
-            stdout: Box::new(Recorder(Arc::clone(&out))),
-            stderr: Box::new(Recorder(Arc::clone(&err))),
+            stdout: PipedOutput::memory(Box::new(Recorder(Arc::clone(&out)))),
+            stderr: PipedOutput::memory(Box::new(Recorder(Arc::clone(&err)))),
         });
         let parent_context = parent.capture_one_task_context().unwrap();
         let parent_tid = parent_context.thread().registry_id();
@@ -1356,8 +1456,8 @@ mod stdio_sink_tests {
         let err = Arc::new(Mutex::new(Vec::new()));
         let mut dispatcher = SyscallDispatcher::new();
         dispatcher.set_stdio_sink(StdioSink::Piped {
-            stdout: Box::new(Recorder(Arc::clone(&out))),
-            stderr: Box::new(Recorder(Arc::clone(&err))),
+            stdout: PipedOutput::memory(Box::new(Recorder(Arc::clone(&out)))),
+            stderr: PipedOutput::memory(Box::new(Recorder(Arc::clone(&err)))),
         });
 
         // exec 3>&1

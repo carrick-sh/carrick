@@ -323,8 +323,6 @@ use crate::linux_abi::{
     LINUX_P_PIDFD,
     LINUX_PAGE_SIZE,
     LINUX_PERSONALITY_QUERY,
-    LINUX_POLLERR,
-    LINUX_POLLHUP,
     LINUX_POLLIN,
     LINUX_POLLNVAL,
     LINUX_POLLOUT,
@@ -666,6 +664,7 @@ pub mod fs;
 #[cfg(any(test, feature = "test-support"))]
 pub use fs::RecordLockContentionFixture;
 pub use fs::StdioSink;
+pub use fs::state::{PipedOutput, StdioReadiness};
 mod keys;
 pub use fs::MountRetirement;
 pub(crate) use fs::{LegacyAioContextId, SplicePushback};
@@ -1105,10 +1104,8 @@ pub(crate) fn watch_addr() -> Option<u64> {
 }
 
 impl SyscallDispatcher {
-    /// Captured stdout/stderr append to the run's in-memory sink and have no
-    /// carrier fd whose readiness could represent them.
-    pub fn captured_stdio_is_writable(&self) -> bool {
-        self.fs_view().captured_stdio_is_writable()
+    pub fn stdio_readiness(&self, fd: i32) -> Option<StdioReadiness> {
+        self.fs_view().stdio_readiness(fd)
     }
     fn mm_authority(&self) -> arc_swap::Guard<Arc<DispatchMmAuthority>> {
         self.mm_binding.current.load()

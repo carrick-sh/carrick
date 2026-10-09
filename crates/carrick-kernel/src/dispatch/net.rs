@@ -91,6 +91,8 @@ use crate::dispatch::wait_plan::{
 use crate::dispatch::wait_source::{
     HostProxyCoverage, HostWaitTarget, WaitInterest, WaitRegistration, WaitSource,
 };
+#[cfg(test)]
+use crate::linux_abi::LINUX_POLLHUP;
 use crate::linux_abi::{
     LINUX_ICMP_ECHO_REPLY, LINUX_ICMP_ECHO_REQUEST, LINUX_IPPROTO_ICMP, LINUX_IPPROTO_TCP,
     LINUX_MSG_NOSIGNAL, LINUX_POLLRDHUP,
@@ -994,34 +996,21 @@ impl<'a> NetView<'a> {
     /// object to query. Absent non-stdio descriptors report `POLLNVAL`.
     pub(super) fn bare_stdio_poll_ready_events(&self, fd: i32, requested_events: i16) -> i16 {
         if is_stdio_fd(fd) {
-            // fd 1/2 are always writable (we either buffer or stream
-            // straight to host write). For fd 0 we have to actually
-            // poll the host because the guest's read(0,...) ultimately
-            // calls libc::read(0,...); without a real readiness check,
-            // ppoll would always return POLLOUT only and never POLLIN,
-            // breaking interactive shells that ppoll(stdin) before
-            // each prompt.
-            let mut revents = requested_events & LINUX_POLLOUT;
-            if fd == 0 && (requested_events & LINUX_POLLIN) != 0 {
-                let mut pfd = libc::pollfd {
-                    fd: 0,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let n = unsafe { libc::poll(&mut pfd as *mut _, 1, 0) };
-                if n > 0 {
-                    if pfd.revents & libc::POLLIN != 0 {
-                        revents |= LINUX_POLLIN;
-                    }
-                    if pfd.revents & libc::POLLHUP != 0 {
-                        revents |= LINUX_POLLHUP;
-                    }
-                    if pfd.revents & libc::POLLERR != 0 {
-                        revents |= LINUX_POLLERR;
-                    }
+            match self.io.stdio_readiness(fd) {
+                Some(super::fs::state::StdioReadiness::AlwaysWritable) => {
+                    requested_events & LINUX_POLLOUT
                 }
+                Some(super::fs::state::StdioReadiness::Host(host_fd)) => {
+                    let mut pfd = libc::pollfd {
+                        fd: host_fd.raw(),
+                        events: requested_events,
+                        revents: 0,
+                    };
+                    let n = unsafe { libc::poll(&mut pfd as *mut _, 1, 0) };
+                    if n > 0 { pfd.revents } else { 0 }
+                }
+                None => LINUX_POLLNVAL,
             }
-            revents
         } else {
             LINUX_POLLNVAL
         }

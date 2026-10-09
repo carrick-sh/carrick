@@ -9,8 +9,8 @@ pub use carrick_abi::{CanonicalNr, LinuxErrno};
 pub use carrick_embed::testing::{ResultAssert, TestContainer, run_in_container};
 pub use carrick_embed::{
     AuditEvent, AuditObserver, ContainerBuilder, ContainerResult, EmbedError, ExitStatus,
-    FastPathVisibility, ImageStore, PullPolicy, RunRequest, StdioConfig, StdioMode, SyscallAction,
-    SyscallInfo, SyscallObserver, SyscallOutcome,
+    FastPathVisibility, ImageStore, PipedOutput, PullPolicy, RunRequest, StdioConfig, StdioMode,
+    SyscallAction, SyscallInfo, SyscallObserver, SyscallOutcome,
 };
 
 /// The wall-clock budget one probe carrier gets, in milliseconds.

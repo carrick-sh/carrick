@@ -36,7 +36,9 @@ executes on the blocking pool); `run_blocking()` refuses to run inside a runtime
   paths), `platform`, `pull_policy`, `image_store`, `max_traps`.
 - Stdio per stream: `StdioConfig::Captured` (default; bytes land in
   `ContainerResult::{stdout, stderr}`), `Inherit` (your process's fd 1/2), or
-  `Piped(Box<dyn Write + Send>)`.
+  `Piped(PipedOutput)`. Use `PipedOutput::memory(writer)` for an in-memory
+  sink or `PipedOutput::host(writer)` for a writer with a pollable host fd;
+  the latter retains a duplicate for readiness waits.
 - `ContainerResult { exit_code, signal, stdout, stderr, trap_limit_hit, traps,
   compat }`, `success()`, `ensure_success()` (turns a failed guest into
   `EmbedError::Guest`).
