@@ -10,7 +10,39 @@ use carrick_guest_mem::ArmRingFirst;
 /// Writes the already-resolved run policy into the guest aperture.
 pub struct ArmRingFirstHatch;
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ArmRingFirstPolicyConflict {
+    held: ArmRingFirst,
+    requested: ArmRingFirst,
+}
+
+impl core::fmt::Display for ArmRingFirstPolicyConflict {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "ARM ring policy conflict: carrier holds {:?}, root requests {:?}",
+            self.held, self.requested
+        )
+    }
+}
+
 impl ArmRingFirstHatch {
+    pub(crate) fn validate_carrier_policy(
+        aperture: &ApertureControl,
+        requested: ArmRingFirst,
+    ) -> Result<(), ArmRingFirstPolicyConflict> {
+        let held = if aperture.is_strict() {
+            ArmRingFirst::Strict
+        } else {
+            ArmRingFirst::OptOut
+        };
+        if requested == held {
+            Ok(())
+        } else {
+            Err(ArmRingFirstPolicyConflict { held, requested })
+        }
+    }
+
     pub fn configure_aperture(aperture: &ApertureControl, policy: ArmRingFirst) {
         aperture.set_strict(policy.is_strict());
     }
@@ -19,6 +51,25 @@ impl ArmRingFirstHatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn carrier_admission_rejects_conflicting_ring_policy_without_changing_it() {
+        for held in [ArmRingFirst::Strict, ArmRingFirst::OptOut] {
+            let aperture = ApertureControl::new();
+            ArmRingFirstHatch::configure_aperture(&aperture, held);
+            assert!(ArmRingFirstHatch::validate_carrier_policy(&aperture, held).is_ok());
+            let requested = if held.is_strict() {
+                ArmRingFirst::OptOut
+            } else {
+                ArmRingFirst::Strict
+            };
+            assert_eq!(
+                ArmRingFirstHatch::validate_carrier_policy(&aperture, requested),
+                Err(ArmRingFirstPolicyConflict { held, requested })
+            );
+            assert_eq!(aperture.is_strict(), held.is_strict());
+        }
+    }
 
     #[test]
     fn test_hatch_parse_semantics() {
