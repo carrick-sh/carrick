@@ -1,9 +1,10 @@
 //! Stopped-CPU physical table loans and root exit for owner-selected native fork.
 //! The caller retains the supervisor stack record across the physical crossing.
 //!
-//! On x86, this crossing is driven by synchronous port I/O over [`FORK_STOCK_PORT`]
-//! and [`NATIVE_ROOT_EXIT_PORT`]. On AArch64, it is driven by `HVC #6` using
-//! [`GRANT_OP_FORK_STOCK`] and [`GRANT_OP_ROOT_EXIT`].
+//! On x86, this crossing is driven by synchronous port I/O over [`FORK_STOCK_PORT`],
+//! [`NATIVE_ROOT_EXIT_PORT`] and [`NATIVE_CHILD_RETIRE_PORT`]. On AArch64, it is
+//! driven by `HVC #6` using [`GRANT_OP_FORK_STOCK`], [`GRANT_OP_ROOT_EXIT`] and
+//! [`GRANT_OP_CHILD_RETIRE`].
 //!
 //! The record wire layouts and alignment are ISA-neutral and 100% byte-identical
 //! across platforms.
@@ -24,6 +25,9 @@ pub const FORK_STOCK_PORT: u16 = 0xd2;
 pub const NATIVE_ROOT_EXIT_PORT: u16 = 0xd3;
 /// x86 synchronous I/O port for native peer readiness notification.
 pub const NATIVE_PEER_READY_PORT: u16 = 0xd4;
+/// x86 synchronous I/O port for [`NativeChildRetire`], the twin of AArch64
+/// `HVC #6` with [`GRANT_OP_CHILD_RETIRE`].
+pub const NATIVE_CHILD_RETIRE_PORT: u16 = 0xd5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ForkStockKind {
@@ -675,11 +679,13 @@ const _: () = {
     assert!(core::mem::size_of::<ForkStockExchange>() == 24 * 8);
     assert!(core::mem::size_of::<ForkStockSettlement>() == 16 * 8);
     assert!(core::mem::size_of::<NativeRootExit>() == 8 * 8);
+    assert!(core::mem::size_of::<NativeChildRetire>() == 8 * 8);
 
     // 2. Wire alignment constants
     assert!(core::mem::align_of::<ForkStockExchange>() == 64);
     assert!(core::mem::align_of::<ForkStockSettlement>() == 64);
     assert!(core::mem::align_of::<NativeRootExit>() == 64);
+    assert!(core::mem::align_of::<NativeChildRetire>() == 64);
 
     // 3. Exact field byte offsets against the previous x86 layout (origin/main)
     assert!(core::mem::offset_of!(ForkStockExchange, tag) == 0);
@@ -699,6 +705,9 @@ const _: () = {
     assert!(FORK_STOCK_PORT == 0xd2);
     assert!(NATIVE_ROOT_EXIT_PORT == 0xd3);
     assert!(NATIVE_PEER_READY_PORT == 0xd4);
+    assert!(NATIVE_CHILD_RETIRE_PORT == 0xd5);
+    assert!(NativeChildRetire::MAGIC == 0x4352_4348_5245_5449);
+    assert!(GRANT_OP_CHILD_RETIRE == 5);
     assert!(GRANT_OP_FORK_STOCK == 3);
     assert!(GRANT_OP_ROOT_EXIT == 4);
 };

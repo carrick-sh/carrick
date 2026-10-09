@@ -147,6 +147,95 @@ impl ForkTableLedger for NoTableLedger {
     fn give_back(&mut self, _: RootGpa, _: ReservationMm) {}
 }
 
+/// Byte stride between lifecycle slots; each slot holds the 4 KiB lifecycle
+/// page and, [`LIFECYCLE_CONTROLS_OFFSET`] above it, the thread controls.
+pub const LIFECYCLE_SLOT_STRIDE: u64 = 0x4000;
+/// Offset of a slot's thread control array from its lifecycle page.
+pub const LIFECYCLE_CONTROLS_OFFSET: u64 = 0x1000;
+
+/// `count` lifecycle slots starting at `first_page` inside the metadata
+/// aperture at `aperture`. Every carrier uses this one slot shape.
+pub fn lifecycle_slots(
+    aperture: u64,
+    first_page: u64,
+    count: u64,
+) -> Option<Vec<ForkLifecycleLoan>> {
+    (0..count)
+        .map(|slot| {
+            let page = first_page.checked_add(slot.checked_mul(LIFECYCLE_SLOT_STRIDE)?)?;
+            ForkLifecycleLoan::new_for_base(
+                aperture,
+                carrick_guest_arch::KernelVa::new(page),
+                carrick_guest_arch::KernelVa::new(page.checked_add(LIFECYCLE_CONTROLS_OFFSET)?),
+            )
+        })
+        .collect()
+}
+
+/// Host view of a guest metadata window that holds lifecycle records, so a
+/// carrier can prove an issued record is cold storage and clear a returned
+/// one before it reenters the stock.
+#[derive(Clone, Copy, Debug)]
+pub struct LifecycleWindow {
+    host: core::ptr::NonNull<u8>,
+    va: u64,
+    len: u64,
+}
+
+impl LifecycleWindow {
+    /// # Safety
+    /// `host` must be valid for reads and writes of `len` bytes for as long
+    /// as the window is used, and must back guest kernel VAs `va..va + len`.
+    pub unsafe fn new(host: core::ptr::NonNull<u8>, va: u64, len: u64) -> Self {
+        Self { host, va, len }
+    }
+
+    fn ranges(self, lifecycle: ForkLifecycleLoan) -> Option<[(*mut u8, usize); 2]> {
+        let range = |va: u64, len: usize| -> Option<(*mut u8, usize)> {
+            let start = va.checked_sub(self.va)?;
+            if start.checked_add(u64::try_from(len).ok()?)? > self.len {
+                return None;
+            }
+            // SAFETY: the constructor licensed `len` host bytes at `host`.
+            let ptr = unsafe { self.host.as_ptr().add(usize::try_from(start).ok()?) };
+            Some((ptr, len))
+        };
+        let controls = core::mem::size_of::<carrick_el1_abi::ThreadControlSlot>()
+            * (carrick_el1_abi::THREAD_POOL_ENTRIES + 1);
+        Some([
+            range(
+                lifecycle.page.raw(),
+                core::mem::size_of::<carrick_el1_abi::ThreadLifecyclePage>(),
+            )?,
+            range(lifecycle.controls.raw(), controls)?,
+        ])
+    }
+
+    /// True when the record's page and controls are all zero.
+    pub fn is_zero(self, lifecycle: ForkLifecycleLoan) -> bool {
+        self.ranges(lifecycle).is_some_and(|ranges| {
+            ranges.iter().all(|(ptr, len)| {
+                // SAFETY: in-window bytes; the record is unexposed while
+                // its custody is decided by a stopped CPU.
+                unsafe { core::slice::from_raw_parts(*ptr, *len) }
+                    .iter()
+                    .all(|byte| *byte == 0)
+            })
+        })
+    }
+
+    /// Zero the record. False when it lies outside the window.
+    pub fn clear(self, lifecycle: ForkLifecycleLoan) -> bool {
+        self.ranges(lifecycle).is_some_and(|ranges| {
+            for (ptr, len) in ranges {
+                // SAFETY: in-window bytes of a record no live task owns.
+                unsafe { core::ptr::write_bytes(ptr, 0, len) };
+            }
+            true
+        })
+    }
+}
+
 /// Ordered key of one MM in carrier custody.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct MmKey(NonZeroU64);
@@ -666,8 +755,8 @@ impl<T: ChildAddressTags> ForkStock<T> {
         ledger: &mut impl ForkTableLedger,
         active: ReservationMm,
         safe_to_reclaim: impl Fn(ReservationMm) -> bool,
-        clear_tables: impl Fn(&[RootGpa]) -> bool,
-        clear_lifecycle: impl Fn(ForkLifecycleLoan) -> bool,
+        mut clear_tables: impl FnMut(&[RootGpa]) -> bool,
+        mut clear_lifecycle: impl FnMut(ForkLifecycleLoan) -> bool,
     ) -> Result<usize, ForkStockServiceError> {
         let active = MmKey::of(active);
         let candidates: Vec<MmKey> = self

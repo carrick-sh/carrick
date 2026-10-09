@@ -96,6 +96,37 @@ pub(crate) fn install_address_context(context: AddressContext<RootGpa>) -> Resul
     Ok(())
 }
 
+/// Leave every process root for the carrier's maintenance root, which holds
+/// only the shared supervisor branches. The caller then releases the slot's
+/// installed space: from that point this CPU caches and walks no table of
+/// any MM, so a retired MM's tables may be cleared and reissued.
+pub fn install_maintenance_root(maintenance: RootGpa) -> Result<(), ArchError> {
+    super::mmu::hardware_live_root()?;
+    let binding = super::context::current_cpu_binding().ok_or(ArchError::Unbound)?;
+    let table = shootdown_table(binding)?;
+    let member = table
+        .members
+        .get(binding.cpu_slot as usize)
+        .ok_or(ArchError::Unbound)?;
+    member.revision.fetch_add(1, Ordering::AcqRel);
+    // SAFETY: the carrier retains the maintenance root's shared supervisor
+    // branches for the VM lifetime; PCID/PGE were rejected above, so MOV CR3
+    // drains every local translation of the previous root.
+    unsafe {
+        core::arch::asm!(
+            "mov cr3, {}",
+            in(reg) maintenance.address().raw(),
+            options(nostack, preserves_flags)
+        )
+    };
+    // No MM is installed: no shootdown sender waits for this CPU.
+    member.root.store(0, Ordering::Relaxed);
+    member.mm_key.store(0, Ordering::Relaxed);
+    member.owner_generation.store(0, Ordering::Relaxed);
+    member.revision.fetch_add(1, Ordering::Release);
+    Ok(())
+}
+
 fn publish_root_request(
     context: AddressContext<RootGpa>,
     table: &super::context::native::ShootdownTable,

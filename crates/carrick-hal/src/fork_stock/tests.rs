@@ -378,3 +378,170 @@ fn stale_lifecycle_record_refuses_without_consuming_stock() {
     assert!(stock.lifecycle_available());
     assert!(stock.pending(CpuId::new(0)).is_none());
 }
+
+/// Host bytes of an x86 CPL0 metadata window, aligned like the retained
+/// carrier mapping.
+struct MetadataBytes {
+    words: Vec<u64>,
+}
+
+const X86_METADATA_LEN: u64 = 0x10_0000;
+const X86_FORK_LIFECYCLE_OFFSET: u64 = 0x8_8000;
+
+impl MetadataBytes {
+    fn new() -> Self {
+        Self {
+            words: vec![0; (X86_METADATA_LEN / 8) as usize],
+        }
+    }
+
+    fn window(&mut self) -> LifecycleWindow {
+        let host = core::ptr::NonNull::new(self.words.as_mut_ptr().cast::<u8>()).unwrap();
+        // SAFETY: the vector outlives every use of the window in the test.
+        unsafe {
+            LifecycleWindow::new(
+                host,
+                carrick_el1_abi::X86_CPL0_DYNAMIC_METADATA_BASE,
+                X86_METADATA_LEN,
+            )
+        }
+    }
+}
+
+fn x86_lifecycles(count: u64) -> Vec<ForkLifecycleLoan> {
+    let base = carrick_el1_abi::X86_CPL0_DYNAMIC_METADATA_BASE;
+    lifecycle_slots(base, base + X86_FORK_LIFECYCLE_OFFSET, count).unwrap()
+}
+
+/// The guest initializes its census in the loaned record before any task.
+fn guest_initializes(window: LifecycleWindow, lifecycle: ForkLifecycleLoan) {
+    let ranges = window.ranges(lifecycle).unwrap();
+    for (ptr, len) in ranges {
+        // SAFETY: in-window test bytes.
+        unsafe { core::ptr::write_bytes(ptr, 0xa5, len) };
+    }
+    assert!(!window.is_zero(lifecycle));
+}
+
+fn x86_loan(
+    stock: &mut ForkStock<UntaggedRoots>,
+    window: LifecycleWindow,
+    child_mm: u64,
+) -> Result<ForkStockLoan, ForkStockRefusal> {
+    let exec = parent();
+    let mut exchange = ForkStockExchange::new(request(exec, child_mm, 1, 1)).unwrap();
+    stock.loan(&mut NoTableLedger, exec, &mut exchange, |life| {
+        window.is_zero(life)
+    })
+}
+
+#[test]
+fn kvm_lifecycle_window_cycles_exceed_stock_with_cleared_records() {
+    let mut bytes = MetadataBytes::new();
+    let window = bytes.window();
+    let mut stock = ForkStock::new(CARRIER, 0x1_0000_0000, UntaggedRoots);
+    stock
+        .install(
+            (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            x86_lifecycles(2),
+        )
+        .unwrap();
+    let cleared = RefCell::new(Vec::new());
+    for cycle in 0..9 {
+        let child_mm = 302 + cycle;
+        let granted = x86_loan(&mut stock, window, child_mm)
+            .unwrap_or_else(|refusal| panic!("cycle {cycle}: {refusal:?}"));
+        guest_initializes(window, granted.lifecycle);
+        commit(&mut stock, parent(), granted, 1, 0).unwrap();
+        retire(&mut stock, child_of(granted, 900 + cycle)).unwrap();
+        let returned = stock
+            .reclaim(
+                &mut NoTableLedger,
+                mm(PARENT_MM),
+                |_| true,
+                |pages| {
+                    cleared.borrow_mut().extend_from_slice(pages);
+                    true
+                },
+                |life| window.clear(life),
+            )
+            .unwrap();
+        assert_eq!(returned, 1);
+        assert!(window.is_zero(granted.lifecycle));
+    }
+    assert_eq!(stock.counters().returned_children, 9);
+    assert_eq!(stock.counters().capacity_refusals, 0);
+}
+
+#[test]
+fn kvm_unclearable_lifecycle_record_is_never_reissued_dirty() {
+    let mut bytes = MetadataBytes::new();
+    let window = bytes.window();
+    let mut stock = ForkStock::new(CARRIER, 0x1_0000_0000, UntaggedRoots);
+    stock
+        .install(
+            (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            x86_lifecycles(1),
+        )
+        .unwrap();
+    let granted = x86_loan(&mut stock, window, 302).unwrap();
+    guest_initializes(window, granted.lifecycle);
+    commit(&mut stock, parent(), granted, 1, 0).unwrap();
+    retire(&mut stock, child_of(granted, 900)).unwrap();
+    // A reclaim that skips clearing returns a dirty record: the next loan
+    // must refuse it as stale inventory rather than hand it to a child.
+    stock
+        .reclaim(
+            &mut NoTableLedger,
+            mm(PARENT_MM),
+            |_| true,
+            |_| true,
+            |_| true,
+        )
+        .unwrap();
+    assert_eq!(
+        x86_loan(&mut stock, window, 303),
+        Err(ForkStockRefusal::Inventory)
+    );
+    assert!(stock.lifecycle_available());
+    assert!(window.clear(granted.lifecycle));
+    x86_loan(&mut stock, window, 303).unwrap();
+}
+
+#[test]
+fn kvm_live_children_beyond_lifecycle_records_are_counted_refusals() {
+    let mut bytes = MetadataBytes::new();
+    let window = bytes.window();
+    let mut stock = ForkStock::new(CARRIER, 0x1_0000_0000, UntaggedRoots);
+    stock
+        .install(
+            (0..32).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            x86_lifecycles(8),
+        )
+        .unwrap();
+    for child_mm in 302..310 {
+        let granted = x86_loan(&mut stock, window, child_mm).unwrap();
+        guest_initializes(window, granted.lifecycle);
+        commit(&mut stock, parent(), granted, 1, 0).unwrap();
+    }
+    assert_eq!(
+        x86_loan(&mut stock, window, 310),
+        Err(ForkStockRefusal::Capacity)
+    );
+    assert_eq!(stock.counters().capacity_refusals, 1);
+    assert_eq!(stock.live_children(), 8);
+}
+
+#[test]
+fn lifecycle_window_refuses_records_outside_the_window() {
+    let mut bytes = MetadataBytes::new();
+    let window = bytes.window();
+    let outside = lifecycle_slots(
+        carrick_el1_abi::X86_CPL0_DYNAMIC_METADATA_BASE,
+        carrick_el1_abi::X86_CPL0_DYNAMIC_METADATA_BASE + X86_METADATA_LEN,
+        1,
+    )
+    .unwrap()[0];
+    assert!(!window.is_zero(outside));
+    assert!(!window.clear(outside));
+}
