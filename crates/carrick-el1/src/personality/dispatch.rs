@@ -139,10 +139,23 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
     #[cfg(not(target_os = "none"))]
     {
         let nr = frame.x[8] as usize;
-        if nr < 512 {
-            counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
+        let is_strict =
+            carrick_el1_abi::host_aperture_control().is_some_and(|ctrl| ctrl.is_strict());
+        if is_strict
+            && !carrick_personality_linux::crossing::AllowedHostCrossing::is_allowed_aarch64(
+                carrick_personality_linux::abi::entry::CanonicalOrdinal::new(frame.x[8]),
+            )
+        {
+            frame.x[0] = (-38_i64) as u64;
+            let bucket = if nr < 512 { nr } else { 512 };
+            counters.refused[bucket].fetch_add(1, Ordering::Relaxed);
+            Action::Served
+        } else {
+            if nr < 512 {
+                counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
+            }
+            Action::Forward
         }
-        Action::Forward
     }
 }
 
@@ -580,6 +593,20 @@ impl<
     fn install_result(&mut self, result: SyscallResult) {
         self.frame
             .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
+    }
+    fn ring_first_strict(&self) -> bool {
+        #[cfg(target_os = "none")]
+        {
+            carrick_el1_abi::aperture_control().is_strict()
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            carrick_el1_abi::host_aperture_control().is_some_and(|ctrl| ctrl.is_strict())
+        }
+    }
+    fn record_refused(&mut self, ordinal: u64) {
+        let bucket = if ordinal < 512 { ordinal as usize } else { 512 };
+        self.counters.refused[bucket].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
     fn lifecycle_native(
         &mut self,

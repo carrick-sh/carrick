@@ -215,6 +215,12 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
             counters.forwarded(ordinal);
         }
     }
+    /// Whether this context enforces the strict ARM ring-first forward allowlist.
+    fn ring_first_strict(&self) -> bool {
+        false
+    }
+    /// Record a refused syscall answering -ENOSYS directly from kernel entry.
+    fn record_refused(&mut self, _ordinal: u64) {}
     fn publish_work(&self, commit: bool) {
         if let Some(task) = self.task_state() {
             if commit {
@@ -499,6 +505,17 @@ fn finish<'a, C: EntryContext + 'a>(
                 .store(original, core::sync::atomic::Ordering::Relaxed);
         }
     }
+    let route = completion_route(result, pending.host_work());
+    if route == CompletionRoute::Forward
+        && pending.ring_first_strict()
+        && !crate::crossing::AllowedHostCrossing::is_allowed_aarch64(
+            carrick_syscall_abi::CanonicalNr::new(ordinal),
+        )
+    {
+        pending.install_result(SyscallResult::new(-38));
+        pending.record_refused(ordinal);
+        return CompletionRoute::Served;
+    }
     match result {
         FamilyCompletion::AccountedComplete(_)
         | FamilyCompletion::AccountedSwitched(_)
@@ -507,7 +524,6 @@ fn finish<'a, C: EntryContext + 'a>(
         FamilyCompletion::Forward | FamilyCompletion::Handback => pending.record_forwarded(ordinal),
         _ => pending.record_served(ordinal),
     }
-    let route = completion_route(result, pending.host_work());
     if route == CompletionRoute::WithWork {
         pending.publish_work(matches!(result, FamilyCompletion::CommitOwed(_)));
     }

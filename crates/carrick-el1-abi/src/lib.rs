@@ -80,6 +80,15 @@ pub const EL1_COUNTERS_OFFSET: u64 = 0x10_0000;
 /// Base guest virtual address of the per-syscall counters page.
 pub const EL1_COUNTERS_BASE: u64 = EL1_REGION_BASE + EL1_COUNTERS_OFFSET;
 
+/// Bit in aperture control word: ARM EL1 enforces strict ring-first forward allowlist.
+pub const APERTURE_CONTROL_ARM_RING_FIRST_STRICT: u64 = 1 << 3;
+
+/// Byte offset of the aperture control word within the region.
+pub const EL1_APERTURE_CONTROL_OFFSET: u64 = 0x1B_0000;
+
+/// Base guest virtual address of the aperture control word.
+pub const EL1_APERTURE_CONTROL_BASE: u64 = EL1_REGION_BASE + EL1_APERTURE_CONTROL_OFFSET;
+
 /// Byte offset of the per-vCPU stack arena within the region.
 pub const EL1_STACKS_OFFSET: u64 = 0x20_0000;
 
@@ -2182,6 +2191,58 @@ pub fn get_el1_region_host_ptr() -> usize {
     EL1_REGION_HOST_PTR.load(Ordering::Acquire)
 }
 
+/// Shared aperture control word.
+#[repr(C, align(64))]
+pub struct ApertureControl {
+    pub control: core::sync::atomic::AtomicU64,
+}
+
+impl ApertureControl {
+    pub const fn new() -> Self {
+        Self {
+            control: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    pub fn is_strict(&self) -> bool {
+        (self.control.load(Ordering::Acquire) & APERTURE_CONTROL_ARM_RING_FIRST_STRICT) != 0
+    }
+
+    #[inline]
+    pub fn set_strict(&self, strict: bool) {
+        if strict {
+            self.control
+                .fetch_or(APERTURE_CONTROL_ARM_RING_FIRST_STRICT, Ordering::Release);
+        } else {
+            self.control
+                .fetch_and(!APERTURE_CONTROL_ARM_RING_FIRST_STRICT, Ordering::Release);
+        }
+    }
+}
+
+impl Default for ApertureControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Read the guest aperture control word.
+#[inline]
+pub fn aperture_control() -> &'static ApertureControl {
+    unsafe { &*(EL1_APERTURE_CONTROL_BASE as *const ApertureControl) }
+}
+
+/// Read the host view of the guest aperture control word, if mapped.
+pub fn host_aperture_control() -> Option<&'static ApertureControl> {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 {
+        None
+    } else {
+        unsafe { Some(&*((ptr + EL1_APERTURE_CONTROL_OFFSET as usize) as *const ApertureControl)) }
+    }
+}
+
 /// The shared IPC memory as one venue addresses it: the directory and the
 /// pool at this venue's addresses (the host authority's allocations, or the
 /// fixed EL1 VAs). Nothing here is persisted in shared memory.
@@ -3285,10 +3346,28 @@ impl Default for InotifyNameCache {
     }
 }
 
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x6c47_2801_7fe6_f330);
+const _: () = {
+    assert!(core::mem::size_of::<ApertureControl>() == 64);
+    assert!(core::mem::align_of::<ApertureControl>() == 64);
+    assert!(EL1_ABI_LAYOUT_HASH == 0x6c47_2801_7fe6_f330);
+};
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_aperture_control_strict_flag() {
+        let aperture = ApertureControl::new();
+        assert!(!aperture.is_strict());
+        aperture.set_strict(true);
+        assert!(aperture.is_strict());
+        assert_eq!(
+            aperture.control.load(Ordering::Relaxed) & APERTURE_CONTROL_ARM_RING_FIRST_STRICT,
+            APERTURE_CONTROL_ARM_RING_FIRST_STRICT
+        );
+        aperture.set_strict(false);
+        assert!(!aperture.is_strict());
+    }
+
     #[test]
     fn lifecycle_mapping_binding_is_revoked_on_task_clear() {
         let task = CurrentTask::new();
