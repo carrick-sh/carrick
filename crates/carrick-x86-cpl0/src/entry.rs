@@ -404,6 +404,9 @@ mod kernel {
         fn user_sp(&self) -> Option<UserVa> { Some(self.call.stack) }
     }
     impl dispatch::GuestDispatchFrame for NativeDispatch<'_> {
+        fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
+            carrick_personality_linux::crossing::HostCrossingSet::X86
+        }
         fn arm_frame(&mut self) -> Option<&mut carrick_el1_abi::TrapFrame> { None }
         fn arm_frame_ref(&self) -> Option<&carrick_el1_abi::TrapFrame> { None }
         fn arm_scheduler(&self) -> bool { false }
