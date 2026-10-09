@@ -430,6 +430,24 @@ pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
     }
 }
 
+/// Calls whose process semantics must be owned by the in-kernel process
+/// registry. Unsupported process clone flags still enter that owner and fail
+/// closed; they cannot fall through to thread creation or host fork.
+pub const fn aarch64_owner_process_call(ordinal: u64, flags: u64) -> bool {
+    // waitid and clone3 are process calls even before their native dispatch
+    // routes are populated. Keep them inside the owner fail-closed boundary.
+    if matches!(ordinal, 95 | 435) {
+        return true;
+    }
+    match route_aarch64(ordinal, u64::MAX) {
+        Family::Lifecycle(LifecycleCall::Clone) => crate::lifecycle::is_process_clone(flags),
+        Family::Lifecycle(
+            LifecycleCall::Fork | LifecycleCall::Wait4 | LifecycleCall::ExitGroup,
+        ) => true,
+        _ => false,
+    }
+}
+
 /// Return transport selected by the Linux completion owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompletionRoute {
@@ -998,5 +1016,23 @@ mod ring_first_tests {
             );
             assert_eq!(pending.refused[ordinal as usize].load(Ordering::Relaxed), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod owner_process_call_tests {
+    use super::aarch64_owner_process_call;
+
+    #[test]
+    fn aarch64_process_calls_cannot_escape_to_thread_or_host_lifecycle() {
+        assert!(aarch64_owner_process_call(220, 17));
+        assert!(aarch64_owner_process_call(220, 17 | 0x0120_0000));
+        assert!(aarch64_owner_process_call(220, 17 | 0x0000_4100));
+        assert!(aarch64_owner_process_call(260, 0));
+        assert!(aarch64_owner_process_call(94, 0));
+        assert!(aarch64_owner_process_call(95, 0));
+        assert!(aarch64_owner_process_call(435, 0));
+        assert!(!aarch64_owner_process_call(220, 0x0001_0000));
+        assert!(!aarch64_owner_process_call(58, 0)); // vhangup on AArch64
     }
 }
