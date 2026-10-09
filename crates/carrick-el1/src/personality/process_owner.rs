@@ -69,14 +69,15 @@ pub struct GuestTaskMetadata<C, U> {
     pub identity: TaskIdentity,
     pub namespace_process_group: u32,
     pub namespace_session: u32,
-    pub ruid: U,
-    pub euid: U,
+    /// Encode a UID into the immutable zombie receipt's presentation domain.
+    pub receipt_uid: fn(carrick_sched_core::process::TaskUid) -> U,
     pub exit_signal: ChildExitSignal,
     pub diagnostic_name: String,
 }
 
 pub struct GuestTask<C, U, N: NativeProcessCustody> {
     metadata: GuestTaskMetadata<C, U>,
+    exit_tid: u32,
     relations: ProcessRelations,
     revision: TaskRevision,
     exiting: AtomicBool,
@@ -212,6 +213,7 @@ impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
         let leader_tid = metadata.namespace_pid;
         Self {
             metadata,
+            exit_tid: leader_tid,
             relations: ProcessRelations::new(parent),
             revision: TaskRevision::INITIAL,
             exiting: AtomicBool::new(false),
@@ -265,6 +267,12 @@ impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
         if tid != self.metadata.namespace_pid {
             self.threads.remove_thread(tid);
         }
+    }
+    #[inline]
+    pub fn select_exit_thread(&mut self, tid: u32) -> Result<(), i64> {
+        self.credentials_for(tid)?;
+        self.exit_tid = tid;
+        Ok(())
     }
     #[inline]
     pub fn leader_credentials(&self) -> Result<&TaskCredentials, i64> {
@@ -970,6 +978,9 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
             .get(&task.id)
             .ok_or(GuestProcessError::Unknown(task.id))?;
         let identity = record.wait_identity();
+        let credentials = record
+            .credentials_for(record.exit_tid)
+            .map_err(|_| GuestProcessError::Stale(task))?;
         let observation = Zombie {
             key: record.metadata.key,
             namespace_pid: record.metadata.namespace_pid,
@@ -980,8 +991,8 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
             namespace_process_group: record.metadata.namespace_process_group,
             namespace_session: record.metadata.namespace_session,
             status: self.status,
-            ruid: record.metadata.ruid.clone(),
-            euid: record.metadata.euid.clone(),
+            ruid: (record.metadata.receipt_uid)(credentials.ruid),
+            euid: (record.metadata.receipt_uid)(credentials.euid),
             rusage: record.native.own_rusage(),
             children_rusage: record.children_rusage,
             exit_signal: record.metadata.exit_signal,

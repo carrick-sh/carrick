@@ -386,8 +386,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                     identity: TaskIdentity::led_by(id),
                     namespace_process_group: visible.get(),
                     namespace_session: visible.get(),
-                    ruid: carrick_sched_core::process::TaskUid::ROOT,
-                    euid: carrick_sched_core::process::TaskUid::ROOT,
+                    receipt_uid: |uid| uid,
                     exit_signal: ChildExitSignal::SIGCHLD,
                     diagnostic_name: String::from("native-root"),
                 },
@@ -812,13 +811,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .ok_or(NativeProcessError::Exhausted)?;
         let (resources, published) = {
             let mut graph = self.runtime.graph.lock();
-            let caller_tid = self.calling_tid;
-            if let Ok(task) = graph.owner.task_mut(self.key)
-                && let Ok(uids) = task.credentials_for(caller_tid).map(|c| (c.ruid, c.euid))
-            {
-                task.metadata_mut().ruid = uids.0;
-                task.metadata_mut().euid = uids.1;
-            }
+            graph
+                .owner
+                .task_mut(self.key)
+                .map_err(|_| NativeProcessError::Stale)?
+                .select_exit_thread(self.calling_tid)
+                .map_err(|_| NativeProcessError::Stale)?;
             native_process_entry::publish_exit(
                 &mut graph.owner,
                 self.key,
@@ -1188,8 +1186,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 identity,
                 namespace_process_group: group,
                 namespace_session: session,
-                ruid: parent_creds.ruid,
-                euid: parent_creds.euid,
+                receipt_uid: |uid| uid,
                 exit_signal: ChildExitSignal::SIGCHLD,
                 diagnostic_name: String::from("native-child"),
             },
@@ -1399,16 +1396,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .owner
             .task_mut(self.key)
             .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
-        let caller_tid = self.calling_tid;
-        let is_leader = caller_tid == task.metadata().namespace_pid;
-        let creds = task.credentials_for_mut(caller_tid)?;
-        f(creds)?;
-        if is_leader {
-            let ruid = creds.ruid;
-            let euid = creds.euid;
-            task.metadata_mut().ruid = ruid;
-            task.metadata_mut().euid = euid;
-        }
+        f(task.credentials_for_mut(self.calling_tid)?)?;
         Ok(())
     }
 }
