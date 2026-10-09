@@ -140,6 +140,8 @@ const NIL: u32 = 0;
     ::core::fmt::Debug,
     ::core::cmp::Eq,
     ::core::cmp::PartialEq,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialOrd,
     ::core::hash::Hash,
 )]
 #[repr(transparent)]
@@ -1479,6 +1481,8 @@ pub enum CurrentHandback {
     ::core::fmt::Debug,
     ::core::cmp::Eq,
     ::core::cmp::PartialEq,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialOrd,
     ::core::hash::Hash,
 )]
 pub struct RecordRef {

@@ -252,10 +252,26 @@ pub enum SignalWaitOutcome {
     Pending,
 }
 
+/// A Linux-visible thread selector decoded from the syscall ABI, not an
+/// admitted identity. Resolution must return an exact live scheduler record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignalThreadSelector(i32);
+impl SignalThreadSelector {
+    pub const fn from_abi(raw: u64) -> Self {
+        Self(raw as i32)
+    }
+    pub const fn positive(self) -> Option<core::num::NonZeroU32> {
+        if self.0 > 0 {
+            core::num::NonZeroU32::new(self.0 as u32)
+        } else {
+            None
+        }
+    }
+}
+
 pub trait ProcessSignals {
     fn force_sigsegv(
         &mut self,
-        tid: u32,
         blocked: carrick_signal_core::policy::SigBlockMask,
     ) -> Result<(), i32>;
 
@@ -276,15 +292,15 @@ pub trait ProcessSignals {
 
     fn tkill(
         &mut self,
-        tid: u32,
+        tid: SignalThreadSelector,
         sig: i32,
         info: Option<crate::abi::signal::LinuxSiginfo>,
     ) -> Result<(), i32>;
 
     fn tgkill(
         &mut self,
-        tgid: u32,
-        tid: u32,
+        tgid: SignalThreadSelector,
+        tid: SignalThreadSelector,
         sig: i32,
         info: Option<crate::abi::signal::LinuxSiginfo>,
     ) -> Result<(), i32>;
@@ -309,14 +325,13 @@ pub trait ProcessSignals {
 
     fn take_deliverable(
         &mut self,
-        tid: u32,
         blocked: carrick_signal_core::policy::SigBlockMask,
     ) -> Option<(
         carrick_signal_core::policy::Signal,
         Option<crate::abi::signal::LinuxSiginfo>,
         carrick_signal_core::policy::Action,
     )> {
-        let _ = (tid, blocked);
+        let _ = blocked;
         None
     }
 }
@@ -333,11 +348,10 @@ pub trait SignalNative<'a>: crate::lifecycle::UserCopy {
     }
     fn restore_signal_frame(&mut self) -> Result<u64, i32>;
     fn force_sigsegv(&mut self) -> bool {
-        let tid = self.current_tid();
         let blocked = self.current_blocked();
         let forced = self
             .process_signals()
-            .is_some_and(|p| p.force_sigsegv(tid, blocked).is_ok());
+            .is_some_and(|p| p.force_sigsegv(blocked).is_ok());
         if forced {
             self.set_current_blocked(carrick_signal_core::policy::SigBlockMask::blocking_all_of(
                 blocked
@@ -534,7 +548,7 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
         }
         SignalCall::Tkill => {
             let [tid, sig, _, _, _, _] = args;
-            let tid = tid as u32;
+            let tid = SignalThreadSelector::from_abi(tid);
             let sig = sig as i32;
             let sender_pid = native.current_pid() as i32;
             let sender_uid = native.current_uid();
@@ -559,8 +573,11 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
         }
         SignalCall::Tgkill => {
             let [tgid, tid, sig, _, _, _] = args;
-            let tgid = tgid as u32;
-            let tid = tid as u32;
+            let tgid = SignalThreadSelector::from_abi(tgid);
+            if tgid.positive().is_none() {
+                return returned(LINUX_EINVAL.guest_retval(), false);
+            }
+            let tid = SignalThreadSelector::from_abi(tid);
             let sig = sig as i32;
             let sender_pid = native.current_pid() as i32;
             let sender_uid = native.current_uid();
@@ -608,8 +625,11 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
         }
         SignalCall::RtTgsigqueueinfo => {
             let [tgid, tid, sig, uinfo_ptr, _, _] = args;
-            let tgid = tgid as u32;
-            let tid = tid as u32;
+            let tgid = SignalThreadSelector::from_abi(tgid);
+            if tgid.positive().is_none() {
+                return returned(LINUX_EINVAL.guest_retval(), false);
+            }
+            let tid = SignalThreadSelector::from_abi(tid);
             let sig = sig as i32;
             let mut bytes = [0u8; core::mem::size_of::<LinuxSiginfo>()];
             if !native.copy_in(&mut bytes, carrick_guest_arch::UserVa::new(uinfo_ptr)) {

@@ -40,6 +40,45 @@ use core::{
     sync::atomic::Ordering,
 };
 const LOCK_SPINS: u32 = 100_000;
+fn signal_record_exists<C: ProcessContext>(zone: &ZoneTables<C>, record: RecordRef) -> bool {
+    if zone.live(record).is_some() {
+        return true;
+    }
+    let retained = zone.record(record.id);
+    retained.incarnation() == record.incarnation
+        && retained.claim() == carrick_sched_core::Claim::Free
+        && retained.home().is_some_and(|slot| {
+            zone.slot(slot).current().is_none() && zone.slot(slot).host_record() == Some(record.id)
+        })
+}
+
+fn owned_control<'a>(
+    page: &'a ThreadLifecyclePage,
+    leader: &'a ThreadControlSlot,
+    address: u64,
+) -> Option<&'a ThreadControlSlot> {
+    if leader as *const _ as u64 == address {
+        return Some(leader);
+    }
+    for index in 0..page.entry_count() {
+        let (generation, state) = page.state(index)?;
+        if !matches!(
+            state,
+            carrick_el1_abi::EntryState::Born | carrick_el1_abi::EntryState::Published
+        ) {
+            continue;
+        }
+        let entry = EntryRef::new(index as u32, generation);
+        if page.control_address(entry) == Some(address) {
+            // SAFETY: the retained lifecycle owner licenses this address for
+            // this live entry. Stock is not reclaimed while the entry is live.
+            let control = unsafe { &*(address as *const ThreadControlSlot) };
+            return (control.entry() == Some(entry)).then_some(control);
+        }
+    }
+    None
+}
+
 /// Retained private task metadata. Slot zero belongs to a host-admitted leader;
 /// shared pool births use the exact entry index plus one, including fork leaders.
 pub struct NativeLifecycleResources<'a> {
@@ -334,8 +373,8 @@ struct Graph<'a, M: Clone, C: ProcessContext> {
     serials: SerialAllocator,
     pending: BTreeMap<TaskKey, PendingWait>,
     pending_exit: BTreeMap<TaskKey, PendingExit>,
-    signal_waits: BTreeMap<TaskKey, PendingSignalWait>,
-    suspend_masks: BTreeMap<TaskKey, carrick_signal_core::policy::SigBlockMask>,
+    signal_waits: BTreeMap<RecordRef, PendingSignalWait>,
+    suspend_masks: BTreeMap<RecordRef, carrick_signal_core::policy::SigBlockMask>,
     _root_roles: NativeClaim,
     uts: carrick_personality_linux::sysinfo::LinuxUtsname,
 }
@@ -387,21 +426,29 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         current: &CurrentTask,
     ) -> Option<NativeProcessSignals<carrick_personality_linux::abi::signal::LinuxSiginfo>> {
         let binding = super::common_entry::execution_binding(current);
-        let key = TaskKey {
-            id: TaskId::from_abi_positive(i32::try_from(binding.task.raw()).ok()?).ok()?,
-            serial: TaskSerial::from_raw_u64(binding.generation.raw())?,
-        };
+        let page = current.metadata.lifecycle_page.load(Ordering::Acquire);
+        let control_address = current.metadata.control_slot.load(Ordering::Acquire);
         let graph = self.graph.lock();
-        Some(
-            graph
-                .owner
-                .task(key)
-                .ok()?
-                .native()
-                .resources()
-                .signals
-                .clone(),
-        )
+        let (_, row) = graph.owner.tasks().iter().find(|(_, row)| {
+            let resources = row.native().resources();
+            resources.address.mm.raw().get() == binding.mm.raw()
+                && resources.page as *const _ as u64 == page
+        })?;
+        let resources = row.native().resources();
+        let control = owned_control(resources.page, resources.control, control_address)?;
+        let record = control
+            .zone_record()
+            .or_else(|| core::ptr::eq(resources.control, control).then_some(resources.record))?;
+        if !signal_record_exists(self.zone, record) {
+            return None;
+        }
+        let thread = self.zone.record(record.id).identity();
+        (thread.tid == binding.task.raw()
+            && thread.serial == binding.thread_generation.raw()
+            && thread.generation == binding.generation.raw()
+            && thread.mm == binding.mm.raw()
+            && thread.control_slot == control as *const _ as u64)
+            .then(|| resources.signals().clone())
     }
     #[allow(clippy::too_many_arguments)]
     pub fn admit_fresh_root<B: carrick_mmu_core::owner_mmu::OwnerForkMmu>(
@@ -588,24 +635,33 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .ok_or(NativeProcessError::Stale)?;
         carrick_core::entry::prepare_handoff(binding, source, record)
             .ok_or(NativeProcessError::Stale)?;
-        let key = TaskKey {
-            id: TaskId::from_abi_positive(
-                i32::try_from(binding.task.raw()).map_err(|_| NativeProcessError::Invalid)?,
-            )
-            .map_err(|_| NativeProcessError::Invalid)?,
-            serial: TaskSerial::from_raw_u64(binding.generation.raw())
-                .ok_or(NativeProcessError::Invalid)?,
-        };
+        let thread = source.zone.record(record).identity();
         let mut graph = self.graph.lock();
+        let key = graph
+            .owner
+            .tasks()
+            .iter()
+            .find_map(|(_, row)| {
+                let resources = row.native().resources();
+                (resources.address.mm.raw().get() == thread.mm
+                    && resources.page as *const _ as u64 == thread.lifecycle_page)
+                    .then_some(row.key())
+            })
+            .ok_or(NativeProcessError::Stale)?;
         let row = graph
             .owner
             .task_mut(key)
             .map_err(|_| NativeProcessError::Stale)?;
-        if row.native().resources().record != source.zone.record_ref(record)
-            || !words.authenticates(row.native().resources().address)
-        {
+        if !words.authenticates(row.native().resources().address) {
             return Err(NativeProcessError::Stale);
         }
+        let control = owned_control(
+            row.native().resources().page,
+            row.native().resources().control,
+            thread.control_slot,
+        )
+        .ok_or(NativeProcessError::Stale)?;
+        control.bind_zone_record(source.zone.record_ref(record));
         *row.context_mut() = words;
         let resources = row.native().resources();
         if current.metadata.lifecycle_page.load(Ordering::Acquire)
@@ -627,6 +683,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             runtime: self,
             source,
             binding,
+            record: source.zone.record_ref(record),
+            control,
             key,
             words,
             service,
@@ -645,23 +703,35 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .ok()
             .flatten()
     }
-    /// Resolve the sole owned live row from an authenticated scheduler record.
-    pub fn record_binding(&self, record: RecordRef) -> Option<NativeRecordBinding<M, C>> {
-        let identity = self.zone.record(record.id).identity();
-        let key = TaskKey {
-            id: TaskId::from_abi_positive(i32::try_from(identity.tid).ok()?).ok()?,
-            serial: TaskSerial::from_raw_u64(identity.generation)?,
-        };
+    /// Resolve the process and exact saved thread context.
+    ///
+    /// # Safety
+    /// The caller must hold exclusive execution custody of this record after
+    /// scheduler selection, so no other executor can mutate its saved context.
+    pub unsafe fn record_binding(&self, record: RecordRef) -> Option<NativeRecordBinding<M, C>> {
+        let live = self.zone.live(record)?;
+        let identity = live.identity();
         let graph = self.graph.lock();
-        let row = graph.owner.task(key).ok()?;
+        let (_, row) = graph.owner.tasks().iter().find(|(_, row)| {
+            let resources = row.native().resources();
+            resources.address.mm.raw().get() == identity.mm
+                && resources.page as *const _ as u64 == identity.lifecycle_page
+        })?;
         let resources = row.native().resources();
-        (resources.record == record).then(|| NativeRecordBinding {
-            key,
+        // SAFETY: the caller selected this exact Queued/OnCpu record after the
+        // scheduler handed it exclusive context custody. Fresh births initialized it.
+        let words = if resources.record == record {
+            *row.context()
+        } else {
+            unsafe { *live.ctx_mut() }
+        };
+        Some(NativeRecordBinding {
+            key: row.key(),
             visible_pid: row.metadata().namespace_pid,
             mm: resources.mm.clone(),
             address: resources.address,
-            words: *row.context(),
-            record: resources.record,
+            words,
+            record,
         })
     }
     pub fn task_binding(&self, key: TaskKey) -> Option<NativeRecordBinding<M, C>> {
@@ -693,6 +763,8 @@ pub struct NativeProcessEntry<
     runtime: &'r NativeProcessRuntime<'a, M, C>,
     source: BornInZoneSource<'a, C>,
     binding: ExecutionBinding,
+    record: RecordRef,
+    control: &'a ThreadControlSlot,
     key: TaskKey,
     words: C,
     service: &'r mut S,
@@ -742,6 +814,121 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             result: SyscallResult::new(0),
         }
     }
+    fn send_thread_signal(
+        &mut self,
+        group: Option<NonZeroU32>,
+        selector: carrick_personality_linux::signal::SignalThreadSelector,
+        sig: i32,
+        info: Option<carrick_personality_linux::abi::signal::LinuxSiginfo>,
+    ) -> Result<(), i32> {
+        use carrick_personality_linux::abi::signal::{LINUX_EINVAL, LINUX_ESRCH};
+        if !(0..=64).contains(&sig) {
+            return Err(LINUX_EINVAL.get());
+        }
+        let visible = selector.positive().ok_or(LINUX_ESRCH.get())?;
+        let graph = self.runtime.graph.lock();
+        let mut selected = None;
+        for (_, row) in graph.owner.tasks() {
+            if group.is_some_and(|group| group.get() != row.metadata().namespace_pid) {
+                continue;
+            }
+            let resources = row.native().resources();
+            if visible.get() == row.metadata().namespace_pid {
+                let record = if row.key() == self.key {
+                    self.record
+                } else {
+                    resources.control.zone_record().unwrap_or(resources.record)
+                };
+                if signal_record_exists(self.source.zone, record) {
+                    selected = Some((
+                        record,
+                        resources.signals().clone(),
+                        resources.channel.clone(),
+                    ));
+                    break;
+                }
+            }
+            for index in 0..resources.page.entry_count() {
+                let Some((generation, state)) = resources.page.state(index) else {
+                    continue;
+                };
+                if !matches!(
+                    state,
+                    carrick_el1_abi::EntryState::Born | carrick_el1_abi::EntryState::Published
+                ) {
+                    continue;
+                }
+                let entry = EntryRef::new(index as u32, generation);
+                let Some(identity) = resources.page.identity(entry) else {
+                    continue;
+                };
+                if identity.visible_tid != visible.get() {
+                    continue;
+                }
+                let Some(address) = resources.page.control_address(entry) else {
+                    continue;
+                };
+                // SAFETY: the lifecycle owner retains and authenticates this control
+                // address for this exact nonretired entry incarnation.
+                let control = unsafe { &*(address as *const ThreadControlSlot) };
+                if control.entry() != Some(entry) {
+                    continue;
+                }
+                let Some(record) = control.zone_record() else {
+                    continue;
+                };
+                let Some(live) = self.source.zone.live(record) else {
+                    continue;
+                };
+                let thread = live.identity();
+                if thread.tid != u64::from(identity.tid)
+                    || thread.serial != identity.thread_serial
+                    || thread.mm != resources.address.mm.raw().get()
+                    || thread.lifecycle_page != resources.page as *const _ as u64
+                    || thread.control_slot != address
+                {
+                    continue;
+                }
+                selected = Some((
+                    record,
+                    resources.signals().clone(),
+                    resources.channel.clone(),
+                ));
+                break;
+            }
+            if selected.is_some() {
+                break;
+            }
+        }
+        let (record, signals, channel) = selected.ok_or(LINUX_ESRCH.get())?;
+        if sig == 0 {
+            return Ok(());
+        }
+        let signal =
+            carrick_signal_core::policy::Signal::from_number(sig).ok_or(LINUX_EINVAL.get())?;
+        let sender = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| LINUX_ESRCH.get())?
+            .metadata()
+            .namespace_pid;
+        let info = info.unwrap_or_else(|| {
+            carrick_personality_linux::abi::signal::LinuxSiginfo::kill(
+                sig,
+                carrick_personality_linux::abi::signal::LINUX_SI_TKILL,
+                sender as i32,
+                0,
+            )
+        });
+        signals.enqueue_thread(record, signal, Some(info));
+        drop(graph);
+        if let Some(channel) = channel {
+            self.publish_channel(&channel)
+                .map_err(|e| -e.errno() as i32)?;
+        }
+        Ok(())
+    }
+
     pub fn take_root_exit(&mut self) -> Option<LinuxWaitStatus> {
         self.root_exit.take()
     }
@@ -988,7 +1175,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // SAFETY: this exact record is still authenticated OnCpu under its bucket guard.
         unsafe { *zone.record(record).ctx_mut() = self.words };
         self.runtime.graph.lock().signal_waits.insert(
-            self.key,
+            self.record,
             PendingSignalWait {
                 kind,
                 channel,
@@ -1001,7 +1188,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             carrick_el1_abi::EntryRecordGeneration(sequence),
         );
         if receipt.is_none() {
-            self.runtime.graph.lock().signal_waits.remove(&self.key);
+            self.runtime.graph.lock().signal_waits.remove(&self.record);
             return Err(NativeProcessError::Busy);
         }
         drop(guard);
@@ -1023,11 +1210,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let signals = resources.signals().clone();
             let mm = resources.mm.clone();
             let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
-                carrick_signal_core::SignalSet::from_bits(resources.control.blocked().0),
+                carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
             );
             drop(graph);
             if let PendingSignalKind::Wait { set, info } = pending.kind {
-                if let Some((signal, payload)) = signals.take_timedwait(self.task_id(), set) {
+                if let Some((signal, payload)) = signals.take_timedwait(self.record, set) {
                     if info.raw() != 0 {
                         let payload = payload.unwrap_or_else(|| {
                             carrick_abi::LinuxSiginfo::kill(
@@ -1042,7 +1229,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     return Ok(returned(i64::from(signal.number())));
                 }
             }
-            if signals.has_deliverable(self.task_id(), blocked) {
+            if signals.has_deliverable(self.record, blocked) {
                 return Ok(returned(
                     carrick_personality_linux::abi::signal::LINUX_EINTR.guest_retval(),
                 ));
@@ -1071,7 +1258,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// The execution lane calls this before returning a woken saved syscall to
     /// userspace. It consumes the retained wait operation instead of replaying it.
     pub fn resume_pending_wait(&mut self) -> Option<LifecycleOutcome> {
-        let signal_wait = self.runtime.graph.lock().signal_waits.remove(&self.key);
+        let signal_wait = self.runtime.graph.lock().signal_waits.remove(&self.record);
         if let Some(pending) = signal_wait {
             return Some(match self.resume_signal_wait(pending) {
                 Ok(outcome) => outcome,
@@ -2638,7 +2825,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 {
     fn force_sigsegv(
         &mut self,
-        tid: u32,
         blocked: carrick_signal_core::policy::SigBlockMask,
     ) -> Result<(), i32> {
         let graph = self.runtime.graph.lock();
@@ -2647,7 +2833,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .task(self.key)
             .map_err(|_| carrick_personality_linux::abi::signal::LINUX_ESRCH.get())?;
         row.native().resources().signals().force_sigsegv(
-            tid,
+            self.record,
             blocked,
             Some(carrick_personality_linux::abi::signal::LinuxSiginfo {
                 si_signo: carrick_signal_core::policy::Signal::SEGV.number(),
@@ -2682,8 +2868,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let Ok(row) = graph.owner.task(self.key) else {
             return 0;
         };
-        let tid = self.key.id.raw() as u32;
-        let pending = row.native().resources().signals().pending_set(tid);
+        let pending = row.native().resources().signals().pending_set(self.record);
         let blocked_pending = pending.intersect(blocked.signals());
         blocked_pending.bits()
     }
@@ -2817,44 +3002,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 
     fn tkill(
         &mut self,
-        tid: u32,
+        tid: carrick_personality_linux::signal::SignalThreadSelector,
         sig: i32,
         info: Option<carrick_personality_linux::abi::signal::LinuxSiginfo>,
     ) -> Result<(), i32> {
-        let einval = carrick_personality_linux::abi::signal::LINUX_EINVAL.get();
-        let esrch = carrick_personality_linux::abi::signal::LINUX_ESRCH.get();
-        if !(0..=64).contains(&sig) {
-            return Err(einval);
-        }
-        if sig == 0 {
-            return Ok(());
-        }
-        let signal = carrick_signal_core::policy::Signal::from_number(sig).ok_or(einval)?;
-        let graph = self.runtime.graph.lock();
-        let row = graph.owner.task(self.key).map_err(|_| esrch)?;
-        let info = info.unwrap_or_else(|| {
-            carrick_personality_linux::abi::signal::LinuxSiginfo::kill(
-                sig,
-                carrick_personality_linux::abi::signal::LINUX_SI_TKILL,
-                i32::from(self.source.slot.raw()),
-                0,
-            )
-        });
-        row.native()
-            .resources()
-            .signals()
-            .enqueue_thread(tid, signal, Some(info));
-        Ok(())
+        self.send_thread_signal(None, tid, sig, info)
     }
 
     fn tgkill(
         &mut self,
-        _tgid: u32,
-        tid: u32,
+        tgid: carrick_personality_linux::signal::SignalThreadSelector,
+        tid: carrick_personality_linux::signal::SignalThreadSelector,
         sig: i32,
         info: Option<carrick_personality_linux::abi::signal::LinuxSiginfo>,
     ) -> Result<(), i32> {
-        self.tkill(tid, sig, info)
+        let group = tgid.positive().ok_or(carrick_abi::LINUX_EINVAL.get())?;
+        self.send_thread_signal(Some(group), tid, sig, info)
     }
 
     fn rt_sigtimedwait(
@@ -2875,16 +3038,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .map_err(|_| carrick_personality_linux::abi::signal::LINUX_ESRCH.get())?;
             let resources = row.native().resources();
             let signals = resources.signals();
-            if let Some((signal, payload)) = signals.take_timedwait(self.task_id(), set) {
+            if let Some((signal, payload)) = signals.take_timedwait(self.record, set) {
                 return Ok(SignalWaitOutcome::Ready(signal, payload));
             }
             if timeout_ns == Some(0) {
                 return Err(carrick_personality_linux::abi::signal::LINUX_EAGAIN.get());
             }
             let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
-                carrick_signal_core::SignalSet::from_bits(resources.control.blocked().0),
+                carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
             );
-            if signals.has_deliverable(self.task_id(), blocked) {
+            if signals.has_deliverable(self.record, blocked) {
                 return Err(carrick_personality_linux::abi::signal::LINUX_EINTR.get());
             }
             let channel = resources
@@ -2931,7 +3094,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .graph
             .lock()
             .suspend_masks
-            .insert(self.key, original);
+            .insert(self.record, original);
         loop {
             let graph = self.runtime.graph.lock();
             let row = graph
@@ -2939,7 +3102,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .task(self.key)
                 .map_err(|_| carrick_personality_linux::abi::signal::LINUX_ESRCH.get())?;
             let signals = row.native().resources().signals();
-            let available = signals.has_deliverable(self.task_id(), mask);
+            let available = signals.has_deliverable(self.record, mask);
             let channel = row
                 .native()
                 .resources()
@@ -2955,19 +3118,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Ok(true) => return Ok(true),
                 Ok(false) => continue,
                 Err(error) => {
-                    self.runtime.graph.lock().suspend_masks.remove(&self.key);
+                    self.runtime.graph.lock().suspend_masks.remove(&self.record);
                     return Err(-error.errno() as i32);
                 }
             }
         }
     }
     fn take_suspend_mask(&mut self) -> Option<carrick_signal_core::policy::SigBlockMask> {
-        self.runtime.graph.lock().suspend_masks.remove(&self.key)
+        self.runtime.graph.lock().suspend_masks.remove(&self.record)
     }
 
     fn take_deliverable(
         &mut self,
-        tid: u32,
         blocked: carrick_signal_core::policy::SigBlockMask,
     ) -> Option<(
         carrick_signal_core::policy::Signal,
@@ -2979,7 +3141,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         row.native()
             .resources()
             .signals()
-            .take_deliverable(tid, blocked)
+            .take_deliverable(self.record, blocked)
     }
 }
 
@@ -3320,6 +3482,8 @@ mod tests {
         let mut entry = runtime
             .enter(source, &task, words(address), &mut service)
             .unwrap();
+        let selector = carrick_personality_linux::signal::SignalThreadSelector::from_abi(41);
+        assert_eq!(entry.tgkill(selector, selector, 0, None), Ok(()));
         assert!(matches!(
             entry.rt_sigtimedwait(set, Some(1000), UserVa::new(0)),
             Ok(SignalWaitOutcome::Pending)
@@ -3343,7 +3507,13 @@ mod tests {
         assert!(
             matches!(entry.resume_pending_wait(), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == -11)
         );
-        assert!(!runtime.graph.lock().signal_waits.contains_key(&entry.key));
+        assert!(
+            !runtime
+                .graph
+                .lock()
+                .signal_waits
+                .contains_key(&entry.record)
+        );
         assert!(zone.timer_owner(slot).is_none());
     }
 

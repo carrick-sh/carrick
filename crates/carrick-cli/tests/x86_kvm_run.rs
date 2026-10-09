@@ -701,3 +701,13 @@ fn mounted_static_x86_signal_wait_pingpong_matches_native() {
 fn mounted_static_x86_fork_reuses_retired_stock_matches_native() {
     compare_mounted_assembly_with_native("x86_fork_stock_reuse.S", b"R\n");
 }
+
+#[test]
+fn mounted_static_x86_signal_thread_identity_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_thread_identity.S", b"T\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_thread_child_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_thread_child.S", b"T\n");
+}
