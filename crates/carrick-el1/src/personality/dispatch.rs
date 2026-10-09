@@ -43,6 +43,12 @@ pub trait GuestDispatchFrame: SyscallFrame {
     fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64>;
     /// Distinguish an ISA-only refusal from a family or venue refusal.
     fn record_isa_unsupported_forward(&self) {}
+    /// Prepare an authenticated host-bound poll through the allowed
+    /// epoll_pwait transport. The ISA adapter restores syscall argument
+    /// registers after host completion.
+    fn prepare_host_poll_crossing(&mut self, _fds: u64, _nfds: u64, _timeout_ms: i32) -> bool {
+        false
+    }
 }
 
 impl GuestDispatchFrame for TrapFrame {
@@ -644,17 +650,20 @@ impl<
             return FamilyCompletion::Complete(-22);
         }
         let mut pollfds = alloc::vec![super::file_table::PollFd::default(); nfds];
-        let mut user = file::ValidatedCopy {
-            task,
-            validator: &file::HardwareValidator,
-        };
         let bytes = unsafe {
             core::slice::from_raw_parts_mut(
                 pollfds.as_mut_ptr() as *mut u8,
                 nfds * core::mem::size_of::<super::file_table::PollFd>(),
             )
         };
-        if !user.copy_in(bytes, fds_ptr) {
+        let copied = {
+            let mut user = file::ValidatedCopy {
+                task,
+                validator: &file::HardwareValidator,
+            };
+            user.copy_in(bytes, fds_ptr)
+        };
+        if !copied {
             return FamilyCompletion::Complete(-14);
         }
         let file_table = task
@@ -662,6 +671,26 @@ impl<
             .file_table
             .load(core::sync::atomic::Ordering::Acquire)
             .max(1);
+        let host_only = super::file_table::poll_has_only_host_bindings(
+            self.fd_map,
+            self.open_table,
+            file_table,
+            &pollfds,
+        );
+        if host_only
+            && self
+                .frame
+                .prepare_host_poll_crossing(fds_ptr, nfds as u64, timeout_ms)
+        {
+            return FamilyCompletion::Forward;
+        }
+        let Some(task) = self.task() else {
+            return FamilyCompletion::Forward;
+        };
+        let mut user = file::ValidatedCopy {
+            task,
+            validator: &file::HardwareValidator,
+        };
         let ready = super::file_table::resolve_poll(
             self.fd_map,
             self.open_table,

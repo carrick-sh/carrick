@@ -21,10 +21,10 @@ _start:
     syscall
     cmpw $0, 6(%rsp)
     jne bad_stdin
-    testw $POLLOUT, 14(%rsp)
-    jz bad_stdout
     cmp $1, %rax
     jne bad_count
+    testw $POLLOUT, 14(%rsp)
+    jz bad_stdout
     mov $SYS_write, %rax
     mov $1, %rdi
     lea ok(%rip), %rsi

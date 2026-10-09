@@ -399,6 +399,18 @@ mod kernel {
             carrick_personality_linux::crossing::HostCrossingSet::X86
         }
 
+        fn prepare_host_poll_crossing(&mut self, fds: u64, nfds: u64, timeout_ms: i32) -> bool {
+            if self.call.native.raw() != 7 {
+                return false;
+            }
+            self.frame.rax = AllowedHostCrossing::EpollPwait as u64;
+            self.frame.rdi = carrick_el1_abi::HostPollEpollBridge::EPOLL_FD_ARG;
+            self.frame.rsi = fds;
+            self.frame.rdx = nfds;
+            self.frame.r10 = timeout_ms as u64;
+            self.frame.rcx = carrick_el1_abi::HostPollEpollBridge::FRAME_TAG;
+            true
+        }
         fn arm_frame(&mut self) -> Option<&mut carrick_el1_abi::TrapFrame> { None }
         fn arm_frame_ref(&self) -> Option<&carrick_el1_abi::TrapFrame> { None }
         fn arm_scheduler(&self) -> bool { false }
@@ -1874,6 +1886,7 @@ mod kernel {
                 }).map_or(core::ptr::null_mut(), |address| address as *mut u8)
             };
             let mut root_exit = None;
+            let original_rcx = frame.rcx;
             let route = if fixture_dispatch_enabled!() {
                 let mut native = NativeDispatch {
                     frame, call, publications: &binding.publications,
@@ -1944,9 +1957,23 @@ mod kernel {
                 CompletionRoute::InvalidCompletion => {
                     doorbell(FATAL_PORT, frame); halt();
                 }
-                // The shared Linux completion owner already admitted an unported
-                // crossing, or preserved a family fallback/handback transport.
-                CompletionRoute::Forward => doorbell(FORWARD_PORT, frame),
+                CompletionRoute::Forward => {
+                    let bridge = call.native.raw() == 7
+                        && frame.rax == AllowedHostCrossing::EpollPwait as u64
+                        && carrick_el1_abi::HostPollEpollBridge::is_bridge(frame.rdi, frame.rcx);
+                    if bridge || AllowedHostCrossing::from_native(call.native.raw()).is_some() {
+                        doorbell(FORWARD_PORT, frame);
+                        if bridge {
+                            frame.rdi = call.args[0];
+                            frame.rsi = call.args[1];
+                            frame.rdx = call.args[2];
+                            frame.r10 = call.args[3];
+                            frame.rcx = original_rcx;
+                        }
+                    } else {
+                        record_refusal(counters, frame, Some(call.native.raw()));
+                    }
+                }
             }
         }
         binding.completions.fetch_add(1, Ordering::Relaxed);
