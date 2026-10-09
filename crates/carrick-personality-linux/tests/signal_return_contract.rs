@@ -105,3 +105,34 @@ fn pidfd_send_signal_retains_host_owner() {
     };
     assert_eq!(invoke(SignalCall::PidfdSendSignal, &mut native), None);
 }
+
+#[test]
+fn signal_delivery_waits_for_the_owned_completion_ledger() {
+    use carrick_personality_linux::{
+        abi::entry::{LinuxTaskState, ServedBoundary},
+        dispatch::CompletionRoute,
+    };
+    let state = LinuxTaskState::new();
+    assert!(signal_delivery_before_work(CompletionRoute::Served, &state));
+    state.mark_pending_host_work();
+    state.record_completed_with_work();
+    assert!(!signal_delivery_before_work(
+        CompletionRoute::WithWork,
+        &state
+    ));
+    // Consuming the completed outcome does not complete its owed work.
+    assert_eq!(
+        state.take_served_boundary(),
+        Some(ServedBoundary::Completed)
+    );
+    assert!(!signal_delivery_before_work(
+        CompletionRoute::Served,
+        &state
+    ));
+    state.clear_pending_host_work();
+    assert!(signal_delivery_before_work(CompletionRoute::Served, &state));
+    assert!(!signal_delivery_before_work(
+        CompletionRoute::Forward,
+        &state
+    ));
+}
