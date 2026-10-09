@@ -835,6 +835,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .ok_or(NativeProcessError::Exhausted)?;
         let (resources, published) = {
             let mut graph = self.runtime.graph.lock();
+            let caller_tid = self.calling_tid;
+            if let Ok(task) = graph.owner.task_mut(self.key)
+                && let Ok(uids) = task.credentials_for(caller_tid).map(|c| (c.ruid, c.euid))
+            {
+                task.metadata_mut().ruid = uids.0;
+                task.metadata_mut().euid = uids.1;
+            }
             native_process_entry::publish_exit(
                 &mut graph.owner,
                 self.key,
@@ -961,13 +968,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let session = row.metadata().namespace_session;
             let signals = row.native().resources().signals.clone();
             let caller_tid = self.calling_tid;
-            let parent_creds = row.credentials_for(caller_tid).clone();
+            let parent_creds = row
+                .credentials_for(caller_tid)
+                .map_err(|_| NativeProcessError::Stale)?
+                .clone();
             let parent_rlimits = row.rlimits;
             let parent_umask = row.umask;
             let parent_personality = row.personality;
             let parent_dumpable = row.dumpable;
             let parent_no_new_privs = row.no_new_privs;
-            let parent_comm = *row.comm_for(caller_tid);
+            let parent_comm = *row
+                .comm_for(caller_tid)
+                .map_err(|_| NativeProcessError::Stale)?;
             let snapshot = graph
                 .owner
                 .capture_parent(self.key)
@@ -1351,7 +1363,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn thread_spawned(&mut self, caller_tid: u32, child_tid: u32) {
         let mut graph = self.runtime.graph.lock();
         if let Ok(task) = graph.owner.task_mut(self.key) {
-            task.spawn_thread(caller_tid, child_tid);
+            let _ = task.spawn_thread(caller_tid, child_tid);
         }
     }
     fn thread_exited(&mut self, tid: u32) {
@@ -1385,12 +1397,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .task_mut(self.key)
                 .map_err(|_| NativeProcessError::Stale)?;
             let leader_pid = task.metadata().namespace_pid;
-            let (creds, comm, comm_len) =
-                task.threads
-                    .exec_completed(caller_tid, leader_pid, path, &task.credentials);
+            let (creds, comm, comm_len) = task
+                .threads
+                .exec_completed(caller_tid, leader_pid, path)
+                .map_err(|_| NativeProcessError::Stale)?;
             task.has_execed = true;
-            task.credentials = creds.clone();
-            task.comm = comm;
             task.metadata_mut().ruid = creds.ruid;
             task.metadata_mut().euid = creds.euid;
             task.metadata_mut().diagnostic_name.clear();
@@ -1421,15 +1432,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
         let caller_tid = self.calling_tid;
         let is_leader = caller_tid == task.metadata().namespace_pid;
-        let cloned = {
-            let creds = task.credentials_for_mut(caller_tid);
-            f(creds)?;
-            if is_leader { Some(creds.clone()) } else { None }
-        };
-        if let Some(cloned) = cloned {
+        let creds = task.credentials_for_mut(caller_tid)?;
+        f(creds)?;
+        if is_leader {
+            let cloned = creds.clone();
             task.metadata_mut().ruid = cloned.ruid;
             task.metadata_mut().euid = cloned.euid;
-            task.credentials = cloned;
         }
         Ok(())
     }
@@ -1441,32 +1449,32 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
 {
     fn get_uids(&self) -> (u32, u32, u32, u32) {
         let graph = self.runtime.graph.lock();
-        if let Ok(task) = graph.owner.task(self.key) {
-            let creds = task.credentials_for(self.calling_tid);
-            (
+        if let Ok(task) = graph.owner.task(self.key)
+            && let Ok(creds) = task.credentials_for(self.calling_tid)
+        {
+            return (
                 creds.ruid.raw(),
                 creds.euid.raw(),
                 creds.suid.raw(),
                 creds.fsuid.raw(),
-            )
-        } else {
-            (0, 0, 0, 0)
+            );
         }
+        (0, 0, 0, 0)
     }
 
     fn get_gids(&self) -> (u32, u32, u32, u32) {
         let graph = self.runtime.graph.lock();
-        if let Ok(task) = graph.owner.task(self.key) {
-            let creds = task.credentials_for(self.calling_tid);
-            (
+        if let Ok(task) = graph.owner.task(self.key)
+            && let Ok(creds) = task.credentials_for(self.calling_tid)
+        {
+            return (
                 creds.rgid.raw(),
                 creds.egid.raw(),
                 creds.sgid.raw(),
                 creds.fsgid.raw(),
-            )
-        } else {
-            (0, 0, 0, 0)
+            );
         }
+        (0, 0, 0, 0)
     }
 
     fn set_resuid(&mut self, r: Option<u32>, e: Option<u32>, s: Option<u32>) -> Result<(), i64> {
@@ -1517,7 +1525,10 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             .owner
             .task(self.key)
             .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
-        if !task.credentials_for(self.calling_tid).is_gid_privileged() {
+        let creds = task
+            .credentials_for(self.calling_tid)
+            .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
+        if !creds.is_gid_privileged() {
             return Err(carrick_personality_linux::identity::EPERM);
         }
         Ok(())
@@ -1528,20 +1539,22 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         graph
             .owner
             .task(self.key)
-            .map(|t| t.credentials_for(self.calling_tid).groups.len())
+            .ok()
+            .and_then(|t| {
+                t.credentials_for(self.calling_tid)
+                    .ok()
+                    .map(|c| c.groups.len())
+            })
             .unwrap_or(0)
     }
 
     fn get_groups(&self, out: &mut alloc::vec::Vec<u32>) {
         let graph = self.runtime.graph.lock();
-        if let Ok(task) = graph.owner.task(self.key) {
+        if let Ok(task) = graph.owner.task(self.key)
+            && let Ok(creds) = task.credentials_for(self.calling_tid)
+        {
             out.clear();
-            out.extend(
-                task.credentials_for(self.calling_tid)
-                    .groups
-                    .iter()
-                    .map(|g| g.raw()),
-            );
+            out.extend(creds.groups.iter().map(|g| g.raw()));
         }
     }
 
@@ -1573,7 +1586,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             .task(self.key)
             .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
         if pid == 0 {
-            let creds = caller.credentials_for(self.calling_tid);
+            let creds = caller.credentials_for(self.calling_tid)?;
             return Ok(carrick_personality_linux::identity::TaskCapabilities {
                 effective: creds.cap_effective,
                 permitted: creds.cap_permitted,
@@ -1582,7 +1595,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         }
         let target_tid = pid as u32;
         if target_tid == caller.metadata().namespace_pid || caller.has_thread(target_tid) {
-            let creds = caller.credentials_for(target_tid);
+            let creds = caller.credentials_for(target_tid)?;
             return Ok(carrick_personality_linux::identity::TaskCapabilities {
                 effective: creds.cap_effective,
                 permitted: creds.cap_permitted,
@@ -1593,7 +1606,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             .owner
             .find_task_by_pid(target_tid)
             .ok_or(carrick_personality_linux::identity::ESRCH)?;
-        let creds = target.credentials_for(target_tid);
+        let creds = target.credentials_for(target_tid)?;
         Ok(carrick_personality_linux::identity::TaskCapabilities {
             effective: creds.cap_effective,
             permitted: creds.cap_permitted,
@@ -1617,8 +1630,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         if target_tid != caller_tid && target_tid != caller_pid && !task.has_thread(target_tid) {
             return Err(carrick_personality_linux::identity::EPERM);
         }
-        let is_leader = target_tid == caller_pid;
-        let caller_creds = task.credentials_for(caller_tid);
+        let caller_creds = task.credentials_for(caller_tid)?;
         if !caller_creds.cap_permitted.contains(caps.permitted) {
             return Err(carrick_personality_linux::identity::EPERM);
         }
@@ -1633,20 +1645,10 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
                 return Err(carrick_personality_linux::identity::EPERM);
             }
         }
-        let cloned = {
-            let target_creds = task.credentials_for_mut(target_tid);
-            target_creds.cap_effective = caps.effective;
-            target_creds.cap_permitted = caps.permitted;
-            target_creds.cap_inheritable = caps.inheritable;
-            if is_leader {
-                Some(target_creds.clone())
-            } else {
-                None
-            }
-        };
-        if let Some(cloned) = cloned {
-            task.credentials = cloned;
-        }
+        let target_creds = task.credentials_for_mut(target_tid)?;
+        target_creds.cap_effective = caps.effective;
+        target_creds.cap_permitted = caps.permitted;
+        target_creds.cap_inheritable = caps.inheritable;
         Ok(())
     }
 
@@ -1817,7 +1819,11 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
     fn prctl_get_name(&self, buf: &mut [u8; 16]) {
         let graph = self.runtime.graph.lock();
         if let Ok(task) = graph.owner.task(self.key) {
-            *buf = *task.comm_for(self.calling_tid);
+            if let Ok(comm) = task.comm_for(self.calling_tid) {
+                *buf = *comm;
+            } else {
+                buf.fill(0);
+            }
         } else {
             buf.fill(0);
         }
@@ -1828,9 +1834,10 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         if let Ok(task) = graph.owner.task_mut(self.key) {
             let caller_tid = self.calling_tid;
             let is_leader = caller_tid == task.metadata().namespace_pid;
-            *task.comm_for_mut(caller_tid) = *name;
+            if let Ok(comm) = task.comm_for_mut(caller_tid) {
+                *comm = *name;
+            }
             if is_leader {
-                task.comm = *name;
                 let len = name.iter().position(|&b| b == 0).unwrap_or(16);
                 if let Ok(s) = core::str::from_utf8(&name[..len]) {
                     task.metadata_mut().diagnostic_name = alloc::string::String::from(s);
@@ -1925,7 +1932,10 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             .owner
             .task(self.key)
             .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
-        if !task.credentials_for(self.calling_tid).is_admin_privileged() {
+        let creds = task
+            .credentials_for(self.calling_tid)
+            .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
+        if !creds.is_admin_privileged() {
             return Err(carrick_personality_linux::sysinfo::EPERM);
         }
         Ok(())
@@ -1937,7 +1947,10 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             .owner
             .task(self.key)
             .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
-        if !task.credentials_for(self.calling_tid).is_admin_privileged() {
+        let creds = task
+            .credentials_for(self.calling_tid)
+            .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
+        if !creds.is_admin_privileged() {
             return Err(carrick_personality_linux::sysinfo::EPERM);
         }
         graph.uts.set_nodename(name);
@@ -1950,7 +1963,10 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             .owner
             .task(self.key)
             .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
-        if !task.credentials_for(self.calling_tid).is_admin_privileged() {
+        let creds = task
+            .credentials_for(self.calling_tid)
+            .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
+        if !creds.is_admin_privileged() {
             return Err(carrick_personality_linux::sysinfo::EPERM);
         }
         Ok(())
@@ -1962,7 +1978,10 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             .owner
             .task(self.key)
             .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
-        if !task.credentials_for(self.calling_tid).is_admin_privileged() {
+        let creds = task
+            .credentials_for(self.calling_tid)
+            .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
+        if !creds.is_admin_privileged() {
             return Err(carrick_personality_linux::sysinfo::EPERM);
         }
         graph.uts.set_domainname(name);
@@ -2000,11 +2019,10 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         if limit.rlim_cur > limit.rlim_max {
             return Err(carrick_personality_linux::sysinfo::EINVAL);
         }
-        if limit.rlim_max > old.rlim_max
-            && !task
-                .credentials_for(self.calling_tid)
-                .is_resource_privileged()
-        {
+        let creds = task
+            .credentials_for(self.calling_tid)
+            .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
+        if limit.rlim_max > old.rlim_max && !creds.is_resource_privileged() {
             return Err(carrick_personality_linux::sysinfo::EPERM);
         }
         task.rlimits.set(resource, limit);
@@ -2023,7 +2041,9 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             .task(self.key)
             .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
         let caller_pid = caller.metadata().namespace_pid;
-        let caller_creds = caller.credentials_for(self.calling_tid);
+        let caller_creds = caller
+            .credentials_for(self.calling_tid)
+            .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
         let caller_privileged = caller_creds.is_resource_privileged();
         let caller_ruid = caller_creds.ruid;
         let caller_rgid = caller_creds.rgid;
@@ -2034,7 +2054,9 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
                 .owner
                 .find_task_by_pid(target_pid)
                 .ok_or(carrick_personality_linux::sysinfo::ESRCH)?;
-            let target_creds = target.credentials_for(target.metadata().namespace_pid);
+            let target_creds = target
+                .credentials_for(target.metadata().namespace_pid)
+                .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
             let uids_match = caller_ruid == target_creds.ruid
                 && caller_ruid == target_creds.euid
                 && caller_ruid == target_creds.suid;
@@ -2980,6 +3002,7 @@ mod tests {
         let mut comm_worker = [0u8; 16];
         entry.set_calling_tid(41);
         entry.prctl_set_name(b"leader\0\0\0\0\0\0\0\0\0\0");
+        entry.thread_spawned(41, 42);
         entry.set_calling_tid(42);
         entry.prctl_set_name(b"worker\0\0\0\0\0\0\0\0\0\0");
 
@@ -3024,7 +3047,7 @@ mod tests {
             .owner
             .find_task_by_pid(child_pid)
             .expect("child task found");
-        let child_creds = child_task.credentials_for(child_pid);
+        let child_creds = child_task.credentials_for(child_pid).unwrap();
         assert_eq!(
             (
                 child_creds.ruid.raw(),
@@ -3034,7 +3057,7 @@ mod tests {
             ),
             (1000, 1000, 1000, 1000)
         );
-        let child_comm = child_task.comm_for(child_pid);
+        let child_comm = child_task.comm_for(child_pid).unwrap();
         assert_eq!(&child_comm[..7], b"worker\0");
     }
 
@@ -3219,6 +3242,7 @@ mod tests {
         );
 
         // 2. Thread-2 setuid(1000) then execve -> getuid() == 1000
+        parent_entry.thread_spawned(41, 42);
         parent_entry.set_calling_tid(42);
         parent_entry.set_uid(1000).unwrap();
         assert_eq!(parent_entry.get_uids().0, 1000);
@@ -3335,5 +3359,125 @@ mod tests {
         // The list must stay bounded to just the leader thread.
         assert_eq!(t.threads.threads.len(), 1);
         assert_eq!(t.has_thread(1050), false);
+    }
+
+    #[test]
+    fn non_leader_credential_changes_and_calling_thread_authority() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let child_page = Box::new(ThreadLifecyclePage::new());
+        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        }));
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        let key = TaskKey {
+            id: TaskId::from_abi_positive(41).unwrap(),
+            serial: TaskSerial::from_raw_u64(11).unwrap(),
+        };
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &*child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+        };
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        use carrick_personality_linux::identity::ProcessIdentityVenue;
+
+        // 1. Unregistered TID lookup must be an explicit error, not silent fallback to leader
+        {
+            let graph = runtime.graph.lock();
+            let t = graph.owner.task(key).unwrap();
+            assert_eq!(
+                t.credentials_for(9999),
+                Err(carrick_personality_linux::identity::ESRCH)
+            );
+        }
+
+        // 2. Caller TID 9999 attempting modify_credentials returns ESRCH
+        entry.set_calling_tid(9999);
+        assert_eq!(
+            entry.set_uid(1000),
+            Err(carrick_personality_linux::identity::ESRCH)
+        );
+
+        // 3. Spawning thread 42 from leader 41
+        entry.set_calling_tid(41);
+        entry.thread_spawned(41, 42);
+
+        // 4. Thread 42 changes credentials to uid 1000
+        entry.set_calling_tid(42);
+        entry.set_uid(1000).unwrap();
+        assert_eq!(entry.get_uids().0, 1000);
+
+        // Leader 41 credentials remain root (0)
+        entry.set_calling_tid(41);
+        assert_eq!(entry.get_uids().0, 0);
+
+        // 5. Thread 43 spawned from thread 42 inherits thread 42 credentials (uid 1000)
+        entry.thread_spawned(42, 43);
+        entry.set_calling_tid(43);
+        assert_eq!(entry.get_uids().0, 1000);
+
+        // 6. Spawning from unknown caller TID 8888 fails with ESRCH
+        {
+            let mut graph = runtime.graph.lock();
+            let t = graph.owner.task_mut(key).unwrap();
+            assert_eq!(
+                t.spawn_thread(8888, 44),
+                Err(carrick_personality_linux::identity::ESRCH)
+            );
+        }
     }
 }

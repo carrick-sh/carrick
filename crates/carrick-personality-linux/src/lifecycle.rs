@@ -679,12 +679,7 @@ fn serve_clone<'a>(
         return None;
     }
     native.enqueue_born(record);
-    let caller_tid = thread
-        .slot
-        .visible_tid()
-        .filter(|&t| t != 0)
-        .or_else(|| native.process_pid())
-        .unwrap_or(0);
+    let caller_tid = thread.slot.visible_tid().unwrap_or(0);
     native.thread_spawned(caller_tid, identity.visible_tid);
     Some(visible as u32)
 }

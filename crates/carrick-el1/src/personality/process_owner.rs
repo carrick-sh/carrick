@@ -86,7 +86,6 @@ pub struct GuestTask<C, U, N: NativeProcessCustody> {
     tracer: Option<TaskKey>,
     tracees: BTreeSet<TaskKey>,
     children_rusage: TaskRusage,
-    pub credentials: TaskCredentials,
     pub rlimits: RlimitSet,
     pub umask: u32,
     pub personality: u64,
@@ -95,7 +94,6 @@ pub struct GuestTask<C, U, N: NativeProcessCustody> {
     pub no_new_privs: bool,
     pub child_subreaper: bool,
     pub has_execed: bool,
-    pub comm: [u8; 16],
     pub threads: GuestThreads,
 }
 
@@ -129,76 +127,51 @@ impl GuestThreads {
     }
 
     #[inline(never)]
-    pub fn credentials_for<'a>(
-        &'a self,
-        tid: u32,
-        fallback: &'a TaskCredentials,
-    ) -> &'a TaskCredentials {
+    pub fn credentials_for(&self, tid: u32) -> Result<&TaskCredentials, i64> {
         self.threads
             .iter()
             .find(|t| t.tid == tid)
             .map(|t| &t.credentials)
-            .unwrap_or(fallback)
+            .ok_or(carrick_personality_linux::identity::ESRCH)
     }
 
     #[inline(never)]
-    pub fn credentials_for_mut(
-        &mut self,
-        tid: u32,
-        default_creds: &TaskCredentials,
-        default_comm: [u8; 16],
-    ) -> &mut TaskCredentials {
-        if !self.has_thread(tid) {
-            self.threads.push(GuestThreadState {
-                tid,
-                credentials: default_creds.clone(),
-                comm: default_comm,
-            });
-        }
-        &mut self
-            .threads
+    pub fn credentials_for_mut(&mut self, tid: u32) -> Result<&mut TaskCredentials, i64> {
+        self.threads
             .iter_mut()
             .find(|t| t.tid == tid)
-            .unwrap()
-            .credentials
+            .map(|t| &mut t.credentials)
+            .ok_or(carrick_personality_linux::identity::ESRCH)
     }
 
     #[inline(never)]
-    pub fn comm_for<'a>(&'a self, tid: u32, fallback: &'a [u8; 16]) -> &'a [u8; 16] {
+    pub fn comm_for(&self, tid: u32) -> Result<&[u8; 16], i64> {
         self.threads
             .iter()
             .find(|t| t.tid == tid)
             .map(|t| &t.comm)
-            .unwrap_or(fallback)
+            .ok_or(carrick_personality_linux::identity::ESRCH)
     }
 
     #[inline(never)]
-    pub fn comm_for_mut(
-        &mut self,
-        tid: u32,
-        default_creds: &TaskCredentials,
-        default_comm: [u8; 16],
-    ) -> &mut [u8; 16] {
-        if !self.has_thread(tid) {
-            self.threads.push(GuestThreadState {
-                tid,
-                credentials: default_creds.clone(),
-                comm: default_comm,
-            });
-        }
-        &mut self.threads.iter_mut().find(|t| t.tid == tid).unwrap().comm
+    pub fn comm_for_mut(&mut self, tid: u32) -> Result<&mut [u8; 16], i64> {
+        self.threads
+            .iter_mut()
+            .find(|t| t.tid == tid)
+            .map(|t| &mut t.comm)
+            .ok_or(carrick_personality_linux::identity::ESRCH)
     }
 
     #[inline(never)]
-    pub fn spawn_thread(
-        &mut self,
-        caller_tid: u32,
-        child_tid: u32,
-        fallback_creds: &TaskCredentials,
-        fallback_comm: &[u8; 16],
-    ) {
-        let creds = self.credentials_for(caller_tid, fallback_creds).clone();
-        let comm = *self.comm_for(caller_tid, fallback_comm);
+    pub fn spawn_thread(&mut self, caller_tid: u32, child_tid: u32) -> Result<(), i64> {
+        let (creds, comm) = {
+            let caller = self
+                .threads
+                .iter()
+                .find(|t| t.tid == caller_tid)
+                .ok_or(carrick_personality_linux::identity::ESRCH)?;
+            (caller.credentials.clone(), caller.comm)
+        };
         if let Some(entry) = self.threads.iter_mut().find(|t| t.tid == child_tid) {
             entry.credentials = creds;
             entry.comm = comm;
@@ -209,6 +182,7 @@ impl GuestThreads {
                 comm,
             });
         }
+        Ok(())
     }
 
     #[inline(never)]
@@ -232,14 +206,13 @@ impl GuestThreads {
         caller_tid: u32,
         leader_pid: u32,
         path: &[u8],
-        fallback_creds: &TaskCredentials,
-    ) -> (TaskCredentials, [u8; 16], usize) {
-        let mut creds = self.credentials_for(caller_tid, fallback_creds).clone();
+    ) -> Result<(TaskCredentials, [u8; 16], usize), i64> {
+        let mut creds = self.credentials_for(caller_tid)?.clone();
         creds.apply_exec();
         let comm = basename_comm(path);
         self.reset_single(leader_pid, creds.clone(), comm);
         let comm_len = comm.iter().position(|&b| b == 0).unwrap_or(15);
-        (creds, comm, comm_len)
+        Ok((creds, comm, comm_len))
     }
 }
 
@@ -282,7 +255,6 @@ impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
             tracer: None,
             tracees: BTreeSet::new(),
             children_rusage: TaskRusage::default(),
-            credentials: TaskCredentials::ROOT,
             rlimits: RlimitSet::DEFAULT,
             umask: 0o022,
             personality: 0,
@@ -291,14 +263,11 @@ impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
             no_new_privs: false,
             child_subreaper: false,
             has_execed: false,
-            comm: [0u8; 16],
             threads: GuestThreads::new(leader_tid),
         }
     }
     #[inline]
     pub fn init_leader(&mut self, tid: u32, creds: TaskCredentials, comm: [u8; 16]) {
-        self.credentials = creds.clone();
-        self.comm = comm;
         self.threads.reset_single(tid, creds, comm);
     }
     #[inline]
@@ -306,32 +275,34 @@ impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
         self.threads.has_thread(tid)
     }
     #[inline]
-    pub fn credentials_for(&self, tid: u32) -> &TaskCredentials {
-        self.threads.credentials_for(tid, &self.credentials)
+    pub fn credentials_for(&self, tid: u32) -> Result<&TaskCredentials, i64> {
+        self.threads.credentials_for(tid)
     }
     #[inline]
-    pub fn credentials_for_mut(&mut self, tid: u32) -> &mut TaskCredentials {
-        self.threads
-            .credentials_for_mut(tid, &self.credentials, self.comm)
+    pub fn credentials_for_mut(&mut self, tid: u32) -> Result<&mut TaskCredentials, i64> {
+        self.threads.credentials_for_mut(tid)
     }
     #[inline]
-    pub fn comm_for(&self, tid: u32) -> &[u8; 16] {
-        self.threads.comm_for(tid, &self.comm)
+    pub fn comm_for(&self, tid: u32) -> Result<&[u8; 16], i64> {
+        self.threads.comm_for(tid)
     }
     #[inline]
-    pub fn comm_for_mut(&mut self, tid: u32) -> &mut [u8; 16] {
-        self.threads.comm_for_mut(tid, &self.credentials, self.comm)
+    pub fn comm_for_mut(&mut self, tid: u32) -> Result<&mut [u8; 16], i64> {
+        self.threads.comm_for_mut(tid)
     }
     #[inline]
-    pub fn spawn_thread(&mut self, caller_tid: u32, child_tid: u32) {
-        self.threads
-            .spawn_thread(caller_tid, child_tid, &self.credentials, &self.comm);
+    pub fn spawn_thread(&mut self, caller_tid: u32, child_tid: u32) -> Result<(), i64> {
+        self.threads.spawn_thread(caller_tid, child_tid)
     }
     #[inline]
     pub fn remove_thread(&mut self, tid: u32) {
         if tid != self.metadata.namespace_pid {
             self.threads.remove_thread(tid);
         }
+    }
+    #[inline]
+    pub fn leader_credentials(&self) -> Result<&TaskCredentials, i64> {
+        self.credentials_for(self.metadata.namespace_pid)
     }
     pub fn key(&self) -> TaskKey {
         self.metadata.key
