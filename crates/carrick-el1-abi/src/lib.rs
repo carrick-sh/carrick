@@ -2063,6 +2063,14 @@ pub enum NativeForkFailureStage {
     PrepareReservation = 22,
     PrepareWait = 23,
     PrepareUnsupportedExecutableCow = 24,
+    PrepareMappingCapacity = 25,
+    PrepareReadCapacity = 26,
+    PrepareChildCapacity = 27,
+    PrepareParentCapacity = 28,
+    PrepareCustodyCapacity = 29,
+    PrepareUnclassifiedCapacity = 30,
+    PrepareEditCapacity = 31,
+    PrepareControlArenaCapacity = 32,
 }
 
 impl NativeForkFailureStage {
@@ -2092,6 +2100,14 @@ impl NativeForkFailureStage {
             22 => Self::PrepareReservation,
             23 => Self::PrepareWait,
             24 => Self::PrepareUnsupportedExecutableCow,
+            25 => Self::PrepareMappingCapacity,
+            26 => Self::PrepareReadCapacity,
+            27 => Self::PrepareChildCapacity,
+            28 => Self::PrepareParentCapacity,
+            29 => Self::PrepareCustodyCapacity,
+            30 => Self::PrepareUnclassifiedCapacity,
+            31 => Self::PrepareEditCapacity,
+            32 => Self::PrepareControlArenaCapacity,
             _ => return None,
         })
     }
