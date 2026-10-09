@@ -429,30 +429,10 @@ mod kernel {
     pub static CARRICK_CPL0_ISA_UNSUPPORTED_FORWARDS: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
 
-    /// Host crossings allowed to leave CPL0 as forwards.
-    pub use carrick_personality_linux::crossing::AllowedHostCrossing;
-
-    fn record_refusal(counters: &Counters, frame: &mut NativeFrame, native: Option<u64>) {
-        frame.rax = (-38_i64) as u64;
-        let bucket = match native {
-            Some(nr) if nr < 512 => {
-                match carrick_syscall_abi::syscall_x86_64::lookup_x86_64(nr) {
-                    Some(entry)
-                        if !matches!(
-                            entry.remap,
-                            carrick_syscall_abi::syscall_x86_64::SyscallRemap::Unknown
-                                | carrick_syscall_abi::syscall_x86_64::SyscallRemap::Private(_)
-                        ) =>
-                    {
-                        nr as usize
-                    }
-                    _ => 512,
-                }
-            }
-            _ => 512,
-        };
-        counters.refused[bucket].fetch_add(1, Ordering::Relaxed);
-    }
+    /// Host crossing evaluation and set from shared personality.
+    pub use carrick_personality_linux::crossing::{
+        evaluate_host_crossing, AllowedHostCrossing, HostCrossingDecision, HostCrossingSet,
+    };
 
     // The KVM fault fixture owns one exact MM and one host-backed prepared
     // page. These records stay live across the native syscall boundary.
@@ -1859,7 +1839,14 @@ mod kernel {
         }
         let Some(call) = carrick_personality_linux::entry::decode_x86_snapshot(frame.snapshot())
         else {
-            record_refusal(counters, frame, None);
+            evaluate_host_crossing(
+                HostCrossingSet::X86,
+                true,
+                None,
+                None,
+                Some(&counters.refused),
+                |ret| frame.rax = ret as u64,
+            );
             binding.completions.fetch_add(1, Ordering::Relaxed);
             fixture_stmt! { if binding.scheduler_witness.load(Ordering::Acquire)
                 == super::scheduler::PROGRESS_STATE {
@@ -1960,10 +1947,16 @@ mod kernel {
                     doorbell(FATAL_PORT, frame); halt();
                 }
                 CompletionRoute::Forward => {
-                    if AllowedHostCrossing::from_canonical_x86(call.canonical).is_some() {
+                    let decision = evaluate_host_crossing(
+                        HostCrossingSet::X86,
+                        true,
+                        Some(call.canonical),
+                        Some(call.native.raw()),
+                        Some(&counters.refused),
+                        |ret| frame.rax = ret as u64,
+                    );
+                    if decision == HostCrossingDecision::Forward {
                         doorbell(FORWARD_PORT, frame);
-                    } else {
-                        record_refusal(counters, frame, Some(call.native.raw()));
                     }
                 }
             }

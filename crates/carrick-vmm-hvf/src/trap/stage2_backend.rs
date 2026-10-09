@@ -930,14 +930,7 @@ pub(crate) fn map_exclusive_region(
             host.add(carrick_el1_abi::EL1_APERTURE_CONTROL_OFFSET as usize)
                 as *mut carrick_el1_abi::ApertureControl
         };
-        if crate::hatch::ArmRingFirstHatch::is_strict() {
-            unsafe {
-                (*aperture_ptr).control.fetch_or(
-                    carrick_el1_abi::APERTURE_CONTROL_ARM_RING_FIRST_STRICT,
-                    std::sync::atomic::Ordering::Release,
-                );
-            }
-        }
+        crate::hatch::ArmRingFirstHatch::configure_aperture(unsafe { &*aperture_ptr });
     }
     Ok((host, size, host_mapping))
 }
