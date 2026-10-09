@@ -1940,6 +1940,13 @@ mod kernel {
                 let words = native_execution::capture(frame, _early_xstate);
                 native_process::admit_root(words, source, task)
                     .unwrap_or_else(|_| initial_boot::fatal_boot());
+                let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
+                if binding.stdio_table_admitted.load(Ordering::Acquire) != file_table {
+                    carrick_el1::personality::file_table::admit_stdio(
+                        fd_map(), &OPEN_TABLE, &OBJECT_TABLE, file_table, [true; 3],
+                    );
+                    binding.stdio_table_admitted.store(file_table, Ordering::Release);
+                }
                 let mut service = native_process::Service::new(task, slot);
                 let route = {
                     let mut process = native_process::runtime().enter(source, task, words, &mut service)
@@ -2005,7 +2012,9 @@ mod kernel {
                             frame.rax = result;
                             handled_in_ring = true;
                         }
-                        if !handled_in_ring && carrick_el1::personality::file_table::is_closed_stdio_tombstone(fd_map(), table, guest_fd) {
+                        if !handled_in_ring && (0..=2).contains(&guest_fd)
+                            && carrick_el1_abi::fd_map_lookup(fd_map(), table, guest_fd).is_none()
+                        {
                             frame.rax = (-9_i64) as u64;
                             handled_in_ring = true;
                         }

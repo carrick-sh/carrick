@@ -61,7 +61,8 @@ fn tombstone_index(fd_map: &[FdMapSlot], file_table: u64, fd: i32) -> Option<usi
     })
 }
 
-pub fn is_closed_stdio_tombstone(fd_map: &[FdMapSlot], file_table: u64, fd: i32) -> bool {
+#[cfg(test)]
+fn is_closed_stdio_tombstone(fd_map: &[FdMapSlot], file_table: u64, fd: i32) -> bool {
     (0..=2).contains(&fd) && tombstone_index(fd_map, file_table, fd).is_some()
 }
 
@@ -266,7 +267,9 @@ pub fn admit_stdio(
             _ => HostObjectBinding::STDERR,
         };
         let ufd = fd as u32;
-        if fd_map_lookup(fd_map, file_table, fd as i32).is_some() {
+        if fd_map_lookup(fd_map, file_table, fd as i32).is_some()
+            || tombstone_index(fd_map, file_table, fd as i32).is_some()
+        {
             continue;
         }
         let Some(slot) = fd_map.iter().take(FD_MAP_CAPACITY).find(|s| s.try_claim()) else {
@@ -807,6 +810,17 @@ mod tests {
             None
         );
         assert_eq!(fd_map[child_index].fd_flags.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn readmitting_a_table_does_not_reopen_explicitly_closed_stdio() {
+        let (fd_map, open_table, object_table) = setup_tables();
+        admit_stdio(&fd_map, &open_table, &object_table, 10, [true; 3]);
+        assert!(close_host_binding(&fd_map, 10, 1).is_some());
+        assert!(is_closed_stdio_tombstone(&fd_map, 10, 1));
+        admit_stdio(&fd_map, &open_table, &object_table, 10, [true; 3]);
+        assert_eq!(fd_map_lookup(&fd_map, 10, 1), None);
+        assert!(is_closed_stdio_tombstone(&fd_map, 10, 1));
     }
 
     #[test]
