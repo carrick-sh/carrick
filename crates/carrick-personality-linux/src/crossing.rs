@@ -4,9 +4,147 @@
 //! `CompletionRoute::Forward`. Used by both ARM EL1 and x86 CPL0.
 //!
 //! Syscalls outside this table must not reach the host when strict ring-first
-//! enforcement is active; they are answered with counted `-ENOSYS` (-38).
+//! enforcement is active; they are answered with counted `-ENOSYS`.
 
-use carrick_syscall_abi::CanonicalNr;
+use carrick_syscall_abi::{CanonicalNr, LinuxErrno};
+
+/// Linux ENOSYS errno in typed domain.
+pub const LINUX_ENOSYS: LinuxErrno = LinuxErrno::new(38);
+
+/// Canonical syscall identities permitted to cross to host.
+pub mod nr {
+    use carrick_syscall_abi::CanonicalNr;
+
+    // Host file contents & filesystem metadata (73 syscalls):
+    pub const SETXATTR: CanonicalNr = CanonicalNr(5);
+    pub const LSETXATTR: CanonicalNr = CanonicalNr(6);
+    pub const FSETXATTR: CanonicalNr = CanonicalNr(7);
+    pub const GETXATTR: CanonicalNr = CanonicalNr(8);
+    pub const LGETXATTR: CanonicalNr = CanonicalNr(9);
+    pub const FGETXATTR: CanonicalNr = CanonicalNr(10);
+    pub const LISTXATTR: CanonicalNr = CanonicalNr(11);
+    pub const LLISTXATTR: CanonicalNr = CanonicalNr(12);
+    pub const FLISTXATTR: CanonicalNr = CanonicalNr(13);
+    pub const REMOVEXATTR: CanonicalNr = CanonicalNr(14);
+    pub const LREMOVEXATTR: CanonicalNr = CanonicalNr(15);
+    pub const FREMOVEXATTR: CanonicalNr = CanonicalNr(16);
+    pub const GETCWD: CanonicalNr = CanonicalNr(17);
+    pub const IOCTL: CanonicalNr = CanonicalNr(29);
+    pub const FLOCK: CanonicalNr = CanonicalNr(32);
+    pub const MKNODAT: CanonicalNr = CanonicalNr(33);
+    pub const MKDIRAT: CanonicalNr = CanonicalNr(34);
+    pub const UNLINKAT: CanonicalNr = CanonicalNr(35);
+    pub const SYMLINKAT: CanonicalNr = CanonicalNr(36);
+    pub const LINKAT: CanonicalNr = CanonicalNr(37);
+    pub const RENAMEAT: CanonicalNr = CanonicalNr(38);
+    pub const STATFS: CanonicalNr = CanonicalNr(43);
+    pub const FSTATFS: CanonicalNr = CanonicalNr(44);
+    pub const TRUNCATE: CanonicalNr = CanonicalNr(45);
+    pub const FTRUNCATE: CanonicalNr = CanonicalNr(46);
+    pub const FALLOCATE: CanonicalNr = CanonicalNr(47);
+    pub const FACCESSAT: CanonicalNr = CanonicalNr(48);
+    pub const CHDIR: CanonicalNr = CanonicalNr(49);
+    pub const FCHDIR: CanonicalNr = CanonicalNr(50);
+    pub const CHROOT: CanonicalNr = CanonicalNr(51);
+    pub const FCHMOD: CanonicalNr = CanonicalNr(52);
+    pub const FCHMODAT: CanonicalNr = CanonicalNr(53);
+    pub const FCHOWNAT: CanonicalNr = CanonicalNr(54);
+    pub const FCHOWN: CanonicalNr = CanonicalNr(55);
+    pub const OPENAT: CanonicalNr = CanonicalNr(56);
+    pub const GETDENTS64: CanonicalNr = CanonicalNr(61);
+    pub const LSEEK: CanonicalNr = CanonicalNr(62);
+    pub const READ: CanonicalNr = CanonicalNr(63);
+    pub const WRITE: CanonicalNr = CanonicalNr(64);
+    pub const READV: CanonicalNr = CanonicalNr(65);
+    pub const WRITEV: CanonicalNr = CanonicalNr(66);
+    pub const PREAD64: CanonicalNr = CanonicalNr(67);
+    pub const PWRITE64: CanonicalNr = CanonicalNr(68);
+    pub const PREADV: CanonicalNr = CanonicalNr(69);
+    pub const PWRITEV: CanonicalNr = CanonicalNr(70);
+    pub const SENDFILE: CanonicalNr = CanonicalNr(71);
+    pub const PSELECT6: CanonicalNr = CanonicalNr(72);
+    pub const PPOLL: CanonicalNr = CanonicalNr(73);
+    pub const VMSPLICE: CanonicalNr = CanonicalNr(75);
+    pub const SPLICE: CanonicalNr = CanonicalNr(76);
+    pub const TEE: CanonicalNr = CanonicalNr(77);
+    pub const READLINKAT: CanonicalNr = CanonicalNr(78);
+    pub const NEWFSTATAT: CanonicalNr = CanonicalNr(79);
+    pub const FSTAT: CanonicalNr = CanonicalNr(80);
+    pub const SYNC: CanonicalNr = CanonicalNr(81);
+    pub const FSYNC: CanonicalNr = CanonicalNr(82);
+    pub const FDATASYNC: CanonicalNr = CanonicalNr(83);
+    pub const SYNC_FILE_RANGE: CanonicalNr = CanonicalNr(84);
+    pub const UTIMENSAT: CanonicalNr = CanonicalNr(88);
+    pub const EXECVE: CanonicalNr = CanonicalNr(221);
+    pub const MSYNC: CanonicalNr = CanonicalNr(227);
+    pub const MLOCK: CanonicalNr = CanonicalNr(228);
+    pub const MUNLOCK: CanonicalNr = CanonicalNr(229);
+    pub const MINCORE: CanonicalNr = CanonicalNr(232);
+    pub const MADVISE: CanonicalNr = CanonicalNr(233);
+    pub const SYNCFS: CanonicalNr = CanonicalNr(267);
+    pub const RENAMEAT2: CanonicalNr = CanonicalNr(276);
+    pub const MLOCK2: CanonicalNr = CanonicalNr(284);
+    pub const COPY_FILE_RANGE: CanonicalNr = CanonicalNr(285);
+    pub const PREADV2: CanonicalNr = CanonicalNr(286);
+    pub const PWRITEV2: CanonicalNr = CanonicalNr(287);
+    pub const STATX: CanonicalNr = CanonicalNr(291);
+    pub const OPENAT2: CanonicalNr = CanonicalNr(437);
+    pub const FACCESSAT2: CanonicalNr = CanonicalNr(439);
+    pub const FCHMODAT2: CanonicalNr = CanonicalNr(452);
+
+    // Host network & BSD sockets (18 syscalls):
+    pub const SOCKET: CanonicalNr = CanonicalNr(198);
+    pub const SOCKETPAIR: CanonicalNr = CanonicalNr(199);
+    pub const BIND: CanonicalNr = CanonicalNr(200);
+    pub const LISTEN: CanonicalNr = CanonicalNr(201);
+    pub const ACCEPT: CanonicalNr = CanonicalNr(202);
+    pub const CONNECT: CanonicalNr = CanonicalNr(203);
+    pub const GETSOCKNAME: CanonicalNr = CanonicalNr(204);
+    pub const GETPEERNAME: CanonicalNr = CanonicalNr(205);
+    pub const SENDTO: CanonicalNr = CanonicalNr(206);
+    pub const RECVFROM: CanonicalNr = CanonicalNr(207);
+    pub const SETSOCKOPT: CanonicalNr = CanonicalNr(208);
+    pub const GETSOCKOPT: CanonicalNr = CanonicalNr(209);
+    pub const SHUTDOWN: CanonicalNr = CanonicalNr(210);
+    pub const SENDMSG: CanonicalNr = CanonicalNr(211);
+    pub const RECVMSG: CanonicalNr = CanonicalNr(212);
+    pub const ACCEPT4: CanonicalNr = CanonicalNr(242);
+    pub const RECVMMSG: CanonicalNr = CanonicalNr(243);
+    pub const SENDMMSG: CanonicalNr = CanonicalNr(269);
+
+    // Host clock & hardware time (6 syscalls):
+    pub const NANOSLEEP: CanonicalNr = CanonicalNr(101);
+    pub const CLOCK_GETTIME: CanonicalNr = CanonicalNr(113);
+    pub const CLOCK_GETRES: CanonicalNr = CanonicalNr(114);
+    pub const CLOCK_NANOSLEEP: CanonicalNr = CanonicalNr(115);
+    pub const TIMES: CanonicalNr = CanonicalNr(153);
+    pub const GETTIMEOFDAY: CanonicalNr = CanonicalNr(169);
+
+    // Host hardware entropy (1 syscall):
+    pub const GETRANDOM: CanonicalNr = CanonicalNr(278);
+
+    // Temporary-forward compat-zone fd rows (16 syscalls):
+    pub const EVENTFD2: CanonicalNr = CanonicalNr(19);
+    pub const EPOLL_CREATE1: CanonicalNr = CanonicalNr(20);
+    pub const EPOLL_CTL: CanonicalNr = CanonicalNr(21);
+    pub const EPOLL_PWAIT: CanonicalNr = CanonicalNr(22);
+    pub const DUP: CanonicalNr = CanonicalNr(23);
+    pub const DUP3: CanonicalNr = CanonicalNr(24);
+    pub const FCNTL: CanonicalNr = CanonicalNr(25);
+    pub const INOTIFY_INIT1: CanonicalNr = CanonicalNr(26);
+    pub const CLOSE: CanonicalNr = CanonicalNr(57);
+    pub const PIPE2: CanonicalNr = CanonicalNr(59);
+    pub const SIGNALFD4: CanonicalNr = CanonicalNr(74);
+    pub const TIMERFD_CREATE: CanonicalNr = CanonicalNr(85);
+    pub const TIMERFD_SETTIME: CanonicalNr = CanonicalNr(86);
+    pub const TIMERFD_GETTIME: CanonicalNr = CanonicalNr(87);
+    pub const CLOSE_RANGE: CanonicalNr = CanonicalNr(436);
+    pub const EPOLL_PWAIT2: CanonicalNr = CanonicalNr(441);
+
+    // x86-only host exit crossings (Wire-in-ring on ARM):
+    pub const EXIT: CanonicalNr = CanonicalNr(93);
+    pub const EXIT_GROUP: CanonicalNr = CanonicalNr(94);
+}
 
 /// Identifies syscalls permitted to cross to the host carrier.
 ///
@@ -16,134 +154,134 @@ use carrick_syscall_abi::CanonicalNr;
 #[repr(u64)]
 pub enum AllowedHostCrossing {
     // Host file contents & filesystem metadata (73 syscalls):
-    Setxattr = 5,
-    Lsetxattr = 6,
-    Fsetxattr = 7,
-    Getxattr = 8,
-    Lgetxattr = 9,
-    Fgetxattr = 10,
-    Listxattr = 11,
-    Llistxattr = 12,
-    Flistxattr = 13,
-    Removexattr = 14,
-    Lremovexattr = 15,
-    Fremovexattr = 16,
-    Getcwd = 17,
-    Ioctl = 29,
-    Flock = 32,
-    Mknodat = 33,
-    Mkdirat = 34,
-    Unlinkat = 35,
-    Symlinkat = 36,
-    Linkat = 37,
-    Renameat = 38,
-    Statfs = 43,
-    Fstatfs = 44,
-    Truncate = 45,
-    Ftruncate = 46,
-    Fallocate = 47,
-    Faccessat = 48,
-    Chdir = 49,
-    Fchdir = 50,
-    Chroot = 51,
-    Fchmod = 52,
-    Fchmodat = 53,
-    Fchownat = 54,
-    Fchown = 55,
-    Openat = 56,
-    Getdents64 = 61,
-    Lseek = 62,
-    Read = 63,
-    Write = 64,
-    Readv = 65,
-    Writev = 66,
-    Pread64 = 67,
-    Pwrite64 = 68,
-    Preadv = 69,
-    Pwritev = 70,
-    Sendfile = 71,
-    Pselect6 = 72,
-    Ppoll = 73,
-    Vmsplice = 75,
-    Splice = 76,
-    Tee = 77,
-    Readlinkat = 78,
-    Newfstatat = 79,
-    Fstat = 80,
-    Sync = 81,
-    Fsync = 82,
-    Fdatasync = 83,
-    SyncFileRange = 84,
-    Utimensat = 88,
-    Execve = 221,
-    Msync = 227,
-    Mlock = 228,
-    Munlock = 229,
-    Mincore = 232,
-    Madvise = 233,
-    Syncfs = 267,
-    Renameat2 = 276,
-    Mlock2 = 284,
-    CopyFileRange = 285,
-    Preadv2 = 286,
-    Pwritev2 = 287,
-    Statx = 291,
-    Openat2 = 437,
-    Faccessat2 = 439,
-    Fchmodat2 = 452,
+    Setxattr = nr::SETXATTR.raw(),
+    Lsetxattr = nr::LSETXATTR.raw(),
+    Fsetxattr = nr::FSETXATTR.raw(),
+    Getxattr = nr::GETXATTR.raw(),
+    Lgetxattr = nr::LGETXATTR.raw(),
+    Fgetxattr = nr::FGETXATTR.raw(),
+    Listxattr = nr::LISTXATTR.raw(),
+    Llistxattr = nr::LLISTXATTR.raw(),
+    Flistxattr = nr::FLISTXATTR.raw(),
+    Removexattr = nr::REMOVEXATTR.raw(),
+    Lremovexattr = nr::LREMOVEXATTR.raw(),
+    Fremovexattr = nr::FREMOVEXATTR.raw(),
+    Getcwd = nr::GETCWD.raw(),
+    Ioctl = nr::IOCTL.raw(),
+    Flock = nr::FLOCK.raw(),
+    Mknodat = nr::MKNODAT.raw(),
+    Mkdirat = nr::MKDIRAT.raw(),
+    Unlinkat = nr::UNLINKAT.raw(),
+    Symlinkat = nr::SYMLINKAT.raw(),
+    Linkat = nr::LINKAT.raw(),
+    Renameat = nr::RENAMEAT.raw(),
+    Statfs = nr::STATFS.raw(),
+    Fstatfs = nr::FSTATFS.raw(),
+    Truncate = nr::TRUNCATE.raw(),
+    Ftruncate = nr::FTRUNCATE.raw(),
+    Fallocate = nr::FALLOCATE.raw(),
+    Faccessat = nr::FACCESSAT.raw(),
+    Chdir = nr::CHDIR.raw(),
+    Fchdir = nr::FCHDIR.raw(),
+    Chroot = nr::CHROOT.raw(),
+    Fchmod = nr::FCHMOD.raw(),
+    Fchmodat = nr::FCHMODAT.raw(),
+    Fchownat = nr::FCHOWNAT.raw(),
+    Fchown = nr::FCHOWN.raw(),
+    Openat = nr::OPENAT.raw(),
+    Getdents64 = nr::GETDENTS64.raw(),
+    Lseek = nr::LSEEK.raw(),
+    Read = nr::READ.raw(),
+    Write = nr::WRITE.raw(),
+    Readv = nr::READV.raw(),
+    Writev = nr::WRITEV.raw(),
+    Pread64 = nr::PREAD64.raw(),
+    Pwrite64 = nr::PWRITE64.raw(),
+    Preadv = nr::PREADV.raw(),
+    Pwritev = nr::PWRITEV.raw(),
+    Sendfile = nr::SENDFILE.raw(),
+    Pselect6 = nr::PSELECT6.raw(),
+    Ppoll = nr::PPOLL.raw(),
+    Vmsplice = nr::VMSPLICE.raw(),
+    Splice = nr::SPLICE.raw(),
+    Tee = nr::TEE.raw(),
+    Readlinkat = nr::READLINKAT.raw(),
+    Newfstatat = nr::NEWFSTATAT.raw(),
+    Fstat = nr::FSTAT.raw(),
+    Sync = nr::SYNC.raw(),
+    Fsync = nr::FSYNC.raw(),
+    Fdatasync = nr::FDATASYNC.raw(),
+    SyncFileRange = nr::SYNC_FILE_RANGE.raw(),
+    Utimensat = nr::UTIMENSAT.raw(),
+    Execve = nr::EXECVE.raw(),
+    Msync = nr::MSYNC.raw(),
+    Mlock = nr::MLOCK.raw(),
+    Munlock = nr::MUNLOCK.raw(),
+    Mincore = nr::MINCORE.raw(),
+    Madvise = nr::MADVISE.raw(),
+    Syncfs = nr::SYNCFS.raw(),
+    Renameat2 = nr::RENAMEAT2.raw(),
+    Mlock2 = nr::MLOCK2.raw(),
+    CopyFileRange = nr::COPY_FILE_RANGE.raw(),
+    Preadv2 = nr::PREADV2.raw(),
+    Pwritev2 = nr::PWRITEV2.raw(),
+    Statx = nr::STATX.raw(),
+    Openat2 = nr::OPENAT2.raw(),
+    Faccessat2 = nr::FACCESSAT2.raw(),
+    Fchmodat2 = nr::FCHMODAT2.raw(),
 
     // Host network & BSD sockets (18 syscalls):
-    Socket = 198,
-    Socketpair = 199,
-    Bind = 200,
-    Listen = 201,
-    Accept = 202,
-    Connect = 203,
-    Getsockname = 204,
-    Getpeername = 205,
-    Sendto = 206,
-    Recvfrom = 207,
-    Setsockopt = 208,
-    Getsockopt = 209,
-    Shutdown = 210,
-    Sendmsg = 211,
-    Recvmsg = 212,
-    Accept4 = 242,
-    Recvmmsg = 243,
-    Sendmmsg = 269,
+    Socket = nr::SOCKET.raw(),
+    Socketpair = nr::SOCKETPAIR.raw(),
+    Bind = nr::BIND.raw(),
+    Listen = nr::LISTEN.raw(),
+    Accept = nr::ACCEPT.raw(),
+    Connect = nr::CONNECT.raw(),
+    Getsockname = nr::GETSOCKNAME.raw(),
+    Getpeername = nr::GETPEERNAME.raw(),
+    Sendto = nr::SENDTO.raw(),
+    Recvfrom = nr::RECVFROM.raw(),
+    Setsockopt = nr::SETSOCKOPT.raw(),
+    Getsockopt = nr::GETSOCKOPT.raw(),
+    Shutdown = nr::SHUTDOWN.raw(),
+    Sendmsg = nr::SENDMSG.raw(),
+    Recvmsg = nr::RECVMSG.raw(),
+    Accept4 = nr::ACCEPT4.raw(),
+    Recvmmsg = nr::RECVMMSG.raw(),
+    Sendmmsg = nr::SENDMMSG.raw(),
 
     // Host clock & hardware time (6 syscalls):
-    Nanosleep = 101,
-    ClockGettime = 113,
-    ClockGetres = 114,
-    ClockNanosleep = 115,
-    Times = 153,
-    Gettimeofday = 169,
+    Nanosleep = nr::NANOSLEEP.raw(),
+    ClockGettime = nr::CLOCK_GETTIME.raw(),
+    ClockGetres = nr::CLOCK_GETRES.raw(),
+    ClockNanosleep = nr::CLOCK_NANOSLEEP.raw(),
+    Times = nr::TIMES.raw(),
+    Gettimeofday = nr::GETTIMEOFDAY.raw(),
 
     // Host hardware entropy (1 syscall):
-    Getrandom = 278,
+    Getrandom = nr::GETRANDOM.raw(),
 
     // Temporary-forward compat-zone fd rows (16 syscalls):
-    Eventfd2 = 19,
-    EpollCreate1 = 20,
-    EpollCtl = 21,
-    EpollPwait = 22,
-    Dup = 23,
-    Dup3 = 24,
-    Fcntl = 25,
-    InotifyInit1 = 26,
-    Close = 57,
-    Pipe2 = 59,
-    Signalfd4 = 74,
-    TimerfdCreate = 85,
-    TimerfdSettime = 86,
-    TimerfdGettime = 87,
-    CloseRange = 436,
-    EpollPwait2 = 441,
+    Eventfd2 = nr::EVENTFD2.raw(),
+    EpollCreate1 = nr::EPOLL_CREATE1.raw(),
+    EpollCtl = nr::EPOLL_CTL.raw(),
+    EpollPwait = nr::EPOLL_PWAIT.raw(),
+    Dup = nr::DUP.raw(),
+    Dup3 = nr::DUP3.raw(),
+    Fcntl = nr::FCNTL.raw(),
+    InotifyInit1 = nr::INOTIFY_INIT1.raw(),
+    Close = nr::CLOSE.raw(),
+    Pipe2 = nr::PIPE2.raw(),
+    Signalfd4 = nr::SIGNALFD4.raw(),
+    TimerfdCreate = nr::TIMERFD_CREATE.raw(),
+    TimerfdSettime = nr::TIMERFD_SETTIME.raw(),
+    TimerfdGettime = nr::TIMERFD_GETTIME.raw(),
+    CloseRange = nr::CLOSE_RANGE.raw(),
+    EpollPwait2 = nr::EPOLL_PWAIT2.raw(),
 
     // x86-only host exit crossings (Wire-in-ring on ARM):
-    Exit = 93,
-    ExitGroup = 94,
+    Exit = nr::EXIT.raw(),
+    ExitGroup = nr::EXIT_GROUP.raw(),
 }
 
 impl AllowedHostCrossing {
@@ -156,18 +294,17 @@ impl AllowedHostCrossing {
     /// Match an allowed host crossing for x86 CPL0.
     ///
     /// Preserves exactly the eight historical x86 host crossings:
-    /// read (63), write (64), lseek (62), pread64 (67), pwrite64 (68),
-    /// exit (93), exit_group (94), epoll_pwait (22).
+    /// read, write, lseek, pread64, pwrite64, exit, exit_group, epoll_pwait.
     pub const fn from_canonical_x86(canonical: CanonicalNr) -> Option<Self> {
-        match canonical.raw() {
-            63 => Some(Self::Read),
-            64 => Some(Self::Write),
-            62 => Some(Self::Lseek),
-            67 => Some(Self::Pread64),
-            68 => Some(Self::Pwrite64),
-            93 => Some(Self::Exit),
-            94 => Some(Self::ExitGroup),
-            22 => Some(Self::EpollPwait),
+        match canonical {
+            nr::READ => Some(Self::Read),
+            nr::WRITE => Some(Self::Write),
+            nr::LSEEK => Some(Self::Lseek),
+            nr::PREAD64 => Some(Self::Pread64),
+            nr::PWRITE64 => Some(Self::Pwrite64),
+            nr::EXIT => Some(Self::Exit),
+            nr::EXIT_GROUP => Some(Self::ExitGroup),
+            nr::EPOLL_PWAIT => Some(Self::EpollPwait),
             _ => None,
         }
     }
@@ -176,125 +313,125 @@ impl AllowedHostCrossing {
     ///
     /// Covers the 100 Forward-Allowlist rows (host files, network, clock,
     /// entropy) and the 16 Temporary-forward fd rows. Excludes in-ring
-    /// handlers (such as exit=93, exit_group=94).
+    /// handlers (such as exit, exit_group).
     pub const fn from_canonical_aarch64(canonical: CanonicalNr) -> Option<Self> {
-        match canonical.raw() {
-            5 => Some(Self::Setxattr),
-            6 => Some(Self::Lsetxattr),
-            7 => Some(Self::Fsetxattr),
-            8 => Some(Self::Getxattr),
-            9 => Some(Self::Lgetxattr),
-            10 => Some(Self::Fgetxattr),
-            11 => Some(Self::Listxattr),
-            12 => Some(Self::Llistxattr),
-            13 => Some(Self::Flistxattr),
-            14 => Some(Self::Removexattr),
-            15 => Some(Self::Lremovexattr),
-            16 => Some(Self::Fremovexattr),
-            17 => Some(Self::Getcwd),
-            19 => Some(Self::Eventfd2),
-            20 => Some(Self::EpollCreate1),
-            21 => Some(Self::EpollCtl),
-            22 => Some(Self::EpollPwait),
-            23 => Some(Self::Dup),
-            24 => Some(Self::Dup3),
-            25 => Some(Self::Fcntl),
-            26 => Some(Self::InotifyInit1),
-            29 => Some(Self::Ioctl),
-            32 => Some(Self::Flock),
-            33 => Some(Self::Mknodat),
-            34 => Some(Self::Mkdirat),
-            35 => Some(Self::Unlinkat),
-            36 => Some(Self::Symlinkat),
-            37 => Some(Self::Linkat),
-            38 => Some(Self::Renameat),
-            43 => Some(Self::Statfs),
-            44 => Some(Self::Fstatfs),
-            45 => Some(Self::Truncate),
-            46 => Some(Self::Ftruncate),
-            47 => Some(Self::Fallocate),
-            48 => Some(Self::Faccessat),
-            49 => Some(Self::Chdir),
-            50 => Some(Self::Fchdir),
-            51 => Some(Self::Chroot),
-            52 => Some(Self::Fchmod),
-            53 => Some(Self::Fchmodat),
-            54 => Some(Self::Fchownat),
-            55 => Some(Self::Fchown),
-            56 => Some(Self::Openat),
-            57 => Some(Self::Close),
-            59 => Some(Self::Pipe2),
-            61 => Some(Self::Getdents64),
-            62 => Some(Self::Lseek),
-            63 => Some(Self::Read),
-            64 => Some(Self::Write),
-            65 => Some(Self::Readv),
-            66 => Some(Self::Writev),
-            67 => Some(Self::Pread64),
-            68 => Some(Self::Pwrite64),
-            69 => Some(Self::Preadv),
-            70 => Some(Self::Pwritev),
-            71 => Some(Self::Sendfile),
-            72 => Some(Self::Pselect6),
-            73 => Some(Self::Ppoll),
-            74 => Some(Self::Signalfd4),
-            75 => Some(Self::Vmsplice),
-            76 => Some(Self::Splice),
-            77 => Some(Self::Tee),
-            78 => Some(Self::Readlinkat),
-            79 => Some(Self::Newfstatat),
-            80 => Some(Self::Fstat),
-            81 => Some(Self::Sync),
-            82 => Some(Self::Fsync),
-            83 => Some(Self::Fdatasync),
-            84 => Some(Self::SyncFileRange),
-            85 => Some(Self::TimerfdCreate),
-            86 => Some(Self::TimerfdSettime),
-            87 => Some(Self::TimerfdGettime),
-            88 => Some(Self::Utimensat),
-            101 => Some(Self::Nanosleep),
-            113 => Some(Self::ClockGettime),
-            114 => Some(Self::ClockGetres),
-            115 => Some(Self::ClockNanosleep),
-            153 => Some(Self::Times),
-            169 => Some(Self::Gettimeofday),
-            198 => Some(Self::Socket),
-            199 => Some(Self::Socketpair),
-            200 => Some(Self::Bind),
-            201 => Some(Self::Listen),
-            202 => Some(Self::Accept),
-            203 => Some(Self::Connect),
-            204 => Some(Self::Getsockname),
-            205 => Some(Self::Getpeername),
-            206 => Some(Self::Sendto),
-            207 => Some(Self::Recvfrom),
-            208 => Some(Self::Setsockopt),
-            209 => Some(Self::Getsockopt),
-            210 => Some(Self::Shutdown),
-            211 => Some(Self::Sendmsg),
-            212 => Some(Self::Recvmsg),
-            221 => Some(Self::Execve),
-            227 => Some(Self::Msync),
-            228 => Some(Self::Mlock),
-            229 => Some(Self::Munlock),
-            232 => Some(Self::Mincore),
-            233 => Some(Self::Madvise),
-            242 => Some(Self::Accept4),
-            243 => Some(Self::Recvmmsg),
-            267 => Some(Self::Syncfs),
-            269 => Some(Self::Sendmmsg),
-            276 => Some(Self::Renameat2),
-            278 => Some(Self::Getrandom),
-            284 => Some(Self::Mlock2),
-            285 => Some(Self::CopyFileRange),
-            286 => Some(Self::Preadv2),
-            287 => Some(Self::Pwritev2),
-            291 => Some(Self::Statx),
-            436 => Some(Self::CloseRange),
-            437 => Some(Self::Openat2),
-            439 => Some(Self::Faccessat2),
-            441 => Some(Self::EpollPwait2),
-            452 => Some(Self::Fchmodat2),
+        match canonical {
+            nr::SETXATTR => Some(Self::Setxattr),
+            nr::LSETXATTR => Some(Self::Lsetxattr),
+            nr::FSETXATTR => Some(Self::Fsetxattr),
+            nr::GETXATTR => Some(Self::Getxattr),
+            nr::LGETXATTR => Some(Self::Lgetxattr),
+            nr::FGETXATTR => Some(Self::Fgetxattr),
+            nr::LISTXATTR => Some(Self::Listxattr),
+            nr::LLISTXATTR => Some(Self::Llistxattr),
+            nr::FLISTXATTR => Some(Self::Flistxattr),
+            nr::REMOVEXATTR => Some(Self::Removexattr),
+            nr::LREMOVEXATTR => Some(Self::Lremovexattr),
+            nr::FREMOVEXATTR => Some(Self::Fremovexattr),
+            nr::GETCWD => Some(Self::Getcwd),
+            nr::EVENTFD2 => Some(Self::Eventfd2),
+            nr::EPOLL_CREATE1 => Some(Self::EpollCreate1),
+            nr::EPOLL_CTL => Some(Self::EpollCtl),
+            nr::EPOLL_PWAIT => Some(Self::EpollPwait),
+            nr::DUP => Some(Self::Dup),
+            nr::DUP3 => Some(Self::Dup3),
+            nr::FCNTL => Some(Self::Fcntl),
+            nr::INOTIFY_INIT1 => Some(Self::InotifyInit1),
+            nr::IOCTL => Some(Self::Ioctl),
+            nr::FLOCK => Some(Self::Flock),
+            nr::MKNODAT => Some(Self::Mknodat),
+            nr::MKDIRAT => Some(Self::Mkdirat),
+            nr::UNLINKAT => Some(Self::Unlinkat),
+            nr::SYMLINKAT => Some(Self::Symlinkat),
+            nr::LINKAT => Some(Self::Linkat),
+            nr::RENAMEAT => Some(Self::Renameat),
+            nr::STATFS => Some(Self::Statfs),
+            nr::FSTATFS => Some(Self::Fstatfs),
+            nr::TRUNCATE => Some(Self::Truncate),
+            nr::FTRUNCATE => Some(Self::Ftruncate),
+            nr::FALLOCATE => Some(Self::Fallocate),
+            nr::FACCESSAT => Some(Self::Faccessat),
+            nr::CHDIR => Some(Self::Chdir),
+            nr::FCHDIR => Some(Self::Fchdir),
+            nr::CHROOT => Some(Self::Chroot),
+            nr::FCHMOD => Some(Self::Fchmod),
+            nr::FCHMODAT => Some(Self::Fchmodat),
+            nr::FCHOWNAT => Some(Self::Fchownat),
+            nr::FCHOWN => Some(Self::Fchown),
+            nr::OPENAT => Some(Self::Openat),
+            nr::CLOSE => Some(Self::Close),
+            nr::PIPE2 => Some(Self::Pipe2),
+            nr::GETDENTS64 => Some(Self::Getdents64),
+            nr::LSEEK => Some(Self::Lseek),
+            nr::READ => Some(Self::Read),
+            nr::WRITE => Some(Self::Write),
+            nr::READV => Some(Self::Readv),
+            nr::WRITEV => Some(Self::Writev),
+            nr::PREAD64 => Some(Self::Pread64),
+            nr::PWRITE64 => Some(Self::Pwrite64),
+            nr::PREADV => Some(Self::Preadv),
+            nr::PWRITEV => Some(Self::Pwritev),
+            nr::SENDFILE => Some(Self::Sendfile),
+            nr::PSELECT6 => Some(Self::Pselect6),
+            nr::PPOLL => Some(Self::Ppoll),
+            nr::SIGNALFD4 => Some(Self::Signalfd4),
+            nr::VMSPLICE => Some(Self::Vmsplice),
+            nr::SPLICE => Some(Self::Splice),
+            nr::TEE => Some(Self::Tee),
+            nr::READLINKAT => Some(Self::Readlinkat),
+            nr::NEWFSTATAT => Some(Self::Newfstatat),
+            nr::FSTAT => Some(Self::Fstat),
+            nr::SYNC => Some(Self::Sync),
+            nr::FSYNC => Some(Self::Fsync),
+            nr::FDATASYNC => Some(Self::Fdatasync),
+            nr::SYNC_FILE_RANGE => Some(Self::SyncFileRange),
+            nr::TIMERFD_CREATE => Some(Self::TimerfdCreate),
+            nr::TIMERFD_SETTIME => Some(Self::TimerfdSettime),
+            nr::TIMERFD_GETTIME => Some(Self::TimerfdGettime),
+            nr::UTIMENSAT => Some(Self::Utimensat),
+            nr::NANOSLEEP => Some(Self::Nanosleep),
+            nr::CLOCK_GETTIME => Some(Self::ClockGettime),
+            nr::CLOCK_GETRES => Some(Self::ClockGetres),
+            nr::CLOCK_NANOSLEEP => Some(Self::ClockNanosleep),
+            nr::TIMES => Some(Self::Times),
+            nr::GETTIMEOFDAY => Some(Self::Gettimeofday),
+            nr::SOCKET => Some(Self::Socket),
+            nr::SOCKETPAIR => Some(Self::Socketpair),
+            nr::BIND => Some(Self::Bind),
+            nr::LISTEN => Some(Self::Listen),
+            nr::ACCEPT => Some(Self::Accept),
+            nr::CONNECT => Some(Self::Connect),
+            nr::GETSOCKNAME => Some(Self::Getsockname),
+            nr::GETPEERNAME => Some(Self::Getpeername),
+            nr::SENDTO => Some(Self::Sendto),
+            nr::RECVFROM => Some(Self::Recvfrom),
+            nr::SETSOCKOPT => Some(Self::Setsockopt),
+            nr::GETSOCKOPT => Some(Self::Getsockopt),
+            nr::SHUTDOWN => Some(Self::Shutdown),
+            nr::SENDMSG => Some(Self::Sendmsg),
+            nr::RECVMSG => Some(Self::Recvmsg),
+            nr::EXECVE => Some(Self::Execve),
+            nr::MSYNC => Some(Self::Msync),
+            nr::MLOCK => Some(Self::Mlock),
+            nr::MUNLOCK => Some(Self::Munlock),
+            nr::MINCORE => Some(Self::Mincore),
+            nr::MADVISE => Some(Self::Madvise),
+            nr::ACCEPT4 => Some(Self::Accept4),
+            nr::RECVMMSG => Some(Self::Recvmmsg),
+            nr::SYNCFS => Some(Self::Syncfs),
+            nr::SENDMMSG => Some(Self::Sendmmsg),
+            nr::RENAMEAT2 => Some(Self::Renameat2),
+            nr::GETRANDOM => Some(Self::Getrandom),
+            nr::MLOCK2 => Some(Self::Mlock2),
+            nr::COPY_FILE_RANGE => Some(Self::CopyFileRange),
+            nr::PREADV2 => Some(Self::Preadv2),
+            nr::PWRITEV2 => Some(Self::Pwritev2),
+            nr::STATX => Some(Self::Statx),
+            nr::CLOSE_RANGE => Some(Self::CloseRange),
+            nr::OPENAT2 => Some(Self::Openat2),
+            nr::FACCESSAT2 => Some(Self::Faccessat2),
+            nr::EPOLL_PWAIT2 => Some(Self::EpollPwait2),
+            nr::FCHMODAT2 => Some(Self::Fchmodat2),
             _ => None,
         }
     }
@@ -314,135 +451,228 @@ impl AllowedHostCrossing {
 
 /// The exact 8 canonical syscalls permitted to cross to host on x86 CPL0.
 pub const X86_HOST_CROSSINGS: [CanonicalNr; 8] = [
-    CanonicalNr(22), // epoll_pwait
-    CanonicalNr(62), // lseek
-    CanonicalNr(63), // read
-    CanonicalNr(64), // write
-    CanonicalNr(67), // pread64
-    CanonicalNr(68), // pwrite64
-    CanonicalNr(93), // exit
-    CanonicalNr(94), // exit_group
+    nr::EPOLL_PWAIT,
+    nr::LSEEK,
+    nr::READ,
+    nr::WRITE,
+    nr::PREAD64,
+    nr::PWRITE64,
+    nr::EXIT,
+    nr::EXIT_GROUP,
 ];
 
 /// The exact 116 canonical syscalls permitted to cross to host on AArch64 ARM EL1.
 pub const AARCH64_HOST_CROSSINGS: [CanonicalNr; 116] = [
-    CanonicalNr(5),   // setxattr
-    CanonicalNr(6),   // lsetxattr
-    CanonicalNr(7),   // fsetxattr
-    CanonicalNr(8),   // getxattr
-    CanonicalNr(9),   // lgetxattr
-    CanonicalNr(10),  // fgetxattr
-    CanonicalNr(11),  // listxattr
-    CanonicalNr(12),  // llistxattr
-    CanonicalNr(13),  // flistxattr
-    CanonicalNr(14),  // removexattr
-    CanonicalNr(15),  // lremovexattr
-    CanonicalNr(16),  // fremovexattr
-    CanonicalNr(17),  // getcwd
-    CanonicalNr(19),  // eventfd2
-    CanonicalNr(20),  // epoll_create1
-    CanonicalNr(21),  // epoll_ctl
-    CanonicalNr(22),  // epoll_pwait
-    CanonicalNr(23),  // dup
-    CanonicalNr(24),  // dup3
-    CanonicalNr(25),  // fcntl
-    CanonicalNr(26),  // inotify_init1
-    CanonicalNr(29),  // ioctl
-    CanonicalNr(32),  // flock
-    CanonicalNr(33),  // mknodat
-    CanonicalNr(34),  // mkdirat
-    CanonicalNr(35),  // unlinkat
-    CanonicalNr(36),  // symlinkat
-    CanonicalNr(37),  // linkat
-    CanonicalNr(38),  // renameat
-    CanonicalNr(43),  // statfs
-    CanonicalNr(44),  // fstatfs
-    CanonicalNr(45),  // truncate
-    CanonicalNr(46),  // ftruncate
-    CanonicalNr(47),  // fallocate
-    CanonicalNr(48),  // faccessat
-    CanonicalNr(49),  // chdir
-    CanonicalNr(50),  // fchdir
-    CanonicalNr(51),  // chroot
-    CanonicalNr(52),  // fchmod
-    CanonicalNr(53),  // fchmodat
-    CanonicalNr(54),  // fchownat
-    CanonicalNr(55),  // fchown
-    CanonicalNr(56),  // openat
-    CanonicalNr(57),  // close
-    CanonicalNr(59),  // pipe2
-    CanonicalNr(61),  // getdents64
-    CanonicalNr(62),  // lseek
-    CanonicalNr(63),  // read
-    CanonicalNr(64),  // write
-    CanonicalNr(65),  // readv
-    CanonicalNr(66),  // writev
-    CanonicalNr(67),  // pread64
-    CanonicalNr(68),  // pwrite64
-    CanonicalNr(69),  // preadv
-    CanonicalNr(70),  // pwritev
-    CanonicalNr(71),  // sendfile
-    CanonicalNr(72),  // pselect6
-    CanonicalNr(73),  // ppoll
-    CanonicalNr(74),  // signalfd4
-    CanonicalNr(75),  // vmsplice
-    CanonicalNr(76),  // splice
-    CanonicalNr(77),  // tee
-    CanonicalNr(78),  // readlinkat
-    CanonicalNr(79),  // newfstatat
-    CanonicalNr(80),  // fstat
-    CanonicalNr(81),  // sync
-    CanonicalNr(82),  // fsync
-    CanonicalNr(83),  // fdatasync
-    CanonicalNr(84),  // sync_file_range
-    CanonicalNr(85),  // timerfd_create
-    CanonicalNr(86),  // timerfd_settime
-    CanonicalNr(87),  // timerfd_gettime
-    CanonicalNr(88),  // utimensat
-    CanonicalNr(101), // nanosleep
-    CanonicalNr(113), // clock_gettime
-    CanonicalNr(114), // clock_getres
-    CanonicalNr(115), // clock_nanosleep
-    CanonicalNr(153), // times
-    CanonicalNr(169), // gettimeofday
-    CanonicalNr(198), // socket
-    CanonicalNr(199), // socketpair
-    CanonicalNr(200), // bind
-    CanonicalNr(201), // listen
-    CanonicalNr(202), // accept
-    CanonicalNr(203), // connect
-    CanonicalNr(204), // getsockname
-    CanonicalNr(205), // getpeername
-    CanonicalNr(206), // sendto
-    CanonicalNr(207), // recvfrom
-    CanonicalNr(208), // setsockopt
-    CanonicalNr(209), // getsockopt
-    CanonicalNr(210), // shutdown
-    CanonicalNr(211), // sendmsg
-    CanonicalNr(212), // recvmsg
-    CanonicalNr(221), // execve
-    CanonicalNr(227), // msync
-    CanonicalNr(228), // mlock
-    CanonicalNr(229), // munlock
-    CanonicalNr(232), // mincore
-    CanonicalNr(233), // madvise
-    CanonicalNr(242), // accept4
-    CanonicalNr(243), // recvmmsg
-    CanonicalNr(267), // syncfs
-    CanonicalNr(269), // sendmmsg
-    CanonicalNr(276), // renameat2
-    CanonicalNr(278), // getrandom
-    CanonicalNr(284), // mlock2
-    CanonicalNr(285), // copy_file_range
-    CanonicalNr(286), // preadv2
-    CanonicalNr(287), // pwritev2
-    CanonicalNr(291), // statx
-    CanonicalNr(436), // close_range
-    CanonicalNr(437), // openat2
-    CanonicalNr(439), // faccessat2
-    CanonicalNr(441), // epoll_pwait2
-    CanonicalNr(452), // fchmodat2
+    nr::SETXATTR,
+    nr::LSETXATTR,
+    nr::FSETXATTR,
+    nr::GETXATTR,
+    nr::LGETXATTR,
+    nr::FGETXATTR,
+    nr::LISTXATTR,
+    nr::LLISTXATTR,
+    nr::FLISTXATTR,
+    nr::REMOVEXATTR,
+    nr::LREMOVEXATTR,
+    nr::FREMOVEXATTR,
+    nr::GETCWD,
+    nr::EVENTFD2,
+    nr::EPOLL_CREATE1,
+    nr::EPOLL_CTL,
+    nr::EPOLL_PWAIT,
+    nr::DUP,
+    nr::DUP3,
+    nr::FCNTL,
+    nr::INOTIFY_INIT1,
+    nr::IOCTL,
+    nr::FLOCK,
+    nr::MKNODAT,
+    nr::MKDIRAT,
+    nr::UNLINKAT,
+    nr::SYMLINKAT,
+    nr::LINKAT,
+    nr::RENAMEAT,
+    nr::STATFS,
+    nr::FSTATFS,
+    nr::TRUNCATE,
+    nr::FTRUNCATE,
+    nr::FALLOCATE,
+    nr::FACCESSAT,
+    nr::CHDIR,
+    nr::FCHDIR,
+    nr::CHROOT,
+    nr::FCHMOD,
+    nr::FCHMODAT,
+    nr::FCHOWNAT,
+    nr::FCHOWN,
+    nr::OPENAT,
+    nr::CLOSE,
+    nr::PIPE2,
+    nr::GETDENTS64,
+    nr::LSEEK,
+    nr::READ,
+    nr::WRITE,
+    nr::READV,
+    nr::WRITEV,
+    nr::PREAD64,
+    nr::PWRITE64,
+    nr::PREADV,
+    nr::PWRITEV,
+    nr::SENDFILE,
+    nr::PSELECT6,
+    nr::PPOLL,
+    nr::SIGNALFD4,
+    nr::VMSPLICE,
+    nr::SPLICE,
+    nr::TEE,
+    nr::READLINKAT,
+    nr::NEWFSTATAT,
+    nr::FSTAT,
+    nr::SYNC,
+    nr::FSYNC,
+    nr::FDATASYNC,
+    nr::SYNC_FILE_RANGE,
+    nr::TIMERFD_CREATE,
+    nr::TIMERFD_SETTIME,
+    nr::TIMERFD_GETTIME,
+    nr::UTIMENSAT,
+    nr::NANOSLEEP,
+    nr::CLOCK_GETTIME,
+    nr::CLOCK_GETRES,
+    nr::CLOCK_NANOSLEEP,
+    nr::TIMES,
+    nr::GETTIMEOFDAY,
+    nr::SOCKET,
+    nr::SOCKETPAIR,
+    nr::BIND,
+    nr::LISTEN,
+    nr::ACCEPT,
+    nr::CONNECT,
+    nr::GETSOCKNAME,
+    nr::GETPEERNAME,
+    nr::SENDTO,
+    nr::RECVFROM,
+    nr::SETSOCKOPT,
+    nr::GETSOCKOPT,
+    nr::SHUTDOWN,
+    nr::SENDMSG,
+    nr::RECVMSG,
+    nr::EXECVE,
+    nr::MSYNC,
+    nr::MLOCK,
+    nr::MUNLOCK,
+    nr::MINCORE,
+    nr::MADVISE,
+    nr::ACCEPT4,
+    nr::RECVMMSG,
+    nr::SYNCFS,
+    nr::SENDMMSG,
+    nr::RENAMEAT2,
+    nr::GETRANDOM,
+    nr::MLOCK2,
+    nr::COPY_FILE_RANGE,
+    nr::PREADV2,
+    nr::PWRITEV2,
+    nr::STATX,
+    nr::CLOSE_RANGE,
+    nr::OPENAT2,
+    nr::FACCESSAT2,
+    nr::EPOLL_PWAIT2,
+    nr::FCHMODAT2,
 ];
+
+/// Target ISA whose crossing allowlist governs host forwarding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostCrossingSet {
+    Aarch64,
+    X86,
+}
+
+impl HostCrossingSet {
+    /// Whether this canonical syscall is permitted to cross to host.
+    #[inline]
+    pub const fn is_allowed(self, canonical: CanonicalNr) -> bool {
+        match self {
+            Self::Aarch64 => AllowedHostCrossing::from_canonical_aarch64(canonical).is_some(),
+            Self::X86 => AllowedHostCrossing::from_canonical_x86(canonical).is_some(),
+        }
+    }
+
+    /// Map a native syscall number to its refusal counter bucket (0..=512).
+    #[inline]
+    pub fn refusal_bucket(self, native: Option<u64>) -> usize {
+        match self {
+            Self::Aarch64 => match native {
+                Some(nr) if nr < 512 => nr as usize,
+                _ => 512,
+            },
+            Self::X86 => match native {
+                Some(nr) if nr < 512 => {
+                    match carrick_syscall_abi::syscall_x86_64::lookup_x86_64(nr) {
+                        Some(entry)
+                            if !matches!(
+                                entry.remap,
+                                carrick_syscall_abi::syscall_x86_64::SyscallRemap::Unknown
+                                    | carrick_syscall_abi::syscall_x86_64::SyscallRemap::Private(_)
+                            ) =>
+                        {
+                            nr as usize
+                        }
+                        _ => 512,
+                    }
+                }
+                _ => 512,
+            },
+        }
+    }
+}
+
+/// The outcome of evaluating a potential host crossing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostCrossingDecision {
+    /// The syscall is permitted to leave the guest for host handling.
+    Forward,
+    /// The syscall was refused at the fast path; -ENOSYS has been installed and counted.
+    Refused,
+}
+
+/// The single shared host crossing refusal decision for ARM EL1 and x86 CPL0.
+///
+/// If strict ring-first mode is disabled (`!strict`), or if `canonical` is present
+/// and allowed in `set`, returns [`HostCrossingDecision::Forward`].
+///
+/// Otherwise, the call is refused:
+/// 1. Its refusal bucket is calculated and counted in `counters` (if provided).
+/// 2. `install_result` is invoked with `LINUX_ENOSYS.guest_retval()` (-38).
+/// 3. Returns [`HostCrossingDecision::Refused`].
+pub fn evaluate_host_crossing<F>(
+    set: HostCrossingSet,
+    strict: bool,
+    canonical: Option<CanonicalNr>,
+    native: Option<u64>,
+    counters: Option<&[core::sync::atomic::AtomicU64]>,
+    install_result: F,
+) -> HostCrossingDecision
+where
+    F: FnOnce(i64),
+{
+    if !strict {
+        return HostCrossingDecision::Forward;
+    }
+    if let Some(canonical) = canonical
+        && set.is_allowed(canonical)
+    {
+        return HostCrossingDecision::Forward;
+    }
+    let bucket = set.refusal_bucket(native);
+    if let Some(counters) = counters
+        && bucket < counters.len()
+    {
+        counters[bucket].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    install_result(LINUX_ENOSYS.guest_retval());
+    HostCrossingDecision::Refused
+}
 
 #[cfg(test)]
 mod tests {
@@ -541,61 +771,127 @@ mod tests {
 
     #[test]
     fn test_unknown_calls_refused_and_counted() {
-        fn record_routing(
-            ordinal: u64,
-            strict: bool,
-            refused: &mut [u64; 513],
-            forwarded: &mut [u64; 513],
-            installed_result: &mut Option<i64>,
-        ) -> bool {
-            let canonical = CanonicalNr::new(ordinal);
-            let bucket = if ordinal < 512 { ordinal as usize } else { 512 };
-            if strict && !AllowedHostCrossing::is_allowed_aarch64(canonical) {
-                refused[bucket] += 1;
-                *installed_result = Some(-38);
-                true // served directly with -ENOSYS
-            } else {
-                forwarded[bucket] += 1;
-                false // forwarded to host
-            }
-        }
-
-        let mut refused = [0u64; 513];
-        let mut forwarded = [0u64; 513];
+        let refused = [const { core::sync::atomic::AtomicU64::new(0) }; 513];
         let mut installed_result: Option<i64> = None;
 
-        // Unknown / non-allowlisted call under strict mode
-        assert!(record_routing(
-            174,
+        // Unknown / non-allowlisted call under strict mode (getuid = 174)
+        let decision = evaluate_host_crossing(
+            HostCrossingSet::Aarch64,
             true,
-            &mut refused,
-            &mut forwarded,
-            &mut installed_result
-        )); // getuid
-        assert_eq!(refused[174], 1);
-        assert_eq!(forwarded[174], 0);
-        assert_eq!(installed_result, Some(-38));
+            Some(CanonicalNr(174)),
+            Some(174),
+            Some(&refused),
+            |ret| installed_result = Some(ret),
+        );
+        assert_eq!(decision, HostCrossingDecision::Refused);
+        assert_eq!(refused[174].load(core::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(installed_result, Some(LINUX_ENOSYS.guest_retval()));
 
-        // Allowlisted call under strict mode
-        assert!(!record_routing(
-            64,
+        // Allowlisted call under strict mode (write = 64)
+        let decision = evaluate_host_crossing(
+            HostCrossingSet::Aarch64,
             true,
-            &mut refused,
-            &mut forwarded,
-            &mut installed_result
-        )); // write
-        assert_eq!(refused[64], 0);
-        assert_eq!(forwarded[64], 1);
+            Some(nr::WRITE),
+            Some(nr::WRITE.raw()),
+            Some(&refused),
+            |_| panic!("should not install on forward"),
+        );
+        assert_eq!(decision, HostCrossingDecision::Forward);
+        assert_eq!(refused[64].load(core::sync::atomic::Ordering::Relaxed), 0);
 
         // Unknown call with hatch off (strict = false) -> forwards
-        assert!(!record_routing(
-            174,
+        let decision = evaluate_host_crossing(
+            HostCrossingSet::Aarch64,
             false,
-            &mut refused,
-            &mut forwarded,
-            &mut installed_result
-        ));
-        assert_eq!(refused[174], 1); // unchanged
-        assert_eq!(forwarded[174], 1); // now forwarded
+            Some(CanonicalNr(174)),
+            Some(174),
+            Some(&refused),
+            |_| panic!("should not install on forward"),
+        );
+        assert_eq!(decision, HostCrossingDecision::Forward);
+        assert_eq!(refused[174].load(core::sync::atomic::Ordering::Relaxed), 1); // unchanged
+    }
+
+    #[test]
+    fn test_x86_refusal_routing() {
+        let refused = [const { core::sync::atomic::AtomicU64::new(0) }; 513];
+        let mut installed_result: Option<i64> = None;
+
+        // Non-crossing call on x86: getuid (canonical 174, x86 native 102)
+        let decision = evaluate_host_crossing(
+            HostCrossingSet::X86,
+            true,
+            Some(CanonicalNr(174)),
+            Some(102),
+            Some(&refused),
+            |ret| installed_result = Some(ret),
+        );
+        assert_eq!(decision, HostCrossingDecision::Refused);
+        assert_eq!(refused[102].load(core::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(installed_result, Some(LINUX_ENOSYS.guest_retval()));
+
+        // Undecoded fallback (None, None)
+        let decision = evaluate_host_crossing(
+            HostCrossingSet::X86,
+            true,
+            None,
+            None,
+            Some(&refused),
+            |ret| installed_result = Some(ret),
+        );
+        assert_eq!(decision, HostCrossingDecision::Refused);
+        assert_eq!(refused[512].load(core::sync::atomic::Ordering::Relaxed), 1);
+
+        // Allowed crossing on x86: write (canonical 64, x86 native 1)
+        let decision = evaluate_host_crossing(
+            HostCrossingSet::X86,
+            true,
+            Some(nr::WRITE),
+            Some(1),
+            Some(&refused),
+            |_| panic!("should not install on forward"),
+        );
+        assert_eq!(decision, HostCrossingDecision::Forward);
+        assert_eq!(refused[1].load(core::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_host_aperture_control_honours_zero_and_default() {
+        let aperture = carrick_el1_abi::ApertureControl::new();
+        // Default / strict:
+        aperture.set_strict(true);
+        assert!(aperture.is_strict());
+
+        let refused = [const { core::sync::atomic::AtomicU64::new(0) }; 513];
+        let mut installed_result = None;
+
+        // When strict is true, getuid (174) is refused
+        let decision = evaluate_host_crossing(
+            HostCrossingSet::Aarch64,
+            aperture.is_strict(),
+            Some(CanonicalNr(174)),
+            Some(174),
+            Some(&refused),
+            |ret| installed_result = Some(ret),
+        );
+        assert_eq!(decision, HostCrossingDecision::Refused);
+        assert_eq!(refused[174].load(core::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(installed_result, Some(LINUX_ENOSYS.guest_retval()));
+
+        // When hatch = 0 (strict = false), getuid (174) forwards
+        aperture.set_strict(false);
+        assert!(!aperture.is_strict());
+
+        let decision = evaluate_host_crossing(
+            HostCrossingSet::Aarch64,
+            aperture.is_strict(),
+            Some(CanonicalNr(174)),
+            Some(174),
+            Some(&refused),
+            |_| panic!("should not install on forward"),
+        );
+        assert_eq!(decision, HostCrossingDecision::Forward);
+        // Counter unchanged
+        assert_eq!(refused[174].load(core::sync::atomic::Ordering::Relaxed), 1);
     }
 }

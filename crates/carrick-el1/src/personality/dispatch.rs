@@ -141,20 +141,23 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
         let nr = frame.x[8] as usize;
         let is_strict =
             carrick_el1_abi::host_aperture_control().is_some_and(|ctrl| ctrl.is_strict());
-        if is_strict
-            && !carrick_personality_linux::crossing::AllowedHostCrossing::is_allowed_aarch64(
-                carrick_personality_linux::abi::entry::CanonicalOrdinal::new(frame.x[8]),
-            )
-        {
-            frame.x[0] = (-38_i64) as u64;
-            let bucket = if nr < 512 { nr } else { 512 };
-            counters.refused[bucket].fetch_add(1, Ordering::Relaxed);
-            Action::Served
-        } else {
-            if nr < 512 {
-                counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
+        let canonical = carrick_personality_linux::abi::entry::CanonicalOrdinal::new(frame.x[8]);
+        let decision = carrick_personality_linux::crossing::evaluate_host_crossing(
+            carrick_personality_linux::crossing::HostCrossingSet::Aarch64,
+            is_strict,
+            Some(canonical),
+            Some(frame.x[8]),
+            Some(&counters.refused),
+            |ret| frame.x[0] = ret as u64,
+        );
+        match decision {
+            carrick_personality_linux::crossing::HostCrossingDecision::Refused => Action::Served,
+            carrick_personality_linux::crossing::HostCrossingDecision::Forward => {
+                if nr < 512 {
+                    counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
+                }
+                Action::Forward
             }
-            Action::Forward
         }
     }
 }
@@ -604,9 +607,11 @@ impl<
             carrick_el1_abi::host_aperture_control().is_some_and(|ctrl| ctrl.is_strict())
         }
     }
-    fn record_refused(&mut self, ordinal: u64) {
-        let bucket = if ordinal < 512 { ordinal as usize } else { 512 };
-        self.counters.refused[bucket].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
+        carrick_personality_linux::crossing::HostCrossingSet::Aarch64
+    }
+    fn refused_counters(&self) -> Option<&'a [core::sync::atomic::AtomicU64]> {
+        Some(&self.counters.refused)
     }
     fn lifecycle_native(
         &mut self,

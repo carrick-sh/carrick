@@ -215,12 +215,18 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
             counters.forwarded(ordinal);
         }
     }
+    /// Host crossing set governing which syscalls may forward to the host.
+    fn crossing_set(&self) -> crate::crossing::HostCrossingSet {
+        crate::crossing::HostCrossingSet::Aarch64
+    }
     /// Whether this context enforces the strict ARM ring-first forward allowlist.
     fn ring_first_strict(&self) -> bool {
         false
     }
-    /// Record a refused syscall answering -ENOSYS directly from kernel entry.
-    fn record_refused(&mut self, _ordinal: u64) {}
+    /// Access to the refusal counters array, if available.
+    fn refused_counters(&self) -> Option<&'a [core::sync::atomic::AtomicU64]> {
+        None
+    }
     fn publish_work(&self, commit: bool) {
         if let Some(task) = self.task_state() {
             if commit {
@@ -506,15 +512,22 @@ fn finish<'a, C: EntryContext + 'a>(
         }
     }
     let route = completion_route(result, pending.host_work());
-    if route == CompletionRoute::Forward
-        && pending.ring_first_strict()
-        && !crate::crossing::AllowedHostCrossing::is_allowed_aarch64(
-            carrick_syscall_abi::CanonicalNr::new(ordinal),
-        )
-    {
-        pending.install_result(SyscallResult::new(-38));
-        pending.record_refused(ordinal);
-        return CompletionRoute::Served;
+    if route == CompletionRoute::Forward {
+        let canonical = carrick_syscall_abi::CanonicalNr::new(ordinal);
+        let crossing_set = pending.crossing_set();
+        let ring_first_strict = pending.ring_first_strict();
+        let counters = pending.refused_counters();
+        let decision = crate::crossing::evaluate_host_crossing(
+            crossing_set,
+            ring_first_strict,
+            Some(canonical),
+            Some(ordinal),
+            counters,
+            |ret| pending.install_result(SyscallResult::new(ret)),
+        );
+        if decision == crate::crossing::HostCrossingDecision::Refused {
+            return CompletionRoute::Served;
+        }
     }
     match result {
         FamilyCompletion::AccountedComplete(_)
