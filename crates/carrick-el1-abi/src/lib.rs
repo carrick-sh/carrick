@@ -2282,7 +2282,13 @@ impl ProcessRefusal {
 }
 
 /// First failing stage of an ARM native fork attempt. Zero means no error.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 #[repr(u64)]
 pub enum NativeForkFailureStage {
     MappingCount = 1,
