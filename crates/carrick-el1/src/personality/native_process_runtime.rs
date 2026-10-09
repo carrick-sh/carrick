@@ -4314,6 +4314,13 @@ mod tests {
     }
     #[test]
     fn actual_compact_root_forks_a_shared_owner_child_with_distinct_visible_identity() {
+        compact_root_fork_wait_contract(false);
+    }
+    #[test]
+    fn caught_signal_interrupts_an_already_parked_owned_child_wait() {
+        compact_root_fork_wait_contract(true);
+    }
+    fn compact_root_fork_wait_contract(interrupt_wait: bool) {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
         let zone = unsafe {
@@ -4390,6 +4397,19 @@ mod tests {
             let mut entry = runtime
                 .enter(source, &task, words(address), &mut service)
                 .unwrap();
+            if interrupt_wait {
+                use carrick_personality_linux::signal::ProcessSignals;
+                use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
+                entry
+                    .rt_sigaction(
+                        Signal::from_number(10).unwrap(),
+                        Some(Action {
+                            disposition: Disposition::Handler(HandlerAddress(0x4000)),
+                            ..Action::default()
+                        }),
+                    )
+                    .unwrap();
+            }
             let LifecycleOutcome::Returned { result, .. } = entry.fork() else {
                 panic!("fork return")
             };
@@ -4487,6 +4507,44 @@ mod tests {
                 ),
                 Err(carrick_abi::LinuxErrno::new(1))
             );
+            if interrupt_wait {
+                use carrick_personality_linux::signal::{SignalProcessSelector, SignalRequest};
+                child_entry
+                    .kill(
+                        SignalProcessSelector::from_abi(41),
+                        SignalRequest::from_abi(10).unwrap(),
+                        SignalInfo::Generated(None),
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    child_entry.rt_sigsuspend(
+                        carrick_signal_core::policy::SigBlockMask::NONE,
+                        carrick_signal_core::policy::SigBlockMask::NONE
+                    ),
+                    Ok(true)
+                ));
+                assert!(child_entry.take_handoff_receipt().is_some());
+                drop(child_entry);
+                activate(&runtime, source, &task, parent);
+                let mut parent_entry = runtime
+                    .enter(source, &task, words(address), &mut service)
+                    .unwrap();
+                let Some(LifecycleOutcome::Returned { result, .. }) =
+                    parent_entry.resume_pending_wait()
+                else {
+                    panic!("caught signal must resume the parked child wait");
+                };
+                assert_eq!(result.raw(), carrick_abi::LINUX_EINTR.guest_retval());
+                assert_eq!(
+                    parent_entry.take_interrupted_child_wait(),
+                    Some(words(address))
+                );
+                assert!(
+                    runtime.namespace_child_key(parent, 42).is_some(),
+                    "interruption cannot reap the live child"
+                );
+                return;
+            }
             assert!(matches!(
                 child_entry.exit_group(7),
                 LifecycleOutcome::Transferred {
