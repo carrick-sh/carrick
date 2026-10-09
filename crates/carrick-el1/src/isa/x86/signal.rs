@@ -69,7 +69,7 @@ impl X86Backend {
         rtsigframe.pretcode = params.restorer.map_or(0, |r| r.raw());
         rtsigframe.uc.uc_flags = 1;
         rtsigframe.uc.uc_link = 0;
-        rtsigframe.uc.uc_stack = SignalStack::empty();
+        rtsigframe.uc.uc_stack = params.stack;
         rtsigframe.uc.uc_sigmask = params.mask;
 
         // Populate uc_mcontext with current register values from frame
@@ -120,6 +120,7 @@ impl X86Backend {
         let info_addr = new_sp + core::mem::offset_of!(RtSigframe, info) as u64;
         let uc_addr = new_sp + core::mem::offset_of!(RtSigframe, uc) as u64;
 
+        frame.r11 = resume.flags.raw() & !((1 << 10) | (1 << 8));
         frame.rcx = params.handler.raw(); // user RIP
         frame.rsp = new_sp; // user RSP
         frame.rdi = params.signum as u64; // arg 1: signum
