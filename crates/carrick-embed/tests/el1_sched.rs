@@ -371,8 +371,20 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
                 )
             })
         });
+        let first_fork_failure = read_el1_counters().and_then(|counters| {
+            carrick_el1_abi::NativeForkFailureStage::from_raw(
+                counters
+                    .first_native_fork_failure
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+        });
+        let fork_progress = read_el1_counters().map(|counters| {
+            counters
+                .native_fork_progress
+                .map(|count| count.load(std::sync::atomic::Ordering::Relaxed))
+        });
         panic!(
-            "EL1 fixture failed before result publication: {error}; process_refusals={refusals:?}; process_calls[clone,wait4,exit,exit_group]={process_calls:?}; metadata={:?}",
+            "EL1 fixture failed before result publication: {error}; process_refusals={refusals:?}; process_calls[clone,wait4,exit,exit_group]={process_calls:?}; first_fork_failure={first_fork_failure:?}; fork_progress={fork_progress:?}; metadata={:?}",
             carrick_runtime::metadata_grant_stats()
         )
     }));
