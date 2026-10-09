@@ -504,6 +504,48 @@ mod tests {
     }
 
     #[test]
+    fn dup2_then_close_keeps_the_shared_host_binding() {
+        let (fd_map, open_table, object_table) = setup_tables();
+        admit_stdio(&fd_map, &open_table, &object_table, 10, [true, true, true]);
+        let original = fd_map_lookup(&fd_map, 10, 1).unwrap().0;
+        assert_eq!(dup2_host_binding(&fd_map, 10, 1, 5), Some(5));
+        assert_eq!(fd_map_lookup(&fd_map, 10, 5).unwrap().0, original);
+        assert_eq!(close_host_binding(&fd_map, 10, 1), Some(false));
+        assert_eq!(fd_map_lookup(&fd_map, 10, 1), None);
+        assert_eq!(fd_map_lookup(&fd_map, 10, 5).unwrap().0, original);
+        let mut entries = [
+            PollFd {
+                fd: 5,
+                events: LINUX_POLLOUT,
+                revents: 0,
+            },
+            PollFd {
+                fd: 1,
+                events: LINUX_POLLOUT,
+                revents: 0,
+            },
+        ];
+        let readiness = [HostReadinessEntry {
+            host_fd: HostBoundFd::new(1).unwrap(),
+            events: LINUX_POLLOUT,
+            revents: LINUX_POLLOUT,
+            poll_index: 0,
+        }];
+        let ready = resolve_poll_with_host_readiness(
+            &fd_map,
+            &open_table,
+            &object_table,
+            None,
+            10,
+            &mut entries,
+            Some(&readiness),
+        );
+        assert_eq!(ready, 2);
+        assert_eq!(entries[0].revents, LINUX_POLLOUT);
+        assert_eq!(entries[1].revents, LINUX_POLLNVAL);
+    }
+
+    #[test]
     fn test_absent_fd_pollnval() {
         let (fd_map, open_table, object_table) = setup_tables();
         let file_table = 10;
