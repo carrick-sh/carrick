@@ -418,7 +418,7 @@ impl<'a, 'lease> HvpatchQuantumControl<'a, 'lease> {
     pub(crate) fn prepare_hvpatch_submission(
         &self,
         directory: &Arc<HvpatchTaskBindingDirectory>,
-        shape: HvpatchSubmissionShape,
+        shape: TaskSubmissionShape,
         thread: Arc<carrick_kernel::kernel::Thread>,
         generation: ExecutionGeneration,
         binding: Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
@@ -721,7 +721,7 @@ impl<B: PersistentTaskBinding + Send + Sync + 'static> TaskBindingDirectory<B> {
     pub(crate) fn prepare_submission(
         self: &Arc<Self>,
         scheduler: &Scheduler,
-        shape: HvpatchSubmissionShape,
+        shape: TaskSubmissionShape,
         grant_authority: Option<&SubmissionAuthority>,
         thread: Arc<carrick_kernel::kernel::Thread>,
         generation: ExecutionGeneration,
@@ -861,7 +861,7 @@ impl<B: PersistentTaskBinding + Send + Sync + 'static> TaskBindingDirectory<B> {
 // prepared now so the subsequent fork/clone conversion cannot fall back to a
 // generic descendant edge while it replaces the compatibility materializers.
 #[allow(dead_code)]
-pub(crate) enum HvpatchSubmissionShape {
+pub(crate) enum TaskSubmissionShape {
     Root,
     ProcessBirth(carrick_kernel::kernel::scheduler::ProcessBirthSubmission),
     Descendant {
@@ -875,14 +875,18 @@ pub(crate) enum HvpatchSubmissionShape {
     },
 }
 
+pub(crate) type HvpatchSubmissionShape = TaskSubmissionShape;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct HvpatchActivationProof {
+pub(crate) struct TaskActivationProof {
     pub(crate) thread: ThreadKey,
     pub(crate) generation: ExecutionGeneration,
     pub(crate) identity: TaskLoadIdentity,
 }
 
-impl HvpatchActivationProof {
+pub(crate) type HvpatchActivationProof = TaskActivationProof;
+
+impl TaskActivationProof {
     pub(crate) fn validate(
         context: &carrick_kernel::kernel::KernelContext,
         state: &MigratableTaskState,
@@ -926,7 +930,7 @@ impl<B: PersistentTaskBinding + Send + Sync + 'static> PreparedTaskSubmission<B>
         mut self,
         scheduler: &Scheduler,
         thread: Arc<carrick_kernel::kernel::Thread>,
-        proof: HvpatchActivationProof,
+        proof: TaskActivationProof,
     ) -> Result<(), TrapError> {
         if self.key != (proof.thread, proof.generation) || thread.key() != proof.thread {
             return Err(TrapError::Hypervisor(

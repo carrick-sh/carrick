@@ -1683,7 +1683,7 @@ fn dormant_submission_is_invisible_until_exact_activation() {
     let dormant = directory
         .prepare_submission(
             &scheduler,
-            HvpatchSubmissionShape::Root,
+            super::TaskSubmissionShape::Root,
             None,
             Arc::clone(context.thread()),
             generation,
@@ -1751,7 +1751,7 @@ fn shared_submission_directory_accepts_a_non_hvpatch_binding() {
         .thread()
         .take_opened_start_gate(generation)
         .expect("open initial root gate");
-    let proof = HvpatchActivationProof::validate(
+    let proof = super::TaskActivationProof::validate(
         &context,
         &state,
         generation,
@@ -1775,6 +1775,129 @@ fn shared_submission_directory_accepts_a_non_hvpatch_binding() {
             .lock()
             .get(&(context.thread().key(), generation))
             .is_some_and(|record| record.active && Arc::ptr_eq(&record.binding, &binding))
+    );
+}
+
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+#[test]
+fn kvm_binding_requires_issued_task_mm_and_saved_x86_generation() {
+    use carrick_hal::guest_arch_binding::{
+        GuestArchBinding,
+        core_arch::{
+            AddressContext, CarrierGeneration, ContextGeneration,
+            ExecutionGeneration as ArchGeneration, FrameGpa, MmGeneration, RootGpa, TaskIdentity,
+            TaskSerial,
+        },
+    };
+    use carrick_hal::threaded::{
+        X86_TASK_RESUME_MAGIC, X86_TASK_RESUME_PAYLOAD_LEN, X86_TASK_XSAVE_LEN, X86TaskCpuStateV1,
+    };
+    let (kernel, context) = bootstrap(13_995);
+    let nonzero = |raw| std::num::NonZeroU64::new(raw).expect("nonzero identity");
+    let root = RootGpa::page_aligned(FrameGpa::new(0x7000)).expect("aligned root");
+    let arch = GuestArchBinding::x86(
+        TaskIdentity {
+            carrier: CarrierGeneration::new(nonzero(8)),
+            task: TaskSerial::new(nonzero(context.task().key().serial.raw())),
+            execution: ArchGeneration::new(nonzero(ExecutionGeneration::INITIAL.raw())),
+        },
+        AddressContext {
+            root,
+            mm: MmGeneration::new(context.shared().mm().id().nonzero()),
+            generation: ContextGeneration::new(nonzero(1)),
+        },
+    );
+    let mut resume = [0u8; X86_TASK_RESUME_PAYLOAD_LEN];
+    resume[56..64].copy_from_slice(&X86_TASK_RESUME_MAGIC.to_le_bytes());
+    let mut gprs = [0; 16];
+    gprs[7] = 0x9000;
+    let cpu = X86TaskCpuStateV1::new(
+        gprs,
+        0x400000,
+        0x202,
+        gprs[7],
+        0x8000_0031,
+        root.address().raw(),
+        0x40620,
+        0xd01,
+        0,
+        0,
+        context.shared().mm().id().raw(),
+        1,
+        vec![0; X86_TASK_XSAVE_LEN],
+        resume.to_vec(),
+    )
+    .expect("valid x86 state");
+    let state = MigratableTaskState {
+        cpu: GuestCpuState::from_x86_64_v1(cpu).expect("saved x86 CPU"),
+        mm: context.shared().mm().id(),
+        asid_generation: 1,
+    };
+    let binding =
+        super::kvm::KvmTaskBinding::new(&context, &state, arch, ExecutionGeneration::INITIAL)
+            .expect("issued KVM root binding");
+    binding
+        .validate_task_state(&state)
+        .expect("exact x86 state");
+    let scheduler = Arc::new(Scheduler::new(kernel));
+    let directory = Arc::new(super::kvm::KvmTaskBindingDirectory::default());
+    <super::kvm::KvmTaskBindingDirectory as TaskBindingResolver<_>>::install_scheduler(
+        &directory, &scheduler,
+    )
+    .expect("install KVM resolver");
+    let generation = scheduler
+        .publish_initial_task_state_gated(context.thread(), state.clone())
+        .expect("publish gated x86 root");
+    let binding = Arc::new(binding);
+    let dormant = directory
+        .prepare_submission(
+            &scheduler,
+            super::TaskSubmissionShape::Root,
+            None,
+            Arc::clone(context.thread()),
+            generation,
+            Arc::clone(&binding),
+        )
+        .expect("prepare KVM root");
+    assert_eq!(scheduler.queued_len(), 0);
+    let start_gate = context
+        .thread()
+        .take_opened_start_gate(generation)
+        .expect("open KVM root gate");
+    let proof = super::TaskActivationProof::validate(
+        &context,
+        &state,
+        generation,
+        binding.load_identity(),
+        start_gate,
+    )
+    .expect("validate KVM root publication");
+    dormant
+        .activate(&scheduler, Arc::clone(context.thread()), proof)
+        .expect("activate KVM root");
+    assert_eq!(scheduler.queued_len(), 1);
+    assert!(Arc::ptr_eq(
+        &<super::kvm::KvmTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+            directory.as_ref(),
+            context.thread().key(),
+            generation,
+        )
+        .expect("resolve KVM root"),
+        &binding,
+    ));
+    let mut wrong_generation = state.clone();
+    wrong_generation.asid_generation = 2;
+    assert!(binding.validate_task_state(&wrong_generation).is_err());
+    let mut wrong_task = arch.task();
+    wrong_task.task = TaskSerial::new(nonzero(context.task().key().serial.raw() + 1));
+    assert!(
+        super::kvm::KvmTaskBinding::new(
+            &context,
+            &state,
+            GuestArchBinding::x86(wrong_task, arch.context()),
+            ExecutionGeneration::INITIAL,
+        )
+        .is_err()
     );
 }
 

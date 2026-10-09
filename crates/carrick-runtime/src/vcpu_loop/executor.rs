@@ -27,6 +27,9 @@ pub use pool::*;
 pub mod preemption;
 pub use preemption::*;
 
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+pub(crate) mod kvm;
+
 pub(crate) fn probe_executor_lifecycle(
     executor: ExecutorId,
     phase: crate::probes::HvpatchExecutorLifecyclePhase,
