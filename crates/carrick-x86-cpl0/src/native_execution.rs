@@ -40,7 +40,7 @@ pub(super) fn capture(
         .unwrap_or_else(|_| initial_boot::fatal_boot());
     context::context_words::from_native(&native)
 }
-fn read_msr(msr: u32) -> u64 {
+pub(super) fn read_msr(msr: u32) -> u64 {
     let low: u32;
     let high: u32;
     // SAFETY: these two architectural TLS MSRs are enabled in the retained

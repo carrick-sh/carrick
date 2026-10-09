@@ -43,8 +43,20 @@ pub fn from_syscall(
     Ok(scheduler::NativeContext {
         frame: scheduler::InterruptFrame {
             gpr: [
-                frame.r15, frame.r14, frame.r13, frame.r12, frame.rbp, frame.rbx, frame.r11,
-                frame.r10, frame.r9, frame.r8, frame.rax, frame.rcx, frame.rdx, frame.rsi,
+                frame.r15,
+                frame.r14,
+                frame.r13,
+                frame.r12,
+                frame.rbp,
+                frame.rbx,
+                frame.user_r11,
+                frame.r10,
+                frame.r9,
+                frame.r8,
+                frame.rax,
+                frame.user_rcx,
+                frame.rdx,
+                frame.rsi,
                 frame.rdi,
             ],
             rip: frame.rcx,
@@ -61,17 +73,13 @@ pub fn from_syscall(
 }
 
 /// Recover a syscall frame from its exact retained address owner.
-/// Arbitrary IRQ contexts must use InterruptFrame directly: their RCX/R11
-/// can differ from RIP/flags and cannot fit the syscall frame losslessly.
+/// The independent user GPR slots retain IRQ RCX/R11 even when they differ
+/// from the return PC/flags.
 pub fn syscall_frame_from_native(
     context: &scheduler::NativeContext,
     expected: AddressContext<RootGpa>,
 ) -> Result<native::NativeFrame, ArchError> {
-    if context.address != expected
-        || !context.frame.valid_user_return()
-        || context.frame.gpr[6] != context.frame.flags
-        || context.frame.gpr[11] != context.frame.rip
-    {
+    if context.address != expected || !context.frame.valid_user_return() {
         return Err(ArchError::InvalidContext);
     }
     let gpr = &context.frame.gpr;
@@ -92,6 +100,8 @@ pub fn syscall_frame_from_native(
         rcx: context.frame.rip,
         r11: context.frame.flags,
         rsp: context.frame.rsp,
+        user_rcx: gpr[11],
+        user_r11: gpr[6],
     })
 }
 
@@ -129,6 +139,8 @@ mod tests {
             rcx: 0x1234,
             r11: 0x302,
             rsp: 0x8000,
+            user_rcx: 0x1234,
+            user_r11: 0x302,
         };
         let address = AddressContext {
             root: RootGpa::page_aligned(FrameGpa::new(0x6000)).unwrap(),
@@ -185,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn syscall_conversion_refuses_invalid_targets_and_non_syscall_state() {
+    fn context_conversion_keeps_irq_gprs_and_refuses_invalid_return() {
         let (frame, address, xsave) = syscall_fixture();
         for invalid in [
             native::NativeFrame { rcx: 0, ..frame },
@@ -223,7 +235,19 @@ mod tests {
                 Err(ArchError::InvalidContext)
             ));
         }
-        for (word, value) in [(6, 99), (11, 99), (16, 8), (19, 16)] {
+        let mut irq = context.clone();
+        irq.frame.gpr[6] = 0x56789;
+        irq.frame.gpr[11] = 0x12345;
+        let returned = syscall_frame_from_native(&irq, address).unwrap();
+        assert_eq!(returned.user_rcx, 0x12345);
+        assert_eq!(returned.user_r11, 0x56789);
+        assert_eq!(
+            from_syscall(&returned, address, irq.fs_base, irq.gs_base, &irq.xsave)
+                .unwrap()
+                .frame,
+            irq.frame
+        );
+        for (word, value) in [(16, 8), (19, 16)] {
             let mut words = from_native(&context);
             words.frame[word] = value;
             let invalid = scheduler::NativeContext {

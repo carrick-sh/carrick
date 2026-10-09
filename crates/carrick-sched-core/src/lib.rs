@@ -1200,6 +1200,10 @@ pub struct WakeEffects {
 }
 
 impl WakeEffects {
+    /// Request a return-to-user reschedule through the existing IRQ lane.
+    pub fn request_reschedule(&mut self, slot: SlotId) {
+        self.push_sgi(slot);
+    }
     fn push_sgi(&mut self, slot: SlotId) {
         self.sgi[slot.index() / 64] |= 1 << (slot.index() % 64);
     }
