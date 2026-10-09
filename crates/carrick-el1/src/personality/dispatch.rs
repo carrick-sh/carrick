@@ -2,6 +2,8 @@
 use super::{file, inotify, ipc, lifecycle, sched};
 use crate::fault::dispatch_fault;
 use crate::memory;
+#[cfg(target_os = "none")]
+use crate::rust_alloc::boxed::Box;
 use carrick_el1_abi::{
     Action, Counters, CurrentTask, DELEGATED_STATE_GUEST, DelegatedFile, DelegatedInotify,
     DelegatedOpenFile, EL1_GUEST_LOCK_SPINS, FdMapSlot, InotifyNameCache, MAX_DELEGATED_FILES,
@@ -146,7 +148,9 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                     .current()
                     .or_else(|| zone.slot(slot).host_record());
                 if let Some(record) = record {
-                    let mut saved = carrick_el1_abi::Aarch64ParkedContext::ZERO;
+                    // Fork preparation remains nested below dispatch. Keep the
+                    // architectural save area off the small per-CPU EL1 stack.
+                    let mut saved = Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
                     sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
                     let ttbr0 = crate::isa::aarch64::hardware_live_ttbr();
                     let admission = super::aarch64_process::admit_entry(
