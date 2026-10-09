@@ -28,8 +28,8 @@ use carrick_sched_core::process::wait::{
     WaitLive, WaitQuery, WaitReadiness, WaitSelection, WaitZombie,
 };
 use carrick_sched_core::process::{
-    ChildExitSignal, LinuxWaitStatus, ProcessContext, ProcessRelations, SessionId, TaskId,
-    TaskIdentity, TaskKey, TaskLifecycle, TaskRusage, Zombie,
+    ChildExitSignal, LinuxWaitStatus, ProcessContext, ProcessRelations, RlimitSet, SessionId,
+    TaskCredentials, TaskId, TaskIdentity, TaskKey, TaskLifecycle, TaskRusage, Zombie,
 };
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -86,6 +86,14 @@ pub struct GuestTask<C, U, N: NativeProcessCustody> {
     tracer: Option<TaskKey>,
     tracees: BTreeSet<TaskKey>,
     children_rusage: TaskRusage,
+    pub credentials: TaskCredentials,
+    pub rlimits: RlimitSet,
+    pub umask: u32,
+    pub personality: u64,
+    pub pdeathsig: u8,
+    pub dumpable: u32,
+    pub no_new_privs: bool,
+    pub child_subreaper: bool,
 }
 impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
     pub fn new(
@@ -106,6 +114,14 @@ impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
             tracer: None,
             tracees: BTreeSet::new(),
             children_rusage: TaskRusage::default(),
+            credentials: TaskCredentials::ROOT,
+            rlimits: RlimitSet::DEFAULT,
+            umask: 0o022,
+            personality: 0,
+            pdeathsig: 0,
+            dumpable: 1,
+            no_new_privs: false,
+            child_subreaper: false,
         }
     }
     pub fn key(&self) -> TaskKey {
@@ -113,6 +129,9 @@ impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
     }
     pub fn metadata(&self) -> &GuestTaskMetadata<C, U> {
         &self.metadata
+    }
+    pub fn metadata_mut(&mut self) -> &mut GuestTaskMetadata<C, U> {
+        &mut self.metadata
     }
     pub fn parent(&self) -> Option<TaskKey> {
         self.relations.parent()
@@ -477,6 +496,18 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
             return Err(GuestProcessError::AlreadyExiting(key.id));
         }
         Ok(task)
+    }
+    pub fn find_task_by_pid(&self, pid: u32) -> Option<&GuestTask<C, U, N>> {
+        self.registry
+            .tasks
+            .values()
+            .find(|row| row.metadata.namespace_pid == pid && row.lifecycle() == TaskLifecycle::Live)
+    }
+    pub fn find_task_by_pid_mut(&mut self, pid: u32) -> Option<&mut GuestTask<C, U, N>> {
+        self.registry
+            .tasks
+            .values_mut()
+            .find(|row| row.metadata.namespace_pid == pid && row.lifecycle() == TaskLifecycle::Live)
     }
     pub fn namespace_child_key(
         &self,
