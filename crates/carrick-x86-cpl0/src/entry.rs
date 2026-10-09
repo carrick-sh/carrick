@@ -1314,7 +1314,7 @@ mod kernel {
             carrick_personality_linux::signal::SignalSet::from_bits(thread.slot.blocked().0),
         );
 
-        let (sig, info, action) = process.take_deliverable(process.task_id(), thread_blocked)?;
+        let (sig, info, action) = process.take_deliverable(thread_blocked)?;
         let saved_mask = process.take_suspend_mask().unwrap_or(thread_blocked);
         match action.disposition {
             policy::Disposition::Ignore => None,
@@ -1405,8 +1405,7 @@ mod kernel {
         }
         // One forced SEGV selection is a semantic fallback, never a frame retry.
         let thread = GuestLifecycleVenue.thread(task)?;
-        let tid = process.task_id();
-        if process.force_sigsegv(tid, blocked).is_err() {
+        if process.force_sigsegv(blocked).is_err() {
             return Some(CompletionRoute::InvalidCompletion);
         }
         let mask = blocked.signals().without(Signal::SEGV);

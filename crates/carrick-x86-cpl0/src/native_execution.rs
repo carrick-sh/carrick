@@ -93,7 +93,8 @@ pub(super) fn schedule(slot: SlotId) -> ! {
             source.zone.leave_idle(slot);
             let runtime = native_process::runtime();
             let record = source.zone.record_ref(selected.record);
-            let Some(state) = runtime.record_binding(record) else {
+            // SAFETY: switch_in_full transferred this exact record to this slot.
+            let Some(state) = (unsafe { runtime.record_binding(record) }) else {
                 source.zone.clear_current(slot);
                 continue;
             };
@@ -103,8 +104,8 @@ pub(super) fn schedule(slot: SlotId) -> ! {
                 .install_space(slot, state.address.mm.raw().get())
                 .unwrap_or_else(|| initial_boot::fatal_boot());
             current.set(
-                carrick_el1_abi::El1TaskId::from_linux_tid(state.key.id.raw()),
-                state.key.serial.raw(),
+                carrick_el1_abi::El1TaskId::from_linux_tid(i32::try_from(identity.tid).unwrap_or_else(|_| initial_boot::fatal_boot())),
+                identity.generation,
                 identity.file_table,
             );
             current
