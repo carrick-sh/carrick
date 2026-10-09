@@ -17,7 +17,7 @@ use carrick_el1_abi::{
     NativeRootExit,
 };
 use carrick_guest_arch::{AddressContext, CpuId, RootGpa};
-use carrick_hal::asid::{AsidAllocator, AsidGeneration};
+use carrick_hal::asid::{AsidAllocator, AsidError, AsidGeneration};
 use carrick_sched_core::process::LinuxWaitStatus;
 use core::num::NonZeroU64;
 
@@ -70,6 +70,7 @@ pub enum ForkStockServiceError {
     ExposedDirtyTable,
     InvalidRecord,
     MemoryAccessFailed,
+    Asid(AsidError),
 }
 
 /// Deterministic table stock allocator: takes contiguous 4 KiB page runs for child
@@ -241,9 +242,11 @@ impl ForkStockHostCustody {
             self.lifecycle,
             Some(asid_gen.asid()),
         ) else {
-            let _ = self.asids.release_unpublished(asid_gen);
             self.grant_tables.extend(child_tables);
             self.grant_tables.extend(parent_tables);
+            self.asids
+                .release_unpublished(asid_gen)
+                .map_err(|_| ForkStockRefusal::Invalid)?;
             exchange.refuse(ForkStockRefusal::Invalid);
             return Err(ForkStockRefusal::Invalid);
         };
@@ -251,9 +254,11 @@ impl ForkStockHostCustody {
         let child_mm = match El1FrameGrantMm::new(request.child_mm.raw()) {
             Some(mm) => mm,
             None => {
-                let _ = self.asids.release_unpublished(asid_gen);
                 self.grant_tables.extend(child_tables);
                 self.grant_tables.extend(parent_tables);
+                self.asids
+                    .release_unpublished(asid_gen)
+                    .map_err(|_| ForkStockRefusal::Invalid)?;
                 exchange.refuse(ForkStockRefusal::Invalid);
                 return Err(ForkStockRefusal::Invalid);
             }
@@ -261,9 +266,11 @@ impl ForkStockHostCustody {
         let parent_mm = match El1FrameGrantMm::new(request.operation.mm.raw()) {
             Some(mm) => mm,
             None => {
-                let _ = self.asids.release_unpublished(asid_gen);
                 self.grant_tables.extend(child_tables);
                 self.grant_tables.extend(parent_tables);
+                self.asids
+                    .release_unpublished(asid_gen)
+                    .map_err(|_| ForkStockRefusal::Invalid)?;
                 exchange.refuse(ForkStockRefusal::Invalid);
                 return Err(ForkStockRefusal::Invalid);
             }
@@ -278,9 +285,11 @@ impl ForkStockHostCustody {
                 for granted in granted_child {
                     ledger.mark_return(granted, 4096, child_mm, false);
                 }
-                let _ = self.asids.release_unpublished(asid_gen);
                 self.grant_tables.extend(child_tables);
                 self.grant_tables.extend(parent_tables);
+                self.asids
+                    .release_unpublished(asid_gen)
+                    .map_err(|_| ForkStockRefusal::Capacity)?;
                 exchange.refuse(ForkStockRefusal::Capacity);
                 return Err(ForkStockRefusal::Capacity);
             }
@@ -298,9 +307,11 @@ impl ForkStockHostCustody {
                 for granted in granted_parent {
                     ledger.mark_return(granted, 4096, parent_mm, false);
                 }
-                let _ = self.asids.release_unpublished(asid_gen);
                 self.grant_tables.extend(child_tables);
                 self.grant_tables.extend(parent_tables);
+                self.asids
+                    .release_unpublished(asid_gen)
+                    .map_err(|_| ForkStockRefusal::Capacity)?;
                 exchange.refuse(ForkStockRefusal::Capacity);
                 return Err(ForkStockRefusal::Capacity);
             }
@@ -333,7 +344,9 @@ impl ForkStockHostCustody {
                 }
                 self.grant_tables.extend(pending.child_tables);
                 self.grant_tables.extend(pending.parent_tables);
-                let _ = self.asids.release_unpublished(pending.asid_gen);
+                self.asids
+                    .release_unpublished(pending.asid_gen)
+                    .map_err(|_| ForkStockRefusal::Invalid)?;
             }
             self.fork_lifecycle_available = true;
             exchange.refuse(ForkStockRefusal::Invalid);
@@ -384,7 +397,9 @@ impl ForkStockHostCustody {
             }
             self.grant_tables.extend(pending.child_tables);
             self.grant_tables.extend(pending.parent_tables);
-            let _ = self.asids.release_unpublished(pending.asid_gen);
+            self.asids
+                .release_unpublished(pending.asid_gen)
+                .map_err(ForkStockServiceError::Asid)?;
             self.fork_lifecycle_available = true;
             if !settlement.accept(loan) {
                 return Err(ForkStockServiceError::InvalidRecord);
@@ -464,10 +479,10 @@ impl ForkStockHostCustody {
             let retired = self
                 .asids
                 .retire(asid_gen)
-                .map_err(|_| ForkStockServiceError::InvalidRecord)?;
+                .map_err(ForkStockServiceError::Asid)?;
             self.asids
                 .acknowledge_tlb_flush(retired)
-                .map_err(|_| ForkStockServiceError::InvalidRecord)?;
+                .map_err(ForkStockServiceError::Asid)?;
         }
         Ok(status)
     }
@@ -1584,6 +1599,45 @@ mod tests {
         assert_eq!(
             custody.el1_frame_grants.lock().snapshot(),
             ledger_after_loan
+        );
+    }
+
+    #[test]
+    fn double_release_unpublished_is_reported_as_error() {
+        let asid_allocator = AsidAllocator::with_limit_for_tests(2);
+        let carrier = NonZeroU64::new(7).unwrap();
+        let mut custody = ForkStockHostCustody::with_asids(carrier, asid_allocator.clone());
+        let mut ledger = El1FrameGrantLedger::default();
+
+        custody.grant_tables = (0..16)
+            .map(|i| RootGpa::page_aligned(FrameGpa::new(0x2_0000 + i * 4096)).unwrap())
+            .collect();
+        let exec = test_execution(41, 0, 301);
+        let req = test_request(exec, 302, 1, 1);
+        let mut exchange = ForkStockExchange::new(req).unwrap();
+        let loan = custody
+            .service_loan(&mut ledger, exec, &mut exchange)
+            .expect("loan granted");
+        let child_asid = loan.asid.expect("child ASID granted");
+
+        // Release the ASID out of band to simulate a prior release:
+        let pending_asid_gen = custody.pending_loans[exec.cpu.raw() as usize]
+            .as_ref()
+            .unwrap()
+            .asid_gen;
+        asid_allocator
+            .release_unpublished(pending_asid_gen)
+            .expect("first release succeeds");
+
+        // Now abort settlement attempts to release the same ASID generation again
+        let mut abort = ForkStockSettlement::abort(loan);
+        let result = custody.service_settlement(&mut ledger, exec, &mut abort, |_| true, |_| true);
+
+        // Double release must be reported as a typed error, not ignored
+        assert_eq!(
+            result,
+            Err(ForkStockServiceError::Asid(AsidError::NotLive(child_asid))),
+            "double release must be reported as a typed error"
         );
     }
 }

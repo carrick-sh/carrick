@@ -878,7 +878,8 @@ pub(crate) fn service_metadata_operation(
                             | crate::fork_stock::ForkStockServiceError::LoanMismatch
                             | crate::fork_stock::ForkStockServiceError::ExposedDirtyTable
                             | crate::fork_stock::ForkStockServiceError::InvalidRecord
-                            | crate::fork_stock::ForkStockServiceError::MemoryAccessFailed => {
+                            | crate::fork_stock::ForkStockServiceError::MemoryAccessFailed
+                            | crate::fork_stock::ForkStockServiceError::Asid(_) => {
                                 ForkStockRefusal::Invalid
                             }
                         };
