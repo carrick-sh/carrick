@@ -500,7 +500,8 @@ fn run_poll_timeout_markers(
             "poll marker {index} missing"
         );
         let mut marker = [0u8; 2];
-        if let Err(error) = stdout.read_exact(&mut marker) {
+        let read_result = stdout.read_exact(&mut marker);
+        if read_result.is_err() {
             let status = child.wait().unwrap();
             let mut stderr = String::new();
             child
@@ -509,8 +510,9 @@ fn run_poll_timeout_markers(
                 .unwrap()
                 .read_to_string(&mut stderr)
                 .unwrap();
-            panic!(
-                "poll marker {index} read failed: {error}; status={status}; output={output:?}; stderr={stderr}"
+            assert!(
+                read_result.is_ok(),
+                "poll marker {index} read failed: {read_result:?}; status={status}; output={output:?}; stderr={stderr}"
             );
         }
         assert_eq!(&marker, *expected);

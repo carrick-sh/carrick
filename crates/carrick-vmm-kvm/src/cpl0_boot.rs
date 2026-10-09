@@ -4771,6 +4771,11 @@ impl ForwardVenue<'_> {
         if count > 1024 {
             return Err(fail("host readiness batch exceeds poll bound"));
         }
+        if count == 0 {
+            // Zero-fd poll carries only a deadline. No guest pointer is
+            // dereferenced, and an empty Rust slice need not have a guest VA.
+            return Ok(use_entries(&mut []));
+        }
         let length = count
             .checked_mul(size_of::<carrick_el1_abi::HostReadinessEntry>())
             .ok_or_else(|| fail("host readiness batch length overflow"))?;
