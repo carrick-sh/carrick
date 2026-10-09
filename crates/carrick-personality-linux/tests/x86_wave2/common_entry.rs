@@ -443,7 +443,7 @@ fn closed_gate_or_hatch_forwards_without_effect() {
 }
 
 #[test]
-fn unissued_task_or_unadmitted_call_forwards() {
+fn unissued_task_cannot_bypass_crossing_admission() {
     let w = World::new(LifecycleHatches::ON);
     assert_eq!(
         w.call(
@@ -456,7 +456,7 @@ fn unissued_task_or_unadmitted_call_forwards() {
             }
         )
         .0,
-        Action::Forward
+        Action::Served
     );
     assert_eq!(
         w.call(
@@ -469,7 +469,7 @@ fn unissued_task_or_unadmitted_call_forwards() {
             }
         )
         .0,
-        Action::Forward
+        Action::Served
     );
     assert_eq!(
         w.call(
@@ -490,7 +490,7 @@ fn unissued_task_or_unadmitted_call_forwards() {
 fn cleared_execution_generation_cannot_publish_to_a_retained_slot() {
     let w = World::new(LifecycleHatches::ON);
     w.tasks[0].execution.generation.store(0, Ordering::Release);
-    assert_eq!(w.robust(0, 0xa000, 24).0, Action::Forward);
+    assert_eq!(w.robust(0, 0xa000, 24).0, Action::Served);
     assert_eq!(w.heads(), [(0, 0), (0, 0)]);
     assert_eq!(w.publications.load(Ordering::Relaxed), 0);
 }

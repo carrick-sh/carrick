@@ -611,6 +611,20 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
         Some(authority) => authority,
         None if family == Family::AllocatorControl => CompletionAuthority::AllocatorDiagnostic,
         None => {
+            let set = pending.crossing_set();
+            let strict = pending.ring_first_strict();
+            let counters = pending.refused_counters();
+            let decision = crate::crossing::evaluate_host_crossing(
+                set,
+                strict,
+                Some(carrick_syscall_abi::CanonicalNr::new(ordinal)),
+                Some(ordinal),
+                counters,
+                |ret| pending.install_result(SyscallResult::new(ret)),
+            );
+            if decision == crate::crossing::HostCrossingDecision::Refused {
+                return CompletionRoute::Served;
+            }
             pending.record_forwarded(ordinal);
             return CompletionRoute::Forward;
         }
@@ -685,6 +699,7 @@ mod ring_first_tests {
     // carrier, just as in x86's crossing set, until native custody serves it.
     struct CarrierOwned<'a> {
         result: i64,
+        admitted: bool,
         work: bool,
         handback: bool,
         refused: &'a [AtomicU64; 513],
@@ -692,6 +707,9 @@ mod ring_first_tests {
     }
     impl<'a> PendingFamilies<'a> for CarrierOwned<'a> {
         fn binding(&self) -> Option<ExecutionBinding> {
+            if !self.admitted {
+                return None;
+            }
             Some(ExecutionBinding {
                 task: EntryTaskKey::from_raw(1),
                 generation: EntryGeneration::from_raw(1),
@@ -730,6 +748,26 @@ mod ring_first_tests {
     }
 
     #[test]
+    fn failed_entry_admission_cannot_bypass_crossing_policy() {
+        let refused = [const { AtomicU64::new(0) }; 513];
+        let mut pending = CarrierOwned {
+            admitted: false,
+            result: 42,
+            work: false,
+            handback: false,
+            refused: &refused,
+            forwarded: [const { AtomicU64::new(0) }; 512],
+        };
+        assert_eq!(
+            dispatch(174, u64::MAX, &mut pending),
+            CompletionRoute::Served
+        );
+        assert_eq!(pending.forwarded[174].load(Ordering::Relaxed), 0);
+        assert_eq!(pending.result, -38);
+        assert_eq!(pending.refused[174].load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn strict_arm_preserves_family_declines_handback_and_owed_work() {
         for (ordinal, work, handback, expected) in [
             (222, false, false, CompletionRoute::Forward),
@@ -744,6 +782,7 @@ mod ring_first_tests {
         ] {
             let refused = [const { AtomicU64::new(0) }; 513];
             let mut pending = CarrierOwned {
+                admitted: true,
                 result: 42,
                 work,
                 handback,
@@ -765,6 +804,7 @@ mod ring_first_tests {
         for ordinal in [93, 94] {
             let refused = [const { AtomicU64::new(0) }; 513];
             let mut pending = CarrierOwned {
+                admitted: true,
                 result: 42,
                 work: false,
                 handback: false,
