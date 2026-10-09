@@ -1360,9 +1360,10 @@ mod tests {
         )
         .expect("dispatcher call");
 
+        // The refused loan record reports its typed Stale refusal (wire 2).
         assert_eq!(
             result,
-            [carrick_el1_abi::METADATA_GRANT_ERR_DENIED, 0, 0, 0]
+            [carrick_el1_abi::METADATA_GRANT_ERR_DENIED, 2, 0, 0]
         );
         // Neither B nor 0 is charged
         assert!(
@@ -1402,9 +1403,10 @@ mod tests {
         )
         .expect("dispatcher call");
 
+        // The refused loan record reports its typed Stale refusal (wire 2).
         assert_eq!(
             result,
-            [carrick_el1_abi::METADATA_GRANT_ERR_DENIED, 0, 0, 0]
+            [carrick_el1_abi::METADATA_GRANT_ERR_DENIED, 2, 0, 0]
         );
         // CPU 0 must NOT have been charged via silent fallback
         assert!(
