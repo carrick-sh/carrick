@@ -333,5 +333,24 @@ outcome re-enrolls with the same retained frame; a completed outcome consumes
 the frame exactly once and restores the guest return register. The empty-pipe
 stdin read witness is green through this path, and the shared pool's
 single-worker continuation test confirms that a blocked task releases the
-worker for another runnable task. Host readiness for poll remains the next
-milestone.
+worker for another runnable task.
+
+### Dedicated host-readiness crossing
+
+The first poll implementation incorrectly reused `epoll_pwait` (281) as a
+transport marker and forwarded the whole poll into the host dispatcher. That
+made one crossing number carry two protocols and moved the poll owner out of
+the ring. The corrected boundary uses one named internal crossing, distinct
+from every Linux syscall ordinal. Its current transport reserves that number;
+the next implementation step must move the readiness request and completion
+into the guest poll call. The guest poll owner must resolve the fd map,
+negative entries, absent entries, duplicates and in-zone descriptions, then
+pass only typed host bindings and their interests to the carrier with the
+caller deadline. The carrier must sample those handles, park an owned
+continuation if none are ready, and return an exact ready set or timeout to
+the same guest poll call. Its KVM adapter will read the request from the
+stopped task's private supervisor memory. The portable syscall and file-table
+code must contain no KVM or x86 types. The stopped forward frame and request
+must remain task-owned across lease release; the shared wait service supplies
+the deadline. This replaces the `epoll_pwait` marker without retaining a
+compatibility path beside it.

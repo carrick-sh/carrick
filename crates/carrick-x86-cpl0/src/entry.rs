@@ -403,12 +403,12 @@ mod kernel {
             if self.call.native.raw() != 7 {
                 return false;
             }
-            self.frame.rax = AllowedHostCrossing::EpollPwait as u64;
-            self.frame.rdi = carrick_el1_abi::HostPollEpollBridge::EPOLL_FD_ARG;
+            self.frame.rax = carrick_el1_abi::HostReadinessCrossing::NUMBER;
+            self.frame.rdi = carrick_el1_abi::HostReadinessCrossing::REQUEST_TAG;
             self.frame.rsi = fds;
             self.frame.rdx = nfds;
             self.frame.r10 = timeout_ms as u64;
-            self.frame.rcx = carrick_el1_abi::HostPollEpollBridge::FRAME_TAG;
+            self.frame.rcx = carrick_el1_abi::HostReadinessCrossing::FRAME_TAG;
             true
         }
         fn arm_frame(&mut self) -> Option<&mut carrick_el1_abi::TrapFrame> { None }
@@ -1959,19 +1959,16 @@ mod kernel {
                 }
                 CompletionRoute::Forward => {
                     let bridge = call.native.raw() == 7
-                        && frame.rax == AllowedHostCrossing::EpollPwait as u64
-                        && carrick_el1_abi::HostPollEpollBridge::is_bridge(frame.rdi, frame.rcx);
-                    if bridge || AllowedHostCrossing::from_native(call.native.raw()).is_some() {
-                        doorbell(FORWARD_PORT, frame);
-                        if bridge {
-                            frame.rdi = call.args[0];
-                            frame.rsi = call.args[1];
-                            frame.rdx = call.args[2];
-                            frame.r10 = call.args[3];
-                            frame.rcx = original_rcx;
-                        }
-                    } else {
-                        record_refusal(counters, frame, Some(call.native.raw()));
+                        && frame.rax == carrick_el1_abi::HostReadinessCrossing::NUMBER
+                        && carrick_el1_abi::HostReadinessCrossing::is_crossing(frame.rdi, frame.rcx);
+                    // The shared personality evaluated the x86 crossing set.
+                    doorbell(FORWARD_PORT, frame);
+                    if bridge {
+                        frame.rdi = call.args[0];
+                        frame.rsi = call.args[1];
+                        frame.rdx = call.args[2];
+                        frame.r10 = call.args[3];
+                        frame.rcx = original_rcx;
                     }
                 }
             }
