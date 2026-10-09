@@ -80,8 +80,8 @@ pub const EL1_COUNTERS_OFFSET: u64 = 0x10_0000;
 /// Base guest virtual address of the per-syscall counters page.
 pub const EL1_COUNTERS_BASE: u64 = EL1_REGION_BASE + EL1_COUNTERS_OFFSET;
 
-/// Bit in aperture control word: ARM EL1 enforces strict ring-first forward allowlist.
-pub const APERTURE_CONTROL_ARM_RING_FIRST_STRICT: u64 = 1 << 3;
+/// Explicit ARM opt-out bit. A zero control word enforces strict admission.
+pub const APERTURE_CONTROL_ARM_RING_FIRST_OPT_OUT: u64 = 1 << 3;
 
 /// Byte offset of the aperture control word within the region.
 pub const EL1_APERTURE_CONTROL_OFFSET: u64 =
@@ -679,7 +679,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::size_of::<ApertureControl>() as u64,
         core::mem::align_of::<ApertureControl>() as u64,
         core::mem::offset_of!(ApertureControl, control) as u64,
-        APERTURE_CONTROL_ARM_RING_FIRST_STRICT,
+        APERTURE_CONTROL_ARM_RING_FIRST_OPT_OUT,
+        2, // control encoding: zero is strict; bit 3 opts out.
     ];
     let mut a = 0;
     while a < aperture_facts.len() {
@@ -2226,17 +2227,17 @@ impl ApertureControl {
 
     #[inline]
     pub fn is_strict(&self) -> bool {
-        (self.control.load(Ordering::Acquire) & APERTURE_CONTROL_ARM_RING_FIRST_STRICT) != 0
+        (self.control.load(Ordering::Acquire) & APERTURE_CONTROL_ARM_RING_FIRST_OPT_OUT) == 0
     }
 
     #[inline]
     pub fn set_strict(&self, strict: bool) {
         if strict {
             self.control
-                .fetch_or(APERTURE_CONTROL_ARM_RING_FIRST_STRICT, Ordering::Release);
+                .fetch_and(!APERTURE_CONTROL_ARM_RING_FIRST_OPT_OUT, Ordering::Release);
         } else {
             self.control
-                .fetch_and(!APERTURE_CONTROL_ARM_RING_FIRST_STRICT, Ordering::Release);
+                .fetch_or(APERTURE_CONTROL_ARM_RING_FIRST_OPT_OUT, Ordering::Release);
         }
     }
 }
@@ -3374,7 +3375,7 @@ impl Default for InotifyNameCache {
 const _: () = {
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
-    assert!(EL1_ABI_LAYOUT_HASH == 0x6e229185340f7fb);
+    assert!(EL1_ABI_LAYOUT_HASH == 0x5933de4bbe84f119);
     assert!(
         EL1_APERTURE_CONTROL_OFFSET.is_multiple_of(core::mem::align_of::<ApertureControl>() as u64)
     );
@@ -3402,12 +3403,15 @@ mod tests {
     #[test]
     fn test_aperture_control_strict_flag() {
         let aperture = ApertureControl::new();
-        assert!(!aperture.is_strict());
+        assert!(
+            aperture.is_strict(),
+            "zero control must enforce strict admission"
+        );
         aperture.set_strict(true);
         assert!(aperture.is_strict());
         assert_eq!(
-            aperture.control.load(Ordering::Relaxed) & APERTURE_CONTROL_ARM_RING_FIRST_STRICT,
-            APERTURE_CONTROL_ARM_RING_FIRST_STRICT
+            aperture.control.load(Ordering::Relaxed) & APERTURE_CONTROL_ARM_RING_FIRST_OPT_OUT,
+            0
         );
         aperture.set_strict(false);
         assert!(!aperture.is_strict());
