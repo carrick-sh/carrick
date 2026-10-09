@@ -470,45 +470,6 @@ pub fn host_readiness_entries(
     (!host_entries.is_empty() || pollfds.iter().all(|entry| entry.fd < 0)).then_some(host_entries)
 }
 
-/// VM-free fixture probe for host-bound descriptions. Production guest code
-/// asks the carrier through the dedicated typed host-readiness crossing.
-#[cfg(all(test, not(target_os = "none")))]
-pub fn query_host_readiness(host_fd: i32, flags: u32) -> i16 {
-    let mut pfd = libc::pollfd {
-        fd: host_fd,
-        events: libc::POLLIN | libc::POLLOUT | libc::POLLPRI,
-        revents: 0,
-    };
-    let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
-    if rc > 0 {
-        let mut r = 0i16;
-        if (pfd.revents & libc::POLLIN) != 0 && (flags & DELEGATED_FLAG_READABLE) != 0 {
-            r |= LINUX_POLLIN | LINUX_POLLRDNORM;
-        }
-        if (pfd.revents & libc::POLLOUT) != 0 && (flags & DELEGATED_FLAG_WRITABLE) != 0 {
-            r |= LINUX_POLLOUT | LINUX_POLLWRNORM;
-        }
-        if (pfd.revents & libc::POLLERR) != 0 {
-            r |= LINUX_POLLERR;
-        }
-        if (pfd.revents & libc::POLLHUP) != 0 {
-            r |= LINUX_POLLHUP;
-        }
-        if (pfd.revents & libc::POLLNVAL) != 0 {
-            r |= LINUX_POLLNVAL;
-        }
-        r
-    } else {
-        0
-    }
-}
-
-/// Without a host crossing, access mode never implies current readiness.
-#[cfg(any(target_os = "none", not(test)))]
-pub fn query_host_readiness(_host_fd: i32, _flags: u32) -> i16 {
-    0
-}
-
 /// Resolves pollfd entries against the zone tables and IPC venue.
 pub fn resolve_poll(
     fd_map: &[FdMapSlot],
@@ -554,20 +515,13 @@ pub fn resolve_poll_with_host_readiness(
         {
             let open_file = &open_table[(handle - 1) as usize];
             if open_file.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST {
-                let flags = open_file.flags.load(Ordering::Acquire);
                 let readiness = if host_cursor
                     .peek()
                     .is_some_and(|next| next.poll_index as usize == index)
                 {
                     host_cursor.next().map_or(0, |next| next.revents)
-                } else if host_entries.is_some() {
-                    0
                 } else {
-                    open_file
-                        .host_object()
-                        .and_then(|binding| binding.stdio_fd())
-                        .or_else(|| open_file.host_fd().map(HostBoundFd::raw))
-                        .map_or(0, |host_fd| query_host_readiness(host_fd, flags))
+                    0
                 };
                 let mut revents = entry.events & readiness;
                 revents |= readiness & (LINUX_POLLERR | LINUX_POLLHUP | LINUX_POLLNVAL);
@@ -664,6 +618,71 @@ mod tests {
     use carrick_el1_abi::MAX_ZONE_OPEN_FILES;
     use carrick_sched_core::ThreadIdentity;
 
+    fn resolve_with_native_batch(
+        fd_map: &[FdMapSlot],
+        open_table: &[DelegatedOpenFile],
+        object_table: &[DelegatedFile],
+        file_table: u64,
+        pollfds: &mut [PollFd],
+    ) -> i32 {
+        let mut entries = host_readiness_entries(fd_map, open_table, file_table, pollfds)
+            .expect("host-bound fixture entries");
+        for entry in &mut entries {
+            let fd = entry
+                .binding
+                .stdio_fd()
+                .map(i32::from)
+                .or_else(|| entry.binding.host_fd().map(HostBoundFd::raw))
+                .expect("host binding");
+            let mut pfd = libc::pollfd {
+                fd,
+                events: entry.events,
+                revents: 0,
+            };
+            assert!(unsafe { libc::poll(&mut pfd, 1, 0) } >= 0);
+            entry.revents = pfd.revents;
+        }
+        resolve_poll_with_host_readiness(
+            fd_map,
+            open_table,
+            object_table,
+            None,
+            file_table,
+            pollfds,
+            Some(&entries),
+        )
+    }
+
+    #[test]
+    fn host_readiness_requires_the_carrier_batch_even_in_vm_free_tests() {
+        let (fd_map, open_table, object_table) = setup_tables();
+        let mut pipe_fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        admit_host_fd(
+            &fd_map,
+            &open_table,
+            &object_table,
+            10,
+            1,
+            pipe_fds[1],
+            DELEGATED_FLAG_WRITABLE,
+        );
+        let mut pollfds = [PollFd {
+            fd: 1,
+            events: LINUX_POLLOUT,
+            revents: 0,
+        }];
+        assert_eq!(
+            resolve_poll(&fd_map, &open_table, &object_table, None, 10, &mut pollfds),
+            0
+        );
+        assert_eq!(pollfds[0].revents, 0);
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+        }
+    }
+
     fn setup_tables() -> (
         [FdMapSlot; FD_MAP_CAPACITY],
         [DelegatedOpenFile; MAX_ZONE_OPEN_FILES],
@@ -706,14 +725,8 @@ mod tests {
                 revents: 0,
             },
         ];
-        let ready = resolve_poll(
-            &fd_map,
-            &open_table,
-            &object_table,
-            None,
-            file_table,
-            &mut pfds,
-        );
+        let ready =
+            resolve_with_native_batch(&fd_map, &open_table, &object_table, file_table, &mut pfds);
 
         // fd 1 is absent -> POLLNVAL
         assert_eq!(pfds[1].revents, LINUX_POLLNVAL);
@@ -925,14 +938,8 @@ mod tests {
             events: 0,
             revents: 0,
         }];
-        let ready = resolve_poll(
-            &fd_map,
-            &open_table,
-            &object_table,
-            None,
-            file_table,
-            &mut pfds,
-        );
+        let ready =
+            resolve_with_native_batch(&fd_map, &open_table, &object_table, file_table, &mut pfds);
         unsafe { libc::close(pipe_fds[0]) };
 
         assert_eq!(ready, 1);
@@ -944,25 +951,28 @@ mod tests {
         let (fd_map, open_table, object_table) = setup_tables();
         let t1 = 10;
         let t2 = 20;
+        let mut pipe_fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
 
-        // t1 has fd 0 with ReadOnly
+        // Native Linux reports no POLLOUT on a pipe read end, while the
+        // write end reports POLLOUT. Access mode alone is not readiness.
         admit_host_fd(
             &fd_map,
             &open_table,
             &object_table,
             t1,
             0,
-            0,
+            pipe_fds[0],
             DELEGATED_FLAG_READABLE,
         );
-        // t2 has fd 0 with WriteOnly
+        // t2 names the other endpoint at the same guest descriptor number.
         admit_host_fd(
             &fd_map,
             &open_table,
             &object_table,
             t2,
             0,
-            1,
+            pipe_fds[1],
             DELEGATED_FLAG_WRITABLE,
         );
 
@@ -971,8 +981,8 @@ mod tests {
             events: LINUX_POLLOUT,
             revents: 0,
         }];
-        let ready1 = resolve_poll(&fd_map, &open_table, &object_table, None, t1, &mut pfds1);
-        // Table 1 fd 0 is ReadOnly, so requested POLLOUT yields 0 revents
+        let ready1 = resolve_with_native_batch(&fd_map, &open_table, &object_table, t1, &mut pfds1);
+        // The read endpoint has no writable readiness.
         assert_eq!(pfds1[0].revents, 0);
         assert_eq!(ready1, 0);
 
@@ -981,10 +991,14 @@ mod tests {
             events: LINUX_POLLOUT,
             revents: 0,
         }];
-        let ready2 = resolve_poll(&fd_map, &open_table, &object_table, None, t2, &mut pfds2);
-        // Table 2 fd 0 is WriteOnly and host fd 1 is writable
+        let ready2 = resolve_with_native_batch(&fd_map, &open_table, &object_table, t2, &mut pfds2);
+        // The write endpoint is writable.
         assert_eq!(pfds2[0].revents & LINUX_POLLOUT, LINUX_POLLOUT);
         assert_eq!(ready2, 1);
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+        }
     }
 
     #[test]
@@ -1064,7 +1078,13 @@ mod tests {
         }
 
         // Host fd write end is NOT writable right now!
-        let host_readiness = query_host_readiness(pipe_fds[1], DELEGATED_FLAG_WRITABLE);
+        let mut native = libc::pollfd {
+            fd: pipe_fds[1],
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut native, 1, 0) }, 0);
+        let host_readiness = native.revents;
         assert_eq!(
             host_readiness & LINUX_POLLOUT,
             0,
@@ -1087,14 +1107,8 @@ mod tests {
             events: LINUX_POLLOUT,
             revents: 0,
         }];
-        let ready = resolve_poll(
-            &fd_map,
-            &open_table,
-            &object_table,
-            None,
-            file_table,
-            &mut pfds,
-        );
+        let ready =
+            resolve_with_native_batch(&fd_map, &open_table, &object_table, file_table, &mut pfds);
         assert_eq!(ready, 0, "full pipe must have 0 ready entries");
         assert_eq!(pfds[0].revents, 0);
 
@@ -1104,14 +1118,8 @@ mod tests {
         assert!(n > 0);
 
         // Pipe is writable again!
-        let ready_after = resolve_poll(
-            &fd_map,
-            &open_table,
-            &object_table,
-            None,
-            file_table,
-            &mut pfds,
-        );
+        let ready_after =
+            resolve_with_native_batch(&fd_map, &open_table, &object_table, file_table, &mut pfds);
         assert_eq!(ready_after, 1, "drained pipe must report POLLOUT");
         assert_eq!(pfds[0].revents & LINUX_POLLOUT, LINUX_POLLOUT);
 
