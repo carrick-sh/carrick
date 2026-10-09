@@ -147,6 +147,7 @@ impl PersistentExecutorFactory for KvmPersistentExecutorFactory {
             scheduler: Arc::clone(&self.scheduler),
             binding: None,
             task: None,
+            loaded_generation: None,
             completion_sent: false,
             first_forward_hook: Arc::clone(&self.first_forward_hook),
             idle_kick: carrick_vmm_kvm::KvmKickHandle::for_current_thread(),
@@ -166,6 +167,7 @@ pub(crate) struct KvmPersistentExecutor {
     scheduler: Arc<Scheduler>,
     binding: Option<Arc<KvmTaskBinding>>,
     task: Option<TaskIdentity>,
+    loaded_generation: Option<ExecutionGeneration>,
     completion_sent: bool,
     first_forward_hook: Arc<Mutex<Option<KvmFirstForwardHook>>>,
 }
@@ -338,6 +340,7 @@ impl PersistentExecutor for KvmPersistentExecutor {
             TrapError::Hypervisor(format!("KVM physical CPU restore at load: {error}"))
         })?;
         self.task = Some(task.binding().arch().task());
+        self.loaded_generation = Some(task.generation());
         self.binding = Some(Arc::clone(task.binding()));
         Ok(())
     }
@@ -352,6 +355,19 @@ impl PersistentExecutor for KvmPersistentExecutor {
                 return Ok(ExecutorExit::Preempted);
             }
             let task = self.task()?;
+            let binding = self
+                .binding
+                .as_ref()
+                .ok_or_else(|| TrapError::Hypervisor("KVM forward lost task binding".into()))?;
+            let lease = submission.execution_lease_mut()?;
+            ForwardOwner::new(
+                binding.thread,
+                self.loaded_generation.ok_or_else(|| {
+                    TrapError::Hypervisor("KVM forward has no loaded lease generation".into())
+                })?,
+                binding.arch().task(),
+            )
+            .admit(lease.thread_key(), lease.generation(), self.task)?;
             if let Some(binding) = self.binding.as_ref().cloned()
                 && submission
                     .execution_lease_mut()?
@@ -709,6 +725,7 @@ impl PersistentExecutor for KvmPersistentExecutor {
                 ));
             }
         };
+        self.loaded_generation = None;
         let saved = match self.physical.cpu_mut().save_and_detach(task) {
             Ok(saved) => saved,
             Err(error) => {
@@ -811,6 +828,79 @@ pub(crate) struct KvmTaskBinding {
     thread: ThreadKey,
     kernel_binding: KernelTaskBinding,
     retained: Mutex<Option<RetainedForward>>,
+}
+
+/// The exact running guest task that may request a stopped physical forward.
+/// The peer's physical slot alone carries no authority to choose a task.
+struct ForwardOwner {
+    thread: ThreadKey,
+    generation: ExecutionGeneration,
+    task: TaskIdentity,
+}
+
+impl ForwardOwner {
+    fn new(thread: ThreadKey, generation: ExecutionGeneration, task: TaskIdentity) -> Self {
+        Self {
+            thread,
+            generation,
+            task,
+        }
+    }
+
+    fn admit(
+        &self,
+        thread: ThreadKey,
+        generation: ExecutionGeneration,
+        loaded: Option<TaskIdentity>,
+    ) -> Result<(), TrapError> {
+        if thread != self.thread || generation != self.generation || loaded != Some(self.task) {
+            return Err(TrapError::Hypervisor(
+                "KVM forward requires the exact running task lease".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod forward_owner_tests {
+    use super::*;
+    use carrick_hal::guest_arch_binding::core_arch::{
+        CarrierGeneration, ExecutionGeneration as ArchExecutionGeneration, TaskSerial,
+    };
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn forward_owner_rejects_wrong_lease_and_idle_peer() {
+        let thread = ThreadKey::from_zone_identity(41, NonZeroU64::new(7).unwrap()).unwrap();
+        let other = ThreadKey::from_zone_identity(42, NonZeroU64::new(8).unwrap()).unwrap();
+        let task = TaskIdentity {
+            carrier: CarrierGeneration::new(NonZeroU64::new(1).unwrap()),
+            task: TaskSerial::new(NonZeroU64::new(41).unwrap()),
+            execution: ArchExecutionGeneration::new(NonZeroU64::new(3).unwrap()),
+        };
+        let owner = ForwardOwner::new(thread, ExecutionGeneration::from_raw(3), task);
+        assert!(
+            owner
+                .admit(thread, ExecutionGeneration::from_raw(3), Some(task))
+                .is_ok()
+        );
+        assert!(
+            owner
+                .admit(other, ExecutionGeneration::from_raw(3), Some(task))
+                .is_err()
+        );
+        assert!(
+            owner
+                .admit(thread, ExecutionGeneration::from_raw(4), Some(task))
+                .is_err()
+        );
+        assert!(
+            owner
+                .admit(thread, ExecutionGeneration::from_raw(3), None)
+                .is_err()
+        );
+    }
 }
 
 impl KvmTaskBinding {
