@@ -1468,9 +1468,9 @@ impl Thread {
         let mut target =
             crate::kernel::scheduler::ExactWakeTarget::new(self.task_key(), self.key, generation);
         if let Some(continuation) = execution.blocked_continuation.as_ref() {
-            if !continuation
+            if continuation
                 .zone_wait()
-                .is_some_and(|wait| wait.record == record)
+                .is_none_or(|wait| wait.record != record)
             {
                 return None;
             }
