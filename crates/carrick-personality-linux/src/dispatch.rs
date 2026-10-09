@@ -1,6 +1,8 @@
 //! The single Linux ordinal-to-family routing table.
 use crate::abi::entry::SyscallResult;
+use crate::identity::IdentityCall;
 use crate::lifecycle::{LifecycleCall, LifecycleOutcome};
+use crate::sysinfo::SysinfoCall;
 use carrick_core_abi::EntryContext;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,6 +28,8 @@ pub enum Family {
     FilePositioned,
     AllocatorControl,
     SignalReturn,
+    Identity(IdentityCall),
+    Sysinfo(SysinfoCall),
     Unported,
 }
 
@@ -272,6 +276,12 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     fn lifecycle_native(&mut self) -> Option<&mut dyn crate::lifecycle::LifecycleNative<'a>> {
         None
     }
+    fn identity_native(&mut self) -> Option<&mut dyn crate::identity::IdentityNative<'a>> {
+        None
+    }
+    fn sysinfo_native(&mut self) -> Option<&mut dyn crate::sysinfo::SysinfoNative<'a>> {
+        None
+    }
     fn original_argument0(&self) -> u64;
     fn install_result(&mut self, result: SyscallResult);
     /// Removed by order 8.
@@ -352,6 +362,26 @@ fn serve_family<'a, C: EntryContext + 'a>(
                 }
             });
     }
+    if let Family::Identity(call) = family {
+        let original = pending.original_argument0();
+        return pending
+            .identity_native()
+            .and_then(|native| crate::identity::invoke(call, native))
+            .map_or(FamilyCompletion::Forward.into(), |result| FamilyRun {
+                completion: FamilyCompletion::Complete(result.raw()),
+                returned: Some((result, original)),
+            });
+    }
+    if let Family::Sysinfo(call) = family {
+        let original = pending.original_argument0();
+        return pending
+            .sysinfo_native()
+            .and_then(|native| crate::sysinfo::invoke(call, native))
+            .map_or(FamilyCompletion::Forward.into(), |result| FamilyRun {
+                completion: FamilyCompletion::Complete(result.raw()),
+                returned: Some((result, original)),
+            });
+    }
     let mut returned = None;
     let completion = match family {
         Family::Anonymous(call) => {
@@ -375,6 +405,8 @@ fn serve_family<'a, C: EntryContext + 'a>(
         Family::Write => pending.write(),
         Family::EpollWait => pending.epoll_wait(),
         Family::Lifecycle(_) => FamilyCompletion::Forward,
+        Family::Identity(_) => FamilyCompletion::Forward,
+        Family::Sysinfo(_) => FamilyCompletion::Forward,
         Family::Futex => pending.futex(),
         Family::InotifyAdd => pending.inotify_add(),
         Family::InotifyRemove => pending.inotify_remove(),
@@ -425,6 +457,42 @@ pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
         nr if nr == carrick_syscall_abi::nr::EXIT_GROUP.raw() => {
             Family::Lifecycle(LifecycleCall::ExitGroup)
         }
+        90 => Family::Identity(IdentityCall::CapGet),
+        91 => Family::Identity(IdentityCall::CapSet),
+        92 => Family::Identity(IdentityCall::Personality),
+        96 => Family::Identity(IdentityCall::SetTidAddress),
+        100 => Family::Identity(IdentityCall::GetRobustList),
+        143 => Family::Identity(IdentityCall::SetReGid),
+        144 => Family::Identity(IdentityCall::SetGid),
+        145 => Family::Identity(IdentityCall::SetReUid),
+        146 => Family::Identity(IdentityCall::SetUid),
+        147 => Family::Identity(IdentityCall::SetResUid),
+        148 => Family::Identity(IdentityCall::GetResUid),
+        149 => Family::Identity(IdentityCall::SetResGid),
+        150 => Family::Identity(IdentityCall::GetResGid),
+        151 => Family::Identity(IdentityCall::SetFsUid),
+        152 => Family::Identity(IdentityCall::SetFsGid),
+        154 => Family::Identity(IdentityCall::SetPgid),
+        155 => Family::Identity(IdentityCall::GetPgid),
+        156 => Family::Identity(IdentityCall::GetSid),
+        157 => Family::Identity(IdentityCall::SetSid),
+        158 => Family::Identity(IdentityCall::GetGroups),
+        159 => Family::Identity(IdentityCall::SetGroups),
+        160 => Family::Sysinfo(SysinfoCall::Uname),
+        161 => Family::Sysinfo(SysinfoCall::SetHostname),
+        162 => Family::Sysinfo(SysinfoCall::SetDomainname),
+        163 => Family::Sysinfo(SysinfoCall::GetRlimit),
+        164 => Family::Sysinfo(SysinfoCall::SetRlimit),
+        165 => Family::Sysinfo(SysinfoCall::GetRusage),
+        166 => Family::Sysinfo(SysinfoCall::Umask),
+        167 => Family::Identity(IdentityCall::Prctl),
+        173 => Family::Identity(IdentityCall::GetPpid),
+        174 => Family::Identity(IdentityCall::GetUid),
+        175 => Family::Identity(IdentityCall::GetEuid),
+        176 => Family::Identity(IdentityCall::GetGid),
+        177 => Family::Identity(IdentityCall::GetEgid),
+        179 => Family::Sysinfo(SysinfoCall::Sysinfo),
+        261 => Family::Sysinfo(SysinfoCall::Prlimit64),
         nr if allocator_control != u64::MAX && nr == allocator_control => Family::AllocatorControl,
         _ => Family::Unported,
     }
