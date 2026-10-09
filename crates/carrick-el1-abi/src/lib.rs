@@ -2004,6 +2004,22 @@ impl AnonymousLeave {
     pub const COUNT: usize = 13;
 }
 
+/// Exact gate that refused an owner-routed process syscall.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub enum ProcessRefusal {
+    MissingEntry,
+    Admission,
+    Service,
+    RegisteredEntry,
+    RootExit,
+    Forwarded,
+}
+
+impl ProcessRefusal {
+    pub const COUNT: usize = 6;
+}
+
 /// Per-syscall accounting counters maintained by the EL1 kernel in the shared aperture.
 #[repr(C)]
 pub struct Counters {
@@ -2029,6 +2045,9 @@ pub struct Counters {
     /// by native ordinal 0..512 plus one overflow bucket for values >= 512
     /// and unmapped/undecodable natives.
     pub refused: [AtomicU64; 513],
+    /// ARM process-entry refusals: missing slot, root admission, service,
+    /// registered entry, root-exit crossing, or personality forwarding.
+    pub process_refusals: [AtomicU64; ProcessRefusal::COUNT],
 }
 
 impl Counters {
@@ -2043,6 +2062,7 @@ impl Counters {
             lifecycle_declines: [const { AtomicU64::new(0) }; LifecycleDecline::COUNT],
             anonymous_leaves: [const { AtomicU64::new(0) }; AnonymousLeave::COUNT],
             refused: [const { AtomicU64::new(0) }; 513],
+            process_refusals: [const { AtomicU64::new(0) }; ProcessRefusal::COUNT],
         }
     }
 
@@ -2087,6 +2107,12 @@ impl Counters {
         }
         for i in 0..513 {
             snapshot.refused[i].store(self.refused[i].load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        for i in 0..ProcessRefusal::COUNT {
+            snapshot.process_refusals[i].store(
+                self.process_refusals[i].load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
         }
         snapshot
     }
@@ -3416,9 +3442,9 @@ const _: () = {
     );
 };
 #[cfg(target_arch = "aarch64")]
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0xa2e6_c6c4_817c_b134);
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x58e2_c574_747e_6324);
 #[cfg(not(target_arch = "aarch64"))]
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x6c47_2801_7fe6_f330);
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0xea24_605d_1d3b_1060);
 
 #[cfg(test)]
 mod tests {
@@ -3553,7 +3579,8 @@ mod tests {
                 + IpcLeave::COUNT
                 + LifecycleDecline::COUNT
                 + AnonymousLeave::COUNT
-                + 513)
+                + 513
+                + 6)
                 * 8
         );
         assert_eq!(core::mem::offset_of!(Counters, served), 0);
