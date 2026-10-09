@@ -2322,7 +2322,6 @@ pub enum NativeForkFailureStage {
     PrepareCustodyCapacity = 29,
     PrepareUnclassifiedCapacity = 30,
     PrepareEditCapacity = 31,
-    PrepareControlArenaCapacity = 32,
 }
 
 impl NativeForkFailureStage {
@@ -2359,7 +2358,6 @@ impl NativeForkFailureStage {
             29 => Self::PrepareCustodyCapacity,
             30 => Self::PrepareUnclassifiedCapacity,
             31 => Self::PrepareEditCapacity,
-            32 => Self::PrepareControlArenaCapacity,
             _ => return None,
         })
     }
