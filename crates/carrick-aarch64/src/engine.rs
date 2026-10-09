@@ -921,8 +921,14 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         let ttbr = self.vcpu.borrow().get_sys_reg(SysReg::Ttbr0)?;
         let hardware_asid = (ttbr >> 48) as u16;
         if hardware_asid != process_asid {
+            let maintenance_root = self
+                .vm
+                .carrier_maintenance_root()
+                .ok()
+                .map(|root| root.raw());
             return Err(TrapError::Hypervisor(format!(
-                "loaded HVPatch projection ASID {process_asid} does not match TTBR ASID {hardware_asid}"
+                "loaded HVPatch projection ASID {process_asid} does not match TTBR ASID {hardware_asid}: live_ttbr={ttbr:#x} projected_root={:?} maintenance_root={maintenance_root:?}",
+                self.page_tables.root_base(),
             )));
         }
         let root = ttbr & TTBR_ROOT_MASK;
