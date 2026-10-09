@@ -1996,26 +1996,45 @@ fn x4_shared_wait_records() {
     assert!(parked.matches(&zone, slot));
     assert!(zone.slot(slot).current().is_none());
 
-    // Verify park_object_record does not invoke save_context when deadline cannot be parked
+    // Concurrent deadlines admit separate owned object continuations.
     let context_saved = std::cell::Cell::new(false);
     let bad_token = OperationToken::new(tid, 2).unwrap();
-    let bad_request =
-        carrick_core_abi::ObjectParkRequest::new(key, snapshot, bad_token, Some(999999));
     let dummy = zone.alloc_record(identity).unwrap();
     let d_seq = zone.next_seq(dummy);
     zone.set_deadline(dummy, 10000);
     zone.arm_timer(slot, dummy, d_seq).unwrap();
     zone.publish_park(dummy, d_seq);
 
-    let res = park_object_record(&zone, slot, bad_request, 1024, &|_| {}, || {
-        context_saved.set(true);
-        Ok((record, false))
-    });
-    assert!(res.is_err());
-    assert!(
-        !context_saved.get(),
-        "occupied timer must refuse before saving context or allocating record"
+    let concurrent_key = ObjectWaitKey::new(3, 10).unwrap();
+    zone.bind_object_wait(concurrent_key, &wait).unwrap();
+    let concurrent_guard = zone.object_wait(concurrent_key, &wait).unwrap();
+    let concurrent_snapshot = concurrent_guard.snapshot();
+    drop(concurrent_guard);
+    let concurrent = zone
+        .alloc_record(ThreadIdentity {
+            tid: tid + 1,
+            serial: (tid + 1) * 10,
+            ..identity
+        })
+        .unwrap();
+    let concurrent_request = carrick_core_abi::ObjectParkRequest::new(
+        concurrent_key,
+        concurrent_snapshot,
+        bad_token,
+        Some(5000),
     );
+    let res = park_object_record(&zone, slot, concurrent_request, 1024, &|_| {}, || {
+        context_saved.set(true);
+        Ok((concurrent, false))
+    })
+    .unwrap();
+    assert!(res.matches(&zone, slot));
+    assert!(
+        context_saved.get(),
+        "another timer does not refuse the owned context"
+    );
+    assert_eq!(zone.timer_deadline(slot), Some(5000));
+    context_saved.set(false);
 
     // Verify park_object_record does not invoke save_context when guard acquisition fails
     let stale_token = OperationToken::new(tid, 3).unwrap();

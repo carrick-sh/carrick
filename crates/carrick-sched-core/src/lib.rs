@@ -85,7 +85,10 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+/// Shared deadline-index publication protocol, authenticated by the image ABI.
+pub const TIMER_INDEX_PROTOCOL: u64 = 1;
 pub mod process;
+mod timer_index;
 
 mod aarch64_context;
 pub mod completion_queue;
@@ -796,9 +799,7 @@ pub struct ZoneBucket {
     len: AtomicU32,
 }
 
-/// The one record a slot's virtual timer serves, with the sequence of the
-/// park it bounds. Each slot holds at most one ([`ZoneTables::arm_timer`]
-/// refuses a second live owner).
+/// The earliest record served by a slot's shared deadline heap.
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,
@@ -807,11 +808,11 @@ pub struct ZoneBucket {
     ::core::cmp::PartialEq,
 )]
 pub struct TimerOwner {
-    pub record: RecordId,
+    pub record: RecordRef,
     pub seq: u32,
 }
 
-/// [`ZoneTables::arm_timer`]: another record's timed park holds the timer.
+/// [`ZoneTables::arm_timer`]: timer admission storage was exhausted.
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,
@@ -858,9 +859,8 @@ pub struct ZoneSlot {
     state: AtomicU32,
     /// `guest CPU + 1` the executor holding the slot is bound to (0: any).
     cpu: AtomicU32,
-    /// The home record whose park has a deadline this slot's timer serves.
-    timer_record: AtomicU32,
-    timer_seq: AtomicU32,
+    /// Retained padding preserves the published slot layout.
+    _reserved_timer_owner: [AtomicU32; 2],
     /// `ICC_SGI1R_EL1` routing bits (Aff3/Aff2/Aff1 and the target-list bit
     /// of Aff0) of this slot's vCPU; EL1 writes it from `MPIDR_EL1` before
     /// the slot idles.
@@ -946,13 +946,6 @@ impl ZoneSlot {
     /// EL1 publishes the SGI routing of its own vCPU.
     pub fn set_sgi_target(&self, target: u64) {
         self.sgi_target.store(target, Ordering::Release);
-    }
-
-    /// The home record whose timed park this slot's timer serves, with the
-    /// park's sequence number.
-    pub fn timer(&self) -> Option<(RecordId, u32)> {
-        RecordId::from_raw(self.timer_record.load(Ordering::Acquire))
-            .map(|record| (record, self.timer_seq.load(Ordering::Acquire)))
     }
 
     /// The `CNTV_CVAL_EL0` EL1 armed (0: disarmed).
@@ -1105,6 +1098,7 @@ pub struct ZoneTables<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
         [completion_queue::CompletionQueue; object_wait::OBJECT_WAIT_QUEUES],
     /// Indexed owner-only delegated inode callbacks; no guest record is needed.
     delegated_host_pending: [AtomicU64; object_wait::DELEGATED_FILE_WAIT_QUEUES.div_ceil(64)],
+    timers: timer_index::Index,
 }
 
 /// How a bucket lock waits: EL1 gives up after a bounded spin (and forwards
@@ -1902,6 +1896,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         if record.has_object_operation() {
             return;
         }
+        self.timers.cancel_record(id);
         record.claim.store(Claim::Free.encode(), Ordering::Release);
         if record.advance_incarnation() {
             Self::free_bit(&self.record_map, id.raw());
@@ -2000,12 +1995,19 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// use [`Self::publish_guest_park`] to arbitrate with host requests.
     pub fn publish_park(&self, record: RecordId, seq: u32) {
         let rec = self.record(record);
+        let timer = rec.deadline().and_then(|deadline| {
+            self.timers
+                .admission(self.record_ref(record), seq, deadline)
+        });
         // This allocation has not been exposed to a host requester.
         rec.host_wanted.clear();
         rec.last_seq.store(seq, Ordering::Relaxed);
         rec.handback.store(0, Ordering::Relaxed);
         rec.claim
             .store(Claim::Parked { seq }.encode(), Ordering::Release);
+        if let Some(timer) = timer {
+            self.timers.activate(timer);
+        }
     }
 
     /// Publish a single-entry guest park, or undo its enrollment when a
@@ -2020,6 +2022,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         seq: u32,
     ) -> bool {
         let rec = self.record(record);
+        let timer = rec
+            .deadline()
+            .and_then(|deadline| {
+                self.timers
+                    .admission(self.record_ref(record), seq, deadline)
+            })
+            .filter(|ticket| ticket.slot == slot);
         let from = rec.claim();
         let previous_seq = rec.last_seq.load(Ordering::Relaxed);
         let previous_handback = rec.handback.load(Ordering::Relaxed);
@@ -2027,6 +2036,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         rec.handback.store(0, Ordering::Relaxed);
         if matches!(from, Claim::Free | Claim::OnCpu { .. }) && rec.cas(from, Claim::Parked { seq })
         {
+            if let Some(timer) = timer {
+                self.timers.activate(timer);
+            }
             return true;
         }
         // Only the running owner can leave OnCpuRequested. The host waits
@@ -2039,10 +2051,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         rec.last_seq.store(previous_seq, Ordering::Relaxed);
         rec.handback.store(previous_handback, Ordering::Relaxed);
         rec.deadline.store(0, Ordering::Relaxed);
-        let s = self.slot(slot);
-        if s.timer_record.load(Ordering::Relaxed) == record.raw() {
-            s.timer_record.store(NIL, Ordering::Release);
-        }
+        self.timers.cancel_record(record);
         false
     }
 
@@ -2892,68 +2901,69 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         moved
     }
 
-    /// The live owner of `slot`'s timer: the record whose timed park (under
-    /// the recorded sequence) is still in force. A stale owner is dropped.
-    pub fn timer_owner(&self, slot: SlotId) -> Option<TimerOwner> {
-        self.timer_deadline(slot)?;
-        let (record, seq) = self.slot(slot).timer()?;
-        Some(TimerOwner { record, seq })
-    }
-
-    /// EL1: `record`'s park (under `seq`) has a deadline this slot's virtual
-    /// timer serves. A slot's timer has exactly one owner: arming never
-    /// displaces another record's live timed park (`TimerBusy`; the caller
-    /// forwards instead). Arm before publishing the park: until then the
-    /// owner is not live and the next check drops it.
-    pub fn arm_timer(&self, slot: SlotId, record: RecordId, seq: u32) -> Result<(), TimerBusy> {
-        if self
-            .timer_owner(slot)
-            .is_some_and(|owner| owner.record != record)
-        {
-            return Err(TimerBusy);
-        }
-        let s = self.slot(slot);
-        s.timer_seq.store(seq, Ordering::Release);
-        s.timer_record.store(record.raw(), Ordering::Release);
-        Ok(())
-    }
-
-    /// Whether a park on `slot` may take its timer now (no live owner).
-    pub fn timer_free(&self, slot: SlotId) -> bool {
-        self.timer_owner(slot).is_none()
-    }
-
-    /// The executor of `slot` is leaving EL1 (any exit), so nothing serves
-    /// its timer until the vCPU returns: take a live timed park of a record
-    /// that is not the slot's home record off the timer. The host must
-    /// claim it ([`ForeignTimer`]); the home record's deadline goes to the
-    /// host through [`Self::unhome`] when its thread is settled.
-    pub fn take_foreign_timer(&self, slot: SlotId) -> Option<ForeignTimer> {
-        let owner = self.timer_owner(slot)?;
-        let s = self.slot(slot);
-        if s.host_record() == Some(owner.record) {
-            return None;
-        }
-        s.timer_record.store(NIL, Ordering::Release);
-        Some(ForeignTimer {
-            record: self.record_ref(owner.record),
-            seq: owner.seq,
+    fn timer_ticket_live(&self, ticket: timer_index::Ticket) -> bool {
+        self.live(ticket.record).is_some_and(|record| {
+            record.claim() == Claim::Parked { seq: ticket.seq }
+                && record.deadline() == Some(ticket.deadline)
         })
     }
 
-    /// The deadline `slot`'s timer must fire at for its timed park, if the
-    /// park is still in force (a stale one is dropped).
+    /// The earliest authenticated timed park served by this slot.
+    pub fn timer_owner(&self, slot: SlotId) -> Option<TimerOwner> {
+        let ticket = self
+            .timers
+            .minimum(slot, |ticket| self.timer_ticket_live(ticket))?;
+        Some(TimerOwner {
+            record: ticket.record,
+            seq: ticket.seq,
+        })
+    }
+
+    /// Reserve an exact record's timer admission before park publication.
+    /// Publication activates it in the slot's shared deadline heap. One node
+    /// per record bounds capacity independently of executor population.
+    pub fn arm_timer(&self, slot: SlotId, record: RecordId, seq: u32) -> Result<(), TimerBusy> {
+        self.timers
+            .reserve(timer_index::Ticket {
+                slot,
+                record: self.record_ref(record),
+                seq,
+                deadline: 0,
+            })
+            .then_some(())
+            .ok_or(TimerBusy)
+    }
+
+    /// Roll back an unpublished exact timer reservation after enrollment fails.
+    pub fn cancel_timer_admission(&self, record: RecordRef) {
+        self.timers.cancel_admission(record);
+    }
+
+    /// Each admitted record has capacity for one timer lease. Other records'
+    /// deadlines never prevent admission on the same serving slot.
+    pub fn timer_admission_available(&self, _slot: SlotId) -> bool {
+        true
+    }
+
+    /// Take one foreign deadline when an executor leaves the guest. The
+    /// carrier drains these receipts before settling the home record.
+    pub fn take_foreign_timer(&self, slot: SlotId) -> Option<ForeignTimer> {
+        let ticket = self
+            .timers
+            .take_foreign(slot, self.slot(slot).host_record(), |ticket| {
+                self.timer_ticket_live(ticket)
+            })?;
+        Some(ForeignTimer {
+            record: ticket.record,
+            seq: ticket.seq,
+        })
+    }
+
+    /// Earliest live deadline, pruning cancelled or completed park leases.
     pub fn timer_deadline(&self, slot: SlotId) -> Option<u64> {
-        let s = self.slot(slot);
-        let (record, seq) = s.timer()?;
-        let rec = self.record(record);
-        match (rec.claim(), rec.deadline()) {
-            (Claim::Parked { seq: current }, Some(deadline)) if current == seq => Some(deadline),
-            _ => {
-                s.timer_record.store(NIL, Ordering::Release);
-                None
-            }
-        }
+        self.timers
+            .minimum(slot, |ticket| self.timer_ticket_live(ticket))
+            .map(|ticket| ticket.deadline)
     }
 
     /// EL1 at `now`: end `slot`'s timed park if its deadline passed. The
@@ -2962,22 +2972,26 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// full; the caller retries at its next timer check.
     #[allow(clippy::result_unit_err)]
     pub fn expire_timer(&self, slot: SlotId, now: u64, result: u64) -> Result<bool, ()> {
-        let s = self.slot(slot);
-        let Some(deadline) = self.timer_deadline(slot) else {
+        let Some(ticket) = self
+            .timers
+            .minimum(slot, |ticket| self.timer_ticket_live(ticket))
+        else {
             return Ok(false);
         };
-        if deadline > now {
+        if ticket.deadline > now {
             return Ok(false);
         }
-        let Some((record, seq)) = s.timer() else {
+        let record = ticket.record.id;
+        let seq = ticket.seq;
+        let Some(rec) = self.live(ticket.record) else {
+            self.timers.remove(ticket);
             return Ok(false);
         };
-        let rec = self.record(record);
         let entry_id = rec.first_entry.load(Ordering::Acquire);
         if entry_id == NIL {
             // A timed object park (an epoll wait): its queue, not a bucket.
-            let expired = self.expire_object_park(slot, record, seq)?;
-            s.timer_record.store(NIL, Ordering::Release);
+            let expired = self.expire_object_park(slot, ticket.record, seq)?;
+            self.timers.remove(ticket);
             if expired {
                 self.counters.el1_timeouts.fetch_add(1, Ordering::Relaxed);
             }
@@ -2991,9 +3005,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             return Err(());
         };
         if self.entry(entry_id).bucket.load(Ordering::Relaxed) as usize != guard.bucket
+            || self.live(ticket.record).is_none()
             || !rec.cas(Claim::Parked { seq }, Claim::Queued { slot, seq })
         {
-            s.timer_record.store(NIL, Ordering::Release);
+            self.timers.remove(ticket);
             return Ok(false);
         }
         self.mark_woken(rec, result);
@@ -3002,7 +3017,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         self.push_locked(&slot_guard, record, None);
         drop(slot_guard);
         drop(guard);
-        s.timer_record.store(NIL, Ordering::Release);
+        self.timers.remove(ticket);
         self.counters.el1_timeouts.fetch_add(1, Ordering::Relaxed);
         Ok(true)
     }
@@ -3230,12 +3245,12 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         let s = self.slot(slot);
         let rec = self.record(record);
         rec.affinity.store(affinity, Ordering::Relaxed);
-        let timer = match s.timer() {
-            Some((timed, seq)) if timed == record => rec.deadline().map(|deadline| (seq, deadline)),
-            _ => None,
-        };
-        // A foreign owner was taken off by `take_foreign_timer` at this exit.
-        s.timer_record.store(NIL, Ordering::Release);
+        let timer = self
+            .timers
+            .owned(self.record_ref(record))
+            .filter(|ticket| self.timer_ticket_live(*ticket))
+            .map(|ticket| (ticket.seq, ticket.deadline));
+        self.timers.cancel_record(record);
         s.host_record.store(NIL, Ordering::Release);
         rec.home.store(0, Ordering::Release);
         timer
@@ -3248,10 +3263,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         let s = self.slot(slot);
         // The run queue is not the loaded thread's: what EL1 queued here
         // stays queued, and EL1 runs it after this thread or steals it.
-        let clean = s.current.load(Ordering::Acquire) == NIL;
+        let clean = s.current.load(Ordering::Acquire) == NIL && self.timer_deadline(slot).is_none();
         s.current.store(NIL, Ordering::Release);
         s.host_record.store(NIL, Ordering::Release);
-        s.timer_record.store(NIL, Ordering::Release);
+
         // The slot may name another vCPU now (a new mailbox lease): what EL1
         // armed on the old one says nothing about this one's timer.
         s.timer_cval.store(0, Ordering::Relaxed);

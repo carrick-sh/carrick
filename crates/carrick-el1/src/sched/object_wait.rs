@@ -72,7 +72,7 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
     }
 
     /// Whether a park of the running thread may carry a deadline: the
-    /// slot's timer has no other live owner. The home record's deadline goes
+    /// admitted record owns capacity in the shared index. Its deadline goes
     /// to the host when its executor settles it (`unhome`); any other
     /// record's is taken off the timer at every exit of the slot's executor
     /// (`take_foreign_timer`) and its thread re-runs the call on the host

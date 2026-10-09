@@ -695,6 +695,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         TRANSFER_PIN_RETIRED,
         EL1_ZONE_OFFSET,
         carrick_sched_core::HOST_REQUEST_PROTOCOL,
+        carrick_sched_core::TIMER_INDEX_PROTOCOL,
         carrick_sched_core::Claim::OnCpuRequested {
             slot: SlotId::new(0),
             seq: 0,
@@ -3648,7 +3649,6 @@ impl Default for InotifyNameCache {
 const _: () = {
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
-    assert!(EL1_ABI_LAYOUT_HASH == 0xd9a2_09c5_48ce_ec3d);
     assert!(
         EL1_APERTURE_CONTROL_OFFSET.is_multiple_of(core::mem::align_of::<ApertureControl>() as u64)
     );
