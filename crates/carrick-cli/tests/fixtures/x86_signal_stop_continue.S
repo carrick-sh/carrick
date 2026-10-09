@@ -1,0 +1,104 @@
+# Owned signal-wait readiness avoids relying on unavailable pipe admission.
+.global _start
+.text
+_start:
+ mov $14, %eax
+ mov $2, %edi
+ lea mask(%rip), %rsi
+ xor %edx, %edx
+ mov $8, %r10d
+ syscall
+ test %rax, %rax
+ jne fail
+ mov $39, %eax
+ syscall
+ mov %rax, %r12
+ mov $57, %eax
+ syscall
+ test %rax, %rax
+ js fail
+ jz child
+ mov %rax, %r13
+ mov $128, %eax
+ lea mask(%rip), %rdi
+ xor %esi, %esi
+ lea timeout(%rip), %rdx
+ mov $8, %r10d
+ syscall
+ cmp $10, %rax
+ jne fail
+ mov $62, %eax
+ mov %r13, %rdi
+ mov $19, %esi
+ syscall
+ test %rax, %rax
+ jne fail
+ mov $61, %eax
+ mov %r13, %rdi
+ lea status(%rip), %rsi
+ mov $2, %edx
+ xor %r10d, %r10d
+ syscall
+ cmp %r13, %rax
+ jne fail
+ cmpl $0x137f, status(%rip)
+ jne fail
+ mov $62, %eax
+ mov %r13, %rdi
+ mov $18, %esi
+ syscall
+ test %rax, %rax
+ jne fail
+ mov $61, %eax
+ mov %r13, %rdi
+ lea status(%rip), %rsi
+ mov $8, %edx
+ xor %r10d, %r10d
+ syscall
+ cmp %r13, %rax
+ jne fail
+ cmpl $0xffff, status(%rip)
+ jne fail
+ mov $62, %eax
+ mov %r13, %rdi
+ mov $15, %esi
+ syscall
+ test %rax, %rax
+ jne fail
+ mov $61, %eax
+ mov %r13, %rdi
+ lea status(%rip), %rsi
+ xor %edx, %edx
+ xor %r10d, %r10d
+ syscall
+ cmp %r13, %rax
+ jne fail
+ cmpl $15, status(%rip)
+ jne fail
+ mov $1, %eax
+ mov $1, %edi
+ lea message(%rip), %rsi
+ mov $2, %edx
+ syscall
+ mov $7, %edi
+ jmp exit
+child:
+ mov $62, %eax
+ mov %r12, %rdi
+ mov $10, %esi
+ syscall
+busy:
+ pause
+ jmp busy
+fail:
+ mov $99, %edi
+exit:
+ mov $231, %eax
+ syscall
+ ud2
+.data
+.align 8
+mask: .quad 0x200
+timeout: .quad 1, 0
+status: .quad 0
+message: .ascii "J\n"
