@@ -213,8 +213,8 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
         #[cfg(target_arch = "aarch64")]
         let slot = SlotId::from_index(frame.slot as usize);
         #[cfg(target_arch = "aarch64")]
-        let process_call = matches!(frame.x[8], 260 | 94 | 95 | 58 | 435)
-            || (frame.x[8] == 220 && frame.x[0] & 0x0001_0000 == 0);
+        let process_call =
+            carrick_personality_linux::dispatch::aarch64_owner_process_call(frame.x[8], frame.x[0]);
         #[cfg(target_arch = "aarch64")]
         if process_call {
             if let (Some(slot), Some(task)) = (slot, current_tasks.get(frame.slot as usize)) {
