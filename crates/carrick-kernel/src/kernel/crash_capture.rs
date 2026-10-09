@@ -519,12 +519,13 @@ mod tests {
             // SAFETY: freshly allocated by this call; nothing else may touch
             // it before `publish_park` makes it claimable.
             unsafe {
-                *zone.record(record).ctx_mut() = ctx;
+                *zone.record(record).ctx_mut() =
+                    carrick_el1_abi::Aarch64ParkedContext::from_register(ctx, 0, mm, 0);
             }
             const UADDR: u64 = 0x1000;
             let guard = zone
                 .lock(
-                    carrick_el1_abi::ZoneTables::bucket_of(mm, UADDR),
+                    carrick_el1_abi::ZoneTables::bucket_of_with_context(mm, UADDR),
                     &crate::el1_zone::HostLockWait,
                 )
                 .expect("bucket lock");

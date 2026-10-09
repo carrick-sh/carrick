@@ -3526,7 +3526,21 @@ fn el1_fork_cow_resolves_in_guest() {
         let host_fault_exits =
             measured.exit_classes[carrick_el1_abi::HostExitClass::Fault as usize];
 
-        assert!(measured.result.success(), "{}", describe(&measured));
+        assert!(
+            measured.result.success(),
+            "{}; owner syscall counts clone served/forwarded={:?}, wait4 served/forwarded={:?}, fatal={}",
+            describe(&measured),
+            read_el1_counters().map(|c| [
+                c.served[220].load(std::sync::atomic::Ordering::Relaxed),
+                c.forwarded[220].load(std::sync::atomic::Ordering::Relaxed),
+            ]),
+            read_el1_counters().map(|c| [
+                c.served[260].load(std::sync::atomic::Ordering::Relaxed),
+                c.forwarded[260].load(std::sync::atomic::Ordering::Relaxed),
+            ]),
+            read_el1_counters().map_or(0, |c| c.served[carrick_el1_abi::PANIC_SENTINEL_SYSCALL_NR]
+                .load(std::sync::atomic::Ordering::Relaxed)),
+        );
         let stdout = measured.result.stdout_utf8();
         let host_line = format!(
             "el1-memory cow guest_faults={faults} host_cow_resolutions={} host_cow_mms={} host_fault_exits={host_fault_exits} exits={} grants={grants} returns={returns} bytes_granted={bytes_granted} bytes_returned={bytes_returned} ok={}",

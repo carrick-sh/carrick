@@ -9,11 +9,13 @@ type Reservations<'a> = super::Reservations<
     'a,
     carrick_personality_linux::mm::LinuxReservationPolicy,
     carrick_el1::memory::reservations::NativeReservationGeometry,
+    carrick_el1_abi::Aarch64ParkedContext,
 >;
 type RootReleaseVenue<'a> = super::RootReleaseVenue<
     'a,
     carrick_personality_linux::mm::LinuxReservationPolicy,
     carrick_el1::memory::reservations::NativeReservationGeometry,
+    carrick_el1_abi::Aarch64ParkedContext,
 >;
 use fixture::{Region, admit_notified};
 
@@ -31,7 +33,7 @@ fn actual_root_release_publishes_blocked_probe() {
     let zone = unsafe {
         &*region
             .add(EL1_ZONE_OFFSET as usize)
-            .cast::<carrick_sched_core::ZoneTables>()
+            .cast::<carrick_el1_abi::ZoneTables>()
     };
     let mm = ReservationMm::new(77).unwrap();
     let index = zone.spaces.publish_closed(77, 0x30000, 0x30000).unwrap();
@@ -59,9 +61,12 @@ fn actual_root_release_publishes_blocked_probe() {
         )
         .unwrap();
     fn deliver(
-        zone: &carrick_sched_core::ZoneTables,
+        zone: &carrick_el1_abi::ZoneTables,
         _: carrick_sched_core::Waker,
-        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >,
     ) {
         // SAFETY: this fixture allocated one exact ABI region; the callback
         // receives its zone, and only reads the authenticated root lock word.
@@ -127,9 +132,12 @@ fn wrong_region_notification_venue_is_rejected() {
     let a = Region::new();
     let b = Region::new();
     fn deliver(
-        _: &carrick_sched_core::ZoneTables,
+        _: &carrick_el1_abi::ZoneTables,
         _: carrick_sched_core::Waker,
-        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >,
     ) {
         let _ = effects.deliver_handbacks(&mut |_| {});
     }
@@ -159,9 +167,12 @@ fn delayed_old_root_admission_cannot_demote_reused_notification_word() {
     let index = zone.spaces.find(mm.raw()).unwrap();
     zone.spaces.close(index);
     fn deliver(
-        _: &carrick_sched_core::ZoneTables,
+        _: &carrick_el1_abi::ZoneTables,
         _: carrick_sched_core::Waker,
-        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >,
     ) {
         let _ = effects.deliver_handbacks(&mut |_| {});
     }
@@ -286,7 +297,7 @@ mod fixture {
             // real client and geometry; this retained region is aligned and zeroed.
             unsafe { &*(self.0.table() as *const _ as *const SharedReservations) }
         }
-        pub fn zone(&self) -> &carrick_sched_core::ZoneTables {
+        pub fn zone(&self) -> &carrick_el1_abi::ZoneTables {
             self.0.zone()
         }
     }

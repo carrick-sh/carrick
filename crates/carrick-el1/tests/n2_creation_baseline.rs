@@ -134,10 +134,10 @@ fn shared_futex_and_waitv_are_outside_current_private_futex_route() {
 // An uninhabited CPU makes accidental hardware use impossible in this fixture.
 enum NoCpu {}
 impl sched::ThreadCpu for NoCpu {
-    fn save(&mut self, _: &TrapFrame, _: &mut carrick_el1_abi::ThreadCtx) {
+    fn save(&mut self, _: &TrapFrame, _: &mut carrick_el1_abi::Aarch64ParkedContext) {
         match *self {}
     }
-    fn load(&mut self, _: &mut TrapFrame, _: &carrick_el1_abi::ThreadCtx) {
+    fn load(&mut self, _: &mut TrapFrame, _: &carrick_el1_abi::Aarch64ParkedContext) {
         match *self {}
     }
     fn set_translation(&mut self, _: u64, _: u64) {

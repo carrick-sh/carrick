@@ -25,8 +25,8 @@ use carrick_el1::personality::lifecycle::{LifecycleThread, LifecycleVenue};
 use carrick_el1::{Zone, dispatch_syscall_with_lifecycle, sched};
 use carrick_el1_abi::{
     Action, BlockedMask, Counters, CurrentTask, El1TaskId, EntryIdentity, EntryRef, EntryState,
-    InotifyNameCache, SlotId, THREAD_POOL_ENTRIES, ThreadControlSlot, ThreadCtx,
-    ThreadLifecyclePage, TrapFrame, ZoneTables,
+    InotifyNameCache, SlotId, THREAD_POOL_ENTRIES, ThreadControlSlot, ThreadLifecyclePage,
+    TrapFrame, ZoneTables,
 };
 
 // The plan's 18 numeric IDs, plus robust-list 99 and execve/execveat 221/281.
@@ -97,13 +97,13 @@ struct SaveCpu {
 }
 
 impl sched::ThreadCpu for SaveCpu {
-    fn save(&mut self, frame: &TrapFrame, ctx: &mut ThreadCtx) {
+    fn save(&mut self, frame: &TrapFrame, ctx: &mut carrick_el1_abi::Aarch64ParkedContext) {
         self.saves += 1;
-        ctx.x = frame.x;
-        ctx.pc = frame.elr;
-        ctx.pstate = frame.spsr;
+        ctx.native.x = frame.x;
+        ctx.native.pc = frame.elr;
+        ctx.native.pstate = frame.spsr;
     }
-    fn load(&mut self, _: &mut TrapFrame, _: &ThreadCtx) {
+    fn load(&mut self, _: &mut TrapFrame, _: &carrick_el1_abi::Aarch64ParkedContext) {
         unreachable!("no switch")
     }
     fn set_translation(&mut self, _: u64, _: u64) {
@@ -247,9 +247,9 @@ fn admitted_thread_creation_owns_one_completion_at_1_8_32() {
                     // SAFETY: all dispatcher workers have separate records. This
                     // child remains queued and no scheduler runs in this fixture.
                     let ctx = unsafe { *zone.record(record).ctx_mut() };
-                    assert_eq!(ctx.x[0], 0);
-                    assert_eq!(ctx.pc, 0x4000);
-                    assert_eq!(ctx.sp_el0, SAME_VA);
+                    assert_eq!(ctx.native.x[0], 0);
+                    assert_eq!(ctx.native.pc, 0x4000);
+                    assert_eq!(ctx.native.sp_el0, SAME_VA);
                 }));
             }
             for _ in 0..n {

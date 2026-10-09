@@ -539,7 +539,17 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         index: usize,
         mm: ReservationMm,
     ) -> Result<Reservations<'_, Policy, Geometry>, Refusal> {
-        self.lock_waiting(index, mm, &NoRootWait)
+        self.lock_with_context(index, mm)
+    }
+
+    /// Source-free model acquisition retains the caller's parked context ABI.
+    #[cfg(any(test, feature = "host-test"))]
+    pub fn lock_with_context<C: Copy + Send + Sync + zerocopy::FromZeros>(
+        &self,
+        index: usize,
+        mm: ReservationMm,
+    ) -> Result<Reservations<'_, Policy, Geometry, C>, Refusal> {
+        self.lock_waiting_with_context(index, mm, &NoRootWait)
     }
 
     /// A host thread's acquisition, `wait` deciding whether to retry a held
@@ -551,6 +561,16 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         mm: ReservationMm,
         wait: &dyn RootWait,
     ) -> Result<Reservations<'_, Policy, Geometry>, Refusal> {
+        self.lock_waiting_with_context(index, mm, wait)
+    }
+
+    #[cfg(any(test, feature = "host-test"))]
+    pub fn lock_waiting_with_context<C: Copy + Send + Sync + zerocopy::FromZeros>(
+        &self,
+        index: usize,
+        mm: ReservationMm,
+        wait: &dyn RootWait,
+    ) -> Result<Reservations<'_, Policy, Geometry, C>, Refusal> {
         self.lock_using(
             index,
             mm,
