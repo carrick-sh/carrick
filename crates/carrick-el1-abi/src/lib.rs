@@ -3944,8 +3944,13 @@ mod tests {
                 + LifecycleDecline::COUNT
                 + AnonymousLeave::COUNT
                 + 513
-                + 6)
+                + ProcessRefusal::COUNT
+                + 1)
                 * 8
+        );
+        assert_eq!(
+            core::mem::offset_of!(Counters, first_native_fork_failure),
+            core::mem::size_of::<Counters>() - 8
         );
         assert_eq!(core::mem::offset_of!(Counters, served), 0);
         assert_eq!(core::mem::offset_of!(Counters, forwarded), 512 * 8);
