@@ -1039,3 +1039,5 @@ mod tests {
 }
 /// Native x86_64 `poll(2)` ordinal, distinct from canonical `ppoll(2)`.
 pub const X86_POLL: crate::NativeNr = crate::NativeNr(7);
+/// Native x86_64 `ppoll(2)` ordinal with a timespec and temporary signal mask.
+pub const X86_PPOLL: crate::NativeNr = crate::NativeNr(271);

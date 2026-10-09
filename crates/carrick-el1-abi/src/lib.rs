@@ -381,6 +381,8 @@ pub struct HostReadinessCrossing;
 
 impl HostReadinessCrossing {
     pub const NUMBER: u64 = u64::MAX - 0x100;
+    pub const MASK_NONE: u64 = 0;
+    pub const MASK_REPLACE: u64 = 1;
     /// `SYSCALL` captures the user return PC in RCX before EL1 writes this
     /// supervisor-only tag. The adapter restores RCX before returning.
     pub const FRAME_TAG: u64 = u64::MAX - 1;

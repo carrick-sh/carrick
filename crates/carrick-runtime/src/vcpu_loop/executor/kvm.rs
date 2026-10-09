@@ -253,6 +253,7 @@ struct HostReadinessRequest {
     address: u64,
     count: usize,
     deadline: Option<std::time::Instant>,
+    sig_mask: carrick_abi::WaitSigMask,
 }
 
 enum HostReadinessStep {
@@ -345,7 +346,7 @@ impl KvmPersistentExecutor {
         Some(DispatchOutcome::WaitOnFds {
             fds: WaitFds::host_readiness(fds),
             timeout,
-            sig_mask: carrick_abi::WaitSigMask::NONE,
+            sig_mask: request.sig_mask,
             completion: FdWaitCompletion::Fd { on_timeout: 0 },
         })
     }
@@ -686,6 +687,23 @@ impl PersistentExecutor for KvmPersistentExecutor {
                             if frame.rax == carrick_el1_abi::HostReadinessCrossing::NUMBER
                                 && carrick_el1_abi::HostReadinessCrossing::is_crossing(frame.rcx)
                             {
+                                let sig_mask = match frame.r8 {
+                                    carrick_el1_abi::HostReadinessCrossing::MASK_NONE => {
+                                        carrick_abi::WaitSigMask::NONE
+                                    }
+                                    carrick_el1_abi::HostReadinessCrossing::MASK_REPLACE => {
+                                        carrick_abi::WaitSigMask::Replace(
+                                            carrick_abi::SigSet::from_raw(frame.r10),
+                                        )
+                                    }
+                                    _ => {
+                                        return Ok(ForwardDecision::Immediate(
+                                            InitialSyscallDisposition::Refused(
+                                                carrick_abi::LINUX_EINVAL,
+                                            ),
+                                        ));
+                                    }
+                                };
                                 let count = usize::try_from(frame.rsi).map_err(|_| {
                                     TrapError::Hypervisor("host readiness count overflow".into())
                                 })?;
@@ -698,6 +716,7 @@ impl PersistentExecutor for KvmPersistentExecutor {
                                     address: frame.rdi,
                                     count,
                                     deadline,
+                                    sig_mask,
                                 };
                                 self.stats
                                     .record(crate::prepare::InitialForwardClass::Host(

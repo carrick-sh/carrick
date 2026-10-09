@@ -28,6 +28,31 @@ use core::sync::atomic::Ordering;
 
 /// ARM frame access is retained for scheduler/IPC park leaves that have not
 /// yet acquired an ISA-neutral saved-context contract.
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
+pub enum PollTimeoutKind {
+    Milliseconds,
+    Timespec,
+}
+
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
+pub enum PollSignalMask {
+    Inherit,
+    Replace(carrick_signal_core::SignalSet),
+}
+
+fn ppoll_timeout_ms(
+    seconds: i64,
+    nanoseconds: i64,
+) -> Result<i32, carrick_syscall_abi::LinuxErrno> {
+    if seconds < 0 || !(0..1_000_000_000).contains(&nanoseconds) {
+        return Err(carrick_syscall_abi::LINUX_EINVAL);
+    }
+    let milliseconds = seconds
+        .saturating_mul(1_000)
+        .saturating_add((nanoseconds + 999_999) / 1_000_000);
+    Ok(milliseconds.min(i64::from(i32::MAX)) as i32)
+}
+
 pub trait GuestDispatchFrame: SyscallFrame {
     fn native_number(&self) -> carrick_guest_arch::NativeOrdinal;
     fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet;
@@ -39,6 +64,9 @@ pub trait GuestDispatchFrame: SyscallFrame {
     /// Whether this native call has the poll argument contract.
     fn may_serve_poll(&self) -> bool {
         false
+    }
+    fn poll_timeout_kind(&self) -> PollTimeoutKind {
+        PollTimeoutKind::Timespec
     }
     fn may_serve_descriptor(&self) -> bool {
         false
@@ -63,8 +91,28 @@ pub trait GuestDispatchFrame: SyscallFrame {
         &mut self,
         _entries: &mut [carrick_el1_abi::HostReadinessEntry],
         _timeout_ms: i32,
+        _sig_mask: PollSignalMask,
     ) -> Option<i64> {
         None
+    }
+}
+
+#[cfg(test)]
+mod poll_timeout_tests {
+    #[test]
+    fn ppoll_timeout_rounds_up_and_rejects_invalid_nanoseconds() {
+        assert_eq!(super::ppoll_timeout_ms(0, 1), Ok(1));
+        assert_eq!(super::ppoll_timeout_ms(0, 999_999), Ok(1));
+        assert_eq!(super::ppoll_timeout_ms(0, 1_000_001), Ok(2));
+        assert_eq!(
+            super::ppoll_timeout_ms(0, 1_000_000_000),
+            Err(carrick_syscall_abi::LINUX_EINVAL)
+        );
+        assert_eq!(
+            super::ppoll_timeout_ms(-1, 0),
+            Err(carrick_syscall_abi::LINUX_EINVAL)
+        );
+        assert_eq!(super::ppoll_timeout_ms(i64::MAX, 999_999_999), Ok(i32::MAX));
     }
 }
 
@@ -646,28 +694,69 @@ impl<
         };
         let fds_ptr = self.frame.argument(0).unwrap_or(0);
         let nfds = self.frame.argument(1).unwrap_or(0) as usize;
-        let timeout_ms = if self.frame.native_ordinal() == Some(7) {
+        let timeout_kind = self.frame.poll_timeout_kind();
+        let timeout_ms = if matches!(timeout_kind, PollTimeoutKind::Milliseconds) {
             self.frame.argument(2).unwrap_or(0) as i32
         } else {
             let tmo_ptr = self.frame.argument(2).unwrap_or(0);
             if tmo_ptr == 0 {
                 -1
             } else {
-                let mut ts = [0i64; 2];
+                let mut ts = [0u8; 16];
                 let mut user = file::ValidatedCopy {
                     task,
                     validator: &file::HardwareValidator,
                 };
-                let bytes =
-                    unsafe { core::slice::from_raw_parts_mut(ts.as_mut_ptr() as *mut u8, 16) };
-                if !user.copy_in(bytes, tmo_ptr) {
+                if !user.copy_in(&mut ts, tmo_ptr) {
                     return FamilyCompletion::Complete(-14);
                 }
-                ts[0].saturating_mul(1000).saturating_add(ts[1] / 1_000_000) as i32
+                let mut seconds = [0u8; 8];
+                let mut nanoseconds = [0u8; 8];
+                seconds.copy_from_slice(&ts[..8]);
+                nanoseconds.copy_from_slice(&ts[8..]);
+                match ppoll_timeout_ms(i64::from_le_bytes(seconds), i64::from_le_bytes(nanoseconds))
+                {
+                    Ok(milliseconds) => milliseconds,
+                    Err(errno) => return FamilyCompletion::Complete(errno.guest_retval()),
+                }
+            }
+        };
+        let sig_mask = if matches!(timeout_kind, PollTimeoutKind::Milliseconds) {
+            PollSignalMask::Inherit
+        } else {
+            let mask_ptr = self.frame.argument(3).unwrap_or(0);
+            if mask_ptr == 0 {
+                PollSignalMask::Inherit
+            } else {
+                let mut bits = [0u8; 8];
+                if self.frame.argument(4).unwrap_or(0) != bits.len() as u64 {
+                    return FamilyCompletion::Complete(
+                        carrick_syscall_abi::LINUX_EINVAL.guest_retval(),
+                    );
+                }
+                let mut user = file::ValidatedCopy {
+                    task,
+                    validator: &file::HardwareValidator,
+                };
+                if !user.copy_in(&mut bits, mask_ptr) {
+                    return FamilyCompletion::Complete(
+                        carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+                    );
+                }
+                PollSignalMask::Replace(
+                    carrick_signal_core::SignalSet::from_bits(u64::from_le_bytes(bits))
+                        .without(carrick_signal_core::policy::Signal::KILL)
+                        .without(carrick_signal_core::policy::Signal::STOP),
+                )
             }
         };
         if nfds == 0 {
-            return FamilyCompletion::Complete(0);
+            let mut empty = [];
+            return FamilyCompletion::Complete(
+                self.frame
+                    .query_host_readiness(&mut empty, timeout_ms, sig_mask)
+                    .unwrap_or(0),
+            );
         }
         if nfds > 1024 {
             return FamilyCompletion::Complete(-22);
@@ -711,7 +800,10 @@ impl<
                 Some(&entries),
             );
             let host_timeout = if already_ready > 0 { 0 } else { timeout_ms };
-            if let Some(result) = self.frame.query_host_readiness(&mut entries, host_timeout) {
+            if let Some(result) =
+                self.frame
+                    .query_host_readiness(&mut entries, host_timeout, sig_mask)
+            {
                 if result < 0 {
                     return FamilyCompletion::Complete(result);
                 }
