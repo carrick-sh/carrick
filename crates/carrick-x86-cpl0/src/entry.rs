@@ -399,17 +399,20 @@ mod kernel {
             carrick_personality_linux::crossing::HostCrossingSet::X86
         }
 
-        fn prepare_host_poll_crossing(&mut self, fds: u64, nfds: u64, timeout_ms: i32) -> bool {
+        fn query_host_readiness(&mut self, entries: &mut [carrick_el1_abi::HostReadinessEntry], timeout_ms: i32) -> Option<i64> {
             if self.call.native.raw() != 7 {
-                return false;
+                return None;
             }
+            let saved = (self.frame.rdi, self.frame.rsi, self.frame.rdx, self.frame.r10, self.frame.rcx);
             self.frame.rax = carrick_el1_abi::HostReadinessCrossing::NUMBER;
-            self.frame.rdi = carrick_el1_abi::HostReadinessCrossing::REQUEST_TAG;
-            self.frame.rsi = fds;
-            self.frame.rdx = nfds;
-            self.frame.r10 = timeout_ms as u64;
+            self.frame.rdi = entries.as_mut_ptr() as u64;
+            self.frame.rsi = entries.len() as u64;
+            self.frame.rdx = timeout_ms as u64;
             self.frame.rcx = carrick_el1_abi::HostReadinessCrossing::FRAME_TAG;
-            true
+            doorbell(FORWARD_PORT, self.frame);
+            let result = self.frame.rax as i64;
+            (self.frame.rdi, self.frame.rsi, self.frame.rdx, self.frame.r10, self.frame.rcx) = saved;
+            Some(result)
         }
         fn arm_frame(&mut self) -> Option<&mut carrick_el1_abi::TrapFrame> { None }
         fn arm_frame_ref(&self) -> Option<&carrick_el1_abi::TrapFrame> { None }
@@ -1886,7 +1889,6 @@ mod kernel {
                 }).map_or(core::ptr::null_mut(), |address| address as *mut u8)
             };
             let mut root_exit = None;
-            let original_rcx = frame.rcx;
             let route = if fixture_dispatch_enabled!() {
                 let mut native = NativeDispatch {
                     frame, call, publications: &binding.publications,
@@ -1958,18 +1960,8 @@ mod kernel {
                     doorbell(FATAL_PORT, frame); halt();
                 }
                 CompletionRoute::Forward => {
-                    let bridge = call.native.raw() == 7
-                        && frame.rax == carrick_el1_abi::HostReadinessCrossing::NUMBER
-                        && carrick_el1_abi::HostReadinessCrossing::is_crossing(frame.rdi, frame.rcx);
                     // The shared personality evaluated the x86 crossing set.
                     doorbell(FORWARD_PORT, frame);
-                    if bridge {
-                        frame.rdi = call.args[0];
-                        frame.rsi = call.args[1];
-                        frame.rdx = call.args[2];
-                        frame.r10 = call.args[3];
-                        frame.rcx = original_rcx;
-                    }
                 }
             }
         }

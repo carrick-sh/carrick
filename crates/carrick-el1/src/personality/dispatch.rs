@@ -43,11 +43,14 @@ pub trait GuestDispatchFrame: SyscallFrame {
     fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64>;
     /// Distinguish an ISA-only refusal from a family or venue refusal.
     fn record_isa_unsupported_forward(&self) {}
-    /// Prepare an authenticated host-bound poll through the dedicated
-    /// host-readiness crossing. The ISA adapter restores syscall argument
-    /// registers after host completion.
-    fn prepare_host_poll_crossing(&mut self, _fds: u64, _nfds: u64, _timeout_ms: i32) -> bool {
-        false
+    /// Query exact host-bound descriptions through the carrier. A blocking
+    /// adapter suspends inside this call and resumes the same guest poll.
+    fn query_host_readiness(
+        &mut self,
+        _entries: &mut [carrick_el1_abi::HostReadinessEntry],
+        _timeout_ms: i32,
+    ) -> Option<i64> {
+        None
     }
 }
 
@@ -671,18 +674,54 @@ impl<
             .file_table
             .load(core::sync::atomic::Ordering::Acquire)
             .max(1);
-        let host_only = super::file_table::poll_has_only_host_bindings(
+        let host_entries = super::file_table::host_readiness_entries(
             self.fd_map,
             self.open_table,
             file_table,
             &pollfds,
         );
-        if host_only
-            && self
-                .frame
-                .prepare_host_poll_crossing(fds_ptr, nfds as u64, timeout_ms)
-        {
-            return FamilyCompletion::Forward;
+        if let Some(mut entries) = host_entries {
+            let already_ready = super::file_table::resolve_poll_with_host_readiness(
+                self.fd_map,
+                self.open_table,
+                self.object_table,
+                self.ipc,
+                file_table,
+                &mut pollfds,
+                Some(&entries),
+            );
+            let host_timeout = if already_ready > 0 { 0 } else { timeout_ms };
+            if let Some(result) = self.frame.query_host_readiness(&mut entries, host_timeout) {
+                if result < 0 {
+                    return FamilyCompletion::Complete(result);
+                }
+                let ready = super::file_table::resolve_poll_with_host_readiness(
+                    self.fd_map,
+                    self.open_table,
+                    self.object_table,
+                    self.ipc,
+                    file_table,
+                    &mut pollfds,
+                    Some(&entries),
+                );
+                let out_bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        pollfds.as_ptr() as *const u8,
+                        nfds * core::mem::size_of::<super::file_table::PollFd>(),
+                    )
+                };
+                let Some(task) = self.task() else {
+                    return FamilyCompletion::Forward;
+                };
+                let mut user = file::ValidatedCopy {
+                    task,
+                    validator: &file::HardwareValidator,
+                };
+                if !user.copy_out(fds_ptr, out_bytes) {
+                    return FamilyCompletion::Complete(-14);
+                }
+                return FamilyCompletion::Complete(ready as i64);
+            }
         }
         let Some(task) = self.task() else {
             return FamilyCompletion::Forward;

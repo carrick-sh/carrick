@@ -89,7 +89,7 @@ one wake and release of the executor at the blocked settlement.
 | --- | --- |
 | `crates/carrick-runtime/src/vcpu_loop/{mod,executor/{backend,binding,pool,settlement}}.rs` | Extract shared continuation preparation/resume and bind the KVM executor to the existing pool and settlement. No copied wait policy. |
 | `crates/carrick-vmm-kvm/src/cpl0_boot.rs`, `carrier_cpu.rs` | Hand worker-owned KVM vCPUs and exact stopped frames to the adapter; use the pool for production fixtures too. |
-| `crates/carrick-runtime/src/prepare.rs` | Replace production initial actor dispatch with scheduler root admission/pool startup; classify the already permitted x86 `epoll_pwait` forward where required. |
+| `crates/carrick-runtime/src/prepare.rs` | Replace production initial actor dispatch with scheduler root admission/pool startup; leave host readiness to the dedicated typed crossing. |
 | `crates/carrick-el1-abi/src/lib.rs`, `crates/carrick-x86-cpl0/src/{entry,native_process}.rs` | Carry exact task/MM/generation and saved-frame binding across the CPL0 boundary; no host descriptor inferred from an inode or bare guest fd. |
 | `crates/carrick-cli/tests/x86_kvm_run.rs` and static fixtures | Native/KVM line-exact read and poll witnesses with a retained empty stdin pipe; keep waits bounded. |
 
@@ -341,16 +341,20 @@ The first poll implementation incorrectly reused `epoll_pwait` (281) as a
 transport marker and forwarded the whole poll into the host dispatcher. That
 made one crossing number carry two protocols and moved the poll owner out of
 the ring. The corrected boundary uses one named internal crossing, distinct
-from every Linux syscall ordinal. Its current transport reserves that number;
-the next implementation step must move the readiness request and completion
-into the guest poll call. The guest poll owner must resolve the fd map,
-negative entries, absent entries, duplicates and in-zone descriptions, then
-pass only typed host bindings and their interests to the carrier with the
-caller deadline. The carrier must sample those handles, park an owned
-continuation if none are ready, and return an exact ready set or timeout to
-the same guest poll call. Its KVM adapter will read the request from the
-stopped task's private supervisor memory. The portable syscall and file-table
-code must contain no KVM or x86 types. The stopped forward frame and request
-must remain task-owned across lease release; the shared wait service supplies
-the deadline. This replaces the `epoll_pwait` marker without retaining a
-compatibility path beside it.
+from every Linux syscall ordinal. The guest poll owner now resolves its fd
+map, negative entries, absent entries and duplicates, and sends only typed
+`HostReadinessEntry` bindings and interests to the carrier. The KVM adapter
+reads that bounded batch from the stopped task's supervisor allocation,
+samples host readiness once, and parks the task through the existing owned
+continuation when no handle is ready. An absolute deadline survives a
+spurious wake and the ready set returns to the same guest poll call, which
+writes final `revents` and count. The physical CPU lease is released while
+the task waits. Neither a Linux `poll` forward nor an `epoll_pwait` alias
+remains.
+
+The in-zone part is still open: `resolve_poll` does not yet project an IPC
+description's pipe/eventfd readiness, and its `PollContinuation` clears the
+zone slot without registering an IPC producer or timer wake. A mixed host and
+in-zone set therefore cannot be reported as complete. The next cutover must
+join the shared IPC object's readiness and wait authority with the host
+ready set and the caller deadline before this design is review-ready.

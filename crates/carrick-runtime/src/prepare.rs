@@ -73,7 +73,6 @@ impl InitialForwardClass {
 pub(crate) fn classify_initial_x86_forward(
     native: carrick_abi::NativeNr,
     args: [u64; 6],
-    poll_host_fds: bool,
 ) -> InitialForwardClass {
     use InitialForwardClass::{Host, Refuse};
     // x86_64 Linux UAPI ordinals. The native-number type prevents a
@@ -82,7 +81,6 @@ pub(crate) fn classify_initial_x86_forward(
         0 if args[0] == 0 => Host("terminal"), // read(stdin)
         1 | 20 if args[0] == 1 || args[0] == 2 => Host("terminal"), // write/writev
         3 if args[0] <= 2 => Host("terminal"), // close(stdio)
-        7 if poll_host_fds => Host("terminal"), // bounded host-backed pollfds
         60 | 231 => Host("exit"),
         63 => Host("system_query"), // uname
         96 | 228 => Host("clock"),  // gettimeofday/clock_gettime
@@ -96,37 +94,6 @@ pub(crate) fn classify_initial_x86_forward(
     }
 }
 
-/// Poll may cross only for the CLI's host-backed descriptors. The kernel's
-/// in-zone descriptor namespace has no authority in the host dispatcher.
-#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
-pub(crate) fn initial_poll_has_only_host_fds(
-    machine: &impl carrick_guest_mem::CurrentMmMemory,
-    args: [u64; 6],
-) -> bool {
-    use zerocopy::FromBytes;
-    let Ok(nfds) = usize::try_from(args[1]) else {
-        return false;
-    };
-    if nfds > 64 {
-        return false;
-    }
-    if nfds == 0 {
-        return true;
-    }
-    let Some(length) = nfds.checked_mul(core::mem::size_of::<carrick_abi::LinuxPollFd>()) else {
-        return false;
-    };
-    let Ok(bytes) = carrick_guest_mem::GuestMemory::read_bytes(machine, args[0], length) else {
-        return false;
-    };
-    bytes
-        .chunks_exact(core::mem::size_of::<carrick_abi::LinuxPollFd>())
-        .all(|chunk| {
-            carrick_abi::LinuxPollFd::read_from_bytes(chunk)
-                .is_ok_and(|entry| entry.fd < 0 || entry.fd <= 2)
-        })
-}
-
 #[cfg(all(test, feature = "platform-linux", target_arch = "x86_64"))]
 mod initial_x86_forward_tests {
     use super::{InitialForwardClass, classify_initial_x86_forward};
@@ -134,8 +101,7 @@ mod initial_x86_forward_tests {
 
     #[test]
     fn only_explicit_host_crossings_reach_host_semantics() {
-        let classify =
-            |nr, fd| classify_initial_x86_forward(NativeNr(nr), [fd, 0, 0, 0, 0, 0], true);
+        let classify = |nr, fd| classify_initial_x86_forward(NativeNr(nr), [fd, 0, 0, 0, 0, 0]);
         assert_eq!(classify(1, 1), InitialForwardClass::Host("terminal"));
         assert_eq!(classify(1, 2), InitialForwardClass::Host("terminal"));
         assert_eq!(classify(1, 3), InitialForwardClass::Refuse("unclassified"));
@@ -144,9 +110,9 @@ mod initial_x86_forward_tests {
         assert_eq!(classify(11, 0), InitialForwardClass::Refuse("memory"));
         assert_eq!(classify(39, 0), InitialForwardClass::Refuse("identity"));
         assert_eq!(classify(13, 0), InitialForwardClass::Refuse("signal"));
-        assert_eq!(classify(7, 0), InitialForwardClass::Host("terminal"));
+        assert_eq!(classify(7, 0), InitialForwardClass::Refuse("unclassified"));
         assert_eq!(
-            classify_initial_x86_forward(NativeNr(7), [0, 3, 0, 0, 0, 0], false),
+            classify_initial_x86_forward(NativeNr(7), [0, 3, 0, 0, 0, 0]),
             InitialForwardClass::Refuse("unclassified")
         );
         assert_eq!(classify(62, 0), InitialForwardClass::Refuse("signal"));
