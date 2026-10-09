@@ -237,8 +237,11 @@ fn ensure_owned_private_directory(path: &Path) -> Result<(), EndpointError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => validate_owned_private_directory(path, &metadata),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(path)?;
-            fs::set_permissions(path, fs::Permissions::from_mode(DIRECTORY_MODE))?;
+            match fs::create_dir(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
             let metadata = fs::symlink_metadata(path)?;
             validate_owned_private_directory(path, &metadata)
         }
@@ -366,5 +369,30 @@ mod tests {
                 phase: OwnerPhase::Serving,
             }
         );
+    }
+
+    #[test]
+    fn concurrent_endpoint_claims_share_uninitialized_base_directory() {
+        let temp = tempfile::Builder::new()
+            .prefix("cc-shared-base")
+            .tempdir_in("/tmp")
+            .expect("tempdir");
+        let shared_base = temp.path().join("control-base");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let base = shared_base.clone();
+            let b = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let endpoint =
+                    ControlEndpoint::in_base(base, &format!("container-{i}")).expect("endpoint");
+                let nonce = ControlNonce::fresh().expect("nonce");
+                b.wait();
+                endpoint.claim(nonce)
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("thread join").expect("claim succeeds");
+        }
     }
 }
