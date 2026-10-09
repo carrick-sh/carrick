@@ -90,8 +90,8 @@ pub(super) fn schedule(slot: SlotId) -> ! {
     loop {
         if let Some(selected) = source.zone.switch_in_full(slot) {
             source.zone.leave_idle(slot);
-            let runtime = native_process::runtime();
             let record = source.zone.record_ref(selected.record);
+            let runtime = native_process::runtime_for_record(source.zone, record);
             let state = runtime
                 .record_binding(record)
                 .unwrap_or_else(|| initial_boot::fatal_boot());
