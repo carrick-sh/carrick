@@ -98,6 +98,11 @@ impl<
             venue.thread_spawned(caller_tid, child_tid);
         }
     }
+    fn thread_exited(&mut self, tid: u32) {
+        if let Some(venue) = self.process_venue() {
+            venue.thread_exited(tid);
+        }
+    }
     fn arguments(&self) -> [u64; 6] {
         [
             self.frame.argument(0).unwrap_or(0),
