@@ -631,6 +631,11 @@ pub(crate) struct TaskBindingRecord<B> {
     pub(crate) active: bool,
 }
 
+pub(crate) type HvpatchTaskBindingDirectory =
+    TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding>;
+pub(crate) type HvpatchTaskRecord =
+    TaskBindingRecord<crate::vcpu_loop::continuation::HvpatchTaskBinding>;
+
 impl<B: PersistentTaskBinding + Send + Sync + 'static> TaskBindingDirectory<B> {
     pub(crate) fn install_scheduler(
         self: &Arc<Self>,
@@ -921,6 +926,9 @@ pub(crate) struct PreparedTaskSubmission<B> {
     key: (ThreadKey, ExecutionGeneration),
     armed: bool,
 }
+
+pub(crate) type PreparedHvpatchSubmission =
+    PreparedTaskSubmission<crate::vcpu_loop::continuation::HvpatchTaskBinding>;
 
 impl<B: PersistentTaskBinding + Send + Sync + 'static> PreparedTaskSubmission<B> {
     pub(crate) fn activate(
