@@ -593,10 +593,10 @@ where
 
     let result = match terminal? {
         Some(Ok(result)) => result,
-        Some(Err(())) => {
-            return Err(RuntimeError::Unsupported(
-                "HVPatch sibling-owned process termination failed".to_owned(),
-            ));
+        Some(Err(cause)) => {
+            return Err(RuntimeError::Unsupported(format!(
+                "HVPatch sibling-owned process termination failed: {cause}"
+            )));
         }
         None => match outcome {
             VcpuLoopOutcome::ProcessExit(r) | VcpuLoopOutcome::TrapLimit(r) => *r,
