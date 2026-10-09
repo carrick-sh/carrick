@@ -71,3 +71,15 @@ fn stopped_kvm_cpu_roundtrips_two_complete_task_images() {
         cpu.audit_idle().unwrap();
     }
 }
+
+#[test]
+fn running_boundary_rejects_wrong_task_before_entering_kvm() {
+    let mut cpu = KvmCarrierCpu::create_stopped(KVM_X86_LAYOUT).unwrap();
+    let a = context(cpu.neutral_image().clone(), 2);
+    let b = context(cpu.neutral_image().clone(), 3);
+    cpu.load(a.clone()).unwrap();
+    assert!(cpu.run_loaded(b.binding().task()).is_err());
+    let saved = cpu.save_and_detach(a.binding().task()).unwrap();
+    assert_eq!(saved.state(), a.state());
+    cpu.audit_idle().unwrap();
+}

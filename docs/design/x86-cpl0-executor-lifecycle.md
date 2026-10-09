@@ -168,3 +168,15 @@ common `ExecutorExit::BlockedContinuation` route and resumes through
 VM-free pool witness proves the worker was free before the writer ran. C3 then
 uses this same route for host-backed poll readiness and deadlines. None of
 these later milestones is complete at this design commit.
+
+### M-a running-boundary refinement
+
+KVM's `KVM_EXIT_IO` can retain a pending PIO completion until the next
+`KVM_RUN`. The carrier CPU's running boundary returns a **snapshot** and a
+typed exit while keeping the physical vCPU loaded. It must not reset the vCPU
+to its neutral image merely because the host has seen the doorbell. C2b must
+complete or transfer this pending physical step using the existing KVM reclaim
+semantics in `kvm_x86_engine.rs` before loading a different task on that vCPU;
+the typed task snapshot alone is not a license to reassign it. This refines
+the earlier table's `save` step: settlement follows an authenticated stopped
+snapshot and a safe physical detach, not the IO-exit observation alone.
