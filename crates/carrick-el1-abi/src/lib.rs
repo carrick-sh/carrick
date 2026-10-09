@@ -2464,11 +2464,22 @@ pub const EL1_NAME_CACHE_BASE: u64 = EL1_REGION_BASE + EL1_NAME_CACHE_OFFSET;
 pub const EL1_NAME_CACHE_SIZE: u64 = 0x1_0000;
 
 pub use carrick_sched_core::{
-    AddressSpaces, BoundedSpin, Claim, CurrentHandback, CurrentRelease, ExcludedEditor, Exhausted,
-    Handback, HostClaim, HostPlacement, HostTransfer, LockWait, ParkedContextRead, RecordId,
-    RecordRef, SlotDrain, SlotId, SlotState, SwitchedIn, ThreadCtx, ThreadIdentity, WakeEffects,
-    WakeRecord, WakeRefusal, Waker, ZONE_SLOTS, ZoneRecord, ZoneTables,
+    Aarch64ParkedContext, AddressSpaces, BoundedSpin, Claim, CurrentHandback, CurrentRelease,
+    ExcludedEditor, Exhausted, Handback, HostClaim, HostPlacement, HostTransfer, LockWait,
+    ParkedContextRead, RecordId, RecordRef, SlotDrain, SlotId, SlotState, SwitchedIn, ThreadCtx,
+    ThreadIdentity, WakeEffects, WakeRecord, WakeRefusal, Waker, ZONE_SLOTS,
 };
+
+/// The ARM guest and its carrier share one record context type. Every zone
+/// reference uses these aliases, including scheduler and process ownership.
+#[cfg(target_arch = "aarch64")]
+pub type ZoneTables = carrick_sched_core::ZoneTables<Aarch64ParkedContext>;
+#[cfg(target_arch = "aarch64")]
+pub type ZoneRecord = carrick_sched_core::ZoneRecord<Aarch64ParkedContext>;
+#[cfg(not(target_arch = "aarch64"))]
+pub type ZoneTables = carrick_sched_core::ZoneTables<ThreadCtx>;
+#[cfg(not(target_arch = "aarch64"))]
+pub type ZoneRecord = carrick_sched_core::ZoneRecord<ThreadCtx>;
 
 /// Byte offset of the in-guest scheduler's tables ([`ZoneTables`]: futex
 /// wait queues, parked-thread records, per-vCPU run queues).
@@ -3734,6 +3745,10 @@ const _: () = {
             <= EL1_MM_PORTAL_OFFSET
     );
 };
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0xa2e6_c6c4_817c_b134);
+#[cfg(not(target_arch = "aarch64"))]
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x6c47_2801_7fe6_f330);
 
 #[cfg(test)]
 mod tests {

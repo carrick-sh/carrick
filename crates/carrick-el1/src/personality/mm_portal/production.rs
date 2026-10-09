@@ -20,17 +20,19 @@ use carrick_personality_linux::mm::LinuxReservationPolicy;
 use core::num::NonZeroU64;
 
 pub struct NativeOwnerVenue;
-impl carrick_core::mm::transaction::OwnerVenue for NativeOwnerVenue {
+impl<C: carrick_el1_abi::EntryContext> carrick_core::mm::transaction::OwnerVenue<C>
+    for NativeOwnerVenue
+{
     fn space_access(
-        zone: &carrick_sched_core::ZoneTables,
+        zone: &carrick_sched_core::ZoneTables<C>,
         slot: carrick_sched_core::SlotId,
-    ) -> carrick_sched_core::spaces::notification::SpaceAccess<'_> {
+    ) -> carrick_sched_core::spaces::notification::SpaceAccess<'_, C> {
         crate::substrate::sched::object_wait::space_access(zone, slot)
     }
     fn deliver_completion(
-        zone: &carrick_sched_core::ZoneTables,
+        zone: &carrick_sched_core::ZoneTables<C>,
         slot: carrick_sched_core::SlotId,
-        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>,
     ) {
         crate::substrate::sched::object_wait::deliver_completion(zone, slot, effects)
     }
@@ -41,6 +43,17 @@ impl carrick_core::mm::transaction::OwnerVenue for NativeOwnerVenue {
         carrick_personality_linux::mm::cancelled_copy_errno()
     }
 }
+#[cfg(target_arch = "aarch64")]
+pub type MmPortal<'a, P, B = NativePortalMmu> = carrick_core::mm::transaction::MmPortal<
+    'a,
+    P,
+    LinuxReservationPolicy,
+    NativeReservationGeometry,
+    NativeOwnerVenue,
+    B,
+    carrick_el1_abi::Aarch64ParkedContext,
+>;
+#[cfg(not(target_arch = "aarch64"))]
 pub type MmPortal<'a, P, B = NativePortalMmu> = carrick_core::mm::transaction::MmPortal<
     'a,
     P,
@@ -49,6 +62,34 @@ pub type MmPortal<'a, P, B = NativePortalMmu> = carrick_core::mm::transaction::M
     NativeOwnerVenue,
     B,
 >;
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub(crate) fn current_mm_words<
+    'a,
+    M: carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance,
+>(
+    live_ttbr: u64,
+    target_ttbr: u64,
+    maintenance: &'a M,
+) -> Result<
+    carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords<'a, M>,
+    carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal,
+> {
+    use carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords;
+    let table = carrick_el1_abi::service_target_table_window(live_ttbr, target_ttbr)
+        .ok_or(carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::BadRange)?;
+    // SAFETY: the admitted current-MM table window and retained pool remain
+    // mapped for the owner's edit; the original grant path used this venue.
+    unsafe {
+        PrimaryTableWords::new(
+            table.words,
+            table.physical_base,
+            carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
+            maintenance,
+        )
+        .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
+    }
+}
 #[cfg(target_os = "none")]
 use carrick_core::mm::frames::apply_grant;
 pub use carrick_core::mm::frames::{GrantTarget, serve_grant};
@@ -345,8 +386,6 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
 
 #[cfg(target_os = "none")]
 pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
-    #[cfg(target_arch = "aarch64")]
-    use carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords;
     // Every pre-claim failure is explicit; only a typed owner wait suspends.
     frame.x[0] = 22;
     frame.x[14] = 0;
@@ -402,24 +441,11 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         Err(_) => return,
     };
     #[cfg(target_arch = "aarch64")]
-    let Some(table) = carrick_el1_abi::service_target_table_window(ttbr, target.grant().ttbr0)
-    else {
-        return;
-    };
-    #[cfg(target_arch = "aarch64")]
     let maintenance = crate::fault::El1TableMaintenance {
         ttbr0: target.grant().ttbr0,
     };
     #[cfg(target_arch = "aarch64")]
-    let Ok(words) = (unsafe {
-        PrimaryTableWords::new(
-            table.words,
-            table.physical_base,
-            carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
-            &maintenance,
-        )
-        .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
-    }) else {
+    let Ok(words) = current_mm_words(ttbr, target.grant().ttbr0, &maintenance) else {
         return;
     };
     let root = target.grant().ttbr0;

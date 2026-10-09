@@ -622,17 +622,25 @@ static SPACES_LOCK: Mutex<()> = Mutex::new(());
 struct SpaceTables {
     spaces: &'static AddressSpaces,
     occupancy: &'static Occupancy,
-    zone: Option<&'static carrick_sched_core::ZoneTables>,
+    zone: Option<&'static carrick_el1_abi::ZoneTables>,
 }
 
 impl SpaceTables {
     fn release_venue(
         self,
-    ) -> Option<carrick_sched_core::spaces::notification::SpaceReleaseVenue<'static>> {
+    ) -> Option<
+        carrick_sched_core::spaces::notification::SpaceReleaseVenue<
+            'static,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >,
+    > {
         fn deliver(
-            zone: &carrick_sched_core::ZoneTables,
+            zone: &carrick_el1_abi::ZoneTables,
             _: carrick_sched_core::Waker,
-            effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+            effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+                '_,
+                carrick_el1_abi::Aarch64ParkedContext,
+            >,
         ) {
             carrick_sched_core::LockWait::complete_object_wake(
                 &crate::el1_zone::HostLockWait,
