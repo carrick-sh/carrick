@@ -418,7 +418,34 @@ impl<
         };
         let mmap_next = editor.mmap_next();
         let brk = root.brk_current();
-        let inner = plan.publish(words, root, child, child_handle)?;
+        let mut stage = carrick_core::mm::fork::ForkPublishStage::RevalidateWords;
+        let inner = match plan.publish(words, root, child, child_handle, &mut stage) {
+            Ok(inner) => inner,
+            Err(error) => {
+                #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+                {
+                    use carrick_core::mm::fork::ForkPublishStage as Phase;
+                    use carrick_el1_abi::NativeForkFailureStage as Stage;
+                    let diagnostic = match stage {
+                        Phase::RevalidateWords => Stage::PublishRevalidateWords,
+                        Phase::AuthenticateParent => Stage::PublishAuthenticateParent,
+                        Phase::CheckReadiness => Stage::PublishCheckReadiness,
+                        Phase::ReserveCertificate => Stage::PublishReserveCertificate,
+                        Phase::StoreChildTables => Stage::PublishStoreChildTables,
+                        Phase::StoreParentTables => Stage::PublishStoreParentTables,
+                        Phase::EditParent => Stage::PublishEditParent,
+                        Phase::SetChildOrigin => Stage::PublishSetChildOrigin,
+                        Phase::CloneReservations => Stage::PublishCloneReservations,
+                        Phase::PublishParent => Stage::PublishPublishParent,
+                        Phase::PublishChild => Stage::PublishPublishChild,
+                    };
+                    carrick_el1_abi::record_native_fork_failure(diagnostic);
+                }
+                #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+                let _ = stage;
+                return Err(error.into());
+            }
+        };
         child_editor.set_mmap_next(mmap_next);
         child_editor.set_brk_current(brk);
         Ok(UnpublishedEl1Child { inner })
