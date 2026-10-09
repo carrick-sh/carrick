@@ -1078,3 +1078,11 @@ contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.el1
 [[surfaces]]
 path = "crates/carrick-vmm-kvm/src/carrier_memory/tests.rs"
 contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/crossing.rs"
+contracts = ["kernel.el1.arm-ring-first-crossing"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/hatch.rs"
+contracts = ["kernel.el1.arm-ring-first-crossing"]
