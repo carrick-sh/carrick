@@ -1,0 +1,5 @@
+{
+  "command": "sudo -n lsof /tmp/carrick-host-lease.lock",
+  "exit_code": 1,
+  "output": ""
+}
