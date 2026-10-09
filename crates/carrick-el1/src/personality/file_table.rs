@@ -18,7 +18,7 @@ use core::sync::atomic::Ordering;
 
 use carrick_el1_abi::{
     DELEGATED_FLAG_READABLE, DELEGATED_FLAG_WRITABLE, DELEGATED_STATE_GUEST, DelegatedFile,
-    DelegatedOpenFile, FD_MAP_CAPACITY, FdMapSlot, fd_map_lookup,
+    DelegatedOpenFile, FD_MAP_CAPACITY, FdMapSlot, HostBoundFd, fd_map_lookup,
 };
 use carrick_sched_core::{SlotId, ZoneTables};
 
@@ -64,6 +64,9 @@ pub fn admit_stdio(
         if !open {
             continue;
         }
+        let Some(host_fd) = HostBoundFd::new(fd as i32) else {
+            continue;
+        };
         let ufd = fd as u32;
         if fd_map_lookup(fd_map, file_table, fd as i32).is_some() {
             continue;
@@ -79,7 +82,7 @@ pub fn admit_stdio(
         if (handle as usize) <= open_table.len() && (handle as usize) <= object_table.len() {
             let obj = &object_table[(handle - 1) as usize];
             let open_file = &open_table[(handle - 1) as usize];
-            obj.inode.set(fd as u64, 0);
+            obj.inode.set(0, 0);
             obj.generation.store(1, Ordering::Relaxed);
             obj.state.store(DELEGATED_STATE_GUEST, Ordering::Release);
 
@@ -93,6 +96,7 @@ pub fn admit_stdio(
             open_file.inode_handle.store(handle, Ordering::Relaxed);
             open_file.inode_generation.store(1, Ordering::Relaxed);
             open_file.offset.store(0, Ordering::Relaxed);
+            open_file.bind_host_fd(host_fd);
             open_file
                 .state
                 .store(DELEGATED_STATE_GUEST, Ordering::Release);
@@ -112,6 +116,7 @@ pub fn admit_host_fd(
     host_fd: i32,
     flags: u32,
 ) -> Option<u32> {
+    let host_fd = HostBoundFd::new(host_fd)?;
     if file_table == 0 || guest_fd < 0 {
         return None;
     }
@@ -131,7 +136,7 @@ pub fn admit_host_fd(
     let obj = object_table.get(idx)?;
 
     let handle = (idx + 1) as u32;
-    obj.inode.set(host_fd as u64, 0);
+    obj.inode.set(0, 0);
     obj.generation.store(1, Ordering::Relaxed);
     obj.state.store(DELEGATED_STATE_GUEST, Ordering::Release);
 
@@ -140,6 +145,7 @@ pub fn admit_host_fd(
     open_file.inode_handle.store(handle, Ordering::Relaxed);
     open_file.inode_generation.store(1, Ordering::Relaxed);
     open_file.offset.store(0, Ordering::Relaxed);
+    open_file.bind_host_fd(host_fd);
     open_file
         .state
         .store(DELEGATED_STATE_GUEST, Ordering::Release);
@@ -230,7 +236,7 @@ pub fn query_host_readiness(_host_fd: i32, flags: u32) -> i16 {
 pub fn resolve_poll(
     fd_map: &[FdMapSlot],
     open_table: &[DelegatedOpenFile],
-    object_table: &[DelegatedFile],
+    _object_table: &[DelegatedFile],
     _ipc: Option<&crate::personality::ipc::IpcVenue<'_>>,
     file_table: u64,
     pollfds: &mut [PollFd],
@@ -248,14 +254,9 @@ pub fn resolve_poll(
             let open_file = &open_table[(handle - 1) as usize];
             if open_file.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST {
                 let flags = open_file.flags.load(Ordering::Acquire);
-                let host_fd = if (handle as usize) <= object_table.len() {
-                    let obj = &object_table[(handle - 1) as usize];
-                    let (dev, _) = obj.inode.get();
-                    if dev != 0 { dev as i32 } else { entry.fd }
-                } else {
-                    entry.fd
-                };
-                let readiness = query_host_readiness(host_fd, flags);
+                let readiness = open_file
+                    .host_fd()
+                    .map_or(0, |host_fd| query_host_readiness(host_fd.raw(), flags));
                 let mut revents = entry.events & readiness;
                 revents |= readiness & (LINUX_POLLERR | LINUX_POLLHUP | LINUX_POLLNVAL);
                 entry.revents = revents;
@@ -669,6 +670,30 @@ mod tests {
             libc::close(pipe_fds[0]);
             libc::close(pipe_fds[1]);
         }
+    }
+
+    #[test]
+    fn host_fd_zero_binding_is_not_guest_descriptor_number() {
+        let (fd_map, open_table, object_table) = setup_tables();
+        // The test runner's stdin is a valid host descriptor. Guest descriptor
+        // 123 is deliberately unrelated to it and absent on the host.
+        assert!(unsafe { libc::fcntl(0, libc::F_GETFD) } >= 0);
+        admit_host_fd(
+            &fd_map,
+            &open_table,
+            &object_table,
+            10,
+            123,
+            0,
+            DELEGATED_FLAG_READABLE,
+        );
+        let mut fds = [PollFd {
+            fd: 123,
+            events: LINUX_POLLIN,
+            revents: 0,
+        }];
+        resolve_poll(&fd_map, &open_table, &object_table, None, 10, &mut fds);
+        assert_eq!(fds[0].revents & LINUX_POLLNVAL, 0);
     }
 
     #[test]

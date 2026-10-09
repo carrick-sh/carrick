@@ -639,6 +639,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(DelegatedFile, marks) as u64,
         core::mem::size_of::<DelegatedOpenFile>() as u64,
         core::mem::offset_of!(DelegatedOpenFile, inode_handle) as u64,
+        core::mem::offset_of!(DelegatedOpenFile, host_fd) as u64,
         core::mem::offset_of!(DelegatedOpenFile, inode_generation) as u64,
         core::mem::offset_of!(DelegatedOpenFile, offset) as u64,
         core::mem::size_of::<DelegatedMark>() as u64,
@@ -1308,6 +1309,21 @@ pub struct DelegatedFile {
 
 unsafe impl Sync for DelegatedFile {}
 
+/// A descriptor in the carrier's host file table, distinct from a guest fd
+/// and from a delegated inode identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostBoundFd(i32);
+
+impl HostBoundFd {
+    pub const fn new(raw: i32) -> Option<Self> {
+        if raw < 0 { None } else { Some(Self(raw)) }
+    }
+
+    pub const fn raw(self) -> i32 {
+        self.0
+    }
+}
+
 /// One open description of an in-zone inode (open(2): an open file
 /// description has its own offset and status flags; every description of an
 /// inode shares its bytes). Guarded by its inode's lock.
@@ -1322,7 +1338,8 @@ pub struct DelegatedOpenFile {
     pub generation: AtomicU64,
     /// 1-based handle of the inode record ([`DelegatedFile`]).
     pub inode_handle: AtomicU32,
-    pub _reserved0: u32,
+    /// Host descriptor binding, encoded as fd + 1 (zero means no host binding).
+    host_fd: AtomicU32,
     /// The inode's generation when this record joined it: an inode handle
     /// reused by another inode never matches.
     pub inode_generation: AtomicU64,
@@ -1332,13 +1349,26 @@ pub struct DelegatedOpenFile {
 }
 
 impl DelegatedOpenFile {
+    pub fn bind_host_fd(&self, fd: HostBoundFd) {
+        self.host_fd.store(fd.raw() as u32 + 1, Ordering::Release);
+    }
+
+    pub fn host_fd(&self) -> Option<HostBoundFd> {
+        let encoded = self.host_fd.load(Ordering::Acquire);
+        if encoded == 0 {
+            None
+        } else {
+            HostBoundFd::new((encoded - 1) as i32)
+        }
+    }
+
     pub const fn new() -> Self {
         Self {
             state: AtomicU32::new(DELEGATED_STATE_DEAD),
             flags: AtomicU32::new(0),
             generation: AtomicU64::new(0),
             inode_handle: AtomicU32::new(0),
-            _reserved0: 0,
+            host_fd: AtomicU32::new(0),
             inode_generation: AtomicU64::new(0),
             offset: AtomicU64::new(0),
             _pad: [0; 3],
