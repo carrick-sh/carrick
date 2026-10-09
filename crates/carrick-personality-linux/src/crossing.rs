@@ -1,10 +1,10 @@
 //! Shared host crossing table for Linux personality.
 //!
-//! Governs which syscalls may cross the guest-to-host boundary via
-//! `CompletionRoute::Forward`. Used by both ARM EL1 and x86 CPL0.
+//! Governs genuinely unported calls leaving ARM EL1 or x86 CPL0.
 //!
-//! Syscalls outside this table must not reach the host when strict ring-first
-//! enforcement is active; they are answered with counted `-ENOSYS`.
+//! Unported syscalls outside this table receive counted `-ENOSYS` under strict
+//! policy. Wired-family fallbacks, owed work and completion handbacks retain
+//! their existing host transport until their owners serve them in-ring.
 
 use crate::abi::entry::SyscallResult;
 use carrick_syscall_abi::CanonicalNr;
