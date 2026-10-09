@@ -998,17 +998,26 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             .unwrap_or_else(|| fatal());
         owner.spaces.close(index);
         let binding = common_entry::execution_binding(self.task);
-        let Some(retire) = carrick_el1_abi::NativeChildRetire::new(binding, mm) else {
+        let Some(mut retire) = carrick_el1_abi::NativeChildRetire::new(binding, mm) else {
             fatal();
         };
-        if self
+        let crossed = self
             .crossing
-            .cross_child_retire(&retire as *const _ as u64, u64::from(self.worker()))
-            .is_err()
-        {
-            fatal();
+            .cross_child_retire(&raw mut retire as u64, u64::from(self.worker()))
+            .is_ok();
+        // x0 and the record's typed reply must agree. A refusal fails only
+        // this process's stock return (it stays charged, never reissued);
+        // the exit still completes. Disagreement is a crossing integrity
+        // fault.
+        match retire.take(binding, mm) {
+            Some(Ok(())) if crossed => {
+                fork_progress(carrick_el1_abi::NativeForkProgress::ChildRetired);
+            }
+            Some(Err(_)) if !crossed => {
+                fork_failure(carrick_el1_abi::NativeForkFailureStage::ChildRetireRefused);
+            }
+            _ => fatal(),
         }
-        fork_progress(carrick_el1_abi::NativeForkProgress::ChildRetired);
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
             let live = crate::isa::aarch64::hardware_live_ttbr();
@@ -1071,7 +1080,11 @@ mod retirement_tests {
         fn cross_root_exit(&self, _: u64, _: u64) -> Result<(), NativeProcessError> {
             Ok(())
         }
-        fn cross_child_retire(&self, _: u64, _: u64) -> Result<(), NativeProcessError> {
+        fn cross_child_retire(&self, record: u64, _: u64) -> Result<(), NativeProcessError> {
+            // Like the carrier: quarantine and reply in the typed word.
+            // SAFETY: the service passes its live, aligned stack record.
+            let record = unsafe { &mut *(record as *mut carrick_el1_abi::NativeChildRetire) };
+            assert!(record.accept());
             Ok(())
         }
     }

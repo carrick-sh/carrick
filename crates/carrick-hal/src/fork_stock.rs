@@ -21,8 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 
 use carrick_el1_abi::{
-    ExecutionBinding, ForkLifecycleLoan, ForkStockExchange, ForkStockLoan, ForkStockRefusal,
-    ForkStockSettlement, NativeChildRetire, ReservationMm,
+    ChildRetireRefusal, ExecutionBinding, ForkLifecycleLoan, ForkStockExchange, ForkStockLoan,
+    ForkStockRefusal, ForkStockSettlement, NativeChildRetire, ReservationMm,
 };
 use carrick_guest_arch::{AddressContext, Asid, CpuId, RootGpa};
 
@@ -281,6 +281,8 @@ pub struct ForkStockCounters {
     pub capacity_refusals: u64,
     /// Children retired into quarantine.
     pub quarantined_children: u64,
+    /// Child retirements refused with a typed reply (stock stays charged).
+    pub retire_refusals: u64,
     /// Quarantined children whose stock returned to the reusable pool.
     pub returned_children: u64,
 }
@@ -732,22 +734,28 @@ impl<T: ChildAddressTags> ForkStock<T> {
 
     /// The executing child has left the shared owner graph: quarantine its
     /// stock. The record must name the executing binding and its exact root.
+    /// The typed reply is written into the record either way.
     pub fn retire_child(
         &mut self,
         execution: GrantExecution,
-        retire: &NativeChildRetire,
+        retire: &mut NativeChildRetire,
     ) -> Result<(), ForkStockServiceError> {
-        let key = ReservationMm::new(execution.binding.mm.raw())
-            .and_then(MmKey::of)
-            .ok_or(ForkStockServiceError::StaleExecution)?;
-        if !retire.matches(execution.binding, execution.context)
-            || self
-                .children
-                .get(&key)
-                .is_none_or(|child| child.root != execution.context.root)
-            || self.quarantine.contains(&key)
-        {
+        let key = ReservationMm::new(execution.binding.mm.raw()).and_then(MmKey::of);
+        let admitted = key.filter(|key| {
+            retire.request_matches(execution.binding, execution.context)
+                && self
+                    .children
+                    .get(key)
+                    .is_some_and(|child| child.root == execution.context.root)
+                && !self.quarantine.contains(key)
+        });
+        let Some(key) = admitted else {
+            retire.refuse(ChildRetireRefusal::Stale);
+            self.counters.retire_refusals = self.counters.retire_refusals.saturating_add(1);
             return Err(ForkStockServiceError::StaleExecution);
+        };
+        if !retire.accept() {
+            return Err(ForkStockServiceError::InvalidRecord);
         }
         self.quarantine.insert(key);
         self.counters.quarantined_children = self.counters.quarantined_children.saturating_add(1);

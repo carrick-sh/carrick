@@ -576,14 +576,24 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             fatal();
         }
         let binding = carrick_el1::personality::common_entry::execution_binding(self.task);
-        let Some(retire) = NativeChildRetire::new(binding, mm) else {
+        let Some(mut retire) = NativeChildRetire::new(binding, mm) else {
             fatal();
         };
         // SAFETY: the aligned record stays on this CPU's supervisor stack
         // through the stopped host crossing, which authenticates the live
-        // binding and root before quarantining the child's stock.
+        // binding and root and writes its typed reply into the record.
         unsafe {
-            core::arch::asm!("out dx, eax", in("dx") NATIVE_CHILD_RETIRE_PORT, in("rax") &raw const retire, options(nostack));
+            core::arch::asm!("out dx, eax", in("dx") NATIVE_CHILD_RETIRE_PORT, in("rax") &raw mut retire, options(nostack));
+        }
+        // A refusal fails only this process's stock return: the stock stays
+        // charged and is never reissued, and the exit still completes. A
+        // missing reply is a crossing integrity fault.
+        match retire.take(binding, mm) {
+            Some(Ok(())) => {}
+            Some(Err(_)) => carrick_el1_abi::record_native_fork_failure(
+                carrick_el1_abi::NativeForkFailureStage::ChildRetireRefused,
+            ),
+            None => fatal(),
         }
         // Absence is published only after CR3 left the retired root; the
         // host drains this MM's quarantine on a later stopped crossing.

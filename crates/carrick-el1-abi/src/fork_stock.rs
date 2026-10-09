@@ -496,8 +496,22 @@ impl NativeRootExit {
     }
 }
 
+/// Why the carrier refused a child retirement. The guest fails the retiring
+/// process cleanly; its stock stays charged rather than being reclaimed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildRetireRefusal {
+    /// The record does not name the executing binding, root, or a live child.
+    Stale,
+    /// The carrier could not accept the record for any other reason.
+    Invalid,
+}
+
 /// A child process has left the shared owner graph. Its physical table pages
 /// enter quarantine until no live slot owns the MM and its ASID is flushed.
+///
+/// Word 7 is the carrier's typed reply: [`Self::PENDING`] on request,
+/// [`Self::QUARANTINED`] or a refusal code, then [`Self::CONSUMED`] once the
+/// guest took it. On AArch64 the `HVC #6` x0 status agrees with this word.
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct NativeChildRetire {
@@ -506,34 +520,86 @@ pub struct NativeChildRetire {
 
 impl NativeChildRetire {
     pub const MAGIC: u64 = 0x4352_4348_5245_5449;
+    pub const PENDING: u64 = 0;
+    pub const QUARANTINED: u64 = 1;
+    pub const REFUSED_STALE: u64 = 2;
+    pub const REFUSED_INVALID: u64 = 3;
+    pub const CONSUMED: u64 = 4;
 
     pub fn new(binding: ExecutionBinding, context: AddressContext<RootGpa>) -> Option<Self> {
         (binding.issued() && binding.mm.raw() == context.mm.raw().get()).then_some(Self {
-            words: [
-                Self::MAGIC,
-                binding.task.raw(),
-                binding.generation.raw(),
-                binding.mm.raw(),
-                binding.thread_generation.raw(),
-                context.root.address().raw(),
-                context.generation.raw().get(),
-                0,
-            ],
+            words: Self::identity(binding, context, Self::PENDING),
         })
     }
 
-    pub fn matches(&self, binding: ExecutionBinding, context: AddressContext<RootGpa>) -> bool {
-        self.words
-            == [
-                Self::MAGIC,
-                binding.task.raw(),
-                binding.generation.raw(),
-                binding.mm.raw(),
-                binding.thread_generation.raw(),
-                context.root.address().raw(),
-                context.generation.raw().get(),
-                0,
-            ]
+    fn identity(
+        binding: ExecutionBinding,
+        context: AddressContext<RootGpa>,
+        status: u64,
+    ) -> [u64; 8] {
+        [
+            Self::MAGIC,
+            binding.task.raw(),
+            binding.generation.raw(),
+            binding.mm.raw(),
+            binding.thread_generation.raw(),
+            context.root.address().raw(),
+            context.generation.raw().get(),
+            status,
+        ]
+    }
+
+    fn names(&self, binding: ExecutionBinding, context: AddressContext<RootGpa>) -> bool {
+        self.words[..7] == Self::identity(binding, context, Self::PENDING)[..7]
+    }
+
+    /// Carrier: an unanswered request naming exactly this execution.
+    pub fn request_matches(
+        &self,
+        binding: ExecutionBinding,
+        context: AddressContext<RootGpa>,
+    ) -> bool {
+        self.words[7] == Self::PENDING && self.names(binding, context)
+    }
+
+    fn reply(&mut self, status: u64) -> bool {
+        if self.words[0] != Self::MAGIC || self.words[7] != Self::PENDING {
+            return false;
+        }
+        self.words[7] = status;
+        true
+    }
+
+    /// Carrier: the child's stock entered quarantine.
+    pub fn accept(&mut self) -> bool {
+        self.reply(Self::QUARANTINED)
+    }
+
+    /// Carrier: refuse with a typed reason.
+    pub fn refuse(&mut self, refusal: ChildRetireRefusal) -> bool {
+        self.reply(match refusal {
+            ChildRetireRefusal::Stale => Self::REFUSED_STALE,
+            ChildRetireRefusal::Invalid => Self::REFUSED_INVALID,
+        })
+    }
+
+    /// Guest: take the reply for exactly this execution, once.
+    pub fn take(
+        &mut self,
+        binding: ExecutionBinding,
+        context: AddressContext<RootGpa>,
+    ) -> Option<Result<(), ChildRetireRefusal>> {
+        if !self.names(binding, context) {
+            return None;
+        }
+        let result = match self.words[7] {
+            Self::QUARANTINED => Ok(()),
+            Self::REFUSED_STALE => Err(ChildRetireRefusal::Stale),
+            Self::REFUSED_INVALID => Err(ChildRetireRefusal::Invalid),
+            _ => return None,
+        };
+        self.words[7] = Self::CONSUMED;
+        Some(result)
     }
 }
 
@@ -773,6 +839,36 @@ mod tests {
         assert!(lifecycle_arm().page.raw() >= crate::EL1_DYNAMIC_METADATA_BASE);
         // Misaligned or out of bounds is refused
         assert!(ForkLifecycleLoan::new(KernelVa::new(0x1000), KernelVa::new(0x2000)).is_none());
+    }
+
+    #[test]
+    fn native_child_retire_carries_one_typed_status_reply() {
+        let req = request();
+        let (binding, context) = (req.binding, req.context);
+        let mut refused = NativeChildRetire::new(binding, context).unwrap();
+        assert!(refused.request_matches(binding, context));
+        assert_eq!(refused.take(binding, context), None, "no reply yet");
+        assert!(refused.refuse(ChildRetireRefusal::Stale));
+        assert!(!refused.request_matches(binding, context));
+        assert!(!refused.accept(), "one reply only");
+        assert_eq!(
+            refused.take(binding, context),
+            Some(Err(ChildRetireRefusal::Stale))
+        );
+        assert_eq!(refused.take(binding, context), None, "consumed once");
+
+        let mut accepted = NativeChildRetire::new(binding, context).unwrap();
+        assert!(accepted.accept());
+        let mut foreign = binding;
+        foreign.task = crate::EntryTaskKey::from_raw(999);
+        assert_eq!(accepted.take(foreign, context), None);
+        assert_eq!(accepted.take(binding, context), Some(Ok(())));
+
+        let mut garbage = NativeChildRetire::new(binding, context).unwrap();
+        garbage.words[7] = 0x77;
+        assert!(!garbage.request_matches(binding, context));
+        assert_eq!(garbage.take(binding, context), None);
+        assert!(!garbage.accept() && !garbage.refuse(ChildRetireRefusal::Invalid));
     }
 
     #[test]

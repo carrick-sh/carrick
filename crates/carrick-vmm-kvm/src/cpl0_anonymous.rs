@@ -632,23 +632,34 @@ impl Cpl0HostCustody {
     }
 
     /// A fork child left the shared owner graph: quarantine its stock. The
-    /// record must name this stopped CPU's live binding and child root.
+    /// record must name this stopped CPU's live binding and child root. A
+    /// refusal is a typed reply in the record (the guest fails only that
+    /// process's stock return); only an unreadable record stops the carrier.
     pub(super) fn service_child_retire(
         &mut self,
         lease: &StoppedCpuLease<'_>,
     ) -> Result<(), TrapError> {
         let execution = self.physical_execution(lease)?;
         // SAFETY: the retire record consists of eight fully initialized u64s.
-        let (_, record) = unsafe {
+        let (physical, mut record) = unsafe {
             self.read_stack_record::<carrick_el1_abi::NativeChildRetire>(
                 lease,
                 execution.context,
                 lease.vcpu.get_gpr(X86Reg::Rax)?,
             )
         }?;
-        self.fork_stock
-            .retire_child(execution, &record)
-            .map_err(|e| fail(format!("native child retire: {e:?}")))
+        // Refusal is recorded in the reply word and counted by the stock.
+        let _ = self.fork_stock.retire_child(execution, &mut record);
+        // SAFETY: the record is a fully initialized array of eight u64 words.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&raw const record).cast::<u8>(),
+                size_of::<carrick_el1_abi::NativeChildRetire>(),
+            )
+        };
+        self._vm
+            .write(physical, bytes)
+            .map_err(|e| fail(e.to_string()))
     }
 
     /// Counters of the shared fork stock (loans, counted refusals, returns).

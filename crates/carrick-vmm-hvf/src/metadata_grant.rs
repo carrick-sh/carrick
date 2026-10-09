@@ -1153,7 +1153,10 @@ pub(crate) fn service_metadata_operation(
         let Some(execution) = execution else {
             return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
         };
-        let retire = unsafe { &*record_ptr };
+        // SAFETY: an aligned record on this stopped vCPU's own stack.
+        let retire = unsafe { &mut *record_ptr };
+        // The record's typed reply and x0 always agree: SUCCESS exactly
+        // when the child's stock entered quarantine.
         match custody
             .fork_stock
             .lock()

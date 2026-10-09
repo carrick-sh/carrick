@@ -138,8 +138,18 @@ fn retire<T: ChildAddressTags>(
     stock: &mut ForkStock<T>,
     child: GrantExecution,
 ) -> Result<(), ForkStockServiceError> {
-    let record = NativeChildRetire::new(child.binding, child.context).unwrap();
-    stock.retire_child(child, &record)
+    let mut record = NativeChildRetire::new(child.binding, child.context).unwrap();
+    let result = stock.retire_child(child, &mut record);
+    // The typed reply in the record always agrees with the result.
+    assert_eq!(
+        record.take(child.binding, child.context),
+        Some(if result.is_ok() {
+            Ok(())
+        } else {
+            Err(carrick_el1_abi::ChildRetireRefusal::Stale)
+        })
+    );
+    result
 }
 
 fn reclaim<T: ChildAddressTags>(
@@ -284,9 +294,9 @@ fn retire_requires_the_exact_committed_child_once() {
     );
     // A record naming another binding.
     let child = child_of(granted, 900);
-    let other = NativeChildRetire::new(child_of(granted, 901).binding, child.context).unwrap();
+    let mut other = NativeChildRetire::new(child_of(granted, 901).binding, child.context).unwrap();
     assert_eq!(
-        stock.retire_child(child, &other),
+        stock.retire_child(child, &mut other),
         Err(ForkStockServiceError::StaleExecution)
     );
     retire(&mut stock, child).unwrap();
@@ -295,6 +305,7 @@ fn retire_requires_the_exact_committed_child_once() {
         Err(ForkStockServiceError::StaleExecution)
     );
     assert_eq!(stock.counters().quarantined_children, 1);
+    assert_eq!(stock.counters().retire_refusals, 4);
 }
 
 #[test]
