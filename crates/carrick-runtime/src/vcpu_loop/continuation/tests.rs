@@ -315,8 +315,8 @@ fn static_hvpatch_continuation_closure_forbids_host_blocking_authority() {
     // completion the signal path itself produced. A Ready->Redispatch
     // resume stashing its default NoRestart vetoed SA_RESTART for the
     // redispatched syscall's own EINTR (waitrestart scenario A).
-    assert!(loop_source.contains("self.continuation_restart = match result.completion"));
-    assert!(loop_source.contains("=> Some(result.restart()),"));
+    assert!(loop_source.contains("let effects = result.take_resume_effects();"));
+    assert!(loop_source.contains("self.continuation_restart = effects.restart;"));
     assert!(loop_source.contains("ContinuationResumeError::StaleFileSlot"));
     assert!(!loop_source.contains("TransitionalSchedulerKick"));
     assert!(!loop_source.contains("continuation_executor"));

@@ -25,8 +25,8 @@ use carrick_kernel::dispatch::{
     DispatchOutcome, FdWaitCompletion, StdioReadiness, SyscallDispatcher, SyscallRequest, WaitFds,
 };
 use carrick_kernel::kernel::continuation::{
-    BlockedContinuation, ContinuationCapture, RestartClass, fold_continuation_completion,
-    resume_continuation,
+    BlockedContinuation, ContinuationCapture, ContinuationResumeEffects, RestartClass,
+    RestartDecision, fold_continuation_completion, resume_continuation,
 };
 use carrick_kernel::kernel::objects::{ExecutorId, ThreadExecutionLease};
 use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
@@ -52,6 +52,23 @@ pub(crate) struct KvmPersistentExecutorFactory {
 
 pub type KvmFirstForwardHook =
     Box<dyn FnOnce(&mut ProductionCpuLease) -> Result<(), TrapError> + Send>;
+
+#[derive(Debug, PartialEq, Eq)]
+enum KvmResumeEffect {
+    Continue(Option<RestartDecision>),
+    Refuse(carrick_abi::LinuxErrno),
+}
+
+fn route_kvm_resume_effects(effects: ContinuationResumeEffects) -> KvmResumeEffect {
+    // The reservation's Drop requeues the exact signal. Until x86 signal
+    // frames land, return an interrupt refusal to this guest call rather than
+    // losing the signal or aborting the carrier.
+    if effects.reserved_signal.is_some() {
+        KvmResumeEffect::Refuse(carrick_abi::LINUX_EINTR)
+    } else {
+        KvmResumeEffect::Continue(effects.restart)
+    }
+}
 
 #[cfg(test)]
 mod resume_effect_tests {
@@ -471,14 +488,18 @@ impl PersistentExecutor for KvmPersistentExecutor {
                 let mut result =
                     resume_continuation(submission.execution_lease_mut()?, event, &context)
                         .map_err(|error| TrapError::Hypervisor(format!("KVM resume: {error:?}")))?;
-                let effects = result.take_resume_effects();
-                if effects.reserved_signal.is_some() {
-                    return Err(TrapError::Hypervisor(
-                        "KVM continuation lacks reserved-signal delivery".into(),
-                    ));
-                }
-                if effects.restart
-                    == Some(carrick_kernel::kernel::continuation::RestartDecision::Restart)
+                let restart = match route_kvm_resume_effects(result.take_resume_effects()) {
+                    KvmResumeEffect::Continue(restart) => restart,
+                    KvmResumeEffect::Refuse(errno) => {
+                        self.physical.complete_forward(
+                            task,
+                            retained.frame,
+                            errno.guest_retval(),
+                        )?;
+                        return Ok(ExecutorExit::Syscall);
+                    }
+                };
+                if restart == Some(carrick_kernel::kernel::continuation::RestartDecision::Restart)
                     && matches!(
                         result.completion,
                         carrick_kernel::kernel::continuation::ContinuationCompletion::Errno(
