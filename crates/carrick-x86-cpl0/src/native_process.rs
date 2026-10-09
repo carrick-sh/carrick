@@ -519,8 +519,13 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
     fn child_file_table(&self, _parent_table: u64, issued: u64) -> u64 {
         issued
     }
-    fn fork_fd_table(&mut self, parent_table: u64, child_table: u64) {
-        carrick_el1::personality::file_table::fork_fd_map(&super::FD_MAP, parent_table, child_table);
+    fn fork_fd_table(&mut self, parent_table: u64, child_table: u64) -> Result<(), NativeProcessError> {
+        carrick_el1::personality::file_table::fork_fd_map(&super::FD_MAP, parent_table, child_table)
+            .then_some(())
+            .ok_or(NativeProcessError::Exhausted)
+    }
+    fn retire_fd_table(&mut self, table: u64) {
+        carrick_el1::personality::file_table::retire_fd_map(&super::FD_MAP, table);
     }
 }
 
