@@ -1777,16 +1777,18 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
     }
 
     fn prctl_set_name(&mut self, name: &[u8; 16]) {
+        let mut bounded = *name;
+        bounded[15] = 0;
         let mut graph = self.runtime.graph.lock();
         if let Ok(task) = graph.owner.task_mut(self.key) {
             let caller_tid = self.calling_tid;
             let is_leader = caller_tid == task.metadata().namespace_pid;
             if let Ok(comm) = task.comm_for_mut(caller_tid) {
-                *comm = *name;
+                *comm = bounded;
             }
             if is_leader {
-                let len = name.iter().position(|&b| b == 0).unwrap_or(16);
-                if let Ok(s) = core::str::from_utf8(&name[..len]) {
+                let len = bounded.iter().position(|&b| b == 0).unwrap_or(15);
+                if let Ok(s) = core::str::from_utf8(&bounded[..len]) {
                     task.metadata_mut().diagnostic_name = alloc::string::String::from(s);
                 }
             }
