@@ -505,7 +505,7 @@ pub(crate) struct KernelState {
     hvpatch_runtime: Option<Arc<HvpatchRuntimeDirectory>>,
     /// Terminal result published by whichever HVPatch thread owns process
     /// teardown. The main loop consumes it after sibling-driven exit_group.
-    process_terminal: Mutex<Option<Result<RunResult, ()>>>,
+    process_terminal: Mutex<Option<Result<RunResult, String>>>,
     process_terminal_ready: Condvar,
     /// Exact physical completions for every logical thread enrolled when
     /// terminal clone admission closed. Outer process owners wait this receipt
@@ -786,7 +786,7 @@ impl KernelState {
         self.clone_admission.close_for_exec(owner)
     }
 
-    fn publish_process_terminal(&self, terminal: Result<RunResult, ()>) {
+    fn publish_process_terminal(&self, terminal: Result<RunResult, String>) {
         let mut published = self.process_terminal.lock();
         if published.is_none() {
             *published = Some(terminal);
@@ -796,7 +796,7 @@ impl KernelState {
 
     pub(crate) fn take_process_terminal(
         &self,
-    ) -> Result<Option<Result<RunResult, ()>>, RuntimeError> {
+    ) -> Result<Option<Result<RunResult, String>>, RuntimeError> {
         let mut published = self.process_terminal.lock();
         if published.is_none() && self.process_exiting() {
             let wait = self
