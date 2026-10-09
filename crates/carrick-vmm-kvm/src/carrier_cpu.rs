@@ -123,6 +123,12 @@ pub struct KvmCarrierCpu<I: CarrierCpuIo = KvmCpuIo> {
     custody: Custody,
 }
 impl KvmCarrierCpu<KvmCpuIo> {
+    pub fn physical_slot(&self) -> Option<carrick_guest_arch::CpuId> {
+        self.io
+            .production_run
+            .as_ref()
+            .map(crate::cpl0_boot::ProductionRunContext::physical_slot)
+    }
     /// M1 hardware witness only: no backing registration or guest execution.
     /// Carrier VM/backing admission and a running boundary belong to M2/M3/M5.
     pub fn create_stopped(layout: BringupLayout) -> Result<Self, TrapError> {
