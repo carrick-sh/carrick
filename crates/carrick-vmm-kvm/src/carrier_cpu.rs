@@ -1,9 +1,7 @@
-//! Stopped CPU custody for the carrier, independent of runtime and MM owners.
-//! This M1 boundary stages/saves two task contexts; it exposes no guest-run
-//! method. M2 supplies entry/run/exit retirement before that surface is added.
+//! Stopped CPU custody and one running boundary for the carrier.
 use carrick_hal::guest_arch_binding::{GuestArchBinding, core_arch::TaskIdentity};
 use carrick_hal::threaded::X86_TASK_RESUME_PAYLOAD_LEN;
-use carrick_hal::{HvVm, TrapError};
+use carrick_hal::{HvVcpu, HvVm, TrapError, VcpuExit};
 use carrick_x86::{BringupLayout, X86VcpuSnapshot, arch_context::X86ArchContext};
 
 mod sealed {
@@ -15,10 +13,10 @@ mod sealed {
 pub trait CarrierCpuIo: sealed::Sealed {
     fn read_image(&self) -> Result<X86VcpuSnapshot, TrapError>;
     fn write_image(&mut self, image: &X86VcpuSnapshot) -> Result<(), TrapError>;
+    fn run(&mut self) -> Result<VcpuExit, TrapError>;
 }
 
-/// Owns a fresh VM and vCPU. Neither handle nor a KVM_RUN method escapes M1.
-/// Therefore no pending IO/MMIO completion can cross this stopped boundary.
+/// Owns a fresh VM and vCPU. The vCPU handle never escapes this boundary.
 pub struct KvmCpuIo {
     vcpu: crate::KvmVcpu,
     _vm: crate::KvmVm,
@@ -42,6 +40,58 @@ impl CarrierCpuIo for KvmCpuIo {
             [0; 4],
             [0; 4],
         )
+    }
+    fn run(&mut self) -> Result<VcpuExit, TrapError> {
+        Ok(HvVcpu::run(&mut self.vcpu)?)
+    }
+}
+
+/// A stopped guest task and the reason its vCPU exited. The vCPU remains
+/// loaded: KVM may still owe completion of an I/O exit on its next entry.
+/// Physical doorbells remain distinct from the authenticated syscall trap.
+#[derive(Debug)]
+pub struct StoppedTaskExit {
+    pub state: X86ArchContext,
+    pub exit: CarrierRunExit,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum CarrierRunExit {
+    SyscallTrap,
+    Halt,
+    Kick,
+    FaultDoorbellWord(u32),
+    FaultException { syndrome: u64, far: u64 },
+    PhysicalDoorbell { port: u16, data: Vec<u8> },
+}
+
+impl CarrierRunExit {
+    fn from_raw(raw: VcpuExit) -> Result<Self, TrapError> {
+        match raw {
+            VcpuExit::IoOut {
+                port: carrick_x86::cpl0_entry::FORWARD_PORT,
+                data,
+            } => {
+                if data.len() != 1 {
+                    return Err(boundary_error("syscall doorbell width"));
+                }
+                Ok(Self::SyscallTrap)
+            }
+            VcpuExit::IoOut {
+                port: carrick_x86::FAULT_DOORBELL_PORT,
+                data,
+            } => {
+                let word: [u8; 4] = data
+                    .try_into()
+                    .map_err(|_| boundary_error("fault doorbell word width"))?;
+                Ok(Self::FaultDoorbellWord(u32::from_le_bytes(word)))
+            }
+            VcpuExit::IoOut { port, data } => Ok(Self::PhysicalDoorbell { port, data }),
+            VcpuExit::Exception { syndrome, far } => Ok(Self::FaultException { syndrome, far }),
+            VcpuExit::Halt => Ok(Self::Halt),
+            VcpuExit::Kicked => Ok(Self::Kick),
+            VcpuExit::MmioWrite { .. } => Err(boundary_error("unexpected CPL0 MMIO exit")),
+        }
     }
 }
 
@@ -105,6 +155,47 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
         audit_image(&self.io.read_image()?, &expected)?;
         self.custody = Custody::Loaded { binding, resume };
         Ok(())
+    }
+    /// Run one exclusively loaded task until the next physical exit. A failed
+    /// KVM run or malformed exit poisons custody; a successful boundary copies
+    /// the complete architectural image before handing it to task policy.
+    /// The vCPU remains loaded until the caller settles any pending KVM I/O.
+    pub fn run_loaded(&mut self, task: TaskIdentity) -> Result<StoppedTaskExit, TrapError> {
+        if !matches!(self.custody, Custody::Loaded { binding, .. } if binding.task() == task) {
+            return Err(boundary_error(
+                "carrier run requires its exact loaded task generation",
+            ));
+        }
+        let raw = match self.io.run() {
+            Ok(exit) => exit,
+            Err(error) => {
+                self.custody = Custody::Poisoned;
+                return Err(error);
+            }
+        };
+        let exit = match CarrierRunExit::from_raw(raw) {
+            Ok(exit) => exit,
+            Err(error) => {
+                self.custody = Custody::Poisoned;
+                return Err(error);
+            }
+        };
+        let (binding, resume) = match self.custody {
+            Custody::Loaded { binding, resume } => (binding, resume),
+            _ => return Err(boundary_error("carrier run lost loaded task custody")),
+        };
+        let state = match self
+            .io
+            .read_image()
+            .and_then(|image| X86ArchContext::capture(binding, &image, resume))
+        {
+            Ok(state) => state,
+            Err(error) => {
+                self.custody = Custody::Poisoned;
+                return Err(error);
+            }
+        };
+        Ok(StoppedTaskExit { state, exit })
     }
     pub fn save_and_detach(&mut self, task: TaskIdentity) -> Result<X86ArchContext, TrapError> {
         let (binding, resume) = match self.custody {
@@ -177,6 +268,13 @@ mod tests {
         fn write_image(&mut self, image: &X86VcpuSnapshot) -> Result<(), TrapError> {
             self.image = image.clone();
             Ok(())
+        }
+        fn run(&mut self) -> Result<VcpuExit, TrapError> {
+            self.image.gprs[0] = 0xabc;
+            Ok(VcpuExit::IoOut {
+                port: carrick_x86::cpl0_entry::FORWARD_PORT,
+                data: vec![0],
+            })
         }
     }
     fn context(tag: u64) -> X86ArchContext {
@@ -258,6 +356,34 @@ mod tests {
             a.state()
         );
         cpu.audit_idle().unwrap();
+    }
+    #[test]
+    fn run_returns_typed_trap_with_stopped_complete_task_image() {
+        let a = context(2);
+        let mut cpu = KvmCarrierCpu::new(TestIo {
+            image: context(1).hardware_image(),
+        })
+        .unwrap();
+        cpu.load(a.clone()).unwrap();
+        let stopped = cpu.run_loaded(a.binding().task()).unwrap();
+        assert_eq!(stopped.exit, CarrierRunExit::SyscallTrap);
+        assert_eq!(stopped.state.binding(), a.binding());
+        assert_eq!(stopped.state.state().gprs()[0], 0xabc);
+        assert_eq!(stopped.state.state().xsave(), a.state().xsave());
+        assert!(cpu.audit_idle().is_err());
+        let detached = cpu.save_and_detach(a.binding().task()).unwrap();
+        assert_eq!(detached.state().gprs()[0], 0xabc);
+        cpu.audit_idle().unwrap();
+    }
+    #[test]
+    fn malformed_forward_doorbell_cannot_become_a_physical_exit() {
+        assert!(
+            CarrierRunExit::from_raw(VcpuExit::IoOut {
+                port: carrick_x86::cpl0_entry::FORWARD_PORT,
+                data: vec![0, 0],
+            })
+            .is_err()
+        );
     }
     #[test]
     fn wrong_task_generation_cannot_detach_or_overwrite_a_loaded_cpu() {
@@ -357,6 +483,9 @@ mod tests {
             self.calls.writes.set(self.calls.writes.get() + 1);
             self.image = image.clone();
             Ok(())
+        }
+        fn run(&mut self) -> Result<VcpuExit, TrapError> {
+            Err(boundary_error("read-fault test driver cannot run"))
         }
     }
     fn assert_read_failure<T>(result: Result<T, TrapError>) {
@@ -503,6 +632,9 @@ mod tests {
                 }
             }
             Ok(())
+        }
+        fn run(&mut self) -> Result<VcpuExit, TrapError> {
+            Err(boundary_error("restore-fault test driver cannot run"))
         }
     }
     #[test]
