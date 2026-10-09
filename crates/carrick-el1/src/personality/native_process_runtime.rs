@@ -1330,20 +1330,24 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
                 return Err(carrick_personality_linux::identity::EPERM);
             }
         }
-        let was_euid_root = task.credentials.euid == carrick_sched_core::process::TaskUid::ROOT;
+        let prev_r = task.credentials.ruid;
+        let prev_e = task.credentials.euid;
+        let prev_s = task.credentials.suid;
+        let prev_f = task.credentials.fsuid;
         if let Some(r_val) = r {
-            task.credentials.ruid = carrick_sched_core::process::TaskUid(r_val);
+            task.credentials.ruid = carrick_sched_core::process::TaskUid::new(r_val);
             task.metadata_mut().ruid = task.credentials.ruid;
         }
         if let Some(e_val) = e {
-            task.credentials.euid = carrick_sched_core::process::TaskUid(e_val);
+            task.credentials.euid = carrick_sched_core::process::TaskUid::new(e_val);
             task.credentials.fsuid = task.credentials.euid;
             task.metadata_mut().euid = task.credentials.euid;
         }
         if let Some(s_val) = s {
-            task.credentials.suid = carrick_sched_core::process::TaskUid(s_val);
+            task.credentials.suid = carrick_sched_core::process::TaskUid::new(s_val);
         }
-        task.credentials.on_uid_change(was_euid_root);
+        task.credentials
+            .on_uid_change(prev_r, prev_e, prev_s, prev_f);
         Ok(())
     }
 
@@ -1369,14 +1373,14 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             }
         }
         if let Some(r_val) = r {
-            task.credentials.rgid = carrick_sched_core::process::TaskGid(r_val);
+            task.credentials.rgid = carrick_sched_core::process::TaskGid::new(r_val);
         }
         if let Some(e_val) = e {
-            task.credentials.egid = carrick_sched_core::process::TaskGid(e_val);
+            task.credentials.egid = carrick_sched_core::process::TaskGid::new(e_val);
             task.credentials.fsgid = task.credentials.egid;
         }
         if let Some(s_val) = s {
-            task.credentials.sgid = carrick_sched_core::process::TaskGid(s_val);
+            task.credentials.sgid = carrick_sched_core::process::TaskGid::new(s_val);
         }
         Ok(())
     }
@@ -1400,20 +1404,24 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             }
         }
         let set_saved = r.is_some() || e.is_some_and(|val| val != cur_r);
-        let was_euid_root = task.credentials.euid == carrick_sched_core::process::TaskUid::ROOT;
+        let prev_r = task.credentials.ruid;
+        let prev_e = task.credentials.euid;
+        let prev_s = task.credentials.suid;
+        let prev_f = task.credentials.fsuid;
         if let Some(r_val) = r {
-            task.credentials.ruid = carrick_sched_core::process::TaskUid(r_val);
+            task.credentials.ruid = carrick_sched_core::process::TaskUid::new(r_val);
             task.metadata_mut().ruid = task.credentials.ruid;
         }
         if let Some(e_val) = e {
-            task.credentials.euid = carrick_sched_core::process::TaskUid(e_val);
+            task.credentials.euid = carrick_sched_core::process::TaskUid::new(e_val);
             task.credentials.fsuid = task.credentials.euid;
             task.metadata_mut().euid = task.credentials.euid;
         }
         if set_saved {
             task.credentials.suid = task.credentials.euid;
         }
-        task.credentials.on_uid_change(was_euid_root);
+        task.credentials
+            .on_uid_change(prev_r, prev_e, prev_s, prev_f);
         Ok(())
     }
 
@@ -1437,10 +1445,10 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         }
         let set_saved = r.is_some() || e.is_some_and(|val| val != cur_r);
         if let Some(r_val) = r {
-            task.credentials.rgid = carrick_sched_core::process::TaskGid(r_val);
+            task.credentials.rgid = carrick_sched_core::process::TaskGid::new(r_val);
         }
         if let Some(e_val) = e {
-            task.credentials.egid = carrick_sched_core::process::TaskGid(e_val);
+            task.credentials.egid = carrick_sched_core::process::TaskGid::new(e_val);
             task.credentials.fsgid = task.credentials.egid;
         }
         if set_saved {
@@ -1456,8 +1464,11 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             .task_mut(self.key)
             .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
         let privileged = task.credentials.is_privileged();
-        let target_uid = carrick_sched_core::process::TaskUid(uid);
-        let was_euid_root = task.credentials.euid == carrick_sched_core::process::TaskUid::ROOT;
+        let target_uid = carrick_sched_core::process::TaskUid::new(uid);
+        let prev_r = task.credentials.ruid;
+        let prev_e = task.credentials.euid;
+        let prev_s = task.credentials.suid;
+        let prev_f = task.credentials.fsuid;
         if privileged {
             task.credentials.ruid = target_uid;
             task.credentials.euid = target_uid;
@@ -1465,13 +1476,15 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             task.credentials.fsuid = target_uid;
             task.metadata_mut().ruid = target_uid;
             task.metadata_mut().euid = target_uid;
-            task.credentials.on_uid_change(was_euid_root);
+            task.credentials
+                .on_uid_change(prev_r, prev_e, prev_s, prev_f);
             Ok(())
         } else if uid == task.credentials.ruid.raw() || uid == task.credentials.suid.raw() {
             task.credentials.euid = target_uid;
             task.credentials.fsuid = target_uid;
             task.metadata_mut().euid = target_uid;
-            task.credentials.on_uid_change(was_euid_root);
+            task.credentials
+                .on_uid_change(prev_r, prev_e, prev_s, prev_f);
             Ok(())
         } else {
             Err(carrick_personality_linux::identity::EPERM)
@@ -1485,7 +1498,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             .task_mut(self.key)
             .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
         let privileged = task.credentials.is_gid_privileged();
-        let target_gid = carrick_sched_core::process::TaskGid(gid);
+        let target_gid = carrick_sched_core::process::TaskGid::new(gid);
         if privileged {
             task.credentials.rgid = target_gid;
             task.credentials.egid = target_gid;
@@ -1513,7 +1526,9 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             || fsuid == task.credentials.suid.raw()
             || fsuid == prev
         {
-            task.credentials.fsuid = carrick_sched_core::process::TaskUid(fsuid);
+            task.credentials.fsuid = carrick_sched_core::process::TaskUid::new(fsuid);
+            task.credentials
+                .on_fsuid_change(carrick_sched_core::process::TaskUid::new(prev));
         }
         prev
     }
@@ -1530,7 +1545,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             || fsgid == task.credentials.sgid.raw()
             || fsgid == prev
         {
-            task.credentials.fsgid = carrick_sched_core::process::TaskGid(fsgid);
+            task.credentials.fsgid = carrick_sched_core::process::TaskGid::new(fsgid);
         }
         prev
     }
@@ -1569,7 +1584,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         task.credentials.groups = groups
             .iter()
             .copied()
-            .map(carrick_sched_core::process::TaskGid)
+            .map(carrick_sched_core::process::TaskGid::new)
             .collect();
         Ok(())
     }
@@ -1617,11 +1632,11 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             .owner
             .task_mut(self.key)
             .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
-        if (caps.effective & !caps.permitted) != 0 {
+        if !caps.permitted.contains(caps.effective) {
             return Err(carrick_personality_linux::identity::EINVAL);
         }
         if !task.credentials.is_privileged()
-            && (caps.permitted & !task.credentials.cap_permitted) != 0
+            && !task.credentials.cap_permitted.contains(caps.permitted)
         {
             return Err(carrick_personality_linux::identity::EPERM);
         }

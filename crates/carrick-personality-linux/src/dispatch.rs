@@ -457,42 +457,90 @@ pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
         nr if nr == carrick_syscall_abi::nr::EXIT_GROUP.raw() => {
             Family::Lifecycle(LifecycleCall::ExitGroup)
         }
-        90 => Family::Identity(IdentityCall::CapGet),
-        91 => Family::Identity(IdentityCall::CapSet),
-        92 => Family::Identity(IdentityCall::Personality),
-        96 => Family::Identity(IdentityCall::SetTidAddress),
-        100 => Family::Identity(IdentityCall::GetRobustList),
-        143 => Family::Identity(IdentityCall::SetReGid),
-        144 => Family::Identity(IdentityCall::SetGid),
-        145 => Family::Identity(IdentityCall::SetReUid),
-        146 => Family::Identity(IdentityCall::SetUid),
-        147 => Family::Identity(IdentityCall::SetResUid),
-        148 => Family::Identity(IdentityCall::GetResUid),
-        149 => Family::Identity(IdentityCall::SetResGid),
-        150 => Family::Identity(IdentityCall::GetResGid),
-        151 => Family::Identity(IdentityCall::SetFsUid),
-        152 => Family::Identity(IdentityCall::SetFsGid),
-        154 => Family::Identity(IdentityCall::SetPgid),
-        155 => Family::Identity(IdentityCall::GetPgid),
-        156 => Family::Identity(IdentityCall::GetSid),
-        157 => Family::Identity(IdentityCall::SetSid),
-        158 => Family::Identity(IdentityCall::GetGroups),
-        159 => Family::Identity(IdentityCall::SetGroups),
-        160 => Family::Sysinfo(SysinfoCall::Uname),
-        161 => Family::Sysinfo(SysinfoCall::SetHostname),
-        162 => Family::Sysinfo(SysinfoCall::SetDomainname),
-        163 => Family::Sysinfo(SysinfoCall::GetRlimit),
-        164 => Family::Sysinfo(SysinfoCall::SetRlimit),
-        165 => Family::Sysinfo(SysinfoCall::GetRusage),
-        166 => Family::Sysinfo(SysinfoCall::Umask),
-        167 => Family::Identity(IdentityCall::Prctl),
-        173 => Family::Identity(IdentityCall::GetPpid),
-        174 => Family::Identity(IdentityCall::GetUid),
-        175 => Family::Identity(IdentityCall::GetEuid),
-        176 => Family::Identity(IdentityCall::GetGid),
-        177 => Family::Identity(IdentityCall::GetEgid),
-        179 => Family::Sysinfo(SysinfoCall::Sysinfo),
-        261 => Family::Sysinfo(SysinfoCall::Prlimit64),
+        nr if nr == carrick_syscall_abi::nr::CAPGET.raw() => Family::Identity(IdentityCall::CapGet),
+        nr if nr == carrick_syscall_abi::nr::CAPSET.raw() => Family::Identity(IdentityCall::CapSet),
+        nr if nr == carrick_syscall_abi::nr::PERSONALITY.raw() => {
+            Family::Identity(IdentityCall::Personality)
+        }
+        nr if nr == carrick_syscall_abi::nr::SET_TID_ADDRESS.raw() => {
+            Family::Identity(IdentityCall::SetTidAddress)
+        }
+        nr if nr == carrick_syscall_abi::nr::GET_ROBUST_LIST.raw() => {
+            Family::Identity(IdentityCall::GetRobustList)
+        }
+        nr if nr == carrick_syscall_abi::nr::SETREGID.raw() => {
+            Family::Identity(IdentityCall::SetReGid)
+        }
+        nr if nr == carrick_syscall_abi::nr::SETGID.raw() => Family::Identity(IdentityCall::SetGid),
+        nr if nr == carrick_syscall_abi::nr::SETREUID.raw() => {
+            Family::Identity(IdentityCall::SetReUid)
+        }
+        nr if nr == carrick_syscall_abi::nr::SETUID.raw() => Family::Identity(IdentityCall::SetUid),
+        nr if nr == carrick_syscall_abi::nr::SETRESUID.raw() => {
+            Family::Identity(IdentityCall::SetResUid)
+        }
+        nr if nr == carrick_syscall_abi::nr::GETRESUID.raw() => {
+            Family::Identity(IdentityCall::GetResUid)
+        }
+        nr if nr == carrick_syscall_abi::nr::SETRESGID.raw() => {
+            Family::Identity(IdentityCall::SetResGid)
+        }
+        nr if nr == carrick_syscall_abi::nr::GETRESGID.raw() => {
+            Family::Identity(IdentityCall::GetResGid)
+        }
+        nr if nr == carrick_syscall_abi::nr::SETFSUID.raw() => {
+            Family::Identity(IdentityCall::SetFsUid)
+        }
+        nr if nr == carrick_syscall_abi::nr::SETFSGID.raw() => {
+            Family::Identity(IdentityCall::SetFsGid)
+        }
+        nr if nr == carrick_syscall_abi::nr::SETPGID.raw() => {
+            Family::Identity(IdentityCall::SetPgid)
+        }
+        nr if nr == carrick_syscall_abi::nr::GETPGID.raw() => {
+            Family::Identity(IdentityCall::GetPgid)
+        }
+        nr if nr == carrick_syscall_abi::nr::GETSID.raw() => Family::Identity(IdentityCall::GetSid),
+        nr if nr == carrick_syscall_abi::nr::SETSID.raw() => Family::Identity(IdentityCall::SetSid),
+        nr if nr == carrick_syscall_abi::nr::GETGROUPS.raw() => {
+            Family::Identity(IdentityCall::GetGroups)
+        }
+        nr if nr == carrick_syscall_abi::nr::SETGROUPS.raw() => {
+            Family::Identity(IdentityCall::SetGroups)
+        }
+        nr if nr == carrick_syscall_abi::nr::UNAME.raw() => Family::Sysinfo(SysinfoCall::Uname),
+        nr if nr == carrick_syscall_abi::nr::SETHOSTNAME.raw() => {
+            Family::Sysinfo(SysinfoCall::SetHostname)
+        }
+        nr if nr == carrick_syscall_abi::nr::SETDOMAINNAME.raw() => {
+            Family::Sysinfo(SysinfoCall::SetDomainname)
+        }
+        nr if nr == carrick_syscall_abi::nr::GETRLIMIT.raw() => {
+            Family::Sysinfo(SysinfoCall::GetRlimit)
+        }
+        nr if nr == carrick_syscall_abi::nr::SETRLIMIT.raw() => {
+            Family::Sysinfo(SysinfoCall::SetRlimit)
+        }
+        nr if nr == carrick_syscall_abi::nr::GETRUSAGE.raw() => {
+            Family::Sysinfo(SysinfoCall::GetRusage)
+        }
+        nr if nr == carrick_syscall_abi::nr::UMASK.raw() => Family::Sysinfo(SysinfoCall::Umask),
+        nr if nr == carrick_syscall_abi::nr::PRCTL.raw() => Family::Identity(IdentityCall::Prctl),
+        nr if nr == carrick_syscall_abi::nr::GETPPID.raw() => {
+            Family::Identity(IdentityCall::GetPpid)
+        }
+        nr if nr == carrick_syscall_abi::nr::GETUID.raw() => Family::Identity(IdentityCall::GetUid),
+        nr if nr == carrick_syscall_abi::nr::GETEUID.raw() => {
+            Family::Identity(IdentityCall::GetEuid)
+        }
+        nr if nr == carrick_syscall_abi::nr::GETGID.raw() => Family::Identity(IdentityCall::GetGid),
+        nr if nr == carrick_syscall_abi::nr::GETEGID.raw() => {
+            Family::Identity(IdentityCall::GetEgid)
+        }
+        nr if nr == carrick_syscall_abi::nr::SYSINFO.raw() => Family::Sysinfo(SysinfoCall::Sysinfo),
+        nr if nr == carrick_syscall_abi::nr::PRLIMIT64.raw() => {
+            Family::Sysinfo(SysinfoCall::Prlimit64)
+        }
         nr if allocator_control != u64::MAX && nr == allocator_control => Family::AllocatorControl,
         _ => Family::Unported,
     }
