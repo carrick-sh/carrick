@@ -381,15 +381,34 @@ pub struct HostReadinessCrossing;
 
 impl HostReadinessCrossing {
     pub const NUMBER: u64 = u64::MAX - 0x100;
-    pub const REQUEST_TAG: u64 = u64::MAX;
     /// `SYSCALL` captures the user return PC in RCX before EL1 writes this
     /// supervisor-only tag. The adapter restores RCX before returning.
     pub const FRAME_TAG: u64 = u64::MAX - 1;
 
-    pub const fn is_crossing(request_tag: u64, tag: u64) -> bool {
-        request_tag == Self::REQUEST_TAG && tag == Self::FRAME_TAG
+    pub const fn is_crossing(tag: u64) -> bool {
+        tag == Self::FRAME_TAG
     }
 }
+
+/// One host-bound description in a readiness request. The guest file owner
+/// supplies `host_fd`; the carrier fills `revents` without changing identity
+/// or interest. `poll_index` keeps duplicate guest entries independent.
+#[repr(C)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub struct HostReadinessEntry {
+    pub host_fd: HostBoundFd,
+    pub events: i16,
+    pub revents: i16,
+    pub poll_index: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<HostReadinessEntry>() == 12);
 
 /// Byte offset of the file page cache arena within the region.
 pub const EL1_CACHE_OFFSET: u64 = EL1_HEAP_OFFSET + 0x10_0000; // 1 MiB into heap
@@ -1334,6 +1353,7 @@ unsafe impl Sync for DelegatedFile {}
     ::core::cmp::Eq,
     ::core::cmp::PartialEq,
 )]
+#[repr(transparent)]
 pub struct HostBoundFd(i32);
 
 impl HostBoundFd {

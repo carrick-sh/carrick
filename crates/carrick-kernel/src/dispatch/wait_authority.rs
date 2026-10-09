@@ -22,6 +22,9 @@ pub enum WaitFdGuard {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InternalWaitKind {
     CarrierControl,
+    /// The CPL0 carrier waits on host-bound descriptions named by the guest
+    /// file owner; no host file-table slot is involved.
+    HostReadiness,
     /// A blocking FIFO `open` parked on the peer-presence pipe owned by
     /// `fifo_beacon`. The guest has no fd for the FIFO yet, so there is no
     /// exact file description to pin; the parked-opener guard owns the host
@@ -242,6 +245,12 @@ impl WaitFds {
             guards: Vec::new(),
             authority,
         }
+    }
+
+    /// Host descriptors authenticated by a supervisor readiness request.
+    /// The carrier duplicates each descriptor when the continuation is built.
+    pub fn host_readiness(fds: Vec<(i32, i16)>) -> Self {
+        Self::raw(fds).with_authority(WaitFdAuthority::internal(InternalWaitKind::HostReadiness))
     }
 
     pub fn raw_one(fd: i32, events: i16) -> Self {

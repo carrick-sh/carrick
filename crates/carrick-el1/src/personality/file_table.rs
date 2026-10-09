@@ -18,7 +18,7 @@ use core::sync::atomic::Ordering;
 
 use carrick_el1_abi::{
     DELEGATED_FLAG_READABLE, DELEGATED_FLAG_WRITABLE, DELEGATED_STATE_GUEST, DelegatedFile,
-    DelegatedOpenFile, FD_MAP_CAPACITY, FdMapSlot, HostBoundFd, fd_map_lookup,
+    DelegatedOpenFile, FD_MAP_CAPACITY, FdMapSlot, HostBoundFd, HostReadinessEntry, fd_map_lookup,
 };
 use carrick_sched_core::{SlotId, ZoneTables};
 
@@ -191,34 +191,39 @@ pub fn fork_fd_map(fd_map: &[FdMapSlot], parent_table: u64, child_table: u64) {
 /// Negative entries do not participate. Absent descriptors can travel with
 /// host-bound entries: the shared dispatcher reports their POLLNVAL result.
 /// In-zone descriptions stay with the guest owner.
-pub fn poll_has_only_host_bindings(
+pub fn host_readiness_entries(
     fd_map: &[FdMapSlot],
     open_table: &[DelegatedOpenFile],
     file_table: u64,
     pollfds: &[PollFd],
-) -> bool {
-    let mut has_host_binding = false;
-    let all_host_or_absent = pollfds.iter().all(|entry| {
+) -> Option<Vec<HostReadinessEntry>> {
+    let mut host_entries = Vec::new();
+    for (index, entry) in pollfds.iter().enumerate() {
         if entry.fd < 0 {
-            return true;
+            continue;
         }
         let Some((handle, _)) = fd_map_lookup(fd_map, file_table, entry.fd) else {
-            return true;
+            continue;
         };
         if handle == 0 {
-            return false;
+            return None;
         }
-        let host_bound = open_table.get((handle - 1) as usize).is_some_and(|open| {
-            open.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST && open.host_fd().is_some()
+        let host_fd = open_table
+            .get((handle - 1) as usize)
+            .filter(|open| open.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST)
+            .and_then(DelegatedOpenFile::host_fd)?;
+        host_entries.push(HostReadinessEntry {
+            host_fd,
+            events: entry.events,
+            revents: 0,
+            poll_index: index as u32,
         });
-        has_host_binding |= host_bound;
-        host_bound
-    });
-    all_host_or_absent && has_host_binding
+    }
+    (!host_entries.is_empty()).then_some(host_entries)
 }
 
 /// VM-free fixture probe for host-bound descriptions. Production guest code
-/// asks the carrier through the allowed epoll_pwait crossing instead.
+/// asks the carrier through the dedicated typed host-readiness crossing.
 #[cfg(all(test, not(target_os = "none")))]
 pub fn query_host_readiness(host_fd: i32, flags: u32) -> i16 {
     let mut pfd = libc::pollfd {
@@ -265,8 +270,31 @@ pub fn resolve_poll(
     file_table: u64,
     pollfds: &mut [PollFd],
 ) -> i32 {
+    resolve_poll_with_host_readiness(
+        fd_map,
+        open_table,
+        _object_table,
+        _ipc,
+        file_table,
+        pollfds,
+        None,
+    )
+}
+
+/// Resolve guest namespace entries using the carrier's exact host ready set.
+/// The host entries are ordered by poll index and preserve duplicates.
+pub fn resolve_poll_with_host_readiness(
+    fd_map: &[FdMapSlot],
+    open_table: &[DelegatedOpenFile],
+    _object_table: &[DelegatedFile],
+    _ipc: Option<&crate::personality::ipc::IpcVenue<'_>>,
+    file_table: u64,
+    pollfds: &mut [PollFd],
+    host_entries: Option<&[HostReadinessEntry]>,
+) -> i32 {
     let mut ready_count = 0;
-    for entry in pollfds.iter_mut() {
+    let mut host_cursor = host_entries.unwrap_or(&[]).iter().peekable();
+    for (index, entry) in pollfds.iter_mut().enumerate() {
         if entry.fd < 0 {
             entry.revents = 0;
             continue;
@@ -278,9 +306,18 @@ pub fn resolve_poll(
             let open_file = &open_table[(handle - 1) as usize];
             if open_file.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST {
                 let flags = open_file.flags.load(Ordering::Acquire);
-                let readiness = open_file
-                    .host_fd()
-                    .map_or(0, |host_fd| query_host_readiness(host_fd.raw(), flags));
+                let readiness = if host_cursor
+                    .peek()
+                    .is_some_and(|next| next.poll_index as usize == index)
+                {
+                    host_cursor.next().map_or(0, |next| next.revents)
+                } else if host_entries.is_some() {
+                    0
+                } else {
+                    open_file
+                        .host_fd()
+                        .map_or(0, |host_fd| query_host_readiness(host_fd.raw(), flags))
+                };
                 let mut revents = entry.events & readiness;
                 revents |= readiness & (LINUX_POLLERR | LINUX_POLLHUP | LINUX_POLLNVAL);
                 entry.revents = revents;
@@ -718,6 +755,65 @@ mod tests {
         }];
         resolve_poll(&fd_map, &open_table, &object_table, None, 10, &mut fds);
         assert_eq!(fds[0].revents & LINUX_POLLNVAL, 0);
+    }
+
+    #[test]
+    fn readiness_batch_uses_host_binding_and_preserves_duplicate_results() {
+        let (fd_map, open_table, object_table) = setup_tables();
+        admit_host_fd(
+            &fd_map,
+            &open_table,
+            &object_table,
+            10,
+            123,
+            0,
+            DELEGATED_FLAG_READABLE,
+        );
+        let mut fds = [
+            PollFd {
+                fd: 123,
+                events: LINUX_POLLIN,
+                revents: 0,
+            },
+            PollFd {
+                fd: -1,
+                events: LINUX_POLLIN,
+                revents: 0,
+            },
+            PollFd {
+                fd: 123,
+                events: LINUX_POLLIN,
+                revents: 0,
+            },
+            PollFd {
+                fd: 999,
+                events: LINUX_POLLIN,
+                revents: 0,
+            },
+        ];
+        let mut entries = host_readiness_entries(&fd_map, &open_table, 10, &fds).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].host_fd.raw(), 0);
+        assert_eq!(entries[0].poll_index, 0);
+        assert_eq!(entries[1].host_fd.raw(), 0);
+        assert_eq!(entries[1].poll_index, 2);
+        entries[0].revents = LINUX_POLLIN;
+        entries[1].revents = LINUX_POLLIN;
+        assert_eq!(
+            resolve_poll_with_host_readiness(
+                &fd_map,
+                &open_table,
+                &object_table,
+                None,
+                10,
+                &mut fds,
+                Some(&entries)
+            ),
+            3
+        );
+        assert_eq!(fds[1].revents, 0);
+        assert_eq!(fds[3].revents, LINUX_POLLNVAL);
+        assert!(host_readiness_entries(&fd_map, &open_table, 10, &fds[3..]).is_none());
     }
 
     #[test]
