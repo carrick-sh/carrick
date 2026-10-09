@@ -273,33 +273,20 @@ fn set_uts_string<'a>(
     native: &mut dyn SysinfoNative<'a>,
     is_domain: bool,
 ) -> Option<SyscallResult> {
-    {
-        let venue = native.process_sysinfo()?;
-        let perm = if is_domain {
-            venue.can_set_domainname()
-        } else {
-            venue.can_set_hostname()
-        };
-        if let Err(e) = perm {
-            return Some(SyscallResult::new(e));
-        }
-        if len == 0 {
-            let _ = if is_domain {
-                venue.set_domainname(&[])
-            } else {
-                venue.set_hostname(&[])
-            };
-            return Some(SyscallResult::new(0));
-        }
+    let venue = native.process_sysinfo()?;
+    let perm = if is_domain {
+        venue.can_set_domainname()
+    } else {
+        venue.can_set_hostname()
+    };
+    if let Err(e) = perm {
+        return Some(SyscallResult::new(e));
     }
     if len > 64 {
         return Some(SyscallResult::new(EINVAL));
     }
-    if ptr.raw() == 0 {
-        return Some(SyscallResult::new(EFAULT));
-    }
     let mut buf = [0u8; 64];
-    if !native.copy_in(&mut buf[..len], ptr) {
+    if len > 0 && (ptr.raw() == 0 || !native.copy_in(&mut buf[..len], ptr)) {
         return Some(SyscallResult::new(EFAULT));
     }
     let venue = native.process_sysinfo()?;
@@ -308,10 +295,7 @@ fn set_uts_string<'a>(
     } else {
         venue.set_hostname(&buf[..len])
     };
-    match res {
-        Ok(()) => Some(SyscallResult::new(0)),
-        Err(e) => Some(SyscallResult::new(e)),
-    }
+    Some(SyscallResult::new(res.err().unwrap_or(0)))
 }
 
 #[inline(never)]
