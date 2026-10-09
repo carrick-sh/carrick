@@ -206,8 +206,8 @@ pub fn object_of_wait_queue(queue: u32) -> Option<(u32, pipe::WaitFor)> {
 /// For a wedge post-mortem: every object queue a live zone record waits on,
 /// with its object's incarnation and readiness. Read-only; each object lock
 /// is taken only if it is free within a few spins, never waited for.
-pub fn write_ipc_wait_census(
-    zone: &carrick_sched_core::ZoneTables,
+pub fn write_ipc_wait_census<C: crate::EntryContext>(
+    zone: &carrick_sched_core::ZoneTables<C>,
     region: &IpcRegion<'_>,
     out: &mut impl core::fmt::Write,
 ) -> core::fmt::Result {

@@ -814,7 +814,7 @@ mod tests {
         }
         impl PreparedHostReservations for View {
             fn lock(&self, _mm: ReservationMm) -> Result<Reservations<'_>, Refusal> {
-                self.table.lock_waiting(
+                self.table.lock_waiting_with_context(
                     self.index,
                     self.mm,
                     &carrick_el1::memory::reservations::NoRootWait,
@@ -826,7 +826,13 @@ mod tests {
         let a = publish(&table, &mem, 0);
         let b = publish(&table, &mem, 1);
         for (index, mm) in [(0, a), (1, b)] {
-            seal(&mut table.lock(index, mm).unwrap(), &mem).unwrap();
+            seal(
+                &mut table
+                    .lock_with_context::<carrick_el1_abi::Aarch64ParkedContext>(index, mm)
+                    .unwrap(),
+                &mem,
+            )
+            .unwrap();
         }
         let mm_id = |key: ReservationMm| {
             crate::kernel::MmId::from_registry_allocation(
@@ -931,10 +937,24 @@ mod tests {
         let b = publish(&table, &mem, 1);
         let host = NonAnonymousVmas::try_from((a, VmaMap::new())).unwrap();
         for (index, mm) in [(0, a), (1, b)] {
-            seal(&mut table.lock(index, mm).unwrap(), &mem).unwrap();
+            seal(
+                &mut table
+                    .lock_with_context::<carrick_el1_abi::Aarch64ParkedContext>(index, mm)
+                    .unwrap(),
+                &mem,
+            )
+            .unwrap();
         }
-        let initial = ReservationProcMaps::capture(&mut table.lock(0, a).unwrap(), &host).unwrap();
-        let mut guest = table.lock(0, a).unwrap();
+        let initial = ReservationProcMaps::capture(
+            &mut table
+                .lock_with_context::<carrick_el1_abi::Aarch64ParkedContext>(0, a)
+                .unwrap(),
+            &host,
+        )
+        .unwrap();
+        let mut guest = table
+            .lock_with_context::<carrick_el1_abi::Aarch64ParkedContext>(0, a)
+            .unwrap();
         let Decision::Work(request) = guest
             .mprotect(
                 ReservationRange::new(va, va + 4096).unwrap(),
@@ -980,7 +1000,9 @@ mod tests {
         assert!(!changed.maps()[0].write);
         assert_eq!(changed.brk_current(), mem.layout.heap_base);
         drop(guest);
-        let mut peer = table.lock(1, b).unwrap();
+        let mut peer = table
+            .lock_with_context::<carrick_el1_abi::Aarch64ParkedContext>(1, b)
+            .unwrap();
         assert!(matches!(
             ReservationProcMaps::capture(&mut peer, &host),
             Err(Refusal::Stale)
@@ -1013,7 +1035,13 @@ mod tests {
         let a = publish(&table, &mem, 0);
         let b = publish(&table, &mem, 1);
         for (index, mm) in [(0, a), (1, b)] {
-            seal(&mut table.lock(index, mm).unwrap(), &mem).unwrap();
+            seal(
+                &mut table
+                    .lock_with_context::<carrick_el1_abi::Aarch64ParkedContext>(index, mm)
+                    .unwrap(),
+                &mem,
+            )
+            .unwrap();
         }
         let va = mem.layout.mmap_base;
         let original = table
@@ -1066,7 +1094,9 @@ mod tests {
             host.fault_plan(va, 4096, ReservationProtection::READ_WRITE),
             Err(Refusal::Limit)
         );
-        let mut peer = table.lock(1, b).unwrap();
+        let mut peer = table
+            .lock_with_context::<carrick_el1_abi::Aarch64ParkedContext>(1, b)
+            .unwrap();
         assert_eq!(
             peer.mapping(va).unwrap().protection,
             ReservationProtection::READ_WRITE
@@ -1083,7 +1113,9 @@ mod tests {
         invalid.end += 16384;
         mem.semantic_vmas.insert(invalid).unwrap();
         let mm = publish(&table, &mem, 0);
-        let mut model = table.lock(0, mm).unwrap();
+        let mut model = table
+            .lock_with_context::<carrick_el1_abi::Aarch64ParkedContext>(0, mm)
+            .unwrap();
         assert_eq!(seal(&mut model, &mem), Err(Refusal::Invalid));
         assert!(model.mapping(mem.layout.mmap_base).is_none());
         model.abort_import().unwrap();

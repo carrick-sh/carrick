@@ -24,14 +24,17 @@ impl DelegatedFileWaitIndex {
     }
 }
 #[derive(Clone, Copy)]
-pub struct DelegatedReleaseVenue<'zone> {
-    pub zone: &'zone ZoneTables,
+pub struct DelegatedReleaseVenue<
+    'zone,
+    C: Copy + Send + Sync + zerocopy::FromZeros = crate::ThreadCtx,
+> {
+    pub zone: &'zone ZoneTables<C>,
     pub waker: Waker,
-    pub deliver: for<'z> fn(&'z ZoneTables, Waker, OwnedObjectWakeEffects<'z>),
+    pub deliver: for<'z> fn(&'z ZoneTables<C>, Waker, OwnedObjectWakeEffects<'z, C>),
     /// A source-licensed owner-only wake, delivered strictly after inode unlock.
-    pub owner_ready: fn(&ZoneTables, Waker),
+    pub owner_ready: fn(&ZoneTables<C>, Waker),
 }
-impl<'zone> DelegatedReleaseVenue<'zone> {
+impl<'zone, C: Copy + Send + Sync + zerocopy::FromZeros> DelegatedReleaseVenue<'zone, C> {
     /// Derive release custody from the live base pin protected by an inode lock.
     /// No queue admission, retry, or owning reconstruction is performed.
     ///
@@ -46,7 +49,7 @@ impl<'zone> DelegatedReleaseVenue<'zone> {
         index: DelegatedFileWaitIndex,
         generation: NonZeroU64,
         lock: &'guard AtomicU32,
-    ) -> Result<DelegatedLockRelease<'guard, 'zone>, ObjectWaitError> {
+    ) -> Result<DelegatedLockRelease<'guard, 'zone, C>, ObjectWaitError> {
         let key = ObjectWaitKey::delegated_file(index, generation);
         let queue = self.zone.object_queue(key.index() as usize);
         if lock.load(Ordering::Acquire) == 0
@@ -71,19 +74,23 @@ impl<'zone> DelegatedReleaseVenue<'zone> {
 /// Exact lock plus one counted release ticket. Drop unlocks before delivering;
 /// it never releases or reconstructs the detached source's base admission.
 #[must_use = "the inode guard must retain its sole unlock authority"]
-pub struct DelegatedLockRelease<'guard, 'zone> {
-    venue: DelegatedReleaseVenue<'zone>,
+pub struct DelegatedLockRelease<
+    'guard,
+    'zone,
+    C: Copy + Send + Sync + zerocopy::FromZeros = crate::ThreadCtx,
+> {
+    venue: DelegatedReleaseVenue<'zone, C>,
     lock: &'guard AtomicU32,
-    ticket: Option<ObjectNotificationTicket<'zone>>,
+    ticket: Option<ObjectNotificationTicket<'zone, C>>,
 }
-impl<'zone> DelegatedLockRelease<'_, 'zone> {
+impl<'zone, C: Copy + Send + Sync + zerocopy::FromZeros> DelegatedLockRelease<'_, 'zone, C> {
     pub fn key(&self) -> ObjectWaitKey {
         let Some(ticket) = &self.ticket else {
             unreachable!("live delegated release ticket")
         };
         ticket.key()
     }
-    pub fn source(&self) -> BorrowedObjectNotificationSource<'_, 'zone> {
+    pub fn source(&self) -> BorrowedObjectNotificationSource<'_, 'zone, C> {
         BorrowedObjectNotificationSource {
             zone: self.venue.zone,
             key: self.key(),
@@ -97,7 +104,7 @@ impl Drop for Unlock<'_> {
         self.0.store(0, Ordering::SeqCst);
     }
 }
-impl DelegatedLockRelease<'_, '_> {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> DelegatedLockRelease<'_, '_, C> {
     /// Release exclusion and publish an owner callback while the source's
     /// counted publication still prevents incarnation rebinding.
     pub fn release_with(mut self, after_unlock: impl FnOnce()) {
@@ -108,7 +115,7 @@ impl DelegatedLockRelease<'_, '_> {
             return;
         };
         let unlock = Unlock(self.lock);
-        let completion = |effects: OwnedObjectWakeEffects<'_>| {
+        let completion = |effects: OwnedObjectWakeEffects<'_, C>| {
             (self.venue.deliver)(self.venue.zone, self.venue.waker, effects)
         };
         let publication = ticket.advance_revision(self.venue.waker, &completion);
@@ -117,7 +124,7 @@ impl DelegatedLockRelease<'_, '_> {
         publication.publish();
     }
 }
-impl Drop for DelegatedLockRelease<'_, '_> {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for DelegatedLockRelease<'_, '_, C> {
     fn drop(&mut self) {
         self.release(|| {});
     }

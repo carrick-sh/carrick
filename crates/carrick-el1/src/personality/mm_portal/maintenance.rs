@@ -20,7 +20,7 @@ const PA: u64 = 0x0000_ffff_ffff_f000;
 /// may run while this borrow exists. Ordinary transfers cannot obtain it.
 pub struct BackingMaintenance<'a> {
     _root: Reservations<'a>,
-    _editor: SpaceEditor<'a>,
+    _editor: SpaceEditor<'a, carrick_el1_abi::Aarch64ParkedContext>,
     request: PortalBackingMaintenance,
     ttbr0: u64,
 }

@@ -144,9 +144,12 @@ impl PreparedHostReservations for PreparedView {
         };
         let index = zone.spaces.find(mm.raw()).ok_or(Refusal::Stale)?.index();
         fn deliver(
-            zone: &carrick_sched_core::ZoneTables,
+            zone: &carrick_el1_abi::ZoneTables,
             _: carrick_sched_core::Waker,
-            effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+            effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+                '_,
+                carrick_el1_abi::Aarch64ParkedContext,
+            >,
         ) {
             carrick_sched_core::LockWait::complete_object_wake(
                 &carrick_kernel::el1_zone::HostLockWait,
