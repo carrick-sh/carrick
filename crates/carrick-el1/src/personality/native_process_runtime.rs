@@ -1574,9 +1574,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             .owner
             .task_mut(self.key)
             .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
-        let caller_pid = task.metadata().namespace_pid;
-        let target_tid = if pid == 0 { caller_tid } else { pid as u32 };
-        if target_tid != caller_tid && target_tid != caller_pid && !task.has_thread(target_tid) {
+        if pid < 0 || (pid != 0 && pid as u32 != caller_tid) {
             return Err(carrick_personality_linux::identity::EPERM);
         }
         let caller_creds = task.credentials_for(caller_tid)?;
@@ -1594,7 +1592,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
                 return Err(carrick_personality_linux::identity::EPERM);
             }
         }
-        let target_creds = task.credentials_for_mut(target_tid)?;
+        let target_creds = task.credentials_for_mut(caller_tid)?;
         target_creds.cap_effective = caps.effective;
         target_creds.cap_permitted = caps.permitted;
         target_creds.cap_inheritable = caps.inheritable;
@@ -3424,5 +3422,97 @@ mod tests {
                 Err(carrick_personality_linux::identity::ESRCH)
             );
         }
+    }
+
+    #[test]
+    fn capset_restricted_to_pid_zero_and_caller_own_tid() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let child_page = Box::new(ThreadLifecyclePage::new());
+        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        }));
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &*child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+        };
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        use carrick_personality_linux::identity::ProcessIdentityVenue;
+
+        entry.set_calling_tid(41);
+        entry.thread_spawned(41, 42);
+
+        // From thread 42:
+        entry.set_calling_tid(42);
+        let caps = entry.capget(0).unwrap();
+
+        // capset on another thread (leader 41) must fail with EPERM
+        assert_eq!(
+            entry.capset(41, caps.clone()),
+            Err(carrick_personality_linux::identity::EPERM)
+        );
+        // capset on negative pid must fail with EPERM
+        assert_eq!(
+            entry.capset(-1, caps.clone()),
+            Err(carrick_personality_linux::identity::EPERM)
+        );
+        // capset on own tid 42 and pid 0 must succeed
+        assert_eq!(entry.capset(42, caps.clone()), Ok(()));
+        assert_eq!(entry.capset(0, caps), Ok(()));
     }
 }
