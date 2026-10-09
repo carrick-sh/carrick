@@ -10,7 +10,7 @@ _start:
     # mask (8 bytes) = 0
     lea handler(%rip), %rax
     mov %rax, sa_act(%rip)
-    movq $0x04000000, sa_act+8(%rip)
+    movq $0x04000004, sa_act+8(%rip)
     lea restorer(%rip), %rax
     mov %rax, sa_act+16(%rip)
     movq $0, sa_act+24(%rip)
@@ -34,8 +34,8 @@ _start:
     mov $62, %rax         # SYS_kill on x86_64
     mov $10, %rsi         # SIGUSR1
     syscall
-    test %rax, %rax
-    jnz fail
+    cmp $0x12345678, %rax
+    jne fail
 
     # After handler returns and rt_sigreturn resumes here: write 'K\n'
     mov $1, %rax          # SYS_write
@@ -48,6 +48,8 @@ _start:
     jmp exit
 
 handler:
+    # Saved RAX is Linux ucontext offset 40 + 13 * 8.
+    movq $0x12345678, 144(%rdx)
     # Handler writes 'H' to stdout
     mov $1, %rax          # SYS_write
     mov $1, %rdi          # stdout
