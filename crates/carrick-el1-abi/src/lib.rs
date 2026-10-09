@@ -1633,6 +1633,15 @@ pub struct FdMapSlot {
 }
 
 impl FdMapSlot {
+    /// Reserved while a publisher fills a vacant slot; never a live incarnation.
+    pub const CLAIMED: u64 = u64::MAX;
+
+    #[inline]
+    pub fn try_claim(&self) -> bool {
+        self.incarnation
+            .compare_exchange(0, Self::CLAIMED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
     pub const fn new() -> Self {
         Self {
             file_table: AtomicU64::new(0),
@@ -1644,10 +1653,11 @@ impl FdMapSlot {
 
     #[inline]
     pub fn clear(&self) {
-        self.incarnation.store(0, Ordering::Release);
+        self.incarnation.store(Self::CLAIMED, Ordering::Release);
         self.handle.store(0, Ordering::Relaxed);
         self.fd.store(0, Ordering::Relaxed);
         self.file_table.store(0, Ordering::Relaxed);
+        self.incarnation.store(0, Ordering::Release);
     }
 
     #[inline]
@@ -1690,6 +1700,7 @@ pub fn fd_map_lookup(map: &[FdMapSlot], file_table: u64, fd: i32) -> Option<(u32
     for (idx, slot) in map.iter().take(FD_MAP_CAPACITY).enumerate() {
         let inc = slot.incarnation.load(Ordering::Acquire);
         if inc != 0
+            && inc != FdMapSlot::CLAIMED
             && slot.fd.load(Ordering::Relaxed) == ufd
             && slot.file_table.load(Ordering::Relaxed) == file_table
         {
@@ -1711,6 +1722,7 @@ pub fn fd_map_lookup_inotify(map: &[FdMapSlot], file_table: u64, fd: i32) -> Opt
     for (idx, slot) in map.iter().take(FD_MAP_CAPACITY).enumerate() {
         let inc = slot.incarnation.load(Ordering::Acquire);
         if inc != 0
+            && inc != FdMapSlot::CLAIMED
             && slot.fd.load(Ordering::Relaxed) == ufd
             && slot.file_table.load(Ordering::Relaxed) == file_table
         {
@@ -1736,6 +1748,7 @@ pub fn fd_map_lookup_kind(
     for (idx, slot) in map.iter().take(FD_MAP_CAPACITY).enumerate() {
         let inc = slot.incarnation.load(Ordering::Acquire);
         if inc != 0
+            && inc != FdMapSlot::CLAIMED
             && slot.fd.load(Ordering::Relaxed) == ufd
             && slot.file_table.load(Ordering::Relaxed) == file_table
         {
