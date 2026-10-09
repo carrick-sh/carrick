@@ -1121,6 +1121,7 @@ dependencies = [
  "kvm-ioctls",
  "libc",
  "serde_json",
+ "static_assertions",
  "tempfile",
  "toml",
  "vmm-sys-util",

@@ -24,6 +24,7 @@ toml.workspace = true
 
 [dev-dependencies]
 carrick-kernel = { path = "../carrick-kernel" }
+static_assertions = "1"
 tempfile.workspace = true
 toml.workspace = true
 serde_json.workspace = true
