@@ -103,7 +103,14 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     fn as_sysinfo_venue(&mut self) -> Option<&mut dyn crate::sysinfo::ProcessSysinfoVenue> {
         None
     }
-    fn thread_spawned(&mut self, _caller_tid: u32, _child_tid: u32) {}
+    fn thread_spawned(
+        &mut self,
+        _caller_tid: u32,
+        _child_tid: u32,
+        publish: &mut dyn FnMut() -> Result<(), i64>,
+    ) -> Result<(), i64> {
+        publish()
+    }
     fn thread_exited(&mut self, _tid: u32) {}
     fn set_calling_tid(&mut self, _tid: u32) {}
 
@@ -125,6 +132,16 @@ pub struct ChildContext {
     pub stack: UserVa,
     pub tls: Option<UserVa>,
     pub visible_tid: u32,
+}
+
+/// Credential admission and runnable publication share the owner's transaction.
+pub struct ThreadBirth<'a, 'b> {
+    pub page: &'a ThreadLifecyclePage,
+    pub claim: &'b mut Option<carrick_core::lifecycle::ClaimedEntry>,
+    pub born: BornRecord,
+    pub record: RecordRef,
+    pub caller_tid: u32,
+    pub child_tid: u32,
 }
 
 pub struct ExitRecord {
@@ -203,7 +220,17 @@ pub trait LifecycleNative<'a>: UserCopy {
     fn process_exit_group(&mut self, _status: u8) -> Option<LifecycleOutcome> {
         None
     }
-    fn thread_spawned(&mut self, _caller_tid: u32, _child_tid: u32) {}
+    fn publish_born(&mut self, birth: ThreadBirth<'a, '_>) -> Result<(), i64> {
+        birth
+            .page
+            .record_born(
+                birth.claim.take().ok_or(crate::identity::EINVAL)?,
+                birth.born,
+            )
+            .map_err(|_| crate::identity::EINVAL)?;
+        self.enqueue_born(birth.record);
+        Ok(())
+    }
     fn thread_exited(&mut self, _tid: u32) {}
 }
 /// Linux aarch64 syscall numbers served here (`SYS_SET_ROBUST_LIST` is the
@@ -368,7 +395,7 @@ pub fn invoke<'a>(
         }
         LifecycleCall::Clone => {
             let visible = serve_clone(args, thread, native)?;
-            Some(returned(SyscallResult::new(i64::from(visible)), false))
+            Some(returned(SyscallResult::new(visible), false))
         }
         LifecycleCall::Exit => {
             if !native.has_scheduler() {
@@ -568,7 +595,7 @@ fn serve_clone<'a>(
     args: [u64; 6],
     thread: LifecycleThread<'a>,
     native: &mut dyn LifecycleNative<'a>,
-) -> Option<u32> {
+) -> Option<i64> {
     if !native.has_scheduler() {
         return None;
     }
@@ -672,17 +699,25 @@ fn serve_clone<'a>(
         clear_child_tid,
         blocked,
     };
-    if page.record_born(claimed, born).is_err() {
-        // Unreachable: only this claimant moves a Claimed entry.
+    let caller_tid = thread.slot.visible_tid().unwrap_or(0);
+    let mut claim = Some(claimed);
+    if let Err(error) = native.publish_born(ThreadBirth {
+        page,
+        claim: &mut claim,
+        born,
+        record,
+        caller_tid,
+        child_tid: identity.visible_tid,
+    }) {
         let _ = page.try_exit();
         outputs.rollback(native);
         native.free_record(record);
-        return None;
+        if let Some(claimed) = claim {
+            let _ = page.unclaim(claimed);
+        }
+        return Some(error);
     }
-    native.enqueue_born(record);
-    let caller_tid = thread.slot.visible_tid().unwrap_or(0);
-    native.thread_spawned(caller_tid, identity.visible_tid);
-    Some(visible as u32)
+    Some(visible as i64)
 }
 
 /// `exit(status)` of a non-leader thread that EL1 switched in, when it is

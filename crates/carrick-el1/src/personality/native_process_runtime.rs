@@ -1314,11 +1314,26 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     ) -> Option<&mut dyn carrick_personality_linux::sysinfo::ProcessSysinfoVenue> {
         Some(self)
     }
-    fn thread_spawned(&mut self, caller_tid: u32, child_tid: u32) {
+    fn thread_spawned(
+        &mut self,
+        caller_tid: u32,
+        child_tid: u32,
+        publish: &mut dyn FnMut() -> Result<(), i64>,
+    ) -> Result<(), i64> {
         let mut graph = self.runtime.graph.lock();
-        if let Ok(task) = graph.owner.task_mut(self.key) {
-            let _ = task.spawn_thread(caller_tid, child_tid);
+        let task = graph
+            .owner
+            .task_mut(self.key)
+            .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
+        if task.has_thread(child_tid) {
+            return Err(carrick_personality_linux::identity::EINVAL);
         }
+        task.spawn_thread(caller_tid, child_tid)?;
+        if let Err(error) = publish() {
+            task.remove_thread(child_tid);
+            return Err(error);
+        }
+        Ok(())
     }
     fn thread_exited(&mut self, tid: u32) {
         self.thread_exited(tid);
@@ -1402,34 +1417,41 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
     carrick_personality_linux::identity::ProcessIdentityVenue
     for NativeProcessEntry<'r, 'a, M, C, S>
 {
-    fn get_uids(&self) -> (u32, u32, u32, u32) {
+    fn get_uids(
+        &self,
+    ) -> Result<(u32, u32, u32, u32), carrick_personality_linux::identity::IdentityReadError> {
         let graph = self.runtime.graph.lock();
-        if let Ok(task) = graph.owner.task(self.key)
-            && let Ok(creds) = task.credentials_for(self.calling_tid)
-        {
-            return (
-                creds.ruid.raw(),
-                creds.euid.raw(),
-                creds.suid.raw(),
-                creds.fsuid.raw(),
-            );
-        }
-        (0, 0, 0, 0)
+        let task = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_personality_linux::identity::IdentityReadError::MissingThread)?;
+        let creds = task
+            .credentials_for(self.calling_tid)
+            .map_err(|_| carrick_personality_linux::identity::IdentityReadError::MissingThread)?;
+        Ok((
+            creds.ruid.raw(),
+            creds.euid.raw(),
+            creds.suid.raw(),
+            creds.fsuid.raw(),
+        ))
     }
-
-    fn get_gids(&self) -> (u32, u32, u32, u32) {
+    fn get_gids(
+        &self,
+    ) -> Result<(u32, u32, u32, u32), carrick_personality_linux::identity::IdentityReadError> {
         let graph = self.runtime.graph.lock();
-        if let Ok(task) = graph.owner.task(self.key)
-            && let Ok(creds) = task.credentials_for(self.calling_tid)
-        {
-            return (
-                creds.rgid.raw(),
-                creds.egid.raw(),
-                creds.sgid.raw(),
-                creds.fsgid.raw(),
-            );
-        }
-        (0, 0, 0, 0)
+        let task = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_personality_linux::identity::IdentityReadError::MissingThread)?;
+        let creds = task
+            .credentials_for(self.calling_tid)
+            .map_err(|_| carrick_personality_linux::identity::IdentityReadError::MissingThread)?;
+        Ok((
+            creds.rgid.raw(),
+            creds.egid.raw(),
+            creds.sgid.raw(),
+            creds.fsgid.raw(),
+        ))
     }
 
     fn set_resuid(&mut self, r: Option<u32>, e: Option<u32>, s: Option<u32>) -> Result<(), i64> {
@@ -1456,22 +1478,30 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         self.update_calling_creds(&mut |creds| creds.set_gid(gid))
     }
 
-    fn set_fsuid(&mut self, fsuid: u32) -> u32 {
-        let mut prev = 0;
-        let _ = self.update_calling_creds(&mut |creds| {
-            prev = creds.set_fsuid(fsuid);
+    fn set_fsuid(
+        &mut self,
+        fsuid: u32,
+    ) -> Result<u32, carrick_personality_linux::identity::IdentityReadError> {
+        let mut prev = None;
+        self.update_calling_creds(&mut |creds| {
+            prev = Some(creds.set_fsuid(fsuid));
             Ok(())
-        });
-        prev
+        })
+        .map_err(|_| carrick_personality_linux::identity::IdentityReadError::MissingThread)?;
+        prev.ok_or(carrick_personality_linux::identity::IdentityReadError::MissingThread)
     }
 
-    fn set_fsgid(&mut self, fsgid: u32) -> u32 {
-        let mut prev = 0;
-        let _ = self.update_calling_creds(&mut |creds| {
-            prev = creds.set_fsgid(fsgid);
+    fn set_fsgid(
+        &mut self,
+        fsgid: u32,
+    ) -> Result<u32, carrick_personality_linux::identity::IdentityReadError> {
+        let mut prev = None;
+        self.update_calling_creds(&mut |creds| {
+            prev = Some(creds.set_fsgid(fsgid));
             Ok(())
-        });
-        prev
+        })
+        .map_err(|_| carrick_personality_linux::identity::IdentityReadError::MissingThread)?;
+        prev.ok_or(carrick_personality_linux::identity::IdentityReadError::MissingThread)
     }
 
     fn can_set_groups(&self) -> Result<(), i64> {
@@ -1489,28 +1519,35 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         Ok(())
     }
 
-    fn get_groups_count(&self) -> usize {
+    fn get_groups_count(
+        &self,
+    ) -> Result<usize, carrick_personality_linux::identity::IdentityReadError> {
         let graph = self.runtime.graph.lock();
-        graph
+        let task = graph
             .owner
             .task(self.key)
-            .ok()
-            .and_then(|t| {
-                t.credentials_for(self.calling_tid)
-                    .ok()
-                    .map(|c| c.groups.len())
-            })
-            .unwrap_or(0)
+            .map_err(|_| carrick_personality_linux::identity::IdentityReadError::MissingThread)?;
+        Ok(task
+            .credentials_for(self.calling_tid)
+            .map_err(|_| carrick_personality_linux::identity::IdentityReadError::MissingThread)?
+            .groups
+            .len())
     }
-
-    fn get_groups(&self, out: &mut alloc::vec::Vec<u32>) {
+    fn get_groups(
+        &self,
+        out: &mut alloc::vec::Vec<u32>,
+    ) -> Result<(), carrick_personality_linux::identity::IdentityReadError> {
         let graph = self.runtime.graph.lock();
-        if let Ok(task) = graph.owner.task(self.key)
-            && let Ok(creds) = task.credentials_for(self.calling_tid)
-        {
-            out.clear();
-            out.extend(creds.groups.iter().map(|g| g.raw()));
-        }
+        let task = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_personality_linux::identity::IdentityReadError::MissingThread)?;
+        let creds = task
+            .credentials_for(self.calling_tid)
+            .map_err(|_| carrick_personality_linux::identity::IdentityReadError::MissingThread)?;
+        out.clear();
+        out.extend(creds.groups.iter().map(|g| g.raw()));
+        Ok(())
     }
 
     fn set_groups(&mut self, groups: &[u32]) -> Result<(), i64> {
@@ -2911,12 +2948,50 @@ mod tests {
         use carrick_personality_linux::identity::ProcessIdentityVenue;
         use carrick_personality_linux::lifecycle::ProcessNative;
 
+        entry.set_calling_tid(999);
+        assert_eq!(
+            entry.get_uids(),
+            Err(carrick_personality_linux::identity::IdentityReadError::MissingThread)
+        );
+        assert_eq!(
+            entry.get_gids(),
+            Err(carrick_personality_linux::identity::IdentityReadError::MissingThread)
+        );
+        assert_eq!(
+            entry.get_groups_count(),
+            Err(carrick_personality_linux::identity::IdentityReadError::MissingThread)
+        );
+        assert_eq!(
+            entry.set_fsuid(1234),
+            Err(carrick_personality_linux::identity::IdentityReadError::MissingThread)
+        );
+        assert_eq!(
+            entry.set_fsgid(1234),
+            Err(carrick_personality_linux::identity::IdentityReadError::MissingThread)
+        );
+        let mut groups = alloc::vec![1234];
+        assert_eq!(
+            entry.get_groups(&mut groups),
+            Err(carrick_personality_linux::identity::IdentityReadError::MissingThread)
+        );
+        assert_eq!(groups, alloc::vec![1234]);
+        let mut published = false;
+        assert_eq!(
+            entry.thread_spawned(999, 88, &mut || {
+                published = true;
+                Ok(())
+            }),
+            Err(carrick_personality_linux::identity::ESRCH)
+        );
+        assert!(!published);
+        assert_eq!(entry.thread_spawned(41, 88, &mut || Err(-14)), Err(-14));
+        assert!(!entry.has_thread(88));
         // Comm per thread
         let mut comm_leader = [0u8; 16];
         let mut comm_worker = [0u8; 16];
         entry.set_calling_tid(41);
         entry.prctl_set_name(b"leader\0\0\0\0\0\0\0\0\0\0");
-        entry.thread_spawned(41, 42);
+        entry.thread_spawned(41, 42, &mut || Ok(())).unwrap();
         entry.set_calling_tid(42);
         entry.prctl_set_name(b"worker\0\0\0\0\0\0\0\0\0\0");
 
@@ -2933,20 +3008,20 @@ mod tests {
         entry
             .set_resuid(Some(1000), Some(1000), Some(1000))
             .unwrap();
-        assert_eq!(entry.get_uids(), (1000, 1000, 1000, 1000));
+        assert_eq!(entry.get_uids().unwrap(), (1000, 1000, 1000, 1000));
 
         // Calling from thread 41 (leader): UIDs must still be root (0, 0, 0, 0)
         entry.set_calling_tid(41);
         assert_eq!(
-            entry.get_uids(),
+            entry.get_uids().unwrap(),
             (0, 0, 0, 0),
             "thread 1 credentials must remain unchanged when thread 2 changes its UID"
         );
 
         // Spawn thread 43 from thread 42: inherits thread 42's credentials and comm
-        entry.thread_spawned(42, 43);
+        entry.thread_spawned(42, 43, &mut || Ok(())).unwrap();
         entry.set_calling_tid(43);
-        assert_eq!(entry.get_uids(), (1000, 1000, 1000, 1000));
+        assert_eq!(entry.get_uids().unwrap(), (1000, 1000, 1000, 1000));
         let mut comm_child = [0u8; 16];
         entry.prctl_get_name(&mut comm_child);
         assert_eq!(&comm_child[..7], b"worker\0");
@@ -3051,7 +3126,7 @@ mod tests {
         // Spawn 100 short-lived threads and exit them.
         for i in 0..100 {
             let tid = 1000 + i;
-            entry.thread_spawned(41, tid);
+            entry.thread_spawned(41, tid, &mut || Ok(())).unwrap();
             entry.thread_exited(tid);
         }
 
@@ -3156,21 +3231,21 @@ mod tests {
 
         // 3. Spawning thread 42 from leader 41
         entry.set_calling_tid(41);
-        entry.thread_spawned(41, 42);
+        entry.thread_spawned(41, 42, &mut || Ok(())).unwrap();
 
         // 4. Thread 42 changes credentials to uid 1000
         entry.set_calling_tid(42);
         entry.set_uid(1000).unwrap();
-        assert_eq!(entry.get_uids().0, 1000);
+        assert_eq!(entry.get_uids().unwrap().0, 1000);
 
         // Leader 41 credentials remain root (0)
         entry.set_calling_tid(41);
-        assert_eq!(entry.get_uids().0, 0);
+        assert_eq!(entry.get_uids().unwrap().0, 0);
 
         // 5. Thread 43 spawned from thread 42 inherits thread 42 credentials (uid 1000)
-        entry.thread_spawned(42, 43);
+        entry.thread_spawned(42, 43, &mut || Ok(())).unwrap();
         entry.set_calling_tid(43);
-        assert_eq!(entry.get_uids().0, 1000);
+        assert_eq!(entry.get_uids().unwrap().0, 1000);
 
         // 6. Spawning from unknown caller TID 8888 fails with ESRCH
         {
@@ -3254,7 +3329,7 @@ mod tests {
         use carrick_personality_linux::identity::ProcessIdentityVenue;
 
         entry.set_calling_tid(41);
-        entry.thread_spawned(41, 42);
+        entry.thread_spawned(41, 42, &mut || Ok(())).unwrap();
 
         // From thread 42:
         entry.set_calling_tid(42);
@@ -3491,7 +3566,7 @@ mod tests {
         assert_eq!(entry.robust_list_permission(41), Ok(()));
 
         // 2. Sibling thread in caller's thread group is permitted without special capability
-        entry.thread_spawned(41, 50);
+        entry.thread_spawned(41, 50, &mut || Ok(())).unwrap();
         assert_eq!(entry.robust_list_permission(50), Ok(()));
 
         // 3. Non-existent PID returns ESRCH
@@ -3582,7 +3657,7 @@ mod tests {
         entry.set_calling_tid(41);
 
         // Spawn a non-leader thread TID 50 in caller process 41
-        entry.thread_spawned(41, 50);
+        entry.thread_spawned(41, 50, &mut || Ok(())).unwrap();
 
         use carrick_personality_linux::sysinfo::ProcessSysinfoVenue;
         // Calling prlimit64 on non-leader TID 50 should resolve to own process limits (not ESRCH)
