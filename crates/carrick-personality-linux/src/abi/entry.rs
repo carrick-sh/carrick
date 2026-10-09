@@ -118,6 +118,9 @@ pub struct CanonicalCall {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SyscallResult(i64);
 impl SyscallResult {
+    pub const fn from_errno(errno: carrick_syscall_abi::LinuxErrno) -> Self {
+        Self(errno.guest_retval())
+    }
     pub const fn new(result: i64) -> Self {
         Self(result)
     }

@@ -6,10 +6,10 @@
 //! Syscalls outside this table must not reach the host when strict ring-first
 //! enforcement is active; they are answered with counted `-ENOSYS`.
 
-use carrick_syscall_abi::{CanonicalNr, LinuxErrno};
-
-/// Linux ENOSYS errno in typed domain.
-pub const LINUX_ENOSYS: LinuxErrno = LinuxErrno::new(38);
+use crate::abi::entry::SyscallResult;
+use carrick_syscall_abi::CanonicalNr;
+pub use carrick_syscall_abi::LINUX_ENOSYS;
+pub use carrick_syscall_abi::NativeNr;
 
 /// Canonical syscall identities permitted to cross to host.
 pub mod nr {
@@ -141,449 +141,187 @@ pub mod nr {
     pub const CLOSE_RANGE: CanonicalNr = CanonicalNr(436);
     pub const EPOLL_PWAIT2: CanonicalNr = CanonicalNr(441);
 
-    // x86-only host exit crossings (Wire-in-ring on ARM):
+    // Terminal carrier notifications when the native process owner declines:
     pub const EXIT: CanonicalNr = CanonicalNr(93);
-    pub const EXIT_GROUP: CanonicalNr = CanonicalNr(94);
+    pub use carrick_syscall_abi::nr::EXIT_GROUP;
 }
 
-/// Identifies syscalls permitted to cross to the host carrier.
-///
-/// Keyed on canonical syscall identities ([`CanonicalNr`]), which map to
-/// Linux asm-generic / AArch64 numbering.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u64)]
-pub enum AllowedHostCrossing {
-    // Host file contents & filesystem metadata (73 syscalls):
-    Setxattr = nr::SETXATTR.raw(),
-    Lsetxattr = nr::LSETXATTR.raw(),
-    Fsetxattr = nr::FSETXATTR.raw(),
-    Getxattr = nr::GETXATTR.raw(),
-    Lgetxattr = nr::LGETXATTR.raw(),
-    Fgetxattr = nr::FGETXATTR.raw(),
-    Listxattr = nr::LISTXATTR.raw(),
-    Llistxattr = nr::LLISTXATTR.raw(),
-    Flistxattr = nr::FLISTXATTR.raw(),
-    Removexattr = nr::REMOVEXATTR.raw(),
-    Lremovexattr = nr::LREMOVEXATTR.raw(),
-    Fremovexattr = nr::FREMOVEXATTR.raw(),
-    Getcwd = nr::GETCWD.raw(),
-    Ioctl = nr::IOCTL.raw(),
-    Flock = nr::FLOCK.raw(),
-    Mknodat = nr::MKNODAT.raw(),
-    Mkdirat = nr::MKDIRAT.raw(),
-    Unlinkat = nr::UNLINKAT.raw(),
-    Symlinkat = nr::SYMLINKAT.raw(),
-    Linkat = nr::LINKAT.raw(),
-    Renameat = nr::RENAMEAT.raw(),
-    Statfs = nr::STATFS.raw(),
-    Fstatfs = nr::FSTATFS.raw(),
-    Truncate = nr::TRUNCATE.raw(),
-    Ftruncate = nr::FTRUNCATE.raw(),
-    Fallocate = nr::FALLOCATE.raw(),
-    Faccessat = nr::FACCESSAT.raw(),
-    Chdir = nr::CHDIR.raw(),
-    Fchdir = nr::FCHDIR.raw(),
-    Chroot = nr::CHROOT.raw(),
-    Fchmod = nr::FCHMOD.raw(),
-    Fchmodat = nr::FCHMODAT.raw(),
-    Fchownat = nr::FCHOWNAT.raw(),
-    Fchown = nr::FCHOWN.raw(),
-    Openat = nr::OPENAT.raw(),
-    Getdents64 = nr::GETDENTS64.raw(),
-    Lseek = nr::LSEEK.raw(),
-    Read = nr::READ.raw(),
-    Write = nr::WRITE.raw(),
-    Readv = nr::READV.raw(),
-    Writev = nr::WRITEV.raw(),
-    Pread64 = nr::PREAD64.raw(),
-    Pwrite64 = nr::PWRITE64.raw(),
-    Preadv = nr::PREADV.raw(),
-    Pwritev = nr::PWRITEV.raw(),
-    Sendfile = nr::SENDFILE.raw(),
-    Pselect6 = nr::PSELECT6.raw(),
-    Ppoll = nr::PPOLL.raw(),
-    Vmsplice = nr::VMSPLICE.raw(),
-    Splice = nr::SPLICE.raw(),
-    Tee = nr::TEE.raw(),
-    Readlinkat = nr::READLINKAT.raw(),
-    Newfstatat = nr::NEWFSTATAT.raw(),
-    Fstat = nr::FSTAT.raw(),
-    Sync = nr::SYNC.raw(),
-    Fsync = nr::FSYNC.raw(),
-    Fdatasync = nr::FDATASYNC.raw(),
-    SyncFileRange = nr::SYNC_FILE_RANGE.raw(),
-    Utimensat = nr::UTIMENSAT.raw(),
-    Execve = nr::EXECVE.raw(),
-    Msync = nr::MSYNC.raw(),
-    Mlock = nr::MLOCK.raw(),
-    Munlock = nr::MUNLOCK.raw(),
-    Mincore = nr::MINCORE.raw(),
-    Madvise = nr::MADVISE.raw(),
-    Syncfs = nr::SYNCFS.raw(),
-    Renameat2 = nr::RENAMEAT2.raw(),
-    Mlock2 = nr::MLOCK2.raw(),
-    CopyFileRange = nr::COPY_FILE_RANGE.raw(),
-    Preadv2 = nr::PREADV2.raw(),
-    Pwritev2 = nr::PWRITEV2.raw(),
-    Statx = nr::STATX.raw(),
-    Openat2 = nr::OPENAT2.raw(),
-    Faccessat2 = nr::FACCESSAT2.raw(),
-    Fchmodat2 = nr::FCHMODAT2.raw(),
+/// Census authority of an admitted ARM crossing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostCrossingKind {
+    Permanent,
+    Temporary,
+    Terminal,
+}
 
-    // Host network & BSD sockets (18 syscalls):
-    Socket = nr::SOCKET.raw(),
-    Socketpair = nr::SOCKETPAIR.raw(),
-    Bind = nr::BIND.raw(),
-    Listen = nr::LISTEN.raw(),
-    Accept = nr::ACCEPT.raw(),
-    Connect = nr::CONNECT.raw(),
-    Getsockname = nr::GETSOCKNAME.raw(),
-    Getpeername = nr::GETPEERNAME.raw(),
-    Sendto = nr::SENDTO.raw(),
-    Recvfrom = nr::RECVFROM.raw(),
-    Setsockopt = nr::SETSOCKOPT.raw(),
-    Getsockopt = nr::GETSOCKOPT.raw(),
-    Shutdown = nr::SHUTDOWN.raw(),
-    Sendmsg = nr::SENDMSG.raw(),
-    Recvmsg = nr::RECVMSG.raw(),
-    Accept4 = nr::ACCEPT4.raw(),
-    Recvmmsg = nr::RECVMMSG.raw(),
-    Sendmmsg = nr::SENDMMSG.raw(),
+// One declaration generates the identity enum and constant-time dense lookup.
+// No separately maintained match or ordinal array can drift from this table.
+macro_rules! host_crossings {
+    ($( $variant:ident = $canonical:path, $x86:literal, $kind:ident; )+) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[repr(u64)]
+        pub enum AllowedHostCrossing { $( $variant = $canonical.raw(), )+ }
+        const HOST_CROSSINGS: [Option<(AllowedHostCrossing, bool, HostCrossingKind)>; 513] = {
+            let mut table = [None; 513];
+            $( table[$canonical.raw() as usize] = Some((AllowedHostCrossing::$variant, $x86, HostCrossingKind::$kind)); )+
+            table
+        };
+    };
+}
 
-    // Host clock & hardware time (6 syscalls):
-    Nanosleep = nr::NANOSLEEP.raw(),
-    ClockGettime = nr::CLOCK_GETTIME.raw(),
-    ClockGetres = nr::CLOCK_GETRES.raw(),
-    ClockNanosleep = nr::CLOCK_NANOSLEEP.raw(),
-    Times = nr::TIMES.raw(),
-    Gettimeofday = nr::GETTIMEOFDAY.raw(),
-
-    // Host hardware entropy (1 syscall):
-    Getrandom = nr::GETRANDOM.raw(),
-
-    // Temporary-forward compat-zone fd rows (16 syscalls):
-    Eventfd2 = nr::EVENTFD2.raw(),
-    EpollCreate1 = nr::EPOLL_CREATE1.raw(),
-    EpollCtl = nr::EPOLL_CTL.raw(),
-    EpollPwait = nr::EPOLL_PWAIT.raw(),
-    Dup = nr::DUP.raw(),
-    Dup3 = nr::DUP3.raw(),
-    Fcntl = nr::FCNTL.raw(),
-    InotifyInit1 = nr::INOTIFY_INIT1.raw(),
-    Close = nr::CLOSE.raw(),
-    Pipe2 = nr::PIPE2.raw(),
-    Signalfd4 = nr::SIGNALFD4.raw(),
-    TimerfdCreate = nr::TIMERFD_CREATE.raw(),
-    TimerfdSettime = nr::TIMERFD_SETTIME.raw(),
-    TimerfdGettime = nr::TIMERFD_GETTIME.raw(),
-    CloseRange = nr::CLOSE_RANGE.raw(),
-    EpollPwait2 = nr::EPOLL_PWAIT2.raw(),
-
-    // x86-only host exit crossings (Wire-in-ring on ARM):
-    Exit = nr::EXIT.raw(),
-    ExitGroup = nr::EXIT_GROUP.raw(),
+host_crossings! {
+    Setxattr = nr::SETXATTR, false, Permanent;
+    Lsetxattr = nr::LSETXATTR, false, Permanent;
+    Fsetxattr = nr::FSETXATTR, false, Permanent;
+    Getxattr = nr::GETXATTR, false, Permanent;
+    Lgetxattr = nr::LGETXATTR, false, Permanent;
+    Fgetxattr = nr::FGETXATTR, false, Permanent;
+    Listxattr = nr::LISTXATTR, false, Permanent;
+    Llistxattr = nr::LLISTXATTR, false, Permanent;
+    Flistxattr = nr::FLISTXATTR, false, Permanent;
+    Removexattr = nr::REMOVEXATTR, false, Permanent;
+    Lremovexattr = nr::LREMOVEXATTR, false, Permanent;
+    Fremovexattr = nr::FREMOVEXATTR, false, Permanent;
+    Getcwd = nr::GETCWD, false, Permanent;
+    Ioctl = nr::IOCTL, false, Permanent;
+    Flock = nr::FLOCK, false, Permanent;
+    Mknodat = nr::MKNODAT, false, Permanent;
+    Mkdirat = nr::MKDIRAT, false, Permanent;
+    Unlinkat = nr::UNLINKAT, false, Permanent;
+    Symlinkat = nr::SYMLINKAT, false, Permanent;
+    Linkat = nr::LINKAT, false, Permanent;
+    Renameat = nr::RENAMEAT, false, Permanent;
+    Statfs = nr::STATFS, false, Permanent;
+    Fstatfs = nr::FSTATFS, false, Permanent;
+    Truncate = nr::TRUNCATE, false, Permanent;
+    Ftruncate = nr::FTRUNCATE, false, Permanent;
+    Fallocate = nr::FALLOCATE, false, Permanent;
+    Faccessat = nr::FACCESSAT, false, Permanent;
+    Chdir = nr::CHDIR, false, Permanent;
+    Fchdir = nr::FCHDIR, false, Permanent;
+    Chroot = nr::CHROOT, false, Permanent;
+    Fchmod = nr::FCHMOD, false, Permanent;
+    Fchmodat = nr::FCHMODAT, false, Permanent;
+    Fchownat = nr::FCHOWNAT, false, Permanent;
+    Fchown = nr::FCHOWN, false, Permanent;
+    Openat = nr::OPENAT, false, Permanent;
+    Getdents64 = nr::GETDENTS64, false, Permanent;
+    Lseek = nr::LSEEK, true, Permanent;
+    Read = nr::READ, true, Permanent;
+    Write = nr::WRITE, true, Permanent;
+    Readv = nr::READV, false, Permanent;
+    Writev = nr::WRITEV, false, Permanent;
+    Pread64 = nr::PREAD64, true, Permanent;
+    Pwrite64 = nr::PWRITE64, true, Permanent;
+    Preadv = nr::PREADV, false, Permanent;
+    Pwritev = nr::PWRITEV, false, Permanent;
+    Sendfile = nr::SENDFILE, false, Permanent;
+    Pselect6 = nr::PSELECT6, false, Permanent;
+    Ppoll = nr::PPOLL, false, Permanent;
+    Vmsplice = nr::VMSPLICE, false, Permanent;
+    Splice = nr::SPLICE, false, Permanent;
+    Tee = nr::TEE, false, Permanent;
+    Readlinkat = nr::READLINKAT, false, Permanent;
+    Newfstatat = nr::NEWFSTATAT, false, Permanent;
+    Fstat = nr::FSTAT, false, Permanent;
+    Sync = nr::SYNC, false, Permanent;
+    Fsync = nr::FSYNC, false, Permanent;
+    Fdatasync = nr::FDATASYNC, false, Permanent;
+    SyncFileRange = nr::SYNC_FILE_RANGE, false, Permanent;
+    Utimensat = nr::UTIMENSAT, false, Permanent;
+    Execve = nr::EXECVE, false, Permanent;
+    Msync = nr::MSYNC, false, Permanent;
+    Mlock = nr::MLOCK, false, Permanent;
+    Munlock = nr::MUNLOCK, false, Permanent;
+    Mincore = nr::MINCORE, false, Permanent;
+    Madvise = nr::MADVISE, false, Permanent;
+    Syncfs = nr::SYNCFS, false, Permanent;
+    Renameat2 = nr::RENAMEAT2, false, Permanent;
+    Mlock2 = nr::MLOCK2, false, Permanent;
+    CopyFileRange = nr::COPY_FILE_RANGE, false, Permanent;
+    Preadv2 = nr::PREADV2, false, Permanent;
+    Pwritev2 = nr::PWRITEV2, false, Permanent;
+    Statx = nr::STATX, false, Permanent;
+    Openat2 = nr::OPENAT2, false, Permanent;
+    Faccessat2 = nr::FACCESSAT2, false, Permanent;
+    Fchmodat2 = nr::FCHMODAT2, false, Permanent;
+    Socket = nr::SOCKET, false, Permanent;
+    Socketpair = nr::SOCKETPAIR, false, Permanent;
+    Bind = nr::BIND, false, Permanent;
+    Listen = nr::LISTEN, false, Permanent;
+    Accept = nr::ACCEPT, false, Permanent;
+    Connect = nr::CONNECT, false, Permanent;
+    Getsockname = nr::GETSOCKNAME, false, Permanent;
+    Getpeername = nr::GETPEERNAME, false, Permanent;
+    Sendto = nr::SENDTO, false, Permanent;
+    Recvfrom = nr::RECVFROM, false, Permanent;
+    Setsockopt = nr::SETSOCKOPT, false, Permanent;
+    Getsockopt = nr::GETSOCKOPT, false, Permanent;
+    Shutdown = nr::SHUTDOWN, false, Permanent;
+    Sendmsg = nr::SENDMSG, false, Permanent;
+    Recvmsg = nr::RECVMSG, false, Permanent;
+    Accept4 = nr::ACCEPT4, false, Permanent;
+    Recvmmsg = nr::RECVMMSG, false, Permanent;
+    Sendmmsg = nr::SENDMMSG, false, Permanent;
+    Nanosleep = nr::NANOSLEEP, false, Permanent;
+    ClockGettime = nr::CLOCK_GETTIME, false, Permanent;
+    ClockGetres = nr::CLOCK_GETRES, false, Permanent;
+    ClockNanosleep = nr::CLOCK_NANOSLEEP, false, Permanent;
+    Times = nr::TIMES, false, Permanent;
+    Gettimeofday = nr::GETTIMEOFDAY, false, Permanent;
+    Getrandom = nr::GETRANDOM, false, Permanent;
+    Eventfd2 = nr::EVENTFD2, false, Temporary;
+    EpollCreate1 = nr::EPOLL_CREATE1, false, Temporary;
+    EpollCtl = nr::EPOLL_CTL, false, Temporary;
+    EpollPwait = nr::EPOLL_PWAIT, true, Temporary;
+    Dup = nr::DUP, false, Temporary;
+    Dup3 = nr::DUP3, false, Temporary;
+    Fcntl = nr::FCNTL, false, Temporary;
+    InotifyInit1 = nr::INOTIFY_INIT1, false, Temporary;
+    Close = nr::CLOSE, false, Temporary;
+    Pipe2 = nr::PIPE2, false, Temporary;
+    Signalfd4 = nr::SIGNALFD4, false, Temporary;
+    TimerfdCreate = nr::TIMERFD_CREATE, false, Temporary;
+    TimerfdSettime = nr::TIMERFD_SETTIME, false, Temporary;
+    TimerfdGettime = nr::TIMERFD_GETTIME, false, Temporary;
+    CloseRange = nr::CLOSE_RANGE, false, Temporary;
+    EpollPwait2 = nr::EPOLL_PWAIT2, false, Temporary;
+    Exit = nr::EXIT, true, Terminal;
+    ExitGroup = nr::EXIT_GROUP, true, Terminal;
 }
 
 impl AllowedHostCrossing {
-    /// Canonical identity of this crossing.
-    #[inline]
     pub const fn canonical(self) -> CanonicalNr {
         CanonicalNr::new(self as u64)
     }
-
-    /// Match an allowed host crossing for x86 CPL0.
-    ///
-    /// Preserves exactly the eight historical x86 host crossings:
-    /// read, write, lseek, pread64, pwrite64, exit, exit_group, epoll_pwait.
+    pub const fn kind(self) -> Option<HostCrossingKind> {
+        match HOST_CROSSINGS[self as usize] {
+            Some((_, _, kind)) => Some(kind),
+            None => None,
+        }
+    }
+    const fn from_canonical(canonical: CanonicalNr, x86: bool) -> Option<Self> {
+        if canonical.raw() > 512 {
+            return None;
+        }
+        match HOST_CROSSINGS[canonical.raw() as usize] {
+            Some((crossing, allowed_x86, _)) if !x86 || allowed_x86 => Some(crossing),
+            _ => None,
+        }
+    }
     pub const fn from_canonical_x86(canonical: CanonicalNr) -> Option<Self> {
-        match canonical {
-            nr::READ => Some(Self::Read),
-            nr::WRITE => Some(Self::Write),
-            nr::LSEEK => Some(Self::Lseek),
-            nr::PREAD64 => Some(Self::Pread64),
-            nr::PWRITE64 => Some(Self::Pwrite64),
-            nr::EXIT => Some(Self::Exit),
-            nr::EXIT_GROUP => Some(Self::ExitGroup),
-            nr::EPOLL_PWAIT => Some(Self::EpollPwait),
-            _ => None,
-        }
+        Self::from_canonical(canonical, true)
     }
-
-    /// Match an allowed host crossing for AArch64 ARM EL1.
-    ///
-    /// Covers the 100 Forward-Allowlist rows (host files, network, clock,
-    /// entropy), the 16 Temporary-forward fd rows, and terminal carrier
-    /// notifications when no in-ring process owner serves exit/exit_group.
     pub const fn from_canonical_aarch64(canonical: CanonicalNr) -> Option<Self> {
-        match canonical {
-            nr::EXIT => Some(Self::Exit),
-            nr::EXIT_GROUP => Some(Self::ExitGroup),
-            nr::SETXATTR => Some(Self::Setxattr),
-            nr::LSETXATTR => Some(Self::Lsetxattr),
-            nr::FSETXATTR => Some(Self::Fsetxattr),
-            nr::GETXATTR => Some(Self::Getxattr),
-            nr::LGETXATTR => Some(Self::Lgetxattr),
-            nr::FGETXATTR => Some(Self::Fgetxattr),
-            nr::LISTXATTR => Some(Self::Listxattr),
-            nr::LLISTXATTR => Some(Self::Llistxattr),
-            nr::FLISTXATTR => Some(Self::Flistxattr),
-            nr::REMOVEXATTR => Some(Self::Removexattr),
-            nr::LREMOVEXATTR => Some(Self::Lremovexattr),
-            nr::FREMOVEXATTR => Some(Self::Fremovexattr),
-            nr::GETCWD => Some(Self::Getcwd),
-            nr::EVENTFD2 => Some(Self::Eventfd2),
-            nr::EPOLL_CREATE1 => Some(Self::EpollCreate1),
-            nr::EPOLL_CTL => Some(Self::EpollCtl),
-            nr::EPOLL_PWAIT => Some(Self::EpollPwait),
-            nr::DUP => Some(Self::Dup),
-            nr::DUP3 => Some(Self::Dup3),
-            nr::FCNTL => Some(Self::Fcntl),
-            nr::INOTIFY_INIT1 => Some(Self::InotifyInit1),
-            nr::IOCTL => Some(Self::Ioctl),
-            nr::FLOCK => Some(Self::Flock),
-            nr::MKNODAT => Some(Self::Mknodat),
-            nr::MKDIRAT => Some(Self::Mkdirat),
-            nr::UNLINKAT => Some(Self::Unlinkat),
-            nr::SYMLINKAT => Some(Self::Symlinkat),
-            nr::LINKAT => Some(Self::Linkat),
-            nr::RENAMEAT => Some(Self::Renameat),
-            nr::STATFS => Some(Self::Statfs),
-            nr::FSTATFS => Some(Self::Fstatfs),
-            nr::TRUNCATE => Some(Self::Truncate),
-            nr::FTRUNCATE => Some(Self::Ftruncate),
-            nr::FALLOCATE => Some(Self::Fallocate),
-            nr::FACCESSAT => Some(Self::Faccessat),
-            nr::CHDIR => Some(Self::Chdir),
-            nr::FCHDIR => Some(Self::Fchdir),
-            nr::CHROOT => Some(Self::Chroot),
-            nr::FCHMOD => Some(Self::Fchmod),
-            nr::FCHMODAT => Some(Self::Fchmodat),
-            nr::FCHOWNAT => Some(Self::Fchownat),
-            nr::FCHOWN => Some(Self::Fchown),
-            nr::OPENAT => Some(Self::Openat),
-            nr::CLOSE => Some(Self::Close),
-            nr::PIPE2 => Some(Self::Pipe2),
-            nr::GETDENTS64 => Some(Self::Getdents64),
-            nr::LSEEK => Some(Self::Lseek),
-            nr::READ => Some(Self::Read),
-            nr::WRITE => Some(Self::Write),
-            nr::READV => Some(Self::Readv),
-            nr::WRITEV => Some(Self::Writev),
-            nr::PREAD64 => Some(Self::Pread64),
-            nr::PWRITE64 => Some(Self::Pwrite64),
-            nr::PREADV => Some(Self::Preadv),
-            nr::PWRITEV => Some(Self::Pwritev),
-            nr::SENDFILE => Some(Self::Sendfile),
-            nr::PSELECT6 => Some(Self::Pselect6),
-            nr::PPOLL => Some(Self::Ppoll),
-            nr::SIGNALFD4 => Some(Self::Signalfd4),
-            nr::VMSPLICE => Some(Self::Vmsplice),
-            nr::SPLICE => Some(Self::Splice),
-            nr::TEE => Some(Self::Tee),
-            nr::READLINKAT => Some(Self::Readlinkat),
-            nr::NEWFSTATAT => Some(Self::Newfstatat),
-            nr::FSTAT => Some(Self::Fstat),
-            nr::SYNC => Some(Self::Sync),
-            nr::FSYNC => Some(Self::Fsync),
-            nr::FDATASYNC => Some(Self::Fdatasync),
-            nr::SYNC_FILE_RANGE => Some(Self::SyncFileRange),
-            nr::TIMERFD_CREATE => Some(Self::TimerfdCreate),
-            nr::TIMERFD_SETTIME => Some(Self::TimerfdSettime),
-            nr::TIMERFD_GETTIME => Some(Self::TimerfdGettime),
-            nr::UTIMENSAT => Some(Self::Utimensat),
-            nr::NANOSLEEP => Some(Self::Nanosleep),
-            nr::CLOCK_GETTIME => Some(Self::ClockGettime),
-            nr::CLOCK_GETRES => Some(Self::ClockGetres),
-            nr::CLOCK_NANOSLEEP => Some(Self::ClockNanosleep),
-            nr::TIMES => Some(Self::Times),
-            nr::GETTIMEOFDAY => Some(Self::Gettimeofday),
-            nr::SOCKET => Some(Self::Socket),
-            nr::SOCKETPAIR => Some(Self::Socketpair),
-            nr::BIND => Some(Self::Bind),
-            nr::LISTEN => Some(Self::Listen),
-            nr::ACCEPT => Some(Self::Accept),
-            nr::CONNECT => Some(Self::Connect),
-            nr::GETSOCKNAME => Some(Self::Getsockname),
-            nr::GETPEERNAME => Some(Self::Getpeername),
-            nr::SENDTO => Some(Self::Sendto),
-            nr::RECVFROM => Some(Self::Recvfrom),
-            nr::SETSOCKOPT => Some(Self::Setsockopt),
-            nr::GETSOCKOPT => Some(Self::Getsockopt),
-            nr::SHUTDOWN => Some(Self::Shutdown),
-            nr::SENDMSG => Some(Self::Sendmsg),
-            nr::RECVMSG => Some(Self::Recvmsg),
-            nr::EXECVE => Some(Self::Execve),
-            nr::MSYNC => Some(Self::Msync),
-            nr::MLOCK => Some(Self::Mlock),
-            nr::MUNLOCK => Some(Self::Munlock),
-            nr::MINCORE => Some(Self::Mincore),
-            nr::MADVISE => Some(Self::Madvise),
-            nr::ACCEPT4 => Some(Self::Accept4),
-            nr::RECVMMSG => Some(Self::Recvmmsg),
-            nr::SYNCFS => Some(Self::Syncfs),
-            nr::SENDMMSG => Some(Self::Sendmmsg),
-            nr::RENAMEAT2 => Some(Self::Renameat2),
-            nr::GETRANDOM => Some(Self::Getrandom),
-            nr::MLOCK2 => Some(Self::Mlock2),
-            nr::COPY_FILE_RANGE => Some(Self::CopyFileRange),
-            nr::PREADV2 => Some(Self::Preadv2),
-            nr::PWRITEV2 => Some(Self::Pwritev2),
-            nr::STATX => Some(Self::Statx),
-            nr::CLOSE_RANGE => Some(Self::CloseRange),
-            nr::OPENAT2 => Some(Self::Openat2),
-            nr::FACCESSAT2 => Some(Self::Faccessat2),
-            nr::EPOLL_PWAIT2 => Some(Self::EpollPwait2),
-            nr::FCHMODAT2 => Some(Self::Fchmodat2),
-            _ => None,
-        }
+        Self::from_canonical(canonical, false)
     }
-
-    /// Whether this canonical identity is an allowed host crossing on x86 CPL0.
-    #[inline]
     pub const fn is_allowed_x86(canonical: CanonicalNr) -> bool {
         Self::from_canonical_x86(canonical).is_some()
     }
-
-    /// Whether this canonical identity is an allowed host crossing on AArch64 ARM EL1.
-    #[inline]
     pub const fn is_allowed_aarch64(canonical: CanonicalNr) -> bool {
         Self::from_canonical_aarch64(canonical).is_some()
     }
 }
-
-/// The exact 8 canonical syscalls permitted to cross to host on x86 CPL0.
-pub const X86_HOST_CROSSINGS: [CanonicalNr; 8] = [
-    nr::EPOLL_PWAIT,
-    nr::LSEEK,
-    nr::READ,
-    nr::WRITE,
-    nr::PREAD64,
-    nr::PWRITE64,
-    nr::EXIT,
-    nr::EXIT_GROUP,
-];
-
-/// The exact 118 canonical syscalls permitted to cross to host on AArch64 ARM EL1.
-pub const AARCH64_HOST_CROSSINGS: [CanonicalNr; 118] = [
-    nr::EXIT,
-    nr::EXIT_GROUP,
-    nr::SETXATTR,
-    nr::LSETXATTR,
-    nr::FSETXATTR,
-    nr::GETXATTR,
-    nr::LGETXATTR,
-    nr::FGETXATTR,
-    nr::LISTXATTR,
-    nr::LLISTXATTR,
-    nr::FLISTXATTR,
-    nr::REMOVEXATTR,
-    nr::LREMOVEXATTR,
-    nr::FREMOVEXATTR,
-    nr::GETCWD,
-    nr::EVENTFD2,
-    nr::EPOLL_CREATE1,
-    nr::EPOLL_CTL,
-    nr::EPOLL_PWAIT,
-    nr::DUP,
-    nr::DUP3,
-    nr::FCNTL,
-    nr::INOTIFY_INIT1,
-    nr::IOCTL,
-    nr::FLOCK,
-    nr::MKNODAT,
-    nr::MKDIRAT,
-    nr::UNLINKAT,
-    nr::SYMLINKAT,
-    nr::LINKAT,
-    nr::RENAMEAT,
-    nr::STATFS,
-    nr::FSTATFS,
-    nr::TRUNCATE,
-    nr::FTRUNCATE,
-    nr::FALLOCATE,
-    nr::FACCESSAT,
-    nr::CHDIR,
-    nr::FCHDIR,
-    nr::CHROOT,
-    nr::FCHMOD,
-    nr::FCHMODAT,
-    nr::FCHOWNAT,
-    nr::FCHOWN,
-    nr::OPENAT,
-    nr::CLOSE,
-    nr::PIPE2,
-    nr::GETDENTS64,
-    nr::LSEEK,
-    nr::READ,
-    nr::WRITE,
-    nr::READV,
-    nr::WRITEV,
-    nr::PREAD64,
-    nr::PWRITE64,
-    nr::PREADV,
-    nr::PWRITEV,
-    nr::SENDFILE,
-    nr::PSELECT6,
-    nr::PPOLL,
-    nr::SIGNALFD4,
-    nr::VMSPLICE,
-    nr::SPLICE,
-    nr::TEE,
-    nr::READLINKAT,
-    nr::NEWFSTATAT,
-    nr::FSTAT,
-    nr::SYNC,
-    nr::FSYNC,
-    nr::FDATASYNC,
-    nr::SYNC_FILE_RANGE,
-    nr::TIMERFD_CREATE,
-    nr::TIMERFD_SETTIME,
-    nr::TIMERFD_GETTIME,
-    nr::UTIMENSAT,
-    nr::NANOSLEEP,
-    nr::CLOCK_GETTIME,
-    nr::CLOCK_GETRES,
-    nr::CLOCK_NANOSLEEP,
-    nr::TIMES,
-    nr::GETTIMEOFDAY,
-    nr::SOCKET,
-    nr::SOCKETPAIR,
-    nr::BIND,
-    nr::LISTEN,
-    nr::ACCEPT,
-    nr::CONNECT,
-    nr::GETSOCKNAME,
-    nr::GETPEERNAME,
-    nr::SENDTO,
-    nr::RECVFROM,
-    nr::SETSOCKOPT,
-    nr::GETSOCKOPT,
-    nr::SHUTDOWN,
-    nr::SENDMSG,
-    nr::RECVMSG,
-    nr::EXECVE,
-    nr::MSYNC,
-    nr::MLOCK,
-    nr::MUNLOCK,
-    nr::MINCORE,
-    nr::MADVISE,
-    nr::ACCEPT4,
-    nr::RECVMMSG,
-    nr::SYNCFS,
-    nr::SENDMMSG,
-    nr::RENAMEAT2,
-    nr::GETRANDOM,
-    nr::MLOCK2,
-    nr::COPY_FILE_RANGE,
-    nr::PREADV2,
-    nr::PWRITEV2,
-    nr::STATX,
-    nr::CLOSE_RANGE,
-    nr::OPENAT2,
-    nr::FACCESSAT2,
-    nr::EPOLL_PWAIT2,
-    nr::FCHMODAT2,
-];
 
 /// Target ISA whose crossing allowlist governs host forwarding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -604,15 +342,15 @@ impl HostCrossingSet {
 
     /// Map a native syscall number to its refusal counter bucket (0..=512).
     #[inline]
-    pub fn refusal_bucket(self, native: Option<u64>) -> usize {
+    pub fn refusal_bucket(self, native: Option<NativeNr>) -> usize {
         match self {
             Self::Aarch64 => match native {
-                Some(nr) if nr < 512 => nr as usize,
+                Some(nr) if nr.raw() < 512 => nr.raw() as usize,
                 _ => 512,
             },
             Self::X86 => match native {
-                Some(nr) if nr < 512 => {
-                    match carrick_syscall_abi::syscall_x86_64::lookup_x86_64(nr) {
+                Some(nr) if nr.raw() < 512 => {
+                    match carrick_syscall_abi::syscall_x86_64::lookup_x86_64(nr.raw()) {
                         Some(entry)
                             if !matches!(
                                 entry.remap,
@@ -620,7 +358,7 @@ impl HostCrossingSet {
                                     | carrick_syscall_abi::syscall_x86_64::SyscallRemap::Private(_)
                             ) =>
                         {
-                            nr as usize
+                            nr.raw() as usize
                         }
                         _ => 512,
                     }
@@ -653,12 +391,12 @@ pub fn evaluate_host_crossing<F>(
     set: HostCrossingSet,
     strict: bool,
     canonical: Option<CanonicalNr>,
-    native: Option<u64>,
+    native: Option<NativeNr>,
     counters: Option<&[core::sync::atomic::AtomicU64]>,
     install_result: F,
 ) -> HostCrossingDecision
 where
-    F: FnOnce(i64),
+    F: FnOnce(SyscallResult),
 {
     if !strict {
         return HostCrossingDecision::Forward;
@@ -674,18 +412,64 @@ where
     {
         counters[bucket].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
-    install_result(LINUX_ENOSYS.guest_retval());
+    install_result(SyscallResult::from_errno(LINUX_ENOSYS));
     HostCrossingDecision::Refused
 }
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
 
     #[test]
+    fn both_sets_match_the_exhaustive_census_through_512() {
+        let mut arm = [None; 513];
+        for row in include_str!("../../../docs/design/arm-ring-first-flip.tsv")
+            .lines()
+            .skip(1)
+        {
+            let columns: std::vec::Vec<_> = row.split('\t').collect();
+            let ordinal: usize = columns[0].parse().unwrap();
+            arm[ordinal] = match columns[9] {
+                "Forward-Allowlist" => Some(HostCrossingKind::Permanent),
+                "Temporary-forward" => Some(HostCrossingKind::Temporary),
+                _ => None,
+            };
+        }
+        arm[93] = Some(HostCrossingKind::Terminal);
+        arm[94] = Some(HostCrossingKind::Terminal);
+        for (ordinal, expected) in arm.into_iter().enumerate() {
+            let canonical = CanonicalNr::new(ordinal as u64);
+            let crossing = AllowedHostCrossing::from_canonical_aarch64(canonical);
+            assert_eq!(
+                crossing.and_then(AllowedHostCrossing::kind),
+                expected,
+                "ARM ordinal={ordinal}"
+            );
+            assert_eq!(
+                HostCrossingSet::Aarch64.is_allowed(canonical),
+                expected.is_some()
+            );
+            assert_eq!(
+                HostCrossingSet::X86.is_allowed(canonical),
+                matches!(ordinal, 22 | 62 | 63 | 64 | 67 | 68 | 93 | 94),
+                "x86 canonical={ordinal}"
+            );
+        }
+    }
+
+    #[test]
     fn test_x86_crossings_exact() {
-        assert_eq!(X86_HOST_CROSSINGS.len(), 8);
-        for nr in X86_HOST_CROSSINGS {
+        assert_eq!(
+            HOST_CROSSINGS
+                .iter()
+                .flatten()
+                .filter(|(_, x86, _)| *x86)
+                .count(),
+            8
+        );
+        for (crossing, _, _) in HOST_CROSSINGS.iter().flatten().filter(|(_, x86, _)| *x86) {
+            let nr = crossing.canonical();
             assert!(
                 AllowedHostCrossing::is_allowed_x86(nr),
                 "expected canonical {nr:?} to be allowed on x86"
@@ -714,15 +498,17 @@ mod tests {
 
     #[test]
     fn test_aarch64_crossings_exact() {
-        assert_eq!(AARCH64_HOST_CROSSINGS.len(), 118);
-        for nr in AARCH64_HOST_CROSSINGS {
+        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 118);
+        for (crossing, _, _) in HOST_CROSSINGS.iter().flatten() {
+            let nr = crossing.canonical();
             assert!(
                 AllowedHostCrossing::is_allowed_aarch64(nr),
                 "expected canonical {nr:?} to be allowed on aarch64"
             );
         }
 
-        // Wire-in-ring calls must NOT forward on ARM
+        // Implemented families are not unported crossings. Their explicit declines
+        // use typed family fallback and bypass this unported-call table.
         for wire_in_ring in [
             CanonicalNr(27),  // inotify_add_watch
             CanonicalNr(28),  // inotify_rm_watch
@@ -781,9 +567,9 @@ mod tests {
             HostCrossingSet::Aarch64,
             true,
             Some(CanonicalNr(174)),
-            Some(174),
+            Some(NativeNr(174)),
             Some(&refused),
-            |ret| installed_result = Some(ret),
+            |ret| installed_result = Some(ret.raw()),
         );
         assert_eq!(decision, HostCrossingDecision::Refused);
         assert_eq!(refused[174].load(core::sync::atomic::Ordering::Relaxed), 1);
@@ -794,7 +580,7 @@ mod tests {
             HostCrossingSet::Aarch64,
             true,
             Some(nr::WRITE),
-            Some(nr::WRITE.raw()),
+            Some(NativeNr(nr::WRITE.raw())),
             Some(&refused),
             |_| panic!("should not install on forward"),
         );
@@ -806,7 +592,7 @@ mod tests {
             HostCrossingSet::Aarch64,
             false,
             Some(CanonicalNr(174)),
-            Some(174),
+            Some(NativeNr(174)),
             Some(&refused),
             |_| panic!("should not install on forward"),
         );
@@ -824,9 +610,9 @@ mod tests {
             HostCrossingSet::X86,
             true,
             Some(CanonicalNr(174)),
-            Some(102),
+            Some(NativeNr(102)),
             Some(&refused),
-            |ret| installed_result = Some(ret),
+            |ret| installed_result = Some(ret.raw()),
         );
         assert_eq!(decision, HostCrossingDecision::Refused);
         assert_eq!(refused[102].load(core::sync::atomic::Ordering::Relaxed), 1);
@@ -839,7 +625,7 @@ mod tests {
             None,
             None,
             Some(&refused),
-            |ret| installed_result = Some(ret),
+            |ret| installed_result = Some(ret.raw()),
         );
         assert_eq!(decision, HostCrossingDecision::Refused);
         assert_eq!(refused[512].load(core::sync::atomic::Ordering::Relaxed), 1);
@@ -849,7 +635,7 @@ mod tests {
             HostCrossingSet::X86,
             true,
             Some(nr::WRITE),
-            Some(1),
+            Some(NativeNr(1)),
             Some(&refused),
             |_| panic!("should not install on forward"),
         );
@@ -872,9 +658,9 @@ mod tests {
             HostCrossingSet::Aarch64,
             aperture.is_strict(),
             Some(CanonicalNr(174)),
-            Some(174),
+            Some(NativeNr(174)),
             Some(&refused),
-            |ret| installed_result = Some(ret),
+            |ret| installed_result = Some(ret.raw()),
         );
         assert_eq!(decision, HostCrossingDecision::Refused);
         assert_eq!(refused[174].load(core::sync::atomic::Ordering::Relaxed), 1);
@@ -888,7 +674,7 @@ mod tests {
             HostCrossingSet::Aarch64,
             aperture.is_strict(),
             Some(CanonicalNr(174)),
-            Some(174),
+            Some(NativeNr(174)),
             Some(&refused),
             |_| panic!("should not install on forward"),
         );
