@@ -492,6 +492,7 @@ fn build_created_state(
         terminal_control: None,
         launch_ticket: None,
         config: RunConfig {
+            arm_ring_first: run.arm_ring_first_policy(),
             platform: run.platform.clone(),
             exec_backend: run.exec_backend,
             env: run.env_overrides.clone(),
@@ -742,7 +743,7 @@ fn rebuild_request_from_state(state: &ContainerState) -> LaunchRequest {
             // A bare `-e KEY` persisted in `env` re-imports from THIS process's
             // environment at relaunch, exactly as before.
             host_env: Some(crate::runtime_util::host_env_snapshot()),
-            arm_ring_first: None,
+            arm_ring_first: Some(c.arm_ring_first),
             mounts: c.mounts.clone(),
             workdir: c.workdir.clone(),
             user: c.user.clone(),
@@ -2595,6 +2596,7 @@ mod tests {
             terminal_control: None,
             launch_ticket: None,
             config: RunConfig {
+                arm_ring_first: carrick_spec::ArmRingFirst::Strict,
                 cap_add: Vec::new(),
                 platform: Some("linux/arm64".into()),
                 env: vec!["A=1".into()],
@@ -2839,6 +2841,32 @@ mod tests {
         assert_eq!(state.config.api_network_mode.as_deref(), Some("bridge-a"));
         assert_eq!(state.config.network_container.as_deref(), Some("peer-id"));
         assert_eq!(state.config.network_attachments[0].name, "bridge-a");
+    }
+
+    #[test]
+    fn restart_preserves_explicit_and_snapshot_arm_ring_policy() {
+        for (explicit, setting, expected) in [
+            (
+                Some(carrick_spec::ArmRingFirst::OptOut),
+                "1",
+                carrick_spec::ArmRingFirst::OptOut,
+            ),
+            (None, "0", carrick_spec::ArmRingFirst::OptOut),
+            (
+                Some(carrick_spec::ArmRingFirst::Strict),
+                "0",
+                carrick_spec::ArmRingFirst::Strict,
+            ),
+        ] {
+            let mut launch = rebuild_request_from_state(&sample_state());
+            launch.run.arm_ring_first = explicit;
+            launch.run.host_env = Some(vec![("CARRICK_ARM_RING_FIRST".into(), setting.into())]);
+            let state = build_created_state(&launch, "policy", None, 17, None);
+            let encoded = serde_json::to_string(&state).expect("serialize state");
+            let restored: ContainerState = serde_json::from_str(&encoded).expect("restore state");
+            let rebuilt = rebuild_request_from_state(&restored);
+            assert_eq!(rebuilt.run.arm_ring_first, Some(expected));
+        }
     }
 
     #[test]
