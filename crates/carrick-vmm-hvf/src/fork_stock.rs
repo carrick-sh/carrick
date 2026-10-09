@@ -826,6 +826,81 @@ mod tests {
         assert_eq!(custody.stock().live_children(), 2);
     }
 
+    /// HVF adapter witness: with the production boot stock and a two-ASID
+    /// allocator, fork far beyond both while the previous child is still
+    /// installed in quarantine. No loan reuses an installed child's pages,
+    /// every reclaim returns its ledger grants, and ASIDs recycle.
+    #[test]
+    fn interleaved_fork_retire_beyond_stock_balances_the_grant_ledger() {
+        let carrier = NonZeroU64::new(7).unwrap();
+        let mut custody =
+            ForkStockHostCustody::with_asids(carrier, AsidAllocator::with_limit_for_tests(2));
+        custody
+            .install_boot_stock(
+                carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE,
+                carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
+                    + carrick_el1_abi::EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64,
+            )
+            .expect("production boot stock");
+        let mut ledger = El1FrameGrantLedger::default();
+        let parent = test_execution(41, 0, 301);
+        let pool = custody.stock().table_stock().len() as u64;
+        let records = custody.stock().lifecycle_stock().len() as u64;
+        let cycles = pool.max(records) + 3;
+        let mut installed: Option<ReservationMm> = None;
+        for cycle in 0..cycles {
+            let child_mm = 302 + cycle;
+            let held = custody.stock().quarantined_tables();
+            let request = test_request(parent, child_mm, 1, 1);
+            let mut exchange = ForkStockExchange::new(request).unwrap();
+            let loan = custody
+                .service_loan(&mut ledger, parent, &mut exchange)
+                .unwrap_or_else(|refusal| panic!("cycle {cycle}: {refusal:?}"));
+            let issued = &custody.stock().pending(parent.cpu).unwrap().child_tables;
+            assert!(issued.iter().all(|page| !held.contains(page)));
+            let completion = PortalForkCompletion {
+                request: loan.request,
+                child: unsafe {
+                    carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                        carrier,
+                        request.child_mm,
+                        NonZeroU64::MIN,
+                    )
+                },
+                parent_generation: ReservationGeneration::INITIAL,
+                child_tables_used: 4096,
+                parent_tables_used: 0,
+            };
+            let mut commit =
+                ForkStockSettlement::new(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 1)
+                    .unwrap();
+            custody
+                .service_settlement(&mut ledger, parent, &mut commit, |_| true, |_| true)
+                .expect("commit");
+            let child = child_execution(42 + cycle, &loan);
+            let retire = NativeChildRetire::new(child.binding, child.context).unwrap();
+            custody
+                .service_child_retire(child, &retire)
+                .expect("child quarantine");
+            let previous = installed.replace(ReservationMm::new(child_mm).unwrap());
+            let still = installed;
+            let returned = custody
+                .reclaim_retired(
+                    &mut ledger,
+                    ReservationMm::new(parent.binding.mm.raw()).unwrap(),
+                    |mm| Some(mm) != still,
+                    |_| true,
+                )
+                .expect("reclaim");
+            assert_eq!(returned, usize::from(previous.is_some()), "cycle {cycle}");
+        }
+        assert_eq!(custody.returned_children(), cycles - 1);
+        // Only the last child's one committed page is still granted.
+        let stats = ledger.snapshot();
+        assert_eq!(stats.bytes_granted - stats.bytes_returned, 4096);
+        assert_eq!(custody.stock().counters().capacity_refusals, 0);
+    }
+
     #[test]
     fn quarantined_child_tables_are_not_reissued_while_mm_is_live() {
         let carrier = NonZeroU64::new(7).unwrap();
