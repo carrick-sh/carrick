@@ -457,13 +457,34 @@ fn mounted_static_x86_poll_empty_sets_sleep_until_timeout() {
     let dir = tempfile::tempdir().unwrap();
     let elf = dir.path().join("poll-empty-sets");
     compile_assembly("x86_poll_empty_sets.S", &elf);
-    let native = run_poll_timeout_markers(std::process::Command::new(&elf));
+    let native =
+        run_poll_timeout_markers(std::process::Command::new(&elf), &[b"B\n", b"N\n", b"T\n"]);
     assert_eq!(native, (b"B\nN\nT\n".to_vec(), Some(7)));
     let command = mounted_poll_command(dir.path(), &elf);
-    assert_eq!(run_poll_timeout_markers(command), native);
+    assert_eq!(
+        run_poll_timeout_markers(command, &[b"B\n", b"N\n", b"T\n"]),
+        native
+    );
 }
 
-fn run_poll_timeout_markers(mut command: std::process::Command) -> (Vec<u8>, Option<i32>) {
+#[test]
+fn mounted_static_x86_ppoll_waits_and_rejects_bad_nsec() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("ppoll-timeout");
+    compile_assembly("x86_ppoll_timeout.S", &elf);
+    let native = run_poll_timeout_markers(std::process::Command::new(&elf), &[b"B\n", b"T\n"]);
+    assert_eq!(native, (b"B\nT\n".to_vec(), Some(7)));
+    let command = mounted_poll_command(dir.path(), &elf);
+    assert_eq!(run_poll_timeout_markers(command, &[b"B\n", b"T\n"]), native);
+}
+
+fn run_poll_timeout_markers(
+    mut command: std::process::Command,
+    markers: &[&[u8; 2]],
+) -> (Vec<u8>, Option<i32>) {
     let mut child = ReapChild(
         command
             .stdout(Stdio::piped())
@@ -473,16 +494,28 @@ fn run_poll_timeout_markers(mut command: std::process::Command) -> (Vec<u8>, Opt
     );
     let mut stdout = child.stdout.take().unwrap();
     let mut output = Vec::new();
-    for (index, expected) in [b"B\n", b"N\n", b"T\n"].iter().enumerate() {
+    for (index, expected) in markers.iter().enumerate() {
         assert!(
             poll_readable(stdout.as_raw_fd(), 5_000),
             "poll marker {index} missing"
         );
         let mut marker = [0u8; 2];
-        stdout.read_exact(&mut marker).unwrap();
+        if let Err(error) = stdout.read_exact(&mut marker) {
+            let status = child.wait().unwrap();
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!(
+                "poll marker {index} read failed: {error}; status={status}; output={output:?}; stderr={stderr}"
+            );
+        }
         assert_eq!(&marker, *expected);
         output.extend_from_slice(&marker);
-        if index < 2 {
+        if index + 1 < markers.len() {
             assert!(
                 !poll_readable(stdout.as_raw_fd(), 40),
                 "poll returned before its 100ms deadline after marker {index}"
