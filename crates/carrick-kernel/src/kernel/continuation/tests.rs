@@ -15,6 +15,18 @@ use super::test_support::*;
 use super::*;
 use crate::dispatch::SharedFutexTarget;
 
+#[test]
+fn redispatch_resume_does_not_veto_later_signal_restart() {
+    let mut resumed = ContinuationResult {
+        completion: ContinuationCompletion::Redispatch,
+        restart: RestartDecision::NoRestart,
+        reserved_signal: None,
+    };
+    let effects = resumed.take_resume_effects();
+    assert_eq!(effects.restart, None);
+    assert!(effects.reserved_signal.is_none());
+}
+
 fn block_on_timeout<F: std::future::Future>(future: F, timeout: Duration) -> Option<F::Output> {
     struct ThreadWaker(std::thread::Thread);
     impl Wake for ThreadWaker {

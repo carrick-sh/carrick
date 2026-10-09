@@ -419,9 +419,27 @@ impl PersistentExecutor for KvmPersistentExecutor {
                     .ok_or_else(|| TrapError::Hypervisor("KVM continuation vanished".into()))?
                     .ready_event()
                     .map_err(|error| TrapError::Hypervisor(format!("KVM wake event: {error:?}")))?;
-                let result =
+                let mut result =
                     resume_continuation(submission.execution_lease_mut()?, event, &context)
                         .map_err(|error| TrapError::Hypervisor(format!("KVM resume: {error:?}")))?;
+                let effects = result.take_resume_effects();
+                if effects.reserved_signal.is_some() {
+                    return Err(TrapError::Hypervisor(
+                        "KVM continuation lacks reserved-signal delivery".into(),
+                    ));
+                }
+                if effects.restart
+                    == Some(carrick_kernel::kernel::continuation::RestartDecision::Restart)
+                    && matches!(
+                        result.completion,
+                        carrick_kernel::kernel::continuation::ContinuationCompletion::Errno(
+                            carrick_abi::LINUX_EINTR
+                        )
+                    )
+                {
+                    result.completion =
+                        carrick_kernel::kernel::continuation::ContinuationCompletion::Redispatch;
+                }
                 let mut dispatcher = self
                     .dispatcher
                     .lock()
