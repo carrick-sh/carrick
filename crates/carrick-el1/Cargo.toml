@@ -39,3 +39,5 @@ carrick-mem = { path = "../carrick-mem" }
 
 [target.'cfg(not(target_os = "none"))'.dependencies]
 carrick-fatal = { path = "../carrick-fatal" }
+libc.workspace = true
+

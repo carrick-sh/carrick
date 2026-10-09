@@ -73,6 +73,14 @@ pub(super) fn admit_root(
         source, task, page, control, address, address, words,
     )?;
     *retained = Some(Box::leak(Box::new(owner)));
+    let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
+    carrick_el1::personality::file_table::admit_stdio(
+        &super::FD_MAP,
+        &super::OPEN_TABLE,
+        &super::OBJECT_TABLE,
+        file_table,
+        [true, true, true],
+    );
     Ok(())
 }
 
@@ -507,6 +515,9 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
     }
     fn wake_effects(&mut self, effects: WakeEffects) {
         deliver_wakes(effects);
+    }
+    fn fork_fd_table(&mut self, parent_table: u64, child_table: u64) {
+        carrick_el1::personality::file_table::fork_fd_map(&super::FD_MAP, parent_table, child_table);
     }
 }
 
