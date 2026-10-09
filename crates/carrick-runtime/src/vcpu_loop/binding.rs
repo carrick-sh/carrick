@@ -1071,7 +1071,7 @@ where
                     %error,
                     "HVPatch terminal owner publishes failure"
                 );
-                (127, 127 << 8, Err(()))
+                (127, 127 << 8, Err(error.to_string()))
             }
             PersistentTerminal::Outcome {
                 outcome: VcpuLoopOutcome::ThreadDone,
@@ -5460,10 +5460,14 @@ where
             });
 
         if receipt.claim == ProcessExitClaim::Owner {
+            let cause = self.executor_failure_cause.clone().unwrap_or_else(|| {
+                "unexpected executor failure without a recorded cause".to_owned()
+            });
             publish_unexpected_executor_failure_retirement(
                 &self.kernel,
                 &self.state.threads,
                 &self.completion,
+                cause,
             )
             .unwrap_or_else(|failure| {
                 tracing::error!(%failure, "publish unexpected executor-failure retirement");
@@ -5476,6 +5480,9 @@ where
             let kernel = Arc::clone(&self.kernel);
             let threads = self.state.threads.clone();
             let current = self.completion.clone();
+            let cause = self.executor_failure_cause.clone().unwrap_or_else(|| {
+                "unexpected executor failure without a recorded cause".to_owned()
+            });
             let owner = self.state.this_tid;
             if let Err(failure) = std::thread::Builder::new()
                 .name("carrick-exit-failure-drain".to_owned())
@@ -5489,7 +5496,7 @@ where
                         .and_then(|()| sibling_stop.publish(&kernel))
                         .and_then(|()| {
                             publish_unexpected_executor_failure_retirement(
-                                &kernel, &threads, &current,
+                                &kernel, &threads, &current, cause,
                             )
                         })
                     {
