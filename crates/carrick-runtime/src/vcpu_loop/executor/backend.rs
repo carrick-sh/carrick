@@ -820,6 +820,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 file_table,
                 visible_pid,
             );
+            let mut loaded_home = None;
             if let Some(mappings) = &self.lifecycle_mappings {
                 let control = task.lease().control_lease().ok_or_else(|| {
                     TrapError::Hypervisor("loaded thread lost lifecycle backing".into())
@@ -834,23 +835,47 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                         ));
                     }
                 }
-                mappings.publish(slot, control).map_err(|error| {
+                let publication = mappings.publish(slot, control).map_err(|error| {
                     TrapError::Hypervisor(format!(
                         "lifecycle metadata publication failed: {error:?}"
                     ))
                 })?;
+                if let crate::vcpu_loop::thread_lifecycle::LifecyclePublication::Published {
+                    page,
+                    control,
+                } = publication
+                {
+                    loaded_home = Some(carrick_el1_abi::ThreadIdentity {
+                        tid: task_id.raw(),
+                        serial: task.thread_key().serial.raw(),
+                        mm: task.binding().identity().mm.raw(),
+                        file_table,
+                        generation,
+                        affinity: task.lease().affinity_mask(),
+                        lifecycle_page: page,
+                        control_slot: control,
+                    });
+                }
             }
-            publish_zone_slot(
+            publish_zone_slot(LoadedZoneSlot {
                 slot,
-                self.raw_vcpu_id,
-                task.binding().identity().mm.raw(),
-                task.thread_key().serial.raw(),
-                self.bound_cpu,
-                task.lease().affinity_mask(),
-                zone_driver(self.executor_id),
-            );
+                vcpu: self.raw_vcpu_id,
+                mm: task.binding().identity().mm.raw(),
+                serial: task.thread_key().serial.raw(),
+                bound_cpu: self.bound_cpu,
+                affinity: task.lease().affinity_mask(),
+                driver: zone_driver(self.executor_id),
+                loaded_home,
+            })?;
         }
         asid_load.mark_resident().map_err(|error| {
+            if let Some(slot) = self.live_mailbox_slot()
+                && let Some(zone) = carrick_kernel::el1_zone::zone()
+                && let Some(slot) = carrick_el1_abi::SlotId::from_index(slot)
+                && let Some(record) = zone.slot(slot).host_record()
+            {
+                let _ = zone.release_host_home(slot, record);
+            }
             self.clear_live_current_task();
             TrapError::Hypervisor(format!("HVPatch ASID residence commit failed: {error}"))
         })?;
@@ -1445,7 +1470,7 @@ pub(crate) fn leave_driven_zone_slot() {
 /// settled it); queued threads stay (one of another address space waits for
 /// this executor to load it), and a slot this executor drove before is left.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn publish_zone_slot(
+struct LoadedZoneSlot {
     slot: usize,
     vcpu: u64,
     mm: u64,
@@ -1453,11 +1478,31 @@ fn publish_zone_slot(
     bound_cpu: Option<u32>,
     affinity: u64,
     driver: u64,
-) {
+    loaded_home: Option<carrick_el1_abi::ThreadIdentity>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn publish_zone_slot(loaded: LoadedZoneSlot) -> Result<(), TrapError> {
+    let LoadedZoneSlot {
+        slot,
+        vcpu,
+        mm,
+        serial,
+        bound_cpu,
+        affinity,
+        driver,
+        loaded_home,
+    } = loaded;
     carrick_vmm_hvf::vcpu_kick::bind_zone_slot_vcpu(slot, vcpu);
     let Some(zone) = carrick_kernel::el1_zone::zone() else {
         carrick_el1_abi::publish_zone_identity(slot, 0, serial);
-        return;
+        return if loaded_home.is_some() {
+            Err(TrapError::Hypervisor(
+                "loaded process has no EL1 zone for home publication".into(),
+            ))
+        } else {
+            Ok(())
+        };
     };
     if let Some(zone_slot) = carrick_el1_abi::SlotId::from_index(slot) {
         drive_zone_slot(zone_slot, driver);
@@ -1491,6 +1536,17 @@ fn publish_zone_slot(
         // the vCPU for this executor when one reaches the head, and the
         // executor loads it.
         zone.publish_slot(zone_slot, mm, bound_cpu, affinity);
+        carrick_el1_abi::publish_zone_identity(slot, mm, serial);
+        if let Some(identity) = loaded_home
+            && zone.publish_loaded_home(zone_slot, identity).is_none()
+        {
+            return Err(TrapError::Hypervisor(
+                "loaded process home publication refused exact task binding".into(),
+            ));
+        }
+        return Ok(());
     }
-    carrick_el1_abi::publish_zone_identity(slot, mm, serial);
+    Err(TrapError::Hypervisor(
+        "loaded process has no EL1 zone slot".into(),
+    ))
 }

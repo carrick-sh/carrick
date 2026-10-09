@@ -2005,7 +2005,13 @@ impl AnonymousLeave {
 }
 
 /// Exact gate that refused an owner-routed process syscall.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(usize)]
 pub enum ProcessRefusal {
     MissingEntry,
