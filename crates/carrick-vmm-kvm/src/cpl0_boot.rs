@@ -1060,6 +1060,14 @@ pub struct Cpl0Carrier {
     pub(crate) custody: Cpl0HostCustody,
 }
 
+/// The kernel graph's issued root identity for the first production task.
+/// Physical CPU slots never manufacture these values.
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
+pub struct InitialTaskBinding {
+    pub task: carrick_sched_core::process::TaskKey,
+    pub thread: carrick_sched_core::ThreadIdentity,
+}
+
 /// One coordinator owns physical backing, grants and retained metadata.
 /// CPU execution leases are disjoint from this custody, so stopped host service
 /// never borrows the carrier or a simultaneously running peer CPU.
@@ -1076,6 +1084,7 @@ pub(crate) struct Cpl0HostCustody {
     initial_rollback_fault: Option<Arc<AtomicBool>>,
     peer_entry: Option<carrick_guest_arch::KernelVa>,
     peer_admission: InitialPeerAdmission,
+    initial_task: Option<InitialTaskBinding>,
     grant_tables: Vec<RootGpa>,
     prepare_table_stock: Option<anonymous_owner::PrepareTableStock>,
     fork_pending: [Option<anonymous_owner::PendingForkLoan>; 2],
@@ -1414,9 +1423,13 @@ impl Cpl0Carrier {
             return false;
         };
         let identity = zone.record(record).identity();
+        let (tid, serial) = self
+            .custody
+            .initial_task
+            .map_or((41, 101), |root| (root.thread.tid, root.thread.serial));
         zone.record(record).home() == Some(slot)
-            && identity.tid == 41
-            && identity.serial == 101
+            && identity.tid == tid
+            && identity.serial == serial
             && identity.mm == INITIAL_MM_KEY
             && identity.lifecycle_page == METADATA_VA
             && identity.control_slot == METADATA_VA + CONTROL_OFFSET
@@ -1583,6 +1596,50 @@ impl Cpl0Carrier {
             Some(initial_extent_bytes),
             false,
         )
+    }
+
+    /// Replace the bootstrap's provisional identity with the exact root
+    /// issued by the shared kernel, before the initial MM is admitted.
+    pub fn bind_initial_task_identity(
+        &mut self,
+        identity: InitialTaskBinding,
+    ) -> Result<(), TrapError> {
+        if self.custody.initial_task.is_some()
+            || self.custody.initial_inventory.is_some()
+            || self
+                .custody
+                .actual_run
+                .iter()
+                .any(|flag| flag.load(Ordering::Acquire) != 0)
+            || identity.thread.tid != identity.task.id.raw() as u64
+            || identity.thread.serial == 0
+            || identity.thread.file_table == 0
+            || identity.thread.generation == 0
+            || identity.thread.mm != 0
+            || identity.thread.lifecycle_page != 0
+            || identity.thread.control_slot != 0
+        {
+            return Err(fail("initial task binding requires stopped root admission"));
+        }
+        let tid = u32::try_from(identity.thread.tid)
+            .map_err(|_| fail("initial task TID outside guest ABI"))?;
+        let control: &ThreadControlSlot = self.metadata(CONTROL_OFFSET);
+        control.reset_for_host_birth(BlockedMask(0));
+        if !control.publish_visible_tid(tid) {
+            return Err(fail("initial root control slot identity"));
+        }
+        let task = self.task(0);
+        task.set(
+            El1TaskId::from_linux_tid(identity.task.id.raw()),
+            identity.thread.generation,
+            identity.thread.file_table,
+        );
+        task.mm
+            .thread_generation
+            .store(identity.thread.serial, Ordering::Release);
+        task.publish_visible_pid(tid);
+        self.custody.initial_task = Some(identity);
+        Ok(())
     }
 
     /// The guest MM owner supplies the executable and stack publication here.
@@ -2195,24 +2252,29 @@ impl Cpl0Carrier {
         zone.enter_guest(slot);
         zone.install_space(slot, mm.raw())
             .ok_or_else(|| fail("production installed MM"))?;
+        let task = self.custody.initial_task;
+        let tid = task.map_or(41, |root| root.thread.tid);
+        let serial = task.map_or(101, |root| root.thread.serial);
+        let generation = task.map_or(11, |root| root.thread.generation);
+        let file_table = task.map_or(5, |root| root.thread.file_table);
         self.bind_execution(
             0,
             carrick_el1_abi::ExecutionBinding {
-                task: carrick_el1_abi::EntryTaskKey::from_raw(41),
-                generation: carrick_el1_abi::EntryGeneration::from_raw(11),
+                task: carrick_el1_abi::EntryTaskKey::from_raw(tid),
+                generation: carrick_el1_abi::EntryGeneration::from_raw(generation),
                 mm: carrick_el1_abi::EntryMmKey::from_raw(mm.raw()),
-                thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(101),
+                thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(serial),
             },
         )?;
-        self.task(0).publish_visible_pid(41);
+        self.task(0).publish_visible_pid(tid as u32);
         zone.current_or_new(
             slot,
             carrick_sched_core::ThreadIdentity {
-                tid: 41,
-                serial: 101,
+                tid,
+                serial,
                 mm: mm.raw(),
-                file_table: 5,
-                generation: 11,
+                file_table,
+                generation,
                 affinity: 3,
                 lifecycle_page: METADATA_VA,
                 control_slot: METADATA_VA + CONTROL_OFFSET,
@@ -3220,6 +3282,7 @@ impl Cpl0Carrier {
                 initial_rollback_fault: None,
                 peer_entry: None,
                 peer_admission: InitialPeerAdmission::Cold,
+                initial_task: None,
                 grant_tables: Vec::new(),
                 prepare_table_stock: None,
                 fork_pending: std::array::from_fn(|_| None),

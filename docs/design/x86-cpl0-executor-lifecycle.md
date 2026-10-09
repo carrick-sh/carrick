@@ -193,3 +193,14 @@ uses this same owned context before the scheduler swap, so its behavior stays
 covered by the existing KVM fixtures. Worker CPU ownership must additionally
 retain the carrier's backing and frame-inventory lifetime; retaining only the
 RAM pointer and VM fd would let registered backing retire underneath a vCPU.
+
+The production bootstrap previously seeded CPL0 with fixture identities 41,
+101 and file table 5. Runtime now captures the kernel graph's issued root
+`TaskKey`, thread serial, execution generation and file-table ID before
+initial MM admission. It projects them through the existing ISA-neutral
+`ThreadIdentity` record; KVM validates the root leader and fills its own MM,
+lifecycle and physical slot fields. This keeps `carrick-kernel` out of the
+VMM dependency closure. The guest root and host graph therefore name the same
+thread and file-table incarnation before scheduler publication. The fixed
+numbers remain only for hardware fixtures that construct a carrier without a
+runtime kernel graph; M-b deletes the production fixed-actor driver.

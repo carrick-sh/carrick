@@ -1067,6 +1067,25 @@ impl PreparedRun {
                     .physical_projection(Arc::new(carrick_kernel::kernel::ObjectIdRegistry::new())),
                 extent_bytes,
             )?;
+            let root_context = dispatcher.capture_one_task_context().map_err(|error| {
+                RuntimeError::Unsupported(format!("capture x86 root identity: {error}"))
+            })?;
+            machine.bind_initial_task_identity(carrick_vmm_kvm::cpl0_boot::InitialTaskBinding {
+                task: root_context.task().key(),
+                thread: carrick_sched_core::ThreadIdentity {
+                    tid: carrick_el1_abi::El1TaskId::from_linux_tid(
+                        root_context.thread().key().tid.raw(),
+                    )
+                    .raw(),
+                    serial: root_context.thread().key().serial.raw(),
+                    mm: 0,
+                    file_table: root_context.resources().files().id().raw(),
+                    generation: carrick_kernel::kernel::objects::ExecutionGeneration::INITIAL.raw(),
+                    affinity: 3,
+                    lifecycle_page: 0,
+                    control_slot: 0,
+                },
+            })?;
             let limits = carrick_vmm_kvm::cpl0_boot::InitialReservationLimits {
                 address: dispatcher.launch_resource_limit(carrick_abi::LinuxResource::As),
                 data: dispatcher.launch_resource_limit(carrick_abi::LinuxResource::Data),

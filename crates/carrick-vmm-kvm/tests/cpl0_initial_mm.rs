@@ -10,6 +10,7 @@ use carrick_guest_mem::GuestMemory;
 use carrick_mem::x86_initial_image::prepare_static_x86_elf;
 use carrick_vmm_kvm::cpl0_boot::{
     Cpl0Carrier, GuestExitStatus, InitialReservationLimits, InitialSyscallDisposition,
+    InitialTaskBinding,
 };
 use carrick_x86::cpl0_entry::OBSERVE_INITIAL_MM;
 use std::path::PathBuf;
@@ -18,6 +19,41 @@ const ELF_X86_64_MACHINE: u16 = 62;
 const ELF_LOAD_VA: u64 = 0x400000;
 const X86_SYS_WRITE: u8 = 1;
 const X86_SYS_EXIT_GROUP: u8 = 231;
+
+#[test]
+fn initial_root_uses_issued_thread_and_file_table_identity() {
+    let elf = tiny_elf();
+    let image = prepare_static_x86_elf(&elf).expect("static ELF");
+    let extent =
+        Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("initial grant extent");
+    let mut carrier =
+        Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM boot");
+    carrier
+        .bind_initial_task_identity(InitialTaskBinding {
+            task: carrick_sched_core::process::TaskKey {
+                id: carrick_sched_core::process::TaskId::from_abi_positive(67)
+                    .expect("fixture task id"),
+                serial: carrick_sched_core::process::TaskSerial::from_registry_allocation(
+                    std::num::NonZeroU64::new(700).expect("fixture task serial"),
+                ),
+            },
+            thread: carrick_sched_core::ThreadIdentity {
+                tid: 67,
+                serial: 701,
+                mm: 0,
+                file_table: 702,
+                generation: 1,
+                affinity: 3,
+                lifecycle_page: 0,
+                control_slot: 0,
+            },
+        })
+        .expect("bind issued root");
+    carrier
+        .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
+        .expect("shared MM owner");
+    assert!(carrier.initial_thread_custody());
+}
 
 fn image() -> PathBuf {
     PathBuf::from(env!("CARRICK_X86_CPL0_FIXTURE_IMAGE"))
