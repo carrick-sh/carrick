@@ -27,6 +27,7 @@ const SET_ROBUST_LIST: usize = 99;
 /// The x86 register adapter used by the shared dispatch witness. Argument 0
 /// and the result occupy different native registers, as in production CPL0.
 struct X86Frame<'a> {
+    isa: GuestIsa,
     native: carrick_guest_arch::NativeOrdinal,
     canonical: CanonicalNr,
     args: [u64; 6],
@@ -62,7 +63,10 @@ impl dispatch::GuestDispatchFrame for X86Frame<'_> {
     }
 
     fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
-        carrick_personality_linux::crossing::HostCrossingSet::X86
+        match self.isa {
+            GuestIsa::Aarch64 => carrick_personality_linux::crossing::HostCrossingSet::Aarch64,
+            GuestIsa::X86_64 => carrick_personality_linux::crossing::HostCrossingSet::X86,
+        }
     }
 
     fn arm_frame(&mut self) -> Option<&mut TrapFrame> {
@@ -141,6 +145,7 @@ impl World {
     fn call(&self, task: usize, native: NativeFrame) -> (Action, X86Frame<'_>) {
         let call = decode_x86_snapshot(native.snapshot()).expect("x86 snapshot");
         let mut frame = X86Frame {
+            isa: call.isa,
             native: call.native,
             canonical: call.canonical,
             args: call.args,
@@ -201,6 +206,7 @@ fn serve_full<'a, Context: dispatch::DispatchContext + 'a>(
     source: Option<carrick_core_abi::BornInZoneSource<'a, Context>>,
 ) -> (carrick_personality_linux::dispatch::CompletionRoute, i64) {
     let mut frame = X86Frame {
+        isa: call.isa,
         native: call.native,
         canonical: call.canonical,
         args: call.args,
@@ -431,22 +437,22 @@ fn pending_host_work_completes_once_and_leaves_with_work() {
 }
 
 #[test]
-fn closed_gate_or_hatch_forwards_without_effect() {
+fn closed_gate_or_hatch_refuses_without_effect() {
     let w = World::new(LifecycleHatches::ON);
     w.venue.pages[0].close();
-    assert_eq!(w.robust(0, 0xa000, 24).0, Action::Forward);
-    assert_eq!(w.robust(0, 0xa000, 23).0, Action::Forward);
+    assert_eq!(w.robust(0, 0xa000, 24).0, Action::Served);
+    assert_eq!(w.robust(0, 0xa000, 23).0, Action::Served);
     let w2 = World::new(LifecycleHatches {
         threads: true,
         sigmask: false,
     });
-    assert_eq!(w2.robust(1, 0xb000, 24).0, Action::Forward);
+    assert_eq!(w2.robust(1, 0xb000, 24).0, Action::Served);
     for w in [&w, &w2] {
         assert_eq!(w.heads(), [(0, 0), (0, 0)]);
         assert_eq!(w.served(), 0);
     }
-    assert_eq!(w.forwarded(), 2);
-    assert_eq!(w2.forwarded(), 1);
+    assert_eq!(w.forwarded(), 0);
+    assert_eq!(w2.forwarded(), 0);
 }
 
 #[test]
@@ -487,10 +493,10 @@ fn unissued_task_cannot_bypass_crossing_admission() {
             }
         )
         .0,
-        Action::Forward
+        Action::Served
     );
     assert_eq!(w.heads(), [(0, 0), (0, 0)]);
-    assert_eq!(w.counters.forwarded[172].load(Ordering::Relaxed), 1);
+    assert_eq!(w.counters.forwarded[172].load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -735,7 +741,7 @@ fn common_linux_entry_calls_native_process_custody() {
     let call = carrick_personality_linux::entry::decode_x86_64(57, [0; 6], 0x7fff0000);
     assert_eq!(
         serve_full(&call, &world, &mut anonymous, Some(&mut process), None).0,
-        carrick_personality_linux::dispatch::CompletionRoute::Forward
+        carrick_personality_linux::dispatch::CompletionRoute::Served
     );
     assert_eq!(process.visits, [57, 61, 231, 61]);
     process.binding = execution_binding(&world.tasks[0]);
@@ -745,7 +751,7 @@ fn common_linux_entry_calls_native_process_custody() {
         let call = carrick_personality_linux::entry::decode_x86_64(56, args, 0x7fff0000);
         assert_eq!(
             serve_full(&call, &world, &mut anonymous, Some(&mut process), None).0,
-            carrick_personality_linux::dispatch::CompletionRoute::Forward
+            carrick_personality_linux::dispatch::CompletionRoute::Served
         );
         assert_eq!(
             process.visits,
