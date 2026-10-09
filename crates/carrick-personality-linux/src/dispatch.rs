@@ -514,7 +514,6 @@ const fn route_shared(ordinal: u64, allocator_control: u64) -> Family {
         138 => Family::Signal(crate::signal::SignalCall::RtSigqueueinfo),
         139 => Family::Signal(crate::signal::SignalCall::RtSigreturn),
         240 => Family::Signal(crate::signal::SignalCall::RtTgsigqueueinfo),
-        424 => Family::Signal(crate::signal::SignalCall::PidfdSendSignal),
         99 => Family::Lifecycle(LifecycleCall::SetRobustList),
         178 => Family::Lifecycle(LifecycleCall::GetTid),
         172 => Family::Lifecycle(LifecycleCall::GetPid),
