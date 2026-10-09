@@ -243,7 +243,7 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
         &mut self,
         _mm: &Self::Mm,
         _address: UserVa,
-        _info: &carrick_abi::LinuxSiginfo,
+        _info: &carrick_syscall_abi::LinuxSiginfo,
     ) -> Result<(), NativeProcessError> {
         Err(NativeProcessError::Unsupported)
     }
@@ -818,7 +818,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         selector: carrick_personality_linux::signal::SignalThreadSelector,
         request: carrick_personality_linux::signal::SignalRequest,
         info: carrick_personality_linux::signal::SignalInfo,
-    ) -> Result<(), carrick_abi::LinuxErrno> {
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
         use carrick_personality_linux::abi::signal::LINUX_ESRCH;
         let sig = request.number();
         let visible = selector.positive().ok_or(LINUX_ESRCH)?;
@@ -950,7 +950,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         if let Some(channel) = channel {
             self.publish_channel(&channel)
-                .map_err(|e| carrick_abi::LinuxErrno::new(-e.errno() as i32))?;
+                .map_err(|e| carrick_syscall_abi::LinuxErrno::new(-e.errno() as i32))?;
         }
         Ok(())
     }
@@ -1179,14 +1179,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub fn force_sigsegv_info(
         &mut self,
         blocked: carrick_signal_core::policy::SigBlockMask,
-        mut info: carrick_abi::LinuxSiginfo,
-    ) -> Result<(), carrick_abi::LinuxErrno> {
+        mut info: carrick_syscall_abi::LinuxSiginfo,
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
         info.si_signo = carrick_signal_core::policy::Signal::SEGV.number();
         let graph = self.runtime.graph.lock();
         let row = graph
             .owner
             .task(self.key)
-            .map_err(|_| carrick_abi::LINUX_ESRCH)?;
+            .map_err(|_| carrick_syscall_abi::LINUX_ESRCH)?;
         row.native()
             .resources()
             .signals()
@@ -1305,9 +1305,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             {
                 if info.raw() != 0 {
                     let payload = payload.unwrap_or_else(|| {
-                        carrick_abi::LinuxSiginfo::kill(
+                        carrick_syscall_abi::LinuxSiginfo::kill(
                             signal.number(),
-                            carrick_abi::LINUX_SI_USER,
+                            carrick_syscall_abi::LINUX_SI_USER,
                             0,
                             0,
                         )
@@ -1649,19 +1649,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 let (code, status) = if let Some(term) = wait_status.term_signal() {
                     (
                         if wait_status.raw() & 0x80 != 0 {
-                            carrick_abi::LINUX_CLD_DUMPED
+                            carrick_syscall_abi::LINUX_CLD_DUMPED
                         } else {
-                            carrick_abi::LINUX_CLD_KILLED
+                            carrick_syscall_abi::LINUX_CLD_KILLED
                         },
                         i32::from(term),
                     )
                 } else {
                     (
-                        carrick_abi::LINUX_CLD_EXITED,
+                        carrick_syscall_abi::LINUX_CLD_EXITED,
                         (wait_status.raw() >> 8) & 0xff,
                     )
                 };
-                let info = carrick_abi::LinuxSiginfo::child_exit(
+                let info = carrick_syscall_abi::LinuxSiginfo::child_exit(
                     signal.number(),
                     child_pid as i32,
                     0,
@@ -2961,17 +2961,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     fn force_sigsegv(
         &mut self,
         blocked: carrick_signal_core::policy::SigBlockMask,
-    ) -> Result<(), carrick_abi::LinuxErrno> {
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
         self.force_sigsegv_info(
             blocked,
-            carrick_abi::LinuxSiginfo::kernel(carrick_signal_core::policy::Signal::SEGV.number()),
+            carrick_syscall_abi::LinuxSiginfo::kernel(
+                carrick_signal_core::policy::Signal::SEGV.number(),
+            ),
         )
     }
     fn rt_sigaction(
         &mut self,
         signal: carrick_signal_core::policy::Signal,
         act: Option<carrick_signal_core::policy::Action>,
-    ) -> Result<carrick_signal_core::policy::Action, carrick_abi::LinuxErrno> {
+    ) -> Result<carrick_signal_core::policy::Action, carrick_syscall_abi::LinuxErrno> {
         let einval = carrick_personality_linux::abi::signal::LINUX_EINVAL;
         let esrch = carrick_personality_linux::abi::signal::LINUX_ESRCH;
         let graph = self.runtime.graph.lock();
@@ -3001,7 +3003,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         pid: carrick_personality_linux::signal::SignalProcessSelector,
         request: carrick_personality_linux::signal::SignalRequest,
         info: carrick_personality_linux::signal::SignalInfo,
-    ) -> Result<(), carrick_abi::LinuxErrno> {
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
         let esrch = carrick_personality_linux::abi::signal::LINUX_ESRCH;
         let pid = pid.abi_number();
         let sig = request.number();
@@ -3162,7 +3164,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         for channel in wake_channels {
             self.publish_channel(&channel)
-                .map_err(|error| carrick_abi::LinuxErrno::new(-error.errno() as i32))?;
+                .map_err(|error| carrick_syscall_abi::LinuxErrno::new(-error.errno() as i32))?;
         }
         Ok(())
     }
@@ -3172,7 +3174,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         tid: carrick_personality_linux::signal::SignalThreadSelector,
         request: carrick_personality_linux::signal::SignalRequest,
         info: carrick_personality_linux::signal::SignalInfo,
-    ) -> Result<(), carrick_abi::LinuxErrno> {
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
         self.send_thread_signal(None, tid, request, info)
     }
 
@@ -3182,8 +3184,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         tid: carrick_personality_linux::signal::SignalThreadSelector,
         request: carrick_personality_linux::signal::SignalRequest,
         info: carrick_personality_linux::signal::SignalInfo,
-    ) -> Result<(), carrick_abi::LinuxErrno> {
-        let group = tgid.positive().ok_or(carrick_abi::LINUX_EINVAL)?;
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
+        let group = tgid.positive().ok_or(carrick_syscall_abi::LINUX_EINVAL)?;
         self.send_thread_signal(Some(group), tid, request, info)
     }
 
@@ -3192,7 +3194,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         set: carrick_signal_core::SignalSet,
         timeout_ns: Option<u64>,
         info: UserVa,
-    ) -> Result<carrick_personality_linux::signal::SignalWaitOutcome, carrick_abi::LinuxErrno> {
+    ) -> Result<carrick_personality_linux::signal::SignalWaitOutcome, carrick_syscall_abi::LinuxErrno>
+    {
         use carrick_personality_linux::signal::SignalWaitOutcome;
         use carrick_signal_core::policy::Signal;
         let set = set.without(Signal::KILL).without(Signal::STOP);
@@ -3227,13 +3230,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 deadline = timeout_ns
                     .map(|nanos| self.service.signal_deadline(nanos))
                     .transpose()
-                    .map_err(|error| carrick_abi::LinuxErrno::new(-error.errno() as i32))?;
+                    .map_err(|error| carrick_syscall_abi::LinuxErrno::new(-error.errno() as i32))?;
             }
             if let Some(deadline) = deadline
                 && self
                     .service
                     .signal_now()
-                    .map_err(|error| carrick_abi::LinuxErrno::new(-error.errno() as i32))?
+                    .map_err(|error| carrick_syscall_abi::LinuxErrno::new(-error.errno() as i32))?
                     .raw()
                     >= deadline.0.raw()
             {
@@ -3246,7 +3249,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     generation,
                     deadline,
                 )
-                .map_err(|error| carrick_abi::LinuxErrno::new(-error.errno() as i32))?
+                .map_err(|error| carrick_syscall_abi::LinuxErrno::new(-error.errno() as i32))?
             {
                 return Ok(SignalWaitOutcome::Pending);
             }
@@ -3256,7 +3259,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         mask: carrick_signal_core::policy::SigBlockMask,
         original: carrick_signal_core::policy::SigBlockMask,
-    ) -> Result<bool, carrick_abi::LinuxErrno> {
+    ) -> Result<bool, carrick_syscall_abi::LinuxErrno> {
         self.runtime
             .graph
             .lock()
@@ -3286,7 +3289,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Ok(false) => continue,
                 Err(error) => {
                     self.runtime.graph.lock().suspend_masks.remove(&self.record);
-                    return Err(carrick_abi::LinuxErrno::new(-error.errno() as i32));
+                    return Err(carrick_syscall_abi::LinuxErrno::new(-error.errno() as i32));
                 }
             }
         }
@@ -3668,7 +3671,7 @@ mod tests {
                 carrick_personality_linux::signal::SignalRequest::from_abi(0).unwrap(),
                 carrick_personality_linux::signal::SignalInfo::Generated(None)
             ),
-            Err(carrick_abi::LinuxErrno::new(3))
+            Err(carrick_syscall_abi::LinuxErrno::new(3))
         );
         assert_eq!(
             entry.kill(
@@ -3676,7 +3679,7 @@ mod tests {
                 carrick_personality_linux::signal::SignalRequest::from_abi(0).unwrap(),
                 carrick_personality_linux::signal::SignalInfo::Generated(None)
             ),
-            Err(carrick_abi::LinuxErrno::new(3)),
+            Err(carrick_syscall_abi::LinuxErrno::new(3)),
             "kill(-1) excludes caller"
         );
         let ignored = carrick_signal_core::policy::Action {
@@ -4469,16 +4472,26 @@ mod tests {
                 .enter(source, &task, child_words, &mut service)
                 .unwrap();
             use carrick_personality_linux::signal::{ProcessSignals, SignalInfo};
-            let forged = carrick_abi::LinuxSiginfo::kill(10, carrick_abi::LINUX_SI_USER, 42, 0);
+            let forged = carrick_syscall_abi::LinuxSiginfo::kill(
+                10,
+                carrick_syscall_abi::LINUX_SI_USER,
+                42,
+                0,
+            );
             assert_eq!(
                 child_entry.kill(
                     carrick_personality_linux::signal::SignalProcessSelector::from_abi((41) as u64),
                     carrick_personality_linux::signal::SignalRequest::from_abi(0).unwrap(),
                     SignalInfo::Queued(forged)
                 ),
-                Err(carrick_abi::LinuxErrno::new(1))
+                Err(carrick_syscall_abi::LinuxErrno::new(1))
             );
-            let queued = carrick_abi::LinuxSiginfo::kill(10, carrick_abi::LINUX_SI_QUEUE, 42, 0);
+            let queued = carrick_syscall_abi::LinuxSiginfo::kill(
+                10,
+                carrick_syscall_abi::LINUX_SI_QUEUE,
+                42,
+                0,
+            );
             assert_eq!(
                 child_entry.kill(
                     carrick_personality_linux::signal::SignalProcessSelector::from_abi((41) as u64),
@@ -4496,8 +4509,12 @@ mod tests {
                 Ok(())
             );
             let selector = carrick_personality_linux::signal::SignalThreadSelector::from_abi(41);
-            let forged_thread =
-                carrick_abi::LinuxSiginfo::kill(10, carrick_abi::LINUX_SI_TKILL, 42, 0);
+            let forged_thread = carrick_syscall_abi::LinuxSiginfo::kill(
+                10,
+                carrick_syscall_abi::LINUX_SI_TKILL,
+                42,
+                0,
+            );
             assert_eq!(
                 child_entry.tgkill(
                     selector,
@@ -4505,7 +4522,7 @@ mod tests {
                     carrick_personality_linux::signal::SignalRequest::Probe,
                     SignalInfo::Queued(forged_thread)
                 ),
-                Err(carrick_abi::LinuxErrno::new(1))
+                Err(carrick_syscall_abi::LinuxErrno::new(1))
             );
             if interrupt_wait {
                 use carrick_personality_linux::signal::{SignalProcessSelector, SignalRequest};
@@ -4534,7 +4551,10 @@ mod tests {
                 else {
                     panic!("caught signal must resume the parked child wait");
                 };
-                assert_eq!(result.raw(), carrick_abi::LINUX_EINTR.guest_retval());
+                assert_eq!(
+                    result.raw(),
+                    carrick_syscall_abi::LINUX_EINTR.guest_retval()
+                );
                 assert_eq!(
                     parent_entry.take_interrupted_child_wait(),
                     Some(words(address))

@@ -16,7 +16,9 @@ pub use capability::{
     CAP_SYS_NICE, CAP_SYS_PACCT, CAP_SYS_PTRACE, CAP_SYS_RAWIO, CAP_SYS_RESOURCE, CAP_SYS_TIME,
     CAP_SYS_TTY_CONFIG, CAP_SYSLOG, CAP_WAKE_ALARM, LinuxCapabilitySet,
 };
-pub use errno::{LINUX_EAGAIN, LINUX_ECHILD, LINUX_EFAULT, LINUX_EINVAL, LINUX_ENOSYS, LinuxErrno};
+pub use errno::*;
+mod signal;
+pub use signal::*;
 
 /// Canonical numbers served by the shared guest lifecycle owner.
 pub mod nr {

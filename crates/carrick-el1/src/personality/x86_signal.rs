@@ -3,13 +3,12 @@ use carrick_guest_arch::{
     ReturnKind, SignalBackend, SignalFrameParams, UserFlags, UserReturn, UserVa,
 };
 
-use super::X86Backend;
-use super::context::native::NativeFrame;
 use crate::isa::ArchError;
+use crate::isa::x86::X86Backend;
+use crate::isa::x86::context::native::NativeFrame;
 
-pub use carrick_abi::{
-    LinuxSiginfo as Siginfo, LinuxSignalStack as SignalStack, X8664Rtsigframe as RtSigframe,
-    X8664Sigcontext as Sigcontext, X8664Ucontext as Ucontext,
+use carrick_syscall_abi::{
+    LinuxSiginfo as Siginfo, X8664Rtsigframe as RtSigframe, X8664Ucontext as Ucontext,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -54,15 +53,16 @@ impl X86Backend {
         }
         fp_image[416..464].fill(0);
         fp_image[520..576].fill(0);
-        let descriptor = carrick_abi::X8664FpxSwBytes {
-            magic1: carrick_abi::X8664_FP_XSTATE_MAGIC1,
+        let descriptor = carrick_syscall_abi::X8664FpxSwBytes {
+            magic1: carrick_syscall_abi::X8664_FP_XSTATE_MAGIC1,
             extended_size: (FP_BYTES + 4) as u32,
             xfeatures: 7,
             xstate_size: FP_BYTES as u32,
             reserved: [0; 7],
         };
         fp_image[464..512].copy_from_slice(descriptor.as_bytes());
-        fp_image[FP_BYTES..].copy_from_slice(&carrick_abi::X8664_FP_XSTATE_MAGIC2.to_le_bytes());
+        fp_image[FP_BYTES..]
+            .copy_from_slice(&carrick_syscall_abi::X8664_FP_XSTATE_MAGIC2.to_le_bytes());
 
         // 2. Build the frame
         let mut rtsigframe = RtSigframe::empty();
@@ -91,8 +91,8 @@ impl X86Backend {
         rtsigframe.uc.uc_mcontext.rsp = resume.stack.raw();
         rtsigframe.uc.uc_mcontext.rip = resume.pc.raw(); // saved RIP from syscall entry
         rtsigframe.uc.uc_mcontext.eflags = resume.flags.raw(); // saved RFLAGS from syscall entry
-        rtsigframe.uc.uc_mcontext.cs = carrick_abi::LINUX_X8664_USER_CS;
-        rtsigframe.uc.uc_mcontext.ss = carrick_abi::LINUX_X8664_USER_DS;
+        rtsigframe.uc.uc_mcontext.cs = carrick_syscall_abi::LINUX_X8664_USER_CS;
+        rtsigframe.uc.uc_mcontext.ss = carrick_syscall_abi::LINUX_X8664_USER_DS;
         rtsigframe.uc.uc_mcontext.fpstate = fp_address;
 
         // Populate siginfo
@@ -196,9 +196,10 @@ impl SignalBackend for X86Backend {
             if !copy_in(&mut restored_fp[..512], UserVa::new(fp_address)) {
                 return Err(ArchError::InvalidFrame);
             }
-            let descriptor = carrick_abi::X8664FpxSwBytes::read_from_bytes(&restored_fp[464..512])
-                .map_err(|_| ArchError::InvalidFrame)?;
-            if descriptor.magic1 == carrick_abi::X8664_FP_XSTATE_MAGIC1 {
+            let descriptor =
+                carrick_syscall_abi::X8664FpxSwBytes::read_from_bytes(&restored_fp[464..512])
+                    .map_err(|_| ArchError::InvalidFrame)?;
+            if descriptor.magic1 == carrick_syscall_abi::X8664_FP_XSTATE_MAGIC1 {
                 if descriptor.xstate_size != FP_BYTES as u32
                     || descriptor.extended_size != (FP_BYTES + 4) as u32
                     || descriptor.xfeatures & !7 != 0
@@ -209,7 +210,7 @@ impl SignalBackend for X86Backend {
                 let mut extended = [0u8; FP_BYTES - 512 + 4];
                 if !copy_in(&mut extended, UserVa::new(tail))
                     || extended[FP_BYTES - 512..]
-                        != carrick_abi::X8664_FP_XSTATE_MAGIC2.to_le_bytes()
+                        != carrick_syscall_abi::X8664_FP_XSTATE_MAGIC2.to_le_bytes()
                 {
                     return Err(ArchError::InvalidFrame);
                 }

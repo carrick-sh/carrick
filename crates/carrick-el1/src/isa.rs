@@ -83,9 +83,6 @@ mod layout_tests {
 /// This is pure conversion; the AArch64 backend and assembly remain unchanged.
 pub mod arm_edit;
 
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-pub(crate) mod arm_signal;
-
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub mod aarch64;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]

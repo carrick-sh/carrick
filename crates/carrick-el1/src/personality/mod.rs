@@ -20,3 +20,8 @@ pub mod native_run_failure;
 pub mod process_owner;
 pub mod sched;
 pub mod thread_setup;
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+mod arm_signal;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod x86_signal;
