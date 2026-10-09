@@ -673,9 +673,15 @@ fn test_abort_after_stock_loan_returns_every_page_once() {
     let child_mm = MmGeneration::new(NonZeroU64::new(2).unwrap());
     let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
 
+    let start = service
+        .prepare_mm_start(&fixture.address, parked, child_mm)
+        .expect("prepare_mm_start should succeed");
+    let published = service
+        .prepare_mm_publish(start)
+        .expect("prepare_mm_publish should succeed");
     let prepared = service
-        .prepare_mm(&fixture.address, parked, child_mm)
-        .expect("prepare_mm should succeed");
+        .prepare_mm_finish(published)
+        .expect("prepare_mm_finish should succeed");
 
     assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 1);
     assert_eq!(crossing.settlements_committed.load(Ordering::Acquire), 0);
