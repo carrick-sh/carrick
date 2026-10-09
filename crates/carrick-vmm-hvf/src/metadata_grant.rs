@@ -1156,7 +1156,13 @@ pub(crate) fn handle_metadata_grant_trap(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum MetadataTrapOutcome {
     Resume,
     RootExit(carrick_sched_core::process::LinuxWaitStatus),
