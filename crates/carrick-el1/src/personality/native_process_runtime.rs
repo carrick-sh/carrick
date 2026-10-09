@@ -1175,6 +1175,25 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         }
     }
+    /// Publish a synchronous fault payload through this exact process owner.
+    pub fn force_sigsegv_info(
+        &mut self,
+        blocked: carrick_signal_core::policy::SigBlockMask,
+        mut info: carrick_abi::LinuxSiginfo,
+    ) -> Result<(), carrick_abi::LinuxErrno> {
+        info.si_signo = carrick_signal_core::policy::Signal::SEGV.number();
+        let graph = self.runtime.graph.lock();
+        let row = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_abi::LINUX_ESRCH)?;
+        row.native()
+            .resources()
+            .signals()
+            .force_sigsegv(self.record, blocked, Some(info));
+        Ok(())
+    }
+
     /// Copy a signal frame through the same exact-MM COW authority as wait status.
     pub fn copy_signal_frame(
         &mut self,
@@ -2943,21 +2962,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         blocked: carrick_signal_core::policy::SigBlockMask,
     ) -> Result<(), carrick_abi::LinuxErrno> {
-        let graph = self.runtime.graph.lock();
-        let row = graph
-            .owner
-            .task(self.key)
-            .map_err(|_| carrick_personality_linux::abi::signal::LINUX_ESRCH)?;
-        row.native().resources().signals().force_sigsegv(
-            self.record,
+        self.force_sigsegv_info(
             blocked,
-            Some(carrick_personality_linux::abi::signal::LinuxSiginfo {
-                si_signo: carrick_signal_core::policy::Signal::SEGV.number(),
-                si_code: carrick_abi::LINUX_SI_KERNEL,
-                ..carrick_personality_linux::abi::signal::LinuxSiginfo::empty()
-            }),
-        );
-        Ok(())
+            carrick_abi::LinuxSiginfo::kernel(carrick_signal_core::policy::Signal::SEGV.number()),
+        )
     }
     fn rt_sigaction(
         &mut self,

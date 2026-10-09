@@ -635,83 +635,42 @@ mod kernel {
         use carrick_el1::fault::OwnerFaultSupplyOutcome;
         match supply.outcome() {
             OwnerFaultSupplyOutcome::PolicyDeclined => {
-                if let Some(rt) = native_process::runtime_opt() {
-                    let segv = carrick_personality_linux::signal::policy::Signal::SEGV;
-                    use carrick_el1::personality::thread_setup::LifecycleVenue;
-                    let Some(signals) = rt.current_signals(task) else { return 6; };
-                    let Some(thread) = GuestLifecycleVenue.thread(task) else { return 6; };
-                    let blocked = carrick_personality_linux::signal::policy::SigBlockMask::blocking_all_of(
-                        carrick_personality_linux::signal::SignalSet::from_bits(thread.slot.blocked().0),
-                    );
-                    let action = signals.forced_action(segv, blocked);
-                    if let carrick_personality_linux::signal::policy::Disposition::Handler(handler) = action.disposition {
-                        let mut native_frame = carrick_el1::isa::x86::context::native::NativeFrame {
-                            r15: frame.saved_gprs[0],
-                            r14: frame.saved_gprs[1],
-                            r13: frame.saved_gprs[2],
-                            r12: frame.saved_gprs[3],
-                            rbp: frame.saved_gprs[4],
-                            rbx: frame.saved_gprs[5],
-                            r11: frame.saved_gprs[6],
-                            r10: frame.saved_gprs[7],
-                            r9: frame.saved_gprs[8],
-                            r8: frame.saved_gprs[9],
-                            rax: frame.saved_gprs[10],
-                            rcx: frame.saved_gprs[11],
-                            rdx: frame.saved_gprs[12],
-                            rsi: frame.saved_gprs[13],
-                            rdi: frame.saved_gprs[14],
-                            rsp: frame.rsp,
-                            user_rcx: frame.saved_gprs[11],
-                            user_r11: frame.saved_gprs[6],
-                        };
-                        let Some((sp, stack)) = carrick_personality_linux::signal::delivery_stack(
-                            thread.slot.read_altstack(), carrick_guest_arch::UserVa::new(frame.rsp), action.flags.on_stack,
-                        ) else { return 6; };
-                        let params = carrick_guest_arch::SignalFrameParams {
-                            stack,
-                            signal: segv,
-                            sigcode: if fault.present { 2 } else { 1 },
-                            fault_addr: far,
-                            handler: carrick_guest_arch::UserVa::new(handler.0),
-                            restorer: action.restorer.map(|r| carrick_guest_arch::UserVa::new(r.0)),
-                            mask: blocked.signals().bits(),
-                            sp,
-                        };
-                        let mut copy = carrick_el1::file::ValidatedCopy {
-                            task,
-                            validator: &carrick_el1::file::HardwareValidator,
-                        };
-                        let mut backend = carrick_el1::isa::x86::X86Backend;
-                        if backend.setup_signal_frame_with_resume(
-                            &mut native_frame,
-                            params,
-                            carrick_guest_arch::UserReturn {
-                                pc: carrick_guest_arch::UserVa::new(frame.rip),
-                                stack: carrick_guest_arch::UserVa::new(frame.rsp),
-                                flags: carrick_guest_arch::UserFlags::new(frame.rflags),
-                                kind: carrick_guest_arch::ReturnKind::ExceptionReturn,
-                            },
-                            None,
-                            &fpstate.0,
-                            &mut |va, bytes| carrick_personality_linux::lifecycle::UserCopy::copy_out(&mut copy, va, bytes),
-                        ).is_ok() {
-                            let handler_mask = carrick_personality_linux::signal::policy::handler_block_mask(segv, action, blocked);
-                            let _ = thread.slot.store_blocked_then_read_pending(
-                                carrick_el1_abi::BlockedMask(handler_mask.signals().bits()), thread.slot.pending(),
-                            );
-                            frame.rflags = native_frame.r11;
-                            frame.rip = native_frame.rcx;
-                            frame.rsp = native_frame.rsp;
-                            frame.saved_gprs[14] = native_frame.rdi;
-                            frame.saved_gprs[13] = native_frame.rsi;
-                            frame.saved_gprs[12] = native_frame.rdx;
-                            frame.saved_gprs[10] = native_frame.rax;
-                            return 0;
-                        }
-                    }
-                }
-                6
+                let mut native_frame = carrick_el1::isa::x86::context::native::NativeFrame {
+                    r15: frame.saved_gprs[0],
+                    r14: frame.saved_gprs[1],
+                    r13: frame.saved_gprs[2],
+                    r12: frame.saved_gprs[3],
+                    rbp: frame.saved_gprs[4],
+                    rbx: frame.saved_gprs[5],
+                    r11: frame.rflags,
+                    r10: frame.saved_gprs[7],
+                    r9: frame.saved_gprs[8],
+                    r8: frame.saved_gprs[9],
+                    rax: frame.saved_gprs[10],
+                    rcx: frame.rip,
+                    rdx: frame.saved_gprs[12],
+                    rsi: frame.saved_gprs[13],
+                    rdi: frame.saved_gprs[14],
+                    rsp: frame.rsp,
+                    user_rcx: frame.saved_gprs[11],
+                    user_r11: frame.saved_gprs[6],
+                };
+                let info = carrick_abi::LinuxSiginfo {
+                    si_signo: carrick_abi::LINUX_SIGSEGV,
+                    si_code: if fault.present { carrick_abi::LINUX_SEGV_ACCERR } else { carrick_abi::LINUX_SEGV_MAPERR },
+                    si_addr: far,
+                    ..carrick_abi::LinuxSiginfo::empty()
+                };
+                if !signal_user_return(&mut native_frame, fpstate, Some(info)) { return 6; }
+                frame.rip = native_frame.rcx;
+                frame.rflags = native_frame.r11;
+                frame.rsp = native_frame.rsp;
+                frame.saved_gprs = [native_frame.r15, native_frame.r14, native_frame.r13,
+                    native_frame.r12, native_frame.rbp, native_frame.rbx,
+                    native_frame.user_r11, native_frame.r10, native_frame.r9, native_frame.r8,
+                    native_frame.rax, native_frame.user_rcx, native_frame.rdx,
+                    native_frame.rsi, native_frame.rdi];
+                0
             }
             OwnerFaultSupplyOutcome::Unavailable => 9,
             OwnerFaultSupplyOutcome::CowSelected => {
@@ -1228,8 +1187,10 @@ mod kernel {
                         sig.number() as u8,
                         core_dump,
                     );
-                    let _ = process.exit_with_status(wait_status);
-                    Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended)
+                    Some(match process.exit_with_status(wait_status) {
+                        Ok(_) => carrick_personality_linux::dispatch::CompletionRoute::Suspended,
+                        Err(_) => carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion,
+                    })
                 } else {
                     None
                 }
@@ -1301,14 +1262,14 @@ mod kernel {
         halt();
     }
 
-    production_items! {
-    pub(crate) fn signal_syscall_return(
+    fn signal_user_return(
         frame: &mut NativeFrame,
-        xsave: &mut carrick_el1::isa::x86::context::scheduler::XsaveArea,
-    ) {
+        xsave: &carrick_el1::isa::x86::context::scheduler::XsaveArea,
+        forced: Option<carrick_abi::LinuxSiginfo>,
+    ) -> bool {
         use carrick_el1::isa::x86::context;
         use carrick_personality_linux::dispatch::CompletionRoute;
-        if native_process::runtime_opt().is_none() { return; }
+        if native_process::runtime_opt().is_none() { return false; }
         let binding = context::current_cpu_binding().unwrap_or_else(|| initial_boot::fatal_boot());
         let slot = carrick_sched_core::SlotId::from_index(binding.cpu_slot as usize).unwrap_or_else(|| initial_boot::fatal_boot());
         let source = native_execution::source(slot);
@@ -1321,6 +1282,15 @@ mod kernel {
             let words = native_execution::capture(frame, xsave);
             let mut service = native_process::Service::new(task, slot);
             let mut process = native_process::runtime().enter(source, task, words, &mut service).unwrap_or_else(|_| initial_boot::fatal_boot());
+            if let Some(info) = forced {
+                use carrick_el1::personality::thread_setup::LifecycleVenue;
+                use carrick_personality_linux::signal::policy::{SigBlockMask, Signal};
+                let Some(thread) = GuestLifecycleVenue.thread(task) else { return false; };
+                let blocked = SigBlockMask::blocking_all_of(carrick_personality_linux::signal::SignalSet::from_bits(thread.slot.blocked().0));
+                if process.force_sigsegv_info(blocked, info).is_err() { return false; }
+                let mask = blocked.signals().without(Signal::SEGV);
+                let _ = thread.slot.store_blocked_then_read_pending(carrick_el1_abi::BlockedMask(mask.bits()), thread.slot.pending());
+            }
             if let Some(route) = deliver_signal_on_syscall_return(task, &mut process, frame, xsave) {
                 if route != CompletionRoute::Suspended { initial_boot::fatal_boot(); }
                 suspended = true;
@@ -1329,6 +1299,15 @@ mod kernel {
         }
         if let Some(status) = root_exit { complete_root_exit(task, status); }
         if suspended { native_execution::schedule(slot); }
+        true
+    }
+
+    production_items! {
+    pub(crate) fn signal_syscall_return(
+        frame: &mut NativeFrame,
+        xsave: &mut carrick_el1::isa::x86::context::scheduler::XsaveArea,
+    ) {
+        signal_user_return(frame, xsave, None);
     }
 
     pub(crate) fn signal_irq_return(

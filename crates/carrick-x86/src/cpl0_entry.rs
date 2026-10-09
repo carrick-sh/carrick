@@ -283,6 +283,8 @@ const _: () = {
     assert!(core::mem::offset_of!(NativeFrame, rcx) == 104);
     assert!(core::mem::offset_of!(NativeFrame, r11) == 112);
     assert!(core::mem::offset_of!(NativeFrame, rsp) == 120);
+    assert!(core::mem::offset_of!(NativeFrame, user_rcx) == 128);
+    assert!(core::mem::offset_of!(NativeFrame, user_r11) == 136);
 };
 
 impl NativeFrame {

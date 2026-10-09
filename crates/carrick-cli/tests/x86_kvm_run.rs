@@ -755,3 +755,21 @@ fn mounted_static_x86_signal_chld_killed_matches_native() {
 fn mounted_static_x86_signal_concurrent_timeouts_match_native() {
     compare_mounted_assembly_with_native("x86_signal_wait_concurrent.S", b"T\n");
 }
+
+#[test]
+fn mounted_static_x86_signal_blocked_fault_forces_segv() {
+    compare_mounted_assembly_with_native("x86_signal_blocked.S", b"F\n");
+}
+#[test]
+fn mounted_static_x86_signal_ignored_fault_forces_segv() {
+    compare_mounted_assembly_with_native("x86_signal_ignored.S", b"F\n");
+}
+#[test]
+fn mounted_static_x86_signal_fault_badstack_forces_segv() {
+    compare_mounted_assembly_with_native("x86_signal_fault_badstack.S", b"F\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_segv_child_action_and_resume_match_native() {
+    compare_mounted_assembly_with_native("x86_signal_segv_child.S", b"S\nP");
+}
