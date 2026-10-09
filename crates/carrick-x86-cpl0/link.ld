@@ -11,6 +11,6 @@ SECTIONS {
     .rodata : ALIGN(4096) { *(.rodata .rodata.*) }
     .data : ALIGN(4096) { *(.data .data.*) *(.got .got.*) }
     .bss : ALIGN(4096) { *(.bss .bss.*) *(COMMON) }
-    ASSERT(. <= 0xffffffff80100000, "CPL0 image exceeds supervisor extent")
+    ASSERT(. <= CARRICK_X86_CPL0_IMAGE_END, "CPL0 image exceeds supervisor extent")
     /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
 }

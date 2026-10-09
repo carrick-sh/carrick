@@ -18,6 +18,14 @@ macro_rules! fixture_dispatch_enabled {
 }
 
 #[cfg(target_os = "none")]
+core::arch::global_asm!(
+    ".global CARRICK_X86_CPL0_IMAGE_END",
+    ".set CARRICK_X86_CPL0_IMAGE_END, {end}",
+    end = const carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_BASE
+        + carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_SIZE,
+);
+
+#[cfg(target_os = "none")]
 extern crate alloc as rust_alloc;
 
 #[cfg(target_os = "none")]

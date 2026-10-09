@@ -71,7 +71,7 @@ impl KernelPodStorage {
             || segment.perms.execute
             || segment.memory_size == 0
             || segment.virtual_address < IMAGE_VA
-            || end > IMAGE_VA + 0x10_0000
+            || end > IMAGE_VA + IMAGE_SIZE
         {
             return None;
         }
@@ -1571,6 +1571,26 @@ mod custody_tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn kernel_pod_storage_enforces_shared_supervisor_extent() {
+        use carrick_mem::elf::{LoadSegment, SegmentPerms};
+        let mut segment = LoadSegment {
+            file_offset: 0,
+            virtual_address: IMAGE_VA + IMAGE_SIZE - 4096,
+            file_size: 0,
+            memory_size: 4096,
+            alignment: 4096,
+            perms: SegmentPerms {
+                read: true,
+                write: true,
+                execute: false,
+            },
+        };
+        assert!(KernelPodStorage::from_load(&segment).is_some());
+        segment.memory_size += 1;
+        assert!(KernelPodStorage::from_load(&segment).is_none());
     }
 
     #[test]

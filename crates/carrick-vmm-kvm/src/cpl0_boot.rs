@@ -88,7 +88,8 @@ const _: () = {
     );
 };
 const IST_STACK_BASE: u64 = 0xf0_0000;
-const IMAGE_VA: u64 = 0xffff_ffff_8000_0000;
+const IMAGE_VA: u64 = carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_BASE;
+const IMAGE_SIZE: u64 = carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_SIZE;
 const IMAGE_GPA: u64 = 0x10_0000;
 const METADATA_VA: u64 = X86_CPL0_DYNAMIC_METADATA_BASE;
 pub const USER_CODE: u64 = 0x1_0000;
@@ -104,6 +105,7 @@ const LAYOUT: BringupLayout = BringupLayout {
     gdt_base: 0x50_0000,
     pml4_base: 0x60_0000,
 };
+const _: () = assert!(IMAGE_GPA + IMAGE_SIZE < LAYOUT.gdt_base);
 const _: () = assert!(FIXTURE_PML4_CAPACITY == carrick_x86::X86_PML4_CAPACITY);
 
 fn fail(message: impl Into<String>) -> TrapError {
@@ -2176,7 +2178,7 @@ impl Cpl0Carrier {
 
     /// Inspect the stopped bootstrap's supervisor direct-window permissions.
     pub fn bootstrap_supervisor_access(&self, gpa: u64, access: Access) -> Result<bool, TrapError> {
-        if !(0x20_0000..0xc0_0000).contains(&gpa) {
+        if !(IMAGE_GPA + IMAGE_SIZE..0xc0_0000).contains(&gpa) {
             return Err(fail("supervisor access outside bootstrap window"));
         }
         let root = RootGpa::page_aligned(FrameGpa::new(LAYOUT.pml4_base))
@@ -2568,8 +2570,8 @@ impl Cpl0Carrier {
             let header = unsafe { header.cast::<X86InitialBootHeader>().read_unaligned() };
             if header.magic != X86_INITIAL_BOOT_MAGIC
                 || header.version != X86_INITIAL_BOOT_VERSION
-                || !(IMAGE_VA..IMAGE_VA + 0x10_0000).contains(&header.entry_va)
-                || !(IMAGE_VA..IMAGE_VA + 0x10_0000).contains(&header.peer_entry_va)
+                || !(IMAGE_VA..IMAGE_VA + IMAGE_SIZE).contains(&header.entry_va)
+                || !(IMAGE_VA..IMAGE_VA + IMAGE_SIZE).contains(&header.peer_entry_va)
             {
                 return Err(fail("production image boot header invalid"));
             }
@@ -3160,7 +3162,7 @@ impl Cpl0Carrier {
         let hardware_interrupts = interrupts || initial_extent_bytes.is_some();
         let plan = carrick_mem::elf::plan_elf_load_bytes_for(bytes, 62)
             .map_err(|e| fail(format!("CPL0 ELF: {e}")))?;
-        if !(IMAGE_VA..IMAGE_VA + 0x10_0000).contains(&plan.entry) {
+        if !(IMAGE_VA..IMAGE_VA + IMAGE_SIZE).contains(&plan.entry) {
             return Err(fail("CPL0 entry outside its supervisor image"));
         }
         let mut ram = GuestRam::new();
@@ -3193,7 +3195,7 @@ impl Cpl0Carrier {
                 .virtual_address
                 .checked_add(segment.memory_size)
                 .ok_or_else(|| fail("CPL0 segment overflow"))?;
-            if segment.virtual_address < IMAGE_VA || end > IMAGE_VA + 0x10_0000 {
+            if segment.virtual_address < IMAGE_VA || end > IMAGE_VA + IMAGE_SIZE {
                 return Err(fail("CPL0 segment outside its supervisor image"));
             }
             let start = segment.file_offset as usize;
@@ -3216,14 +3218,14 @@ impl Cpl0Carrier {
         // and exception stubs, remains the hardware authority.
         let stub_start = carrick_x86::fault_stub_base(LAYOUT);
         let stub_end = carrick_x86::fault_tss_base(LAYOUT);
-        if !(0x20_0000 < stub_start && stub_start < stub_end && stub_end < 0xc0_0000) {
+        if !(IMAGE_GPA + IMAGE_SIZE < stub_start && stub_start < stub_end && stub_end < 0xc0_0000) {
             return Err(fail("CPL0 stub outside direct window"));
         }
         // Retained exception stubs execute from their supervisor alias. The
         // page tables, private IDTs, TSS, stacks and records need write access
         // but must never be executable in that alias.
         for (start, end, write, exec) in [
-            (0x20_0000, stub_start, true, false),
+            (IMAGE_GPA + IMAGE_SIZE, stub_start, true, false),
             (stub_start, stub_end, false, true),
             (stub_end, 0xc0_0000, true, false),
         ] {
@@ -3436,7 +3438,7 @@ impl Cpl0Carrier {
             if words[0] != IRQ_HEADER_MAGIC
                 || words[1..]
                     .iter()
-                    .any(|pc| !(IMAGE_VA..IMAGE_VA + 0x10_0000).contains(pc))
+                    .any(|pc| !(IMAGE_VA..IMAGE_VA + IMAGE_SIZE).contains(pc))
             {
                 return Err(fail("native IRQ header or entry outside image"));
             }
