@@ -2745,6 +2745,27 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         }
     }
 
+    /// Publish the host-loaded task's exact home before its first guest
+    /// instruction, including when that task has never parked in the zone.
+    pub fn publish_loaded_home(&self, slot: SlotId, identity: ThreadIdentity) -> Option<RecordId> {
+        if identity.tid == 0
+            || identity.serial == 0
+            || identity.generation == 0
+            || identity.mm == 0
+            || identity.lifecycle_page == 0
+            || identity.control_slot == 0
+            || self.slot(slot).mm() != identity.mm
+            || self.installed_space(slot) != identity.mm
+            || self.slot(slot).current().is_some()
+        {
+            return None;
+        }
+        if let Some(record) = self.slot(slot).host_record() {
+            return (self.record(record).identity() == identity).then_some(record);
+        }
+        self.current_or_new(slot, identity).ok()
+    }
+
     /// EL1: undo [`Self::current_or_new`] for a new home record that was
     /// never published (a park or preemption that could not complete).
     pub fn discard_unpublished(&self, slot: SlotId, record: RecordId) {

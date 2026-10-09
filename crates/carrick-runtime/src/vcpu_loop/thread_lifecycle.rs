@@ -21,7 +21,7 @@ fn publish_for_page<R>(
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum LifecyclePublication {
-    Published,
+    Published { page: u64, control: u64 },
     HostServed,
 }
 
@@ -38,7 +38,7 @@ fn publish_resolved(
         Err(error) => return Err(error),
     };
     task.publish_lifecycle(page, control);
-    Ok(LifecyclePublication::Published)
+    Ok(LifecyclePublication::Published { page, control })
 }
 
 #[derive(Debug)]
