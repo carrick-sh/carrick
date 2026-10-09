@@ -10,6 +10,7 @@ pub mod ci_receipt;
 pub mod ci_scaler;
 pub mod cli;
 pub mod command;
+pub mod el1_stack;
 pub mod fixtures;
 pub mod guest_image;
 pub mod host_lease;
