@@ -23,6 +23,10 @@ use carrick_el1_abi::{
     HostReadinessEntry, fd_map_lookup,
 };
 use carrick_sched_core::{SlotId, ZoneTables};
+pub use carrick_syscall_abi::{
+    LINUX_POLLERR, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT, LINUX_POLLPRI,
+    LINUX_POLLRDBAND, LINUX_POLLRDNORM, LINUX_POLLWRBAND, LINUX_POLLWRNORM,
+};
 
 // Descriptor mutations and poll snapshots share one short in-ring critical
 // section. No host crossing or blocking wait is made while it is held.
@@ -226,17 +230,6 @@ pub struct PollFd {
     pub events: i16,
     pub revents: i16,
 }
-
-pub const LINUX_POLLIN: i16 = 0x0001;
-pub const LINUX_POLLPRI: i16 = 0x0002;
-pub const LINUX_POLLOUT: i16 = 0x0004;
-pub const LINUX_POLLERR: i16 = 0x0008;
-pub const LINUX_POLLHUP: i16 = 0x0010;
-pub const LINUX_POLLNVAL: i16 = 0x0020;
-pub const LINUX_POLLRDNORM: i16 = 0x0040;
-pub const LINUX_POLLRDBAND: i16 = 0x0080;
-pub const LINUX_POLLWRNORM: i16 = 0x0100;
-pub const LINUX_POLLWRBAND: i16 = 0x0200;
 
 /// Admits standard descriptors 0..2 as host-backed open descriptions in the
 /// existing zone tables for `file_table`.
@@ -681,6 +674,13 @@ mod tests {
             libc::close(pipe_fds[0]);
             libc::close(pipe_fds[1]);
         }
+    }
+
+    #[test]
+    fn poll_event_values_come_from_shared_linux_abi() {
+        assert_eq!(carrick_syscall_abi::LINUX_POLLIN, 0x0001);
+        assert_eq!(carrick_syscall_abi::LINUX_POLLERR, 0x0008);
+        assert_eq!(carrick_syscall_abi::LINUX_POLLNVAL, 0x0020);
     }
 
     fn setup_tables() -> (

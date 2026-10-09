@@ -837,7 +837,7 @@ fn x4_linux_common_entry() {
             assert_eq!(stopped.heads, [(0, 0); 2]);
             assert_eq!(stopped.served, 0);
             assert_eq!(stopped.host_forwards, 0);
-            assert_eq!(carrier.refusal_count(273), 1);
+            assert_eq!(carrier.refusal_count(carrick_abi::NativeNr(273)), 1);
             continue;
         }
         let observed = carrier
@@ -854,7 +854,10 @@ fn x4_linux_common_entry() {
             stopped.host_forwards, 0,
             "refusal is served directly in CPL0 with ENOSYS, no host forward"
         );
-        assert_eq!(carrier.refusal_count(native as u64), 1);
+        assert_eq!(
+            carrier.refusal_count(carrick_abi::NativeNr(native as u64)),
+            1
+        );
     }
 }
 

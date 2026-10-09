@@ -379,6 +379,60 @@ pub const MAX_ZONE_OPEN_FILES: usize = 512;
 /// Linux syscall number and cannot alias an allowed guest forward.
 pub struct HostReadinessCrossing;
 
+/// Result carried beside the x86 CPL0 fault record, before the carrier
+/// applies the unresolved-fault policy.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub enum X86FaultDisposition {
+    PolicyDeclined,
+}
+
+impl X86FaultDisposition {
+    pub const fn raw(self) -> u64 {
+        match self {
+            Self::PolicyDeclined => 6,
+        }
+    }
+
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        match raw {
+            6 => Some(Self::PolicyDeclined),
+            _ => None,
+        }
+    }
+}
+
+/// Millisecond timeout carried by the private readiness request. Negative
+/// values mean no deadline, matching Linux `poll`.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub struct HostReadinessTimeout(i32);
+
+impl HostReadinessTimeout {
+    pub const fn from_wire(raw: u64) -> Option<Self> {
+        let millis = raw as i32;
+        if millis as i64 as u64 == raw {
+            Some(Self(millis))
+        } else {
+            None
+        }
+    }
+
+    pub const fn millis(self) -> i32 {
+        self.0
+    }
+}
+
 impl HostReadinessCrossing {
     pub const NUMBER: u64 = u64::MAX - 0x100;
     pub const MASK_NONE: u64 = 0;
@@ -3643,6 +3697,17 @@ mod tests {
         );
         aperture.set_strict(false);
         assert!(!aperture.is_strict());
+    }
+
+    #[test]
+    fn readiness_timeout_rejects_noncanonical_wire_words() {
+        use super::HostReadinessTimeout;
+        assert_eq!(
+            HostReadinessTimeout::from_wire(u64::MAX).unwrap().millis(),
+            -1
+        );
+        assert_eq!(HostReadinessTimeout::from_wire(7).unwrap().millis(), 7);
+        assert_eq!(HostReadinessTimeout::from_wire(0x1_0000_0000), None);
     }
 
     #[test]

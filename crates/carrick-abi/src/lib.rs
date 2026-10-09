@@ -3755,6 +3755,7 @@ impl From<NsGid> for u32 {
     }
 }
 
+pub use carrick_syscall_abi::PollEvents;
 pub use carrick_syscall_abi::{
     LINUX_EAGAIN, LINUX_ECHILD, LINUX_EFAULT, LINUX_EINVAL, LINUX_ENOSYS, LinuxErrno,
 };
@@ -4772,16 +4773,10 @@ pub const LINUX_LOCK_SH: u64 = 1;
 pub const LINUX_LOCK_EX: u64 = 2;
 pub const LINUX_LOCK_NB: u64 = 4;
 pub const LINUX_LOCK_UN: u64 = 8;
-pub const LINUX_POLLIN: i16 = 0x0001;
-pub const LINUX_POLLOUT: i16 = 0x0004;
-pub const LINUX_POLLERR: i16 = 0x0008;
-pub const LINUX_POLLHUP: i16 = 0x0010;
-pub const LINUX_POLLNVAL: i16 = 0x0020;
-pub const LINUX_POLLRDHUP: i16 = 0x2000;
-pub const LINUX_POLLRDNORM: i16 = 0x0040;
-pub const LINUX_POLLRDBAND: i16 = 0x0080;
-pub const LINUX_POLLWRNORM: i16 = 0x0100;
-pub const LINUX_POLLWRBAND: i16 = 0x0200;
+pub use carrick_syscall_abi::{
+    LINUX_POLLERR, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT, LINUX_POLLRDBAND,
+    LINUX_POLLRDHUP, LINUX_POLLRDNORM, LINUX_POLLWRBAND, LINUX_POLLWRNORM,
+};
 pub const LINUX_TFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
 pub const LINUX_TFD_CLOEXEC: u64 = LINUX_O_CLOEXEC;
 pub const LINUX_TIMER_ABSTIME: u64 = 0x1;
