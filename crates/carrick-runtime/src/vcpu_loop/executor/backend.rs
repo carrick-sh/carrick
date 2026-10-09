@@ -876,13 +876,26 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 .current
                 .as_mut()
                 .ok_or_else(|| TrapError::Hypervisor("HVPatch load lost attached engine".into()))?;
-            engine.reaffirm_resident_task_state_on_live_executor(cpu, &resident.metadata)?;
+            engine
+                .reaffirm_resident_task_state_on_live_executor(cpu, &resident.metadata)
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "resident reaffirmation for {:?} failed: {error}",
+                        task.thread_key()
+                    ))
+                })?;
             engine.adopt_owed_resume_invalidation(resident.owed_invalidation)?;
         } else {
             self.current
                 .as_mut()
                 .ok_or_else(|| TrapError::Hypervisor("HVPatch load lost attached engine".into()))?
-                .overlay_task_state_on_live_executor(cpu)?;
+                .overlay_task_state_on_live_executor(cpu)
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "task overlay for {:?} failed: {error}",
+                        task.thread_key()
+                    ))
+                })?;
         }
         task.binding().service_pending_cow_invalidation(
             &cow_invalidation_observer,
