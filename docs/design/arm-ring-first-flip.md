@@ -498,3 +498,22 @@ The aperture policy is carrier-wide. Later roots in an explicit carrier must
 request the already-held policy; conflicting roots fail admission before
 mapping, and leave the live carrier's control word unchanged. Use a separate
 carrier to run the other setting.
+
+## Shared identity exec dependency (`shared-owner-exec-completion`)
+
+The shared in-ring process owner has no production exec-completion ingress.
+ARM exec is completed by the host runtime and rebinds its host kernel owner,
+not `NativeProcessRuntime`; the CPL0 owner currently has no exec implementation.
+The unused shared `exec_completed` surface and its direct-call tests are removed.
+Identity retirement cannot claim exec integration until a committed-image receipt
+reaches the exact shared process and executing thread in the real syscall path.
+
+That receipt must atomically mark `has_execed` (setpgid EACCES), retain only the
+execing thread under the promoted leader identity, set comm to the executable
+basename, reset clear_child_tid and robust-list registration, and apply the
+capabilities(7) transformation including the calling thread's bounding set.
+Required witnesses use nonleader exec with distinct credentials and two live
+processes through production dispatch and rebind, not direct helper calls.
+Existing credential transformation unit tests prove only ordinary executable
+semantics without file capabilities or securebits; ARM signed integration and
+CPL0 exec remain named dependencies rather than accepted behavior.
