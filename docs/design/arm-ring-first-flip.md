@@ -457,3 +457,8 @@ run and boot image carry the typed policy to HVF aperture initialization.
 The backend does not read process environment, and the newly introduced
 backend environment-read authority-debt cohort is removed. The signed
 witness selects each policy directly, without mutating process environment.
+
+The aperture policy is carrier-wide. Later roots in an explicit carrier must
+request the already-held policy; conflicting roots fail admission before
+mapping, and leave the live carrier's control word unchanged. Use a separate
+carrier to run the other setting.

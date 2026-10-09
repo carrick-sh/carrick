@@ -15,6 +15,8 @@ use super::*;
     ::serde::Serialize,
 )]
 pub struct GuestMappingPlan {
+    /// Resolved policy for root admission into the carrier-wide aperture.
+    pub arm_ring_first: carrick_guest_mem::ArmRingFirst,
     /// The user-mode entry point (real `_start` of the loaded ELF, already
     /// rebased through any PIE bias). When `el0_trampoline_entry` is `None`
     /// this is also the vCPU's initial PC. When the trampoline is installed
@@ -376,6 +378,7 @@ impl GuestMappingPlan {
         }
 
         Ok(Self {
+            arm_ring_first: address_space.arm_ring_first(),
             entry: address_space.entry(),
             initial_stack_pointer: address_space.initial_stack_pointer(),
             el0_trampoline_entry: address_space.el0_trampoline_entry(),
@@ -454,6 +457,29 @@ impl HvfVmState {
         };
         let mut global_plan = match &carrier {
             Some(spec) => {
+                // Carrier control bytes are shared by all live roots. Reject
+                // incompatible policy before admitting this root's mappings.
+                if plan.mappings.iter().any(|mapping| {
+                    mapping.guest_start == carrick_mem::memory::LINUX_EL1_KERNEL_BASE
+                }) {
+                    let host = spec
+                        .carrier_mappings
+                        .host_pointer_for_ipa(
+                            carrick_el1_abi::EL1_APERTURE_CONTROL_BASE,
+                            core::mem::size_of::<carrick_el1_abi::ApertureControl>(),
+                        )
+                        .ok_or_else(|| {
+                            TrapError::Hypervisor("published carrier aperture is not mapped".into())
+                        })?;
+                    // SAFETY: the published carrier retains the aligned EL1
+                    // control mapping for every admitted root's lifetime.
+                    let aperture = unsafe { &*host.cast::<carrick_el1_abi::ApertureControl>() };
+                    crate::hatch::ArmRingFirstHatch::validate_carrier_policy(
+                        aperture,
+                        plan.arm_ring_first,
+                    )
+                    .map_err(|conflict| TrapError::Hypervisor(conflict.to_string()))?;
+                }
                 spec.carrier_mappings.audit()?;
                 audit_plan_against_installed_carrier(plan, &spec.carrier_mappings)?;
                 Some(prepare_global_exec_plan(plan, None)?)
