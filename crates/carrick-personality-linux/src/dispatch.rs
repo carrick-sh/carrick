@@ -25,6 +25,7 @@ pub enum Family {
     FileSeek,
     FilePositioned,
     AllocatorControl,
+    SignalReturn,
     Unported,
 }
 
@@ -380,6 +381,7 @@ fn serve_family<'a, C: EntryContext + 'a>(
         Family::FileSeek => pending.file_seek(),
         Family::FilePositioned => pending.file_positioned(ordinal),
         Family::AllocatorControl => pending.allocator_control(),
+        Family::SignalReturn => FamilyCompletion::Handback,
         Family::Unported => FamilyCompletion::Forward,
     };
     FamilyRun {
@@ -414,6 +416,7 @@ pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
         93 => Family::Lifecycle(LifecycleCall::Exit),
         132 => Family::Lifecycle(LifecycleCall::SigAltStack),
         135 => Family::Lifecycle(LifecycleCall::SigProcMask),
+        139 => Family::SignalReturn,
         99 => Family::Lifecycle(LifecycleCall::SetRobustList),
         178 => Family::Lifecycle(LifecycleCall::GetTid),
         172 => Family::Lifecycle(LifecycleCall::GetPid),
@@ -793,6 +796,7 @@ mod ring_first_tests {
             (98, false, false, CompletionRoute::Forward),
             (98, false, true, CompletionRoute::Forward),
             (98, true, true, CompletionRoute::WithWork),
+            (139, false, false, CompletionRoute::Forward),
             (220, false, false, CompletionRoute::Forward),
             (260, false, false, CompletionRoute::Forward),
             (174, true, false, CompletionRoute::WithWork),

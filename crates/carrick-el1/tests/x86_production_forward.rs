@@ -133,6 +133,7 @@ fn production_x86_family_absences_forward_without_touching_user_memory() {
         ("inotify remove", 255),
         ("lifecycle sigprocmask", 14),
         ("lifecycle sigaltstack", 131),
+        ("signal-return transport", 15),
     ] {
         let call = decode_x86_64(native, args, 0x7fff_0000);
         assert_ne!(call.canonical.raw(), u64::MAX, "{family} must decode");

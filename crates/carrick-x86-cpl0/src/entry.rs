@@ -423,7 +423,7 @@ mod kernel {
 
     /// Host crossing evaluation and set from shared personality.
     pub use carrick_personality_linux::crossing::{
-        evaluate_host_crossing, AllowedHostCrossing, HostCrossingDecision, HostCrossingSet,
+        evaluate_host_crossing, HostCrossingSet,
     };
 
     // The KVM fault fixture owns one exact MM and one host-backed prepared
