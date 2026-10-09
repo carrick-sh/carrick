@@ -1,0 +1,72 @@
+//! signal.return.no-result: sigreturn(2) restores context without a syscall result.
+#![allow(clippy::unwrap_used)]
+use carrick_guest_arch::UserVa;
+use carrick_personality_linux::{lifecycle::UserCopy, signal::*};
+use carrick_signal_core::{SignalSet, policy::SigBlockMask};
+
+struct Native {
+    accumulator: u64,
+    blocked: SigBlockMask,
+}
+impl UserCopy for Native {
+    fn copy_in(&mut self, _: &mut [u8], _: UserVa) -> bool {
+        false
+    }
+    fn copy_out(&mut self, _: UserVa, _: &[u8]) -> bool {
+        false
+    }
+}
+impl<'a> SignalNative<'a> for Native {
+    fn arguments(&self) -> [u64; 6] {
+        [0; 6]
+    }
+    fn process_signals(&mut self) -> Option<&mut dyn ProcessSignals> {
+        None
+    }
+    fn current_blocked(&self) -> SigBlockMask {
+        self.blocked
+    }
+    fn set_current_blocked(&mut self, mask: SigBlockMask) {
+        self.blocked = mask;
+    }
+    fn current_pid(&self) -> u32 {
+        1
+    }
+    fn current_tid(&self) -> u32 {
+        1
+    }
+    fn restore_signal_frame(&mut self) -> Result<u64, i32> {
+        self.accumulator = 0x1234_5678;
+        Ok(1 << 9)
+    }
+}
+#[test]
+fn restored_context_has_no_syscall_result() {
+    let mut native = Native {
+        accumulator: 139,
+        blocked: SigBlockMask::blocking_all_of(SignalSet::default()),
+    };
+    let outcome = invoke(SignalCall::RtSigreturn, &mut native).unwrap();
+    assert!(!matches!(outcome, SignalOutcome::Returned { .. }));
+    assert_eq!(native.accumulator, 0x1234_5678);
+    assert_eq!(native.blocked.signals().bits(), 1 << 9);
+}
+
+#[test]
+fn restored_context_finishes_same_entry_and_retains_return_work() {
+    use carrick_personality_linux::dispatch::{
+        CompletionRoute, FamilyCompletion, completion_route,
+    };
+    assert_eq!(
+        signal_effect(&SignalOutcome::Restored),
+        FamilyCompletion::FrameRestored
+    );
+    assert_eq!(
+        completion_route(FamilyCompletion::FrameRestored, false),
+        CompletionRoute::Served
+    );
+    assert_eq!(
+        completion_route(FamilyCompletion::FrameRestored, true),
+        CompletionRoute::WithWork
+    );
+}
