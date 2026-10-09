@@ -545,3 +545,48 @@ fn lifecycle_window_refuses_records_outside_the_window() {
     assert!(!window.is_zero(outside));
     assert!(!window.clear(outside));
 }
+
+/// Fork the next child while the previous one is quarantined but still
+/// installed on a slot: the new loan may never contain its pages. Then the
+/// previous child leaves its slot and only it is reclaimed.
+fn interleaved_cycles<T: ChildAddressTags>(tags: T, cycles: u64) -> ForkStock<T> {
+    let mut stock = stock(tags, 6, 2);
+    let mut installed: Option<ReservationMm> = None;
+    let cleared = RefCell::new(Vec::new());
+    for cycle in 0..cycles {
+        let child_mm = 302 + cycle;
+        let held = stock.quarantined_tables();
+        let granted = loan(&mut stock, parent(), child_mm, 1, 1)
+            .unwrap_or_else(|refusal| panic!("cycle {cycle}: {refusal:?}"));
+        let issued = stock.pending(CpuId::new(0)).unwrap().child_tables.clone();
+        assert!(
+            issued.iter().all(|page| !held.contains(page)),
+            "cycle {cycle}: reissued a page of an installed quarantined MM"
+        );
+        commit(&mut stock, parent(), granted, 1, 0).unwrap();
+        retire(&mut stock, child_of(granted, 900 + cycle)).unwrap();
+        // The new child is still installed; the previous one has left.
+        let previous = installed.replace(mm(child_mm));
+        let still = installed;
+        let returned = reclaim(&mut stock, |candidate| Some(candidate) != still, &cleared);
+        assert_eq!(returned, usize::from(previous.is_some()), "cycle {cycle}");
+        assert!(stock.is_quarantined(mm(child_mm)));
+        if let Some(previous) = previous {
+            assert!(!stock.is_quarantined(previous));
+        }
+    }
+    assert_eq!(stock.counters().returned_children, cycles - 1);
+    assert_eq!(stock.counters().capacity_refusals, 0);
+    stock
+}
+
+#[test]
+fn interleaved_untagged_cycles_never_reissue_installed_quarantine() {
+    interleaved_cycles(UntaggedRoots, 20);
+}
+
+#[test]
+fn interleaved_asid_cycles_never_reissue_installed_quarantine() {
+    // Two live children at a time: one installed in quarantine, one forking.
+    interleaved_cycles(AsidAllocator::with_limit_for_tests(2), 20);
+}
