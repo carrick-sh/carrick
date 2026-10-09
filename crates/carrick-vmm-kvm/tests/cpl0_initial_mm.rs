@@ -68,14 +68,33 @@ fn initial_root_uses_issued_thread_and_file_table_identity() {
         let mut lease = root_factory.claim(0).expect("root CPU claim");
         assert_eq!(lease.physical_slot().map(|slot| slot.raw()), Some(0));
         assert!(root_factory.claim(0).is_err());
-        let cpu = lease.cpu_mut();
-        cpu.audit_idle().expect("stopped root CPU");
-        cpu.load(root.clone()).expect("load issued root");
-        let saved = cpu
+        lease.cpu_mut().audit_idle().expect("stopped root CPU");
+        lease
+            .cpu_mut()
+            .load(root.clone())
+            .expect("load issued root");
+        let mut wrong = root.binding().task();
+        wrong.execution = carrick_guest_arch::ExecutionGeneration::new(
+            std::num::NonZeroU64::new(2).expect("other execution"),
+        );
+        let unknown = carrick_vmm_kvm::carrier_cpu::CarrierRunExit::PhysicalDoorbell {
+            port: 0xffff,
+            data: vec![],
+        };
+        let wrong_error = lease
+            .service_physical_doorbell(wrong, &unknown)
+            .expect_err("wrong task cannot enter physical service");
+        assert!(wrong_error.to_string().contains("task generation"));
+        let port_error = lease
+            .service_physical_doorbell(root.binding().task(), &unknown)
+            .expect_err("unknown physical crossing must fail closed");
+        assert!(port_error.to_string().contains("unexpected physical"));
+        let saved = lease
+            .cpu_mut()
             .save_and_detach(root.binding().task())
             .expect("save issued root");
         assert_eq!(saved.state(), root.state());
-        cpu.audit_idle().expect("detached root CPU");
+        lease.cpu_mut().audit_idle().expect("detached root CPU");
     })
     .join()
     .expect("root worker ownership transfer");

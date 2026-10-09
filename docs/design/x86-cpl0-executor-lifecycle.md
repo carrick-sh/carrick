@@ -286,3 +286,33 @@ The guest still sees ENOSYS for unfinished memory and signal effects, but
 these are no longer classified as host-forward refusals in this branch. The
 new empty-stdin
 read and poll witnesses are red until the continuation and readiness work.
+
+### Stopped forward-frame custody
+
+The CPL0 forward doorbell points at a `NativeFrame` on that physical CPU's
+private supervisor stack. A blocked guest must release its executor, so a
+later task can reuse the stack before the first task resumes. The KVM adapter
+copies the complete checked frame into an owned `ProductionForwardFrame`
+token, recording the exact task generation, MM context, physical slot and
+stack address. A worker restores the whole frame and writes only the final
+return register after reloading that task and revalidating its stopped MM
+binding. Until the supervisor stack and GS/CPU metadata are rebased for
+cross-slot migration, a frame-bearing task remains eligible only on the
+original guest CPU. This is scheduling affinity, not a vCPU handle owned by
+the task: the worker and vCPU still return to the pool while the task waits.
+
+### Production pool handoff
+
+The KVM initial-process path now submits its root through the shared binding
+directory and scheduler, then starts the shared executor pool with two physical
+KVM CPUs. Each worker leases the exact submitted task, restores its stopped
+CPU state, and returns that state to the task after a typed carrier exit. The
+root remains eligible for guest CPU 0 while its CPL0 stack and per-CPU metadata
+are slot-specific; this does not give it permanent ownership of the vCPU.
+The peer enters the guest idle path with the pool's publish/recheck/kick
+handshake, so queue publication and shutdown can interrupt `KVM_RUN` without
+a host polling thread. The production restore reapplies the CPL0 descriptor
+tables and syscall MSRs after the portable register image, which otherwise
+replaces them with fixture bootstrap values. A terminal root outcome closes
+the scheduler and joins the pool. Forwarded blocking outcomes still need the
+owned-continuation route in the next milestone.

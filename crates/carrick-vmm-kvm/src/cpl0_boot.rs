@@ -1,7 +1,7 @@
 //! Shared CPL0 KVM carrier and its retained guest-MM/metadata backing.
 //! Hardware fixtures and the initial production process use the same image;
 //! fixture observation ports remain separate from the production transport.
-use crate::carrier_cpu::KvmCarrierCpu;
+use crate::carrier_cpu::{CarrierRunExit, KvmCarrierCpu};
 use crate::carrier_memory::{
     BackingExtent, BackingHandle, CarrierMachine, CarrierMemory, InventoryTransaction,
     PreparedBacking,
@@ -1084,7 +1084,71 @@ pub struct ProductionCpuLease {
     _custody: Arc<std::sync::Mutex<Cpl0HostCustody>>,
 }
 
+/// A forwarded frame copied out of a physical CPU's private CPL0 stack.
+/// Another task may reuse that stack while this one waits; the frame is
+/// restored only after its exact task and MM binding is loaded again.
+pub struct ProductionForwardFrame {
+    task: carrick_guest_arch::TaskIdentity,
+    slot: carrick_guest_arch::CpuId,
+    address: u64,
+    execution: ForwardExecution,
+    frame: NativeFrame,
+}
+
 impl ProductionCpuLease {
+    pub fn run_idle_peer(&mut self) -> Result<CarrierRunExit, TrapError> {
+        self.cpu.run_idle_peer()
+    }
+
+    pub fn audit_unloaded_peer(&self) -> Result<(), TrapError> {
+        self.cpu.audit_unloaded_peer()
+    }
+
+    pub fn service_idle_peer_doorbell(
+        &mut self,
+        exit: &CarrierRunExit,
+    ) -> Result<Option<GuestExitStatus>, TrapError> {
+        let CarrierRunExit::PhysicalDoorbell { port, .. } = exit else {
+            return Err(fail("idle peer service requires physical doorbell"));
+        };
+        let mut custody = self
+            ._custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        self.cpu.with_idle_peer_vcpu(|vcpu| {
+            let lease = StoppedCpuLease {
+                cpu: carrick_guest_arch::CpuId::new(1),
+                vcpu,
+            };
+            match *port {
+                OWNER_GRANT_PORT => {
+                    custody.owner_grant_crossings = custody
+                        .owner_grant_crossings
+                        .checked_add(1)
+                        .ok_or_else(|| fail("physical crossing counter exhausted"))?;
+                    custody.service_anonymous_grant(&lease)?;
+                    Ok(None)
+                }
+                carrick_el1_abi::FORK_STOCK_PORT => {
+                    custody.owner_grant_crossings = custody
+                        .owner_grant_crossings
+                        .checked_add(1)
+                        .ok_or_else(|| fail("physical crossing counter exhausted"))?;
+                    custody.service_fork_stock(&lease)?;
+                    Ok(None)
+                }
+                carrick_el1_abi::NATIVE_ROOT_EXIT_PORT => {
+                    custody.root_exit_crossings = custody
+                        .root_exit_crossings
+                        .checked_add(1)
+                        .ok_or_else(|| fail("physical crossing counter exhausted"))?;
+                    custody.service_root_exit(&lease).map(Some)
+                }
+                _ => Err(fail("unexpected idle peer physical doorbell")),
+            }
+        })
+    }
+
     pub fn cpu_mut(&mut self) -> &mut KvmCarrierCpu {
         &mut self.cpu
     }
@@ -1092,9 +1156,217 @@ impl ProductionCpuLease {
     pub fn physical_slot(&self) -> Option<carrick_guest_arch::CpuId> {
         self.cpu.physical_slot()
     }
+
+    pub fn capture_forward<R>(
+        &mut self,
+        task: carrick_guest_arch::TaskIdentity,
+        forward: impl FnOnce(&mut ForwardVenue<'_>, &NativeFrame) -> Result<R, TrapError>,
+    ) -> Result<(R, ProductionForwardFrame), TrapError> {
+        let slot = self
+            .physical_slot()
+            .ok_or_else(|| fail("production CPU has no physical slot"))?;
+        let mut custody = self
+            ._custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        self.cpu.with_stopped_vcpu(task, |vcpu| {
+            let address = vcpu.get_gpr(X86Reg::Rax)?;
+            let stack_end = custody.binding(slot).kernel_stack + 16;
+            if address & 7 != 0
+                || address < stack_end - 0x1_0000
+                || address
+                    .checked_add(size_of::<NativeFrame>() as u64)
+                    .is_none_or(|end| end > stack_end)
+            {
+                return Err(fail("forward frame outside private kernel stack"));
+            }
+            let ptr = custody
+                .ram
+                .host_ptr(address - DIRECT_VA, size_of::<NativeFrame>())
+                .ok_or_else(|| fail("forward frame backing"))?
+                .cast::<NativeFrame>();
+            // SAFETY: KVM_RUN stopped after the exact frame publication; no
+            // guest instruction runs while this copy is made.
+            let frame = unsafe { *ptr };
+            let mut venue = ForwardVenue::new(&mut custody, StoppedCpuLease { cpu: slot, vcpu })?;
+            let execution = venue.execution;
+            let result = forward(&mut venue, &frame)?;
+            custody.host_forwards = custody
+                .host_forwards
+                .checked_add(1)
+                .ok_or_else(|| fail("host forward counter exhausted"))?;
+            Ok((
+                result,
+                ProductionForwardFrame {
+                    task,
+                    slot,
+                    address,
+                    execution,
+                    frame,
+                },
+            ))
+        })
+    }
+
+    pub fn complete_forward(
+        &mut self,
+        task: carrick_guest_arch::TaskIdentity,
+        token: ProductionForwardFrame,
+        value: i64,
+    ) -> Result<(), TrapError> {
+        if token.task != task || self.physical_slot() != Some(token.slot) {
+            return Err(fail("forward completion task or physical slot changed"));
+        }
+        let mut custody = self
+            ._custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        self.cpu.with_stopped_vcpu(task, |vcpu| {
+            let lease = StoppedCpuLease {
+                cpu: token.slot,
+                vcpu,
+            };
+            let current = ForwardVenue::new(&mut custody, lease)?.execution;
+            if current.binding != token.execution.binding
+                || current.context != token.execution.context
+            {
+                return Err(fail("forward completion MM binding changed"));
+            }
+            let ptr = custody
+                .ram
+                .host_ptr(token.address - DIRECT_VA, size_of::<NativeFrame>())
+                .ok_or_else(|| fail("forward completion frame backing"))?
+                .cast::<NativeFrame>();
+            let mut frame = token.frame;
+            frame.rax = value as u64;
+            // SAFETY: the exact stopped task owns this private kernel stack
+            // after reloading its saved CPU image. Restore the whole frame
+            // because another task may have used the stack during the wait.
+            unsafe { ptr.write(frame) };
+            Ok(())
+        })
+    }
+
+    /// Service one physical doorbell on the stopped worker CPU. Task
+    /// identity is supplied by the executor's claimed binding, never by the
+    /// doorbell payload or the physical slot.
+    pub fn service_physical_doorbell(
+        &mut self,
+        task: carrick_guest_arch::TaskIdentity,
+        exit: &CarrierRunExit,
+    ) -> Result<Option<GuestExitStatus>, TrapError> {
+        let CarrierRunExit::PhysicalDoorbell { port, .. } = exit else {
+            return Err(fail("physical service requires a doorbell exit"));
+        };
+        let slot = self
+            .physical_slot()
+            .ok_or_else(|| fail("production CPU has no physical slot"))?;
+        let mut custody = self
+            ._custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        self.cpu.with_stopped_vcpu(task, |vcpu| {
+            let lease = StoppedCpuLease { cpu: slot, vcpu };
+            match *port {
+                OWNER_GRANT_PORT => {
+                    custody.owner_grant_crossings = custody
+                        .owner_grant_crossings
+                        .checked_add(1)
+                        .ok_or_else(|| fail("physical crossing counter exhausted"))?;
+                    custody.service_anonymous_grant(&lease)?;
+                    Ok(None)
+                }
+                carrick_el1_abi::FORK_STOCK_PORT => {
+                    custody.owner_grant_crossings = custody
+                        .owner_grant_crossings
+                        .checked_add(1)
+                        .ok_or_else(|| fail("physical crossing counter exhausted"))?;
+                    custody.service_fork_stock(&lease)?;
+                    Ok(None)
+                }
+                carrick_el1_abi::NATIVE_ROOT_EXIT_PORT => {
+                    custody.root_exit_crossings = custody
+                        .root_exit_crossings
+                        .checked_add(1)
+                        .ok_or_else(|| fail("physical crossing counter exhausted"))?;
+                    custody.service_root_exit(&lease).map(Some)
+                }
+                _ => Err(fail("unexpected physical production doorbell")),
+            }
+        })
+    }
 }
 
 impl ProductionCpuFactory {
+    pub fn initial_execution_witness(&self) -> Result<(u64, u64), TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        Ok((
+            custody
+                .binding(carrick_guest_arch::CpuId::new(0))
+                .entries
+                .load(Ordering::Acquire),
+            custody.host_forwards,
+        ))
+    }
+
+    pub fn anonymous_private_pages(&self) -> Result<u64, TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        Ok(custody.private_anonymous_witness.private_pages())
+    }
+
+    pub fn anonymous_private_mms(
+        &self,
+    ) -> Result<Vec<crate::cpl0_private_witness::PrivateAnonymousMmEvidence>, TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        Ok(custody.private_anonymous_witness.rows())
+    }
+
+    pub fn cross_mm_private_aliases(&self) -> Result<u64, TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        Ok(custody.private_anonymous_witness.cross_mm_private_aliases())
+    }
+
+    pub fn peer_active_private_grants(&self) -> Result<u64, TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        Ok(custody
+            .private_anonymous_witness
+            .peer_active_private_grants())
+    }
+
+    pub fn physical_crossing_counts(
+        &self,
+    ) -> Result<[(PhysicalCrossingFamily, u64); 2], TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        Ok([
+            (
+                PhysicalCrossingFamily::OwnerGrant,
+                custody.owner_grant_crossings,
+            ),
+            (
+                PhysicalCrossingFamily::RootExit,
+                custody.root_exit_crossings,
+            ),
+        ])
+    }
+
     pub fn claim(&self, slot: usize) -> Result<ProductionCpuLease, TrapError> {
         let mut cpus = self.cpus.lock().map_err(|_| fail("CPU factory poisoned"))?;
         let cpu = cpus

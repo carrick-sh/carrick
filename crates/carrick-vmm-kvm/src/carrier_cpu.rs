@@ -2,7 +2,7 @@
 use carrick_hal::guest_arch_binding::{GuestArchBinding, core_arch::TaskIdentity};
 use carrick_hal::threaded::X86_TASK_RESUME_PAYLOAD_LEN;
 use carrick_hal::{HvVcpu, HvVm, TrapError, VcpuExit};
-use carrick_x86::{BringupLayout, X86VcpuSnapshot, arch_context::X86ArchContext};
+use carrick_x86::{BringupLayout, X86Vcpu, X86VcpuSnapshot, arch_context::X86ArchContext};
 
 mod sealed {
     pub trait Sealed {}
@@ -23,6 +23,14 @@ pub struct KvmCpuIo {
     _vm: crate::KvmVm,
     layout: BringupLayout,
     production_run: Option<crate::cpl0_boot::ProductionRunContext>,
+    production_static: Option<ProductionCpuStatic>,
+}
+
+struct ProductionCpuStatic {
+    sregs: kvm_bindings::kvm_sregs,
+    lstar: u64,
+    star: u64,
+    sfmask: u64,
 }
 impl sealed::Sealed for KvmCpuIo {}
 impl CarrierCpuIo for KvmCpuIo {
@@ -41,7 +49,27 @@ impl CarrierCpuIo for KvmCpuIo {
             [0; 4],
             [0; 4],
             [0; 4],
-        )
+        )?;
+        if let Some(static_state) = &self.production_static {
+            let mut sregs = self
+                .vcpu
+                .fd()
+                .get_sregs()
+                .map_err(|error| boundary_error(&error.to_string()))?;
+            sregs.gdt = static_state.sregs.gdt;
+            sregs.idt = static_state.sregs.idt;
+            sregs.tr = static_state.sregs.tr;
+            sregs.ldt = static_state.sregs.ldt;
+            sregs.apic_base = static_state.sregs.apic_base;
+            self.vcpu
+                .fd()
+                .set_sregs(&sregs)
+                .map_err(|error| boundary_error(&error.to_string()))?;
+            self.vcpu
+                .set_syscall_msrs(static_state.lstar, static_state.star, static_state.sfmask)
+                .map_err(|error| boundary_error(&error.to_string()))?;
+        }
+        Ok(())
     }
     fn run(&mut self) -> Result<VcpuExit, TrapError> {
         if let Some(context) = &self.production_run {
@@ -123,6 +151,53 @@ pub struct KvmCarrierCpu<I: CarrierCpuIo = KvmCpuIo> {
     custody: Custody,
 }
 impl KvmCarrierCpu<KvmCpuIo> {
+    /// Run the carrier's physical peer while no host task lease is claimed.
+    /// This lane has no Linux task identity; only physical doorbells may be
+    /// served until the in-guest scheduler hands a task back to the host.
+    pub(crate) fn run_idle_peer(&mut self) -> Result<CarrierRunExit, TrapError> {
+        self.audit_unloaded_peer()?;
+        if self.physical_slot() != Some(carrick_guest_arch::CpuId::new(1)) {
+            return Err(boundary_error(
+                "only the physical peer has idle guest entry",
+            ));
+        }
+        CarrierRunExit::from_raw(self.io.run()?)
+    }
+
+    pub(crate) fn with_idle_peer_vcpu<R>(
+        &mut self,
+        service: impl FnOnce(&mut crate::KvmVcpu) -> Result<R, TrapError>,
+    ) -> Result<R, TrapError> {
+        self.audit_unloaded_peer()?;
+        if self.physical_slot() != Some(carrick_guest_arch::CpuId::new(1)) {
+            return Err(boundary_error("physical idle service requires peer slot"));
+        }
+        service(&mut self.io.vcpu)
+    }
+
+    pub(crate) fn audit_unloaded_peer(&self) -> Result<(), TrapError> {
+        if self.physical_slot() != Some(carrick_guest_arch::CpuId::new(1))
+            || !matches!(self.custody, Custody::Idle)
+        {
+            return Err(boundary_error("physical peer owns a host task"));
+        }
+        Ok(())
+    }
+    /// Lend the stopped production vCPU to its physical crossing service.
+    /// The caller supplies the exact task generation that was loaded before
+    /// KVM_RUN; a physical slot cannot manufacture a Linux task identity.
+    pub(crate) fn with_stopped_vcpu<R>(
+        &mut self,
+        task: TaskIdentity,
+        service: impl FnOnce(&mut crate::KvmVcpu) -> Result<R, TrapError>,
+    ) -> Result<R, TrapError> {
+        if !matches!(self.custody, Custody::Loaded { binding, .. } if binding.task() == task) {
+            return Err(boundary_error(
+                "physical service requires its loaded task generation",
+            ));
+        }
+        service(&mut self.io.vcpu)
+    }
     pub fn physical_slot(&self) -> Option<carrick_guest_arch::CpuId> {
         self.io
             .production_run
@@ -143,6 +218,7 @@ impl KvmCarrierCpu<KvmCpuIo> {
             _vm: vm,
             layout,
             production_run: None,
+            production_static: None,
         })
     }
 
@@ -152,11 +228,27 @@ impl KvmCarrierCpu<KvmCpuIo> {
         layout: BringupLayout,
         production_run: crate::cpl0_boot::ProductionRunContext,
     ) -> Result<Self, TrapError> {
+        let static_state = ProductionCpuStatic {
+            sregs: vcpu
+                .fd()
+                .get_sregs()
+                .map_err(|error| boundary_error(&error.to_string()))?,
+            lstar: vcpu
+                .read_msr(0xc000_0082)
+                .map_err(|error| boundary_error(&error.to_string()))?,
+            star: vcpu
+                .read_msr(0xc000_0081)
+                .map_err(|error| boundary_error(&error.to_string()))?,
+            sfmask: vcpu
+                .read_msr(0xc000_0084)
+                .map_err(|error| boundary_error(&error.to_string()))?,
+        };
         Self::new(KvmCpuIo {
             vcpu,
             _vm: vm,
             layout,
             production_run: Some(production_run),
+            production_static: Some(static_state),
         })
     }
 }
@@ -224,11 +316,16 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
             } => (binding, resume),
             _ => return Err(boundary_error("carrier run lost loaded task custody")),
         };
-        let state = match self
-            .io
-            .read_image()
-            .and_then(|image| X86ArchContext::capture(binding, &image, resume))
-        {
+        let state = match self.io.read_image().and_then(|image| {
+            X86ArchContext::capture(binding, &image, resume).map_err(|error| {
+                let context = binding.context();
+                boundary_error(&format!(
+                    "stopped CPU image after {exit:?}: {error}; expected root {:#x}, actual CR3 {:#x}, RSP {:#x}, saved GPR7 {:#x}, expected MM {}, context {}",
+                    context.root.address().raw(), image.cr3, image.rsp, image.gprs[7],
+                    context.mm.raw(), context.generation.raw()
+                ))
+            })
+        }) {
             Ok(state) => state,
             Err(error) => {
                 self.custody = Custody::Poisoned;
