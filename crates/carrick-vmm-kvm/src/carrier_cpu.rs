@@ -151,6 +151,11 @@ pub struct KvmCarrierCpu<I: CarrierCpuIo = KvmCpuIo> {
     custody: Custody,
 }
 impl KvmCarrierCpu<KvmCpuIo> {
+    pub(crate) fn arm_idle_kick(&mut self, kick: &crate::KvmKickHandle) -> Result<(), TrapError> {
+        self.audit_unloaded_peer()?;
+        self.io.vcpu.arm_idle_kick(kick);
+        Ok(())
+    }
     /// Run the carrier's physical peer while no host task lease is claimed.
     /// This lane has no Linux task identity; only physical doorbells may be
     /// served until the in-guest scheduler hands a task back to the host.

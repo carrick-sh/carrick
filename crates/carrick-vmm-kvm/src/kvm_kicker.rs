@@ -19,7 +19,17 @@
 //! the Dekker handshake with the fork / page-table coordinators is SeqCst on
 //! both sides.
 
-use std::sync::Once;
+use std::sync::{
+    Arc, Mutex, Once,
+    atomic::{AtomicU8, Ordering},
+};
+
+#[derive(Clone, Copy)]
+struct IdleRunExitByte(*mut u8);
+
+// SAFETY: the mapped KVM byte is installed and removed under the idle-kick
+// mutex. Its owner does not recycle the vCPU until after removal.
+unsafe impl Send for IdleRunExitByte {}
 
 /// The signal carrick uses to force a vCPU out of `KVM_RUN`.
 ///
@@ -71,6 +81,7 @@ pub fn install_kvm_kick_handler() {
 pub struct KvmKickHandle {
     /// The owning vCPU thread's pthread id (the kick target).
     tid: libc::pthread_t,
+    idle_exit: Arc<Mutex<Option<IdleRunExitByte>>>,
 }
 
 impl KvmKickHandle {
@@ -85,12 +96,48 @@ impl KvmKickHandle {
         install_kvm_kick_handler();
         // SAFETY: `pthread_self` is always safe and returns this thread's id.
         let tid = unsafe { libc::pthread_self() };
-        Self { tid }
+        Self {
+            tid,
+            idle_exit: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Publish the KVM_RUN byte before the scheduler's last runnable check.
+    /// A kick after this point survives even if its signal precedes KVM_RUN.
+    pub(crate) fn arm_idle_run(&self, immediate_exit: &mut u8) {
+        let mut armed = self
+            .idle_exit
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *immediate_exit = 0;
+        *armed = Some(IdleRunExitByte(immediate_exit as *mut u8));
+    }
+
+    /// Revoke the mapped-byte publication after KVM_RUN returns or idle is cancelled.
+    pub fn disarm_idle_run(&self) {
+        let mut armed = self
+            .idle_exit
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(byte) = armed.take() {
+            // SAFETY: the pointer was published from the live vCPU's mmap and
+            // the owner disarms it before that mapping can be recycled.
+            unsafe { AtomicU8::from_ptr(byte.0).store(0, Ordering::SeqCst) };
+        }
     }
 }
 
 impl carrick_hal::VcpuKick for KvmKickHandle {
     fn kick(&self) {
+        let armed = self
+            .idle_exit
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(byte) = *armed {
+            // SAFETY: the arm holds the vCPU mapping alive through disarm;
+            // the mutex serializes this write with disarm and recycling.
+            unsafe { AtomicU8::from_ptr(byte.0).store(1, Ordering::SeqCst) };
+        }
         // SAFETY: `pthread_kill` with a live pthread id + a valid signal. A kick
         // to a thread that has already exited returns ESRCH, which we ignore (a
         // missed kick is caught at the next syscall boundary, never UB).
@@ -115,6 +162,19 @@ mod tests {
         InGuestFlag, VcpuKick, VcpuLeaseDrainPoll, VcpuRegistrationEnrollment, VcpuRegistry,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn idle_kick_survives_signal_before_kvm_run() {
+        let handle = KvmKickHandle::for_current_thread();
+        let mut immediate_exit = 0_u8;
+        handle.arm_idle_run(&mut immediate_exit);
+        std::thread::scope(|scope| {
+            scope.spawn(|| handle.kick()).join().expect("kick thread");
+        });
+        assert_eq!(immediate_exit, 1, "KVM_RUN must see the pre-entry kick");
+        handle.disarm_idle_run();
+        assert_eq!(immediate_exit, 0, "task entry must not inherit idle kick");
+    }
 
     /// A pure-data stand-in for a real `KvmKickHandle`: it records nothing and
     /// kicks nothing, so the registry bookkeeping tests run on ANY host (no
