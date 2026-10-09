@@ -137,3 +137,23 @@ crossings. The GNU fixture gains a loader-only mode without fork; its new
 signed bindings require completing libc calls, file-backed mmap forwarding,
 exit forwarding and exact getuid policy counters. Final signed verification
 and director-owned KVM comparison remain pending.
+
+### Loader counter correction
+
+The first second-review signed recipe finishes in 247.74s. Both loader-only
+programs successfully return the expected output and policy getuid counters,
+but their new tests fail on an incorrect requirement for getpid personality
+accounting. The default mailbox identity shim reads the process PID and
+returns before personality dispatch. Its existing bytecode tests prove this
+path: `shim_dispatches_only_process_identity` and
+`mailbox_vector_retains_identity_fast_paths_when_enabled` both pass.
+The corrected witness requires a positive guest PID and exactly zero
+refusal, served and forwarded personality counters for getpid. Other loader,
+I/O, mmap, getuid and exit assertions are retained. This changed host witness
+requires a new signed artifact; the guest/runtime and published fixture input
+identity remain unchanged. The failed artifact and dSYM are preserved as
+`target/ringswitch-rereview-counter-red-signed`; its SHA-256 is
+`0287547b7483eb522a45ba2fd5fc05234fd8f615ffebfa57ec3024cdda893774`.
+The `re-review-counter-red-*` records retain the failing assertions, exact
+counters, artifact identities, clean admission and zero-survivor cleanup.
+Signed verification of the corrected witness remains pending.
