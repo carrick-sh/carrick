@@ -631,7 +631,13 @@ mod kernel {
             OwnerFaultSupplyOutcome::PolicyDeclined => {
                 if let Some(rt) = native_process::runtime_opt() {
                     let segv = carrick_personality_linux::signal::policy::Signal::SEGV;
-                    let action = rt.root_signals().action(segv);
+                    use carrick_el1::personality::thread_setup::LifecycleVenue;
+                    let Some(signals) = rt.current_signals(task) else { return 6; };
+                    let Some(thread) = GuestLifecycleVenue.thread(task) else { return 6; };
+                    let blocked = carrick_personality_linux::signal::policy::SigBlockMask::blocking_all_of(
+                        carrick_personality_linux::signal::SignalSet::from_bits(thread.slot.blocked().0),
+                    );
+                    let action = signals.forced_action(segv, blocked);
                     if let carrick_personality_linux::signal::policy::Disposition::Handler(handler) = action.disposition {
                         let mut native_frame = carrick_el1::isa::x86::context::native::NativeFrame {
                             r15: frame.saved_gprs[0],
@@ -653,11 +659,11 @@ mod kernel {
                         };
                         let params = carrick_guest_arch::SignalFrameParams {
                             signum: 11,
-                            sigcode: 1,
+                            sigcode: if fault.present { 2 } else { 1 },
                             fault_addr: far,
                             handler: carrick_guest_arch::UserVa::new(handler.0),
                             restorer: action.restorer.map(|r| carrick_guest_arch::UserVa::new(r.0)),
-                            mask: 0,
+                            mask: blocked.signals().bits(),
                             sp: carrick_guest_arch::UserVa::new(frame.rsp),
                         };
                         let mut copy = carrick_el1::file::ValidatedCopy {
@@ -665,13 +671,19 @@ mod kernel {
                             validator: &carrick_el1::file::HardwareValidator,
                         };
                         let mut backend = carrick_el1::isa::x86::X86Backend;
-                        if carrick_guest_arch::SignalBackend::setup_signal_frame(
-                            &mut backend,
+                        if backend.setup_fault_signal_frame(
                             &mut native_frame,
                             params,
+                            frame.rip,
+                            frame.rflags,
                             None,
                             &mut |va, bytes| carrick_personality_linux::lifecycle::UserCopy::copy_out(&mut copy, va, bytes),
                         ).is_ok() {
+                            let mut handler_mask = blocked.signals().union(action.mask);
+                            if !action.flags.nodefer { handler_mask = handler_mask.with(segv); }
+                            let _ = thread.slot.store_blocked_then_read_pending(
+                                carrick_el1_abi::BlockedMask(handler_mask.bits()), thread.slot.pending(),
+                            );
                             frame.rip = native_frame.rcx;
                             frame.rsp = native_frame.rsp;
                             frame.saved_gprs[14] = native_frame.rdi;

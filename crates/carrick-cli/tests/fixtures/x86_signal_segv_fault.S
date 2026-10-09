@@ -10,7 +10,7 @@ _start:
     movq $0x04000004, sa_act+8(%rip)
     lea restorer(%rip), %rax
     mov %rax, sa_act+16(%rip)
-    movq $0, sa_act+24(%rip)
+    movq $2048, sa_act+24(%rip)
 
     # rt_sigaction(SIGSEGV=11, &sa_act, NULL, 8)
     mov $13, %rax         # SYS_rt_sigaction
@@ -22,11 +22,29 @@ _start:
     test %rax, %rax
     jnz fail
 
+    # Block USR1 before the fault; the frame must preserve that mask.
+    mov $14, %rax
+    xor %rdi, %rdi
+    lea mask_before(%rip), %rsi
+    xor %rdx, %rdx
+    mov $8, %r10
+    syscall
+    test %rax, %rax
+    jnz fail
+
     # 2. Deliberate fault: dereference NULL pointer
     xor %rax, %rax
 fault_insn:
     movb (%rax), %bl
 resume_point:
+    mov $14, %rax
+    xor %rdi, %rdi
+    xor %rsi, %rsi
+    lea observed_mask(%rip), %rdx
+    mov $8, %r10
+    syscall
+    cmpq $512, observed_mask(%rip)
+    jne fail
     # 3. Write 'C\n'
     mov $1, %rax
     mov $1, %rdi
@@ -38,8 +56,26 @@ resume_point:
     jmp exit
 
 handler:
+    # A fault must save the architectural RIP, rather than the last syscall RCX.
+    lea fault_insn(%rip), %rax
+    cmp %rax, 168(%rdx)
+    jne fail
+    cmpl $1, 8(%rsi)          # SEGV_MAPERR for unmapped NULL
+    jne fail
     # %rdi = signum (11), %rsi = &siginfo, %rdx = &ucontext
-    # Write 'S'
+    cmpq $512, 296(%rdx)     # saved uc_sigmask
+    jne fail
+    push %rdx
+    mov $14, %rax
+    xor %rdi, %rdi
+    xor %rsi, %rsi
+    lea observed_mask(%rip), %rdx
+    mov $8, %r10
+    syscall
+    pop %rdx
+    cmpq $3584, observed_mask(%rip) # USR1 | SEGV | sa_mask USR2
+    jne fail
+    # Write 'S' 
     push %rdx
     mov $1, %rax
     mov $1, %rdi
@@ -69,6 +105,10 @@ exit:
 .align 8
 sa_act:
     .space 32
+mask_before:
+    .quad 512
+observed_mask:
+    .quad 0
 
 .section .rodata
 msg_s:

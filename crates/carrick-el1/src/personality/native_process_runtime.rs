@@ -291,15 +291,27 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
     pub fn zone(&self) -> &'a ZoneTables<C> {
         self.zone
     }
-    pub fn root_signals(
+    /// Snapshot the sighand of the exact faulting task incarnation.
+    pub fn current_signals(
         &self,
-    ) -> NativeProcessSignals<carrick_personality_linux::abi::signal::LinuxSiginfo> {
+        current: &CurrentTask,
+    ) -> Option<NativeProcessSignals<carrick_personality_linux::abi::signal::LinuxSiginfo>> {
+        let binding = super::common_entry::execution_binding(current);
+        let key = TaskKey {
+            id: TaskId::from_abi_positive(i32::try_from(binding.task.raw()).ok()?).ok()?,
+            serial: TaskSerial::from_raw_u64(binding.generation.raw())?,
+        };
         let graph = self.graph.lock();
-        let row = graph
-            .owner
-            .task(graph.root_key)
-            .expect("root task must exist");
-        row.native().resources().signals.clone()
+        Some(
+            graph
+                .owner
+                .task(key)
+                .ok()?
+                .native()
+                .resources()
+                .signals
+                .clone(),
+        )
     }
     #[allow(clippy::too_many_arguments)]
     pub fn admit_fresh_root<B: carrick_mmu_core::owner_mmu::OwnerForkMmu>(

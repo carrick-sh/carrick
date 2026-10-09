@@ -186,15 +186,17 @@ impl RtSigframe {
     }
 }
 
-impl SignalBackend for X86Backend {
+impl X86Backend {
     #[inline(never)]
-    fn setup_signal_frame<'a>(
+    pub fn setup_fault_signal_frame<'a>(
         &mut self,
         frame: &mut NativeFrame,
         params: SignalFrameParams,
+        resume_pc: u64,
+        resume_flags: u64,
         siginfo: Option<&'a [u8]>,
         copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
-    ) -> Result<UserVa, Self::Error> {
+    ) -> Result<UserVa, ArchError> {
         // 1. Determine stack location
         // On x86_64, user stack has a 128-byte red zone:
         let sp = params.sp.raw().wrapping_sub(128);
@@ -226,8 +228,8 @@ impl SignalBackend for X86Backend {
         rtsigframe.uc.uc_mcontext.rax = frame.rax;
         rtsigframe.uc.uc_mcontext.rcx = frame.rcx;
         rtsigframe.uc.uc_mcontext.rsp = frame.rsp;
-        rtsigframe.uc.uc_mcontext.rip = frame.rcx; // saved RIP from syscall entry
-        rtsigframe.uc.uc_mcontext.eflags = frame.r11; // saved RFLAGS from syscall entry
+        rtsigframe.uc.uc_mcontext.rip = resume_pc; // saved RIP from syscall entry
+        rtsigframe.uc.uc_mcontext.eflags = resume_flags; // saved RFLAGS from syscall entry
         rtsigframe.uc.uc_mcontext.cs = 0x33;
 
         // Populate siginfo
@@ -261,6 +263,18 @@ impl SignalBackend for X86Backend {
         frame.rax = 0;
 
         Ok(UserVa::new(new_sp))
+    }
+}
+
+impl SignalBackend for X86Backend {
+    fn setup_signal_frame<'a>(
+        &mut self,
+        frame: &mut NativeFrame,
+        params: SignalFrameParams,
+        siginfo: Option<&'a [u8]>,
+        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
+    ) -> Result<UserVa, Self::Error> {
+        self.setup_fault_signal_frame(frame, params, frame.rcx, frame.r11, siginfo, copy_out)
     }
 
     #[inline(never)]
