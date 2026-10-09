@@ -918,7 +918,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         group: Option<NonZeroU32>,
         selector: carrick_personality_linux::signal::SignalThreadSelector,
         sig: i32,
-        info: Option<carrick_personality_linux::abi::signal::LinuxSiginfo>,
+        info: carrick_personality_linux::signal::SignalInfo,
     ) -> Result<(), i32> {
         use carrick_personality_linux::abi::signal::{LINUX_EINVAL, LINUX_ESRCH};
         if !(0..=64).contains(&sig) {
@@ -940,6 +940,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 };
                 if signal_record_exists(self.source.zone, record) {
                     selected = Some((
+                        row.key(),
                         record,
                         resources.signals().clone(),
                         resources.channel.clone(),
@@ -989,6 +990,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     continue;
                 }
                 selected = Some((
+                    row.key(),
                     record,
                     resources.signals().clone(),
                     resources.channel.clone(),
@@ -999,7 +1001,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 break;
             }
         }
-        let (record, signals, channel) = selected.ok_or(LINUX_ESRCH.get())?;
+        let (target_key, record, signals, channel) = selected.ok_or(LINUX_ESRCH.get())?;
+        use carrick_personality_linux::signal::SignalTargetScope;
+        info.check_target(if target_key == self.key {
+            SignalTargetScope::CallingProcess
+        } else {
+            SignalTargetScope::OtherProcess
+        })
+        .map_err(|error| error.get())?;
         if sig == 0 {
             return Ok(());
         }
@@ -1011,7 +1020,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .map_err(|_| LINUX_ESRCH.get())?
             .metadata()
             .namespace_pid;
-        let info = info.unwrap_or_else(|| {
+        let info = info.payload().unwrap_or_else(|| {
             carrick_personality_linux::abi::signal::LinuxSiginfo::kill(
                 sig,
                 carrick_personality_linux::abi::signal::LINUX_SI_TKILL,
@@ -3780,7 +3789,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         pid: i32,
         sig: i32,
-        info: Option<carrick_personality_linux::abi::signal::LinuxSiginfo>,
+        info: carrick_personality_linux::signal::SignalInfo,
     ) -> Result<(), i32> {
         let einval = carrick_personality_linux::abi::signal::LINUX_EINVAL.get();
         let esrch = carrick_personality_linux::abi::signal::LINUX_ESRCH.get();
@@ -3796,6 +3805,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let graph = self.runtime.graph.lock();
         let caller_row = graph.owner.task(self.key).map_err(|_| esrch)?;
         let caller_pgid = caller_row.metadata().namespace_process_group;
+        let caller_pid = caller_row.metadata().namespace_pid;
 
         let mut targets = alloc::vec::Vec::new();
         if pid > 0 {
@@ -3811,12 +3821,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
             }
             if targets.is_empty() {
-                let in_zombies = graph
+                if let Some(zombie) = graph
                     .owner
                     .zombies()
                     .values()
-                    .any(|z| z.receipt.namespace_pid == target_pid);
-                if in_zombies && sig == 0 {
+                    .find(|z| z.receipt.namespace_pid == target_pid)
+                {
+                    use carrick_personality_linux::signal::SignalTargetScope;
+                    info.check_target(if zombie.receipt.key == self.key {
+                        SignalTargetScope::CallingProcess
+                    } else {
+                        SignalTargetScope::OtherProcess
+                    })
+                    .map_err(|error| error.get())?;
                     return Ok(());
                 }
                 return Err(esrch);
@@ -3836,7 +3853,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         } else if pid == -1 {
             for (&_id, task) in graph.owner.tasks() {
-                if task.metadata().namespace_pid != 1 {
+                if task.metadata().namespace_pid != 1 && task.key() != self.key {
                     targets.push((
                         task.key(),
                         task.native().resources().signals().clone(),
@@ -3863,6 +3880,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         }
 
+        use carrick_personality_linux::signal::SignalTargetScope;
+        for (key, _, _) in &targets {
+            info.check_target(if *key == self.key {
+                SignalTargetScope::CallingProcess
+            } else {
+                SignalTargetScope::OtherProcess
+            })
+            .map_err(|error| error.get())?;
+        }
         if sig == 0 {
             return Ok(());
         }
@@ -3870,11 +3896,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let Some(signal) = signal else {
             return Err(einval);
         };
-        let info = info.unwrap_or_else(|| {
+        let info = info.payload().unwrap_or_else(|| {
             carrick_personality_linux::abi::signal::LinuxSiginfo::kill(
                 sig,
                 carrick_personality_linux::abi::signal::LINUX_SI_USER,
-                i32::from(self.source.slot.raw()),
+                caller_pid as i32,
                 0,
             )
         });
@@ -3882,10 +3908,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let mut wake_channels = Vec::new();
         let mut interrupts = Vec::new();
         for (target_key, target_signals, _) in targets {
-            let action = target_signals.action(signal);
-            if action.disposition == carrick_signal_core::policy::Disposition::Ignore {
-                continue;
-            }
             let _ = target_signals.enqueue(target_key, signal, Some(info));
             if let Ok(row) = graph.owner.task(target_key) {
                 let resources = row.native().resources();
@@ -3946,7 +3968,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         tid: carrick_personality_linux::signal::SignalThreadSelector,
         sig: i32,
-        info: Option<carrick_personality_linux::abi::signal::LinuxSiginfo>,
+        info: carrick_personality_linux::signal::SignalInfo,
     ) -> Result<(), i32> {
         self.send_thread_signal(None, tid, sig, info)
     }
@@ -3956,7 +3978,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         tgid: carrick_personality_linux::signal::SignalThreadSelector,
         tid: carrick_personality_linux::signal::SignalThreadSelector,
         sig: i32,
-        info: Option<carrick_personality_linux::abi::signal::LinuxSiginfo>,
+        info: carrick_personality_linux::signal::SignalInfo,
     ) -> Result<(), i32> {
         let group = tgid.positive().ok_or(carrick_abi::LINUX_EINVAL.get())?;
         self.send_thread_signal(Some(group), tid, sig, info)
@@ -4425,9 +4447,55 @@ mod tests {
             .enter(source, &task, words(address), &mut service)
             .unwrap();
         let selector = carrick_personality_linux::signal::SignalThreadSelector::from_abi(41);
-        assert_eq!(entry.tgkill(selector, selector, 0, None), Ok(()));
+        assert_eq!(
+            entry.tgkill(
+                selector,
+                selector,
+                0,
+                carrick_personality_linux::signal::SignalInfo::Generated(None)
+            ),
+            Ok(())
+        );
         // kill(2): INT_MIN selects no representable process group.
-        assert_eq!(entry.kill(i32::MIN, 0, None), Err(3));
+        assert_eq!(
+            entry.kill(
+                i32::MIN,
+                0,
+                carrick_personality_linux::signal::SignalInfo::Generated(None)
+            ),
+            Err(3)
+        );
+        assert_eq!(
+            entry.kill(
+                -1,
+                0,
+                carrick_personality_linux::signal::SignalInfo::Generated(None)
+            ),
+            Err(3),
+            "kill(-1) excludes caller"
+        );
+        let ignored = carrick_signal_core::policy::Action {
+            disposition: carrick_signal_core::policy::Disposition::Ignore,
+            ..Default::default()
+        };
+        entry.rt_sigaction(10, Some(ignored)).unwrap();
+        let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(set);
+        control.init_blocked(carrick_el1_abi::BlockedMask(set.bits()));
+        entry
+            .kill(
+                41,
+                10,
+                carrick_personality_linux::signal::SignalInfo::Generated(None),
+            )
+            .unwrap();
+        assert_eq!(
+            entry.rt_sigpending(blocked),
+            set.bits(),
+            "blocked ignored signal remains queued"
+        );
+        entry.rt_sigaction(10, Some(ignored)).unwrap();
+        assert_eq!(entry.rt_sigpending(blocked), 0);
+        control.init_blocked(carrick_el1_abi::BlockedMask(0));
         assert!(matches!(
             entry.rt_sigtimedwait(set, Some(1000), UserVa::new(0)),
             Ok(SignalWaitOutcome::Pending)
@@ -5178,6 +5246,19 @@ mod tests {
             let mut child_entry = runtime
                 .enter(source, &task, child_words, &mut service)
                 .unwrap();
+            use carrick_personality_linux::signal::{ProcessSignals, SignalInfo};
+            let forged = carrick_abi::LinuxSiginfo::kill(10, carrick_abi::LINUX_SI_USER, 42, 0);
+            assert_eq!(child_entry.kill(41, 0, SignalInfo::Queued(forged)), Err(1));
+            let queued = carrick_abi::LinuxSiginfo::kill(10, carrick_abi::LINUX_SI_QUEUE, 42, 0);
+            assert_eq!(child_entry.kill(41, 0, SignalInfo::Queued(queued)), Ok(()));
+            assert_eq!(child_entry.kill(42, 0, SignalInfo::Queued(forged)), Ok(()));
+            let selector = carrick_personality_linux::signal::SignalThreadSelector::from_abi(41);
+            let forged_thread =
+                carrick_abi::LinuxSiginfo::kill(10, carrick_abi::LINUX_SI_TKILL, 42, 0);
+            assert_eq!(
+                child_entry.tgkill(selector, selector, 0, SignalInfo::Queued(forged_thread)),
+                Err(1)
+            );
             assert!(matches!(
                 child_entry.exit_group(7),
                 LifecycleOutcome::Transferred {
@@ -5217,6 +5298,16 @@ mod tests {
             let mut parent_entry = runtime
                 .enter(source, &task, words(address), &mut service)
                 .unwrap();
+            use carrick_personality_linux::signal::ProcessSignals;
+            assert_eq!(
+                parent_entry.kill(
+                    42,
+                    15,
+                    carrick_personality_linux::signal::SignalInfo::Generated(None)
+                ),
+                Ok(()),
+                "zombie target exists"
+            );
             let Some(LifecycleOutcome::Returned { result, .. }) =
                 parent_entry.resume_pending_wait()
             else {
