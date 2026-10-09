@@ -691,7 +691,14 @@ impl Cpl0HostCustody {
                 child_tables,
                 parent_tables,
             });
-            if !record.grant(child_base, parent_base, KERNEL_REGION_GPA, id, lifecycle, 0) {
+            if !record.grant(
+                child_base,
+                parent_base,
+                KERNEL_REGION_GPA,
+                id,
+                lifecycle,
+                None,
+            ) {
                 return Err(fail("physical fork stock reply changed"));
             }
         } else {

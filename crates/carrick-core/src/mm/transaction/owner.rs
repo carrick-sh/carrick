@@ -142,6 +142,24 @@ impl<
             vma_visits: core::sync::atomic::AtomicUsize::new(0),
         }
     }
+
+    /// Construct a portal bound to an active zone without pre-resolved reservation nodes.
+    pub fn for_zone(
+        carrier: NonZeroU64,
+        roots: &'a SharedReservations<Policy, Geometry>,
+        zone: &'a carrick_sched_core::ZoneTables<Context>,
+    ) -> Self {
+        Self {
+            backend: core::marker::PhantomData,
+            carrier,
+            roots,
+            spaces: &zone.spaces,
+            nodes: None,
+            zone: Some(zone),
+            #[cfg(any(test, feature = "host-test"))]
+            vma_visits: core::sync::atomic::AtomicUsize::new(0),
+        }
+    }
     /// Select descriptor geometry without reconstructing owner state.
     pub fn with_mmu<B: OwnerMmu>(
         self,

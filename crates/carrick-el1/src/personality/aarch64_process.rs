@@ -248,16 +248,11 @@ impl<'a, X: ForkStockCrossing> Aarch64NativeProcessService<'a, X> {
     }
 
     fn portal(&self) -> Result<Portal<'_>, NativeProcessError> {
-        Ok(carrick_core::mm::transaction::MmPortal {
-            backend: core::marker::PhantomData,
-            carrier: self.carrier,
-            roots: self.roots,
-            spaces: &self.zone.spaces,
-            nodes: None,
-            zone: Some(self.zone),
-            #[cfg(any(test, feature = "host-test"))]
-            vma_visits: core::sync::atomic::AtomicUsize::new(0),
-        })
+        Ok(carrick_core::mm::transaction::MmPortal::for_zone(
+            self.carrier,
+            self.roots,
+            self.zone,
+        ))
     }
 }
 
