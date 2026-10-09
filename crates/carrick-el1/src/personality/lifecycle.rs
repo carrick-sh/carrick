@@ -437,20 +437,18 @@ impl<
         }
         let target_tid = tid as u32;
         if let Some(process) = self.process.as_deref() {
-            process.robust_list_permission(target_tid)?;
+            if Some(process.binding()) != LifecycleNative::binding(self) {
+                return Err(carrick_personality_linux::identity::ESRCH);
+            }
+            return process.read_robust_list(target_tid, &mut |page, entry| {
+                self.born_slot(page, entry)
+                    .map(ThreadControlSlot::robust_list)
+            });
         }
         if let Some(entry_ref) = thread.page.entry_ref_for_visible_tid(target_tid)
             && let Some(child_slot) = self.born_slot(thread.page, entry_ref)
         {
             return Ok(child_slot.robust_list());
-        }
-        if let Some(process) = self.process.as_deref()
-            && process.has_thread(target_tid)
-        {
-            return Ok((
-                0,
-                carrick_personality_linux::thread::ROBUST_LIST_HEAD_SIZE as u32,
-            ));
         }
         Err(carrick_personality_linux::identity::ESRCH)
     }

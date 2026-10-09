@@ -217,6 +217,8 @@ impl<'a, M: Clone, C: ProcessContext> ProcessResources for NativeResources<'a, M
     }
 }
 type Custody<'a, M, C> = RetainedProcessCustody<NativeResources<'a, M, C>>;
+type NativeIdentityTask<'a, M, C> =
+    GuestTask<VisibleNamespace, carrick_sched_core::process::TaskUid, Custody<'a, M, C>>;
 type Owner<'a, M, C> =
     GuestProcessOwner<VisibleNamespace, carrick_sched_core::process::TaskUid, Custody<'a, M, C>>;
 struct PendingWait {
@@ -1402,27 +1404,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     #[inline(never)]
     fn robust_list_permission(&self, tid: u32) -> Result<(), i64> {
         let graph = self.runtime.graph.lock();
-        let caller = graph
-            .owner
-            .task(self.key)
-            .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
-        if caller.metadata().namespace_pid == tid || caller.has_thread(tid) {
-            return Ok(());
+        self.robust_target(&graph.owner, tid).map(|_| ())
+    }
+    fn read_robust_list(
+        &self,
+        tid: u32,
+        read_slot: &mut carrick_personality_linux::lifecycle::RobustSlotReader<'_>,
+    ) -> Result<(u64, u32), i64> {
+        let graph = self.runtime.graph.lock();
+        let target = self.robust_target(&graph.owner, tid)?;
+        let resources = target.native().resources();
+        if tid == target.metadata().namespace_pid {
+            return Ok(resources.control.robust_list());
         }
-        let _target = graph
-            .owner
-            .find_task_by_pid(tid)
+        let entry = resources
+            .page
+            .entry_ref_for_visible_tid(tid)
             .ok_or(carrick_personality_linux::identity::ESRCH)?;
-        let creds = caller.credentials_for(self.calling_tid)?;
-        if creds.is_privileged()
-            || creds
-                .cap_effective
-                .contains(carrick_sched_core::process::LinuxCapabilitySet::CAP_SYS_PTRACE)
-        {
-            Ok(())
-        } else {
-            Err(carrick_personality_linux::identity::EPERM)
-        }
+        read_slot(resources.page, entry).ok_or(carrick_personality_linux::identity::ESRCH)
     }
 }
 
@@ -1434,6 +1433,45 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let mut graph = self.runtime.graph.lock();
         if let Ok(task) = graph.owner.task_mut(self.key) {
             task.remove_thread(tid);
+        }
+    }
+
+    fn robust_target<'g>(
+        &self,
+        owner: &'g Owner<'a, M, C>,
+        tid: u32,
+    ) -> Result<&'g NativeIdentityTask<'a, M, C>, i64> {
+        use carrick_personality_linux::identity::{EPERM, ESRCH};
+        use carrick_sched_core::process::LinuxCapabilitySet;
+        let caller = owner.task(self.key).map_err(|_| ESRCH)?;
+        let credentials = caller.credentials_for(self.calling_tid)?;
+        let target = owner
+            .find_task_by_thread(caller.metadata().container, tid)
+            .ok_or(ESRCH)?;
+        if target.key() == self.key {
+            return Ok(target);
+        }
+        if credentials
+            .cap_effective
+            .contains(LinuxCapabilitySet::CAP_SYS_PTRACE)
+        {
+            return Ok(target);
+        }
+        let peer = target.credentials_for(tid)?;
+        let uid_matches = peer.ruid == credentials.ruid
+            && peer.euid == credentials.ruid
+            && peer.suid == credentials.ruid;
+        let gid_matches = peer.rgid == credentials.rgid
+            && peer.egid == credentials.rgid
+            && peer.sgid == credentials.rgid;
+        if uid_matches
+            && gid_matches
+            && target.dumpable == 1
+            && credentials.cap_permitted.contains(peer.cap_permitted)
+        {
+            Ok(target)
+        } else {
+            Err(EPERM)
         }
     }
 
@@ -3626,6 +3664,76 @@ mod tests {
         assert_eq!(
             entry.robust_list_permission(child_pid),
             Err(carrick_personality_linux::identity::EPERM)
+        );
+        {
+            let mut graph = runtime.graph.lock();
+            let credentials = graph
+                .owner
+                .task(entry.key)
+                .unwrap()
+                .credentials_for(41)
+                .unwrap()
+                .clone();
+            let peer = graph.owner.find_task_by_pid_mut(child_pid).unwrap();
+            *peer.credentials_for_mut(child_pid).unwrap() = credentials;
+            peer.spawn_thread(child_pid, 987).unwrap();
+        }
+        assert_eq!(entry.robust_list_permission(child_pid), Ok(()));
+        assert_eq!(entry.robust_list_permission(987), Ok(()));
+        child_controls[1].set_robust_list(0xbeef, 24);
+        assert_eq!(
+            entry.read_robust_list(child_pid, &mut |_, _| None),
+            Ok((0xbeef, 24))
+        );
+        assert_eq!(
+            entry.read_robust_list(987, &mut |_, _| None),
+            Err(carrick_personality_linux::identity::ESRCH)
+        );
+        let peer_entry = child_page
+            .stock(
+                1,
+                carrick_el1_abi::EntryIdentity {
+                    tid: 987,
+                    visible_tid: 987,
+                    thread_serial: 987,
+                    uid_credit: 1,
+                },
+            )
+            .unwrap();
+        child_controls[2].set_robust_list(0xcafe, 24);
+        assert_eq!(
+            entry.read_robust_list(987, &mut |page, reference| {
+                assert!(core::ptr::eq(page, &*child_page));
+                assert_eq!(reference, peer_entry);
+                Some(child_controls[2].robust_list())
+            }),
+            Ok((0xcafe, 24))
+        );
+        {
+            let mut graph = runtime.graph.lock();
+            let peer = graph.owner.find_task_by_pid_mut(child_pid).unwrap();
+            *peer.credentials_for_mut(child_pid).unwrap() =
+                carrick_sched_core::process::TaskCredentials::ROOT;
+        }
+        entry
+            .update_calling_creds(&mut |c| {
+                c.cap_effective = carrick_sched_core::process::LinuxCapabilitySet::CAP_SETUID;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            entry.robust_list_permission(child_pid),
+            Err(carrick_personality_linux::identity::EPERM)
+        );
+        entry
+            .update_calling_creds(&mut |c| {
+                c.cap_effective = carrick_sched_core::process::LinuxCapabilitySet::CAP_SYS_PTRACE;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            entry.read_robust_list(child_pid, &mut |_, _| None),
+            Ok((0xbeef, 24))
         );
     }
 
