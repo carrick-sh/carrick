@@ -5,11 +5,12 @@
 mod common;
 
 use std::io::{self, Write};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use carrick_conformance_next::{
-    ContainerResult, EmbedError, PullPolicy, ResultAssert, StdioConfig, TestContainer,
+    ContainerResult, EmbedError, PipedOutput, PullPolicy, ResultAssert, StdioConfig, TestContainer,
 };
 
 /// Writer wrapper that delegates raw writes while capturing the first I/O error into shared state.
@@ -77,6 +78,12 @@ impl<W: Write> Write for RecordingWriter<W> {
     }
 }
 
+impl<W: AsFd> AsFd for RecordingWriter<W> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.inner.as_fd()
+    }
+}
+
 /// Run a test container, streaming guest stdout and stderr directly into host log files
 /// when `CARRICK_REDUCER_ARTIFACT_DIR` is set so diagnostics are preserved during execution
 /// even if the host aborts. When no artifact directory is configured, falls back to default
@@ -121,8 +128,12 @@ where
 
         let run_result = container
             .builder(argv)
-            .stdout(StdioConfig::Piped(Box::new(stdout_writer)))
-            .stderr(StdioConfig::Piped(Box::new(stderr_writer)))
+            .stdout(StdioConfig::Piped(
+                PipedOutput::host(stdout_writer).unwrap(),
+            ))
+            .stderr(StdioConfig::Piped(
+                PipedOutput::host(stderr_writer).unwrap(),
+            ))
             .run_blocking();
 
         if let Some((err_path, err)) = first_error.lock().unwrap().take() {

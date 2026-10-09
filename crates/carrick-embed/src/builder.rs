@@ -25,7 +25,7 @@ pub enum StdioConfig {
     /// Write through to the host process's own fd 1/2.
     Inherit,
     /// Hand every write to this writer as the guest produces it.
-    Piped(Box<dyn Write + Send>),
+    Piped(carrick_kernel::dispatch::PipedOutput),
 }
 
 impl StdioConfig {
@@ -71,10 +71,18 @@ impl StdioPlan {
             },
             StdioMode::Piped => {
                 let mut captured = CapturedStreams::default();
-                let stdout =
-                    piped_writer(stdout, || Box::new(std::io::stdout()), &mut captured.stdout);
-                let stderr =
-                    piped_writer(stderr, || Box::new(std::io::stderr()), &mut captured.stderr);
+                let stdout = piped_writer(
+                    stdout,
+                    || Box::new(std::io::stdout()),
+                    carrick_el1_abi::HostBoundFd::STDOUT,
+                    &mut captured.stdout,
+                );
+                let stderr = piped_writer(
+                    stderr,
+                    || Box::new(std::io::stderr()),
+                    carrick_el1_abi::HostBoundFd::STDERR,
+                    &mut captured.stderr,
+                );
                 Self {
                     sink: StdioSink::Piped { stdout, stderr },
                     captured,
@@ -87,15 +95,17 @@ impl StdioPlan {
 fn piped_writer(
     config: StdioConfig,
     inherit: impl FnOnce() -> Box<dyn Write + Send>,
+    inherited_fd: carrick_el1_abi::HostBoundFd,
     capture_slot: &mut Option<CaptureBuffer>,
-) -> Box<dyn Write + Send> {
+) -> carrick_kernel::dispatch::PipedOutput {
+    use carrick_kernel::dispatch::PipedOutput;
     match config {
         StdioConfig::Captured => {
             let buffer = CaptureBuffer::default();
             *capture_slot = Some(buffer.clone());
-            Box::new(buffer)
+            PipedOutput::memory(Box::new(buffer))
         }
-        StdioConfig::Inherit => inherit(),
+        StdioConfig::Inherit => PipedOutput::inherited(inherit(), inherited_fd),
         StdioConfig::Piped(writer) => writer,
     }
 }
@@ -1162,10 +1172,12 @@ mod tests {
     fn piped_writer_receives_bytes_written_through_the_plan() {
         let sink_buffer = CaptureBuffer::default();
         let plan = StdioPlan::lower(
-            StdioConfig::Piped(Box::new(sink_buffer.clone())),
+            StdioConfig::Piped(carrick_kernel::dispatch::PipedOutput::memory(Box::new(
+                sink_buffer.clone(),
+            ))),
             StdioConfig::Captured,
         );
-        let StdioSink::Piped { mut stdout, .. } = plan.sink else {
+        let StdioSink::Piped { stdout, .. } = plan.sink else {
             panic!("mixed config must lower to Piped");
         };
         stdout.write_all(b"hello").unwrap();

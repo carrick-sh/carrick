@@ -200,8 +200,8 @@ fn stdio_writer_mutex_contention_allows_spare_progression_and_mm_mutation() {
         timers: Arc::new(carrick_hal::NullGuestTimerBridge::default()),
     });
     dispatcher.set_stdio_sink(StdioSink::Piped {
-        stdout: Box::new(writer),
-        stderr: Box::new(std::io::sink()),
+        stdout: carrick_kernel::dispatch::PipedOutput::memory(Box::new(writer)),
+        stderr: carrick_kernel::dispatch::PipedOutput::memory(Box::new(std::io::sink())),
     });
 
     let root = dispatcher.capture_one_task_context().unwrap();

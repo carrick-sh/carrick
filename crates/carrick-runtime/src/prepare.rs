@@ -1569,8 +1569,12 @@ mod tests {
             resolve_stdio(
                 &spec,
                 Some(StdioSink::Piped {
-                    stdout: Box::new(std::io::sink()),
-                    stderr: Box::new(std::io::sink()),
+                    stdout: carrick_kernel::dispatch::PipedOutput::memory(
+                        Box::new(std::io::sink())
+                    ),
+                    stderr: carrick_kernel::dispatch::PipedOutput::memory(
+                        Box::new(std::io::sink())
+                    ),
                 })
             ),
             Ok(StdioSink::Piped { .. })

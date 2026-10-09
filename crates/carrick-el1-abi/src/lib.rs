@@ -1374,6 +1374,9 @@ unsafe impl Sync for DelegatedFile {}
 pub struct HostBoundFd(i32);
 
 impl HostBoundFd {
+    pub const STDOUT: Self = Self(1);
+    pub const STDERR: Self = Self(2);
+
     pub const fn new(raw: i32) -> Option<Self> {
         if raw < 0 { None } else { Some(Self(raw)) }
     }

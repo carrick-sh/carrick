@@ -1088,13 +1088,13 @@ fn run_injected_host_operation(retire_waiter: bool, operation: InjectedOperation
     dispatcher.set_host_io(host_io.clone());
     if stdio {
         dispatcher.set_stdio_sink(carrick_kernel::dispatch::StdioSink::Piped {
-            stdout: Box::new(HeldWriter {
+            stdout: carrick_kernel::dispatch::PipedOutput::memory(Box::new(HeldWriter {
                 held: host_io.clone(),
                 error_after_prefix,
                 wrote_prefix: false,
                 panic_after_release,
-            }),
-            stderr: Box::new(std::io::sink()),
+            })),
+            stderr: carrick_kernel::dispatch::PipedOutput::memory(Box::new(std::io::sink())),
         });
     }
     let root = dispatcher.capture_one_task_context().unwrap();
