@@ -267,6 +267,54 @@ pub trait SysinfoNative<'a>: UserCopy {
 }
 
 #[inline(never)]
+fn set_uts_string<'a>(
+    ptr: UserVa,
+    len: usize,
+    native: &mut dyn SysinfoNative<'a>,
+    is_domain: bool,
+) -> Option<SyscallResult> {
+    {
+        let venue = native.process_sysinfo()?;
+        let perm = if is_domain {
+            venue.can_set_domainname()
+        } else {
+            venue.can_set_hostname()
+        };
+        if let Err(e) = perm {
+            return Some(SyscallResult::new(e));
+        }
+        if len == 0 {
+            let _ = if is_domain {
+                venue.set_domainname(&[])
+            } else {
+                venue.set_hostname(&[])
+            };
+            return Some(SyscallResult::new(0));
+        }
+    }
+    if len > 64 {
+        return Some(SyscallResult::new(EINVAL));
+    }
+    if ptr.raw() == 0 {
+        return Some(SyscallResult::new(EFAULT));
+    }
+    let mut buf = [0u8; 64];
+    if !native.copy_in(&mut buf[..len], ptr) {
+        return Some(SyscallResult::new(EFAULT));
+    }
+    let venue = native.process_sysinfo()?;
+    let res = if is_domain {
+        venue.set_domainname(&buf[..len])
+    } else {
+        venue.set_hostname(&buf[..len])
+    };
+    match res {
+        Ok(()) => Some(SyscallResult::new(0)),
+        Err(e) => Some(SyscallResult::new(e)),
+    }
+}
+
+#[inline(never)]
 pub fn invoke<'a>(call: SysinfoCall, native: &mut dyn SysinfoNative<'a>) -> Option<SyscallResult> {
     let args = native.arguments();
     match call {
@@ -285,62 +333,10 @@ pub fn invoke<'a>(call: SysinfoCall, native: &mut dyn SysinfoNative<'a>) -> Opti
             Some(SyscallResult::new(0))
         }
         SysinfoCall::SetHostname => {
-            let ptr = UserVa::new(args[0]);
-            let len = args[1] as usize;
-            if len > 64 {
-                return Some(SyscallResult::new(EINVAL));
-            }
-            {
-                let venue = native.process_sysinfo()?;
-                if let Err(e) = venue.can_set_hostname() {
-                    return Some(SyscallResult::new(e));
-                }
-                if len == 0 {
-                    let _ = venue.set_hostname(&[]);
-                    return Some(SyscallResult::new(0));
-                }
-            }
-            if ptr.raw() == 0 {
-                return Some(SyscallResult::new(EFAULT));
-            }
-            let mut buf = [0u8; 64];
-            if !native.copy_in(&mut buf[..len], ptr) {
-                return Some(SyscallResult::new(EFAULT));
-            }
-            let venue = native.process_sysinfo()?;
-            match venue.set_hostname(&buf[..len]) {
-                Ok(()) => Some(SyscallResult::new(0)),
-                Err(e) => Some(SyscallResult::new(e)),
-            }
+            set_uts_string(UserVa::new(args[0]), args[1] as usize, native, false)
         }
         SysinfoCall::SetDomainname => {
-            let ptr = UserVa::new(args[0]);
-            let len = args[1] as usize;
-            if len > 64 {
-                return Some(SyscallResult::new(EINVAL));
-            }
-            {
-                let venue = native.process_sysinfo()?;
-                if let Err(e) = venue.can_set_domainname() {
-                    return Some(SyscallResult::new(e));
-                }
-                if len == 0 {
-                    let _ = venue.set_domainname(&[]);
-                    return Some(SyscallResult::new(0));
-                }
-            }
-            if ptr.raw() == 0 {
-                return Some(SyscallResult::new(EFAULT));
-            }
-            let mut buf = [0u8; 64];
-            if !native.copy_in(&mut buf[..len], ptr) {
-                return Some(SyscallResult::new(EFAULT));
-            }
-            let venue = native.process_sysinfo()?;
-            match venue.set_domainname(&buf[..len]) {
-                Ok(()) => Some(SyscallResult::new(0)),
-                Err(e) => Some(SyscallResult::new(e)),
-            }
+            set_uts_string(UserVa::new(args[0]), args[1] as usize, native, true)
         }
         SysinfoCall::GetRlimit => {
             let resource = args[0] as usize;
@@ -641,6 +637,26 @@ mod tests {
         mock.args[1] = 65;
         let res = invoke(SysinfoCall::SetHostname, &mut mock).unwrap();
         assert_eq!(res.raw(), EINVAL);
+    }
+
+    #[test]
+    fn sethostname_checks_permission_before_len_exceeds_64() {
+        let mut mock = MockNative::new();
+        mock.venue.can_set_host_error = Some(EPERM);
+        mock.args[0] = 0x1000;
+        mock.args[1] = 65; // len > 64
+        let res = invoke(SysinfoCall::SetHostname, &mut mock).unwrap();
+        assert_eq!(res.raw(), EPERM);
+    }
+
+    #[test]
+    fn setdomainname_checks_permission_before_len_exceeds_64() {
+        let mut mock = MockNative::new();
+        mock.venue.can_set_domain_error = Some(EPERM);
+        mock.args[0] = 0x1000;
+        mock.args[1] = 65; // len > 64
+        let res = invoke(SysinfoCall::SetDomainname, &mut mock).unwrap();
+        assert_eq!(res.raw(), EPERM);
     }
 
     #[test]
