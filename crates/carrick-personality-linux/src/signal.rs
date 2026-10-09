@@ -222,6 +222,15 @@ pub enum SignalOutcome {
     },
 }
 
+/// Whether the completed entry may consume pending delivery before its
+/// executor completes the return work ledger.
+pub fn signal_delivery_before_work(
+    route: crate::dispatch::CompletionRoute,
+    task: &crate::abi::entry::LinuxTaskState,
+) -> bool {
+    route == crate::dispatch::CompletionRoute::Served && !task.has_pending_host_work()
+}
+
 pub fn signal_effect(outcome: &SignalOutcome) -> crate::dispatch::FamilyCompletion {
     use crate::dispatch::FamilyCompletion;
     match *outcome {

@@ -1211,6 +1211,11 @@ mod kernel {
         use carrick_personality_linux::signal::policy::{self, SigBlockMask};
         use carrick_personality_linux::signal::ProcessSignals;
 
+        // IRQ and post-forward callers obey the same completion ledger. The
+        // post-WORK validation leaf consumes delivery after the debt is cleared.
+        if !carrick_personality_linux::signal::signal_delivery_before_work(
+            carrick_personality_linux::dispatch::CompletionRoute::Served, &task.linux,
+        ) { return None; }
         let thread = GuestLifecycleVenue.thread(task)?;
         let thread_blocked = SigBlockMask::blocking_all_of(
             carrick_personality_linux::signal::SignalSet::from_bits(thread.slot.blocked().0),
@@ -2248,7 +2253,7 @@ mod kernel {
                     if let Some(reason) = process.take_run_failure() {
                         complete_run_failure(task, reason);
                     }
-                    if (route == CompletionRoute::Served || route == CompletionRoute::WithWork)
+                    if carrick_personality_linux::signal::signal_delivery_before_work(route, &task.linux)
                         && let Some(r) = deliver_signal_on_syscall_return(task, &mut process, frame, _early_xstate)
                     {
                         route = r;
