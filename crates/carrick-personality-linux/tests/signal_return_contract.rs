@@ -108,6 +108,9 @@ fn pidfd_send_signal_retains_host_owner() {
 
 #[test]
 fn signal_delivery_waits_for_the_owned_completion_ledger() {
+    // Production WORK_PORT remains a dependency of the x86 in-zone fd-table
+    // executor lane. This contract proves ledger ordering, not that carrier
+    // handler's runtime implementation. See docs/design/in-ring-signals-status.md.
     use carrick_personality_linux::{
         abi::entry::{LinuxTaskState, ServedBoundary},
         dispatch::CompletionRoute,
