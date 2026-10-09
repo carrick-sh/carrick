@@ -204,3 +204,10 @@ VMM dependency closure. The guest root and host graph therefore name the same
 thread and file-table incarnation before scheduler publication. The fixed
 numbers remain only for hardware fixtures that construct a carrier without a
 runtime kernel graph; M-b deletes the production fixed-actor driver.
+
+KVM already flushes a pending `KVM_EXIT_IO` under `immediate_exit` in its vCPU
+recycler. The carrier CPU now records whether its last typed exit is an I/O
+doorbell and consumes that completion exactly once before its saved image and
+neutral reset. This is the detach step the pool will call before giving a
+worker another task. A failed completion poisons that physical CPU; it cannot
+yield a task-state receipt or be silently reused.

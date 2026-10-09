@@ -574,13 +574,6 @@ unsafe impl TranslationDrain for Cpl0Drain<'_> {
 // restoring the interrupted image. Otherwise a drained CPU replays its old
 // observation doorbell. This is the existing recycler's completion protocol.
 fn complete_control_exit(cpu: &mut KvmVcpu) -> Result<(), MemoryError> {
-    cpu.fd_mut().set_kvm_immediate_exit(1);
-    let result = HvVcpu::run(cpu);
-    cpu.fd_mut().set_kvm_immediate_exit(0);
-    match result {
-        Ok(VcpuExit::Kicked) => Ok(()),
-        _ => Err(error(
-            "control IO completion did not stop before guest entry",
-        )),
-    }
+    cpu.complete_pending_io_exit()
+        .map_err(|_| error("control IO completion did not stop before guest entry"))
 }

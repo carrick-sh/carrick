@@ -14,6 +14,7 @@ pub trait CarrierCpuIo: sealed::Sealed {
     fn read_image(&self) -> Result<X86VcpuSnapshot, TrapError>;
     fn write_image(&mut self, image: &X86VcpuSnapshot) -> Result<(), TrapError>;
     fn run(&mut self) -> Result<VcpuExit, TrapError>;
+    fn complete_pending_io(&mut self) -> Result<(), TrapError>;
 }
 
 /// Owns a fresh VM and vCPU. The vCPU handle never escapes this boundary.
@@ -43,6 +44,11 @@ impl CarrierCpuIo for KvmCpuIo {
     }
     fn run(&mut self) -> Result<VcpuExit, TrapError> {
         Ok(HvVcpu::run(&mut self.vcpu)?)
+    }
+    fn complete_pending_io(&mut self) -> Result<(), TrapError> {
+        self.vcpu
+            .complete_pending_io_exit()
+            .map_err(|error| boundary_error(&error.to_string()))
     }
 }
 
@@ -100,6 +106,7 @@ enum Custody {
     Loaded {
         binding: GuestArchBinding,
         resume: [u8; X86_TASK_RESUME_PAYLOAD_LEN],
+        pending_io: bool,
     },
     // A partial ioctl or failed readback cannot advertise detach or allow reuse.
     Poisoned,
@@ -153,7 +160,11 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
         self.custody = Custody::Poisoned;
         self.io.write_image(&expected)?;
         audit_image(&self.io.read_image()?, &expected)?;
-        self.custody = Custody::Loaded { binding, resume };
+        self.custody = Custody::Loaded {
+            binding,
+            resume,
+            pending_io: false,
+        };
         Ok(())
     }
     /// Run one exclusively loaded task until the next physical exit. A failed
@@ -173,6 +184,7 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
                 return Err(error);
             }
         };
+        let pending_io = matches!(raw, VcpuExit::IoOut { .. });
         let exit = match CarrierRunExit::from_raw(raw) {
             Ok(exit) => exit,
             Err(error) => {
@@ -181,7 +193,9 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
             }
         };
         let (binding, resume) = match self.custody {
-            Custody::Loaded { binding, resume } => (binding, resume),
+            Custody::Loaded {
+                binding, resume, ..
+            } => (binding, resume),
             _ => return Err(boundary_error("carrier run lost loaded task custody")),
         };
         let state = match self
@@ -195,11 +209,20 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
                 return Err(error);
             }
         };
+        self.custody = Custody::Loaded {
+            binding,
+            resume,
+            pending_io,
+        };
         Ok(StoppedTaskExit { state, exit })
     }
     pub fn save_and_detach(&mut self, task: TaskIdentity) -> Result<X86ArchContext, TrapError> {
-        let (binding, resume) = match self.custody {
-            Custody::Loaded { binding, resume } if binding.task() == task => (binding, resume),
+        let (binding, resume, pending_io) = match self.custody {
+            Custody::Loaded {
+                binding,
+                resume,
+                pending_io,
+            } if binding.task() == task => (binding, resume, pending_io),
             _ => {
                 return Err(boundary_error(
                     "carrier detach requires its exact loaded task generation",
@@ -209,6 +232,9 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
         // Until the read/save/reset/audit transaction completes the CPU is
         // poisoned, even if a read or a checked snapshot fails before a write.
         self.custody = Custody::Poisoned;
+        if pending_io {
+            self.io.complete_pending_io()?;
+        }
         let saved = X86ArchContext::capture(binding, &self.io.read_image()?, resume)?;
         self.io.write_image(&self.neutral)?;
         audit_image(&self.io.read_image()?, &self.neutral)?;
@@ -275,6 +301,9 @@ mod tests {
                 port: carrick_x86::cpl0_entry::FORWARD_PORT,
                 data: vec![0],
             })
+        }
+        fn complete_pending_io(&mut self) -> Result<(), TrapError> {
+            Ok(())
         }
     }
     fn context(tag: u64) -> X86ArchContext {
@@ -374,6 +403,61 @@ mod tests {
         let detached = cpu.save_and_detach(a.binding().task()).unwrap();
         assert_eq!(detached.state().gprs()[0], 0xabc);
         cpu.audit_idle().unwrap();
+    }
+    struct PendingIo {
+        image: X86VcpuSnapshot,
+        pending: bool,
+        completions: Rc<Cell<usize>>,
+    }
+    impl sealed::Sealed for PendingIo {}
+    impl CarrierCpuIo for PendingIo {
+        fn read_image(&self) -> Result<X86VcpuSnapshot, TrapError> {
+            Ok(self.image.clone())
+        }
+        fn write_image(&mut self, image: &X86VcpuSnapshot) -> Result<(), TrapError> {
+            if self.pending {
+                return Err(boundary_error("pending PIO reached task image restore"));
+            }
+            self.image = image.clone();
+            Ok(())
+        }
+        fn run(&mut self) -> Result<VcpuExit, TrapError> {
+            self.pending = true;
+            Ok(VcpuExit::IoOut {
+                port: carrick_x86::cpl0_entry::FORWARD_PORT,
+                data: vec![0],
+            })
+        }
+        fn complete_pending_io(&mut self) -> Result<(), TrapError> {
+            if !self.pending {
+                return Err(boundary_error("PIO completion without pending exit"));
+            }
+            self.pending = false;
+            self.image.rip += 2;
+            self.completions.set(self.completions.get() + 1);
+            Ok(())
+        }
+    }
+    #[test]
+    fn detach_consumes_pending_pio_once_before_a_different_task_loads() {
+        let a = context(2);
+        let b = context(3);
+        let completions = Rc::new(Cell::new(0));
+        let mut cpu = KvmCarrierCpu::new(PendingIo {
+            image: context(1).hardware_image(),
+            pending: false,
+            completions: Rc::clone(&completions),
+        })
+        .unwrap();
+        cpu.load(a.clone()).unwrap();
+        let stopped = cpu.run_loaded(a.binding().task()).unwrap();
+        assert_eq!(stopped.state.state().rip(), a.state().rip());
+        let saved = cpu.save_and_detach(a.binding().task()).unwrap();
+        assert_eq!(saved.state().rip(), a.state().rip() + 2);
+        assert_eq!(completions.get(), 1);
+        cpu.load(b.clone()).unwrap();
+        cpu.save_and_detach(b.binding().task()).unwrap();
+        assert_eq!(completions.get(), 1);
     }
     #[test]
     fn malformed_forward_doorbell_cannot_become_a_physical_exit() {
@@ -486,6 +570,9 @@ mod tests {
         }
         fn run(&mut self) -> Result<VcpuExit, TrapError> {
             Err(boundary_error("read-fault test driver cannot run"))
+        }
+        fn complete_pending_io(&mut self) -> Result<(), TrapError> {
+            Err(boundary_error("read-fault test driver cannot complete IO"))
         }
     }
     fn assert_read_failure<T>(result: Result<T, TrapError>) {
@@ -635,6 +722,11 @@ mod tests {
         }
         fn run(&mut self) -> Result<VcpuExit, TrapError> {
             Err(boundary_error("restore-fault test driver cannot run"))
+        }
+        fn complete_pending_io(&mut self) -> Result<(), TrapError> {
+            Err(boundary_error(
+                "restore-fault test driver cannot complete IO",
+            ))
         }
     }
     #[test]
