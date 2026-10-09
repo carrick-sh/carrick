@@ -15,7 +15,12 @@ pub fn decode_x86_64(native: u64, mut args: [u64; 6], stack: u64) -> CanonicalCa
     if native == 56 {
         args.swap(3, 4);
     }
-    let canonical = if native == 57 {
+    let canonical = if native == 33 {
+        // dup2 has no canonical Linux ordinal: preserve its no-flags and
+        // oldfd == newfd semantics under the existing private x86 ordinal.
+        args = [args[0], args[1], 0, 0, 0, 0];
+        carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2
+    } else if native == 57 {
         // fork has no separate canonical syscall: normalize its no-argument
         // ABI to the minimal process clone shape, preserving its native nr.
         args = [
@@ -103,5 +108,16 @@ mod decode_tests {
         assert_eq!(call.canonical.raw(), 63); // read, served by the shared IPC/file family
         assert_eq!(call.args, [7, 0x1000, 8, 0, 0, 0]);
         assert_eq!(call.native.raw(), 0);
+    }
+
+    #[test]
+    fn x86_dup2_keeps_its_native_identity_with_zero_flags() {
+        let call = decode_x86_64(33, [1, 5, 999, 0, 0, 0], 0x8000);
+        assert_eq!(
+            call.canonical.raw(),
+            carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2
+        );
+        assert_eq!(call.native.raw(), 33);
+        assert_eq!(call.args, [1, 5, 0, 0, 0, 0]);
     }
 }
