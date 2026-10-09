@@ -81,6 +81,10 @@ use carrick_guest_arch::UserVa;
 use carrick_sched_core::{RecordRef, ThreadIdentity};
 use core::sync::atomic::Ordering;
 
+/// A retained native slot reader returns owned scalar state, never a borrowed slot.
+pub type RobustSlotReader<'r> =
+    dyn FnMut(&ThreadLifecyclePage, EntryRef) -> Option<(u64, u32)> + 'r;
+
 /// Native process custody supplied by the execution lane. Registry decisions
 /// remain in the shared scheduler owner; this adapter retains machine context.
 pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::ThreadCtx> {
@@ -116,6 +120,13 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
 
     fn has_thread(&self, _tid: u32) -> bool {
         false
+    }
+    fn read_robust_list(
+        &self,
+        _tid: u32,
+        _read_slot: &mut RobustSlotReader<'_>,
+    ) -> Result<(u64, u32), i64> {
+        Err(crate::identity::ESRCH)
     }
     fn robust_list_permission(&self, _tid: u32) -> Result<(), i64> {
         Err(crate::identity::ESRCH)
