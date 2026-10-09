@@ -423,6 +423,20 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .cloned()
     }
 
+    /// The exact admitted process address for a published thread-group
+    /// member. The group's page and visible PID prevent MM-only adoption.
+    pub fn group_address(
+        &self,
+        zone: &ZoneTables<C>,
+        address: AddressContext<RootGpa>,
+        page: &ThreadLifecyclePage,
+        visible_pid: u32,
+    ) -> Option<AddressContext<RootGpa>> {
+        let group = Self::group_key(zone, address, page, visible_pid);
+        let (runtime, process) = self.state.lock().groups.get(&group).cloned()?;
+        runtime.task_binding(process).map(|binding| binding.address)
+    }
+
     fn register_child(
         &self,
         parent: &NativeProcessRuntime<'a, M, C>,
@@ -1841,7 +1855,7 @@ mod tests {
         for (mm, address) in [(1, 0), (104, 0xffff_ffff_a800_0000), (u64::MAX, u64::MAX)] {
             assert_eq!(
                 ZoneTables::<ParkedContextWords>::bucket_of_with_context(mm, address),
-                ZoneTables::bucket_of(mm, address)
+                ZoneTables::<carrick_sched_core::ThreadCtx>::bucket_of(mm, address)
             );
         }
     }

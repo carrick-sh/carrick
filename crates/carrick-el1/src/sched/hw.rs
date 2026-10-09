@@ -12,7 +12,7 @@ mod aarch64_context;
 pub(super) use aarch64_context::{load_frame, save_frame};
 use carrick_el1_abi::CurrentTask;
 #[cfg(target_os = "none")]
-use carrick_el1_abi::{ThreadCtx, TrapFrame};
+use carrick_el1_abi::{Aarch64ParkedContext, TrapFrame};
 
 /// EL1's user-word reader: stage-1 permission check, then one fixup-guarded
 /// unprivileged 32-bit load (single-copy atomic for an aligned word).
@@ -118,11 +118,11 @@ pub struct HardwareCpu;
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl ThreadCpu for HardwareCpu {
-    fn save(&mut self, frame: &TrapFrame, ctx: &mut ThreadCtx) {
-        aarch64_context::save(frame, ctx);
+    fn save(&mut self, frame: &TrapFrame, ctx: &mut Aarch64ParkedContext) {
+        aarch64_context::save(frame, &mut ctx.native);
     }
-    fn load(&mut self, frame: &mut TrapFrame, ctx: &ThreadCtx) {
-        aarch64_context::load(frame, ctx);
+    fn load(&mut self, frame: &mut TrapFrame, ctx: &Aarch64ParkedContext) {
+        aarch64_context::load(frame, &ctx.native);
     }
 
     fn set_translation(&mut self, ttbr0: u64, ttbr1: u64) {
@@ -255,10 +255,10 @@ impl ThreadCpu for HardwareCpu {
     // AArch64 entry. CPL0 switches through ZoneRecord<ParkedContextWords>
     // and an authenticated CR3 in cpl0_lifecycle. Reaching these leaves on
     // x86 is an invalid entry-lane mix, never a successful context switch.
-    fn save(&mut self, _frame: &TrapFrame, _ctx: &mut ThreadCtx) {
+    fn save(&mut self, _frame: &TrapFrame, _ctx: &mut Aarch64ParkedContext) {
         crate::isa::x86::fatal_entry_binding()
     }
-    fn load(&mut self, _frame: &mut TrapFrame, _ctx: &ThreadCtx) {
+    fn load(&mut self, _frame: &mut TrapFrame, _ctx: &Aarch64ParkedContext) {
         crate::isa::x86::fatal_entry_binding()
     }
     fn set_translation(&mut self, _ttbr0: u64, _ttbr1: u64) {

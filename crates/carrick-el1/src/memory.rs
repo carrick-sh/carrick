@@ -992,7 +992,7 @@ pub fn delegated_anonymous_root<
 pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
     frame: &TrapFrame,
     current_tasks: &[CurrentTask],
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     editor: &mut E,
 ) -> MunmapDisposition {
     if frame.x[8] != SYS_MUNMAP {
@@ -1055,7 +1055,7 @@ pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
 pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
     frame: &TrapFrame,
     current_tasks: &[CurrentTask],
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     editor: &mut E,
 ) -> MprotectDisposition {
     if frame.x[8] != SYS_MPROTECT {
@@ -1506,7 +1506,7 @@ mod tests {
             mm: &Mm,
         ) -> reservations::Reservations<'a> {
             table
-                .lock(
+                .lock_with_context(
                     spaces.find(mm.key).unwrap().index(),
                     ReservationMm::new(mm.key).unwrap(),
                 )

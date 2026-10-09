@@ -38,13 +38,14 @@ pub fn grant_target<
     P: PinnedMetadataExtent,
     Policy: ReservationPolicy,
     Geometry: ReservationGeometry,
-    Venue: OwnerVenue,
+    Venue: OwnerVenue<Context>,
     B: OwnerMmu,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
 >(
-    portal: &'a MmPortal<'_, P, Policy, Geometry, Venue, B>,
+    portal: &'a MmPortal<'_, P, Policy, Geometry, Venue, B, Context>,
     window: carrick_core_abi::PortalGrantWindow,
     worker: u32,
-) -> Result<GrantTarget<'a>, MmError> {
+) -> Result<GrantTarget<'a, Context>, MmError> {
     if window.operation.carrier != portal.carrier {
         return Err(MmError::Stale);
     }
@@ -147,11 +148,12 @@ pub fn serve_grant<
     P: PinnedMetadataExtent,
     Policy: ReservationPolicy,
     Geometry: ReservationGeometry,
-    Venue: OwnerVenue,
+    Venue: OwnerVenue<Context>,
     B: OwnerGrantMmu,
     W: LiveDescriptorWords + ?Sized,
+    Context: Copy + Send + Sync + zerocopy::FromZeros,
 >(
-    portal: &MmPortal<'_, P, Policy, Geometry, Venue, B>,
+    portal: &MmPortal<'_, P, Policy, Geometry, Venue, B, Context>,
     slot: &carrick_core_abi::PortalGrantSlot,
     words: &W,
     residency: &FrameGrantResidencyTable,

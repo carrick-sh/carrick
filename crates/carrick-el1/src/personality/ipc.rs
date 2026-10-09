@@ -809,7 +809,7 @@ mod tests {
     }
 
     struct HostWait;
-    impl LockWait for HostWait {
+    impl<C: carrick_el1_abi::EntryContext> LockWait<C> for HostWait {
         fn wait(&self, _attempt: u32) -> bool {
             core::hint::spin_loop();
             true
@@ -1159,14 +1159,17 @@ mod tests {
             let uaddr = 0x5000 + tid;
             let guard = self
                 .zone
-                .lock(ZoneTables::bucket_of(mm, uaddr), &HostWait)
+                .lock(ZoneTables::bucket_of_with_context(mm, uaddr), &HostWait)
                 .unwrap();
             let record = self.zone.alloc_record(identity(tid, mm)).unwrap();
             let mut ctx = ThreadCtx::ZERO;
             ctx.x = frame.x;
             ctx.pc = svc;
             // SAFETY: freshly allocated and unpublished.
-            unsafe { *self.zone.record(record).ctx_mut() = ctx };
+            unsafe {
+                *self.zone.record(record).ctx_mut() =
+                    carrick_el1_abi::Aarch64ParkedContext::from_register(ctx, 0, mm, 1)
+            };
             let seq = self.zone.next_seq(record);
             self.zone
                 .enqueue(&guard, record, seq, mm, uaddr, u32::MAX, 0)

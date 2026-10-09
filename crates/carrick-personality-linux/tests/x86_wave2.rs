@@ -70,10 +70,18 @@ fn unmigrated_family_completes_once_through_linux_owner() {
 // absence of a native scheduling venue, rather than model a second scheduler.
 struct NoCpu;
 impl carrick_el1::personality::sched::ThreadCpu for NoCpu {
-    fn save(&mut self, _: &carrick_el1_abi::TrapFrame, _: &mut carrick_el1_abi::ThreadCtx) {
+    fn save(
+        &mut self,
+        _: &carrick_el1_abi::TrapFrame,
+        _: &mut carrick_el1_abi::Aarch64ParkedContext,
+    ) {
         panic!("no CPU venue");
     }
-    fn load(&mut self, _: &mut carrick_el1_abi::TrapFrame, _: &carrick_el1_abi::ThreadCtx) {
+    fn load(
+        &mut self,
+        _: &mut carrick_el1_abi::TrapFrame,
+        _: &carrick_el1_abi::Aarch64ParkedContext,
+    ) {
         panic!("no CPU venue");
     }
     fn set_translation(&mut self, _: u64, _: u64) {

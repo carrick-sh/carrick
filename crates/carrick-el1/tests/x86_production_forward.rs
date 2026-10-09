@@ -66,10 +66,10 @@ impl dispatch::GuestDispatchFrame for X86Frame<'_> {
 // No native scheduling venue is supplied. Any CPU hook would be a bug.
 struct NoCpu;
 impl sched::ThreadCpu for NoCpu {
-    fn save(&mut self, _: &TrapFrame, _: &mut carrick_el1_abi::ThreadCtx) {
+    fn save(&mut self, _: &TrapFrame, _: &mut carrick_el1_abi::Aarch64ParkedContext) {
         panic!("no CPU venue");
     }
-    fn load(&mut self, _: &mut TrapFrame, _: &carrick_el1_abi::ThreadCtx) {
+    fn load(&mut self, _: &mut TrapFrame, _: &carrick_el1_abi::Aarch64ParkedContext) {
         panic!("no CPU venue");
     }
     fn set_translation(&mut self, _: u64, _: u64) {

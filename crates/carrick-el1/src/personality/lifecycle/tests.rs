@@ -411,6 +411,7 @@ fn clone_serves_libc_and_go_thread_flag_sets_and_queues_the_child() {
         assert_eq!(rec.home(), None);
         // SAFETY: queued, owned by this vCPU; the test only reads.
         let ctx = unsafe { *rec.ctx_mut() };
+        let ctx = ctx.native;
         assert_eq!(ctx.x[0], 0);
         assert_eq!(&ctx.x[1..5], &frame.x[1..5]);
         assert_eq!(ctx.pc, CLONE_PC);

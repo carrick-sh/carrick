@@ -169,30 +169,37 @@ impl carrick_el1_abi::MetadataCompletionWake for MetadataCompletionWake {
     }
 }
 
+fn complete_object_wake<C: carrick_el1_abi::EntryContext>(
+    zone: &carrick_sched_core::ZoneTables<C>,
+    owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>,
+) {
+    let (waker, effects) = owned.deliver_handbacks(&mut publish_handback);
+    let own = match waker {
+        carrick_sched_core::Waker::El1 { slot } => Some(slot),
+        carrick_sched_core::Waker::Host => None,
+    };
+    assert!(own.is_some() || (!effects.queued_own && !effects.misplaced));
+    for slot in effects
+        .sgi_slots()
+        .chain(own.filter(|_| effects.queued_own))
+    {
+        zone.owe_resched(slot);
+        resched_slot(slot);
+    }
+    if effects.misplaced
+        && let Some(slot) = own
+    {
+        kick_slot(slot);
+    }
+}
+
 impl LockWait for HostLockWait {
     fn complete_object_wake(
         &self,
-        zone: &ZoneTables,
-        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects,
+        zone: &carrick_sched_core::ZoneTables,
+        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
     ) {
-        let (waker, effects) = owned.deliver_handbacks(&mut publish_handback);
-        let own = match waker {
-            carrick_sched_core::Waker::El1 { slot } => Some(slot),
-            carrick_sched_core::Waker::Host => None,
-        };
-        assert!(own.is_some() || (!effects.queued_own && !effects.misplaced));
-        for slot in effects
-            .sgi_slots()
-            .chain(own.filter(|_| effects.queued_own))
-        {
-            zone.owe_resched(slot);
-            resched_slot(slot);
-        }
-        if effects.misplaced
-            && let Some(slot) = own
-        {
-            kick_slot(slot);
-        }
+        complete_object_wake(zone, owned);
     }
 
     fn wait(&self, attempt: u32) -> bool {
@@ -202,6 +209,23 @@ impl LockWait for HostLockWait {
             std::thread::yield_now();
         }
         true
+    }
+}
+
+impl LockWait<carrick_el1_abi::Aarch64ParkedContext> for HostLockWait {
+    fn complete_object_wake(
+        &self,
+        zone: &ZoneTables,
+        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >,
+    ) {
+        complete_object_wake(zone, owned);
+    }
+
+    fn wait(&self, attempt: u32) -> bool {
+        <Self as LockWait>::wait(self, attempt)
     }
 }
 
@@ -326,7 +350,8 @@ pub fn wake(zone: &ZoneTables, mm: u64, uaddr: u64, bitset: u32, count: u32) -> 
     let mut placements = Vec::new();
     let mut transfers = Vec::new();
     {
-        let Some(guard) = zone.lock(ZoneTables::bucket_of(mm, uaddr), &HostLockWait) else {
+        let Some(guard) = zone.lock(ZoneTables::bucket_of_with_context(mm, uaddr), &HostLockWait)
+        else {
             return wake;
         };
         wake.count = zone.wake_host(
@@ -365,8 +390,8 @@ pub fn requeue<E>(
     requeue_count: u32,
     check: impl FnOnce() -> Result<(), E>,
 ) -> Result<(Vec<RecordRef>, u32), E> {
-    let from_bucket = ZoneTables::bucket_of(mm, from);
-    let to_bucket = ZoneTables::bucket_of(mm, to);
+    let from_bucket = ZoneTables::bucket_of_with_context(mm, from);
+    let to_bucket = ZoneTables::bucket_of_with_context(mm, to);
     let (first, second) = if from_bucket <= to_bucket {
         (from_bucket, to_bucket)
     } else {
@@ -571,6 +596,7 @@ pub unsafe fn read_quiesced_parked_registers(
             QuiescedParkedRegisters::Unauthenticated
         }
         carrick_el1_abi::ParkedContextRead::Found(ctx) => {
+            let ctx = ctx.native;
             QuiescedParkedRegisters::Found(carrick_hal::Aarch64CoreRegisters {
                 gprs: ctx.x,
                 sp_el0: ctx.sp_el0,
@@ -1363,7 +1389,7 @@ mod tests {
             &mut |record| published.push(record),
             &mut |records| {
                 struct RefuseWait;
-                impl LockWait for RefuseWait {
+                impl<C: carrick_el1_abi::EntryContext> LockWait<C> for RefuseWait {
                     fn wait(&self, _: u32) -> bool {
                         false
                     }

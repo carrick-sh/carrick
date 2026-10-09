@@ -124,7 +124,7 @@ pub(crate) fn materialize_zone(
 }
 
 fn materialize_zone_in(
-    zone: &carrick_sched_core::ZoneTables,
+    zone: &carrick_el1_abi::ZoneTables,
     base: &GuestCpuState,
     record: carrick_el1_abi::RecordRef,
 ) -> Result<GuestCpuState, TrapError> {
@@ -156,9 +156,12 @@ fn materialize_zone_in(
     }
     // SAFETY: the host owns the record (checked above); its context is
     // frozen until the loader frees it.
-    let ctx = unsafe { *rec.ctx_mut() };
+    let parked = unsafe { *rec.ctx_mut() };
+    let ctx = parked.native;
     let mut state = (**base).clone();
     state.gprs = ctx.x;
+    state.ttbr0 = parked.root();
+    state.ttbr1 = parked.root();
     state.pc = ctx.pc;
     state.pstate = ctx.pstate;
     state.trap_pc = ctx.pc;
@@ -183,9 +186,10 @@ fn materialize_zone_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carrick_el1_abi::ZoneTables;
     use carrick_hal::threaded::Aarch64SyscallContinuationV1;
     use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken, OwnedObjectWakeEffects};
-    use carrick_sched_core::{BoundedSpin, RecordRef, ThreadIdentity, Waker, ZoneTables};
+    use carrick_sched_core::{BoundedSpin, RecordRef, ThreadIdentity, Waker};
     use std::cell::RefCell;
 
     fn zone() -> Box<ZoneTables> {
@@ -246,11 +250,12 @@ mod tests {
         let zone = zone();
         let key = ObjectWaitKey::metadata_request(17).unwrap();
         let delivered = RefCell::new(Vec::new());
-        let complete = |owned: OwnedObjectWakeEffects<'_>| {
-            let (_, effects) =
-                owned.deliver_handbacks(&mut |record| delivered.borrow_mut().push(record));
-            assert!(!effects.queued_own);
-        };
+        let complete =
+            |owned: OwnedObjectWakeEffects<'_, carrick_el1_abi::Aarch64ParkedContext>| {
+                let (_, effects) =
+                    owned.deliver_handbacks(&mut |record| delivered.borrow_mut().push(record));
+                assert!(!effects.queued_own);
+            };
         zone.bind_object_wait_with_completion(key, &BoundedSpin(0), &complete)
             .unwrap();
         let original = pending_read();
@@ -279,7 +284,10 @@ mod tests {
             )
             .expect("a repeated owner wait still owns its syscall");
             // SAFETY: this newly allocated record has not been published.
-            unsafe { *zone.record(record).ctx_mut() = ctx };
+            unsafe {
+                *zone.record(record).ctx_mut() =
+                    carrick_el1_abi::Aarch64ParkedContext::from_register(ctx, 0, 1, 1)
+            };
             {
                 let guard = zone
                     .object_wait_with_completion(key, &BoundedSpin(0), &complete)
@@ -361,14 +369,20 @@ mod tests {
         )
         .unwrap();
         // SAFETY: the freshly allocated record has not been published.
-        unsafe { *zone.record(record).ctx_mut() = ctx };
+        unsafe {
+            *zone.record(record).ctx_mut() =
+                carrick_el1_abi::Aarch64ParkedContext::from_register(ctx, 0, 1, 1)
+        };
         let GuestCpuState::Aarch64V1(cpu) = &mut saved else {
             panic!("AArch64 fixture");
         };
         // zone_park retires the completed futex syscall before saving its CPU.
         std::sync::Arc::make_mut(cpu).syscall_continuation = None;
         let guard = zone
-            .lock(ZoneTables::bucket_of(1, 0x6000), &BoundedSpin(0))
+            .lock(
+                ZoneTables::bucket_of_with_context(1, 0x6000),
+                &BoundedSpin(0),
+            )
             .unwrap();
         let seq = zone.next_seq(record);
         zone.enqueue(&guard, record, seq, 1, 0x6000, u32::MAX, 0)
@@ -474,9 +488,10 @@ mod tests {
                 .unwrap();
             let zone = zone();
             let key = ObjectWaitKey::metadata_request(17).unwrap();
-            let complete = |owned: OwnedObjectWakeEffects<'_>| {
-                owned.deliver_handbacks(&mut |_| {});
-            };
+            let complete =
+                |owned: OwnedObjectWakeEffects<'_, carrick_el1_abi::Aarch64ParkedContext>| {
+                    owned.deliver_handbacks(&mut |_| {});
+                };
             zone.bind_object_wait_with_completion(key, &BoundedSpin(0), &complete)
                 .unwrap();
             let source = zone

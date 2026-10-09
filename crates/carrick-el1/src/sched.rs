@@ -1,7 +1,7 @@
 //! Context switching, wait enrollment, timer expiration and CPU hardware.
 use carrick_el1_abi::{
-    Counters, CurrentTask, El1ExitReason, GIC_KICK_INTID, GIC_RESCHED_INTID, GIC_SPURIOUS_INTID,
-    GIC_VTIMER_INTID, SlotId, ThreadCtx, ThreadIdentity, TrapFrame, Waker, ZoneTables,
+    Aarch64ParkedContext, Counters, CurrentTask, El1ExitReason, GIC_KICK_INTID, GIC_RESCHED_INTID,
+    GIC_SPURIOUS_INTID, GIC_VTIMER_INTID, SlotId, ThreadIdentity, TrapFrame, Waker, ZoneTables,
 };
 use carrick_sched_core::{BoundedSpin, IDLE_SPIN_NS, PREEMPT_SLICE_NS, SwitchedIn, WakeEffects};
 use core::sync::atomic::Ordering;
@@ -19,9 +19,9 @@ pub mod object_wait;
 /// The CPU state and the per-vCPU hardware the in-guest scheduler uses.
 pub trait ThreadCpu {
     /// Save the running thread's `frame` and live state into `ctx`.
-    fn save(&mut self, frame: &TrapFrame, ctx: &mut ThreadCtx);
+    fn save(&mut self, frame: &TrapFrame, ctx: &mut Aarch64ParkedContext);
     /// Make `ctx` the running thread: fill `frame` and load live state.
-    fn load(&mut self, frame: &mut TrapFrame, ctx: &ThreadCtx);
+    fn load(&mut self, frame: &mut TrapFrame, ctx: &Aarch64ParkedContext);
     /// Install translation roots (`TTBR0_EL1`, `TTBR1_EL1`), effective for
     /// everything after the call.
     fn set_translation(&mut self, ttbr0: u64, ttbr1: u64);
@@ -116,7 +116,7 @@ pub struct Sched<'a, C: ThreadCpu, U: UserWord> {
     pub cpu: &'a mut C,
     pub user: &'a U,
     pub counters: &'a Counters,
-    pub handoff: Option<&'a mut Option<carrick_el1_abi::EntryHandoffReceipt>>,
+    pub handoff: Option<&'a mut Option<carrick_el1_abi::EntryHandoffReceipt<Aarch64ParkedContext>>>,
 }
 
 /// What [`Sched::take_irqs`] acknowledged.
@@ -128,7 +128,10 @@ pub struct IrqsTaken {
 }
 
 impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
-    pub(crate) fn record_handoff(&mut self, receipt: Option<carrick_el1_abi::EntryHandoffReceipt>) {
+    pub(crate) fn record_handoff(
+        &mut self,
+        receipt: Option<carrick_el1_abi::EntryHandoffReceipt<Aarch64ParkedContext>>,
+    ) {
         if let Some(destination) = self.handoff.as_deref_mut() {
             *destination = receipt;
         }
@@ -159,7 +162,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         let (zone, slot) = (self.zone, self.slot);
         let was_empty = zone.slot(slot).queued() == 0;
         let guard = zone.lock(
-            ZoneTables::bucket_of(mm, uaddr),
+            ZoneTables::bucket_of_with_context(mm, uaddr),
             &BoundedSpin(EL1_ZONE_LOCK_SPINS),
         )?;
         let mut effects = WakeEffects::default();
@@ -206,7 +209,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     ) -> Option<Served> {
         let (zone, slot) = (self.zone, self.slot);
         let guard = zone.lock(
-            ZoneTables::bucket_of(mm, uaddr),
+            ZoneTables::bucket_of_with_context(mm, uaddr),
             &BoundedSpin(EL1_ZONE_LOCK_SPINS),
         )?;
         let Some(word) = self.user.read_u32(self.task, uaddr) else {
@@ -342,7 +345,10 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         // SAFETY: switch_in_full made the record OnCpu on this slot.
         let ctx = unsafe { rec.ctx_mut() };
         self.cpu.load(frame, ctx);
-        self.task.linux.orig_arg0.store(ctx.x[0], Ordering::Relaxed);
+        self.task
+            .linux
+            .orig_arg0
+            .store(ctx.native.x[0], Ordering::Relaxed);
         if let Some(result) = switched.result {
             frame.x[0] = result;
         }
@@ -736,7 +742,8 @@ impl Default for FakeCpu {
 
 #[cfg(test)]
 impl ThreadCpu for FakeCpu {
-    fn save(&mut self, frame: &TrapFrame, ctx: &mut ThreadCtx) {
+    fn save(&mut self, frame: &TrapFrame, ctx: &mut Aarch64ParkedContext) {
+        let ctx = &mut ctx.native;
         hw::save_frame(frame, ctx);
         ctx.sp_el0 = self.regs.sp_el0;
         ctx.tpidr_el0 = self.regs.tpidr_el0;
@@ -749,7 +756,8 @@ impl ThreadCpu for FakeCpu {
         }
     }
 
-    fn load(&mut self, frame: &mut TrapFrame, ctx: &ThreadCtx) {
+    fn load(&mut self, frame: &mut TrapFrame, ctx: &Aarch64ParkedContext) {
+        let ctx = &ctx.native;
         hw::load_frame(frame, ctx);
         self.regs.sp_el0 = ctx.sp_el0;
         self.regs.tpidr_el0 = ctx.tpidr_el0;
