@@ -352,9 +352,20 @@ writes final `revents` and count. The physical CPU lease is released while
 the task waits. Neither a Linux `poll` forward nor an `epoll_pwait` alias
 remains.
 
-The in-zone part is still open: `resolve_poll` does not yet project an IPC
-description's pipe/eventfd readiness, and its `PollContinuation` clears the
-zone slot without registering an IPC producer or timer wake. A mixed host and
-in-zone set therefore cannot be reported as complete. The next cutover must
-join the shared IPC object's readiness and wait authority with the host
-ready set and the caller deadline before this design is review-ready.
+### Next milestone: in-zone IPC poll
+
+KVM currently calls shared dispatch with `ipc=None` and maps no IPC region or
+table map. The KVM host-bound poll milestone is reviewable on that boundary:
+there is no in-zone KVM descriptor for it to misclassify. The next milestone
+must map an ISA-neutral `IpcVenue` on KVM, publish the task's IPC table binding,
+and project pipe, eventfd and epoll readiness from their actual descriptions
+in `resolve_poll`. A mixed host and in-zone set needs one ready-set assembly
+and one absolute deadline, with a multi-object wait path that subscribes to
+each producer before releasing the physical CPU lease. It must reconcile
+producer publication racing enrollment, remove subscriptions on completion or
+cancellation, and resume through the shared owned-continuation route.
+
+The ARM `PollContinuation` also needs a separate repair in that milestone:
+register its IPC producer wake and shared timer before `clear_current`, then
+complete from re-sampled `revents` exactly once. Merely clearing the slot
+without those registrations returns a false zero and can lose the wake.
