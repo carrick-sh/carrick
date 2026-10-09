@@ -418,6 +418,7 @@ where
                 );
                 continue;
             }
+            task.binding().record_executor_failure(error.to_string());
             let settlement = fail_running_and_retire::<F::TaskBinding, _>(
                 resolver.as_ref(),
                 scheduler,
