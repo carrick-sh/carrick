@@ -93,10 +93,43 @@ impl<
     fn process_exit_group(&mut self, status: u8) -> Option<LifecycleOutcome> {
         Some(self.process_venue()?.exit_group(status))
     }
-    fn thread_spawned(&mut self, caller_tid: u32, child_tid: u32) {
-        if let Some(venue) = self.process_venue() {
-            venue.thread_spawned(caller_tid, child_tid);
-        }
+    fn publish_born(&mut self, birth: ThreadBirth<'a, '_>) -> Result<(), i64> {
+        let mut process = self.process.take();
+        let result = if let Some(venue) = process.as_deref_mut() {
+            if Some(venue.binding()) != LifecycleNative::binding(self) {
+                Err(carrick_personality_linux::identity::ESRCH)
+            } else {
+                venue.thread_spawned(birth.caller_tid, birth.child_tid, &mut || {
+                    birth
+                        .page
+                        .record_born(
+                            birth
+                                .claim
+                                .take()
+                                .ok_or(carrick_personality_linux::identity::EINVAL)?,
+                            birth.born,
+                        )
+                        .map_err(|_| carrick_personality_linux::identity::EINVAL)?;
+                    self.enqueue_born(birth.record);
+                    Ok(())
+                })
+            }
+        } else {
+            birth
+                .page
+                .record_born(
+                    birth
+                        .claim
+                        .take()
+                        .ok_or(carrick_personality_linux::identity::EINVAL)?,
+                    birth.born,
+                )
+                .map_err(|_| carrick_personality_linux::identity::EINVAL)?;
+            self.enqueue_born(birth.record);
+            Ok(())
+        };
+        self.process = process;
+        result
     }
     fn thread_exited(&mut self, tid: u32) {
         if let Some(venue) = self.process_venue() {

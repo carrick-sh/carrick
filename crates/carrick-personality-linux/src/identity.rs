@@ -73,20 +73,32 @@ pub enum IdentityCall {
     Prctl,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdentityReadError {
+    MissingThread,
+}
+impl IdentityReadError {
+    pub const fn errno(self) -> i64 {
+        match self {
+            Self::MissingThread => ESRCH,
+        }
+    }
+}
+
 pub trait ProcessIdentityVenue {
-    fn get_uids(&self) -> (u32, u32, u32, u32);
-    fn get_gids(&self) -> (u32, u32, u32, u32);
+    fn get_uids(&self) -> Result<(u32, u32, u32, u32), IdentityReadError>;
+    fn get_gids(&self) -> Result<(u32, u32, u32, u32), IdentityReadError>;
     fn set_resuid(&mut self, r: Option<u32>, e: Option<u32>, s: Option<u32>) -> Result<(), i64>;
     fn set_resgid(&mut self, r: Option<u32>, e: Option<u32>, s: Option<u32>) -> Result<(), i64>;
     fn set_reuid(&mut self, r: Option<u32>, e: Option<u32>) -> Result<(), i64>;
     fn set_regid(&mut self, r: Option<u32>, e: Option<u32>) -> Result<(), i64>;
     fn set_uid(&mut self, uid: u32) -> Result<(), i64>;
     fn set_gid(&mut self, gid: u32) -> Result<(), i64>;
-    fn set_fsuid(&mut self, fsuid: u32) -> u32;
-    fn set_fsgid(&mut self, fsgid: u32) -> u32;
+    fn set_fsuid(&mut self, fsuid: u32) -> Result<u32, IdentityReadError>;
+    fn set_fsgid(&mut self, fsgid: u32) -> Result<u32, IdentityReadError>;
     fn can_set_groups(&self) -> Result<(), i64>;
-    fn get_groups_count(&self) -> usize;
-    fn get_groups(&self, out: &mut alloc::vec::Vec<u32>);
+    fn get_groups_count(&self) -> Result<usize, IdentityReadError>;
+    fn get_groups(&self, out: &mut alloc::vec::Vec<u32>) -> Result<(), IdentityReadError>;
     fn set_groups(&mut self, groups: &[u32]) -> Result<(), i64>;
     fn capget(&self, pid: i32) -> Result<TaskCapabilities, i64>;
     fn capset(&mut self, pid: i32, caps: TaskCapabilities) -> Result<(), i64>;
@@ -158,28 +170,43 @@ pub fn invoke<'a>(
         }
         IdentityCall::GetUid => {
             let venue = native.process_identity()?;
-            let (ruid, _, _, _) = venue.get_uids();
+            let (ruid, _, _, _) = match venue.get_uids() {
+                Ok(value) => value,
+                Err(error) => return Some(SyscallResult::new(error.errno())),
+            };
             Some(SyscallResult::new(i64::from(ruid)))
         }
         IdentityCall::GetEuid => {
             let venue = native.process_identity()?;
-            let (_, euid, _, _) = venue.get_uids();
+            let (_, euid, _, _) = match venue.get_uids() {
+                Ok(value) => value,
+                Err(error) => return Some(SyscallResult::new(error.errno())),
+            };
             Some(SyscallResult::new(i64::from(euid)))
         }
         IdentityCall::GetGid => {
             let venue = native.process_identity()?;
-            let (rgid, _, _, _) = venue.get_gids();
+            let (rgid, _, _, _) = match venue.get_gids() {
+                Ok(value) => value,
+                Err(error) => return Some(SyscallResult::new(error.errno())),
+            };
             Some(SyscallResult::new(i64::from(rgid)))
         }
         IdentityCall::GetEgid => {
             let venue = native.process_identity()?;
-            let (_, egid, _, _) = venue.get_gids();
+            let (_, egid, _, _) = match venue.get_gids() {
+                Ok(value) => value,
+                Err(error) => return Some(SyscallResult::new(error.errno())),
+            };
             Some(SyscallResult::new(i64::from(egid)))
         }
         IdentityCall::GetResUid => {
             let (ruid, euid, suid) = {
                 let venue = native.process_identity()?;
-                let (r, e, s, _) = venue.get_uids();
+                let (r, e, s, _) = match venue.get_uids() {
+                    Ok(value) => value,
+                    Err(error) => return Some(SyscallResult::new(error.errno())),
+                };
                 (r, e, s)
             };
             if args[0] != 0 && !native.copy_out(UserVa::new(args[0]), &ruid.to_ne_bytes()) {
@@ -196,7 +223,10 @@ pub fn invoke<'a>(
         IdentityCall::GetResGid => {
             let (rgid, egid, sgid) = {
                 let venue = native.process_identity()?;
-                let (r, e, s, _) = venue.get_gids();
+                let (r, e, s, _) = match venue.get_gids() {
+                    Ok(value) => value,
+                    Err(error) => return Some(SyscallResult::new(error.errno())),
+                };
                 (r, e, s)
             };
             if args[0] != 0 && !native.copy_out(UserVa::new(args[0]), &rgid.to_ne_bytes()) {
@@ -262,19 +292,28 @@ pub fn invoke<'a>(
         }
         IdentityCall::SetFsUid => {
             let venue = native.process_identity()?;
-            let old = venue.set_fsuid(args[0] as u32);
+            let old = match venue.set_fsuid(args[0] as u32) {
+                Ok(value) => value,
+                Err(error) => return Some(SyscallResult::new(error.errno())),
+            };
             Some(SyscallResult::new(i64::from(old)))
         }
         IdentityCall::SetFsGid => {
             let venue = native.process_identity()?;
-            let old = venue.set_fsgid(args[0] as u32);
+            let old = match venue.set_fsgid(args[0] as u32) {
+                Ok(value) => value,
+                Err(error) => return Some(SyscallResult::new(error.errno())),
+            };
             Some(SyscallResult::new(i64::from(old)))
         }
         IdentityCall::GetGroups => {
             let size = args[0] as usize;
             let list_ptr = UserVa::new(args[1]);
             let venue = native.process_identity()?;
-            let count = venue.get_groups_count();
+            let count = match venue.get_groups_count() {
+                Ok(value) => value,
+                Err(error) => return Some(SyscallResult::new(error.errno())),
+            };
             if size == 0 {
                 return Some(SyscallResult::new(count as i64));
             }
@@ -282,7 +321,10 @@ pub fn invoke<'a>(
                 return Some(SyscallResult::new(EINVAL));
             }
             let mut groups = alloc::vec::Vec::new();
-            venue.get_groups(&mut groups);
+            match venue.get_groups(&mut groups) {
+                Ok(value) => value,
+                Err(error) => return Some(SyscallResult::new(error.errno())),
+            };
             let mut cur_addr = list_ptr.raw();
             for &gid in groups.iter().take(count) {
                 if !native.copy_out(UserVa::new(cur_addr), &gid.to_ne_bytes()) {
@@ -722,11 +764,11 @@ mod tests {
     }
 
     impl ProcessIdentityVenue for MockVenue {
-        fn get_uids(&self) -> (u32, u32, u32, u32) {
-            self.uids
+        fn get_uids(&self) -> Result<(u32, u32, u32, u32), IdentityReadError> {
+            Ok(self.uids)
         }
-        fn get_gids(&self) -> (u32, u32, u32, u32) {
-            self.gids
+        fn get_gids(&self) -> Result<(u32, u32, u32, u32), IdentityReadError> {
+            Ok(self.gids)
         }
         fn set_resuid(
             &mut self,
@@ -794,19 +836,19 @@ mod tests {
             self.gids.1 = gid;
             Ok(())
         }
-        fn set_fsuid(&mut self, fsuid: u32) -> u32 {
+        fn set_fsuid(&mut self, fsuid: u32) -> Result<u32, IdentityReadError> {
             let prev = self.uids.3;
             if fsuid != u32::MAX {
                 self.uids.3 = fsuid;
             }
-            prev
+            Ok(prev)
         }
-        fn set_fsgid(&mut self, fsgid: u32) -> u32 {
+        fn set_fsgid(&mut self, fsgid: u32) -> Result<u32, IdentityReadError> {
             let prev = self.gids.3;
             if fsgid != u32::MAX {
                 self.gids.3 = fsgid;
             }
-            prev
+            Ok(prev)
         }
         fn can_set_groups(&self) -> Result<(), i64> {
             if let Some(err) = self.can_set_groups_error {
@@ -814,12 +856,13 @@ mod tests {
             }
             Ok(())
         }
-        fn get_groups_count(&self) -> usize {
-            self.groups.len()
+        fn get_groups_count(&self) -> Result<usize, IdentityReadError> {
+            Ok(self.groups.len())
         }
-        fn get_groups(&self, out: &mut alloc::vec::Vec<u32>) {
+        fn get_groups(&self, out: &mut alloc::vec::Vec<u32>) -> Result<(), IdentityReadError> {
             out.clear();
             out.extend_from_slice(&self.groups);
+            Ok(())
         }
         fn set_groups(&mut self, groups: &[u32]) -> Result<(), i64> {
             self.groups = groups.to_vec();
