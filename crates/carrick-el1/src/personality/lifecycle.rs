@@ -555,7 +555,9 @@ impl<
             .unwrap_or(0)
     }
 
-    fn restore_signal_frame(&mut self) -> Result<u64, carrick_syscall_abi::LinuxErrno> {
+    fn restore_signal_frame(
+        &mut self,
+    ) -> Result<carrick_signal_core::policy::SigBlockMask, carrick_syscall_abi::LinuxErrno> {
         let task_idx = self.frame.task_index();
         #[cfg(test)]
         if let Some(user) = &mut self.lifecycle_user {

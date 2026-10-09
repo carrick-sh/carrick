@@ -43,7 +43,7 @@ pub trait GuestDispatchFrame: SyscallFrame {
     fn restore_signal_frame(
         &mut self,
         copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
-    ) -> Result<u64, carrick_syscall_abi::LinuxErrno> {
+    ) -> Result<carrick_signal_core::policy::SigBlockMask, carrick_syscall_abi::LinuxErrno> {
         let _ = copy_in;
         Err(carrick_personality_linux::abi::signal::LINUX_ENOSYS)
     }
@@ -80,7 +80,7 @@ impl GuestDispatchFrame for TrapFrame {
     fn restore_signal_frame(
         &mut self,
         copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
-    ) -> Result<u64, carrick_syscall_abi::LinuxErrno> {
+    ) -> Result<carrick_signal_core::policy::SigBlockMask, carrick_syscall_abi::LinuxErrno> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
             let mut backend = crate::isa::aarch64::Aarch64Backend;

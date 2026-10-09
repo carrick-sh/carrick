@@ -720,7 +720,7 @@ pub struct SignalFrameParams {
     pub sp: UserVa,
     pub handler: UserVa,
     pub restorer: Option<UserVa>,
-    pub mask: u64,
+    pub mask: carrick_signal_core::policy::SigBlockMask,
 }
 
 arch_trait!(SignalArch, SignalBackend {
@@ -736,7 +736,7 @@ arch_trait!(SignalArch, SignalBackend {
         frame: &mut Self::NativeFrame,
         fpstate: &mut [u8],
         copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool
-    ) -> Result<u64, Self::Error>;
+    ) -> Result<carrick_signal_core::policy::SigBlockMask, Self::Error>;
 });
 
 pub trait KernelArch:
