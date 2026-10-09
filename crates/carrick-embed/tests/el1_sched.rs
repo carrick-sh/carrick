@@ -3444,7 +3444,15 @@ fn el1_fork_cow_resolves_in_guest() {
     // container run. Baselines taken before that read incomplete and must
     // never be differenced, so warm the carrier with a one-fork workload
     // first; every measured delta then lies inside one live ledger.
-    run_fixture(&carrier, &["fork-cow", "1", "1"], Duration::from_secs(120));
+    let warmup = run_fixture(&carrier, &["fork-cow", "1", "1"], Duration::from_secs(120));
+    assert!(
+        warmup.result.success(),
+        "warm-up fork failed: {}; owner process refusal stages={:?}",
+        describe(&warmup),
+        read_el1_counters().map(|c| c
+            .process_refusals
+            .map(|n| n.load(std::sync::atomic::Ordering::Relaxed)))
+    );
     assert!(
         carrick_embed::host_cow_snapshot().complete,
         "warm-up must publish the carrier's host COW ledger"
@@ -3526,7 +3534,7 @@ fn el1_fork_cow_resolves_in_guest() {
 
         assert!(
             measured.result.success(),
-            "{}; owner syscall counts clone served/forwarded={:?}, wait4 served/forwarded={:?}, exit_group served/forwarded={:?}, fatal={}",
+            "{}; owner syscall counts clone served/forwarded={:?}, wait4 served/forwarded={:?}, exit_group served/forwarded={:?}, process refusal stages={:?}, fatal={}",
             describe(&measured),
             read_el1_counters().map(|c| [
                 c.served[220].load(std::sync::atomic::Ordering::Relaxed),
@@ -3540,6 +3548,9 @@ fn el1_fork_cow_resolves_in_guest() {
                 c.served[94].load(std::sync::atomic::Ordering::Relaxed),
                 c.forwarded[94].load(std::sync::atomic::Ordering::Relaxed),
             ]),
+            read_el1_counters().map(|c| c
+                .process_refusals
+                .map(|n| n.load(std::sync::atomic::Ordering::Relaxed))),
             read_el1_counters().map_or(0, |c| c.served[carrick_el1_abi::PANIC_SENTINEL_SYSCALL_NR]
                 .load(std::sync::atomic::Ordering::Relaxed)),
         );
