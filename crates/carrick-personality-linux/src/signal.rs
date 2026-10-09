@@ -365,8 +365,8 @@ pub trait SignalNative<'a>: crate::lifecycle::UserCopy {
 
 pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<SignalOutcome> {
     use crate::abi::signal::{
-        LINUX_EBADF, LINUX_EFAULT, LINUX_EINTR, LINUX_EINVAL, LINUX_SI_TKILL, LINUX_SI_USER,
-        LinuxSigaction, LinuxSiginfo, RT_SIGSET_SIZE,
+        LINUX_EFAULT, LINUX_EINTR, LINUX_EINVAL, LINUX_SI_TKILL, LINUX_SI_USER, LinuxSigaction,
+        LinuxSiginfo, RT_SIGSET_SIZE,
     };
     use zerocopy::{FromBytes, IntoBytes};
     let args = native.arguments();
@@ -647,13 +647,9 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 ),
             }
         }
-        SignalCall::PidfdSendSignal => {
-            let [_pidfd, _sig, _uinfo, flags, _, _] = args;
-            if flags != 0 {
-                return returned(LINUX_EINVAL.guest_retval(), false);
-            }
-            returned(LINUX_EBADF.guest_retval(), false)
-        }
+        // pidfd descriptors are still owned by the host dispatcher. Preserve
+        // its validation, identity mapping, and signaling semantics.
+        SignalCall::PidfdSendSignal => None,
         SignalCall::RtSigsuspend => {
             let [mask_ptr, size, _, _, _, _] = args;
             if size != RT_SIGSET_SIZE {
