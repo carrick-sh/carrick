@@ -36,6 +36,9 @@ pub trait GuestDispatchFrame: SyscallFrame {
             carrick_personality_linux::crossing::HostCrossingSet::X86 => true,
             carrick_personality_linux::crossing::HostCrossingSet::Aarch64 => arm_policy(),
         }
+    /// Whether this native call has the poll argument contract.
+    fn may_serve_poll(&self) -> bool {
+        false
     }
     fn arm_frame(&mut self) -> Option<&mut TrapFrame>;
     fn arm_frame_ref(&self) -> Option<&TrapFrame>;
@@ -568,6 +571,9 @@ impl<
     Context: DispatchContext,
 > PendingFamilies<'a, Context> for El1PendingFamilies<'a, F, C, U, G, Context>
 {
+    fn may_serve_poll(&self) -> bool {
+        self.frame.may_serve_poll()
+    }
     fn take_handoff_receipt(&mut self) -> Option<carrick_el1_abi::EntryHandoffReceipt<Context>> {
         self.process
             .as_deref_mut()

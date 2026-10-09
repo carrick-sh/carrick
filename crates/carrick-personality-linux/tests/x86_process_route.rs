@@ -3,6 +3,11 @@ use carrick_personality_linux::{
     entry::decode_x86_64,
     lifecycle::LifecycleCall,
 };
+
+#[test]
+fn arm_ppoll_stays_forwarded_until_guest_wait_is_complete() {
+    assert_eq!(route_aarch64(73, u64::MAX), Family::Unported);
+}
 use carrick_syscall_abi::syscall_x86_64::{SyscallRemap, lookup_x86_64};
 
 #[test]
