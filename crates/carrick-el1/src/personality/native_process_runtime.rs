@@ -1985,49 +1985,18 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
     }
 
     fn set_hostname(&mut self, name: &[u8]) -> Result<(), i64> {
-        let mut graph = self.runtime.graph.lock();
-        let task = graph
-            .owner
-            .task(self.key)
-            .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
-        let creds = task
-            .credentials_for(self.calling_tid)
-            .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
-        if !creds.is_admin_privileged() {
-            return Err(carrick_personality_linux::sysinfo::EPERM);
-        }
-        graph.uts.set_nodename(name);
+        self.can_set_hostname()?;
+        self.runtime.graph.lock().uts.set_nodename(name);
         Ok(())
     }
 
     fn can_set_domainname(&self) -> Result<(), i64> {
-        let graph = self.runtime.graph.lock();
-        let task = graph
-            .owner
-            .task(self.key)
-            .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
-        let creds = task
-            .credentials_for(self.calling_tid)
-            .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
-        if !creds.is_admin_privileged() {
-            return Err(carrick_personality_linux::sysinfo::EPERM);
-        }
-        Ok(())
+        self.can_set_hostname()
     }
 
     fn set_domainname(&mut self, name: &[u8]) -> Result<(), i64> {
-        let mut graph = self.runtime.graph.lock();
-        let task = graph
-            .owner
-            .task(self.key)
-            .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
-        let creds = task
-            .credentials_for(self.calling_tid)
-            .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
-        if !creds.is_admin_privileged() {
-            return Err(carrick_personality_linux::sysinfo::EPERM);
-        }
-        graph.uts.set_domainname(name);
+        self.can_set_hostname()?;
+        self.runtime.graph.lock().uts.set_domainname(name);
         Ok(())
     }
 
@@ -2050,34 +2019,19 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         resource: usize,
         limit: carrick_personality_linux::sysinfo::LinuxRlimit,
     ) -> Result<(), i64> {
-        let mut graph = self.runtime.graph.lock();
-        let task = graph
-            .owner
-            .task_mut(self.key)
-            .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
-        let old = task
-            .rlimits
-            .get(resource)
-            .ok_or(carrick_personality_linux::sysinfo::EINVAL)?;
-        if limit.rlim_cur > limit.rlim_max {
-            return Err(carrick_personality_linux::sysinfo::EINVAL);
-        }
-        let creds = task
-            .credentials_for(self.calling_tid)
-            .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
-        if limit.rlim_max > old.rlim_max && !creds.is_resource_privileged() {
-            return Err(carrick_personality_linux::sysinfo::EPERM);
-        }
-        task.rlimits.set(resource, limit);
-        Ok(())
+        self.prlimit64(0, resource, Some(limit)).map(|_| ())
     }
 
+    #[inline(never)]
     fn prlimit64(
         &mut self,
         pid: i32,
         resource: usize,
         new_limit: Option<carrick_personality_linux::sysinfo::LinuxRlimit>,
     ) -> Result<carrick_personality_linux::sysinfo::LinuxRlimit, i64> {
+        if new_limit.is_some_and(|limit| limit.rlim_cur > limit.rlim_max) {
+            return Err(carrick_personality_linux::sysinfo::EINVAL);
+        }
         let mut graph = self.runtime.graph.lock();
         let caller = graph
             .owner
@@ -2092,7 +2046,8 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         let caller_rgid = caller_creds.rgid;
 
         let target_pid = if pid == 0 { caller_pid } else { pid as u32 };
-        if target_pid != caller_pid && !caller_privileged {
+        let is_self_process = target_pid == caller_pid || caller.has_thread(target_pid);
+        if !is_self_process && !caller_privileged {
             let target = graph
                 .owner
                 .find_task_by_pid(target_pid)
@@ -2100,18 +2055,12 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             let target_creds = target
                 .credentials_for(target.metadata().namespace_pid)
                 .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
-            let uids_match = caller_ruid == target_creds.ruid
-                && caller_ruid == target_creds.euid
-                && caller_ruid == target_creds.suid;
-            let gids_match = caller_rgid == target_creds.rgid
-                && caller_rgid == target_creds.egid
-                && caller_rgid == target_creds.sgid;
-            if !uids_match || !gids_match {
+            if !target_creds.allows_prlimit_from(caller_ruid, caller_rgid) {
                 return Err(carrick_personality_linux::sysinfo::EPERM);
             }
         }
 
-        let target = if target_pid == caller_pid {
+        let target = if is_self_process {
             graph
                 .owner
                 .task_mut(self.key)
@@ -3850,5 +3799,102 @@ mod tests {
             entry.robust_list_permission(child_pid),
             Err(carrick_personality_linux::identity::EPERM)
         );
+    }
+
+    #[test]
+    fn prlimit64_resolves_non_leader_tid_of_own_process() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let child_page = Box::new(ThreadLifecyclePage::new());
+        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        }));
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &*child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+        };
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        entry.set_calling_tid(41);
+
+        // Spawn a non-leader thread TID 50 in caller process 41
+        entry.thread_spawned(41, 50);
+
+        use carrick_personality_linux::sysinfo::ProcessSysinfoVenue;
+        // Calling prlimit64 on non-leader TID 50 should resolve to own process limits (not ESRCH)
+        let res = entry.prlimit64(50, 7, None);
+        assert!(
+            res.is_ok(),
+            "prlimit64 on non-leader tid should succeed: {:?}",
+            res
+        );
+
+        // Unprivileged caller on non-leader TID 50 also succeeds because it's own process
+        use carrick_personality_linux::identity::ProcessIdentityVenue;
+        entry.set_uid(1000).unwrap();
+        let res_unpriv = entry.prlimit64(50, 7, None);
+        assert!(
+            res_unpriv.is_ok(),
+            "prlimit64 unprivileged on own non-leader tid should succeed: {:?}",
+            res_unpriv
+        );
+
+        // Calling prlimit64 on truly nonexistent TID 999 still returns ESRCH
+        let res_missing = entry.prlimit64(999, 7, None);
+        assert_eq!(res_missing, Err(carrick_personality_linux::sysinfo::ESRCH));
     }
 }

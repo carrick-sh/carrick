@@ -510,6 +510,15 @@ impl TaskCredentials {
             .contains(LinuxCapabilitySet::CAP_SYS_RESOURCE)
     }
 
+    pub fn allows_prlimit_from(&self, caller_ruid: TaskUid, caller_rgid: TaskGid) -> bool {
+        self.ruid == caller_ruid
+            && self.euid == caller_ruid
+            && self.suid == caller_ruid
+            && self.rgid == caller_rgid
+            && self.egid == caller_rgid
+            && self.sgid == caller_rgid
+    }
+
     /// Effect of user ID changes on capabilities per capabilities(7).
     pub fn on_uid_change(
         &mut self,
