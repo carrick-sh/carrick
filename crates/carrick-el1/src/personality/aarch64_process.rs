@@ -161,6 +161,7 @@ impl core::fmt::Debug for Born<'_> {
 pub trait ForkStockCrossing {
     fn cross_fork_stock(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError>;
     fn cross_root_exit(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError>;
+    fn cross_child_retire(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError>;
 }
 
 impl<T: ForkStockCrossing> ForkStockCrossing for &T {
@@ -170,6 +171,10 @@ impl<T: ForkStockCrossing> ForkStockCrossing for &T {
 
     fn cross_root_exit(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
         (**self).cross_root_exit(record_gpa, cpu)
+    }
+
+    fn cross_child_retire(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
+        (**self).cross_child_retire(record_gpa, cpu)
     }
 }
 
@@ -194,6 +199,19 @@ impl ForkStockCrossing for HvcForkStockCrossing {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
             crate::isa::aarch64::cross_hvc_root_exit(record_gpa, cpu)
+                .map_err(|_| NativeProcessError::Fault)
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        {
+            let _ = (record_gpa, cpu);
+            Err(NativeProcessError::Unsupported)
+        }
+    }
+
+    fn cross_child_retire(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            crate::isa::aarch64::cross_hvc_child_retire(record_gpa, cpu)
                 .map_err(|_| NativeProcessError::Fault)
         }
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
@@ -703,7 +721,43 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         fatal();
     }
 
-    fn retire_mm(&mut self, _mm: Self::Mm) {}
+    fn retire_mm(&mut self, mm: Self::Mm) {
+        // The root uses the terminal root-exit crossing after graph exit.
+        // Only fork-born children own lifecycle and table stock to quarantine.
+        if self.task.visible_pid() == Some(1) {
+            return;
+        }
+        if mm.mm.raw().get() != self.task.mm.key.load(Ordering::Acquire) {
+            fatal();
+        }
+        let binding = common_entry::execution_binding(self.task);
+        let Some(retire) = carrick_el1_abi::NativeChildRetire::new(binding, mm) else {
+            fatal();
+        };
+        if self
+            .crossing
+            .cross_child_retire(&retire as *const _ as u64, u64::from(self.worker()))
+            .is_err()
+        {
+            fatal();
+        }
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            let live = crate::isa::aarch64::hardware_live_ttbr();
+            if live & AARCH64_ROOT_ADDRESS_MASK != mm.root.address().raw() {
+                fatal();
+            }
+            let idle = self.zone.spaces.idle_ttbr();
+            if idle == 0 {
+                fatal();
+            }
+            crate::sched::ThreadCpu::set_translation(&mut crate::sched::HardwareCpu, idle, idle);
+            crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, live);
+            // Publish absence only after the broadcast TLBI completed. The
+            // host can drain this MM's quarantined stock on any later request.
+            self.zone.release_space(self.slot);
+        }
+    }
 
     fn wake_effects(&mut self, effects: WakeEffects) {
         deliver_wakes(effects);

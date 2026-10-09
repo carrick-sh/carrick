@@ -10,13 +10,13 @@
 //! - `El1FrameGrantLedger` accounts for all physical grants and returns;
 //! - [`PendingForkLoan`] records outstanding loans and validates exactly-once completion.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use carrick_el1_abi::{
     ForkLifecycleLoan, ForkStockExchange, ForkStockLoan, ForkStockRefusal, ForkStockSettlement,
-    NativeRootExit,
+    NativeChildRetire, NativeRootExit,
 };
-use carrick_guest_arch::{AddressContext, CpuId, RootGpa};
+use carrick_guest_arch::{AddressContext, CpuId, FrameGpa, KernelVa, RootGpa};
 use carrick_hal::asid::{AsidAllocator, AsidError, AsidGeneration};
 use carrick_sched_core::process::LinuxWaitStatus;
 use core::num::NonZeroU64;
@@ -58,6 +58,7 @@ pub struct PendingForkLoan {
     pub execution: GrantExecution,
     pub child_tables: Vec<RootGpa>,
     pub parent_tables: Vec<RootGpa>,
+    pub lifecycle: ForkLifecycleLoan,
     pub asid_gen: AsidGeneration,
 }
 
@@ -121,11 +122,12 @@ pub fn take_fork_table_stock(
 pub struct ForkStockHostCustody {
     pub grant_tables: Vec<RootGpa>,
     pub pending_loans: Vec<Option<PendingForkLoan>>,
-    pub active_executions: Vec<Option<GrantExecution>>,
     pub fork_next_loan: u64,
-    pub fork_lifecycle_available: bool,
+    pub lifecycle_stock: Vec<ForkLifecycleLoan>,
+    pub committed_lifecycle: BTreeMap<u64, ForkLifecycleLoan>,
+    pub committed_tables: BTreeMap<u64, Vec<RootGpa>>,
+    pub retired_mms: BTreeSet<u64>,
     pub kernel_region_gpa: u64,
-    pub lifecycle: ForkLifecycleLoan,
     pub carrier: NonZeroU64,
     pub asids: AsidAllocator,
     pub committed_asids: BTreeMap<u64, AsidGeneration>,
@@ -145,35 +147,67 @@ impl ForkStockHostCustody {
         Self {
             grant_tables: Vec::new(),
             pending_loans: vec![None; 32],
-            active_executions: vec![None; 32],
             fork_next_loan: 1,
-            fork_lifecycle_available: true,
+            lifecycle_stock: if cfg!(test) {
+                vec![ForkLifecycleLoan::ARM_DEFAULT]
+            } else {
+                Vec::new()
+            },
+            committed_lifecycle: BTreeMap::new(),
+            committed_tables: BTreeMap::new(),
+            retired_mms: BTreeSet::new(),
             kernel_region_gpa: carrick_mem::memory::LINUX_KERNEL_REGION_BASE,
-            lifecycle: ForkLifecycleLoan::ARM_DEFAULT,
             carrier,
             asids,
             committed_asids: BTreeMap::new(),
         }
     }
 
-    pub fn set_active_execution(&mut self, execution: GrantExecution) {
-        let cpu = execution.cpu.raw() as usize;
-        if cpu >= self.active_executions.len() {
-            self.active_executions.resize(cpu + 1, None);
+    /// Seed the same bounded stock in production and VM-free witnesses. Both
+    /// extents are carrier-owned, live stage-2 mappings admitted before guest
+    /// entry by the metadata aperture; lifecycle and table pages are disjoint.
+    pub fn install_boot_stock(
+        &mut self,
+        lifecycle_base: u64,
+        table_base: u64,
+    ) -> Result<(), ForkStockServiceError> {
+        let extent = carrick_el1_abi::EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64;
+        let aperture = carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE;
+        let limit = aperture + carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE;
+        let valid = |base: u64| {
+            base >= aperture
+                && base.is_multiple_of(extent)
+                && base.checked_add(extent).is_some_and(|end| end <= limit)
+        };
+        if !valid(lifecycle_base)
+            || !valid(table_base)
+            || lifecycle_base == table_base
+            || !self.grant_tables.is_empty()
+            || !self.committed_tables.is_empty()
+            || !self.committed_lifecycle.is_empty()
+            || self.pending_loans.iter().any(Option::is_some)
+        {
+            return Err(ForkStockServiceError::InvalidRecord);
         }
-        self.active_executions[cpu] = Some(execution);
-    }
-
-    pub fn clear_active_execution(&mut self, cpu: CpuId) {
-        let cpu = cpu.raw() as usize;
-        if cpu < self.active_executions.len() {
-            self.active_executions[cpu] = None;
-        }
-    }
-
-    pub fn active_execution_for_cpu(&self, cpu: CpuId) -> Option<GrantExecution> {
-        let cpu = cpu.raw() as usize;
-        self.active_executions.get(cpu).copied().flatten()
+        let lifecycles = ((lifecycle_base + 0x4000)..(lifecycle_base + extent))
+            .step_by(0x4000)
+            .map(|page| {
+                ForkLifecycleLoan::new_for_base(
+                    aperture,
+                    KernelVa::new(page),
+                    KernelVa::new(page + 0x1000),
+                )
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or(ForkStockServiceError::InvalidRecord)?;
+        let tables = (table_base..table_base + extent)
+            .step_by(4096)
+            .map(|ipa| RootGpa::page_aligned(FrameGpa::new(ipa)))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(ForkStockServiceError::InvalidRecord)?;
+        self.lifecycle_stock = lifecycles;
+        self.grant_tables = tables;
+        Ok(())
     }
 
     /// Service a stopped-vCPU loan request.
@@ -198,7 +232,7 @@ impl ForkStockHostCustody {
         if cpu_index >= self.pending_loans.len() {
             self.pending_loans.resize(cpu_index + 1, None);
         }
-        if self.pending_loans[cpu_index].is_some() || !self.fork_lifecycle_available {
+        if self.pending_loans[cpu_index].is_some() || self.lifecycle_stock.is_empty() {
             exchange.refuse(ForkStockRefusal::Capacity);
             return Err(ForkStockRefusal::Capacity);
         }
@@ -234,16 +268,26 @@ impl ForkStockHostCustody {
                 return Err(ForkStockRefusal::Capacity);
             }
         };
+        let Some(lifecycle) = self.lifecycle_stock.pop() else {
+            self.grant_tables.extend(child_tables);
+            self.grant_tables.extend(parent_tables);
+            self.asids
+                .release_unpublished(asid_gen)
+                .map_err(|_| ForkStockRefusal::Capacity)?;
+            exchange.refuse(ForkStockRefusal::Capacity);
+            return Err(ForkStockRefusal::Capacity);
+        };
         let Some(loan) = request.admit_loan(
             child_base,
             parent_base,
             self.kernel_region_gpa,
             id,
-            self.lifecycle,
+            lifecycle,
             Some(asid_gen.asid()),
         ) else {
             self.grant_tables.extend(child_tables);
             self.grant_tables.extend(parent_tables);
+            self.lifecycle_stock.push(lifecycle);
             self.asids
                 .release_unpublished(asid_gen)
                 .map_err(|_| ForkStockRefusal::Invalid)?;
@@ -256,6 +300,7 @@ impl ForkStockHostCustody {
             None => {
                 self.grant_tables.extend(child_tables);
                 self.grant_tables.extend(parent_tables);
+                self.lifecycle_stock.push(lifecycle);
                 self.asids
                     .release_unpublished(asid_gen)
                     .map_err(|_| ForkStockRefusal::Invalid)?;
@@ -268,6 +313,7 @@ impl ForkStockHostCustody {
             None => {
                 self.grant_tables.extend(child_tables);
                 self.grant_tables.extend(parent_tables);
+                self.lifecycle_stock.push(lifecycle);
                 self.asids
                     .release_unpublished(asid_gen)
                     .map_err(|_| ForkStockRefusal::Invalid)?;
@@ -287,6 +333,7 @@ impl ForkStockHostCustody {
                 }
                 self.grant_tables.extend(child_tables);
                 self.grant_tables.extend(parent_tables);
+                self.lifecycle_stock.push(lifecycle);
                 self.asids
                     .release_unpublished(asid_gen)
                     .map_err(|_| ForkStockRefusal::Capacity)?;
@@ -309,6 +356,7 @@ impl ForkStockHostCustody {
                 }
                 self.grant_tables.extend(child_tables);
                 self.grant_tables.extend(parent_tables);
+                self.lifecycle_stock.push(lifecycle);
                 self.asids
                     .release_unpublished(asid_gen)
                     .map_err(|_| ForkStockRefusal::Capacity)?;
@@ -318,12 +366,12 @@ impl ForkStockHostCustody {
             granted_parent.push(page.address().raw());
         }
 
-        self.fork_lifecycle_available = false;
         self.pending_loans[cpu_index] = Some(PendingForkLoan {
             loan,
             execution,
             child_tables,
             parent_tables,
+            lifecycle,
             asid_gen,
         });
 
@@ -332,7 +380,7 @@ impl ForkStockHostCustody {
             parent_base,
             self.kernel_region_gpa,
             id,
-            self.lifecycle,
+            lifecycle,
             Some(asid_gen.asid()),
         ) {
             if let Some(pending) = self.pending_loans[cpu_index].take() {
@@ -344,11 +392,11 @@ impl ForkStockHostCustody {
                 }
                 self.grant_tables.extend(pending.child_tables);
                 self.grant_tables.extend(pending.parent_tables);
+                self.lifecycle_stock.push(pending.lifecycle);
                 self.asids
                     .release_unpublished(pending.asid_gen)
                     .map_err(|_| ForkStockRefusal::Invalid)?;
             }
-            self.fork_lifecycle_available = true;
             exchange.refuse(ForkStockRefusal::Invalid);
             return Err(ForkStockRefusal::Invalid);
         }
@@ -397,10 +445,10 @@ impl ForkStockHostCustody {
             }
             self.grant_tables.extend(pending.child_tables);
             self.grant_tables.extend(pending.parent_tables);
+            self.lifecycle_stock.push(pending.lifecycle);
             self.asids
                 .release_unpublished(pending.asid_gen)
                 .map_err(ForkStockServiceError::Asid)?;
-            self.fork_lifecycle_available = true;
             if !settlement.accept(loan) {
                 return Err(ForkStockServiceError::InvalidRecord);
             }
@@ -441,9 +489,20 @@ impl ForkStockHostCustody {
                 .ok_or(ForkStockServiceError::NoPendingLoan)?;
             self.committed_asids
                 .insert(pending.loan.request.child_mm.raw(), pending.asid_gen);
+            self.committed_lifecycle
+                .insert(pending.loan.request.child_mm.raw(), pending.lifecycle);
 
             let unused_child: Vec<_> = pending.child_tables.drain(child_used..).collect();
             let unused_parent: Vec<_> = pending.parent_tables.drain(parent_used..).collect();
+
+            self.committed_tables
+                .entry(loan.request.child_mm.raw())
+                .or_default()
+                .extend(pending.child_tables);
+            self.committed_tables
+                .entry(loan.request.operation.mm.raw())
+                .or_default()
+                .extend(pending.parent_tables);
 
             for page in &unused_child {
                 ledger.mark_return(page.address().raw(), 4096, child_mm, false);
@@ -485,6 +544,76 @@ impl ForkStockHostCustody {
                 .map_err(ForkStockServiceError::Asid)?;
         }
         Ok(status)
+    }
+
+    pub(crate) fn service_child_retire(
+        &mut self,
+        execution: GrantExecution,
+        retire: &NativeChildRetire,
+    ) -> Result<(), ForkStockServiceError> {
+        if !retire.matches(execution.binding, execution.context)
+            || !self
+                .committed_asids
+                .contains_key(&execution.binding.mm.raw())
+            || !self
+                .committed_lifecycle
+                .contains_key(&execution.binding.mm.raw())
+        {
+            return Err(ForkStockServiceError::StaleExecution);
+        }
+        self.retired_mms.insert(execution.binding.mm.raw());
+        Ok(())
+    }
+
+    /// Reclaim only MMs whose final guest execution has moved off their root.
+    /// The caller authenticates absence from every live zone slot and clears
+    /// physical table bytes before returned pages reenter the stock.
+    pub(crate) fn reclaim_retired(
+        &mut self,
+        ledger: &mut El1FrameGrantLedger,
+        active_mm: u64,
+        safe_to_reclaim: impl Fn(u64) -> bool,
+        clear_tables: impl Fn(&[RootGpa]) -> bool,
+    ) -> Result<usize, ForkStockServiceError> {
+        let candidates: Vec<_> = self
+            .retired_mms
+            .iter()
+            .copied()
+            .filter(|mm| *mm != active_mm && safe_to_reclaim(*mm))
+            .collect();
+        let mut reclaimed = 0;
+        for mm in candidates {
+            let pages = self
+                .committed_tables
+                .get(&mm)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if !clear_tables(pages) {
+                return Err(ForkStockServiceError::MemoryAccessFailed);
+            }
+            if let Some(asid_gen) = self.committed_asids.remove(&mm) {
+                let retired = self
+                    .asids
+                    .retire(asid_gen)
+                    .map_err(ForkStockServiceError::Asid)?;
+                self.asids
+                    .acknowledge_tlb_flush(retired)
+                    .map_err(ForkStockServiceError::Asid)?;
+            }
+            if let Some(pages) = self.committed_tables.remove(&mm) {
+                let owner = El1FrameGrantMm::new(mm).ok_or(ForkStockServiceError::InvalidRecord)?;
+                for page in &pages {
+                    ledger.mark_return(page.address().raw(), 4096, owner, false);
+                }
+                self.grant_tables.extend(pages);
+            }
+            if let Some(lifecycle) = self.committed_lifecycle.remove(&mm) {
+                self.lifecycle_stock.push(lifecycle);
+            }
+            self.retired_mms.remove(&mm);
+            reclaimed += 1;
+        }
+        Ok(reclaimed)
     }
 
     /// Read/write helper resolving GPA through CarrierVmCustody stage-2 mappings.
@@ -926,17 +1055,27 @@ mod tests {
             .service_settlement(&mut ledger, exec, &mut commit, |_| true, |_| true)
             .expect("commit settlement");
 
-        // Root exit for the child MM retires the ASID exactly once
+        // Child exit marks the MM retired while its TTBR0 may still be live.
         let child_exec = test_execution(42, 0, 303);
-        let root_exit =
-            NativeRootExit::new(child_exec.binding, LinuxWaitStatus::from_wait_encoding(0))
-                .unwrap();
-        let status = custody
-            .service_root_exit(child_exec, &root_exit)
-            .expect("root exit");
-        assert_eq!(status, LinuxWaitStatus::from_wait_encoding(0));
+        let retire = NativeChildRetire::new(child_exec.binding, child_exec.context).unwrap();
+        custody
+            .service_child_retire(child_exec, &retire)
+            .expect("child quarantine");
 
-        // Calling root exit a second time finds no committed ASID for that MM
+        assert!(custody.committed_asids.contains_key(&303));
+        assert_eq!(
+            custody
+                .reclaim_retired(&mut ledger, exec.binding.mm.raw(), |_| true, |_| true)
+                .expect("reclaim after parent resumes"),
+            1
+        );
+        // A second pass cannot reclaim the same child twice.
+        assert_eq!(
+            custody
+                .reclaim_retired(&mut ledger, exec.binding.mm.raw(), |_| true, |_| true)
+                .expect("exactly once"),
+            0
+        );
         assert!(custody.committed_asids.get(&303).is_none());
 
         // The retired and acknowledged ASID is now reusable in the allocator
@@ -948,6 +1087,177 @@ mod tests {
             child_asid2,
             "retired ASID should be released back to the reusable pool"
         );
+    }
+
+    #[test]
+    fn sequential_fork_wait_reuses_retired_stock_beyond_pool_size() {
+        let carrier = NonZeroU64::new(7).unwrap();
+        let mut custody =
+            ForkStockHostCustody::with_asids(carrier, AsidAllocator::with_limit_for_tests(2));
+        let mut ledger = El1FrameGrantLedger::default();
+        custody
+            .install_boot_stock(
+                carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE,
+                carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
+                    + carrick_el1_abi::EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64,
+            )
+            .expect("production boot stock");
+        let pool_pages = custody.grant_tables.len();
+        let lifecycle_slots = custody.lifecycle_stock.len();
+        let parent = test_execution(41, 0, 301);
+
+        for cycle in 0..=pool_pages as u64 {
+            let child_mm = 302 + cycle;
+            let request = test_request(parent, child_mm, 1, 1);
+            let mut exchange = ForkStockExchange::new(request).unwrap();
+            let loan = custody
+                .service_loan(&mut ledger, parent, &mut exchange)
+                .expect("bounded stock serves each fork");
+            let completion = PortalForkCompletion {
+                request: loan.request,
+                child: unsafe {
+                    carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                        carrier,
+                        request.child_mm,
+                        NonZeroU64::MIN,
+                    )
+                },
+                parent_generation: ReservationGeneration::INITIAL,
+                child_tables_used: 4096,
+                parent_tables_used: 0,
+            };
+            let mut commit =
+                ForkStockSettlement::new(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 1)
+                    .unwrap();
+            custody
+                .service_settlement(&mut ledger, parent, &mut commit, |_| true, |_| true)
+                .expect("settle child and return unused parent page");
+            let child = test_execution(42 + cycle, 0, child_mm);
+            let retire = NativeChildRetire::new(child.binding, child.context).unwrap();
+            custody
+                .service_child_retire(child, &retire)
+                .expect("child quarantine");
+            assert_eq!(
+                custody
+                    .reclaim_retired(&mut ledger, parent.binding.mm.raw(), |_| true, |_| true)
+                    .expect("parent has resumed"),
+                1
+            );
+            assert_eq!(custody.grant_tables.len(), pool_pages);
+            assert_eq!(custody.lifecycle_stock.len(), lifecycle_slots);
+        }
+    }
+
+    #[test]
+    fn two_live_children_take_distinct_boot_lifecycle_pages() {
+        let carrier = NonZeroU64::new(7).unwrap();
+        let mut custody = ForkStockHostCustody::new(carrier);
+        custody
+            .install_boot_stock(
+                carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE,
+                carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
+                    + carrick_el1_abi::EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64,
+            )
+            .expect("production boot stock");
+        let mut ledger = El1FrameGrantLedger::default();
+        let parent = test_execution(41, 0, 301);
+        let mut lifecycles = Vec::new();
+        for child_mm in [302, 303] {
+            let request = test_request(parent, child_mm, 1, 1);
+            let mut exchange = ForkStockExchange::new(request).unwrap();
+            let loan = custody
+                .service_loan(&mut ledger, parent, &mut exchange)
+                .expect("fork while prior child remains live");
+            lifecycles.push(loan.lifecycle);
+            let completion = PortalForkCompletion {
+                request: loan.request,
+                child: unsafe {
+                    carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                        carrier,
+                        request.child_mm,
+                        NonZeroU64::MIN,
+                    )
+                },
+                parent_generation: ReservationGeneration::INITIAL,
+                child_tables_used: 4096,
+                parent_tables_used: 0,
+            };
+            let mut commit =
+                ForkStockSettlement::new(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 1)
+                    .unwrap();
+            custody
+                .service_settlement(&mut ledger, parent, &mut commit, |_| true, |_| true)
+                .expect("committed child stays live");
+        }
+        assert_ne!(lifecycles[0], lifecycles[1]);
+        assert_eq!(custody.committed_lifecycle.len(), 2);
+    }
+
+    #[test]
+    fn quarantined_child_tables_are_not_reissued_while_mm_is_live() {
+        let carrier = NonZeroU64::new(7).unwrap();
+        let mut custody = ForkStockHostCustody::new(carrier);
+        custody
+            .install_boot_stock(
+                carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE,
+                carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
+                    + carrick_el1_abi::EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64,
+            )
+            .expect("production boot stock");
+        let mut ledger = El1FrameGrantLedger::default();
+        let parent = test_execution(41, 0, 301);
+        let pool_pages = custody.grant_tables.len() as u64;
+        let request = test_request(parent, 302, pool_pages - 1, 1);
+        let mut exchange = ForkStockExchange::new(request).unwrap();
+        let loan = custody
+            .service_loan(&mut ledger, parent, &mut exchange)
+            .expect("first child takes available table stock");
+        let completion = PortalForkCompletion {
+            request: loan.request,
+            child: unsafe {
+                carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                    carrier,
+                    request.child_mm,
+                    NonZeroU64::MIN,
+                )
+            },
+            parent_generation: ReservationGeneration::INITIAL,
+            child_tables_used: (pool_pages - 1) * 4096,
+            parent_tables_used: 0,
+        };
+        let mut commit =
+            ForkStockSettlement::new(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 1)
+                .unwrap();
+        custody
+            .service_settlement(&mut ledger, parent, &mut commit, |_| true, |_| true)
+            .expect("commit first child");
+        let child = test_execution(42, 0, 302);
+        let retire = NativeChildRetire::new(child.binding, child.context).unwrap();
+        custody
+            .service_child_retire(child, &retire)
+            .expect("quarantine child tables");
+        assert_eq!(
+            custody
+                .reclaim_retired(&mut ledger, parent.binding.mm.raw(), |_| false, |_| true)
+                .unwrap(),
+            0
+        );
+        let next = test_request(parent, 303, pool_pages - 1, 1);
+        let mut refused = ForkStockExchange::new(next).unwrap();
+        assert_eq!(
+            custody.service_loan(&mut ledger, parent, &mut refused),
+            Err(ForkStockRefusal::Capacity)
+        );
+        assert_eq!(
+            custody
+                .reclaim_retired(&mut ledger, parent.binding.mm.raw(), |_| true, |_| true)
+                .unwrap(),
+            1
+        );
+        let mut admitted = ForkStockExchange::new(next).unwrap();
+        custody
+            .service_loan(&mut ledger, parent, &mut admitted)
+            .expect("stock is reusable only after quarantine drains");
     }
 
     #[repr(align(64))]
@@ -1006,7 +1316,6 @@ mod tests {
         }
 
         let exec = test_execution(41, 0, 301);
-        custody.fork_stock.lock().set_active_execution(exec);
 
         let req = test_request(exec, 302, 4, 1);
         let exchange = ForkStockExchange::new(req).unwrap();
@@ -1019,6 +1328,7 @@ mod tests {
             &custody,
             Some(generation),
             exec.cpu,
+            Some(exec),
             carrick_el1_abi::GRANT_OP_FORK_STOCK,
             record_ipa,
             0,
@@ -1070,6 +1380,7 @@ mod tests {
             &custody,
             Some(generation),
             exec.cpu,
+            Some(exec),
             carrick_el1_abi::GRANT_OP_FORK_STOCK,
             record_ipa,
             0,
@@ -1137,6 +1448,7 @@ mod tests {
             &custody,
             Some(generation),
             exec.cpu,
+            None,
             carrick_el1_abi::GRANT_OP_FORK_STOCK,
             record_ipa,
             0,
@@ -1155,7 +1467,6 @@ mod tests {
         // Case 2: Mismatched foreign execution -> typed refusal (Stale), ledger unchanged
         let mut foreign_exec = exec;
         foreign_exec.binding.task = EntryTaskKey::from_raw(999);
-        custody.fork_stock.lock().set_active_execution(foreign_exec);
         let exchange = ForkStockExchange::new(req).unwrap();
         unsafe {
             (record_page.0.as_mut_ptr() as *mut ForkStockExchange).write(exchange);
@@ -1164,6 +1475,7 @@ mod tests {
             &custody,
             Some(generation),
             foreign_exec.cpu,
+            Some(foreign_exec),
             carrick_el1_abi::GRANT_OP_FORK_STOCK,
             record_ipa,
             0,
@@ -1184,6 +1496,7 @@ mod tests {
             &custody,
             Some(generation),
             exec.cpu,
+            Some(exec),
             carrick_el1_abi::GRANT_OP_FORK_STOCK,
             record_ipa + 1,
             0,
@@ -1201,6 +1514,7 @@ mod tests {
             &custody,
             Some(generation),
             exec.cpu,
+            Some(exec),
             carrick_el1_abi::GRANT_OP_FORK_STOCK,
             0x9999_0000,
             0,
@@ -1248,11 +1562,11 @@ mod tests {
         }
 
         // Case 1: Matching active execution -> SUCCESS with status, ledger unchanged
-        custody.fork_stock.lock().set_active_execution(exec);
         let result = crate::metadata_grant::service_metadata_operation(
             &custody,
             Some(generation),
             exec.cpu,
+            Some(exec),
             carrick_el1_abi::GRANT_OP_ROOT_EXIT,
             record_ipa,
             0,
@@ -1273,11 +1587,11 @@ mod tests {
         // Case 2: Stale active execution -> ERR_DENIED, ledger unchanged
         let mut foreign_exec = exec;
         foreign_exec.binding.generation = EntryGeneration::from_raw(999);
-        custody.fork_stock.lock().set_active_execution(foreign_exec);
         let result = crate::metadata_grant::service_metadata_operation(
             &custody,
             Some(generation),
             foreign_exec.cpu,
+            Some(foreign_exec),
             carrick_el1_abi::GRANT_OP_ROOT_EXIT,
             record_ipa,
             0,
@@ -1341,9 +1655,6 @@ mod tests {
         let exec_0 = test_execution(41, 0, 300);
         let exec_a = test_execution(41, 1, 301);
         let exec_b = test_execution(41, 2, 302);
-        custody.fork_stock.lock().set_active_execution(exec_0);
-        custody.fork_stock.lock().set_active_execution(exec_a);
-        custody.fork_stock.lock().set_active_execution(exec_b);
         custody.fork_stock.lock().carrier = NonZeroU64::new(7).unwrap();
 
         let initial_ledger = custody.el1_frame_grants.lock().snapshot();
@@ -1358,7 +1669,8 @@ mod tests {
         let result = crate::metadata_grant::service_metadata_operation(
             &custody,
             Some(generation),
-            exec_a.cpu, // Trapped on vCPU A!
+            exec_a.cpu,
+            Some(exec_a), // Trapped on vCPU A!
             carrick_el1_abi::GRANT_OP_FORK_STOCK,
             record_ipa,
             exec_b.cpu.raw() as u64, // Guest attempts to name vCPU B
@@ -1385,7 +1697,8 @@ mod tests {
         let result = crate::metadata_grant::service_metadata_operation(
             &custody,
             Some(generation),
-            exec_a.cpu, // Trapped on vCPU A!
+            exec_a.cpu,
+            Some(exec_a), // Trapped on vCPU A!
             carrick_el1_abi::GRANT_OP_FORK_STOCK,
             record_ipa,
             9999, // Out of range!
@@ -1411,7 +1724,8 @@ mod tests {
         let result = crate::metadata_grant::service_metadata_operation(
             &custody,
             Some(generation),
-            exec_a.cpu, // Trapped on vCPU A!
+            exec_a.cpu,
+            Some(exec_a), // Trapped on vCPU A!
             carrick_el1_abi::GRANT_OP_FORK_STOCK,
             record_ipa,
             0,
@@ -1433,7 +1747,8 @@ mod tests {
         let result = crate::metadata_grant::service_metadata_operation(
             &custody,
             Some(generation),
-            exec_a.cpu, // Trapped on A
+            exec_a.cpu,
+            Some(exec_a), // Trapped on A
             carrick_el1_abi::GRANT_OP_ROOT_EXIT,
             record_ipa,
             exec_b.cpu.raw() as u64, // Guest attempts to name B
@@ -1526,7 +1841,6 @@ mod tests {
         }
 
         let exec = test_execution(41, 0, 301);
-        custody.fork_stock.lock().set_active_execution(exec);
         custody.fork_stock.lock().carrier = NonZeroU64::new(7).unwrap();
         let req = test_request(exec, 302, 4, 1);
 
@@ -1539,6 +1853,7 @@ mod tests {
             &custody,
             Some(generation),
             exec.cpu,
+            Some(exec),
             carrick_el1_abi::GRANT_OP_FORK_STOCK,
             record_ipa,
             0,
@@ -1578,6 +1893,7 @@ mod tests {
             &custody,
             Some(generation),
             exec.cpu,
+            Some(exec),
             carrick_el1_abi::GRANT_OP_FORK_STOCK,
             record_ipa,
             0,
