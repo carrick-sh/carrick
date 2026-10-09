@@ -559,7 +559,7 @@ fn finish<'a, C: EntryContext + 'a>(
     } else {
         completion_route(result, pending.host_work())
     };
-    if (route == CompletionRoute::Forward && reason == ForwardReason::Unported)
+    if (result == FamilyCompletion::Forward && run.forward_reason == ForwardReason::Unported)
         || (pending.crossing_set() == crate::crossing::HostCrossingSet::X86
             && matches!(
                 result,
@@ -666,7 +666,15 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
         pending.declined_for_work(ordinal);
         return finish(
             ordinal,
-            FamilyCompletion::Forward.into(),
+            FamilyRun {
+                completion: FamilyCompletion::Forward,
+                returned: None,
+                forward_reason: if family == Family::Unported {
+                    ForwardReason::Unported
+                } else {
+                    ForwardReason::FamilyFallback
+                },
+            },
             pending,
             completion,
         );
@@ -721,6 +729,7 @@ mod ring_first_tests {
     // No lifecycle or process venue: a terminal call still belongs to the
     // carrier, just as in x86's crossing set, until native custody serves it.
     struct CarrierOwned<'a> {
+        state: crate::abi::entry::LinuxTaskState,
         result: i64,
         native: carrick_syscall_abi::NativeNr,
         admitted: bool,
@@ -743,6 +752,9 @@ mod ring_first_tests {
         }
         fn native_number(&self) -> Option<carrick_syscall_abi::NativeNr> {
             Some(self.native)
+        }
+        fn task_state(&self) -> Option<&crate::abi::entry::LinuxTaskState> {
+            Some(&self.state)
         }
         fn host_work(&self) -> bool {
             self.work
@@ -781,6 +793,7 @@ mod ring_first_tests {
     fn failed_entry_admission_cannot_bypass_crossing_policy() {
         let refused = [const { AtomicU64::new(0) }; 513];
         let mut pending = CarrierOwned {
+            state: crate::abi::entry::LinuxTaskState::new(),
             native: carrick_syscall_abi::NativeNr(174),
             admitted: false,
             result: 42,
@@ -815,6 +828,7 @@ mod ring_first_tests {
         ] {
             let refused = [const { AtomicU64::new(0) }; 513];
             let mut pending = CarrierOwned {
+                state: crate::abi::entry::LinuxTaskState::new(),
                 native: carrick_syscall_abi::NativeNr(ordinal),
                 admitted: true,
                 result: 42,
@@ -828,8 +842,21 @@ mod ring_first_tests {
                 expected,
                 "ordinal={ordinal} work={work} handback={handback}"
             );
-            assert_eq!(pending.result, 42);
-            assert_eq!(pending.refused[ordinal as usize].load(Ordering::Relaxed), 0);
+            if ordinal == 174 {
+                assert_eq!(
+                    pending.result, -38,
+                    "pending work must not leak host getuid"
+                );
+                assert_eq!(pending.refused[174].load(Ordering::Relaxed), 1);
+                assert_eq!(pending.forwarded[174].load(Ordering::Relaxed), 0);
+                assert_eq!(
+                    pending.state.take_served_boundary(),
+                    Some(crate::abi::entry::ServedBoundary::Completed)
+                );
+            } else {
+                assert_eq!(pending.result, 42);
+                assert_eq!(pending.refused[ordinal as usize].load(Ordering::Relaxed), 0);
+            }
         }
     }
 
@@ -838,6 +865,7 @@ mod ring_first_tests {
         for ordinal in [93, 94] {
             let refused = [const { AtomicU64::new(0) }; 513];
             let mut pending = CarrierOwned {
+                state: crate::abi::entry::LinuxTaskState::new(),
                 native: carrick_syscall_abi::NativeNr(ordinal),
                 admitted: true,
                 result: 42,
