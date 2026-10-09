@@ -11,6 +11,7 @@ use carrick_core_abi::{
     ReservationGeneration, ReservationMm, ReservationNodeFlags, ReservationProtection,
     ReservationRange,
 };
+use carrick_el1_abi::{EL1_DYNAMIC_METADATA_BASE, EL1_DYNAMIC_METADATA_EXTENT_SIZE};
 use carrick_mmu_core::aarch64::descriptor_txn::{DescriptorRefusal, LiveDescriptorWords};
 use carrick_mmu_core::aarch64::owner_fork::{
     GRANULE_SIZE, IDENTITY_PAGE_BASE, IDENTITY_PAGE_OFFSET, IDENTITY_PAGE_SIZE,
@@ -124,6 +125,134 @@ fn arm_fork_control_alias_maps_only_loaned_child_table_pages() {
         0x40_0000
     );
     assert_eq!(scratch.child[alias_entry + 4], 0);
+}
+
+#[test]
+fn arm_fork_publish_needs_the_carrier_owned_stock_window() {
+    let mut request = sample_arm_request(1);
+    let words = TestMemory::new();
+    let root = 0x10_0000;
+    let l1 = 0x10_1000;
+    let l2 = 0x10_2000;
+    words.store(root, l1 | TYPE_TABLE_OR_PAGE);
+    words.store(l1 + 180 * 8, l2 | TYPE_TABLE_OR_PAGE);
+    words.store(l2, KERNEL_CONTROL_BASE | AF | SH_IS | TYPE_BLOCK);
+    let mut count = ForkCensus {
+        child: 0,
+        parent: 0,
+        live: 0,
+        custody: 0,
+    };
+    census_table::<Aarch64Mmu, _, _>(&LinuxForkPolicy, &words, &[], root, 0, 0, &mut count)
+        .unwrap();
+    request.child_tables = PortalForkTableArena::new(
+        EL1_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64,
+        (count.child * 8) as u64,
+    )
+    .unwrap();
+    let mut scratch = ForkScratch::bounded(
+        request,
+        0,
+        count.child,
+        count.parent,
+        count.live,
+        count.custody,
+    )
+    .unwrap();
+    copy_table::<Aarch64Mmu, _, _>(
+        &LinuxForkPolicy,
+        &words,
+        request,
+        &mut scratch,
+        ForkTableCursor {
+            table: root,
+            level: 0,
+            base: 0,
+            child_offset: 0,
+        },
+    )
+    .unwrap();
+    let child = TestChildRoot {
+        incarnation: 1,
+        admitted: false,
+        authorized: true,
+        origin: Arc::new(Mutex::new(None)),
+        finished: false,
+        retired: Arc::new(AtomicBool::new(false)),
+    };
+    let parent = TestParentRoot {
+        incarnation: 1,
+        generation: Arc::new(Mutex::new(ReservationGeneration::new(1).unwrap())),
+        sequence: 1,
+        ready: true,
+        authorized: true,
+        finished: false,
+    };
+    let mut stage = ForkPublishStage::RevalidateWords;
+    let restricted = StockWindowMemory {
+        inner: &words,
+        stock_visible: false,
+    };
+    assert_eq!(
+        PreparedOwnerFork::<Aarch64Mmu>::new(request, root, scratch.clone())
+            .publish(
+                &restricted,
+                parent.clone(),
+                child.clone(),
+                sample_child_handle(20),
+                &mut stage
+            )
+            .err(),
+        Some(ForkError::Core)
+    );
+    assert_eq!(stage, ForkPublishStage::StoreChildTables);
+    let admitted = StockWindowMemory {
+        inner: &words,
+        stock_visible: true,
+    };
+    PreparedOwnerFork::<Aarch64Mmu>::new(request, root, scratch)
+        .publish(
+            &admitted,
+            parent,
+            child,
+            sample_child_handle(20),
+            &mut stage,
+        )
+        .unwrap();
+}
+
+struct StockWindowMemory<'a> {
+    inner: &'a TestMemory,
+    stock_visible: bool,
+}
+
+impl LiveDescriptorWords for StockWindowMemory<'_> {
+    fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
+        self.inner.load(pa)
+    }
+    fn compare_exchange(
+        &self,
+        pa: u64,
+        before: u64,
+        after: u64,
+    ) -> Result<bool, DescriptorRefusal> {
+        self.inner.compare_exchange(pa, before, after)
+    }
+    fn store_unlinked(&self, pa: u64, value: u64) -> Result<(), DescriptorRefusal> {
+        let base = EL1_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64;
+        if !self.stock_visible
+            && (base..base + EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64).contains(&pa)
+        {
+            return Err(DescriptorRefusal::TableOutsidePrimary);
+        }
+        self.inner.store_unlinked(pa, value)
+    }
+    fn publish_barrier(&self) {
+        self.inner.publish_barrier()
+    }
+    fn invalidate_range(&self, va: u64, len: u64) {
+        self.inner.invalidate_range(va, len)
+    }
 }
 
 impl TestMemory {

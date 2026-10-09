@@ -3460,6 +3460,7 @@ fn el1_fork_cow_resolves_in_guest() {
     let _guard = common::guest_lock();
     reset_el1_counters();
     let carrier = carrier_or_fail();
+    let returned_before = carrick_vmm_hvf::fork_stock_returned();
     // The carrier VM (and its host-COW ledger) is published by its first
     // container run. Baselines taken before that read incomplete and must
     // never be differenced, so warm the carrier with a one-fork workload
@@ -3467,7 +3468,7 @@ fn el1_fork_cow_resolves_in_guest() {
     let warmup = run_fixture(&carrier, &["fork-cow", "1", "1"], Duration::from_secs(120));
     assert!(
         warmup.result.success(),
-        "warm-up fork failed: {}; owner process refusal stages={:?}; first native fork failure={:?}",
+        "warm-up fork failed: {}; owner process refusal stages={:?}; first native fork failure={:?}; fork progress={:?}; returned child stock delta={}",
         describe(&warmup),
         read_el1_counters().map(|c| c
             .process_refusals
@@ -3475,7 +3476,11 @@ fn el1_fork_cow_resolves_in_guest() {
         read_el1_counters().and_then(|c| carrick_el1_abi::NativeForkFailureStage::from_raw(
             c.first_native_fork_failure
                 .load(std::sync::atomic::Ordering::Relaxed)
-        ))
+        )),
+        read_el1_counters().map(|c| c
+            .native_fork_progress
+            .map(|n| n.load(std::sync::atomic::Ordering::Relaxed))),
+        carrick_vmm_hvf::fork_stock_returned().saturating_sub(returned_before),
     );
     assert!(
         carrick_embed::host_cow_snapshot().complete,
