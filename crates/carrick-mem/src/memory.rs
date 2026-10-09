@@ -249,8 +249,8 @@ pub const LINUX_EL1_VECTORS_SIZE: u64 = 0x4000;
 // `ldaxr`/`stlxr` need to work — without it ARMv8 treats every data
 // access as Device-nGnRnE and exclusive ops are prohibited.
 pub const LINUX_PAGE_TABLES_BASE: u64 = carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE;
-// 1.75 MiB: six boot tables (L0, L1A, L1B, L2A, L2B, L3A in the first six 4 KiB
-// pages) plus a 442-page spare pool the runtime page-table manager
+// 444 pages: six boot tables (L0, L1A, L1B, L2A, L2B, L3A in the first six 4 KiB
+// pages) plus a spare pool the runtime page-table manager
 // (`carrick_mmu_core::aarch64`) carves sub-tables from when it splits a coarse block to
 // finer granularity for guest mprotect/PROT_NONE/munmap. The spare tail is
 // zero-filled (invalid descriptors). Sized up from 0x40000 (58 spare): each
@@ -260,17 +260,17 @@ pub const LINUX_PAGE_TABLES_BASE: u64 = carrick_el1_abi::AARCH64_STAGE1_TABLES_A
 // live working set of the full Go runtime.test reached the 58-page cap and
 // OOM'd in TestPageAllocAlloc (PROVEN via the pt-pool watermark hitting 58/58).
 // Whole region stays inside the kernel hole's first 2 MiB block alongside the
-// maintenance trampoline (0x20000 + 0x1C0000 + maint 0x4000 = 0x1E4000 <
-// 0x200000), so it remains kernel-only.
+// maintenance trampoline, so it remains kernel-only. The freed last 16 KiB
+// of the old table arena holds the FD control backing.
 pub const LINUX_PAGE_TABLES_SIZE: u64 = carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE;
 // Carrick-owned EL1 stage-1 maintenance trampoline. After the host edits page
 // descriptors (host backing of the table region), the stage-1 TLB is stale; the
 // guest can't observe the edit until a `tlbi`. arm64 public HVF has no stage-2
 // TLBI, but Carrick owns guest EL1, so it runs this tiny EL1 routine
 // (`dsb sy; tlbi vmalle1is; dsb sy; isb; hvc #1`) on its own vCPU to flush
-// stage-1. Lives just past the (grown) page-table region, still inside the
+// stage-1. Lives after the table region and FD control page, inside the
 // kernel hole's first 2 MiB block (so it's EL1-only, EL1-executable:
-// PXN=0/UXN=1). 0x20000 (PT base) + 0x1C0000 (PT size) = 0x1E0000.
+// PXN=0/UXN=1).
 pub const LINUX_EL1_MAINT_BASE: u64 = LINUX_KERNEL_REGION_BASE + 0x1E0000;
 pub const LINUX_EL1_MAINT_SIZE: u64 = 0x4000;
 pub const LINUX_EL1_ASID_MAINT_BASE: u64 = LINUX_EL1_MAINT_BASE + 0x100;
@@ -349,6 +349,7 @@ const _: () = assert!(
 );
 const _: () = assert!(LINUX_SYSCALL_MAILBOX_SLOT_SIZE == 256);
 const _: () = assert!(carrick_el1_abi::EL1_STACK_SIZE == 16 * 1024);
+const _: () = assert!(carrick_el1_abi::EL1_STACK_GUARD_SIZE == 4096);
 const _: () = assert!(
     (LINUX_SYSCALL_MAILBOX_SLOTS as u64) * carrick_el1_abi::EL1_STACK_SIZE
         <= carrick_el1_abi::EL1_STACKS_SIZE
@@ -396,15 +397,16 @@ const _: () = assert!(
 /// while EL0 cannot reach the kernel-only block and stage-2 denies guest
 /// writes. The host updates both words atomically through the owned carrier
 /// backing.
-pub const LINUX_FD_CEILING_CONTROL_BASE: u64 =
-    LINUX_CARRIER_MAINT_ROOT_BASE + LINUX_CARRIER_MAINT_ROOT_SIZE;
-pub const LINUX_FD_CEILING_CONTROL_SIZE: u64 = 0x4000;
+pub const LINUX_FD_CEILING_CONTROL_BASE: u64 = carrick_el1_abi::AARCH64_FD_CEILING_CONTROL_BASE;
+pub const LINUX_FD_CEILING_CONTROL_SIZE: u64 = carrick_el1_abi::AARCH64_FD_CEILING_CONTROL_SIZE;
 pub const LINUX_FD_CEILING_OFF_CEILING: u64 = 0;
 pub const LINUX_FD_CEILING_OFF_GATE: u64 = 4;
 pub const FD_CEILING_GATE_UNINITIALIZED: u32 = 0;
 pub const FD_CEILING_GATE_ENABLED: u32 = 1;
 pub const FD_CEILING_GATE_PERMANENTLY_DISABLED: u32 = 2;
 const _: () = assert!(LINUX_FD_CEILING_CONTROL_BASE.is_multiple_of(0x4000));
+const _: () =
+    assert!(LINUX_FD_CEILING_CONTROL_BASE + LINUX_FD_CEILING_CONTROL_SIZE <= LINUX_EL1_MAINT_BASE);
 const _: () = assert!(
     (LINUX_FD_CEILING_CONTROL_BASE - LINUX_KERNEL_REGION_BASE) + LINUX_FD_CEILING_CONTROL_SIZE
         <= LINUX_KERNEL_REGION_SIZE,
@@ -3586,7 +3588,7 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
     if let Err(error) = seal_fresh_image_windows(&mut mgr) {
         carrick_fatal!(
             "mem::stage1_tables",
-            "failed to apply PROT_NONE to the carrier windows in initial stage-1 page tables: {error:?}"
+            "failed to seal carrier windows and EL1 stack guards in initial stage-1 page tables: {error:?}"
         );
     }
     match mgr.into_bytes() {
@@ -3754,6 +3756,10 @@ pub fn seal_fresh_image_windows(
             .map_err(|_| carrick_mmu_core::aarch64::PageTableError::BadAddress)?;
         mgr.set_prot_none(base, len, None)?;
     }
+    for slot in 0..carrick_el1_abi::EL1_STACK_SLOTS {
+        let guard = carrick_el1_abi::EL1_STACKS_BASE + slot * carrick_el1_abi::EL1_STACK_SIZE;
+        mgr.set_prot_none(guard, carrick_el1_abi::EL1_STACK_GUARD_SIZE as usize, None)?;
+    }
     Ok(())
 }
 
@@ -3913,6 +3919,7 @@ pub fn stage1_carrier_maintenance_page_tables() -> Vec<u8> {
     const NON_GLOBAL: u64 = 1 << 11;
     const KERNEL_BLOCK_FLAGS: u64 = ((1u64 << 54) | (1 << 10) | (0b11 << 8)) | 0b01;
     const PA_MASK_2MIB: u64 = 0x0000_FFFF_FFE0_0000;
+    const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
 
     let size = LINUX_CARRIER_MAINT_ROOT_SIZE as usize;
     let mut bytes = vec![0_u8; size];
@@ -3952,6 +3959,24 @@ pub fn stage1_carrier_maintenance_page_tables() -> Vec<u8> {
         let desc = (pa & PA_MASK_2MIB) | KERNEL_BLOCK_FLAGS | NON_GLOBAL;
         let off = l2_off + index * 8;
         bytes[off..off + 8].copy_from_slice(&desc.to_le_bytes());
+    }
+    // Two L3 tables split the 4 MiB stack arena into 4 KiB leaves. Every
+    // slot's first leaf remains invalid; the other three are EL1-only.
+    for table in 0..2_u64 {
+        let va = carrick_el1_abi::EL1_STACKS_BASE + table * 0x20_0000;
+        let l2_index = ((va - LINUX_KERNEL_REGION_BASE) >> 21) as usize;
+        let l3_pa = root_pa + 0x4000 + table * 0x1000;
+        let l2_entry = 0x2000 + l2_index * 8;
+        bytes[l2_entry..l2_entry + 8].copy_from_slice(&table_descriptor(l3_pa).to_le_bytes());
+        for page in 0..512_u64 {
+            if page % 4 == 0 {
+                continue;
+            }
+            let pa = va + page * 0x1000;
+            let desc = (pa & PA_MASK_4KIB) | KERNEL_BLOCK_FLAGS | NON_GLOBAL | 0b10;
+            let off = (0x4000 + table * 0x1000 + page * 8) as usize;
+            bytes[off..off + 8].copy_from_slice(&desc.to_le_bytes());
+        }
     }
 
     let dyn_first =
@@ -7514,6 +7539,10 @@ mod stage1_tests {
         let ipc_end = ipc_first + (carrick_el1_abi::EL1_IPC_SIZE >> 21) as usize;
         for index in 1..512usize {
             let d = read_u64_le(&bytes, 0x4000 + index * 8);
+            if (el1_first + 1..el1_first + 3).contains(&index) {
+                assert_eq!(d & 0b11, 0b11, "EL1 stack L2[{index}] must split");
+                continue;
+            }
             assert!(valid_block(d), "L2_B[{}] must be a block", index);
             if (el1_first..el1_end).contains(&index)
                 || (dynamic_first..dynamic_end).contains(&index)
@@ -7775,6 +7804,37 @@ mod stage1_tests {
     }
 
     #[test]
+    fn every_el1_stack_has_an_unmapped_stage1_guard_in_both_roots() {
+        for (name, bytes, root) in [
+            (
+                "process",
+                stage1_identity_page_tables(),
+                LINUX_PAGE_TABLES_BASE,
+            ),
+            (
+                "carrier",
+                stage1_carrier_maintenance_page_tables(),
+                LINUX_CARRIER_MAINT_ROOT_BASE,
+            ),
+        ] {
+            for slot in 0..carrick_el1_abi::EL1_STACK_SLOTS {
+                let base =
+                    carrick_el1_abi::EL1_STACKS_BASE + slot * carrick_el1_abi::EL1_STACK_SIZE;
+                for (offset, mapped) in [(0, false), (0x1000, true), (0x3000, true)] {
+                    let leaf = carrick_mmu_core::aarch64::terminal_descriptor(
+                        carrick_mmu_core::aarch64::walk_descriptors(&bytes, root, base + offset),
+                    );
+                    assert_eq!(
+                        leaf & 1 != 0,
+                        mapped,
+                        "{name} slot {slot} offset {offset:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn fd_ceiling_control_builder_installs_disabled_kernel_control_page() {
         let image = AddressSpace::from_segments(
             0x1000,
@@ -7824,8 +7884,12 @@ mod stage1_tests {
             spare_pages >= 7,
             "need a spare-table pool, got {spare_pages}"
         );
-        // Spare tail is zero-filled (invalid descriptors).
-        assert!(bytes[0xA000..].iter().all(|&b| b == 0));
+        // Two live L3 tables hold the stack guards. The remaining spare tail
+        // stays zero-filled and leaves headroom for ordinary guest splits.
+        let last_used = bytes.iter().rposition(|byte| *byte != 0).unwrap_or(0);
+        let spare_start = (last_used / 0x1000 + 1) * 0x1000;
+        assert!(bytes[spare_start..].iter().all(|&byte| byte == 0));
+        assert!(bytes.len() - spare_start >= 7 * 0x1000);
         // Whole table region stays inside the kernel hole's first 2 MiB block,
         // so it remains kernel-only (EL1) after the size bump.
         let region_end_off =
