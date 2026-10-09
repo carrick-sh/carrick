@@ -94,3 +94,14 @@ fn invalid_signal_frame_is_not_an_errno_return() {
     assert_eq!(outcome, Some(SignalOutcome::Restored));
     assert!(native.forced);
 }
+
+#[test]
+fn pidfd_send_signal_retains_host_owner() {
+    let mut native = Native {
+        accumulator: 434,
+        invalid: false,
+        forced: false,
+        blocked: SigBlockMask::NONE,
+    };
+    assert_eq!(invoke(SignalCall::PidfdSendSignal, &mut native), None);
+}
