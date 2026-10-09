@@ -55,14 +55,14 @@ use carrick_vfs::{BindVfs, HostResolverSnapshot, Vfs};
 /// all guest MM, identity, signal, wait, and IPC calls remain with CPL0.
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum InitialForwardClass {
+pub(crate) enum InitialForwardClass {
     Host(&'static str),
     Refuse(&'static str),
 }
 
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
 impl InitialForwardClass {
-    const fn family(self) -> &'static str {
+    pub(crate) const fn family(self) -> &'static str {
         match self {
             Self::Host(family) | Self::Refuse(family) => family,
         }
@@ -70,7 +70,7 @@ impl InitialForwardClass {
 }
 
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
-fn classify_initial_x86_forward(
+pub(crate) fn classify_initial_x86_forward(
     native: carrick_abi::NativeNr,
     args: [u64; 6],
     poll_host_fds: bool,
@@ -99,7 +99,7 @@ fn classify_initial_x86_forward(
 /// Poll may cross only for the CLI's host-backed descriptors. The kernel's
 /// in-zone descriptor namespace has no authority in the host dispatcher.
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
-fn initial_poll_has_only_host_fds(
+pub(crate) fn initial_poll_has_only_host_fds(
     machine: &impl carrick_guest_mem::CurrentMmMemory,
     args: [u64; 6],
 ) -> bool {
@@ -1092,74 +1092,93 @@ impl PreparedRun {
                 data: dispatcher.launch_resource_limit(carrick_abi::LinuxResource::Data),
             };
             machine.load_guest_mm(&image, &argv, &env, limits)?;
-            let reporter = carrick_kernel::compat::CompatReporter::default();
-            let mut forward_families = std::collections::BTreeMap::<&'static str, u64>::new();
-            let mut refusal_families = std::collections::BTreeMap::<&'static str, u64>::new();
-            let outcome = machine.run_initial_process(max_traps, |machine, frame| {
-                use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
-                use carrick_kernel::dispatch::{DispatchOutcome, SyscallRequest};
-                use carrick_vmm_kvm::cpl0_boot::InitialSyscallDisposition as Decision;
-                let syscall = carrick_guest_mem::X8664SyscallFrame {
-                    rax: frame.rax,
-                    rdi: frame.rdi,
-                    rsi: frame.rsi,
-                    rdx: frame.rdx,
-                    r10: frame.r10,
-                    r8: frame.r8,
-                    r9: frame.r9,
-                };
-                let raw = match X8664GuestArch::normalize_syscall(&syscall) {
-                    SyscallNorm::Plain(raw) => raw,
-                    SyscallNorm::ArchPrctl { code, addr } => {
-                        let value =
-                            carrick_hal::x8664_arch::service_arch_prctl(machine, code, addr)?;
-                        return Ok(Decision::Return(value));
-                    }
-                };
-                let poll_host_fds =
-                    raw.native_number.0 == 7 && initial_poll_has_only_host_fds(machine, raw.args);
-                match classify_initial_x86_forward(raw.native_number, raw.args, poll_host_fds) {
-                    InitialForwardClass::Host(family) => {
-                        *forward_families.entry(family).or_default() += 1;
-                    }
-                    refusal @ InitialForwardClass::Refuse(_) => {
-                        *refusal_families.entry(refusal.family()).or_default() += 1;
-                        reporter.record(carrick_kernel::compat::CompatEvent::partial_syscall(
-                            raw.number.0,
-                            format!("x86_native_{}", raw.native_number.0),
-                            carrick_kernel::compat::SyscallArgs::new(raw.args),
-                            format!("cpl0_{}_owner_unbound", refusal.family()),
-                        ));
-                        return Ok(Decision::Refused(carrick_abi::LINUX_ENOSYS));
-                    }
-                }
-                let kernel = dispatcher.capture_one_task_context().map_err(|error| {
-                    carrick_hal::TrapError::Hypervisor(format!(
-                        "capture x86 syscall context: {error}"
-                    ))
-                })?;
-                let request = SyscallRequest::from_raw(raw).with_current_guest_sp(Some(frame.rsp));
-                let outcome = dispatcher
-                    .dispatch(&kernel, request, machine, &reporter)
-                    .map_err(|error| {
-                        carrick_hal::TrapError::Hypervisor(format!("dispatch x86 syscall: {error}"))
-                    })?;
-                match outcome {
-                    DispatchOutcome::Returned { value } => Ok(Decision::Return(value)),
-                    DispatchOutcome::Errno { errno } => Ok(Decision::Refused(errno)),
-                    DispatchOutcome::Exit { code } | DispatchOutcome::ThreadExit { code } => {
-                        Ok(Decision::Exit(
-                            carrick_vmm_kvm::cpl0_boot::GuestExitStatus::from_linux_code(code),
-                        ))
-                    }
-                    other => Err(carrick_hal::TrapError::Hypervisor(format!(
-                        "x86 syscall needs runtime completion: {other:?}"
-                    ))),
-                }
-            })?;
-            let (guest_entries, portal_exits) = machine.initial_execution_witness();
-            let physical_crossing_families: Vec<_> = machine
-                .physical_crossing_counts()
+            use crate::vcpu_loop::executor::{self, PersistentTaskBinding};
+            use carrick_hal::threaded::GuestCpuState;
+            use carrick_kernel::kernel::objects::MigratableTaskState;
+            use carrick_kernel::kernel::scheduler::{CpuAffinity, GuestCpuId, GuestCpuPolicy};
+            let parts = machine.into_worker_parts(max_traps)?;
+            let (root_cpu, physical) = parts.into_factory();
+            let physical = Arc::new(physical);
+            let reporter = Arc::new(carrick_kernel::compat::CompatReporter::default());
+            let stats = Arc::new(executor::kvm::KvmForwardStats::default());
+            let dispatcher = Arc::new(std::sync::Mutex::new(dispatcher));
+            root_context
+                .thread()
+                .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+            let scheduler = Arc::new(carrick_kernel::kernel::Scheduler::new_with_policy(
+                Arc::clone(root_context.kernel()),
+                Arc::new(GuestCpuPolicy::new(2)),
+            ));
+            let state = MigratableTaskState {
+                cpu: GuestCpuState::X86_64V1(Arc::new(root_cpu.state().clone())),
+                mm: root_context.shared().mm().id(),
+                asid_generation: root_cpu.state().asid_generation(),
+            };
+            let generation = scheduler
+                .publish_initial_task_state_gated(root_context.thread(), state.clone())
+                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+            let binding = Arc::new(executor::kvm::KvmTaskBinding::new(
+                &root_context,
+                &state,
+                root_cpu.binding(),
+                generation,
+            )?);
+            let directory = Arc::new(executor::kvm::KvmTaskBindingDirectory::default());
+            let dormant = directory.prepare_submission(
+                &scheduler,
+                executor::TaskSubmissionShape::Root,
+                None,
+                Arc::clone(root_context.thread()),
+                generation,
+                Arc::clone(&binding),
+            )?;
+            let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+            let factory = Arc::new(executor::kvm::KvmPersistentExecutorFactory::new(
+                Arc::clone(&physical),
+                Arc::clone(&dispatcher),
+                Arc::clone(&reporter),
+                completed_tx,
+                max_traps,
+                Arc::clone(&stats),
+                Arc::clone(&scheduler),
+            ));
+            let pool = executor::ExecutorPool::start(
+                executor::ExecutorPoolConfig {
+                    bound_workers: 2,
+                    spare_executors: 0,
+                    vcpu_ceiling: 2,
+                    reserve: 0,
+                },
+                Arc::clone(&scheduler),
+                Arc::clone(&factory),
+                Arc::clone(&directory),
+                executor::ExecutorBoundaryAudit,
+            )
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+            let start_gate = root_context
+                .thread()
+                .take_opened_start_gate(generation)
+                .ok_or_else(|| RuntimeError::Configuration("KVM root start gate absent".into()))?;
+            let proof = executor::TaskActivationProof::validate(
+                &root_context,
+                &state,
+                generation,
+                binding.load_identity(),
+                start_gate,
+            )?;
+            dormant.activate(&scheduler, Arc::clone(root_context.thread()), proof)?;
+            drop(factory);
+            let completion = completed_rx.recv();
+            let shutdown = pool.shutdown();
+            let outcome = completion
+                .map_err(|error| {
+                    RuntimeError::Configuration(format!("KVM executor completion: {error}"))
+                })?
+                .map_err(RuntimeError::Configuration)?;
+            shutdown.map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+            let (guest_entries, portal_exits) = physical.initial_execution_witness()?;
+            let physical_crossing_families: Vec<_> = physical
+                .physical_crossing_counts()?
                 .into_iter()
                 .filter(|(_, count)| *count != 0)
                 .map(|(family, count)| crate::compat::ExecutionFamilyCount {
@@ -1177,6 +1196,7 @@ impl PreparedRun {
                     })
                     .collect()
             };
+            let (forward_families, refusal_families) = stats.snapshot()?;
             let host_forwards = forward_families.values().sum();
             let mut report = reporter.snapshot();
             report.execution_witness = Some(crate::compat::ExecutionWitness {
@@ -1184,9 +1204,9 @@ impl PreparedRun {
                 guest_entries,
                 portal_exits: portal_exits + physical_exits,
                 host_forwards,
-                anonymous_private_pages: machine.anonymous_private_pages(),
-                anonymous_private_mms: machine
-                    .anonymous_private_mms()
+                anonymous_private_pages: physical.anonymous_private_pages()?,
+                anonymous_private_mms: physical
+                    .anonymous_private_mms()?
                     .into_iter()
                     .map(|row| carrick_observability::compat::AnonymousPrivateMm {
                         mm: row.mm,
@@ -1197,8 +1217,8 @@ impl PreparedRun {
                         cpu_mask: row.cpu_mask,
                     })
                     .collect(),
-                cross_mm_private_aliases: machine.cross_mm_private_aliases(),
-                peer_active_private_grants: machine.peer_active_private_grants(),
+                cross_mm_private_aliases: physical.cross_mm_private_aliases()?,
+                peer_active_private_grants: physical.peer_active_private_grants()?,
                 physical_crossing_families,
                 host_forward_families: count_family(forward_families),
                 guest_refusal_families: count_family(refusal_families),
@@ -1221,11 +1241,17 @@ impl PreparedRun {
                     (128 + signal, Some(signal), exits)
                 }
             };
+            let (stdout, stderr) = {
+                let dispatcher = dispatcher
+                    .lock()
+                    .map_err(|_| RuntimeError::Configuration("KVM dispatcher poisoned".into()))?;
+                (dispatcher.stdout(), dispatcher.stderr())
+            };
             Ok(RunResult {
                 exit_code,
                 terminating_signal,
-                stdout: dispatcher.stdout(),
-                stderr: dispatcher.stderr(),
+                stdout,
+                stderr,
                 traps,
                 report,
                 trap_limit_hit: false,
