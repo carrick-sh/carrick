@@ -12,7 +12,7 @@ ARM switch. A refused getuid has exactly one refusal and zero forwarded calls;
 with the exact =0 hatch it has zero refusals and one forwarded call. Terminal
 calls must preserve their status and forward once when no in-ring process
 owner serves them, as on x86. The signed witness also checks getpid and the
-host clock, and bounds its descriptor readiness wait to five seconds. It has
+EL1 monotonic clock fast path (zero host forwards), and bounds its descriptor readiness wait to five seconds. It has
 no libc or runtime startup. No workload timing ratio is claimed. Aperture
 control geometry is compile-time disjoint from service-copy descriptors and
 the MM portal, and included in the image layout hash. The aligned VM-free
@@ -23,7 +23,7 @@ changing either live policy.
 """
 
 [bindings]
-vm_free = "carrick-personality-linux::dispatch::ring_first_tests::strict_arm_terminal_calls_without_process_owner_cross_to_carrier; carrick-el1-abi::tests::aperture_control_is_disjoint_from_service_copy_descriptors; carrick-vmm-hvf::hatch::tests::aperture_configuration_preserves_service_copy_slot_zero; carrick-vmm-hvf::hatch::tests::carrier_admission_rejects_conflicting_ring_policy_without_changing_it"
+vm_free = "carrick-personality-linux::dispatch::ring_first_tests::strict_arm_terminal_calls_without_process_owner_cross_to_carrier; carrick-el1-abi::tests::aperture_control_is_disjoint_from_service_copy_descriptors; carrick-vmm-hvf::hatch::tests::aperture_configuration_preserves_service_copy_slot_zero; carrick-vmm-hvf::hatch::tests::carrier_admission_rejects_conflicting_ring_policy_without_changing_it; carrick-mem::memory::el1_shim_tests::mailbox_shim_routes_raw_clock_gettime_only_when_fast_paths_are_enabled"
 embed = "carrick-embed::arm_ring_first_strict_refusal_witness; carrick-embed::arm_ring_first_hatch_disabled_forward_witness"
 
 [bindings.unresolved]

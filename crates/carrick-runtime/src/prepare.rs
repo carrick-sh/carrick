@@ -1045,7 +1045,13 @@ impl PreparedRun {
         #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
         let run = if backend == ExecutionBackend::KvmX86Cpl0 {
             let mut dispatcher = dispatcher;
-            let _ = (&debug_state_path, &root, &carrier, &carrier_lease);
+            let _ = (
+                &debug_state_path,
+                &root,
+                &carrier,
+                &carrier_lease,
+                &arm_ring_first,
+            );
             let bytes = dispatcher.read_exec_file(&executable).ok_or_else(|| {
                 RuntimeError::Unsupported(format!("guest executable not found: {executable}"))
             })?;
@@ -1213,6 +1219,7 @@ impl PreparedRun {
         #[cfg(all(feature = "platform-linux", target_arch = "aarch64"))]
         let run = {
             let _ = (
+                arm_ring_first,
                 backend,
                 executable,
                 argv,
@@ -1231,6 +1238,7 @@ impl PreparedRun {
         #[cfg(any(feature = "platform-freebsd", feature = "platform-netbsd"))]
         let run = {
             let _ = (
+                arm_ring_first,
                 backend,
                 executable,
                 argv,

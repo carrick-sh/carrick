@@ -1,0 +1,11 @@
+{
+  "source_head": "cf248424743c512406f2df6bab29eda8a541f12d",
+  "run_id": "ring-switch-20261009-cf2484247-1",
+  "executable_sha256": "c9c5ff59dff0252181b7eb6992e590583b57800545ed66c0f1aa8f98bf4575be",
+  "cdhash": "c0bd5d4e17b4510f9aec337c2759fce0b7f3577f",
+  "lc_uuid": "24A4FC88-0FFA-34C9-8030-D1070B1FC62E",
+  "test_execution_seconds": 0.07,
+  "terminal_status": "failed_clock_forward_assertion",
+  "deadline_exceeded": false,
+  "remaining_processes": 0
+}

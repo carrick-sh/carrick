@@ -1,0 +1,40 @@
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/arm_ring_first_hatch-49046773201fdb39 arm_ring_first_ --nocapture
+
+running 2 tests
+test arm_ring_first_hatch_disabled_forward_witness ... ring-first strict=false getuid refused=0 forwarded=1 exit_group refused=0 forwarded=1
+
+thread 'arm_ring_first_hatch_disabled_forward_witness' (133229915) panicked at crates/carrick-embed/tests/arm_ring_first_hatch.rs:65:5:
+assertion `left == right` failed
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test arm_ring_first_strict_refusal_witness ... ring-first strict=true getuid refused=1 forwarded=0 exit_group refused=0 forwarded=1
+
+thread 'arm_ring_first_strict_refusal_witness' (133229952) panicked at crates/carrick-embed/tests/arm_ring_first_hatch.rs:65:5:
+assertion `left == right` failed
+  left: 0
+ right: 1
+FAILED
+
+failures:
+
+failures:
+    arm_ring_first_hatch_disabled_forward_witness
+    arm_ring_first_strict_refusal_witness
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+test-signed: FAIL /Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/arm_ring_first_hatch-49046773201fdb39
+/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/entitlement_negative-5ab05077e3c45bd1.noent.98953: replacing existing signature
+test-signed: negative control on /Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/entitlement_negative-5ab05077e3c45bd1.noent.98953
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+test-signed: FAILED (carrick-embed)
+remaining carrick procs (run-id ring-switch-20261009-cf2484247-1) = 0
+remaining carrick procs (run-id ring-switch-20261009-cf2484247-1-cli) = 0
+error: recipe `test-embed` failed on line 824 with exit code 1
