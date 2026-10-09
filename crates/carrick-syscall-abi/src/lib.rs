@@ -19,6 +19,7 @@ pub mod nr {
     pub const SCHED_GET_PRIORITY_MIN: CanonicalNr = CanonicalNr(126);
     pub const SCHED_RR_GET_INTERVAL: CanonicalNr = CanonicalNr(127);
     pub const WAIT4: CanonicalNr = CanonicalNr(260);
+    pub const PPOLL: CanonicalNr = CanonicalNr(73);
 }
 
 /// Linux SCHED_* policy values (kernel ABI, not the libc-internal names).
