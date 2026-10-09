@@ -174,8 +174,13 @@ fn test_dispatch_syscall_with_regions_entry_pending_work() {
         |_| core::ptr::null_mut(),
     );
 
-    // Entry check: must forward immediately without modifying file state
-    assert_eq!(action, Action::Forward);
+    // Owed work leaves through WithWork with original-argument replay, without
+    // modifying file state or claiming the syscall completed.
+    assert_eq!(action, Action::ServedWithWork);
+    assert_eq!(
+        tasks[0].linux.take_served_boundary(),
+        Some(carrick_el1_abi::ServedBoundary::ReplayOriginal { x0: 3 })
+    );
     assert_eq!(open_table[0].offset.load(Ordering::Relaxed), 10);
     assert_eq!(counters.served[62].load(Ordering::Relaxed), 0);
     assert_eq!(counters.forwarded[62].load(Ordering::Relaxed), 1);
@@ -220,7 +225,7 @@ fn test_dispatch_syscall_with_regions_exit_pending_work() {
     // Simulate host marking pending work while/right before syscall exit
     tasks[0].linux.mark_pending_host_work();
 
-    // At entry, pending_host_work is already set, so it forwards
+    // At entry, pending host work must publish before replaying this call
     let action = dispatch_syscall_with_regions(
         &mut frame,
         &counters,
@@ -233,7 +238,7 @@ fn test_dispatch_syscall_with_regions_exit_pending_work() {
         None::<Zone<'_, NoCpu, sched::HardwareUserWord>>,
         |_| core::ptr::null_mut(),
     );
-    assert_eq!(action, Action::Forward);
+    assert_eq!(action, Action::ServedWithWork);
 
     // Now test exit check: pending_host_work starts clear, then gets set during operation
     tasks[0].linux.clear_pending_host_work();

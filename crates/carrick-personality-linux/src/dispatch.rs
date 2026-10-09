@@ -225,6 +225,13 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     fn refused_counters(&self) -> Option<&'a [core::sync::atomic::AtomicU64]> {
         None
     }
+    fn publish_forward_work(&self) {
+        if let Some(task) = self.task_state() {
+            // No family ran: after owed work drains the host must execute the
+            // original syscall, never treat its argument register as a result.
+            task.record_commit_owed(self.original_argument0());
+        }
+    }
     fn publish_work(&self, commit: bool) {
         if let Some(task) = self.task_state() {
             if commit {
@@ -336,6 +343,7 @@ fn serve_family<'a, C: EntryContext + 'a>(
                 FamilyRun {
                     completion: crate::lifecycle::lifecycle_effect(&outcome),
                     returned,
+                    forward_reason: ForwardReason::FamilyFallback,
                 }
             });
     }
@@ -373,6 +381,11 @@ fn serve_family<'a, C: EntryContext + 'a>(
     FamilyRun {
         completion,
         returned,
+        forward_reason: if family == Family::Unported {
+            ForwardReason::Unported
+        } else {
+            ForwardReason::FamilyFallback
+        },
     }
 }
 
@@ -451,7 +464,18 @@ enum CompletionAuthority<'a, C: EntryContext> {
     AllocatorDiagnostic,
 }
 
+/// Why an entry leaves its in-ring owner. Only genuinely unported calls
+/// require crossing admission; retained work and handbacks are transports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForwardReason {
+    Unported,
+    FamilyFallback,
+    HostWork,
+    Handback,
+}
+
 struct FamilyRun {
+    forward_reason: ForwardReason,
     completion: FamilyCompletion,
     returned: Option<(SyscallResult, u64)>,
 }
@@ -460,6 +484,7 @@ impl From<FamilyCompletion> for FamilyRun {
         Self {
             completion,
             returned: None,
+            forward_reason: ForwardReason::FamilyFallback,
         }
     }
 }
@@ -509,8 +534,23 @@ fn finish<'a, C: EntryContext + 'a>(
                 .store(original, core::sync::atomic::Ordering::Relaxed);
         }
     }
-    let route = completion_route(result, pending.host_work());
-    if route == CompletionRoute::Forward {
+    let reason = if result == FamilyCompletion::Handback {
+        ForwardReason::Handback
+    } else if pending.host_work() {
+        ForwardReason::HostWork
+    } else {
+        run.forward_reason
+    };
+    let route = if reason == ForwardReason::HostWork
+        && matches!(
+            result,
+            FamilyCompletion::Forward | FamilyCompletion::AccountedForward
+        ) {
+        CompletionRoute::WithWork
+    } else {
+        completion_route(result, pending.host_work())
+    };
+    if route == CompletionRoute::Forward && reason == ForwardReason::Unported {
         let canonical = carrick_syscall_abi::CanonicalNr::new(ordinal);
         let crossing_set = pending.crossing_set();
         let ring_first_strict = pending.ring_first_strict();
@@ -536,7 +576,16 @@ fn finish<'a, C: EntryContext + 'a>(
         _ => pending.record_served(ordinal),
     }
     if route == CompletionRoute::WithWork {
-        pending.publish_work(matches!(result, FamilyCompletion::CommitOwed(_)));
+        if reason == ForwardReason::HostWork
+            && matches!(
+                result,
+                FamilyCompletion::Forward | FamilyCompletion::AccountedForward
+            )
+        {
+            pending.publish_forward_work();
+        } else {
+            pending.publish_work(matches!(result, FamilyCompletion::CommitOwed(_)));
+        }
     }
     route
 }
@@ -636,6 +685,8 @@ mod ring_first_tests {
     // carrier, just as in x86's crossing set, until native custody serves it.
     struct CarrierOwned<'a> {
         result: i64,
+        work: bool,
+        handback: bool,
         refused: &'a [AtomicU64; 513],
         forwarded: [AtomicU64; 512],
     }
@@ -647,6 +698,16 @@ mod ring_first_tests {
                 mm: EntryMmKey::from_raw(1),
                 thread_generation: EntryThreadGeneration::from_raw(1),
             })
+        }
+        fn host_work(&self) -> bool {
+            self.work
+        }
+        fn futex(&mut self) -> FamilyCompletion {
+            if self.handback {
+                FamilyCompletion::Handback
+            } else {
+                FamilyCompletion::Forward
+            }
         }
         fn crossing_set(&self) -> HostCrossingSet {
             HostCrossingSet::Aarch64
@@ -669,11 +730,44 @@ mod ring_first_tests {
     }
 
     #[test]
+    fn strict_arm_preserves_family_declines_handback_and_owed_work() {
+        for (ordinal, work, handback, expected) in [
+            (222, false, false, CompletionRoute::Forward),
+            (226, false, false, CompletionRoute::Forward),
+            (215, false, false, CompletionRoute::Forward),
+            (27, false, false, CompletionRoute::Forward),
+            (98, false, false, CompletionRoute::Forward),
+            (98, false, true, CompletionRoute::Forward),
+            (220, false, false, CompletionRoute::Forward),
+            (260, false, false, CompletionRoute::Forward),
+            (174, true, false, CompletionRoute::WithWork),
+        ] {
+            let refused = [const { AtomicU64::new(0) }; 513];
+            let mut pending = CarrierOwned {
+                result: 42,
+                work,
+                handback,
+                refused: &refused,
+                forwarded: [const { AtomicU64::new(0) }; 512],
+            };
+            assert_eq!(
+                dispatch(ordinal, u64::MAX, &mut pending),
+                expected,
+                "ordinal={ordinal} work={work} handback={handback}"
+            );
+            assert_eq!(pending.result, 42);
+            assert_eq!(pending.refused[ordinal as usize].load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
     fn strict_arm_terminal_calls_without_process_owner_cross_to_carrier() {
         for ordinal in [93, 94] {
             let refused = [const { AtomicU64::new(0) }; 513];
             let mut pending = CarrierOwned {
                 result: 42,
+                work: false,
+                handback: false,
                 refused: &refused,
                 forwarded: [const { AtomicU64::new(0) }; 512],
             };

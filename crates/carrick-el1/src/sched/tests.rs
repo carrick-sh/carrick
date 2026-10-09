@@ -844,10 +844,13 @@ fn queued_threads_do_not_send_other_syscalls_to_the_host() {
     assert_eq!(run(&mut frame, &mut cpu), carrick_el1_abi::Action::Served);
     assert_eq!(frame.x[0], 50);
     assert_eq!(counters.forwarded[62].load(Ordering::Relaxed), 0);
-    // A pending host kick forwards even a servable futex call.
+    // A pending host kick publishes work before replaying a servable futex call.
     tasks[3].linux.mark_pending_host_work();
     set_op(&mut frame, uaddr, FUTEX_WAIT_PRIVATE, 0);
-    assert_eq!(run(&mut frame, &mut cpu), carrick_el1_abi::Action::Forward);
+    assert_eq!(
+        run(&mut frame, &mut cpu),
+        carrick_el1_abi::Action::ServedWithWork
+    );
     let mut retirement = authority.try_host().unwrap().unwrap();
     objects[0]
         .state
