@@ -218,7 +218,7 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     }
     /// Host crossing set governing which syscalls may forward to the host.
     fn crossing_set(&self) -> crate::crossing::HostCrossingSet;
-    /// Whether this context enforces the strict ARM ring-first forward allowlist.
+    /// Whether this context enforces its ISA's unported-call allowlist.
     fn ring_first_strict(&self) -> bool {
         false
     }
