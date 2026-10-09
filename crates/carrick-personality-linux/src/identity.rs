@@ -515,6 +515,7 @@ pub fn invoke<'a>(
                         }
                         cur_addr = cur_addr.wrapping_add(1);
                     }
+                    name[15] = 0;
                     let venue = native.process_identity()?;
                     venue.prctl_set_name(&name);
                     Some(SyscallResult::new(0))
@@ -899,6 +900,21 @@ mod tests {
         assert_eq!(res.raw(), 0);
         assert_eq!(&mock.venue.comm[..5], b"test\0");
         assert_eq!(&mock.venue.comm[5..], &[0; 11]);
+    }
+
+    #[test]
+    fn prctl_set_name_terminates_at_byte_15() {
+        let mut mock = MockNative::new();
+        mock.args[0] = LINUX_PR_SET_NAME;
+        mock.args[1] = 0x1000;
+        for i in 0..16 {
+            mock.memory.insert(0x1000 + i, b'a' + (i as u8));
+        }
+
+        let res = invoke(IdentityCall::Prctl, &mut mock).unwrap();
+        assert_eq!(res.raw(), 0);
+        assert_eq!(&mock.venue.comm[..15], b"abcdefghijklmno");
+        assert_eq!(mock.venue.comm[15], 0);
     }
 
     #[test]
