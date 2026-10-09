@@ -92,6 +92,10 @@ const _: () = {
 impl OwnerForkMmu for Aarch64Mmu {
     const ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
 
+    fn omit_unloaned_control_alias() -> bool {
+        true
+    }
+
     fn control_window() -> Option<(UserVa, UserVa)> {
         Some((
             UserVa::new(KERNEL_CONTROL_BASE),

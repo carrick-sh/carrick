@@ -399,6 +399,26 @@ fn prepare_error_stage(
     }
 }
 
+fn publish_error_stage(
+    error: carrick_core::mm::transaction::MmError,
+) -> carrick_el1_abi::NativeForkFailureStage {
+    use carrick_core::mm::transaction::MmError;
+    use carrick_el1_abi::NativeForkFailureStage as Stage;
+    match error {
+        MmError::Invalid => Stage::PublishInvalid,
+        MmError::Stale => Stage::PublishStale,
+        MmError::Busy => Stage::PublishBusy,
+        MmError::NoMemory => Stage::PublishNoMemory,
+        MmError::MetadataRequired => Stage::PublishMetadataRequired,
+        MmError::Fault => Stage::PublishFault,
+        MmError::Core => Stage::PublishCore,
+        MmError::Table(_) => Stage::PublishTable,
+        MmError::Reservation(_) => Stage::PublishReservation,
+        MmError::Wait(_) => Stage::PublishWait,
+        MmError::UnsupportedExecutableCow => Stage::PublishUnsupportedExecutableCow,
+    }
+}
+
 impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     for Aarch64NativeProcessService<'a, X>
 {
@@ -587,7 +607,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             Ok(child) => child,
             Err(e) => {
                 owner.spaces.free(index);
-                return Err(err(carrick_el1_abi::NativeForkFailureStage::Publish, e));
+                return Err(err(publish_error_stage(e), e));
             }
         };
         let completion = child.completion();

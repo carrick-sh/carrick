@@ -2,9 +2,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use carrick_core::mm::fork::{
-    ForkCapacityFailure, ForkCensus, ForkChildRoot, ForkError, ForkParentRoot, ForkScratch,
-    ForkTableCursor, Mapping, MappingInheritancePolicy, Policy, PreparedOwnerFork, census_table,
-    copy_table, rollback,
+    ForkCapacityFailure, ForkCensus, ForkChildRoot, ForkError, ForkParentRoot, ForkPublishStage,
+    ForkScratch, ForkTableCursor, Mapping, MappingInheritancePolicy, Policy, PreparedOwnerFork,
+    census_table, copy_table, rollback,
 };
 use carrick_core_abi::{
     El1MmHandle, PortalForkCustody, PortalForkRequest, PortalForkTableArena, PortalOperation,
@@ -617,15 +617,32 @@ fn test_arm_fork_geometry_and_cow_lifecycle() {
         authorized: true,
         finished: false,
     };
+    let original_root_word = mem.load(root_pa).unwrap();
+    mem.store(root_pa, 0);
+    let mut refused_stage = ForkPublishStage::PublishChild;
+    let refused = PreparedOwnerFork::<Aarch64Mmu>::new(req, root_pa, scratch.clone()).publish(
+        &mem,
+        parent_root.clone(),
+        child_root.clone(),
+        sample_child_handle(20),
+        &mut refused_stage,
+    );
+    assert_eq!(refused.err(), Some(ForkError::Stale));
+    assert_eq!(refused_stage, ForkPublishStage::RevalidateWords);
+    mem.store(root_pa, original_root_word);
+
     let prepared = PreparedOwnerFork::<Aarch64Mmu>::new(req, root_pa, scratch.clone());
+    let mut publish_stage = ForkPublishStage::RevalidateWords;
     let unpublished = prepared
         .publish(
             &mem,
             parent_root.clone(),
             child_root.clone(),
             sample_child_handle(20),
+            &mut publish_stage,
         )
         .unwrap();
+    assert_eq!(publish_stage, ForkPublishStage::PublishChild);
 
     // Verify parent edits are live
     assert_eq!(mem.load(l3_user_pa + 16 * 8).unwrap(), priv_edit.after);
