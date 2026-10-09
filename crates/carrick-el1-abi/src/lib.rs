@@ -2029,6 +2029,46 @@ impl ProcessRefusal {
     pub const COUNT: usize = 6;
 }
 
+/// First failing stage of an ARM native fork attempt. Zero means no error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+pub enum NativeForkFailureStage {
+    MappingCount = 1,
+    SpaceAccess = 2,
+    Root = 3,
+    ObserveMappings = 4,
+    TransferSequence = 5,
+    Census = 6,
+    RootPublication = 7,
+    Scratch = 8,
+    Prepare = 9,
+    Publish = 10,
+    Commit = 11,
+    Abort = 12,
+    BornSpaceAccess = 13,
+}
+
+impl NativeForkFailureStage {
+    pub fn from_raw(raw: u64) -> Option<Self> {
+        Some(match raw {
+            1 => Self::MappingCount,
+            2 => Self::SpaceAccess,
+            3 => Self::Root,
+            4 => Self::ObserveMappings,
+            5 => Self::TransferSequence,
+            6 => Self::Census,
+            7 => Self::RootPublication,
+            8 => Self::Scratch,
+            9 => Self::Prepare,
+            10 => Self::Publish,
+            11 => Self::Commit,
+            12 => Self::Abort,
+            13 => Self::BornSpaceAccess,
+            _ => return None,
+        })
+    }
+}
+
 /// Per-syscall accounting counters maintained by the EL1 kernel in the shared aperture.
 #[repr(C)]
 pub struct Counters {
@@ -2057,6 +2097,8 @@ pub struct Counters {
     /// ARM process-entry refusals: missing slot, root admission, service,
     /// registered entry, root-exit crossing, or personality forwarding.
     pub process_refusals: [AtomicU64; ProcessRefusal::COUNT],
+    /// First typed ARM fork service failure, retained across a carrier run.
+    pub first_native_fork_failure: AtomicU64,
 }
 
 impl Counters {
@@ -2072,6 +2114,7 @@ impl Counters {
             anonymous_leaves: [const { AtomicU64::new(0) }; AnonymousLeave::COUNT],
             refused: [const { AtomicU64::new(0) }; 513],
             process_refusals: [const { AtomicU64::new(0) }; ProcessRefusal::COUNT],
+            first_native_fork_failure: AtomicU64::new(0),
         }
     }
 
@@ -2123,12 +2166,32 @@ impl Counters {
                 Ordering::Relaxed,
             );
         }
+        snapshot.first_native_fork_failure.store(
+            self.first_native_fork_failure.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         snapshot
     }
 
     pub fn record_lifecycle_decline(&self, reason: LifecycleDecline) {
         self.lifecycle_declines[reason as usize].fetch_add(1, Ordering::Relaxed);
     }
+
+    pub fn record_first_native_fork_failure(&self, stage: NativeForkFailureStage) {
+        let _ = self.first_native_fork_failure.compare_exchange(
+            0,
+            stage as u64,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
+#[cfg(target_os = "none")]
+pub fn record_native_fork_failure(stage: NativeForkFailureStage) {
+    // SAFETY: EL1 maps the shared counters aperture for every carrier vCPU.
+    let counters = unsafe { &*(EL1_COUNTERS_BASE as *const Counters) };
+    counters.record_first_native_fork_failure(stage);
 }
 
 const _: () = assert!(core::mem::size_of::<Counters>() as u64 <= EL1_COUNTERS_SIZE);
@@ -3451,9 +3514,9 @@ const _: () = {
     );
 };
 #[cfg(target_arch = "aarch64")]
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x58e2_c574_747e_6324);
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x3dbe_2b67_88b7_1f8c);
 #[cfg(not(target_arch = "aarch64"))]
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0xea24_605d_1d3b_1060);
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0xfcac_b81b_35cf_8448);
 
 #[cfg(test)]
 mod tests {
@@ -3467,6 +3530,21 @@ mod tests {
             aperture_end <= EL1_SERVICE_COPY_TABLE_OFFSET
                 || service_end <= EL1_APERTURE_CONTROL_OFFSET,
             "strict control aliases the service-copy L3 descriptors"
+        );
+    }
+
+    #[test]
+    fn native_fork_failure_preserves_the_first_stage() {
+        let counters = Counters::new();
+        counters.record_first_native_fork_failure(NativeForkFailureStage::Census);
+        counters.record_first_native_fork_failure(NativeForkFailureStage::Publish);
+        let snapshot = counters.copy_snapshot();
+        assert_eq!(
+            NativeForkFailureStage::from_raw(
+                snapshot.first_native_fork_failure.load(Ordering::Acquire)
+            ),
+            Some(NativeForkFailureStage::Census)
+
         );
     }
 
