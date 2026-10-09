@@ -882,3 +882,20 @@ ARM delivery remains host-owned; this does not enable an ARM signal frame.
 The shared wire crate now builds for `x86_64-unknown-none`; host and ring
 signal records refer to that one definition. Signed ARM acceptance and
 runtime-ratio measurement remain outstanding.
+
+## In-ring signal handler admission
+
+`signal.handler.admission` owns handler masks, reset disposition, alternate
+stack selection and failed-frame escalation. Authority: sigaction(2) and
+sigaltstack(2). Native/KVM witnesses check nested delivery with SA_NODEFER
+clear, SA_RESETHAND publication, DF clearing/restoration, a SIGSEGV handler
+on the retained alternate stack after stack overflow, and default SIGSEGV
+when handler frame construction fails. The first four admission witnesses
+failed before correction; the VM-free reset-action contract failed before
+the action was committed at selection.
+
+Action selection and reset share the sighand lock. Frame publication saves
+the old mask and stack before applying the handler mask. Stack selection is
+constant work; failure admits at most one forced SIGSEGV frame, whose own
+failure terminates the task. No allocation, sleep or polling is introduced
+in successful frame construction. Signed ARM acceptance remains outstanding.
