@@ -1,0 +1,8 @@
+{
+  "run_id": "ring-switch-20261009-0601bee00-2",
+  "command": "CARRICK_RUN_ID=ring-switch-20261009-0601bee00-2 CARRICK_CONTRACT_ID=kernel.el1.arm-ring-first-crossing just test-embed arm_ring_first_ --nocapture",
+  "exit_code": 0,
+  "cleanup_exit_code": 0,
+  "deadline_exceeded": false,
+  "elapsed_seconds": 343.36853262479417
+}

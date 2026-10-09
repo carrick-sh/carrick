@@ -1,0 +1,25 @@
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/arm_ring_first_hatch-49046773201fdb39 arm_ring_first_ --nocapture
+
+running 2 tests
+test arm_ring_first_hatch_disabled_forward_witness ... ring-first strict=false getuid refused=0 forwarded=1 exit_group refused=0 forwarded=1 clock_gettime forwarded=0
+ok
+test arm_ring_first_strict_refusal_witness ... ring-first strict=true getuid refused=1 forwarded=0 exit_group refused=0 forwarded=1 clock_gettime forwarded=0
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/entitlement_negative-5ab05077e3c45bd1.noent.60998: replacing existing signature
+test-signed: negative control on /Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/entitlement_negative-5ab05077e3c45bd1.noent.60998
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+remaining carrick procs (run-id ring-switch-20261009-0601bee00-2) = 0
+remaining carrick procs (run-id ring-switch-20261009-0601bee00-2-cli) = 0
+test-signed: receipt target/test-results/carrick-embed-signed-artifacts.jsonl
+test-signed: OK (carrick-embed: 2 invoked signed executable(s) passed, 34 signed, negative control passed)
+
+Explicit post-run cleanup:
+remaining carrick procs (run-id ring-switch-20261009-0601bee00-2) = 0
