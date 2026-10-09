@@ -3557,6 +3557,7 @@ pub(crate) mod tests {
             slot_wait: None,
             terminal_settlement: HvpatchExternalTerminalSettlement::new(result, completion.clone()),
             terminal_result: None,
+            executor_failure_cause: None,
             completion,
             traps: 0,
             budget_floor: 0,
