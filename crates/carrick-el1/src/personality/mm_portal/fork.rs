@@ -336,10 +336,14 @@ impl<
             }
         })?;
         if capacity_refused {
+            #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+            carrick_el1_abi::record_native_fork_failure(
+                carrick_el1_abi::NativeForkFailureStage::PrepareMappingCapacity,
+            );
             return Err(MmError::NoMemory);
         }
         let parent_root = grant.ttbr0 & B::ADDRESS_MASK;
-        copy_table::<B, _, _>(
+        let copied = copy_table::<B, _, _>(
             &LinuxForkPolicy,
             words,
             request,
@@ -350,7 +354,23 @@ impl<
                 base: 0,
                 child_offset: 0,
             },
-        )?;
+        );
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        if matches!(copied, Err(carrick_core::mm::fork::ForkError::NoMemory)) {
+            use carrick_core::mm::fork::ForkCapacityFailure;
+            use carrick_el1_abi::NativeForkFailureStage as Stage;
+            let stage = match scratch.capacity_failure {
+                Some(ForkCapacityFailure::Reads) => Stage::PrepareReadCapacity,
+                Some(ForkCapacityFailure::ChildTables) => Stage::PrepareChildCapacity,
+                Some(ForkCapacityFailure::ParentTables) => Stage::PrepareParentCapacity,
+                Some(ForkCapacityFailure::Edits) => Stage::PrepareEditCapacity,
+                Some(ForkCapacityFailure::Custody) => Stage::PrepareCustodyCapacity,
+                Some(ForkCapacityFailure::ControlArena) => Stage::PrepareControlArenaCapacity,
+                None => Stage::PrepareUnclassifiedCapacity,
+            };
+            carrick_el1_abi::record_native_fork_failure(stage);
+        }
+        copied?;
         if scratch.reads.iter().any(|(pa, _)| {
             request.child_tables.contains(*pa) || request.parent_tables.contains(*pa)
         }) {
