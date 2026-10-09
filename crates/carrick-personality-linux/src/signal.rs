@@ -210,6 +210,8 @@ pub enum SignalCall {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignalOutcome {
+    /// The same task resumes a restored context without a result word.
+    Restored,
     Returned {
         result: crate::abi::entry::SyscallResult,
         work: bool,
@@ -223,6 +225,7 @@ pub enum SignalOutcome {
 pub fn signal_effect(outcome: &SignalOutcome) -> crate::dispatch::FamilyCompletion {
     use crate::dispatch::FamilyCompletion;
     match *outcome {
+        SignalOutcome::Restored => FamilyCompletion::FrameRestored,
         SignalOutcome::Returned { result, work: true } => {
             FamilyCompletion::CompleteWithWork(result.raw())
         }
@@ -463,7 +466,7 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                             carrick_signal_core::SignalSet::from_bits(new_mask),
                         ),
                     );
-                    returned(0, false)
+                    Some(SignalOutcome::Restored)
                 }
                 Err(err) => returned(
                     carrick_syscall_abi::LinuxErrno::new(err).guest_retval(),

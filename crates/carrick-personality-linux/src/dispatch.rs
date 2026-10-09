@@ -38,6 +38,7 @@ pub enum Family {
 /// turns it into the entry's completion/continuation decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FamilyCompletion {
+    FrameRestored,
     Complete(i64),
     CompleteWithWork(i64),
     Switched(i64),
@@ -414,7 +415,8 @@ fn serve_family<'a, C: EntryContext + 'a>(
                     crate::signal::SignalOutcome::Returned { result, .. } => {
                         Some((result, original))
                     }
-                    crate::signal::SignalOutcome::Transferred { .. } => None,
+                    crate::signal::SignalOutcome::Transferred { .. }
+                    | crate::signal::SignalOutcome::Restored => None,
                 };
                 FamilyRun {
                     completion: crate::signal::signal_effect(&outcome),
@@ -623,10 +625,15 @@ pub enum CompletionRoute {
 /// Linux return-work ordering, shared by common entry and pending families.
 pub fn completion_route(completion: FamilyCompletion, pending: bool) -> CompletionRoute {
     match completion {
-        FamilyCompletion::Complete(_) | FamilyCompletion::Switched(_) if pending => {
+        FamilyCompletion::Complete(_)
+        | FamilyCompletion::Switched(_)
+        | FamilyCompletion::FrameRestored
+            if pending =>
+        {
             CompletionRoute::WithWork
         }
-        FamilyCompletion::Complete(_)
+        FamilyCompletion::FrameRestored
+        | FamilyCompletion::Complete(_)
         | FamilyCompletion::AccountedComplete(_)
         | FamilyCompletion::Switched(_)
         | FamilyCompletion::AccountedSwitched(_) => CompletionRoute::Served,
