@@ -1525,10 +1525,9 @@ fn next_runnable<F: PersistentExecutor>(
         }
         if let Some((_, slot)) = zone {
             carrick_kernel::el1_zone::drain_to_host(slot);
-        } else {
+        } else if backend.has_physical_idle_lane() {
             // A backend with a physical in-guest idle lane uses the same
             // publish/recheck/kick handshake as the EL1-zone path below.
-            // Most backends return Unsupported and take the host queue.
             kick.set_guest_idle(true);
             if let Err(error) = backend.arm_guest_idle() {
                 kick.set_guest_idle(false);
