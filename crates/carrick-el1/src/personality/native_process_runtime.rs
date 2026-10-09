@@ -148,13 +148,23 @@ impl NativeProcessError {
 /// work. A failed settlement retains the closed child and never queues it.
 pub trait NativeProcessService<'a, C: ProcessContext> {
     type Mm: Clone;
+    type PreparedMmStart;
+    type PreparedMmPublished;
     type PreparedMm;
     type Born;
-    fn prepare_mm(
+    fn prepare_mm_start(
         &mut self,
         parent: &Self::Mm,
         words: C,
         child: MmGeneration,
+    ) -> Result<Self::PreparedMmStart, NativeProcessError>;
+    fn prepare_mm_publish(
+        &mut self,
+        start: Self::PreparedMmStart,
+    ) -> Result<Self::PreparedMmPublished, NativeProcessError>;
+    fn prepare_mm_finish(
+        &mut self,
+        published: Self::PreparedMmPublished,
     ) -> Result<Self::PreparedMm, NativeProcessError>;
     fn prepared_mm(&self, prepared: &Self::PreparedMm) -> Self::Mm;
     fn prepared_context(&self, prepared: &Self::PreparedMm) -> AddressContext<RootGpa>;
@@ -2879,7 +2889,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 resources.file_table,
             )
         };
-        let prepared = match self.service.prepare_mm(&parent_mm, self.words, child_mm) {
+        let prepared_start = match self
+            .service
+            .prepare_mm_start(&parent_mm, self.words, child_mm)
+        {
+            Ok(p) => p,
+            Err(error) => {
+                self.runtime.graph.lock().owner.rollback_birth(&permit);
+                return Err(error);
+            }
+        };
+        let prepared_published = match self.service.prepare_mm_publish(prepared_start) {
+            Ok(p) => p,
+            Err(error) => {
+                self.runtime.graph.lock().owner.rollback_birth(&permit);
+                return Err(error);
+            }
+        };
+        let prepared = match self.service.prepare_mm_finish(prepared_published) {
             Ok(p) => p,
             Err(error) => {
                 self.runtime.graph.lock().owner.rollback_birth(&permit);
@@ -4885,9 +4912,11 @@ mod tests {
     }
     impl<'a> NativeProcessService<'a, ParkedContextWords> for Physical<'a> {
         type Mm = AddressContext<RootGpa>;
+        type PreparedMmStart = AddressContext<RootGpa>;
+        type PreparedMmPublished = AddressContext<RootGpa>;
         type PreparedMm = AddressContext<RootGpa>;
         type Born = AddressContext<RootGpa>;
-        fn prepare_mm(
+        fn prepare_mm_start(
             &mut self,
             _: &Self::Mm,
             _: ParkedContextWords,
@@ -4903,6 +4932,18 @@ mod tests {
                 .publish_closed(child.raw().get(), address.root.address().raw(), 0)
                 .ok_or(NativeProcessError::Exhausted)?;
             Ok(address)
+        }
+        fn prepare_mm_publish(
+            &mut self,
+            start: Self::PreparedMmStart,
+        ) -> Result<Self::PreparedMmPublished, NativeProcessError> {
+            Ok(start)
+        }
+        fn prepare_mm_finish(
+            &mut self,
+            published: Self::PreparedMmPublished,
+        ) -> Result<Self::PreparedMm, NativeProcessError> {
+            Ok(published)
         }
         fn prepared_mm(&self, p: &Self::PreparedMm) -> Self::Mm {
             *p
