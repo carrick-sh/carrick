@@ -37,8 +37,8 @@ impl<'a> SignalNative<'a> for Native {
     fn current_tid(&self) -> u32 {
         1
     }
-    fn restore_signal_frame(&mut self) -> Result<u64, i32> {
-        Err(14)
+    fn restore_signal_frame(&mut self) -> Result<u64, carrick_syscall_abi::LinuxErrno> {
+        Err(carrick_syscall_abi::LinuxErrno::new(14))
     }
 }
 impl ProcessSignals for Native {
@@ -47,7 +47,7 @@ impl ProcessSignals for Native {
     }
     fn rt_sigaction(
         &mut self,
-        _: i32,
+        _: carrick_signal_core::policy::Signal,
         _: Option<Action>,
     ) -> Result<Action, carrick_syscall_abi::LinuxErrno> {
         self.calls += 1;
@@ -62,8 +62,8 @@ impl ProcessSignals for Native {
     }
     fn kill(
         &mut self,
-        _: i32,
-        _: i32,
+        _: SignalProcessSelector,
+        _: SignalRequest,
         _: SignalInfo,
     ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
         Err(carrick_syscall_abi::LinuxErrno::new(22))
@@ -71,7 +71,7 @@ impl ProcessSignals for Native {
     fn tkill(
         &mut self,
         _: SignalThreadSelector,
-        _: i32,
+        _: SignalRequest,
         _: SignalInfo,
     ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
         Err(carrick_syscall_abi::LinuxErrno::new(22))
@@ -80,7 +80,7 @@ impl ProcessSignals for Native {
         &mut self,
         _: SignalThreadSelector,
         _: SignalThreadSelector,
-        _: i32,
+        _: SignalRequest,
         _: SignalInfo,
     ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
         Err(carrick_syscall_abi::LinuxErrno::new(22))
@@ -155,6 +155,37 @@ fn signal_owner_errno_has_positive_typed_domain() {
         calls: 0,
         fail: true,
     };
-    let result: Result<Action, carrick_syscall_abi::LinuxErrno> = native.rt_sigaction(10, None);
+    let result: Result<Action, carrick_syscall_abi::LinuxErrno> = native.rt_sigaction(
+        carrick_signal_core::policy::Signal::from_number(10).unwrap(),
+        None,
+    );
     assert_eq!(result.unwrap_err().guest_retval(), -13);
+}
+
+#[test]
+fn signal_owner_admits_validated_requests_and_selectors() {
+    use carrick_personality_linux::signal::{SignalProcessSelector, SignalRequest};
+    let mut native = Native {
+        args: [0; 6],
+        calls: 0,
+        fail: false,
+    };
+    let result = native.kill(
+        SignalProcessSelector::from_abi(1),
+        SignalRequest::Probe,
+        SignalInfo::Generated(None),
+    );
+    assert_eq!(result.unwrap_err().get(), 22);
+    let restored: Result<u64, carrick_syscall_abi::LinuxErrno> = native.restore_signal_frame();
+    assert_eq!(restored.unwrap_err().get(), 14);
+}
+
+#[test]
+fn queued_siginfo_carries_the_admitted_signal_number() {
+    let signal = carrick_signal_core::policy::Signal::from_number(10).unwrap();
+    let payload = SignalInfo::Queued(carrick_abi::LinuxSiginfo::kill(64, -1, 1, 0))
+        .payload(signal)
+        .unwrap();
+    let number = payload.si_signo;
+    assert_eq!(number, 10);
 }
