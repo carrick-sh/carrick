@@ -787,6 +787,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         // same-generation snapshot must leave the runnable task untouched.
         let initial_cpu = &task.validate_for_load()?.cpu;
         let initial_residency = task.binding().cpu_residency();
+        let was_guest_idle = matches!(&self.resident_task, ExecutorTaskResidence::GuestIdle(_));
         let matches_thread_token = match initial_residency {
             Some(TaskCpuResidency::Resident {
                 executor,
@@ -819,17 +820,26 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         };
         // GuestIdle materialization can change the binding after the first
         // residency read. Select the CPU image from that publication.
-        let materialized_cpu = match task.binding().cpu_residency() {
-            Some(TaskCpuResidency::Resident { executor, .. }) if executor != self.executor_id => {
-                task.binding().wait_for_materialized(task.thread_key())?
-            }
-            Some(TaskCpuResidency::Materialized(cpu)) => Some(cpu),
+        let (materialized_cpu, cpu_source) = match task.binding().cpu_residency() {
+            Some(TaskCpuResidency::Resident { executor, .. }) if executor != self.executor_id => (
+                task.binding().wait_for_materialized(task.thread_key())?,
+                "cross-executor",
+            ),
+            Some(TaskCpuResidency::Materialized(cpu)) => (
+                Some(cpu),
+                if was_guest_idle {
+                    "guest-idle"
+                } else {
+                    "materialized"
+                },
+            ),
             // Parked in the in-guest zone: its registers are in the record
             // its handback made host-owned (the job frees it on resume).
-            Some(TaskCpuResidency::Zone { base, record }) => {
-                Some(super::residency::materialize_zone(&base, record)?)
-            }
-            _ => None,
+            Some(TaskCpuResidency::Zone { base, record }) => (
+                Some(super::residency::materialize_zone(&base, record)?),
+                "zone",
+            ),
+            _ => (None, "lease"),
         };
         let cpu = materialized_cpu.as_ref().unwrap_or(initial_cpu);
         task.binding()
@@ -913,8 +923,8 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 .overlay_task_state_on_live_executor(cpu)
                 .map_err(|error| {
                     TrapError::Hypervisor(format!(
-                        "task overlay for {:?} failed: {error}",
-                        task.thread_key()
+                        "task overlay for {:?} from {cpu_source} failed: {error}",
+                        task.thread_key(),
                     ))
                 })?;
         }
