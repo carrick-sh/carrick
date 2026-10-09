@@ -1311,7 +1311,13 @@ unsafe impl Sync for DelegatedFile {}
 
 /// A descriptor in the carrier's host file table, distinct from a guest fd
 /// and from a delegated inode identity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HostBoundFd(i32);
 
 impl HostBoundFd {
@@ -1360,6 +1366,11 @@ impl DelegatedOpenFile {
         } else {
             HostBoundFd::new((encoded - 1) as i32)
         }
+    }
+
+    /// Clear the binding before publishing a reused description as live.
+    pub fn clear_host_fd(&self) {
+        self.host_fd.store(0, Ordering::Release);
     }
 
     pub const fn new() -> Self {
@@ -3487,6 +3498,14 @@ mod tests {
         assert!(!aperture.is_strict());
     }
 
+    #[test]
+    fn host_binding_does_not_survive_description_reuse() {
+        let description = super::DelegatedOpenFile::new();
+        description.bind_host_fd(super::HostBoundFd::new(0).unwrap());
+        assert_eq!(description.host_fd().map(super::HostBoundFd::raw), Some(0));
+        description.clear_host_fd();
+        assert_eq!(description.host_fd(), None);
+    }
     #[test]
     fn lifecycle_mapping_binding_is_revoked_on_task_clear() {
         let task = CurrentTask::new();
