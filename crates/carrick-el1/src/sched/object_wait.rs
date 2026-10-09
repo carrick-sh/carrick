@@ -8,7 +8,7 @@
 use crate::substrate::sched::{
     EL1_ZONE_LOCK_SPINS, Sched, Served, ThreadCpu, UserWord, identity_of,
 };
-use carrick_el1_abi::{Aarch64ParkedContext, SlotId, TrapFrame};
+use carrick_el1_abi::{SlotId, TrapFrame, ZoneContext};
 use carrick_sched_core::object_wait::{
     ObjectWaitError, ObjectWaitKey, ObjectWaitSnapshot, ObjectWakeReport, OperationToken,
 };
@@ -67,7 +67,7 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
     ) -> Result<ObjectWaitSnapshot, ObjectWaitError> {
         let completion = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
             '_,
-            Aarch64ParkedContext,
+            ZoneContext,
         >| { deliver_completion(self.zone, self.slot, effects) };
         carrick_core::wait::observe_object(self.zone, self.slot, key, &completion)
     }
@@ -101,12 +101,12 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
         resume: OperationResumePc,
         operation: OperationToken,
         deadline: Option<u64>,
-    ) -> Result<ObjectParked<'a, Aarch64ParkedContext>, (ObjectWaitError, OperationToken)> {
+    ) -> Result<ObjectParked<'a, ZoneContext>, (ObjectWaitError, OperationToken)> {
         let zone = self.zone;
         let slot = self.slot;
         let completion = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
             '_,
-            Aarch64ParkedContext,
+            ZoneContext,
         >| { deliver_completion(zone, slot, effects) };
         let request =
             carrick_core::wait::ObjectParkRequest::new(key, snapshot, operation, deadline);
@@ -126,7 +126,7 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
                 // home record. Only this CPU owns its context until publish below.
                 let ctx = unsafe { zone.record(record).ctx_mut() };
                 self.cpu.save(frame, ctx);
-                ctx.native.pc = resume.raw();
+                crate::substrate::sched::native_context_mut(ctx).pc = resume.raw();
                 Ok((record, fresh))
             },
         )
@@ -138,7 +138,7 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
     /// pending signals). All caller locks must be released.
     pub fn leave_after_object_park(
         &mut self,
-        mut parked: ObjectParked<'_, Aarch64ParkedContext>,
+        mut parked: ObjectParked<'_, ZoneContext>,
     ) -> Option<Served> {
         if !parked.matches(self.zone, self.slot) {
             return None;
@@ -154,7 +154,7 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
     pub fn resume_after_object_park(
         &mut self,
         frame: &mut TrapFrame,
-        mut parked: ObjectParked<'_, Aarch64ParkedContext>,
+        mut parked: ObjectParked<'_, ZoneContext>,
         timeout_result: u64,
     ) -> Option<Served> {
         if !parked.matches(self.zone, self.slot) {

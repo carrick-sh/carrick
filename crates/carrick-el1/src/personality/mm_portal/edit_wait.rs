@@ -58,7 +58,7 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
     let observe = |key| {
         let completion = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
             '_,
-            carrick_el1_abi::Aarch64ParkedContext,
+            carrick_el1_abi::ZoneContext,
         >| {
             crate::substrate::sched::object_wait::deliver_completion(zone, slot, effects);
         };
