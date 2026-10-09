@@ -61,6 +61,8 @@ pub(crate) trait PersistentQuantumJob: Send + 'static {
 
     fn after_terminal_settlement(&mut self) {}
 
+    fn note_executor_failure(&mut self, _cause: String) {}
+
     /// The executor unloaded this task from its vCPU (the task may stay
     /// admitted: an executor can preempt it at a syscall boundary). The job
     /// vacates the vCPU's address-space occupancy.
@@ -105,6 +107,7 @@ pub(crate) trait PersistentQuantumJob: Send + 'static {
 
 pub(crate) struct HvpatchTaskQuantum {
     job: Mutex<Box<dyn PersistentQuantumJob>>,
+    failure_cause: Mutex<Option<String>>,
     completion: LogicalJobCompletion,
     _physical_retirement: PhysicalJobRetirementPublisher,
 }
@@ -117,6 +120,7 @@ impl HvpatchTaskQuantum {
         let physical_retirement = completion.physical_retirement_publisher();
         Self {
             job: Mutex::new(job),
+            failure_cause: Mutex::new(None),
             completion,
             _physical_retirement: physical_retirement,
         }
@@ -134,6 +138,13 @@ impl HvpatchTaskQuantum {
         self.job.lock().end_residency();
     }
 
+    pub(crate) fn record_executor_failure(&self, cause: String) {
+        let mut first = self.failure_cause.lock();
+        if first.is_none() {
+            *first = Some(cause);
+        }
+    }
+
     pub(crate) fn after_terminal_settlement(&self) {
         self.job.lock().after_terminal_settlement();
         self.completion.publish();
@@ -145,7 +156,12 @@ impl HvpatchTaskQuantum {
     }
 
     pub(crate) fn after_executor_failure_settlement(&self) {
-        match self.job.lock().after_executor_failure_settlement() {
+        let cause = self.failure_cause.lock().take();
+        let mut job = self.job.lock();
+        if let Some(cause) = cause {
+            job.note_executor_failure(cause);
+        }
+        match job.after_executor_failure_settlement() {
             ExecutorFailureSettlement::PublishCurrent => self.completion.publish(),
             // Fail closed on the one shape that cannot be recovered later: an
             // unpublished job whose executor is gone has no remaining
@@ -217,6 +233,9 @@ enum HvpatchBindingTerminalGeneration {
 }
 
 impl HvpatchTaskBinding {
+    pub(crate) fn record_executor_failure(&self, cause: String) {
+        self.quantum.record_executor_failure(cause);
+    }
     #[cfg(test)]
     pub(crate) fn new(
         identity: crate::vcpu_loop::executor::TaskLoadIdentity,
@@ -978,6 +997,34 @@ mod tests {
 
     use super::*;
     use carrick_kernel::kernel::continuation::test_support::bootstrap;
+
+    #[test]
+    fn executor_failure_preserves_first_cause_for_exact_job() {
+        struct FailedJob(Arc<Mutex<Vec<String>>>);
+        impl PersistentQuantumJob for FailedJob {
+            fn poll_quantum_with_engine(
+                &mut self,
+                _engine: &mut dyn std::any::Any,
+                _control: &mut crate::vcpu_loop::executor::HvpatchQuantumControl<'_, '_>,
+            ) -> crate::vcpu_loop::executor::ExecutorExit {
+                unreachable!("failed job never polls")
+            }
+
+            fn note_executor_failure(&mut self, cause: String) {
+                self.0.lock().push(cause);
+            }
+        }
+        let causes = Arc::new(Mutex::new(Vec::new()));
+        let completion = LogicalJobCompletion::pending();
+        let quantum =
+            HvpatchTaskQuantum::new(Box::new(FailedJob(Arc::clone(&causes))), completion.clone());
+        quantum.record_executor_failure("first load error".to_owned());
+        quantum.record_executor_failure("later cleanup error".to_owned());
+        quantum.after_executor_failure_settlement();
+        assert_eq!(causes.lock().as_slice(), &["first load error"]);
+        assert!(completion.is_finished());
+    }
+
     #[test]
     fn hvpatch_persistent_quantum_and_binding_exclude_executor_authority() {
         fn assert_send<T: Send>() {}

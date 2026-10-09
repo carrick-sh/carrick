@@ -1500,6 +1500,7 @@ pub(crate) mod tests {
                     job_completion.clone(),
                 ),
                 terminal_result: None,
+                executor_failure_cause: None,
                 completion: job_completion,
                 traps: 0,
                 budget_floor: 0,
