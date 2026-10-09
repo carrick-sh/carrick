@@ -173,7 +173,7 @@ pub struct NativeResources<'a, M, C: ProcessContext> {
     page: &'a ThreadLifecyclePage,
     mm: M,
     address: AddressContext<RootGpa>,
-    signals: NativeProcessSignals<()>,
+    signals: NativeProcessSignals<carrick_personality_linux::abi::signal::LinuxSiginfo>,
     _thread_claim: NativeClaim,
     channel: Option<Arc<WaitChannel>>,
     usage: TaskRusage,
@@ -191,7 +191,10 @@ impl<'a, M: Clone, C: ProcessContext> ProcessResources for NativeResources<'a, M
     type Transaction = NonZeroU64;
     type Member = NativeMember<'a, C>;
     type Resources = M;
-    type SignalTarget = NativeExitSignals<(), &'a ThreadControlSlot>;
+    type SignalTarget = NativeExitSignals<
+        carrick_personality_linux::abi::signal::LinuxSiginfo,
+        &'a ThreadControlSlot,
+    >;
     fn wait_event(&self, _: WaitJobControl, _: bool) -> Option<()> {
         None
     }
@@ -231,7 +234,7 @@ struct ExitWakeCustody {
     channel: Arc<WaitChannel>,
 }
 struct PendingExit {
-    status: u8,
+    status: LinuxWaitStatus,
     channel: Arc<WaitChannel>,
     wake: Option<ExitWakeCustody>,
 }
@@ -273,10 +276,30 @@ impl<M, C: ProcessContext> NativeResources<'_, M, C> {
     fn record_identity_mm(&self) -> u64 {
         self.zone.record(self.record.id).identity().mm
     }
+    pub fn signals(
+        &self,
+    ) -> &NativeProcessSignals<carrick_personality_linux::abi::signal::LinuxSiginfo> {
+        &self.signals
+    }
+    pub fn signals_mut(
+        &mut self,
+    ) -> &mut NativeProcessSignals<carrick_personality_linux::abi::signal::LinuxSiginfo> {
+        &mut self.signals
+    }
 }
 impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
     pub fn zone(&self) -> &'a ZoneTables<C> {
         self.zone
+    }
+    pub fn root_signals(
+        &self,
+    ) -> NativeProcessSignals<carrick_personality_linux::abi::signal::LinuxSiginfo> {
+        let graph = self.graph.lock();
+        let row = graph
+            .owner
+            .task(graph.root_key)
+            .expect("root task must exist");
+        row.native().resources().signals.clone()
     }
     #[allow(clippy::too_many_arguments)]
     pub fn admit_fresh_root<B: carrick_mmu_core::owner_mmu::OwnerForkMmu>(
@@ -618,6 +641,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub fn take_root_exit(&mut self) -> Option<LinuxWaitStatus> {
         self.root_exit.take()
     }
+    pub fn task_id(&self) -> u32 {
+        self.key.id.raw() as u32
+    }
     pub fn is_root_process(&self) -> bool {
         let graph = self.runtime.graph.lock();
         self.key == graph.root_key
@@ -910,6 +936,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 
     #[inline(never)]
     fn exit_owned(&mut self, status: u8) -> Result<LifecycleOutcome, NativeProcessError> {
+        self.exit_with_status(LinuxWaitStatus::from_wait_encoding(i32::from(status) << 8))
+    }
+    pub fn exit_with_signal(&mut self, sig: u8) -> Result<LifecycleOutcome, NativeProcessError> {
+        self.exit_with_status(LinuxWaitStatus::signaled(sig, false))
+    }
+    pub fn exit_with_status(
+        &mut self,
+        wait_status: LinuxWaitStatus,
+    ) -> Result<LifecycleOutcome, NativeProcessError> {
         let (page, channel) = {
             let mut graph = self.runtime.graph.lock();
             let row = graph
@@ -942,7 +977,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 graph.pending_exit.insert(
                     self.key,
                     PendingExit {
-                        status,
+                        status: wait_status,
                         channel,
                         wake,
                     },
@@ -970,7 +1005,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             );
         }
         let root_exit = self.is_root_process();
-        let wait_status = LinuxWaitStatus::from_wait_encoding(i32::from(status) << 8);
         let transaction = self
             .runtime
             .graph
@@ -1594,6 +1628,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             .entry_ref_for_visible_tid(tid)
             .ok_or(carrick_personality_linux::identity::ESRCH)?;
         read_slot(resources.page, entry).ok_or(carrick_personality_linux::identity::ESRCH)
+    }
+    fn signal_venue(
+        &mut self,
+    ) -> Option<&mut dyn carrick_personality_linux::signal::ProcessSignals> {
+        Some(self)
     }
 }
 
@@ -2338,6 +2377,254 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         ru.ru_stime.tv_sec = usage.system_time.as_secs() as i64;
         ru.ru_stime.tv_usec = usage.system_time.subsec_micros() as i64;
         Ok(ru)
+    }
+}
+
+impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
+    carrick_personality_linux::signal::ProcessSignals for NativeProcessEntry<'_, 'a, M, C, S>
+{
+    fn rt_sigaction(
+        &mut self,
+        signum: i32,
+        act: Option<carrick_signal_core::policy::Action>,
+    ) -> Result<carrick_signal_core::policy::Action, i32> {
+        let einval = carrick_personality_linux::abi::signal::LINUX_EINVAL.get();
+        let esrch = carrick_personality_linux::abi::signal::LINUX_ESRCH.get();
+        let signal = carrick_signal_core::policy::Signal::from_number(signum).ok_or(einval)?;
+        let graph = self.runtime.graph.lock();
+        let row = graph.owner.task(self.key).map_err(|_| esrch)?;
+        let signals = row.native().resources().signals();
+        if let Some(new_action) = act {
+            signals
+                .install_action(self.key, signal, new_action)
+                .map_err(|_| einval)
+        } else {
+            Ok(signals.action(signal))
+        }
+    }
+
+    fn rt_sigpending(&self, blocked: carrick_signal_core::policy::SigBlockMask) -> u64 {
+        let graph = self.runtime.graph.lock();
+        let Ok(row) = graph.owner.task(self.key) else {
+            return 0;
+        };
+        let tid = self.key.id.raw() as u32;
+        let pending = row.native().resources().signals().pending_set(tid);
+        let blocked_pending = pending.intersect(blocked.signals());
+        blocked_pending.bits()
+    }
+
+    fn kill(
+        &mut self,
+        pid: i32,
+        sig: i32,
+        info: Option<carrick_personality_linux::abi::signal::LinuxSiginfo>,
+    ) -> Result<(), i32> {
+        let einval = carrick_personality_linux::abi::signal::LINUX_EINVAL.get();
+        let esrch = carrick_personality_linux::abi::signal::LINUX_ESRCH.get();
+        if !(0..=64).contains(&sig) {
+            return Err(einval);
+        }
+        let signal = if sig != 0 {
+            Some(carrick_signal_core::policy::Signal::from_number(sig).ok_or(einval)?)
+        } else {
+            None
+        };
+
+        let graph = self.runtime.graph.lock();
+        let caller_row = graph.owner.task(self.key).map_err(|_| esrch)?;
+        let caller_pgid = caller_row.metadata().namespace_process_group;
+
+        let mut targets = alloc::vec::Vec::new();
+        if pid > 0 {
+            let target_pid = pid as u32;
+            for (&_id, task) in graph.owner.tasks() {
+                if task.metadata().namespace_pid == target_pid {
+                    targets.push((
+                        task.key(),
+                        task.native().resources().signals().clone(),
+                        task.parent(),
+                    ));
+                    break;
+                }
+            }
+            if targets.is_empty() {
+                let in_zombies = graph
+                    .owner
+                    .zombies()
+                    .values()
+                    .any(|z| z.receipt.namespace_pid == target_pid);
+                if in_zombies && sig == 0 {
+                    return Ok(());
+                }
+                return Err(esrch);
+            }
+        } else if pid == 0 {
+            for (&_id, task) in graph.owner.tasks() {
+                if task.metadata().namespace_process_group == caller_pgid {
+                    targets.push((
+                        task.key(),
+                        task.native().resources().signals().clone(),
+                        task.parent(),
+                    ));
+                }
+            }
+            if targets.is_empty() {
+                return Err(esrch);
+            }
+        } else if pid == -1 {
+            for (&_id, task) in graph.owner.tasks() {
+                if task.metadata().namespace_pid != 1 {
+                    targets.push((
+                        task.key(),
+                        task.native().resources().signals().clone(),
+                        task.parent(),
+                    ));
+                }
+            }
+            if targets.is_empty() {
+                return Err(esrch);
+            }
+        } else {
+            let target_pgid = (-pid) as u32;
+            for (&_id, task) in graph.owner.tasks() {
+                if task.metadata().namespace_process_group == target_pgid {
+                    targets.push((
+                        task.key(),
+                        task.native().resources().signals().clone(),
+                        task.parent(),
+                    ));
+                }
+            }
+            if targets.is_empty() {
+                return Err(esrch);
+            }
+        }
+
+        if sig == 0 {
+            return Ok(());
+        }
+
+        let Some(signal) = signal else {
+            return Err(einval);
+        };
+        let info = info.unwrap_or_else(|| {
+            carrick_personality_linux::abi::signal::LinuxSiginfo::kill(
+                sig,
+                carrick_personality_linux::abi::signal::LINUX_SI_USER,
+                i32::from(self.source.slot.raw()),
+                0,
+            )
+        });
+
+        for (target_key, target_signals, _) in targets {
+            let action = target_signals.action(signal);
+            if action.disposition == carrick_signal_core::policy::Disposition::Ignore {
+                continue;
+            }
+            let _ = target_signals.enqueue(target_key, signal, Some(info));
+            if let Some(channel) = graph
+                .owner
+                .task(target_key)
+                .ok()
+                .and_then(|t| t.native().resources().channel.clone())
+            {
+                let _ = channel.generation.publish();
+            }
+        }
+
+        Ok(())
+    }
+
+    fn tkill(
+        &mut self,
+        tid: u32,
+        sig: i32,
+        info: Option<carrick_personality_linux::abi::signal::LinuxSiginfo>,
+    ) -> Result<(), i32> {
+        let einval = carrick_personality_linux::abi::signal::LINUX_EINVAL.get();
+        let esrch = carrick_personality_linux::abi::signal::LINUX_ESRCH.get();
+        if !(0..=64).contains(&sig) {
+            return Err(einval);
+        }
+        if sig == 0 {
+            return Ok(());
+        }
+        let signal = carrick_signal_core::policy::Signal::from_number(sig).ok_or(einval)?;
+        let graph = self.runtime.graph.lock();
+        let row = graph.owner.task(self.key).map_err(|_| esrch)?;
+        let info = info.unwrap_or_else(|| {
+            carrick_personality_linux::abi::signal::LinuxSiginfo::kill(
+                sig,
+                carrick_personality_linux::abi::signal::LINUX_SI_TKILL,
+                i32::from(self.source.slot.raw()),
+                0,
+            )
+        });
+        row.native()
+            .resources()
+            .signals()
+            .enqueue_thread(tid, signal, Some(info));
+        Ok(())
+    }
+
+    fn tgkill(
+        &mut self,
+        _tgid: u32,
+        tid: u32,
+        sig: i32,
+        info: Option<carrick_personality_linux::abi::signal::LinuxSiginfo>,
+    ) -> Result<(), i32> {
+        self.tkill(tid, sig, info)
+    }
+
+    fn rt_sigtimedwait(
+        &mut self,
+        set: carrick_signal_core::SignalSet,
+        timeout_ns: Option<u64>,
+    ) -> Result<
+        (
+            carrick_signal_core::policy::Signal,
+            Option<carrick_personality_linux::abi::signal::LinuxSiginfo>,
+        ),
+        i32,
+    > {
+        let esrch = carrick_personality_linux::abi::signal::LINUX_ESRCH.get();
+        let eagain = carrick_personality_linux::abi::signal::LINUX_EAGAIN.get();
+        let graph = self.runtime.graph.lock();
+        let row = graph.owner.task(self.key).map_err(|_| esrch)?;
+        let tid = self.key.id.raw() as u32;
+        if let Some(res) = row.native().resources().signals().take_timedwait(tid, set) {
+            return Ok(res);
+        }
+        if let Some(_timeout) = timeout_ns {
+            return Err(eagain);
+        }
+        Err(eagain)
+    }
+
+    fn rt_sigsuspend(
+        &mut self,
+        _mask: carrick_signal_core::policy::SigBlockMask,
+    ) -> Result<(), i32> {
+        Err(carrick_personality_linux::abi::signal::LINUX_EINTR.get())
+    }
+
+    fn take_deliverable(
+        &mut self,
+        tid: u32,
+        blocked: carrick_signal_core::policy::SigBlockMask,
+    ) -> Option<(
+        carrick_signal_core::policy::Signal,
+        Option<carrick_personality_linux::abi::signal::LinuxSiginfo>,
+        carrick_signal_core::policy::Action,
+    )> {
+        let graph = self.runtime.graph.lock();
+        let row = graph.owner.task(self.key).ok()?;
+        row.native()
+            .resources()
+            .signals()
+            .take_deliverable(tid, blocked)
     }
 }
 

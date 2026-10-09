@@ -21,6 +21,7 @@ pub enum Family {
     Write,
     EpollWait,
     Lifecycle(LifecycleCall),
+    Signal(crate::signal::SignalCall),
     Futex,
     InotifyAdd,
     InotifyRemove,
@@ -282,6 +283,9 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     fn sysinfo_native(&mut self) -> Option<&mut dyn crate::sysinfo::SysinfoNative<'a>> {
         None
     }
+    fn signal_native(&mut self) -> Option<&mut dyn crate::signal::SignalNative<'a>> {
+        None
+    }
     fn original_argument0(&self) -> u64;
     fn install_result(&mut self, result: SyscallResult);
     /// Removed by order 8.
@@ -400,6 +404,24 @@ fn serve_family<'a, C: EntryContext + 'a>(
                 },
             );
     }
+    if let Family::Signal(call) = family {
+        let original = pending.original_argument0();
+        return pending
+            .signal_native()
+            .and_then(|native| crate::signal::invoke(call, native))
+            .map_or(FamilyCompletion::Forward.into(), |outcome| {
+                let returned = match outcome {
+                    crate::signal::SignalOutcome::Returned { result, .. } => {
+                        Some((result, original))
+                    }
+                    crate::signal::SignalOutcome::Transferred { .. } => None,
+                };
+                FamilyRun {
+                    completion: crate::signal::signal_effect(&outcome),
+                    returned,
+                }
+            });
+    }
     let mut returned = None;
     let completion = match family {
         Family::Anonymous(call) => {
@@ -425,6 +447,7 @@ fn serve_family<'a, C: EntryContext + 'a>(
         Family::Lifecycle(_) => FamilyCompletion::Forward,
         Family::Identity(_) => FamilyCompletion::Forward,
         Family::Sysinfo(_) => FamilyCompletion::Forward,
+        Family::Signal(_) => FamilyCompletion::Forward,
         Family::Futex => pending.futex(),
         Family::InotifyAdd => pending.inotify_add(),
         Family::InotifyRemove => pending.inotify_remove(),
@@ -464,9 +487,19 @@ pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
         28 => Family::InotifyRemove,
         98 => Family::Futex,
         93 => Family::Lifecycle(LifecycleCall::Exit),
+        129 => Family::Signal(crate::signal::SignalCall::Kill),
+        130 => Family::Signal(crate::signal::SignalCall::Tkill),
+        131 => Family::Signal(crate::signal::SignalCall::Tgkill),
         132 => Family::Lifecycle(LifecycleCall::SigAltStack),
+        133 => Family::Signal(crate::signal::SignalCall::RtSigsuspend),
+        134 => Family::Signal(crate::signal::SignalCall::RtSigaction),
         135 => Family::Lifecycle(LifecycleCall::SigProcMask),
-        139 => Family::SignalReturn,
+        136 => Family::Signal(crate::signal::SignalCall::RtSigpending),
+        137 => Family::Signal(crate::signal::SignalCall::RtSigtimedwait),
+        138 => Family::Signal(crate::signal::SignalCall::RtSigqueueinfo),
+        139 => Family::Signal(crate::signal::SignalCall::RtSigreturn),
+        240 => Family::Signal(crate::signal::SignalCall::RtTgsigqueueinfo),
+        424 => Family::Signal(crate::signal::SignalCall::PidfdSendSignal),
         99 => Family::Lifecycle(LifecycleCall::SetRobustList),
         178 => Family::Lifecycle(LifecycleCall::GetTid),
         172 => Family::Lifecycle(LifecycleCall::GetPid),

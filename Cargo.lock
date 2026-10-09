@@ -848,6 +848,7 @@ dependencies = [
  "carrick-signal-core",
  "carrick-syscall-abi",
  "carrick-x86",
+ "zerocopy",
 ]
 
 [[package]]

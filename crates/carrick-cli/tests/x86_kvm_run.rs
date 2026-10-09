@@ -465,6 +465,31 @@ fn mounted_static_x86_memory_and_fork_wait_match_native() {
     compare_mounted_assembly_with_native("x86_memory_fork_wait.S", b"F\n");
 }
 
+#[test]
+fn mounted_static_x86_signal_handler_and_rt_sigreturn_match_native() {
+    compare_mounted_assembly_with_native("x86_signal_handler.S", b"HK\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_block_pending_and_unblock_match_native() {
+    compare_mounted_assembly_with_native("x86_signal_block_pending.S", b"BHU\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_kill_child_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_kill_child.S", b"W\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_timedwait_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_timedwait.S", b"PT\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_segv_fault_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_segv_fault.S", b"SC\n");
+}
+
 fn skip_without_kvm() -> bool {
     let present = std::path::Path::new("/dev/kvm").exists();
     assert!(

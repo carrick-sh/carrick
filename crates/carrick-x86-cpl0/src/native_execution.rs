@@ -92,9 +92,10 @@ pub(super) fn schedule(slot: SlotId) -> ! {
             source.zone.leave_idle(slot);
             let runtime = native_process::runtime();
             let record = source.zone.record_ref(selected.record);
-            let state = runtime
-                .record_binding(record)
-                .unwrap_or_else(|| initial_boot::fatal_boot());
+            let Some(state) = runtime.record_binding(record) else {
+                source.zone.clear_current(slot);
+                continue;
+            };
             let identity = source.zone.record(selected.record).identity();
             source
                 .zone
@@ -105,6 +106,10 @@ pub(super) fn schedule(slot: SlotId) -> ! {
                 state.key.serial.raw(),
                 identity.file_table,
             );
+            current
+                .mm
+                .key
+                .store(state.address.mm.raw().get(), Ordering::Release);
             current
                 .mm
                 .thread_generation

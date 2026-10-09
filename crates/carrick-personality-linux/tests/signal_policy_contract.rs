@@ -360,7 +360,7 @@ fn fork_and_exec_reset_actions_pending_and_masks_in_their_own_domains() {
     let mut copied = actions.clone();
     copied.install(sig(10), Action::default()).unwrap();
     assert_eq!(actions.action(sig(10)), handler);
-    let exec = actions.for_exec();
+    let exec = actions.clone_for_exec();
     assert_eq!(exec.action(sig(10)), Action::default());
     assert_eq!(exec.action(sig(12)), ignored);
     assert_eq!(actions.action(sig(10)), handler);

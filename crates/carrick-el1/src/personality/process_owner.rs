@@ -677,6 +677,15 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
                 && row.metadata.namespace_process_group == pgid
         })
     }
+    pub fn tasks(&self) -> &BTreeMap<TaskId, GuestTask<C, U, N>> {
+        &self.registry.tasks
+    }
+    pub fn tasks_mut(&mut self) -> &mut BTreeMap<TaskId, GuestTask<C, U, N>> {
+        &mut self.registry.tasks
+    }
+    pub fn zombies(&self) -> &BTreeMap<TaskId, GuestZombie<C, U, N::Claim>> {
+        &self.registry.zombies
+    }
     pub fn namespace_child_key(
         &self,
         caller: TaskKey,

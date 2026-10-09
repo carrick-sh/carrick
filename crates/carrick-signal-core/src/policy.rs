@@ -22,6 +22,7 @@ pub struct Signal(u8);
 
 impl Signal {
     pub const KILL: Self = Self(9);
+    pub const SEGV: Self = Self(11);
     pub const ALRM: Self = Self(14);
     pub const CHLD: Self = Self(17);
     pub const CONT: Self = Self(18);
@@ -170,7 +171,7 @@ impl ActionTable {
 
     /// Exec makes a private table: caught handlers reset and ignored actions
     /// stay ignored. Reset default metadata as the existing kernel Sighand does.
-    pub fn for_exec(&self) -> Self {
+    pub fn clone_for_exec(&self) -> Self {
         Self {
             actions: self
                 .actions

@@ -137,6 +137,9 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     ) -> Result<(u64, u32), i64> {
         Err(crate::identity::ESRCH)
     }
+    fn signal_venue(&mut self) -> Option<&mut dyn crate::signal::ProcessSignals> {
+        None
+    }
 }
 
 pub trait UserCopy {

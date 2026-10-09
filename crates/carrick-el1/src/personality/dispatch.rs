@@ -40,6 +40,22 @@ pub trait GuestDispatchFrame: SyscallFrame {
     fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64>;
     /// Distinguish an ISA-only refusal from a family or venue refusal.
     fn record_isa_unsupported_forward(&self) {}
+    fn restore_signal_frame(
+        &mut self,
+        copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
+    ) -> Result<u64, i32> {
+        let _ = copy_in;
+        Err(carrick_personality_linux::abi::signal::LINUX_ENOSYS.get())
+    }
+    fn setup_signal_frame(
+        &mut self,
+        params: carrick_guest_arch::SignalFrameParams,
+        siginfo: Option<&[u8]>,
+        copy_out: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
+    ) -> Result<carrick_guest_arch::UserVa, i32> {
+        let _ = (params, siginfo, copy_out);
+        Err(carrick_personality_linux::abi::signal::LINUX_ENOSYS.get())
+    }
 }
 
 impl GuestDispatchFrame for TrapFrame {
@@ -60,6 +76,50 @@ impl GuestDispatchFrame for TrapFrame {
     }
     fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
         None
+    }
+    fn restore_signal_frame(
+        &mut self,
+        copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
+    ) -> Result<u64, i32> {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            let mut backend = crate::isa::aarch64::Aarch64Backend;
+            carrick_guest_arch::SignalBackend::restore_signal_frame(
+                &mut backend,
+                self,
+                &mut |dst, va| copy_in.copy_in(dst, va),
+            )
+            .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT.get())
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        {
+            let _ = copy_in;
+            Err(carrick_personality_linux::abi::signal::LINUX_ENOSYS.get())
+        }
+    }
+    fn setup_signal_frame(
+        &mut self,
+        params: carrick_guest_arch::SignalFrameParams,
+        siginfo: Option<&[u8]>,
+        copy_out: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
+    ) -> Result<carrick_guest_arch::UserVa, i32> {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            let mut backend = crate::isa::aarch64::Aarch64Backend;
+            carrick_guest_arch::SignalBackend::setup_signal_frame(
+                &mut backend,
+                self,
+                params,
+                siginfo,
+                &mut |va, src| copy_out.copy_out(va, src),
+            )
+            .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT.get())
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        {
+            let _ = (params, siginfo, copy_out);
+            Err(carrick_personality_linux::abi::signal::LINUX_ENOSYS.get())
+        }
     }
 }
 
@@ -592,6 +652,11 @@ impl<
         }
     }
     fn file_venue(&mut self) -> Option<&mut dyn PendingFileVenue> {
+        Some(self)
+    }
+    fn signal_native(
+        &mut self,
+    ) -> Option<&mut dyn carrick_personality_linux::signal::SignalNative<'a>> {
         Some(self)
     }
     fn task_state(&self) -> Option<&LinuxTaskState> {

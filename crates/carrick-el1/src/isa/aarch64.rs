@@ -303,3 +303,249 @@ pub fn complete_native_run_failure(
     }
     hw::fatal_entry_binding()
 }
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Siginfo {
+    si_signo: i32,
+    si_errno: i32,
+    si_code: i32,
+    _pad0: i32,
+    si_addr: u64,
+    _pad: [u8; 128 - 24],
+}
+
+impl Siginfo {
+    const fn empty() -> Self {
+        Self {
+            si_signo: 0,
+            si_errno: 0,
+            si_code: 0,
+            _pad0: 0,
+            si_addr: 0,
+            _pad: [0; 128 - 24],
+        }
+    }
+
+    fn ref_from_bytes(bytes: &[u8]) -> Option<&Self> {
+        if bytes.len() >= core::mem::size_of::<Self>() {
+            Some(unsafe { &*(bytes.as_ptr() as *const Self) })
+        } else {
+            None
+        }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SignalStack {
+    ss_sp: u64,
+    ss_flags: i32,
+    _pad0: u32,
+    ss_size: u64,
+}
+
+impl SignalStack {
+    const fn empty() -> Self {
+        Self {
+            ss_sp: 0,
+            ss_flags: 0,
+            _pad0: 0,
+            ss_size: 0,
+        }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SignalContext {
+    fault_address: u64,
+    regs: [u64; 31],
+    sp: u64,
+    pc: u64,
+    pstate: u64,
+    _pad: [u8; 8],
+    __reserved: [u8; 4096],
+}
+
+impl SignalContext {
+    const fn empty() -> Self {
+        Self {
+            fault_address: 0,
+            regs: [0; 31],
+            sp: 0,
+            pc: 0,
+            pstate: 0,
+            _pad: [0; 8],
+            __reserved: [0; 4096],
+        }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Ucontext {
+    uc_flags: u64,
+    uc_link: u64,
+    uc_stack: SignalStack,
+    uc_sigmask: u64,
+    _pad: [u8; 120],
+    _pad2: [u8; 8],
+    uc_mcontext: SignalContext,
+}
+
+impl Ucontext {
+    const fn empty() -> Self {
+        Self {
+            uc_flags: 0,
+            uc_link: 0,
+            uc_stack: SignalStack::empty(),
+            uc_sigmask: 0,
+            _pad: [0; 120],
+            _pad2: [0; 8],
+            uc_mcontext: SignalContext::empty(),
+        }
+    }
+}
+
+const ARM64_SIGFRAME_MAGIC: u64 = 0x4361_7272_6963_6b53;
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Arm64Sigframe {
+    siginfo: Siginfo,
+    ucontext: Ucontext,
+    magic: u64,
+    signum: u32,
+    _pad0: u32,
+    saved_x: [u64; 31],
+    saved_pc: u64,
+    saved_sp: u64,
+    saved_spsr: u64,
+    _reserved: [u64; 6],
+}
+
+impl Arm64Sigframe {
+    const fn empty() -> Self {
+        Self {
+            siginfo: Siginfo::empty(),
+            ucontext: Ucontext::empty(),
+            magic: ARM64_SIGFRAME_MAGIC,
+            signum: 0,
+            _pad0: 0,
+            saved_x: [0; 31],
+            saved_pc: 0,
+            saved_sp: 0,
+            saved_spsr: 0,
+            _reserved: [0; 6],
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            core::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                core::mem::size_of::<Self>(),
+            )
+        }
+    }
+
+    fn ref_from_bytes(bytes: &[u8]) -> Option<&Self> {
+        if bytes.len() >= core::mem::size_of::<Self>() {
+            Some(unsafe { &*(bytes.as_ptr() as *const Self) })
+        } else {
+            None
+        }
+    }
+}
+
+impl carrick_guest_arch::SignalBackend for Aarch64Backend {
+    fn setup_signal_frame<'a>(
+        &mut self,
+        frame: &mut TrapFrame,
+        params: carrick_guest_arch::SignalFrameParams,
+        siginfo: Option<&'a [u8]>,
+        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
+    ) -> Result<UserVa, Self::Error> {
+        let frame_size = core::mem::size_of::<Arm64Sigframe>() as u64;
+        let new_sp = (params.sp.raw().saturating_sub(frame_size)) & !15;
+
+        let mut sigframe = Arm64Sigframe::empty();
+        sigframe.signum = params.signum as u32;
+        sigframe.saved_pc = frame.elr;
+        sigframe.saved_spsr = frame.spsr;
+        sigframe.saved_sp = params.sp.raw();
+        sigframe.saved_x = frame.x;
+        sigframe.ucontext.uc_sigmask = params.mask;
+
+        if let Some(bytes) = siginfo {
+            if let Some(info) = Siginfo::ref_from_bytes(bytes) {
+                sigframe.siginfo = *info;
+            }
+        } else {
+            let mut info = Siginfo::empty();
+            info.si_signo = params.signum;
+            info.si_code = params.sigcode;
+            info.si_addr = params.fault_addr;
+            sigframe.siginfo = info;
+        }
+
+        let frame_bytes = sigframe.as_bytes();
+        if !copy_out(UserVa::new(new_sp), frame_bytes) {
+            return Err(ArchError::InvalidFrame);
+        }
+
+        let info_addr = new_sp + core::mem::offset_of!(Arm64Sigframe, siginfo) as u64;
+        let uc_addr = new_sp + core::mem::offset_of!(Arm64Sigframe, ucontext) as u64;
+
+        frame.elr = params.handler.raw();
+        frame.x[0] = params.signum as u64;
+        frame.x[1] = info_addr;
+        frame.x[2] = uc_addr;
+        frame.x[30] = params.restorer.map_or(0, |r| r.raw());
+
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        unsafe {
+            core::arch::asm!("msr sp_el0, {}", in(reg) new_sp, options(nomem, nostack));
+        }
+
+        Ok(UserVa::new(new_sp))
+    }
+
+    fn restore_signal_frame(
+        &mut self,
+        frame: &mut TrapFrame,
+        copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
+    ) -> Result<u64, Self::Error> {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        let sp_val = {
+            let sp: u64;
+            unsafe {
+                core::arch::asm!("mrs {}, sp_el0", out(reg) sp, options(nomem, nostack));
+            }
+            sp
+        };
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        let sp_val = 0u64;
+
+        let sp = UserVa::new(sp_val);
+        let mut bytes = [0u8; core::mem::size_of::<Arm64Sigframe>()];
+        if !copy_in(&mut bytes, sp) {
+            return Err(ArchError::InvalidFrame);
+        }
+        let Some(sigframe) = Arm64Sigframe::ref_from_bytes(&bytes) else {
+            return Err(ArchError::InvalidFrame);
+        };
+
+        frame.x = sigframe.saved_x;
+        frame.elr = sigframe.saved_pc;
+        frame.spsr = sigframe.saved_spsr;
+
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        unsafe {
+            core::arch::asm!("msr sp_el0, {}", in(reg) sigframe.saved_sp, options(nomem, nostack));
+        }
+
+        Ok(sigframe.ucontext.uc_sigmask)
+    }
+}

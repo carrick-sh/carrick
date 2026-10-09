@@ -495,6 +495,99 @@ impl<
     }
 }
 
+impl<
+    'a,
+    F: Fn(u32) -> *mut u8,
+    C: ThreadCpu,
+    U: UserWord,
+    G: GuestDispatchFrame,
+    Context: super::dispatch::DispatchContext,
+> carrick_personality_linux::signal::SignalNative<'a>
+    for El1PendingFamilies<'a, F, C, U, G, Context>
+{
+    fn arguments(&self) -> [u64; 6] {
+        [
+            self.frame.argument(0).unwrap_or(0),
+            self.frame.argument(1).unwrap_or(0),
+            self.frame.argument(2).unwrap_or(0),
+            self.frame.argument(3).unwrap_or(0),
+            self.frame.argument(4).unwrap_or(0),
+            self.frame.argument(5).unwrap_or(0),
+        ]
+    }
+
+    fn process_signals(
+        &mut self,
+    ) -> Option<&mut dyn carrick_personality_linux::signal::ProcessSignals> {
+        self.process.as_deref_mut().and_then(|p| p.signal_venue())
+    }
+
+    fn current_blocked(&self) -> carrick_signal_core::policy::SigBlockMask {
+        let bits = self.thread().map(|t| t.slot.blocked().0).unwrap_or(0);
+        carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+            carrick_signal_core::SignalSet::from_bits(bits),
+        )
+    }
+
+    fn set_current_blocked(&mut self, mask: carrick_signal_core::policy::SigBlockMask) {
+        if let Some(thread) = self.thread() {
+            let new_mask =
+                carrick_personality_linux::abi::thread::BlockedMask(mask.signals().bits());
+            let _ = thread
+                .slot
+                .store_blocked_then_read_pending(new_mask, thread.slot.pending());
+        }
+    }
+
+    fn current_pid(&self) -> u32 {
+        self.process_pid().unwrap_or(0)
+    }
+
+    fn current_tid(&self) -> u32 {
+        self.visible_tid()
+            .or_else(|| self.process_pid())
+            .unwrap_or(0)
+    }
+
+    fn restore_signal_frame(&mut self) -> Result<u64, i32> {
+        let task_idx = self.frame.task_index();
+        #[cfg(test)]
+        if let Some(user) = &mut self.lifecycle_user {
+            struct Adapter<'u>(&'u mut (dyn crate::file::UserCopy + 'u));
+            impl carrick_personality_linux::lifecycle::UserCopy for Adapter<'_> {
+                fn copy_out(&mut self, dst: carrick_guest_arch::UserVa, src: &[u8]) -> bool {
+                    self.0.copy_out(dst.raw(), src)
+                }
+                fn copy_in(&mut self, dst: &mut [u8], src: carrick_guest_arch::UserVa) -> bool {
+                    self.0.copy_in(dst, src.raw())
+                }
+            }
+            let mut adapter = Adapter(*user);
+            return self.frame.restore_signal_frame(&mut adapter);
+        }
+        let Some(task) = self.current_tasks.get(task_idx) else {
+            return Err(carrick_personality_linux::abi::signal::LINUX_EFAULT.get());
+        };
+        let mut copy = crate::file::ValidatedCopy {
+            task,
+            validator: &crate::file::HardwareValidator,
+        };
+        self.frame.restore_signal_frame(&mut copy)
+    }
+}
+
+impl<V: crate::file::MemoryValidator> carrick_personality_linux::lifecycle::UserCopy
+    for crate::file::ValidatedCopy<'_, V>
+{
+    fn copy_out(&mut self, dst: carrick_guest_arch::UserVa, src: &[u8]) -> bool {
+        crate::file::UserCopy::copy_out(self, dst.raw(), src)
+    }
+
+    fn copy_in(&mut self, dst: &mut [u8], src: carrick_guest_arch::UserVa) -> bool {
+        crate::file::UserCopy::copy_in(self, dst, src.raw())
+    }
+}
+
 #[cfg(test)]
 #[path = "lifecycle/tests.rs"]
 mod tests;

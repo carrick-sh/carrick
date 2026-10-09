@@ -711,12 +711,50 @@ arch_trait!(CrossingArch, CrossingBackend {
     fn report_fatal(report: FatalReport) -> !;
 });
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SignalFrameParams {
+    pub signum: i32,
+    pub sigcode: i32,
+    pub fault_addr: u64,
+    pub sp: UserVa,
+    pub handler: UserVa,
+    pub restorer: Option<UserVa>,
+    pub mask: u64,
+}
+
+arch_trait!(SignalArch, SignalBackend {
+    fn setup_signal_frame<'a>(
+        frame: &mut Self::NativeFrame,
+        params: SignalFrameParams,
+        siginfo: Option<&'a [u8]>,
+        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool
+    ) -> Result<UserVa, Self::Error>;
+
+    fn restore_signal_frame(
+        frame: &mut Self::NativeFrame,
+        copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool
+    ) -> Result<u64, Self::Error>;
+});
+
 pub trait KernelArch:
-    sealed::Sealed + LayoutArch + EntryArch + MmuArch + MmuEditArch + InterruptArch + CrossingArch
+    sealed::Sealed
+    + LayoutArch
+    + EntryArch
+    + MmuArch
+    + MmuEditArch
+    + InterruptArch
+    + CrossingArch
+    + SignalArch
 {
 }
 impl<
-    B: LayoutBackend + EntryBackend + MmuBackend + MmuEditBackend + InterruptBackend + CrossingBackend,
+    B: LayoutBackend
+        + EntryBackend
+        + MmuBackend
+        + MmuEditBackend
+        + InterruptBackend
+        + CrossingBackend
+        + SignalBackend,
 > KernelArch for Arch<B>
 {
 }

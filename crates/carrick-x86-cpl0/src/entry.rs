@@ -413,6 +413,34 @@ mod kernel {
         fn record_isa_unsupported_forward(&self) {
             CARRICK_CPL0_ISA_UNSUPPORTED_FORWARDS.fetch_add(1, Ordering::Relaxed);
         }
+        fn restore_signal_frame(
+            &mut self,
+            copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
+        ) -> Result<u64, i32> {
+            let mut backend = carrick_el1::isa::x86::X86Backend;
+            carrick_guest_arch::SignalBackend::restore_signal_frame(
+                &mut backend,
+                self.frame,
+                &mut |dst, va| copy_in.copy_in(dst, va),
+            )
+            .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT.get())
+        }
+        fn setup_signal_frame(
+            &mut self,
+            params: carrick_guest_arch::SignalFrameParams,
+            siginfo: Option<&[u8]>,
+            copy_out: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
+        ) -> Result<carrick_guest_arch::UserVa, i32> {
+            let mut backend = carrick_el1::isa::x86::X86Backend;
+            carrick_guest_arch::SignalBackend::setup_signal_frame(
+                &mut backend,
+                self.frame,
+                params,
+                siginfo,
+                &mut |va, src| copy_out.copy_out(va, src),
+            )
+            .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT.get())
+        }
     }
 
     static EMPTY_NAME_CACHE: InotifyNameCache = InotifyNameCache::new();
@@ -463,7 +491,7 @@ mod kernel {
     /// Vector 14 from CPL3: classify the native error then use the same
     /// reservation/editor/COW owner as ARM's data-abort policy.
     #[unsafe(no_mangle)]
-    extern "C" fn carrick_x86_handle_user_page_fault(frame: &PageFaultStack) -> u64 {
+    extern "C" fn carrick_x86_handle_user_page_fault(frame: &mut PageFaultStack) -> u64 {
         use carrick_el1::fault::dispatch_x86_fault_with_prepared;
         fixture_items! { use carrick_el1::fault::X86CowResolver; }
         use carrick_el1_abi::Action;
@@ -600,7 +628,62 @@ mod kernel {
         }
         use carrick_el1::fault::OwnerFaultSupplyOutcome;
         match supply.outcome() {
-            OwnerFaultSupplyOutcome::PolicyDeclined => 6,
+            OwnerFaultSupplyOutcome::PolicyDeclined => {
+                if let Some(rt) = native_process::runtime_opt() {
+                    let segv = carrick_personality_linux::signal::policy::Signal::SEGV;
+                    let action = rt.root_signals().action(segv);
+                    if let carrick_personality_linux::signal::policy::Disposition::Handler(handler) = action.disposition {
+                        let mut native_frame = carrick_el1::isa::x86::context::native::NativeFrame {
+                            r15: frame.saved_gprs[0],
+                            r14: frame.saved_gprs[1],
+                            r13: frame.saved_gprs[2],
+                            r12: frame.saved_gprs[3],
+                            rbp: frame.saved_gprs[4],
+                            rbx: frame.saved_gprs[5],
+                            r11: frame.saved_gprs[6],
+                            r10: frame.saved_gprs[7],
+                            r9: frame.saved_gprs[8],
+                            r8: frame.saved_gprs[9],
+                            rax: frame.saved_gprs[10],
+                            rcx: frame.saved_gprs[11],
+                            rdx: frame.saved_gprs[12],
+                            rsi: frame.saved_gprs[13],
+                            rdi: frame.saved_gprs[14],
+                            rsp: frame.rsp,
+                        };
+                        let params = carrick_guest_arch::SignalFrameParams {
+                            signum: 11,
+                            sigcode: 1,
+                            fault_addr: far,
+                            handler: carrick_guest_arch::UserVa::new(handler.0),
+                            restorer: action.restorer.map(|r| carrick_guest_arch::UserVa::new(r.0)),
+                            mask: 0,
+                            sp: carrick_guest_arch::UserVa::new(frame.rsp),
+                        };
+                        let mut copy = carrick_el1::file::ValidatedCopy {
+                            task,
+                            validator: &carrick_el1::file::HardwareValidator,
+                        };
+                        let mut backend = carrick_el1::isa::x86::X86Backend;
+                        if carrick_guest_arch::SignalBackend::setup_signal_frame(
+                            &mut backend,
+                            &mut native_frame,
+                            params,
+                            None,
+                            &mut |va, bytes| carrick_personality_linux::lifecycle::UserCopy::copy_out(&mut copy, va, bytes),
+                        ).is_ok() {
+                            frame.rip = native_frame.rcx;
+                            frame.rsp = native_frame.rsp;
+                            frame.saved_gprs[14] = native_frame.rdi;
+                            frame.saved_gprs[13] = native_frame.rsi;
+                            frame.saved_gprs[12] = native_frame.rdx;
+                            frame.saved_gprs[10] = native_frame.rax;
+                            return 0;
+                        }
+                    }
+                }
+                6
+            }
             OwnerFaultSupplyOutcome::Unavailable => 9,
             OwnerFaultSupplyOutcome::CowSelected => {
                 // The shared owner selected this exact inherited private page
@@ -1082,6 +1165,70 @@ mod kernel {
                 );
             }
             true
+        }
+    }
+
+    #[inline(never)]
+    fn deliver_signal_on_syscall_return(
+        task: &CurrentTask,
+        process: &mut carrick_el1::personality::native_process_runtime::NativeProcessEntry<'_, 'static, native_process::Mm, carrick_sched_core::ParkedContextWords, native_process::Service>,
+        frame: &mut NativeFrame,
+    ) -> Option<carrick_personality_linux::dispatch::CompletionRoute> {
+        use carrick_el1::personality::thread_setup::LifecycleVenue;
+        use carrick_personality_linux::signal::policy::{self, SigBlockMask};
+        use carrick_personality_linux::signal::ProcessSignals;
+
+        let thread_blocked = GuestLifecycleVenue.thread(task)
+            .map(|t| SigBlockMask::blocking_all_of(
+                carrick_personality_linux::signal::SignalSet::from_bits(t.slot.blocked().0)
+            ))
+            .unwrap_or(SigBlockMask::NONE);
+
+        let (sig, info, action) = process.take_deliverable(process.task_id(), thread_blocked)?;
+        match action.disposition {
+            policy::Disposition::Ignore => None,
+            policy::Disposition::Default => {
+                if let policy::Delivery::Terminate { core_dump } = policy::default_delivery(sig) {
+                    let wait_status = carrick_sched_core::process::LinuxWaitStatus::signaled(
+                        sig.number() as u8,
+                        core_dump,
+                    );
+                    let _ = process.exit_with_status(wait_status);
+                    Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended)
+                } else {
+                    None
+                }
+            }
+            policy::Disposition::Handler(handler) => {
+                let params = carrick_guest_arch::SignalFrameParams {
+                    signum: sig.number(),
+                    sigcode: info.as_ref().map_or(0, |i| i.si_code),
+                    fault_addr: info.as_ref().map_or(0, |i| i.si_addr),
+                    handler: carrick_guest_arch::UserVa::new(handler.0),
+                    restorer: action.restorer.map(|r| carrick_guest_arch::UserVa::new(r.0)),
+                    mask: thread_blocked.signals().bits(),
+                    sp: carrick_guest_arch::UserVa::new(frame.rsp),
+                };
+                let mut copy = carrick_el1::file::ValidatedCopy {
+                    task,
+                    validator: &carrick_el1::file::HardwareValidator,
+                };
+                let mut backend = carrick_el1::isa::x86::X86Backend;
+                let info_bytes = info.as_ref().map(|i| unsafe {
+                    core::slice::from_raw_parts(
+                        i as *const _ as *const u8,
+                        core::mem::size_of_val(i),
+                    )
+                });
+                let _ = carrick_guest_arch::SignalBackend::setup_signal_frame(
+                    &mut backend,
+                    frame,
+                    params,
+                    info_bytes,
+                    &mut |va, bytes| carrick_personality_linux::lifecycle::UserCopy::copy_out(&mut copy, va, bytes),
+                );
+                None
+            }
         }
     }
 
@@ -1917,7 +2064,7 @@ mod kernel {
                         frame, call, publications: &binding.publications,
                         slot: carrick_guest_arch::SlotId::from_index(binding.cpu_slot as usize),
                     };
-                    let route = dispatch::dispatch_syscall_with_native(
+                    let mut route = dispatch::dispatch_syscall_with_native(
                         &mut native, counters, core::slice::from_ref(task),
                         &[], &[], &[], &[], &EMPTY_NAME_CACHE,
                         None::<dispatch::Zone<'_, sched::HardwareCpu, sched::HardwareUserWord>>,
@@ -1926,6 +2073,11 @@ mod kernel {
                     );
                     if let Some(reason) = process.take_run_failure() {
                         complete_run_failure(task, reason);
+                    }
+                    if (route == CompletionRoute::Served || route == CompletionRoute::WithWork)
+                        && let Some(r) = deliver_signal_on_syscall_return(task, &mut process, frame)
+                    {
+                        route = r;
                     }
                     root_exit = process.take_root_exit();
                     route

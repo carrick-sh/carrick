@@ -221,6 +221,35 @@ impl LinuxWaitStatus {
         Self(raw)
     }
 
+    pub const fn signaled(sig: u8, core_dumped: bool) -> Self {
+        let core_bit = if core_dumped { 0x80 } else { 0 };
+        Self((sig as i32 & 0x7f) | core_bit)
+    }
+
+    pub const fn exited(status: u8) -> Self {
+        Self((status as i32) << 8)
+    }
+
+    pub const fn stopped(sig: u8) -> Self {
+        Self(((sig as i32) << 8) | 0x7f)
+    }
+
+    pub const fn continued() -> Self {
+        Self(0xffff)
+    }
+
+    pub const fn is_signaled(self) -> bool {
+        (self.0 & 0x7f) != 0 && (self.0 & 0x7f) != 0x7f
+    }
+
+    pub const fn term_signal(self) -> Option<u8> {
+        if self.is_signaled() {
+            Some((self.0 & 0x7f) as u8)
+        } else {
+            None
+        }
+    }
+
     pub const fn raw(self) -> i32 {
         self.0
     }
