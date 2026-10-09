@@ -441,7 +441,9 @@ pub trait SignalNative<'a>: crate::lifecycle::UserCopy {
     fn current_uid(&self) -> u32 {
         0
     }
-    fn restore_signal_frame(&mut self) -> Result<u64, carrick_syscall_abi::LinuxErrno>;
+    fn restore_signal_frame(
+        &mut self,
+    ) -> Result<carrick_signal_core::policy::SigBlockMask, carrick_syscall_abi::LinuxErrno>;
     fn force_sigsegv(&mut self) -> bool {
         let blocked = self.current_blocked();
         let forced = self
@@ -607,11 +609,7 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
             let res = native.restore_signal_frame();
             match res {
                 Ok(new_mask) => {
-                    native.set_current_blocked(
-                        carrick_signal_core::policy::SigBlockMask::blocking_all_of(
-                            carrick_signal_core::SignalSet::from_bits(new_mask),
-                        ),
-                    );
+                    native.set_current_blocked(new_mask);
                     Some(SignalOutcome::Restored)
                 }
                 Err(_) => native.force_sigsegv().then_some(SignalOutcome::Restored),

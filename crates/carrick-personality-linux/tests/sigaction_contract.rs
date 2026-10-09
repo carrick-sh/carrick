@@ -37,7 +37,9 @@ impl<'a> SignalNative<'a> for Native {
     fn current_tid(&self) -> u32 {
         1
     }
-    fn restore_signal_frame(&mut self) -> Result<u64, carrick_syscall_abi::LinuxErrno> {
+    fn restore_signal_frame(
+        &mut self,
+    ) -> Result<carrick_signal_core::policy::SigBlockMask, carrick_syscall_abi::LinuxErrno> {
         Err(carrick_syscall_abi::LinuxErrno::new(14))
     }
 }
@@ -176,14 +178,17 @@ fn signal_owner_admits_validated_requests_and_selectors() {
         SignalInfo::Generated(None),
     );
     assert_eq!(result.unwrap_err().get(), 22);
-    let restored: Result<u64, carrick_syscall_abi::LinuxErrno> = native.restore_signal_frame();
+    let restored: Result<
+        carrick_signal_core::policy::SigBlockMask,
+        carrick_syscall_abi::LinuxErrno,
+    > = native.restore_signal_frame();
     assert_eq!(restored.unwrap_err().get(), 14);
 }
 
 #[test]
 fn queued_siginfo_carries_the_admitted_signal_number() {
     let signal = carrick_signal_core::policy::Signal::from_number(10).unwrap();
-    let payload = SignalInfo::Queued(carrick_abi::LinuxSiginfo::kill(64, -1, 1, 0))
+    let payload = SignalInfo::Queued(carrick_syscall_abi::LinuxSiginfo::kill(64, -1, 1, 0))
         .payload(signal)
         .unwrap();
     let number = payload.si_signo;
