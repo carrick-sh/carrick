@@ -1525,6 +1525,28 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
+    fn every_mailbox_worker_has_the_same_zero_based_stack_slot() {
+        let allocator = Arc::new(crate::syscall_mailbox::MailboxSlotAllocator::new());
+        let leases: Vec<_> = (0..carrick_el1_abi::EL1_STACK_SLOTS)
+            .map(|_| allocator.allocate().expect("worker mailbox"))
+            .collect();
+        for (index, lease) in leases.iter().enumerate() {
+            let slot = lease.id();
+            assert_eq!(usize::from(slot.raw()), index);
+            let cpu = carrick_guest_arch::CpuId::new(u32::from(slot.raw()));
+            let frame = carrick_el1_abi::el1_slot_frame_va(index);
+            assert!(native_record_on_cpu_stack(frame, cpu));
+            if index != 0 {
+                assert!(!native_record_on_cpu_stack(
+                    frame,
+                    carrick_guest_arch::CpuId::new((index - 1) as u32)
+                ));
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
     fn authenticated_root_exit_hvc_is_terminal_and_other_replies_resume() {
         assert_eq!(
             classify_metadata_trap(GRANT_OP_ROOT_EXIT, [METADATA_GRANT_SUCCESS, 7 << 8, 0, 0]),
