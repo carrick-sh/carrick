@@ -436,6 +436,17 @@ impl PersistentExecutor for KvmPersistentExecutor {
         self.physical.cpu_mut().load(arch).map_err(|error| {
             TrapError::Hypervisor(format!("KVM physical CPU restore at load: {error}"))
         })?;
+        {
+            let stack = task
+                .binding()
+                .kernel_stack
+                .lock()
+                .map_err(|_| TrapError::Hypervisor("KVM task stack custody poisoned".into()))?;
+            if let Some(snapshot) = stack.as_ref() {
+                self.physical
+                    .restore_kernel_stack(task.binding().arch().task(), snapshot)?;
+            }
+        }
         self.task = Some(task.binding().arch().task());
         self.loaded_generation = Some(task.generation());
         self.binding = Some(Arc::clone(task.binding()));
@@ -919,6 +930,10 @@ impl PersistentExecutor for KvmPersistentExecutor {
             }
         };
         self.loaded_generation = None;
+        let stack = match self.physical.save_kernel_stack(task) {
+            Ok(stack) => stack,
+            Err(error) => return Err(ExecutorSaveError::new(error, lease)),
+        };
         let saved = match self.physical.cpu_mut().save_and_detach(task) {
             Ok(saved) => saved,
             Err(error) => {
@@ -946,6 +961,19 @@ impl PersistentExecutor for KvmPersistentExecutor {
                 TrapError::Hypervisor(error.to_string()),
                 lease,
             ));
+        }
+        match self
+            .binding
+            .as_ref()
+            .and_then(|binding| binding.kernel_stack.lock().ok())
+        {
+            Some(mut owned) => *owned = stack,
+            None => {
+                return Err(ExecutorSaveError::new(
+                    TrapError::Hypervisor("KVM task stack custody poisoned".into()),
+                    lease,
+                ));
+            }
         }
         self.binding = None;
         Ok(SavedRunnable::new(lease))
@@ -1021,6 +1049,7 @@ pub(crate) struct KvmTaskBinding {
     thread: ThreadKey,
     kernel_binding: KernelTaskBinding,
     retained: Mutex<Option<RetainedForward>>,
+    kernel_stack: Mutex<Option<carrick_vmm_kvm::cpl0_boot::KernelStackSnapshot>>,
 }
 
 /// The exact running guest task that may request a stopped physical forward.
@@ -1125,6 +1154,7 @@ impl KvmTaskBinding {
             thread: context.thread().key(),
             kernel_binding: context.task_binding(),
             retained: Mutex::new(None),
+            kernel_stack: Mutex::new(None),
         };
         binding.validate_task_state(state)?;
         Ok(binding)
