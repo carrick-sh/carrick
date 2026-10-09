@@ -2,7 +2,7 @@
 use super::{file, inotify, ipc, lifecycle, sched};
 use crate::fault::dispatch_fault;
 use crate::memory;
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 use crate::rust_alloc::boxed::Box;
 use carrick_el1_abi::{
     Action, Counters, CurrentTask, DELEGATED_STATE_GUEST, DelegatedFile, DelegatedInotify,
