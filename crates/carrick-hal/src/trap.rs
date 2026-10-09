@@ -414,6 +414,12 @@ pub enum TrapError {
     },
     #[error("syscall trapping is not available on this platform")]
     UnsupportedPlatform,
+    /// An authenticated in-kernel owner retired its root task. The carrier
+    /// must finish the physical job without returning to guest execution.
+    #[error("native process root exited with wait status {status:?}")]
+    NativeRootExit {
+        status: carrick_sched_core::process::LinuxWaitStatus,
+    },
     #[error("hypervisor operation failed: {0}")]
     Hypervisor(String),
     /// The signal frame could not be written to the guest's user stack. Linux

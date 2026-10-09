@@ -1128,7 +1128,7 @@ pub(crate) fn handle_metadata_grant_trap(
     cpu: carrick_guest_arch::CpuId,
     custody: &crate::trap::CarrierVmCustody,
     generation: Option<crate::trap::CarrierVmGeneration>,
-) -> Result<(), TrapError> {
+) -> Result<MetadataTrapOutcome, TrapError> {
     use applevisor::vcpu::Reg;
     INLINE_HVC_TRAPS.fetch_add(1, Ordering::Relaxed);
     let op = vcpu
@@ -1152,12 +1152,52 @@ pub(crate) fn handle_metadata_grant_trap(
         .map_err(|e| TrapError::Hypervisor(format!("set X2: {e}")))?;
     vcpu.set_reg(Reg::X3, result[3])
         .map_err(|e| TrapError::Hypervisor(format!("set X3: {e}")))?;
-    Ok(())
+    Ok(classify_metadata_trap(op, result))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MetadataTrapOutcome {
+    Resume,
+    RootExit(carrick_sched_core::process::LinuxWaitStatus),
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn classify_metadata_trap(op: u64, reply: [u64; 4]) -> MetadataTrapOutcome {
+    if op == GRANT_OP_ROOT_EXIT
+        && reply[0] == METADATA_GRANT_SUCCESS
+        && let Ok(status) = i32::try_from(reply[1])
+    {
+        MetadataTrapOutcome::RootExit(
+            carrick_sched_core::process::LinuxWaitStatus::from_wait_encoding(status),
+        )
+    } else {
+        MetadataTrapOutcome::Resume
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn authenticated_root_exit_hvc_is_terminal_and_other_replies_resume() {
+        assert_eq!(
+            classify_metadata_trap(GRANT_OP_ROOT_EXIT, [METADATA_GRANT_SUCCESS, 7 << 8, 0, 0]),
+            MetadataTrapOutcome::RootExit(
+                carrick_sched_core::process::LinuxWaitStatus::from_wait_encoding(7 << 8)
+            )
+        );
+        assert_eq!(
+            classify_metadata_trap(GRANT_OP_ROOT_EXIT, [METADATA_GRANT_ERR_DENIED, 0, 0, 0]),
+            MetadataTrapOutcome::Resume
+        );
+        assert_eq!(
+            classify_metadata_trap(METADATA_GRANT_OP_ALLOC, [METADATA_GRANT_SUCCESS, 0, 0, 0]),
+            MetadataTrapOutcome::Resume
+        );
+    }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn test_record(
