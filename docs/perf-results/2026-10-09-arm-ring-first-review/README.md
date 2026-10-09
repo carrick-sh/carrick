@@ -57,5 +57,34 @@ is unavailable on this Mac and remains director-owned.
 The real-base domain gate passes with 1,232 source counters and native compiler
 profiles macos-cli-default, macos-runtime-default and macos-hvf-default. Six
 Linux/BSD profiles remain pending on this Mac; this is not matrix completeness.
-Signed receipts will be added after completion.
+
+## Signed review verdicts
+
+The monitored recipe finished in 504.41 seconds, below ten minutes. Both raw
+witnesses PASS: Strict getuid refusal/forward = 1/0; OptOut = 0/1. Each has
+exit_group refusal/forward = 0/1 and clock host forwards = 0.
+Both glibc/fork-wait witnesses FAIL with the identical process-child fault:
+`HVPatch COW compound IPA 0x2e00000000 has no exact inventory coverage`.
+The error prevents their counter assertions from executing; their refusal
+counts are unavailable, not presumed zero. The signed negative control passes.
+Runner, CLI-suffix and explicit cleanup all leave zero survivors.
+
+`signed-result.json`, `signed-verdicts.txt`, `signed-failure-identity.json`
+and `fixture-validation.json` retain the exact command, artifact, failure and
+clean input-identity admission. The failed signed executable and dSYM are
+retained locally as `target/ringswitch-review-failed-signed`.
+The test SHA-256 is
+`60a5b5100171e092176ae7282054ceff684c6bcf3835ec1c40fd228975e5dbf1`;
+the glibc guest ELF is
+`8d3fc3dec6d2e94b215a09c0c5a44505091b1bc62f788287cd0c123d9d3971e7`.
+The final archive SHA-256 is
+`cc87e661e2d5500b114ef4080041f7055c399848d620ba35016ae7d7d3be2e87`.
+
+The fault address equals LINUX_VVAR_BASE. The fork refresh path attempts a
+privileged COW write of the vvar RNG-generation field; exact compound inventory
+coverage rejects it. This mechanism and these source files are unchanged from
+origin/main. That alone does not establish baseline attribution: per director
+ruling, an isolated unmodified-product main A/B control is being prepared with
+the identical GNU fixture. No unchanged signed artifact was retried, no gate
+assertion was weakened, and no COW runtime change is included here.
 No Docker, full acceptance gate or runtime-ratio claim is included.
