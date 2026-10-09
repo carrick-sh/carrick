@@ -926,6 +926,18 @@ pub(crate) fn map_exclusive_region(
         let counters_ptr = unsafe { host.add(carrick_el1_abi::EL1_COUNTERS_OFFSET as usize) };
         record_el1_counters_host_ptr(counters_ptr as usize);
         record_el1_region_host_ptr(host as usize);
+        let aperture_ptr = unsafe {
+            host.add(carrick_el1_abi::EL1_APERTURE_CONTROL_OFFSET as usize)
+                as *mut carrick_el1_abi::ApertureControl
+        };
+        if crate::hatch::ArmRingFirstHatch::is_strict() {
+            unsafe {
+                (*aperture_ptr).control.fetch_or(
+                    carrick_el1_abi::APERTURE_CONTROL_ARM_RING_FIRST_STRICT,
+                    std::sync::atomic::Ordering::Release,
+                );
+            }
+        }
     }
     Ok((host, size, host_mapping))
 }

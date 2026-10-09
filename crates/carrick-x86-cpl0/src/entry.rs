@@ -430,40 +430,7 @@ mod kernel {
         core::sync::atomic::AtomicU64::new(0);
 
     /// Host crossings allowed to leave CPL0 as forwards.
-    #[derive(
-        ::core::clone::Clone,
-        ::core::marker::Copy,
-        ::core::fmt::Debug,
-        ::core::cmp::PartialEq,
-        ::core::cmp::Eq,
-    )]
-    #[repr(u64)]
-    pub enum AllowedHostCrossing {
-        Read = 0,
-        Write = 1,
-        Lseek = 8,
-        Pread64 = 17,
-        Pwrite64 = 18,
-        Exit = 60,
-        ExitGroup = 231,
-        EpollPwait = 281,
-    }
-
-    impl AllowedHostCrossing {
-        pub const fn from_native(native: u64) -> Option<Self> {
-            match native {
-                0 => Some(Self::Read),
-                1 => Some(Self::Write),
-                8 => Some(Self::Lseek),
-                17 => Some(Self::Pread64),
-                18 => Some(Self::Pwrite64),
-                60 => Some(Self::Exit),
-                231 => Some(Self::ExitGroup),
-                281 => Some(Self::EpollPwait),
-                _ => None,
-            }
-        }
-    }
+    pub use carrick_personality_linux::crossing::AllowedHostCrossing;
 
     fn record_refusal(counters: &Counters, frame: &mut NativeFrame, native: Option<u64>) {
         frame.rax = (-38_i64) as u64;
@@ -1993,7 +1960,7 @@ mod kernel {
                     doorbell(FATAL_PORT, frame); halt();
                 }
                 CompletionRoute::Forward => {
-                    if AllowedHostCrossing::from_native(call.native.raw()).is_some() {
+                    if AllowedHostCrossing::from_canonical_x86(call.canonical).is_some() {
                         doorbell(FORWARD_PORT, frame);
                     } else {
                         record_refusal(counters, frame, Some(call.native.raw()));
