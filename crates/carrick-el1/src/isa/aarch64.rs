@@ -4,7 +4,7 @@
 
 use super::ArchError;
 use crate::substrate::sched::{ThreadCpu, UserWord, hw};
-use carrick_el1_abi::{CurrentTask, ThreadCtx, TrapFrame};
+use carrick_el1_abi::{Aarch64ParkedContext, CurrentTask, ThreadCtx, TrapFrame};
 use carrick_guest_arch::{
     Access, AddressContext, ArchTypes, CopyProgress, CounterFrequency, CounterTick, CpuId,
     CpuTarget, CrossingBackend, Deadline, EntryBackend, EntryEvent, FatalReport, FrameGpa,
@@ -131,16 +131,16 @@ impl EntryBackend for Aarch64Backend {
         Ok(())
     }
     fn save_context(&mut self, frame: &TrapFrame) -> Result<ThreadCtx, Self::Error> {
-        let mut context = ThreadCtx::ZERO;
+        let mut context = Aarch64ParkedContext::ZERO;
         hw::HardwareCpu.save(frame, &mut context);
-        Ok(context)
+        Ok(context.native)
     }
     fn load_context(
         &mut self,
         frame: &mut TrapFrame,
         saved: &ThreadCtx,
     ) -> Result<(), Self::Error> {
-        hw::HardwareCpu.load(frame, saved);
+        hw::HardwareCpu.load(frame, &Aarch64ParkedContext::from_register(*saved, 0, 0, 0));
         Ok(())
     }
     fn prepare_user_return(&mut self, _frame: &TrapFrame) -> Result<UserReturn, Self::Error> {

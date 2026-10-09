@@ -694,6 +694,14 @@ impl ThreadExecutionLease {
             .and_then(|thread| crate::namespace::pid::ns_visible_thread_tid(&thread))
     }
 
+    pub fn visible_pid(&self) -> Option<u32> {
+        self.owner
+            .upgrade()
+            .filter(|thread| thread.key() == self.owner_key)
+            .and_then(|thread| thread.task())
+            .and_then(|task| crate::namespace::pid::ns_visible_task_pid(&task))
+    }
+
     /// The leased thread's CPU affinity as a mask of guest CPUs 0-63 (0 when
     /// the thread is gone), for the in-guest scheduler's placement.
     pub fn affinity_mask(&self) -> u64 {

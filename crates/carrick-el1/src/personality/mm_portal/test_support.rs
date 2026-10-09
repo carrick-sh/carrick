@@ -49,7 +49,7 @@ impl Region {
                 .cast()
         }
     }
-    pub fn zone(&self) -> &carrick_sched_core::ZoneTables {
+    pub fn zone(&self) -> &carrick_el1_abi::ZoneTables {
         unsafe {
             &*self
                 .ptr
@@ -221,7 +221,7 @@ pub fn admit_kind(
 ) -> ReservationMm {
     admit_access(
         region,
-        carrick_sched_core::spaces::notification::SpaceAccess::source_free(spaces),
+        carrick_sched_core::spaces::notification::SpaceAccess::source_free_with_context(spaces),
         mm,
         root,
         pages,
@@ -248,7 +248,10 @@ pub fn admit_notified(
 }
 fn admit_access(
     region: &Region,
-    spaces: carrick_sched_core::spaces::notification::SpaceAccess<'_>,
+    spaces: carrick_sched_core::spaces::notification::SpaceAccess<
+        '_,
+        carrick_el1_abi::Aarch64ParkedContext,
+    >,
     mm: u64,
     root: u64,
     pages: usize,
@@ -281,7 +284,7 @@ fn admit_access(
             .unwrap()
     } else {
         table
-            .lock_el1_resolved(index.index(), mm, &view, 0)
+            .lock_el1_resolved_with_context(index.index(), mm, &view, 0)
             .unwrap()
     };
     owner
@@ -585,7 +588,10 @@ pub fn native_owner_matrix(mut make: impl FnMut() -> Box<dyn PhysicalTransferFix
 /// retaining that MM's editor. The fixture has no host policy mirror.
 pub fn change_policy(
     region: &Region,
-    spaces: carrick_sched_core::spaces::notification::SpaceAccess<'_>,
+    spaces: carrick_sched_core::spaces::notification::SpaceAccess<
+        '_,
+        carrick_el1_abi::Aarch64ParkedContext,
+    >,
     mm: ReservationMm,
     tables: &Tables,
     protection: Option<ReservationProtection>,
@@ -611,7 +617,7 @@ pub fn change_policy(
             }
             None => region
                 .table()
-                .lock_el1_resolved(index.index(), mm, &view, 0)
+                .lock_el1_resolved_with_context(index.index(), mm, &view, 0)
                 .unwrap(),
         };
         let range = ReservationRange::new(VA, VA + 4096).unwrap();
@@ -676,7 +682,7 @@ pub fn change_policy(
             .unwrap(),
         None => region
             .table()
-            .lock_el1_resolved(index.index(), mm, &view, 0)
+            .lock_el1_resolved_with_context(index.index(), mm, &view, 0)
             .unwrap(),
     })
     .complete(receipt)

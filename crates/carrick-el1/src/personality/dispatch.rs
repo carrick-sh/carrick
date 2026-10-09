@@ -119,7 +119,7 @@ pub static CARRICK_EL1_ABI_HASH: u64 = carrick_el1_abi::EL1_ABI_LAYOUT_HASH;
 pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
     #[cfg(target_os = "none")]
     {
-        let current_tasks =
+        let current_tasks: &'static [CurrentTask; EL1_STACK_SLOTS as usize] =
             unsafe { &*(EL1_CURRENT_TASKS_BASE as *const [CurrentTask; EL1_STACK_SLOTS as usize]) };
         let fd_map = unsafe { &*(EL1_FD_MAP_BASE as *const [FdMapSlot; FD_MAP_CAPACITY]) };
         let object_table =
@@ -131,7 +131,96 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
             &*(EL1_INOTIFY_TABLE_BASE as *const [DelegatedInotify; MAX_DELEGATED_INOTIFY])
         };
         let name_cache = unsafe { &*(EL1_NAME_CACHE_BASE as *const InotifyNameCache) };
-        let zone = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
+        let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
+        let slot = SlotId::from_index(frame.slot as usize);
+        let process_call = matches!(frame.x[8], 260 | 94 | 95 | 58 | 435)
+            || (frame.x[8] == 220 && frame.x[0] & 0x0001_0000 == 0);
+        if process_call {
+            if let (Some(slot), Some(task)) = (slot, current_tasks.get(frame.slot as usize)) {
+                let source = carrick_el1_abi::BornInZoneSource { zone, slot };
+                let record = zone
+                    .slot(slot)
+                    .current()
+                    .or_else(|| zone.slot(slot).host_record());
+                if let Some(record) = record {
+                    let mut saved = carrick_el1_abi::Aarch64ParkedContext::ZERO;
+                    sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
+                    let ttbr0 = crate::isa::aarch64::hardware_live_ttbr();
+                    if let Ok((runtime, address, words)) = super::aarch64_process::admit_entry(
+                        source,
+                        task,
+                        saved.native,
+                        ttbr0,
+                        zone.record(record).incarnation(),
+                    ) {
+                        let mut service =
+                            match super::aarch64_process::Aarch64NativeProcessService::new(
+                                task, slot,
+                            ) {
+                                Ok(service) => service,
+                                Err(_) => return refuse_owner_process_call(frame, counters),
+                            };
+                        let action = {
+                            let mut process = match runtime.enter_registered(
+                                super::aarch64_process::registry(),
+                                source,
+                                task,
+                                address,
+                                words,
+                                &mut service,
+                            ) {
+                                Ok(process) => process,
+                                Err(_) => return refuse_owner_process_call(frame, counters),
+                            };
+                            let route = dispatch_syscall_with_native(
+                                frame,
+                                counters,
+                                current_tasks,
+                                fd_map,
+                                object_table,
+                                open_table,
+                                inotify_table,
+                                name_cache,
+                                Some(Zone {
+                                    tables: zone,
+                                    cpu: &mut sched::HardwareCpu,
+                                    user: &sched::HardwareUserWord,
+                                }),
+                                ipc::guest_venue(frame.slot as u32).as_ref(),
+                                lifecycle::guest_venue(),
+                                Some(&mut process),
+                                Some(source),
+                                None,
+                                |handle| {
+                                    carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8
+                                },
+                            );
+                            let root_exit = process.take_root_exit();
+                            (route, root_exit)
+                        };
+                        if let Some(status) = action.1
+                            && super::aarch64_process::cross_root_exit(
+                                &mut service.crossing,
+                                task,
+                                status,
+                                u32::from(slot.raw()),
+                            )
+                            .is_err()
+                        {
+                            return refuse_owner_process_call(frame, counters);
+                        }
+                        return match action.0 {
+                            carrick_personality_linux::dispatch::CompletionRoute::Served => Action::Served,
+                            carrick_personality_linux::dispatch::CompletionRoute::WithWork => Action::ServedWithWork,
+                            carrick_personality_linux::dispatch::CompletionRoute::Suspended => Action::Idle,
+                            carrick_personality_linux::dispatch::CompletionRoute::Forward => refuse_owner_process_call(frame, counters),
+                            carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion => invalid_completion(NativeInvariant::EntryBinding),
+                        };
+                    }
+                }
+            }
+            return refuse_owner_process_call(frame, counters);
+        }
         dispatch_syscall_with_ipc(
             frame,
             counters,
@@ -175,6 +264,16 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
             }
         }
     }
+}
+
+#[cfg(target_os = "none")]
+fn refuse_owner_process_call(frame: &mut TrapFrame, counters: &Counters) -> Action {
+    let nr = frame.x[8] as usize;
+    frame.x[0] = (-38_i64) as u64;
+    if nr < 512 {
+        counters.served[nr].fetch_add(1, Ordering::Relaxed);
+    }
+    Action::Served
 }
 
 /// Handle an interrupt taken while EL0 ran (the vector's EL0 IRQ hook marks
@@ -346,7 +445,7 @@ pub fn dispatch_syscall_with_lifecycle<'a, F, C, U, G>(
     zone: Option<Zone<'a, C, U>>,
     ipc: Option<&'a ipc::IpcVenue<'a>>,
     lifecycle: Option<&'a dyn lifecycle::LifecycleVenue>,
-    process: Option<&'a mut dyn lifecycle::ProcessNative>,
+    process: Option<&'a mut dyn lifecycle::ProcessNative<LegacyDispatchContext>>,
     cache_lookup: F,
 ) -> Action
 where
@@ -382,6 +481,11 @@ where
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+type LegacyDispatchContext = carrick_el1_abi::Aarch64ParkedContext;
+#[cfg(not(target_arch = "aarch64"))]
+type LegacyDispatchContext = carrick_sched_core::ThreadCtx;
+
 /// Exact context capability for the shared dispatcher. Only the ARM context
 /// can obtain an ARM scheduler source or consume an ARM scheduler receipt.
 pub trait DispatchContext: carrick_el1_abi::EntryContext {
@@ -390,20 +494,21 @@ pub trait DispatchContext: carrick_el1_abi::EntryContext {
         slot: SlotId,
     ) -> Option<carrick_el1_abi::BornInZoneSource<'_, Self>>;
     fn arm_receipt(
-        receipt: carrick_el1_abi::EntryHandoffReceipt,
+        receipt: carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::Aarch64ParkedContext>,
     ) -> Option<carrick_el1_abi::EntryHandoffReceipt<Self>>;
 }
 impl DispatchContext for carrick_sched_core::ThreadCtx {
     fn arm_source(
-        zone: &ZoneTables,
-        slot: SlotId,
+        _: &ZoneTables,
+        _: SlotId,
     ) -> Option<carrick_el1_abi::BornInZoneSource<'_, Self>> {
-        Some(carrick_el1_abi::BornInZoneSource { zone, slot })
+        None
     }
     fn arm_receipt(
-        receipt: carrick_el1_abi::EntryHandoffReceipt,
+        receipt: carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::Aarch64ParkedContext>,
     ) -> Option<carrick_el1_abi::EntryHandoffReceipt<Self>> {
-        Some(receipt)
+        let _ = receipt;
+        None
     }
 }
 impl DispatchContext for carrick_sched_core::ParkedContextWords {
@@ -414,9 +519,22 @@ impl DispatchContext for carrick_sched_core::ParkedContextWords {
         None
     }
     fn arm_receipt(
-        _: carrick_el1_abi::EntryHandoffReceipt,
+        _: carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::Aarch64ParkedContext>,
     ) -> Option<carrick_el1_abi::EntryHandoffReceipt<Self>> {
         None
+    }
+}
+impl DispatchContext for carrick_sched_core::Aarch64ParkedContext {
+    fn arm_source(
+        zone: &ZoneTables,
+        slot: SlotId,
+    ) -> Option<carrick_el1_abi::BornInZoneSource<'_, Self>> {
+        Some(carrick_el1_abi::BornInZoneSource { zone, slot })
+    }
+    fn arm_receipt(
+        receipt: carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::Aarch64ParkedContext>,
+    ) -> Option<carrick_el1_abi::EntryHandoffReceipt<Self>> {
+        Some(receipt)
     }
 }
 
@@ -527,7 +645,8 @@ pub struct El1PendingFamilies<
     G: GuestDispatchFrame = TrapFrame,
     Context: DispatchContext = carrick_sched_core::ThreadCtx,
 > {
-    pub(super) handoff: Option<carrick_el1_abi::EntryHandoffReceipt>,
+    pub(super) handoff:
+        Option<carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::Aarch64ParkedContext>>,
     #[cfg(test)]
     pub(super) lifecycle_user: Option<&'a mut dyn file::UserCopy>,
     pub(super) frame: &'a mut G,
@@ -907,7 +1026,9 @@ pub(super) fn native_scheduler<'s, C: sched::ThreadCpu, U: sched::UserWord>(
     task: &'s CurrentTask,
     counters: &'s Counters,
     slot: SlotId,
-    handoff: &'s mut Option<carrick_el1_abi::EntryHandoffReceipt>,
+    handoff: &'s mut Option<
+        carrick_el1_abi::EntryHandoffReceipt<carrick_sched_core::Aarch64ParkedContext>,
+    >,
 ) -> sched::Sched<'s, C, U> {
     sched::Sched {
         handoff: Some(handoff),
@@ -1397,13 +1518,16 @@ mod tests {
                         let address = (0x2000..0x2400)
                             .step_by(4)
                             .find(|address| {
-                                ZoneTables::bucket_of(mm, *address)
-                                    != ZoneTables::bucket_of(mm, 0x1000)
+                                ZoneTables::bucket_of_with_context(mm, *address)
+                                    != ZoneTables::bucket_of_with_context(mm, 0x1000)
                             })
                             .unwrap();
                         let guard = self
                             .zone
-                            .lock(ZoneTables::bucket_of(mm, address), &BoundedSpin(1024))
+                            .lock(
+                                ZoneTables::bucket_of_with_context(mm, address),
+                                &BoundedSpin(1024),
+                            )
                             .unwrap();
                         let sequence = self.zone.next_seq(self.record);
                         self.zone
@@ -1536,7 +1660,9 @@ mod tests {
                             ipc: None,
                             lifecycle: None,
                             process: None::<
-                                &mut dyn carrick_personality_linux::lifecycle::ProcessNative,
+                                &mut dyn carrick_personality_linux::lifecycle::ProcessNative<
+                                    carrick_el1_abi::Aarch64ParkedContext,
+                                >,
                             >,
                             source: None,
                             anonymous: None,

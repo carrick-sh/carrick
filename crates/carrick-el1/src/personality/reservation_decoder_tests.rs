@@ -20,7 +20,7 @@ fn layout() -> Layout {
 fn admitted(table: &SharedReservations, index: usize, raw: u64) -> Reservations<'_> {
     let mm = ReservationMm::new(raw).unwrap();
     table.publish(index, mm, layout()).unwrap();
-    let mut root = table.lock(index, mm).unwrap();
+    let mut root = table.lock_with_context(index, mm).unwrap();
     root.finish_import().unwrap();
     root
 }
@@ -68,7 +68,7 @@ fn reservation_decoder_counts_completion_only_and_keeps_two_mm_origins() {
         for _ in 0..rounds {
             for slot in 0..2 {
                 let mm = ReservationMm::new(slot as u64 + 17).unwrap();
-                let mut model = table.lock(slot, mm).unwrap();
+                let mut model = table.lock_with_context(slot, mm).unwrap();
                 let mut frame = TrapFrame {
                     slot: slot as u64,
                     elr: 0x40004,
@@ -135,7 +135,7 @@ fn reservation_mmap_overflow_preserves_linux_errno() {
     let table = table();
     let mm = ReservationMm::new(17).unwrap();
     table.publish(0, mm, layout()).unwrap();
-    let mut model = table.lock(0, mm).unwrap();
+    let mut model = table.lock_with_context(0, mm).unwrap();
     model.finish_import().unwrap();
     let current = CurrentTask::new();
     current.execution.task.store(1, Ordering::Relaxed);
@@ -167,7 +167,7 @@ fn reservation_unadmitted_root_never_serves_a_syscall() {
     let table = table();
     let mm = ReservationMm::new(17).unwrap();
     table.publish(0, mm, layout()).unwrap();
-    let mut model = table.lock(0, mm).unwrap();
+    let mut model = table.lock_with_context(0, mm).unwrap();
     let current = CurrentTask::new();
     current.execution.task.store(1, Ordering::Relaxed);
     current.mm.thread_generation.store(11, Ordering::Relaxed);
@@ -188,7 +188,7 @@ fn reservation_continuation_rejects_rebound_task_without_losing_owner() {
     let table = table();
     let mm = ReservationMm::new(17).unwrap();
     table.publish(0, mm, layout()).unwrap();
-    let mut model = table.lock(0, mm).unwrap();
+    let mut model = table.lock_with_context(0, mm).unwrap();
     model.finish_import().unwrap();
     let current = CurrentTask::new();
     current.execution.task.store(1, Ordering::Relaxed);

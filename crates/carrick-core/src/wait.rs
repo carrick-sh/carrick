@@ -13,11 +13,11 @@ use carrick_sched_core::{
 use core::sync::atomic::Ordering;
 
 /// Snapshot before checking the object predicate.
-pub fn observe_object(
-    zone: &ZoneTables,
+pub fn observe_object<C: carrick_core_abi::EntryContext>(
+    zone: &ZoneTables<C>,
     slot: SlotId,
     key: ObjectWaitKey,
-    completion: &dyn Fn(OwnedObjectWakeEffects<'_>),
+    completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
 ) -> Result<ObjectWaitSnapshot, ObjectWaitError> {
     let _ = slot;
     let guard = if zone.completion_enabled(key) {
@@ -30,12 +30,18 @@ pub fn observe_object(
 
 /// Whether a park of the running thread on `slot` may carry a deadline:
 /// the slot's timer has no other live owner.
-pub fn may_time_park(zone: &ZoneTables, slot: SlotId) -> bool {
+pub fn may_time_park<C: carrick_core_abi::EntryContext>(
+    zone: &ZoneTables<C>,
+    slot: SlotId,
+) -> bool {
     zone.timer_free(slot)
 }
 
 /// Whether the switched-in record's last object park ended at its deadline.
-pub fn object_wait_expired(zone: &ZoneTables, slot: SlotId) -> bool {
+pub fn object_wait_expired<C: carrick_core_abi::EntryContext>(
+    zone: &ZoneTables<C>,
+    slot: SlotId,
+) -> bool {
     zone.slot(slot)
         .current()
         .is_some_and(|record| zone.record(record).object_wait_expired())
@@ -43,14 +49,14 @@ pub fn object_wait_expired(zone: &ZoneTables, slot: SlotId) -> bool {
 
 /// Save and park a pending operation record without switching while caller locks
 /// might still be live. On Changed the caller rechecks the predicate.
-pub fn park_object_record<'a, S>(
-    zone: &'a ZoneTables,
+pub fn park_object_record<'a, S, C: carrick_core_abi::EntryContext>(
+    zone: &'a ZoneTables<C>,
     slot: SlotId,
     request: ObjectParkRequest,
     spins: u32,
-    completion: &dyn Fn(OwnedObjectWakeEffects<'_>),
+    completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
     save_context: S,
-) -> Result<ObjectParked<'a>, (ObjectWaitError, OperationToken)>
+) -> Result<ObjectParked<'a, C>, (ObjectWaitError, OperationToken)>
 where
     S: FnOnce() -> Result<(RecordId, bool), ObjectWaitError>,
 {
@@ -114,8 +120,8 @@ where
 }
 
 /// Authenticate exact record ownership, identity and address space, then take the operation token.
-pub fn take_object_operation(
-    zone: &ZoneTables,
+pub fn take_object_operation<C: carrick_core_abi::EntryContext>(
+    zone: &ZoneTables<C>,
     slot: SlotId,
     expected: ThreadIdentity,
 ) -> Result<Option<OperationToken>, ObjectWaitError> {
@@ -136,8 +142,8 @@ pub fn take_object_operation(
 }
 
 /// Notify under the caller's object lock.
-pub fn notify_object(
-    zone: &ZoneTables,
+pub fn notify_object<C: carrick_core_abi::EntryContext>(
+    zone: &ZoneTables<C>,
     slot: SlotId,
     key: ObjectWaitKey,
     spins: u32,
@@ -164,9 +170,9 @@ pub fn space_access<'a, C: Copy + Send + Sync + zerocopy::FromZeros>(
 /// Coordinate a conflicting reservation edit wait: validates active wait key,
 /// detects overlap against prepared proposals, releases root lock before enrollment,
 /// and retries if the predicate changed before the park was published.
-pub fn coordinate_prepared_edit_wait<P, G, O, C, F, T>(
+pub fn coordinate_prepared_edit_wait<P, G, O, C, F, T, Context: carrick_core_abi::EntryContext>(
     table: &crate::mm::reservation::SharedReservations<P, G>,
-    target: EditWaitTarget<'_>,
+    target: EditWaitTarget<'_, Context>,
     resumed: Option<OperationToken>,
     mut observe: O,
     mut check_conflict: C,
@@ -176,7 +182,7 @@ where
     P: carrick_core_abi::ReservationPolicy,
     G: carrick_core_abi::ReservationGeometry,
     O: FnMut(ObjectWaitKey) -> Result<ObjectWaitSnapshot, ObjectWaitError>,
-    C: FnMut(&mut crate::mm::reservation::Reservations<'_, P, G>) -> Option<bool>,
+    C: FnMut(&mut crate::mm::reservation::Reservations<'_, P, G, Context>) -> Option<bool>,
     F: FnMut(
         ObjectWaitKey,
         ObjectWaitSnapshot,

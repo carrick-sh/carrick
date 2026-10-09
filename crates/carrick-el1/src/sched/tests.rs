@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use carrick_el1_abi::{
-    CurrentTask, GIC_KICK_INTID, GIC_RESCHED_INTID, GIC_VTIMER_INTID, SlotId, ThreadCtx,
-    ThreadIdentity, ZoneTables,
+    Aarch64ParkedContext, CurrentTask, GIC_KICK_INTID, GIC_RESCHED_INTID, GIC_VTIMER_INTID, SlotId,
+    ThreadCtx, ThreadIdentity, ZoneTables,
 };
 
 extern crate std;
@@ -22,7 +22,7 @@ const SLOT: SlotId = SlotId::new(3);
 
 struct HostWait;
 
-impl LockWait for HostWait {
+impl LockWait<Aarch64ParkedContext> for HostWait {
     fn wait(&self, _attempt: u32) -> bool {
         core::hint::spin_loop();
         true
@@ -123,11 +123,13 @@ fn task_for(tid: u64) -> CurrentTask {
 /// queue and publish under the bucket lock.
 fn host_park(zone: &ZoneTables, tid: u64, uaddr: u64, ctx: ThreadCtx) -> RecordId {
     let guard = zone
-        .lock(ZoneTables::bucket_of(MM, uaddr), &HostWait)
+        .lock(ZoneTables::bucket_of_with_context(MM, uaddr), &HostWait)
         .unwrap();
     let record = zone.alloc_record(identity(tid)).unwrap();
     // SAFETY: freshly allocated and unpublished.
-    unsafe { *zone.record(record).ctx_mut() = ctx };
+    unsafe {
+        *zone.record(record).ctx_mut() = Aarch64ParkedContext::from_register(ctx, TTBR_MM, MM, 1)
+    };
     let seq = zone.next_seq(record);
     zone.enqueue(&guard, record, seq, MM, uaddr, u32::MAX, 0)
         .unwrap();
@@ -965,9 +967,9 @@ fn a_slice_ending_before_a_host_runnable_thread_leaves_for_the_host() {
     assert_eq!(zone.record(own).handback(), Some(Handback::Resumed));
     // SAFETY: the record is queued on this slot, which the test owns.
     let saved = unsafe { *zone.record(own).ctx_mut() };
-    assert_eq!(saved.x, running.0.x);
-    assert_eq!(saved.pc, running.0.elr);
-    assert_eq!(saved.v, running.1.v);
+    assert_eq!(saved.native.x, running.0.x);
+    assert_eq!(saved.native.pc, running.0.elr);
+    assert_eq!(saved.native.v, running.1.v);
 }
 
 /// The idle entry: an executor with no thread starts its vCPU in the
@@ -1118,11 +1120,18 @@ fn queue_foreign_binding(
 ) -> RecordId {
     let mm = binding.mm;
     let guard = zone
-        .lock(ZoneTables::bucket_of(mm, uaddr), &HostWait)
+        .lock(ZoneTables::bucket_of_with_context(mm, uaddr), &HostWait)
         .unwrap();
     let record = zone.alloc_record(binding).unwrap();
     // SAFETY: freshly allocated and unpublished.
-    unsafe { *zone.record(record).ctx_mut() = ctx };
+    unsafe {
+        *zone.record(record).ctx_mut() = Aarch64ParkedContext::from_register(
+            ctx,
+            if mm == MM { TTBR_MM } else { TTBR_OTHER },
+            mm,
+            binding.generation,
+        )
+    };
     let seq = zone.next_seq(record);
     zone.enqueue(&guard, record, seq, mm, uaddr, u32::MAX, 0)
         .unwrap();
@@ -1197,7 +1206,7 @@ fn a_futex_wait_switches_the_vcpu_to_another_process_in_guest() {
     // home slot; B waits and the vCPU goes back to A in address space 7.
     {
         let guard = zone
-            .lock(ZoneTables::bucket_of(MM, a_addr), &HostWait)
+            .lock(ZoneTables::bucket_of_with_context(MM, a_addr), &HostWait)
             .unwrap();
         let woken = zone.wake_host(
             &guard,
@@ -1346,7 +1355,10 @@ fn the_idle_entry_runs_no_thread_itself() {
     let b_word = AtomicU32::new(0);
     let b_addr = b_word.as_ptr() as u64;
     let guard = zone
-        .lock(ZoneTables::bucket_of(OTHER_MM, b_addr), &HostWait)
+        .lock(
+            ZoneTables::bucket_of_with_context(OTHER_MM, b_addr),
+            &HostWait,
+        )
         .unwrap();
     let record = zone
         .alloc_record(ThreadIdentity {
@@ -1355,7 +1367,10 @@ fn the_idle_entry_runs_no_thread_itself() {
         })
         .unwrap();
     // SAFETY: freshly allocated and unpublished.
-    unsafe { *zone.record(record).ctx_mut() = thread_ctx(0xB, b_addr) };
+    unsafe {
+        *zone.record(record).ctx_mut() =
+            Aarch64ParkedContext::from_register(thread_ctx(0xB, b_addr), TTBR_OTHER, OTHER_MM, 1)
+    };
     let seq = zone.next_seq(record);
     zone.enqueue(&guard, record, seq, OTHER_MM, b_addr, u32::MAX, 0)
         .unwrap();
@@ -1404,7 +1419,10 @@ fn el1_ipc_wait_cross_mm_resume_restores_arguments_and_owned_operation() {
     b_ctx.x[1] = 0x4000;
     b_ctx.pc = 0x8000;
     // SAFETY: freshly allocated, unpublished record.
-    unsafe { *zone.record(b).ctx_mut() = b_ctx };
+    unsafe {
+        *zone.record(b).ctx_mut() =
+            Aarch64ParkedContext::from_register(b_ctx, TTBR_OTHER, OTHER_MM, 1)
+    };
     let guard = zone.object_wait(key_b, &HostWait).unwrap();
     guard
         .park(guard.snapshot(), b, OperationToken::new(202, 4).unwrap())
@@ -1556,31 +1574,37 @@ fn arm_fake_backend_context_trace_is_unchanged() {
     let b = thread_ctx(0xb, 0x2000);
     let (mut frame, mut cpu) = live(0xa, 0x1000, FUTEX_WAIT_PRIVATE, 0);
     frame.x = a.x;
-    let mut saved = ThreadCtx::ZERO;
+    let mut saved = Aarch64ParkedContext::ZERO;
     cpu.save(&frame, &mut saved);
-    assert_eq!(saved.x, a.x);
-    assert_eq!(saved.pc, a.pc);
-    assert_eq!(saved.pstate, a.pstate);
-    assert_eq!(saved.sp_el0, a.sp_el0);
-    assert_eq!(saved.tpidr_el0, a.tpidr_el0);
-    assert_eq!(saved.tpidrro_el0, a.tpidrro_el0);
-    assert_eq!(saved.contextidr_el1, a.contextidr_el1);
-    assert_eq!(saved.v, a.v, "ARM FP state must survive the seam");
-    assert_eq!(saved.fpsr, a.fpsr);
-    assert_eq!(saved.fpcr, a.fpcr);
-    cpu.load(&mut frame, &b);
+    assert_eq!(saved.native.x, a.x);
+    assert_eq!(saved.native.pc, a.pc);
+    assert_eq!(saved.native.pstate, a.pstate);
+    assert_eq!(saved.native.sp_el0, a.sp_el0);
+    assert_eq!(saved.native.tpidr_el0, a.tpidr_el0);
+    assert_eq!(saved.native.tpidrro_el0, a.tpidrro_el0);
+    assert_eq!(saved.native.contextidr_el1, a.contextidr_el1);
+    assert_eq!(saved.native.v, a.v, "ARM FP state must survive the seam");
+    assert_eq!(saved.native.fpsr, a.fpsr);
+    assert_eq!(saved.native.fpcr, a.fpcr);
+    cpu.load(
+        &mut frame,
+        &Aarch64ParkedContext::from_register(b, TTBR_MM, MM, 1),
+    );
     cpu.save(&frame, &mut saved);
-    assert_eq!(saved.x, b.x);
-    assert_eq!(saved.pc, b.pc);
-    assert_eq!(saved.pstate, b.pstate);
-    assert_eq!(saved.sp_el0, b.sp_el0);
-    assert_eq!(saved.tpidr_el0, b.tpidr_el0);
-    assert_eq!(saved.tpidrro_el0, b.tpidrro_el0);
-    assert_eq!(saved.contextidr_el1, b.contextidr_el1);
-    assert_eq!(saved.v, b.v);
-    assert_eq!(saved.fpsr, b.fpsr);
-    assert_eq!(saved.fpcr, b.fpcr);
-    cpu.load(&mut frame, &a);
+    assert_eq!(saved.native.x, b.x);
+    assert_eq!(saved.native.pc, b.pc);
+    assert_eq!(saved.native.pstate, b.pstate);
+    assert_eq!(saved.native.sp_el0, b.sp_el0);
+    assert_eq!(saved.native.tpidr_el0, b.tpidr_el0);
+    assert_eq!(saved.native.tpidrro_el0, b.tpidrro_el0);
+    assert_eq!(saved.native.contextidr_el1, b.contextidr_el1);
+    assert_eq!(saved.native.v, b.v);
+    assert_eq!(saved.native.fpsr, b.fpsr);
+    assert_eq!(saved.native.fpcr, b.fpcr);
+    cpu.load(
+        &mut frame,
+        &Aarch64ParkedContext::from_register(a, TTBR_MM, MM, 1),
+    );
     cpu.set_translation(0x7000, 0x8000);
     cpu.invalidate_asid(0x7000);
     cpu.set_timer(Some(123));

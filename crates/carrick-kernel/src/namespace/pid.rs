@@ -882,6 +882,16 @@ pub fn ns_visible_thread_tid(thread: &crate::kernel::objects::ThreadRef) -> Opti
     }
 }
 
+/// Namespace-visible process identity of a task, independent of the
+/// executor thread that currently carries it.
+pub fn ns_visible_task_pid(task: &crate::kernel::objects::TaskRef) -> Option<u32> {
+    let pid = u32::try_from(task.key().id.raw()).ok()?;
+    match task.pid_ns_region() {
+        Some(region) => region.host_to_ns(pid),
+        None => Some(pid),
+    }
+}
+
 pub(crate) fn ns_to_kernel_for(
     context: &crate::kernel::KernelContext,
     namespace_id: u32,

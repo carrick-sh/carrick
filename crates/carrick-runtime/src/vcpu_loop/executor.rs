@@ -1487,7 +1487,7 @@ fn adopt_born_record(
     let frame = unsafe { *live.ctx_mut() };
     if scheduler
         .kernel()
-        .adopt_born_thread_at_first_entry(key, &frame)
+        .adopt_born_thread_at_first_entry(key, &frame.native)
         .map_err(NextError::Fatal)?
     {
         zone.free_record(record.id);

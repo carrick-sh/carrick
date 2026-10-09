@@ -100,7 +100,7 @@ pub(in crate::dispatch) struct Root {
 struct View(Carrier);
 impl PreparedHostReservations for View {
     fn lock(&self, mm: ReservationMm) -> Result<Reservations<'_>, Refusal> {
-        self.0.table.lock_waiting(
+        self.0.table.lock_waiting_with_context(
             self.0.slot(mm)?,
             mm,
             &carrick_el1::memory::reservations::NoRootWait,
@@ -206,7 +206,7 @@ impl Root {
 
     pub(in crate::dispatch) fn lock(&self) -> Reservations<'_> {
         let slot = self.carrier.slot(self.mm).unwrap();
-        self.carrier.table.lock(slot, self.mm).unwrap()
+        self.carrier.table.lock_with_context(slot, self.mm).unwrap()
     }
 
     /// What guest EL1 does for `brk` on its own venue.

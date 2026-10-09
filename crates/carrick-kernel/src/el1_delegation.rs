@@ -79,7 +79,13 @@ pub fn clear_el1_region_host_ptr() {
 }
 
 /// Publish the current task binding for an executor vCPU mailbox slot into the EL1 aperture.
-pub fn publish_current_task(slot: usize, task_id: El1TaskId, generation: u64, file_table: u64) {
+pub fn publish_current_task(
+    slot: usize,
+    task_id: El1TaskId,
+    generation: u64,
+    file_table: u64,
+    visible_pid: u32,
+) {
     if file_table == 0 {
         TABLELESS_PUBLISHES.fetch_add(1, Ordering::Relaxed);
     }
@@ -105,6 +111,7 @@ pub fn publish_current_task(slot: usize, task_id: El1TaskId, generation: u64, fi
         .linux
         .file_table
         .store(file_table, Ordering::Relaxed);
+    current_task.publish_visible_pid(visible_pid);
     current_task
         .execution
         .generation
@@ -591,7 +598,7 @@ pub(crate) fn recall_inode(identity: InodeIdentity) -> bool {
 fn execute_recall(
     identity: InodeIdentity,
     binding: GuestBinding,
-    mut file_guard: DelegatedFileGuard<'_>,
+    mut file_guard: DelegatedFileGuard<'_, carrick_el1_abi::Aarch64ParkedContext>,
 ) -> Vec<Arc<FileDescription>> {
     let region_ptr = get_el1_region_host_ptr();
     if region_ptr == 0 {
@@ -1139,7 +1146,10 @@ pub(crate) static YIELD_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// spin briefly, then yield between bursts. The long bound is evidence of a
 /// bug, never a scheduling budget.
 #[track_caller]
-fn lock_delegated_file(file: &DelegatedFile, handle: u32) -> DelegatedFileGuard<'_> {
+fn lock_delegated_file(
+    file: &DelegatedFile,
+    handle: u32,
+) -> DelegatedFileGuard<'_, carrick_el1_abi::Aarch64ParkedContext> {
     let authority = delegated_file_authority(file, handle);
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(30);
@@ -1176,7 +1186,10 @@ fn lock_delegated_file(file: &DelegatedFile, handle: u32) -> DelegatedFileGuard<
     })
 }
 
-fn delegated_file_authority(file: &DelegatedFile, handle: u32) -> DelegatedFileAuthority<'_> {
+fn delegated_file_authority(
+    file: &DelegatedFile,
+    handle: u32,
+) -> DelegatedFileAuthority<'_, carrick_el1_abi::Aarch64ParkedContext> {
     use carrick_sched_core::object_wait::{DelegatedFileWaitIndex, DelegatedReleaseVenue};
     let zone = zone_tables()
         .unwrap_or_else(|| carrick_fatal!("el1_delegation", "delegated inode has no carrier zone"));
@@ -1185,9 +1198,12 @@ fn delegated_file_authority(file: &DelegatedFile, handle: u32) -> DelegatedFileA
         .and_then(|index| DelegatedFileWaitIndex::from_index(index as usize))
         .unwrap_or_else(|| carrick_fatal!("el1_delegation", "invalid delegated inode handle"));
     fn deliver(
-        zone: &carrick_sched_core::ZoneTables,
+        zone: &carrick_el1_abi::ZoneTables,
         _: carrick_sched_core::Waker,
-        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >,
     ) {
         carrick_sched_core::LockWait::complete_object_wake(
             &crate::el1_zone::HostLockWait,
