@@ -1015,6 +1015,12 @@ impl PersistentExecutor for KvmPersistentExecutor {
         self.audit_boundary()
     }
 
+    fn has_physical_idle_lane(&self) -> bool {
+        self.physical
+            .physical_slot()
+            .is_some_and(|slot| slot.raw() == 1)
+    }
+
     fn arm_guest_idle(&mut self) -> Result<(), TrapError> {
         if self
             .physical

@@ -523,6 +523,12 @@ pub(crate) trait PersistentExecutor: 'static {
         Ok(())
     }
 
+    /// Whether this worker has a physical guest idle entry even when it has
+    /// no EL1 scheduler zone slot. Most backends park on the host queue.
+    fn has_physical_idle_lane(&self) -> bool {
+        false
+    }
+
     /// Prepare a physical idle run before the final scheduler recheck. Backends
     /// without an idle vCPU have nothing to arm.
     fn arm_guest_idle(&mut self) -> Result<(), TrapError> {

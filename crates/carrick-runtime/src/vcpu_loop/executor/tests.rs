@@ -565,6 +565,11 @@ struct FakeExecutor {
 
 struct BoundaryAuditProbe;
 
+#[test]
+fn backends_without_a_physical_idle_lane_do_not_advertise_one() {
+    assert!(!BoundaryAuditProbe.has_physical_idle_lane());
+}
+
 #[derive(Debug)]
 struct MaliciousBinding {
     identity: TaskLoadIdentity,
