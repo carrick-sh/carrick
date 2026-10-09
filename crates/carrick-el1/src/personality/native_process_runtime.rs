@@ -3038,7 +3038,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             usage: TaskRusage::default(),
             file_table: child_file_table,
         };
-        let mut child = GuestTask::new(
+        let mut child = Box::new(GuestTask::new(
             GuestTaskMetadata {
                 key: child_key,
                 container: parent_container,
@@ -3054,21 +3054,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             child_words,
             custody(resources),
             claim,
-        );
+        ));
         child.init_leader(visible.get(), parent_creds, parent_comm);
         child.rlimits = parent_rlimits;
         child.umask = parent_umask;
         child.personality = parent_personality;
         child.dumpable = parent_dumpable;
         child.no_new_privs = parent_no_new_privs;
-        let prep = PreparedFork::from_reserved(
+        let prep = Box::new(PreparedFork::from_reserved(
             snapshot,
             snapshot,
             child,
             prepared,
             BirthAttachment::Parent,
             permit,
-        );
+        ));
         let result = {
             let mut graph = self.runtime.graph.lock();
             prep.try_publish_with(&mut graph.owner, |prepared| {
