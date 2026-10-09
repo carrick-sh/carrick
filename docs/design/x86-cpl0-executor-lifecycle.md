@@ -332,6 +332,18 @@ physical peer slot; the root slot and ARM/HVPatch without an active EL1 zone
 use the ordinary host run queue. This keeps the extra publish/recheck/kick
 handshake scoped to a vCPU that can actually run a guest idle entry.
 
+### Production test seam removal
+
+The pool now has one `run_prepared_kvm_pool` entry. Its forward path has no
+fixture hook or lock, and the carrier has no metadata-corruption method on a
+worker lease. The old nested-fault case required an after-first-forward
+metadata mutation; pre-run mutation produces a different early fault, so that
+case was retired with the hook. The production user-fault differential remains
+in `cpl0_initial_mm`. VM-free poll tests sample native readiness in their
+fixture and pass the resulting `HostReadinessEntry` batch through the same
+resolver used by guest code; EL1 itself never calls host `poll` under a test
+configuration.
+
 ### Blocking forwarded calls
 
 The readiness crossing is an internal carrier request, not a Linux syscall.

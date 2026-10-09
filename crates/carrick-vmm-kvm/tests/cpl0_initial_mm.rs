@@ -11,9 +11,7 @@ use carrick_vmm_kvm::cpl0_boot::{Cpl0Carrier, InitialReservationLimits, InitialT
 #[path = "common/kvm_pool_fixture.rs"]
 mod kvm_pool_fixture;
 use carrick_x86::cpl0_entry::OBSERVE_INITIAL_MM;
-use kvm_pool_fixture::{
-    run_pool_fixture, run_pool_fixture_with, try_run_pool_fixture_with_first_forward_hook,
-};
+use kvm_pool_fixture::{run_pool_fixture, run_pool_fixture_with};
 use std::path::PathBuf;
 
 const ELF_X86_64_MACHINE: u16 = 62;
@@ -348,22 +346,4 @@ fn production_fault_elf() -> Vec<u8> {
     let size = elf.len() as u64;
     elf[96..104].copy_from_slice(&size.to_le_bytes());
     elf
-}
-
-#[test]
-fn nested_kernel_fault_refuses_after_invalidated_counters_venue() {
-    let elf = production_fault_elf();
-    let error = try_run_pool_fixture_with_first_forward_hook(
-        &elf,
-        32,
-        Box::new(|cpu| cpu.invalidate_user_fault_counters_venue()),
-    )
-    .err()
-    .expect("nested kernel refusal");
-    assert!(
-        error
-            .to_string()
-            .contains("port 0xcc; outer fault active 1, address 0xdead000, reason 8"),
-        "{error:?}"
-    );
 }

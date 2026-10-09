@@ -1208,23 +1208,6 @@ impl ProductionCpuLease {
     pub fn arm_idle_kick(&mut self, kick: &KvmKickHandle) -> Result<(), TrapError> {
         self.cpu.arm_idle_kick(kick)
     }
-    /// Fixture fault injection at a stopped forwarded-call boundary.
-    pub fn invalidate_user_fault_counters_venue(&mut self) -> Result<(), TrapError> {
-        let mut custody = self
-            ._custody
-            .lock()
-            .map_err(|_| fail("physical custody poisoned"))?;
-        let address =
-            META_GPA + BINDING_OFFSET + core::mem::offset_of!(CpuBinding, counters_address) as u64;
-        custody
-            ._vm
-            .write(
-                FrameGpa::new(address),
-                &0xffff_dead_0000_0000_u64.to_le_bytes(),
-            )
-            .map_err(|error| fail(error.to_string()))
-    }
-
     pub fn capture_fault_record(
         &mut self,
         task: carrick_guest_arch::TaskIdentity,
@@ -5836,20 +5819,6 @@ impl Cpl0Carrier {
             zone.free_record(record);
         }
         Ok(capacity)
-    }
-
-    /// Break only the stopped fault-policy counters venue to force a nested
-    /// supervisor #PF after the next user fault acquired per-CPU custody.
-    pub fn invalidate_user_fault_counters_venue(&mut self) -> Result<(), TrapError> {
-        let address =
-            META_GPA + BINDING_OFFSET + core::mem::offset_of!(CpuBinding, counters_address) as u64;
-        self.custody
-            ._vm
-            .write(
-                FrameGpa::new(address),
-                &0xffff_dead_0000_0000_u64.to_le_bytes(),
-            )
-            .map_err(|error| fail(error.to_string()))
     }
 
     /// Stopped hardware diagnostics, retained independently of the syscall frame.
