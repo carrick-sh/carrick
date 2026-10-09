@@ -132,6 +132,8 @@ pub struct ForkStockHostCustody {
     pub asids: AsidAllocator,
     pub committed_asids: BTreeMap<u64, AsidGeneration>,
     run_failure: carrick_el1_abi::NativeRunFailureConsumer,
+    /// Retired child stocks reclaimed after slot absence and table clearing.
+    pub returned_children: u64,
 }
 
 #[allow(dead_code)]
@@ -162,6 +164,7 @@ impl ForkStockHostCustody {
             asids,
             committed_asids: BTreeMap::new(),
             run_failure: carrick_el1_abi::NativeRunFailureConsumer::default(),
+            returned_children: 0,
         }
     }
 
@@ -631,6 +634,7 @@ impl ForkStockHostCustody {
             }
             self.retired_mms.remove(&mm);
             reclaimed += 1;
+            self.returned_children += 1;
         }
         Ok(reclaimed)
     }

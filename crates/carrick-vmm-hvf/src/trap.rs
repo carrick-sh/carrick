@@ -341,6 +341,23 @@ pub fn el1_frame_grant_unreturned() -> Vec<String> {
     }
 }
 
+/// Published carrier count of children whose quarantined stock returned.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn fork_stock_returned() -> u64 {
+    let carrier = persistent_carrier_cell().lock();
+    match carrier.as_ref() {
+        Some(PersistentCarrierCellEntry::Published(carrier)) => {
+            carrier
+                .carrier_foreign_mm_transport
+                .custody
+                .fork_stock
+                .lock()
+                .returned_children
+        }
+        _ => 0,
+    }
+}
+
 /// Snapshot only the currently published carrier; absence is incomplete.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub fn el1_frame_grant_stats() -> El1FrameGrantStats {
