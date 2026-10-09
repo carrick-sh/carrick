@@ -718,6 +718,10 @@ fn serial_host_persistent_carrier_authority_outlives_terminal_task_cleanup_and_d
     let mut drop_observations = Vec::new();
     for (start, size) in [
         (
+            crate::memory::LINUX_EL1_KERNEL_BASE,
+            crate::memory::LINUX_EL1_KERNEL_SIZE,
+        ),
+        (
             crate::memory::LINUX_EL0_TRAMPOLINE_BASE,
             crate::memory::LINUX_EL0_TRAMPOLINE_SIZE,
         ),
@@ -777,6 +781,18 @@ fn serial_host_persistent_carrier_authority_outlives_terminal_task_cleanup_and_d
         std::sync::Arc::new(CarrierVmCustody::new_live_fixture()),
     )
     .expect("extract exact carrier mapping authority");
+    let record = authority
+        .custody
+        .stage2_record_covering(
+            carrick_el1_abi::EL1_STACKS_BASE + 0x40,
+            core::mem::size_of::<carrick_el1_abi::ForkStockExchange>(),
+        )
+        .expect("fixed EL1 stack record is in carrier stage-2 custody");
+    let snapshot = authority
+        .custody
+        .stage2_record_snapshot(record.record_id)
+        .expect("registered EL1 region remains live");
+    assert_eq!(snapshot.ipa, carrick_el1_abi::EL1_REGION_BASE);
     assert_eq!(
         task_mappings.len(),
         1,
