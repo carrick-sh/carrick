@@ -447,37 +447,6 @@ impl PersistentExecutor for KvmPersistentExecutor {
                 let outcome =
                     self.physical
                         .with_retained_forward(task, &retained.frame, |venue| {
-                            if let Some(readiness) = retained.host_readiness {
-                                use carrick_kernel::kernel::continuation::ContinuationCompletion;
-                                return match result.completion {
-                                    ContinuationCompletion::Return(value) => {
-                                        Ok(DispatchOutcome::Returned { value })
-                                    }
-                                    ContinuationCompletion::Redispatch => {
-                                        match Self::sample_host_readiness(
-                                            venue,
-                                            readiness,
-                                            dispatcher.captured_stdio_is_writable(),
-                                        )? {
-                                            HostReadinessStep::Ready(value) => {
-                                                Ok(DispatchOutcome::Returned { value })
-                                            }
-                                            HostReadinessStep::Wait(fds) => {
-                                                Ok(Self::host_readiness_wait(readiness, fds)
-                                                    .unwrap_or(DispatchOutcome::Returned {
-                                                        value: 0,
-                                                    }))
-                                            }
-                                        }
-                                    }
-                                    ContinuationCompletion::Errno(errno) => {
-                                        Ok(DispatchOutcome::Errno { errno })
-                                    }
-                                    other => Err(TrapError::Hypervisor(format!(
-                                        "unexpected host readiness completion: {other:?}"
-                                    ))),
-                                };
-                            }
                             let folded = fold_continuation_completion(
                                 result.completion,
                                 &dispatcher,
@@ -487,6 +456,21 @@ impl PersistentExecutor for KvmPersistentExecutor {
                             .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
                             match folded {
                                 Some(outcome) => Ok(outcome),
+                                None if let Some(readiness) = retained.host_readiness => {
+                                    match Self::sample_host_readiness(
+                                        venue,
+                                        readiness,
+                                        dispatcher.captured_stdio_is_writable(),
+                                    )? {
+                                        HostReadinessStep::Ready(value) => {
+                                            Ok(DispatchOutcome::Returned { value })
+                                        }
+                                        HostReadinessStep::Wait(fds) => {
+                                            Ok(Self::host_readiness_wait(readiness, fds)
+                                                .unwrap_or(DispatchOutcome::Returned { value: 0 }))
+                                        }
+                                    }
+                                }
                                 None => dispatcher
                                     .dispatch(&context, retained.request, venue, &self.reporter)
                                     .map_err(|error| TrapError::Hypervisor(error.to_string())),
