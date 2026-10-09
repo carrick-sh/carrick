@@ -1,0 +1,259 @@
+
+## p0-1 (target/ringswitch-review-p0-1-red.log)
+   Compiling carrick-el1 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-el1)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.14s
+     Running unittests src/lib.rs (target/debug/deps/carrick_el1-ad60908755bf43ff)
+
+running 1 test
+test personality::dispatch::tests::x86_context_selects_x86_crossings_without_arm_aperture ... FAILED
+
+failures:
+
+---- personality::dispatch::tests::x86_context_selects_x86_crossings_without_arm_aperture stdout ----
+
+thread 'personality::dispatch::tests::x86_context_selects_x86_crossings_without_arm_aperture' (134001737) panicked at crates/carrick-el1/src/personality/dispatch.rs:1267:9:
+assertion `left == right` failed
+  left: Aarch64
+ right: X86
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    personality::dispatch::tests::x86_context_selects_x86_crossings_without_arm_aperture
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 318 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-el1 --lib`
+
+## p0-2 (target/ringswitch-review-p0-2-red.log)
+   Compiling carrick-x86 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-x86)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.01s
+     Running unittests src/lib.rs (target/debug/deps/carrick_personality_linux-ef062da23f06c993)
+
+running 1 test
+test dispatch::ring_first_tests::strict_arm_preserves_family_declines_handback_and_owed_work ... FAILED
+
+failures:
+
+---- dispatch::ring_first_tests::strict_arm_preserves_family_declines_handback_and_owed_work stdout ----
+
+thread 'dispatch::ring_first_tests::strict_arm_preserves_family_declines_handback_and_owed_work' (134025432) panicked at crates/carrick-personality-linux/src/dispatch.rs:695:13:
+assertion `left == right` failed: ordinal=222 work=false handback=false
+  left: Served
+ right: Forward
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    dispatch::ring_first_tests::strict_arm_preserves_family_declines_handback_and_owed_work
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-personality-linux --lib`
+
+## p1-3 (target/ringswitch-review-p1-3-red.log)
+   Compiling carrick-x86 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-x86)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.58s
+     Running unittests src/lib.rs (target/debug/deps/carrick_personality_linux-ef062da23f06c993)
+
+running 1 test
+test dispatch::ring_first_tests::failed_entry_admission_cannot_bypass_crossing_policy ... FAILED
+
+failures:
+
+---- dispatch::ring_first_tests::failed_entry_admission_cannot_bypass_crossing_policy stdout ----
+
+thread 'dispatch::ring_first_tests::failed_entry_admission_cannot_bypass_crossing_policy' (134081360) panicked at crates/carrick-personality-linux/src/dispatch.rs:741:9:
+assertion `left == right` failed
+  left: Forward
+ right: InvalidCompletion
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    dispatch::ring_first_tests::failed_entry_admission_cannot_bypass_crossing_policy
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 35 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-personality-linux --lib`
+
+## p1-4 (target/ringswitch-review-p1-4-red.log)
+   Compiling carrick-personality-linux v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-personality-linux)
+   Compiling carrick-el1-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-el1-abi)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.14s
+     Running unittests src/lib.rs (target/debug/deps/carrick_el1_abi-3991132def0a4e54)
+
+running 1 test
+test tests::test_aperture_control_strict_flag ... FAILED
+
+failures:
+
+---- tests::test_aperture_control_strict_flag stdout ----
+
+thread 'tests::test_aperture_control_strict_flag' (134123699) panicked at crates/carrick-el1-abi/src/lib.rs:3405:9:
+zero control must enforce strict admission
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::test_aperture_control_strict_flag
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 124 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-el1-abi --lib`
+
+## p2-5 (target/ringswitch-review-p2-5-red.log)
+     |
+3408 |         assert_eq!(checked_aperture_host_address(0x1000, offset + size - 1), None);
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `checked_aperture_host_address` in this scope
+    --> crates/carrick-el1-abi/src/lib.rs:3409:20
+     |
+3409 |         assert_eq!(checked_aperture_host_address(0x1001, offset + size), None);
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `checked_aperture_host_address` in this scope
+    --> crates/carrick-el1-abi/src/lib.rs:3410:20
+     |
+3410 |         assert_eq!(checked_aperture_host_address(usize::MAX - 63, EL1_REGION_SIZE as usize), None);
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `checked_aperture_host_address` in this scope
+    --> crates/carrick-el1-abi/src/lib.rs:3411:20
+     |
+3411 |         assert_eq!(checked_aperture_host_address(0, EL1_REGION_SIZE as usize), None);
+     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `carrick-el1-abi` (lib test) due to 5 previous errors
+
+## p2-6 (target/ringswitch-review-p2-6-red.log)
+   Compiling carrick-cli v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 12s
+     Running unittests src/main.rs (target/debug/deps/carrick-11f3f8f93eb88b68)
+
+running 1 test
+test lifecycle::tests::restart_preserves_explicit_and_snapshot_arm_ring_policy ... FAILED
+
+failures:
+
+---- lifecycle::tests::restart_preserves_explicit_and_snapshot_arm_ring_policy stdout ----
+
+thread 'lifecycle::tests::restart_preserves_explicit_and_snapshot_arm_ring_policy' (134191591) panicked at crates/carrick-cli/src/lifecycle.rs:2858:13:
+assertion `left == right` failed
+  left: None
+ right: Some(OptOut)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    lifecycle::tests::restart_preserves_explicit_and_snapshot_arm_ring_policy
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 211 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-cli --bin carrick`
+
+## p2-7 (target/ringswitch-review-p2-7-red.log)
+   Compiling carrick-hal v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-hal)
+   Compiling carrick-conformance-contract v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-conformance-contract)
+   Compiling carrick-host-bsd v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-host-bsd)
+   Compiling carrick-thread v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-thread)
+   Compiling carrick-aarch64 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-aarch64)
+   Compiling carrick-vfs v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-vfs)
+   Compiling carrick-kernel-example v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-kernel-example)
+   Compiling carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-runtime)
+   Compiling native-syscall-slice v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/experiments/native-syscall-slice)
+error[E0308]: mismatched types
+    --> crates/carrick-runtime/src/runtime.rs:2668:35
+     |
+2668 |         let _entry: PolicyEntry = run_rootfs_elf_with_hvf_args_and_dispatcher_debug;
+     |                     -----------   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ incorrect number of function parameters
+     |                     |
+     |                     expected due to this
+     |
+     = note: expected fn pointer `fn(PathBuf, &RootFs, ..., ..., ..., usize, ..., ...) -> ...`
+                   found fn item `fn(_, ..., ..., _, _, usize, ...) -> ... {run_rootfs_elf_with_hvf_args_and_dispatcher_debug::<_, _, _>}`
+     = note: the full name for the type has been written to '/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/debug/deps/carrick_runtime-626fde4f5e1a58e5.long-type-5563043750852612623.txt'
+     = note: consider using `--verbose` to print the full type name to the console
+
+For more information about this error, try `rustc --explain E0308`.
+error: could not compile `carrick-runtime` (lib test) due to 1 previous error
+
+## p2-8 (target/ringswitch-review-p2-8-red.log)
+   Compiling carrick-aarch64 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-aarch64)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 07s
+     Running tests/x86_production_forward.rs (target/debug/deps/x86_production_forward-fbe2290b44f983ac)
+
+running 1 test
+test x86_unported_refusal_counts_native_ordinal_not_canonical_ordinal ... FAILED
+
+failures:
+
+---- x86_unported_refusal_counts_native_ordinal_not_canonical_ordinal stdout ----
+
+thread 'x86_unported_refusal_counts_native_ordinal_not_canonical_ordinal' (134217459) panicked at crates/carrick-el1/tests/x86_production_forward.rs:219:5:
+assertion `left == right` failed
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    x86_unported_refusal_counts_native_ordinal_not_canonical_ordinal
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-el1 --test x86_production_forward`
+
+## handback-work (target/ringswitch-review-handback-work-red.log)
+   Compiling carrick-x86 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-x86)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.35s
+     Running unittests src/lib.rs (target/debug/deps/carrick_personality_linux-ef062da23f06c993)
+
+running 1 test
+test dispatch::ring_first_tests::strict_arm_preserves_family_declines_handback_and_owed_work ... FAILED
+
+failures:
+
+---- dispatch::ring_first_tests::strict_arm_preserves_family_declines_handback_and_owed_work stdout ----
+
+thread 'dispatch::ring_first_tests::strict_arm_preserves_family_declines_handback_and_owed_work' (134262975) panicked at crates/carrick-personality-linux/src/dispatch.rs:804:13:
+assertion `left == right` failed: ordinal=98 work=true handback=true
+  left: Forward
+ right: WithWork
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    dispatch::ring_first_tests::strict_arm_preserves_family_declines_handback_and_owed_work
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 36 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-personality-linux --lib`
+
+## p2-9 (target/ringswitch-review-p2-9-red.log)
+
+failures:
+
+---- crossing::tests::ring_first_census_host_files_and_signal_return_are_admitted stdout ----
+
+thread 'crossing::tests::ring_first_census_host_files_and_signal_return_are_admitted' (134388538) panicked at crates/carrick-personality-linux/src/crossing.rs:427:13:
+ARM fallback ordinal=213
+
+---- crossing::tests::ring_first_census_guest_fd_and_memory_rows_are_temporary stdout ----
+
+thread 'crossing::tests::ring_first_census_guest_fd_and_memory_rows_are_temporary' (134388537) panicked at crates/carrick-personality-linux/src/crossing.rs:438:13:
+assertion `left == right` failed: ordinal=72
+  left: Some(Permanent)
+ right: Some(Temporary)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    crossing::tests::ring_first_census_guest_fd_and_memory_rows_are_temporary
+    crossing::tests::ring_first_census_host_files_and_signal_return_are_admitted
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 37 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-personality-linux --lib`
