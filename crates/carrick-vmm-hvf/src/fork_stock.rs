@@ -1276,6 +1276,106 @@ mod tests {
         assert_eq!(custody.el1_frame_grants.lock().snapshot(), initial_ledger);
     }
 
+    /// Commit and retire one child of `parent` whose single table page is
+    /// the published stage-2 page at `ipa`; returns the child MM.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn quarantine_one_child(
+        custody: &CarrierVmCustody,
+        generation: crate::trap::CarrierVmGeneration,
+        pages: &mut Vec<Box<AlignedPage>>,
+        parent: GrantExecution,
+    ) -> ReservationMm {
+        let mut tables = Vec::new();
+        for i in 0..4u64 {
+            let mut aligned = Box::new(AlignedPage([0u8; 4096]));
+            let ipa = 0x2001_0000u64 + i * 4096;
+            let spec = crate::trap::CarrierStage2RecordSpec {
+                vm_generation: generation,
+                ipa,
+                len: 4096,
+                host_addr: aligned.0.as_mut_ptr() as usize,
+                mapped: true,
+                backend_map_installed: true,
+                release_ipa: false,
+                perms: 3,
+                logical_owner: Some(crate::trap::CarrierLogicalOwner {
+                    id: 2 + i,
+                    generation: 1,
+                }),
+            };
+            custody.publish_stage2_record_using(spec, || 0).unwrap();
+            pages.push(aligned);
+            tables.push(page(ipa));
+        }
+        let carrier = NonZeroU64::new(7).unwrap();
+        let mut fork = custody.fork_stock.lock();
+        fork.seed_for_tests(tables);
+        fork.set_carrier_for_tests(carrier);
+        let mut ledger = custody.el1_frame_grants.lock();
+        let request = test_request(parent, 302, 1, 1);
+        let mut exchange = ForkStockExchange::new(request).unwrap();
+        let loan = fork
+            .service_loan(&mut ledger, parent, &mut exchange)
+            .expect("loan");
+        let completion = PortalForkCompletion {
+            request: loan.request,
+            child: unsafe {
+                carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                    carrier,
+                    request.child_mm,
+                    NonZeroU64::MIN,
+                )
+            },
+            parent_generation: ReservationGeneration::INITIAL,
+            child_tables_used: 4096,
+            parent_tables_used: 0,
+        };
+        let mut commit =
+            ForkStockSettlement::new(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 1)
+                .unwrap();
+        fork.service_settlement(&mut ledger, parent, &mut commit, |_| true, |_| true)
+            .expect("commit");
+        let child = child_execution(42, &loan);
+        let retire = NativeChildRetire::new(child.binding, child.context).unwrap();
+        fork.service_child_retire(child, &retire)
+            .expect("quarantine");
+        request.child_mm
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn quarantine_drain_without_occupancy_authority_is_a_typed_error() {
+        let custody = CarrierVmCustody::new();
+        let generation = custody.begin_create().unwrap();
+        custody.commit_create(generation).unwrap();
+        let parent = test_execution(41, 0, 301);
+        // Nothing quarantined: no occupancy proof is needed.
+        assert_eq!(
+            crate::metadata_grant::drain_fork_quarantine(&custody, parent, None),
+            Ok(())
+        );
+        let mut pages = Vec::new();
+        let child = quarantine_one_child(&custody, generation, &mut pages, parent);
+        assert_eq!(
+            crate::metadata_grant::drain_fork_quarantine(&custody, parent, None),
+            Err(ForkStockServiceError::OccupancyUnavailable)
+        );
+        assert!(custody.fork_stock.lock().stock().is_quarantined(child));
+        assert_eq!(custody.fork_stock.lock().returned_children(), 0);
+
+        // With a zone that installs nothing, the same drain reclaims.
+        let layout = std::alloc::Layout::new::<carrick_el1_abi::ZoneTables>();
+        let pointer = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!pointer.is_null());
+        let zone = unsafe { Box::from_raw(pointer.cast::<carrick_el1_abi::ZoneTables>()) };
+        assert_eq!(
+            crate::metadata_grant::drain_fork_quarantine(&custody, parent, Some(&zone)),
+            Ok(())
+        );
+        assert!(!custody.fork_stock.lock().stock().is_quarantined(child));
+        assert_eq!(custody.fork_stock.lock().returned_children(), 1);
+    }
+
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn dispatcher_root_exit_success_and_stale_refusal() {
