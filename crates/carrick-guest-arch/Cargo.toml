@@ -9,7 +9,6 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-carrick-abi = { path = "../carrick-abi" }
 carrick-signal-core = { path = "../carrick-signal-core" }
 carrick-syscall-abi = { path = "../carrick-syscall-abi" }
 zerocopy.workspace = true

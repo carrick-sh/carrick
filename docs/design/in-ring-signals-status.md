@@ -51,3 +51,11 @@ admission permits an ordinary reap; an interrupted wait requires EINTR in
 the saved context. `caught_signal_interrupts_an_already_parked_owned_child_wait`
 provides the deterministic parked-continuation proof, including retained
 restart context and no reap of the live child.
+
+The public `carrick-abi` facade reexports the single canonical signal wire
+records from its existing guest-safe `carrick-syscall-abi` leaf. The shared
+substrate depends on that leaf, never the umbrella personality crate.
+Linux frame encoding/decoding lives in EL1 personality modules; ISA modules
+retain neutral machine state and privilege checks. The boundary gate was
+red with 27 violations before this relocation and clean for all nine
+substrate crates afterwards. No boundary exceptions were added.
