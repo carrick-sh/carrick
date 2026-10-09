@@ -1,0 +1,1 @@
+The initial --skip glibc_fork_wait_witness invocation was rejected by the receipted runner before any guest started (exit 2). Scoped cleanup: zero survivors. Supported filters were used for all final signed proofs; no guest was retried.
