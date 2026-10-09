@@ -59,6 +59,33 @@ fn live_fork_execution(
         .then(|| crate::fork_stock::GrantExecution::new(cpu, binding, context))
 }
 
+/// Terminal root exit runs after `retire_current` has removed the zone
+/// record. Authenticate that final crossing against the still host-published
+/// per-vCPU task binding and the address space still installed on this slot.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn terminal_root_binding(
+    custody: &crate::trap::CarrierVmCustody,
+    cpu: carrick_guest_arch::CpuId,
+) -> Option<carrick_el1_abi::ExecutionBinding> {
+    let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
+    let zone = carrick_el1_abi::zone_tables()?;
+    let lane = zone.slot(slot);
+    if lane.current().is_some() || lane.host_record().is_some() {
+        return None;
+    }
+    let task_gpa = carrick_el1_abi::EL1_CURRENT_TASKS_BASE.checked_add(
+        u64::from(cpu.raw()) * core::mem::size_of::<carrick_el1_abi::CurrentTask>() as u64,
+    )?;
+    let task_ptr = crate::fork_stock::ForkStockHostCustody::resolve_record_ptr::<
+        carrick_el1_abi::CurrentTask,
+    >(custody, task_gpa)
+    .ok()?;
+    // SAFETY: the live carrier stage-2 record covers this fixed ABI slot.
+    let task = unsafe { &*task_ptr };
+    let binding = carrick_core::entry::binding(&task.execution, &task.mm);
+    (binding.issued() && binding.mm.raw() == lane.mm()).then_some(binding)
+}
+
 fn native_record_on_cpu_stack(record_gpa: u64, cpu: carrick_guest_arch::CpuId) -> bool {
     let Some(offset) = record_gpa.checked_sub(carrick_el1_abi::EL1_STACKS_BASE) else {
         return true;
@@ -1067,11 +1094,14 @@ pub(crate) fn service_metadata_operation(
             return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
         }
         let root_exit = unsafe { &*record_ptr };
-        let Some(execution) = execution else {
+        let Some(binding) = execution
+            .map(|execution| execution.binding)
+            .or_else(|| terminal_root_binding(custody, cpu))
+        else {
             return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
         };
         let mut fork_stock = custody.fork_stock.lock();
-        match fork_stock.service_root_exit(execution, root_exit) {
+        match fork_stock.service_root_exit(binding, root_exit) {
             Ok(status) => Ok([METADATA_GRANT_SUCCESS, status.raw() as u64, 0, 0]),
             Err(_) => Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]),
         }
