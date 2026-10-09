@@ -1,0 +1,26 @@
+{
+  "command": "sudo -n lsof /tmp/carrick-host-lease.lock",
+  "exit_code": 1,
+  "output": "",
+  "no_holders": true,
+  "main_product_diff_command": "git diff --exit-code dfc9100e277339016f537ba09e2b475470c953b6 HEAD -- crates/carrick-runtime crates/carrick-kernel crates/carrick-mem crates/carrick-vmm-hvf crates/carrick-el1 crates/carrick-el1-abi crates/carrick-personality-linux crates/carrick-cli crates/carrick-engine",
+  "main_product_diff_exit_code": 0,
+  "main_control_precompile_commands": [
+    "cargo check -p carrick-embed --test arm_ring_first_main_control",
+    "just build",
+    "cargo --config 'build.rustc-wrapper=\"/opt/homebrew/bin/sccache\"' test -p carrick-embed --release --no-run"
+  ],
+  "main_control_precompile_exit_codes": [
+    0,
+    0,
+    0
+  ],
+  "evidence_verification": [
+    "just fmt-check",
+    "git diff --check"
+  ],
+  "evidence_verification_exit_codes": [
+    0,
+    0
+  ]
+}

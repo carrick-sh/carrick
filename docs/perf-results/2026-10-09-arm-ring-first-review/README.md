@@ -80,11 +80,45 @@ the glibc guest ELF is
 The final archive SHA-256 is
 `cc87e661e2d5500b114ef4080041f7055c399848d620ba35016ae7d7d3be2e87`.
 
+## Main control attribution
+
+The director-approved main control `10e41549e0e27546e0b536a7ada847e8c10365d7`
+contains only fixture, test and xtask fixture-plumbing changes over product
+baseline `dfc9100e277339016f537ba09e2b475470c953b6`. Its runtime, memory,
+HVF, kernel, EL1, ABI, personality, engine and CLI product sources are unchanged.
+The published archive verifies 1,135 executables with clean input admission.
+Its GNU guest ELF has the identical SHA-256 recorded above.
+
+| Runtime | Signed witness | Verdict |
+| --- | --- | --- |
+| Ring-switch Strict | Raw | PASS; getuid refusal/forward 1/0 |
+| Ring-switch OptOut | Raw | PASS; getuid refusal/forward 0/1 |
+| Ring-switch Strict | GNU loader + fork/wait | FAIL; child COW inventory |
+| Ring-switch OptOut | GNU loader + fork/wait | FAIL; child COW inventory |
+| Main product control | Identical GNU loader + fork/wait | FAIL; identical child COW inventory |
+
+The main guest fails after 5.09 seconds with the exact same error:
+`HVPatch COW compound IPA 0x2e00000000 has no exact inventory coverage`.
+The monitored main recipe finishes in 235.63 seconds, with negative control
+PASS, explicit cleanup exit zero and zero survivors. The shared host lease
+has no holder after completion. Main refusal counts are unavailable because
+the child fault prevents counter assertions from executing.
+
+The main signed test SHA-256 is
+`ac7fabcda9a9eb2cbe57c0beb4e071d1a65371e557e7453d540544661b55a427`.
+`main-control-signed-failure-identity.json` retains the binary, CLI, guest,
+CDHash, LC_UUID, entitlement and DOF identities; the accompanying result,
+verdict and fixture-validation files retain the exact command and admission.
+The failed executable and dSYM are retained in the control worktree as
+`target/ringswitch-main-control-failed-signed`.
+
 The fault address equals LINUX_VVAR_BASE. The fork refresh path attempts a
 privileged COW write of the vvar RNG-generation field; exact compound inventory
-coverage rejects it. This mechanism and these source files are unchanged from
-origin/main. That alone does not establish baseline attribution: per director
-ruling, an isolated unmodified-product main A/B control is being prepared with
-the identical GNU fixture. No unchanged signed artifact was retried, no gate
-assertion was weakened, and no COW runtime change is included here.
-No Docker, full acceptance gate or runtime-ratio claim is included.
+coverage rejects it. The A/B control establishes that this witness failure
+exists on main as well as both switch policies. Per the director's ruling,
+the switch is review-ready and the inherited inventory defect belongs to the
+ARM fork lane. The GNU tests remain failing assertions; none is weakened or
+converted to an expected failure. No COW runtime change is included here.
+No unchanged signed artifact was retried. No Docker, full acceptance gate or
+runtime-ratio claim is included. KVM execution and the stacked full gate
+remain director-owned.
