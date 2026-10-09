@@ -293,14 +293,22 @@ read and poll witnesses are red until the continuation and readiness work.
 The CPL0 forward doorbell points at a `NativeFrame` on that physical CPU's
 private supervisor stack. A blocked guest must release its executor, so a
 later task can reuse the stack before the first task resumes. The KVM adapter
-copies the complete checked frame into an owned `ProductionForwardFrame`
-token, recording the exact task generation, MM context, physical slot and
-stack address. A worker restores the whole frame and writes only the final
-return register after reloading that task and revalidating its stopped MM
-binding. Until the supervisor stack and GS/CPU metadata are rebased for
+copies the checked frame into an owned `ProductionForwardFrame` token,
+recording the exact task generation, MM context, physical slot and stack
+address. That frame alone is insufficient: the saved CPL0 RSP can still
+point into Rust call frames and xstate below it. On every task save, including
+a kick, the KVM adapter copies the live private stack span from stopped RSP
+to stack top into task-owned `KernelStackSnapshot`. On load it restores that
+span before any guest instruction runs; completion then restores the checked
+frame and writes the final return register. The snapshot is authenticated to
+its physical slot and stack extent. Until the supervisor stack and GS/CPU
+metadata are rebased for
 cross-slot migration, a frame-bearing task remains eligible only on the
 original guest CPU. This is scheduling affinity, not a vCPU handle owned by
 the task: the worker and vCPU still return to the pool while the task waits.
+The root is pinned to guest CPU 0 at publication. A future second runnable
+task needs the same affinity rule until dedicated per-task mapped stacks
+permit cross-slot execution.
 
 ### Production pool handoff
 
