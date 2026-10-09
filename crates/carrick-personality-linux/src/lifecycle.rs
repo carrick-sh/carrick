@@ -103,6 +103,8 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     fn as_sysinfo_venue(&mut self) -> Option<&mut dyn crate::sysinfo::ProcessSysinfoVenue> {
         None
     }
+    fn thread_spawned(&mut self, _caller_tid: u32, _child_tid: u32) {}
+    fn set_calling_tid(&mut self, _tid: u32) {}
 }
 
 pub trait UserCopy {
@@ -193,6 +195,7 @@ pub trait LifecycleNative<'a>: UserCopy {
     fn process_exit_group(&mut self, _status: u8) -> Option<LifecycleOutcome> {
         None
     }
+    fn thread_spawned(&mut self, _caller_tid: u32, _child_tid: u32) {}
 }
 /// Linux aarch64 syscall numbers served here (`SYS_SET_ROBUST_LIST` is the
 /// shared canonical number from [`crate::thread`]).
@@ -668,6 +671,13 @@ fn serve_clone<'a>(
         return None;
     }
     native.enqueue_born(record);
+    let caller_tid = thread
+        .slot
+        .visible_tid()
+        .filter(|&t| t != 0)
+        .or_else(|| native.process_pid())
+        .unwrap_or(0);
+    native.thread_spawned(caller_tid, identity.visible_tid);
     Some(visible as u32)
 }
 
