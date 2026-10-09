@@ -968,6 +968,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
     /// Enter through the exact process registry. A non-leader thread retains
     /// its own execution binding and context, while process operations name
     /// the graph row of its authenticated thread group.
+    // The caller's architectural context is 864 bytes on AArch64. Ownership
+    // crosses this boundary boxed so the fork call chain keeps one stack copy.
+    #[allow(clippy::boxed_local)]
     pub fn enter_registered<'r, S: NativeProcessService<'a, C, Mm = M>>(
         &'r self,
         registry: &NativeProcessRegistry<'a, M, C>,
