@@ -1718,6 +1718,66 @@ fn dormant_submission_is_invisible_until_exact_activation() {
     assert!(Arc::ptr_eq(&resolved, &binding));
 }
 
+#[test]
+fn shared_submission_directory_accepts_a_non_hvpatch_binding() {
+    let (kernel, context) = bootstrap(13_994);
+    let state = task_state(&context, 94);
+    let generation = context
+        .thread()
+        .publish_initial_task_state(state.clone())
+        .expect("publish root state");
+    let scheduler = Arc::new(Scheduler::new(kernel));
+    let directory = Arc::new(super::TaskBindingDirectory::<FakeBinding>::default());
+    directory.install_scheduler(&scheduler).unwrap();
+    let binding = FakeBinding::new(94, []);
+    FakeFactory::default().install(&context, Arc::clone(&binding));
+    let dormant = directory
+        .prepare_submission(
+            &scheduler,
+            HvpatchSubmissionShape::Root,
+            None,
+            Arc::clone(context.thread()),
+            generation,
+            Arc::clone(&binding),
+        )
+        .expect("prepare generic root");
+    assert_eq!(scheduler.queued_len(), 0);
+    assert!(
+        directory
+            .resolve_active(context.thread().key(), generation)
+            .is_err()
+    );
+    let start_gate = context
+        .thread()
+        .take_opened_start_gate(generation)
+        .expect("open initial root gate");
+    let proof = HvpatchActivationProof::validate(
+        &context,
+        &state,
+        generation,
+        binding.load_identity(),
+        start_gate,
+    )
+    .expect("generic activation proof");
+    dormant
+        .activate(&scheduler, Arc::clone(context.thread()), proof)
+        .expect("activate generic root");
+    assert_eq!(scheduler.queued_len(), 1);
+    assert!(Arc::ptr_eq(
+        &directory
+            .resolve_active(context.thread().key(), generation)
+            .expect("resolve active generic root"),
+        &binding
+    ));
+    assert!(
+        directory
+            .bindings
+            .lock()
+            .get(&(context.thread().key(), generation))
+            .is_some_and(|record| record.active && Arc::ptr_eq(&record.binding, &binding))
+    );
+}
+
 /// An executor kick that records, every time the scheduler consults its
 /// binding, whether the HVPatch binding directory was free. Exec retarget
 /// nests `directory.bindings` INSIDE a kick's binding lock
