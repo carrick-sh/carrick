@@ -245,6 +245,12 @@ pub fn signal_effect(outcome: &SignalOutcome) -> crate::dispatch::FamilyCompleti
 }
 
 pub trait ProcessSignals {
+    fn force_sigsegv(
+        &mut self,
+        tid: u32,
+        blocked: carrick_signal_core::policy::SigBlockMask,
+    ) -> Result<(), i32>;
+
     fn rt_sigaction(
         &mut self,
         signum: i32,
@@ -315,6 +321,21 @@ pub trait SignalNative<'a>: crate::lifecycle::UserCopy {
         0
     }
     fn restore_signal_frame(&mut self) -> Result<u64, i32>;
+    fn force_sigsegv(&mut self) -> bool {
+        let tid = self.current_tid();
+        let blocked = self.current_blocked();
+        let forced = self
+            .process_signals()
+            .is_some_and(|p| p.force_sigsegv(tid, blocked).is_ok());
+        if forced {
+            self.set_current_blocked(carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                blocked
+                    .signals()
+                    .without(carrick_signal_core::policy::Signal::SEGV),
+            ));
+        }
+        forced
+    }
 }
 
 pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<SignalOutcome> {
@@ -468,10 +489,7 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                     );
                     Some(SignalOutcome::Restored)
                 }
-                Err(err) => returned(
-                    carrick_syscall_abi::LinuxErrno::new(err).guest_retval(),
-                    false,
-                ),
+                Err(_) => native.force_sigsegv().then_some(SignalOutcome::Restored),
             }
         }
         SignalCall::Kill => {

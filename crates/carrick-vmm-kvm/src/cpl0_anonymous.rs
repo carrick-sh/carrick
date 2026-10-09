@@ -603,7 +603,11 @@ impl Cpl0HostCustody {
         let status = record
             .status_for(execution.binding)
             .ok_or_else(|| fail("native root exit execution/status"))?;
-        Ok(GuestExitStatus::from_linux_code(status.raw() >> 8))
+        Ok(GuestExitStatus::from_linux_code(
+            status
+                .term_signal()
+                .map_or(status.raw() >> 8, |signal| 128 + i32::from(signal)),
+        ))
     }
 
     pub(super) fn service_fork_stock(
