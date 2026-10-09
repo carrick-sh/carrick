@@ -674,6 +674,13 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
             .values()
             .find(|row| row.metadata.namespace_pid == pid && row.lifecycle() == TaskLifecycle::Live)
     }
+    pub fn find_task_by_thread(&self, container: C, tid: u32) -> Option<&GuestTask<C, U, N>> {
+        self.registry.tasks.values().find(|row| {
+            row.metadata.container == container
+                && row.lifecycle() == TaskLifecycle::Live
+                && row.has_thread(tid)
+        })
+    }
     pub fn find_task_by_pid_mut(&mut self, pid: u32) -> Option<&mut GuestTask<C, U, N>> {
         self.registry
             .tasks
