@@ -12,7 +12,9 @@ pub mod nr {
     use super::CanonicalNr;
 
     pub const EXIT_GROUP: CanonicalNr = CanonicalNr(94);
+    pub const WAITID: CanonicalNr = CanonicalNr(95);
     pub const WAIT4: CanonicalNr = CanonicalNr(260);
+    pub const CLONE3: CanonicalNr = CanonicalNr(435);
 }
 
 /// A CANONICAL syscall number — the asm-generic/aarch64 numbering every guest

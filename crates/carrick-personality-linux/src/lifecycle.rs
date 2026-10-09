@@ -37,6 +37,8 @@ pub enum LifecycleCall {
     Clone,
     Fork,
     Wait4,
+    WaitId,
+    Clone3,
     ExitGroup,
 }
 
