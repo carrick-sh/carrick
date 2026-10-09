@@ -100,6 +100,8 @@ pub const EL1_STACKS_BASE: u64 = EL1_REGION_BASE + EL1_STACKS_OFFSET;
 
 /// Size of each vCPU's EL1 kernel stack: 16 KiB.
 pub const EL1_STACK_SIZE: u64 = 0x4000;
+/// The first 4 KiB of every EL1 stack slot has no stage-1 translation.
+pub const EL1_STACK_GUARD_SIZE: u64 = 0x1000;
 
 /// Number of vCPU stack slots supported in the stack arena (matches mailbox slots).
 pub const EL1_STACK_SLOTS: u64 = 256;
@@ -159,6 +161,11 @@ pub const AARCH64_STAGE1_TABLES_ALIAS_BASE: u64 =
 /// publication must reject every descriptor outside this primary arena.
 pub const AARCH64_STAGE1_TABLES_PRIMARY_SIZE: u64 =
     carrick_mmu_core::aarch64::owner_fork::STAGE1_TABLES_PRIMARY_SIZE;
+/// The carrier FD control backing occupies the last free aligned window before
+/// the EL1 maintenance trampoline.
+pub const AARCH64_FD_CEILING_CONTROL_BASE: u64 =
+    AARCH64_STAGE1_TABLES_ALIAS_BASE + AARCH64_STAGE1_TABLES_PRIMARY_SIZE;
+pub const AARCH64_FD_CEILING_CONTROL_SIZE: u64 = 0x4000;
 
 /// Guest-physical base of the carrier's dense pool of 2 MiB stage-1 table
 /// arenas: every MM's primary arena (its root slot) and every extension arena
@@ -605,6 +612,9 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         EL1_SERVICE_COPY_SIZE,
         EL1_CARRIER_MAINT_ROOT_BASE,
         EL1_CARRIER_MAINT_ROOT_SIZE,
+        AARCH64_STAGE1_TABLES_PRIMARY_SIZE,
+        AARCH64_FD_CEILING_CONTROL_BASE,
+        AARCH64_FD_CEILING_CONTROL_SIZE,
         EL1_RESERVATIONS_OFFSET,
         EL1_RESERVATIONS_END,
         RESERVATION_PROTOCOL_VERSION,
@@ -628,6 +638,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         ReservationNodeFlags::ATTRIBUTES.bits() as u64,
         EL1_STACKS_OFFSET,
         EL1_STACK_SIZE,
+        EL1_STACK_GUARD_SIZE,
         EL1_CURRENT_TASKS_OFFSET,
         EL1_METADATA_MAILBOX_OFFSET,
         EL1_FRAME_GRANT_MAILBOX_OFFSET,
@@ -3936,9 +3947,9 @@ const _: () = {
     );
 };
 #[cfg(target_arch = "aarch64")]
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0xc109_9eb6_2f22_9cc4);
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0xa27e_c1a8_9c85_4cd7);
 #[cfg(not(target_arch = "aarch64"))]
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x4c32_dfa3_5da9_7580);
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0xf9e1_467b_7ce8_27db);
 
 #[cfg(test)]
 mod tests {
