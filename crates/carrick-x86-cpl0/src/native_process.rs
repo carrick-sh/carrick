@@ -36,6 +36,9 @@ static RETIRED: SpinLock<Vec<Mm>> = SpinLock::new(Vec::new());
 pub(super) fn runtime() -> &'static Runtime {
     RUNTIME.lock().as_ref().copied().unwrap_or_else(|| fatal())
 }
+pub(super) fn runtime_opt() -> Option<&'static Runtime> {
+    RUNTIME.lock().as_ref().copied()
+}
 pub(super) fn admit_root(
     words: ParkedContextWords,
     source: BornInZoneSource<'static, ParkedContextWords>,
