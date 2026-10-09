@@ -535,6 +535,220 @@ impl TaskCredentials {
                 .insert(self.cap_permitted & LinuxCapabilitySet::FS_MASK);
         }
     }
+
+    #[inline(never)]
+    pub fn set_resuid(
+        &mut self,
+        r: Option<u32>,
+        e: Option<u32>,
+        s: Option<u32>,
+    ) -> Result<(), i64> {
+        let cur_r = self.ruid.raw();
+        let cur_e = self.euid.raw();
+        let cur_s = self.suid.raw();
+        if !self.is_privileged() {
+            if r.is_some_and(|rv| rv != cur_r && rv != cur_e && rv != cur_s) {
+                return Err(-1);
+            }
+            if e.is_some_and(|ev| ev != cur_r && ev != cur_e && ev != cur_s) {
+                return Err(-1);
+            }
+            if s.is_some_and(|sv| sv != cur_r && sv != cur_e && sv != cur_s) {
+                return Err(-1);
+            }
+        }
+        let prev_r = self.ruid;
+        let prev_e = self.euid;
+        let prev_s = self.suid;
+        let prev_f = self.fsuid;
+        if let Some(rv) = r {
+            self.ruid = TaskUid::new(rv);
+        }
+        if let Some(ev) = e {
+            self.euid = TaskUid::new(ev);
+            self.fsuid = self.euid;
+        }
+        if let Some(sv) = s {
+            self.suid = TaskUid::new(sv);
+        }
+        self.on_uid_change(prev_r, prev_e, prev_s, prev_f);
+        Ok(())
+    }
+
+    #[inline(never)]
+    pub fn set_resgid(
+        &mut self,
+        r: Option<u32>,
+        e: Option<u32>,
+        s: Option<u32>,
+    ) -> Result<(), i64> {
+        let cur_r = self.rgid.raw();
+        let cur_e = self.egid.raw();
+        let cur_s = self.sgid.raw();
+        if !self.is_gid_privileged() {
+            if r.is_some_and(|rv| rv != cur_r && rv != cur_e && rv != cur_s) {
+                return Err(-1);
+            }
+            if e.is_some_and(|ev| ev != cur_r && ev != cur_e && ev != cur_s) {
+                return Err(-1);
+            }
+            if s.is_some_and(|sv| sv != cur_r && sv != cur_e && sv != cur_s) {
+                return Err(-1);
+            }
+        }
+        if let Some(rv) = r {
+            self.rgid = TaskGid::new(rv);
+        }
+        if let Some(ev) = e {
+            self.egid = TaskGid::new(ev);
+            self.fsgid = self.egid;
+        }
+        if let Some(sv) = s {
+            self.sgid = TaskGid::new(sv);
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    pub fn set_reuid(&mut self, r: Option<u32>, e: Option<u32>) -> Result<(), i64> {
+        let cur_r = self.ruid.raw();
+        let cur_e = self.euid.raw();
+        let cur_s = self.suid.raw();
+        if !self.is_privileged() {
+            if r.is_some_and(|rv| rv != cur_r && rv != cur_e) {
+                return Err(-1);
+            }
+            if e.is_some_and(|ev| ev != cur_r && ev != cur_e && ev != cur_s) {
+                return Err(-1);
+            }
+        }
+        let set_saved = r.is_some() || (e.is_some() && e != Some(cur_r));
+        let prev_r = self.ruid;
+        let prev_e = self.euid;
+        let prev_s = self.suid;
+        let prev_f = self.fsuid;
+        if let Some(rv) = r {
+            self.ruid = TaskUid::new(rv);
+        }
+        if let Some(ev) = e {
+            self.euid = TaskUid::new(ev);
+            self.fsuid = self.euid;
+        }
+        if set_saved {
+            self.suid = self.euid;
+        }
+        self.on_uid_change(prev_r, prev_e, prev_s, prev_f);
+        Ok(())
+    }
+
+    #[inline(never)]
+    pub fn set_regid(&mut self, r: Option<u32>, e: Option<u32>) -> Result<(), i64> {
+        let cur_r = self.rgid.raw();
+        let cur_e = self.egid.raw();
+        let cur_s = self.sgid.raw();
+        if !self.is_gid_privileged() {
+            if r.is_some_and(|rv| rv != cur_r && rv != cur_e) {
+                return Err(-1);
+            }
+            if e.is_some_and(|ev| ev != cur_r && ev != cur_e && ev != cur_s) {
+                return Err(-1);
+            }
+        }
+        let set_saved = r.is_some() || (e.is_some() && e != Some(cur_r));
+        if let Some(rv) = r {
+            self.rgid = TaskGid::new(rv);
+        }
+        if let Some(ev) = e {
+            self.egid = TaskGid::new(ev);
+            self.fsgid = self.egid;
+        }
+        if set_saved {
+            self.sgid = self.egid;
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    pub fn set_uid(&mut self, uid: u32) -> Result<(), i64> {
+        if uid == u32::MAX {
+            return Err(-22);
+        }
+        let target = TaskUid::new(uid);
+        let prev_r = self.ruid;
+        let prev_e = self.euid;
+        let prev_s = self.suid;
+        let prev_f = self.fsuid;
+        if self.is_privileged() {
+            self.ruid = target;
+            self.euid = target;
+            self.suid = target;
+            self.fsuid = target;
+            self.on_uid_change(prev_r, prev_e, prev_s, prev_f);
+        } else if uid == self.ruid.raw() || uid == self.suid.raw() {
+            self.euid = target;
+            self.fsuid = target;
+            self.on_uid_change(prev_r, prev_e, prev_s, prev_f);
+        } else {
+            return Err(-1);
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    pub fn set_gid(&mut self, gid: u32) -> Result<(), i64> {
+        if gid == u32::MAX {
+            return Err(-22);
+        }
+        let target = TaskGid::new(gid);
+        if self.is_gid_privileged() {
+            self.rgid = target;
+            self.egid = target;
+            self.sgid = target;
+            self.fsgid = target;
+        } else if gid == self.rgid.raw() || gid == self.sgid.raw() {
+            self.egid = target;
+            self.fsgid = target;
+        } else {
+            return Err(-1);
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    pub fn set_fsuid(&mut self, fsuid: u32) -> u32 {
+        let prev = self.fsuid.raw();
+        if fsuid == u32::MAX {
+            return prev;
+        }
+        if self.is_privileged()
+            || fsuid == self.ruid.raw()
+            || fsuid == self.euid.raw()
+            || fsuid == self.suid.raw()
+            || fsuid == prev
+        {
+            let prev_uid = self.fsuid;
+            self.fsuid = TaskUid::new(fsuid);
+            self.on_fsuid_change(prev_uid);
+        }
+        prev
+    }
+
+    #[inline(never)]
+    pub fn set_fsgid(&mut self, fsgid: u32) -> u32 {
+        let prev = self.fsgid.raw();
+        if fsgid == u32::MAX {
+            return prev;
+        }
+        if self.is_gid_privileged()
+            || fsgid == self.rgid.raw()
+            || fsgid == self.egid.raw()
+            || fsgid == self.sgid.raw()
+            || fsgid == prev
+        {
+            self.fsgid = TaskGid::new(fsgid);
+        }
+        prev
+    }
 }
 
 /// Linux resource limit specification.

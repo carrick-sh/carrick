@@ -266,6 +266,7 @@ pub trait SysinfoNative<'a>: UserCopy {
     fn process_sysinfo(&mut self) -> Option<&mut dyn ProcessSysinfoVenue>;
 }
 
+#[inline(never)]
 pub fn invoke<'a>(call: SysinfoCall, native: &mut dyn SysinfoNative<'a>) -> Option<SyscallResult> {
     let args = native.arguments();
     match call {
