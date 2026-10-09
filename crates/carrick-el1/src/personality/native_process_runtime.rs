@@ -122,6 +122,9 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     fn prepared_mm(&self, prepared: &Self::PreparedMm) -> Self::Mm;
     fn prepared_context(&self, prepared: &Self::PreparedMm) -> AddressContext<RootGpa>;
     fn fork_child_context(&self, parent: C, prepared: &Self::PreparedMm) -> C;
+    fn fork_child_context_boxed(&self, parent: C, prepared: &Self::PreparedMm) -> Box<C> {
+        Box::new(self.fork_child_context(parent, prepared))
+    }
     fn child_lifecycle(&self, prepared: &Self::PreparedMm) -> NativeLifecycleResources<'a>;
     fn commit_mm(
         &mut self,
@@ -961,7 +964,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         source: BornInZoneSource<'a, C>,
         current: &'a CurrentTask,
         address: AddressContext<RootGpa>,
-        words: C,
+        words: Box<C>,
         service: &'r mut S,
     ) -> Result<Box<NativeProcessEntry<'r, 'a, M, C, S>>, NativeProcessError> {
         if !core::ptr::eq(source.zone, self.zone) {
@@ -1007,7 +1010,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             if resources.record != source.zone.record_ref(record) {
                 return Err(NativeProcessError::Stale);
             }
-            *row.context_mut() = words;
+            *row.context_mut() = *words;
         }
         drop(graph);
         Ok(Box::new(NativeProcessEntry {
@@ -1016,7 +1019,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             binding,
             key: member.process,
             caller_address: address,
-            words,
+            words: *words,
             service,
             handoff: None,
             root_exit: None,
@@ -1929,10 +1932,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             };
             return Err(error);
         }
-        let child_words = self.service.fork_child_context(self.words, &prepared);
+        let child_words = self.service.fork_child_context_boxed(self.words, &prepared);
         // SAFETY: this exact newly allocated record remains Free and unpublished.
         unsafe {
-            *self.source.zone.record(record).ctx_mut() = child_words;
+            *self.source.zone.record(record).ctx_mut() = *child_words;
             // The parent still owns its running record. Publish the exact
             // admitted image before either record can be scheduled again.
             let parent_record = self
@@ -1964,7 +1967,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             usage: TaskRusage::default(),
             file_table: child_file_table,
         };
-        let mut child = Box::new(GuestTask::new(
+        let mut child = Box::new(GuestTask::new_with_boxed_context(
             GuestTaskMetadata {
                 key: child_key,
                 container: parent_container,
@@ -3426,7 +3429,7 @@ mod tests {
                 source,
                 &thread,
                 address,
-                words(address),
+                Box::new(words(address)),
                 &mut service,
             )
             .unwrap();

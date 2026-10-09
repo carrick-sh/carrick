@@ -6,6 +6,7 @@
 //! Cancellation and signal snapshots occur after the enclosing guard is dropped.
 //! This adapter returns custody, never syscall completion or a CPU/MM operation.
 extern crate alloc;
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -81,7 +82,7 @@ pub struct GuestTask<C, U, N: NativeProcessCustody> {
     relations: ProcessRelations,
     revision: TaskRevision,
     exiting: AtomicBool,
-    context: N::Context,
+    context: Box<N::Context>,
     native: N,
     claim: N::Claim,
     tracer: Option<TaskKey>,
@@ -207,6 +208,15 @@ impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
         metadata: GuestTaskMetadata<C, U>,
         parent: Option<TaskKey>,
         context: N::Context,
+        native: N,
+        claim: N::Claim,
+    ) -> Self {
+        Self::new_with_boxed_context(metadata, parent, Box::new(context), native, claim)
+    }
+    pub fn new_with_boxed_context(
+        metadata: GuestTaskMetadata<C, U>,
+        parent: Option<TaskKey>,
+        context: Box<N::Context>,
         native: N,
         claim: N::Claim,
     ) -> Self {
@@ -457,7 +467,7 @@ impl<C, U, Claim> ExitZombiePublication for GuestZombie<C, U, Claim> {
 /// only the numeric claim survives in the shared zombie record.
 pub struct GuestRetiring<N: NativeProcessCustody> {
     identity: WaitIdentity,
-    pub context: N::Context,
+    pub context: Box<N::Context>,
     pub native: N,
 }
 impl<N: NativeProcessCustody> WaitIdentitySource for GuestRetiring<N> {
