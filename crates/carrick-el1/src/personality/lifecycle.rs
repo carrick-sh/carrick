@@ -58,6 +58,12 @@ impl<
         if let Some(user) = &mut self.lifecycle_user {
             return user.copy_out(dst.raw(), src);
         }
+        if let Some(result) = self
+            .process_venue()
+            .and_then(|venue| venue.copy_out_owned(dst, src))
+        {
+            return result;
+        }
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return false;
         };
