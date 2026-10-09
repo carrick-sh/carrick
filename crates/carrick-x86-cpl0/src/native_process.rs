@@ -1,7 +1,7 @@
 // Machine custody for the sole shared native process owner. Physical OUTs
 // happen after guest MM editors and process admission guards are released.
 use super::{InitialWords, anonymous};
-use crate::rust_alloc::{boxed::Box, vec::Vec};
+use crate::rust_alloc::{boxed::Box, sync::Arc, vec::Vec};
 use carrick_core::mm::fork::{ForkCensus, ForkScratch, census_table};
 use carrick_core::mm::transaction::{MmPortal, OwnerVenue, SelectionVenues, TransferStep};
 use carrick_el1::lock::SpinLock;
@@ -11,8 +11,8 @@ use carrick_el1::memory::reservations::{
 use carrick_el1::personality::mm_portal::production::GuestMetadataPin;
 use carrick_el1::personality::mm_portal::{LinuxForkPolicy, NativeForkPortal, UnpublishedEl1Child};
 use carrick_el1::personality::native_process_runtime::{
-    NativeForkPreparation, NativeLifecycleResources, NativeProcessError, NativeProcessRuntime,
-    NativeProcessService,
+    NativeForkPreparation, NativeLifecycleResources, NativeProcessError, NativeProcessRegistry,
+    NativeProcessRuntime, NativeProcessService,
 };
 use carrick_el1_abi::{
     BornInZoneSource, CurrentTask, KernelFaultVenues, Lifecycle, MmPortalSlots, PortalForkCustody,
@@ -30,27 +30,44 @@ use core::{marker::PhantomData, num::NonZeroU64, sync::atomic::Ordering};
 
 pub(super) type Mm = AddressContext<RootGpa>;
 type Runtime = NativeProcessRuntime<'static, Mm, ParkedContextWords>;
-static RUNTIME: SpinLock<Option<&'static Runtime>> = SpinLock::new(None);
+static REGISTRY: NativeProcessRegistry<'static, Mm, ParkedContextWords> =
+    NativeProcessRegistry::new();
 static RETIRED: SpinLock<Vec<Mm>> = SpinLock::new(Vec::new());
 
-pub(super) fn runtime() -> &'static Runtime {
-    RUNTIME.lock().as_ref().copied().unwrap_or_else(|| fatal())
+pub(super) fn registry() -> &'static NativeProcessRegistry<'static, Mm, ParkedContextWords> {
+    &REGISTRY
+}
+pub(super) fn runtime(
+    source: BornInZoneSource<'static, ParkedContextWords>,
+    task: &'static CurrentTask,
+) -> Result<(Arc<Runtime>, Mm), NativeProcessError> {
+    let root = carrick_el1::isa::x86::hardware_live_root().map_err(|_| NativeProcessError::Stale)?;
+    let mm = MmGeneration::new(
+        NonZeroU64::new(task.mm.key.load(Ordering::Acquire)).ok_or(NativeProcessError::Stale)?,
+    );
+    let address = anonymous::live_context(mm, root).ok_or(NativeProcessError::Stale)?;
+    Ok((REGISTRY.for_entry(source, task, address)?, address))
+}
+pub(super) fn runtime_for_record(
+    zone: &ZoneTables<ParkedContextWords>,
+    record: carrick_sched_core::RecordRef,
+) -> Arc<Runtime> {
+    REGISTRY.for_record(zone, record).unwrap_or_else(|| fatal())
 }
 pub(super) fn admit_root(
     words: ParkedContextWords,
     source: BornInZoneSource<'static, ParkedContextWords>,
     task: &'static CurrentTask,
 ) -> Result<(), NativeProcessError> {
-    let mut retained = RUNTIME.lock();
-    if retained.is_some() {
-        return Ok(());
-    }
     let root =
         carrick_el1::isa::x86::hardware_live_root().map_err(|_| NativeProcessError::Stale)?;
     let mm = MmGeneration::new(
         NonZeroU64::new(task.mm.key.load(Ordering::Acquire)).ok_or(NativeProcessError::Stale)?,
     );
     let address = anonymous::live_context(mm, root).ok_or(NativeProcessError::Stale)?;
+    if REGISTRY.for_entry(source, task, address).is_ok() {
+        return Ok(());
+    }
     // SAFETY: the authenticated admitted root's boot metadata is retained
     // throughout the native lane; the shared constructor rechecks both pointers.
     let (page, control) = unsafe {
@@ -59,6 +76,10 @@ pub(super) fn admit_root(
             &*(task.metadata.control_slot.load(Ordering::Acquire) as *const ThreadControlSlot),
         )
     };
+    if control.entry().is_some() {
+        REGISTRY.register_thread(source, task, address, page, control)?;
+        return Ok(());
+    }
     // The stopped-host x86 bootstrap retains a temporary extra leader count.
     // This fresh launch adapter owns that census; the shared owner never
     // normalizes arbitrary live membership supplied by another execution lane.
@@ -72,7 +93,7 @@ pub(super) fn admit_root(
     let owner = NativeProcessRuntime::admit_fresh_root::<X86Mmu>(
         source, task, page, control, address, address, words,
     )?;
-    *retained = Some(Box::leak(Box::new(owner)));
+    REGISTRY.register_root(Arc::new(owner), source, task, address)?;
     let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
     carrick_el1::personality::file_table::admit_stdio(
         super::fd_map(),
@@ -137,13 +158,14 @@ fn portal() -> Result<Portal, NativeProcessError> {
     let layout = carrick_el1::isa::x86_kernel_layout();
     // SAFETY: the boot owner retains the one compact native portal region.
     let slots = unsafe { &*(layout.portal.raw() as *const MmPortalSlots) };
+    let zone = super::native_execution::source(carrick_guest_arch::SlotId::new(0)).zone;
     Ok(Portal {
         backend: PhantomData,
         carrier: slots.carrier().ok_or(NativeProcessError::Stale)?,
         roots: shared_x86_cpl0_guest(),
-        spaces: &runtime().zone().spaces,
+        spaces: &zone.spaces,
         nodes: None,
-        zone: Some(runtime().zone()),
+        zone: Some(zone),
     })
 }
 fn error(_: impl core::fmt::Debug) -> NativeProcessError {
