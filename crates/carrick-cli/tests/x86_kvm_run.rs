@@ -416,6 +416,67 @@ fn mounted_static_x86_poll_empty_stdin_matches_native() {
     assert_eq!(run_poll_with_open_empty_stdin(command), native);
 }
 
+#[test]
+fn mounted_static_x86_blocking_poll_wakes_once_on_stdin_data() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("poll-blocking-stdin");
+    compile_assembly("x86_poll_blocking_stdin.S", &elf);
+    let native = run_with_empty_stdin_then_write(std::process::Command::new(&elf));
+    assert_eq!(native, (b"R\nP\n".to_vec(), Some(7)));
+    let command = mounted_poll_command(dir.path(), &elf);
+    assert_eq!(run_with_empty_stdin_then_write(command), native);
+}
+
+#[test]
+fn mounted_static_x86_poll_timeout_returns_zero() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("poll-timeout");
+    compile_assembly("x86_poll_timeout.S", &elf);
+    let native = run_poll_with_open_empty_stdin(std::process::Command::new(&elf));
+    assert_eq!(native, (b"T\n".to_vec(), Some(7)));
+    let command = mounted_poll_command(dir.path(), &elf);
+    assert_eq!(run_poll_with_open_empty_stdin(command), native);
+}
+
+fn mounted_poll_command(dir: &std::path::Path, elf: &std::path::Path) -> std::process::Command {
+    let archive = dir.join("image.tar");
+    std::fs::write(&archive, empty_image_archive()).unwrap();
+    let cli = assert_cmd::cargo::cargo_bin("carrick");
+    let home = dir.join("home");
+    let load = Command::new(&cli)
+        .timeout(Duration::from_secs(5))
+        .env("CARRICK_HOME", &home)
+        .args(["load", "--input", archive.to_str().unwrap()])
+        .output()
+        .expect("load local image");
+    assert!(
+        load.status.success(),
+        "{}",
+        String::from_utf8_lossy(&load.stderr)
+    );
+    let mut command = std::process::Command::new(&cli);
+    command
+        .env("CARRICK_HOME", &home)
+        .env("CARRICK_RUN_ID", "x86-kvm-poll-wait-test")
+        .args([
+            "run",
+            "--platform",
+            "linux/amd64",
+            "--pull",
+            "never",
+            "--volume",
+            &format!("{}:/hello:ro", elf.display()),
+            "x86-kvm-hello:latest",
+        ]);
+    command
+}
+
 struct ReapChild(Child);
 
 impl std::ops::Deref for ReapChild {
