@@ -914,3 +914,16 @@ transaction, live-descriptor or inventory authentication.
 This changes no population or work budget: one frame initialization,
 descriptor edit and publication per initial page. A forked signal wait found
 the defect when a COW write correctly refused an unowned source descriptor.
+
+### Owned in-ring signal waits
+
+`signal_wait_owns_context_and_shared_deadline` checks that a finite signal
+wait retains its saved context, releases its executor and completes only
+when the shared timer reaches its deadline. The mounted native/KVM
+`sigsuspend` and `sigtimedwait` witnesses retain three fork/reap iterations;
+they must not be shortened to hide fork-stock exhaustion. Their second fork
+currently depends on the separately owned shared child-MM retirement work.
+The signal-free `x86_fork_stock_reuse.S` reduction records this dependency.
+
+The current single-owner timer still refuses a concurrent finite wait on
+that slot; this is unfinished admission work, not Linux timeout semantics.

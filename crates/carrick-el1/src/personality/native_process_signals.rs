@@ -157,51 +157,84 @@ impl<T> NativeProcessSignals<T> {
             .map_or(SignalSet::EMPTY, |(_, p)| p.present());
         proc.union(thread)
     }
+    pub fn has_deliverable(&self, tid: u32, blocked: SigBlockMask) -> bool {
+        let resources = self.resources.lock();
+        let thread = resources
+            .thread_pending
+            .iter()
+            .find(|(id, _)| *id == tid)
+            .map_or(SignalSet::EMPTY, |(_, pending)| pending.present());
+        let mut selected = blocked.select(resources.inbox.pending().present().union(thread));
+        while let Some(number) = selected.lowest() {
+            let Some(signal) = Signal::from_number(number) else {
+                return false;
+            };
+            let action = resources.actions.action(signal);
+            let ignored = action.disposition == Disposition::Ignore
+                || (action.disposition == Disposition::Default
+                    && carrick_signal_core::policy::default_delivery(signal)
+                        == carrick_signal_core::policy::Delivery::Ignore);
+            if !ignored {
+                return true;
+            }
+            selected = selected.without(signal);
+        }
+        resources.forced_segv.contains(&tid)
+    }
     pub fn take_deliverable(
         &self,
         tid: u32,
         blocked: SigBlockMask,
     ) -> Option<(Signal, Option<T>, Action)> {
-        let mut resources = self.resources.lock();
-        let idx = resources.thread_pending.iter().position(|(t, _)| *t == tid);
-        let mut thread_pending = idx
-            .map(|i| resources.thread_pending.remove(i).1)
-            .unwrap_or_default();
-        let forced = resources.forced_segv.contains(&tid);
-        let delivery = {
-            let proc_pending = resources.inbox.pending_mut();
-            let present = proc_pending.present().union(thread_pending.present());
-            let unblocked = if present
-                .intersect(SignalSet::EMPTY.with(Signal::KILL))
-                .bits()
-                != 0
-            {
-                SignalSet::EMPTY.with(Signal::KILL)
-            } else if forced {
-                SignalSet::EMPTY.with(Signal::SEGV)
-            } else {
-                blocked.select(present)
+        loop {
+            let mut resources = self.resources.lock();
+            let idx = resources.thread_pending.iter().position(|(t, _)| *t == tid);
+            let mut thread_pending = idx
+                .map(|i| resources.thread_pending.remove(i).1)
+                .unwrap_or_default();
+            let forced = resources.forced_segv.contains(&tid);
+            let delivery = {
+                let proc_pending = resources.inbox.pending_mut();
+                let present = proc_pending.present().union(thread_pending.present());
+                let unblocked = if present
+                    .intersect(SignalSet::EMPTY.with(Signal::KILL))
+                    .bits()
+                    != 0
+                {
+                    SignalSet::EMPTY.with(Signal::KILL)
+                } else if forced {
+                    SignalSet::EMPTY.with(Signal::SEGV)
+                } else {
+                    blocked.select(present)
+                };
+                carrick_personality_linux::signal::take_pending(
+                    &mut thread_pending,
+                    proc_pending,
+                    unblocked,
+                )
             };
-            carrick_personality_linux::signal::take_pending(
-                &mut thread_pending,
-                proc_pending,
-                unblocked,
-            )
-        };
-        if !thread_pending.is_empty() {
-            resources.thread_pending.push((tid, thread_pending));
+            if !thread_pending.is_empty() {
+                resources.thread_pending.push((tid, thread_pending));
+            }
+            let delivery = delivery?;
+            let signal = delivery.entry.signal;
+            if signal == Signal::SEGV {
+                resources.forced_segv.retain(|id| *id != tid);
+            }
+            let action = resources.actions.action(signal);
+            if action.disposition == Disposition::Ignore
+                || (action.disposition == Disposition::Default
+                    && carrick_signal_core::policy::default_delivery(signal)
+                        == carrick_signal_core::policy::Delivery::Ignore)
+            {
+                continue;
+            }
+            resources.actions.prepare_delivery(
+                signal,
+                &mut carrick_signal_core::policy::MaskState::new(blocked),
+            );
+            return Some((signal, delivery.entry.info, action));
         }
-        let delivery = delivery?;
-        let signal = delivery.entry.signal;
-        if signal == Signal::SEGV {
-            resources.forced_segv.retain(|id| *id != tid);
-        }
-        let action = resources.actions.action(signal);
-        resources.actions.prepare_delivery(
-            signal,
-            &mut carrick_signal_core::policy::MaskState::new(blocked),
-        );
-        Some((signal, delivery.entry.info, action))
     }
     pub fn take_timedwait(&self, tid: u32, set: SignalSet) -> Option<(Signal, Option<T>)> {
         let mut resources = self.resources.lock();

@@ -594,6 +594,36 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
 
     fn retire_mm(&mut self, _mm: Self::Mm) {}
 
+    fn copy_signal_bytes(
+        &mut self,
+        mm: &Self::Mm,
+        address: UserVa,
+        bytes: &[u8],
+    ) -> Result<(), NativeProcessError> {
+        if self.task.mm.key.load(Ordering::Acquire) != mm.mm.raw().get() {
+            return Err(NativeProcessError::Stale);
+        }
+        let mut copy = crate::file::ValidatedCopy {
+            task: self.task,
+            validator: &crate::file::HardwareValidator,
+        };
+        if !carrick_personality_linux::lifecycle::UserCopy::copy_out(&mut copy, address, bytes) {
+            return Err(NativeProcessError::Fault);
+        }
+        Ok(())
+    }
+    fn copy_siginfo(
+        &mut self,
+        mm: &Self::Mm,
+        address: UserVa,
+        info: &carrick_abi::LinuxSiginfo,
+    ) -> Result<(), NativeProcessError> {
+        // SAFETY: this canonical initialized ABI record owns all wire bytes.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(info as *const _ as *const u8, core::mem::size_of_val(info))
+        };
+        self.copy_signal_bytes(mm, address, bytes)
+    }
     fn wake_effects(&mut self, effects: WakeEffects) {
         deliver_wakes(effects);
     }
