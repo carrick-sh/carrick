@@ -707,22 +707,29 @@ fn request_has_live_vm(
     generation.is_some() && custody.live_generation() == generation
 }
 
+/// Return quarantined child stock whose MM no zone slot has installed.
+/// `zone` is the carrier's occupancy authority; without one, waiting
+/// quarantine cannot be proven idle and the drain fails with a typed
+/// [`ForkStockServiceError::OccupancyUnavailable`] instead of skipping.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn drain_fork_quarantine(
+pub(crate) fn drain_fork_quarantine(
     custody: &crate::trap::CarrierVmCustody,
     execution: crate::fork_stock::GrantExecution,
-) -> Result<(), TrapError> {
+    zone: Option<&carrick_el1_abi::ZoneTables>,
+) -> Result<(), crate::fork_stock::ForkStockServiceError> {
+    use crate::fork_stock::ForkStockServiceError;
+    let mut fork_stock = custody.fork_stock.lock();
+    if !fork_stock.stock().has_quarantine() {
+        return Ok(());
+    }
+    let zone = zone.ok_or(ForkStockServiceError::OccupancyUnavailable)?;
+    let active_mm = carrick_el1_abi::ReservationMm::new(execution.binding.mm.raw())
+        .ok_or(ForkStockServiceError::StaleExecution)?;
     let safe_to_reclaim = |mm: carrick_el1_abi::ReservationMm| {
-        let Some(zone) = carrick_el1_abi::zone_tables() else {
-            return false;
-        };
         (0..carrick_el1_abi::EL1_STACK_SLOTS as usize).all(|index| {
             carrick_guest_arch::SlotId::from_index(index)
                 .is_some_and(|slot| zone.installed_space(slot) != mm.raw())
         })
-    };
-    let Some(active_mm) = carrick_el1_abi::ReservationMm::new(execution.binding.mm.raw()) else {
-        return Ok(());
     };
     let clear_tables = |pages: &[carrick_guest_arch::RootGpa]| {
         pages.iter().all(|page| {
@@ -738,21 +745,14 @@ fn drain_fork_quarantine(
             true
         })
     };
-    custody
-        .fork_stock
-        .lock()
+    fork_stock
         .reclaim_retired(
             &mut custody.el1_frame_grants.lock(),
             active_mm,
             safe_to_reclaim,
             clear_tables,
         )
-        .map_err(|error| {
-            TrapError::Hypervisor(format!(
-                "retired fork stock could not be reclaimed: {error:?}"
-            ))
-        })?;
-    Ok(())
+        .map(|_| ())
 }
 
 /// Reserve carrier-owned metadata extents before any EL1 process can request
@@ -1007,10 +1007,6 @@ pub(crate) fn service_metadata_operation(
             return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
         }
 
-        if let Some(execution) = execution {
-            drain_fork_quarantine(custody, execution)?;
-        }
-
         match ForkStockKind::decode(tag) {
             Some(ForkStockKind::Loan) => {
                 let exchange = unsafe { &mut *record_ptr.cast::<ForkStockExchange>() };
@@ -1018,6 +1014,20 @@ pub(crate) fn service_metadata_operation(
                     exchange.refuse(ForkStockRefusal::Stale);
                     return Ok([METADATA_GRANT_ERR_DENIED, exchange.response[0], 0, 0]);
                 };
+                // Reclaim before loaning. Missing occupancy authority is a
+                // typed inventory refusal; a failed clear is fatal custody.
+                match drain_fork_quarantine(custody, execution, carrick_el1_abi::zone_tables()) {
+                    Ok(()) => {}
+                    Err(crate::fork_stock::ForkStockServiceError::OccupancyUnavailable) => {
+                        exchange.refuse(ForkStockRefusal::Inventory);
+                        return Ok([METADATA_GRANT_ERR_DENIED, exchange.response[0], 0, 0]);
+                    }
+                    Err(error) => {
+                        return Err(TrapError::Hypervisor(format!(
+                            "retired fork stock could not be reclaimed: {error:?}"
+                        )));
+                    }
+                }
                 let mut fork_stock = custody.fork_stock.lock();
                 let mut ledger = custody.el1_frame_grants.lock();
                 match fork_stock.service_loan(&mut ledger, execution, exchange) {
@@ -1081,7 +1091,8 @@ pub(crate) fn service_metadata_operation(
                             | crate::fork_stock::ForkStockServiceError::ExposedDirtyTable
                             | crate::fork_stock::ForkStockServiceError::InvalidRecord
                             | crate::fork_stock::ForkStockServiceError::MemoryAccessFailed
-                            | crate::fork_stock::ForkStockServiceError::Asid(_) => {
+                            | crate::fork_stock::ForkStockServiceError::Asid(_)
+                            | crate::fork_stock::ForkStockServiceError::OccupancyUnavailable => {
                                 ForkStockRefusal::Invalid
                             }
                         };

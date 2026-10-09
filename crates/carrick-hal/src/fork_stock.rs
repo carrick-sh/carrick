@@ -65,6 +65,9 @@ pub enum ForkStockServiceError {
     InvalidRecord,
     MemoryAccessFailed,
     Asid(AsidError),
+    /// Quarantined stock is waiting, but the carrier holds no zone
+    /// occupancy authority to prove its MM runs nowhere.
+    OccupancyUnavailable,
 }
 
 /// Per-child address-space tag. AArch64 tags every forked root with a
@@ -405,6 +408,11 @@ impl<T: ChildAddressTags> ForkStock<T> {
 
     pub fn child_lifecycle(&self, mm: ReservationMm) -> Option<ForkLifecycleLoan> {
         Some(self.children.get(&MmKey::of(mm)?)?.lifecycle)
+    }
+
+    /// True when some retired child is waiting for reclaim.
+    pub fn has_quarantine(&self) -> bool {
+        !self.quarantine.is_empty()
     }
 
     pub fn is_quarantined(&self, mm: ReservationMm) -> bool {
