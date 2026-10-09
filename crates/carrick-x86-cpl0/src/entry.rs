@@ -353,7 +353,7 @@ mod kernel {
     mod native_process {
         include!("native_process.rs");
     }
-    mod native_execution {
+    pub(crate) mod native_execution {
         include!("native_execution.rs");
     }
     use super::adapter::*;
@@ -1207,6 +1207,7 @@ mod kernel {
         );
 
         let (sig, info, action) = process.take_deliverable(process.task_id(), thread_blocked)?;
+        let saved_mask = process.take_suspend_mask().unwrap_or(thread_blocked);
         match action.disposition {
             policy::Disposition::Ignore => None,
             policy::Disposition::Default => {
@@ -1235,12 +1236,8 @@ mod kernel {
                     fault_addr: info.as_ref().map_or(0, |i| i.si_addr),
                     handler: carrick_guest_arch::UserVa::new(handler.0),
                     restorer: action.restorer.map(|r| carrick_guest_arch::UserVa::new(r.0)),
-                    mask: thread_blocked.signals().bits(),
+                    mask: saved_mask.signals().bits(),
                     sp,
-                };
-                let mut copy = carrick_el1::file::ValidatedCopy {
-                    task,
-                    validator: &carrick_el1::file::HardwareValidator,
                 };
                 let mut backend = carrick_el1::isa::x86::X86Backend;
                 let info_bytes = info.as_ref().map(|i| unsafe {
@@ -1255,7 +1252,7 @@ mod kernel {
                     params,
                     info_bytes,
                     &fpstate.0,
-                    &mut |va, bytes| carrick_personality_linux::lifecycle::UserCopy::copy_out(&mut copy, va, bytes),
+                    &mut |va, bytes| process.copy_signal_frame(va, bytes).is_ok(),
                 );
                 if setup.is_err() {
                     return force_delivery_fault(task, process, frame, fpstate, sig, thread_blocked);
@@ -1267,6 +1264,18 @@ mod kernel {
                 None
             }
         }
+    }
+
+    pub(super) fn complete_root_exit(task: &CurrentTask, status: carrick_sched_core::process::LinuxWaitStatus) -> ! {
+        let exit = carrick_el1_abi::NativeRootExit::new(
+            carrick_el1::personality::common_entry::execution_binding(task), status,
+        ).unwrap_or_else(|| initial_boot::fatal_boot());
+        // SAFETY: shared retirement authenticated this exact root completion.
+        unsafe {
+            core::arch::asm!("out dx, al", in("dx") carrick_el1_abi::NATIVE_ROOT_EXIT_PORT,
+                in("rax") &exit as *const _ as u64, options(nostack, preserves_flags));
+        }
+        halt();
     }
 
     fn force_delivery_fault(

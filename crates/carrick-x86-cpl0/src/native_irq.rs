@@ -121,6 +121,13 @@ extern "C" fn carrick_x86_receive_irq(vector: u32, frame: *const InterruptFrame)
         }
         crate::kernel::halt();
     }
+    if vector == u32::from(interrupts::TIMER_VECTOR) {
+        crate::kernel::native_execution::expire_signal_timer(
+            carrick_sched_core::SlotId::from_index(
+                carrick_el1::isa::x86::context::current_cpu_binding().unwrap_or_else(|| crate::kernel::halt()).cpu_slot as usize
+            ).unwrap_or_else(|| crate::kernel::halt())
+        );
+    }
     if frame.cs & 3 == 3 && interrupt::check_user_return_generation().is_err() {
         unsafe {
             core::arch::asm!(

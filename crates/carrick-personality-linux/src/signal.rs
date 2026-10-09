@@ -244,6 +244,14 @@ pub fn signal_effect(outcome: &SignalOutcome) -> crate::dispatch::FamilyCompleti
     }
 }
 
+pub enum SignalWaitOutcome {
+    Ready(
+        carrick_signal_core::policy::Signal,
+        Option<crate::abi::signal::LinuxSiginfo>,
+    ),
+    Pending,
+}
+
 pub trait ProcessSignals {
     fn force_sigsegv(
         &mut self,
@@ -285,16 +293,19 @@ pub trait ProcessSignals {
         &mut self,
         set: carrick_signal_core::SignalSet,
         timeout_ns: Option<u64>,
-    ) -> Result<
-        (
-            carrick_signal_core::policy::Signal,
-            Option<crate::abi::signal::LinuxSiginfo>,
-        ),
-        i32,
-    >;
+        info: carrick_guest_arch::UserVa,
+    ) -> Result<SignalWaitOutcome, i32>;
 
-    fn rt_sigsuspend(&mut self, mask: carrick_signal_core::policy::SigBlockMask)
-    -> Result<(), i32>;
+    /// true means this entry transferred its owned continuation to the scheduler.
+    fn rt_sigsuspend(
+        &mut self,
+        mask: carrick_signal_core::policy::SigBlockMask,
+        original: carrick_signal_core::policy::SigBlockMask,
+    ) -> Result<bool, i32>;
+
+    fn take_suspend_mask(&mut self) -> Option<carrick_signal_core::policy::SigBlockMask> {
+        None
+    }
 
     fn take_deliverable(
         &mut self,
@@ -636,16 +647,23 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
             let mask = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
                 carrick_signal_core::SignalSet::from_bits(mask_bits),
             );
+            native.process_signals()?;
+            let original = native.current_blocked();
+            native.set_current_blocked(mask);
             let signals = native.process_signals()?;
-            match signals.rt_sigsuspend(mask) {
-                Ok(()) => Some(SignalOutcome::Transferred {
+            match signals.rt_sigsuspend(mask, original) {
+                Ok(true) => Some(SignalOutcome::Transferred {
                     progress: carrick_core_abi::Served::Idle,
                     result: crate::abi::entry::SyscallResult::new(LINUX_EINTR.guest_retval()),
                 }),
-                Err(e) => returned(
-                    carrick_syscall_abi::LinuxErrno::new(e).guest_retval(),
-                    false,
-                ),
+                Ok(false) => returned(LINUX_EINTR.guest_retval(), false),
+                Err(e) => {
+                    native.set_current_blocked(original);
+                    returned(
+                        carrick_syscall_abi::LinuxErrno::new(e).guest_retval(),
+                        false,
+                    )
+                }
             }
         }
         SignalCall::RtSigtimedwait => {
@@ -657,7 +675,9 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
             if !native.copy_in(&mut bytes, carrick_guest_arch::UserVa::new(uthese_ptr)) {
                 return returned(LINUX_EFAULT.guest_retval(), false);
             }
-            let set = carrick_signal_core::SignalSet::from_bits(u64::from_le_bytes(bytes));
+            let set = carrick_signal_core::SignalSet::from_bits(u64::from_le_bytes(bytes))
+                .without(carrick_signal_core::policy::Signal::KILL)
+                .without(carrick_signal_core::policy::Signal::STOP);
             let timeout_ns = if uts_ptr != 0 {
                 let mut ts_bytes = [0u8; 16];
                 if !native.copy_in(&mut ts_bytes, carrick_guest_arch::UserVa::new(uts_ptr)) {
@@ -682,16 +702,22 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
             };
             let timedwait_res = {
                 let signals = native.process_signals()?;
-                signals.rt_sigtimedwait(set, timeout_ns)
+                signals.rt_sigtimedwait(set, timeout_ns, carrick_guest_arch::UserVa::new(uinfo_ptr))
             };
             match timedwait_res {
-                Ok((sig, info)) => {
+                Ok(SignalWaitOutcome::Pending) => Some(SignalOutcome::Transferred {
+                    progress: carrick_core_abi::Served::Idle,
+                    result: crate::abi::entry::SyscallResult::new(0),
+                }),
+                Ok(SignalWaitOutcome::Ready(sig, info)) => {
                     if uinfo_ptr != 0 {
                         let info = info.unwrap_or_else(|| {
                             LinuxSiginfo::kill(sig.number(), LINUX_SI_USER, 0, 0)
                         });
                         let bytes = IntoBytes::as_bytes(&info);
-                        let _ = native.copy_out(carrick_guest_arch::UserVa::new(uinfo_ptr), bytes);
+                        if !native.copy_out(carrick_guest_arch::UserVa::new(uinfo_ptr), bytes) {
+                            return returned(LINUX_EFAULT.guest_retval(), false);
+                        }
                     }
                     returned(sig.number() as i64, false)
                 }

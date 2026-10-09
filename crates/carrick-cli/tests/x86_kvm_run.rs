@@ -673,3 +673,31 @@ fn mounted_static_x86_signal_failed_frame_setup_matches_native() {
 fn mounted_static_x86_signal_resethand_matches_native() {
     compare_mounted_assembly_with_native("x86_signal_resethand.S", b"HK\n");
 }
+
+#[test]
+fn mounted_static_x86_signal_sigsuspend_loop_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_sigsuspend.S", b"S\n");
+}
+#[test]
+fn mounted_static_x86_signal_wait_child_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_wait_child.S", b"W\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_wait_copyfault_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_wait_copyfault.S", b"F\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_sigsuspend_pingpong_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_sigsuspend_pingpong.S", b"S\n");
+}
+#[test]
+fn mounted_static_x86_signal_wait_pingpong_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_wait_pingpong.S", b"W\n");
+}
+
+#[test]
+fn mounted_static_x86_fork_reuses_retired_stock_matches_native() {
+    compare_mounted_assembly_with_native("x86_fork_stock_reuse.S", b"R\n");
+}

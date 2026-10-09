@@ -119,3 +119,13 @@ mod signal_resume_tests {
         assert!(super::signal_resume_is_el0(0xf000_0000));
     }
 }
+
+/// The native monotonic timer projection used by owned signal continuations.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn signal_clock() -> x86::X86Backend {
+    x86::X86Backend
+}
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub(crate) fn signal_clock() -> aarch64::Aarch64Backend {
+    aarch64::Aarch64Backend
+}

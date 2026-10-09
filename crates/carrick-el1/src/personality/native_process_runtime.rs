@@ -133,6 +133,81 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     fn quarantine_born(&mut self, born: Self::Born);
     fn retire_mm(&mut self, mm: Self::Mm);
     fn wake_effects(&mut self, effects: WakeEffects);
+    fn signal_deadline(
+        &mut self,
+        nanos: u64,
+    ) -> Result<carrick_guest_arch::Deadline, NativeProcessError> {
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = nanos;
+            Err(NativeProcessError::Unsupported)
+        }
+        #[cfg(target_os = "none")]
+        {
+            let mut backend = crate::isa::signal_clock();
+            use carrick_guest_arch::InterruptBackend;
+            let now = backend
+                .counter()
+                .map_err(|_| NativeProcessError::Unsupported)?
+                .raw();
+            let frequency = backend
+                .frequency()
+                .map_err(|_| NativeProcessError::Unsupported)?
+                .raw()
+                .get();
+            let ticks = (u128::from(nanos) * u128::from(frequency)).div_ceil(1_000_000_000);
+            let ticks = u64::try_from(ticks).map_err(|_| NativeProcessError::Invalid)?;
+            Ok(carrick_guest_arch::Deadline(
+                carrick_guest_arch::CounterTick::new(now.saturating_add(ticks)),
+            ))
+        }
+    }
+    fn arm_signal_timer(
+        &mut self,
+        deadline: carrick_guest_arch::Deadline,
+    ) -> Result<(), NativeProcessError> {
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = deadline;
+            Err(NativeProcessError::Unsupported)
+        }
+        #[cfg(target_os = "none")]
+        {
+            use carrick_guest_arch::InterruptBackend;
+            crate::isa::signal_clock()
+                .arm_timer(Some(deadline))
+                .map_err(|_| NativeProcessError::Unsupported)
+        }
+    }
+    fn signal_now(&mut self) -> Result<carrick_guest_arch::CounterTick, NativeProcessError> {
+        #[cfg(not(target_os = "none"))]
+        {
+            Err(NativeProcessError::Unsupported)
+        }
+        #[cfg(target_os = "none")]
+        {
+            use carrick_guest_arch::InterruptBackend;
+            crate::isa::signal_clock()
+                .counter()
+                .map_err(|_| NativeProcessError::Unsupported)
+        }
+    }
+    fn copy_signal_bytes(
+        &mut self,
+        _mm: &Self::Mm,
+        _address: UserVa,
+        _bytes: &[u8],
+    ) -> Result<(), NativeProcessError> {
+        Err(NativeProcessError::Unsupported)
+    }
+    fn copy_siginfo(
+        &mut self,
+        _mm: &Self::Mm,
+        _address: UserVa,
+        _info: &carrick_abi::LinuxSiginfo,
+    ) -> Result<(), NativeProcessError> {
+        Err(NativeProcessError::Unsupported)
+    }
 }
 pub struct NativeClaim {
     namespace: Arc<SpinLock<NamespaceState>>,
@@ -238,6 +313,19 @@ struct PendingExit {
     channel: Arc<WaitChannel>,
     wake: Option<ExitWakeCustody>,
 }
+#[derive(Clone, Copy)]
+enum PendingSignalKind {
+    Suspend,
+    Wait {
+        set: carrick_signal_core::SignalSet,
+        info: UserVa,
+    },
+}
+struct PendingSignalWait {
+    kind: PendingSignalKind,
+    channel: Arc<WaitChannel>,
+    deadline: Option<carrick_guest_arch::Deadline>,
+}
 struct Graph<'a, M: Clone, C: ProcessContext> {
     owner: Owner<'a, M, C>,
     root_key: TaskKey,
@@ -246,6 +334,8 @@ struct Graph<'a, M: Clone, C: ProcessContext> {
     serials: SerialAllocator,
     pending: BTreeMap<TaskKey, PendingWait>,
     pending_exit: BTreeMap<TaskKey, PendingExit>,
+    signal_waits: BTreeMap<TaskKey, PendingSignalWait>,
+    suspend_masks: BTreeMap<TaskKey, carrick_signal_core::policy::SigBlockMask>,
     _root_roles: NativeClaim,
     uts: carrick_personality_linux::sysinfo::LinuxUtsname,
 }
@@ -471,6 +561,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 serials,
                 pending: BTreeMap::new(),
                 pending_exit: BTreeMap::new(),
+                signal_waits: BTreeMap::new(),
+                suspend_masks: BTreeMap::new(),
                 _root_roles: root_roles,
                 uts,
             }),
@@ -837,9 +929,155 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         }
     }
+    /// Copy a signal frame through the same exact-MM COW authority as wait status.
+    pub fn copy_signal_frame(
+        &mut self,
+        address: UserVa,
+        bytes: &[u8],
+    ) -> Result<(), NativeProcessError> {
+        let mm = self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale)?
+            .native()
+            .resources()
+            .mm
+            .clone();
+        self.service.copy_signal_bytes(&mm, address, bytes)
+    }
+    fn park_signal_wait(
+        &mut self,
+        kind: PendingSignalKind,
+        channel: Arc<WaitChannel>,
+        observed: carrick_sched_core::process::wait::TaskWakeGeneration,
+        deadline: Option<carrick_guest_arch::Deadline>,
+    ) -> Result<bool, NativeProcessError> {
+        let zone = self.source.zone;
+        let record = zone
+            .slot(self.source.slot)
+            .current()
+            .or_else(|| zone.slot(self.source.slot).host_record())
+            .ok_or(NativeProcessError::Stale)?;
+        let start = carrick_core::entry::prepare_handoff(self.binding, self.source, record)
+            .ok_or(NativeProcessError::Stale)?;
+        let address = WaitChannel::address(&channel);
+        let guard = zone
+            .lock(
+                ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
+                &BoundedSpin(LOCK_SPINS),
+            )
+            .ok_or(NativeProcessError::Busy)?;
+        if channel.generation.generation() != observed {
+            return Ok(false);
+        }
+        if deadline.is_some() && !zone.timer_free(self.source.slot) {
+            return Err(NativeProcessError::Busy);
+        }
+        let sequence = zone.next_seq(record);
+        zone.set_deadline(record, deadline.map_or(0, |deadline| deadline.0.raw()));
+        if let Some(deadline) = deadline {
+            self.service.arm_signal_timer(deadline)?;
+            zone.arm_timer(self.source.slot, record, sequence)
+                .map_err(|_| NativeProcessError::Busy)?;
+        }
+        zone.enqueue(&guard, record, sequence, channel.mm, address, u32::MAX, 0)
+            .map_err(|_| NativeProcessError::Exhausted)?;
+        // SAFETY: this exact record is still authenticated OnCpu under its bucket guard.
+        unsafe { *zone.record(record).ctx_mut() = self.words };
+        self.runtime.graph.lock().signal_waits.insert(
+            self.key,
+            PendingSignalWait {
+                kind,
+                channel,
+                deadline,
+            },
+        );
+        let receipt = carrick_core::entry::publish_handoff_park(
+            start,
+            &guard,
+            carrick_el1_abi::EntryRecordGeneration(sequence),
+        );
+        if receipt.is_none() {
+            self.runtime.graph.lock().signal_waits.remove(&self.key);
+            return Err(NativeProcessError::Busy);
+        }
+        drop(guard);
+        zone.clear_current(self.source.slot);
+        self.handoff = receipt;
+        Ok(true)
+    }
+    fn resume_signal_wait(
+        &mut self,
+        pending: PendingSignalWait,
+    ) -> Result<LifecycleOutcome, NativeProcessError> {
+        loop {
+            let graph = self.runtime.graph.lock();
+            let row = graph
+                .owner
+                .task(self.key)
+                .map_err(|_| NativeProcessError::Stale)?;
+            let resources = row.native().resources();
+            let signals = resources.signals().clone();
+            let mm = resources.mm.clone();
+            let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                carrick_signal_core::SignalSet::from_bits(resources.control.blocked().0),
+            );
+            drop(graph);
+            if let PendingSignalKind::Wait { set, info } = pending.kind {
+                if let Some((signal, payload)) = signals.take_timedwait(self.task_id(), set) {
+                    if info.raw() != 0 {
+                        let payload = payload.unwrap_or_else(|| {
+                            carrick_abi::LinuxSiginfo::kill(
+                                signal.number(),
+                                carrick_abi::LINUX_SI_USER,
+                                0,
+                                0,
+                            )
+                        });
+                        self.service.copy_siginfo(&mm, info, &payload)?;
+                    }
+                    return Ok(returned(i64::from(signal.number())));
+                }
+            }
+            if signals.has_deliverable(self.task_id(), blocked) {
+                return Ok(returned(
+                    carrick_personality_linux::abi::signal::LINUX_EINTR.guest_retval(),
+                ));
+            }
+            if let Some(deadline) = pending.deadline
+                && self.service.signal_now()?.raw() >= deadline.0.raw()
+            {
+                return Ok(returned(
+                    carrick_personality_linux::abi::signal::LINUX_EAGAIN.guest_retval(),
+                ));
+            }
+            let observed = pending.channel.generation.generation();
+            if self.park_signal_wait(
+                pending.kind,
+                pending.channel.clone(),
+                observed,
+                pending.deadline,
+            )? {
+                return Ok(LifecycleOutcome::Transferred {
+                    progress: carrick_core::Served::Idle,
+                    result: SyscallResult::new(0),
+                });
+            }
+        }
+    }
     /// The execution lane calls this before returning a woken saved syscall to
     /// userspace. It consumes the retained wait operation instead of replaying it.
     pub fn resume_pending_wait(&mut self) -> Option<LifecycleOutcome> {
+        let signal_wait = self.runtime.graph.lock().signal_waits.remove(&self.key);
+        if let Some(pending) = signal_wait {
+            return Some(match self.resume_signal_wait(pending) {
+                Ok(outcome) => outcome,
+                Err(error) => self.fail(error),
+            });
+        }
         let pending = self.runtime.graph.lock().pending.remove(&self.key)?;
         if pending.caller != self.key
             || pending.channel.generation.generation() == pending.precheck.wake_generation()
@@ -1498,6 +1736,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
 {
     fn take_run_failure(&mut self) -> Option<carrick_el1_abi::NativeRunFailureReason> {
         self.run_failure.take()
+    }
+    fn copy_out_owned(&mut self, dst: UserVa, bytes: &[u8]) -> Option<bool> {
+        Some(self.copy_signal_frame(dst, bytes).is_ok())
     }
     fn binding(&self) -> ExecutionBinding {
         self.binding
@@ -2550,6 +2791,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             )
         });
 
+        let mut wake_channels = Vec::new();
         for (target_key, target_signals, _) in targets {
             let action = target_signals.action(signal);
             if action.disposition == carrick_signal_core::policy::Disposition::Ignore {
@@ -2562,10 +2804,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .ok()
                 .and_then(|t| t.native().resources().channel.clone())
             {
-                let _ = channel.generation.publish();
+                wake_channels.push(channel);
             }
         }
-
+        drop(graph);
+        for channel in wake_channels {
+            self.publish_channel(&channel)
+                .map_err(|error| -error.errno() as i32)?;
+        }
         Ok(())
     }
 
@@ -2615,32 +2861,108 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         set: carrick_signal_core::SignalSet,
         timeout_ns: Option<u64>,
-    ) -> Result<
-        (
-            carrick_signal_core::policy::Signal,
-            Option<carrick_personality_linux::abi::signal::LinuxSiginfo>,
-        ),
-        i32,
-    > {
-        let esrch = carrick_personality_linux::abi::signal::LINUX_ESRCH.get();
-        let eagain = carrick_personality_linux::abi::signal::LINUX_EAGAIN.get();
-        let graph = self.runtime.graph.lock();
-        let row = graph.owner.task(self.key).map_err(|_| esrch)?;
-        let tid = self.key.id.raw() as u32;
-        if let Some(res) = row.native().resources().signals().take_timedwait(tid, set) {
-            return Ok(res);
+        info: UserVa,
+    ) -> Result<carrick_personality_linux::signal::SignalWaitOutcome, i32> {
+        use carrick_personality_linux::signal::SignalWaitOutcome;
+        use carrick_signal_core::policy::Signal;
+        let set = set.without(Signal::KILL).without(Signal::STOP);
+        let mut deadline = None;
+        loop {
+            let graph = self.runtime.graph.lock();
+            let row = graph
+                .owner
+                .task(self.key)
+                .map_err(|_| carrick_personality_linux::abi::signal::LINUX_ESRCH.get())?;
+            let resources = row.native().resources();
+            let signals = resources.signals();
+            if let Some((signal, payload)) = signals.take_timedwait(self.task_id(), set) {
+                return Ok(SignalWaitOutcome::Ready(signal, payload));
+            }
+            if timeout_ns == Some(0) {
+                return Err(carrick_personality_linux::abi::signal::LINUX_EAGAIN.get());
+            }
+            let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                carrick_signal_core::SignalSet::from_bits(resources.control.blocked().0),
+            );
+            if signals.has_deliverable(self.task_id(), blocked) {
+                return Err(carrick_personality_linux::abi::signal::LINUX_EINTR.get());
+            }
+            let channel = resources
+                .channel
+                .clone()
+                .ok_or(carrick_personality_linux::abi::signal::LINUX_ESRCH.get())?;
+            let generation = channel.generation.generation();
+            drop(graph);
+            if deadline.is_none() {
+                deadline = timeout_ns
+                    .map(|nanos| self.service.signal_deadline(nanos))
+                    .transpose()
+                    .map_err(|error| -error.errno() as i32)?;
+            }
+            if let Some(deadline) = deadline
+                && self
+                    .service
+                    .signal_now()
+                    .map_err(|error| -error.errno() as i32)?
+                    .raw()
+                    >= deadline.0.raw()
+            {
+                return Err(carrick_personality_linux::abi::signal::LINUX_EAGAIN.get());
+            }
+            if self
+                .park_signal_wait(
+                    PendingSignalKind::Wait { set, info },
+                    channel,
+                    generation,
+                    deadline,
+                )
+                .map_err(|error| -error.errno() as i32)?
+            {
+                return Ok(SignalWaitOutcome::Pending);
+            }
         }
-        if let Some(_timeout) = timeout_ns {
-            return Err(eagain);
-        }
-        Err(eagain)
     }
-
     fn rt_sigsuspend(
         &mut self,
-        _mask: carrick_signal_core::policy::SigBlockMask,
-    ) -> Result<(), i32> {
-        Err(carrick_personality_linux::abi::signal::LINUX_EINTR.get())
+        mask: carrick_signal_core::policy::SigBlockMask,
+        original: carrick_signal_core::policy::SigBlockMask,
+    ) -> Result<bool, i32> {
+        self.runtime
+            .graph
+            .lock()
+            .suspend_masks
+            .insert(self.key, original);
+        loop {
+            let graph = self.runtime.graph.lock();
+            let row = graph
+                .owner
+                .task(self.key)
+                .map_err(|_| carrick_personality_linux::abi::signal::LINUX_ESRCH.get())?;
+            let signals = row.native().resources().signals();
+            let available = signals.has_deliverable(self.task_id(), mask);
+            let channel = row
+                .native()
+                .resources()
+                .channel
+                .clone()
+                .ok_or(carrick_personality_linux::abi::signal::LINUX_ESRCH.get())?;
+            let generation = channel.generation.generation();
+            drop(graph);
+            if available {
+                return Ok(false);
+            }
+            match self.park_signal_wait(PendingSignalKind::Suspend, channel, generation, None) {
+                Ok(true) => return Ok(true),
+                Ok(false) => continue,
+                Err(error) => {
+                    self.runtime.graph.lock().suspend_masks.remove(&self.key);
+                    return Err(-error.errno() as i32);
+                }
+            }
+        }
+    }
+    fn take_suspend_mask(&mut self) -> Option<carrick_signal_core::policy::SigBlockMask> {
+        self.runtime.graph.lock().suspend_masks.remove(&self.key)
     }
 
     fn take_deliverable(
@@ -2763,6 +3085,28 @@ mod tests {
             };
             self.copies.push(status);
             Ok(())
+        }
+        fn signal_deadline(
+            &mut self,
+            nanos: u64,
+        ) -> Result<carrick_guest_arch::Deadline, NativeProcessError> {
+            Ok(carrick_guest_arch::Deadline(
+                carrick_guest_arch::CounterTick::new(1000 + nanos),
+            ))
+        }
+        fn arm_signal_timer(
+            &mut self,
+            _: carrick_guest_arch::Deadline,
+        ) -> Result<(), NativeProcessError> {
+            Ok(())
+        }
+        fn signal_now(&mut self) -> Result<carrick_guest_arch::CounterTick, NativeProcessError> {
+            let now = if self.zone.counters.el1_timeouts.load(Ordering::Acquire) == 0 {
+                1000
+            } else {
+                2000
+            };
+            Ok(carrick_guest_arch::CounterTick::new(now))
         }
         fn quarantine_prepared(&mut self, _: Self::PreparedMm) {
             panic!("unexpected quarantine")
@@ -2888,6 +3232,121 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn signal_wait_owns_context_and_shared_deadline() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let child_page = Box::new(ThreadLifecyclePage::new());
+        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        }));
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
+        assert!(matches!(
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            ),
+            Err(NativeProcessError::Invalid)
+        ));
+        assert_eq!(page.live(), 2, "admission must not remove a live member");
+        page.release_live(1).unwrap(); // fixture settles its bootstrap census
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        assert_eq!(page.live(), 1);
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &*child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+        };
+        use carrick_personality_linux::signal::{ProcessSignals, SignalWaitOutcome};
+        let set = carrick_signal_core::SignalSet::EMPTY
+            .with(carrick_signal_core::policy::Signal::from_number(10).unwrap());
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        assert!(matches!(
+            entry.rt_sigtimedwait(set, Some(1000), UserVa::new(0)),
+            Ok(SignalWaitOutcome::Pending)
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+        drop(entry);
+        assert!(zone.slot(slot).current().is_none());
+        let timer = zone.timer_owner(slot).unwrap();
+        assert_eq!(zone.timer_deadline(slot), Some(2000));
+        assert!(matches!(
+            zone.record(timer.record).claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ));
+        assert_eq!(zone.expire_timer(slot, 1999, (-11i64) as u64), Ok(false));
+        assert_eq!(zone.expire_timer(slot, 2000, (-11i64) as u64), Ok(true));
+        let selected = zone.switch_in_full(slot).unwrap();
+        assert_eq!(selected.record, timer.record);
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        assert!(
+            matches!(entry.resume_pending_wait(), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == -11)
+        );
+        assert!(!runtime.graph.lock().signal_waits.contains_key(&entry.key));
+        assert!(zone.timer_owner(slot).is_none());
+    }
+
     #[test]
     fn actual_compact_root_can_exit_before_its_first_park() {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();

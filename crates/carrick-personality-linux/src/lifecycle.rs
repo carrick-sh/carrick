@@ -95,6 +95,11 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     fn take_run_failure(&mut self) -> Option<NativeRunFailureReason> {
         None
     }
+    /// An admitted process may retain an exact-MM write authority (including COW).
+    /// None means this venue does not own user transfers.
+    fn copy_out_owned(&mut self, _dst: UserVa, _bytes: &[u8]) -> Option<bool> {
+        None
+    }
     fn binding(&self) -> ExecutionBinding;
     fn fork(&mut self) -> LifecycleOutcome;
     fn wait4(
