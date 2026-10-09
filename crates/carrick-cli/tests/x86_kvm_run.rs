@@ -516,6 +516,14 @@ fn run_poll_with_open_empty_stdin(mut command: std::process::Command) -> (Vec<u8
     if !completed {
         child.kill().unwrap();
         child.wait().unwrap();
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(completed, "empty-stdin poll did not complete: {stderr}");
     }
     assert!(completed, "empty-stdin poll did not complete");
     let mut output = Vec::new();

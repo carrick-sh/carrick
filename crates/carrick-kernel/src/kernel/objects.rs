@@ -1904,6 +1904,15 @@ impl FileSlotAuthority {
     pub const fn description(self) -> FileDescriptionId {
         self.description
     }
+
+    /// Bare standard I/O has a stable synthetic authority but no installed
+    /// file-table slot to subscribe to. Its host descriptor is the wake source.
+    pub fn is_bare_stdio(self) -> bool {
+        let raw = self.number.raw();
+        (0..3).contains(&raw)
+            && self.slot_generation == 0
+            && FileDescriptionId::from_raw_u64(u64::MAX - raw as u64) == Some(self.description)
+    }
 }
 
 type FileSlotCallback = Arc<dyn Fn(FileSlotAuthority) + Send + Sync + 'static>;

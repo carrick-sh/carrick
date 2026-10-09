@@ -187,8 +187,39 @@ pub fn fork_fd_map(fd_map: &[FdMapSlot], parent_table: u64, child_table: u64) {
     }
 }
 
-/// Query host readiness via libc poll for a host file descriptor.
-#[cfg(not(target_os = "none"))]
+/// Whether every live poll entry names a host-bound open description.
+/// Negative entries do not participate. Absent descriptors can travel with
+/// host-bound entries: the shared dispatcher reports their POLLNVAL result.
+/// In-zone descriptions stay with the guest owner.
+pub fn poll_has_only_host_bindings(
+    fd_map: &[FdMapSlot],
+    open_table: &[DelegatedOpenFile],
+    file_table: u64,
+    pollfds: &[PollFd],
+) -> bool {
+    let mut has_host_binding = false;
+    let all_host_or_absent = pollfds.iter().all(|entry| {
+        if entry.fd < 0 {
+            return true;
+        }
+        let Some((handle, _)) = fd_map_lookup(fd_map, file_table, entry.fd) else {
+            return true;
+        };
+        if handle == 0 {
+            return false;
+        }
+        let host_bound = open_table.get((handle - 1) as usize).is_some_and(|open| {
+            open.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST && open.host_fd().is_some()
+        });
+        has_host_binding |= host_bound;
+        host_bound
+    });
+    all_host_or_absent && has_host_binding
+}
+
+/// VM-free fixture probe for host-bound descriptions. Production guest code
+/// asks the carrier through the allowed epoll_pwait crossing instead.
+#[cfg(all(test, not(target_os = "none")))]
 pub fn query_host_readiness(host_fd: i32, flags: u32) -> i16 {
     let mut pfd = libc::pollfd {
         fd: host_fd,
@@ -219,17 +250,10 @@ pub fn query_host_readiness(host_fd: i32, flags: u32) -> i16 {
     }
 }
 
-/// Bare-metal guest fallback for host readiness.
-#[cfg(target_os = "none")]
-pub fn query_host_readiness(_host_fd: i32, flags: u32) -> i16 {
-    let mut r = 0i16;
-    if (flags & DELEGATED_FLAG_READABLE) != 0 {
-        r |= LINUX_POLLIN | LINUX_POLLRDNORM;
-    }
-    if (flags & DELEGATED_FLAG_WRITABLE) != 0 {
-        r |= LINUX_POLLOUT | LINUX_POLLWRNORM;
-    }
-    r
+/// Without a host crossing, access mode never implies current readiness.
+#[cfg(any(target_os = "none", not(test)))]
+pub fn query_host_readiness(_host_fd: i32, _flags: u32) -> i16 {
+    0
 }
 
 /// Resolves pollfd entries against the zone tables and IPC venue.

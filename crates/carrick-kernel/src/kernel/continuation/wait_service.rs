@@ -1353,6 +1353,11 @@ impl CarrierWaitService {
             // A watched slot has no interest to probe with, by type.
             let targets = registrations
                 .iter()
+                // The synthetic bare-stdio authority has no table slot.
+                // Subscribing it always fails and used to publish Ready
+                // immediately, causing an unbounded poll redispatch loop.
+                // Its host descriptor is already enrolled in the reactor.
+                .filter(|registration| !registration.slot().is_bare_stdio())
                 .map(|registration| {
                     let source = registration.source();
                     let probe_with = if source.probe_after_enrol() {

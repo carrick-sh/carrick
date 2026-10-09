@@ -709,6 +709,16 @@ impl<'a> NetView<'a> {
         // stdio the guest never reopened IS its host descriptor. Any other
         // unknown fd never passes the guest number through as a host fd (see
         // `host_fd_for_poll`).
+        if (fd == 1 || fd == 2)
+            && matches!(
+                self.io.route(),
+                crate::dispatch::fs::state::StdioRoute::Captured
+            )
+        {
+            // Captured output appends to a Carrick-owned buffer. The carrier's
+            // fd 1/2 is unrelated to the guest's writable sink.
+            return described();
+        }
         is_stdio_fd(fd).then(|| WaitSource::Host {
             host: HostWaitTarget::new(HostFd(fd), requested),
         })
@@ -3762,6 +3772,20 @@ mod wait_source_tests {
 
     fn interest(events: LinuxPollEvents) -> WaitInterest {
         WaitInterest::new(events).expect("non-empty interest")
+    }
+
+    #[test]
+    fn captured_stdout_wait_uses_its_sink_not_carrier_fd() {
+        let dispatcher = SyscallDispatcher::new();
+        assert!(matches!(
+            source(&dispatcher, 1, LinuxPollEvents::OUT),
+            WaitSource::Description { .. }
+        ));
+        dispatcher.set_stdio_sink(crate::dispatch::StdioSink::Inherit);
+        assert!(matches!(
+            source(&dispatcher, 1, LinuxPollEvents::OUT),
+            WaitSource::Host { .. }
+        ));
     }
 
     /// An in-zone listener's Darwin listen socket never sees a connection
