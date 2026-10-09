@@ -198,9 +198,11 @@ impl Service {
 
 impl NativeProcessService<'static, ParkedContextWords> for Service {
     type Mm = Mm;
+    type PreparedMmStart = Prepared;
+    type PreparedMmPublished = Prepared;
     type PreparedMm = Prepared;
     type Born = Box<Born>;
-    fn prepare_mm(
+    fn prepare_mm_start(
         &mut self,
         parent: &Mm,
         words: ParkedContextWords,
@@ -371,6 +373,19 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             address,
             custody,
         })
+    }
+    fn prepare_mm_publish(&mut self, start: Prepared) -> Result<Prepared, NativeProcessError> {
+        Ok(start)
+    }
+    fn prepare_mm_finish(&mut self, published: Prepared) -> Result<Prepared, NativeProcessError> {
+        Ok(published)
+    }
+    fn fork_child_context(
+        &self,
+        parent: ParkedContextWords,
+        prepared: &Prepared,
+    ) -> ParkedContextWords {
+        parent.fork_child(prepared.address)
     }
     fn prepared_mm(&self, p: &Prepared) -> Mm {
         p.address
