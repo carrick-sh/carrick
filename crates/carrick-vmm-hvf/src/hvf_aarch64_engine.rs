@@ -492,6 +492,24 @@ pub fn persistent_vcpu_hardware_kick(
 pub fn bring_up(image: &AddressSpace) -> Result<HvfAarch64Engine, TrapError> {
     let plan = GuestMappingPlan::from_address_space(image)?;
     let (state, staged) = HvfVmState::new_with_plan(&plan)?;
+    if image
+        .regions()
+        .iter()
+        .any(|region| region.start == carrick_mem::memory::LINUX_EL1_KERNEL_BASE)
+    {
+        let host = state
+            .host_ptr(
+                carrick_el1_abi::EL1_APERTURE_CONTROL_BASE,
+                core::mem::size_of::<carrick_el1_abi::ApertureControl>(),
+            )
+            .ok_or_else(|| {
+                TrapError::Hypervisor("ARM EL1 aperture control is not mapped".into())
+            })?;
+        // SAFETY: the mapped EL1 region owns aligned aperture ABI storage.
+        let aperture = unsafe { &*host.cast::<carrick_el1_abi::ApertureControl>() };
+        crate::hatch::ArmRingFirstHatch::configure_aperture(aperture, image.arm_ring_first());
+    }
+
     let vmm = HvfAarch64Vmm {
         state,
         host_writes: Default::default(),

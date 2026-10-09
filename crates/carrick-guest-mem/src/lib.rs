@@ -64,6 +64,31 @@
 //! `serde::Serialize`, and `thiserror::Error` — precisely so it sits at the
 //! bottom of the build graph and almost never has to be rebuilt.
 
+/// Policy written into the ARM EL1 aperture before guest execution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ArmRingFirst {
+    /// Refuse calls outside the explicit ARM host crossing set.
+    #[default]
+    Strict,
+    /// Restore pre-flip forwarding for this run.
+    OptOut,
+}
+
+impl ArmRingFirst {
+    /// Resolve the exact opt-out spelling from a frontend environment snapshot.
+    pub fn from_setting(value: Option<&str>) -> Self {
+        if value == Some("0") {
+            Self::OptOut
+        } else {
+            Self::Strict
+        }
+    }
+
+    pub const fn is_strict(self) -> bool {
+        matches!(self, Self::Strict)
+    }
+}
+
 mod prepared;
 pub use prepared::{
     GuestWriteRange, LegacyProtectionRead, MemoryPrepareError, MemoryReadSuspension,

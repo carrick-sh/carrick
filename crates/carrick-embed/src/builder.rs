@@ -131,6 +131,7 @@ pub struct ContainerBuilder {
     host_io: Option<std::sync::Arc<dyn carrick_kernel::dispatch::HostIo>>,
     budget: Option<carrick_kernel::observe::ResourceBudget>,
     max_traps: usize,
+    arm_ring_first: carrick_spec::ArmRingFirst,
     observers: Vec<std::sync::Arc<dyn carrick_kernel::observe::SyscallObserver>>,
     interceptors: Vec<std::sync::Arc<dyn carrick_kernel::observe::SyscallInterceptor>>,
     auditors: Vec<std::sync::Arc<dyn carrick_kernel::observe::KernelAuditor>>,
@@ -161,6 +162,7 @@ impl ContainerBuilder {
             carrier,
             capture_identity: Default::default(),
             image: image.into(),
+            arm_ring_first: Default::default(),
             platform: None,
             pull: PullPolicy::Missing,
             store: None,
@@ -523,6 +525,7 @@ impl ContainerBuilder {
             // Bare `KEY` host-env import is a CLI convenience; a library caller
             // passes explicit values, so the engine is told there is nothing to import.
             host_env: None,
+            arm_ring_first: Some(self.arm_ring_first),
             mounts: self.mounts.clone(),
             workdir: self.workdir.clone(),
             user: self.user.clone(),
@@ -566,6 +569,7 @@ impl ContainerBuilder {
             host_io: self.host_io,
             budget: self.budget,
             max_traps: self.max_traps,
+            arm_ring_first: self.arm_ring_first,
             observers: self.observers,
             interceptors: self.interceptors,
             auditors: self.auditors,
@@ -573,6 +577,12 @@ impl ContainerBuilder {
             shared_buffers: self.shared_buffers,
             work_scope: self.work_scope,
         })
+    }
+
+    /// Set the ARM EL1 host-crossing policy for this run.
+    pub fn arm_ring_first(mut self, policy: carrick_spec::ArmRingFirst) -> Self {
+        self.arm_ring_first = policy;
+        self
     }
 
     /// Resolve the image (async) and freeze the run. Validates configuration at build time.
@@ -609,6 +619,7 @@ impl Container {
             entrypoint_override: self.entrypoint.clone(),
             env_overrides,
             host_env: None,
+            arm_ring_first: Some(self.arm_ring_first),
             mounts: self.mounts.clone(),
             workdir: self.workdir.clone(),
             user: self.user.clone(),
@@ -740,6 +751,7 @@ impl Container {
 
 /// A validated, runnable container configuration.
 pub struct Container {
+    arm_ring_first: carrick_spec::ArmRingFirst,
     carrier: CarrierBinding,
     capture_identity: carrick_kernel::wedge_capture::CarrierCaptureIdentity,
     image: String,
@@ -802,6 +814,24 @@ mod tests {
     use carrick_engine::{request_platform, resolve_run_spec};
     use carrick_image::ResolvedImage;
     use carrick_spec::ImageConfig;
+
+    #[test]
+    fn arm_ring_first_policy_survives_builder_freeze() {
+        for policy in [
+            carrick_spec::ArmRingFirst::Strict,
+            carrick_spec::ArmRingFirst::OptOut,
+        ] {
+            let builder = ContainerBuilder::from_image("ubuntu:24.04").arm_ring_first(policy);
+            assert_eq!(
+                builder.to_run_request().unwrap().arm_ring_first,
+                Some(policy)
+            );
+            assert_eq!(
+                builder.build().unwrap().to_run_request().arm_ring_first,
+                Some(policy)
+            );
+        }
+    }
 
     struct ContinueInterceptor;
 

@@ -1147,6 +1147,7 @@ pub fn ipa_for_va(va: u64) -> u64 {
 
 #[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize)]
 pub struct AddressSpace {
+    arm_ring_first: carrick_guest_mem::ArmRingFirst,
     entry: u64,
     regions: Vec<MemoryRegion>,
     initial_stack_pointer: Option<u64>,
@@ -1411,6 +1412,16 @@ pub enum AddressSpaceError {
 }
 
 impl AddressSpace {
+    /// Attach the resolved ARM aperture policy to this boot image.
+    pub fn with_arm_ring_first(mut self, policy: carrick_guest_mem::ArmRingFirst) -> Self {
+        self.arm_ring_first = policy;
+        self
+    }
+
+    pub fn arm_ring_first(&self) -> carrick_guest_mem::ArmRingFirst {
+        self.arm_ring_first
+    }
+
     pub fn load_elf(path: impl AsRef<Path>) -> Result<Self, AddressSpaceError> {
         // EM_AARCH64 = 183 — the default aarch64 path; byte-identical to the
         // previous unconditional implementation.
@@ -1669,6 +1680,7 @@ impl AddressSpace {
             }
         }
         Ok(Self {
+            arm_ring_first: Default::default(),
             entry,
             regions,
             initial_stack_pointer: None,
@@ -1908,6 +1920,7 @@ impl AddressSpace {
         };
 
         let AddressSpace {
+            arm_ring_first,
             entry,
             regions,
             initial_stack_pointer,
@@ -1922,6 +1935,7 @@ impl AddressSpace {
             ..
         } = self;
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
+        image.arm_ring_first = arm_ring_first;
         image.initial_stack_pointer = initial_stack_pointer;
         image.el0_trampoline_entry = el0_trampoline_entry;
         image.el1_vectors_base = el1_vectors_base;
@@ -2005,6 +2019,7 @@ impl AddressSpace {
 
         // Reconstruct via `from_regions` so the overlap check still runs.
         let AddressSpace {
+            arm_ring_first,
             entry,
             regions,
             initial_stack_pointer,
@@ -2018,6 +2033,7 @@ impl AddressSpace {
             ..
         } = self;
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
+        image.arm_ring_first = arm_ring_first;
         image.initial_stack_pointer = initial_stack_pointer;
         image.linux_auxv = linux_auxv;
         // Preserve the serialized auxv image (/proc/self/auxv); `..` above drops
@@ -2167,6 +2183,7 @@ impl AddressSpace {
             bytes: carrick_el1_image::IMAGE.to_vec().into(),
         };
         let AddressSpace {
+            arm_ring_first,
             entry,
             regions,
             initial_stack_pointer,
@@ -2181,6 +2198,7 @@ impl AddressSpace {
             ..
         } = self;
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
+        image.arm_ring_first = arm_ring_first;
         image.initial_stack_pointer = initial_stack_pointer;
         image.linux_auxv = linux_auxv;
         image.linux_auxv_image = linux_auxv_image;
@@ -2215,6 +2233,7 @@ impl AddressSpace {
         };
 
         let AddressSpace {
+            arm_ring_first,
             entry,
             regions,
             initial_stack_pointer,
@@ -2228,6 +2247,7 @@ impl AddressSpace {
             ..
         } = self;
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
+        image.arm_ring_first = arm_ring_first;
         image.initial_stack_pointer = initial_stack_pointer;
         image.linux_auxv = linux_auxv;
         image.linux_auxv_image = linux_auxv_image; // preserve /proc/self/auxv (`..` drops it)
@@ -2275,6 +2295,7 @@ impl AddressSpace {
         };
 
         let AddressSpace {
+            arm_ring_first,
             entry,
             regions,
             initial_stack_pointer,
@@ -2289,6 +2310,7 @@ impl AddressSpace {
             ..
         } = self;
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
+        image.arm_ring_first = arm_ring_first;
         image.initial_stack_pointer = initial_stack_pointer;
         image.linux_auxv = linux_auxv;
         image.linux_auxv_image = linux_auxv_image; // preserve /proc/self/auxv (`..` drops it)
@@ -2322,6 +2344,7 @@ impl AddressSpace {
         };
 
         let AddressSpace {
+            arm_ring_first,
             entry,
             regions,
             initial_stack_pointer,
@@ -2335,6 +2358,7 @@ impl AddressSpace {
             file_mappings,
         } = self;
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
+        image.arm_ring_first = arm_ring_first;
         image.initial_stack_pointer = initial_stack_pointer;
         image.linux_auxv = linux_auxv;
         image.linux_auxv_image = linux_auxv_image;
@@ -2369,6 +2393,7 @@ impl AddressSpace {
         };
 
         let AddressSpace {
+            arm_ring_first,
             entry,
             regions,
             initial_stack_pointer,
@@ -2382,6 +2407,7 @@ impl AddressSpace {
             file_mappings,
         } = self;
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
+        image.arm_ring_first = arm_ring_first;
         image.initial_stack_pointer = initial_stack_pointer;
         image.linux_auxv = linux_auxv;
         image.linux_auxv_image = linux_auxv_image;
@@ -2421,6 +2447,7 @@ impl AddressSpace {
         };
 
         let AddressSpace {
+            arm_ring_first,
             entry,
             regions,
             initial_stack_pointer,
@@ -2434,6 +2461,7 @@ impl AddressSpace {
             file_mappings,
         } = self;
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
+        image.arm_ring_first = arm_ring_first;
         image.initial_stack_pointer = initial_stack_pointer;
         image.linux_auxv = linux_auxv;
         image.linux_auxv_image = linux_auxv_image;
@@ -2528,6 +2556,7 @@ impl AddressSpace {
         };
 
         let AddressSpace {
+            arm_ring_first,
             entry,
             regions,
             initial_stack_pointer,
@@ -2542,6 +2571,7 @@ impl AddressSpace {
         } = self;
         let mut image =
             Self::from_regions(entry, regions.into_iter().chain([region, maint]).collect())?;
+        image.arm_ring_first = arm_ring_first;
         image.initial_stack_pointer = initial_stack_pointer;
         image.linux_auxv = linux_auxv;
         image.linux_auxv_image = linux_auxv_image; // preserve /proc/self/auxv (`..` drops it)
@@ -2627,6 +2657,7 @@ impl AddressSpace {
         };
 
         let AddressSpace {
+            arm_ring_first,
             entry,
             regions,
             initial_stack_pointer,
@@ -2646,6 +2677,7 @@ impl AddressSpace {
         }
         let mut image =
             Self::from_regions(entry, regions.into_iter().chain([vvar, vdso]).collect())?;
+        image.arm_ring_first = arm_ring_first;
         image.initial_stack_pointer = initial_stack_pointer;
         image.linux_auxv = linux_auxv;
         image.linux_auxv_image = linux_auxv_image;
@@ -2725,6 +2757,7 @@ impl AddressSpace {
         E::Item: AsRef<[u8]>,
     {
         let AddressSpace {
+            arm_ring_first,
             entry,
             regions,
             linux_auxv,
@@ -2755,6 +2788,7 @@ impl AddressSpace {
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
         image.initial_stack_pointer = Some(stack_pointer);
         image.linux_auxv = linux_auxv;
+        image.arm_ring_first = arm_ring_first;
         image.linux_auxv_image = auxv_image;
         image.el0_trampoline_entry = el0_trampoline_entry;
         image.el1_vectors_base = el1_vectors_base;
@@ -8666,6 +8700,24 @@ mod el1_shim_tests {
                 "lower-EL IRQ slot (0x480) must eret after hvc #4"
             );
         }
+    }
+
+    #[test]
+    fn arm_ring_first_policy_survives_boot_region_builders() {
+        let image = minimal_image()
+            .with_arm_ring_first(carrick_guest_mem::ArmRingFirst::OptOut)
+            .with_vdso()
+            .expect("vdso")
+            .with_linux_initial_stack(vec!["prog".to_string()], Vec::<String>::new())
+            .expect("stack")
+            .with_el1_vectors_mailbox(true)
+            .expect("EL1")
+            .with_stage1_page_tables()
+            .expect("stage1");
+        assert_eq!(
+            image.arm_ring_first(),
+            carrick_guest_mem::ArmRingFirst::OptOut
+        );
     }
 
     fn minimal_image() -> AddressSpace {

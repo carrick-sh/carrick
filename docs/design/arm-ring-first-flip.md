@@ -449,3 +449,14 @@ Setting `CARRICK_ARM_RING_FIRST=0`:
 | **4.1** | Step 6 N1 host fork deletion | **READ** | [`crates/carrick-vmm-hvf/src/fork_quiesce.rs:1-120`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-vmm-hvf/src/fork_quiesce.rs#L1-L120), [`crates/carrick-kernel/src/dispatch/proc.rs:180-245`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/proc.rs#L180-L245) |
 | **5.1** | `=0` Hatch naming and aperture control word | **INFERENCE** | Patterned after existing `CARRICK_DSR_ZERO_REMAP` and aperture control bitfields |
 | **6.1** | Multi-phase PR rollout ordering | **INFERENCE** | Ordered to keep each PR atomically verifiable and under review budget |
+
+### Typed run policy (director ruling, 2026-10-09)
+
+`CARRICK_ARM_RING_FIRST` is resolved from the CLI's existing host-environment
+snapshot during engine run-spec assembly. Only the exact `0` selects
+`ArmRingFirst::OptOut`; absent or other values select `Strict`. An explicit
+embed builder option overrides the snapshot. The frozen container, prepared
+run and boot image carry the typed policy to HVF aperture initialization.
+The backend does not read process environment, and the newly introduced
+backend environment-read authority-debt cohort is removed. The signed
+witness selects each policy directly, without mutating process environment.
