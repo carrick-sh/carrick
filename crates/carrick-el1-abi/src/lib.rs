@@ -402,10 +402,27 @@ impl HostReadinessCrossing {
     ::core::cmp::PartialEq,
 )]
 pub struct HostReadinessEntry {
-    pub host_fd: HostBoundFd,
+    pub binding: HostObjectBinding,
     pub events: i16,
     pub revents: i16,
     pub poll_index: u32,
+}
+
+/// Typed write of an in-ring descriptor's host-bound object. The object id
+/// travels in RDI, byte address in RSI, length in RDX; the saved native frame
+/// is restored by the guest after this synchronous crossing completes.
+pub struct HostObjectWriteCrossing;
+impl HostObjectWriteCrossing {
+    pub const NUMBER: u64 = 0x4341_5252_574f_424a;
+    pub const FRAME_TAG: u64 = 0x574f_424a_4543_5431;
+}
+
+/// Last guest reference to one host object description. RDI carries the
+/// binding, RSI the description handle, RDX its incarnation.
+pub struct HostObjectReleaseCrossing;
+impl HostObjectReleaseCrossing {
+    pub const NUMBER: u64 = 0x4341_5252_5245_4c53;
+    pub const FRAME_TAG: u64 = 0x5245_4c45_4153_4531;
 }
 
 const _: () = assert!(core::mem::size_of::<HostReadinessEntry>() == 12);
@@ -1366,6 +1383,56 @@ impl HostBoundFd {
     }
 }
 
+/// Host-owned object identity. Stdio streams keep the dispatcher's chosen
+/// Captured/Piped/Inherit route; they are not carrier descriptor numbers.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+#[repr(transparent)]
+pub struct HostObjectBinding(u32);
+
+impl HostObjectBinding {
+    pub const STDIN: Self = Self(1);
+    pub const STDOUT: Self = Self(2);
+    pub const STDERR: Self = Self(3);
+
+    pub const fn from_encoded(encoded: u32) -> Option<Self> {
+        if encoded == 0 {
+            None
+        } else {
+            Some(Self(encoded))
+        }
+    }
+
+    pub const fn from_host_fd(fd: HostBoundFd) -> Self {
+        Self(fd.raw() as u32 + 4)
+    }
+
+    pub const fn encoded(self) -> u32 {
+        self.0
+    }
+
+    pub const fn stdio_fd(self) -> Option<i32> {
+        if self.0 >= 1 && self.0 <= 3 {
+            Some(self.0 as i32 - 1)
+        } else {
+            None
+        }
+    }
+
+    pub const fn host_fd(self) -> Option<HostBoundFd> {
+        if self.0 < 4 {
+            None
+        } else {
+            HostBoundFd::new((self.0 - 4) as i32)
+        }
+    }
+}
+
 /// One open description of an in-zone inode (open(2): an open file
 /// description has its own offset and status flags; every description of an
 /// inode shares its bytes). Guarded by its inode's lock.
@@ -1380,7 +1447,8 @@ pub struct DelegatedOpenFile {
     pub generation: AtomicU64,
     /// 1-based handle of the inode record ([`DelegatedFile`]).
     pub inode_handle: AtomicU32,
-    /// Host descriptor binding, encoded as fd + 1 (zero means no host binding).
+    /// Host object binding: 1..3 are the dispatcher's stdio routes, and
+    /// values >= 4 name explicit host descriptors as fd + 4.
     host_fd: AtomicU32,
     /// The inode's generation when this record joined it: an inode handle
     /// reused by another inode never matches.
@@ -1392,15 +1460,23 @@ pub struct DelegatedOpenFile {
 
 impl DelegatedOpenFile {
     pub fn bind_host_fd(&self, fd: HostBoundFd) {
-        self.host_fd.store(fd.raw() as u32 + 1, Ordering::Release);
+        self.host_fd.store(fd.raw() as u32 + 4, Ordering::Release);
+    }
+
+    pub fn bind_host_object(&self, binding: HostObjectBinding) {
+        self.host_fd.store(binding.encoded(), Ordering::Release);
+    }
+
+    pub fn host_object(&self) -> Option<HostObjectBinding> {
+        HostObjectBinding::from_encoded(self.host_fd.load(Ordering::Acquire))
     }
 
     pub fn host_fd(&self) -> Option<HostBoundFd> {
         let encoded = self.host_fd.load(Ordering::Acquire);
-        if encoded == 0 {
+        if encoded < 4 {
             None
         } else {
-            HostBoundFd::new((encoded - 1) as i32)
+            HostBoundFd::new((encoded - 4) as i32)
         }
     }
 
@@ -1630,6 +1706,8 @@ pub struct FdMapSlot {
     pub handle: AtomicU32,
     /// Host-assigned incarnation of the delegated file.
     pub incarnation: AtomicU64,
+    /// Per-descriptor flags; these are not open-description status flags.
+    pub fd_flags: AtomicU32,
 }
 
 impl FdMapSlot {
@@ -1648,6 +1726,7 @@ impl FdMapSlot {
             fd: AtomicU32::new(0),
             handle: AtomicU32::new(0),
             incarnation: AtomicU64::new(0),
+            fd_flags: AtomicU32::new(0),
         }
     }
 
@@ -1657,14 +1736,28 @@ impl FdMapSlot {
         self.handle.store(0, Ordering::Relaxed);
         self.fd.store(0, Ordering::Relaxed);
         self.file_table.store(0, Ordering::Relaxed);
+        self.fd_flags.store(0, Ordering::Relaxed);
         self.incarnation.store(0, Ordering::Release);
     }
 
     #[inline]
     pub fn set(&self, file_table: u64, fd: u32, handle: u32, incarnation: u64) {
+        self.set_with_flags(file_table, fd, handle, incarnation, 0);
+    }
+
+    #[inline]
+    pub fn set_with_flags(
+        &self,
+        file_table: u64,
+        fd: u32,
+        handle: u32,
+        incarnation: u64,
+        fd_flags: u32,
+    ) {
         self.file_table.store(file_table, Ordering::Relaxed);
         self.fd.store(fd, Ordering::Relaxed);
         self.handle.store(handle, Ordering::Relaxed);
+        self.fd_flags.store(fd_flags, Ordering::Relaxed);
         self.incarnation.store(incarnation, Ordering::Release);
     }
 }
@@ -3788,7 +3881,7 @@ mod tests {
 
     #[test]
     fn test_fd_map_slot_layout() {
-        assert_eq!(core::mem::size_of::<FdMapSlot>(), 24);
+        assert_eq!(core::mem::size_of::<FdMapSlot>(), 32);
         assert_eq!(core::mem::align_of::<FdMapSlot>(), 8);
         assert_eq!(core::mem::offset_of!(FdMapSlot, file_table), 0);
         assert_eq!(core::mem::offset_of!(FdMapSlot, fd), 8);
