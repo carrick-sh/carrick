@@ -133,9 +133,15 @@ fn materialize_zone_in(
             "zone residency on a non-AArch64 task".to_owned(),
         ));
     };
-    let rec = zone
-        .live(record)
-        .ok_or_else(|| TrapError::Hypervisor(format!("zone record {record:?} is gone")))?;
+    let rec = zone.live(record).ok_or_else(|| {
+        let current = zone.record_ref(record.id);
+        let row = zone.record(record.id);
+        TrapError::Hypervisor(format!(
+            "zone record {record:?} is gone: current={current:?} claim={:?} identity={:?}",
+            row.claim(),
+            row.identity()
+        ))
+    })?;
     if !matches!(rec.claim(), carrick_el1_abi::Claim::Host { .. }) {
         return Err(TrapError::Hypervisor(format!(
             "zone record {record:?} is not host-owned: {:?}",
