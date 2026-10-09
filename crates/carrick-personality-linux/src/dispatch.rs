@@ -627,6 +627,12 @@ const fn route_shared(ordinal: u64, allocator_control: u64) -> Family {
         172 => Family::Lifecycle(LifecycleCall::GetPid),
         220 => Family::Lifecycle(LifecycleCall::Clone),
         nr if nr == carrick_syscall_abi::nr::WAIT4.raw() => Family::Lifecycle(LifecycleCall::Wait4),
+        nr if nr == carrick_syscall_abi::nr::WAITID.raw() => {
+            Family::Lifecycle(LifecycleCall::WaitId)
+        }
+        nr if nr == carrick_syscall_abi::nr::CLONE3.raw() => {
+            Family::Lifecycle(LifecycleCall::Clone3)
+        }
         nr if nr == carrick_syscall_abi::nr::EXIT_GROUP.raw() => {
             Family::Lifecycle(LifecycleCall::ExitGroup)
         }
@@ -1357,17 +1363,26 @@ mod ring_first_tests {
 #[cfg(test)]
 mod owner_process_call_tests {
     use super::aarch64_owner_process_call;
+    use carrick_abi::{LINUX_CLONE_THREAD, LINUX_CLONE_VFORK, LINUX_CLONE_VM, LINUX_SIGCHLD};
+    use carrick_syscall_abi::nr;
 
     #[test]
     fn aarch64_process_calls_cannot_escape_to_thread_or_host_lifecycle() {
-        assert!(aarch64_owner_process_call(220, 17));
-        assert!(aarch64_owner_process_call(220, 17 | 0x0120_0000));
-        assert!(aarch64_owner_process_call(220, 17 | 0x0000_4100));
-        assert!(aarch64_owner_process_call(260, 0));
-        assert!(aarch64_owner_process_call(94, 0));
-        assert!(aarch64_owner_process_call(95, 0));
-        assert!(aarch64_owner_process_call(435, 0));
-        assert!(!aarch64_owner_process_call(220, 0x0001_0000));
-        assert!(!aarch64_owner_process_call(58, 0)); // vhangup on AArch64
+        let clone = carrick_abi::syscall::nr::CLONE.raw();
+        let sigchld = LINUX_SIGCHLD as u64;
+        assert!(aarch64_owner_process_call(clone, sigchld));
+        assert!(aarch64_owner_process_call(
+            clone,
+            sigchld | LINUX_CLONE_VM | LINUX_CLONE_VFORK
+        ));
+        assert!(aarch64_owner_process_call(nr::WAIT4.raw(), 0));
+        assert!(aarch64_owner_process_call(nr::EXIT_GROUP.raw(), 0));
+        assert!(aarch64_owner_process_call(nr::WAITID.raw(), 0));
+        assert!(aarch64_owner_process_call(nr::CLONE3.raw(), 0));
+        assert!(!aarch64_owner_process_call(clone, LINUX_CLONE_THREAD));
+        assert!(!aarch64_owner_process_call(
+            carrick_abi::syscall::nr::VHANGUP.raw(),
+            0
+        ));
     }
 }
