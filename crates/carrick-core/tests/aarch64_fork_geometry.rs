@@ -2,8 +2,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use carrick_core::mm::fork::{
-    ForkCensus, ForkChildRoot, ForkError, ForkParentRoot, ForkScratch, ForkTableCursor, Mapping,
-    MappingInheritancePolicy, Policy, PreparedOwnerFork, census_table, copy_table, rollback,
+    ForkCapacityFailure, ForkCensus, ForkChildRoot, ForkError, ForkParentRoot, ForkScratch,
+    ForkTableCursor, Mapping, MappingInheritancePolicy, Policy, PreparedOwnerFork, census_table,
+    copy_table, rollback,
 };
 use carrick_core_abi::{
     El1MmHandle, PortalForkCustody, PortalForkRequest, PortalForkTableArena, PortalOperation,
@@ -45,6 +46,33 @@ const KERNEL_PAGE_FLAGS: u64 = UXN | AF | SH_IS | TYPE_TABLE_OR_PAGE;
 
 struct TestMemory {
     words: Mutex<BTreeMap<u64, u64>>,
+}
+
+#[test]
+fn arm_fork_copy_reports_the_exact_exhausted_table_bound() {
+    let request = sample_arm_request(1);
+    let words = TestMemory::new();
+    let parent_root = 0x10_0000;
+    words.store(parent_root, 0x10_1000 | TYPE_TABLE_OR_PAGE);
+    let mut scratch = ForkScratch::bounded(request, 0, 512, 0, 1024, 0).unwrap();
+    let error = copy_table::<Aarch64Mmu, _, _>(
+        &LinuxForkPolicy,
+        &words,
+        request,
+        &mut scratch,
+        ForkTableCursor {
+            table: parent_root,
+            level: 0,
+            base: 0,
+            child_offset: 0,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error, ForkError::NoMemory);
+    assert_eq!(
+        scratch.capacity_failure,
+        Some(ForkCapacityFailure::ChildTables)
+    );
 }
 
 impl TestMemory {
