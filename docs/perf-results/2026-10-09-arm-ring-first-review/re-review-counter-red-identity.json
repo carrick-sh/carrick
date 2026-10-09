@@ -1,0 +1,14 @@
+{
+  "source_head": "38b85945e815633f36b65bdaf0cbbc2854e8050e",
+  "canonical_path": "/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/arm_ring_first_hatch-49046773201fdb39",
+  "retained_path": "/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/ringswitch-rereview-counter-red-signed",
+  "sha256": "0287547b7483eb522a45ba2fd5fc05234fd8f615ffebfa57ec3024cdda893774",
+  "cdhash": "e39a176ab0183f76fda283ac0df1d517da936f64",
+  "lc_uuid": "2F52F7F7-B6B4-3C67-9B42-8D6036BC1D4F",
+  "dof_carrick_present": true,
+  "entitlement_present": true,
+  "entitlements": "Executable=/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/arm_ring_first_hatch-49046773201fdb39\nwarning: Specifying ':' in the path is deprecated and will not work in a future release\n<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"https://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>\n",
+  "cli_sha256": "fe4c58c3f9181bfeba256af69243c325d4a0ad30291d0dcde0779663d8a06996",
+  "guest_sha256": "69f6c577f5fe1f5cf67877804d64c9535eb1890d1d3efe96b4612a6c525dfc7d",
+  "bundle_sha256": "05c18f1c96019cde74c9de19bd26c2ec4f467e741c1cbcdc59d6ab8c1ab8397a"
+}

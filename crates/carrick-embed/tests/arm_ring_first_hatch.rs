@@ -178,7 +178,7 @@ fn loader_witness(strict: bool) {
         counters.forwarded[174].load(Ordering::Relaxed),
         u64::from(!strict)
     );
-    for ordinal in [56, 63, 64, 94, 172, 222] {
+    for ordinal in [56, 63, 64, 94, 222] {
         assert_eq!(counters.refused[ordinal].load(Ordering::Relaxed), 0);
         assert!(
             counters.forwarded[ordinal].load(Ordering::Relaxed)
@@ -187,6 +187,12 @@ fn loader_witness(strict: bool) {
             "loader/ordinary call {ordinal} must complete"
         );
     }
+    // The mailbox identity shim handles getpid before personality dispatch.
+    // The fixture requires a positive PID; no dispatcher or crossing counter
+    // should change for that completed identity-page read.
+    assert_eq!(counters.refused[172].load(Ordering::Relaxed), 0);
+    assert_eq!(counters.served[172].load(Ordering::Relaxed), 0);
+    assert_eq!(counters.forwarded[172].load(Ordering::Relaxed), 0);
     assert!(
         counters.forwarded[222].load(Ordering::Relaxed) > 0,
         "ld.so must forward file-backed mappings"

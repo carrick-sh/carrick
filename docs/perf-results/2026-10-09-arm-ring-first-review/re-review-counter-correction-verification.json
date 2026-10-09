@@ -1,0 +1,61 @@
+{
+  "checks": [
+    {
+      "command": "cargo test -p carrick-mem --lib shim_dispatches_only_process_identity",
+      "exit_code": 0,
+      "output_tail": [
+        "",
+        "running 1 test",
+        "test memory::el1_shim_tests::shim_dispatches_only_process_identity ... ok",
+        "",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 188 filtered out; finished in 0.00s",
+        ""
+      ]
+    },
+    {
+      "command": "cargo test -p carrick-mem --lib mailbox_vector_retains_identity_fast_paths_when_enabled",
+      "exit_code": 0,
+      "output_tail": [
+        "",
+        "running 1 test",
+        "test memory::syscall_mailbox_tests::mailbox_vector_retains_identity_fast_paths_when_enabled ... ok",
+        "",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 188 filtered out; finished in 0.00s",
+        ""
+      ]
+    },
+    {
+      "command": "cargo check -p carrick-embed --test arm_ring_first_hatch",
+      "exit_code": 0,
+      "output_tail": [
+        "    Checking carrick-image v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-image)",
+        "    Checking carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-kernel)",
+        "    Checking carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-runtime)",
+        "    Checking carrick-engine v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-engine)",
+        "    Checking carrick-embed v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-embed)",
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 22.20s"
+      ]
+    },
+    {
+      "command": "just fmt",
+      "exit_code": 0,
+      "output_tail": [
+        "   Compiling oci-client v0.15.0",
+        "   Compiling carrick-spec v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-spec)",
+        "   Compiling carrick-conformance v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-conformance)",
+        "   Compiling carrick-xtask v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-xtask)",
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.30s",
+        "     Running `target/debug/carrick-xtask worktree-run -- cargo --config 'build.rustc-wrapper=\"/opt/homebrew/bin/sccache\"' fmt --all`"
+      ]
+    },
+    {
+      "command": "target/debug/carrick-xtask fixtures verify --receipt target/ringswitch-loader-counter-fixture-validation.json",
+      "exit_code": 0,
+      "output_tail": [
+        "fixtures: verified 1135 executables for 38b85945e815633f36b65bdaf0cbbc2854e8050e by input_identity ec7b5e7c720ff9ba653b6ef212da4177831150eff9a0641b75048f23266f2169 (bundle built at 585e9b936ac5709d31ba9a5f1d2b6ab26fc310ab)"
+      ]
+    }
+  ],
+  "fixture_inputs_sha256": "ec7b5e7c720ff9ba653b6ef212da4177831150eff9a0641b75048f23266f2169",
+  "signed_status": "pending changed-witness artifact"
+}
