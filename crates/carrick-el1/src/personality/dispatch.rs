@@ -156,7 +156,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                     let admission = super::aarch64_process::admit_entry(
                         source,
                         task,
-                        saved.native,
+                        &saved.native,
                         ttbr0,
                         zone.record(record).incarnation(),
                     );
