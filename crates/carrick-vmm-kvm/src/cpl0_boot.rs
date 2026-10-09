@@ -3425,6 +3425,7 @@ impl Cpl0Carrier {
                     fault_reason: AtomicU64::new(0),
                     mm_owner_generation: AtomicU64::new(1),
                     last_seen_generation: AtomicU64::new(0),
+                    stdio_table_admitted: AtomicU64::new(0),
                 });
             }
         }
