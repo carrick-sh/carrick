@@ -1,0 +1,32 @@
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/ring-switch-main-ab-20261009/target/release/deps/arm_ring_first_main_control-e7b3a65c0c362aeb arm_ring_first_main_ --nocapture
+
+running 1 test
+test arm_ring_first_main_glibc_fork_wait_witness ... 
+thread 'arm_ring_first_main_glibc_fork_wait_witness' (135273775) panicked at crates/carrick-embed/tests/common/mod.rs:158:21:
+container run failed: runtime failure: filesystem backend error: failed to run ELF from dispatcher: unsupported in this backend: HVPatch process child panicked (1 failed): first: trap engine failed: hypervisor operation failed: HVPatch COW compound IPA 0x2e00000000 has no exact inventory coverage
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    arm_ring_first_main_glibc_fork_wait_witness
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.09s
+
+test-signed: FAIL /Volumes/CaseSensitive/carrick/.worktrees/ring-switch-main-ab-20261009/target/release/deps/arm_ring_first_main_control-e7b3a65c0c362aeb
+/Volumes/CaseSensitive/carrick/.worktrees/ring-switch-main-ab-20261009/target/release/deps/entitlement_negative-5ab05077e3c45bd1.noent.53802: replacing existing signature
+test-signed: negative control on /Volumes/CaseSensitive/carrick/.worktrees/ring-switch-main-ab-20261009/target/release/deps/entitlement_negative-5ab05077e3c45bd1.noent.53802
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+test-signed: FAILED (carrick-embed)
+remaining carrick procs (run-id ring-switch-main-ab-20261009-10e41549e-1) = 0
+remaining carrick procs (run-id ring-switch-main-ab-20261009-10e41549e-1-cli) = 0
+error: recipe `test-embed` failed on line 824 with exit code 1
+
+Explicit cleanup:
+remaining carrick procs (run-id ring-switch-main-ab-20261009-10e41549e-1) = 0
