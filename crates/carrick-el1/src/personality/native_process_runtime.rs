@@ -6,7 +6,7 @@ use super::{
     native_process_custody::{ProcessResources, ProcessWake, RetainedProcessCustody},
     native_process_entry::{self, CopiedWaitOutcome, ForkTryError, PreparedFork, WaitWork},
     native_process_signals::{NativeExitSignals, NativeProcessSignals},
-    process_owner::*,
+    process_owner::{GuestProcessOwner, GuestTask, GuestTaskMetadata},
 };
 use crate::lock::SpinLock;
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec};
@@ -824,7 +824,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let visible = selector.positive().ok_or(LINUX_ESRCH)?;
         let graph = self.runtime.graph.lock();
         let mut selected = None;
-        for (_, row) in graph.owner.tasks() {
+        for row in graph.owner.tasks().values() {
             if group.is_some_and(|group| group.get() != row.metadata().namespace_pid) {
                 continue;
             }
@@ -1300,21 +1300,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
             );
             drop(graph);
-            if let PendingSignalKind::Wait { set, info } = pending.kind {
-                if let Some((signal, payload)) = signals.take_timedwait(self.record, set) {
-                    if info.raw() != 0 {
-                        let payload = payload.unwrap_or_else(|| {
-                            carrick_abi::LinuxSiginfo::kill(
-                                signal.number(),
-                                carrick_abi::LINUX_SI_USER,
-                                0,
-                                0,
-                            )
-                        });
-                        self.service.copy_siginfo(&mm, info, &payload)?;
-                    }
-                    return Ok(returned(i64::from(signal.number())));
+            if let PendingSignalKind::Wait { set, info } = pending.kind
+                && let Some((signal, payload)) = signals.take_timedwait(self.record, set)
+            {
+                if info.raw() != 0 {
+                    let payload = payload.unwrap_or_else(|| {
+                        carrick_abi::LinuxSiginfo::kill(
+                            signal.number(),
+                            carrick_abi::LINUX_SI_USER,
+                            0,
+                            0,
+                        )
+                    });
+                    self.service.copy_siginfo(&mm, info, &payload)?;
                 }
+                return Ok(returned(i64::from(signal.number())));
             }
             if signals.has_deliverable(self.record, blocked) {
                 return Ok(returned(
