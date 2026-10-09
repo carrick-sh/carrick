@@ -83,7 +83,7 @@ fn libc_witness(policy: carrick_embed::ArmRingFirst) {
     let path = common::repo_root().join("fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-gnu/release/carrick-linux-aarch64-ring-first-glibc");
     assert!(path.is_file(), "published GNU fixture is required");
     // The fixture links glibc and has PT_INTERP; ld.so must map libc from host
-    // files. Its parent polls for pipe EOF for five seconds and reaps with
+    // files. Its parent polls SIGCHLD for five seconds and reaps with
     // WNOHANG exactly once. A missing child completion fails rather than waits.
     let result = common::run_or_fail(
         ContainerBuilder::from_image(common::SMOKE_IMAGE)
