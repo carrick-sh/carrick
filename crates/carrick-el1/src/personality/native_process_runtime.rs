@@ -1222,7 +1222,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         address: AddressContext<RootGpa>,
         words: C,
         service: &'r mut S,
-    ) -> Result<NativeProcessEntry<'r, 'a, M, C, S>, NativeProcessError> {
+    ) -> Result<Box<NativeProcessEntry<'r, 'a, M, C, S>>, NativeProcessError> {
         if !core::ptr::eq(source.zone, self.zone) {
             return Err(NativeProcessError::Stale);
         }
@@ -1287,7 +1287,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         row.credentials_for(calling_tid)
             .map_err(|_| NativeProcessError::Stale)?;
         drop(graph);
-        Ok(NativeProcessEntry {
+        Ok(Box::new(NativeProcessEntry {
             runtime: self,
             source,
             current,
