@@ -727,11 +727,13 @@ arch_trait!(SignalArch, SignalBackend {
         frame: &mut Self::NativeFrame,
         params: SignalFrameParams,
         siginfo: Option<&'a [u8]>,
+        fpstate: &[u8],
         copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool
     ) -> Result<UserVa, Self::Error>;
 
     fn restore_signal_frame(
         frame: &mut Self::NativeFrame,
+        fpstate: &mut [u8],
         copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool
     ) -> Result<u64, Self::Error>;
 });

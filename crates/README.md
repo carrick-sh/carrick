@@ -35,7 +35,7 @@ Platform code is selected by Cargo features. The default feature is
 
 | Crate | Role |
 | --- | --- |
-| `carrick-abi` | Linux ABI constants and wire structs, with compile-time layout/constant assertions. |
+| `carrick-abi` | `no_std` Linux ABI constants and wire structs shared by host and ring code, with compile-time layout/constant assertions. |
 | `carrick-core` | Neutral MM, fork, COW, and wait/lifecycle substrate for Carrick (shared owner algorithms; hardware and Linux lowering stay with clients). |
 | `carrick-core-abi` | Neutral owner identities and transport, shared by both ISA images. |
 | `carrick-el1-abi` | Contracts, memory layouts, and definitions shared between the host runtime and the bare-metal in-guest EL1 kernel (`carrick-el1`). |
