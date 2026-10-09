@@ -41,9 +41,9 @@ impl<'a> SignalNative<'a> for Native {
         self.forced = true;
         true
     }
-    fn restore_signal_frame(&mut self) -> Result<u64, i32> {
+    fn restore_signal_frame(&mut self) -> Result<u64, carrick_syscall_abi::LinuxErrno> {
         if self.invalid {
-            return Err(14);
+            return Err(carrick_syscall_abi::LinuxErrno::new(14));
         }
         self.accumulator = 0x1234_5678;
         Ok(1 << 9)
