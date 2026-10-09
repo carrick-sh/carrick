@@ -711,3 +711,28 @@ fn mounted_static_x86_signal_thread_identity_matches_native() {
 fn mounted_static_x86_signal_thread_child_matches_native() {
     compare_mounted_assembly_with_native("x86_signal_thread_child.S", b"T\n");
 }
+
+#[test]
+fn mounted_static_x86_signal_kills_busy_child_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_kill_loop.S", b"K\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_kills_reading_child_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_kill_read.S", b"K\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_segv_resume_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_segv_resume.S", b"S\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_interrupts_owned_wait4_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_wait4_interrupt.S", b"I\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_restarts_owned_wait4_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_wait4_restart.S", b"R\n");
+}

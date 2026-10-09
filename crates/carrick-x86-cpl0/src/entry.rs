@@ -61,6 +61,8 @@ core::arch::global_asm!(
     "swapgs",
     "mov gs:[8], rsp",
     "mov rsp, gs:[0]",
+    "push r11",
+    "push rcx",
     "push qword ptr gs:[8]",
     "push r11",
     "push rcx",
@@ -101,6 +103,7 @@ core::arch::global_asm!(
     // A host forward may alter the retained frame after the entry check.
     // Validate once more after every early return and before SWAPGS/IRETQ.
     "mov rdi, r12",
+    "mov rsi, r13",
     "call carrick_x86_validate_return",
     "mov eax, 7",
     "xor edx, edx",
@@ -125,6 +128,8 @@ core::arch::global_asm!(
     "push r11",
     "push 0x23",
     "push rcx",
+    "mov rcx, qword ptr [rsp + 32]",
+    "mov r11, qword ptr [rsp + 40]",
     "mov qword ptr [rsp + 32], 0x1b",
     "swapgs",
     "iretq",
@@ -657,6 +662,8 @@ mod kernel {
                             rsi: frame.saved_gprs[13],
                             rdi: frame.saved_gprs[14],
                             rsp: frame.rsp,
+                            user_rcx: frame.saved_gprs[11],
+                            user_r11: frame.saved_gprs[6],
                         };
                         let Some((sp, stack)) = carrick_personality_linux::signal::delivery_stack(
                             thread.slot.read_altstack(), carrick_guest_arch::UserVa::new(frame.rsp), action.flags.on_stack,
@@ -1223,6 +1230,18 @@ mod kernel {
                 }
             }
             policy::Disposition::Handler(handler) => {
+                if let Some(original) = process.take_interrupted_child_wait()
+                    && action.flags.restart
+                {
+                    // The child wait has not consumed a receipt or copied status.
+                    // Restore its exact saved syscall accumulator and instruction.
+                    use carrick_guest_arch::ProcessContext;
+                    frame.rax = original.syscall_return();
+                    let Some(restart_pc) = frame.rcx.checked_sub(2) else {
+                        return force_delivery_fault(task, process, frame, fpstate, sig, thread_blocked);
+                    };
+                    frame.rcx = restart_pc;
+                }
                 let selected_stack = carrick_personality_linux::signal::delivery_stack(
                     thread.slot.read_altstack(), carrick_guest_arch::UserVa::new(frame.rsp), action.flags.on_stack,
                 );
@@ -1276,6 +1295,86 @@ mod kernel {
                 in("rax") &exit as *const _ as u64, options(nostack, preserves_flags));
         }
         halt();
+    }
+
+    production_items! {
+    pub(crate) fn signal_syscall_return(
+        frame: &mut NativeFrame,
+        xsave: &mut carrick_el1::isa::x86::context::scheduler::XsaveArea,
+    ) {
+        use carrick_el1::isa::x86::context;
+        use carrick_personality_linux::dispatch::CompletionRoute;
+        if native_process::runtime_opt().is_none() { return; }
+        let binding = context::current_cpu_binding().unwrap_or_else(|| initial_boot::fatal_boot());
+        let slot = carrick_sched_core::SlotId::from_index(binding.cpu_slot as usize).unwrap_or_else(|| initial_boot::fatal_boot());
+        let source = native_execution::source(slot);
+        // SAFETY: return validation runs on the CPU that owns this task binding.
+        let task = unsafe { &*(binding.task_address as *const CurrentTask) };
+        let mut suspended = false;
+        let root_exit;
+        {
+            let _copy_gate = crate::user_fault_gate::install();
+            let words = native_execution::capture(frame, xsave);
+            let mut service = native_process::Service::new(task, slot);
+            let mut process = native_process::runtime().enter(source, task, words, &mut service).unwrap_or_else(|_| initial_boot::fatal_boot());
+            if let Some(route) = deliver_signal_on_syscall_return(task, &mut process, frame, xsave) {
+                if route != CompletionRoute::Suspended { initial_boot::fatal_boot(); }
+                suspended = true;
+            }
+            root_exit = process.take_root_exit();
+        }
+        if let Some(status) = root_exit { complete_root_exit(task, status); }
+        if suspended { native_execution::schedule(slot); }
+    }
+
+    pub(crate) fn signal_irq_return(
+        frame: &mut carrick_el1::isa::x86::context::scheduler::InterruptFrame,
+        xsave: &mut carrick_el1::isa::x86::context::scheduler::XsaveArea,
+    ) {
+        use carrick_el1::isa::x86::context;
+        use carrick_personality_linux::dispatch::CompletionRoute;
+        let binding = context::current_cpu_binding().unwrap_or_else(|| initial_boot::fatal_boot());
+        let slot = carrick_sched_core::SlotId::from_index(binding.cpu_slot as usize).unwrap_or_else(|| initial_boot::fatal_boot());
+        let source = native_execution::source(slot);
+        if native_process::runtime_opt().is_none() { return; }
+        // SAFETY: this CPU owns its retained current-task binding during IRQ entry.
+        let task = unsafe { &*(binding.task_address as *const CurrentTask) };
+        let mm = carrick_el1_abi::ReservationMm::new(task.mm.key.load(Ordering::Acquire)).unwrap_or_else(|| initial_boot::fatal_boot());
+        let address = anonymous::live_words(mm).and_then(|words| words.context).unwrap_or_else(|| initial_boot::fatal_boot());
+        let mut native = context::scheduler::NativeContext {
+            frame: *frame, address,
+            fs_base: native_execution::read_msr(0xc000_0100),
+            gs_base: native_execution::read_msr(0xc000_0102),
+            xsave: xsave.clone(),
+        };
+        let mut returned = context::context_words::syscall_frame_from_native(&native, address).unwrap_or_else(|_| initial_boot::fatal_boot());
+        let record = source.zone.slot(slot).current().or_else(|| source.zone.slot(slot).host_record()).unwrap_or_else(|| initial_boot::fatal_boot());
+        let mut suspended = false;
+        let root_exit;
+        {
+            let _copy_gate = crate::user_fault_gate::install();
+            let mut service = native_process::Service::new(task, slot);
+            let mut process = native_process::runtime().enter(source, task, context::context_words::from_native(&native), &mut service).unwrap_or_else(|_| initial_boot::fatal_boot());
+            if let Some(route) = deliver_signal_on_syscall_return(task, &mut process, &mut returned, xsave) {
+                if route != CompletionRoute::Suspended { initial_boot::fatal_boot(); }
+                suspended = true;
+            }
+            root_exit = process.take_root_exit();
+        }
+        if let Some(status) = root_exit { complete_root_exit(task, status); }
+        if !suspended {
+            native = context::context_words::from_syscall(&returned, address, native.fs_base, native.gs_base, xsave).unwrap_or_else(|_| initial_boot::fatal_boot());
+            *frame = native.frame;
+            if source.zone.runnable_head(slot).is_some() {
+                // SAFETY: IRQ entry owns this exact running/home record's context.
+                unsafe { *source.zone.record(record).ctx_mut() = context::context_words::from_native(&native); }
+                source.zone.requeue_preempted(slot, record);
+                suspended = true;
+            }
+        }
+        if suspended { native_execution::schedule(slot); }
+    }
+
     }
 
     fn force_delivery_fault(
@@ -2193,7 +2292,8 @@ mod kernel {
     }
 
     #[unsafe(no_mangle)]
-    extern "C" fn carrick_x86_validate_return(frame: &mut NativeFrame) {
+    extern "C" fn carrick_x86_validate_return(frame: &mut NativeFrame, xsave: &mut carrick_el1::isa::x86::context::scheduler::XsaveArea) {
+        crate::signal_syscall_return(frame, xsave);
         if !frame.valid_user_return() {
             doorbell(FATAL_PORT, frame);
             halt();

@@ -515,7 +515,8 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         let bytes = unsafe { core::slice::from_raw_parts(info as *const _ as *const u8, core::mem::size_of_val(info)) };
         self.copy_signal_bytes(mm, address, bytes)
     }
-    fn wake_effects(&mut self, effects: WakeEffects) {
+    fn wake_effects(&mut self, mut effects: WakeEffects) {
+        if effects.queued_own { effects.request_reschedule(self.slot); }
         deliver_wakes(effects);
     }
 }

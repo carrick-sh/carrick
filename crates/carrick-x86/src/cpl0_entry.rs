@@ -261,8 +261,11 @@ pub struct NativeFrame {
     pub rcx: u64,
     pub r11: u64,
     pub rsp: u64,
+    /// Actual user GPRs, independent of the saved IRET PC and flags above.
+    pub user_rcx: u64,
+    pub user_r11: u64,
 }
-const _: () = assert!(core::mem::size_of::<NativeFrame>() == 128);
+const _: () = assert!(core::mem::size_of::<NativeFrame>() == 144);
 const _: () = {
     assert!(core::mem::offset_of!(NativeFrame, r15) == 0);
     assert!(core::mem::offset_of!(NativeFrame, r14) == 8);

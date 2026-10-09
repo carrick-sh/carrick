@@ -693,6 +693,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             run_failure: None,
             calling_tid,
             slot,
+            interrupted_child_wait: None,
         })
     }
     pub fn namespace_child_key(&self, caller: TaskKey, visible: u32) -> Option<TaskKey> {
@@ -720,11 +721,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         let resources = row.native().resources();
         // SAFETY: the caller selected this exact Queued/OnCpu record after the
         // scheduler handed it exclusive context custody. Fresh births initialized it.
-        let words = if resources.record == record {
-            *row.context()
-        } else {
-            unsafe { *live.ctx_mut() }
-        };
+        let words = unsafe { *live.ctx_mut() };
         Some(NativeRecordBinding {
             key: row.key(),
             visible_pid: row.metadata().namespace_pid,
@@ -773,6 +770,7 @@ pub struct NativeProcessEntry<
     run_failure: Option<carrick_el1_abi::NativeRunFailureReason>,
     calling_tid: u32,
     slot: Option<&'a ThreadControlSlot>,
+    interrupted_child_wait: Option<C>,
 }
 fn returned(value: i64) -> LifecycleOutcome {
     LifecycleOutcome::Returned {
@@ -921,12 +919,51 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             )
         });
         signals.enqueue_thread(record, signal, Some(info));
+        let target = self.source.zone.record(record.id).identity();
+        let blocked = graph
+            .owner
+            .tasks()
+            .iter()
+            .find_map(|(_, row)| {
+                let resources = row.native().resources();
+                (resources.address.mm.raw().get() == target.mm
+                    && resources.page as *const _ as u64 == target.lifecycle_page)
+                    .then(|| owned_control(resources.page, resources.control, target.control_slot))
+                    .flatten()
+            })
+            .map(|control| {
+                carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                    carrick_signal_core::SignalSet::from_bits(control.blocked().0),
+                )
+            });
+        let interrupt = blocked.is_some_and(|blocked| signals.has_deliverable(record, blocked));
         drop(graph);
+        if interrupt {
+            self.interrupt_signal_record(record);
+        }
         if let Some(channel) = channel {
             self.publish_channel(&channel)
                 .map_err(|e| -e.errno() as i32)?;
         }
         Ok(())
+    }
+
+    fn interrupt_signal_record(&mut self, record: RecordRef) {
+        if !signal_record_exists(self.source.zone, record) {
+            return;
+        }
+        let owned = self.source.zone.record(record.id);
+        let target = match owned.claim() {
+            carrick_sched_core::Claim::OnCpu { slot, .. }
+            | carrick_sched_core::Claim::OnCpuRequested { slot, .. } => Some(slot),
+            carrick_sched_core::Claim::Free => owned.home(),
+            _ => None,
+        };
+        if let Some(slot) = target {
+            let mut effects = WakeEffects::default();
+            effects.request_reschedule(slot);
+            self.service.wake_effects(effects);
+        }
     }
 
     pub fn take_root_exit(&mut self) -> Option<LinuxWaitStatus> {
@@ -1078,6 +1115,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         let graph = self.runtime.graph.lock();
                         if graph.pending.contains_key(&self.key) {
                             return Err(NativeProcessError::Busy);
+                        }
+                        let resources = graph
+                            .owner
+                            .task(self.key)
+                            .map_err(|_| NativeProcessError::Stale)?
+                            .native()
+                            .resources();
+                        let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                            carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
+                        );
+                        if resources.signals().has_deliverable(self.record, blocked) {
+                            self.interrupted_child_wait = Some(self.words);
+                            return Ok(returned(
+                                carrick_personality_linux::abi::signal::LINUX_EINTR.guest_retval(),
+                            ));
                         }
                     }
                     let sequence = zone.next_seq(record);
@@ -1272,12 +1324,36 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.runtime.graph.lock().pending.insert(self.key, pending);
             return Some(self.fail(NativeProcessError::Stale));
         }
+        let graph = self.runtime.graph.lock();
+        let signals = graph
+            .owner
+            .task(self.key)
+            .ok()?
+            .native()
+            .resources()
+            .signals();
+        let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+            carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
+        );
+        let interrupted = signals.has_deliverable(self.record, blocked);
+        drop(graph);
+        if interrupted {
+            self.interrupted_child_wait = Some(self.words);
+            return Some(returned(
+                carrick_personality_linux::abi::signal::LINUX_EINTR.guest_retval(),
+            ));
+        }
         Some(
             match self.wait_query(pending.query, pending.status, false) {
                 Ok(outcome) => outcome,
                 Err(error) => self.fail(error),
             },
         )
+    }
+    /// Original context of an interrupted, unconsumed child-wait query.
+    /// Only this owned operation may be restarted after a caught handler.
+    pub fn take_interrupted_child_wait(&mut self) -> Option<C> {
+        self.interrupted_child_wait.take()
     }
     fn publish_channel(&mut self, channel: &Arc<WaitChannel>) -> Result<(), NativeProcessError> {
         let zone = self.source.zone;
@@ -2977,12 +3053,48 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         });
 
         let mut wake_channels = Vec::new();
+        let mut interrupts = Vec::new();
         for (target_key, target_signals, _) in targets {
             let action = target_signals.action(signal);
             if action.disposition == carrick_signal_core::policy::Disposition::Ignore {
                 continue;
             }
             let _ = target_signals.enqueue(target_key, signal, Some(info));
+            if let Ok(row) = graph.owner.task(target_key) {
+                let resources = row.native().resources();
+                let leader = resources.control.zone_record().unwrap_or(resources.record);
+                let leader_mask = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                    carrick_signal_core::SignalSet::from_bits(resources.control.blocked().0),
+                );
+                if target_signals.has_deliverable(leader, leader_mask) {
+                    interrupts.push(leader);
+                }
+                for index in 0..resources.page.entry_count() {
+                    let Some((generation, state)) = resources.page.state(index) else {
+                        continue;
+                    };
+                    if !matches!(
+                        state,
+                        carrick_el1_abi::EntryState::Born | carrick_el1_abi::EntryState::Published
+                    ) {
+                        continue;
+                    }
+                    let entry = EntryRef::new(index as u32, generation);
+                    if let Some(address) = resources.page.control_address(entry)
+                        && let Some(control) =
+                            owned_control(resources.page, resources.control, address)
+                        && let Some(record) = control.zone_record()
+                        && record != leader
+                    {
+                        let mask = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                            carrick_signal_core::SignalSet::from_bits(control.blocked().0),
+                        );
+                        if target_signals.has_deliverable(record, mask) {
+                            interrupts.push(record);
+                        }
+                    }
+                }
+            }
             if let Some(channel) = graph
                 .owner
                 .task(target_key)
@@ -2993,6 +3105,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         }
         drop(graph);
+        for record in interrupts {
+            self.interrupt_signal_record(record);
+        }
         for channel in wake_channels {
             self.publish_channel(&channel)
                 .map_err(|error| -error.errno() as i32)?;

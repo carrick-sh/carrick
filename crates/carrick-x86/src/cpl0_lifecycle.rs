@@ -343,6 +343,8 @@ impl NativeBirthContext {
             rcx: 0,
             r11: 0,
             rsp: 0,
+            user_rcx: 0,
+            user_r11: 0,
         },
         fs_base: 0,
         gs_base: 0,
