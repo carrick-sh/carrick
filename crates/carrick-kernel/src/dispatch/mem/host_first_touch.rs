@@ -4,6 +4,7 @@ use super::*;
 use crate::dispatch::mm_mutation::{HostAliasPermit, MmMutationGuard};
 use crate::dispatch::mm_quiesce::FrameCowExactMmGuard;
 use crate::kernel::MmId;
+use carrick_el1::memory::reservations::Refusal;
 use carrick_el1_abi::ReservationRange;
 
 #[derive(
@@ -418,8 +419,11 @@ impl SyscallDispatcher {
     /// grant re-asks under it.
     pub fn first_touch_is_root_owned(&self, page: u64) -> bool {
         let page = page_floor(page, self.linux_page_size());
-        let first_touch_owner = self.mem().lock().first_touch_owner(page);
-        matches!(first_touch_owner, FirstTouchOwner::Root(..))
+        match self.mem().lock().try_first_touch_owner(page) {
+            Ok(FirstTouchOwner::Root(..)) | Err(Refusal::Busy) => true,
+            Ok(FirstTouchOwner::Host | FirstTouchOwner::Unmapped) => false,
+            Err(refusal) => super::anonymous::broken_root("a first-touch observation", refusal),
+        }
     }
 
     /// Read-only access prevalidation for an untouched root-owned page.
@@ -434,8 +438,8 @@ impl SyscallDispatcher {
         let page = page_floor(page, self.linux_page_size());
         let mem_authority = self.mem();
         let mem = mem_authority.lock();
-        match mem.first_touch_owner(page) {
-            FirstTouchOwner::Root(mapping, incarnation) => mem
+        match mem.try_first_touch_owner(page) {
+            Ok(FirstTouchOwner::Root(mapping, incarnation)) => mem
                 .root_armed_prot(&mapping, incarnation, page)
                 .is_some_and(|prot| {
                     prot.contains(match access {
@@ -444,7 +448,8 @@ impl SyscallDispatcher {
                         carrick_mmu_core::aarch64::LeafAccess::Execute => LinuxProtFlags::EXEC,
                     })
                 }),
-            FirstTouchOwner::Host | FirstTouchOwner::Unmapped => false,
+            Ok(FirstTouchOwner::Host | FirstTouchOwner::Unmapped) | Err(Refusal::Busy) => false,
+            Err(refusal) => super::anonymous::broken_root("a first-touch observation", refusal),
         }
     }
 }

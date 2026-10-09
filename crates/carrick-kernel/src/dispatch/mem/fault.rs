@@ -281,6 +281,14 @@ impl ResidentFacts {
             .is_some_and(|(_, &(end, fact))| page < end && fact == owner)
     }
 
+    /// Whether `page` is resident under any owner.
+    pub(crate) fn is_resident(&self, page: u64) -> bool {
+        self.facts
+            .range(..=page)
+            .next_back()
+            .is_some_and(|(_, &(end, _))| page < end)
+    }
+
     /// The parts of `[start, end)` resident under exactly `owner`, clipped,
     /// in address order: O(log n + k).
     pub(crate) fn within(&self, start: u64, end: u64, owner: ResidencyOwner) -> Vec<(u64, u64)> {
@@ -398,14 +406,11 @@ impl RootPiece {
 }
 
 impl MemState {
-    /// Who answers `page`'s first-touch facts (see [`FirstTouchOwner`]).
-    pub(in crate::dispatch) fn first_touch_owner(&self, page: u64) -> FirstTouchOwner {
-        self.try_first_touch_owner(page)
-            .unwrap_or_else(|refusal| broken_root("a first-touch observation", refusal))
-    }
-
     /// A pre-exclusion reader must preserve contention as an admission result.
-    fn try_first_touch_owner(&self, page: u64) -> Result<FirstTouchOwner, Refusal> {
+    pub(in crate::dispatch::mem) fn try_first_touch_owner(
+        &self,
+        page: u64,
+    ) -> Result<FirstTouchOwner, Refusal> {
         let Some(root) = self.delegated_root() else {
             return Ok(FirstTouchOwner::Host);
         };
@@ -414,6 +419,12 @@ impl MemState {
         }
         let node = root.with_root(|model| Ok(model.node(page)))?;
         Ok(match node {
+            None if self.resident_fault_ranges.prot_for_page(page).is_some()
+                && (self.shared.guest_range_has_owner(page, 1)
+                    || self.overlay.guest_range_has_owner(page, 1)) =>
+            {
+                FirstTouchOwner::Host
+            }
             None => FirstTouchOwner::Unmapped,
             Some((mapping, incarnation))
                 if mapping.anonymous
@@ -436,7 +447,8 @@ impl MemState {
         let pieces = if self.venue_owns(start, end) {
             Vec::new()
         } else {
-            self.root_first_touch_pieces(start, end)
+            self.try_root_first_touch_pieces(start, end)
+                .unwrap_or_else(|refusal| broken_root("resident record pieces", refusal))
         };
         let mut cursor = start;
         for piece in &pieces {
@@ -457,16 +469,16 @@ impl MemState {
     /// The root-owned first-touch pieces (anonymous nodes outside the heap)
     /// overlapping `[start, end)`, clipped to it, in address order, one per
     /// node. Empty in host setup.
-    pub(in crate::dispatch) fn root_first_touch_pieces(
+    pub(in crate::dispatch::mem) fn try_root_first_touch_pieces(
         &self,
         start: u64,
         end: u64,
-    ) -> Vec<RootPiece> {
+    ) -> Result<Vec<RootPiece>, Refusal> {
         let Some(root) = self.delegated_root() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Some(range) = ReservationRange::new(start, end) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let layout = self.layout;
         let mut pieces = Vec::new();
@@ -487,27 +499,24 @@ impl MemState {
                     });
                 }
             })
-        })
-        .unwrap_or_else(|refusal| broken_root("a first-touch observation", refusal));
-        pieces
+        })?;
+        Ok(pieces)
     }
 
-    fn root_owes_backing_at(&self, page: u64) -> bool {
-        self.root_owes_backing_within(page, page.saturating_add(1))
+    fn try_root_owes_backing_at(&self, page: u64) -> Result<bool, Refusal> {
+        self.try_root_owes_backing_within(page, page.saturating_add(1))
     }
 
-    fn root_owes_backing_within(&self, start: u64, end: u64) -> bool {
-        self.delegated_root().is_some_and(|root| {
-            root.with_root(|model| {
-                let mut overlaps = false;
-                model.observe_deferred_returns(&mut |entry| {
-                    overlaps |= entry.range.start() < end && start < entry.range.end();
-                });
-                Ok(overlaps)
-            })
-            .unwrap_or_else(|refusal| {
-                super::anonymous::broken_root("a resident fault predecessor observation", refusal)
-            })
+    fn try_root_owes_backing_within(&self, start: u64, end: u64) -> Result<bool, Refusal> {
+        let Some(root) = self.delegated_root() else {
+            return Ok(false);
+        };
+        root.with_root(|model| {
+            let mut overlaps = false;
+            model.observe_deferred_returns(&mut |entry| {
+                overlaps |= entry.range.start() < end && start < entry.range.end();
+            });
+            Ok(overlaps)
         })
     }
 
@@ -537,21 +546,29 @@ impl MemState {
     /// covers a resident page, another node (heap, host-owned, other
     /// protection), an owed return the host has not reconciled, or backing
     /// an earlier grant of this MM already prepared.
-    fn root_grant_for_page(
+    fn try_root_grant_for_page(
         &self,
         mapping: &Mapping,
         incarnation: ReservationIncarnation,
         page: u64,
         max_len: u64,
-    ) -> Option<ResidentFaultRange> {
+    ) -> Result<Option<ResidentFaultRange>, Refusal> {
         if max_len == 0 {
-            return None;
+            return Ok(None);
         }
-        let prot = self.root_armed_prot(mapping, incarnation, page)?;
-        let root = self.delegated_root()?;
+        let Some(prot) = self.root_armed_prot(mapping, incarnation, page) else {
+            return Ok(None);
+        };
+        let Some(root) = self.delegated_root() else {
+            return Ok(None);
+        };
         let window_start = page - page % max_len;
-        let window_end = window_start.checked_add(max_len)?;
-        let window = ReservationRange::new(window_start, window_end)?;
+        let Some(window_end) = window_start.checked_add(max_len) else {
+            return Ok(None);
+        };
+        let Some(window) = ReservationRange::new(window_start, window_end) else {
+            return Ok(None);
+        };
         // Stock stays inside the arena and inside the half window holding
         // `page`: a stock grant never claims a whole block, which only a
         // mapping that fills it may (EL1 cannot retire part of a block).
@@ -609,8 +626,7 @@ impl MemState {
                 owed.push((entry.range.start(), entry.range.end()));
             });
             Ok(())
-        })
-        .unwrap_or_else(|refusal| broken_root("a first-touch grant plan", refusal));
+        })?;
         // Holes the host itself still records resident are not stock, and
         // no span this MM's committed backing still occupies is fresh.
         let mut blocked = owed;
@@ -653,9 +669,12 @@ impl MemState {
         }
         // The maximal contiguous eligible run containing `page`.
         eligible.sort_unstable();
-        let index = eligible
+        let Some(index) = eligible
             .iter()
-            .position(|&(start, end)| start <= page && page < end)?;
+            .position(|&(start, end)| start <= page && page < end)
+        else {
+            return Ok(None);
+        };
         let (mut start, mut end) = eligible[index];
         for &(piece_start, piece_end) in eligible[..index].iter().rev() {
             if piece_end != start {
@@ -674,7 +693,7 @@ impl MemState {
                 continue;
             }
             if blocked_start <= page && page < blocked_end {
-                return None;
+                return Ok(None);
             }
             if blocked_end <= page {
                 start = start.max(blocked_end);
@@ -682,8 +701,10 @@ impl MemState {
                 end = end.min(blocked_start);
             }
         }
-        let range = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end))?;
-        Some(ResidentFaultRange { range, prot })
+        let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)) else {
+            return Ok(None);
+        };
+        Ok(Some(ResidentFaultRange { range, prot }))
     }
 
     /// Retire the host's residency facts for `holes`: ranges the root held
@@ -708,7 +729,10 @@ impl MemState {
     /// Facts the host venue recorded for a range its own pending proposal
     /// held now belong to the node incarnations the completion committed.
     pub(in crate::dispatch) fn adopt_completed_residency(&mut self, start: u64, end: u64) {
-        for piece in self.root_first_touch_pieces(start, end) {
+        let pieces = self
+            .try_root_first_touch_pieces(start, end)
+            .unwrap_or_else(|refusal| broken_root("completed residency pieces", refusal));
+        for piece in pieces {
             self.resident
                 .hand_over(piece.range, ResidencyOwner::Host, piece.owner());
         }
@@ -762,7 +786,9 @@ pub(crate) fn tracked_nonresident_subranges(
     range: carrick_vfs::GuestMemoryRange,
 ) -> Vec<carrick_vfs::GuestMemoryRange> {
     let (range_start, range_end) = (range.start().raw(), range.end().raw());
-    let pieces = mem.root_first_touch_pieces(range_start, range_end);
+    let pieces = mem
+        .try_root_first_touch_pieces(range_start, range_end)
+        .unwrap_or_else(|refusal| broken_root("tracked nonresident pieces", refusal));
     let mut out = Vec::new();
     let first = mem
         .resident_tracked_ranges
@@ -1282,20 +1308,23 @@ impl<'a> MemView<'a> {
         let page = page_floor(address, self.linux_page_size());
         let mem_authority_32 = self.mem();
         let mem = mem_authority_32.lock();
-        if mem.root_owes_backing_at(page) {
-            return None;
+        match mem.try_root_owes_backing_at(page) {
+            Ok(true) | Err(Refusal::Busy) => return None,
+            Ok(false) => {}
+            Err(refusal) => broken_root("a resident fault predecessor observation", refusal),
         }
-        let prot = match mem.first_touch_owner(page) {
-            FirstTouchOwner::Host => {
+        let prot = match mem.try_first_touch_owner(page) {
+            Ok(FirstTouchOwner::Host) => {
                 if bus_fault_contains(&mem.bus_fault_ranges, page) {
                     return None;
                 }
                 mem.resident_fault_ranges.prot_for_page(page)?
             }
-            FirstTouchOwner::Root(mapping, incarnation) => {
+            Ok(FirstTouchOwner::Root(mapping, incarnation)) => {
                 mem.root_armed_prot(&mapping, incarnation, page)?
             }
-            FirstTouchOwner::Unmapped => return None,
+            Ok(FirstTouchOwner::Unmapped) | Err(Refusal::Busy) => return None,
+            Err(refusal) => broken_root("a first-touch observation", refusal),
         }
         .bits();
         Some(ResidentFaultPlan {
@@ -1319,18 +1348,23 @@ impl<'a> MemView<'a> {
         let page = page_floor(address, page_size);
         let mem_authority = self.mem();
         let mem = mem_authority.lock();
-        let (grant, owner_span, root_incarnation) = match mem.first_touch_owner(page) {
-            FirstTouchOwner::Host => (
+        let (grant, owner_span, root_incarnation) = match mem.try_first_touch_owner(page) {
+            Ok(FirstTouchOwner::Host) => (
                 mem.resident_fault_ranges.grant_for_page(page, max_len)?,
                 None,
                 None,
             ),
-            FirstTouchOwner::Root(mapping, incarnation) => (
-                mem.root_grant_for_page(&mapping, incarnation, page, max_len)?,
-                Some(mapping.range),
-                Some(incarnation),
-            ),
-            FirstTouchOwner::Unmapped => return None,
+            Ok(FirstTouchOwner::Root(mapping, incarnation)) => {
+                let grant = match mem.try_root_grant_for_page(&mapping, incarnation, page, max_len)
+                {
+                    Ok(Some(grant)) => grant,
+                    Ok(None) | Err(Refusal::Busy) => return None,
+                    Err(refusal) => broken_root("a first-touch grant plan", refusal),
+                };
+                (grant, Some(mapping.range), Some(incarnation))
+            }
+            Ok(FirstTouchOwner::Unmapped) | Err(Refusal::Busy) => return None,
+            Err(refusal) => broken_root("a first-touch observation", refusal),
         };
         let root_owned = owner_span.is_some();
         let mut start = grant.range.start().raw();
@@ -1462,7 +1496,10 @@ impl<'a> MemView<'a> {
         let exclusion = self.begin_host_alias_dispatch(permit);
         let mem_authority = self.mem();
         let mem = mem_authority.lock();
-        if matches!(mem.first_touch_owner(resident.va), FirstTouchOwner::Host)
+        let owner = mem
+            .try_first_touch_owner(resident.va)
+            .unwrap_or_else(|refusal| broken_root("published grant first-touch owner", refusal));
+        if matches!(owner, FirstTouchOwner::Host)
             && bus_fault_contains(&mem.bus_fault_ranges, resident.va)
         {
             return Err(PublishedFrameGrantRefusal::BusFault);
@@ -1496,7 +1533,7 @@ impl<'a> MemView<'a> {
         }
         // The authenticated publication is not a fresh allocation. EL1's
         // residency reconciliation may already have committed this page.
-        let (prot, root_owned) = match mem.first_touch_owner(resident.va) {
+        let (prot, root_owned) = match owner {
             FirstTouchOwner::Root(mapping, _) => (
                 LinuxProtFlags::from_bits_truncate(mapping.protection.bits()),
                 true,

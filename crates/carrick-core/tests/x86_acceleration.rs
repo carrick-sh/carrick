@@ -229,6 +229,7 @@ fn x1_shared_mm_owner() {
     transfer_fixture(64, 16);
     transfer_fixture(256, 16);
     x86_wrong_output_pin_refuses_before_preparing_copy();
+    mm_owner::prepare_busy_suspends_and_forwards_instead_of_completing_with_ebusy();
 }
 
 mod fork_cow {
