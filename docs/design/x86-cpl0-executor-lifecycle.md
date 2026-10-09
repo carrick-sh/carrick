@@ -101,3 +101,70 @@ independent `revents` for duplicates and unconditional ERR/HUP/NVAL. The
 empty-stdin, full-pipe stdout, one-wake and timeout-zero witnesses are red
 before that implementation. KVM gates prove this lane; ARM/HVF signed gates
 remain a separate artifact-bound acceptance step on macOS.
+
+## C2a: exact driver replacement map
+
+The old physical actors are *not* scheduler participants. In
+`cpl0_actors.rs::drive`, each scoped worker owns one borrowed `KvmVcpu`, while
+the coordinator owns the stopped CPU and calls `service`. `ActorDecision::Park`
+retains that stopped CPU; it never creates a `ThreadExecutionLease` or a task
+run-queue row. `run_initial_process` fixes that arrangement to two CPUs. The
+production swap replaces this call, rather than adding a fourth decision to
+its enum. Keep it for physical fixture tests only.
+
+| Old fixed-actor role | Shared-pool role | KVM adapter |
+| --- | --- | --- |
+| `cpus[0]` initial runner | Bound executor for guest CPU 0, claiming root's task lease | Move the vCPU into a worker-owned KVM executor; load the root's typed saved x86 state before entry. |
+| `cpus[1]` admitted peer | Bound executor for guest CPU 1; host run-queue idle when no task is assigned | Keep the peer's KVM vCPU and private guest-kernel stack, but no synthetic Linux task identity. |
+| `run_member` + `VcpuExit` | `PersistentExecutor::run_until_boundary` | Preserve KVM run/kick and physical service ports; translate an authenticated `FORWARD_PORT` to one `ExecutorExit`. |
+| `ForwardVenue` stopped-frame borrow | Worker-owned stopped CPU plus task binding | Copy the checked `NativeFrame` into owned task state; never retain its RAM pointer after yielding. |
+| `ActorDecision::Resume/Park/Finish` | `ExecutorExit` plus common `save`/settlement | A saved runnable lease requeues; a blocked continuation enrolls once; exit settles terminal. |
+| `Cpl0HostCustody` physical grants | VM-wide physical inventory service | Share custody with workers under exact stopped-CPU grants; it does not choose runnable tasks. |
+
+The scheduler is constructed with **two** guest CPUs and an executor ceiling
+of two for this carrier. `ExecutorPoolConfig` then starts two bound workers and
+zero spares. It must reject a policy with more CPUs; it must not silently
+reduce the guest's advertised CPU topology. A blocked task releases its
+claimed lease and worker so the other runnable task can be claimed. The
+physical peer may be idle, but it cannot stand in for a task lease.
+
+Root publication follows the ARM sequence in
+`vcpu_loop/binding.rs::prepare_initial_runner_handoff` (the function
+that calls `publish_initial_task_state_gated`): capture the exact root
+`KernelContext`, save the x86 runner state, construct
+`MigratableTaskState { cpu: GuestCpuState::X86_64V1, mm, asid_generation }`,
+publish the gated initial state, take its opened start gate, then prepare and
+activate one submission through `TaskBindingResolver` and `Scheduler`. The
+ordering is required: a wake after state publication but before submission
+must remain unclaimable. `TaskBindingResolver::prepare_submission` with its
+`Root` shape calls `Scheduler::admit_process_root` for root authority; no KVM
+queue or thread registry is added. Fork and clone use the same
+gated publication and submission sequence as
+`vcpu_loop/thread_adoption.rs`, with their own exact `ThreadKey`, MM and
+generation. The two-live-MM witness checks that the second process has a
+distinct saved root and that both can be scheduled before C2c changes waits.
+
+Already portable and reused verbatim: `Scheduler` claim/settlement, the
+`ExecutorPool` worker loop, `PersistentExecutorFactory`, `PersistentExecutor`,
+`TaskBindingResolver`, `BlockedContinuation`, `CarrierWaitService`, and the
+`X86TaskCpuStateV1`/`GuestCpuState::X86_64V1` Kernel state format. Existing
+KVM/x86 adapters are `carrick-vmm-kvm/src/carrier_cpu.rs` (`KvmCarrierCpu`
+checked load/save/detach) and `carrick-x86/src/arch_context.rs`
+(`X86ArchContext` snapshot conversion and exact `GuestArchBinding`). Extend
+the former with a running boundary on the production VM instead of making a
+second snapshot format or copying ARM settlement. The remaining thin KVM
+seams are worker-owned vCPU creation from the retained carrier, task binding
+resolution to its exact `X86ArchContext`, KVM kick/guest entry, checked forward
+frame capture and physical-port service, and `save_and_detach` into the
+lease's migratable state. `PersistentTaskBinding` still exposes ARM-specific
+retirement methods; the KVM implementation supplies only its own applicable
+methods and keeps those defaults unused until lifecycle operations need them.
+
+C2b changes the production driver at `prepare.rs` and KVM carrier ownership,
+then proves the existing x86 fixture suite and the two-live-MM fork witness
+without claiming new blocking behavior. C2c makes `WaitOnFds` follow the
+common `ExecutorExit::BlockedContinuation` route and resumes through
+`resume_persistent_continuation`; the red empty-pipe read becomes green and a
+VM-free pool witness proves the worker was free before the writer ran. C3 then
+uses this same route for host-backed poll readiness and deadlines. None of
+these later milestones is complete at this design commit.
