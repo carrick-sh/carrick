@@ -1,6 +1,7 @@
 //! Shared CPL0 KVM carrier and its retained guest-MM/metadata backing.
 //! Hardware fixtures and the initial production process use the same image;
 //! fixture observation ports remain separate from the production transport.
+use crate::carrier_cpu::KvmCarrierCpu;
 use crate::carrier_memory::{
     BackingExtent, BackingHandle, CarrierMachine, CarrierMemory, InventoryTransaction,
     PreparedBacking,
@@ -22,8 +23,8 @@ use carrick_el1_abi::{ReservationMm, ReservationRange};
 use carrick_el1_abi::{
     X86_INITIAL_BOOT_HEADER_GPA, X86_INITIAL_BOOT_LOADED, X86_INITIAL_BOOT_MAGIC,
     X86_INITIAL_BOOT_PORT, X86_INITIAL_BOOT_VERSION, X86_INITIAL_MAX_REGIONS,
-    X86_INITIAL_MAX_STRINGS, X86InitialBootGrant, X86InitialBootHeader, X86InitialBootRegion,
-    X86InitialBootRequest, X86InitialBootString,
+    X86_INITIAL_MAX_STRINGS, X86_INITIAL_RUNNER_READY_PORT, X86InitialBootGrant,
+    X86InitialBootHeader, X86InitialBootRegion, X86InitialBootRequest, X86InitialBootString,
 };
 use carrick_guest_arch::FrameGpa;
 use carrick_guest_arch::{AddressContext, ContextGeneration, MmGeneration, RootGpa, UserVa};
@@ -1060,6 +1061,34 @@ pub struct Cpl0Carrier {
     pub(crate) custody: Cpl0HostCustody,
 }
 
+/// Stopped production CPUs after the bootstrap I/O receipts are complete.
+/// Field order keeps both CPU handles ahead of retained physical backing.
+pub struct ProductionWorkerParts {
+    cpus: [KvmCarrierCpu; 2],
+    custody: Cpl0HostCustody,
+    root_state: carrick_x86::arch_context::X86ArchContext,
+}
+
+impl ProductionWorkerParts {
+    pub fn root_state(&self) -> &carrick_x86::arch_context::X86ArchContext {
+        &self.root_state
+    }
+
+    pub fn cpu_mut(&mut self, slot: usize) -> Option<&mut KvmCarrierCpu> {
+        self.cpus.get_mut(slot)
+    }
+
+    pub fn initial_execution_witness(&self) -> (u64, u64) {
+        (
+            self.custody
+                .binding(carrick_guest_arch::CpuId::new(0))
+                .entries
+                .load(Ordering::Acquire),
+            self.custody.host_forwards,
+        )
+    }
+}
+
 /// The kernel graph's issued root identity for the first production task.
 /// Physical CPU slots never manufacture these values.
 #[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
@@ -1642,6 +1671,79 @@ impl Cpl0Carrier {
         Ok(())
     }
 
+    /// Transfer the two physical CPUs to executor adapters after completing
+    /// the bootstrap I/O steps. The returned root image is the state to
+    /// publish under the kernel scheduler's first execution lease.
+    pub fn into_worker_parts(
+        mut self,
+        max_exits: usize,
+    ) -> Result<ProductionWorkerParts, TrapError> {
+        let root = self
+            .custody
+            .initial_task
+            .ok_or_else(|| fail("worker handoff has no issued root task"))?;
+        let mm = NonZeroU64::new(INITIAL_MM_KEY).ok_or_else(|| fail("initial MM key"))?;
+        let context = self
+            .custody
+            ._vm
+            .root(mm)
+            .ok_or_else(|| fail("worker handoff has no initial MM"))?;
+        self.start_initial_peer(max_exits)?;
+        for cpu in &mut self.cpus {
+            cpu.complete_pending_io_exit()
+                .map_err(|error| fail(format!("complete bootstrap I/O: {error}")))?;
+        }
+        let binding = carrick_hal::guest_arch_binding::GuestArchBinding::x86(
+            carrick_guest_arch::TaskIdentity {
+                carrier: carrick_guest_arch::CarrierGeneration::new(
+                    self.custody._vm.identity().nonzero(),
+                ),
+                task: carrick_guest_arch::TaskSerial::new(
+                    NonZeroU64::new(root.task.serial.raw())
+                        .ok_or_else(|| fail("worker root task serial"))?,
+                ),
+                execution: carrick_guest_arch::ExecutionGeneration::new(
+                    NonZeroU64::new(root.thread.generation)
+                        .ok_or_else(|| fail("worker root execution generation"))?,
+                ),
+            },
+            context,
+        );
+        let mut resume = [0; carrick_hal::threaded::X86_TASK_RESUME_PAYLOAD_LEN];
+        resume[56..64].copy_from_slice(&carrick_hal::threaded::X86_TASK_RESUME_MAGIC.to_le_bytes());
+        let root_state = carrick_x86::arch_context::X86ArchContext::capture(
+            binding,
+            &carrick_x86::snapshot(&self.cpus[0])?,
+            resume,
+        )?;
+        let runs = [
+            self.custody.production_run_context(0)?,
+            self.custody.production_run_context(1)?,
+        ];
+        let shared_vm = self.custody._vm.vm().vm_handle();
+        let Self {
+            cpus: [first, second],
+            custody,
+        } = self;
+        let first = KvmCarrierCpu::from_production(
+            first,
+            crate::KvmVm::from_shared_vm(shared_vm.clone()),
+            LAYOUT,
+            runs[0].clone(),
+        )?;
+        let second = KvmCarrierCpu::from_production(
+            second,
+            crate::KvmVm::from_shared_vm(shared_vm),
+            LAYOUT,
+            runs[1].clone(),
+        )?;
+        Ok(ProductionWorkerParts {
+            cpus: [first, second],
+            custody,
+            root_state,
+        })
+    }
+
     /// The guest MM owner supplies the executable and stack publication here.
     /// This is the sole unbound seam between a stopped production carrier and
     /// EL0 admission; no fixture user page is used as an ELF loader.
@@ -2126,6 +2228,23 @@ impl Cpl0Carrier {
                     || fail("Prepare working table suffix is not exclusive zero storage"),
                 )?,
             );
+            match self.run_cpu(0)? {
+                VcpuExit::IoOut {
+                    port: X86_INITIAL_RUNNER_READY_PORT,
+                    ..
+                } if self.cpus[0].get_gpr(X86Reg::Rax)? == X86_CPL0_INITIAL_EXTENT_VA => {}
+                VcpuExit::Kicked => return Err(fail("initial runner cancelled")),
+                _ => return Err(fail("initial runner did not install its MM")),
+            }
+            if self.cpus[0]
+                .fd()
+                .get_sregs()
+                .map_err(|error| fail(error.to_string()))?
+                .cr3
+                != root.address().raw()
+            {
+                return Err(fail("initial runner installed a different MM"));
+            }
             Ok(())
         })();
         let outcome = match outcome {
