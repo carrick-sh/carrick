@@ -317,19 +317,29 @@ pub trait ProcessSignals {
     fn force_sigsegv(
         &mut self,
         blocked: carrick_signal_core::policy::SigBlockMask,
-    ) -> Result<(), i32>;
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno>;
 
     fn rt_sigaction(
         &mut self,
         signum: i32,
         act: Option<carrick_signal_core::policy::Action>,
-    ) -> Result<carrick_signal_core::policy::Action, i32>;
+    ) -> Result<carrick_signal_core::policy::Action, carrick_syscall_abi::LinuxErrno>;
 
     fn rt_sigpending(&self, blocked: carrick_signal_core::policy::SigBlockMask) -> u64;
 
-    fn kill(&mut self, pid: i32, sig: i32, info: SignalInfo) -> Result<(), i32>;
+    fn kill(
+        &mut self,
+        pid: i32,
+        sig: i32,
+        info: SignalInfo,
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno>;
 
-    fn tkill(&mut self, tid: SignalThreadSelector, sig: i32, info: SignalInfo) -> Result<(), i32>;
+    fn tkill(
+        &mut self,
+        tid: SignalThreadSelector,
+        sig: i32,
+        info: SignalInfo,
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno>;
 
     fn tgkill(
         &mut self,
@@ -337,21 +347,21 @@ pub trait ProcessSignals {
         tid: SignalThreadSelector,
         sig: i32,
         info: SignalInfo,
-    ) -> Result<(), i32>;
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno>;
 
     fn rt_sigtimedwait(
         &mut self,
         set: carrick_signal_core::SignalSet,
         timeout_ns: Option<u64>,
         info: carrick_guest_arch::UserVa,
-    ) -> Result<SignalWaitOutcome, i32>;
+    ) -> Result<SignalWaitOutcome, carrick_syscall_abi::LinuxErrno>;
 
     /// true means this entry transferred its owned continuation to the scheduler.
     fn rt_sigsuspend(
         &mut self,
         mask: carrick_signal_core::policy::SigBlockMask,
         original: carrick_signal_core::policy::SigBlockMask,
-    ) -> Result<bool, i32>;
+    ) -> Result<bool, carrick_syscall_abi::LinuxErrno>;
 
     fn take_suspend_mask(&mut self) -> Option<carrick_signal_core::policy::SigBlockMask> {
         None
@@ -437,14 +447,14 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 };
                 let flags = carrick_signal_core::policy::ActionFlags {
                     on_stack: newact.sa_flags & carrick_abi::LINUX_SA_ONSTACK != 0,
-                    reset_hand: newact.sa_flags & 0x80000000 != 0,
-                    nodefer: newact.sa_flags & 0x40000000 != 0,
-                    restart: newact.sa_flags & 0x10000000 != 0,
-                    siginfo: newact.sa_flags & 0x00000004 != 0,
-                    no_child_wait: newact.sa_flags & 0x00000002 != 0,
-                    no_child_stop: newact.sa_flags & 0x00000001 != 0,
+                    reset_hand: newact.sa_flags & carrick_abi::LINUX_SA_RESETHAND != 0,
+                    nodefer: newact.sa_flags & carrick_abi::LINUX_SA_NODEFER != 0,
+                    restart: newact.sa_flags & carrick_abi::LINUX_SA_RESTART != 0,
+                    siginfo: newact.sa_flags & carrick_abi::LINUX_SA_SIGINFO != 0,
+                    no_child_wait: newact.sa_flags & carrick_abi::LINUX_SA_NOCLDWAIT != 0,
+                    no_child_stop: newact.sa_flags & carrick_abi::LINUX_SA_NOCLDSTOP != 0,
                 };
-                let restorer = if newact.sa_flags & 0x04000000 != 0 {
+                let restorer = if newact.sa_flags & carrick_abi::LINUX_SA_RESTORER != 0 {
                     Some(carrick_signal_core::policy::RestorerAddress(
                         newact.sa_restorer,
                     ))
@@ -469,10 +479,7 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 match signals.rt_sigaction(signum, new_action) {
                     Ok(action) => action,
                     Err(error) => {
-                        return returned(
-                            carrick_syscall_abi::LinuxErrno::new(error).guest_retval(),
-                            false,
-                        );
+                        return returned(error.guest_retval(), false);
                     }
                 }
             };
@@ -488,25 +495,25 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                     flags |= carrick_abi::LINUX_SA_ONSTACK;
                 }
                 if current.flags.siginfo {
-                    flags |= 0x00000004; // SA_SIGINFO
+                    flags |= carrick_abi::LINUX_SA_SIGINFO; // SA_SIGINFO
                 }
                 if current.flags.nodefer {
-                    flags |= 0x40000000; // SA_NODEFER
+                    flags |= carrick_abi::LINUX_SA_NODEFER; // SA_NODEFER
                 }
                 if current.flags.reset_hand {
-                    flags |= 0x80000000; // SA_RESETHAND
+                    flags |= carrick_abi::LINUX_SA_RESETHAND; // SA_RESETHAND
                 }
                 if current.flags.restart {
-                    flags |= 0x10000000; // SA_RESTART
+                    flags |= carrick_abi::LINUX_SA_RESTART; // SA_RESTART
                 }
                 if current.flags.no_child_stop {
-                    flags |= 0x00000001; // SA_NOCLDSTOP
+                    flags |= carrick_abi::LINUX_SA_NOCLDSTOP; // SA_NOCLDSTOP
                 }
                 if current.flags.no_child_wait {
-                    flags |= 0x00000002; // SA_NOCLDWAIT
+                    flags |= carrick_abi::LINUX_SA_NOCLDWAIT; // SA_NOCLDWAIT
                 }
                 if let Some(restorer) = current.restorer {
-                    flags |= 0x04000000; // SA_RESTORER
+                    flags |= carrick_abi::LINUX_SA_RESTORER; // SA_RESTORER
                     oldact.sa_restorer = restorer.0;
                 }
                 if current.flags.on_stack {
@@ -575,10 +582,7 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
             let signals = native.process_signals()?;
             match signals.kill(pid, sig, SignalInfo::Generated(info)) {
                 Ok(()) => returned(0, false),
-                Err(e) => returned(
-                    carrick_syscall_abi::LinuxErrno::new(e).guest_retval(),
-                    false,
-                ),
+                Err(e) => returned(e.guest_retval(), false),
             }
         }
         SignalCall::Tkill => {
@@ -600,10 +604,7 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
             let signals = native.process_signals()?;
             match signals.tkill(tid, sig, SignalInfo::Generated(info)) {
                 Ok(()) => returned(0, false),
-                Err(e) => returned(
-                    carrick_syscall_abi::LinuxErrno::new(e).guest_retval(),
-                    false,
-                ),
+                Err(e) => returned(e.guest_retval(), false),
             }
         }
         SignalCall::Tgkill => {
@@ -629,10 +630,7 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
             let signals = native.process_signals()?;
             match signals.tgkill(tgid, tid, sig, SignalInfo::Generated(info)) {
                 Ok(()) => returned(0, false),
-                Err(e) => returned(
-                    carrick_syscall_abi::LinuxErrno::new(e).guest_retval(),
-                    false,
-                ),
+                Err(e) => returned(e.guest_retval(), false),
             }
         }
         SignalCall::RtSigqueueinfo => {
@@ -652,10 +650,7 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
             let signals = native.process_signals()?;
             match signals.kill(tgid, sig, SignalInfo::Queued(*info)) {
                 Ok(()) => returned(0, false),
-                Err(e) => returned(
-                    carrick_syscall_abi::LinuxErrno::new(e).guest_retval(),
-                    false,
-                ),
+                Err(e) => returned(e.guest_retval(), false),
             }
         }
         SignalCall::RtTgsigqueueinfo => {
@@ -676,10 +671,7 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
             let signals = native.process_signals()?;
             match signals.tgkill(tgid, tid, sig, SignalInfo::Queued(*info)) {
                 Ok(()) => returned(0, false),
-                Err(e) => returned(
-                    carrick_syscall_abi::LinuxErrno::new(e).guest_retval(),
-                    false,
-                ),
+                Err(e) => returned(e.guest_retval(), false),
             }
         }
         // pidfd descriptors are still owned by the host dispatcher. Preserve
@@ -710,10 +702,7 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 Ok(false) => returned(LINUX_EINTR.guest_retval(), false),
                 Err(e) => {
                     native.set_current_blocked(original);
-                    returned(
-                        carrick_syscall_abi::LinuxErrno::new(e).guest_retval(),
-                        false,
-                    )
+                    returned(e.guest_retval(), false)
                 }
             }
         }
@@ -772,10 +761,7 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                     }
                     returned(sig.number() as i64, false)
                 }
-                Err(e) => returned(
-                    carrick_syscall_abi::LinuxErrno::new(e).guest_retval(),
-                    false,
-                ),
+                Err(e) => returned(e.guest_retval(), false),
             }
         }
     }

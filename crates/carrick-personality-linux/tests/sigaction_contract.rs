@@ -42,13 +42,17 @@ impl<'a> SignalNative<'a> for Native {
     }
 }
 impl ProcessSignals for Native {
-    fn force_sigsegv(&mut self, _: SigBlockMask) -> Result<(), i32> {
-        Err(22)
+    fn force_sigsegv(&mut self, _: SigBlockMask) -> Result<(), carrick_syscall_abi::LinuxErrno> {
+        Err(carrick_syscall_abi::LinuxErrno::new(22))
     }
-    fn rt_sigaction(&mut self, _: i32, _: Option<Action>) -> Result<Action, i32> {
+    fn rt_sigaction(
+        &mut self,
+        _: i32,
+        _: Option<Action>,
+    ) -> Result<Action, carrick_syscall_abi::LinuxErrno> {
         self.calls += 1;
         if self.fail {
-            Err(13)
+            Err(carrick_syscall_abi::LinuxErrno::new(13))
         } else {
             Ok(Action::default())
         }
@@ -56,11 +60,21 @@ impl ProcessSignals for Native {
     fn rt_sigpending(&self, _: SigBlockMask) -> u64 {
         0
     }
-    fn kill(&mut self, _: i32, _: i32, _: SignalInfo) -> Result<(), i32> {
-        Err(22)
+    fn kill(
+        &mut self,
+        _: i32,
+        _: i32,
+        _: SignalInfo,
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
+        Err(carrick_syscall_abi::LinuxErrno::new(22))
     }
-    fn tkill(&mut self, _: SignalThreadSelector, _: i32, _: SignalInfo) -> Result<(), i32> {
-        Err(22)
+    fn tkill(
+        &mut self,
+        _: SignalThreadSelector,
+        _: i32,
+        _: SignalInfo,
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
+        Err(carrick_syscall_abi::LinuxErrno::new(22))
     }
     fn tgkill(
         &mut self,
@@ -68,19 +82,23 @@ impl ProcessSignals for Native {
         _: SignalThreadSelector,
         _: i32,
         _: SignalInfo,
-    ) -> Result<(), i32> {
-        Err(22)
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
+        Err(carrick_syscall_abi::LinuxErrno::new(22))
     }
     fn rt_sigtimedwait(
         &mut self,
         _: SignalSet,
         _: Option<u64>,
         _: UserVa,
-    ) -> Result<SignalWaitOutcome, i32> {
-        Err(22)
+    ) -> Result<SignalWaitOutcome, carrick_syscall_abi::LinuxErrno> {
+        Err(carrick_syscall_abi::LinuxErrno::new(22))
     }
-    fn rt_sigsuspend(&mut self, _: SigBlockMask, _: SigBlockMask) -> Result<bool, i32> {
-        Err(22)
+    fn rt_sigsuspend(
+        &mut self,
+        _: SigBlockMask,
+        _: SigBlockMask,
+    ) -> Result<bool, carrick_syscall_abi::LinuxErrno> {
+        Err(carrick_syscall_abi::LinuxErrno::new(22))
     }
 }
 fn result(outcome: Option<SignalOutcome>) -> Option<i64> {
@@ -128,4 +146,15 @@ fn owner_errno_is_negative() {
         result(invoke(SignalCall::RtSigaction, &mut native)),
         Some(-13)
     );
+}
+
+#[test]
+fn signal_owner_errno_has_positive_typed_domain() {
+    let mut native = Native {
+        args: [0; 6],
+        calls: 0,
+        fail: true,
+    };
+    let result: Result<Action, carrick_syscall_abi::LinuxErrno> = native.rt_sigaction(10, None);
+    assert_eq!(result.unwrap_err().guest_retval(), -13);
 }
