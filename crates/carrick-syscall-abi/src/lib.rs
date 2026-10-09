@@ -67,6 +67,8 @@ pub mod nr {
     pub const WAIT4: CanonicalNr = CanonicalNr(260);
     pub const PPOLL: CanonicalNr = CanonicalNr(73);
     pub const PRLIMIT64: CanonicalNr = CanonicalNr(261);
+    pub const WAITID: CanonicalNr = CanonicalNr(95);
+    pub const CLONE3: CanonicalNr = CanonicalNr(435);
 }
 
 /// Linux SCHED_* policy values (kernel ABI, not the libc-internal names).
