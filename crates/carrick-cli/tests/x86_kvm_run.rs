@@ -296,6 +296,21 @@ fn mounted_static_x86_getpid_matches_guest_gettid() {
 }
 
 #[test]
+fn mounted_static_x86_startup_sequence_matches_native() {
+    compare_mounted_assembly_with_native("x86_startup_sequence.S", b"S\n");
+}
+
+#[test]
+fn mounted_static_x86_identity_eperm_matches_native() {
+    compare_mounted_assembly_with_native("x86_identity_eperm.S", b"P\n");
+}
+
+#[test]
+fn mounted_static_x86_identity_fork_matches_native() {
+    compare_mounted_assembly_with_native("x86_identity_fork.S", b"K\n");
+}
+
+#[test]
 fn mounted_static_x86_guest_owned_calls_refuse_without_host_effects() {
     if skip_without_kvm() {
         return;
