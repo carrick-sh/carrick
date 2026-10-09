@@ -48,6 +48,31 @@ fn zone() -> Box<ZoneTables> {
 const MM: u64 = 7;
 const SLOT: SlotId = SlotId::new(3);
 
+#[test]
+fn loaded_root_has_an_exact_home_before_its_first_syscall() {
+    let zone = zone();
+    host_publish(&zone, SLOT, MM, Some(0), 1);
+    let loaded = ThreadIdentity {
+        lifecycle_page: 0x1000,
+        control_slot: 0x2000,
+        ..identity(41)
+    };
+    assert!(zone.slot(SLOT).current().is_none());
+    assert!(zone.slot(SLOT).host_record().is_none());
+    let record = zone
+        .publish_loaded_home(SLOT, loaded)
+        .expect("host load must publish the root before EL0");
+    assert_eq!(zone.slot(SLOT).host_record(), Some(record));
+    assert_eq!(zone.record(record).identity(), loaded);
+
+    let foreign = ThreadIdentity {
+        mm: MM + 1,
+        ..loaded
+    };
+    assert!(zone.publish_loaded_home(SLOT, foreign).is_none());
+    assert_eq!(zone.slot(SLOT).host_record(), Some(record));
+}
+
 fn identity(tid: u64) -> ThreadIdentity {
     ThreadIdentity {
         tid,
