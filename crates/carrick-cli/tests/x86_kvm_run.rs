@@ -7,7 +7,10 @@
 ))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::ExitStatusExt;
+use std::process::{Child, Stdio};
 use std::time::Duration;
 
 use assert_cmd::Command;
@@ -375,6 +378,236 @@ fn mounted_static_x86_sched_unported_refusal_returns_enosys() {
         "stderr: {}",
         String::from_utf8_lossy(&run.stderr)
     );
+}
+
+#[test]
+fn mounted_static_x86_poll_empty_stdin_matches_native() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("poll-empty-stdin");
+    compile_assembly("x86_poll_empty_stdin.S", &elf);
+    let native = run_poll_with_open_empty_stdin(std::process::Command::new(&elf));
+    assert_eq!(native, (b"E\n".to_vec(), Some(7)));
+
+    let archive = dir.path().join("image.tar");
+    std::fs::write(&archive, empty_image_archive()).unwrap();
+    let cli = assert_cmd::cargo::cargo_bin("carrick");
+    let home = dir.path().join("home");
+    let load = Command::new(&cli)
+        .timeout(Duration::from_secs(5))
+        .env("CARRICK_HOME", &home)
+        .args(["load", "--input", archive.to_str().unwrap()])
+        .output()
+        .expect("load local image");
+    assert!(
+        load.status.success(),
+        "{}",
+        String::from_utf8_lossy(&load.stderr)
+    );
+    let mut command = std::process::Command::new(&cli);
+    command
+        .env("CARRICK_HOME", &home)
+        .env("CARRICK_RUN_ID", "x86-kvm-empty-poll-test")
+        .args([
+            "run",
+            "--platform",
+            "linux/amd64",
+            "--pull",
+            "never",
+            "--volume",
+            &format!("{}:/hello:ro", elf.display()),
+            "x86-kvm-hello:latest",
+        ]);
+    assert_eq!(run_poll_with_open_empty_stdin(command), native);
+}
+
+struct ReapChild(Child);
+
+impl std::ops::Deref for ReapChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ReapChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ReapChild {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+fn run_poll_with_open_empty_stdin(mut command: std::process::Command) -> (Vec<u8>, Option<i32>) {
+    let mut child = ReapChild(
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn empty-stdin poll witness"),
+    );
+    let mut stdout = child.stdout.take().unwrap();
+    let completed = poll_readable(stdout.as_raw_fd(), 5_000);
+    if !completed {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    assert!(completed, "empty-stdin poll did not complete");
+    let mut output = Vec::new();
+    stdout.read_to_end(&mut output).unwrap();
+    let status = child.wait().unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(stderr.is_empty(), "{stderr}");
+    (output, status.code())
+}
+
+#[test]
+fn mounted_static_x86_blocking_stdin_read_matches_native() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("blocking-stdin");
+    compile_assembly("x86_blocking_stdin.S", &elf);
+    let native = run_with_empty_stdin_then_write(std::process::Command::new(&elf));
+    assert_eq!(native.0, b"R\nB\n");
+    assert_eq!(native.1, Some(7));
+
+    let archive = dir.path().join("image.tar");
+    std::fs::write(&archive, empty_image_archive()).unwrap();
+    let cli = assert_cmd::cargo::cargo_bin("carrick");
+    let home = dir.path().join("home");
+    let load = Command::new(&cli)
+        .timeout(Duration::from_secs(5))
+        .env("CARRICK_HOME", &home)
+        .args(["load", "--input", archive.to_str().unwrap()])
+        .output()
+        .expect("load local image");
+    assert!(
+        load.status.success(),
+        "{}",
+        String::from_utf8_lossy(&load.stderr)
+    );
+    let mut command = std::process::Command::new(&cli);
+    command
+        .env("CARRICK_HOME", &home)
+        .env("CARRICK_RUN_ID", "x86-kvm-blocking-read-test")
+        .args([
+            "run",
+            "--platform",
+            "linux/amd64",
+            "--pull",
+            "never",
+            "--volume",
+            &format!("{}:/hello:ro", elf.display()),
+            "x86-kvm-hello:latest",
+        ]);
+    let observed = run_with_empty_stdin_then_write(command);
+    assert_eq!(
+        observed, native,
+        "blocking read must complete like native Linux"
+    );
+}
+
+fn run_with_empty_stdin_then_write(mut command: std::process::Command) -> (Vec<u8>, Option<i32>) {
+    let mut child = ReapChild(
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn blocking stdin witness"),
+    );
+    let mut stdout = child.stdout.take().unwrap();
+    let mut first = [0; 2];
+    assert!(
+        poll_readable(stdout.as_raw_fd(), 5_000),
+        "ready marker missing"
+    );
+    let marker = stdout.read_exact(&mut first);
+    if let Err(ref error) = marker {
+        let status = child.wait().unwrap();
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(
+            marker.is_ok(),
+            "ready marker read: {error}; status: {status}; stderr: {stderr}"
+        );
+    }
+    assert_eq!(&first, b"R\n");
+    // The write end remains open and empty. The guest must remain blocked
+    // until the parent supplies its byte; EOF or an immediate error is red.
+    let premature = poll_readable(stdout.as_raw_fd(), 50);
+    if premature {
+        drop(child.stdin.take());
+        let mut rest = Vec::new();
+        stdout.read_to_end(&mut rest).unwrap();
+        let status = child.wait().unwrap();
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(
+            !premature,
+            "read completed before input: status={status}, stdout={rest:?}, stderr={stderr}"
+        );
+    }
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "reader exited before input"
+    );
+    child.stdin.take().unwrap().write_all(b"X").unwrap();
+    assert!(
+        poll_readable(stdout.as_raw_fd(), 5_000),
+        "completion marker missing"
+    );
+    let mut rest = Vec::new();
+    stdout.read_to_end(&mut rest).unwrap();
+    let status = child.wait().unwrap();
+    let mut output = first.to_vec();
+    output.extend(rest);
+    (output, status.code())
+}
+
+fn poll_readable(fd: i32, timeout_ms: i32) -> bool {
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: pollfd is a valid stack allocation for one descriptor.
+    let result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+    assert!(
+        result >= 0,
+        "host poll failed: {}",
+        std::io::Error::last_os_error()
+    );
+    result > 0
 }
 
 #[test]
