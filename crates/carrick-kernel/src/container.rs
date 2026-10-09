@@ -124,6 +124,8 @@ fn legacy_stop_signal_abi() -> StopSignalAbi {
 #[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
 pub struct RunConfig {
+    /// Resolved ARM crossing policy preserved across restart and exec.
+    pub arm_ring_first: carrick_spec::ArmRingFirst,
     /// Raw `--platform` string (`None` = host default).
     pub platform: Option<String>,
     /// Execution backend request preserved across start/restart/exec.
@@ -256,6 +258,7 @@ pub struct NetworkAttachment {
 impl Default for RunConfig {
     fn default() -> Self {
         Self {
+            arm_ring_first: carrick_spec::ArmRingFirst::Strict,
             platform: None,
             exec_backend: carrick_spec::ExecBackendRequest::HvPatch,
             env: Vec::new(),
