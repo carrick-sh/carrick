@@ -140,63 +140,83 @@ fn production_x86_family_absences_obey_eight_crossings_without_user_memory() {
         ("getpid decline", 39),
         ("gettid decline", 186),
     ] {
-        let call = decode_x86_64(native, args, 0x7fff_0000);
-        assert_ne!(call.canonical.raw(), u64::MAX, "{family} must decode");
-        let mut frame = X86Frame {
-            native: call.native,
-            canonical: call.canonical,
-            args: call.args,
-            rax: 0xfeed,
-            isa_unsupported: &isa_unsupported,
-        };
-        let before_isa = isa_unsupported.load(Ordering::Relaxed);
-        let bucket = if native == 57 { 512 } else { native as usize };
-        let before_refused = counters.refused[bucket].load(Ordering::Relaxed);
-        let action = dispatch::dispatch_syscall_with_lifecycle(
-            &mut frame,
-            &counters,
-            &tasks,
-            &[],
-            &[],
-            &[],
-            &[],
-            &names,
-            None::<dispatch::Zone<'_, NoCpu, sched::HardwareUserWord>>,
-            None,
-            None,
-            None,
-            |_| core::ptr::null_mut(),
-        );
-        let allowed = matches!(native, 0 | 1 | 8 | 17 | 18 | 281);
-        assert_eq!(
-            action,
-            if allowed {
-                Action::Forward
+        for work in [false, true] {
+            if work {
+                tasks[0].linux.mark_pending_host_work();
             } else {
-                Action::Served
-            },
-            "{family}"
-        );
-        assert_eq!(
-            frame.rax as i64,
-            if allowed { 0xfeed } else { -38 },
-            "{family}"
-        );
-        assert_eq!(
-            counters.refused[bucket].load(Ordering::Relaxed) - before_refused,
-            u64::from(!allowed),
-            "{family}"
-        );
-        assert_eq!(
-            isa_unsupported.load(Ordering::Relaxed) - before_isa,
-            u64::from(matches!(native, 202)),
-            "{family} must distinguish ISA refusal from semantic forwarding"
-        );
-        assert_eq!(
-            counters.served[call.canonical.raw() as usize].load(Ordering::Relaxed),
-            0,
-            "{family} must not record a guest service"
-        );
+                tasks[0].linux.clear_pending_host_work();
+            }
+            let call = decode_x86_64(native, args, 0x7fff_0000);
+            assert_ne!(call.canonical.raw(), u64::MAX, "{family} must decode");
+            let mut frame = X86Frame {
+                native: call.native,
+                canonical: call.canonical,
+                args: call.args,
+                rax: 0xfeed,
+                isa_unsupported: &isa_unsupported,
+            };
+            let before_isa = isa_unsupported.load(Ordering::Relaxed);
+            let bucket = if native == 57 { 512 } else { native as usize };
+            let before_refused = counters.refused[bucket].load(Ordering::Relaxed);
+            let action = dispatch::dispatch_syscall_with_lifecycle(
+                &mut frame,
+                &counters,
+                &tasks,
+                &[],
+                &[],
+                &[],
+                &[],
+                &names,
+                None::<dispatch::Zone<'_, NoCpu, sched::HardwareUserWord>>,
+                None,
+                None,
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            let allowed = matches!(native, 0 | 1 | 8 | 17 | 18 | 281);
+            assert_eq!(
+                action,
+                if allowed {
+                    Action::Forward
+                } else {
+                    if work {
+                        Action::ServedWithWork
+                    } else {
+                        Action::Served
+                    }
+                },
+                "{family}"
+            );
+            assert_eq!(
+                frame.rax as i64,
+                if allowed { 0xfeed } else { -38 },
+                "{family}"
+            );
+            assert_eq!(
+                counters.refused[bucket].load(Ordering::Relaxed) - before_refused,
+                u64::from(!allowed),
+                "{family}"
+            );
+            assert_eq!(
+                isa_unsupported.load(Ordering::Relaxed) - before_isa,
+                u64::from(!work && matches!(native, 202)),
+                "{family} must distinguish ISA refusal from semantic forwarding"
+            );
+            assert_eq!(
+                counters.served[call.canonical.raw() as usize].load(Ordering::Relaxed),
+                0,
+                "{family} must not record a guest service"
+            );
+            assert_eq!(
+                tasks[0].linux.take_served_boundary(),
+                if work && !allowed {
+                    Some(carrick_el1_abi::ServedBoundary::Completed)
+                } else {
+                    None
+                },
+                "{family} work={work}"
+            );
+        }
     }
 }
 

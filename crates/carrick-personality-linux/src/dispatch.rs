@@ -230,11 +230,11 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     fn refused_counters(&self) -> Option<&'a [core::sync::atomic::AtomicU64]> {
         None
     }
-    fn publish_forward_work(&self) {
+    fn publish_forward_work(&self, original_argument0: u64) {
         if let Some(task) = self.task_state() {
             // No family ran: after owed work drains the host must execute the
             // original syscall, never treat its argument register as a result.
-            task.record_commit_owed(self.original_argument0());
+            task.record_commit_owed(original_argument0);
         }
     }
     fn publish_work(&self, commit: bool) {
@@ -471,14 +471,12 @@ enum CompletionAuthority<'a, C: EntryContext> {
     AllocatorDiagnostic,
 }
 
-/// Why an entry leaves its in-ring owner. Only genuinely unported calls
-/// require crossing admission; retained work and handbacks are transports.
+/// Whether a call has an in-ring family. ARM admits unported crossings;
+/// x86 admits every forwarding completion through its eight-crossing set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ForwardReason {
     Unported,
     FamilyFallback,
-    HostWork,
-    Handback,
 }
 
 struct FamilyRun {
@@ -498,6 +496,7 @@ impl From<FamilyCompletion> for FamilyRun {
 
 fn finish<'a, C: EntryContext + 'a>(
     ordinal: u64,
+    original_argument0: u64,
     run: FamilyRun,
     pending: &mut dyn PendingFamilies<'a, C>,
     authority: CompletionAuthority<'a, C>,
@@ -541,24 +540,6 @@ fn finish<'a, C: EntryContext + 'a>(
                 .store(original, core::sync::atomic::Ordering::Relaxed);
         }
     }
-    let reason = if pending.host_work() {
-        ForwardReason::HostWork
-    } else if result == FamilyCompletion::Handback {
-        ForwardReason::Handback
-    } else {
-        run.forward_reason
-    };
-    let route = if reason == ForwardReason::HostWork
-        && matches!(
-            result,
-            FamilyCompletion::Forward
-                | FamilyCompletion::AccountedForward
-                | FamilyCompletion::Handback
-        ) {
-        CompletionRoute::WithWork
-    } else {
-        completion_route(result, pending.host_work())
-    };
     if (result == FamilyCompletion::Forward && run.forward_reason == ForwardReason::Unported)
         || (pending.crossing_set() == crate::crossing::HostCrossingSet::X86
             && matches!(
@@ -588,6 +569,17 @@ fn finish<'a, C: EntryContext + 'a>(
             return CompletionRoute::Served;
         }
     }
+    // Only an effect-free ARM decline can use the host replay boundary.
+    // Handback retains its operation; AccountedForward has already run its
+    // family. The x86 WORK_PORT has no replay transport.
+    let replay = pending.host_work()
+        && pending.crossing_set() == crate::crossing::HostCrossingSet::Aarch64
+        && result == FamilyCompletion::Forward;
+    let route = if replay {
+        CompletionRoute::WithWork
+    } else {
+        completion_route(result, pending.host_work())
+    };
     match result {
         FamilyCompletion::AccountedComplete(_)
         | FamilyCompletion::AccountedSwitched(_)
@@ -597,15 +589,8 @@ fn finish<'a, C: EntryContext + 'a>(
         _ => pending.record_served(ordinal),
     }
     if route == CompletionRoute::WithWork {
-        if reason == ForwardReason::HostWork
-            && matches!(
-                result,
-                FamilyCompletion::Forward
-                    | FamilyCompletion::AccountedForward
-                    | FamilyCompletion::Handback
-            )
-        {
-            pending.publish_forward_work();
+        if replay {
+            pending.publish_forward_work(original_argument0);
         } else {
             pending.publish_work(matches!(result, FamilyCompletion::CommitOwed(_)));
         }
@@ -620,6 +605,7 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
     control: u64,
     pending: &mut dyn PendingFamilies<'a, C>,
 ) -> CompletionRoute {
+    let original_argument0 = pending.original_argument0();
     let family = route_aarch64(ordinal, control);
     let completion = match pending.binding().and_then(|binding| {
         if let Some(token) = carrick_core::entry::admit(binding, pending.record_source()) {
@@ -655,7 +641,13 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
     if matches!(family, Family::Anonymous(_))
         && let Some(result) = pending.prepare_anonymous()
     {
-        return finish(ordinal, result.into(), pending, completion);
+        return finish(
+            ordinal,
+            original_argument0,
+            result.into(),
+            pending,
+            completion,
+        );
     }
     let setup = pending.lifecycle_available()
         && matches!(family, Family::Lifecycle(_))
@@ -666,6 +658,7 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
         pending.declined_for_work(ordinal);
         return finish(
             ordinal,
+            original_argument0,
             FamilyRun {
                 completion: FamilyCompletion::Forward,
                 returned: None,
@@ -681,11 +674,11 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
     }
     let mut result = serve_family(family, ordinal, pending);
     if result.completion != FamilyCompletion::Forward {
-        return finish(ordinal, result, pending, completion);
+        return finish(ordinal, original_argument0, result, pending, completion);
     }
     if pending.host_work() && !setup {
         pending.declined_for_work(ordinal);
-        return finish(ordinal, result, pending, completion);
+        return finish(ordinal, original_argument0, result, pending, completion);
     }
     // File fallback follows the IPC authority's explicit decline, never a
     // retained operation's handback or completion.
@@ -694,7 +687,7 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
         Family::Write => pending.file_write().into(),
         _ => result,
     };
-    finish(ordinal, result, pending, completion)
+    finish(ordinal, original_argument0, result, pending, completion)
 }
 
 /// The anonymous family retains an owned operation until settlement; only a
@@ -729,6 +722,8 @@ mod ring_first_tests {
     // No lifecycle or process venue: a terminal call still belongs to the
     // carrier, just as in x86's crossing set, until native custody serves it.
     struct CarrierOwned<'a> {
+        set: HostCrossingSet,
+        mutate_forward: bool,
         state: crate::abi::entry::LinuxTaskState,
         result: i64,
         native: carrick_syscall_abi::NativeNr,
@@ -762,7 +757,14 @@ mod ring_first_tests {
         fn resumes_operation(&self) -> bool {
             self.handback
         }
+        fn prepare_anonymous(&mut self) -> Option<FamilyCompletion> {
+            self.handback.then_some(FamilyCompletion::Handback)
+        }
         fn futex(&mut self) -> FamilyCompletion {
+            if self.mutate_forward {
+                self.result = 0xbeef;
+                self.work = true;
+            }
             if self.handback {
                 FamilyCompletion::Handback
             } else {
@@ -770,7 +772,7 @@ mod ring_first_tests {
             }
         }
         fn crossing_set(&self) -> HostCrossingSet {
-            HostCrossingSet::Aarch64
+            self.set
         }
         fn ring_first_strict(&self) -> bool {
             true
@@ -793,6 +795,8 @@ mod ring_first_tests {
     fn failed_entry_admission_cannot_bypass_crossing_policy() {
         let refused = [const { AtomicU64::new(0) }; 513];
         let mut pending = CarrierOwned {
+            set: HostCrossingSet::Aarch64,
+            mutate_forward: false,
             state: crate::abi::entry::LinuxTaskState::new(),
             native: carrick_syscall_abi::NativeNr(174),
             admitted: false,
@@ -820,7 +824,8 @@ mod ring_first_tests {
             (27, false, false, CompletionRoute::Forward),
             (98, false, false, CompletionRoute::Forward),
             (98, false, true, CompletionRoute::Forward),
-            (98, true, true, CompletionRoute::WithWork),
+            (98, true, true, CompletionRoute::Forward),
+            (222, true, true, CompletionRoute::Forward),
             (139, false, false, CompletionRoute::Forward),
             (220, false, false, CompletionRoute::Forward),
             (260, false, false, CompletionRoute::Forward),
@@ -828,6 +833,8 @@ mod ring_first_tests {
         ] {
             let refused = [const { AtomicU64::new(0) }; 513];
             let mut pending = CarrierOwned {
+                set: HostCrossingSet::Aarch64,
+                mutate_forward: false,
                 state: crate::abi::entry::LinuxTaskState::new(),
                 native: carrick_syscall_abi::NativeNr(ordinal),
                 admitted: true,
@@ -861,10 +868,77 @@ mod ring_first_tests {
     }
 
     #[test]
+    fn owed_work_does_not_replay_handback_accounted_forward_or_x86() {
+        for (set, completion) in [
+            (HostCrossingSet::Aarch64, FamilyCompletion::Handback),
+            (HostCrossingSet::Aarch64, FamilyCompletion::AccountedForward),
+            (HostCrossingSet::X86, FamilyCompletion::Forward),
+        ] {
+            let refused = [const { AtomicU64::new(0) }; 513];
+            let mut pending = CarrierOwned {
+                set,
+                mutate_forward: false,
+                state: crate::abi::entry::LinuxTaskState::new(),
+                native: carrick_syscall_abi::NativeNr(0),
+                admitted: true,
+                result: 42,
+                work: true,
+                handback: false,
+                refused: &refused,
+                forwarded: [const { AtomicU64::new(0) }; 512],
+            };
+            assert_eq!(
+                finish(
+                    63,
+                    42,
+                    completion.into(),
+                    &mut pending,
+                    CompletionAuthority::AllocatorDiagnostic
+                ),
+                CompletionRoute::Forward,
+                "{set:?} {completion:?}"
+            );
+            assert_eq!(
+                pending.state.take_served_boundary(),
+                None,
+                "forward transport must not publish replay"
+            );
+        }
+    }
+
+    #[test]
+    fn no_effect_arm_forward_replays_saved_argument_not_mutated_frame() {
+        let refused = [const { AtomicU64::new(0) }; 513];
+        let mut pending = CarrierOwned {
+            set: HostCrossingSet::Aarch64,
+            mutate_forward: true,
+            state: crate::abi::entry::LinuxTaskState::new(),
+            native: carrick_syscall_abi::NativeNr(98),
+            admitted: true,
+            result: 42,
+            work: false,
+            handback: false,
+            refused: &refused,
+            forwarded: [const { AtomicU64::new(0) }; 512],
+        };
+        assert_eq!(
+            dispatch(98, u64::MAX, &mut pending),
+            CompletionRoute::WithWork
+        );
+        assert_eq!(pending.result, 0xbeef);
+        assert_eq!(
+            pending.state.take_served_boundary(),
+            Some(crate::abi::entry::ServedBoundary::ReplayOriginal { x0: 42 })
+        );
+    }
+
+    #[test]
     fn strict_arm_terminal_calls_without_process_owner_cross_to_carrier() {
         for ordinal in [93, 94] {
             let refused = [const { AtomicU64::new(0) }; 513];
             let mut pending = CarrierOwned {
+                set: HostCrossingSet::Aarch64,
+                mutate_forward: false,
                 state: crate::abi::entry::LinuxTaskState::new(),
                 native: carrick_syscall_abi::NativeNr(ordinal),
                 admitted: true,
