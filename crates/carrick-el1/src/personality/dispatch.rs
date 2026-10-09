@@ -993,6 +993,20 @@ impl<
         self.current_tasks.get(self.frame.task_index())?;
         Some(self)
     }
+    fn identity_native(
+        &mut self,
+    ) -> Option<&mut dyn carrick_personality_linux::identity::IdentityNative<'a>> {
+        self.process.as_ref()?;
+        self.current_tasks.get(self.frame.task_index())?;
+        Some(self)
+    }
+    fn sysinfo_native(
+        &mut self,
+    ) -> Option<&mut dyn carrick_personality_linux::sysinfo::SysinfoNative<'a>> {
+        self.process.as_ref()?;
+        self.current_tasks.get(self.frame.task_index())?;
+        Some(self)
+    }
     fn futex(&mut self) -> FamilyCompletion {
         let Some(frame) = self.frame.arm_frame() else {
             self.frame.record_isa_unsupported_forward();

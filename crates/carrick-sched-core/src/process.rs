@@ -403,5 +403,158 @@ impl<Container, Uid> Zombie<Container, Uid> {
     }
 }
 
+/// Typed user identity within a namespace.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TaskUid(pub u32);
+
+impl TaskUid {
+    pub const ROOT: Self = Self(0);
+
+    pub const fn new(uid: u32) -> Self {
+        Self(uid)
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// Typed group identity within a namespace.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TaskGid(pub u32);
+
+impl TaskGid {
+    pub const ROOT: Self = Self(0);
+
+    pub const fn new(gid: u32) -> Self {
+        Self(gid)
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// Linux credential set for a process/task.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskCredentials {
+    pub ruid: TaskUid,
+    pub euid: TaskUid,
+    pub suid: TaskUid,
+    pub fsuid: TaskUid,
+    pub rgid: TaskGid,
+    pub egid: TaskGid,
+    pub sgid: TaskGid,
+    pub fsgid: TaskGid,
+    pub groups: alloc::vec::Vec<TaskGid>,
+    pub cap_permitted: u64,
+    pub cap_effective: u64,
+    pub cap_inheritable: u64,
+}
+
+impl TaskCredentials {
+    pub const ROOT: Self = Self {
+        ruid: TaskUid::ROOT,
+        euid: TaskUid::ROOT,
+        suid: TaskUid::ROOT,
+        fsuid: TaskUid::ROOT,
+        rgid: TaskGid::ROOT,
+        egid: TaskGid::ROOT,
+        sgid: TaskGid::ROOT,
+        fsgid: TaskGid::ROOT,
+        groups: alloc::vec::Vec::new(),
+        cap_permitted: 0x0000_01ff_ffff_ffff,
+        cap_effective: 0x0000_01ff_ffff_ffff,
+        cap_inheritable: 0,
+    };
+
+    pub fn is_privileged(&self) -> bool {
+        self.euid == TaskUid::ROOT || (self.cap_effective & (1 << 7)) != 0
+    }
+
+    pub fn is_gid_privileged(&self) -> bool {
+        self.euid == TaskUid::ROOT || (self.cap_effective & (1 << 6)) != 0
+    }
+
+    pub fn is_admin_privileged(&self) -> bool {
+        self.euid == TaskUid::ROOT || (self.cap_effective & (1 << 21)) != 0
+    }
+
+    pub fn is_resource_privileged(&self) -> bool {
+        self.euid == TaskUid::ROOT || (self.cap_effective & (1 << 24)) != 0
+    }
+
+    pub fn on_uid_change(&mut self, was_euid_root: bool) {
+        if was_euid_root && self.euid != TaskUid::ROOT {
+            self.cap_effective = 0;
+        } else if !was_euid_root && self.euid == TaskUid::ROOT {
+            self.cap_effective = self.cap_permitted;
+        }
+        if self.ruid != TaskUid::ROOT && self.euid != TaskUid::ROOT && self.suid != TaskUid::ROOT {
+            self.cap_permitted = 0;
+            self.cap_effective = 0;
+        }
+    }
+}
+
+/// Linux resource limit specification.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinuxRlimit {
+    pub rlim_cur: u64,
+    pub rlim_max: u64,
+}
+
+impl LinuxRlimit {
+    pub const INFINITY: u64 = u64::MAX;
+
+    pub const fn new(rlim_cur: u64, rlim_max: u64) -> Self {
+        Self { rlim_cur, rlim_max }
+    }
+
+    pub const fn unlimited() -> Self {
+        Self {
+            rlim_cur: Self::INFINITY,
+            rlim_max: Self::INFINITY,
+        }
+    }
+}
+
+/// The 16 Linux resource limits per process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RlimitSet {
+    pub limits: [LinuxRlimit; 16],
+}
+
+impl RlimitSet {
+    pub const DEFAULT: Self = Self::new_default();
+
+    pub const fn new_default() -> Self {
+        let inf = LinuxRlimit::unlimited();
+        let mut limits = [inf; 16];
+        limits[3] = LinuxRlimit::new(8 * 1024 * 1024, LinuxRlimit::INFINITY); // STACK = 8 MiB
+        limits[6] = LinuxRlimit::new(8192, 8192); // NPROC = 8192
+        limits[7] = LinuxRlimit::new(1_048_576, 1_048_576); // NOFILE = 1 Mi
+        limits[11] = LinuxRlimit::new(63880, 63880); // SIGPENDING
+        limits[12] = LinuxRlimit::new(819_200, 819_200); // MSGQUEUE
+        limits[13] = LinuxRlimit::new(0, 0); // NICE
+        limits[14] = LinuxRlimit::new(0, 0); // RTPRIO
+        Self { limits }
+    }
+
+    pub fn get(&self, resource: usize) -> Option<LinuxRlimit> {
+        self.limits.get(resource).copied()
+    }
+
+    pub fn set(&mut self, resource: usize, limit: LinuxRlimit) -> bool {
+        if let Some(slot) = self.limits.get_mut(resource) {
+            *slot = limit;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod wait_tests;

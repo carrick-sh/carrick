@@ -342,6 +342,89 @@ impl<
     }
 }
 
+impl<
+    'a,
+    F: Fn(u32) -> *mut u8,
+    C: ThreadCpu,
+    U: UserWord,
+    G: GuestDispatchFrame,
+    Context: super::dispatch::DispatchContext,
+> carrick_personality_linux::identity::IdentityNative<'a>
+    for El1PendingFamilies<'a, F, C, U, G, Context>
+{
+    fn arguments(&self) -> [u64; 6] {
+        [
+            self.frame.argument(0).unwrap_or(0),
+            self.frame.argument(1).unwrap_or(0),
+            self.frame.argument(2).unwrap_or(0),
+            self.frame.argument(3).unwrap_or(0),
+            self.frame.argument(4).unwrap_or(0),
+            self.frame.argument(5).unwrap_or(0),
+        ]
+    }
+    fn visible_tid(&self) -> Option<u32> {
+        let binding = LifecycleNative::binding(self)?;
+        let process = self.process.as_deref()?;
+        if process.binding() != binding {
+            return None;
+        }
+        self.thread()?.slot.visible_tid()
+    }
+    fn set_clear_child_tid(&mut self, address: u64) -> bool {
+        let Some(thread) = self.thread() else {
+            return false;
+        };
+        thread.slot.set_clear_child_tid(address);
+        true
+    }
+    fn robust_list(&self) -> Option<(u64, u32)> {
+        let thread = self.thread()?;
+        Some(thread.slot.robust_list())
+    }
+    fn process_identity(
+        &mut self,
+    ) -> Option<&mut dyn carrick_personality_linux::identity::ProcessIdentityVenue> {
+        let binding = LifecycleNative::binding(self)?;
+        let process = self.process.as_deref_mut()?;
+        if process.binding() != binding {
+            return None;
+        }
+        process.as_identity_venue()
+    }
+}
+
+impl<
+    'a,
+    F: Fn(u32) -> *mut u8,
+    C: ThreadCpu,
+    U: UserWord,
+    G: GuestDispatchFrame,
+    Context: super::dispatch::DispatchContext,
+> carrick_personality_linux::sysinfo::SysinfoNative<'a>
+    for El1PendingFamilies<'a, F, C, U, G, Context>
+{
+    fn arguments(&self) -> [u64; 6] {
+        [
+            self.frame.argument(0).unwrap_or(0),
+            self.frame.argument(1).unwrap_or(0),
+            self.frame.argument(2).unwrap_or(0),
+            self.frame.argument(3).unwrap_or(0),
+            self.frame.argument(4).unwrap_or(0),
+            self.frame.argument(5).unwrap_or(0),
+        ]
+    }
+    fn process_sysinfo(
+        &mut self,
+    ) -> Option<&mut dyn carrick_personality_linux::sysinfo::ProcessSysinfoVenue> {
+        let binding = LifecycleNative::binding(self)?;
+        let process = self.process.as_deref_mut()?;
+        if process.binding() != binding {
+            return None;
+        }
+        process.as_sysinfo_venue()
+    }
+}
+
 #[cfg(test)]
 #[path = "lifecycle/tests.rs"]
 mod tests;

@@ -100,6 +100,12 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
         rusage: UserVa,
     ) -> LifecycleOutcome;
     fn exit_group(&mut self, status: u8) -> LifecycleOutcome;
+    fn as_identity_venue(&mut self) -> Option<&mut dyn crate::identity::ProcessIdentityVenue> {
+        None
+    }
+    fn as_sysinfo_venue(&mut self) -> Option<&mut dyn crate::sysinfo::ProcessSysinfoVenue> {
+        None
+    }
 }
 
 pub trait UserCopy {
