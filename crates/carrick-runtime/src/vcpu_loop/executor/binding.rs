@@ -43,6 +43,9 @@ pub trait PersistentTaskBinding {
 
     fn validate_task_state(&self, state: &MigratableTaskState) -> Result<(), TrapError>;
 
+    /// Retain the first executor error on the exact logical job it failed.
+    fn record_executor_failure(&self, _cause: String) {}
+
     fn after_terminal_settlement(&self) {}
 
     /// The scheduler settled this thread against a TERMINAL target: nothing
@@ -122,6 +125,10 @@ impl PersistentTaskBinding for crate::vcpu_loop::continuation::HvpatchTaskBindin
 
     fn validate_task_state(&self, state: &MigratableTaskState) -> Result<(), TrapError> {
         self.validate_state(state)
+    }
+
+    fn record_executor_failure(&self, cause: String) {
+        crate::vcpu_loop::continuation::HvpatchTaskBinding::record_executor_failure(self, cause);
     }
 
     fn after_terminal_settlement(&self) {
