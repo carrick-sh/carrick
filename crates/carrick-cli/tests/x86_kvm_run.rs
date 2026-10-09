@@ -449,6 +449,50 @@ fn mounted_static_x86_poll_timeout_returns_zero() {
     assert_eq!(run_poll_with_open_empty_stdin(command), native);
 }
 
+#[test]
+fn mounted_static_x86_poll_empty_sets_sleep_until_timeout() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("poll-empty-sets");
+    compile_assembly("x86_poll_empty_sets.S", &elf);
+    let native = run_poll_timeout_markers(std::process::Command::new(&elf));
+    assert_eq!(native, (b"B\nN\nT\n".to_vec(), Some(7)));
+    let command = mounted_poll_command(dir.path(), &elf);
+    assert_eq!(run_poll_timeout_markers(command), native);
+}
+
+fn run_poll_timeout_markers(mut command: std::process::Command) -> (Vec<u8>, Option<i32>) {
+    let mut child = ReapChild(
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn empty-set poll witness"),
+    );
+    let mut stdout = child.stdout.take().unwrap();
+    let mut output = Vec::new();
+    for (index, expected) in [b"B\n", b"N\n", b"T\n"].iter().enumerate() {
+        assert!(
+            poll_readable(stdout.as_raw_fd(), 5_000),
+            "poll marker {index} missing"
+        );
+        let mut marker = [0u8; 2];
+        stdout.read_exact(&mut marker).unwrap();
+        assert_eq!(&marker, *expected);
+        output.extend_from_slice(&marker);
+        if index < 2 {
+            assert!(
+                !poll_readable(stdout.as_raw_fd(), 40),
+                "poll returned before its 100ms deadline after marker {index}"
+            );
+        }
+    }
+    let status = child.wait().unwrap();
+    (output, status.code())
+}
+
 fn mounted_poll_command(dir: &std::path::Path, elf: &std::path::Path) -> std::process::Command {
     let archive = dir.join("image.tar");
     std::fs::write(&archive, empty_image_archive()).unwrap();
