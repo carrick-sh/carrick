@@ -220,6 +220,41 @@ impl GuestThreads {
             comm,
         });
     }
+
+    #[inline(never)]
+    pub fn exec_completed(
+        &mut self,
+        caller_tid: u32,
+        leader_pid: u32,
+        path: &[u8],
+        fallback_creds: &TaskCredentials,
+    ) -> (TaskCredentials, [u8; 16], usize) {
+        let mut creds = self.credentials_for(caller_tid, fallback_creds).clone();
+        creds.apply_exec();
+        let comm = basename_comm(path);
+        self.reset_single(leader_pid, creds.clone(), comm);
+        let comm_len = comm.iter().position(|&b| b == 0).unwrap_or(15);
+        (creds, comm, comm_len)
+    }
+}
+
+#[inline(never)]
+pub fn basename_comm(path: &[u8]) -> [u8; 16] {
+    let mut comm = [0u8; 16];
+    let mut end = path.len();
+    while end > 1 && path[end - 1] == b'/' {
+        end -= 1;
+    }
+    let trimmed = &path[..end];
+    let start = match trimmed.iter().rposition(|&b| b == b'/') {
+        Some(pos) => pos + 1,
+        None => 0,
+    };
+    let base = &trimmed[start..];
+    let copy_len = base.len().min(15);
+    comm[..copy_len].copy_from_slice(&base[..copy_len]);
+    comm[copy_len] = 0;
+    comm
 }
 
 impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
