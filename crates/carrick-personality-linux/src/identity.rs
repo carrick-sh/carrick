@@ -23,18 +23,20 @@ pub const LINUX_PR_GET_CHILD_SUBREAPER: u64 = 37;
 pub const LINUX_PR_SET_NO_NEW_PRIVS: u64 = 38;
 pub const LINUX_PR_GET_NO_NEW_PRIVS: u64 = 39;
 
+use carrick_syscall_abi::LinuxCapabilitySet;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaskCapabilities {
-    pub effective: u64,
-    pub permitted: u64,
-    pub inheritable: u64,
+    pub effective: LinuxCapabilitySet,
+    pub permitted: LinuxCapabilitySet,
+    pub inheritable: LinuxCapabilitySet,
 }
 
 impl TaskCapabilities {
     pub const FULL: Self = Self {
-        effective: 0x0000_01ff_ffff_ffff,
-        permitted: 0x0000_01ff_ffff_ffff,
-        inheritable: 0,
+        effective: LinuxCapabilitySet::FULL,
+        permitted: LinuxCapabilitySet::FULL,
+        inheritable: LinuxCapabilitySet::empty(),
     };
 }
 
@@ -341,20 +343,23 @@ pub fn invoke<'a>(
             }
             if version == LINUX_CAPABILITY_VERSION_1 {
                 let mut data = [0u8; 12];
-                data[0..4].copy_from_slice(&(caps.effective as u32).to_ne_bytes());
-                data[4..8].copy_from_slice(&(caps.permitted as u32).to_ne_bytes());
-                data[8..12].copy_from_slice(&(caps.inheritable as u32).to_ne_bytes());
+                data[0..4].copy_from_slice(&(caps.effective.bits() as u32).to_ne_bytes());
+                data[4..8].copy_from_slice(&(caps.permitted.bits() as u32).to_ne_bytes());
+                data[8..12].copy_from_slice(&(caps.inheritable.bits() as u32).to_ne_bytes());
                 if !native.copy_out(data_ptr, &data) {
                     return Some(SyscallResult::new(EFAULT));
                 }
             } else {
                 let mut data = [0u8; 24];
-                data[0..4].copy_from_slice(&(caps.effective as u32).to_ne_bytes());
-                data[4..8].copy_from_slice(&(caps.permitted as u32).to_ne_bytes());
-                data[8..12].copy_from_slice(&(caps.inheritable as u32).to_ne_bytes());
-                data[12..16].copy_from_slice(&((caps.effective >> 32) as u32).to_ne_bytes());
-                data[16..20].copy_from_slice(&((caps.permitted >> 32) as u32).to_ne_bytes());
-                data[20..24].copy_from_slice(&((caps.inheritable >> 32) as u32).to_ne_bytes());
+                let eff = caps.effective.bits();
+                let prm = caps.permitted.bits();
+                let inh = caps.inheritable.bits();
+                data[0..4].copy_from_slice(&(eff as u32).to_ne_bytes());
+                data[4..8].copy_from_slice(&(prm as u32).to_ne_bytes());
+                data[8..12].copy_from_slice(&(inh as u32).to_ne_bytes());
+                data[12..16].copy_from_slice(&((eff >> 32) as u32).to_ne_bytes());
+                data[16..20].copy_from_slice(&((prm >> 32) as u32).to_ne_bytes());
+                data[20..24].copy_from_slice(&((inh >> 32) as u32).to_ne_bytes());
                 if !native.copy_out(data_ptr, &data) {
                     return Some(SyscallResult::new(EFAULT));
                 }
@@ -383,7 +388,7 @@ pub fn invoke<'a>(
             if pid < 0 {
                 return Some(SyscallResult::new(ESRCH));
             }
-            let (eff, prm, inh) = if version == LINUX_CAPABILITY_VERSION_1 {
+            let (eff_raw, prm_raw, inh_raw) = if version == LINUX_CAPABILITY_VERSION_1 {
                 let mut data = [0u8; 12];
                 if !native.copy_in(&mut data, data_ptr) {
                     return Some(SyscallResult::new(EFAULT));
@@ -410,7 +415,13 @@ pub fn invoke<'a>(
                     i_lo | (i_hi << 32),
                 )
             };
-            if (eff & !prm) != 0 {
+            if ((eff_raw | prm_raw | inh_raw) & !LinuxCapabilitySet::ALL_CAPS_MASK) != 0 {
+                return Some(SyscallResult::new(EINVAL));
+            }
+            let eff = LinuxCapabilitySet::from_bits_retain(eff_raw);
+            let prm = LinuxCapabilitySet::from_bits_retain(prm_raw);
+            let inh = LinuxCapabilitySet::from_bits_retain(inh_raw);
+            if !prm.contains(eff) {
                 return Some(SyscallResult::new(EPERM));
             }
             let venue = native.process_identity()?;

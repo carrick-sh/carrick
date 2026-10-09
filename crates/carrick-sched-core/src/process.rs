@@ -1,6 +1,6 @@
 //! Shared process identity and exit receipts. These are the same domains
 //! used by host kernel graph consumers and guest lifecycle owners.
-use carrick_syscall_abi::LinuxWaitOptions;
+use carrick_syscall_abi::{LinuxCapabilitySet, LinuxWaitOptions};
 use core::num::{NonZeroI32, NonZeroU64};
 use core::time::Duration;
 
@@ -405,7 +405,7 @@ impl<Container, Uid> Zombie<Container, Uid> {
 
 /// Typed user identity within a namespace.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct TaskUid(pub u32);
+pub struct TaskUid(u32);
 
 impl TaskUid {
     pub const ROOT: Self = Self(0);
@@ -421,7 +421,7 @@ impl TaskUid {
 
 /// Typed group identity within a namespace.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct TaskGid(pub u32);
+pub struct TaskGid(u32);
 
 impl TaskGid {
     pub const ROOT: Self = Self(0);
@@ -447,9 +447,9 @@ pub struct TaskCredentials {
     pub sgid: TaskGid,
     pub fsgid: TaskGid,
     pub groups: alloc::vec::Vec<TaskGid>,
-    pub cap_permitted: u64,
-    pub cap_effective: u64,
-    pub cap_inheritable: u64,
+    pub cap_permitted: LinuxCapabilitySet,
+    pub cap_effective: LinuxCapabilitySet,
+    pub cap_inheritable: LinuxCapabilitySet,
 }
 
 impl TaskCredentials {
@@ -463,36 +463,80 @@ impl TaskCredentials {
         sgid: TaskGid::ROOT,
         fsgid: TaskGid::ROOT,
         groups: alloc::vec::Vec::new(),
-        cap_permitted: 0x0000_01ff_ffff_ffff,
-        cap_effective: 0x0000_01ff_ffff_ffff,
-        cap_inheritable: 0,
+        cap_permitted: LinuxCapabilitySet::FULL,
+        cap_effective: LinuxCapabilitySet::FULL,
+        cap_inheritable: LinuxCapabilitySet::empty(),
     };
 
     pub fn is_privileged(&self) -> bool {
-        self.euid == TaskUid::ROOT || (self.cap_effective & (1 << 7)) != 0
+        self.euid == TaskUid::ROOT || self.cap_effective.contains(LinuxCapabilitySet::CAP_SETUID)
     }
 
     pub fn is_gid_privileged(&self) -> bool {
-        self.euid == TaskUid::ROOT || (self.cap_effective & (1 << 6)) != 0
+        self.euid == TaskUid::ROOT || self.cap_effective.contains(LinuxCapabilitySet::CAP_SETGID)
     }
 
     pub fn is_admin_privileged(&self) -> bool {
-        self.euid == TaskUid::ROOT || (self.cap_effective & (1 << 21)) != 0
+        self.euid == TaskUid::ROOT
+            || self
+                .cap_effective
+                .contains(LinuxCapabilitySet::CAP_SYS_ADMIN)
     }
 
     pub fn is_resource_privileged(&self) -> bool {
-        self.euid == TaskUid::ROOT || (self.cap_effective & (1 << 24)) != 0
+        self.euid == TaskUid::ROOT
+            || self
+                .cap_effective
+                .contains(LinuxCapabilitySet::CAP_SYS_RESOURCE)
     }
 
-    pub fn on_uid_change(&mut self, was_euid_root: bool) {
-        if was_euid_root && self.euid != TaskUid::ROOT {
-            self.cap_effective = 0;
-        } else if !was_euid_root && self.euid == TaskUid::ROOT {
+    /// Effect of user ID changes on capabilities per capabilities(7).
+    pub fn on_uid_change(
+        &mut self,
+        prev_ruid: TaskUid,
+        prev_euid: TaskUid,
+        prev_suid: TaskUid,
+        prev_fsuid: TaskUid,
+    ) {
+        let had_root =
+            prev_ruid == TaskUid::ROOT || prev_euid == TaskUid::ROOT || prev_suid == TaskUid::ROOT;
+        let has_no_root =
+            self.ruid != TaskUid::ROOT && self.euid != TaskUid::ROOT && self.suid != TaskUid::ROOT;
+
+        // Rule 1: If one or more of real, effective, or saved UIDs was 0,
+        // and as a result of UID changes all IDs are non-zero, clear permitted and effective.
+        if had_root && has_no_root {
+            self.cap_permitted = LinuxCapabilitySet::empty();
+            self.cap_effective = LinuxCapabilitySet::empty();
+        }
+
+        // Rule 2: If effective UID is changed from 0 to non-zero, clear effective.
+        if prev_euid == TaskUid::ROOT && self.euid != TaskUid::ROOT {
+            self.cap_effective = LinuxCapabilitySet::empty();
+        }
+
+        // Rule 3: If effective UID is changed from non-zero to 0, copy permitted to effective.
+        if prev_euid != TaskUid::ROOT && self.euid == TaskUid::ROOT {
             self.cap_effective = self.cap_permitted;
         }
-        if self.ruid != TaskUid::ROOT && self.euid != TaskUid::ROOT && self.suid != TaskUid::ROOT {
-            self.cap_permitted = 0;
-            self.cap_effective = 0;
+
+        // Rule 4: If filesystem UID is changed from 0 to non-zero, clear FS capabilities from effective.
+        // If filesystem UID is changed from non-zero to 0, restore FS capabilities enabled in permitted.
+        if prev_fsuid == TaskUid::ROOT && self.fsuid != TaskUid::ROOT {
+            self.cap_effective.remove(LinuxCapabilitySet::FS_MASK);
+        } else if prev_fsuid != TaskUid::ROOT && self.fsuid == TaskUid::ROOT {
+            self.cap_effective
+                .insert(self.cap_permitted & LinuxCapabilitySet::FS_MASK);
+        }
+    }
+
+    /// Effect of filesystem user ID changes on capabilities per capabilities(7).
+    pub fn on_fsuid_change(&mut self, prev_fsuid: TaskUid) {
+        if prev_fsuid == TaskUid::ROOT && self.fsuid != TaskUid::ROOT {
+            self.cap_effective.remove(LinuxCapabilitySet::FS_MASK);
+        } else if prev_fsuid != TaskUid::ROOT && self.fsuid == TaskUid::ROOT {
+            self.cap_effective
+                .insert(self.cap_permitted & LinuxCapabilitySet::FS_MASK);
         }
     }
 }
@@ -556,5 +600,7 @@ impl RlimitSet {
     }
 }
 
+#[cfg(test)]
+mod credential_tests;
 #[cfg(test)]
 mod wait_tests;
