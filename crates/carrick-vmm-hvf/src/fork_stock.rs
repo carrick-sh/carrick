@@ -10,11 +10,14 @@
 //! - `El1FrameGrantLedger` accounts for all physical grants and returns;
 //! - [`PendingForkLoan`] records outstanding loans and validates exactly-once completion.
 
+use std::collections::BTreeMap;
+
 use carrick_el1_abi::{
     ForkLifecycleLoan, ForkStockExchange, ForkStockLoan, ForkStockRefusal, ForkStockSettlement,
     NativeRootExit,
 };
 use carrick_guest_arch::{AddressContext, CpuId, RootGpa};
+use carrick_hal::asid::{AsidAllocator, AsidGeneration};
 use carrick_sched_core::process::LinuxWaitStatus;
 use core::num::NonZeroU64;
 
@@ -55,6 +58,7 @@ pub struct PendingForkLoan {
     pub execution: GrantExecution,
     pub child_tables: Vec<RootGpa>,
     pub parent_tables: Vec<RootGpa>,
+    pub asid_gen: AsidGeneration,
 }
 
 /// Errors returned by the fork stock host service.
@@ -122,13 +126,21 @@ pub struct ForkStockHostCustody {
     pub kernel_region_gpa: u64,
     pub lifecycle: ForkLifecycleLoan,
     pub carrier: NonZeroU64,
-    pub fork_next_asid: u16,
-    pub free_asids: Vec<u16>,
+    pub asids: AsidAllocator,
+    pub committed_asids: BTreeMap<u64, AsidGeneration>,
 }
 
 #[allow(dead_code)]
 impl ForkStockHostCustody {
     pub fn new(carrier: NonZeroU64) -> Self {
+        Self::with_asids(carrier, AsidAllocator::new())
+    }
+
+    pub fn asids(&self) -> &AsidAllocator {
+        &self.asids
+    }
+
+    pub fn with_asids(carrier: NonZeroU64, asids: AsidAllocator) -> Self {
         Self {
             grant_tables: Vec::new(),
             pending_loans: vec![None; 32],
@@ -138,26 +150,8 @@ impl ForkStockHostCustody {
             kernel_region_gpa: carrick_mem::memory::LINUX_KERNEL_REGION_BASE,
             lifecycle: ForkLifecycleLoan::ARM_DEFAULT,
             carrier,
-            fork_next_asid: 2,
-            free_asids: Vec::new(),
-        }
-    }
-
-    pub fn allocate_asid(&mut self) -> Option<u16> {
-        if let Some(asid) = self.free_asids.pop() {
-            Some(asid)
-        } else if self.fork_next_asid < u16::MAX {
-            let asid = self.fork_next_asid;
-            self.fork_next_asid += 1;
-            Some(asid)
-        } else {
-            None
-        }
-    }
-
-    pub fn release_asid(&mut self, asid: u16) {
-        if asid != 0 && !self.free_asids.contains(&asid) {
-            self.free_asids.push(asid);
+            asids,
+            committed_asids: BTreeMap::new(),
         }
     }
 
@@ -230,11 +224,14 @@ impl ForkStockHostCustody {
         self.fork_next_loan = next_loan;
         let child_base = child_tables[0].address().raw();
         let parent_base = parent_tables[0].address().raw();
-        let Some(asid) = self.allocate_asid() else {
-            self.grant_tables.extend(child_tables);
-            self.grant_tables.extend(parent_tables);
-            exchange.refuse(ForkStockRefusal::Capacity);
-            return Err(ForkStockRefusal::Capacity);
+        let asid_gen = match self.asids.allocate() {
+            Ok(asid_gen) => asid_gen,
+            Err(_) => {
+                self.grant_tables.extend(child_tables);
+                self.grant_tables.extend(parent_tables);
+                exchange.refuse(ForkStockRefusal::Capacity);
+                return Err(ForkStockRefusal::Capacity);
+            }
         };
         let Some(loan) = request.admit_loan(
             child_base,
@@ -242,9 +239,9 @@ impl ForkStockHostCustody {
             self.kernel_region_gpa,
             id,
             self.lifecycle,
-            asid,
+            Some(asid_gen.asid()),
         ) else {
-            self.release_asid(asid);
+            let _ = self.asids.release_unpublished(asid_gen);
             self.grant_tables.extend(child_tables);
             self.grant_tables.extend(parent_tables);
             exchange.refuse(ForkStockRefusal::Invalid);
@@ -254,7 +251,7 @@ impl ForkStockHostCustody {
         let child_mm = match El1FrameGrantMm::new(request.child_mm.raw()) {
             Some(mm) => mm,
             None => {
-                self.release_asid(asid);
+                let _ = self.asids.release_unpublished(asid_gen);
                 self.grant_tables.extend(child_tables);
                 self.grant_tables.extend(parent_tables);
                 exchange.refuse(ForkStockRefusal::Invalid);
@@ -264,7 +261,7 @@ impl ForkStockHostCustody {
         let parent_mm = match El1FrameGrantMm::new(request.operation.mm.raw()) {
             Some(mm) => mm,
             None => {
-                self.release_asid(asid);
+                let _ = self.asids.release_unpublished(asid_gen);
                 self.grant_tables.extend(child_tables);
                 self.grant_tables.extend(parent_tables);
                 exchange.refuse(ForkStockRefusal::Invalid);
@@ -281,7 +278,7 @@ impl ForkStockHostCustody {
                 for granted in granted_child {
                     ledger.mark_return(granted, 4096, child_mm, false);
                 }
-                self.release_asid(asid);
+                let _ = self.asids.release_unpublished(asid_gen);
                 self.grant_tables.extend(child_tables);
                 self.grant_tables.extend(parent_tables);
                 exchange.refuse(ForkStockRefusal::Capacity);
@@ -301,7 +298,7 @@ impl ForkStockHostCustody {
                 for granted in granted_parent {
                     ledger.mark_return(granted, 4096, parent_mm, false);
                 }
-                self.release_asid(asid);
+                let _ = self.asids.release_unpublished(asid_gen);
                 self.grant_tables.extend(child_tables);
                 self.grant_tables.extend(parent_tables);
                 exchange.refuse(ForkStockRefusal::Capacity);
@@ -316,6 +313,7 @@ impl ForkStockHostCustody {
             execution,
             child_tables,
             parent_tables,
+            asid_gen,
         });
 
         if !exchange.grant(
@@ -324,7 +322,7 @@ impl ForkStockHostCustody {
             self.kernel_region_gpa,
             id,
             self.lifecycle,
-            asid,
+            Some(asid_gen.asid()),
         ) {
             if let Some(pending) = self.pending_loans[cpu_index].take() {
                 for page in &pending.child_tables {
@@ -335,8 +333,8 @@ impl ForkStockHostCustody {
                 }
                 self.grant_tables.extend(pending.child_tables);
                 self.grant_tables.extend(pending.parent_tables);
+                let _ = self.asids.release_unpublished(pending.asid_gen);
             }
-            self.release_asid(asid);
             self.fork_lifecycle_available = true;
             exchange.refuse(ForkStockRefusal::Invalid);
             return Err(ForkStockRefusal::Invalid);
@@ -386,7 +384,7 @@ impl ForkStockHostCustody {
             }
             self.grant_tables.extend(pending.child_tables);
             self.grant_tables.extend(pending.parent_tables);
-            self.release_asid(loan.asid);
+            let _ = self.asids.release_unpublished(pending.asid_gen);
             self.fork_lifecycle_available = true;
             if !settlement.accept(loan) {
                 return Err(ForkStockServiceError::InvalidRecord);
@@ -426,6 +424,8 @@ impl ForkStockHostCustody {
             let mut pending = self.pending_loans[cpu_index]
                 .take()
                 .ok_or(ForkStockServiceError::NoPendingLoan)?;
+            self.committed_asids
+                .insert(pending.loan.request.child_mm.raw(), pending.asid_gen);
 
             let unused_child: Vec<_> = pending.child_tables.drain(child_used..).collect();
             let unused_parent: Vec<_> = pending.parent_tables.drain(parent_used..).collect();
@@ -449,16 +449,27 @@ impl ForkStockHostCustody {
 
     /// Service a container root exit notification.
     ///
-    /// Validates the executing task binding against the record and returns the Linux wait status.
+    /// Validates the executing task binding against the record, retires the child's ASID
+    /// generation exactly once through the shared allocator, and returns the Linux wait status.
     /// If the binding does not match, returns `Err(StaleExecution)` without modifying any ledger.
     pub(crate) fn service_root_exit(
-        &self,
+        &mut self,
         execution: GrantExecution,
         root_exit: &NativeRootExit,
     ) -> Result<LinuxWaitStatus, ForkStockServiceError> {
-        root_exit
+        let status = root_exit
             .status_for(execution.binding)
-            .ok_or(ForkStockServiceError::StaleExecution)
+            .ok_or(ForkStockServiceError::StaleExecution)?;
+        if let Some(asid_gen) = self.committed_asids.remove(&execution.binding.mm.raw()) {
+            let retired = self
+                .asids
+                .retire(asid_gen)
+                .map_err(|_| ForkStockServiceError::InvalidRecord)?;
+            self.asids
+                .acknowledge_tlb_flush(retired)
+                .map_err(|_| ForkStockServiceError::InvalidRecord)?;
+        }
+        Ok(status)
     }
 
     /// Read/write helper resolving GPA through CarrierVmCustody stage-2 mappings.
@@ -790,7 +801,7 @@ mod tests {
     #[test]
     fn root_exit_refuses_stale_custody_and_leaves_ledger_unchanged() {
         let carrier = NonZeroU64::new(7).unwrap();
-        let custody = ForkStockHostCustody::new(carrier);
+        let mut custody = ForkStockHostCustody::new(carrier);
         let ledger = El1FrameGrantLedger::default();
         let initial_stats = ledger.snapshot();
 
@@ -827,6 +838,101 @@ mod tests {
         let exit_status = custody.service_root_exit(exec, &root_exit).unwrap();
         assert_eq!(exit_status, valid_status);
         assert_eq!(ledger.snapshot(), initial_stats);
+    }
+
+    #[test]
+    fn shared_asid_allocator_host_and_fork_stock_coexist() {
+        let asid_allocator = AsidAllocator::with_limit_for_tests(2);
+        let carrier = NonZeroU64::new(7).unwrap();
+        let mut custody = ForkStockHostCustody::with_asids(carrier, asid_allocator.clone());
+        let mut ledger = El1FrameGrantLedger::default();
+
+        // 1. Allocate an ASID for a host-created MM through the production path
+        let host_asid_gen = asid_allocator.allocate().expect("host MM ASID");
+        let host_asid = host_asid_gen.asid();
+
+        // 2. Fork through the fork-stock path and assert the child's ASID differs
+        custody.grant_tables = (0..16)
+            .map(|i| RootGpa::page_aligned(FrameGpa::new(0x2_0000 + i * 4096)).unwrap())
+            .collect();
+        let exec = test_execution(41, 0, 301);
+        let req = test_request(exec, 302, 1, 1);
+        let mut exchange = ForkStockExchange::new(req).unwrap();
+        let loan = custody
+            .service_loan(&mut ledger, exec, &mut exchange)
+            .expect("loan granted");
+
+        let child_asid = loan.asid.expect("child ASID granted");
+        assert_ne!(
+            child_asid, host_asid,
+            "child ASID must differ from host MM ASID"
+        );
+
+        // 3. Abort releases the ASID back to reusable pool
+        let mut abort = ForkStockSettlement::abort(loan);
+        custody
+            .service_settlement(&mut ledger, exec, &mut abort, |_| true, |_| true)
+            .expect("abort settlement");
+
+        // The aborted ASID was released unpublished and can now be reallocated
+        let reallocated_gen = asid_allocator.allocate().expect("allocate after abort");
+        assert_eq!(
+            reallocated_gen.asid(),
+            child_asid,
+            "aborted ASID should be released back to the allocator immediately"
+        );
+        asid_allocator.release_unpublished(reallocated_gen).unwrap();
+
+        // 4. Now fork again, commit, and retire through root exit
+        let req2 = test_request(exec, 303, 1, 1);
+        let mut exchange2 = ForkStockExchange::new(req2).unwrap();
+        let loan2 = custody
+            .service_loan(&mut ledger, exec, &mut exchange2)
+            .expect("loan 2 granted");
+        let child_asid2 = loan2.asid.expect("child ASID 2");
+
+        let completion = PortalForkCompletion {
+            request: loan2.request,
+            child: unsafe {
+                carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                    carrier,
+                    req2.child_mm,
+                    NonZeroU64::MIN,
+                )
+            },
+            parent_generation: ReservationGeneration::INITIAL,
+            child_tables_used: 4096,
+            parent_tables_used: 4096,
+        };
+        let mut commit =
+            ForkStockSettlement::new(loan2, completion, KernelVa::new(0xffff_8000_0001_0000), 1)
+                .unwrap();
+        custody
+            .service_settlement(&mut ledger, exec, &mut commit, |_| true, |_| true)
+            .expect("commit settlement");
+
+        // Root exit for the child MM retires the ASID exactly once
+        let child_exec = test_execution(42, 0, 303);
+        let root_exit =
+            NativeRootExit::new(child_exec.binding, LinuxWaitStatus::from_wait_encoding(0))
+                .unwrap();
+        let status = custody
+            .service_root_exit(child_exec, &root_exit)
+            .expect("root exit");
+        assert_eq!(status, LinuxWaitStatus::from_wait_encoding(0));
+
+        // Calling root exit a second time finds no committed ASID for that MM
+        assert!(custody.committed_asids.get(&303).is_none());
+
+        // The retired and acknowledged ASID is now reusable in the allocator
+        let reallocated_gen2 = asid_allocator
+            .allocate()
+            .expect("allocate after retirement");
+        assert_eq!(
+            reallocated_gen2.asid(),
+            child_asid2,
+            "retired ASID should be released back to the reusable pool"
+        );
     }
 
     #[repr(align(64))]

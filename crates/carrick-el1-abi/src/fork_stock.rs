@@ -12,7 +12,7 @@ use crate::{
     ExecutionBinding, PortalForkRequest, PortalForkTableArena, PortalOperation,
     ReservationGeneration, ReservationMm,
 };
-use carrick_guest_arch::{AddressContext, KernelVa, RootGpa};
+use carrick_guest_arch::{AddressContext, Asid, KernelVa, RootGpa};
 use core::num::NonZeroU64;
 
 #[allow(unused_imports)]
@@ -181,7 +181,7 @@ impl ForkStockRequest {
         kernel_control_ipa: u64,
         loan: NonZeroU64,
         lifecycle: ForkLifecycleLoan,
-        asid: u16,
+        asid: Option<Asid>,
     ) -> Option<ForkStockLoan> {
         if !self.valid() {
             return None;
@@ -213,7 +213,7 @@ pub struct ForkStockLoan {
     pub id: NonZeroU64,
     pub request: PortalForkRequest,
     pub lifecycle: ForkLifecycleLoan,
-    pub asid: u16,
+    pub asid: Option<Asid>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -306,7 +306,7 @@ impl ForkStockExchange {
         kernel_control_ipa: u64,
         id: NonZeroU64,
         lifecycle: ForkLifecycleLoan,
-        asid: u16,
+        asid: Option<Asid>,
     ) -> bool {
         if self.status != 0
             || self
@@ -333,7 +333,7 @@ impl ForkStockExchange {
             lifecycle.page.raw(),
             lifecycle.controls.raw(),
         ];
-        self._reserved = u64::from(asid);
+        self._reserved = asid.map_or(0, |a| u64::from(a.raw()));
         self.status = 1;
         true
     }
@@ -362,7 +362,13 @@ impl ForkStockExchange {
         }
         let result = match self.status {
             1 => {
-                let asid = u16::try_from(self._reserved).ok()?;
+                let asid = if self._reserved == 0 {
+                    None
+                } else {
+                    let raw = u16::try_from(self._reserved).ok()?;
+                    let nonzero = core::num::NonZeroU16::new(raw)?;
+                    Some(Asid::from_registry_allocation(nonzero))
+                };
                 Ok(expected.admit_loan(
                     self.response[0],
                     self.response[1],
@@ -745,7 +751,7 @@ mod tests {
                 0x100000000,
                 NonZeroU64::MIN,
                 lifecycle_arm(),
-                0,
+                None,
             )
             .unwrap();
         let completion = crate::PortalForkCompletion {
@@ -801,7 +807,7 @@ mod tests {
                 0x100000000,
                 NonZeroU64::MIN,
                 lifecycle_arm(),
-                0,
+                None,
             )
             .unwrap();
         assert_eq!(loan.request.operation, request.operation);
@@ -816,7 +822,7 @@ mod tests {
                     0x100000000,
                     NonZeroU64::MIN,
                     lifecycle_arm(),
-                    0,
+                    None,
                 )
                 .is_none()
         );
@@ -828,7 +834,7 @@ mod tests {
                     0x100000000,
                     NonZeroU64::MIN,
                     lifecycle_arm(),
-                    0,
+                    None,
                 )
                 .is_none()
         );
@@ -869,7 +875,7 @@ mod tests {
             0x100000000,
             NonZeroU64::MIN,
             lifecycle_arm(),
-            0,
+            None,
         ));
         assert_eq!(exchange.request(), Some(request));
         let mut other = request;
@@ -886,7 +892,7 @@ mod tests {
             0x100000000,
             NonZeroU64::MIN,
             lifecycle_arm(),
-            0,
+            None,
         ));
         let mut refused = ForkStockExchange::new(request).unwrap();
         assert!(refused.refuse(ForkStockRefusal::Capacity));
@@ -1026,7 +1032,7 @@ mod tests {
         // Grant response
         let lifecycle = lifecycle_x86();
         let loan_id = NonZeroU64::new(42).unwrap();
-        assert!(exchange.grant(0x20000, 0x30000, 0x100000000, loan_id, lifecycle, 0));
+        assert!(exchange.grant(0x20000, 0x30000, 0x100000000, loan_id, lifecycle, None));
         let granted_bytes = unsafe {
             core::slice::from_raw_parts(
                 (&raw const exchange).cast::<u8>(),
@@ -1076,7 +1082,7 @@ mod tests {
 
         // 3. Settlement wire layout
         let loan = req
-            .admit_loan(0x20000, 0x30000, 0x100000000, loan_id, lifecycle, 0)
+            .admit_loan(0x20000, 0x30000, 0x100000000, loan_id, lifecycle, None)
             .unwrap();
         let completion = crate::PortalForkCompletion {
             request: loan.request,
@@ -1161,5 +1167,39 @@ mod tests {
         );
         assert_eq!(u64::from_ne_bytes(re_bytes[48..56].try_into().unwrap()), 0);
         assert_eq!(u64::from_ne_bytes(re_bytes[56..64].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn asid_typed_round_trip_and_zero_unrepresentable() {
+        use core::num::NonZeroU16;
+
+        let request = request();
+        let mut exchange = ForkStockExchange::new(request).unwrap();
+        let asid = Asid::from_registry_allocation(NonZeroU16::new(42).unwrap());
+        assert!(exchange.grant(
+            0x20000,
+            0x30000,
+            0x100000000,
+            NonZeroU64::new(1).unwrap(),
+            lifecycle_arm(),
+            Some(asid),
+        ));
+        assert_eq!(exchange._reserved, 42);
+        let loan = exchange.take(request).unwrap().unwrap();
+        assert_eq!(loan.asid, Some(asid));
+
+        // When _reserved is 0, asid decodes to None (unrepresentable as 0-valued Asid)
+        let mut exchange_zero = ForkStockExchange::new(request).unwrap();
+        assert!(exchange_zero.grant(
+            0x20000,
+            0x30000,
+            0x100000000,
+            NonZeroU64::new(1).unwrap(),
+            lifecycle_arm(),
+            None,
+        ));
+        assert_eq!(exchange_zero._reserved, 0);
+        let loan_zero = exchange_zero.take(request).unwrap().unwrap();
+        assert_eq!(loan_zero.asid, None);
     }
 }

@@ -51,6 +51,29 @@ impl AddressSpaceRegister {
     }
 }
 
+/// Nonzero AArch64 stage-1 address-space identifier.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct Asid(core::num::NonZeroU16);
+
+impl Asid {
+    pub const fn from_registry_allocation(raw: core::num::NonZeroU16) -> Self {
+        Self(raw)
+    }
+
+    pub const fn first() -> Self {
+        Self(core::num::NonZeroU16::MIN)
+    }
+
+    pub const fn raw(self) -> u16 {
+        self.0.get()
+    }
+
+    pub const fn nonzero(self) -> core::num::NonZeroU16 {
+        self.0
+    }
+}
+
 /// A vCPU slot (the syscall-mailbox slot index).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[repr(transparent)]

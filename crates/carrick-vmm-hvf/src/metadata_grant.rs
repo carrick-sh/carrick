@@ -908,7 +908,7 @@ pub(crate) fn service_metadata_operation(
         let Some(execution) = execution else {
             return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
         };
-        let fork_stock = custody.fork_stock.lock();
+        let mut fork_stock = custody.fork_stock.lock();
         match fork_stock.service_root_exit(execution, root_exit) {
             Ok(status) => Ok([METADATA_GRANT_SUCCESS, status.raw() as u64, 0, 0]),
             Err(_) => Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]),

@@ -587,6 +587,10 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         None
     }
 
+    fn carrier_asid_allocator(&self) -> Option<carrick_hal::asid::AsidAllocator> {
+        None
+    }
+
     fn frame_cow_owner_inventory(
         &self,
     ) -> Option<std::sync::Arc<dyn carrick_hal::FrameCowOwnerInventory>> {
