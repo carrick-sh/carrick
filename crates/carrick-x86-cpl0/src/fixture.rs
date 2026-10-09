@@ -39,6 +39,26 @@ fn carrick_x86_fixture_dispatch_witness() -> bool {
         )
     }) == 0x7bd6_8a91_c4e2_5f03
 }
+#[cfg(target_os = "none")]
+macro_rules! production_items {
+    ($($item:item)*) => {};
+}
+#[cfg(target_os = "none")]
+fn signal_irq_return(
+    frame: &mut carrick_el1::isa::x86::context::scheduler::InterruptFrame,
+    xsave: &mut carrick_el1::isa::x86::context::scheduler::XsaveArea,
+) {
+    let _ = (frame, xsave);
+}
+
+#[cfg(target_os = "none")]
+fn signal_syscall_return(
+    frame: &mut carrick_el1::isa::x86::context::native::NativeFrame,
+    xsave: &mut carrick_el1::isa::x86::context::scheduler::XsaveArea,
+) {
+    let _ = (frame, xsave);
+}
+
 include!("entry.rs");
 
 #[cfg(target_os = "none")]
