@@ -1111,6 +1111,7 @@ dependencies = [
  "carrick-kernel",
  "carrick-mem",
  "carrick-mmu-core",
+ "carrick-runtime",
  "carrick-sched-core",
  "carrick-signal-linux",
  "carrick-thread",

@@ -88,7 +88,7 @@ one wake and release of the executor at the blocked settlement.
 | File | Change |
 | --- | --- |
 | `crates/carrick-runtime/src/vcpu_loop/{mod,executor/{backend,binding,pool,settlement}}.rs` | Extract shared continuation preparation/resume and bind the KVM executor to the existing pool and settlement. No copied wait policy. |
-| `crates/carrick-vmm-kvm/src/cpl0_boot.rs`, `cpl0_actors.rs` | Hand worker-owned KVM vCPUs and exact stopped frames to the adapter; retain fixture hardware actors only. |
+| `crates/carrick-vmm-kvm/src/cpl0_boot.rs`, `carrier_cpu.rs` | Hand worker-owned KVM vCPUs and exact stopped frames to the adapter; use the pool for production fixtures too. |
 | `crates/carrick-runtime/src/prepare.rs` | Replace production initial actor dispatch with scheduler root admission/pool startup; classify the already permitted x86 `epoll_pwait` forward where required. |
 | `crates/carrick-el1-abi/src/lib.rs`, `crates/carrick-x86-cpl0/src/{entry,native_process}.rs` | Carry exact task/MM/generation and saved-frame binding across the CPL0 boundary; no host descriptor inferred from an inode or bare guest fd. |
 | `crates/carrick-cli/tests/x86_kvm_run.rs` and static fixtures | Native/KVM line-exact read and poll witnesses with a retained empty stdin pipe; keep waits bounded. |
@@ -104,13 +104,14 @@ remain a separate artifact-bound acceptance step on macOS.
 
 ## C2a: exact driver replacement map
 
-The old physical actors are *not* scheduler participants. In
-`cpl0_actors.rs::drive`, each scoped worker owns one borrowed `KvmVcpu`, while
-the coordinator owns the stopped CPU and calls `service`. `ActorDecision::Park`
-retains that stopped CPU; it never creates a `ThreadExecutionLease` or a task
-run-queue row. `run_initial_process` fixes that arrangement to two CPUs. The
-production swap replaces this call, rather than adding a fourth decision to
-its enum. Keep it for physical fixture tests only.
+The retired physical actors were *not* scheduler participants. Their scoped
+workers owned borrowed `KvmVcpu`s while a coordinator serviced stopped CPUs.
+`ActorDecision::Park` retained a stopped CPU without a `ThreadExecutionLease`
+or task run-queue row. The shared pool now runs the production fixtures as
+well; `run_initial_process`, `run_two_actors`, and `cpl0_actors` are deleted.
+Fault-record collection and a deterministic fixture-only mid-forward hook
+remain on the worker-owned stopped CPU. A failed running boundary sends a
+terminal error before the launcher waits for pool shutdown.
 
 | Old fixed-actor role | Shared-pool role | KVM adapter |
 | --- | --- | --- |

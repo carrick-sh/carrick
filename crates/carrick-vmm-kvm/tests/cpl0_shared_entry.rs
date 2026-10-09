@@ -3,15 +3,9 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::expect_used)]
 
-#[path = "common/physical_inventory.rs"]
-mod physical_inventory;
-use physical_inventory::physical_inventory;
-
-use carrick_mem::x86_initial_image::prepare_static_x86_elf;
-use carrick_vmm_kvm::cpl0_boot::{
-    Cpl0Carrier, InitialProcessExit, InitialReservationLimits, InitialSyscallDisposition,
-    PhysicalCrossingFamily,
-};
+#[path = "common/kvm_pool_fixture.rs"]
+mod kvm_pool_fixture;
+use kvm_pool_fixture::run_pool_fixture;
 
 fn tiny_elf(code: &[u8]) -> Vec<u8> {
     let mut bytes = vec![0; 0xb0 + code.len()];
@@ -55,26 +49,12 @@ fn production_sigprocmask_uses_shared_lifecycle_family() {
         0x0f, 0x05, 0x0f, 0x0b, // syscall; ud2
     ];
     let elf = tiny_elf(&code);
-    let image = prepare_static_x86_elf(&elf).expect("static x86 ELF");
-    let extent =
-        Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("bounded initial extent");
-    let mut carrier =
-        Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM image");
-    carrier
-        .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
-        .expect("initial guest MM");
-    let exit = carrier
-        .run_initial_process(4, |_, _| Ok(InitialSyscallDisposition::Return(-1)))
-        .expect("shared lifecycle call and root exit");
-    assert!(matches!(exit, InitialProcessExit::Exited { code: 7, .. }));
-    assert_eq!(carrier.initial_execution_witness().1, 0);
-    assert_eq!(
-        carrier.physical_crossing_counts(),
-        [
-            (PhysicalCrossingFamily::OwnerGrant, 0),
-            (PhysicalCrossingFamily::RootExit, 1)
-        ]
-    );
+    let run = run_pool_fixture(&elf, 4).run;
+    assert_eq!(run.exit_code, 7);
+    let witness = run.report.execution_witness.expect("CPL0 witness");
+    assert_eq!(witness.physical_crossing_families.len(), 1);
+    assert_eq!(witness.physical_crossing_families[0].family, "root_exit");
+    assert_eq!(witness.physical_crossing_families[0].count, 1);
 }
 
 #[test]
@@ -104,27 +84,11 @@ fn production_cpl0_refuses_non_allowlisted_forwards_with_enosys() {
         code[branch + 1] = u8::try_from(failure - (branch + 2)).expect("bounded branch");
     }
     let elf = tiny_elf(&code);
-    let image = prepare_static_x86_elf(&elf).expect("static x86 ELF");
-    let extent =
-        Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("bounded initial extent");
-    let mut carrier =
-        Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM image");
-    carrier
-        .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
-        .expect("initial guest MM");
-    let exit = carrier
-        .run_initial_process(8, |_, _| Ok(InitialSyscallDisposition::Return(-1)))
-        .expect("static x86 binary runs to native root exit");
-    assert!(matches!(exit, InitialProcessExit::Exited { code: 42, .. }));
-    assert_eq!(carrier.initial_execution_witness().1, 0);
-    assert_eq!(
-        carrier.physical_crossing_counts(),
-        [
-            (PhysicalCrossingFamily::OwnerGrant, 0),
-            (PhysicalCrossingFamily::RootExit, 1)
-        ]
-    );
-    assert_eq!(carrier.refusal_count(101), 1);
-    assert_eq!(carrier.refusal_count(103), 1);
-    assert_eq!(carrier.refusal_overflow_count(), 0);
+    let outcome = run_pool_fixture(&elf, 8);
+    assert_eq!(outcome.run.exit_code, 42);
+    assert_eq!(outcome.physical.initial_execution_witness().unwrap().1, 0);
+    assert_eq!(outcome.physical.physical_crossing_counts().unwrap()[1].1, 1);
+    assert_eq!(outcome.physical.refusal_count(101).unwrap(), 1);
+    assert_eq!(outcome.physical.refusal_count(103).unwrap(), 1);
+    assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
 }

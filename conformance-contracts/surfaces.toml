@@ -998,7 +998,7 @@ path = "crates/carrick-el1/src/isa/x86/context_resume.rs"
 contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion"]
 
 [[surfaces]]
-path = "crates/carrick-vmm-kvm/src/cpl0_actors.rs"
+path = "crates/carrick-vmm-kvm/src/carrier_cpu.rs"
 contracts = ["kernel.mm.address-space-occupancy"]
 
 [[surfaces]]

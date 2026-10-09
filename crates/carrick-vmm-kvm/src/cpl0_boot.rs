@@ -52,7 +52,6 @@ use kvm_bindings::{
 };
 use kvm_ioctls::VcpuExit as KvmExit;
 use kvm_ioctls::VmFd;
-use std::collections::VecDeque;
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::ptr::NonNull;
@@ -601,39 +600,6 @@ fn stopped_at_interruptible_user(cpu: &KvmVcpu) -> Result<bool, TrapError> {
         && events.interrupt.injected == 0)
 }
 
-fn physical_interrupt_ready(cpu: &mut KvmVcpu) -> Result<bool, TrapError> {
-    let regs = cpu.fd().get_regs().map_err(|e| fail(e.to_string()))?;
-    if regs.rflags & (1 << 9) == 0 {
-        return Ok(false);
-    }
-    let events = cpu
-        .fd()
-        .get_vcpu_events()
-        .map_err(|e| fail(e.to_string()))?;
-    if events.interrupt.shadow != 0 {
-        return Ok(false);
-    }
-    if events.interrupt.injected != 0 {
-        return Ok(true);
-    }
-    let lapic = cpu.fd().get_lapic().map_err(|e| fail(e.to_string()))?;
-    let word =
-        |offset: usize| u32::from_le_bytes(std::array::from_fn(|i| lapic.regs[offset + i] as u8));
-    let tpr = word(0x80) & 0xff;
-    let isr_priority = (0..8)
-        .rev()
-        .find_map(|i| {
-            let bits = word(0x100 + i * 0x10);
-            (bits != 0).then(|| (i as u32 * 32 + 31 - bits.leading_zeros()) & 0xf0)
-        })
-        .unwrap_or(0);
-    let priority = (tpr & 0xf0).max(isr_priority);
-    Ok((0..8).any(|i| {
-        let bits = word(0x200 + i * 0x10);
-        (0..32).any(|bit| bits & (1 << bit) != 0 && ((i * 32 + bit) as u32 & 0xf0) > priority)
-    }))
-}
-
 pub(crate) fn run_member(
     cpu: &mut KvmVcpu,
     table: &ShootdownTable,
@@ -1096,6 +1062,53 @@ pub struct ProductionForwardFrame {
 }
 
 impl ProductionCpuLease {
+    /// Fixture fault injection at a stopped forwarded-call boundary.
+    pub fn invalidate_user_fault_counters_venue(&mut self) -> Result<(), TrapError> {
+        let mut custody = self
+            ._custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        let address =
+            META_GPA + BINDING_OFFSET + core::mem::offset_of!(CpuBinding, counters_address) as u64;
+        custody
+            ._vm
+            .write(
+                FrameGpa::new(address),
+                &0xffff_dead_0000_0000_u64.to_le_bytes(),
+            )
+            .map_err(|error| fail(error.to_string()))
+    }
+
+    pub fn capture_fault_record(
+        &mut self,
+        task: carrick_guest_arch::TaskIdentity,
+        first: u32,
+    ) -> Result<carrick_x86::FaultDoorbellRecord, TrapError> {
+        let slot = self
+            .physical_slot()
+            .ok_or_else(|| fail("fault exit has no physical slot"))?;
+        let mut words = vec![first];
+        while words.len() < carrick_x86::X86_FAULT_RECORD_U32_WORDS {
+            let stopped = self.cpu.run_loaded(task)?;
+            let crate::carrier_cpu::CarrierRunExit::FaultDoorbellWord(word) = stopped.exit else {
+                return Err(fail("fault record interrupted"));
+            };
+            words.push(word);
+        }
+        let record = carrick_x86::FaultDoorbellRecord::from_u32_words(&words)?;
+        let custody = self
+            ._custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        let reason = custody.binding(slot).fault_reason.load(Ordering::Acquire);
+        if reason != 6 {
+            return Err(fail(format!(
+                "kernel fault policy refused: reason {reason}, {record:?}"
+            )));
+        }
+        Ok(record)
+    }
+
     pub fn run_idle_peer(&mut self) -> Result<CarrierRunExit, TrapError> {
         self.cpu.run_idle_peer()
     }
@@ -1321,13 +1334,99 @@ impl ProductionCpuLease {
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
                     custody.service_root_exit(&lease).map(Some)
                 }
-                _ => Err(fail("unexpected physical production doorbell")),
+                _ => {
+                    let binding = custody.binding(slot);
+                    Err(fail(format!(
+                        "unexpected physical production port {port:#x}; outer fault active {}, address {:#x}, reason {}",
+                        binding.fault_active.load(Ordering::Acquire),
+                        binding.fault_address.load(Ordering::Acquire),
+                        binding.fault_reason.load(Ordering::Acquire),
+                    )))
+                }
             }
         })
     }
 }
 
 impl ProductionCpuFactory {
+    pub fn refusal_count(&self, nr: u64) -> Result<u64, TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        let counters: &Counters = custody.metadata(COUNTERS_OFFSET);
+        let index = usize::try_from(nr)
+            .ok()
+            .filter(|index| *index < 512)
+            .unwrap_or(512);
+        Ok(counters.refused[index].load(Ordering::Acquire))
+    }
+
+    pub fn refusal_overflow_count(&self) -> Result<u64, TrapError> {
+        self.refusal_count(512)
+    }
+
+    pub fn robust_list_head(&self, index: usize) -> Result<u64, TrapError> {
+        if index >= 2 {
+            return Err(fail("unknown CPL0 task"));
+        }
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        let slot: &ThreadControlSlot = custody.metadata(CONTROL_OFFSET + index as u64 * STRIDE);
+        Ok(slot.robust_list().0)
+    }
+
+    pub fn fixture_pending_irqs(&self, index: usize) -> Result<u32, TrapError> {
+        if index >= 2 {
+            return Err(fail("unknown CPL0 CPU slot"));
+        }
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        Ok(custody
+            .binding(carrick_guest_arch::CpuId::new(index as u32))
+            .pending_irqs
+            .load(Ordering::Acquire))
+    }
+
+    pub fn user_fault_state(&self, index: usize) -> Result<(u64, u64, u64, u64, u64), TrapError> {
+        if index >= 2 {
+            return Err(fail("unknown CPL0 task"));
+        }
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        let binding = custody.binding(carrick_guest_arch::CpuId::new(index as u32));
+        let frame = binding.fault_frame.load(Ordering::Acquire);
+        let (error, pc) = if frame == 0 {
+            (0, 0)
+        } else {
+            let bytes = custody
+                ._vm
+                .read(FrameGpa::new(frame - DIRECT_VA + 120), 16)
+                .map_err(|error| fail(error.to_string()))?;
+            (
+                u64::from_le_bytes(
+                    bytes[..8]
+                        .try_into()
+                        .map_err(|_| fail("fault error width"))?,
+                ),
+                u64::from_le_bytes(bytes[8..].try_into().map_err(|_| fail("fault PC width"))?),
+            )
+        };
+        Ok((
+            binding.fault_active.load(Ordering::Acquire),
+            binding.fault_address.load(Ordering::Acquire),
+            error,
+            pc,
+            binding.fault_reason.load(Ordering::Acquire),
+        ))
+    }
+
     pub fn initial_execution_witness(&self) -> Result<(u64, u64), TrapError> {
         let custody = self
             .custody
@@ -2846,208 +2945,6 @@ impl Cpl0Carrier {
             VcpuExit::Kicked => Err(fail("initial peer cancelled")),
             _ => Err(fail("initial peer readiness exit before READY")),
         }
-    }
-
-    pub fn run_initial_process(
-        &mut self,
-        max_exits: usize,
-        mut forward: impl FnMut(
-            &mut ForwardVenue<'_>,
-            &NativeFrame,
-        ) -> Result<InitialSyscallDisposition, TrapError>,
-    ) -> Result<InitialProcessExit, TrapError> {
-        let mm = NonZeroU64::new(self.initial_mm_key()).ok_or_else(|| fail("initial MM key"))?;
-        if self.custody._vm.root(mm).is_none() {
-            return Err(fail("initial MM not published"));
-        }
-        self.start_initial_peer(max_exits)?;
-        let run_contexts = [
-            self.custody.production_run_context(0)?,
-            self.custody.production_run_context(1)?,
-        ];
-        let custody = &mut self.custody;
-        let mut recent_forwards = VecDeque::with_capacity(8);
-        let mut exits = 0usize;
-        crate::cpl0_actors::run_two_actors(
-            &mut self.cpus,
-            |cpu_id, cpu| run_contexts[cpu_id.raw() as usize].run(cpu),
-            |cpu_id, cpu, exit| {
-                use crate::cpl0_actors::ActorDecision;
-                exits = exits
-                    .checked_add(1)
-                    .ok_or_else(|| fail("initial process exit counter"))?;
-                if exits > max_exits {
-                    return Err(fail("initial process exit budget exceeded"));
-                }
-                let index = cpu_id.raw() as usize;
-                if matches!(exit, VcpuExit::Halt) {
-                    return Ok(ActorDecision::Park);
-                }
-                if matches!(exit, VcpuExit::Kicked) {
-                    return Err(fail("initial process cancelled"));
-                }
-                if matches!(
-                    exit,
-                    VcpuExit::IoOut {
-                        port: OWNER_GRANT_PORT,
-                        ..
-                    }
-                ) {
-                    custody.owner_grant_crossings = custody
-                        .owner_grant_crossings
-                        .checked_add(1)
-                        .ok_or_else(|| fail("physical crossing counter exhausted"))?;
-                    let lease = StoppedCpuLease {
-                        cpu: cpu_id,
-                        vcpu: cpu,
-                    };
-                    custody.service_anonymous_grant(&lease)?;
-                    return Ok(ActorDecision::Resume);
-                }
-                if matches!(
-                    exit,
-                    VcpuExit::IoOut {
-                        port: carrick_el1_abi::FORK_STOCK_PORT,
-                        ..
-                    }
-                ) {
-                    custody.owner_grant_crossings = custody
-                        .owner_grant_crossings
-                        .checked_add(1)
-                        .ok_or_else(|| fail("physical crossing counter exhausted"))?;
-                    let lease = StoppedCpuLease {
-                        cpu: cpu_id,
-                        vcpu: cpu,
-                    };
-                    custody.service_fork_stock(&lease)?;
-                    return Ok(ActorDecision::Resume);
-                }
-                if matches!(
-                    exit,
-                    VcpuExit::IoOut {
-                        port: carrick_el1_abi::NATIVE_ROOT_EXIT_PORT,
-                        ..
-                    }
-                ) {
-                    custody.root_exit_crossings = custody
-                        .root_exit_crossings
-                        .checked_add(1)
-                        .ok_or_else(|| fail("physical crossing counter exhausted"))?;
-                    let lease = StoppedCpuLease {
-                        cpu: cpu_id,
-                        vcpu: cpu,
-                    };
-                    let status = custody.service_root_exit(&lease)?;
-                    return Ok(ActorDecision::Finish(InitialProcessExit::Exited {
-                        code: status.code(),
-                        exits,
-                    }));
-                }
-                let VcpuExit::IoOut {
-                    port: FORWARD_PORT, ..
-                } = exit
-                else {
-                    if let VcpuExit::IoOut {
-                        port: carrick_x86::FAULT_DOORBELL_PORT,
-                        data,
-                    } = exit
-                    {
-                        let mut words = vec![u32::from_le_bytes(
-                            data.as_slice()
-                                .try_into()
-                                .map_err(|_| fail("initial fault word width"))?,
-                        )];
-                        while words.len() < carrick_x86::X86_FAULT_RECORD_U32_WORDS {
-                            let VcpuExit::IoOut {
-                                port: carrick_x86::FAULT_DOORBELL_PORT,
-                                data,
-                            } = run_contexts[index].run(cpu)?
-                            else {
-                                return Err(fail("initial fault record interrupted"));
-                            };
-                            words.push(u32::from_le_bytes(
-                                data.as_slice()
-                                    .try_into()
-                                    .map_err(|_| fail("initial fault word width"))?,
-                            ));
-                        }
-                        let record = carrick_x86::FaultDoorbellRecord::from_u32_words(&words)?;
-                        let reason = custody.binding(cpu_id).fault_reason.load(Ordering::Acquire);
-                        if reason != 6 {
-                            return Err(fail(format!(
-                                "kernel fault policy refused: reason {reason}, {record:?}"
-                            )));
-                        }
-                        return Ok(ActorDecision::Finish(InitialProcessExit::Fault {
-                            record,
-                            exits,
-                        }));
-                    }
-                    let mut detail = match exit {
-                        VcpuExit::IoOut { port, .. } => {
-                            format!("unexpected initial process port {port:#x}")
-                        }
-                        VcpuExit::Halt => "initial process halted".to_owned(),
-                        _ => "unexpected initial process exit".to_owned(),
-                    };
-                    cpu.append_debug_state(&mut detail);
-                    return Err(fail(detail));
-                };
-                let address = cpu.get_gpr(X86Reg::Rax)?;
-                let stack_end = custody.binding(cpu_id).kernel_stack + 16;
-                if address & 7 != 0
-                    || address < stack_end - 0x1_0000
-                    || address
-                        .checked_add(size_of::<NativeFrame>() as u64)
-                        .is_none_or(|end| end > stack_end)
-                {
-                    return Err(fail("initial syscall frame outside private kernel stack"));
-                }
-                let ptr = custody
-                    .ram
-                    .host_ptr(address - DIRECT_VA, size_of::<NativeFrame>())
-                    .ok_or_else(|| fail("initial syscall frame backing"))?
-                    .cast::<NativeFrame>();
-                // SAFETY: the stopped CPU published this exact stack-local frame.
-                // Copy it before lending the carrier to the host dispatcher, then
-                // write only the return register back before resuming the vCPU.
-                let mut frame = unsafe { *ptr };
-                let native_nr = frame.rax;
-                let native_args = [frame.rdi, frame.rsi, frame.rdx];
-                custody.host_forwards += 1;
-                let decision = {
-                    let mut venue = ForwardVenue::new(
-                        custody,
-                        StoppedCpuLease {
-                            cpu: cpu_id,
-                            vcpu: cpu,
-                        },
-                    )?;
-                    forward(&mut venue, &frame)?
-                };
-                match decision {
-                    InitialSyscallDisposition::Return(value) => frame.rax = value as u64,
-                    InitialSyscallDisposition::Refused(errno) => {
-                        frame.rax = errno.guest_retval() as u64;
-                    }
-                    InitialSyscallDisposition::Exit(code) => {
-                        return Ok(ActorDecision::Finish(InitialProcessExit::Exited {
-                            code: code.code(),
-                            exits,
-                        }));
-                    }
-                }
-                if recent_forwards.len() == 8 {
-                    recent_forwards.pop_front();
-                }
-                recent_forwards.push_back((native_nr, native_args, frame.rax as i64));
-                // SAFETY: `ptr` names the validated retained supervisor stack and
-                // the vCPU is stopped until the next `HvVcpu::run` above.
-                unsafe { ptr.write(frame) };
-                Ok(ActorDecision::Resume)
-            },
-            |_cpu_id, cpu| physical_interrupt_ready(cpu),
-        )
     }
 
     /// Counters from the stopped production carrier, including its initial
