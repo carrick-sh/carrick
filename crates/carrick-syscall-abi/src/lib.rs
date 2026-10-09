@@ -106,6 +106,36 @@ impl NativeNr {
     }
 }
 
+/// Linux `pollfd.events` and `pollfd.revents` ABI bits shared by the inner
+/// kernel and host dispatcher. The guest may request any combination; ERR,
+/// HUP, and NVAL are returned independently of requested bits.
+pub const LINUX_POLLIN: i16 = 0x0001;
+pub const LINUX_POLLPRI: i16 = 0x0002;
+pub const LINUX_POLLOUT: i16 = 0x0004;
+pub const LINUX_POLLERR: i16 = 0x0008;
+pub const LINUX_POLLHUP: i16 = 0x0010;
+pub const LINUX_POLLNVAL: i16 = 0x0020;
+pub const LINUX_POLLRDNORM: i16 = 0x0040;
+pub const LINUX_POLLRDBAND: i16 = 0x0080;
+pub const LINUX_POLLWRNORM: i16 = 0x0100;
+pub const LINUX_POLLWRBAND: i16 = 0x0200;
+pub const LINUX_POLLRDHUP: i16 = 0x2000;
+
+/// Linux poll interest/result bits after decoding the wire `i16` field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct PollEvents(i16);
+
+impl PollEvents {
+    pub const fn from_bits(bits: i16) -> Self {
+        Self(bits)
+    }
+
+    pub const fn bits(self) -> i16 {
+        self.0
+    }
+}
+
 /// Ordinals for the carrick-internal ("private") normalized x86 syscall
 /// numbers below. Each public constant derives its value from THIS enum's
 /// sequential discriminants via [`private_x86_number`], so two entries can

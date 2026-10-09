@@ -201,7 +201,8 @@ pub(crate) struct HvpatchRuntimeDirectory {
     /// task of every container in one carrier with ONE run queue, so the `P`
     /// set and the placement policy over it belong to the carrier.
     scheduling_policy: Mutex<Option<Arc<dyn carrick_hal::SchedulingPolicy>>>,
-    persistent_bindings: Arc<executor::HvpatchTaskBindingDirectory>,
+    persistent_bindings:
+        Arc<executor::TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding>>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     carrier_tasks:
         Mutex<Option<Arc<carrick_vmm_hvf::hvf_aarch64_engine::HvpatchCarrierTaskStateDirectory>>>,
@@ -210,7 +211,7 @@ pub(crate) struct HvpatchRuntimeDirectory {
         Option<
             executor::ExecutorPool<
                 executor::HvpatchPersistentExecutorFactory,
-                executor::HvpatchTaskBindingDirectory,
+                executor::TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
             >,
         >,
     >,
@@ -687,7 +688,10 @@ impl HvpatchRuntimeDirectory {
             .sum()
     }
 
-    pub(crate) fn persistent_bindings(&self) -> &Arc<executor::HvpatchTaskBindingDirectory> {
+    pub(crate) fn persistent_bindings(
+        &self,
+    ) -> &Arc<executor::TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding>>
+    {
         &self.persistent_bindings
     }
 

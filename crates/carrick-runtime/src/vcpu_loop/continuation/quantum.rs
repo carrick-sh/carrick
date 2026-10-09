@@ -1407,7 +1407,7 @@ mod tests {
         );
         for required in [
             "ops.prepare",
-            "HvpatchSubmissionShape::ProcessBirth",
+            "TaskSubmissionShape::ProcessBirth",
             "prepare_submission",
             "take_opened_start_gate",
             "dormant.activate",
@@ -1473,8 +1473,8 @@ mod tests {
         for required in [
             "ops.prepare",
             "prepare_hvpatch_logical_job",
-            "HvpatchSubmissionShape::Descendant",
-            "HvpatchSubmissionShape::PeerRoot",
+            "TaskSubmissionShape::Descendant",
+            "TaskSubmissionShape::PeerRoot",
             "take_opened_start_gate",
             "let dormant",
             ".activate(",

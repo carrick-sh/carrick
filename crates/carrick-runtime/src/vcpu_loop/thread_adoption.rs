@@ -622,7 +622,7 @@ where
     })?;
     let dormant = runtime.persistent_bindings().prepare_submission(
         &scheduler,
-        executor::HvpatchSubmissionShape::ProcessBirth(adopted.submission),
+        executor::TaskSubmissionShape::ProcessBirth(adopted.submission),
         None,
         context.thread().clone(),
         generation,

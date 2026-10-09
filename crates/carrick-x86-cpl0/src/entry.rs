@@ -581,7 +581,7 @@ mod kernel {
                 None::<carrick_el1::fault::PreparedFaultPath<'_, NoopPreparedResolver>>,
                 &mut cow,
             );
-            if result == Action::Served { 0 } else { 6 }
+            if result == Action::Served { 0 } else { carrick_el1_abi::X86FaultDisposition::PolicyDeclined.raw() }
         };
             let lane = binding.scheduler_witness.load(Ordering::Acquire);
             if lane == super::lifecycle::LIFECYCLE_LANE
@@ -664,7 +664,7 @@ mod kernel {
         }
         use carrick_el1::fault::OwnerFaultSupplyOutcome;
         match supply.outcome() {
-            OwnerFaultSupplyOutcome::PolicyDeclined => 6,
+            OwnerFaultSupplyOutcome::PolicyDeclined => carrick_el1_abi::X86FaultDisposition::PolicyDeclined.raw(),
             OwnerFaultSupplyOutcome::Unavailable => 9,
             OwnerFaultSupplyOutcome::CowSelected => {
                 // The shared owner selected this exact inherited private page
