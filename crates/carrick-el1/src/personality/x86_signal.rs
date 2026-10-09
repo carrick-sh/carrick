@@ -70,7 +70,7 @@ impl X86Backend {
         rtsigframe.uc.uc_flags = 1;
         rtsigframe.uc.uc_link = 0;
         rtsigframe.uc.uc_stack = params.stack;
-        rtsigframe.uc.uc_sigmask = params.mask;
+        rtsigframe.uc.uc_sigmask = params.mask.signals().bits();
 
         // Populate uc_mcontext with current register values from frame
         rtsigframe.uc.uc_mcontext.r8 = frame.r8;
@@ -162,7 +162,7 @@ impl SignalBackend for X86Backend {
         frame: &mut NativeFrame,
         fpstate: &mut [u8],
         copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
-    ) -> Result<u64, Self::Error> {
+    ) -> Result<carrick_signal_core::policy::SigBlockMask, Self::Error> {
         let uc_addr = UserVa::new(frame.rsp);
         let mut uc_bytes = [0u8; core::mem::size_of::<Ucontext>()];
         if !copy_in(&mut uc_bytes, uc_addr) {
@@ -259,6 +259,8 @@ impl SignalBackend for X86Backend {
         frame.user_rcx = uc.uc_mcontext.rcx;
         frame.rsp = uc.uc_mcontext.rsp;
 
-        Ok(uc.uc_sigmask)
+        Ok(carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+            carrick_signal_core::SignalSet::from_bits(uc.uc_sigmask),
+        ))
     }
 }
