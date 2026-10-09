@@ -375,6 +375,22 @@ pub const EL1_OPEN_FILE_TABLE_SIZE: u64 = 0x1_0000;
 /// Maximum open-file records (open descriptions of in-zone inodes).
 pub const MAX_ZONE_OPEN_FILES: usize = 512;
 
+/// Internal `epoll_pwait` transport for a guest poll whose descriptions are
+/// already authenticated as host-bound by the shared file owner. This value
+/// is never a guest-visible epoll descriptor.
+pub struct HostPollEpollBridge;
+
+impl HostPollEpollBridge {
+    pub const EPOLL_FD_ARG: u64 = u64::MAX;
+    /// `SYSCALL` captures the user return PC in RCX before EL1 writes this
+    /// supervisor-only tag. The adapter restores RCX before returning.
+    pub const FRAME_TAG: u64 = u64::MAX - 1;
+
+    pub const fn is_bridge(epoll_fd: u64, tag: u64) -> bool {
+        epoll_fd == Self::EPOLL_FD_ARG && tag == Self::FRAME_TAG
+    }
+}
+
 /// Byte offset of the file page cache arena within the region.
 pub const EL1_CACHE_OFFSET: u64 = EL1_HEAP_OFFSET + 0x10_0000; // 1 MiB into heap
 

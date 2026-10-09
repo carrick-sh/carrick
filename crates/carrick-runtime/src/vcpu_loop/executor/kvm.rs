@@ -43,7 +43,6 @@ pub(crate) struct KvmPersistentExecutorFactory {
     max_exits: usize,
     stats: Arc<KvmForwardStats>,
     scheduler: Arc<Scheduler>,
-    #[cfg(feature = "test-support")]
     first_forward_hook: Arc<Mutex<Option<KvmFirstForwardHook>>>,
 }
 
@@ -109,12 +108,10 @@ impl KvmPersistentExecutorFactory {
             max_exits,
             stats,
             scheduler,
-            #[cfg(feature = "test-support")]
             first_forward_hook: Arc::new(Mutex::new(None)),
         }
     }
 
-    #[cfg(feature = "test-support")]
     pub(crate) fn install_first_forward_hook(
         &self,
         hook: KvmFirstForwardHook,
@@ -149,7 +146,6 @@ impl PersistentExecutorFactory for KvmPersistentExecutorFactory {
             binding: None,
             task: None,
             completion_sent: false,
-            #[cfg(feature = "test-support")]
             first_forward_hook: Arc::clone(&self.first_forward_hook),
         })
     }
@@ -167,7 +163,6 @@ pub(crate) struct KvmPersistentExecutor {
     binding: Option<Arc<KvmTaskBinding>>,
     task: Option<TaskIdentity>,
     completion_sent: bool,
-    #[cfg(feature = "test-support")]
     first_forward_hook: Arc<Mutex<Option<KvmFirstForwardHook>>>,
 }
 
@@ -387,14 +382,30 @@ impl PersistentExecutor for KvmPersistentExecutor {
                         .map_err(|_| TrapError::Hypervisor("KVM dispatcher poisoned".into()))?;
                     let (decision, token) =
                         self.physical.capture_forward(task, |venue, frame| {
-                            let syscall = carrick_guest_mem::X8664SyscallFrame {
-                                rax: frame.rax,
-                                rdi: frame.rdi,
-                                rsi: frame.rsi,
-                                rdx: frame.rdx,
-                                r10: frame.r10,
-                                r8: frame.r8,
-                                r9: frame.r9,
+                            let bridge = frame.rax == 281
+                                && carrick_el1_abi::HostPollEpollBridge::is_bridge(
+                                    frame.rdi, frame.rcx,
+                                );
+                            let syscall = if bridge {
+                                carrick_guest_mem::X8664SyscallFrame {
+                                    rax: 7,
+                                    rdi: frame.rsi,
+                                    rsi: frame.rdx,
+                                    rdx: frame.r10,
+                                    r10: 0,
+                                    r8: 0,
+                                    r9: 0,
+                                }
+                            } else {
+                                carrick_guest_mem::X8664SyscallFrame {
+                                    rax: frame.rax,
+                                    rdi: frame.rdi,
+                                    rsi: frame.rsi,
+                                    rdx: frame.rdx,
+                                    r10: frame.r10,
+                                    r8: frame.r8,
+                                    r9: frame.r9,
+                                }
                             };
                             let raw = match X8664GuestArch::normalize_syscall(&syscall) {
                                 SyscallNorm::Plain(raw) => raw,
@@ -408,7 +419,10 @@ impl PersistentExecutor for KvmPersistentExecutor {
                                 }
                             };
                             let host_poll = raw.native_number.0 == 7
-                                && crate::prepare::initial_poll_has_only_host_fds(venue, raw.args);
+                                && (bridge
+                                    || crate::prepare::initial_poll_has_only_host_fds(
+                                        venue, raw.args,
+                                    ));
                             let class = crate::prepare::classify_initial_x86_forward(
                                 raw.native_number,
                                 raw.args,
@@ -459,7 +473,6 @@ impl PersistentExecutor for KvmPersistentExecutor {
                                 other => Ok(ForwardDecision::Blocked(request, Box::new(other))),
                             }
                         })?;
-                    #[cfg(feature = "test-support")]
                     {
                         let hook = self
                             .first_forward_hook

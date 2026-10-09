@@ -4019,6 +4019,36 @@ fn a_blocked_host_fd_wait_costs_one_nudge_and_no_enroll_poll() {
     close_pair(fds);
 }
 
+#[test]
+fn finite_host_fd_wait_wakes_once_at_its_deadline() {
+    let (kernel, context) = bootstrap(15_912);
+    let generation = publish(&context, 0x912);
+    let service = CarrierWaitService::new(Arc::new(Scheduler::new(kernel)));
+    let fds = pipe_pair();
+    let authority = install_test_fd_authority(&context, 0);
+    let continuation = BlockedContinuation::from_dispatch_outcome(
+        DispatchOutcome::WaitOnFds {
+            fds: WaitFds::raw(vec![(fds[0], libc::POLLIN)]).with_slot_authorities(vec![authority]),
+            timeout: Some(Duration::from_millis(50)),
+            sig_mask: WaitSigMask::NONE,
+            completion: FdWaitCompletion::Fd { on_timeout: 0 },
+        },
+        capture(&context, generation),
+    )
+    .expect("timed host fd continuation");
+    let mut registration = service.prepare_registration(&continuation);
+    service.enroll(&mut registration).expect("enroll timed fd");
+    assert_eq!(
+        await_event_timeout(&service, registration.wake_token(), Duration::from_secs(1))
+            .expect("deadline wake")
+            .expect("timer event"),
+        ContinuationEvent::Timeout
+    );
+    drop(registration);
+    drop(continuation);
+    close_pair(fds);
+}
+
 /// Lost-wakeup stress for the enroll path without its host `poll`: readiness
 /// lands before prepare, between prepare and enroll, during enroll, or after
 /// it, and every wait still wakes within a bound. Readiness that predates
