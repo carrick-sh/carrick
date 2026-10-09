@@ -886,7 +886,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         address: AddressContext<RootGpa>,
         words: C,
         service: &'r mut S,
-    ) -> Result<NativeProcessEntry<'r, 'a, M, C, S>, NativeProcessError> {
+    ) -> Result<Box<NativeProcessEntry<'r, 'a, M, C, S>>, NativeProcessError> {
         if !core::ptr::eq(source.zone, self.zone) {
             return Err(NativeProcessError::Stale);
         }
@@ -933,7 +933,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             *row.context_mut() = words;
         }
         drop(graph);
-        Ok(NativeProcessEntry {
+        Ok(Box::new(NativeProcessEntry {
             runtime: self,
             source,
             binding,
@@ -943,7 +943,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             service,
             handoff: None,
             root_exit: None,
-        })
+        }))
     }
     pub fn namespace_child_key(&self, caller: TaskKey, visible: u32) -> Option<TaskKey> {
         self.graph
