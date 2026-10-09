@@ -633,7 +633,7 @@ fn physical_interrupt_ready(cpu: &mut KvmVcpu) -> Result<bool, TrapError> {
     }))
 }
 
-fn run_member(
+pub(crate) fn run_member(
     cpu: &mut KvmVcpu,
     table: &ShootdownTable,
     slot: usize,
@@ -700,6 +700,37 @@ fn run_member(
         }
     }
     Ok(result)
+}
+
+/// Physical run authority retained by a worker after the carrier's vCPU is
+/// moved out of its bootstrap owner. The RAM owner keeps the atomic shootdown
+/// table alive; the slot is a physical identity, never a Linux task identity.
+#[derive(::core::clone::Clone)]
+pub(crate) struct ProductionRunContext {
+    ram: Arc<GuestRam>,
+    vm: Arc<VmFd>,
+    actual_run: Arc<[AtomicU32; 2]>,
+    slot: usize,
+}
+
+impl ProductionRunContext {
+    pub(crate) fn run(&self, cpu: &mut KvmVcpu) -> Result<VcpuExit, TrapError> {
+        let table = self
+            .ram
+            .host_ptr(META_GPA + SHOOTDOWN_OFFSET, size_of::<ShootdownTable>())
+            .ok_or_else(|| fail("retained shootdown table backing"))?
+            .cast::<ShootdownTable>();
+        // SAFETY: the retained RAM owns this aligned table for the entire
+        // worker lifetime. The guest and host access its published atomics.
+        let table = unsafe { &*table };
+        run_member(
+            cpu,
+            table,
+            self.slot,
+            &self.vm,
+            Some(&self.actual_run[self.slot]),
+        )
+    }
 }
 impl Watchdog {
     pub(crate) fn start() -> Self {
@@ -1095,6 +1126,18 @@ pub struct ForwardVenue<'a> {
 }
 
 impl Cpl0HostCustody {
+    fn production_run_context(&self, slot: usize) -> Result<ProductionRunContext, TrapError> {
+        if slot >= self.actual_run.len() {
+            return Err(fail("unknown CPL0 CPU slot"));
+        }
+        Ok(ProductionRunContext {
+            ram: Arc::clone(&self.ram),
+            vm: Arc::clone(&self._vm.vm().vm),
+            actual_run: Arc::clone(&self.actual_run),
+            slot,
+        })
+    }
+
     fn metadata<T>(&self, offset: u64) -> &T {
         // SAFETY: the retained owner initialized each aligned record before
         // publication. Callers access atomic metadata or their stopped lane.
@@ -1152,27 +1195,8 @@ impl<'a> ForwardVenue<'a> {
 
 impl Cpl0Carrier {
     fn run_cpu(&mut self, index: usize) -> Result<VcpuExit, TrapError> {
-        if index >= self.cpus.len() {
-            return Err(fail("unknown CPL0 CPU slot"));
-        }
-        // SAFETY: `metadata_base` owns this aligned table until every vCPU
-        // and scoped guest-run thread has stopped. The table and vCPU fields
-        // are disjoint even while this method borrows the vCPU mutably.
-        let table = unsafe {
-            &*self
-                .custody
-                .metadata_base
-                .as_ptr()
-                .add(SHOOTDOWN_OFFSET as usize)
-                .cast::<ShootdownTable>()
-        };
-        run_member(
-            &mut self.cpus[index],
-            table,
-            index,
-            &self.custody._vm.vm().vm,
-            Some(&self.custody.actual_run[index]),
-        )
+        let context = self.custody.production_run_context(index)?;
+        context.run(&mut self.cpus[index])
     }
     /// Size one private retained aperture for the host-staged PT_LOAD bytes,
     /// the boot record, and guest-owned table/data grants. Capacity follows
@@ -2275,31 +2299,16 @@ impl Cpl0Carrier {
             return Err(fail("initial MM not published"));
         }
         self.start_initial_peer(max_exits)?;
-        let vm = Arc::clone(&self.custody._vm.vm().vm);
-        // SAFETY: retained atomic-only shootdown table outlives both scoped actors.
-        let table = unsafe {
-            &*self
-                .custody
-                .metadata_base
-                .as_ptr()
-                .add(SHOOTDOWN_OFFSET as usize)
-                .cast::<ShootdownTable>()
-        };
-        let actual_run = Arc::clone(&self.custody.actual_run);
+        let run_contexts = [
+            self.custody.production_run_context(0)?,
+            self.custody.production_run_context(1)?,
+        ];
         let custody = &mut self.custody;
         let mut recent_forwards = VecDeque::with_capacity(8);
         let mut exits = 0usize;
         crate::cpl0_actors::run_two_actors(
             &mut self.cpus,
-            |cpu_id, cpu| {
-                run_member(
-                    cpu,
-                    table,
-                    cpu_id.raw() as usize,
-                    &vm,
-                    Some(&actual_run[cpu_id.raw() as usize]),
-                )
-            },
+            |cpu_id, cpu| run_contexts[cpu_id.raw() as usize].run(cpu),
             |cpu_id, cpu, exit| {
                 use crate::cpl0_actors::ActorDecision;
                 exits = exits
@@ -2390,7 +2399,7 @@ impl Cpl0Carrier {
                             let VcpuExit::IoOut {
                                 port: carrick_x86::FAULT_DOORBELL_PORT,
                                 data,
-                            } = run_member(cpu, table, index, &vm, Some(&actual_run[index]))?
+                            } = run_contexts[index].run(cpu)?
                             else {
                                 return Err(fail("initial fault record interrupted"));
                             };

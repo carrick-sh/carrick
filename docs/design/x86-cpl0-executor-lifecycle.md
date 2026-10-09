@@ -180,3 +180,16 @@ semantics in `kvm_x86_engine.rs` before loading a different task on that vCPU;
 the typed task snapshot alone is not a license to reassign it. This refines
 the earlier table's `save` step: settlement follows an authenticated stopped
 snapshot and a safe physical detach, not the IO-exit observation alone.
+
+### M-b physical run ownership refinement
+
+The retained shootdown table is in the carrier RAM aperture, while KVM's VM
+handle and physical run flag have separate owners. A worker's production run
+context therefore retains `GuestRam`, the exact shared `VmFd`, the two physical
+run flags and its physical slot. `run_member` still performs the existing
+atomic admission, pending shootdown MSI and stopped-user acknowledgement. The
+context does not derive a Linux task from the slot. The bootstrap carrier now
+uses this same owned context before the scheduler swap, so its behavior stays
+covered by the existing KVM fixtures. Worker CPU ownership must additionally
+retain the carrier's backing and frame-inventory lifetime; retaining only the
+RAM pointer and VM fd would let registered backing retire underneath a vCPU.
