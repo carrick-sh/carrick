@@ -3769,7 +3769,9 @@ impl From<NsGid> for u32 {
     }
 }
 
-pub use carrick_syscall_abi::{LINUX_EAGAIN, LINUX_ECHILD, LINUX_EFAULT, LINUX_EINVAL, LinuxErrno};
+pub use carrick_syscall_abi::{
+    LINUX_EAGAIN, LINUX_ECHILD, LINUX_EFAULT, LINUX_EINVAL, LINUX_ENOSYS, LinuxErrno,
+};
 
 // ===== ABI constants moved from dispatch.rs (Goal #3, pub set) =====
 pub const LINUX_EPERM: LinuxErrno = LinuxErrno::new(1);
@@ -3820,7 +3822,6 @@ pub const LINUX_ENOTTY: LinuxErrno = LinuxErrno::new(25);
 pub const LINUX_EFBIG: LinuxErrno = LinuxErrno::new(27);
 pub const LINUX_ERANGE: LinuxErrno = LinuxErrno::new(34);
 pub const LINUX_ENAMETOOLONG: LinuxErrno = LinuxErrno::new(36);
-pub const LINUX_ENOSYS: LinuxErrno = LinuxErrno::new(38);
 pub const LINUX_ENOTEMPTY: LinuxErrno = LinuxErrno::new(39);
 pub const LINUX_ENODATA: LinuxErrno = LinuxErrno::new(61);
 pub const LINUX_E2BIG: LinuxErrno = LinuxErrno::new(7);

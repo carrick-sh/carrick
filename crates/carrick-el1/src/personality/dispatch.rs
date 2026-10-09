@@ -26,6 +26,7 @@ use core::sync::atomic::Ordering;
 /// ARM frame access is retained for scheduler/IPC park leaves that have not
 /// yet acquired an ISA-neutral saved-context contract.
 pub trait GuestDispatchFrame: SyscallFrame {
+    fn native_number(&self) -> carrick_guest_arch::NativeOrdinal;
     fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet;
     fn crossing_strict(&self, arm_policy: impl FnOnce() -> bool) -> bool {
         match self.crossing_set() {
@@ -42,6 +43,9 @@ pub trait GuestDispatchFrame: SyscallFrame {
 }
 
 impl GuestDispatchFrame for TrapFrame {
+    fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
+        carrick_guest_arch::NativeOrdinal::new(self.x[8])
+    }
     fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
         carrick_personality_linux::crossing::HostCrossingSet::Aarch64
     }
@@ -157,9 +161,9 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
             carrick_personality_linux::crossing::HostCrossingSet::Aarch64,
             is_strict,
             Some(canonical),
-            Some(frame.x[8]),
+            Some(carrick_personality_linux::crossing::NativeNr(frame.x[8])),
             Some(&counters.refused),
-            |ret| frame.x[0] = ret as u64,
+            |ret| frame.x[0] = ret.raw() as u64,
         );
         match decision {
             carrick_personality_linux::crossing::HostCrossingDecision::Refused => Action::Served,
@@ -626,6 +630,11 @@ impl<
     }
     fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
         self.frame.crossing_set()
+    }
+    fn native_number(&self) -> Option<carrick_personality_linux::crossing::NativeNr> {
+        Some(carrick_personality_linux::crossing::NativeNr(
+            self.frame.native_number().raw(),
+        ))
     }
     fn refused_counters(&self) -> Option<&'a [core::sync::atomic::AtomicU64]> {
         Some(&self.counters.refused)

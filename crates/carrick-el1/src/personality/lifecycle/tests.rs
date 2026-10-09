@@ -1278,6 +1278,9 @@ fn x86_split_result_does_not_read_argument_zero() {
         }
     }
     impl GuestDispatchFrame for SplitFrame {
+        fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
+            carrick_guest_arch::NativeOrdinal::new(93)
+        }
         fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
             carrick_personality_linux::crossing::HostCrossingSet::Aarch64
         }

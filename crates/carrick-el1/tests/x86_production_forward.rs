@@ -9,6 +9,7 @@ use carrick_personality_linux::entry::decode_x86_64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 struct X86Frame<'a> {
+    native: carrick_guest_arch::NativeOrdinal,
     canonical: CanonicalNr,
     args: [u64; 6],
     rax: u64,
@@ -37,6 +38,10 @@ impl SyscallFrame for X86Frame<'_> {
 }
 
 impl dispatch::GuestDispatchFrame for X86Frame<'_> {
+    fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
+        self.native
+    }
+
     fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
         carrick_personality_linux::crossing::HostCrossingSet::X86
     }
@@ -132,6 +137,7 @@ fn production_x86_family_absences_forward_without_touching_user_memory() {
         let call = decode_x86_64(native, args, 0x7fff_0000);
         assert_ne!(call.canonical.raw(), u64::MAX, "{family} must decode");
         let mut frame = X86Frame {
+            native: call.native,
             canonical: call.canonical,
             args: call.args,
             rax: 0xfeed,
@@ -173,6 +179,7 @@ fn x86_context_selects_x86_crossings_without_arm_aperture() {
     use dispatch::GuestDispatchFrame;
     let counter = AtomicU64::new(0);
     let frame = X86Frame {
+        native: carrick_guest_arch::NativeOrdinal::new(0),
         canonical: CanonicalNr::new(63),
         args: [0; 6],
         rax: 0,
@@ -183,4 +190,40 @@ fn x86_context_selects_x86_crossings_without_arm_aperture() {
         carrick_personality_linux::crossing::HostCrossingSet::X86
     );
     assert!(frame.crossing_strict(|| panic!("x86 must not read ARM aperture")));
+}
+
+#[test]
+fn x86_unported_refusal_counts_native_ordinal_not_canonical_ordinal() {
+    let tasks = [CurrentTask::new()];
+    tasks[0].set(El1TaskId::from_linux_tid(41), 1, 7);
+    let counters = Counters::new();
+    let names = InotifyNameCache::new();
+    let isa_unsupported = AtomicU64::new(0);
+    let call = decode_x86_64(102, [0; 6], 0x7fff_0000); // getuid -> canonical 174
+    let mut frame = X86Frame {
+        native: call.native,
+        canonical: call.canonical,
+        args: call.args,
+        rax: 102,
+        isa_unsupported: &isa_unsupported,
+    };
+    let action = dispatch::dispatch_syscall_with_lifecycle(
+        &mut frame,
+        &counters,
+        &tasks,
+        &[],
+        &[],
+        &[],
+        &[],
+        &names,
+        None::<dispatch::Zone<'_, NoCpu, sched::HardwareUserWord>>,
+        None,
+        None,
+        None,
+        |_| core::ptr::null_mut(),
+    );
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.rax as i64, -38);
+    assert_eq!(counters.refused[102].load(Ordering::Relaxed), 1);
+    assert_eq!(counters.refused[174].load(Ordering::Relaxed), 0);
 }

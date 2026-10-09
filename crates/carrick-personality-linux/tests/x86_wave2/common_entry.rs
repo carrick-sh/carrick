@@ -27,6 +27,7 @@ const SET_ROBUST_LIST: usize = 99;
 /// The x86 register adapter used by the shared dispatch witness. Argument 0
 /// and the result occupy different native registers, as in production CPL0.
 struct X86Frame<'a> {
+    native: carrick_guest_arch::NativeOrdinal,
     canonical: CanonicalNr,
     args: [u64; 6],
     rax: u64,
@@ -56,6 +57,10 @@ impl SyscallFrame for X86Frame<'_> {
     }
 }
 impl dispatch::GuestDispatchFrame for X86Frame<'_> {
+    fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
+        self.native
+    }
+
     fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
         carrick_personality_linux::crossing::HostCrossingSet::X86
     }
@@ -136,6 +141,7 @@ impl World {
     fn call(&self, task: usize, native: NativeFrame) -> (Action, X86Frame<'_>) {
         let call = decode_x86_snapshot(native.snapshot()).expect("x86 snapshot");
         let mut frame = X86Frame {
+            native: call.native,
             canonical: call.canonical,
             args: call.args,
             rax: native.rax,
@@ -195,6 +201,7 @@ fn serve_full<'a, Context: dispatch::DispatchContext + 'a>(
     source: Option<carrick_core_abi::BornInZoneSource<'a, Context>>,
 ) -> (carrick_personality_linux::dispatch::CompletionRoute, i64) {
     let mut frame = X86Frame {
+        native: call.native,
         canonical: call.canonical,
         args: call.args,
         rax: call.native.raw(),
