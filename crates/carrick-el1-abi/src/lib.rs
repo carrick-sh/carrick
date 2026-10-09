@@ -2259,14 +2259,31 @@ pub unsafe fn aperture_control() -> &'static ApertureControl {
     unsafe { &*(EL1_APERTURE_CONTROL_BASE as *const ApertureControl) }
 }
 
-/// Read the host view of the guest aperture control word, if mapped.
-pub fn host_aperture_control() -> Option<&'static ApertureControl> {
-    let ptr = get_el1_region_host_ptr();
-    if ptr == 0 {
-        None
-    } else {
-        unsafe { Some(&*((ptr + EL1_APERTURE_CONTROL_OFFSET as usize) as *const ApertureControl)) }
+fn checked_aperture_host_address(base: usize, region_len: usize) -> Option<usize> {
+    let offset = usize::try_from(EL1_APERTURE_CONTROL_OFFSET).ok()?;
+    let end = offset.checked_add(core::mem::size_of::<ApertureControl>())?;
+    if base == 0 || end > region_len {
+        return None;
     }
+    let address = base.checked_add(offset)?;
+    base.checked_add(end)?;
+    address
+        .is_multiple_of(core::mem::align_of::<ApertureControl>())
+        .then_some(address)
+}
+
+/// Read the host view of the guest aperture control word, if mapped.
+///
+/// # Safety
+/// The caller must retain the registered, initialized EL1 region mapping
+/// (EL1_REGION_SIZE bytes) throughout use of the returned reference. The
+/// registration must not be replaced or unmapped while the reference is live.
+pub unsafe fn host_aperture_control() -> Option<&'static ApertureControl> {
+    let address =
+        checked_aperture_host_address(get_el1_region_host_ptr(), EL1_REGION_SIZE as usize)?;
+    // SAFETY: checked geometry keeps this aligned object within the registered
+    // region; the caller retains the mapping and its initialized atomic word.
+    unsafe { Some(&*(address as *const ApertureControl)) }
 }
 
 /// The shared IPC memory as one venue addresses it: the directory and the
@@ -3397,6 +3414,29 @@ mod tests {
             aperture_end <= EL1_SERVICE_COPY_TABLE_OFFSET
                 || service_end <= EL1_APERTURE_CONTROL_OFFSET,
             "strict control aliases the service-copy L3 descriptors"
+        );
+    }
+
+    #[test]
+    fn host_aperture_address_checks_region_bounds_alignment_and_overflow() {
+        let offset = EL1_APERTURE_CONTROL_OFFSET as usize;
+        let size = core::mem::size_of::<ApertureControl>();
+        assert_eq!(
+            checked_aperture_host_address(0x1000, offset + size),
+            Some(0x1000 + offset)
+        );
+        assert_eq!(
+            checked_aperture_host_address(0x1000, offset + size - 1),
+            None
+        );
+        assert_eq!(checked_aperture_host_address(0x1001, offset + size), None);
+        assert_eq!(
+            checked_aperture_host_address(usize::MAX - 63, EL1_REGION_SIZE as usize),
+            None
+        );
+        assert_eq!(
+            checked_aperture_host_address(0, EL1_REGION_SIZE as usize),
+            None
         );
     }
 
