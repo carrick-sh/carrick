@@ -53,6 +53,11 @@ pub trait OwnerForkMmu: OwnerMmu {
         va: UserVa,
         child_tables: FrameGpa,
     ) -> Result<FrameGpa, OwnerMmuRefusal>;
+    /// Whether a control alias beyond the exact child table loan represents
+    /// unused primary capacity that must remain absent in the child.
+    fn omit_unloaned_control_alias() -> bool {
+        false
+    }
     fn control_copy_destination(
         va: UserVa,
         child_control: FrameGpa,
