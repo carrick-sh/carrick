@@ -163,7 +163,7 @@ impl ForkStockHostCustody {
     pub(crate) fn service_child_retire(
         &mut self,
         execution: GrantExecution,
-        retire: &NativeChildRetire,
+        retire: &mut NativeChildRetire,
     ) -> Result<(), ForkStockServiceError> {
         self.stock.retire_child(execution, retire)
     }
@@ -665,9 +665,9 @@ mod tests {
 
         // Child exit marks the MM retired while its TTBR0 may still be live.
         let child_exec = child_execution(42, &loan2);
-        let retire = NativeChildRetire::new(child_exec.binding, child_exec.context).unwrap();
+        let mut retire = NativeChildRetire::new(child_exec.binding, child_exec.context).unwrap();
         custody
-            .service_child_retire(child_exec, &retire)
+            .service_child_retire(child_exec, &mut retire)
             .expect("child quarantine");
 
         assert!(
@@ -761,9 +761,9 @@ mod tests {
                 .service_settlement(&mut ledger, parent, &mut commit, |_| true, |_| true)
                 .expect("settle child and return unused parent page");
             let child = child_execution(42 + cycle, &loan);
-            let retire = NativeChildRetire::new(child.binding, child.context).unwrap();
+            let mut retire = NativeChildRetire::new(child.binding, child.context).unwrap();
             custody
-                .service_child_retire(child, &retire)
+                .service_child_retire(child, &mut retire)
                 .expect("child quarantine");
             assert_eq!(
                 custody
@@ -878,9 +878,9 @@ mod tests {
                 .service_settlement(&mut ledger, parent, &mut commit, |_| true, |_| true)
                 .expect("commit");
             let child = child_execution(42 + cycle, &loan);
-            let retire = NativeChildRetire::new(child.binding, child.context).unwrap();
+            let mut retire = NativeChildRetire::new(child.binding, child.context).unwrap();
             custody
-                .service_child_retire(child, &retire)
+                .service_child_retire(child, &mut retire)
                 .expect("child quarantine");
             let previous = installed.replace(ReservationMm::new(child_mm).unwrap());
             let still = installed;
@@ -940,9 +940,9 @@ mod tests {
             .service_settlement(&mut ledger, parent, &mut commit, |_| true, |_| true)
             .expect("commit first child");
         let child = child_execution(42, &loan);
-        let retire = NativeChildRetire::new(child.binding, child.context).unwrap();
+        let mut retire = NativeChildRetire::new(child.binding, child.context).unwrap();
         custody
-            .service_child_retire(child, &retire)
+            .service_child_retire(child, &mut retire)
             .expect("quarantine child tables");
         assert_eq!(
             custody
@@ -1336,10 +1336,56 @@ mod tests {
         fork.service_settlement(&mut ledger, parent, &mut commit, |_| true, |_| true)
             .expect("commit");
         let child = child_execution(42, &loan);
-        let retire = NativeChildRetire::new(child.binding, child.context).unwrap();
-        fork.service_child_retire(child, &retire)
+        let mut retire = NativeChildRetire::new(child.binding, child.context).unwrap();
+        fork.service_child_retire(child, &mut retire)
             .expect("quarantine");
         request.child_mm
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn dispatcher_child_retire_reply_word_agrees_with_x0() {
+        let custody = CarrierVmCustody::new();
+        let generation = custody.begin_create().unwrap();
+        custody.commit_create(generation).unwrap();
+        let mut record_page = Box::new(AlignedPage([0u8; 4096]));
+        let record_ipa = 0x2000_0000u64;
+        let spec = crate::trap::CarrierStage2RecordSpec {
+            vm_generation: generation,
+            ipa: record_ipa,
+            len: 4096,
+            host_addr: record_page.0.as_mut_ptr() as usize,
+            mapped: true,
+            backend_map_installed: true,
+            release_ipa: false,
+            perms: 3,
+            logical_owner: Some(crate::trap::CarrierLogicalOwner {
+                id: 1,
+                generation: 1,
+            }),
+        };
+        custody.publish_stage2_record_using(spec, || 0).unwrap();
+        // Not a committed child: refused with x0 DENIED and a Stale reply.
+        let stranger = test_execution(42, 0, 777);
+        let record = NativeChildRetire::new(stranger.binding, stranger.context).unwrap();
+        unsafe { (record_page.0.as_mut_ptr() as *mut NativeChildRetire).write(record) };
+        let reply = crate::metadata_grant::service_metadata_operation(
+            &custody,
+            Some(generation),
+            stranger.cpu,
+            Some(stranger),
+            carrick_el1_abi::GRANT_OP_CHILD_RETIRE,
+            record_ipa,
+            0,
+            0,
+        )
+        .expect("dispatched refusal");
+        assert_eq!(reply, [carrick_el1_abi::METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+        let written = unsafe { &mut *(record_page.0.as_mut_ptr() as *mut NativeChildRetire) };
+        assert_eq!(
+            written.take(stranger.binding, stranger.context),
+            Some(Err(carrick_el1_abi::ChildRetireRefusal::Stale))
+        );
     }
 
     #[test]

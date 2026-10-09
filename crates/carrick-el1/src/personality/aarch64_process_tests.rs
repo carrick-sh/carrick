@@ -34,6 +34,9 @@ struct TestStockCrossing {
     settlements_committed: AtomicUsize,
     settlements_aborted: AtomicUsize,
     pending_loan: std::sync::Mutex<Option<ForkStockLoan>>,
+    /// Refuse child retirement with a typed Stale reply (and x0 failure).
+    refuse_retire: core::sync::atomic::AtomicBool,
+    retires: AtomicUsize,
 }
 
 impl TestStockCrossing {
@@ -50,6 +53,8 @@ impl TestStockCrossing {
             settlements_committed: AtomicUsize::new(0),
             settlements_aborted: AtomicUsize::new(0),
             pending_loan: std::sync::Mutex::new(None),
+            refuse_retire: core::sync::atomic::AtomicBool::new(false),
+            retires: AtomicUsize::new(0),
         }
     }
 }
@@ -169,8 +174,18 @@ impl ForkStockCrossing for TestStockCrossing {
         Ok(())
     }
 
-    fn cross_child_retire(&self, _record_gpa: u64, _cpu: u64) -> Result<(), NativeProcessError> {
-        Ok(())
+    fn cross_child_retire(&self, record_gpa: u64, _cpu: u64) -> Result<(), NativeProcessError> {
+        self.retires.fetch_add(1, Ordering::SeqCst);
+        // SAFETY: the service passes its live, aligned stack record.
+        let record = unsafe { &mut *(record_gpa as *mut carrick_el1_abi::NativeChildRetire) };
+        // Like the HVC: x0 agrees with the record's typed reply.
+        if self.refuse_retire.load(Ordering::SeqCst) {
+            assert!(record.refuse(carrick_el1_abi::ChildRetireRefusal::Stale));
+            Err(NativeProcessError::Fault)
+        } else {
+            assert!(record.accept());
+            Ok(())
+        }
     }
 }
 
@@ -469,6 +484,17 @@ fn activate(
 /// Red-first Test 3: wait4 consumes the zombie exactly once with exact status copied.
 #[test]
 fn test_wait4_consumes_zombie_once_with_exact_status() {
+    wait4_consumes_zombie_once(false);
+}
+
+/// A refused child retirement fails only the retiring process's stock
+/// return: the exit completes and the parent still reaps it once.
+#[test]
+fn test_refused_child_retire_still_completes_exit_and_reap() {
+    wait4_consumes_zombie_once(true);
+}
+
+fn wait4_consumes_zombie_once(refuse_retire: bool) {
     let fixture = Fixture::new(0x10000, asid(1));
     let source = BornInZoneSource {
         zone: fixture.zone,
@@ -492,6 +518,9 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
     let crossing = TestStockCrossing::new(&[
         0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
     ]);
+    crossing
+        .refuse_retire
+        .store(refuse_retire, Ordering::SeqCst);
     let mut service = Aarch64NativeProcessService::with_crossing(
         &fixture.task,
         fixture.slot,
@@ -601,6 +630,7 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
         re_wait,
         LifecycleOutcome::Returned { result, .. } if result.raw() == NativeProcessError::NoChild.errno()
     ));
+    assert_eq!(crossing.retires.load(Ordering::SeqCst), 1);
 }
 
 /// Red-first Test 4: stock loan is requested and settled once.

@@ -2128,6 +2128,8 @@ pub enum NativeForkFailureStage {
     SettlePortal = 59,
     SettleSpace = 60,
     RegisterChild = 61,
+    /// The carrier refused a fork child's retirement; its stock stays held.
+    ChildRetireRefused = 62,
 }
 
 impl NativeForkFailureStage {
@@ -2194,6 +2196,7 @@ impl NativeForkFailureStage {
             59 => Self::SettlePortal,
             60 => Self::SettleSpace,
             61 => Self::RegisterChild,
+            62 => Self::ChildRetireRefused,
             _ => return None,
         })
     }
