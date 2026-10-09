@@ -1438,3 +1438,11 @@ fn owner_instantiated_with_aarch64_context_checks_fork_child_and_syscall_return(
     assert!(row.context().authenticates(parent_addr));
     assert!(!row.context().authenticates(child_addr));
 }
+
+#[test]
+fn group_exists_in_session_checks_live_tasks() {
+    let o = owner();
+    assert!(o.group_exists_in_session(1, 1));
+    assert!(!o.group_exists_in_session(1, 2));
+    assert!(!o.group_exists_in_session(2, 1));
+}

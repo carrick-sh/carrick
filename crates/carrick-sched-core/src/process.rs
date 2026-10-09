@@ -469,25 +469,21 @@ impl TaskCredentials {
     };
 
     pub fn is_privileged(&self) -> bool {
-        self.euid == TaskUid::ROOT || self.cap_effective.contains(LinuxCapabilitySet::CAP_SETUID)
+        self.cap_effective.contains(LinuxCapabilitySet::CAP_SETUID)
     }
 
     pub fn is_gid_privileged(&self) -> bool {
-        self.euid == TaskUid::ROOT || self.cap_effective.contains(LinuxCapabilitySet::CAP_SETGID)
+        self.cap_effective.contains(LinuxCapabilitySet::CAP_SETGID)
     }
 
     pub fn is_admin_privileged(&self) -> bool {
-        self.euid == TaskUid::ROOT
-            || self
-                .cap_effective
-                .contains(LinuxCapabilitySet::CAP_SYS_ADMIN)
+        self.cap_effective
+            .contains(LinuxCapabilitySet::CAP_SYS_ADMIN)
     }
 
     pub fn is_resource_privileged(&self) -> bool {
-        self.euid == TaskUid::ROOT
-            || self
-                .cap_effective
-                .contains(LinuxCapabilitySet::CAP_SYS_RESOURCE)
+        self.cap_effective
+            .contains(LinuxCapabilitySet::CAP_SYS_RESOURCE)
     }
 
     /// Effect of user ID changes on capabilities per capabilities(7).

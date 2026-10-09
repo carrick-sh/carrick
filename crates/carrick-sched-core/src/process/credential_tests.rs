@@ -157,3 +157,69 @@ fn rule4_fsuid_change_does_not_restore_fs_capabilities_not_in_permitted() {
     );
     assert!(creds.cap_effective.contains(LinuxCapabilitySet::FOWNER));
 }
+
+#[test]
+fn privilege_checks_depend_on_effective_capabilities_not_euid() {
+    let mut creds = TaskCredentials::ROOT;
+    assert_eq!(creds.euid, TaskUid::ROOT);
+    creds.cap_effective = LinuxCapabilitySet::empty();
+
+    // Even though euid is ROOT, with no effective capabilities privilege checks must be false!
+    assert!(!creds.is_privileged());
+    assert!(!creds.is_gid_privileged());
+    assert!(!creds.is_admin_privileged());
+    assert!(!creds.is_resource_privileged());
+
+    // With non-root euid but specific capability present, the check succeeds
+    creds.euid = TaskUid::new(1000);
+    creds.cap_effective = LinuxCapabilitySet::CAP_SETUID;
+    assert!(creds.is_privileged());
+    assert!(!creds.is_gid_privileged());
+    assert!(!creds.is_admin_privileged());
+    assert!(!creds.is_resource_privileged());
+}
+
+#[test]
+fn on_uid_change_between_nonzero_uids_preserves_permitted_capabilities() {
+    let mut creds = TaskCredentials::ROOT;
+    let non_root_1 = TaskUid::new(1000);
+    let non_root_2 = TaskUid::new(2000);
+
+    // Initial transition from root drops capabilities per rule 1
+    let prev_r = creds.ruid;
+    let prev_e = creds.euid;
+    let prev_s = creds.suid;
+    let prev_f = creds.fsuid;
+    creds.ruid = non_root_1;
+    creds.euid = non_root_1;
+    creds.suid = non_root_1;
+    creds.fsuid = non_root_1;
+    creds.on_uid_change(prev_r, prev_e, prev_s, prev_f);
+    assert_eq!(creds.cap_permitted, LinuxCapabilitySet::empty());
+
+    // Suppose task had CAP_NET_BIND_SERVICE in permitted
+    creds.cap_permitted = LinuxCapabilitySet::CAP_NET_BIND_SERVICE;
+    creds.cap_effective = LinuxCapabilitySet::CAP_NET_BIND_SERVICE;
+
+    // Transition between two non-zero UIDs (neither was root before)
+    let prev_r = creds.ruid;
+    let prev_e = creds.euid;
+    let prev_s = creds.suid;
+    let prev_f = creds.fsuid;
+    creds.ruid = non_root_2;
+    creds.euid = non_root_2;
+    creds.suid = non_root_2;
+    creds.fsuid = non_root_2;
+    creds.on_uid_change(prev_r, prev_e, prev_s, prev_f);
+
+    // Rule 1 does NOT fire because none of the previous IDs was 0!
+    assert_eq!(
+        creds.cap_permitted,
+        LinuxCapabilitySet::CAP_NET_BIND_SERVICE
+    );
+    // Rule 2 does not fire because prev_euid was not 0
+    assert_eq!(
+        creds.cap_effective,
+        LinuxCapabilitySet::CAP_NET_BIND_SERVICE
+    );
+}

@@ -94,6 +94,8 @@ pub struct GuestTask<C, U, N: NativeProcessCustody> {
     pub dumpable: u32,
     pub no_new_privs: bool,
     pub child_subreaper: bool,
+    pub has_execed: bool,
+    pub comm: [u8; 16],
 }
 impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
     pub fn new(
@@ -122,6 +124,8 @@ impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
             dumpable: 1,
             no_new_privs: false,
             child_subreaper: false,
+            has_execed: false,
+            comm: [0u8; 16],
         }
     }
     pub fn key(&self) -> TaskKey {
@@ -508,6 +512,13 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
             .tasks
             .values_mut()
             .find(|row| row.metadata.namespace_pid == pid && row.lifecycle() == TaskLifecycle::Live)
+    }
+    pub fn group_exists_in_session(&self, session: u32, pgid: u32) -> bool {
+        self.registry.tasks.values().any(|row| {
+            row.lifecycle() == TaskLifecycle::Live
+                && row.metadata.namespace_session == session
+                && row.metadata.namespace_process_group == pgid
+        })
     }
     pub fn namespace_child_key(
         &self,
