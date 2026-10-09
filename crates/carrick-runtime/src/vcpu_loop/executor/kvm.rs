@@ -21,11 +21,15 @@ use super::{PersistentTaskBinding, TaskBindingDirectory, TaskBindingResolver, Ta
 use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
 use carrick_kernel::compat::CompatReporter;
 use carrick_kernel::dispatch::{DispatchOutcome, SyscallDispatcher, SyscallRequest};
+use carrick_kernel::kernel::continuation::{
+    BlockedContinuation, ContinuationCapture, RestartClass, fold_continuation_completion,
+    resume_continuation,
+};
 use carrick_kernel::kernel::objects::{ExecutorId, ThreadExecutionLease};
 use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
 use carrick_vmm_kvm::cpl0_boot::{
     GuestExitStatus, InitialProcessExit, InitialSyscallDisposition, ProductionCpuFactory,
-    ProductionCpuLease,
+    ProductionCpuLease, ProductionForwardFrame,
 };
 use carrick_x86::arch_context::X86ArchContext;
 
@@ -139,7 +143,56 @@ pub(crate) struct KvmPersistentExecutor {
     completion_sent: bool,
 }
 
+struct RetainedForward {
+    frame: ProductionForwardFrame,
+    request: SyscallRequest,
+}
+
+enum ForwardDecision {
+    Immediate(InitialSyscallDisposition),
+    Blocked(SyscallRequest, Box<DispatchOutcome>),
+}
+
 impl KvmPersistentExecutor {
+    fn block_forward(
+        binding: &Arc<KvmTaskBinding>,
+        submission: &mut ExecutorSubmissionContext<'_>,
+        request: SyscallRequest,
+        outcome: DispatchOutcome,
+        frame: Option<ProductionForwardFrame>,
+    ) -> Result<ExecutorExit, TrapError> {
+        let context = binding.fresh_context()?;
+        let restart =
+            if carrick_kernel::kernel::continuation::is_restartable_syscall(request.number.raw()) {
+                RestartClass::RestartSyscall
+            } else {
+                RestartClass::Never
+            };
+        let capture = ContinuationCapture::from_lease(
+            &context,
+            submission.execution_lease_mut()?,
+            request,
+            restart,
+        )
+        .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+        let continuation = BlockedContinuation::from_dispatch_outcome(outcome, capture)
+            .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+        if let Some(frame) = frame {
+            let mut retained = binding
+                .retained
+                .lock()
+                .map_err(|_| TrapError::Hypervisor("KVM retained frame poisoned".into()))?;
+            if retained.is_some() {
+                return Err(TrapError::Hypervisor("KVM forward already retained".into()));
+            }
+            *retained = Some(RetainedForward { frame, request });
+        }
+        Ok(ExecutorExit::BlockedContinuation {
+            continuation: Box::new(continuation),
+            vfork_activation: None,
+        })
+    }
+
     fn task(&self) -> Result<TaskIdentity, TrapError> {
         self.task
             .ok_or_else(|| TrapError::Hypervisor("KVM executor has no loaded task".into()))
@@ -189,12 +242,80 @@ impl PersistentExecutor for KvmPersistentExecutor {
     fn run_until_boundary(
         &mut self,
         need_resched: &AtomicBool,
-        _submission: &mut ExecutorSubmissionContext<'_>,
+        submission: &mut ExecutorSubmissionContext<'_>,
     ) -> Result<ExecutorExit, TrapError> {
         if need_resched.load(Ordering::Acquire) {
             return Ok(ExecutorExit::Preempted);
         }
         let task = self.task()?;
+        if let Some(binding) = self.binding.as_ref().cloned()
+            && submission
+                .execution_lease_mut()?
+                .blocked_continuation()
+                .is_some()
+        {
+            let retained = binding
+                .retained
+                .lock()
+                .map_err(|_| TrapError::Hypervisor("KVM retained frame poisoned".into()))?
+                .take()
+                .ok_or_else(|| {
+                    TrapError::Hypervisor("KVM blocked task lost forward frame".into())
+                })?;
+            let context = binding.fresh_context()?;
+            let event = submission
+                .execution_lease_mut()?
+                .blocked_continuation()
+                .ok_or_else(|| TrapError::Hypervisor("KVM continuation vanished".into()))?
+                .ready_event()
+                .map_err(|error| TrapError::Hypervisor(format!("KVM wake event: {error:?}")))?;
+            let result = resume_continuation(submission.execution_lease_mut()?, event, &context)
+                .map_err(|error| TrapError::Hypervisor(format!("KVM resume: {error:?}")))?;
+            let mut dispatcher = self
+                .dispatcher
+                .lock()
+                .map_err(|_| TrapError::Hypervisor("KVM dispatcher poisoned".into()))?;
+            let outcome = self
+                .physical
+                .with_retained_forward(task, &retained.frame, |venue| {
+                    let folded = fold_continuation_completion(
+                        result.completion,
+                        &dispatcher,
+                        &context,
+                        venue,
+                    )
+                    .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+                    match folded {
+                        Some(outcome) => Ok(outcome),
+                        None => dispatcher
+                            .dispatch(&context, retained.request, venue, &self.reporter)
+                            .map_err(|error| TrapError::Hypervisor(error.to_string())),
+                    }
+                })?;
+            drop(dispatcher);
+            match outcome {
+                DispatchOutcome::Returned { value } => {
+                    self.physical
+                        .complete_forward(task, retained.frame, value)?;
+                    return Ok(ExecutorExit::Syscall);
+                }
+                DispatchOutcome::Errno { errno } => {
+                    self.physical
+                        .complete_forward(task, retained.frame, errno.guest_retval())?;
+                    return Ok(ExecutorExit::Syscall);
+                }
+                other => {
+                    let mut slot = binding
+                        .retained
+                        .lock()
+                        .map_err(|_| TrapError::Hypervisor("KVM retained frame poisoned".into()))?;
+                    let request = retained.request;
+                    *slot = Some(retained);
+                    drop(slot);
+                    return Self::block_forward(&binding, submission, request, other, None);
+                }
+            }
+        }
         let exited = self
             .exits
             .fetch_add(1, Ordering::AcqRel)
@@ -249,7 +370,9 @@ impl PersistentExecutor for KvmPersistentExecutor {
                         SyscallNorm::ArchPrctl { code, addr } => {
                             let value =
                                 carrick_hal::x8664_arch::service_arch_prctl(venue, code, addr)?;
-                            return Ok(InitialSyscallDisposition::Return(value));
+                            return Ok(ForwardDecision::Immediate(
+                                InitialSyscallDisposition::Return(value),
+                            ));
                         }
                     };
                     let host_poll = raw.native_number.0 == 7
@@ -271,8 +394,8 @@ impl PersistentExecutor for KvmPersistentExecutor {
                                     format!("cpl0_{}_owner_unbound", refusal.family()),
                                 ),
                             );
-                            return Ok(InitialSyscallDisposition::Refused(
-                                carrick_abi::LINUX_ENOSYS,
+                            return Ok(ForwardDecision::Immediate(
+                                InitialSyscallDisposition::Refused(carrick_abi::LINUX_ENOSYS),
                             ));
                         }
                     }
@@ -285,32 +408,38 @@ impl PersistentExecutor for KvmPersistentExecutor {
                             TrapError::Hypervisor(format!("dispatch x86 syscall: {error}"))
                         })?;
                     match outcome {
-                        DispatchOutcome::Returned { value } => {
-                            Ok(InitialSyscallDisposition::Return(value))
-                        }
-                        DispatchOutcome::Errno { errno } => {
-                            Ok(InitialSyscallDisposition::Refused(errno))
-                        }
+                        DispatchOutcome::Returned { value } => Ok(ForwardDecision::Immediate(
+                            InitialSyscallDisposition::Return(value),
+                        )),
+                        DispatchOutcome::Errno { errno } => Ok(ForwardDecision::Immediate(
+                            InitialSyscallDisposition::Refused(errno),
+                        )),
                         DispatchOutcome::Exit { code } | DispatchOutcome::ThreadExit { code } => {
-                            Ok(InitialSyscallDisposition::Exit(
+                            Ok(ForwardDecision::Immediate(InitialSyscallDisposition::Exit(
                                 GuestExitStatus::from_linux_code(code),
-                            ))
+                            )))
                         }
-                        other => Err(TrapError::Hypervisor(format!(
-                            "x86 syscall needs runtime completion: {other:?}"
-                        ))),
+                        other => Ok(ForwardDecision::Blocked(request, Box::new(other))),
                     }
                 })?;
                 drop(dispatcher);
                 match decision {
-                    InitialSyscallDisposition::Return(value) => {
+                    ForwardDecision::Blocked(request, outcome) => {
+                        return Self::block_forward(
+                            binding,
+                            submission,
+                            request,
+                            *outcome,
+                            Some(token),
+                        );
+                    }
+                    ForwardDecision::Immediate(InitialSyscallDisposition::Return(value)) => {
                         self.physical.complete_forward(task, token, value)?
                     }
-                    InitialSyscallDisposition::Refused(errno) => {
-                        self.physical
-                            .complete_forward(task, token, errno.guest_retval())?
-                    }
-                    InitialSyscallDisposition::Exit(status) => {
+                    ForwardDecision::Immediate(InitialSyscallDisposition::Refused(errno)) => self
+                        .physical
+                        .complete_forward(task, token, errno.guest_retval())?,
+                    ForwardDecision::Immediate(InitialSyscallDisposition::Exit(status)) => {
                         self.publish_exit(InitialProcessExit::Exited {
                             code: status.code(),
                             exits: exited,
@@ -447,6 +576,7 @@ pub(crate) struct KvmTaskBinding {
     arch: GuestArchBinding,
     thread: ThreadKey,
     kernel_binding: KernelTaskBinding,
+    retained: Mutex<Option<RetainedForward>>,
 }
 
 impl KvmTaskBinding {
@@ -477,6 +607,7 @@ impl KvmTaskBinding {
             arch,
             thread: context.thread().key(),
             kernel_binding: context.task_binding(),
+            retained: Mutex::new(None),
         };
         binding.validate_task_state(state)?;
         Ok(binding)

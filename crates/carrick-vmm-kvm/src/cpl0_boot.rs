@@ -1247,6 +1247,36 @@ impl ProductionCpuLease {
         })
     }
 
+    /// Service a retained forward after the exact task has regained a CPU.
+    /// The frame remains owned by the task until `complete_forward` consumes it.
+    pub fn with_retained_forward<R>(
+        &mut self,
+        task: carrick_guest_arch::TaskIdentity,
+        token: &ProductionForwardFrame,
+        service: impl FnOnce(&mut ForwardVenue<'_>) -> Result<R, TrapError>,
+    ) -> Result<R, TrapError> {
+        if token.task != task || self.physical_slot() != Some(token.slot) {
+            return Err(fail("retained forward task or physical slot changed"));
+        }
+        let mut custody = self
+            ._custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        self.cpu.with_stopped_vcpu(task, |vcpu| {
+            let lease = StoppedCpuLease {
+                cpu: token.slot,
+                vcpu,
+            };
+            let mut venue = ForwardVenue::new(&mut custody, lease)?;
+            if venue.execution.binding != token.execution.binding
+                || venue.execution.context != token.execution.context
+            {
+                return Err(fail("retained forward MM binding changed"));
+            }
+            service(&mut venue)
+        })
+    }
+
     /// Service one physical doorbell on the stopped worker CPU. Task
     /// identity is supplied by the executor's claimed binding, never by the
     /// doorbell payload or the physical slot.
