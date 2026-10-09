@@ -383,7 +383,7 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
             if size != RT_SIGSET_SIZE {
                 return returned(LINUX_EINVAL.guest_retval(), false);
             }
-            if signum <= 0 || signum > 64 || signum == 9 || signum == 19 {
+            if signum <= 0 || signum > 64 || (act_ptr != 0 && (signum == 9 || signum == 19)) {
                 return returned(LINUX_EINVAL.guest_retval(), false);
             }
             let new_action = if act_ptr != 0 {
@@ -429,22 +429,20 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
             } else {
                 None
             };
-            let old_action = if oldact_ptr != 0 {
+            // The owner exchanges old/new under one sighand admission.
+            let current = {
                 let signals = native.process_signals()?;
-                match signals.rt_sigaction(signum, None) {
-                    Ok(action) => Some(action),
-                    Err(e) => return returned(e as i64, false),
+                match signals.rt_sigaction(signum, new_action) {
+                    Ok(action) => action,
+                    Err(error) => {
+                        return returned(
+                            carrick_syscall_abi::LinuxErrno::new(error).guest_retval(),
+                            false,
+                        );
+                    }
                 }
-            } else {
-                None
             };
-            if let Some(action) = new_action {
-                let signals = native.process_signals()?;
-                if let Err(e) = signals.rt_sigaction(signum, Some(action)) {
-                    return returned(e as i64, false);
-                }
-            }
-            if let Some(current) = old_action {
+            if oldact_ptr != 0 {
                 let mut oldact = LinuxSigaction::empty();
                 oldact.sa_handler = match current.disposition {
                     carrick_signal_core::policy::Disposition::Default => 0,
@@ -452,6 +450,9 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                     carrick_signal_core::policy::Disposition::Handler(addr) => addr.0,
                 };
                 let mut flags = 0u64;
+                if current.flags.on_stack {
+                    flags |= carrick_abi::LINUX_SA_ONSTACK;
+                }
                 if current.flags.siginfo {
                     flags |= 0x00000004; // SA_SIGINFO
                 }
