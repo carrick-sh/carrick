@@ -3,23 +3,70 @@
 
 use bitflags::bitflags;
 
+mod capability;
 mod errno;
 pub mod syscall_x86_64;
 pub use errno::{
     LINUX_EAGAIN, LINUX_EBADF, LINUX_ECHILD, LINUX_EFAULT, LINUX_EINVAL, LINUX_EIO, LINUX_EMFILE,
     LINUX_ENOSYS, LINUX_EPERM, LINUX_ESRCH, LinuxErrno,
 };
+pub use capability::{
+    CAP_AUDIT_CONTROL, CAP_AUDIT_READ, CAP_AUDIT_WRITE, CAP_BLOCK_SUSPEND, CAP_BPF,
+    CAP_CHECKPOINT_RESTORE, CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER,
+    CAP_FSETID, CAP_IPC_LOCK, CAP_IPC_OWNER, CAP_KILL, CAP_LAST_CAP, CAP_LEASE,
+    CAP_LINUX_IMMUTABLE, CAP_MAC_ADMIN, CAP_MAC_OVERRIDE, CAP_MKNOD, CAP_NET_ADMIN,
+    CAP_NET_BIND_SERVICE, CAP_NET_BROADCAST, CAP_NET_RAW, CAP_PERFMON, CAP_SETFCAP, CAP_SETGID,
+    CAP_SETPCAP, CAP_SETUID, CAP_SYS_ADMIN, CAP_SYS_BOOT, CAP_SYS_CHROOT, CAP_SYS_MODULE,
+    CAP_SYS_NICE, CAP_SYS_PACCT, CAP_SYS_PTRACE, CAP_SYS_RAWIO, CAP_SYS_RESOURCE, CAP_SYS_TIME,
+    CAP_SYS_TTY_CONFIG, CAP_SYSLOG, CAP_WAKE_ALARM, LinuxCapabilitySet,
+};
 
 /// Canonical numbers served by the shared guest lifecycle owner.
 pub mod nr {
     use super::CanonicalNr;
 
+    pub const CAPGET: CanonicalNr = CanonicalNr(90);
+    pub const CAPSET: CanonicalNr = CanonicalNr(91);
+    pub const PERSONALITY: CanonicalNr = CanonicalNr(92);
     pub const EXIT_GROUP: CanonicalNr = CanonicalNr(94);
     pub const SCHED_GET_PRIORITY_MAX: CanonicalNr = CanonicalNr(125);
     pub const SCHED_GET_PRIORITY_MIN: CanonicalNr = CanonicalNr(126);
     pub const SCHED_RR_GET_INTERVAL: CanonicalNr = CanonicalNr(127);
+    pub const SET_TID_ADDRESS: CanonicalNr = CanonicalNr(96);
+    pub const GET_ROBUST_LIST: CanonicalNr = CanonicalNr(100);
+    pub const SETREGID: CanonicalNr = CanonicalNr(143);
+    pub const SETGID: CanonicalNr = CanonicalNr(144);
+    pub const SETREUID: CanonicalNr = CanonicalNr(145);
+    pub const SETUID: CanonicalNr = CanonicalNr(146);
+    pub const SETRESUID: CanonicalNr = CanonicalNr(147);
+    pub const GETRESUID: CanonicalNr = CanonicalNr(148);
+    pub const SETRESGID: CanonicalNr = CanonicalNr(149);
+    pub const GETRESGID: CanonicalNr = CanonicalNr(150);
+    pub const SETFSUID: CanonicalNr = CanonicalNr(151);
+    pub const SETFSGID: CanonicalNr = CanonicalNr(152);
+    pub const SETPGID: CanonicalNr = CanonicalNr(154);
+    pub const GETPGID: CanonicalNr = CanonicalNr(155);
+    pub const GETSID: CanonicalNr = CanonicalNr(156);
+    pub const SETSID: CanonicalNr = CanonicalNr(157);
+    pub const GETGROUPS: CanonicalNr = CanonicalNr(158);
+    pub const SETGROUPS: CanonicalNr = CanonicalNr(159);
+    pub const UNAME: CanonicalNr = CanonicalNr(160);
+    pub const SETHOSTNAME: CanonicalNr = CanonicalNr(161);
+    pub const SETDOMAINNAME: CanonicalNr = CanonicalNr(162);
+    pub const GETRLIMIT: CanonicalNr = CanonicalNr(163);
+    pub const SETRLIMIT: CanonicalNr = CanonicalNr(164);
+    pub const GETRUSAGE: CanonicalNr = CanonicalNr(165);
+    pub const UMASK: CanonicalNr = CanonicalNr(166);
+    pub const PRCTL: CanonicalNr = CanonicalNr(167);
+    pub const GETPPID: CanonicalNr = CanonicalNr(173);
+    pub const GETUID: CanonicalNr = CanonicalNr(174);
+    pub const GETEUID: CanonicalNr = CanonicalNr(175);
+    pub const GETGID: CanonicalNr = CanonicalNr(176);
+    pub const GETEGID: CanonicalNr = CanonicalNr(177);
+    pub const SYSINFO: CanonicalNr = CanonicalNr(179);
     pub const WAIT4: CanonicalNr = CanonicalNr(260);
     pub const PPOLL: CanonicalNr = CanonicalNr(73);
+    pub const PRLIMIT64: CanonicalNr = CanonicalNr(261);
 }
 
 /// Linux SCHED_* policy values (kernel ABI, not the libc-internal names).
