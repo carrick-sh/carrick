@@ -1,6 +1,9 @@
 //! Linux syscall dispatch and completion mapping.
+extern crate alloc;
+
 use super::{file, inotify, ipc, lifecycle, sched};
 use crate::fault::dispatch_fault;
+use crate::file::UserCopy;
 use crate::memory;
 use carrick_el1_abi::{
     Action, Counters, CurrentTask, DELEGATED_STATE_GUEST, DelegatedFile, DelegatedInotify,
@@ -607,6 +610,87 @@ impl<
     }
     fn epoll_wait(&mut self) -> FamilyCompletion {
         self.ipc_transfer()
+    }
+    fn poll(&mut self) -> FamilyCompletion {
+        let Some(task) = self.task() else {
+            return FamilyCompletion::Forward;
+        };
+        let fds_ptr = self.frame.argument(0).unwrap_or(0);
+        let nfds = self.frame.argument(1).unwrap_or(0) as usize;
+        let timeout_ms = if self.frame.native_ordinal() == Some(7) {
+            self.frame.argument(2).unwrap_or(0) as i32
+        } else {
+            let tmo_ptr = self.frame.argument(2).unwrap_or(0);
+            if tmo_ptr == 0 {
+                -1
+            } else {
+                let mut ts = [0i64; 2];
+                let mut user = file::ValidatedCopy {
+                    task,
+                    validator: &file::HardwareValidator,
+                };
+                let bytes =
+                    unsafe { core::slice::from_raw_parts_mut(ts.as_mut_ptr() as *mut u8, 16) };
+                if !user.copy_in(bytes, tmo_ptr) {
+                    return FamilyCompletion::Complete(-14);
+                }
+                ts[0].saturating_mul(1000).saturating_add(ts[1] / 1_000_000) as i32
+            }
+        };
+        if nfds == 0 {
+            return FamilyCompletion::Complete(0);
+        }
+        if nfds > 1024 {
+            return FamilyCompletion::Complete(-22);
+        }
+        let mut pollfds = alloc::vec![super::file_table::PollFd::default(); nfds];
+        let mut user = file::ValidatedCopy {
+            task,
+            validator: &file::HardwareValidator,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                pollfds.as_mut_ptr() as *mut u8,
+                nfds * core::mem::size_of::<super::file_table::PollFd>(),
+            )
+        };
+        if !user.copy_in(bytes, fds_ptr) {
+            return FamilyCompletion::Complete(-14);
+        }
+        let file_table = task
+            .linux
+            .file_table
+            .load(core::sync::atomic::Ordering::Acquire)
+            .max(1);
+        let ready = super::file_table::resolve_poll(
+            self.fd_map,
+            self.open_table,
+            self.object_table,
+            self.ipc,
+            file_table,
+            &mut pollfds,
+        );
+        let out_bytes = unsafe {
+            core::slice::from_raw_parts(
+                pollfds.as_ptr() as *const u8,
+                nfds * core::mem::size_of::<super::file_table::PollFd>(),
+            )
+        };
+        if !user.copy_out(fds_ptr, out_bytes) {
+            return FamilyCompletion::Complete(-14);
+        }
+        if ready > 0 || timeout_ms == 0 {
+            FamilyCompletion::Complete(ready as i64)
+        } else {
+            let slot = self.frame.slot();
+            let mut continuation = super::file_table::PollContinuation::new(
+                file_table, pollfds, timeout_ms, fds_ptr, slot,
+            );
+            if let (Some(zone), Some(_)) = (self.zone.as_ref(), slot) {
+                continuation.release_capacity(zone.tables);
+            }
+            FamilyCompletion::Complete(ready as i64)
+        }
     }
     fn original_argument0(&self) -> u64 {
         self.frame.argument(0).unwrap_or(0)
