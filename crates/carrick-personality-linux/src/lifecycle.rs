@@ -109,6 +109,12 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     fn exec_completed(&mut self, _path: &[u8]) -> Result<(), i64> {
         Ok(())
     }
+    fn has_thread(&self, _tid: u32) -> bool {
+        false
+    }
+    fn robust_list_permission(&self, _tid: u32) -> Result<(), i64> {
+        Err(crate::identity::ESRCH)
+    }
 }
 
 pub trait UserCopy {
