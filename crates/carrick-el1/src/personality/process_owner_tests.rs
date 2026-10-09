@@ -1103,7 +1103,7 @@ fn entry_adapter_uses_retained_primitive_custody_through_fork_exit_wait() {
         GuestTask::new(
             row.metadata,
             parent,
-            row.context,
+            *row.context,
             RetainedProcessCustody::new(row.native),
             row.claim,
         )

@@ -97,7 +97,7 @@ pub fn admit_entry(
     native: carrick_sched_core::ThreadCtx,
     ttbr0: u64,
     record_incarnation: u64,
-) -> Result<(Arc<Runtime>, Mm, Aarch64ParkedContext), NativeProcessError> {
+) -> Result<(Arc<Runtime>, Mm, Box<Aarch64ParkedContext>), NativeProcessError> {
     let (page, control) = task.lifecycle_refs().ok_or(NativeProcessError::Stale)?;
     let observed = Mm {
         root: RootGpa::page_aligned(FrameGpa::new(ttbr0 & AARCH64_ROOT_ADDRESS_MASK))
@@ -122,12 +122,12 @@ pub fn admit_entry(
     } else {
         observed
     };
-    let words = Aarch64ParkedContext::from_register(
+    let words = Box::new(Aarch64ParkedContext::from_register(
         native,
         ttbr0,
         address.mm.raw().get(),
         address.generation.raw().get(),
-    );
+    ));
     if let Ok(runtime) = REGISTRY.for_entry(source, task, address) {
         if task.visible_pid() != Some(1) {
             fork_progress(carrick_el1_abi::NativeForkProgress::ChildEntered);
@@ -139,7 +139,7 @@ pub fn admit_entry(
         return Ok((runtime, address, words));
     }
     let runtime = Arc::new(NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
-        source, task, page, control, address, address, words,
+        source, task, page, control, address, address, *words,
     )?);
     REGISTRY.register_root(runtime.clone(), source, task, address)?;
     Ok((runtime, address, words))
