@@ -1438,6 +1438,42 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
+    fn two_live_mailbox_leases_have_distinct_el1_stack_authority() {
+        let allocator = Arc::new(crate::syscall_mailbox::MailboxSlotAllocator::new());
+        let first = allocator.allocate().expect("first worker mailbox");
+        let second = allocator.allocate().expect("second worker mailbox");
+        assert_eq!((first.id().raw(), second.id().raw()), (0, 1));
+
+        for (lease, other) in [(&first, &second), (&second, &first)] {
+            let slot = usize::from(lease.id().raw());
+            let other_slot = usize::from(other.id().raw());
+            let frame = carrick_el1_abi::el1_slot_frame_va(slot);
+            let stack_base =
+                carrick_el1_abi::EL1_STACKS_BASE + slot as u64 * carrick_el1_abi::EL1_STACK_SIZE;
+            let record = (frame - core::mem::size_of::<ForkStockSettlement>() as u64) & !63;
+            assert!(record >= stack_base);
+            assert!(
+                record + core::mem::size_of::<ForkStockSettlement>() as u64
+                    <= stack_base + carrick_el1_abi::EL1_STACK_SIZE
+            );
+            assert!(native_record_on_cpu_stack(
+                record,
+                carrick_guest_arch::CpuId::new(slot as u32)
+            ));
+            assert!(!native_record_on_cpu_stack(
+                record,
+                carrick_guest_arch::CpuId::new(other_slot as u32)
+            ));
+            assert_eq!(
+                lease.id().guest_address(),
+                carrick_mem::memory::LINUX_SYSCALL_MAILBOX_BASE
+                    + slot as u64 * carrick_aarch64::mailbox::AARCH64_SYSCALL_MAILBOX_SIZE
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
     fn authenticated_root_exit_hvc_is_terminal_and_other_replies_resume() {
         assert_eq!(
             classify_metadata_trap(GRANT_OP_ROOT_EXIT, [METADATA_GRANT_SUCCESS, 7 << 8, 0, 0]),
