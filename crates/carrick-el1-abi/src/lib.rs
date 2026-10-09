@@ -2304,6 +2304,17 @@ pub enum NativeForkFailureStage {
     Commit = 11,
     Abort = 12,
     BornSpaceAccess = 13,
+    PrepareInvalid = 14,
+    PrepareStale = 15,
+    PrepareBusy = 16,
+    PrepareNoMemory = 17,
+    PrepareMetadataRequired = 18,
+    PrepareFault = 19,
+    PrepareCore = 20,
+    PrepareTable = 21,
+    PrepareReservation = 22,
+    PrepareWait = 23,
+    PrepareUnsupportedExecutableCow = 24,
 }
 
 impl NativeForkFailureStage {
@@ -2322,6 +2333,17 @@ impl NativeForkFailureStage {
             11 => Self::Commit,
             12 => Self::Abort,
             13 => Self::BornSpaceAccess,
+            14 => Self::PrepareInvalid,
+            15 => Self::PrepareStale,
+            16 => Self::PrepareBusy,
+            17 => Self::PrepareNoMemory,
+            18 => Self::PrepareMetadataRequired,
+            19 => Self::PrepareFault,
+            20 => Self::PrepareCore,
+            21 => Self::PrepareTable,
+            22 => Self::PrepareReservation,
+            23 => Self::PrepareWait,
+            24 => Self::PrepareUnsupportedExecutableCow,
             _ => return None,
         })
     }
