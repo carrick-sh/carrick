@@ -1,6 +1,7 @@
 //! Shared process identity and exit receipts. These are the same domains
 //! used by host kernel graph consumers and guest lifecycle owners.
-use carrick_syscall_abi::{LinuxCapabilitySet, LinuxWaitOptions};
+pub use carrick_syscall_abi::LinuxCapabilitySet;
+use carrick_syscall_abi::LinuxWaitOptions;
 use core::num::{NonZeroI32, NonZeroU64};
 use core::time::Duration;
 
@@ -417,6 +418,10 @@ impl TaskUid {
     pub const fn raw(self) -> u32 {
         self.0
     }
+
+    pub const fn is_root(self) -> bool {
+        self.0 == 0
+    }
 }
 
 /// Typed group identity within a namespace.
@@ -432,6 +437,10 @@ impl TaskGid {
 
     pub const fn raw(self) -> u32 {
         self.0
+    }
+
+    pub const fn is_root(self) -> bool {
+        self.0 == 0
     }
 }
 
@@ -450,6 +459,7 @@ pub struct TaskCredentials {
     pub cap_permitted: LinuxCapabilitySet,
     pub cap_effective: LinuxCapabilitySet,
     pub cap_inheritable: LinuxCapabilitySet,
+    pub cap_ambient: LinuxCapabilitySet,
 }
 
 impl TaskCredentials {
@@ -466,7 +476,21 @@ impl TaskCredentials {
         cap_permitted: LinuxCapabilitySet::FULL,
         cap_effective: LinuxCapabilitySet::FULL,
         cap_inheritable: LinuxCapabilitySet::empty(),
+        cap_ambient: LinuxCapabilitySet::empty(),
     };
+
+    /// Apply capabilities(7) exec rules:
+    /// uid 0 (ruid == 0 or euid == 0): full set
+    /// non-root: permitted and effective cleared unless ambient
+    pub fn apply_exec(&mut self) {
+        if self.ruid.is_root() || self.euid.is_root() {
+            self.cap_permitted = LinuxCapabilitySet::FULL;
+            self.cap_effective = LinuxCapabilitySet::FULL;
+        } else {
+            self.cap_permitted = self.cap_ambient;
+            self.cap_effective = self.cap_ambient;
+        }
+    }
 
     pub fn is_privileged(&self) -> bool {
         self.cap_effective.contains(LinuxCapabilitySet::CAP_SETUID)
