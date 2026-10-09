@@ -2405,10 +2405,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .owner
             .task(self.key)
             .map_err(|_| carrick_personality_linux::abi::signal::LINUX_ESRCH.get())?;
-        row.native()
-            .resources()
-            .signals()
-            .force_sigsegv(tid, blocked);
+        row.native().resources().signals().force_sigsegv(
+            tid,
+            blocked,
+            Some(carrick_personality_linux::abi::signal::LinuxSiginfo {
+                si_signo: carrick_signal_core::policy::Signal::SEGV.number(),
+                si_code: carrick_abi::LINUX_SI_KERNEL,
+                ..carrick_personality_linux::abi::signal::LinuxSiginfo::empty()
+            }),
+        );
         Ok(())
     }
     fn rt_sigaction(

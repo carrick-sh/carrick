@@ -658,14 +658,18 @@ mod kernel {
                             rdi: frame.saved_gprs[14],
                             rsp: frame.rsp,
                         };
+                        let Some((sp, stack)) = carrick_personality_linux::signal::delivery_stack(
+                            thread.slot.read_altstack(), carrick_guest_arch::UserVa::new(frame.rsp), action.flags.on_stack,
+                        ) else { return 6; };
                         let params = carrick_guest_arch::SignalFrameParams {
+                            stack,
                             signum: 11,
                             sigcode: if fault.present { 2 } else { 1 },
                             fault_addr: far,
                             handler: carrick_guest_arch::UserVa::new(handler.0),
                             restorer: action.restorer.map(|r| carrick_guest_arch::UserVa::new(r.0)),
                             mask: blocked.signals().bits(),
-                            sp: carrick_guest_arch::UserVa::new(frame.rsp),
+                            sp,
                         };
                         let mut copy = carrick_el1::file::ValidatedCopy {
                             task,
@@ -685,11 +689,11 @@ mod kernel {
                             &fpstate.0,
                             &mut |va, bytes| carrick_personality_linux::lifecycle::UserCopy::copy_out(&mut copy, va, bytes),
                         ).is_ok() {
-                            let mut handler_mask = blocked.signals().union(action.mask);
-                            if !action.flags.nodefer { handler_mask = handler_mask.with(segv); }
+                            let handler_mask = carrick_personality_linux::signal::policy::handler_block_mask(segv, action, blocked);
                             let _ = thread.slot.store_blocked_then_read_pending(
-                                carrick_el1_abi::BlockedMask(handler_mask.bits()), thread.slot.pending(),
+                                carrick_el1_abi::BlockedMask(handler_mask.signals().bits()), thread.slot.pending(),
                             );
+                            frame.rflags = native_frame.r11;
                             frame.rip = native_frame.rcx;
                             frame.rsp = native_frame.rsp;
                             frame.saved_gprs[14] = native_frame.rdi;
@@ -1197,11 +1201,10 @@ mod kernel {
         use carrick_personality_linux::signal::policy::{self, SigBlockMask};
         use carrick_personality_linux::signal::ProcessSignals;
 
-        let thread_blocked = GuestLifecycleVenue.thread(task)
-            .map(|t| SigBlockMask::blocking_all_of(
-                carrick_personality_linux::signal::SignalSet::from_bits(t.slot.blocked().0)
-            ))
-            .unwrap_or(SigBlockMask::NONE);
+        let thread = GuestLifecycleVenue.thread(task)?;
+        let thread_blocked = SigBlockMask::blocking_all_of(
+            carrick_personality_linux::signal::SignalSet::from_bits(thread.slot.blocked().0),
+        );
 
         let (sig, info, action) = process.take_deliverable(process.task_id(), thread_blocked)?;
         match action.disposition {
@@ -1219,14 +1222,21 @@ mod kernel {
                 }
             }
             policy::Disposition::Handler(handler) => {
+                let selected_stack = carrick_personality_linux::signal::delivery_stack(
+                    thread.slot.read_altstack(), carrick_guest_arch::UserVa::new(frame.rsp), action.flags.on_stack,
+                );
+                let Some((sp, stack)) = selected_stack else {
+                    return force_delivery_fault(task, process, frame, fpstate, sig, thread_blocked);
+                };
                 let params = carrick_guest_arch::SignalFrameParams {
+                    stack,
                     signum: sig.number(),
                     sigcode: info.as_ref().map_or(0, |i| i.si_code),
                     fault_addr: info.as_ref().map_or(0, |i| i.si_addr),
                     handler: carrick_guest_arch::UserVa::new(handler.0),
                     restorer: action.restorer.map(|r| carrick_guest_arch::UserVa::new(r.0)),
                     mask: thread_blocked.signals().bits(),
-                    sp: carrick_guest_arch::UserVa::new(frame.rsp),
+                    sp,
                 };
                 let mut copy = carrick_el1::file::ValidatedCopy {
                     task,
@@ -1239,7 +1249,7 @@ mod kernel {
                         core::mem::size_of_val(i),
                     )
                 });
-                let _ = carrick_guest_arch::SignalBackend::setup_signal_frame(
+                let setup = carrick_guest_arch::SignalBackend::setup_signal_frame(
                     &mut backend,
                     frame,
                     params,
@@ -1247,9 +1257,44 @@ mod kernel {
                     &fpstate.0,
                     &mut |va, bytes| carrick_personality_linux::lifecycle::UserCopy::copy_out(&mut copy, va, bytes),
                 );
+                if setup.is_err() {
+                    return force_delivery_fault(task, process, frame, fpstate, sig, thread_blocked);
+                }
+                let mask = policy::handler_block_mask(sig, action, thread_blocked);
+                let _ = thread.slot.store_blocked_then_read_pending(
+                    carrick_el1_abi::BlockedMask(mask.signals().bits()), thread.slot.pending(),
+                );
                 None
             }
         }
+    }
+
+    fn force_delivery_fault(
+        task: &CurrentTask,
+        process: &mut carrick_el1::personality::native_process_runtime::NativeProcessEntry<'_, 'static, native_process::Mm, carrick_sched_core::ParkedContextWords, native_process::Service>,
+        frame: &mut NativeFrame,
+        fpstate: &carrick_el1::isa::x86::context::scheduler::XsaveArea,
+        original: carrick_personality_linux::signal::policy::Signal,
+        blocked: carrick_personality_linux::signal::policy::SigBlockMask,
+    ) -> Option<carrick_personality_linux::dispatch::CompletionRoute> {
+        use carrick_el1::personality::thread_setup::LifecycleVenue;
+        use carrick_personality_linux::signal::{ProcessSignals, policy::Signal};
+        use carrick_personality_linux::dispatch::CompletionRoute;
+        if original == Signal::SEGV {
+            return Some(match process.exit_with_signal(Signal::SEGV.number() as u8) {
+                Ok(_) => CompletionRoute::Suspended,
+                Err(_) => CompletionRoute::InvalidCompletion,
+            });
+        }
+        // One forced SEGV selection is a semantic fallback, never a frame retry.
+        let thread = GuestLifecycleVenue.thread(task)?;
+        let tid = process.task_id();
+        if process.force_sigsegv(tid, blocked).is_err() {
+            return Some(CompletionRoute::InvalidCompletion);
+        }
+        let mask = blocked.signals().without(Signal::SEGV);
+        let _ = thread.slot.store_blocked_then_read_pending(carrick_el1_abi::BlockedMask(mask.bits()), thread.slot.pending());
+        deliver_signal_on_syscall_return(task, process, frame, fpstate)
     }
 
     #[unsafe(no_mangle)]

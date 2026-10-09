@@ -713,6 +713,7 @@ arch_trait!(CrossingArch, CrossingBackend {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SignalFrameParams {
+    pub stack: carrick_abi::LinuxSignalStack,
     pub signum: i32,
     pub sigcode: i32,
     pub fault_addr: u64,

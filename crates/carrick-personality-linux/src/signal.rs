@@ -377,6 +377,7 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                     ),
                 };
                 let flags = carrick_signal_core::policy::ActionFlags {
+                    on_stack: newact.sa_flags & carrick_abi::LINUX_SA_ONSTACK != 0,
                     reset_hand: newact.sa_flags & 0x80000000 != 0,
                     nodefer: newact.sa_flags & 0x40000000 != 0,
                     restart: newact.sa_flags & 0x10000000 != 0,
@@ -447,6 +448,9 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 if let Some(restorer) = current.restorer {
                     flags |= 0x04000000; // SA_RESTORER
                     oldact.sa_restorer = restorer.0;
+                }
+                if current.flags.on_stack {
+                    flags |= carrick_abi::LINUX_SA_ONSTACK;
                 }
                 oldact.sa_flags = flags;
                 oldact.sa_mask = [current.mask.bits()];
@@ -698,4 +702,41 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
             }
         }
     }
+}
+
+/// Snapshot uc_stack and choose the handler stack without changing the saved SP.
+pub fn delivery_stack(
+    stack: crate::abi::thread::AltStack,
+    interrupted_sp: carrick_guest_arch::UserVa,
+    on_stack: bool,
+) -> Option<(carrick_guest_arch::UserVa, carrick_abi::LinuxSignalStack)> {
+    if stack.is_disabled() {
+        return Some((
+            interrupted_sp,
+            carrick_abi::LinuxSignalStack {
+                ss_flags: carrick_abi::LINUX_SS_DISABLE as i32,
+                ..carrick_abi::LinuxSignalStack::empty()
+            },
+        ));
+    }
+    let top = stack.sp.checked_add(stack.size)?;
+    let already_on = interrupted_sp.raw() >= stack.sp && interrupted_sp.raw() < top;
+    let flags = stack.flags
+        | if already_on {
+            carrick_abi::LINUX_SS_ONSTACK as u32
+        } else {
+            0
+        };
+    let record = carrick_abi::LinuxSignalStack {
+        ss_sp: stack.sp,
+        ss_flags: flags as i32,
+        _pad0: 0,
+        ss_size: stack.size,
+    };
+    let selected = if on_stack && !already_on {
+        carrick_guest_arch::UserVa::new(top)
+    } else {
+        interrupted_sp
+    };
+    Some((selected, record))
 }

@@ -649,3 +649,27 @@ fn mounted_static_x86_signal_return_badframe_matches_native() {
 fn mounted_static_x86_signal_sse_state_matches_native() {
     compare_mounted_assembly_with_native("x86_signal_sse.S", b"HK\n");
 }
+
+#[test]
+fn mounted_static_x86_signal_nested_without_nodefer_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_nested.S", b"HHK\n");
+}
+#[test]
+fn mounted_static_x86_signal_handler_direction_flag_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_direction_flag.S", b"HK\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_altstack_overflow_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_altstack.S", b"S\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_failed_frame_setup_matches_native() {
+    compare_mounted_fault_with_native("x86_signal_badstack.S");
+}
+
+#[test]
+fn mounted_static_x86_signal_resethand_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_resethand.S", b"HK\n");
+}

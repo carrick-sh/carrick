@@ -3,10 +3,9 @@
 //! Semantic authority: <https://man7.org/linux/man-pages/man7/signal.7.html>,
 //! sigaction(2), sigprocmask(2), sigsuspend(2), wait(2), clone(2), fork(2)
 //! and execve(2). Numbering is Linux asm-generic, as used by AArch64.
-//! `carrick-abi` is the repository's wire-ABI source of truth; its current std
-//! dependency closure cannot enter this no_std core. These minimal domain
-//! equivalents store no host types or ABI structs. The adapter translates the
-//! named action flags and retains unsupported wire fields itself.
+//! `carrick-abi` owns wire layouts; this core owns semantic domains and named
+//! policy flags. The adapter translates the wire flags without duplicating ABI
+//! records or importing host facilities.
 //!
 //! The consuming EL1 owner serializes action lookup/reset, pending dequeue and
 //! mask publication in one transaction. No graph, lock or scheduler is created
@@ -124,10 +123,20 @@ pub fn handler_return(
     }
 }
 
+/// Handler entry adds sa_mask and defers its own signal unless SA_NODEFER.
+pub fn handler_block_mask(signal: Signal, action: Action, blocked: SigBlockMask) -> SigBlockMask {
+    let mut set = blocked.signals().union(action.mask);
+    if !action.flags.nodefer {
+        set = set.with(signal);
+    }
+    SigBlockMask::blocking_all_of(set)
+}
+
 /// Named policy flags, translated from SA_* by the ABI adapter.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ActionFlags {
     pub reset_hand: bool,
+    pub on_stack: bool,
     pub nodefer: bool,
     pub restart: bool,
     pub siginfo: bool,
@@ -212,12 +221,8 @@ impl ActionTable {
                 }
                 let effective = masks.effective();
                 let restore_mask = masks.blocked;
-                let mut handler_mask = effective.signals().union(action.mask);
-                if !action.flags.nodefer {
-                    handler_mask = handler_mask.with(signal);
-                }
                 masks.temporary = None;
-                masks.blocked = SigBlockMask::blocking_all_of(handler_mask);
+                masks.blocked = handler_block_mask(signal, action, effective);
                 Delivery::Handler(HandlerDelivery {
                     address,
                     siginfo: action.flags.siginfo,

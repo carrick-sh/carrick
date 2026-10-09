@@ -596,6 +596,7 @@ dependencies = [
 name = "carrick-guest-arch"
 version = "0.1.0"
 dependencies = [
+ "carrick-abi",
  "carrick-syscall-abi",
  "zerocopy",
 ]
