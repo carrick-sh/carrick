@@ -22,6 +22,7 @@ pub struct KvmCpuIo {
     vcpu: crate::KvmVcpu,
     _vm: crate::KvmVm,
     layout: BringupLayout,
+    production_run: Option<crate::cpl0_boot::ProductionRunContext>,
 }
 impl sealed::Sealed for KvmCpuIo {}
 impl CarrierCpuIo for KvmCpuIo {
@@ -43,7 +44,11 @@ impl CarrierCpuIo for KvmCpuIo {
         )
     }
     fn run(&mut self) -> Result<VcpuExit, TrapError> {
-        Ok(HvVcpu::run(&mut self.vcpu)?)
+        if let Some(context) = &self.production_run {
+            context.run(&mut self.vcpu)
+        } else {
+            Ok(HvVcpu::run(&mut self.vcpu)?)
+        }
     }
     fn complete_pending_io(&mut self) -> Result<(), TrapError> {
         self.vcpu
@@ -131,6 +136,21 @@ impl KvmCarrierCpu<KvmCpuIo> {
             vcpu,
             _vm: vm,
             layout,
+            production_run: None,
+        })
+    }
+
+    pub(crate) fn from_production(
+        vcpu: crate::KvmVcpu,
+        vm: crate::KvmVm,
+        layout: BringupLayout,
+        production_run: crate::cpl0_boot::ProductionRunContext,
+    ) -> Result<Self, TrapError> {
+        Self::new(KvmCpuIo {
+            vcpu,
+            _vm: vm,
+            layout,
+            production_run: Some(production_run),
         })
     }
 }

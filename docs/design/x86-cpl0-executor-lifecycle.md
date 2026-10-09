@@ -211,3 +211,12 @@ doorbell and consumes that completion exactly once before its saved image and
 neutral reset. This is the detach step the pool will call before giving a
 worker another task. A failed completion poisons that physical CPU; it cannot
 yield a task-state receipt or be silently reused.
+
+The initial boot request doorbell precedes the guest's installation of its
+published user address-space root. Capturing the root task there yields a
+bootstrap CR3 and cannot satisfy `X86ArchContext`'s binding check. A second
+physical doorbell after `install_context`, before the first `iretq`, is the
+stopped handoff point. The carrier verifies its request pointer and CR3
+against the published root, then completes the pending PIO step before
+transferring the vCPU to a worker. This doorbell is a KVM bootstrap protocol,
+not a forwarded Linux syscall or a new host crossing.
