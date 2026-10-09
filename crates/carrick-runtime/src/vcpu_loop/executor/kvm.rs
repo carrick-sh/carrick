@@ -20,7 +20,7 @@ use super::{
 use super::{PersistentTaskBinding, TaskBindingDirectory, TaskBindingResolver, TaskLoadIdentity};
 
 use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
-use carrick_kernel::compat::{CompatReporter, SyscallArgs};
+use carrick_kernel::compat::CompatReporter;
 use carrick_kernel::dispatch::{
     DispatchOutcome, FdWaitCompletion, StdioReadiness, SyscallDispatcher, SyscallRequest, WaitFds,
 };
@@ -244,8 +244,7 @@ pub(crate) struct KvmPersistentExecutor {
 
 struct RetainedForward {
     frame: ProductionForwardFrame,
-    request: SyscallRequest,
-    host_readiness: Option<HostReadinessRequest>,
+    request: ForwardRequest,
 }
 
 #[derive(Clone, Copy)]
@@ -256,6 +255,34 @@ struct HostReadinessRequest {
     sig_mask: carrick_abi::WaitSigMask,
 }
 
+#[derive(Clone, Copy)]
+enum ForwardRequest {
+    Syscall(SyscallRequest),
+    HostReadiness(HostReadinessRequest),
+}
+
+impl ForwardRequest {
+    fn syscall(self) -> Option<SyscallRequest> {
+        match self {
+            Self::Syscall(request) => Some(request),
+            Self::HostReadiness(_) => None,
+        }
+    }
+
+    fn restart_class(self) -> RestartClass {
+        match self {
+            Self::Syscall(request)
+                if carrick_kernel::kernel::continuation::is_restartable_syscall(
+                    request.number.raw(),
+                ) =>
+            {
+                RestartClass::RestartSyscall
+            }
+            Self::Syscall(_) | Self::HostReadiness(_) => RestartClass::Never,
+        }
+    }
+}
+
 enum HostReadinessStep {
     Ready(i64),
     Wait(Vec<(i32, i16)>),
@@ -263,11 +290,7 @@ enum HostReadinessStep {
 
 enum ForwardDecision {
     Immediate(InitialSyscallDisposition),
-    Blocked(
-        SyscallRequest,
-        Box<DispatchOutcome>,
-        Option<HostReadinessRequest>,
-    ),
+    Blocked(ForwardRequest, Box<DispatchOutcome>),
 }
 
 impl KvmPersistentExecutor {
@@ -354,24 +377,23 @@ impl KvmPersistentExecutor {
     fn block_forward(
         binding: &Arc<KvmTaskBinding>,
         submission: &mut ExecutorSubmissionContext<'_>,
-        request: SyscallRequest,
+        request: ForwardRequest,
         outcome: DispatchOutcome,
         frame: Option<ProductionForwardFrame>,
-        host_readiness: Option<HostReadinessRequest>,
     ) -> Result<ExecutorExit, TrapError> {
         let context = binding.fresh_context()?;
-        let restart =
-            if carrick_kernel::kernel::continuation::is_restartable_syscall(request.number.raw()) {
-                RestartClass::RestartSyscall
-            } else {
-                RestartClass::Never
-            };
-        let capture = ContinuationCapture::from_lease(
-            &context,
-            submission.execution_lease_mut()?,
-            request,
-            restart,
-        )
+        let capture = match request {
+            ForwardRequest::Syscall(syscall) => ContinuationCapture::from_lease(
+                &context,
+                submission.execution_lease_mut()?,
+                syscall,
+                request.restart_class(),
+            ),
+            ForwardRequest::HostReadiness(_) => ContinuationCapture::from_host_readiness_lease(
+                &context,
+                submission.execution_lease_mut()?,
+            ),
+        }
         .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
         let continuation = BlockedContinuation::from_dispatch_outcome(outcome, capture)
             .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
@@ -383,11 +405,7 @@ impl KvmPersistentExecutor {
             if retained.is_some() {
                 return Err(TrapError::Hypervisor("KVM forward already retained".into()));
             }
-            *retained = Some(RetainedForward {
-                frame,
-                request,
-                host_readiness,
-            });
+            *retained = Some(RetainedForward { frame, request });
         }
         Ok(ExecutorExit::BlockedContinuation {
             continuation: Box::new(continuation),
@@ -538,7 +556,9 @@ impl PersistentExecutor for KvmPersistentExecutor {
                             .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
                             match folded {
                                 Some(outcome) => Ok(outcome),
-                                None if let Some(readiness) = retained.host_readiness => {
+                                None if let ForwardRequest::HostReadiness(readiness) =
+                                    retained.request =>
+                                {
                                     match Self::sample_host_readiness(
                                         venue,
                                         readiness,
@@ -554,7 +574,16 @@ impl PersistentExecutor for KvmPersistentExecutor {
                                     }
                                 }
                                 None => dispatcher
-                                    .dispatch(&context, retained.request, venue, &self.reporter)
+                                    .dispatch(
+                                        &context,
+                                        retained.request.syscall().ok_or_else(|| {
+                                            TrapError::Hypervisor(
+                                                "readiness request lacks its owner".into(),
+                                            )
+                                        })?,
+                                        venue,
+                                        &self.reporter,
+                                    )
                                     .map_err(|error| TrapError::Hypervisor(error.to_string())),
                             }
                         })?;
@@ -578,17 +607,9 @@ impl PersistentExecutor for KvmPersistentExecutor {
                             TrapError::Hypervisor("KVM retained frame poisoned".into())
                         })?;
                         let request = retained.request;
-                        let host_readiness = retained.host_readiness;
                         *slot = Some(retained);
                         drop(slot);
-                        return Self::block_forward(
-                            &binding,
-                            submission,
-                            request,
-                            other,
-                            None,
-                            host_readiness,
-                        );
+                        return Self::block_forward(&binding, submission, request, other, None);
                     }
                 }
             }
@@ -746,14 +767,8 @@ impl PersistentExecutor for KvmPersistentExecutor {
                                     HostReadinessStep::Wait(fds) => {
                                         match Self::host_readiness_wait(readiness, fds) {
                                             Some(outcome) => Ok(ForwardDecision::Blocked(
-                                                SyscallRequest::new(
-                                                    carrick_el1_abi::HostReadinessCrossing::NUMBER,
-                                                    SyscallArgs([
-                                                        frame.rdi, frame.rsi, frame.rdx, 0, 0, 0,
-                                                    ]),
-                                                ),
+                                                ForwardRequest::HostReadiness(readiness),
                                                 Box::new(outcome),
-                                                Some(readiness),
                                             )),
                                             None => Ok(ForwardDecision::Immediate(
                                                 InitialSyscallDisposition::Return(0),
@@ -828,9 +843,10 @@ impl PersistentExecutor for KvmPersistentExecutor {
                                         GuestExitStatus::from_linux_code(code),
                                     )))
                                 }
-                                other => {
-                                    Ok(ForwardDecision::Blocked(request, Box::new(other), None))
-                                }
+                                other => Ok(ForwardDecision::Blocked(
+                                    ForwardRequest::Syscall(request),
+                                    Box::new(other),
+                                )),
                             }
                         })?;
                     {
@@ -845,14 +861,13 @@ impl PersistentExecutor for KvmPersistentExecutor {
                     }
                     drop(dispatcher);
                     match decision {
-                        ForwardDecision::Blocked(request, outcome, host_readiness) => {
+                        ForwardDecision::Blocked(request, outcome) => {
                             return Self::block_forward(
                                 binding,
                                 submission,
                                 request,
                                 *outcome,
                                 Some(token),
-                                host_readiness,
                             );
                         }
                         ForwardDecision::Immediate(InitialSyscallDisposition::Return(value)) => {
@@ -1091,6 +1106,18 @@ mod forward_owner_tests {
         CarrierGeneration, ExecutionGeneration as ArchExecutionGeneration, TaskSerial,
     };
     use std::num::NonZeroU64;
+
+    #[test]
+    fn host_readiness_capture_has_no_guest_syscall_number() {
+        let request = ForwardRequest::HostReadiness(HostReadinessRequest {
+            address: 0x1000,
+            count: 1,
+            deadline: None,
+            sig_mask: carrick_abi::WaitSigMask::NONE,
+        });
+        assert!(request.syscall().is_none());
+        assert_eq!(request.restart_class(), RestartClass::Never);
+    }
 
     #[test]
     fn forward_owner_rejects_wrong_lease_and_idle_peer() {
