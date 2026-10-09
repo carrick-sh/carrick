@@ -204,3 +204,50 @@ pub(super) fn prepared_copy_commit_and_cancel_never_acquire_held_root_or_editor(
     );
     drop(held_editor);
 }
+
+#[test]
+pub(super) fn prepare_busy_suspends_and_forwards_instead_of_completing_with_ebusy() {
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, 2, 0);
+    let view = nodes(&region);
+    let portal = FixturePortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let tables = Tables::new(ROOT, IPA, 2);
+    let maintenance = CallerInvalidatesAsid;
+    let transfer = portal
+        .begin(
+            portal.admitted_handle(mm, 0).unwrap(),
+            GuestVa::new(VA),
+            4096,
+            TransferIntent::UserWrite,
+            0,
+        )
+        .unwrap();
+    let request = selected(select(&portal, &transfer, &tables))
+        .request(TransferIntent::UserWrite, retained())
+        .unwrap();
+    let slot = carrick_core_abi::PortalTransferSlot::new();
+    let mut ticket = slot.submit_prepare(request).unwrap();
+
+    // A peer on slot 1 holds the root, causing prepare on slot 0 to encounter Refusal::Busy
+    // and return MmError::Busy.
+    let _held_root = portal.root(mm, 1).unwrap();
+
+    let result = serve_transfer(
+        &portal,
+        slot.claim().unwrap(),
+        &tables.live(&maintenance),
+        0,
+        || panic!("prepare must not copy"),
+    );
+
+    assert_eq!(result, Ok(()));
+    assert!(
+        ticket.take_prepare_suspension().is_some(),
+        "busy prepare must suspend/forward"
+    );
+    assert!(
+        ticket.take_completion().is_none(),
+        "busy prepare must not complete with EBUSY errno 16"
+    );
+}
