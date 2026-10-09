@@ -345,6 +345,11 @@ fn mounted_static_x86_poll_stdio_matches_native() {
 }
 
 #[test]
+fn mounted_static_x86_poll_closed_stdio_matches_native() {
+    compare_mounted_assembly_with_native("x86_poll_closed_stdio.S", b"C\n");
+}
+
+#[test]
 fn mounted_static_x86_sched_inring_matches_native() {
     compare_mounted_assembly_with_native("x86_sched_inring.S", b"S\n");
 }
