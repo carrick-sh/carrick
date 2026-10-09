@@ -1865,11 +1865,11 @@ where
                 );
             });
         let shape = if is_external_exec || request.clone_parent {
-            executor::HvpatchSubmissionShape::PeerRoot {
+            executor::TaskSubmissionShape::PeerRoot {
                 grant: (grant_thread, grant_generation),
             }
         } else {
-            executor::HvpatchSubmissionShape::Descendant {
+            executor::TaskSubmissionShape::Descendant {
                 grant: (grant_thread, grant_generation),
             }
         };

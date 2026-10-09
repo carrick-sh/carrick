@@ -262,7 +262,7 @@ impl ForwardRequest {
 
 enum HostReadinessStep {
     Ready(i64),
-    Wait(Vec<(i32, i16)>),
+    Wait(Vec<(carrick_el1_abi::HostBoundFd, carrick_abi::PollEvents)>),
 }
 
 enum ForwardDecision {
@@ -326,7 +326,11 @@ impl KvmPersistentExecutor {
                     pollfds
                         .into_iter()
                         .filter(|fd| fd.fd >= 0)
-                        .map(|fd| (fd.fd, fd.events))
+                        .filter_map(|fd| {
+                            carrick_el1_abi::HostBoundFd::new(fd.fd).map(|host_fd| {
+                                (host_fd, carrick_abi::PollEvents::from_bits(fd.events))
+                            })
+                        })
                         .collect(),
                 ))
             }
@@ -335,7 +339,7 @@ impl KvmPersistentExecutor {
 
     fn host_readiness_wait(
         request: HostReadinessRequest,
-        fds: Vec<(i32, i16)>,
+        fds: Vec<(carrick_el1_abi::HostBoundFd, carrick_abi::PollEvents)>,
     ) -> Option<DispatchOutcome> {
         let timeout = request
             .deadline
@@ -716,7 +720,16 @@ impl PersistentExecutor for KvmPersistentExecutor {
                                 let count = usize::try_from(frame.rsi).map_err(|_| {
                                     TrapError::Hypervisor("host readiness count overflow".into())
                                 })?;
-                                let timeout_ms = frame.rdx as i32;
+                                let Some(timeout) =
+                                    carrick_el1_abi::HostReadinessTimeout::from_wire(frame.rdx)
+                                else {
+                                    return Ok(ForwardDecision::Immediate(
+                                        InitialSyscallDisposition::Refused(
+                                            carrick_abi::LINUX_EINVAL,
+                                        ),
+                                    ));
+                                };
+                                let timeout_ms = timeout.millis();
                                 let deadline = (timeout_ms >= 0).then(|| {
                                     std::time::Instant::now()
                                         + std::time::Duration::from_millis(timeout_ms as u64)
@@ -968,11 +981,7 @@ impl PersistentExecutor for KvmPersistentExecutor {
         Ok(())
     }
     fn audit_boundary(&mut self) -> Result<(), TrapError> {
-        if self
-            .physical
-            .physical_slot()
-            .is_some_and(|slot| slot.raw() == 1)
-        {
+        if self.physical.is_idle_peer_slot() {
             self.physical.audit_unloaded_peer()
         } else {
             self.physical.cpu_mut().audit_idle()
@@ -983,17 +992,11 @@ impl PersistentExecutor for KvmPersistentExecutor {
     }
 
     fn has_physical_idle_lane(&self) -> bool {
-        self.physical
-            .physical_slot()
-            .is_some_and(|slot| slot.raw() == 1)
+        self.physical.is_idle_peer_slot()
     }
 
     fn arm_guest_idle(&mut self) -> Result<(), TrapError> {
-        if self
-            .physical
-            .physical_slot()
-            .is_some_and(|slot| slot.raw() == 1)
-        {
+        if self.physical.is_idle_peer_slot() {
             self.physical.arm_idle_kick(&self.idle_kick)?;
         }
         Ok(())
@@ -1004,11 +1007,7 @@ impl PersistentExecutor for KvmPersistentExecutor {
     }
 
     fn wait_in_guest(&mut self) -> Result<GuestIdleExit, TrapError> {
-        if self
-            .physical
-            .physical_slot()
-            .is_none_or(|slot| slot.raw() != 1)
-        {
+        if !self.physical.is_idle_peer_slot() {
             return Ok(GuestIdleExit::Unsupported);
         }
         match self.physical.run_idle_peer()? {

@@ -1230,7 +1230,9 @@ impl ProductionCpuLease {
             .lock()
             .map_err(|_| fail("physical custody poisoned"))?;
         let reason = custody.binding(slot).fault_reason.load(Ordering::Acquire);
-        if reason != 6 {
+        if carrick_el1_abi::X86FaultDisposition::from_raw(reason)
+            != Some(carrick_el1_abi::X86FaultDisposition::PolicyDeclined)
+        {
             return Err(fail(format!(
                 "kernel fault policy refused: reason {reason}, {record:?}"
             )));
@@ -1297,6 +1299,10 @@ impl ProductionCpuLease {
 
     pub fn physical_slot(&self) -> Option<carrick_guest_arch::CpuId> {
         self.cpu.physical_slot()
+    }
+
+    pub fn is_idle_peer_slot(&self) -> bool {
+        self.physical_slot() == Some(carrick_guest_arch::CpuId::new(1))
     }
 
     pub fn capture_forward<R>(
@@ -1478,13 +1484,13 @@ impl ProductionCpuLease {
 }
 
 impl ProductionCpuFactory {
-    pub fn refusal_count(&self, nr: u64) -> Result<u64, TrapError> {
+    pub fn refusal_count(&self, nr: carrick_abi::NativeNr) -> Result<u64, TrapError> {
         let custody = self
             .custody
             .lock()
             .map_err(|_| fail("physical custody poisoned"))?;
         let counters: &Counters = custody.metadata(COUNTERS_OFFSET);
-        let index = usize::try_from(nr)
+        let index = usize::try_from(nr.raw())
             .ok()
             .filter(|index| *index < 512)
             .unwrap_or(512);
@@ -1492,7 +1498,7 @@ impl ProductionCpuFactory {
     }
 
     pub fn refusal_overflow_count(&self) -> Result<u64, TrapError> {
-        self.refusal_count(512)
+        self.refusal_count(carrick_abi::NativeNr(512))
     }
 
     pub fn robust_list_head(&self, index: usize) -> Result<u64, TrapError> {
@@ -3106,9 +3112,9 @@ impl Cpl0Carrier {
 
     /// Read the per-ordinal CPL0 refusal counter for a native syscall ordinal.
     /// Ordinals >= 512 are read from the overflow bucket.
-    pub fn refusal_count(&self, nr: u64) -> u64 {
+    pub fn refusal_count(&self, nr: carrick_abi::NativeNr) -> u64 {
         let counters: &Counters = self.metadata(COUNTERS_OFFSET);
-        if let Ok(index @ 0..=511) = usize::try_from(nr) {
+        if let Ok(index @ 0..=511) = usize::try_from(nr.raw()) {
             return counters.refused[index].load(Ordering::Acquire);
         }
         counters.refused[512].load(Ordering::Acquire)

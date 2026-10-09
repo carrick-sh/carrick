@@ -2718,7 +2718,7 @@ where
         };
         let dormant = match runtime.persistent_bindings().prepare_submission(
             &runtime.continuation_services(child_context.kernel()).0,
-            executor::HvpatchSubmissionShape::ProcessBirth(child_runtime.submission),
+            executor::TaskSubmissionShape::ProcessBirth(child_runtime.submission),
             None,
             Arc::clone(child_context.thread()),
             generation,
@@ -5967,13 +5967,11 @@ impl PreparedHvpatchLogicalJob {
         Ok(())
     }
 
-    pub(crate) fn activation_proof(
-        &mut self,
-    ) -> Result<executor::HvpatchActivationProof, TrapError> {
+    pub(crate) fn activation_proof(&mut self) -> Result<executor::TaskActivationProof, TrapError> {
         let start_gate = self.start_gate.take().ok_or_else(|| {
             TrapError::Hypervisor("HVPatch start-gate proof was already consumed".to_owned())
         })?;
-        executor::HvpatchActivationProof::validate(
+        executor::TaskActivationProof::validate(
             &self.context,
             &self.cpu,
             self.generation,
@@ -6313,7 +6311,7 @@ where
         });
         let dormant = match directory.persistent_bindings().prepare_submission(
             &prepared.scheduler,
-            executor::HvpatchSubmissionShape::Root,
+            executor::TaskSubmissionShape::Root,
             None,
             Arc::clone(&thread),
             prepared.generation,

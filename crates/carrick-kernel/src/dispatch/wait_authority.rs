@@ -249,8 +249,15 @@ impl WaitFds {
 
     /// Host descriptors authenticated by a supervisor readiness request.
     /// The carrier duplicates each descriptor when the continuation is built.
-    pub fn host_readiness(fds: Vec<(i32, i16)>) -> Self {
-        Self::raw(fds).with_authority(WaitFdAuthority::internal(InternalWaitKind::HostReadiness))
+    pub fn host_readiness(
+        fds: Vec<(carrick_el1_abi::HostBoundFd, carrick_abi::PollEvents)>,
+    ) -> Self {
+        Self::raw(
+            fds.into_iter()
+                .map(|(fd, events)| (fd.raw(), events.bits()))
+                .collect(),
+        )
+        .with_authority(WaitFdAuthority::internal(InternalWaitKind::HostReadiness))
     }
 
     pub fn raw_one(fd: i32, events: i16) -> Self {

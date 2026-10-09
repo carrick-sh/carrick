@@ -88,7 +88,19 @@ fn production_cpl0_refuses_non_allowlisted_forwards_with_enosys() {
     assert_eq!(outcome.run.exit_code, 42);
     assert_eq!(outcome.physical.initial_execution_witness().unwrap().1, 0);
     assert_eq!(outcome.physical.physical_crossing_counts().unwrap()[1].1, 1);
-    assert_eq!(outcome.physical.refusal_count(101).unwrap(), 1);
-    assert_eq!(outcome.physical.refusal_count(103).unwrap(), 1);
+    assert_eq!(
+        outcome
+            .physical
+            .refusal_count(carrick_abi::NativeNr(101))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        outcome
+            .physical
+            .refusal_count(carrick_abi::NativeNr(103))
+            .unwrap(),
+        1
+    );
     assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
 }

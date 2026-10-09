@@ -1422,7 +1422,7 @@ pub(crate) mod tests {
                 .persistent_bindings()
                 .prepare_submission(
                     &scheduler,
-                    executor::HvpatchSubmissionShape::Root,
+                    executor::TaskSubmissionShape::Root,
                     None,
                     Arc::clone(root.thread()),
                     root_generation,
@@ -1862,7 +1862,7 @@ pub(crate) mod tests {
                 .persistent_bindings()
                 .prepare_submission(
                     &scheduler,
-                    executor::HvpatchSubmissionShape::Root,
+                    executor::TaskSubmissionShape::Root,
                     None,
                     Arc::clone(root.thread()),
                     root_generation,
@@ -1930,7 +1930,7 @@ pub(crate) mod tests {
                 .persistent_bindings()
                 .prepare_submission(
                     &scheduler,
-                    executor::HvpatchSubmissionShape::Root,
+                    executor::TaskSubmissionShape::Root,
                     None,
                     Arc::clone(root.thread()),
                     root_generation,

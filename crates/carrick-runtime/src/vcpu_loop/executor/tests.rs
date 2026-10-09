@@ -13,10 +13,10 @@ use carrick_kernel::kernel::CarrierProcess;
 use super::{
     ExecBindingTransition, ExecutionLeaseAuthoritySlot, ExecutorBoundaryAudit, ExecutorCpuReceipt,
     ExecutorExit, ExecutorPool, ExecutorPoolConfig, ExecutorPoolEvent, ExecutorSaveError,
-    ExecutorSubmissionContext, HvpatchActivationProof, HvpatchQuantumControl,
-    HvpatchSubmissionShape, HvpatchTaskBindingDirectory, PersistentExecutor,
+    ExecutorSubmissionContext, HvpatchQuantumControl, PersistentExecutor,
     PersistentExecutorFactory, PersistentTaskBinding, PreemptionDriver, ReceiptLog, RunnableTask,
-    SavedRunnable, TaskBindingResolver, TaskLoadIdentity, WorkerBoundaryAudit, WorkerKick,
+    SavedRunnable, TaskActivationProof, TaskBindingDirectory, TaskBindingResolver,
+    TaskLoadIdentity, TaskSubmissionShape, WorkerBoundaryAudit, WorkerKick,
     executor_claim_probe_asid_generation, process_leader_event_identity,
     restore_worker_vcpu_before_binding_publication, retire_failed_hvpatch_clone_authority,
 };
@@ -378,7 +378,11 @@ struct FakeFactory {
     concurrent_loads: Arc<parking_lot::Mutex<BTreeSet<(ThreadKey, ExecutionGeneration)>>>,
     inherited_state: Arc<parking_lot::Mutex<Vec<InheritedStateRow>>>,
     retired_bindings: Arc<parking_lot::Mutex<Vec<(ThreadKey, ExecutionGeneration)>>>,
-    directory: Arc<parking_lot::Mutex<Option<Arc<HvpatchTaskBindingDirectory>>>>,
+    directory: Arc<
+        parking_lot::Mutex<
+            Option<Arc<TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding>>>,
+        >,
+    >,
 }
 
 impl FakeFactory {
@@ -394,7 +398,10 @@ impl FakeFactory {
         self.bindings.lock().insert(context.thread().key(), binding);
     }
 
-    fn install_directory(&self, directory: Arc<HvpatchTaskBindingDirectory>) {
+    fn install_directory(
+        &self,
+        directory: Arc<TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding>>,
+    ) {
         *self.directory.lock() = Some(directory);
     }
 
@@ -1649,7 +1656,7 @@ fn hvpatch_test_binding_with_completion(
 }
 
 pub(crate) fn activate_hvpatch_test_submission(
-    dormant: super::PreparedHvpatchSubmission,
+    dormant: super::PreparedTaskSubmission<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
     scheduler: &Scheduler,
     context: &KernelContext,
     state: &MigratableTaskState,
@@ -1660,14 +1667,9 @@ pub(crate) fn activate_hvpatch_test_submission(
         .thread()
         .take_opened_start_gate(generation)
         .expect("exact opened start gate");
-    let proof = HvpatchActivationProof::validate(
-        context,
-        state,
-        generation,
-        binding.identity(),
-        start_gate,
-    )
-    .expect("exact activation proof");
+    let proof =
+        TaskActivationProof::validate(context, state, generation, binding.identity(), start_gate)
+            .expect("exact activation proof");
     dormant
         .activate(scheduler, Arc::clone(context.thread()), proof)
         .expect("activate exact dormant submission");
@@ -1682,7 +1684,9 @@ fn dormant_submission_is_invisible_until_exact_activation() {
         .publish_initial_task_state(state.clone())
         .expect("publish root state");
     let scheduler = Arc::new(Scheduler::new(kernel));
-    let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+    let directory = Arc::new(TaskBindingDirectory::<
+        crate::vcpu_loop::continuation::HvpatchTaskBinding,
+    >::default());
     directory.install_scheduler(&scheduler).unwrap();
     let binding = hvpatch_test_binding(&context, &state, 93);
     let dormant = directory
@@ -1698,7 +1702,7 @@ fn dormant_submission_is_invisible_until_exact_activation() {
 
     assert_eq!(scheduler.queued_len(), 0);
     assert!(
-        <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+        <TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding> as TaskBindingResolver<_>>::resolve(
             directory.as_ref(),
             context.thread().key(),
             generation,
@@ -1714,7 +1718,7 @@ fn dormant_submission_is_invisible_until_exact_activation() {
         binding.as_ref(),
     );
     assert_eq!(scheduler.queued_len(), 1);
-    let resolved = <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+    let resolved = <TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding> as TaskBindingResolver<_>>::resolve(
         directory.as_ref(),
         context.thread().key(),
         generation,
@@ -1739,7 +1743,7 @@ fn shared_submission_directory_accepts_a_non_hvpatch_binding() {
     let dormant = directory
         .prepare_submission(
             &scheduler,
-            HvpatchSubmissionShape::Root,
+            TaskSubmissionShape::Root,
             None,
             Arc::clone(context.thread()),
             generation,
@@ -1912,7 +1916,7 @@ fn kvm_binding_requires_issued_task_mm_and_saved_x86_generation() {
 /// (`rebind_exact_with` -> `replace_exec`), so any publication that
 /// consults kicks while holding the directory closes an ABBA cycle.
 struct DirectoryLockOrderProbeKick {
-    directory: Arc<HvpatchTaskBindingDirectory>,
+    directory: Arc<TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding>>,
     consulted: AtomicUsize,
     directory_free: AtomicBool,
 }
@@ -1968,7 +1972,9 @@ fn exact_activation_publishes_without_holding_the_binding_directory() {
         .publish_initial_task_state(state.clone())
         .expect("publish root state");
     let scheduler = Arc::new(Scheduler::new(kernel));
-    let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+    let directory = Arc::new(TaskBindingDirectory::<
+        crate::vcpu_loop::continuation::HvpatchTaskBinding,
+    >::default());
     directory.install_scheduler(&scheduler).unwrap();
     let probe = Arc::new(DirectoryLockOrderProbeKick {
         directory: Arc::clone(&directory),
@@ -1982,7 +1988,7 @@ fn exact_activation_publishes_without_holding_the_binding_directory() {
     let dormant = directory
         .prepare_submission(
             &scheduler,
-            HvpatchSubmissionShape::Root,
+            TaskSubmissionShape::Root,
             None,
             Arc::clone(context.thread()),
             generation,
@@ -2010,7 +2016,7 @@ fn exact_activation_publishes_without_holding_the_binding_directory() {
     );
     assert_eq!(scheduler.queued_len(), 1);
     assert!(
-        <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+        <TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding> as TaskBindingResolver<_>>::resolve(
             directory.as_ref(),
             context.thread().key(),
             generation,
@@ -2074,13 +2080,15 @@ fn same_task_clone_binding_stays_dormant_until_kernel_gate_opens() {
         .publish_initial_task_state(root_state.clone())
         .unwrap();
     let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
-    let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+    let directory = Arc::new(TaskBindingDirectory::<
+        crate::vcpu_loop::continuation::HvpatchTaskBinding,
+    >::default());
     directory.install_scheduler(&scheduler).unwrap();
     let root_binding = hvpatch_test_binding(&root, &root_state, 88);
     let root_submission = directory
         .prepare_submission(
             &scheduler,
-            HvpatchSubmissionShape::Root,
+            TaskSubmissionShape::Root,
             None,
             Arc::clone(root.thread()),
             root_generation,
@@ -2125,7 +2133,7 @@ fn same_task_clone_binding_stays_dormant_until_kernel_gate_opens() {
     let dormant = directory
         .prepare_submission(
             &scheduler,
-            HvpatchSubmissionShape::SameTaskSibling {
+            TaskSubmissionShape::SameTaskSibling {
                 grant: (root.thread().key(), root_generation),
             },
             Some(&root_authority),
@@ -2153,7 +2161,7 @@ fn same_task_clone_binding_stays_dormant_until_kernel_gate_opens() {
         .thread()
         .take_opened_start_gate(child_generation)
         .unwrap();
-    let proof = HvpatchActivationProof::validate(
+    let proof = TaskActivationProof::validate(
         &child,
         &child_state,
         child_generation,
@@ -2204,13 +2212,15 @@ fn dormant_and_active_clone_directory_retirement_is_exact() {
             .publish_initial_task_state(root_state.clone())
             .unwrap();
         let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
-        let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+        let directory = Arc::new(TaskBindingDirectory::<
+            crate::vcpu_loop::continuation::HvpatchTaskBinding,
+        >::default());
         directory.install_scheduler(&scheduler).unwrap();
         let root_binding = hvpatch_test_binding(&root, &root_state, 80 + case as u64);
         let root_submission = directory
             .prepare_submission(
                 &scheduler,
-                HvpatchSubmissionShape::Root,
+                TaskSubmissionShape::Root,
                 None,
                 Arc::clone(root.thread()),
                 root_generation,
@@ -2259,7 +2269,7 @@ fn dormant_and_active_clone_directory_retirement_is_exact() {
             directory
                 .prepare_submission(
                     &scheduler,
-                    HvpatchSubmissionShape::SameTaskSibling {
+                    TaskSubmissionShape::SameTaskSibling {
                         grant: (root.thread().key(), root_generation),
                     },
                     Some(&root_authority),
@@ -2276,7 +2286,7 @@ fn dormant_and_active_clone_directory_retirement_is_exact() {
                 .thread()
                 .take_opened_start_gate(child_generation)
                 .unwrap();
-            let proof = HvpatchActivationProof::validate(
+            let proof = TaskActivationProof::validate(
                 &child,
                 &child_state,
                 child_generation,
@@ -2398,12 +2408,14 @@ fn dormant_submission_drop_rolls_back_binding_and_queue_authority() {
         .publish_initial_task_state(state.clone())
         .expect("publish root state");
     let scheduler = Scheduler::new(kernel);
-    let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+    let directory = Arc::new(TaskBindingDirectory::<
+        crate::vcpu_loop::continuation::HvpatchTaskBinding,
+    >::default());
     let binding = hvpatch_test_binding(&context, &state, 94);
     let dormant = directory
         .prepare_submission(
             &scheduler,
-            HvpatchSubmissionShape::Root,
+            TaskSubmissionShape::Root,
             None,
             Arc::clone(context.thread()),
             generation,
@@ -2414,7 +2426,7 @@ fn dormant_submission_drop_rolls_back_binding_and_queue_authority() {
 
     assert_eq!(scheduler.queued_len(), 0);
     assert!(
-        <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+        <TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding> as TaskBindingResolver<_>>::resolve(
             directory.as_ref(),
             context.thread().key(),
             generation,
@@ -2424,7 +2436,7 @@ fn dormant_submission_drop_rolls_back_binding_and_queue_authority() {
     let retry = directory
         .prepare_submission(
             &scheduler,
-            HvpatchSubmissionShape::Root,
+            TaskSubmissionShape::Root,
             None,
             Arc::clone(context.thread()),
             generation,
@@ -2445,12 +2457,14 @@ fn dormant_submission_rejects_duplicate_exact_key() {
         .publish_initial_task_state(state.clone())
         .expect("publish root state");
     let scheduler = Scheduler::new(kernel);
-    let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+    let directory = Arc::new(TaskBindingDirectory::<
+        crate::vcpu_loop::continuation::HvpatchTaskBinding,
+    >::default());
     let binding = hvpatch_test_binding(&context, &state, 95);
     let first = directory
         .prepare_submission(
             &scheduler,
-            HvpatchSubmissionShape::Root,
+            TaskSubmissionShape::Root,
             None,
             Arc::clone(context.thread()),
             generation,
@@ -2461,7 +2475,7 @@ fn dormant_submission_rejects_duplicate_exact_key() {
         directory
             .prepare_submission(
                 &scheduler,
-                HvpatchSubmissionShape::Root,
+                TaskSubmissionShape::Root,
                 None,
                 Arc::clone(context.thread()),
                 generation,
@@ -2486,12 +2500,14 @@ fn dormant_activation_coalesces_onto_a_preexisting_exact_queue_row() {
         .publish_initial_task_state(state.clone())
         .expect("publish root state");
     let scheduler = Scheduler::new(kernel);
-    let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+    let directory = Arc::new(TaskBindingDirectory::<
+        crate::vcpu_loop::continuation::HvpatchTaskBinding,
+    >::default());
     let binding = hvpatch_test_binding(&context, &state, 108);
     let dormant = directory
         .prepare_submission(
             &scheduler,
-            HvpatchSubmissionShape::Root,
+            TaskSubmissionShape::Root,
             None,
             Arc::clone(context.thread()),
             generation,
@@ -2508,20 +2524,15 @@ fn dormant_activation_coalesces_onto_a_preexisting_exact_queue_row() {
         .thread()
         .take_opened_start_gate(generation)
         .expect("opened root start gate");
-    let proof = HvpatchActivationProof::validate(
-        &context,
-        &state,
-        generation,
-        binding.identity(),
-        start_gate,
-    )
-    .unwrap();
+    let proof =
+        TaskActivationProof::validate(&context, &state, generation, binding.identity(), start_gate)
+            .unwrap();
 
     dormant
         .activate(&scheduler, Arc::clone(context.thread()), proof)
         .expect("activation coalesces onto the exact row already queued");
     assert!(
-        <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+        <TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding> as TaskBindingResolver<_>>::resolve(
             directory.as_ref(),
             context.thread().key(),
             generation,
@@ -2552,12 +2563,14 @@ fn a_legitimate_wake_before_activation_does_not_reject_the_dormant_submission() 
         .publish_initial_task_state(state.clone())
         .expect("publish root state");
     let scheduler = Scheduler::new(kernel);
-    let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+    let directory = Arc::new(TaskBindingDirectory::<
+        crate::vcpu_loop::continuation::HvpatchTaskBinding,
+    >::default());
     let binding = hvpatch_test_binding(&context, &state, 109);
     let dormant = directory
         .prepare_submission(
             &scheduler,
-            HvpatchSubmissionShape::Root,
+            TaskSubmissionShape::Root,
             None,
             Arc::clone(context.thread()),
             generation,
@@ -2575,21 +2588,16 @@ fn a_legitimate_wake_before_activation_does_not_reject_the_dormant_submission() 
         .thread()
         .take_opened_start_gate(generation)
         .expect("opened root start gate");
-    let proof = HvpatchActivationProof::validate(
-        &context,
-        &state,
-        generation,
-        binding.identity(),
-        start_gate,
-    )
-    .unwrap();
+    let proof =
+        TaskActivationProof::validate(&context, &state, generation, binding.identity(), start_gate)
+            .unwrap();
 
     dormant
         .activate(&scheduler, Arc::clone(context.thread()), proof)
         .expect("a wake-queued exact row must not reject its own activation");
     assert_eq!(scheduler.queued_len(), 1);
     assert!(
-        <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+        <TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding> as TaskBindingResolver<_>>::resolve(
             directory.as_ref(),
             context.thread().key(),
             generation,
@@ -2708,12 +2716,14 @@ fn a_dropped_dormant_submission_leaves_no_claimable_row_for_its_generation() {
     let executor = scheduler
         .register_executor(Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default()))))
         .unwrap();
-    let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+    let directory = Arc::new(TaskBindingDirectory::<
+        crate::vcpu_loop::continuation::HvpatchTaskBinding,
+    >::default());
     let binding = hvpatch_test_binding(&context, &state, 109);
     let dormant = directory
         .prepare_submission(
             &scheduler,
-            HvpatchSubmissionShape::Root,
+            TaskSubmissionShape::Root,
             None,
             Arc::clone(context.thread()),
             generation,
@@ -2725,7 +2735,7 @@ fn a_dropped_dormant_submission_leaves_no_claimable_row_for_its_generation() {
     // while the Kernel thread stays Runnable at this generation.
     drop(dormant);
     assert!(
-        <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+        <TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding> as TaskBindingResolver<_>>::resolve(
             directory.as_ref(),
             context.thread().key(),
             generation,
@@ -2742,7 +2752,7 @@ fn a_dropped_dormant_submission_leaves_no_claimable_row_for_its_generation() {
     let claimable = scheduler.queued_len();
     if claimable != 0 {
         let running = scheduler.take(&executor).expect("claim the queued row");
-        let resolved = <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+        let resolved = <TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding> as TaskBindingResolver<_>>::resolve(
             directory.as_ref(),
             running.thread_key(),
             running.generation(),
@@ -2799,12 +2809,14 @@ fn a_wake_before_activation_leaves_the_dormant_row_unclaimable() {
     let executor = scheduler
         .register_executor(Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default()))))
         .unwrap();
-    let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+    let directory = Arc::new(TaskBindingDirectory::<
+        crate::vcpu_loop::continuation::HvpatchTaskBinding,
+    >::default());
     let binding = hvpatch_test_binding(&context, &state, 110);
     let dormant = directory
         .prepare_submission(
             &scheduler,
-            HvpatchSubmissionShape::Root,
+            TaskSubmissionShape::Root,
             None,
             Arc::clone(context.thread()),
             generation,
@@ -2823,7 +2835,7 @@ fn a_wake_before_activation_leaves_the_dormant_row_unclaimable() {
         let running = scheduler
             .take(&executor)
             .expect("claim the wake-queued row");
-        let resolved = <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+        let resolved = <TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding> as TaskBindingResolver<_>>::resolve(
             directory.as_ref(),
             running.thread_key(),
             running.generation(),
@@ -2843,14 +2855,9 @@ fn a_wake_before_activation_leaves_the_dormant_row_unclaimable() {
         .thread()
         .take_opened_start_gate(generation)
         .expect("opened root start gate");
-    let proof = HvpatchActivationProof::validate(
-        &context,
-        &state,
-        generation,
-        binding.identity(),
-        start_gate,
-    )
-    .unwrap();
+    let proof =
+        TaskActivationProof::validate(&context, &state, generation, binding.identity(), start_gate)
+            .unwrap();
     dormant
         .activate(&scheduler, Arc::clone(context.thread()), proof)
         .expect("activation publishes the wake's held row");
@@ -2861,7 +2868,7 @@ fn a_wake_before_activation_leaves_the_dormant_row_unclaimable() {
     let running = scheduler
         .take(&executor)
         .expect("claim the row activation released");
-    <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+    <TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding> as TaskBindingResolver<_>>::resolve(
         directory.as_ref(),
         running.thread_key(),
         running.generation(),
@@ -2878,7 +2885,9 @@ fn dormant_submission_activates_all_four_exact_authority_shapes() {
     let first_child = process_child(&kernel, &root, 33_996, "first-child");
     let peer_child = process_child(&kernel, &root, 43_996, "peer-child");
     let scheduler = Arc::new(Scheduler::new(kernel));
-    let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+    let directory = Arc::new(TaskBindingDirectory::<
+        crate::vcpu_loop::continuation::HvpatchTaskBinding,
+    >::default());
     directory.install_scheduler(&scheduler).unwrap();
 
     let root_state = task_state(&root, 96);
@@ -2909,7 +2918,7 @@ fn dormant_submission_activates_all_four_exact_authority_shapes() {
     let root_submission = directory
         .prepare_submission(
             &scheduler,
-            HvpatchSubmissionShape::Root,
+            TaskSubmissionShape::Root,
             None,
             Arc::clone(root.thread()),
             root_generation,
@@ -2932,7 +2941,7 @@ fn dormant_submission_activates_all_four_exact_authority_shapes() {
         directory
             .prepare_submission(
                 &scheduler,
-                HvpatchSubmissionShape::SameTaskSibling { grant: root_grant },
+                TaskSubmissionShape::SameTaskSibling { grant: root_grant },
                 None,
                 Arc::clone(sibling.thread()),
                 sibling_generation,
@@ -2957,7 +2966,7 @@ fn dormant_submission_activates_all_four_exact_authority_shapes() {
     let sibling_submission = worker_submission
         .prepare_hvpatch_submission(
             &directory,
-            HvpatchSubmissionShape::SameTaskSibling { grant: root_grant },
+            TaskSubmissionShape::SameTaskSibling { grant: root_grant },
             Arc::clone(sibling.thread()),
             sibling_generation,
             Arc::clone(&sibling_binding),
@@ -2975,7 +2984,7 @@ fn dormant_submission_activates_all_four_exact_authority_shapes() {
     let child_submission = directory
         .prepare_submission(
             &scheduler,
-            HvpatchSubmissionShape::Descendant { grant: root_grant },
+            TaskSubmissionShape::Descendant { grant: root_grant },
             Some(&root_authority),
             Arc::clone(first_child.thread()),
             first_child_generation,
@@ -2997,7 +3006,7 @@ fn dormant_submission_activates_all_four_exact_authority_shapes() {
     let peer_submission = directory
         .prepare_submission(
             &scheduler,
-            HvpatchSubmissionShape::PeerRoot {
+            TaskSubmissionShape::PeerRoot {
                 grant: (first_child.thread().key(), first_child_generation),
             },
             Some(&first_child_authority),
@@ -3031,7 +3040,9 @@ fn dormant_submission_rejects_each_wrong_non_root_authority_shape() {
     let first_child = process_child(&kernel, &root, 33_997, "first-child");
     let peer_child = process_child(&kernel, &root, 43_997, "peer-child");
     let scheduler = Scheduler::new(Arc::clone(&kernel));
-    let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+    let directory = Arc::new(TaskBindingDirectory::<
+        crate::vcpu_loop::continuation::HvpatchTaskBinding,
+    >::default());
     let root_state = task_state(&root, 100);
     let root_generation = root
         .thread()
@@ -3041,7 +3052,7 @@ fn dormant_submission_rejects_each_wrong_non_root_authority_shape() {
     let root_submission = directory
         .prepare_submission(
             &scheduler,
-            HvpatchSubmissionShape::Root,
+            TaskSubmissionShape::Root,
             None,
             Arc::clone(root.thread()),
             root_generation,
@@ -3075,7 +3086,7 @@ fn dormant_submission_rejects_each_wrong_non_root_authority_shape() {
         directory
             .prepare_submission(
                 &scheduler,
-                HvpatchSubmissionShape::SameTaskSibling { grant: root_grant },
+                TaskSubmissionShape::SameTaskSibling { grant: root_grant },
                 Some(&root_authority),
                 Arc::clone(first_child.thread()),
                 first_child_generation,
@@ -3084,8 +3095,8 @@ fn dormant_submission_rejects_each_wrong_non_root_authority_shape() {
             .is_err()
     );
     for shape in [
-        HvpatchSubmissionShape::Descendant { grant: root_grant },
-        HvpatchSubmissionShape::PeerRoot { grant: root_grant },
+        TaskSubmissionShape::Descendant { grant: root_grant },
+        TaskSubmissionShape::PeerRoot { grant: root_grant },
     ] {
         assert!(
             directory
@@ -3105,7 +3116,7 @@ fn dormant_submission_rejects_each_wrong_non_root_authority_shape() {
     let first_child_submission = directory
         .prepare_submission(
             &scheduler,
-            HvpatchSubmissionShape::Descendant { grant: root_grant },
+            TaskSubmissionShape::Descendant { grant: root_grant },
             Some(&root_authority),
             Arc::clone(first_child.thread()),
             first_child_generation,
@@ -3134,7 +3145,7 @@ fn dormant_submission_rejects_each_wrong_non_root_authority_shape() {
         directory
             .prepare_submission(
                 &scheduler,
-                HvpatchSubmissionShape::Descendant { grant: root_grant },
+                TaskSubmissionShape::Descendant { grant: root_grant },
                 Some(&root_authority),
                 Arc::clone(child_sibling.thread()),
                 child_sibling_generation,
@@ -3152,7 +3163,7 @@ fn dormant_submission_rejects_each_wrong_non_root_authority_shape() {
         directory
             .prepare_submission(
                 &scheduler,
-                HvpatchSubmissionShape::Descendant {
+                TaskSubmissionShape::Descendant {
                     grant: (first_child.thread().key(), first_child_generation),
                 },
                 Some(&first_child_authority),
@@ -3172,7 +3183,7 @@ fn dormant_submission_rejects_each_wrong_non_root_authority_shape() {
         directory
             .prepare_submission(
                 &scheduler,
-                HvpatchSubmissionShape::PeerRoot {
+                TaskSubmissionShape::PeerRoot {
                     grant: (first_child.thread().key(), first_child_generation),
                 },
                 Some(&first_child_authority),
@@ -3200,14 +3211,16 @@ fn dormant_root_submission_rejects_a_process_child_authority_shape() {
         .publish_initial_task_state(state.clone())
         .expect("publish child state");
     let scheduler = Scheduler::new(kernel);
-    let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+    let directory = Arc::new(TaskBindingDirectory::<
+        crate::vcpu_loop::continuation::HvpatchTaskBinding,
+    >::default());
     let binding = hvpatch_test_binding(&child, &state, 92);
 
     assert!(
         directory
             .prepare_submission(
                 &scheduler,
-                HvpatchSubmissionShape::Root,
+                TaskSubmissionShape::Root,
                 None,
                 Arc::clone(child.thread()),
                 generation,
@@ -3840,7 +3853,8 @@ fn hvpatch_binding_rollover_publishes_exact_successor_before_retiring_predecesso
         )),
         Box::new(17_u64),
     ));
-    let directory = HvpatchTaskBindingDirectory::default();
+    let directory =
+        TaskBindingDirectory::<crate::vcpu_loop::continuation::HvpatchTaskBinding>::default();
     directory
         .publish(context.thread().key(), first, Arc::clone(&binding))
         .unwrap();
@@ -3848,14 +3862,14 @@ fn hvpatch_binding_rollover_publishes_exact_successor_before_retiring_predecesso
         .rollover_exact(context.thread().key(), first, successor)
         .unwrap();
     assert!(
-        <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+        <TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding> as TaskBindingResolver<_>>::resolve(
             &directory,
             context.thread().key(),
             first,
         )
         .is_err()
     );
-    let resolved = <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+    let resolved = <TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding> as TaskBindingResolver<_>>::resolve(
         &directory,
         context.thread().key(),
         successor,
@@ -3885,7 +3899,9 @@ fn shutdown_cancels_dormant_exact_binding_and_completes_once() {
     let (kernel, context) = bootstrap(14_014);
     let generation = publish(&context, 14);
     let scheduler = Arc::new(Scheduler::new(kernel));
-    let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+    let directory = Arc::new(TaskBindingDirectory::<
+        crate::vcpu_loop::continuation::HvpatchTaskBinding,
+    >::default());
     directory.install_scheduler(&scheduler).unwrap();
     let completion = crate::vcpu_loop::continuation::LogicalJobCompletion::pending();
     let binding = Arc::new(crate::vcpu_loop::continuation::HvpatchTaskBinding::new(
@@ -3950,7 +3966,7 @@ fn shutdown_cancels_dormant_exact_binding_and_completes_once() {
         ThreadExecutionState::Failed { .. }
     ));
     assert!(
-        <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+        <TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding> as TaskBindingResolver<_>>::resolve(
             directory.as_ref(),
             context.thread().key(),
             blocked_generation,
@@ -3976,7 +3992,9 @@ fn exec_replacement_keeps_worker_identity_and_swaps_thread_mm_asid_binding() {
     let old_mm = context.shared().mm().id();
     let old_generation = publish(&context, 16);
     let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
-    let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+    let directory = Arc::new(TaskBindingDirectory::<
+        crate::vcpu_loop::continuation::HvpatchTaskBinding,
+    >::default());
     directory.install_scheduler(&scheduler).unwrap();
     let completion = crate::vcpu_loop::continuation::LogicalJobCompletion::pending();
     let old_binding = Arc::new(crate::vcpu_loop::continuation::HvpatchTaskBinding::new(
@@ -5931,7 +5949,8 @@ fn pre_exit_executor_failure_publishes_an_error_instead_of_thread_done() {
         )),
         Box::new(161_u64),
     ));
-    let directory = HvpatchTaskBindingDirectory::default();
+    let directory =
+        TaskBindingDirectory::<crate::vcpu_loop::continuation::HvpatchTaskBinding>::default();
     directory
         .publish(context.thread().key(), generation, binding)
         .expect("publish exact failure-settlement binding");
@@ -5971,9 +5990,10 @@ struct VforkTestFixture {
     factory: Arc<FakeFactory>,
     parent_binding: Arc<FakeBinding>,
     parent_authority: Option<SubmissionAuthority>,
-    directory: Arc<HvpatchTaskBindingDirectory>,
-    dormant: Option<super::PreparedHvpatchSubmission>,
-    child_proof: HvpatchActivationProof,
+    directory: Arc<TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding>>,
+    dormant:
+        Option<super::PreparedTaskSubmission<crate::vcpu_loop::continuation::HvpatchTaskBinding>>,
+    child_proof: TaskActivationProof,
     child_threads: crate::vcpu_loop::VcpuThreadRegistry,
     terminal_settlement: super::super::HvpatchExternalTerminalSettlement,
     runtime_directory: Arc<super::super::HvpatchRuntimeDirectory>,
@@ -6018,12 +6038,14 @@ impl VforkTestFixture {
             .admit_root(parent.thread().key(), parent_generation)
             .expect("admit root");
 
-        let directory = Arc::new(HvpatchTaskBindingDirectory::default());
+        let directory = Arc::new(TaskBindingDirectory::<
+            crate::vcpu_loop::continuation::HvpatchTaskBinding,
+        >::default());
         factory.install_directory(Arc::clone(&directory));
         let dormant = directory
             .prepare_submission(
                 &scheduler,
-                HvpatchSubmissionShape::Descendant {
+                TaskSubmissionShape::Descendant {
                     grant: (parent.thread().key(), parent_generation),
                 },
                 Some(&parent_authority),
@@ -6040,7 +6062,7 @@ impl VforkTestFixture {
             .thread()
             .take_opened_start_gate(child_generation)
             .unwrap();
-        let child_proof = HvpatchActivationProof::validate(
+        let child_proof = TaskActivationProof::validate(
             &child,
             &child_state,
             child_generation,
@@ -6080,7 +6102,7 @@ impl VforkTestFixture {
 
     fn make_activation(
         &mut self,
-        proof: Option<HvpatchActivationProof>,
+        proof: Option<TaskActivationProof>,
     ) -> super::PreparedVforkChildActivation {
         let member_pub = super::super::PersistentProcessMemberPublication::new(
             self.child_threads.clone(),
@@ -6382,7 +6404,7 @@ fn vfork_child_activation_failure_rolls_back_and_fails_parent_claim() {
     let continuation = fixture.make_continuation();
 
     // Invalid proof with mismatched thread
-    let invalid_proof = HvpatchActivationProof {
+    let invalid_proof = TaskActivationProof {
         thread: fixture.parent.thread().key(),
         generation: fixture.child_generation,
         identity: TaskLoadIdentity {
@@ -6413,7 +6435,7 @@ fn vfork_child_activation_failure_rolls_back_and_fails_parent_claim() {
 
     // Child dormant submission rolled back (not present in directory)
     assert!(
-        <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+        <TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding> as TaskBindingResolver<_>>::resolve(
             fixture.directory.as_ref(),
             fixture.child.thread().key(),
             fixture.child_generation,
@@ -6465,7 +6487,7 @@ fn vfork_child_activation_failpoint_rolls_back_and_fails_parent_claim() {
     let _ = pool.shutdown();
 
     assert!(
-        <HvpatchTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+        <TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding> as TaskBindingResolver<_>>::resolve(
             fixture.directory.as_ref(),
             fixture.child.thread().key(),
             fixture.child_generation,
@@ -7559,7 +7581,7 @@ fn run_production_exec_failure_pool_case(boundary: InjectedExecFailureBoundary, 
         .persistent_bindings()
         .prepare_submission(
             &scheduler,
-            HvpatchSubmissionShape::Root,
+            TaskSubmissionShape::Root,
             None,
             Arc::clone(context.thread()),
             generation,
@@ -7593,7 +7615,7 @@ fn run_production_exec_failure_pool_case(boundary: InjectedExecFailureBoundary, 
         .persistent_bindings()
         .prepare_submission(
             &scheduler,
-            HvpatchSubmissionShape::Descendant { grant: root_grant },
+            TaskSubmissionShape::Descendant { grant: root_grant },
             Some(&root_authority),
             Arc::clone(follow_child.thread()),
             follow_generation,

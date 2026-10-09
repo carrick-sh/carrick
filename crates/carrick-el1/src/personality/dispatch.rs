@@ -708,7 +708,9 @@ impl<
                     validator: &file::HardwareValidator,
                 };
                 if !user.copy_in(&mut ts, tmo_ptr) {
-                    return FamilyCompletion::Complete(-14);
+                    return FamilyCompletion::Complete(
+                        carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+                    );
                 }
                 let mut seconds = [0u8; 8];
                 let mut nanoseconds = [0u8; 8];
@@ -759,7 +761,7 @@ impl<
             );
         }
         if nfds > 1024 {
-            return FamilyCompletion::Complete(-22);
+            return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EINVAL.guest_retval());
         }
         let mut pollfds = alloc::vec![super::file_table::PollFd::default(); nfds];
         let bytes = unsafe {
@@ -776,7 +778,7 @@ impl<
             user.copy_in(bytes, fds_ptr)
         };
         if !copied {
-            return FamilyCompletion::Complete(-14);
+            return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EFAULT.guest_retval());
         }
         let file_table = task
             .linux
@@ -830,7 +832,9 @@ impl<
                     validator: &file::HardwareValidator,
                 };
                 if !user.copy_out(fds_ptr, out_bytes) {
-                    return FamilyCompletion::Complete(-14);
+                    return FamilyCompletion::Complete(
+                        carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+                    );
                 }
                 return FamilyCompletion::Complete(ready as i64);
             }
@@ -857,7 +861,7 @@ impl<
             )
         };
         if !user.copy_out(fds_ptr, out_bytes) {
-            return FamilyCompletion::Complete(-14);
+            return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EFAULT.guest_retval());
         }
         if ready > 0 || timeout_ms == 0 {
             FamilyCompletion::Complete(ready as i64)
@@ -885,7 +889,9 @@ impl<
                 let new = self.frame.argument(1).unwrap_or(0) as i32;
                 let flags = self.frame.argument(2).unwrap_or(0);
                 if flags & !0x80000 != 0 || old == new {
-                    return FamilyCompletion::Complete(-22);
+                    return FamilyCompletion::Complete(
+                        carrick_syscall_abi::LINUX_EINVAL.guest_retval(),
+                    );
                 }
                 super::file_table::dup2_host_binding(self.fd_map, file_table, old, new, flags != 0)
             }

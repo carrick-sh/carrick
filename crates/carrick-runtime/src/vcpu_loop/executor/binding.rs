@@ -417,12 +417,13 @@ impl<'a, 'lease> HvpatchQuantumControl<'a, 'lease> {
 
     pub(crate) fn prepare_hvpatch_submission(
         &self,
-        directory: &Arc<HvpatchTaskBindingDirectory>,
+        directory: &Arc<TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding>>,
         shape: TaskSubmissionShape,
         thread: Arc<carrick_kernel::kernel::Thread>,
         generation: ExecutionGeneration,
         binding: Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
-    ) -> Result<PreparedHvpatchSubmission, TrapError> {
+    ) -> Result<PreparedTaskSubmission<crate::vcpu_loop::continuation::HvpatchTaskBinding>, TrapError>
+    {
         self.submission
             .prepare_hvpatch_submission(directory, shape, thread, generation, binding)
     }
@@ -480,12 +481,13 @@ impl ExecutorSubmissionContext<'_> {
     #[allow(dead_code)]
     pub(crate) fn prepare_hvpatch_submission(
         &self,
-        directory: &Arc<HvpatchTaskBindingDirectory>,
-        shape: HvpatchSubmissionShape,
+        directory: &Arc<TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding>>,
+        shape: TaskSubmissionShape,
         thread: Arc<carrick_kernel::kernel::Thread>,
         generation: ExecutionGeneration,
         binding: Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
-    ) -> Result<PreparedHvpatchSubmission, TrapError> {
+    ) -> Result<PreparedTaskSubmission<crate::vcpu_loop::continuation::HvpatchTaskBinding>, TrapError>
+    {
         let current = self.current.ok_or_else(|| {
             TrapError::Hypervisor(
                 "resident HVPatch task has no worker-held submission authority".to_owned(),
@@ -622,11 +624,6 @@ pub(crate) struct TaskBindingRecord<B> {
     pub(crate) active: bool,
 }
 
-pub(crate) type HvpatchTaskBindingDirectory =
-    TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding>;
-pub(crate) type HvpatchTaskRecord =
-    TaskBindingRecord<crate::vcpu_loop::continuation::HvpatchTaskBinding>;
-
 impl<B: PersistentTaskBinding + Send + Sync + 'static> TaskBindingDirectory<B> {
     pub(crate) fn install_scheduler(
         self: &Arc<Self>,
@@ -735,31 +732,31 @@ impl<B: PersistentTaskBinding + Send + Sync + 'static> TaskBindingDirectory<B> {
             ));
         }
         let authority = match (shape, grant_authority) {
-            (HvpatchSubmissionShape::ProcessBirth(reservation), None) => {
+            (TaskSubmissionShape::ProcessBirth(reservation), None) => {
                 reservation.activate(scheduler, &thread).map_err(|_| {
                     TrapError::Hypervisor(
                         "process birth submission rejected its exact thread".to_owned(),
                     )
                 })?
             }
-            (HvpatchSubmissionShape::Root, None) => scheduler
+            (TaskSubmissionShape::Root, None) => scheduler
                 .admit_process_root(key.0, key.1)
                 .map_err(|error| TrapError::Hypervisor(error.to_string()))?,
-            (HvpatchSubmissionShape::Descendant { grant }, Some(authority))
+            (TaskSubmissionShape::Descendant { grant }, Some(authority))
                 if (authority.thread_key(), authority.generation()) == grant =>
             {
                 authority
                     .admit_descendant(key.0, key.1)
                     .map_err(|error| TrapError::Hypervisor(error.to_string()))?
             }
-            (HvpatchSubmissionShape::SameTaskSibling { grant }, Some(authority))
+            (TaskSubmissionShape::SameTaskSibling { grant }, Some(authority))
                 if (authority.thread_key(), authority.generation()) == grant =>
             {
                 authority
                     .admit_same_task_sibling(key.0, key.1)
                     .map_err(|error| TrapError::Hypervisor(error.to_string()))?
             }
-            (HvpatchSubmissionShape::PeerRoot { grant }, Some(authority))
+            (TaskSubmissionShape::PeerRoot { grant }, Some(authority))
                 if (authority.thread_key(), authority.generation()) == grant =>
             {
                 authority
@@ -875,16 +872,12 @@ pub(crate) enum TaskSubmissionShape {
     },
 }
 
-pub(crate) type HvpatchSubmissionShape = TaskSubmissionShape;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TaskActivationProof {
     pub(crate) thread: ThreadKey,
     pub(crate) generation: ExecutionGeneration,
     pub(crate) identity: TaskLoadIdentity,
 }
-
-pub(crate) type HvpatchActivationProof = TaskActivationProof;
 
 impl TaskActivationProof {
     pub(crate) fn validate(
@@ -921,9 +914,6 @@ pub(crate) struct PreparedTaskSubmission<B> {
     key: (ThreadKey, ExecutionGeneration),
     armed: bool,
 }
-
-pub(crate) type PreparedHvpatchSubmission =
-    PreparedTaskSubmission<crate::vcpu_loop::continuation::HvpatchTaskBinding>;
 
 impl<B: PersistentTaskBinding + Send + Sync + 'static> PreparedTaskSubmission<B> {
     pub(crate) fn activate(
@@ -1000,10 +990,10 @@ static VFORK_ACTIVATION_HOOK: crate::test_hooks::TaskHookRegistry<Box<dyn Fn() +
     crate::test_hooks::TaskHookRegistry::new();
 
 pub(crate) struct PreparedVforkChildActivation {
-    dormant: PreparedHvpatchSubmission,
+    dormant: PreparedTaskSubmission<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
     scheduler: Arc<Scheduler>,
     child_thread: Arc<carrick_kernel::kernel::Thread>,
-    proof: HvpatchActivationProof,
+    proof: TaskActivationProof,
     member_publication: PersistentProcessMemberPublication,
     job_reservation: ContainerJobReservation,
     job_result: HvpatchLoopResult,
@@ -1017,10 +1007,10 @@ impl PreparedVforkChildActivation {
     // compile time; a loose builder would permit partially armed activation.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        dormant: PreparedHvpatchSubmission,
+        dormant: PreparedTaskSubmission<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
         scheduler: Arc<Scheduler>,
         child_thread: Arc<carrick_kernel::kernel::Thread>,
-        proof: HvpatchActivationProof,
+        proof: TaskActivationProof,
         member_publication: PersistentProcessMemberPublication,
         job_reservation: ContainerJobReservation,
         job_result: HvpatchLoopResult,
@@ -1189,10 +1179,10 @@ impl<B: PersistentTaskBinding + Send + Sync + 'static>
 }
 
 impl TaskBindingResolver<crate::vcpu_loop::continuation::HvpatchTaskBinding>
-    for HvpatchTaskBindingDirectory
+    for TaskBindingDirectory<crate::vcpu_loop::continuation::HvpatchTaskBinding>
 {
     fn install_scheduler(self: &Arc<Self>, scheduler: &Arc<Scheduler>) -> Result<(), TrapError> {
-        HvpatchTaskBindingDirectory::install_scheduler(self, scheduler)
+        TaskBindingDirectory::<crate::vcpu_loop::continuation::HvpatchTaskBinding>::install_scheduler(self, scheduler)
     }
 
     fn resolve(
@@ -1218,7 +1208,9 @@ impl TaskBindingResolver<crate::vcpu_loop::continuation::HvpatchTaskBinding>
     }
 
     fn retire(&self, thread: ThreadKey, generation: ExecutionGeneration) {
-        HvpatchTaskBindingDirectory::retire(self, thread, generation);
+        TaskBindingDirectory::<crate::vcpu_loop::continuation::HvpatchTaskBinding>::retire(
+            self, thread, generation,
+        );
     }
 
     fn cancel_dormant(
@@ -1327,7 +1319,7 @@ impl TaskBindingResolver<crate::vcpu_loop::continuation::HvpatchTaskBinding>
         };
         bindings.insert(
             (successor_thread, successor_generation),
-            HvpatchTaskRecord {
+            TaskBindingRecord::<crate::vcpu_loop::continuation::HvpatchTaskBinding> {
                 binding: Arc::clone(&replacement),
                 authority: None,
                 active: true,
