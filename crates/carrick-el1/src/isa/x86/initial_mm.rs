@@ -5,8 +5,8 @@ extern crate alloc as image_alloc;
 
 use carrick_el1_abi::GuestMmuPublication;
 use carrick_guest_arch::{
-    AddressContext, ContextGeneration, EditBacking, EditIntent, EditLeafSize, EditOperation,
-    EditOwner, EditPermissions, FrameGpa, GuestLen, MmGeneration, RootGpa, UserRange, UserVa,
+    AddressContext, ContextGeneration, EditBacking, EditIntent, EditOperation, EditOwner,
+    EditPermissions, FrameGpa, GuestLen, MmGeneration, RootGpa, UserRange, UserVa,
 };
 use carrick_mmu_core::x86::descriptor_txn::{
     DescriptorOutcome, DescriptorTxn, InlineJournal, LiveDescriptorWords, PRESENT, USER,
@@ -500,20 +500,11 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
             let intent = EditIntent::checked(
                 owner,
                 range,
-                match region.contents {
-                    RegionContents::Stack(_) => EditOperation::Prepare {
-                        output: grant.frame,
-                        permissions: region.perms,
-                        resident: range,
-                        backing: grant.backing,
-                    },
-                    RegionContents::Guest(_) => EditOperation::Map {
-                        output: grant.frame,
-                        permissions: region.perms,
-                        size: EditLeafSize::Page,
-                        resident: true,
-                        backing: grant.backing,
-                    },
+                EditOperation::Prepare {
+                    output: grant.frame,
+                    permissions: region.perms,
+                    resident: range,
+                    backing: grant.backing,
                 },
                 &tables[used_tables..],
             )
@@ -787,6 +778,19 @@ mod tests {
             stack_leaf.descriptor & carrick_mmu_core::x86::descriptor_txn::PRIVATE,
             0,
             "the initial anonymous stack needs owner-private COW custody"
+        );
+        let data_leaf = translate_leaf(
+            &words,
+            loaded.address.root,
+            UserVa::new(0x402000),
+            Access::Write,
+            true,
+        )
+        .unwrap();
+        assert_ne!(
+            data_leaf.descriptor & carrick_mmu_core::x86::descriptor_txn::PRIVATE,
+            0,
+            "initial ELF data is private Linux mapping custody too"
         );
         assert_eq!(loaded.publications.len(), 3);
         assert_eq!(loaded.initial_break.raw(), 0x403000);
