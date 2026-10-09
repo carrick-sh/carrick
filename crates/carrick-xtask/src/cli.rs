@@ -20,6 +20,8 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    #[command(about = "Check the AArch64 EL1 fork stack budget")]
+    El1Stack(crate::el1_stack::El1StackArgs),
     #[command(about = "Compare guest asm source between two git revisions")]
     AsmDiff(crate::asm_diff::AsmDiffArgs),
     #[command(about = "Display repository information as JSON")]
@@ -157,6 +159,8 @@ pub enum CliError {
     AuthorityDebt(#[from] crate::authority_debt::DebtError),
     #[error("impact: {0}")]
     Impact(String),
+    #[error("EL1 stack audit: {0}")]
+    El1Stack(String),
     #[error("{0}")]
     Clap(#[from] clap::Error),
 
@@ -308,6 +312,7 @@ where
         }
     }
     match cli.command {
+        Commands::El1Stack(args) => crate::el1_stack::run(args, writer).map_err(CliError::El1Stack),
         Commands::AsmDiff(args) => {
             let info = resolve_repo_info(cli.root.as_deref())?;
             crate::asm_diff::run(&info.repository_root, args, writer)?;

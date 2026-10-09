@@ -3,6 +3,8 @@
 use super::MmPortal;
 use super::{El1MmHandle, MmError};
 #[cfg(target_os = "none")]
+use crate::rust_alloc::boxed::Box;
+#[cfg(target_os = "none")]
 use crate::rust_alloc::vec::Vec;
 use carrick_core::mm::transaction::{MmPortal as CoreMmPortal, OwnerVenue};
 use carrick_el1_abi::{EntryContext, ReservationGeometry, ReservationPolicy};
@@ -19,6 +21,8 @@ use carrick_mmu_core::x86::owner_mmu::X86Mmu as NativeForkMmu;
 #[cfg(target_os = "none")]
 use carrick_personality_linux::mm::MmErrorLinux;
 use core::num::NonZeroU64;
+#[cfg(not(target_os = "none"))]
+use std::boxed::Box;
 #[cfg(not(target_os = "none"))]
 use std::vec::Vec;
 
@@ -168,6 +172,14 @@ pub trait NativeForkPortal<P: PinnedMetadataExtent, B: OwnerForkMmu = NativeFork
     fn publish_fork<W: LiveDescriptorWords + ?Sized>(
         &self,
         plan: PreparedOwnerFork<B>,
+        words: &W,
+        worker: u32,
+    ) -> Result<UnpublishedEl1Child<B>, MmError> {
+        self.publish_fork_boxed(Box::new(plan), words, worker)
+    }
+    fn publish_fork_boxed<W: LiveDescriptorWords + ?Sized>(
+        &self,
+        plan: Box<PreparedOwnerFork<B>>,
         words: &W,
         worker: u32,
     ) -> Result<UnpublishedEl1Child<B>, MmError>;
@@ -383,9 +395,9 @@ impl<
     /// Physical custody is acquired from `plan.custody()` with no owner lock.
     /// After that effect, this phase revalidates every live parent word before
     /// linking any new table, then clones only the owner's reservation tree.
-    fn publish_fork<W: LiveDescriptorWords + ?Sized>(
+    fn publish_fork_boxed<W: LiveDescriptorWords + ?Sized>(
         &self,
-        plan: PreparedOwnerFork<B>,
+        plan: Box<PreparedOwnerFork<B>>,
         words: &W,
         worker: u32,
     ) -> Result<UnpublishedEl1Child<B>, MmError> {
@@ -419,7 +431,7 @@ impl<
         let mmap_next = editor.mmap_next();
         let brk = root.brk_current();
         let mut stage = carrick_core::mm::fork::ForkPublishStage::RevalidateWords;
-        let inner = match plan.publish(words, root, child, child_handle, &mut stage) {
+        let inner = match (*plan).publish(words, root, child, child_handle, &mut stage) {
             Ok(inner) => inner,
             Err(error) => {
                 #[cfg(all(target_os = "none", target_arch = "aarch64"))]

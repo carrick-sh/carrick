@@ -10,6 +10,7 @@ use super::{
     PreparedNodeHeader as PreparedHeader, ReservationNode as Node, ReservationNodeData as NodeData,
     ReservationNodePayload as NodePayload,
 };
+use alloc::vec::Vec;
 use carrick_core_abi::*;
 pub use carrick_core_abi::{Decision, Layout, MoveTarget, Placement, Refusal};
 use core::cell::UnsafeCell;
@@ -33,6 +34,11 @@ pub use notification::RootReleaseVenue;
 
 const ROOTS: usize = carrick_sched_core::spaces::ADDRESS_SPACES;
 const NODES: usize = 1024;
+struct AvlDepth(usize);
+// Minimum-node AVL recurrence N(h)=1+N(h-1)+N(h-2): height 46 needs
+// 4,807,526,975 nodes, more than the u32 node-index domain.
+const MAX_AVL_DEPTH: AvlDepth = AvlDepth(46);
+const MAX_BALANCED_BUILD_DEPTH: AvlDepth = AvlDepth(34);
 // The high two bits of next_free describe node custody while it is outside a
 // free list. Prepared-copy phases use the same bits; every phase owns its node.
 const NODE_OWNED: u64 = 1 << 63;
@@ -906,6 +912,7 @@ impl<
             .read(node.left)
             .height
             .max(self.read(node.right).height);
+        assert!(node.height as usize <= MAX_AVL_DEPTH.0);
         self.write(id, node);
         id
     }
@@ -955,19 +962,42 @@ impl<
         }
         id
     }
+    #[inline(never)]
     fn source_insert(&mut self, root: u32, id: u32) -> u32 {
-        if root == 0 {
-            return self.source_fix(id);
-        }
-        let mut node = self.read(root);
         let inserted = self.read(id);
-        if (inserted.start, inserted.end) < (node.start, node.end) {
-            node.left = self.source_insert(node.left, id);
-        } else {
-            node.right = self.source_insert(node.right, id);
+        // Carry the AVL descent explicitly. An AVL tree of height 46 needs
+        // more than 2^32 nodes, beyond this table's u32 index domain.
+        let mut ancestors = [0u32; MAX_AVL_DEPTH.0];
+        let mut left_turns = 0u64;
+        let mut depth = 0usize;
+        let mut cursor = root;
+        while cursor != 0 {
+            assert!(
+                depth < ancestors.len(),
+                "source AVL height exceeds u32 capacity"
+            );
+            let node = self.read(cursor);
+            let left = (inserted.start, inserted.end) < (node.start, node.end);
+            ancestors[depth] = cursor;
+            left_turns |= u64::from(left) << depth;
+            depth += 1;
+            cursor = if left { node.left } else { node.right };
         }
-        self.write(root, node);
-        self.source_balance(root)
+        let mut subtree = self.source_fix(id);
+        while depth != 0 {
+            depth -= 1;
+            let parent = ancestors[depth];
+            let left = left_turns & (1 << depth) != 0;
+            let mut node = self.read(parent);
+            if left {
+                node.left = subtree;
+            } else {
+                node.right = subtree;
+            }
+            self.write(parent, node);
+            subtree = self.source_balance(parent);
+        }
+        subtree
     }
     fn source_min(&mut self, id: u32) -> (u32, u32) {
         let mut node = self.read(id);
@@ -1366,10 +1396,27 @@ impl<
         if id == 0 {
             return Ok(());
         }
-        let node = self.read(id);
-        self.observe_tree(node.left, runs)?;
-        runs.push(node)?;
-        self.observe_tree(node.right, runs)
+        // Keep one copied node per AVL level in operation-owned scratch, so
+        // observation retains one read per node without recursive EL1 frames.
+        let mut pending = Vec::new();
+        pending
+            .try_reserve_exact(MAX_AVL_DEPTH.0)
+            .map_err(|_| Refusal::Limit)?;
+        let mut cursor = id;
+        while cursor != 0 || !pending.is_empty() {
+            while cursor != 0 {
+                if pending.len() == pending.capacity() {
+                    return Err(Refusal::Limit);
+                }
+                let node = self.read(cursor);
+                cursor = node.left;
+                pending.push(node);
+            }
+            let node = pending.pop().ok_or(Refusal::Stale)?;
+            runs.push(node)?;
+            cursor = node.right;
+        }
+        Ok(())
     }
     /// The committed nodes overlapping `range`, each with its incarnation,
     /// in address order: one bounded descent per node, independent of the
@@ -1566,6 +1613,7 @@ impl<
         let l = self.read(n.left);
         let r = self.read(n.right);
         n.height = 1 + l.height.max(r.height);
+        assert!(n.height as usize <= MAX_AVL_DEPTH.0);
         n.first = if n.left == 0 { n.start } else { l.first };
         n.last = if n.right == 0 { n.end } else { r.last };
         n.gap = l
@@ -2792,48 +2840,99 @@ impl<
         list: &mut CopyList,
         child: &mut Reservations<'_, Policy, Geometry, C>,
     ) -> Result<(), Refusal> {
-        if id == 0 {
-            return Ok(());
-        }
-        let n = self.read(id);
-        self.copy_in_order(n.left, list, child)?;
-        if Policy::inherits(&n) {
-            let copy = self.pool_node()?;
-            let mut data = n;
-            data.left = 0;
-            data.right = 0;
-            self.write(copy, data);
-            if list.tail == 0 {
-                list.head = copy;
-            } else {
-                let mut tail = self.read(list.tail);
-                tail.right = copy;
-                self.write(list.tail, tail);
+        // A recursive walk retained one EL1 frame per AVL level during fork.
+        // Height 46 needs more than 2^32 nodes, beyond the u32 index domain.
+        let mut pending = [0u32; MAX_AVL_DEPTH.0];
+        let mut depth = 0usize;
+        let mut cursor = id;
+        while cursor != 0 || depth != 0 {
+            while cursor != 0 {
+                let slot = pending.get_mut(depth).ok_or(Refusal::Limit)?;
+                *slot = cursor;
+                depth += 1;
+                cursor = self.read(cursor).left;
             }
-            list.tail = copy;
-            list.len += 1;
-            if let Some(source) = n.host_backing {
-                child.source_reserve(source)?;
-                child.source_add(source, n.end - n.start)?;
+            depth -= 1;
+            let n = self.read(pending[depth]);
+            if Policy::inherits(&n) {
+                let copy = self.pool_node()?;
+                let mut data = n;
+                data.left = 0;
+                data.right = 0;
+                self.write(copy, data);
+                if list.tail == 0 {
+                    list.head = copy;
+                } else {
+                    let mut tail = self.read(list.tail);
+                    tail.right = copy;
+                    self.write(list.tail, tail);
+                }
+                list.tail = copy;
+                list.len += 1;
+                if let Some(source) = n.host_backing {
+                    child.source_reserve(source)?;
+                    child.source_add(source, n.end - n.start)?;
+                }
             }
+            cursor = n.right;
         }
-        self.copy_in_order(n.right, list, child)
+        Ok(())
     }
     /// Consume `len` nodes of a `right`-linked sorted list into a perfectly
     /// balanced subtree (a valid AVL tree), constant work per node.
     fn build_balanced(&mut self, len: usize, cursor: &mut u32) -> u32 {
-        if len == 0 {
-            return 0;
+        // The sorted list contains at most u32::MAX nodes. Its balanced
+        // construction needs at most 33 explicit levels, never one EL1 frame
+        // per level.
+        let mut lengths = [0usize; MAX_BALANCED_BUILD_DEPTH.0];
+        let mut left = [0u32; MAX_BALANCED_BUILD_DEPTH.0];
+        let mut ids = [0u32; MAX_BALANCED_BUILD_DEPTH.0];
+        let mut phase = [0u8; MAX_BALANCED_BUILD_DEPTH.0];
+        lengths[0] = len;
+        let mut depth = 0usize;
+        let mut result = 0u32;
+        loop {
+            if lengths[depth] == 0 {
+                result = 0;
+                if depth == 0 {
+                    return result;
+                }
+                depth -= 1;
+                continue;
+            }
+            match phase[depth] {
+                0 => {
+                    phase[depth] = 1;
+                    let child_len = lengths[depth] / 2;
+                    depth += 1;
+                    lengths[depth] = child_len;
+                    phase[depth] = 0;
+                }
+                1 => {
+                    left[depth] = result;
+                    let id = *cursor;
+                    *cursor = self.read(id).right;
+                    ids[depth] = id;
+                    phase[depth] = 2;
+                    let child_len = lengths[depth] - lengths[depth] / 2 - 1;
+                    depth += 1;
+                    lengths[depth] = child_len;
+                    phase[depth] = 0;
+                }
+                _ => {
+                    let id = ids[depth];
+                    let mut node = self.read(id);
+                    node.left = left[depth];
+                    node.right = result;
+                    self.write(id, node);
+                    result = self.fix(id);
+                    if depth == 0 {
+                        return result;
+                    }
+                    depth -= 1;
+                }
+            }
         }
-        let left = self.build_balanced(len / 2, cursor);
-        let id = *cursor;
-        let mut n = self.read(id);
-        *cursor = n.right;
-        let right = self.build_balanced(len - len / 2 - 1, cursor);
-        n.left = left;
-        n.right = right;
-        self.write(id, n);
-        self.fix(id)
     }
     fn insert_coalescing(&mut self, id: u32) {
         let mut n = self.read(id);
@@ -2968,10 +3067,45 @@ impl<
         if id == 0 {
             return;
         }
-        let n = self.read(id);
-        self.release_tree(n.left);
-        self.release_tree(n.right);
-        self.table.release(id, self.banks);
+        let mut pending = [(0u32, 0u8); MAX_AVL_DEPTH.0];
+        pending[0] = (id, 0);
+        let mut depth = 0usize;
+        loop {
+            let (node, phase) = pending[depth];
+            match phase {
+                0 => {
+                    pending[depth].1 = 1;
+                    let left = self.read(node).left;
+                    if left != 0 {
+                        depth += 1;
+                        assert!(
+                            depth < pending.len(),
+                            "source AVL height exceeds u32 capacity"
+                        );
+                        pending[depth] = (left, 0);
+                    }
+                }
+                1 => {
+                    pending[depth].1 = 2;
+                    let right = self.read(node).right;
+                    if right != 0 {
+                        depth += 1;
+                        assert!(
+                            depth < pending.len(),
+                            "source AVL height exceeds u32 capacity"
+                        );
+                        pending[depth] = (right, 0);
+                    }
+                }
+                _ => {
+                    self.table.release(node, self.banks);
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+            }
+        }
     }
 }
 
