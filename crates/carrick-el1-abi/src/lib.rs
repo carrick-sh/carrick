@@ -2247,9 +2247,14 @@ impl Default for ApertureControl {
     }
 }
 
-/// Read the guest aperture control word.
+/// Read the ARM guest aperture control word.
+///
+/// # Safety
+/// The caller must have mapped and initialized the ABI aperture at the ARM
+/// kernel VA and retain that mapping for the returned reference's lifetime.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline]
-pub fn aperture_control() -> &'static ApertureControl {
+pub unsafe fn aperture_control() -> &'static ApertureControl {
     unsafe { &*(EL1_APERTURE_CONTROL_BASE as *const ApertureControl) }
 }
 

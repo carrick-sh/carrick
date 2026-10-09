@@ -37,6 +37,10 @@ impl SyscallFrame for X86Frame<'_> {
 }
 
 impl dispatch::GuestDispatchFrame for X86Frame<'_> {
+    fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
+        carrick_personality_linux::crossing::HostCrossingSet::X86
+    }
+
     fn arm_frame(&mut self) -> Option<&mut TrapFrame> {
         None
     }
@@ -162,4 +166,21 @@ fn production_x86_family_absences_forward_without_touching_user_memory() {
             "{family} must not record a guest service"
         );
     }
+}
+
+#[test]
+fn x86_context_selects_x86_crossings_without_arm_aperture() {
+    use dispatch::GuestDispatchFrame;
+    let counter = AtomicU64::new(0);
+    let frame = X86Frame {
+        canonical: CanonicalNr::new(63),
+        args: [0; 6],
+        rax: 0,
+        isa_unsupported: &counter,
+    };
+    assert_eq!(
+        frame.crossing_set(),
+        carrick_personality_linux::crossing::HostCrossingSet::X86
+    );
+    assert!(frame.crossing_strict(|| panic!("x86 must not read ARM aperture")));
 }
