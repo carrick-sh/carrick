@@ -247,3 +247,14 @@ custody so backing and inventory cannot retire while a worker still owns
 the vCPU. This factory is the KVM-specific input to the portable executor
 pool's `PersistentExecutorFactory::create`; the latter still needs its task
 binding and syscall service adapter before production uses it.
+
+The executor submission directory now has an ISA-neutral binding parameter.
+Its exact-key record, dormant authority, scheduler rollover observer and
+activation transaction are shared unchanged with ARM; the existing
+`HvpatchTaskBindingDirectory` and `PreparedHvpatchSubmission` names remain
+aliases for ARM callers. A runtime witness publishes and resolves a
+`FakeBinding` through this same transaction to prove the directory no longer
+requires `HvpatchTaskBinding`. The ARM-specific cancellation and exec
+replacement policy remains on the ARM resolver implementation. The KVM
+resolver can use the shared record and authority operations without adding
+another queue or thread registry.
