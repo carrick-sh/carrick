@@ -1353,3 +1353,21 @@ mod ring_first_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod owner_process_call_tests {
+    use super::aarch64_owner_process_call;
+
+    #[test]
+    fn aarch64_process_calls_cannot_escape_to_thread_or_host_lifecycle() {
+        assert!(aarch64_owner_process_call(220, 17));
+        assert!(aarch64_owner_process_call(220, 17 | 0x0120_0000));
+        assert!(aarch64_owner_process_call(220, 17 | 0x0000_4100));
+        assert!(aarch64_owner_process_call(260, 0));
+        assert!(aarch64_owner_process_call(94, 0));
+        assert!(aarch64_owner_process_call(95, 0));
+        assert!(aarch64_owner_process_call(435, 0));
+        assert!(!aarch64_owner_process_call(220, 0x0001_0000));
+        assert!(!aarch64_owner_process_call(58, 0)); // vhangup on AArch64
+    }
+}
