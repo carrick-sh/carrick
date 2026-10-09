@@ -84,7 +84,8 @@ pub const EL1_COUNTERS_BASE: u64 = EL1_REGION_BASE + EL1_COUNTERS_OFFSET;
 pub const APERTURE_CONTROL_ARM_RING_FIRST_STRICT: u64 = 1 << 3;
 
 /// Byte offset of the aperture control word within the region.
-pub const EL1_APERTURE_CONTROL_OFFSET: u64 = 0x1B_0000;
+pub const EL1_APERTURE_CONTROL_OFFSET: u64 =
+    EL1_SERVICE_COPY_TABLE_OFFSET + core::mem::size_of::<ServiceCopyTable>() as u64;
 
 /// Base guest virtual address of the aperture control word.
 pub const EL1_APERTURE_CONTROL_BASE: u64 = EL1_REGION_BASE + EL1_APERTURE_CONTROL_OFFSET;
@@ -672,6 +673,25 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
             b += 1;
         }
         i += 1;
+    }
+    let aperture_facts = [
+        EL1_APERTURE_CONTROL_OFFSET,
+        core::mem::size_of::<ApertureControl>() as u64,
+        core::mem::align_of::<ApertureControl>() as u64,
+        core::mem::offset_of!(ApertureControl, control) as u64,
+        APERTURE_CONTROL_ARM_RING_FIRST_STRICT,
+    ];
+    let mut a = 0;
+    while a < aperture_facts.len() {
+        let mut word = aperture_facts[a];
+        let mut b = 0;
+        while b < 8 {
+            hash ^= word & 0xff;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            word >>= 8;
+            b += 1;
+        }
+        a += 1;
     }
     hash
 };
@@ -3349,11 +3369,31 @@ impl Default for InotifyNameCache {
 const _: () = {
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
-    assert!(EL1_ABI_LAYOUT_HASH == 0x6c47_2801_7fe6_f330);
+    assert!(EL1_ABI_LAYOUT_HASH == 0x6e229185340f7fb);
+    assert!(
+        EL1_APERTURE_CONTROL_OFFSET.is_multiple_of(core::mem::align_of::<ApertureControl>() as u64)
+    );
+    assert!(
+        EL1_APERTURE_CONTROL_OFFSET + core::mem::size_of::<ApertureControl>() as u64
+            <= EL1_MM_PORTAL_OFFSET
+    );
 };
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn aperture_control_is_disjoint_from_service_copy_descriptors() {
+        let aperture_end =
+            EL1_APERTURE_CONTROL_OFFSET + core::mem::size_of::<ApertureControl>() as u64;
+        let service_end =
+            EL1_SERVICE_COPY_TABLE_OFFSET + core::mem::size_of::<ServiceCopyTable>() as u64;
+        assert!(
+            aperture_end <= EL1_SERVICE_COPY_TABLE_OFFSET
+                || service_end <= EL1_APERTURE_CONTROL_OFFSET,
+            "strict control aliases the service-copy L3 descriptors"
+        );
+    }
+
     #[test]
     fn test_aperture_control_strict_flag() {
         let aperture = ApertureControl::new();

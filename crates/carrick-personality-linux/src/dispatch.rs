@@ -622,3 +622,71 @@ pub fn dispatch_anonymous<W, R>(
     }
     decision
 }
+
+#[cfg(test)]
+mod ring_first_tests {
+    use super::*;
+    use crate::crossing::HostCrossingSet;
+    use carrick_core_abi::{
+        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    // No lifecycle or process venue: a terminal call still belongs to the
+    // carrier, just as in x86's crossing set, until native custody serves it.
+    struct CarrierOwned<'a> {
+        result: i64,
+        refused: &'a [AtomicU64; 513],
+        forwarded: [AtomicU64; 512],
+    }
+    impl<'a> PendingFamilies<'a> for CarrierOwned<'a> {
+        fn binding(&self) -> Option<ExecutionBinding> {
+            Some(ExecutionBinding {
+                task: EntryTaskKey::from_raw(1),
+                generation: EntryGeneration::from_raw(1),
+                mm: EntryMmKey::from_raw(1),
+                thread_generation: EntryThreadGeneration::from_raw(1),
+            })
+        }
+        fn crossing_set(&self) -> HostCrossingSet {
+            HostCrossingSet::Aarch64
+        }
+        fn ring_first_strict(&self) -> bool {
+            true
+        }
+        fn refused_counters(&self) -> Option<&'a [AtomicU64]> {
+            Some(self.refused)
+        }
+        fn original_argument0(&self) -> u64 {
+            self.result as u64
+        }
+        fn install_result(&mut self, result: SyscallResult) {
+            self.result = result.raw();
+        }
+        fn record_forwarded(&self, nr: u64) {
+            self.forwarded[nr as usize].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn strict_arm_terminal_calls_without_process_owner_cross_to_carrier() {
+        for ordinal in [93, 94] {
+            let refused = [const { AtomicU64::new(0) }; 513];
+            let mut pending = CarrierOwned {
+                result: 42,
+                refused: &refused,
+                forwarded: [const { AtomicU64::new(0) }; 512],
+            };
+            assert_eq!(
+                dispatch(ordinal, u64::MAX, &mut pending),
+                CompletionRoute::Forward
+            );
+            assert_eq!(pending.result, 42, "exit status must reach the carrier");
+            assert_eq!(
+                pending.forwarded[ordinal as usize].load(Ordering::Relaxed),
+                1
+            );
+            assert_eq!(pending.refused[ordinal as usize].load(Ordering::Relaxed), 0);
+        }
+    }
+}

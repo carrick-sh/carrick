@@ -21,6 +21,27 @@ On 2026-10-08, the owner decided that ARM EL1 moves to the **x86 CPL0 model** im
 
 ---
 
+## Implementation ruling (2026-10-09)
+
+The host crossing set also includes `exit` and `exit_group`, matching x86.
+They forward only when the native owner declines; serving them in-ring takes
+precedence over crossing evaluation. The live ARM entry on this branch does
+not yet bind Step 5 process custody, and thread exit deliberately declines
+home and last-thread exits. Refusing those terminal notifications prevents
+carrier completion. Thus the implemented set has 118 entries: the 116
+file/network/clock/fd rows plus two terminal notifications. The census below
+still describes the primary family assignments, not fallback eligibility.
+
+Aperture control follows `ServiceCopyTable` in the shared region, with checked
+alignment and an end below the MM portal. Its geometry participates in the
+image ABI hash. The initial proposed `0x1B_0000` control location aliases the
+service-copy L3 table and must never be used for control storage.
+
+Contract: `kernel.el1.arm-ring-first-crossing`. Its VM-free terminal-route
+witness is red before the crossing correction; its layout witness is red at
+the aliased offset. The signed raw-syscall fixture avoids unported libc startup
+and bounds descriptor readiness to five seconds.
+
 ## 1. Today's ARM Routing Table & Census
 
 ### 1.1 Methodology & Codebase Citations

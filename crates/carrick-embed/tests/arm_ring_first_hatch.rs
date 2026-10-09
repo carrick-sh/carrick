@@ -1,86 +1,91 @@
-//! Signed ARM ring-first flip allowlist and hatch witness verification.
-//!
-//! Run ONLY through `just test-embed` (scripts/test-signed.sh).
+//! Signed ARM crossing policy and terminal-completion witness.
+//! Run only through `just test-embed arm_ring_first_`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 mod common;
 
+use carrick_embed::{ContainerBuilder, read_el1_counters, reset_el1_counters};
+use carrick_image::PullPolicy;
 use std::sync::atomic::Ordering;
 
-use carrick_embed::{read_el1_counters, reset_el1_counters};
-
-#[test]
-fn arm_ring_first_strict_refusal_witness() {
+fn witness(strict: bool) {
     let _guard = common::guest_lock();
-    reset_el1_counters();
-
-    // Default: CARRICK_ARM_RING_FIRST is unset (strict mode on).
-    unsafe {
-        std::env::remove_var("CARRICK_ARM_RING_FIRST");
+    let previous = std::env::var_os("CARRICK_ARM_RING_FIRST");
+    // Restore the caller's environment even if an assertion fails.
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var("CARRICK_ARM_RING_FIRST", value),
+                    None => std::env::remove_var("CARRICK_ARM_RING_FIRST"),
+                }
+            }
+        }
     }
-
-    let result = common::run_or_fail(common::interceptor_probe_builder("identity").run_blocking());
-
-    assert!(result.success(), "exit_code={}", result.exit_code);
-    let stdout = result.stdout_utf8();
-    // Non-allowlisted getuid (174) must answer -ENOSYS (errno 38)
-    assert!(
-        stdout.contains("uid=-1 uid_errno=38"),
-        "expected non-allowlisted getuid to fail with ENOSYS (38), got stdout:\n{stdout}"
+    let _restore = Restore(previous);
+    unsafe {
+        if strict {
+            std::env::remove_var("CARRICK_ARM_RING_FIRST");
+        } else {
+            std::env::set_var("CARRICK_ARM_RING_FIRST", "0");
+        }
+    }
+    reset_el1_counters();
+    let path = common::repo_root().join(
+        "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-ring-first",
     );
-    // Wire-in-ring getpid (172) succeeds
     assert!(
-        stdout.contains("pid_errno=0"),
-        "expected wire-in-ring getpid to succeed, got stdout:\n{stdout}"
+        path.is_file(),
+        "signed fixture bundle must contain {}",
+        path.display()
     );
-    // Forward-allowlisted clock_gettime (113) succeeds
+    let result = common::run_or_fail(
+        ContainerBuilder::from_image(common::SMOKE_IMAGE)
+            .pull_policy(PullPolicy::Missing)
+            .command(["/p/carrick-linux-aarch64-ring-first"])
+            .mount_readonly(
+                path.parent().expect("fixture directory").to_string_lossy(),
+                "/p",
+            )
+            .run_blocking(),
+    );
     assert!(
-        stdout.contains("clock_rc=0 clock_errno=0"),
-        "expected allowlisted clock_gettime to succeed, got stdout:\n{stdout}"
+        result.success(),
+        "exit={} stdout={} stderr={}",
+        result.exit_code,
+        result.stdout_utf8(),
+        result.stderr_utf8()
     );
-
-    let counters = read_el1_counters().expect("EL1 counters should be populated");
-    let refused_getuid = counters.refused[174].load(Ordering::Relaxed);
-    assert!(
-        refused_getuid >= 1,
-        "expected counters.refused[174] >= 1 under strict ring-first mode, got {refused_getuid}"
+    assert_eq!(
+        result.stdout_utf8(),
+        if strict {
+            "ring-first strict\n"
+        } else {
+            "ring-first forward\n"
+        }
     );
+    let counters = read_el1_counters().expect("EL1 counters populated");
+    let refused = counters.refused[174].load(Ordering::Relaxed);
+    let forwarded = counters.forwarded[174].load(Ordering::Relaxed);
+    println!(
+        "ring-first strict={strict} getuid refused={refused} forwarded={forwarded} exit_group refused={} forwarded={}",
+        counters.refused[94].load(Ordering::Relaxed),
+        counters.forwarded[94].load(Ordering::Relaxed)
+    );
+    assert_eq!(refused, u64::from(strict));
+    assert_eq!(forwarded, u64::from(!strict));
+    assert_eq!(counters.refused[94].load(Ordering::Relaxed), 0);
+    assert_eq!(counters.forwarded[94].load(Ordering::Relaxed), 1);
+    assert_eq!(counters.refused[172].load(Ordering::Relaxed), 0);
+    assert_eq!(counters.refused[113].load(Ordering::Relaxed), 0);
+    assert_eq!(counters.forwarded[113].load(Ordering::Relaxed), 1);
 }
 
 #[test]
+fn arm_ring_first_strict_refusal_witness() {
+    witness(true);
+}
+#[test]
 fn arm_ring_first_hatch_disabled_forward_witness() {
-    let _guard = common::guest_lock();
-    reset_el1_counters();
-
-    // CARRICK_ARM_RING_FIRST=0 restores pre-flip forwarding.
-    unsafe {
-        std::env::set_var("CARRICK_ARM_RING_FIRST", "0");
-    }
-
-    let result = common::run_or_fail(common::interceptor_probe_builder("identity").run_blocking());
-
-    // Clean up environment variable
-    unsafe {
-        std::env::remove_var("CARRICK_ARM_RING_FIRST");
-    }
-
-    assert!(result.success(), "exit_code={}", result.exit_code);
-    let stdout = result.stdout_utf8();
-    // With hatch = 0, getuid is forwarded to host and succeeds with uid >= 0, errno 0
-    assert!(
-        stdout.contains("uid_errno=0") && !stdout.contains("uid_errno=38"),
-        "expected forwarded getuid to succeed with errno 0, got stdout:\n{stdout}"
-    );
-
-    let counters = read_el1_counters().expect("EL1 counters should be populated");
-    let refused_getuid = counters.refused[174].load(Ordering::Relaxed);
-    assert_eq!(
-        refused_getuid, 0,
-        "expected counters.refused[174] == 0 when hatch is disabled, got {refused_getuid}"
-    );
-    let forwarded_getuid = counters.forwarded[174].load(Ordering::Relaxed);
-    assert!(
-        forwarded_getuid >= 1,
-        "expected counters.forwarded[174] >= 1 when hatch is disabled, got {forwarded_getuid}"
-    );
+    witness(false);
 }

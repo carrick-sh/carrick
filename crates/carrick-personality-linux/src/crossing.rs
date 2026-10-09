@@ -312,10 +312,12 @@ impl AllowedHostCrossing {
     /// Match an allowed host crossing for AArch64 ARM EL1.
     ///
     /// Covers the 100 Forward-Allowlist rows (host files, network, clock,
-    /// entropy) and the 16 Temporary-forward fd rows. Excludes in-ring
-    /// handlers (such as exit, exit_group).
+    /// entropy), the 16 Temporary-forward fd rows, and terminal carrier
+    /// notifications when no in-ring process owner serves exit/exit_group.
     pub const fn from_canonical_aarch64(canonical: CanonicalNr) -> Option<Self> {
         match canonical {
+            nr::EXIT => Some(Self::Exit),
+            nr::EXIT_GROUP => Some(Self::ExitGroup),
             nr::SETXATTR => Some(Self::Setxattr),
             nr::LSETXATTR => Some(Self::Lsetxattr),
             nr::FSETXATTR => Some(Self::Fsetxattr),
@@ -461,8 +463,10 @@ pub const X86_HOST_CROSSINGS: [CanonicalNr; 8] = [
     nr::EXIT_GROUP,
 ];
 
-/// The exact 116 canonical syscalls permitted to cross to host on AArch64 ARM EL1.
-pub const AARCH64_HOST_CROSSINGS: [CanonicalNr; 116] = [
+/// The exact 118 canonical syscalls permitted to cross to host on AArch64 ARM EL1.
+pub const AARCH64_HOST_CROSSINGS: [CanonicalNr; 118] = [
+    nr::EXIT,
+    nr::EXIT_GROUP,
     nr::SETXATTR,
     nr::LSETXATTR,
     nr::FSETXATTR,
@@ -710,7 +714,7 @@ mod tests {
 
     #[test]
     fn test_aarch64_crossings_exact() {
-        assert_eq!(AARCH64_HOST_CROSSINGS.len(), 116);
+        assert_eq!(AARCH64_HOST_CROSSINGS.len(), 118);
         for nr in AARCH64_HOST_CROSSINGS {
             assert!(
                 AllowedHostCrossing::is_allowed_aarch64(nr),
@@ -722,8 +726,6 @@ mod tests {
         for wire_in_ring in [
             CanonicalNr(27),  // inotify_add_watch
             CanonicalNr(28),  // inotify_rm_watch
-            CanonicalNr(93),  // exit
-            CanonicalNr(94),  // exit_group
             CanonicalNr(98),  // futex
             CanonicalNr(99),  // set_robust_list
             CanonicalNr(132), // sigaltstack
