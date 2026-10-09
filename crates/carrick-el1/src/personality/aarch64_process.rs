@@ -156,7 +156,7 @@ pub struct Prepared<'a> {
 /// Retained fork plan between census/stock preparation and guest-MM
 /// publication. The first phase's stack frame is gone before publication.
 pub struct PreparedStart<'a> {
-    loan: ForkStockLoan,
+    loan: Box<ForkStockLoan>,
     words: PreparedWords<'a>,
     plan: Option<PreparedOwnerFork<Aarch64Mmu>>,
     child: Option<UnpublishedEl1Child<Aarch64Mmu>>,
@@ -586,10 +586,12 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             &raw mut *exchange as *mut _ as u64,
             u64::from(self.worker()),
         )?;
-        let loan = exchange
-            .take(request)
-            .ok_or(NativeProcessError::Stale)?
-            .map_err(|_| NativeProcessError::Exhausted)?;
+        let loan = Box::new(
+            exchange
+                .take(request)
+                .ok_or(NativeProcessError::Stale)?
+                .map_err(|_| NativeProcessError::Exhausted)?,
+        );
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         let live = if self.words.is_none() {
             let child_window =
@@ -721,7 +723,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             generation: ContextGeneration::new(completion.child.incarnation()),
         };
         Ok(Box::new(Prepared {
-            loan,
+            loan: *loan,
             child,
             words,
             address,
