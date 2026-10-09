@@ -465,6 +465,7 @@ impl carrick_guest_arch::SignalBackend for Aarch64Backend {
         frame: &mut TrapFrame,
         params: carrick_guest_arch::SignalFrameParams,
         siginfo: Option<&'a [u8]>,
+        _fpstate: &[u8],
         copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
     ) -> Result<UserVa, Self::Error> {
         let frame_size = core::mem::size_of::<Arm64Sigframe>() as u64;
@@ -515,6 +516,7 @@ impl carrick_guest_arch::SignalBackend for Aarch64Backend {
     fn restore_signal_frame(
         &mut self,
         frame: &mut TrapFrame,
+        _fpstate: &mut [u8],
         copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
     ) -> Result<u64, Self::Error> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]

@@ -87,6 +87,7 @@ impl GuestDispatchFrame for TrapFrame {
             carrick_guest_arch::SignalBackend::restore_signal_frame(
                 &mut backend,
                 self,
+                &mut [],
                 &mut |dst, va| copy_in.copy_in(dst, va),
             )
             .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT.get())
@@ -111,6 +112,7 @@ impl GuestDispatchFrame for TrapFrame {
                 self,
                 params,
                 siginfo,
+                &[],
                 &mut |va, src| copy_out.copy_out(va, src),
             )
             .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT.get())

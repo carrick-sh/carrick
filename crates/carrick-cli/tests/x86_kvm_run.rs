@@ -644,3 +644,8 @@ fn mounted_static_x86_signal_return_flags_match_native() {
 fn mounted_static_x86_signal_return_badframe_matches_native() {
     compare_mounted_fault_with_native("x86_signal_return_badframe.S");
 }
+
+#[test]
+fn mounted_static_x86_signal_sse_state_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_sse.S", b"HK\n");
+}

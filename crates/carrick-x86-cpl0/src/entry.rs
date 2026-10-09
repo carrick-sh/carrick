@@ -84,17 +84,13 @@ core::arch::global_asm!(
     "sub rsp, 896",
     "and rsp, -64",
     "mov r13, rsp",
-    // XSAVE does not initialize reserved header words. Reused stack bytes
-    // must not become an unsupported component or XRSTOR reserved-bit fault.
+    // Initialize all capture bytes: XSAVE leaves reserved/padding bytes alone.
+    // GPRs are already saved; clear DF before the bounded REP store.
+    "cld",
     "xor eax, eax",
-    "mov qword ptr [rsp + 512], rax",
-    "mov qword ptr [rsp + 520], rax",
-    "mov qword ptr [rsp + 528], rax",
-    "mov qword ptr [rsp + 536], rax",
-    "mov qword ptr [rsp + 544], rax",
-    "mov qword ptr [rsp + 552], rax",
-    "mov qword ptr [rsp + 560], rax",
-    "mov qword ptr [rsp + 568], rax",
+    "mov rdi, rsp",
+    "mov ecx, 104",
+    "rep stosq",
     "mov eax, 7",
     "xor edx, edx",
     "xsave64 [rsp]",
@@ -201,10 +197,12 @@ core::arch::global_asm!(
     "mov rsp, gs:[0]",
     "sub rsp, 4160",
     "and rsp, -64",
+    "cld", "xor eax, eax", "mov rdi, rsp", "mov ecx, 104", "rep stosq",
     "mov rdi, rsp",
     "call carrick_x86_save_extended_state",
     "mov r14, cr2",
     "mov rdi, r12",
+    "mov rsi, rsp",
     "call carrick_x86_handle_user_page_fault",
     "mov r13, rax",
     "test r13, r13",
@@ -382,6 +380,7 @@ mod kernel {
 
     struct NativeDispatch<'a> {
         frame: &'a mut NativeFrame,
+        fpstate: &'a mut carrick_el1::isa::x86::context::scheduler::XsaveArea,
         call: carrick_personality_linux::entry::CanonicalCall,
         publications: &'a core::sync::atomic::AtomicU64,
         slot: Option<carrick_guest_arch::SlotId>,
@@ -421,6 +420,7 @@ mod kernel {
             carrick_guest_arch::SignalBackend::restore_signal_frame(
                 &mut backend,
                 self.frame,
+                &mut self.fpstate.0,
                 &mut |dst, va| copy_in.copy_in(dst, va),
             )
             .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT.get())
@@ -437,6 +437,7 @@ mod kernel {
                 self.frame,
                 params,
                 siginfo,
+                &self.fpstate.0,
                 &mut |va, src| copy_out.copy_out(va, src),
             )
             .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT.get())
@@ -491,7 +492,7 @@ mod kernel {
     /// Vector 14 from CPL3: classify the native error then use the same
     /// reservation/editor/COW owner as ARM's data-abort policy.
     #[unsafe(no_mangle)]
-    extern "C" fn carrick_x86_handle_user_page_fault(frame: &mut PageFaultStack) -> u64 {
+    extern "C" fn carrick_x86_handle_user_page_fault(frame: &mut PageFaultStack, fpstate: &carrick_el1::isa::x86::context::scheduler::XsaveArea) -> u64 {
         use carrick_el1::fault::dispatch_x86_fault_with_prepared;
         fixture_items! { use carrick_el1::fault::X86CowResolver; }
         use carrick_el1_abi::Action;
@@ -671,12 +672,17 @@ mod kernel {
                             validator: &carrick_el1::file::HardwareValidator,
                         };
                         let mut backend = carrick_el1::isa::x86::X86Backend;
-                        if backend.setup_fault_signal_frame(
+                        if backend.setup_signal_frame_with_resume(
                             &mut native_frame,
                             params,
-                            frame.rip,
-                            frame.rflags,
+                            carrick_guest_arch::UserReturn {
+                                pc: carrick_guest_arch::UserVa::new(frame.rip),
+                                stack: carrick_guest_arch::UserVa::new(frame.rsp),
+                                flags: carrick_guest_arch::UserFlags::new(frame.rflags),
+                                kind: carrick_guest_arch::ReturnKind::ExceptionReturn,
+                            },
                             None,
+                            &fpstate.0,
                             &mut |va, bytes| carrick_personality_linux::lifecycle::UserCopy::copy_out(&mut copy, va, bytes),
                         ).is_ok() {
                             let mut handler_mask = blocked.signals().union(action.mask);
@@ -1185,6 +1191,7 @@ mod kernel {
         task: &CurrentTask,
         process: &mut carrick_el1::personality::native_process_runtime::NativeProcessEntry<'_, 'static, native_process::Mm, carrick_sched_core::ParkedContextWords, native_process::Service>,
         frame: &mut NativeFrame,
+        fpstate: &carrick_el1::isa::x86::context::scheduler::XsaveArea,
     ) -> Option<carrick_personality_linux::dispatch::CompletionRoute> {
         use carrick_el1::personality::thread_setup::LifecycleVenue;
         use carrick_personality_linux::signal::policy::{self, SigBlockMask};
@@ -1237,6 +1244,7 @@ mod kernel {
                     frame,
                     params,
                     info_bytes,
+                    &fpstate.0,
                     &mut |va, bytes| carrick_personality_linux::lifecycle::UserCopy::copy_out(&mut copy, va, bytes),
                 );
                 None
@@ -2046,7 +2054,7 @@ mod kernel {
             let mut root_exit = None;
             let route = if fixture_dispatch_enabled!() {
                 let mut native = NativeDispatch {
-                    frame, call, publications: &binding.publications,
+                    frame, fpstate: _early_xstate, call, publications: &binding.publications,
                     slot: carrick_guest_arch::SlotId::from_index(binding.cpu_slot as usize),
                 };
                 match carrick_x86_cpl0::production_boundary(dispatch::dispatch_syscall_with_lifecycle(
@@ -2073,7 +2081,7 @@ mod kernel {
                     let mut process = native_process::runtime().enter(source, task, words, &mut service)
                         .unwrap_or_else(|_| initial_boot::fatal_boot());
                     let mut native = NativeDispatch {
-                        frame, call, publications: &binding.publications,
+                        frame, fpstate: _early_xstate, call, publications: &binding.publications,
                         slot: carrick_guest_arch::SlotId::from_index(binding.cpu_slot as usize),
                     };
                     let mut route = dispatch::dispatch_syscall_with_native(
@@ -2087,7 +2095,7 @@ mod kernel {
                         complete_run_failure(task, reason);
                     }
                     if (route == CompletionRoute::Served || route == CompletionRoute::WithWork)
-                        && let Some(r) = deliver_signal_on_syscall_return(task, &mut process, frame)
+                        && let Some(r) = deliver_signal_on_syscall_return(task, &mut process, frame, _early_xstate)
                     {
                         route = r;
                     }

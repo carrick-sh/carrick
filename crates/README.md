@@ -35,7 +35,7 @@ Platform code is selected by Cargo features. The default feature is
 
 | Crate | Role |
 | --- | --- |
-| `carrick-abi` | Linux ABI constants and wire structs, with compile-time layout/constant assertions. |
+| `carrick-abi` | `no_std` Linux ABI constants and wire structs shared by host and ring code, with compile-time layout/constant assertions. |
 | `carrick-guest-mem` | Guest-memory trait, memory error type, and syscall-frame hub types shared by handlers and VMM engines. |
 | `carrick-kernel-arena` | The per-run kernel arena: a file-backed `MAP_SHARED` region holding the Linux-visible cross-process delta (identity, leases, shared kernel objects) the host kernel cannot express, with no authority daemon -- processes operate on it via atomics and robust bucket locks. |
 | `carrick-mem` | Guest address-space construction: ELF layout, boot identity/hvpatch tables, trampolines, VDSO/vvar, region helpers. |

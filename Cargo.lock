@@ -485,6 +485,7 @@ name = "carrick-el1"
 version = "0.1.0"
 dependencies = [
  "carrick-aarch64",
+ "carrick-abi",
  "carrick-core",
  "carrick-el1-abi",
  "carrick-fatal",
@@ -839,6 +840,7 @@ dependencies = [
 name = "carrick-personality-linux"
 version = "0.1.0"
 dependencies = [
+ "carrick-abi",
  "carrick-core",
  "carrick-core-abi",
  "carrick-el1",
