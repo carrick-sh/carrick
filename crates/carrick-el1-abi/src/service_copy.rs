@@ -6,7 +6,7 @@ pub const EL1_SERVICE_COPY_TABLE_BASE: u64 = crate::EL1_REGION_BASE + EL1_SERVIC
 pub const EL1_SERVICE_COPY_BASE: u64 = 0x2D_3FE0_0000;
 pub const EL1_SERVICE_COPY_SIZE: u64 = crate::EL1_STACK_SLOTS * 2 * 4096;
 pub const EL1_CARRIER_MAINT_ROOT_BASE: u64 = 0x2D_001F_8000;
-pub const EL1_CARRIER_MAINT_ROOT_SIZE: u64 = 0x4000;
+pub const EL1_CARRIER_MAINT_ROOT_SIZE: u64 = 0x6000;
 
 /// Authenticate a host service's claimed slot against the executing EL1
 /// stack. A request cannot borrow another executor's alias or wire slots.
