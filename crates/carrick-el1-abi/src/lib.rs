@@ -375,19 +375,19 @@ pub const EL1_OPEN_FILE_TABLE_SIZE: u64 = 0x1_0000;
 /// Maximum open-file records (open descriptions of in-zone inodes).
 pub const MAX_ZONE_OPEN_FILES: usize = 512;
 
-/// Internal `epoll_pwait` transport for a guest poll whose descriptions are
-/// already authenticated as host-bound by the shared file owner. This value
-/// is never a guest-visible epoll descriptor.
-pub struct HostPollEpollBridge;
+/// Dedicated supervisor crossing for host-bound poll readiness. It is not a
+/// Linux syscall number and cannot alias an allowed guest forward.
+pub struct HostReadinessCrossing;
 
-impl HostPollEpollBridge {
-    pub const EPOLL_FD_ARG: u64 = u64::MAX;
+impl HostReadinessCrossing {
+    pub const NUMBER: u64 = u64::MAX - 0x100;
+    pub const REQUEST_TAG: u64 = u64::MAX;
     /// `SYSCALL` captures the user return PC in RCX before EL1 writes this
     /// supervisor-only tag. The adapter restores RCX before returning.
     pub const FRAME_TAG: u64 = u64::MAX - 1;
 
-    pub const fn is_bridge(epoll_fd: u64, tag: u64) -> bool {
-        epoll_fd == Self::EPOLL_FD_ARG && tag == Self::FRAME_TAG
+    pub const fn is_crossing(request_tag: u64, tag: u64) -> bool {
+        request_tag == Self::REQUEST_TAG && tag == Self::FRAME_TAG
     }
 }
 

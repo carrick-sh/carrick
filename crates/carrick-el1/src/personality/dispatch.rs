@@ -43,8 +43,8 @@ pub trait GuestDispatchFrame: SyscallFrame {
     fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64>;
     /// Distinguish an ISA-only refusal from a family or venue refusal.
     fn record_isa_unsupported_forward(&self) {}
-    /// Prepare an authenticated host-bound poll through the allowed
-    /// epoll_pwait transport. The ISA adapter restores syscall argument
+    /// Prepare an authenticated host-bound poll through the dedicated
+    /// host-readiness crossing. The ISA adapter restores syscall argument
     /// registers after host completion.
     fn prepare_host_poll_crossing(&mut self, _fds: u64, _nfds: u64, _timeout_ms: i32) -> bool {
         false
