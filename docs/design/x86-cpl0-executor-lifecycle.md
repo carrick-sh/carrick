@@ -314,5 +314,23 @@ handshake, so queue publication and shutdown can interrupt `KVM_RUN` without
 a host polling thread. The production restore reapplies the CPL0 descriptor
 tables and syscall MSRs after the portable register image, which otherwise
 replaces them with fixture bootstrap values. A terminal root outcome closes
-the scheduler and joins the pool. Forwarded blocking outcomes still need the
-owned-continuation route in the next milestone.
+the scheduler and joins the pool. Forwarded blocking outcomes use the
+owned-continuation route described below.
+
+### Blocking forwarded calls
+
+A blocking forwarded dispatch now captures a `ContinuationCapture` from the
+worker's live `ThreadExecutionLease` and returns the shared pool's
+`BlockedContinuation` exit. The task binding retains its owned forward frame
+and original syscall request while the pool saves the stopped CPU image,
+enrolls the wait, settles the task blocked, and releases execution capacity.
+When the existing wait service marks it ready, a worker leases the task again,
+reloads its image, and invokes `resume_continuation`. It folds a completed
+result through the original stopped guest-memory venue, or redispatches the
+same request if the continuation asks for redispatch. A repeated blocking
+outcome re-enrolls with the same retained frame; a completed outcome consumes
+the frame exactly once and restores the guest return register. The empty-pipe
+stdin read witness is green through this path, and the shared pool's
+single-worker continuation test confirms that a blocked task releases the
+worker for another runnable task. Host readiness for poll remains the next
+milestone.
