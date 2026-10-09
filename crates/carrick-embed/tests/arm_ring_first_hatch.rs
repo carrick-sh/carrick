@@ -52,9 +52,10 @@ fn witness(strict: bool) {
     let refused = counters.refused[174].load(Ordering::Relaxed);
     let forwarded = counters.forwarded[174].load(Ordering::Relaxed);
     println!(
-        "ring-first strict={strict} getuid refused={refused} forwarded={forwarded} exit_group refused={} forwarded={}",
+        "ring-first strict={strict} getuid refused={refused} forwarded={forwarded} exit_group refused={} forwarded={} clock_gettime forwarded={}",
         counters.refused[94].load(Ordering::Relaxed),
-        counters.forwarded[94].load(Ordering::Relaxed)
+        counters.forwarded[94].load(Ordering::Relaxed),
+        counters.forwarded[113].load(Ordering::Relaxed)
     );
     assert_eq!(refused, u64::from(strict));
     assert_eq!(forwarded, u64::from(!strict));
@@ -62,7 +63,9 @@ fn witness(strict: bool) {
     assert_eq!(counters.forwarded[94].load(Ordering::Relaxed), 1);
     assert_eq!(counters.refused[172].load(Ordering::Relaxed), 0);
     assert_eq!(counters.refused[113].load(Ordering::Relaxed), 0);
-    assert_eq!(counters.forwarded[113].load(Ordering::Relaxed), 1);
+    // The default image routes raw monotonic clock reads through EL1 before
+    // the mailbox; a successful clock read must not add a host crossing.
+    assert_eq!(counters.forwarded[113].load(Ordering::Relaxed), 0);
 }
 
 #[test]

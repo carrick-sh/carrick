@@ -378,7 +378,8 @@ exit_group. The signed filter is `just test-embed arm_ring_first_ --nocapture`:
   refusal and zero forwarded calls.
 - `arm_ring_first_hatch_disabled_forward_witness`: the typed opt-out restores
   getuid's host return, with zero refusals and one forwarded call.
-- Both settings require zero terminal refusals and one exit_group forward;
+- Both settings require zero terminal refusals, one exit_group forward and
+  zero clock_gettime host forwards (the normal EL1 clock fast path);
   an unexpectedly returning terminal syscall traps rather than spinning.
 
 ---
