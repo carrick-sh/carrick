@@ -83,6 +83,9 @@ mod layout_tests {
 /// This is pure conversion; the AArch64 backend and assembly remain unchanged.
 pub mod arm_edit;
 
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(crate) mod arm_signal;
+
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub mod aarch64;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -103,8 +106,8 @@ pub mod x86_initial_mm;
 
 /// Validate guest-controlled ARM signal resume state before register publication.
 pub const fn signal_resume_is_el0(pstate: u64) -> bool {
-    // M[3:0] must select EL0t and DAIF must not mask user exceptions.
-    pstate & (0xf | (0xf << 6)) == 0
+    // M[4:0] must select AArch64 EL0t and DAIF must not mask exceptions.
+    pstate & (0x1f | (0xf << 6)) == 0
 }
 
 #[cfg(test)]
