@@ -11,39 +11,41 @@ use carrick_mmu_core::aarch64::descriptor_txn::{
 use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa};
 use carrick_mmu_core::x86::owner_mmu::X86Mmu;
 
+/// Every I/O port this CPL0 carrier decodes from one VM; each must be
+/// distinct. `carrick_x86::FP_STUB_DOORBELL_PORT` (0xc6) is deliberately
+/// absent: only the legacy no-FP-getter x86 engine in a bhyve VM decodes
+/// it (`run_fp_stub`), never a KVM CPL0 VM, so its number is shared with
+/// [`carrick_el1_abi::X86_INITIAL_BOOT_PORT`] without aliasing.
+pub(super) const CPL0_CARRIER_PORTS: [u16; 17] = [
+    FAULT_DOORBELL_PORT,
+    FORWARD_PORT,
+    CONTROL_PORT,
+    ENTRY_KICK_PORT,
+    RETURN_KICK_PORT,
+    WORK_PORT,
+    FATAL_PORT,
+    YIELD_PORT,
+    OWNER_GRANT_PORT,
+    carrick_el1_abi::X86_INITIAL_BOOT_PORT,
+    carrick_x86::cpl0_scheduler::PROGRESS_ENTRY_PORT,
+    carrick_x86::cpl0_scheduler::PROGRESS_RETURN_PORT,
+    carrick_x86::cpl0_scheduler::PROGRESS_DONE_PORT,
+    carrick_el1_abi::FORK_STOCK_PORT,
+    carrick_el1_abi::NATIVE_ROOT_EXIT_PORT,
+    carrick_el1_abi::NATIVE_PEER_READY_PORT,
+    carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
+];
+
 const _: () = {
-    let physical = [
-        carrick_el1_abi::FORK_STOCK_PORT,
-        carrick_el1_abi::NATIVE_ROOT_EXIT_PORT,
-        carrick_el1_abi::NATIVE_PEER_READY_PORT,
-        carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
-    ];
-    let existing = [
-        FAULT_DOORBELL_PORT,
-        FORWARD_PORT,
-        CONTROL_PORT,
-        ENTRY_KICK_PORT,
-        RETURN_KICK_PORT,
-        WORK_PORT,
-        FATAL_PORT,
-        YIELD_PORT,
-        OWNER_GRANT_PORT,
-        carrick_el1_abi::X86_INITIAL_BOOT_PORT,
-        carrick_x86::FP_STUB_DOORBELL_PORT,
-        carrick_x86::cpl0_scheduler::PROGRESS_ENTRY_PORT,
-        carrick_x86::cpl0_scheduler::PROGRESS_RETURN_PORT,
-        carrick_x86::cpl0_scheduler::PROGRESS_DONE_PORT,
-    ];
+    let ports = CPL0_CARRIER_PORTS;
     let mut i = 0;
-    while i < physical.len() {
+    while i < ports.len() {
         let mut j = 0;
-        while j < existing.len() {
-            assert!(physical[i] != existing[j]);
-            j += 1;
-        }
-        j = 0;
         while j < i {
-            assert!(physical[i] != physical[j]);
+            assert!(
+                ports[i] != ports[j],
+                "CPL0 carrier ports must be pairwise distinct"
+            );
             j += 1;
         }
         i += 1;
@@ -1616,34 +1618,18 @@ mod custody_tests {
 
     #[test]
     fn production_physical_ports_do_not_alias_native_or_fixture_doorbells() {
-        let physical = [
-            carrick_el1_abi::FORK_STOCK_PORT,
-            carrick_el1_abi::NATIVE_ROOT_EXIT_PORT,
-            carrick_el1_abi::NATIVE_PEER_READY_PORT,
-        ];
-        let existing = [
-            FAULT_DOORBELL_PORT,
-            FORWARD_PORT,
-            CONTROL_PORT,
-            ENTRY_KICK_PORT,
-            RETURN_KICK_PORT,
-            WORK_PORT,
-            FATAL_PORT,
-            YIELD_PORT,
-            OWNER_GRANT_PORT,
-            carrick_el1_abi::X86_INITIAL_BOOT_PORT,
-            carrick_x86::FP_STUB_DOORBELL_PORT,
-            carrick_x86::cpl0_scheduler::PROGRESS_ENTRY_PORT,
-            carrick_x86::cpl0_scheduler::PROGRESS_RETURN_PORT,
-            carrick_x86::cpl0_scheduler::PROGRESS_DONE_PORT,
-        ];
-        for (index, port) in physical.iter().enumerate() {
+        for (index, port) in CPL0_CARRIER_PORTS.iter().enumerate() {
             assert!(
-                !existing.contains(port),
-                "physical port {port:#x} aliases an existing doorbell"
+                !CPL0_CARRIER_PORTS[..index].contains(port),
+                "CPL0 carrier port {port:#x} is decoded twice"
             );
-            assert!(!physical[..index].contains(port));
         }
+        // The bhyve-only FP-stub doorbell shares its number with the
+        // initial-boot port, which this carrier decodes exactly once.
+        assert_eq!(
+            carrick_x86::FP_STUB_DOORBELL_PORT,
+            carrick_el1_abi::X86_INITIAL_BOOT_PORT
+        );
     }
 
     #[test]
