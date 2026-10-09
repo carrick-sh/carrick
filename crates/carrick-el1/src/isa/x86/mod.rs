@@ -13,6 +13,7 @@ pub mod user_access;
 pub use super::x86_user_tables as user_tables;
 
 pub mod interrupts;
+pub mod signal;
 
 /// The CPL0 backend's native leaves. Context and MM owners are bound by
 /// later families; their current projections fault before publishing state.
