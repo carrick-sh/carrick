@@ -2142,9 +2142,13 @@ pub use carrick_sched_core::{
 #[cfg(target_arch = "aarch64")]
 pub type ZoneTables = carrick_sched_core::ZoneTables<Aarch64ParkedContext>;
 #[cfg(target_arch = "aarch64")]
+pub type ZoneContext = Aarch64ParkedContext;
+#[cfg(target_arch = "aarch64")]
 pub type ZoneRecord = carrick_sched_core::ZoneRecord<Aarch64ParkedContext>;
 #[cfg(not(target_arch = "aarch64"))]
 pub type ZoneTables = carrick_sched_core::ZoneTables<ThreadCtx>;
+#[cfg(not(target_arch = "aarch64"))]
+pub type ZoneContext = ThreadCtx;
 #[cfg(not(target_arch = "aarch64"))]
 pub type ZoneRecord = carrick_sched_core::ZoneRecord<ThreadCtx>;
 

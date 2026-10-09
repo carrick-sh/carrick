@@ -55,20 +55,12 @@ pub fn shared_x86_cpl0_guest() -> &'static X86Cpl0Reservations {
     // CPL0 enters, and its image owner publishes the layout before EL0.
     unsafe { &*(address as *const X86Cpl0Reservations) }
 }
-pub type Reservations<'a> = owner::Reservations<
-    'a,
-    LinuxReservationPolicy,
-    NativeReservationGeometry,
-    Aarch64ParkedContext,
->;
+pub type Reservations<'a> =
+    owner::Reservations<'a, LinuxReservationPolicy, NativeReservationGeometry, ZoneContext>;
 pub type ResolvedReservationNodes<P> =
     owner::ResolvedReservationNodes<P, LinuxReservationPolicy, NativeReservationGeometry>;
-pub type RootReleaseVenue<'a> = owner::RootReleaseVenue<
-    'a,
-    LinuxReservationPolicy,
-    NativeReservationGeometry,
-    Aarch64ParkedContext,
->;
+pub type RootReleaseVenue<'a> =
+    owner::RootReleaseVenue<'a, LinuxReservationPolicy, NativeReservationGeometry, ZoneContext>;
 pub type ClaimedPreparedCopy<'a> =
     owner::ClaimedPreparedCopy<'a, LinuxReservationPolicy, NativeReservationGeometry>;
 pub const RESERVATIONS_OFFSET: usize = EL1_RESERVATIONS_OFFSET as usize;
