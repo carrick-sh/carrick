@@ -302,7 +302,13 @@ fn test_fork_child_gets_distinct_root_and_x0_zero() {
     };
     let mut native = ThreadCtx::ZERO;
     native.x[0] = 99;
-    let parked = Aarch64ParkedContext::from_parts(native, fixture.address);
+    let parent_ttbr = (1_u64 << 48) | fixture.address.root.address().raw();
+    let parked = Aarch64ParkedContext::from_register(
+        native,
+        parent_ttbr,
+        fixture.address.mm.raw().get(),
+        fixture.address.generation.raw().get(),
+    );
     let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
         source,
         &fixture.task,
@@ -345,6 +351,10 @@ fn test_fork_child_gets_distinct_root_and_x0_zero() {
     let child_key = runtime.namespace_child_key(parent_key, child_pid).unwrap();
     assert_ne!(child_key, parent_key);
 
+    let parent_binding = runtime.task_binding(parent_key).unwrap();
+    let parent_record = unsafe { *fixture.zone.record(parent_binding.record.id).ctx_mut() };
+    assert_eq!(parent_record.root(), parent_ttbr);
+
     let child_binding = runtime.task_binding(child_key).unwrap();
     assert_eq!(child_binding.words.syscall_return(), 0);
     assert_eq!(child_binding.words.native.x[0], 0);
@@ -366,6 +376,7 @@ fn test_fork_child_gets_distinct_root_and_x0_zero() {
         .grant(child_index, child_binding.address.mm.raw().get())
         .unwrap();
     assert_eq!(grant.ttbr0 >> 48, 42);
+    assert_eq!(child_binding.words.root(), grant.ttbr0);
 }
 
 /// Red-first Test 2: private pages are COW-armed in both parent and child.
