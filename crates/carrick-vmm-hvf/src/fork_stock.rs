@@ -547,13 +547,13 @@ impl ForkStockHostCustody {
     /// If the binding does not match, returns `Err(StaleExecution)` without modifying any ledger.
     pub(crate) fn service_root_exit(
         &mut self,
-        execution: GrantExecution,
+        binding: carrick_el1_abi::ExecutionBinding,
         root_exit: &NativeRootExit,
     ) -> Result<LinuxWaitStatus, ForkStockServiceError> {
         let status = root_exit
-            .status_for(execution.binding)
+            .status_for(binding)
             .ok_or(ForkStockServiceError::StaleExecution)?;
-        if let Some(asid_gen) = self.committed_asids.remove(&execution.binding.mm.raw()) {
+        if let Some(asid_gen) = self.committed_asids.remove(&binding.mm.raw()) {
             let retired = self
                 .asids
                 .retire(asid_gen)
@@ -998,14 +998,14 @@ mod tests {
         // Foreign execution binding (wrong task ID)
         let mut foreign_exec = exec;
         foreign_exec.binding.task = EntryTaskKey::from_raw(99);
-        let result = custody.service_root_exit(foreign_exec, &root_exit);
+        let result = custody.service_root_exit(foreign_exec.binding, &root_exit);
         assert_eq!(result, Err(ForkStockServiceError::StaleExecution));
 
         // Foreign generation
         let mut foreign_gen_exec = exec;
         foreign_gen_exec.binding.generation = EntryGeneration::from_raw(99);
         assert_eq!(
-            custody.service_root_exit(foreign_gen_exec, &root_exit),
+            custody.service_root_exit(foreign_gen_exec.binding, &root_exit),
             Err(ForkStockServiceError::StaleExecution)
         );
 
@@ -1013,7 +1013,7 @@ mod tests {
         let mut foreign_mm_exec = exec;
         foreign_mm_exec.binding.mm = EntryMmKey::from_raw(99);
         assert_eq!(
-            custody.service_root_exit(foreign_mm_exec, &root_exit),
+            custody.service_root_exit(foreign_mm_exec.binding, &root_exit),
             Err(ForkStockServiceError::StaleExecution)
         );
 
@@ -1021,7 +1021,7 @@ mod tests {
         assert_eq!(ledger.snapshot(), initial_stats);
 
         // Matching binding succeeds and still leaves ledger unchanged
-        let exit_status = custody.service_root_exit(exec, &root_exit).unwrap();
+        let exit_status = custody.service_root_exit(exec.binding, &root_exit).unwrap();
         assert_eq!(exit_status, valid_status);
         assert_eq!(ledger.snapshot(), initial_stats);
     }
