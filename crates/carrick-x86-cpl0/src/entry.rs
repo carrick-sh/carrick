@@ -399,6 +399,9 @@ mod kernel {
             carrick_personality_linux::crossing::HostCrossingSet::X86
         }
 
+        fn may_serve_poll(&self) -> bool {
+            self.call.native.raw() == carrick_syscall_abi::syscall_x86_64::X86_POLL.raw()
+        }
         fn query_host_readiness(&mut self, entries: &mut [carrick_el1_abi::HostReadinessEntry], timeout_ms: i32) -> Option<i64> {
             if self.call.native.raw() != 7 {
                 return None;

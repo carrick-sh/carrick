@@ -1037,3 +1037,5 @@ mod tests {
         );
     }
 }
+/// Native x86_64 `poll(2)` ordinal, distinct from canonical `ppoll(2)`.
+pub const X86_POLL: crate::NativeNr = crate::NativeNr(7);

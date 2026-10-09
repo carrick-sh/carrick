@@ -163,6 +163,10 @@ impl EntryCounters<'_> {
 /// Methods disappear with their named order; implementations never select a
 /// different family and never publish entry completion.
 pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadCtx> {
+    /// The native ABI and current venue jointly admit the poll family.
+    fn may_serve_poll(&self) -> bool {
+        false
+    }
     fn take_handoff_receipt(&mut self) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
         None
     }
@@ -458,7 +462,6 @@ pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
         27 => Family::InotifyAdd,
         28 => Family::InotifyRemove,
         98 => Family::Futex,
-        73 => Family::Poll,
         93 => Family::Lifecycle(LifecycleCall::Exit),
         132 => Family::Lifecycle(LifecycleCall::SigAltStack),
         135 => Family::Lifecycle(LifecycleCall::SigProcMask),
@@ -662,7 +665,11 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
     pending: &mut dyn PendingFamilies<'a, C>,
 ) -> CompletionRoute {
     let original_argument0 = pending.original_argument0();
-    let family = route_aarch64(ordinal, control);
+    let family = if ordinal == carrick_syscall_abi::nr::PPOLL.raw() {
+        if pending.may_serve_poll() { Family::Poll } else { Family::Unported }
+    } else {
+        route_aarch64(ordinal, control)
+    };
     let completion = match pending.binding().and_then(|binding| {
         if let Some(token) = carrick_core::entry::admit(binding, pending.record_source()) {
             Some(CompletionAuthority::Entry(token))
