@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 carrick-core = { path = "../carrick-core" }
 carrick-core-abi = { path = "../carrick-core-abi" }
+carrick-sched-core = { path = "../carrick-sched-core" }
 carrick-fatal.workspace = true
 # The shared aarch64 engine scaffold sits ABOVE carrick-hal/carrick-mem/
 # carrick-guest-mem and BELOW the per-VMM backend crates (carrick-vmm-hvf /

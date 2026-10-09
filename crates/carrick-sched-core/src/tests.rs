@@ -60,8 +60,9 @@ fn loaded_root_has_an_exact_home_before_its_first_syscall() {
     assert!(zone.slot(SLOT).current().is_none());
     assert!(zone.slot(SLOT).host_record().is_none());
     let record = zone
-        .publish_loaded_home(SLOT, loaded)
+        .prepare_loaded_home(SLOT, loaded)
         .expect("host load must publish the root before EL0");
+    let record = record.commit().expect("installed MM admits exact home");
     assert_eq!(zone.slot(SLOT).host_record(), Some(record));
     assert_eq!(zone.record(record).identity(), loaded);
 
@@ -69,8 +70,55 @@ fn loaded_root_has_an_exact_home_before_its_first_syscall() {
         mm: MM + 1,
         ..loaded
     };
-    assert!(zone.publish_loaded_home(SLOT, foreign).is_none());
+    assert!(zone.prepare_loaded_home(SLOT, foreign).is_none());
     assert_eq!(zone.slot(SLOT).host_record(), Some(record));
+}
+
+#[test]
+fn loaded_root_home_is_prepared_before_occupancy_and_validated_after() {
+    let zone = zone();
+    zone.drive(SLOT, 1);
+    zone.publish_slot(SLOT, MM, Some(0), 1);
+    let loaded = ThreadIdentity {
+        lifecycle_page: 0x1000,
+        control_slot: 0x2000,
+        ..identity(42)
+    };
+    assert_eq!(zone.installed_space(SLOT), 0);
+    let prepared = zone
+        .prepare_loaded_home(SLOT, loaded)
+        .expect("backend load prepares the exact home before occupancy");
+    assert!(zone.slot(SLOT).host_record().is_none());
+    assert!(zone.occupancy.replace(ExecutionSlot::zone(SLOT), 0, MM));
+    let record = prepared
+        .commit()
+        .expect("occupancy commits the prepared home");
+    assert_eq!(zone.slot(SLOT).host_record(), Some(record));
+    assert_eq!(zone.record(record).identity(), loaded);
+}
+
+#[test]
+fn loaded_root_home_mismatch_rolls_back_record() {
+    let zone = zone();
+    zone.drive(SLOT, 1);
+    zone.publish_slot(SLOT, MM, Some(0), 1);
+    let loaded = ThreadIdentity {
+        lifecycle_page: 0x1000,
+        control_slot: 0x2000,
+        ..identity(43)
+    };
+    let prepared = zone.prepare_loaded_home(SLOT, loaded).unwrap();
+    assert!(zone.occupancy.replace(ExecutionSlot::zone(SLOT), 0, MM + 1));
+    assert!(prepared.commit().is_none());
+    assert!(zone.slot(SLOT).host_record().is_none());
+    assert!(
+        zone.occupancy
+            .replace(ExecutionSlot::zone(SLOT), MM + 1, MM)
+    );
+    let replacement = zone
+        .prepare_loaded_home(SLOT, loaded)
+        .expect("mismatch released the record for a new preparation");
+    assert!(replacement.commit().is_some());
 }
 
 fn identity(tid: u64) -> ThreadIdentity {
