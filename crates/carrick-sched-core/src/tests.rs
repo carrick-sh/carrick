@@ -121,6 +121,54 @@ fn loaded_root_home_mismatch_rolls_back_record() {
     assert!(replacement.commit().is_some());
 }
 
+#[test]
+fn committed_loaded_home_survives_handle_drop_and_slot_reload() {
+    let zone = zone();
+    host_publish(&zone, SLOT, MM, Some(0), 1);
+    let loaded = ThreadIdentity {
+        lifecycle_page: 0x1000,
+        control_slot: 0x2000,
+        ..identity(44)
+    };
+    let record = zone
+        .prepare_loaded_home(SLOT, loaded)
+        .expect("prepare exact home")
+        .commit()
+        .expect("commit exact home");
+    let exact = zone.record_ref(record);
+    assert_eq!(zone.record(record).claim(), Claim::Free);
+    assert!(zone.reset_slot(SLOT));
+    zone.publish_slot(SLOT, MM, Some(0), 1);
+    let reloaded = zone
+        .prepare_reloaded_home(SLOT, exact, loaded)
+        .expect("same exact task reuses its committed home")
+        .commit()
+        .expect("reloaded MM occupancy still matches");
+    assert_eq!(reloaded, record);
+    assert_eq!(zone.record_ref(reloaded), exact);
+    assert_eq!(zone.slot(SLOT).host_record(), Some(record));
+}
+
+#[test]
+fn prepared_home_is_reused_by_first_guest_park() {
+    let zone = zone();
+    host_publish(&zone, SLOT, MM, Some(0), 1);
+    let loaded = ThreadIdentity {
+        lifecycle_page: 0x1000,
+        control_slot: 0x2000,
+        ..identity(45)
+    };
+    let record = zone
+        .prepare_loaded_home(SLOT, loaded)
+        .unwrap()
+        .commit()
+        .unwrap();
+    assert_eq!(zone.slot(SLOT).host_record(), Some(record));
+    assert_eq!(zone.record(record).claim(), Claim::Free);
+    assert_eq!(zone.current_or_new(SLOT, loaded), Ok(record));
+    assert_eq!(zone.slot(SLOT).host_record(), Some(record));
+}
+
 fn identity(tid: u64) -> ThreadIdentity {
     ThreadIdentity {
         tid,

@@ -284,7 +284,14 @@ where
         // returns, so another thread's timed park on it goes to the host.
         carrick_kernel::el1_zone::hand_back_foreign_timer(slot);
         let s = zone.slot(slot);
-        let (mut current, own) = (s.current(), s.host_record());
+        // A loader-prepared home is visible to process admission before the
+        // first syscall, but Claim::Free means EL1 has not parked this thread.
+        // Only a published park transfers its CPU state into zone residency.
+        let (mut current, own) = (
+            s.current(),
+            s.host_record()
+                .filter(|record| zone.record(*record).claim() != carrick_el1_abi::Claim::Free),
+        );
         let mut requeued = false;
         if let (Some(switched), Some(own)) = (current, own)
             && switched == own

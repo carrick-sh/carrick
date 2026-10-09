@@ -2769,6 +2769,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         match self.slot(slot).current() {
             Some(record) => Ok(record),
             None => {
+                if let Some(record) = self.slot(slot).host_record() {
+                    let existing = self.record(record);
+                    if existing.claim() != Claim::Free || existing.identity() != identity {
+                        return Err(Exhausted);
+                    }
+                    return Ok(record);
+                }
                 let record = self.alloc_record(identity)?;
                 self.record(record)
                     .home
@@ -2805,6 +2812,32 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             zone: self,
             slot,
             record: Some(record),
+        })
+    }
+
+    /// Reattach an unused committed home after the executor unloaded and
+    /// reloaded the same exact task. No new incarnation or record is minted.
+    pub fn prepare_reloaded_home(
+        &self,
+        slot: SlotId,
+        retained: RecordRef,
+        identity: ThreadIdentity,
+    ) -> Option<PreparedHome<'_, C>> {
+        let row = self.record(retained.id);
+        if self.slot(slot).current().is_some()
+            || self.slot(slot).host_record().is_some()
+            || self.slot(slot).mm() != identity.mm
+            || self.record_ref(retained.id) != retained
+            || row.claim() != Claim::Free
+            || row.identity() != identity
+            || row.home.load(Ordering::Acquire) != slot.plus_one()
+        {
+            return None;
+        }
+        Some(PreparedHome {
+            zone: self,
+            slot,
+            record: Some(retained.id),
         })
     }
 
