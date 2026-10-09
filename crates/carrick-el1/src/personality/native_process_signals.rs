@@ -38,6 +38,7 @@ struct SignalResources<T> {
     actions: ActionTable,
     inbox: SignalInbox<TaskKey, T>,
     thread_pending: Vec<(u32, PendingSignals<T>)>,
+    forced_segv: Vec<u32>,
 }
 /// One actual sighand and pending owner, retained by exact task handles.
 pub struct NativeProcessSignals<T> {
@@ -67,6 +68,7 @@ impl<T> NativeProcessSignals<T> {
                 actions: ActionTable::default(),
                 inbox: SignalInbox::new(key),
                 thread_pending: Vec::new(),
+                forced_segv: Vec::new(),
             })),
         }
     }
@@ -87,16 +89,25 @@ impl<T> NativeProcessSignals<T> {
             .map_err(SignalActionError::Action)
     }
     pub fn forced_action(&self, signal: Signal, blocked: SigBlockMask) -> Action {
-        let action = self.action(signal);
+        let mut resources = self.resources.lock();
+        let action = resources.actions.action(signal);
         if blocked.contains(signal) || action.disposition == Disposition::Ignore {
+            let _ = resources.actions.install(signal, Action::default());
             Action::default()
         } else {
+            resources.actions.prepare_delivery(
+                signal,
+                &mut carrick_signal_core::policy::MaskState::new(blocked),
+            );
             action
         }
     }
-    pub fn force_sigsegv(&self, tid: u32, blocked: SigBlockMask) {
+    pub fn force_sigsegv(&self, tid: u32, blocked: SigBlockMask, info: Option<T>) {
         let mut resources = self.resources.lock();
         let signal = Signal::SEGV;
+        if !resources.forced_segv.contains(&tid) {
+            resources.forced_segv.push(tid);
+        }
         if blocked.contains(signal)
             || resources.actions.action(signal).disposition == Disposition::Ignore
         {
@@ -107,10 +118,10 @@ impl<T> NativeProcessSignals<T> {
             .iter_mut()
             .find(|(id, _)| *id == tid)
         {
-            pending.enqueue(signal, None);
+            pending.enqueue(signal, info);
         } else {
             let mut pending = PendingSignals::default();
-            pending.enqueue(signal, None);
+            pending.enqueue(signal, info);
             resources.thread_pending.push((tid, pending));
         }
     }
@@ -152,14 +163,25 @@ impl<T> NativeProcessSignals<T> {
         blocked: SigBlockMask,
     ) -> Option<(Signal, Option<T>, Action)> {
         let mut resources = self.resources.lock();
-        let actions = resources.actions.clone();
         let idx = resources.thread_pending.iter().position(|(t, _)| *t == tid);
         let mut thread_pending = idx
             .map(|i| resources.thread_pending.remove(i).1)
             .unwrap_or_default();
+        let forced = resources.forced_segv.contains(&tid);
         let delivery = {
             let proc_pending = resources.inbox.pending_mut();
-            let unblocked = blocked.select(proc_pending.present().union(thread_pending.present()));
+            let present = proc_pending.present().union(thread_pending.present());
+            let unblocked = if present
+                .intersect(SignalSet::EMPTY.with(Signal::KILL))
+                .bits()
+                != 0
+            {
+                SignalSet::EMPTY.with(Signal::KILL)
+            } else if forced {
+                SignalSet::EMPTY.with(Signal::SEGV)
+            } else {
+                blocked.select(present)
+            };
             carrick_personality_linux::signal::take_pending(
                 &mut thread_pending,
                 proc_pending,
@@ -171,7 +193,14 @@ impl<T> NativeProcessSignals<T> {
         }
         let delivery = delivery?;
         let signal = delivery.entry.signal;
-        let action = actions.action(signal);
+        if signal == Signal::SEGV {
+            resources.forced_segv.retain(|id| *id != tid);
+        }
+        let action = resources.actions.action(signal);
+        resources.actions.prepare_delivery(
+            signal,
+            &mut carrick_signal_core::policy::MaskState::new(blocked),
+        );
         Some((signal, delivery.entry.info, action))
     }
     pub fn take_timedwait(&self, tid: u32, set: SignalSet) -> Option<(Signal, Option<T>)> {
@@ -210,6 +239,7 @@ impl<T> NativeProcessSignals<T> {
                 actions,
                 inbox: source.inbox.for_fork(child),
                 thread_pending: Vec::new(),
+                forced_segv: Vec::new(),
             })),
         })
     }
@@ -265,6 +295,26 @@ mod tests {
             serial: TaskSerial::from_raw_u64(serial).unwrap(),
         }
     }
+    #[test]
+    fn reset_hand_is_committed_with_selected_action_snapshot() {
+        let task = key(41, 11);
+        let signals = NativeProcessSignals::<()>::fresh_root(task);
+        let caught = Action {
+            disposition: Disposition::Handler(HandlerAddress(0x400000)),
+            flags: carrick_signal_core::policy::ActionFlags {
+                reset_hand: true,
+                ..Default::default()
+            },
+            ..Action::default()
+        };
+        let usr1 = Signal::from_number(10).unwrap();
+        signals.install_action(task, usr1, caught).unwrap();
+        signals.enqueue(task, usr1, None).unwrap();
+        let (_, _, snapshot) = signals.take_deliverable(41, SigBlockMask::NONE).unwrap();
+        assert_eq!(snapshot, caught);
+        assert_eq!(signals.action(usr1).disposition, Disposition::Default);
+    }
+
     #[test]
     fn blocked_or_ignored_synchronous_segv_forces_default() {
         let task = key(41, 11);
