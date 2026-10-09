@@ -18,13 +18,14 @@ impl InternalIdentity {
 
 /// Exact root namespace numbering domain, distinct from task IDs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct VisibleNamespace {
-    id: NonZeroU32,
-    incarnation: NonZeroU32,
-}
+pub struct VisibleNamespace(NonZeroU64);
 impl VisibleNamespace {
     pub const fn new(id: NonZeroU32, incarnation: NonZeroU32) -> Self {
-        Self { id, incarnation }
+        let raw = ((id.get() as u64) << 32) | (incarnation.get() as u64);
+        match NonZeroU64::new(raw) {
+            Some(nz) => Self(nz),
+            None => unreachable!(),
+        }
     }
 }
 /// Linux-visible PID/TID; never an internal registry key.

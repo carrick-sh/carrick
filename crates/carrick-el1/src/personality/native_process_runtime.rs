@@ -180,7 +180,7 @@ pub struct NativeResources<'a, M, C: ProcessContext> {
     file_table: u64,
 }
 pub type NativeForkPreparation<'a, M, P, C> = PreparedFork<
-    (),
+    VisibleNamespace,
     carrick_sched_core::process::TaskUid,
     RetainedProcessCustody<NativeResources<'a, M, C>>,
     P,
@@ -218,7 +218,7 @@ impl<'a, M: Clone, C: ProcessContext> ProcessResources for NativeResources<'a, M
 }
 type Custody<'a, M, C> = RetainedProcessCustody<NativeResources<'a, M, C>>;
 type Owner<'a, M, C> =
-    GuestProcessOwner<(), carrick_sched_core::process::TaskUid, Custody<'a, M, C>>;
+    GuestProcessOwner<VisibleNamespace, carrick_sched_core::process::TaskUid, Custody<'a, M, C>>;
 struct PendingWait {
     caller: TaskKey,
     query: WaitQuery,
@@ -405,7 +405,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .seed_initial(GuestTask::new(
                 GuestTaskMetadata {
                     key,
-                    container: (),
+                    container: visible_namespace,
                     namespace_pid: visible.get(),
                     identity: TaskIdentity::led_by(id),
                     namespace_process_group: visible.get(),
@@ -810,6 +810,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.service.wake_effects(effects);
         Ok(())
     }
+    #[inline(never)]
     fn exit_owned(&mut self, status: u8) -> Result<LifecycleOutcome, NativeProcessError> {
         let root_exit = self.is_root_process();
         let wait_status = LinuxWaitStatus::from_wait_encoding(i32::from(status) << 8);
@@ -934,6 +935,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             result: SyscallResult::new(0),
         })
     }
+    #[inline(never)]
     fn fork_owned(&mut self) -> Result<u32, NativeProcessError> {
         let (
             snapshot,
@@ -956,6 +958,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             parent_dumpable,
             parent_no_new_privs,
             parent_comm,
+            parent_container,
         ) = {
             let mut graph = self.runtime.graph.lock();
             let row = graph
@@ -968,6 +971,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let session = row.metadata().namespace_session;
             let signals = row.native().resources().signals.clone();
             let caller_tid = self.calling_tid;
+            let parent_container = row.metadata().container;
             let parent_creds = row
                 .credentials_for(caller_tid)
                 .map_err(|_| NativeProcessError::Stale)?
@@ -1059,6 +1063,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 parent_dumpable,
                 parent_no_new_privs,
                 parent_comm,
+                parent_container,
             )
         };
         let signals = match signals.for_fork(child_key) {
@@ -1219,7 +1224,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let mut child = GuestTask::new(
             GuestTaskMetadata {
                 key: child_key,
-                container: (),
+                container: parent_container,
                 namespace_pid: visible.get(),
                 identity,
                 namespace_process_group: group,
@@ -1664,7 +1669,6 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         let Ok(parent) = graph.owner.task(parent_key) else {
             return 0;
         };
-        #[allow(clippy::unit_cmp)]
         if parent.metadata().container != task.metadata().container {
             return 0;
         }
@@ -3571,5 +3575,146 @@ mod tests {
         // capset on own tid 42 and pid 0 must succeed
         assert_eq!(entry.capset(42, caps.clone()), Ok(()));
         assert_eq!(entry.capset(0, caps), Ok(()));
+    }
+
+    #[test]
+    fn getppid_returns_zero_when_parent_outside_pid_namespace() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let child_page = Box::new(ThreadLifecyclePage::new());
+        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        }));
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &*child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+        };
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        use carrick_personality_linux::identity::ProcessIdentityVenue;
+
+        let parent_key = TaskKey {
+            id: TaskId::from_abi_positive(41).unwrap(),
+            serial: TaskSerial::from_raw_u64(11).unwrap(),
+        };
+        let parent_record = runtime
+            .graph
+            .lock()
+            .owner
+            .task(parent_key)
+            .unwrap()
+            .native()
+            .resources()
+            .record;
+
+        entry.set_calling_tid(41);
+        let child_pid = entry.fork_owned().expect("fork child succeeds") as i32;
+        drop(entry);
+
+        zone.requeue_preempted(slot, parent_record.id);
+        let child_key = {
+            let graph = runtime.graph.lock();
+            graph
+                .owner
+                .find_task_by_pid(child_pid as u32)
+                .unwrap()
+                .key()
+        };
+        let (child_address, child_words, child_record) = {
+            let graph = runtime.graph.lock();
+            let row = graph.owner.task(child_key).unwrap();
+            (
+                row.native().resources().address,
+                *row.context(),
+                row.native().resources().record,
+            )
+        };
+        assert_eq!(zone.switch_in_full(slot).unwrap().record, child_record.id);
+        zone.install_space(slot, child_address.mm.raw().get())
+            .unwrap();
+        let child_identity = zone.record(child_record.id).identity();
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(child_key.id.raw()),
+            child_key.serial.raw(),
+            child_identity.file_table,
+        );
+        task.mm
+            .key
+            .store(child_address.mm.raw().get(), Ordering::Release);
+        task.mm
+            .thread_generation
+            .store(child_identity.serial, Ordering::Release);
+        task.publish_visible_pid(child_pid as u32);
+        task.publish_lifecycle(child_identity.lifecycle_page, child_identity.control_slot);
+
+        let child_entry = runtime
+            .enter(source, &task, child_words, &mut service)
+            .unwrap();
+
+        // 1. Same namespace: child get_ppid returns parent's pid (41)
+        assert_eq!(child_entry.get_ppid(), 41);
+
+        // 2. Parent placed outside caller's pid namespace: get_ppid returns 0
+        {
+            let mut graph = runtime.graph.lock();
+            let parent_task = graph.owner.task_mut(parent_key).unwrap();
+            parent_task.metadata_mut().container =
+                VisibleNamespace::new(NonZeroU32::new(99).unwrap(), NonZeroU32::new(1).unwrap());
+        }
+        assert_eq!(child_entry.get_ppid(), 0);
     }
 }
