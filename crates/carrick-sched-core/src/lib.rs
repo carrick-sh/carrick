@@ -94,7 +94,9 @@ pub mod occupancy;
 pub mod spaces;
 mod x86_context;
 pub use aarch64_context::{AARCH64_ROOT_ADDRESS_MASK, Aarch64ParkedContext};
-pub use x86_context::{ParkedContextWords, X86_XSAVE_BYTES, valid_user_return_words};
+pub use x86_context::{
+    ParkedContextWords, X86_XSAVE_BYTES, signal_return_flags, valid_user_return_words,
+};
 
 pub use occupancy::{
     AddressSpaceKey, EXECUTION_SLOTS, ExecutionSlot, HOST_EXECUTION_SLOTS, Occupancy, SlotBusy,

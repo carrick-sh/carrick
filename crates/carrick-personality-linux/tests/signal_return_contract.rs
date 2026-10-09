@@ -6,6 +6,8 @@ use carrick_signal_core::{SignalSet, policy::SigBlockMask};
 
 struct Native {
     accumulator: u64,
+    invalid: bool,
+    forced: bool,
     blocked: SigBlockMask,
 }
 impl UserCopy for Native {
@@ -35,7 +37,14 @@ impl<'a> SignalNative<'a> for Native {
     fn current_tid(&self) -> u32 {
         1
     }
+    fn force_sigsegv(&mut self) -> bool {
+        self.forced = true;
+        true
+    }
     fn restore_signal_frame(&mut self) -> Result<u64, i32> {
+        if self.invalid {
+            return Err(14);
+        }
         self.accumulator = 0x1234_5678;
         Ok(1 << 9)
     }
@@ -44,6 +53,8 @@ impl<'a> SignalNative<'a> for Native {
 fn restored_context_has_no_syscall_result() {
     let mut native = Native {
         accumulator: 139,
+        invalid: false,
+        forced: false,
         blocked: SigBlockMask::blocking_all_of(SignalSet::default()),
     };
     let outcome = invoke(SignalCall::RtSigreturn, &mut native).unwrap();
@@ -69,4 +80,17 @@ fn restored_context_finishes_same_entry_and_retains_return_work() {
         completion_route(FamilyCompletion::FrameRestored, true),
         CompletionRoute::WithWork
     );
+}
+
+#[test]
+fn invalid_signal_frame_is_not_an_errno_return() {
+    let mut native = Native {
+        accumulator: 139,
+        invalid: true,
+        forced: false,
+        blocked: SigBlockMask::NONE,
+    };
+    let outcome = invoke(SignalCall::RtSigreturn, &mut native);
+    assert_eq!(outcome, Some(SignalOutcome::Restored));
+    assert!(native.forced);
 }
