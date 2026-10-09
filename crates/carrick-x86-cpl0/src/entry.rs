@@ -13,7 +13,10 @@ fn main() {}
 #[cfg(target_os = "none")]
 macro_rules! fixture_dispatch_enabled {
     () => {
-        fixture_expr!(crate::carrick_x86_fixture_dispatch_witness())
+        fixture_expr!({
+            let _ = crate::carrick_x86_fixture_dispatch_witness();
+            true
+        })
     };
 }
 
@@ -1235,7 +1238,6 @@ mod kernel {
                 {
                     // The child wait has not consumed a receipt or copied status.
                     // Restore its exact saved syscall accumulator and instruction.
-                    use carrick_guest_arch::ProcessContext;
                     frame.rax = original.syscall_return();
                     let Some(restart_pc) = frame.rcx.checked_sub(2) else {
                         return force_delivery_fault(task, process, frame, fpstate, sig, thread_blocked);
