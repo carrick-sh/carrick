@@ -37,8 +37,8 @@ use carrick_personality_linux::signal::PendingSignals;
 struct SignalResources<T> {
     actions: ActionTable,
     inbox: SignalInbox<TaskKey, T>,
-    thread_pending: Vec<(u32, PendingSignals<T>)>,
-    forced_segv: Vec<u32>,
+    thread_pending: Vec<(carrick_sched_core::RecordRef, PendingSignals<T>)>,
+    forced_segv: Vec<carrick_sched_core::RecordRef>,
 }
 /// One actual sighand and pending owner, retained by exact task handles.
 pub struct NativeProcessSignals<T> {
@@ -102,7 +102,12 @@ impl<T> NativeProcessSignals<T> {
             action
         }
     }
-    pub fn force_sigsegv(&self, tid: u32, blocked: SigBlockMask, info: Option<T>) {
+    pub fn force_sigsegv(
+        &self,
+        tid: carrick_sched_core::RecordRef,
+        blocked: SigBlockMask,
+        info: Option<T>,
+    ) {
         let mut resources = self.resources.lock();
         let signal = Signal::SEGV;
         if !resources.forced_segv.contains(&tid) {
@@ -136,7 +141,12 @@ impl<T> NativeProcessSignals<T> {
     ) -> Result<EnqueueOutcome, StaleTarget> {
         self.resources.lock().inbox.enqueue_for(key, signal, info)
     }
-    pub fn enqueue_thread(&self, tid: u32, signal: Signal, info: Option<T>) -> EnqueueOutcome {
+    pub fn enqueue_thread(
+        &self,
+        tid: carrick_sched_core::RecordRef,
+        signal: Signal,
+        info: Option<T>,
+    ) -> EnqueueOutcome {
         let mut res = self.resources.lock();
         if let Some((_, p)) = res.thread_pending.iter_mut().find(|(t, _)| *t == tid) {
             p.enqueue(signal, info)
@@ -147,7 +157,7 @@ impl<T> NativeProcessSignals<T> {
             outcome
         }
     }
-    pub fn pending_set(&self, tid: u32) -> SignalSet {
+    pub fn pending_set(&self, tid: carrick_sched_core::RecordRef) -> SignalSet {
         let resources = self.resources.lock();
         let proc = resources.inbox.pending().present();
         let thread = resources
@@ -157,7 +167,11 @@ impl<T> NativeProcessSignals<T> {
             .map_or(SignalSet::EMPTY, |(_, p)| p.present());
         proc.union(thread)
     }
-    pub fn has_deliverable(&self, tid: u32, blocked: SigBlockMask) -> bool {
+    pub fn has_deliverable(
+        &self,
+        tid: carrick_sched_core::RecordRef,
+        blocked: SigBlockMask,
+    ) -> bool {
         let resources = self.resources.lock();
         let thread = resources
             .thread_pending
@@ -183,7 +197,7 @@ impl<T> NativeProcessSignals<T> {
     }
     pub fn take_deliverable(
         &self,
-        tid: u32,
+        tid: carrick_sched_core::RecordRef,
         blocked: SigBlockMask,
     ) -> Option<(Signal, Option<T>, Action)> {
         loop {
@@ -236,7 +250,11 @@ impl<T> NativeProcessSignals<T> {
             return Some((signal, delivery.entry.info, action));
         }
     }
-    pub fn take_timedwait(&self, tid: u32, set: SignalSet) -> Option<(Signal, Option<T>)> {
+    pub fn take_timedwait(
+        &self,
+        tid: carrick_sched_core::RecordRef,
+        set: SignalSet,
+    ) -> Option<(Signal, Option<T>)> {
         let mut resources = self.resources.lock();
         let idx = resources.thread_pending.iter().position(|(t, _)| *t == tid);
         let mut thread_pending = idx
@@ -329,6 +347,31 @@ mod tests {
         }
     }
     #[test]
+    fn recycled_record_cannot_consume_another_thread_incarnations_signal() {
+        let signals = NativeProcessSignals::<u32>::fresh_root(key(41, 11));
+        let old = carrick_sched_core::RecordRef {
+            id: carrick_sched_core::RecordId::from_raw(1).unwrap(),
+            incarnation: 7,
+        };
+        let replacement = carrick_sched_core::RecordRef {
+            incarnation: 8,
+            ..old
+        };
+        let usr1 = Signal::from_number(10).unwrap();
+        signals.enqueue_thread(old, usr1, Some(41));
+        assert_eq!(signals.pending_set(replacement), SignalSet::EMPTY);
+        assert!(
+            signals
+                .take_timedwait(replacement, SignalSet::EMPTY.with(usr1))
+                .is_none()
+        );
+        assert_eq!(
+            signals.take_timedwait(old, SignalSet::EMPTY.with(usr1)),
+            Some((usr1, Some(41)))
+        );
+    }
+
+    #[test]
     fn reset_hand_is_committed_with_selected_action_snapshot() {
         let task = key(41, 11);
         let signals = NativeProcessSignals::<()>::fresh_root(task);
@@ -343,7 +386,15 @@ mod tests {
         let usr1 = Signal::from_number(10).unwrap();
         signals.install_action(task, usr1, caught).unwrap();
         signals.enqueue(task, usr1, None).unwrap();
-        let (_, _, snapshot) = signals.take_deliverable(41, SigBlockMask::NONE).unwrap();
+        let (_, _, snapshot) = signals
+            .take_deliverable(
+                carrick_sched_core::RecordRef {
+                    id: carrick_sched_core::RecordId::from_raw(1).unwrap(),
+                    incarnation: 1,
+                },
+                SigBlockMask::NONE,
+            )
+            .unwrap();
         assert_eq!(snapshot, caught);
         assert_eq!(signals.action(usr1).disposition, Disposition::Default);
     }
