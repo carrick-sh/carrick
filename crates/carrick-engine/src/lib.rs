@@ -173,6 +173,20 @@ pub struct RunRequest {
 
 /// Hand-written rather than derived: a derived `Default` would set
 /// `max_traps` to `0`, which trips the trap limit on the first syscall.
+impl RunRequest {
+    /// Resolve policy from this launch's snapshot once; persisted relaunches
+    /// supply an explicit policy and do not consult a later environment.
+    pub fn arm_ring_first_policy(&self) -> carrick_spec::ArmRingFirst {
+        self.arm_ring_first.unwrap_or_else(|| {
+            carrick_spec::ArmRingFirst::from_setting(self.host_env.as_ref().and_then(|env| {
+                env.iter()
+                    .find(|(key, _)| key == "CARRICK_ARM_RING_FIRST")
+                    .map(|(_, value)| value.as_str())
+            }))
+        })
+    }
+}
+
 impl Default for RunRequest {
     fn default() -> Self {
         Self {
@@ -322,6 +336,7 @@ pub fn check_platform_runnable(platform: Platform) -> Result<(), String> {
 }
 
 pub fn resolve_run_spec(req: RunRequest, image: ResolvedImage) -> Result<Resolved, String> {
+    let arm_ring_first = req.arm_ring_first_policy();
     let platform = request_platform(&req);
 
     // 1. Resolve argv (entrypoint + cmd overrides)
@@ -544,13 +559,6 @@ pub fn resolve_run_spec(req: RunRequest, image: ResolvedImage) -> Result<Resolve
     };
     let seccomp_policy = resolve_seccomp_policy(base_seccomp_policy, &req.security_opts)?;
 
-    let arm_ring_first = req.arm_ring_first.unwrap_or_else(|| {
-        carrick_spec::ArmRingFirst::from_setting(req.host_env.as_ref().and_then(|env| {
-            env.iter()
-                .find(|(key, _)| key == "CARRICK_ARM_RING_FIRST")
-                .map(|(_, value)| value.as_str())
-        }))
-    });
     let spec = RunSpec {
         arm_ring_first,
         process: ProcessSpec {
