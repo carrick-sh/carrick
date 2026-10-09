@@ -278,6 +278,48 @@ impl SignalThreadSelector {
     }
 }
 
+/// A validated signal send, with signal zero represented as an existence probe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignalRequest {
+    Probe,
+    Deliver(carrick_signal_core::policy::Signal),
+}
+impl SignalRequest {
+    pub fn from_abi(raw: u64) -> Result<Self, carrick_syscall_abi::LinuxErrno> {
+        let number = raw as i32;
+        if number == 0 {
+            return Ok(Self::Probe);
+        }
+        carrick_signal_core::policy::Signal::from_number(number)
+            .map(Self::Deliver)
+            .ok_or(carrick_abi::LINUX_EINVAL)
+    }
+    pub const fn signal(self) -> Option<carrick_signal_core::policy::Signal> {
+        match self {
+            Self::Probe => None,
+            Self::Deliver(signal) => Some(signal),
+        }
+    }
+    pub const fn number(self) -> i32 {
+        match self {
+            Self::Probe => 0,
+            Self::Deliver(signal) => signal.number(),
+        }
+    }
+}
+
+/// Signed kill(2) namespace selection, distinct from an admitted task key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignalProcessSelector(i32);
+impl SignalProcessSelector {
+    pub const fn from_abi(raw: u64) -> Self {
+        Self(raw as i32)
+    }
+    pub const fn abi_number(self) -> i32 {
+        self.0
+    }
+}
+
 /// Generated sender metadata cannot be confused with a user-supplied queue
 /// record. Only queued records need the rt_sigqueueinfo forging restriction.
 #[derive(Clone, Copy)]
@@ -305,11 +347,20 @@ impl SignalInfo {
         }
         Ok(())
     }
-    pub fn payload(self) -> Option<crate::abi::signal::LinuxSiginfo> {
-        match self {
+    pub fn payload(
+        self,
+        signal: carrick_signal_core::policy::Signal,
+    ) -> Option<crate::abi::signal::LinuxSiginfo> {
+        let payload = match self {
             Self::Generated(info) => info,
             Self::Queued(info) => Some(info),
-        }
+        };
+        // rt_sigqueueinfo(2): si_signo names the admitted signal, not a
+        // caller-controlled header field in the queue payload.
+        payload.map(|mut info| {
+            info.si_signo = signal.number();
+            info
+        })
     }
 }
 
@@ -321,7 +372,7 @@ pub trait ProcessSignals {
 
     fn rt_sigaction(
         &mut self,
-        signum: i32,
+        signum: carrick_signal_core::policy::Signal,
         act: Option<carrick_signal_core::policy::Action>,
     ) -> Result<carrick_signal_core::policy::Action, carrick_syscall_abi::LinuxErrno>;
 
@@ -329,15 +380,15 @@ pub trait ProcessSignals {
 
     fn kill(
         &mut self,
-        pid: i32,
-        sig: i32,
+        pid: SignalProcessSelector,
+        sig: SignalRequest,
         info: SignalInfo,
     ) -> Result<(), carrick_syscall_abi::LinuxErrno>;
 
     fn tkill(
         &mut self,
         tid: SignalThreadSelector,
-        sig: i32,
+        sig: SignalRequest,
         info: SignalInfo,
     ) -> Result<(), carrick_syscall_abi::LinuxErrno>;
 
@@ -345,7 +396,7 @@ pub trait ProcessSignals {
         &mut self,
         tgid: SignalThreadSelector,
         tid: SignalThreadSelector,
-        sig: i32,
+        sig: SignalRequest,
         info: SignalInfo,
     ) -> Result<(), carrick_syscall_abi::LinuxErrno>;
 
@@ -390,7 +441,7 @@ pub trait SignalNative<'a>: crate::lifecycle::UserCopy {
     fn current_uid(&self) -> u32 {
         0
     }
-    fn restore_signal_frame(&mut self) -> Result<u64, i32>;
+    fn restore_signal_frame(&mut self) -> Result<u64, carrick_syscall_abi::LinuxErrno>;
     fn force_sigsegv(&mut self) -> bool {
         let blocked = self.current_blocked();
         let forced = self
@@ -476,7 +527,10 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
             // The owner exchanges old/new under one sighand admission.
             let current = {
                 let signals = native.process_signals()?;
-                match signals.rt_sigaction(signum, new_action) {
+                match signals.rt_sigaction(
+                    carrick_signal_core::policy::Signal::from_number(signum)?,
+                    new_action,
+                ) {
                     Ok(action) => action,
                     Err(error) => {
                         return returned(error.guest_retval(), false);
@@ -565,13 +619,16 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
         }
         SignalCall::Kill => {
             let [pid, sig, _, _, _, _] = args;
-            let pid = pid as i32;
-            let sig = sig as i32;
+            let pid = SignalProcessSelector::from_abi(pid);
+            let sig = match SignalRequest::from_abi(sig) {
+                Ok(request) => request,
+                Err(errno) => return returned(errno.guest_retval(), false),
+            };
             let sender_pid = native.current_pid() as i32;
             let sender_uid = native.current_uid();
-            let info = if sig != 0 {
+            let info = if sig.signal().is_some() {
                 Some(LinuxSiginfo::kill(
-                    sig,
+                    sig.number(),
                     LINUX_SI_USER,
                     sender_pid,
                     sender_uid,
@@ -588,12 +645,15 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
         SignalCall::Tkill => {
             let [tid, sig, _, _, _, _] = args;
             let tid = SignalThreadSelector::from_abi(tid);
-            let sig = sig as i32;
+            let sig = match SignalRequest::from_abi(sig) {
+                Ok(request) => request,
+                Err(errno) => return returned(errno.guest_retval(), false),
+            };
             let sender_pid = native.current_pid() as i32;
             let sender_uid = native.current_uid();
-            let info = if sig != 0 {
+            let info = if sig.signal().is_some() {
                 Some(LinuxSiginfo::kill(
-                    sig,
+                    sig.number(),
                     LINUX_SI_TKILL,
                     sender_pid,
                     sender_uid,
@@ -614,12 +674,15 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 return returned(LINUX_EINVAL.guest_retval(), false);
             }
             let tid = SignalThreadSelector::from_abi(tid);
-            let sig = sig as i32;
+            let sig = match SignalRequest::from_abi(sig) {
+                Ok(request) => request,
+                Err(errno) => return returned(errno.guest_retval(), false),
+            };
             let sender_pid = native.current_pid() as i32;
             let sender_uid = native.current_uid();
-            let info = if sig != 0 {
+            let info = if sig.signal().is_some() {
                 Some(LinuxSiginfo::kill(
-                    sig,
+                    sig.number(),
                     LINUX_SI_TKILL,
                     sender_pid,
                     sender_uid,
@@ -635,9 +698,12 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
         }
         SignalCall::RtSigqueueinfo => {
             let [tgid, sig, uinfo_ptr, _, _, _] = args;
-            let tgid = tgid as i32;
-            let sig = sig as i32;
-            if tgid <= 0 {
+            let tgid = SignalProcessSelector::from_abi(tgid);
+            let sig = match SignalRequest::from_abi(sig) {
+                Ok(request) => request,
+                Err(errno) => return returned(errno.guest_retval(), false),
+            };
+            if tgid.abi_number() <= 0 {
                 return returned(LINUX_EINVAL.guest_retval(), false);
             }
             let mut bytes = [0u8; core::mem::size_of::<LinuxSiginfo>()];
@@ -660,7 +726,10 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 return returned(LINUX_EINVAL.guest_retval(), false);
             }
             let tid = SignalThreadSelector::from_abi(tid);
-            let sig = sig as i32;
+            let sig = match SignalRequest::from_abi(sig) {
+                Ok(request) => request,
+                Err(errno) => return returned(errno.guest_retval(), false),
+            };
             let mut bytes = [0u8; core::mem::size_of::<LinuxSiginfo>()];
             if !native.copy_in(&mut bytes, carrick_guest_arch::UserVa::new(uinfo_ptr)) {
                 return returned(LINUX_EFAULT.guest_retval(), false);

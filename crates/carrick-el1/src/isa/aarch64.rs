@@ -328,7 +328,7 @@ impl carrick_guest_arch::SignalBackend for Aarch64Backend {
         let uc_addr = new_sp + core::mem::offset_of!(Arm64Sigframe, ucontext) as u64;
 
         frame.elr = params.handler.raw();
-        frame.x[0] = params.signum as u64;
+        frame.x[0] = params.signal.number() as u64;
         frame.x[1] = info_addr;
         frame.x[2] = uc_addr;
         frame.x[29] = new_sp + core::mem::offset_of!(Arm64Sigframe, _reserved) as u64;
