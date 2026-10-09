@@ -377,6 +377,8 @@ unsafe impl<V: Aarch64Vmm> carrick_mmu_core::aarch64::HostArenaResolver
 /// Per-backend behaviour is reached only through the [`Aarch64Vmm`] /
 /// [`Aarch64Vcpu`] trait pair.
 pub struct Aarch64EngineCore<V: Aarch64Vmm> {
+    /// A host-loaded EL1 home remains invisible until MM occupancy is live.
+    prepared_home: Option<carrick_sched_core::PreparedHome<'static, carrick_el1_abi::ZoneContext>>,
     // ── backend bindings (the only per-VMM members) ──
     /// Owns stage-2 mapping, fork/execve rebuild, sibling spawn.
     vm: V,
@@ -754,6 +756,23 @@ impl<V: Aarch64Vmm> TransferServiceLoan<'_, V> {
 }
 
 impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
+    /// Retain the loader's unpublished home until the runtime occupies the MM.
+    pub fn install_prepared_home(
+        &mut self,
+        home: carrick_sched_core::PreparedHome<'static, carrick_el1_abi::ZoneContext>,
+    ) -> Result<(), TrapError> {
+        if self.prepared_home.is_some() {
+            return Err(TrapError::Hypervisor(
+                "aarch64 engine already holds a prepared home".to_owned(),
+            ));
+        }
+        self.prepared_home = Some(home);
+        Ok(())
+    }
+
+    pub fn discard_prepared_home(&mut self) {
+        self.prepared_home.take();
+    }
     /// Borrow the VM-bearing backend while preparing a persistent executor
     /// factory. Task state extraction below remains the only consuming split.
     pub fn backend(&self) -> &V {
@@ -782,6 +801,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         Self {
             vm,
             vcpu: std::cell::RefCell::new(vcpu),
+            prepared_home: None,
             pending_resume_pc: None,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
@@ -1032,6 +1052,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         Self {
             vm,
             vcpu: std::cell::RefCell::new(vcpu),
+            prepared_home: None,
             pending_resume_pc,
             last_syscall_nr,
             last_syscall_orig_x0,
@@ -1376,6 +1397,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         Self {
             vm,
             vcpu: std::cell::RefCell::new(vcpu),
+            prepared_home: None,
             pending_resume_pc: None,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
@@ -1500,6 +1522,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         Self {
             vm,
             vcpu: std::cell::RefCell::new(vcpu),
+            prepared_home: None,
             pending_resume_pc: None,
             last_syscall_nr: None,
             last_syscall_orig_x0: 0,
@@ -2510,6 +2533,9 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 .value
                 .map_err(|error| self.vm.enrich_vcpu_run_error(&*self.vcpu.get_mut(), error))?
             {
+                Aarch64Exit::RootExit(status) => {
+                    return Err(TrapError::NativeRootExit { status });
+                }
                 Aarch64Exit::Syscall {
                     frame,
                     resume_pc,
@@ -3226,6 +3252,7 @@ fn maintenance_exit_detail(exit: &Aarch64Exit) -> String {
 fn exit_variant_name(exit: &Aarch64Exit) -> &'static str {
     match exit {
         Aarch64Exit::Syscall { .. } => "Syscall",
+        Aarch64Exit::RootExit(_) => "RootExit",
         Aarch64Exit::EL0Fault { .. } => "EL0Fault",
         Aarch64Exit::Stage1CowFault { .. } => "Stage1CowFault",
         Aarch64Exit::Sys64Read { .. } => "Sys64Read",
@@ -5229,6 +5256,16 @@ fn seed_sibling_snapshot(
 }
 
 impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
+    fn commit_prepared_home(&mut self) -> Result<(), TrapError> {
+        if let Some(home) = self.prepared_home.take() {
+            home.commit().ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "loaded EL1 process home did not match installed MM occupancy".to_owned(),
+                )
+            })?;
+        }
+        Ok(())
+    }
     fn el1_switchable_roots(&self) -> Option<(u64, u64)> {
         self.vcpu.borrow_mut().el1_switchable_roots()
     }
