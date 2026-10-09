@@ -228,6 +228,7 @@ mod tests {
 
     fn plan() -> GuestMappingPlan {
         GuestMappingPlan {
+            arm_ring_first: Default::default(),
             entry: 0x40_1000,
             initial_stack_pointer: Some(0xff_ffff_e000),
             el0_trampoline_entry: Some(0x2d_0000_0000),

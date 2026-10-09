@@ -876,6 +876,7 @@ fn root_exec_test_plan() -> GuestMappingPlan {
         crate::memory::mmap_arena_size(),
     );
     GuestMappingPlan {
+        arm_ring_first: Default::default(),
         mappings: vec![data, page_tables, sparse],
         entry: 0x20_0000,
         initial_stack_pointer: None,

@@ -17,11 +17,13 @@ no libc or runtime startup. No workload timing ratio is claimed. Aperture
 control geometry is compile-time disjoint from service-copy descriptors and
 the MM portal, and included in the image layout hash. The aligned VM-free
 hatch fixture toggles control with slot-zero idle descriptors populated and
-reclaims the exact slot after every setting.
+reclaims the exact slot after every setting. A later root must match the
+carrier-held policy; conflicting root admission fails before mapping without
+changing either live policy.
 """
 
 [bindings]
-vm_free = "carrick-personality-linux::dispatch::ring_first_tests::strict_arm_terminal_calls_without_process_owner_cross_to_carrier; carrick-el1-abi::tests::aperture_control_is_disjoint_from_service_copy_descriptors; carrick-vmm-hvf::hatch::tests::aperture_configuration_preserves_service_copy_slot_zero"
+vm_free = "carrick-personality-linux::dispatch::ring_first_tests::strict_arm_terminal_calls_without_process_owner_cross_to_carrier; carrick-el1-abi::tests::aperture_control_is_disjoint_from_service_copy_descriptors; carrick-vmm-hvf::hatch::tests::aperture_configuration_preserves_service_copy_slot_zero; carrick-vmm-hvf::hatch::tests::carrier_admission_rejects_conflicting_ring_policy_without_changing_it"
 embed = "carrick-embed::arm_ring_first_strict_refusal_witness; carrick-embed::arm_ring_first_hatch_disabled_forward_witness"
 
 [bindings.unresolved]
