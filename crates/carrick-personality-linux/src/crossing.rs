@@ -15,7 +15,7 @@ pub use carrick_syscall_abi::NativeNr;
 pub mod nr {
     use carrick_syscall_abi::CanonicalNr;
 
-    // Host file contents & filesystem metadata (73 syscalls):
+    // Canonical file/fd/memory identities. Authority is classified in the table:
     pub const SETXATTR: CanonicalNr = CanonicalNr(5);
     pub const LSETXATTR: CanonicalNr = CanonicalNr(6);
     pub const FSETXATTR: CanonicalNr = CanonicalNr(7);
@@ -92,7 +92,7 @@ pub mod nr {
     pub const FACCESSAT2: CanonicalNr = CanonicalNr(439);
     pub const FCHMODAT2: CanonicalNr = CanonicalNr(452);
 
-    // Host network & BSD sockets (18 syscalls):
+    // Network and guest socketpair identities:
     pub const SOCKET: CanonicalNr = CanonicalNr(198);
     pub const SOCKETPAIR: CanonicalNr = CanonicalNr(199);
     pub const BIND: CanonicalNr = CanonicalNr(200);
@@ -123,7 +123,7 @@ pub mod nr {
     // Host hardware entropy (1 syscall):
     pub const GETRANDOM: CanonicalNr = CanonicalNr(278);
 
-    // Temporary-forward compat-zone fd rows (16 syscalls):
+    // Compat-zone fd identities:
     pub const EVENTFD2: CanonicalNr = CanonicalNr(19);
     pub const EPOLL_CREATE1: CanonicalNr = CanonicalNr(20);
     pub const EPOLL_CTL: CanonicalNr = CanonicalNr(21);
@@ -140,6 +140,13 @@ pub mod nr {
     pub const TIMERFD_GETTIME: CanonicalNr = CanonicalNr(87);
     pub const CLOSE_RANGE: CanonicalNr = CanonicalNr(436);
     pub const EPOLL_PWAIT2: CanonicalNr = CanonicalNr(441);
+
+    pub const READAHEAD: CanonicalNr = CanonicalNr(213);
+    pub const FADVISE64: CanonicalNr = CanonicalNr(223);
+    pub const EXECVEAT: CanonicalNr = CanonicalNr(281);
+    pub const MLOCKALL: CanonicalNr = CanonicalNr(230);
+    pub const MUNLOCKALL: CanonicalNr = CanonicalNr(231);
+    pub const RT_SIGRETURN: CanonicalNr = CanonicalNr(139);
 
     // Terminal carrier notifications when the native process owner declines:
     pub const EXIT: CanonicalNr = CanonicalNr(93);
@@ -216,11 +223,11 @@ host_crossings! {
     Preadv = nr::PREADV, false, Permanent;
     Pwritev = nr::PWRITEV, false, Permanent;
     Sendfile = nr::SENDFILE, false, Permanent;
-    Pselect6 = nr::PSELECT6, false, Permanent;
-    Ppoll = nr::PPOLL, false, Permanent;
-    Vmsplice = nr::VMSPLICE, false, Permanent;
-    Splice = nr::SPLICE, false, Permanent;
-    Tee = nr::TEE, false, Permanent;
+    Pselect6 = nr::PSELECT6, false, Temporary;
+    Ppoll = nr::PPOLL, false, Temporary;
+    Vmsplice = nr::VMSPLICE, false, Temporary;
+    Splice = nr::SPLICE, false, Temporary;
+    Tee = nr::TEE, false, Temporary;
     Readlinkat = nr::READLINKAT, false, Permanent;
     Newfstatat = nr::NEWFSTATAT, false, Permanent;
     Fstat = nr::FSTAT, false, Permanent;
@@ -231,13 +238,13 @@ host_crossings! {
     Utimensat = nr::UTIMENSAT, false, Permanent;
     Execve = nr::EXECVE, false, Permanent;
     Msync = nr::MSYNC, false, Permanent;
-    Mlock = nr::MLOCK, false, Permanent;
-    Munlock = nr::MUNLOCK, false, Permanent;
-    Mincore = nr::MINCORE, false, Permanent;
-    Madvise = nr::MADVISE, false, Permanent;
+    Mlock = nr::MLOCK, false, Temporary;
+    Munlock = nr::MUNLOCK, false, Temporary;
+    Mincore = nr::MINCORE, false, Temporary;
+    Madvise = nr::MADVISE, false, Temporary;
     Syncfs = nr::SYNCFS, false, Permanent;
     Renameat2 = nr::RENAMEAT2, false, Permanent;
-    Mlock2 = nr::MLOCK2, false, Permanent;
+    Mlock2 = nr::MLOCK2, false, Temporary;
     CopyFileRange = nr::COPY_FILE_RANGE, false, Permanent;
     Preadv2 = nr::PREADV2, false, Permanent;
     Pwritev2 = nr::PWRITEV2, false, Permanent;
@@ -246,7 +253,7 @@ host_crossings! {
     Faccessat2 = nr::FACCESSAT2, false, Permanent;
     Fchmodat2 = nr::FCHMODAT2, false, Permanent;
     Socket = nr::SOCKET, false, Permanent;
-    Socketpair = nr::SOCKETPAIR, false, Permanent;
+    Socketpair = nr::SOCKETPAIR, false, Temporary;
     Bind = nr::BIND, false, Permanent;
     Listen = nr::LISTEN, false, Permanent;
     Accept = nr::ACCEPT, false, Permanent;
@@ -286,6 +293,12 @@ host_crossings! {
     TimerfdGettime = nr::TIMERFD_GETTIME, false, Temporary;
     CloseRange = nr::CLOSE_RANGE, false, Temporary;
     EpollPwait2 = nr::EPOLL_PWAIT2, false, Temporary;
+    Readahead = nr::READAHEAD, false, Permanent;
+    Fadvise64 = nr::FADVISE64, false, Permanent;
+    Execveat = nr::EXECVEAT, false, Permanent;
+    Mlockall = nr::MLOCKALL, false, Temporary;
+    Munlockall = nr::MUNLOCKALL, false, Temporary;
+    RtSigreturn = nr::RT_SIGRETURN, false, Temporary;
     Exit = nr::EXIT, true, Terminal;
     ExitGroup = nr::EXIT_GROUP, true, Terminal;
 }
@@ -422,6 +435,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ring_first_census_host_files_and_signal_return_are_admitted() {
+        for ordinal in [213, 223, 281, 139, 230, 231] {
+            assert!(
+                HostCrossingSet::Aarch64.is_allowed(CanonicalNr::new(ordinal)),
+                "ARM fallback ordinal={ordinal}"
+            );
+            assert!(!HostCrossingSet::X86.is_allowed(CanonicalNr::new(ordinal)));
+        }
+    }
+
+    #[test]
+    fn ring_first_census_guest_fd_and_memory_rows_are_temporary() {
+        for ordinal in [72, 73, 75, 76, 77, 199, 228, 229, 232, 233, 284] {
+            assert_eq!(
+                AllowedHostCrossing::from_canonical_aarch64(CanonicalNr::new(ordinal))
+                    .and_then(AllowedHostCrossing::kind),
+                Some(HostCrossingKind::Temporary),
+                "ordinal={ordinal}"
+            );
+        }
+    }
+
+    #[test]
     fn both_sets_match_the_exhaustive_census_through_512() {
         let mut arm = [None; 513];
         for row in include_str!("../../../docs/design/arm-ring-first-flip.tsv")
@@ -498,7 +534,7 @@ mod tests {
 
     #[test]
     fn test_aarch64_crossings_exact() {
-        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 118);
+        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 124);
         for (crossing, _, _) in HOST_CROSSINGS.iter().flatten() {
             let nr = crossing.canonical();
             assert!(
