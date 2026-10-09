@@ -13,10 +13,7 @@ fn main() {}
 #[cfg(target_os = "none")]
 macro_rules! fixture_dispatch_enabled {
     () => {
-        fixture_expr!({
-            let _ = crate::carrick_x86_fixture_dispatch_witness();
-            true
-        })
+        fixture_expr!(crate::carrick_x86_fixture_dispatch_witness())
     };
 }
 
