@@ -149,8 +149,9 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
     #[cfg(not(target_os = "none"))]
     {
         let nr = frame.x[8] as usize;
+        // SAFETY: entry retains the registered EL1 region, or no mapping is registered.
         let is_strict =
-            carrick_el1_abi::host_aperture_control().is_none_or(|ctrl| ctrl.is_strict());
+            unsafe { carrick_el1_abi::host_aperture_control() }.is_none_or(|ctrl| ctrl.is_strict());
         let canonical = carrick_personality_linux::abi::entry::CanonicalOrdinal::new(frame.x[8]);
         let decision = carrick_personality_linux::crossing::evaluate_host_crossing(
             carrick_personality_linux::crossing::HostCrossingSet::Aarch64,
@@ -616,7 +617,10 @@ impl<
             }
             #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
             {
-                carrick_el1_abi::host_aperture_control().is_none_or(|ctrl| ctrl.is_strict())
+                // SAFETY: this entry retains its registered region; tests without a
+                // region return None before any pointer is dereferenced.
+                unsafe { carrick_el1_abi::host_aperture_control() }
+                    .is_none_or(|ctrl| ctrl.is_strict())
             }
         })
     }
