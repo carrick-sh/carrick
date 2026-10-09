@@ -328,6 +328,12 @@ owned-continuation route described below.
 
 ### Blocking forwarded calls
 
+The readiness crossing is an internal carrier request, not a Linux syscall.
+`ForwardRequest` distinguishes it from a decoded `SyscallRequest`; the shared
+continuation capture stores a `HostReadiness` origin with no syscall frame and
+`RestartClass::Never`. Its signal, timer, enrollment, and lease settlement
+still use the same continuation machinery as forwarded blocking syscalls.
+
 A blocking forwarded dispatch now captures a `ContinuationCapture` from the
 worker's live `ThreadExecutionLease` and returns the shared pool's
 `BlockedContinuation` exit. The task binding retains its owned forward frame

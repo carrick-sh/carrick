@@ -104,6 +104,7 @@ impl SyscallFrame {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ContinuationOrigin {
     Syscall(SyscallFrame),
+    HostReadiness,
     ChildTidClear,
 }
 
@@ -141,6 +142,21 @@ impl ContinuationCapture {
             lease,
             ContinuationOrigin::Syscall(SyscallFrame { request }),
             restart,
+        )
+    }
+
+    /// An internal host-readiness crossing carries no Linux syscall number.
+    /// Its owning CPL0 frame is retained by the carrier, and the shared wait
+    /// service still authenticates the exact task lease on resume.
+    pub fn from_host_readiness_lease(
+        context: &KernelContext,
+        lease: &crate::kernel::objects::ThreadExecutionLease,
+    ) -> Result<Self, ContinuationBuildError> {
+        Self::capture_lease(
+            context,
+            lease,
+            ContinuationOrigin::HostReadiness,
+            RestartClass::Never,
         )
     }
 
@@ -323,7 +339,7 @@ impl ContinuationAuthority {
     pub const fn syscall(&self) -> Option<SyscallFrame> {
         match self.origin {
             ContinuationOrigin::Syscall(frame) => Some(frame),
-            ContinuationOrigin::ChildTidClear => None,
+            ContinuationOrigin::HostReadiness | ContinuationOrigin::ChildTidClear => None,
         }
     }
 
