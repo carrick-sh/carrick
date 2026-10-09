@@ -46,3 +46,12 @@ fn x86_process_calls_route_to_neutral_lifecycle_hooks() {
         Family::Lifecycle(LifecycleCall::ExitGroup)
     );
 }
+
+#[test]
+fn arm_sigreturn_stays_with_host_frame_owner() {
+    assert_eq!(route_aarch64(139, u64::MAX), Family::Unported);
+    assert_eq!(
+        carrick_personality_linux::dispatch::route_x86_64(139, u64::MAX),
+        Family::Signal(carrick_personality_linux::signal::SignalCall::RtSigreturn)
+    );
+}

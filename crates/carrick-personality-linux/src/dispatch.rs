@@ -472,6 +472,19 @@ fn serve_family<'a, C: EntryContext + 'a>(
 /// EL1 traits until orders 6-9 move their semantic bodies; they never choose
 /// another family or own completion.
 pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
+    // ARM delivery still belongs to the carrier, which owns the frame ABI.
+    if ordinal == 139 {
+        return Family::Unported;
+    }
+    route_shared(ordinal, allocator_control)
+}
+
+/// Route canonical Linux ordinals for the x86 in-ring frame owner.
+pub const fn route_x86_64(ordinal: u64, allocator_control: u64) -> Family {
+    route_shared(ordinal, allocator_control)
+}
+
+const fn route_shared(ordinal: u64, allocator_control: u64) -> Family {
     match ordinal {
         214 => Family::Anonymous(AnonymousCall::Brk),
         215 => Family::Anonymous(AnonymousCall::Munmap),
@@ -774,7 +787,10 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
     pending: &mut dyn PendingFamilies<'a, C>,
 ) -> CompletionRoute {
     let original_argument0 = pending.original_argument0();
+    #[cfg(target_arch = "aarch64")]
     let family = route_aarch64(ordinal, control);
+    #[cfg(not(target_arch = "aarch64"))]
+    let family = route_x86_64(ordinal, control);
     let completion = match pending.binding().and_then(|binding| {
         if let Some(token) = carrick_core::entry::admit(binding, pending.record_source()) {
             Some(CompletionAuthority::Entry(token))

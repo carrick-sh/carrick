@@ -100,3 +100,22 @@ mod x86_live_context;
 #[cfg(any(target_arch = "x86_64", test))]
 #[path = "isa/x86/initial_mm.rs"]
 pub mod x86_initial_mm;
+
+/// Validate guest-controlled ARM signal resume state before register publication.
+pub const fn signal_resume_is_el0(pstate: u64) -> bool {
+    // M[3:0] must select EL0t and DAIF must not mask user exceptions.
+    pstate & (0xf | (0xf << 6)) == 0
+}
+
+#[cfg(test)]
+mod signal_resume_tests {
+    #[test]
+    fn forged_supervisor_or_masked_pstate_is_refused() {
+        assert!(!super::signal_resume_is_el0(0b0101));
+        for mask in [1 << 6, 1 << 7, 1 << 8, 1 << 9] {
+            assert!(!super::signal_resume_is_el0(mask));
+        }
+        assert!(super::signal_resume_is_el0(0));
+        assert!(super::signal_resume_is_el0(0xf000_0000));
+    }
+}

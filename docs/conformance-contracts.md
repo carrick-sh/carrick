@@ -807,3 +807,24 @@ transaction, live-descriptor or inventory authentication.
 This changes no population or work budget: one frame initialization,
 descriptor edit and publication per initial page. A forked signal wait found
 the defect when a COW write correctly refused an unowned source descriptor.
+
+## ARM signal return privilege boundary
+
+`signal.arm.resume-privilege` owns ARM `rt_sigreturn` routing and the
+supervisor resume-state publication boundary. Linux authority is
+`sigreturn(2)`: return restores a userspace context, never a supervisor
+execution context. Until ARM delivery moves in-ring, syscall 139 forwards
+to the carrier that owns the delivered frame ABI.
+
+VM-free bindings are `arm_sigreturn_stays_with_host_frame_owner` in
+`carrick-personality-linux` and
+`forged_supervisor_or_masked_pstate_is_refused` in `carrick-el1`. The latter
+rejects EL1 and each DAIF masking bit, while accepting EL0 with NZCV.
+The structural budget is one constant-time PSTATE check before any register
+publication, with no additional copies, waits, or allocations. Both tests
+were red before the routing and validation corrections.
+
+Signed ARM execution and same-image oracle bindings remain outstanding;
+VM-free evidence does not establish full signal frame compatibility. The
+in-ring ARM restore path remains unrouted until Linux ucontext and FPSIMD
+restore and forced SIGSEGV on invalid frames are implemented together.
