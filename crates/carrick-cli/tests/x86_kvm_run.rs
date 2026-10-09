@@ -7,7 +7,7 @@
 ))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::time::Duration;
 
 use assert_cmd::Command;
@@ -569,7 +569,24 @@ fn compare_mounted_binary_with_native(
     expected_exit: i32,
     run_id: &str,
 ) {
-    let native = Command::new(elf)
+    let mut native_command = std::process::Command::new(elf);
+    if run_id == "x86_signal_abort.S" {
+        // Only the native oracle child changes its limit. A core-class signal
+        // must not imply that a core file was actually written.
+        unsafe {
+            native_command.pre_exec(|| {
+                let limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::setrlimit(libc::RLIMIT_CORE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let native = Command::from_std(native_command)
         .timeout(Duration::from_secs(5))
         .output()
         .expect("run native x86 Linux oracle");
@@ -772,4 +789,9 @@ fn mounted_static_x86_signal_fault_badstack_forces_segv() {
 #[test]
 fn mounted_static_x86_signal_segv_child_action_and_resume_match_native() {
     compare_mounted_assembly_with_native("x86_signal_segv_child.S", b"S\nP");
+}
+
+#[test]
+fn mounted_static_x86_signal_abort_without_core_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_abort.S", b"A\n");
 }

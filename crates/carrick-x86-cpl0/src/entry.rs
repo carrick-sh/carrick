@@ -1182,12 +1182,10 @@ mod kernel {
         match action.disposition {
             policy::Disposition::Ignore => None,
             policy::Disposition::Default => {
-                if let policy::Delivery::Terminate { core_dump } = policy::default_delivery(sig) {
-                    let wait_status = carrick_sched_core::process::LinuxWaitStatus::signaled(
-                        sig.number() as u8,
-                        core_dump,
-                    );
-                    Some(match process.exit_with_status(wait_status) {
+                if let policy::Delivery::Terminate { .. } = policy::default_delivery(sig) {
+                    // A core-class disposition is not evidence of a written core.
+                    // This lane has no core writer; publish a signal-only exit.
+                    Some(match process.exit_with_signal(sig.number() as u8) {
                         Ok(_) => carrick_personality_linux::dispatch::CompletionRoute::Suspended,
                         Err(_) => carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion,
                     })
