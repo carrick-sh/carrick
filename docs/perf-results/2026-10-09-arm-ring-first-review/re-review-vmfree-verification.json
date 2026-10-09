@@ -1,0 +1,249 @@
+{
+  "source_checkpoint": "585e9b936ac5709d31ba9a5f1d2b6ab26fc310ab",
+  "pr_base": "dfc9100e277339016f537ba09e2b475470c953b6",
+  "checks": [
+    {
+      "command": "cargo test -p carrick-personality-linux",
+      "exit_code": 0,
+      "log": "target/ringswitch-n3-green.log",
+      "test_results": [
+        "test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ],
+      "output_tail": [
+        "test dispatch::unmigrated_family_completes_once_through_linux_owner ... ok",
+        "test x4_linux_common_entry ... ok",
+        "test x5_linux_clone_exit ... ok",
+        "",
+        "test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+        "",
+        "   Doc-tests carrick_personality_linux",
+        "",
+        "running 0 tests",
+        "",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        ""
+      ]
+    },
+    {
+      "command": "cargo test -p carrick-el1 --lib",
+      "exit_code": 0,
+      "log": "target/ringswitch-n3-el1.log",
+      "test_results": [
+        "test result: ok. 318 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.73s"
+      ],
+      "output_tail": [
+        "test x86_interrupt_timer_tests::fallback_tests::calibrated_long_deadline_clamps_then_scheduler_can_rearm ... ok",
+        "test x86_context_words_tests::tests::x86_zone_owns_exact_space_notification_custody ... ok",
+        "test x86_context_words_tests::tests::x86_parked_context_roots_clone_through_shared_fork_owner ... ok",
+        "test personality::ipc::tests::el1_ipc_io_nonblocking_saturation_and_atomic_small_writes ... ok",
+        "test personality::lifecycle::tests::sigprocmask_dekker_storm_loses_no_signal ... ok",
+        "test personality::lifecycle::tests::sigprocmask_process_dekker_storm_loses_no_signal ... ok",
+        "test personality::ipc::tests::el1_ipc_io_large_write_suspends_without_replay ... ok",
+        "test personality::ipc::tests::el1_ipc_io_steady_state_scales_without_host_calls_or_allocation ... ok",
+        "test personality::ipc::tests::el1_ipc_io_contended_object_lock_waits_for_its_holder_instead_of_forwarding ... ok",
+        "",
+        "test result: ok. 318 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.73s",
+        ""
+      ]
+    },
+    {
+      "command": "cargo test -p carrick-el1 --test x86_production_forward",
+      "exit_code": 0,
+      "log": "target/ringswitch-n3-x86-work.log",
+      "test_results": [
+        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ],
+      "output_tail": [
+        "   Compiling carrick-el1 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-el1)",
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.52s",
+        "     Running tests/x86_production_forward.rs (target/debug/deps/x86_production_forward-fbe2290b44f983ac)",
+        "",
+        "running 3 tests",
+        "test x86_context_selects_x86_crossings_without_arm_aperture ... ok",
+        "test x86_unported_refusal_counts_native_ordinal_not_canonical_ordinal ... ok",
+        "test production_x86_family_absences_obey_eight_crossings_without_user_memory ... ok",
+        "",
+        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        ""
+      ]
+    },
+    {
+      "command": "cargo test -p carrick-el1-abi",
+      "exit_code": 0,
+      "log": "target/ringswitch-rereview-abi.log",
+      "test_results": [
+        "test result: ok. 126 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ],
+      "output_tail": [
+        "test ipc_tables::tests::el1_ipc_window_attach_fails_closed_until_published ... ok",
+        "test ipc::tests::el1_ipc_steady_state_transfers_scale_linearly_without_allocation ... ok",
+        "test ipc::tests::el1_ipc_object_and_description_stores_grow_by_segment ... ok",
+        "",
+        "test result: ok. 126 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s",
+        "",
+        "   Doc-tests carrick_el1_abi",
+        "",
+        "running 0 tests",
+        "",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        ""
+      ]
+    },
+    {
+      "command": "just test-kernel-semantics",
+      "exit_code": 0,
+      "log": "target/ringswitch-rereview-kernel.log",
+      "test_results": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s",
+        "test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s",
+        "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+        "test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+        "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+        "test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s",
+        "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s",
+        "test result: ok. 4 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.06s",
+        "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s",
+        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.46s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s",
+        "test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+        "test result: ok. 8 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 4.59s",
+        "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+        "test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s",
+        "test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s",
+        "test result: ok. 88 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+        "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s",
+        "test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+        "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s"
+      ],
+      "output_tail": [
+        "     Running tests/unicode_paths.rs (target/debug/deps/unicode_paths-72e7a3068e74f778)",
+        "",
+        "running 6 tests",
+        "test test_unicode_composed_vs_decomposed_alias_protection ... ok",
+        "test test_unicode_file_create_write_read_reopen_unlink ... ok",
+        "test test_unicode_symlink_and_directory_names ... ok",
+        "test test_unicode_rename_and_replacement ... ok",
+        "test test_unicode_hardlink_exact_name_retained ... ok",
+        "test test_unicode_lookup_bounds_directory_entry_visits_with_siblings ... ok",
+        "",
+        "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+        ""
+      ]
+    },
+    {
+      "command": "cargo check -p carrick-x86-cpl0 --target x86_64-unknown-none",
+      "exit_code": 0,
+      "log": "target/ringswitch-rereview-x86-compile.log",
+      "test_results": [],
+      "output_tail": [
+        "    Blocking waiting for file lock on build directory",
+        "    Checking carrick-personality-linux v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-personality-linux)",
+        "    Checking carrick-el1-abi v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-el1-abi)",
+        "    Checking carrick-el1 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-el1)",
+        "    Checking carrick-x86-cpl0 v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-x86-cpl0)",
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 37.14s"
+      ]
+    },
+    {
+      "command": "just fmt-check",
+      "exit_code": 0,
+      "log": "target/ringswitch-rereview-fmt.log",
+      "test_results": [],
+      "output_tail": [
+        "   Compiling ring v0.17.14",
+        "   Compiling rustls v0.23.40",
+        "   Compiling rustls-webpki v0.103.13",
+        "   Compiling tokio-rustls v0.26.4",
+        "   Compiling hyper-rustls v0.27.9",
+        "   Compiling reqwest v0.12.28",
+        "   Compiling oci-client v0.15.0",
+        "   Compiling carrick-spec v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-spec)",
+        "   Compiling carrick-conformance v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-conformance)",
+        "   Compiling carrick-xtask v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-xtask)",
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.20s",
+        "     Running `target/debug/carrick-xtask worktree-run -- cargo --config 'build.rustc-wrapper=\"/opt/homebrew/bin/sccache\"' fmt --all -- --check`"
+      ]
+    },
+    {
+      "command": "git push origin work/ring-switch",
+      "exit_code": 0,
+      "log": "target/ringswitch-rereview-push.log",
+      "test_results": [],
+      "output_tail": [
+        "    Checking carrick-vmm-kvm v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-vmm-kvm)",
+        "    Checking carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-kernel)",
+        "   Compiling carrick-conformance-next v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-conformance-next)",
+        "    Checking carrick-runtime v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-runtime)",
+        "    Checking carrick-kernel-example v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-kernel-example)",
+        "    Checking native-syscall-slice v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/experiments/native-syscall-slice)",
+        "    Checking carrick-engine v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-engine)",
+        "    Checking carrick-embed v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-embed)",
+        "    Checking carrick-cli v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-cli)",
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 56.94s",
+        "To github.com:carrick-sh/carrick.git",
+        "   e59c71cd0..585e9b936  work/ring-switch -> work/ring-switch"
+      ],
+      "verification": "pre-push clippy hook completed successfully"
+    },
+    {
+      "command": "CARRICK_AUTHORITY_BASE=dfc9100e277339016f537ba09e2b475470c953b6 just lint-domains",
+      "exit_code": 0,
+      "log": "target/ringswitch-rereview-domains.log",
+      "test_results": [
+        "test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.50s",
+        "test result: ok. 140 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.43s"
+      ],
+      "output_tail": [
+        "   Compiling tokio-rustls v0.26.4",
+        "   Compiling hyper-rustls v0.27.9",
+        "   Compiling reqwest v0.12.28",
+        "   Compiling oci-client v0.15.0",
+        "   Compiling carrick-spec v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-spec)",
+        "   Compiling carrick-conformance v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-conformance)",
+        "   Compiling carrick-xtask v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-xtask)",
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 20.96s",
+        "     Running `target/debug/carrick-xtask authority-debt`",
+        "live host discovery passed; executed: [\"macos-cli-default\",\"macos-runtime-default\",\"macos-hvf-default\"]; pending: [\"linux-cli\",\"linux-runtime\",\"freebsd-cli\",\"freebsd-runtime\",\"netbsd-cli\",\"netbsd-runtime\"]",
+        "authority debt PR-base ratchet passed (dfc9100e277339016f537ba09e2b475470c953b6)",
+        "authority debt ceilings passed; source counters: 1232"
+      ]
+    },
+    {
+      "command": "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc cargo build --locked --release --manifest-path fixtures/linux-aarch64-hello/Cargo.toml --target aarch64-unknown-linux-gnu --bin carrick-linux-aarch64-ring-first-glibc",
+      "exit_code": 0,
+      "log": "target/ringswitch-loader-final-build.log",
+      "test_results": [],
+      "output_tail": [
+        "   Compiling carrick-linux-aarch64-hello v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/fixtures/linux-aarch64-hello)",
+        "    Finished `release` profile [optimized] target(s) in 0.06s"
+      ]
+    },
+    {
+      "command": "cargo check -p carrick-embed --test arm_ring_first_hatch",
+      "exit_code": 0,
+      "log": "target/ringswitch-loader-final-check.log",
+      "test_results": [],
+      "output_tail": [
+        "    Checking carrick-embed v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/crates/carrick-embed)",
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.27s"
+      ]
+    }
+  ],
+  "signed_status": "pending new loader-only proof; inherited fork/wait failure remains separate"
+}
