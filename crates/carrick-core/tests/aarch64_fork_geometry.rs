@@ -75,6 +75,57 @@ fn arm_fork_copy_reports_the_exact_exhausted_table_bound() {
     );
 }
 
+#[test]
+fn arm_fork_control_alias_maps_only_loaned_child_table_pages() {
+    let mut request = sample_arm_request(1);
+    let words = TestMemory::new();
+    let root = 0x10_0000;
+    let l1 = 0x10_1000;
+    let l2 = 0x10_2000;
+    words.store(root, l1 | TYPE_TABLE_OR_PAGE);
+    words.store(l1 + 180 * 8, l2 | TYPE_TABLE_OR_PAGE);
+    words.store(l2, KERNEL_CONTROL_BASE | AF | SH_IS | TYPE_BLOCK);
+
+    let mut count = ForkCensus {
+        child: 0,
+        parent: 0,
+        live: 0,
+        custody: 0,
+    };
+    census_table::<Aarch64Mmu, _, _>(&LinuxForkPolicy, &words, &[], root, 0, 0, &mut count)
+        .unwrap();
+    assert_eq!(count.child, 4 * 512);
+    request.child_tables = PortalForkTableArena::new(0x40_0000, (count.child * 8) as u64).unwrap();
+    let mut scratch = ForkScratch::bounded(
+        request,
+        0,
+        count.child,
+        count.parent,
+        count.live,
+        count.custody,
+    )
+    .unwrap();
+    copy_table::<Aarch64Mmu, _, _>(
+        &LinuxForkPolicy,
+        &words,
+        request,
+        &mut scratch,
+        ForkTableCursor {
+            table: root,
+            level: 0,
+            base: 0,
+            child_offset: 0,
+        },
+    )
+    .unwrap();
+    let alias_entry = 3 * 512 + (STAGE1_TABLES_ALIAS_OFFSET >> SHIFTS[3]) as usize;
+    assert_eq!(
+        scratch.child[alias_entry] & Aarch64Mmu::ADDRESS_MASK,
+        0x40_0000
+    );
+    assert_eq!(scratch.child[alias_entry + 4], 0);
+}
+
 impl TestMemory {
     fn new() -> Self {
         Self {
