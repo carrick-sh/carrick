@@ -2159,6 +2159,14 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
 )]
 mod tests {
     #[test]
+    fn cpl0_clear_tid_dependency_names_the_arm_reference() {
+        let design = include_str!("../../../../docs/design/arm-ring-first-flip.md");
+        assert!(design.contains("shared-cpl0-thread-exit-clear-tid"));
+        assert!(
+            design.contains("exit_of_a_born_thread_clears_cleartid_wakes_the_joiner_and_runs_it")
+        );
+    }
+    #[test]
     fn unsupported_exec_has_no_completion_surface() {
         let source = include_str!("native_process_runtime.rs");
         let production = source.split("mod tests {").next().unwrap();
