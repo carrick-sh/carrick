@@ -55,6 +55,8 @@ pub use fork_stock::{
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod gic;
+pub mod hatch;
+pub use hatch::ArmRingFirstHatch;
 pub mod host_signal;
 pub mod io_wait;
 pub mod itimer;
