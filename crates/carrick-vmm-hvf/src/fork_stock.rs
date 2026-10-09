@@ -5,9 +5,9 @@
 //! The stopped vCPU retains its exclusive execution context and stack-allocated wire
 //! record ([`ForkStockExchange`], [`ForkStockSettlement`], or [`NativeRootExit`]).
 //!
-//! Frame authority is rooted in [`CarrierVmCustody`]:
+//! Frame authority is rooted in `CarrierVmCustody`:
 //! - `grant_tables: Vec<RootGpa>` supplies bounded stage-2 table frames;
-//! - [`El1FrameGrantLedger`] accounts for all physical grants and returns;
+//! - `El1FrameGrantLedger` accounts for all physical grants and returns;
 //! - [`PendingForkLoan`] records outstanding loans and validates exactly-once completion.
 
 use carrick_el1_abi::{
