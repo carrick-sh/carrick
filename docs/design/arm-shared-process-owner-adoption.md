@@ -470,6 +470,36 @@ runtime maintenance need their own signed adoption evidence.
   just test-embed el1_fork_cow_resolves_in_guest
   ```
 
+#### Step 5 signed checkpoint (2026-10-09; incomplete)
+
+At `c67964b7bfed262dec92a0910ccea6863497d618`, the focused signed
+`el1_fork_cow_resolves_in_guest` run used
+`CARRICK_RUN_ID=arm-step5-c679-focused-20261009`. Its `el1_sched` executable
+SHA-256 was `ce53e7b80d6306703db3e1b720240023a3f79ec0e7e35475cd5aa8f392bf9e6e`.
+The run failed, with zero surviving Carrick processes. The first fork-stock HVC
+now succeeds: one clone was served, fork progress reached commit, and the
+refusal counters stayed zero. The first remaining error is an EL1 data abort
+at `ELR=0x2d04054120`, `FAR=0x2108`; the exact ELF maps this instruction to
+`Sched::idle` loading a counters pointer from its stack-resident `Sched`
+value. Termination then reports ASID 1 against a zero TTBR pair. Neither the
+focused witness nor the full signed `el1_` batch is green.
+
+The preceding signed run at `97206616b9685ecd53ab959e97afdd0844edb7b1`
+stopped at fork-stock authentication: its worker lease was slot 2, but
+`SP_EL1=0x2d04207d80` and the settlement record at `0x2d04207f40` lay in
+slot 1, below slot 2's base `0x2d04208000`. This is a 640-byte EL1 stack
+overrun, not a one-based slot conversion. The host stack guard was retained.
+Moving the 864-byte architectural save area off the dispatch stack passed
+that first HVC but did not establish stack safety.
+
+An offline build of the exact EL1 target with `RUSTC_BOOTSTRAP=1` and
+`RUSTFLAGS='-Z emit-stack-sizes'` reported individual static frames of 8,512
+bytes for `ProcessNative::fork`, 4,112 for `dispatch_syscall`, and 2,240 for
+ARM `prepare_mm`. These sizes are not a measured peak: nesting and inlining
+must be accounted for, and a 4 KiB unmapped guard below every worker stack
+still needs to be installed in every stage-1 root. The guard and a bounded
+peak-depth witness are prerequisites to another signed closure claim.
+
 ### Step 6: Retire Obsolete N1 Host-Side Fork Code
 - **Objective:** Delete the dead hybrid fork path and host protection vetoes.
 - **Changes:**
