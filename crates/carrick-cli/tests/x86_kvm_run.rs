@@ -736,3 +736,8 @@ fn mounted_static_x86_signal_interrupts_owned_wait4_matches_native() {
 fn mounted_static_x86_signal_restarts_owned_wait4_matches_native() {
     compare_mounted_assembly_with_native("x86_signal_wait4_restart.S", b"R\n");
 }
+
+#[test]
+fn mounted_static_x86_signal_stop_continue_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_stop_continue.S", b"J\n");
+}
