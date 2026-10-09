@@ -538,17 +538,19 @@ fn finish<'a, C: EntryContext + 'a>(
                 .store(original, core::sync::atomic::Ordering::Relaxed);
         }
     }
-    let reason = if result == FamilyCompletion::Handback {
-        ForwardReason::Handback
-    } else if pending.host_work() {
+    let reason = if pending.host_work() {
         ForwardReason::HostWork
+    } else if result == FamilyCompletion::Handback {
+        ForwardReason::Handback
     } else {
         run.forward_reason
     };
     let route = if reason == ForwardReason::HostWork
         && matches!(
             result,
-            FamilyCompletion::Forward | FamilyCompletion::AccountedForward
+            FamilyCompletion::Forward
+                | FamilyCompletion::AccountedForward
+                | FamilyCompletion::Handback
         ) {
         CompletionRoute::WithWork
     } else {
@@ -583,7 +585,9 @@ fn finish<'a, C: EntryContext + 'a>(
         if reason == ForwardReason::HostWork
             && matches!(
                 result,
-                FamilyCompletion::Forward | FamilyCompletion::AccountedForward
+                FamilyCompletion::Forward
+                    | FamilyCompletion::AccountedForward
+                    | FamilyCompletion::Handback
             )
         {
             pending.publish_forward_work();
@@ -728,6 +732,9 @@ mod ring_first_tests {
         fn host_work(&self) -> bool {
             self.work
         }
+        fn resumes_operation(&self) -> bool {
+            self.handback
+        }
         fn futex(&mut self) -> FamilyCompletion {
             if self.handback {
                 FamilyCompletion::Handback
@@ -785,6 +792,7 @@ mod ring_first_tests {
             (27, false, false, CompletionRoute::Forward),
             (98, false, false, CompletionRoute::Forward),
             (98, false, true, CompletionRoute::Forward),
+            (98, true, true, CompletionRoute::WithWork),
             (220, false, false, CompletionRoute::Forward),
             (260, false, false, CompletionRoute::Forward),
             (174, true, false, CompletionRoute::WithWork),
