@@ -150,7 +150,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
     {
         let nr = frame.x[8] as usize;
         let is_strict =
-            carrick_el1_abi::host_aperture_control().is_some_and(|ctrl| ctrl.is_strict());
+            carrick_el1_abi::host_aperture_control().is_none_or(|ctrl| ctrl.is_strict());
         let canonical = carrick_personality_linux::abi::entry::CanonicalOrdinal::new(frame.x[8]);
         let decision = carrick_personality_linux::crossing::evaluate_host_crossing(
             carrick_personality_linux::crossing::HostCrossingSet::Aarch64,
@@ -616,7 +616,7 @@ impl<
             }
             #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
             {
-                carrick_el1_abi::host_aperture_control().is_some_and(|ctrl| ctrl.is_strict())
+                carrick_el1_abi::host_aperture_control().is_none_or(|ctrl| ctrl.is_strict())
             }
         })
     }
@@ -1563,18 +1563,15 @@ mod tests {
             None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
             |_| core::ptr::null_mut(),
         );
-        assert_eq!(
-            action,
-            if cfg!(feature = "allocator-test-control") {
-                Action::Served
-            } else {
-                Action::Forward
-            }
-        );
+        assert_eq!(action, Action::Served);
+        if !cfg!(feature = "allocator-test-control") {
+            assert_eq!(frame.x[0] as i64, -38);
+            assert_eq!(counters.refused[512].load(Ordering::Relaxed), 1);
+        }
     }
 
     #[test]
-    fn test_dispatch_forwards_all_and_counts() {
+    fn unconfigured_host_aperture_refuses_unported_calls_and_counts() {
         let mut frame = TrapFrame::default();
         let counters = Counters::default();
 
@@ -1586,14 +1583,17 @@ mod tests {
 
         frame.x[8] = 172; // getpid
         let action = dispatch_syscall(&mut frame, &counters);
-        assert_eq!(action, Action::Forward);
-        assert_eq!(counters.forwarded[172].load(Ordering::Relaxed), 1);
+        assert_eq!(action, Action::Served);
+        assert_eq!(frame.x[0] as i64, -38);
+        assert_eq!(counters.forwarded[172].load(Ordering::Relaxed), 0);
+        assert_eq!(counters.refused[172].load(Ordering::Relaxed), 1);
         assert_eq!(counters.forwarded[64].load(Ordering::Relaxed), 1);
 
         // Out-of-bounds syscall nr
         frame.x[8] = 999;
         let action = dispatch_syscall(&mut frame, &counters);
-        assert_eq!(action, Action::Forward);
+        assert_eq!(action, Action::Served);
+        assert_eq!(counters.refused[512].load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1678,9 +1678,9 @@ mod tests {
         };
 
         let action = dispatch_entry(&mut frame, &counters);
-        assert_eq!(action, Action::Forward);
+        assert_eq!(action, Action::Served);
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 0);
-        assert_eq!(counters.forwarded[172].load(Ordering::Relaxed), 1);
+        assert_eq!(counters.forwarded[172].load(Ordering::Relaxed), 0);
         assert_eq!(counters.served[172].load(Ordering::Relaxed), 0);
     }
 }
