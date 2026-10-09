@@ -108,7 +108,7 @@ impl sched::ThreadCpu for NoCpu {
 }
 
 #[test]
-fn production_x86_family_absences_forward_without_touching_user_memory() {
+fn production_x86_family_absences_obey_eight_crossings_without_user_memory() {
     let tasks = [CurrentTask::new()];
     tasks[0].set(El1TaskId::from_linux_tid(41), 1, 7);
     let counters = Counters::new();
@@ -134,6 +134,11 @@ fn production_x86_family_absences_forward_without_touching_user_memory() {
         ("lifecycle sigprocmask", 14),
         ("lifecycle sigaltstack", 131),
         ("signal-return transport", 15),
+        ("clone", 56),
+        ("fork", 57),
+        ("wait4", 61),
+        ("getpid decline", 39),
+        ("gettid decline", 186),
     ] {
         let call = decode_x86_64(native, args, 0x7fff_0000);
         assert_ne!(call.canonical.raw(), u64::MAX, "{family} must decode");
@@ -145,6 +150,8 @@ fn production_x86_family_absences_forward_without_touching_user_memory() {
             isa_unsupported: &isa_unsupported,
         };
         let before_isa = isa_unsupported.load(Ordering::Relaxed);
+        let bucket = if native == 57 { 512 } else { native as usize };
+        let before_refused = counters.refused[bucket].load(Ordering::Relaxed);
         let action = dispatch::dispatch_syscall_with_lifecycle(
             &mut frame,
             &counters,
@@ -160,8 +167,26 @@ fn production_x86_family_absences_forward_without_touching_user_memory() {
             None,
             |_| core::ptr::null_mut(),
         );
-        assert_eq!(action, Action::Forward, "{family}");
-        assert_eq!(frame.rax, 0xfeed, "{family} must not install a result");
+        let allowed = matches!(native, 0 | 1 | 8 | 17 | 18 | 281);
+        assert_eq!(
+            action,
+            if allowed {
+                Action::Forward
+            } else {
+                Action::Served
+            },
+            "{family}"
+        );
+        assert_eq!(
+            frame.rax as i64,
+            if allowed { 0xfeed } else { -38 },
+            "{family}"
+        );
+        assert_eq!(
+            counters.refused[bucket].load(Ordering::Relaxed) - before_refused,
+            u64::from(!allowed),
+            "{family}"
+        );
         assert_eq!(
             isa_unsupported.load(Ordering::Relaxed) - before_isa,
             u64::from(matches!(native, 202)),
