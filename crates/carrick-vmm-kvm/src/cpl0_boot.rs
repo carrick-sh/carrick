@@ -4755,6 +4755,57 @@ impl Cpl0Carrier {
 }
 
 impl ForwardVenue<'_> {
+    /// Inspect a typed readiness batch in the stopped task's supervisor
+    /// region. The batch stays on its task-owned kernel stack or heap while
+    /// an owned continuation releases the physical CPU.
+    pub fn with_host_readiness_entries<R>(
+        &mut self,
+        address: u64,
+        count: usize,
+        use_entries: impl FnOnce(&mut [carrick_el1_abi::HostReadinessEntry]) -> R,
+    ) -> Result<R, TrapError> {
+        if count > 1024 {
+            return Err(fail("host readiness batch exceeds poll bound"));
+        }
+        let length = count
+            .checked_mul(size_of::<carrick_el1_abi::HostReadinessEntry>())
+            .ok_or_else(|| fail("host readiness batch length overflow"))?;
+        let region = if let Some(offset) = address.checked_sub(X86_CPL0_BOOTSTRAP_METADATA_BASE)
+            && offset < EL1_BOOTSTRAP_METADATA_SIZE
+        {
+            Some((ALLOCATOR_GPA, offset, EL1_BOOTSTRAP_METADATA_SIZE))
+        } else if let Some(offset) = address.checked_sub(X86_CPL0_REGION_BASE)
+            && offset < carrick_el1_abi::EL1_REGION_SIZE
+        {
+            Some((KERNEL_REGION_GPA, offset, carrick_el1_abi::EL1_REGION_SIZE))
+        } else {
+            None
+        };
+        let (region_gpa, offset, region_len) = region.ok_or_else(|| {
+            fail(format!(
+                "host readiness batch outside supervisor region: {address:#x}"
+            ))
+        })?;
+        if offset
+            .checked_add(length as u64)
+            .is_none_or(|end| end > region_len)
+            || !address
+                .is_multiple_of(core::mem::align_of::<carrick_el1_abi::HostReadinessEntry>() as u64)
+        {
+            return Err(fail("host readiness batch outside supervisor region"));
+        }
+        let ptr = self
+            .custody
+            .ram
+            .host_ptr(region_gpa + offset, length)
+            .ok_or_else(|| fail("host readiness batch has no backing"))?
+            .cast::<carrick_el1_abi::HostReadinessEntry>();
+        // SAFETY: KVM_RUN stopped this task before the carrier inspects the
+        // bounded, aligned supervisor-region batch.
+        let entries = unsafe { core::slice::from_raw_parts_mut(ptr, count) };
+        Ok(use_entries(entries))
+    }
+
     fn authenticate_initial_copy_page(
         &self,
         output: FrameGpa,
