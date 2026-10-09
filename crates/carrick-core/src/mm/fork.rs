@@ -48,6 +48,18 @@ pub struct ForkScratch {
     pub mappings: Vec<Mapping>,
     pub child_used: usize,
     pub parent_used: usize,
+    /// First exact scratch bound hit while copying this fork's tables.
+    pub capacity_failure: Option<ForkCapacityFailure>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForkCapacityFailure {
+    Reads,
+    ChildTables,
+    ParentTables,
+    Edits,
+    Custody,
+    ControlArena,
 }
 
 impl ForkScratch {
@@ -119,6 +131,7 @@ impl ForkScratch {
             mappings,
             child_used: 512,
             parent_used: 0,
+            capacity_failure: None,
         })
     }
 
@@ -133,28 +146,37 @@ impl ForkScratch {
 
     pub fn allocate_child(&mut self) -> Result<usize, ForkError> {
         let offset = self.child_used;
-        self.child_used = self
+        let next = self
             .child_used
             .checked_add(512)
-            .filter(|end| *end <= self.child.capacity())
-            .ok_or(ForkError::NoMemory)?;
+            .filter(|end| *end <= self.child.capacity());
+        let Some(next) = next else {
+            self.capacity_failure = Some(ForkCapacityFailure::ChildTables);
+            return Err(ForkError::NoMemory);
+        };
+        self.child_used = next;
         self.child.resize(self.child_used, 0);
         Ok(offset)
     }
 
     pub fn allocate_parent(&mut self) -> Result<usize, ForkError> {
         let offset = self.parent_used;
-        self.parent_used = self
+        let next = self
             .parent_used
             .checked_add(512)
-            .filter(|end| *end <= self.parent.capacity())
-            .ok_or(ForkError::NoMemory)?;
+            .filter(|end| *end <= self.parent.capacity());
+        let Some(next) = next else {
+            self.capacity_failure = Some(ForkCapacityFailure::ParentTables);
+            return Err(ForkError::NoMemory);
+        };
+        self.parent_used = next;
         self.parent.resize(self.parent_used, 0);
         Ok(offset)
     }
 
     pub fn custody(&mut self, value: PortalForkCustody) -> Result<(), ForkError> {
         if self.custody.len() == self.custody.capacity() {
+            self.capacity_failure = Some(ForkCapacityFailure::Custody);
             return Err(ForkError::NoMemory);
         }
         self.custody.push(value);
@@ -822,6 +844,7 @@ pub fn copy_table<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
         let address = cursor.table + index as u64 * 8;
         let descriptor = words.load(address).map_err(|_| ForkError::Core)?;
         if scratch.reads.len() == scratch.reads.capacity() {
+            scratch.capacity_failure = Some(ForkCapacityFailure::Reads);
             return Err(ForkError::NoMemory);
         }
         scratch.reads.push((address, descriptor));
@@ -842,6 +865,7 @@ pub fn copy_table<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
         scratch.child[cursor.child_offset + index] = child;
         if parent != descriptor {
             if scratch.edits.len() == scratch.edits.capacity() {
+                scratch.capacity_failure = Some(ForkCapacityFailure::Edits);
                 return Err(ForkError::NoMemory);
             }
             scratch.edits.push(JournalEntry {
@@ -938,6 +962,7 @@ pub fn copy_entry<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
             .map_err(|_| ForkError::Core)?
             .raw();
             if !request.child_tables.contains(output) {
+                scratch.capacity_failure = Some(ForkCapacityFailure::ControlArena);
                 return Err(ForkError::NoMemory);
             }
             return Ok((descriptor, (descriptor & !B::ADDRESS_MASK) | output));
