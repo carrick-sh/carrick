@@ -16,7 +16,9 @@ single supervisor half, builds its own stack, initializes private zeroed
 frames and maps each user page through an edit intent. One publication record
 is returned per mapped page. The VM-free fixture checks three user pages,
 three data grants, one root plus exactly five unique page-table grants, and
-zero-filled BSS. The KVM fixture enters a real static ELF at its mapped RIP
+zero-filled BSS, and that every owned initial page (text, data and the
+anonymous stack) is published with owner-private (PRIVATE) custody, so a
+later copy-on-write of an ELF data page is admitted. The KVM fixture enters a real static ELF at its mapped RIP
 and observes exit_group(7), with no semantic host forward. This bounded
 carrier fixture does not prove production VM/vCPU lifetime or the CLI x86 run
 path; those belong to the x86-run milestone and director acceptance.
