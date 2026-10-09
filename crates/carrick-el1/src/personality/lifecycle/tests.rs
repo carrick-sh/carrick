@@ -598,9 +598,12 @@ fn pending_host_work_gettid_forwards_without_completion() {
         w.task().linux.mark_pending_host_work();
         for _ in 0..scale {
             let (action, frame) = w.syscall(SYS_GETTID, &[0xfeed]);
-            assert_eq!(action, Action::Forward);
+            assert_eq!(action, Action::ServedWithWork);
             assert_eq!(frame.x[0], 0xfeed);
-            assert_eq!(w.task().linux.served_with_work.load(Ordering::Acquire), 0);
+            assert_eq!(
+                w.task().linux.take_served_boundary(),
+                Some(carrick_el1_abi::ServedBoundary::ReplayOriginal { x0: 0xfeed })
+            );
         }
         assert_eq!(w.served(SYS_GETTID), 0);
         assert_eq!(w.forwarded(SYS_GETTID), scale);
@@ -1067,7 +1070,15 @@ fn exit_forwards_unless_a_switched_in_non_last_thread_may_leave() {
         setup(&w);
         let live = w.page().live();
         let action = w.call(&mut frame, SYS_EXIT, &[3]);
-        assert_eq!(action, Action::Forward, "{label}");
+        assert_eq!(
+            action,
+            if label == "host work pending" {
+                Action::ServedWithWork
+            } else {
+                Action::Forward
+            },
+            "{label}"
+        );
         assert_eq!(
             w.counters
                 .lifecycle_declines
