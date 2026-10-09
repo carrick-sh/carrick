@@ -1264,6 +1264,10 @@ fn x86_split_result_does_not_read_argument_zero() {
         }
     }
     impl GuestDispatchFrame for SplitFrame {
+        fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
+            carrick_personality_linux::crossing::HostCrossingSet::Aarch64
+        }
+
         fn arm_frame(&mut self) -> Option<&mut TrapFrame> {
             None
         }

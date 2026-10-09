@@ -56,6 +56,10 @@ impl SyscallFrame for X86Frame<'_> {
     }
 }
 impl dispatch::GuestDispatchFrame for X86Frame<'_> {
+    fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
+        carrick_personality_linux::crossing::HostCrossingSet::X86
+    }
+
     fn arm_frame(&mut self) -> Option<&mut TrapFrame> {
         None
     }

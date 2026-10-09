@@ -26,6 +26,13 @@ use core::sync::atomic::Ordering;
 /// ARM frame access is retained for scheduler/IPC park leaves that have not
 /// yet acquired an ISA-neutral saved-context contract.
 pub trait GuestDispatchFrame: SyscallFrame {
+    fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet;
+    fn crossing_strict(&self, arm_policy: impl FnOnce() -> bool) -> bool {
+        match self.crossing_set() {
+            carrick_personality_linux::crossing::HostCrossingSet::X86 => true,
+            carrick_personality_linux::crossing::HostCrossingSet::Aarch64 => arm_policy(),
+        }
+    }
     fn arm_frame(&mut self) -> Option<&mut TrapFrame>;
     fn arm_frame_ref(&self) -> Option<&TrapFrame>;
     fn arm_scheduler(&self) -> bool;
@@ -35,6 +42,9 @@ pub trait GuestDispatchFrame: SyscallFrame {
 }
 
 impl GuestDispatchFrame for TrapFrame {
+    fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
+        carrick_personality_linux::crossing::HostCrossingSet::Aarch64
+    }
     fn arm_frame(&mut self) -> Option<&mut TrapFrame> {
         Some(self)
     }
@@ -598,17 +608,20 @@ impl<
             .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
     }
     fn ring_first_strict(&self) -> bool {
-        #[cfg(target_os = "none")]
-        {
-            carrick_el1_abi::aperture_control().is_strict()
-        }
-        #[cfg(not(target_os = "none"))]
-        {
-            carrick_el1_abi::host_aperture_control().is_some_and(|ctrl| ctrl.is_strict())
-        }
+        self.frame.crossing_strict(|| {
+            #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+            {
+                // SAFETY: ARM entry maps the ABI aperture for the lifetime of EL1.
+                unsafe { carrick_el1_abi::aperture_control() }.is_strict()
+            }
+            #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+            {
+                carrick_el1_abi::host_aperture_control().is_some_and(|ctrl| ctrl.is_strict())
+            }
+        })
     }
     fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
-        carrick_personality_linux::crossing::HostCrossingSet::Aarch64
+        self.frame.crossing_set()
     }
     fn refused_counters(&self) -> Option<&'a [core::sync::atomic::AtomicU64]> {
         Some(&self.counters.refused)
