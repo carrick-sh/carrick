@@ -1894,7 +1894,11 @@ mod kernel {
                     .unwrap_or_else(|_| initial_boot::fatal_boot());
                 let mut service = native_process::Service::new(task, slot);
                 let route = {
-                    let mut process = native_process::runtime().enter(source, task, words, &mut service)
+                    let (runtime, address) = native_process::runtime(source, task)
+                        .unwrap_or_else(|_| initial_boot::fatal_boot());
+                    let mut process = runtime.enter_registered(
+                        native_process::registry(), source, task, address, words, &mut service,
+                    )
                         .unwrap_or_else(|_| initial_boot::fatal_boot());
                     let mut native = NativeDispatch {
                         frame, call, publications: &binding.publications,
