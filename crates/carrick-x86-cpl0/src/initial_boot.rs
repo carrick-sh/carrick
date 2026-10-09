@@ -6,6 +6,7 @@ use carrick_el1::isa::x86::initial_mm::{
 use carrick_el1_abi::{
     X86_CPL0_INITIAL_EXTENT_GPA, X86_CPL0_INITIAL_EXTENT_MAX_SIZE, X86_CPL0_INITIAL_EXTENT_VA,
     X86_INITIAL_BOOT_LOADED, X86_INITIAL_BOOT_MAGIC, X86_INITIAL_BOOT_PORT,
+    X86_INITIAL_RUNNER_READY_PORT,
     X86_INITIAL_BOOT_REFUSED, X86_INITIAL_BOOT_VERSION, X86_INITIAL_MAX_REGIONS,
     X86_INITIAL_MAX_STRINGS, X86InitialBootGrant, X86InitialBootRegion, X86InitialBootRequest,
     X86InitialBootString,
@@ -304,6 +305,9 @@ pub extern "C" fn carrick_x86_initial_boot(request_va: u64) -> ! {
         generation: carrick_guest_arch::ContextGeneration::new(generation),
     };
     if carrick_el1::isa::x86::X86Backend.install_context(context).is_err() { loop { core::hint::spin_loop(); } }
+    // SAFETY: this physical stop exposes the installed CR3 to the carrier
+    // before it publishes the stopped root image to the executor pool.
+    unsafe { core::arch::asm!("out dx, al", in("dx") X86_INITIAL_RUNNER_READY_PORT, in("rax") request_va, options(nostack, preserves_flags)); }
     // SAFETY: after host acknowledgement, the exact MM is published and the
     // user selectors/entry/stack came from the guest-owned image transaction.
     unsafe { carrick_x86_boot_iret(entry, stack) }

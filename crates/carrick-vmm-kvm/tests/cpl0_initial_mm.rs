@@ -53,6 +53,19 @@ fn initial_root_uses_issued_thread_and_file_table_identity() {
         .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
         .expect("shared MM owner");
     assert!(carrier.initial_thread_custody());
+    let mut workers = carrier.into_worker_parts(8).expect("worker handoff");
+    assert_eq!(workers.root_state().binding().task().task.raw().get(), 700);
+    assert_eq!(workers.root_state().state().mm_generation(), 301);
+    workers
+        .cpu_mut(0)
+        .expect("root physical CPU")
+        .audit_idle()
+        .unwrap();
+    workers
+        .cpu_mut(1)
+        .expect("peer physical CPU")
+        .audit_idle()
+        .unwrap();
 }
 
 fn image() -> PathBuf {

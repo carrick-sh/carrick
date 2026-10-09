@@ -6,6 +6,8 @@ pub const X86_INITIAL_BOOT_MAGIC: u64 = u64::from_le_bytes(*b"CXRUN001");
 pub const X86_INITIAL_BOOT_VERSION: u32 = 3;
 pub const X86_INITIAL_BOOT_HEADER_GPA: u64 = 0x10_1000;
 pub const X86_INITIAL_BOOT_PORT: u16 = 0xc6;
+/// Physical stop after the initial MM is installed, before entering EL0.
+pub const X86_INITIAL_RUNNER_READY_PORT: u16 = 0xd5;
 pub const X86_INITIAL_MAX_REGIONS: usize = 32;
 pub const X86_INITIAL_MAX_STRINGS: usize = 256;
 /// CPL0's retained metadata binds the neutral reservation and zone owners
