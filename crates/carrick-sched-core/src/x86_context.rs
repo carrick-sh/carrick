@@ -37,6 +37,13 @@ pub const fn valid_user_return_words(rip: u64, rsp: u64, flags: u64) -> bool {
         && flags & ((3 << 12) | (1 << 14) | (1 << 17) | (1 << 19) | (1 << 20)) == 0
 }
 
+/// sigreturn may update arithmetic/debug flags, never interrupt or privilege state.
+pub const fn signal_return_flags(current: u64, requested: u64) -> u64 {
+    const USER_MODIFIABLE: u64 = 0x50dd5;
+    const PRIVILEGED: u64 = (3 << 12) | (1 << 14) | (1 << 17) | (1 << 19) | (1 << 20);
+    ((current & !USER_MODIFIABLE) | (requested & USER_MODIFIABLE) | 0x202) & !PRIVILEGED
+}
+
 const _: () = {
     assert!(core::mem::offset_of!(ParkedContextWords, frame) == 0);
     assert!(core::mem::offset_of!(ParkedContextWords, root) == 160);
@@ -117,5 +124,17 @@ impl carrick_guest_arch::ProcessContext for ParkedContextWords {
     }
     fn syscall_return(&self) -> u64 {
         ParkedContextWords::syscall_return(self)
+    }
+}
+
+#[cfg(test)]
+mod signal_return_tests {
+    #[test]
+    fn flags_preserve_interrupts_and_refuse_privilege() {
+        let restored = super::signal_return_flags(0x202, u64::MAX);
+        assert_eq!(restored & 0x202, 0x202);
+        assert_eq!(restored & ((3 << 12) | (1 << 14)), 0);
+        assert!(super::valid_user_return_words(0x400000, 0x700000, restored));
+        assert!(!super::valid_user_return_words(1 << 47, 0x700000, restored));
     }
 }
