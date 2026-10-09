@@ -628,6 +628,7 @@ dependencies = [
  "carrick-signal-linux",
  "carrick-timer-core",
  "libc",
+ "parking_lot",
  "serde",
  "thiserror",
  "zerocopy",

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use carrick_fatal::carrick_fatal;
 use parking_lot::{Condvar, Mutex};
 
-use super::asid::{AsidError, AsidGeneration, AsidLoad, AsidResidencyError};
+use super::asid::{AsidAllocator, AsidError, AsidGeneration, AsidLoad, AsidResidencyError};
 use super::stage1_mm::{
     PreparedStage1Mm, PreparedStage1MmAbort, Stage1MmBackend, Stage1MmError, Stage1MmLease,
     Stage1MmPool, Stage1MmRetirement, Stage1RootRetirementReceipt, Stage1RootRetirementTicket,
@@ -910,8 +910,9 @@ impl MmResources {
 
     pub(crate) fn new_root(
         stage1_root: u64,
+        asids: AsidAllocator,
     ) -> Result<(Self, Arc<Stage1MmBackend>), MmResourcesError> {
-        let (mm_pool, root_mm) = Stage1MmPool::new_root(stage1_root)?;
+        let (mm_pool, root_mm) = Stage1MmPool::with_allocator(stage1_root, asids)?;
         let backend = root_mm.backend();
         Ok((
             Self {

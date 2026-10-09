@@ -2130,6 +2130,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.cow_authority.clone()
     }
 
+    fn carrier_asid_allocator(&self) -> Option<carrick_hal::asid::AsidAllocator> {
+        Some(self.state.carrier_vm_custody().asids.clone())
+    }
+
     fn prepare_anonymous_discard(
         &self,
         va: u64,

@@ -394,7 +394,8 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 controls.add(index).write(ThreadControlSlot::new());
             }
         }
-        let ttbr0 = (u64::from(loan.asid) << 48)
+        let asid = loan.asid.ok_or(NativeProcessError::Stale)?;
+        let ttbr0 = (u64::from(asid.raw()) << 48)
             | (loan.request.child_tables.base & AARCH64_ROOT_ADDRESS_MASK);
         let index = owner
             .spaces

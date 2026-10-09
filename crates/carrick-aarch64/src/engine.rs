@@ -5241,6 +5241,10 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.foreign_mm_endpoint()
     }
 
+    fn carrier_asid_allocator(&self) -> Option<carrick_hal::asid::AsidAllocator> {
+        self.vm.carrier_asid_allocator()
+    }
+
     fn frame_cow_owner_inventory(
         &self,
     ) -> Option<std::sync::Arc<dyn carrick_hal::FrameCowOwnerInventory>> {

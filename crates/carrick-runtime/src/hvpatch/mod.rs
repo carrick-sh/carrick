@@ -151,7 +151,9 @@ impl RootProcessInitialization {
 pub(crate) fn process_context_for_tests(
     pid: i32,
 ) -> (ProcessContext, carrick_kernel::kernel::KernelContext) {
-    let (resources, backend) = MmResources::new_root(0x4000).expect("test HVPatch root resources");
+    let (resources, backend) =
+        MmResources::new_root(0x4000, carrick_hal::asid::AsidAllocator::new())
+            .expect("test HVPatch root resources");
     let bootstrap = carrick_kernel::kernel::RootBootstrap::with_mm_backend(
         pid,
         crate::thread::ThreadId::synthetic_for_tests(pid),
@@ -1067,7 +1069,8 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
     })? & TTBR_ROOT_MASK;
     let identity = root_bootstrap_identity(std::process::id())?;
     let pid = identity.pid;
-    let (table, mm_backend) = MmResources::new_root(stage1_root)
+    let asids = engine.carrier_asid_allocator().unwrap_or_default();
+    let (table, mm_backend) = MmResources::new_root(stage1_root, asids)
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
     let table = std::sync::Arc::new(table);
     let root_tid = identity.tid;
@@ -1662,7 +1665,8 @@ mod tests {
 
     fn authoritative_root() -> (ProcessContext, carrick_kernel::kernel::KernelContext) {
         let pid = 10_000;
-        let (table, backend) = MmResources::new_root(0x4000).unwrap();
+        let (table, backend) =
+            MmResources::new_root(0x4000, carrick_hal::asid::AsidAllocator::new()).unwrap();
         let bootstrap = carrick_kernel::kernel::RootBootstrap::with_mm_backend(
             pid,
             crate::thread::ThreadId::synthetic_for_tests(pid),

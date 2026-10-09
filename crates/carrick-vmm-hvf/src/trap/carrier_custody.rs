@@ -406,7 +406,7 @@ impl CarrierVmCustodyState {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(::core::fmt::Debug)]
 #[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
-pub(crate) struct CarrierVmCustody {
+pub struct CarrierVmCustody {
     pub(crate) transfer_carrier: core::num::NonZeroU64,
     pub(crate) el1_frame_grants: std::sync::Arc<parking_lot::Mutex<El1FrameGrantLedger>>,
     /// Host COW accounting for every MM admitted to this carrier.
@@ -414,7 +414,8 @@ pub(crate) struct CarrierVmCustody {
     pub(crate) metadata_completion:
         parking_lot::Mutex<Option<std::sync::Arc<dyn carrick_el1_abi::MetadataCompletionWake>>>,
     pub(crate) metadata_aperture: parking_lot::Mutex<crate::metadata_grant::HostApertureState>,
-    pub(crate) fork_stock: parking_lot::Mutex<crate::fork_stock::ForkStockHostCustody>,
+    pub fork_stock: parking_lot::Mutex<crate::fork_stock::ForkStockHostCustody>,
+    pub asids: carrick_hal::asid::AsidAllocator,
     pub(crate) state: parking_lot::Mutex<CarrierVmCustodyState>,
     pub(crate) structural_backings: parking_lot::Mutex<
         std::collections::BTreeMap<
@@ -602,7 +603,7 @@ impl Default for CarrierVmCustody {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
 impl CarrierVmCustody {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         static NEXT_CARRIER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id = NEXT_CARRIER
             .fetch_update(
@@ -616,6 +617,7 @@ impl CarrierVmCustody {
         let transfer_carrier = core::num::NonZeroU64::new(id).unwrap_or_else(|| {
             carrick_fatal::carrick_fatal!("hvf::transfer", "zero carrier identity")
         });
+        let asids = carrick_hal::asid::AsidAllocator::new();
         Self {
             transfer_carrier,
             el1_frame_grants: std::sync::Arc::new(parking_lot::Mutex::new(
@@ -626,9 +628,13 @@ impl CarrierVmCustody {
             metadata_aperture: parking_lot::Mutex::new(
                 crate::metadata_grant::HostApertureState::new(),
             ),
-            fork_stock: parking_lot::Mutex::new(crate::fork_stock::ForkStockHostCustody::new(
-                transfer_carrier,
-            )),
+            fork_stock: parking_lot::Mutex::new(
+                crate::fork_stock::ForkStockHostCustody::with_asids(
+                    transfer_carrier,
+                    asids.clone(),
+                ),
+            ),
+            asids,
             state: parking_lot::Mutex::new(CarrierVmCustodyState {
                 next_generation: 1,
                 lifecycle: CarrierVmLifecycle::Vacant,
@@ -656,6 +662,10 @@ impl CarrierVmCustody {
             root_slot_pool: parking_lot::Mutex::new(CarrierRootSlotPoolState::Uninitialized),
             guest_cow_states: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    pub fn asid_allocator(&self) -> &carrick_hal::asid::AsidAllocator {
+        &self.asids
     }
 
     pub(crate) fn request_global_frame_retirement_retry(&self) {

@@ -2,66 +2,16 @@
 // complete allocator contract buildable while that integration is in flight.
 #![allow(dead_code)]
 
-use std::collections::{BTreeSet, VecDeque};
-use std::num::{NonZeroU16, NonZeroU64};
 use std::sync::Arc;
 
 use parking_lot::{Condvar, Mutex};
 
-use carrick_kernel::kernel::Asid;
+pub(crate) use carrick_hal::asid::{
+    AsidAllocator, AsidError, AsidGeneration, PreparedAsidAllocatorRetirement, RetiredAsid,
+};
 
-const FIRST_GUEST_ASID: u16 = 1;
-const LAST_GUEST_ASID: u16 = u16::MAX;
-
-/// Proof that an ASID left the live set but has not yet had its stale TLB
-/// translations invalidated. The token is deliberately neither `Clone` nor
-/// constructible outside this module: consuming it is the only route back to
-/// the allocator's reusable pool.
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct RetiredAsid {
-    generation: AsidGeneration,
-}
-
-/// Exact lifetime of one numeric architectural ASID. Numeric reuse always
-/// receives a fresh generation, so stale residency or acknowledgement tokens
-/// cannot authorize its successor.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct AsidGeneration {
-    asid: Asid,
-    generation: NonZeroU64,
-}
-
-impl AsidGeneration {
-    pub(crate) const fn asid(self) -> Asid {
-        self.asid
-    }
-
-    pub(crate) const fn raw(self) -> u16 {
-        self.asid.raw()
-    }
-
-    pub(crate) const fn generation(self) -> u64 {
-        self.generation.get()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_tests(raw: u16, generation: u64) -> Self {
-        Self {
-            asid: Asid::from_registry_allocation(
-                NonZeroU16::new(raw).expect("test ASID must be nonzero"),
-            ),
-            generation: NonZeroU64::new(generation).expect("test ASID generation must be nonzero"),
-        }
-    }
-
-    #[cfg(test)]
-    fn successor_for_tests(self) -> Self {
-        Self {
-            asid: self.asid,
-            generation: NonZeroU64::new(self.generation.get().wrapping_add(1).max(1)).unwrap(),
-        }
-    }
-}
+pub(crate) use carrick_core::mm::retirement::ResidencyError as AsidResidencyError;
+use carrick_core::mm::retirement::{InvalidationProof, ResidencyState, ResidencyVenue};
 
 /// Proof that one broadcast `TLBI ASIDE1IS` for an ASID generation completed
 /// on a vCPU of the VM, and therefore on every PE of the Inner Shareable
@@ -78,9 +28,6 @@ impl BroadcastInvalidation {
         Self { generation }
     }
 }
-
-pub(crate) use carrick_core::mm::retirement::ResidencyError as AsidResidencyError;
-use carrick_core::mm::retirement::{InvalidationProof, ResidencyState, ResidencyVenue};
 
 /// Native synchronization only; the residency lifecycle belongs to Core.
 #[derive(Clone, Debug, Default)]
@@ -115,191 +62,6 @@ pub(crate) type PreparedAsidResidencyRetirement =
     carrick_core::mm::retirement::PreparedResidencyRetirement<HostResidencyVenue, AsidGeneration>;
 pub(crate) type AsidRetirement =
     carrick_core::mm::retirement::ResidencyRetirement<HostResidencyVenue, AsidGeneration>;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub(crate) enum AsidError {
-    #[error("all guest ASIDs are live or awaiting TLB invalidation")]
-    Exhausted,
-    #[error("guest ASID {0:?} is not live")]
-    NotLive(Asid),
-    #[error("guest ASID {0:?} is not awaiting TLB invalidation")]
-    NotRetired(Asid),
-}
-
-/// Allocates nonzero process ASIDs and quarantines retired identifiers until
-/// the caller confirms that the matching `TLBI ASIDE1IS` completed.
-#[derive(Debug)]
-pub(crate) struct AsidAllocator {
-    state: Arc<Mutex<AsidAllocatorState>>,
-}
-
-#[derive(Debug)]
-struct AsidAllocatorState {
-    next: u32,
-    next_generation: u64,
-    limit: u16,
-    reusable: VecDeque<Asid>,
-    live: BTreeSet<AsidGeneration>,
-    retirement_prepared: BTreeSet<AsidGeneration>,
-    retired: BTreeSet<AsidGeneration>,
-}
-
-impl Default for AsidAllocator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl AsidAllocator {
-    pub(crate) fn new() -> Self {
-        Self {
-            state: Arc::new(Mutex::new(AsidAllocatorState {
-                next: u32::from(FIRST_GUEST_ASID),
-                next_generation: 1,
-                limit: LAST_GUEST_ASID,
-                reusable: VecDeque::new(),
-                live: BTreeSet::new(),
-                retirement_prepared: BTreeSet::new(),
-                retired: BTreeSet::new(),
-            })),
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn with_limit_for_tests(limit: u16) -> Self {
-        assert!(limit >= FIRST_GUEST_ASID);
-        let allocator = Self::new();
-        allocator.state.lock().limit = limit;
-        allocator
-    }
-
-    pub(crate) fn allocate(&self) -> Result<AsidGeneration, AsidError> {
-        let mut state = self.state.lock();
-        // Minting the strong generation must be proven possible before a
-        // numeric ASID is popped or advanced. Otherwise generation exhaustion
-        // would silently lose an otherwise reusable architectural identifier.
-        let generation = NonZeroU64::new(state.next_generation).ok_or(AsidError::Exhausted)?;
-        let next_generation = state
-            .next_generation
-            .checked_add(1)
-            .ok_or(AsidError::Exhausted)?;
-        // Prefer a never-used identifier while the 16-bit architectural space
-        // has one.  Recycling immediately after a process exit needlessly puts
-        // a new address space behind the exact ASID most likely to remain in a
-        // physical CPU's translation structures; the acknowledged pool is the
-        // exhaustion fallback, not the fast path.
-        let asid = if state.next <= u32::from(state.limit) {
-            let Ok(raw) = u16::try_from(state.next) else {
-                return Err(AsidError::Exhausted);
-            };
-            let raw = NonZeroU16::new(raw).ok_or(AsidError::Exhausted)?;
-            let asid = Asid::from_registry_allocation(raw);
-            state.next += 1;
-            asid
-        } else if let Some(asid) = state.reusable.pop_front() {
-            asid
-        } else {
-            return Err(AsidError::Exhausted);
-        };
-        state.next_generation = next_generation;
-        let generation = AsidGeneration { asid, generation };
-        let inserted = state.live.insert(generation);
-        debug_assert!(inserted, "allocator returned an ASID that was already live");
-        Ok(generation)
-    }
-
-    /// Release an ASID reserved for an address space that was never published
-    /// to a vCPU. No TLB proof is required because no translation could have
-    /// been installed under this identity.
-    pub(crate) fn release_unpublished(&self, generation: AsidGeneration) -> Result<(), AsidError> {
-        let mut state = self.state.lock();
-        if !state.live.remove(&generation) {
-            return Err(AsidError::NotLive(generation.asid));
-        }
-        state.reusable.push_back(generation.asid);
-        Ok(())
-    }
-
-    pub(crate) fn prepare_retirement(
-        &self,
-        generation: AsidGeneration,
-    ) -> Result<PreparedAsidAllocatorRetirement, AsidError> {
-        let mut state = self.state.lock();
-        if !state.live.remove(&generation) {
-            return Err(AsidError::NotLive(generation.asid));
-        }
-        let inserted = state.retirement_prepared.insert(generation);
-        assert!(inserted, "live ASID was already prepared for retirement");
-        Ok(PreparedAsidAllocatorRetirement {
-            allocator: Self {
-                state: Arc::clone(&self.state),
-            },
-            generation,
-            active: true,
-        })
-    }
-
-    pub(crate) fn retire(&self, generation: AsidGeneration) -> Result<RetiredAsid, AsidError> {
-        Ok(self.prepare_retirement(generation)?.commit())
-    }
-
-    /// Make a retired ASID reusable after the caller has completed the
-    /// architectural invalidation for that ASID on every vCPU in the VM.
-    pub(crate) fn acknowledge_tlb_flush(&self, retired: RetiredAsid) -> Result<(), AsidError> {
-        let mut state = self.state.lock();
-        if !state.retired.remove(&retired.generation) {
-            return Err(AsidError::NotRetired(retired.generation.asid));
-        }
-        state.reusable.push_back(retired.generation.asid);
-        Ok(())
-    }
-}
-
-/// Exact allocator reservation for a live generation that may either return to
-/// the live set on drop or move infallibly into TLB quarantine on commit.
-#[derive(Debug)]
-pub(crate) struct PreparedAsidAllocatorRetirement {
-    allocator: AsidAllocator,
-    generation: AsidGeneration,
-    active: bool,
-}
-
-impl PreparedAsidAllocatorRetirement {
-    pub(crate) fn commit(mut self) -> RetiredAsid {
-        {
-            let mut state = self.allocator.state.lock();
-            assert!(
-                state.retirement_prepared.remove(&self.generation),
-                "prepared ASID allocator retirement lost its exact generation"
-            );
-            assert!(
-                state.retired.insert(self.generation),
-                "prepared ASID allocator retirement committed twice"
-            );
-        }
-        self.active = false;
-        RetiredAsid {
-            generation: self.generation,
-        }
-    }
-}
-
-impl Drop for PreparedAsidAllocatorRetirement {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        let mut state = self.allocator.state.lock();
-        assert!(
-            state.retirement_prepared.remove(&self.generation),
-            "prepared ASID allocator retirement lost its exact generation"
-        );
-        ::std::assert!(
-            state.live.insert(self.generation),
-            "prepared ASID allocator retirement returned a generation twice"
-        );
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -401,11 +163,11 @@ mod tests {
         allocator
             .acknowledge_tlb_flush(retired)
             .expect("acknowledge first generation");
-        allocator.state.lock().next_generation = u64::MAX;
+        allocator.set_next_generation_for_tests(u64::MAX);
 
         assert_eq!(allocator.allocate(), Err(AsidError::Exhausted));
 
-        allocator.state.lock().next_generation = 9;
+        allocator.set_next_generation_for_tests(9);
         let recovered = allocator
             .allocate()
             .expect("overflow preflight preserves numeric ASID");

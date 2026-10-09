@@ -429,18 +429,6 @@ struct Stage1MmPoolInner {
     root_nonce_exhausted: bool,
 }
 
-fn carrier_stage1_mm_pool() -> &'static Arc<Mutex<Stage1MmPoolInner>> {
-    static CELL: std::sync::OnceLock<Arc<Mutex<Stage1MmPoolInner>>> = std::sync::OnceLock::new();
-    CELL.get_or_init(|| {
-        Arc::new(Mutex::new(Stage1MmPoolInner {
-            asids: AsidAllocator::new(),
-            free_root_slots: (0..STAGE1_ROOT_SLOT_COUNT).map(Stage1RootSlot).collect(),
-            #[cfg(test)]
-            root_nonce_exhausted: false,
-        }))
-    })
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct Stage1MmTableArenaSource {
     pool: Stage1MmPool,
@@ -576,18 +564,6 @@ impl carrick_mmu_core::aarch64::TableArenaSource for Stage1MmTableArenaSource {
 }
 
 impl Stage1MmPool {
-    pub(crate) fn new_root(stage1_root: u64) -> Result<(Self, Arc<Stage1MmLease>), Stage1MmError> {
-        let pool = Self {
-            inner: Arc::clone(carrier_stage1_mm_pool()),
-        };
-        let inner = pool.inner.lock();
-        let asid = inner.asids.allocate()?;
-        let stage1_root = Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(stage1_root))?;
-        let root = Arc::new(Stage1MmLease::new(asid, stage1_root, None));
-        drop(inner);
-        Ok((pool, root))
-    }
-
     #[cfg(test)]
     pub(crate) fn new_root_for_tests(
         stage1_root: u64,
@@ -596,8 +572,7 @@ impl Stage1MmPool {
         Self::with_allocator(stage1_root, AsidAllocator::with_limit_for_tests(asid_limit))
     }
 
-    #[cfg(test)]
-    fn with_allocator(
+    pub(crate) fn with_allocator(
         stage1_root: u64,
         asids: AsidAllocator,
     ) -> Result<(Self, Arc<Stage1MmLease>), Stage1MmError> {
@@ -615,6 +590,16 @@ impl Stage1MmPool {
             },
             root,
         ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allocate_root(
+        &self,
+        stage1_root: u64,
+    ) -> Result<Arc<Stage1MmLease>, Stage1MmError> {
+        let asid = self.inner.lock().asids.allocate()?;
+        let stage1_root = Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(stage1_root))?;
+        Ok(Arc::new(Stage1MmLease::new(asid, stage1_root, None)))
     }
 
     pub(crate) fn prepare_child(&self) -> Result<PreparedStage1Mm, Stage1MmError> {
@@ -1518,7 +1503,8 @@ mod tests {
     #[test]
     fn old_observer_keeps_its_binding_after_exec_and_retirement() {
         let task = root_key();
-        let (table, backend) = MmResources::new_root(0x8000).expect("root table");
+        let (table, backend) =
+            MmResources::new_root(0x8000, AsidAllocator::new()).expect("root table");
         table.publish_root(task).expect("publish root");
         let initial = backend.binding();
 
@@ -2372,7 +2358,8 @@ mod tests {
 
     #[test]
     fn fails_closed_when_vma_authority_is_unbound() {
-        let (_table, backend) = MmResources::new_root(0x8000).expect("root table");
+        let (_table, backend) =
+            MmResources::new_root(0x8000, AsidAllocator::new()).expect("root table");
 
         assert_eq!(
             backend.snapshot(Instant::now() + std::time::Duration::from_secs(1)),
@@ -2384,6 +2371,11 @@ mod tests {
 
     #[test]
     fn concurrent_carrier_roots_allocate_distinct_asids_and_root_slots() {
+        let asids = AsidAllocator::new();
+        let (pool, root1) =
+            Stage1MmPool::with_allocator(0x10000, asids).expect("first carrier root");
+        let pool1 = pool.clone();
+        let pool2 = pool.clone();
         let start_barrier = Arc::new(std::sync::Barrier::new(3));
         let hold_barrier = Arc::new(std::sync::Barrier::new(3));
         let s1 = Arc::clone(&start_barrier);
@@ -2393,22 +2385,21 @@ mod tests {
 
         let t1 = std::thread::spawn(move || {
             s1.wait();
-            let (pool, root) = Stage1MmPool::new_root(0x10000).expect("first carrier root");
-            let child = pool.prepare_child().expect("child for root 1");
+            let child = pool1.prepare_child().expect("child for root 1");
             let slot = child.root_slot();
             let lease = child.commit();
             h1.wait();
-            (root.binding(), lease.binding(), slot)
+            (root1.binding(), lease.binding(), slot)
         });
 
         let t2 = std::thread::spawn(move || {
             s2.wait();
-            let (pool, root) = Stage1MmPool::new_root(0x20000).expect("second carrier root");
-            let child = pool.prepare_child().expect("child for root 2");
+            let root2 = pool2.allocate_root(0x20000).expect("second carrier root");
+            let child = pool2.prepare_child().expect("child for root 2");
             let slot = child.root_slot();
             let lease = child.commit();
             h2.wait();
-            (root.binding(), lease.binding(), slot)
+            (root2.binding(), lease.binding(), slot)
         });
 
         start_barrier.wait();
@@ -2544,5 +2535,33 @@ mod tests {
             initial_free,
             "all slots returned"
         );
+    }
+
+    #[test]
+    fn host_created_mm_and_shared_asid_allocator() {
+        let asids = AsidAllocator::with_limit_for_tests(2);
+        // 1. Host-created MM through production path (Stage1MmPool::with_allocator)
+        let (_pool, root_lease) =
+            Stage1MmPool::with_allocator(0x8000, asids.clone()).expect("root pool");
+        let host_asid = root_lease.binding().asid;
+
+        // 2. Fork-stock path allocates from the same allocator instance:
+        let child_asid_gen = asids.allocate().expect("child asid");
+        let child_asid = child_asid_gen.asid();
+        assert_ne!(host_asid, child_asid);
+
+        // 3. Abort releases child ASID:
+        asids
+            .release_unpublished(child_asid_gen)
+            .expect("release unpublished");
+        let reallocated = asids.allocate().expect("reallocate after abort");
+        assert_eq!(reallocated.asid(), child_asid);
+
+        // 4. Retire releases once:
+        let retired = asids.retire(reallocated).expect("retire");
+        assert_eq!(asids.allocate(), Err(AsidError::Exhausted));
+        asids.acknowledge_tlb_flush(retired).expect("ack flush");
+        let recycled = asids.allocate().expect("reallocated after retire");
+        assert_eq!(recycled.asid(), child_asid);
     }
 }
