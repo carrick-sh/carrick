@@ -76,29 +76,37 @@ mod tests {
     }
 
     #[test]
-    fn test_host_aperture_control_honours_zero_and_default() {
-        let total_size = carrick_el1_abi::EL1_APERTURE_CONTROL_OFFSET as usize
-            + std::mem::size_of::<ApertureControl>();
-        let mut region = vec![0u8; total_size];
-        let ptr = region.as_mut_ptr() as usize;
-
-        carrick_el1_abi::record_el1_region_host_ptr(ptr);
-
-        let aperture = carrick_el1_abi::host_aperture_control()
-            .expect("host_aperture_control must be accessible when region is recorded");
-
-        // 1. With hatch = 0:
-        ArmRingFirstHatch::configure_aperture_with(aperture, Some(OsStr::new("0")));
-        assert!(!aperture.is_strict(), "hatch = 0 must clear strict mode");
-
-        // 2. With default (None):
-        ArmRingFirstHatch::configure_aperture_with(aperture, None);
-        assert!(
-            aperture.is_strict(),
-            "default hatch must enable strict mode"
+    fn aperture_configuration_preserves_service_copy_slot_zero() {
+        let region = carrick_test_support::TestEl1Region::zeroed();
+        // SAFETY: TestEl1Region owns aligned, zero-valid shared ABI storage;
+        // both offsets are checked disjoint by the ABI geometry assertions.
+        let (aperture, service) = unsafe {
+            (
+                &*region
+                    .as_ptr()
+                    .add(carrick_el1_abi::EL1_APERTURE_CONTROL_OFFSET as usize)
+                    .cast::<ApertureControl>(),
+                &*region
+                    .as_ptr()
+                    .add(carrick_el1_abi::EL1_SERVICE_COPY_TABLE_OFFSET as usize)
+                    .cast::<carrick_el1_abi::ServiceCopyTable>(),
+            )
+        };
+        let slot = carrick_el1_abi::SlotId::from_index(0).expect("slot zero");
+        drop(
+            service
+                .try_claim(slot)
+                .expect("initialize idle descriptors"),
         );
-
-        // Clean up global host pointer
-        carrick_el1_abi::record_el1_region_host_ptr(0);
+        for setting in [None, Some(OsStr::new("0")), None] {
+            ArmRingFirstHatch::configure_aperture_with(aperture, setting);
+            assert_eq!(aperture.is_strict(), setting.is_none());
+            // Reclaim asserts that the idle leaves still name exact slot bytes.
+            drop(
+                service
+                    .try_claim(slot)
+                    .expect("hatch must preserve the alias"),
+            );
+        }
     }
 }
