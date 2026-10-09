@@ -39,10 +39,10 @@ pub(crate) fn yield_host_effect() {
     }
 }
 
-pub(crate) fn cross_hvc_fork_stock(record_gpa: u64, cpu: u64) -> Result<(), ()> {
+fn cross_hvc_process(op: u64, record_gpa: u64, cpu: u64) -> Result<(), ()> {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
-        let mut status: u64 = carrick_el1_abi::GRANT_OP_FORK_STOCK;
+        let mut status = op;
         unsafe {
             core::arch::asm!(
                 "hvc #6",
@@ -60,35 +60,21 @@ pub(crate) fn cross_hvc_fork_stock(record_gpa: u64, cpu: u64) -> Result<(), ()> 
     }
     #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
     {
-        let _ = (record_gpa, cpu);
+        let _ = (op, record_gpa, cpu);
         Ok(())
     }
 }
 
+pub(crate) fn cross_hvc_fork_stock(record_gpa: u64, cpu: u64) -> Result<(), ()> {
+    cross_hvc_process(carrick_el1_abi::GRANT_OP_FORK_STOCK, record_gpa, cpu)
+}
+
 pub(crate) fn cross_hvc_root_exit(record_gpa: u64, cpu: u64) -> Result<(), ()> {
-    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    {
-        let mut status: u64 = carrick_el1_abi::GRANT_OP_ROOT_EXIT;
-        unsafe {
-            core::arch::asm!(
-                "hvc #6",
-                inout("x0") status,
-                in("x1") record_gpa,
-                in("x2") cpu,
-                in("x3") 0u64,
-                options(nostack)
-            );
-        }
-        if status != 0 {
-            return Err(());
-        }
-        Ok(())
-    }
-    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-    {
-        let _ = (record_gpa, cpu);
-        Ok(())
-    }
+    cross_hvc_process(carrick_el1_abi::GRANT_OP_ROOT_EXIT, record_gpa, cpu)
+}
+
+pub(crate) fn cross_hvc_child_retire(record_gpa: u64, cpu: u64) -> Result<(), ()> {
+    cross_hvc_process(carrick_el1_abi::GRANT_OP_CHILD_RETIRE, record_gpa, cpu)
 }
 
 impl ArchTypes for Aarch64Backend {
