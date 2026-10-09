@@ -53,6 +53,54 @@ pub(crate) struct KvmPersistentExecutorFactory {
 pub type KvmFirstForwardHook =
     Box<dyn FnOnce(&mut ProductionCpuLease) -> Result<(), TrapError> + Send>;
 
+#[cfg(test)]
+mod resume_effect_tests {
+    use super::*;
+    use carrick_abi::SigSet;
+    use carrick_kernel::kernel::continuation::test_support::bootstrap;
+    use carrick_kernel::kernel::continuation::{
+        ContinuationResumeEffects, ReservedSignal, RestartDecision,
+    };
+
+    #[test]
+    fn reserved_signal_refuses_guest_call_and_requeues_the_reservation() {
+        let (_kernel, context) = bootstrap(162_911);
+        let authority = context.signal_authority();
+        let signal = carrick_kernel::kernel::LinuxSignal::for_signal_number(10).unwrap();
+        authority.enqueue_thread_standard(signal, None);
+        let dequeued = authority.take_lowest_in(SigSet::EMPTY.with(10)).unwrap();
+        let (generation, action) = authority.action_with_generation(signal);
+        let reserved = ReservedSignal::kernel(
+            authority.clone(),
+            dequeued,
+            generation,
+            action,
+            SigSet::EMPTY,
+        );
+        let effects = ContinuationResumeEffects {
+            restart: Some(RestartDecision::NoRestart),
+            reserved_signal: Some(reserved),
+        };
+        assert_eq!(
+            route_kvm_resume_effects(effects),
+            KvmResumeEffect::Refuse(carrick_abi::LINUX_EINTR)
+        );
+        assert!(authority.take_lowest_in(SigSet::EMPTY.with(10)).is_some());
+    }
+
+    #[test]
+    fn restart_effect_stays_available_for_kvm_resume() {
+        let effects = ContinuationResumeEffects {
+            restart: Some(RestartDecision::Restart),
+            reserved_signal: None,
+        };
+        assert_eq!(
+            route_kvm_resume_effects(effects),
+            KvmResumeEffect::Continue(Some(RestartDecision::Restart))
+        );
+    }
+}
+
 type KvmForwardCounts = BTreeMap<&'static str, u64>;
 
 #[derive(Default)]
