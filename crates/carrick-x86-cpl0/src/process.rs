@@ -299,8 +299,9 @@ pub(crate) fn fork_mm(parent_root: RootGpa) -> Option<(RootGpa, GuestMmuPublicat
     // SAFETY: the fixture reserved the child root under the same retained
     // carrier before the guest publishes it; no host descriptor author runs.
     let handle = unsafe { El1MmHandle::from_admitted_owner(one, request.child_mm, one) };
+    let mut stage = carrick_core::mm::fork::ForkPublishStage::RevalidateWords;
     let mut child = plan
-        .publish(&InitialWords::fixture(), Parent, Child, handle)
+        .publish(&InitialWords::fixture(), Parent, Child, handle, &mut stage)
         .ok()?;
     let completion = child.commit(Parent, Child).ok()?;
     let publication =
