@@ -715,6 +715,9 @@ pub(crate) struct ProductionRunContext {
 }
 
 impl ProductionRunContext {
+    pub(crate) fn physical_slot(&self) -> carrick_guest_arch::CpuId {
+        carrick_guest_arch::CpuId::new(self.slot as u32)
+    }
     pub(crate) fn run(&self, cpu: &mut KvmVcpu) -> Result<VcpuExit, TrapError> {
         let table = self
             .ram
@@ -1069,23 +1072,67 @@ pub struct ProductionWorkerParts {
     root_state: carrick_x86::arch_context::X86ArchContext,
 }
 
+/// Physical CPUs are claimed once by executor workers. Shared host custody
+/// outlives every claimed CPU and is only entered for stopped host service.
+pub struct ProductionCpuFactory {
+    cpus: std::sync::Mutex<[Option<KvmCarrierCpu>; 2]>,
+    custody: Arc<std::sync::Mutex<Cpl0HostCustody>>,
+}
+
+pub struct ProductionCpuLease {
+    cpu: KvmCarrierCpu,
+    _custody: Arc<std::sync::Mutex<Cpl0HostCustody>>,
+}
+
+impl ProductionCpuLease {
+    pub fn cpu_mut(&mut self) -> &mut KvmCarrierCpu {
+        &mut self.cpu
+    }
+
+    pub fn physical_slot(&self) -> Option<carrick_guest_arch::CpuId> {
+        self.cpu.physical_slot()
+    }
+}
+
+impl ProductionCpuFactory {
+    pub fn claim(&self, slot: usize) -> Result<ProductionCpuLease, TrapError> {
+        let mut cpus = self.cpus.lock().map_err(|_| fail("CPU factory poisoned"))?;
+        let cpu = cpus
+            .get_mut(slot)
+            .and_then(Option::take)
+            .ok_or_else(|| fail("physical CPU already claimed or absent"))?;
+        if cpu.physical_slot() != Some(carrick_guest_arch::CpuId::new(slot as u32)) {
+            return Err(fail("claimed CPU physical identity mismatch"));
+        }
+        Ok(ProductionCpuLease {
+            cpu,
+            _custody: Arc::clone(&self.custody),
+        })
+    }
+}
+
 impl ProductionWorkerParts {
+    pub fn into_factory(
+        self,
+    ) -> (
+        carrick_x86::arch_context::X86ArchContext,
+        ProductionCpuFactory,
+    ) {
+        let Self {
+            cpus,
+            custody,
+            root_state,
+        } = self;
+        (
+            root_state,
+            ProductionCpuFactory {
+                cpus: std::sync::Mutex::new(cpus.map(Some)),
+                custody: Arc::new(std::sync::Mutex::new(custody)),
+            },
+        )
+    }
     pub fn root_state(&self) -> &carrick_x86::arch_context::X86ArchContext {
         &self.root_state
-    }
-
-    pub fn cpu_mut(&mut self, slot: usize) -> Option<&mut KvmCarrierCpu> {
-        self.cpus.get_mut(slot)
-    }
-
-    pub fn initial_execution_witness(&self) -> (u64, u64) {
-        (
-            self.custody
-                .binding(carrick_guest_arch::CpuId::new(0))
-                .entries
-                .load(Ordering::Acquire),
-            self.custody.host_forwards,
-        )
     }
 }
 
@@ -1095,6 +1142,7 @@ impl ProductionWorkerParts {
 pub struct InitialTaskBinding {
     pub task: carrick_sched_core::process::TaskKey,
     pub thread: carrick_sched_core::ThreadIdentity,
+    pub mm: MmGeneration,
 }
 
 /// One coordinator owns physical backing, grants and retained metadata.
@@ -1239,6 +1287,11 @@ impl<'a> ForwardVenue<'a> {
 }
 
 impl Cpl0Carrier {
+    fn initial_mm_key(&self) -> u64 {
+        self.custody
+            .initial_task
+            .map_or(INITIAL_MM_KEY, |identity| identity.mm.raw().get())
+    }
     fn run_cpu(&mut self, index: usize) -> Result<VcpuExit, TrapError> {
         let context = self.custody.production_run_context(index)?;
         context.run(&mut self.cpus[index])
@@ -1343,7 +1396,7 @@ impl Cpl0Carrier {
                 META_GPA + carrick_el1_abi::X86_CPL0_ZONE_OFFSET,
                 size_of::<X86Cpl0Zone>(),
             ),
-            ReservationMm::new(INITIAL_MM_KEY),
+            ReservationMm::new(self.initial_mm_key()),
         ) else {
             return false;
         };
@@ -1388,7 +1441,8 @@ impl Cpl0Carrier {
                 &*zone.cast::<X86Cpl0Zone>(),
             )
         };
-        let mm = ReservationMm::new(INITIAL_MM_KEY).ok_or_else(|| fail("initial census MM"))?;
+        let mm =
+            ReservationMm::new(self.initial_mm_key()).ok_or_else(|| fail("initial census MM"))?;
         let index = zone
             .spaces
             .find(mm.raw())
@@ -1466,7 +1520,7 @@ impl Cpl0Carrier {
         zone.record(record).home() == Some(slot)
             && identity.tid == tid
             && identity.serial == serial
-            && identity.mm == INITIAL_MM_KEY
+            && identity.mm == self.initial_mm_key()
             && identity.lifecycle_page == METADATA_VA
             && identity.control_slot == METADATA_VA + CONTROL_OFFSET
     }
@@ -1689,7 +1743,7 @@ impl Cpl0Carrier {
             .custody
             .initial_task
             .ok_or_else(|| fail("worker handoff has no issued root task"))?;
-        let mm = NonZeroU64::new(INITIAL_MM_KEY).ok_or_else(|| fail("initial MM key"))?;
+        let mm = NonZeroU64::new(self.initial_mm_key()).ok_or_else(|| fail("initial MM key"))?;
         let context = self
             .custody
             ._vm
@@ -1858,7 +1912,8 @@ impl Cpl0Carrier {
             4096,
             NonZeroU64::MIN,
             MmGeneration::new(
-                NonZeroU64::new(INITIAL_MM_KEY).ok_or_else(|| fail("initial inventory MM"))?,
+                NonZeroU64::new(self.initial_mm_key())
+                    .ok_or_else(|| fail("initial inventory MM"))?,
             ),
         )?;
         self.custody.initial_rollback_fault = Some(Arc::clone(&inventory.rollback_fault));
@@ -1915,7 +1970,7 @@ impl Cpl0Carrier {
                 result_rsp: 0,
                 result_status: carrick_el1_abi::X86_INITIAL_BOOT_PENDING,
                 extent_pages: (extent_len / 4096) as u32,
-                mm_key: INITIAL_MM_KEY,
+                mm_key: self.initial_mm_key(),
                 generation: 1,
                 result_table_used: 0,
                 result_data_used: 0,
@@ -2426,7 +2481,7 @@ impl Cpl0Carrier {
         let initial = self
             .custody
             ._vm
-            .root(NonZeroU64::new(INITIAL_MM_KEY).ok_or_else(|| fail("initial MM"))?)
+            .root(NonZeroU64::new(self.initial_mm_key()).ok_or_else(|| fail("initial MM"))?)
             .ok_or_else(|| fail("initial peer root"))?;
         let cpu = &mut self.cpus[1];
         let mut sregs = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
@@ -2482,7 +2537,7 @@ impl Cpl0Carrier {
             &NativeFrame,
         ) -> Result<InitialSyscallDisposition, TrapError>,
     ) -> Result<InitialProcessExit, TrapError> {
-        let mm = NonZeroU64::new(INITIAL_MM_KEY).ok_or_else(|| fail("initial MM key"))?;
+        let mm = NonZeroU64::new(self.initial_mm_key()).ok_or_else(|| fail("initial MM key"))?;
         if self.custody._vm.root(mm).is_none() {
             return Err(fail("initial MM not published"));
         }

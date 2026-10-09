@@ -32,6 +32,9 @@ fn initial_root_uses_issued_thread_and_file_table_identity() {
         Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM boot");
     carrier
         .bind_initial_task_identity(InitialTaskBinding {
+            mm: carrick_guest_arch::MmGeneration::new(
+                std::num::NonZeroU64::new(911).expect("issued fixture MM"),
+            ),
             task: carrick_sched_core::process::TaskKey {
                 id: carrick_sched_core::process::TaskId::from_abi_positive(67)
                     .expect("fixture task id"),
@@ -55,12 +58,17 @@ fn initial_root_uses_issued_thread_and_file_table_identity() {
         .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
         .expect("shared MM owner");
     assert!(carrier.initial_thread_custody());
-    let mut workers = carrier.into_worker_parts(8).expect("worker handoff");
+    let workers = carrier.into_worker_parts(8).expect("worker handoff");
     assert_eq!(workers.root_state().binding().task().task.raw().get(), 700);
-    assert_eq!(workers.root_state().state().mm_generation(), 301);
+    assert_eq!(workers.root_state().state().mm_generation(), 911);
+    let (root, factory) = workers.into_factory();
+    let factory = std::sync::Arc::new(factory);
+    let root_factory = std::sync::Arc::clone(&factory);
     std::thread::spawn(move || {
-        let root = workers.root_state().clone();
-        let cpu = workers.cpu_mut(0).expect("root physical CPU");
+        let mut lease = root_factory.claim(0).expect("root CPU claim");
+        assert_eq!(lease.physical_slot().map(|slot| slot.raw()), Some(0));
+        assert!(root_factory.claim(0).is_err());
+        let cpu = lease.cpu_mut();
         cpu.audit_idle().expect("stopped root CPU");
         cpu.load(root.clone()).expect("load issued root");
         let saved = cpu
@@ -68,14 +76,17 @@ fn initial_root_uses_issued_thread_and_file_table_identity() {
             .expect("save issued root");
         assert_eq!(saved.state(), root.state());
         cpu.audit_idle().expect("detached root CPU");
-        workers
-            .cpu_mut(1)
-            .expect("peer physical CPU")
-            .audit_idle()
-            .expect("stopped peer CPU");
     })
     .join()
-    .expect("worker ownership transfer");
+    .expect("root worker ownership transfer");
+    std::thread::spawn(move || {
+        let mut lease = factory.claim(1).expect("peer CPU claim");
+        assert_eq!(lease.physical_slot().map(|slot| slot.raw()), Some(1));
+        assert!(factory.claim(1).is_err());
+        lease.cpu_mut().audit_idle().expect("stopped peer CPU");
+    })
+    .join()
+    .expect("peer worker ownership transfer");
 }
 
 fn image() -> PathBuf {

@@ -231,3 +231,18 @@ witness transfers the complete parts to a new host thread, loads the issued
 root image there, saves and detaches it, then checks both physical CPUs are
 idle. The production pool still has to split worker CPU ownership from this
 coordinator custody before scheduler submission.
+
+The initial guest MM key must be the kernel graph's issued `MmId`: the
+shared scheduler rejects a `MigratableTaskState` whose saved CPU MM generation
+differs from its `MmId`. The physical fixtures continue to use their local
+initial key, while production binds `InitialTaskBinding.mm` from the root
+`KernelContext` before the guest stages its MM. The host inventory, boot
+request, zone record and saved x86 image then carry that one identity.
+
+The stopped handoff now offers a worker CPU factory. Each physical vCPU has
+one claim, checked against its carrier run-context slot; claiming the same
+slot twice fails. A claimed CPU retains an `Arc` to the shared physical
+custody so backing and inventory cannot retire while a worker still owns
+the vCPU. This factory is the KVM-specific input to the portable executor
+pool's `PersistentExecutorFactory::create`; the latter still needs its task
+binding and syscall service adapter before production uses it.

@@ -1072,6 +1072,7 @@ impl PreparedRun {
             })?;
             machine.bind_initial_task_identity(carrick_vmm_kvm::cpl0_boot::InitialTaskBinding {
                 task: root_context.task().key(),
+                mm: carrick_hal::MmGeneration::new(root_context.shared().mm().id().nonzero()),
                 thread: carrick_sched_core::ThreadIdentity {
                     tid: carrick_el1_abi::El1TaskId::from_linux_tid(
                         root_context.thread().key().tid.raw(),
