@@ -197,6 +197,10 @@ pub const SYS_GETTID: usize = 178;
 pub const SYS_GETPID: usize = 172;
 pub const SYS_CLONE: usize = 220;
 
+fn is_process_fork_clone(args: [u64; 6]) -> bool {
+    args[0] == carrick_signal_core::policy::Signal::CHLD.number() as u64 && args[1] == 0
+}
+
 // clone(2) flags.
 const CLONE_VM: u64 = 0x0000_0100;
 const CLONE_FS: u64 = 0x0000_0200;
@@ -297,17 +301,7 @@ pub fn invoke<'a>(
     {
         return Some(returned(SyscallResult::new(i64::from(tid)), false));
     }
-    if call == LifecycleCall::Clone
-        && args
-            == [
-                carrick_signal_core::policy::Signal::CHLD.number() as u64,
-                0,
-                0,
-                0,
-                0,
-                0,
-            ]
-    {
+    if call == LifecycleCall::Clone && is_process_fork_clone(args) {
         return native.process_fork();
     }
     match call {
@@ -777,4 +771,18 @@ fn serve_exit<'a>(
     }
     Some(native.run_next(SyscallResult::new(crate::sched::ETIMEDOUT_RESULT as i64)))
         .map(|(served, result)| (served, result.raw()))
+}
+
+#[cfg(test)]
+mod process_fork_clone_tests {
+    use super::is_process_fork_clone;
+
+    #[test]
+    fn sigchld_clone_ignores_argument_registers_without_selected_flags() {
+        assert!(is_process_fork_clone([
+            17, 0, 0xbeef, 0xfeed, 0xabba, 0x1234
+        ]));
+        assert!(!is_process_fork_clone([17, 0x1000, 0, 0, 0, 0]));
+        assert!(!is_process_fork_clone([17 | 0x0001_0000, 0, 0, 0, 0, 0]));
+    }
 }

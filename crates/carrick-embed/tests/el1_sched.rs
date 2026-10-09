@@ -3526,7 +3526,7 @@ fn el1_fork_cow_resolves_in_guest() {
 
         assert!(
             measured.result.success(),
-            "{}; owner syscall counts clone served/forwarded={:?}, wait4 served/forwarded={:?}, fatal={}",
+            "{}; owner syscall counts clone served/forwarded={:?}, wait4 served/forwarded={:?}, exit_group served/forwarded={:?}, fatal={}",
             describe(&measured),
             read_el1_counters().map(|c| [
                 c.served[220].load(std::sync::atomic::Ordering::Relaxed),
@@ -3535,6 +3535,10 @@ fn el1_fork_cow_resolves_in_guest() {
             read_el1_counters().map(|c| [
                 c.served[260].load(std::sync::atomic::Ordering::Relaxed),
                 c.forwarded[260].load(std::sync::atomic::Ordering::Relaxed),
+            ]),
+            read_el1_counters().map(|c| [
+                c.served[94].load(std::sync::atomic::Ordering::Relaxed),
+                c.forwarded[94].load(std::sync::atomic::Ordering::Relaxed),
             ]),
             read_el1_counters().map_or(0, |c| c.served[carrick_el1_abi::PANIC_SENTINEL_SYSCALL_NR]
                 .load(std::sync::atomic::Ordering::Relaxed)),
