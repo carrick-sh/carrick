@@ -712,14 +712,17 @@ fn drain_fork_quarantine(
     custody: &crate::trap::CarrierVmCustody,
     execution: crate::fork_stock::GrantExecution,
 ) -> Result<(), TrapError> {
-    let safe_to_reclaim = |mm: u64| {
+    let safe_to_reclaim = |mm: carrick_el1_abi::ReservationMm| {
         let Some(zone) = carrick_el1_abi::zone_tables() else {
             return false;
         };
         (0..carrick_el1_abi::EL1_STACK_SLOTS as usize).all(|index| {
             carrick_guest_arch::SlotId::from_index(index)
-                .is_some_and(|slot| zone.installed_space(slot) != mm)
+                .is_some_and(|slot| zone.installed_space(slot) != mm.raw())
         })
+    };
+    let Some(active_mm) = carrick_el1_abi::ReservationMm::new(execution.binding.mm.raw()) else {
+        return Ok(());
     };
     let clear_tables = |pages: &[carrick_guest_arch::RootGpa]| {
         pages.iter().all(|page| {
@@ -740,7 +743,7 @@ fn drain_fork_quarantine(
         .lock()
         .reclaim_retired(
             &mut custody.el1_frame_grants.lock(),
-            execution.binding.mm.raw(),
+            active_mm,
             safe_to_reclaim,
             clear_tables,
         )

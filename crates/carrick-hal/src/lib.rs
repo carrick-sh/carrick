@@ -33,6 +33,7 @@ pub use foreign_mm::{
 };
 pub mod asid;
 pub mod el1_editor_exclusion;
+pub mod fork_stock;
 pub mod stage1_exclusive;
 pub mod stage1_mm;
 
