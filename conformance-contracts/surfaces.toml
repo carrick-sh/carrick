@@ -1008,6 +1008,10 @@ path = "crates/carrick-core/src/mm/fork/reservation.rs"
 contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
 
 [[surfaces]]
+path = "crates/carrick-vmm-hvf/src/fork_stock.rs"
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
+
+[[surfaces]]
 path = "crates/carrick-el1-abi/src/fork_stock.rs"
 contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
 
