@@ -1,0 +1,98 @@
+[
+  {
+    "kind": "loader",
+    "sha256": "c0511263e3018d1190533ef84f1c5d6ee15210e6cf510d2ab57a331fe0b85147",
+    "executions": [
+      {
+        "schema": "carrick.signed-embed-test.v1",
+        "record_type": "execution",
+        "executable_id": "c0511263e3018d1190533ef84f1c5d6ee15210e6cf510d2ab57a331fe0b85147:/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/arm_ring_first_hatch-49046773201fdb39",
+        "test_name": "arm_ring_first_opt_out_glibc_loader_witness",
+        "requested_test_filter": "glibc_loader_witness",
+        "terminal_status": "passed"
+      },
+      {
+        "schema": "carrick.signed-embed-test.v1",
+        "record_type": "execution",
+        "executable_id": "c0511263e3018d1190533ef84f1c5d6ee15210e6cf510d2ab57a331fe0b85147:/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/arm_ring_first_hatch-49046773201fdb39",
+        "test_name": "arm_ring_first_strict_glibc_loader_witness",
+        "requested_test_filter": "glibc_loader_witness",
+        "terminal_status": "passed"
+      }
+    ],
+    "verdicts": [
+      "test arm_ring_first_opt_out_glibc_loader_witness ... ring-first loader strict=false ordinal=56 refused=0 served=0 forwarded=3",
+      "ring-first loader strict=false ordinal=63 refused=0 served=0 forwarded=2",
+      "ring-first loader strict=false ordinal=64 refused=0 served=0 forwarded=1",
+      "ring-first loader strict=false ordinal=94 refused=0 served=0 forwarded=1",
+      "ring-first loader strict=false ordinal=172 refused=0 served=0 forwarded=0",
+      "ring-first loader strict=false ordinal=174 refused=0 served=0 forwarded=1",
+      "ring-first loader strict=false ordinal=222 refused=0 served=1 forwarded=5",
+      "test arm_ring_first_strict_glibc_loader_witness ... ring-first loader strict=true ordinal=56 refused=0 served=0 forwarded=3",
+      "ring-first loader strict=true ordinal=63 refused=0 served=0 forwarded=2",
+      "ring-first loader strict=true ordinal=64 refused=0 served=0 forwarded=1",
+      "ring-first loader strict=true ordinal=94 refused=0 served=0 forwarded=1",
+      "ring-first loader strict=true ordinal=172 refused=0 served=0 forwarded=0",
+      "ring-first loader strict=true ordinal=174 refused=1 served=0 forwarded=0",
+      "ring-first loader strict=true ordinal=222 refused=0 served=1 forwarded=5",
+      "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.13s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s",
+      "remaining carrick procs (run-id ring-switch-optout-loader-20261009-ec8279a72-1) = 0",
+      "remaining carrick procs (run-id ring-switch-optout-loader-20261009-ec8279a72-1-cli) = 0",
+      "test-signed: OK (carrick-embed: 1 invoked signed executable(s) passed, 34 signed, negative control passed)"
+    ],
+    "explicit_cleanup": "remaining carrick procs (run-id ring-switch-optout-loader-20261009-ec8279a72-1) = 0\n",
+    "lease_preflight": "",
+    "lease_after": ""
+  },
+  {
+    "kind": "raw-strict",
+    "sha256": "2fd5eb20286473716910684eece0d96af3c4793495a34da26ba5bbd46fbfc506",
+    "executions": [
+      {
+        "schema": "carrick.signed-embed-test.v1",
+        "record_type": "execution",
+        "executable_id": "2fd5eb20286473716910684eece0d96af3c4793495a34da26ba5bbd46fbfc506:/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/arm_ring_first_hatch-49046773201fdb39",
+        "test_name": "arm_ring_first_strict_refusal_witness",
+        "requested_test_filter": "arm_ring_first_strict_refusal_witness",
+        "terminal_status": "passed"
+      }
+    ],
+    "verdicts": [
+      "test arm_ring_first_strict_refusal_witness ... ring-first strict=true getuid refused=1 forwarded=0 exit_group refused=0 forwarded=1 clock_gettime forwarded=0",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.05s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s",
+      "remaining carrick procs (run-id ring-switch-optout-raw-strict-20261009-ec8279a72-1) = 0",
+      "remaining carrick procs (run-id ring-switch-optout-raw-strict-20261009-ec8279a72-1-cli) = 0",
+      "test-signed: OK (carrick-embed: 1 invoked signed executable(s) passed, 34 signed, negative control passed)"
+    ],
+    "explicit_cleanup": "remaining carrick procs (run-id ring-switch-optout-raw-strict-20261009-ec8279a72-1) = 0\n",
+    "lease_preflight": "",
+    "lease_after": ""
+  },
+  {
+    "kind": "raw-optout",
+    "sha256": "855537d201c73c3efc5803d1cc0c4d2238b8ef622b028490f75581880203331d",
+    "executions": [
+      {
+        "schema": "carrick.signed-embed-test.v1",
+        "record_type": "execution",
+        "executable_id": "855537d201c73c3efc5803d1cc0c4d2238b8ef622b028490f75581880203331d:/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/arm_ring_first_hatch-49046773201fdb39",
+        "test_name": "arm_ring_first_hatch_disabled_forward_witness",
+        "requested_test_filter": "arm_ring_first_hatch_disabled_forward_witness",
+        "terminal_status": "passed"
+      }
+    ],
+    "verdicts": [
+      "test arm_ring_first_hatch_disabled_forward_witness ... ring-first strict=false getuid refused=0 forwarded=1 exit_group refused=0 forwarded=1 clock_gettime forwarded=0",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.11s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s",
+      "remaining carrick procs (run-id ring-switch-optout-raw-optout-20261009-ec8279a72-1) = 0",
+      "remaining carrick procs (run-id ring-switch-optout-raw-optout-20261009-ec8279a72-1-cli) = 0",
+      "test-signed: OK (carrick-embed: 1 invoked signed executable(s) passed, 34 signed, negative control passed)"
+    ],
+    "explicit_cleanup": "remaining carrick procs (run-id ring-switch-optout-raw-optout-20261009-ec8279a72-1) = 0\n",
+    "lease_preflight": "",
+    "lease_after": ""
+  }
+]
