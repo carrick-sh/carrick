@@ -5800,13 +5800,6 @@
     {
       "family": "global_config_debug",
       "operation": "global:env_var_os",
-      "owner": "carrick_vmm_hvf::hatch::ArmRingFirstHatch::is_strict::CARRICK_ARM_RING_FIRST",
-      "lane": "hvf",
-      "ceiling": 1
-    },
-    {
-      "family": "global_config_debug",
-      "operation": "global:env_var_os",
       "owner": "carrick_vmm_hvf::host_signal::invoke_process_signal_wake_hook::CARRICK_SIG_DEBUG",
       "lane": "hvf",
       "ceiling": 1

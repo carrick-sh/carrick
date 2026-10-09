@@ -365,6 +365,7 @@ enum RootBacking {
 /// `self`. Field order is drop order — the dispatcher (which owns the fs
 /// backend and the network lease) first, then the terminal restore.
 pub struct PreparedRun {
+    arm_ring_first: carrick_spec::ArmRingFirst,
     backend: ExecutionBackend,
     executable: String,
     argv: Vec<String>,
@@ -925,6 +926,7 @@ fn prepare_with_lease(
 
     let ExecutionPlan { env, .. } = plan;
     Ok(PreparedRun {
+        arm_ring_first: spec.arm_ring_first,
         backend: plan.page.backend,
         executable: spec.process.executable.clone(),
         argv: spec.process.argv.clone(),
@@ -984,6 +986,7 @@ impl PreparedRun {
     /// ```
     pub fn execute(self) -> Result<RunResult, RuntimeError> {
         let PreparedRun {
+            arm_ring_first,
             backend,
             executable,
             argv,
@@ -1007,6 +1010,7 @@ impl PreparedRun {
                     argv,
                     env,
                     RunElfExecutionOptions {
+                        arm_ring_first,
                         max_traps,
                         debug_state_path: debug_state_path.as_ref(),
                         carrier,
@@ -1024,6 +1028,7 @@ impl PreparedRun {
                     argv,
                     env,
                     RunElfExecutionOptions {
+                        arm_ring_first,
                         max_traps,
                         debug_state_path: debug_state_path.as_ref(),
                         carrier,
@@ -1415,6 +1420,7 @@ mod tests {
 
     fn hvpatch_run_spec() -> RunSpec {
         RunSpec {
+            arm_ring_first: Default::default(),
             process: carrick_spec::ProcessSpec {
                 executable: "/bin/sh".to_string(),
                 argv: vec!["/bin/sh".to_string()],

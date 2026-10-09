@@ -256,6 +256,7 @@ where
 }
 
 pub struct RunStaticElfBackendOptions<'a> {
+    pub arm_ring_first: carrick_spec::ArmRingFirst,
     pub max_traps: usize,
     pub debug_state_path: Option<&'a PathBuf>,
     pub exec_backend: carrick_spec::ExecBackendRequest,
@@ -287,6 +288,7 @@ where
         env,
         options.max_traps,
         options.debug_state_path,
+        options.arm_ring_first,
     )
 }
 
@@ -375,6 +377,7 @@ where
         argv,
         env,
         RunRootfsElfExecutionOptions {
+            arm_ring_first: Default::default(),
             max_traps,
             debug_state_path,
             ownership: None,
@@ -383,6 +386,7 @@ where
 }
 
 pub(crate) struct RunElfExecutionOptions<'a> {
+    pub arm_ring_first: carrick_spec::ArmRingFirst,
     pub max_traps: usize,
     pub debug_state_path: Option<&'a PathBuf>,
     pub carrier: crate::carrier::CarrierRuntime,
@@ -390,6 +394,7 @@ pub(crate) struct RunElfExecutionOptions<'a> {
 }
 
 pub(crate) struct RunRootfsElfExecutionOptions<'a> {
+    pub arm_ring_first: carrick_spec::ArmRingFirst,
     pub max_traps: usize,
     pub debug_state_path: Option<&'a PathBuf>,
     pub ownership: Option<(crate::carrier::CarrierRuntime, crate::carrier::CarrierLease)>,
@@ -415,6 +420,7 @@ where
         argv,
         env,
         RunRootfsElfExecutionOptions {
+            arm_ring_first: options.arm_ring_first,
             max_traps: options.max_traps,
             debug_state_path: options.debug_state_path,
             ownership: Some((options.carrier, options.lease)),
@@ -435,6 +441,7 @@ where
     E: IntoIterator<Item = String>,
 {
     let RunRootfsElfExecutionOptions {
+        arm_ring_first,
         max_traps,
         debug_state_path,
         ownership,
@@ -486,7 +493,7 @@ where
     )?;
     let requires_syscall_traps = dispatcher.requires_syscall_traps();
     finish_and_run_image_owned(
-        image,
+        image.with_arm_ring_first(arm_ring_first),
         dispatcher,
         requires_syscall_traps,
         max_traps,
@@ -531,6 +538,7 @@ where
     E: IntoIterator<Item = String>,
 {
     let RunElfExecutionOptions {
+        arm_ring_first,
         max_traps,
         debug_state_path,
         carrier,
@@ -628,7 +636,7 @@ where
         )
     });
     drop(launch_context);
-    let mut image = built?;
+    let mut image = built?.with_arm_ring_first(arm_ring_first);
     if let Some(path) = main_image_path {
         // Byte-based boot loading leaves the main PT_LOAD paths empty. Bind
         // the resolved ELF identity before dispatcher VMA/backing publication.

@@ -1499,6 +1499,7 @@ pub(crate) fn run_static_hvpatch<A, E>(
     env: E,
     max_traps: usize,
     debug_state_path: Option<&PathBuf>,
+    arm_ring_first: carrick_spec::ArmRingFirst,
 ) -> Result<RunResult, RuntimeError>
 where
     A: IntoIterator<Item = String>,
@@ -1530,6 +1531,7 @@ where
     });
     drop(launch_context);
     let image = loaded?
+        .with_arm_ring_first(arm_ring_first)
         .with_main_file_path(path.to_string_lossy())
         .with_vdso_auxv(crate::runtime::vdso_enabled_for_debug())
         .with_linux_initial_stack_page_size(argv, env, PAGE_SIZE)?;

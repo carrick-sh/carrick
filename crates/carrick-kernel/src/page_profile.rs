@@ -129,6 +129,7 @@ mod tests {
         exec_backend: ExecBackendRequest,
     ) -> RunSpec {
         RunSpec {
+            arm_ring_first: Default::default(),
             process: carrick_spec::ProcessSpec {
                 executable: "/bin/sh".to_string(),
                 argv: vec!["/bin/sh".to_string()],

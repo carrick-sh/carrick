@@ -960,9 +960,13 @@ pub struct SecuritySpec {
     pub cap_add: Vec<String>,
 }
 
+pub use carrick_guest_mem::ArmRingFirst;
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
 pub struct RunSpec {
+    /// ARM EL1 crossing policy resolved by the frontend.
+    pub arm_ring_first: ArmRingFirst,
     pub process: ProcessSpec,
     pub mounts: MountSpec,
     pub network: NetworkSpec,

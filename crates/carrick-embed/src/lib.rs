@@ -164,6 +164,6 @@ pub use carrick_runtime::{
     vcpu_hvc_not_svc_total, vcpu_run_exit_classes, vcpu_run_exits_total,
 };
 pub use carrick_spec::{
-    Mount, MountSpec, NetworkSpec, Platform, ProcessSpec, ResourceSpec, RunSpec, SecuritySpec,
-    StdioMode,
+    ArmRingFirst, Mount, MountSpec, NetworkSpec, Platform, ProcessSpec, ResourceSpec, RunSpec,
+    SecuritySpec, StdioMode,
 };
