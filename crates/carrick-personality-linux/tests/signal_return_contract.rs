@@ -41,12 +41,16 @@ impl<'a> SignalNative<'a> for Native {
         self.forced = true;
         true
     }
-    fn restore_signal_frame(&mut self) -> Result<u64, carrick_syscall_abi::LinuxErrno> {
+    fn restore_signal_frame(
+        &mut self,
+    ) -> Result<carrick_signal_core::policy::SigBlockMask, carrick_syscall_abi::LinuxErrno> {
         if self.invalid {
             return Err(carrick_syscall_abi::LinuxErrno::new(14));
         }
         self.accumulator = 0x1234_5678;
-        Ok(1 << 9)
+        Ok(SigBlockMask::blocking_all_of(
+            carrick_signal_core::SignalSet::from_bits(1 << 9),
+        ))
     }
 }
 #[test]
@@ -138,4 +142,32 @@ fn signal_delivery_waits_for_the_owned_completion_ledger() {
         CompletionRoute::Forward,
         &state
     ));
+}
+
+#[test]
+fn frame_masks_cross_as_blocked_domains() {
+    fn frame_mask(params: carrick_guest_arch::SignalFrameParams) -> SigBlockMask {
+        params.mask
+    }
+    fn restored_mask(native: &mut Native) -> Result<SigBlockMask, carrick_syscall_abi::LinuxErrno> {
+        native.restore_signal_frame()
+    }
+    let mask = SigBlockMask::blocking_all_of(carrick_signal_core::SignalSet::from_bits(1 << 9));
+    let params = carrick_guest_arch::SignalFrameParams {
+        stack: carrick_syscall_abi::LinuxSignalStack::empty(),
+        signal: carrick_signal_core::policy::Signal::from_number(10).unwrap(),
+        sigcode: 0,
+        fault_addr: 0,
+        sp: carrick_guest_arch::UserVa::new(0x4000),
+        handler: carrick_guest_arch::UserVa::new(0x5000),
+        restorer: Some(carrick_guest_arch::UserVa::new(0x6000)),
+        mask,
+    };
+    let mut native = Native {
+        accumulator: 15,
+        invalid: false,
+        forced: false,
+        blocked: SigBlockMask::NONE,
+    };
+    assert_eq!(frame_mask(params), restored_mask(&mut native).unwrap());
 }

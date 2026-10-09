@@ -60,7 +60,7 @@ pub(crate) fn build(
     signal.saved_spsr = frame.spsr;
     signal.saved_sp = params.sp.raw();
     signal.saved_x = frame.x;
-    signal.ucontext.uc_sigmask = params.mask;
+    signal.ucontext.uc_sigmask = params.mask.signals().bits();
     signal.ucontext.uc_stack = params.stack;
     signal.ucontext.uc_mcontext.regs = frame.x;
     signal.ucontext.uc_mcontext.pc = frame.elr;
@@ -115,7 +115,9 @@ mod tests {
             sp: UserVa::new(0x20000),
             handler: UserVa::new(0x30000),
             restorer: Some(UserVa::new(0x40000)),
-            mask: 8,
+            mask: carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                carrick_signal_core::SignalSet::from_bits(8),
+            ),
         };
         let (sp, signal) = build(&frame, params, None, fp.as_bytes()).unwrap();
         assert_eq!(sp.raw() & 15, 0);
@@ -248,7 +250,7 @@ impl carrick_guest_arch::SignalBackend for crate::isa::aarch64::Aarch64Backend {
         frame: &mut TrapFrame,
         _fpstate: &mut [u8],
         copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
-    ) -> Result<u64, Self::Error> {
+    ) -> Result<carrick_signal_core::policy::SigBlockMask, Self::Error> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         let sp_val = {
             let sp: u64;
@@ -276,6 +278,8 @@ impl carrick_guest_arch::SignalBackend for crate::isa::aarch64::Aarch64Backend {
             core::arch::asm!("msr sp_el0, {}", in(reg) saved_sp, options(nomem, nostack));
         }
 
-        Ok(mask)
+        Ok(carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+            carrick_signal_core::SignalSet::from_bits(mask),
+        ))
     }
 }
