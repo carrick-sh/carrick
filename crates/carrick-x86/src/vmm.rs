@@ -195,10 +195,9 @@ pub struct WindowPlan {
 }
 
 /// Capacity of the PML4 table region in bytes (448 pages × 4 KiB = 1.75 MiB).
-/// Shared with `carrick_mem::memory::LINUX_PAGE_TABLES_SIZE` so the `pml4_tables`
-/// budget matches the aarch64 lane. The bring-up reserves a supervisor-only
+/// Independent of the AArch64 maintenance-root table arena. The bring-up reserves a supervisor-only
 /// window of this size for the page tables at `BringupLayout::pml4_base`.
-pub const X86_PML4_CAPACITY: u64 = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE;
+pub const X86_PML4_CAPACITY: u64 = carrick_el1_abi::X86_CPL0_TABLE_ARENA_BYTES;
 
 impl WindowPlan {
     /// The minimum contiguous `[0, max_gpa)` size a single-segment backend
