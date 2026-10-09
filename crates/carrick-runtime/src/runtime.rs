@@ -353,10 +353,18 @@ where
     E: IntoIterator<Item = String>,
 {
     run_rootfs_elf_with_hvf_args_and_dispatcher_debug(
-        path, rootfs, dispatcher, argv, env, max_traps, None,
+        path,
+        rootfs,
+        dispatcher,
+        argv,
+        env,
+        max_traps,
+        None,
+        carrick_spec::ArmRingFirst::Strict,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_rootfs_elf_with_hvf_args_and_dispatcher_debug<A, E>(
     path: impl AsRef<Path>,
     rootfs: &RootFs,
@@ -365,6 +373,7 @@ pub fn run_rootfs_elf_with_hvf_args_and_dispatcher_debug<A, E>(
     env: E,
     max_traps: usize,
     debug_state_path: Option<&PathBuf>,
+    arm_ring_first: carrick_spec::ArmRingFirst,
 ) -> Result<RunResult, RuntimeError>
 where
     A: IntoIterator<Item = String>,
@@ -377,7 +386,7 @@ where
         argv,
         env,
         RunRootfsElfExecutionOptions {
-            arm_ring_first: Default::default(),
+            arm_ring_first,
             max_traps,
             debug_state_path,
             ownership: None,
@@ -691,6 +700,7 @@ where
         env,
         max_traps,
         debug_state_path,
+        carrick_spec::ArmRingFirst::Strict,
     )
 }
 
@@ -2661,6 +2671,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_rootfs_debug_entry_requires_typed_arm_policy() {
+        type PolicyEntry = fn(
+            PathBuf,
+            &RootFs,
+            SyscallDispatcher,
+            Vec<String>,
+            Vec<String>,
+            usize,
+            Option<&PathBuf>,
+            carrick_spec::ArmRingFirst,
+        ) -> Result<RunResult, RuntimeError>;
+        let _entry: PolicyEntry = run_rootfs_elf_with_hvf_args_and_dispatcher_debug;
+    }
 
     #[derive(Default)]
     struct RetryCompletionTrap {
