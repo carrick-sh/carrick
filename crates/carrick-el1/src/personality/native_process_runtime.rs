@@ -3021,7 +3021,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(esrch);
             }
         } else {
-            let target_pgid = (-pid) as u32;
+            let target_pgid = pid.checked_abs().ok_or(esrch)? as u32;
             for (&_id, task) in graph.owner.tasks() {
                 if task.metadata().namespace_process_group == target_pgid {
                     targets.push((
@@ -3599,6 +3599,8 @@ mod tests {
             .unwrap();
         let selector = carrick_personality_linux::signal::SignalThreadSelector::from_abi(41);
         assert_eq!(entry.tgkill(selector, selector, 0, None), Ok(()));
+        // kill(2): INT_MIN selects no representable process group.
+        assert_eq!(entry.kill(i32::MIN, 0, None), Err(3));
         assert!(matches!(
             entry.rt_sigtimedwait(set, Some(1000), UserVa::new(0)),
             Ok(SignalWaitOutcome::Pending)
