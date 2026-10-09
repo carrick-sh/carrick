@@ -420,7 +420,7 @@ mod kernel {
         fn restore_signal_frame(
             &mut self,
             copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
-        ) -> Result<u64, i32> {
+        ) -> Result<u64, carrick_abi::LinuxErrno> {
             let mut backend = carrick_el1::isa::x86::X86Backend;
             carrick_guest_arch::SignalBackend::restore_signal_frame(
                 &mut backend,
@@ -428,14 +428,14 @@ mod kernel {
                 &mut self.fpstate.0,
                 &mut |dst, va| copy_in.copy_in(dst, va),
             )
-            .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT.get())
+            .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT)
         }
         fn setup_signal_frame(
             &mut self,
             params: carrick_guest_arch::SignalFrameParams,
             siginfo: Option<&[u8]>,
             copy_out: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
-        ) -> Result<carrick_guest_arch::UserVa, i32> {
+        ) -> Result<carrick_guest_arch::UserVa, carrick_abi::LinuxErrno> {
             let mut backend = carrick_el1::isa::x86::X86Backend;
             carrick_guest_arch::SignalBackend::setup_signal_frame(
                 &mut backend,
@@ -445,7 +445,7 @@ mod kernel {
                 &self.fpstate.0,
                 &mut |va, src| copy_out.copy_out(va, src),
             )
-            .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT.get())
+            .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT)
         }
     }
 
@@ -670,7 +670,7 @@ mod kernel {
                         ) else { return 6; };
                         let params = carrick_guest_arch::SignalFrameParams {
                             stack,
-                            signum: 11,
+                            signal: segv,
                             sigcode: if fault.present { 2 } else { 1 },
                             fault_addr: far,
                             handler: carrick_guest_arch::UserVa::new(handler.0),
@@ -1254,7 +1254,7 @@ mod kernel {
                 };
                 let params = carrick_guest_arch::SignalFrameParams {
                     stack,
-                    signum: sig.number(),
+                    signal: sig,
                     sigcode: info.as_ref().map_or(0, |i| i.si_code),
                     fault_addr: info.as_ref().map_or(0, |i| i.si_addr),
                     handler: carrick_guest_arch::UserVa::new(handler.0),

@@ -102,7 +102,7 @@ impl X86Backend {
             }
         } else {
             let mut info = Siginfo::empty();
-            info.si_signo = params.signum;
+            info.si_signo = params.signal.number();
             info.si_code = params.sigcode;
             info.si_addr = params.fault_addr;
             rtsigframe.info = info;
@@ -123,7 +123,7 @@ impl X86Backend {
         frame.r11 = resume.flags.raw() & !((1 << 10) | (1 << 8));
         frame.rcx = params.handler.raw(); // user RIP
         frame.rsp = new_sp; // user RSP
-        frame.rdi = params.signum as u64; // arg 1: signum
+        frame.rdi = params.signal.number() as u64; // arg 1: signum
         frame.rsi = info_addr; // arg 2: siginfo_t*
         frame.rdx = uc_addr; // arg 3: ucontext_t*
         frame.rax = 0;

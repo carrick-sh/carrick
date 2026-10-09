@@ -816,13 +816,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         group: Option<NonZeroU32>,
         selector: carrick_personality_linux::signal::SignalThreadSelector,
-        sig: i32,
+        request: carrick_personality_linux::signal::SignalRequest,
         info: carrick_personality_linux::signal::SignalInfo,
     ) -> Result<(), carrick_abi::LinuxErrno> {
-        use carrick_personality_linux::abi::signal::{LINUX_EINVAL, LINUX_ESRCH};
-        if !(0..=64).contains(&sig) {
-            return Err(LINUX_EINVAL);
-        }
+        use carrick_personality_linux::abi::signal::LINUX_ESRCH;
+        let sig = request.number();
         let visible = selector.positive().ok_or(LINUX_ESRCH)?;
         let graph = self.runtime.graph.lock();
         let mut selected = None;
@@ -910,14 +908,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if sig == 0 {
             return Ok(());
         }
-        let signal = carrick_signal_core::policy::Signal::from_number(sig).ok_or(LINUX_EINVAL)?;
+        let Some(signal) = request.signal() else {
+            return Ok(());
+        };
         let sender = graph
             .owner
             .task(self.key)
             .map_err(|_| LINUX_ESRCH)?
             .metadata()
             .namespace_pid;
-        let info = info.payload().unwrap_or_else(|| {
+        let info = info.payload(signal).unwrap_or_else(|| {
             carrick_personality_linux::abi::signal::LinuxSiginfo::kill(
                 sig,
                 carrick_personality_linux::abi::signal::LINUX_SI_TKILL,
@@ -2961,12 +2961,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
     fn rt_sigaction(
         &mut self,
-        signum: i32,
+        signal: carrick_signal_core::policy::Signal,
         act: Option<carrick_signal_core::policy::Action>,
     ) -> Result<carrick_signal_core::policy::Action, carrick_abi::LinuxErrno> {
         let einval = carrick_personality_linux::abi::signal::LINUX_EINVAL;
         let esrch = carrick_personality_linux::abi::signal::LINUX_ESRCH;
-        let signal = carrick_signal_core::policy::Signal::from_number(signum).ok_or(einval)?;
         let graph = self.runtime.graph.lock();
         let row = graph.owner.task(self.key).map_err(|_| esrch)?;
         let signals = row.native().resources().signals();
@@ -2991,20 +2990,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 
     fn kill(
         &mut self,
-        pid: i32,
-        sig: i32,
+        pid: carrick_personality_linux::signal::SignalProcessSelector,
+        request: carrick_personality_linux::signal::SignalRequest,
         info: carrick_personality_linux::signal::SignalInfo,
     ) -> Result<(), carrick_abi::LinuxErrno> {
-        let einval = carrick_personality_linux::abi::signal::LINUX_EINVAL;
         let esrch = carrick_personality_linux::abi::signal::LINUX_ESRCH;
-        if !(0..=64).contains(&sig) {
-            return Err(einval);
-        }
-        let signal = if sig != 0 {
-            Some(carrick_signal_core::policy::Signal::from_number(sig).ok_or(einval)?)
-        } else {
-            None
-        };
+        let pid = pid.abi_number();
+        let sig = request.number();
+        let signal = request.signal();
 
         let graph = self.runtime.graph.lock();
         let caller_row = graph.owner.task(self.key).map_err(|_| esrch)?;
@@ -3096,9 +3089,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
 
         let Some(signal) = signal else {
-            return Err(einval);
+            return Ok(());
         };
-        let info = info.payload().unwrap_or_else(|| {
+        let info = info.payload(signal).unwrap_or_else(|| {
             carrick_personality_linux::abi::signal::LinuxSiginfo::kill(
                 sig,
                 carrick_personality_linux::abi::signal::LINUX_SI_USER,
@@ -3169,21 +3162,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     fn tkill(
         &mut self,
         tid: carrick_personality_linux::signal::SignalThreadSelector,
-        sig: i32,
+        request: carrick_personality_linux::signal::SignalRequest,
         info: carrick_personality_linux::signal::SignalInfo,
     ) -> Result<(), carrick_abi::LinuxErrno> {
-        self.send_thread_signal(None, tid, sig, info)
+        self.send_thread_signal(None, tid, request, info)
     }
 
     fn tgkill(
         &mut self,
         tgid: carrick_personality_linux::signal::SignalThreadSelector,
         tid: carrick_personality_linux::signal::SignalThreadSelector,
-        sig: i32,
+        request: carrick_personality_linux::signal::SignalRequest,
         info: carrick_personality_linux::signal::SignalInfo,
     ) -> Result<(), carrick_abi::LinuxErrno> {
         let group = tgid.positive().ok_or(carrick_abi::LINUX_EINVAL)?;
-        self.send_thread_signal(Some(group), tid, sig, info)
+        self.send_thread_signal(Some(group), tid, request, info)
     }
 
     fn rt_sigtimedwait(
@@ -3653,7 +3646,7 @@ mod tests {
             entry.tgkill(
                 selector,
                 selector,
-                0,
+                carrick_personality_linux::signal::SignalRequest::Probe,
                 carrick_personality_linux::signal::SignalInfo::Generated(None)
             ),
             Ok(())
@@ -3661,16 +3654,18 @@ mod tests {
         // kill(2): INT_MIN selects no representable process group.
         assert_eq!(
             entry.kill(
-                i32::MIN,
-                0,
+                carrick_personality_linux::signal::SignalProcessSelector::from_abi(
+                    (i32::MIN) as u64
+                ),
+                carrick_personality_linux::signal::SignalRequest::from_abi(0).unwrap(),
                 carrick_personality_linux::signal::SignalInfo::Generated(None)
             ),
             Err(carrick_abi::LinuxErrno::new(3))
         );
         assert_eq!(
             entry.kill(
-                -1,
-                0,
+                carrick_personality_linux::signal::SignalProcessSelector::from_abi((-1_i32) as u64),
+                carrick_personality_linux::signal::SignalRequest::from_abi(0).unwrap(),
                 carrick_personality_linux::signal::SignalInfo::Generated(None)
             ),
             Err(carrick_abi::LinuxErrno::new(3)),
@@ -3680,13 +3675,18 @@ mod tests {
             disposition: carrick_signal_core::policy::Disposition::Ignore,
             ..Default::default()
         };
-        entry.rt_sigaction(10, Some(ignored)).unwrap();
+        entry
+            .rt_sigaction(
+                carrick_signal_core::policy::Signal::from_number(10).unwrap(),
+                Some(ignored),
+            )
+            .unwrap();
         let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(set);
         control.init_blocked(carrick_el1_abi::BlockedMask(set.bits()));
         entry
             .kill(
-                41,
-                10,
+                carrick_personality_linux::signal::SignalProcessSelector::from_abi((41) as u64),
+                carrick_personality_linux::signal::SignalRequest::from_abi(10).unwrap(),
                 carrick_personality_linux::signal::SignalInfo::Generated(None),
             )
             .unwrap();
@@ -3695,7 +3695,12 @@ mod tests {
             set.bits(),
             "blocked ignored signal remains queued"
         );
-        entry.rt_sigaction(10, Some(ignored)).unwrap();
+        entry
+            .rt_sigaction(
+                carrick_signal_core::policy::Signal::from_number(10).unwrap(),
+                Some(ignored),
+            )
+            .unwrap();
         assert_eq!(entry.rt_sigpending(blocked), 0);
         control.init_blocked(carrick_el1_abi::BlockedMask(0));
         assert!(matches!(
@@ -3708,13 +3713,13 @@ mod tests {
         let timer = zone.timer_owner(slot).unwrap();
         assert_eq!(zone.timer_deadline(slot), Some(2000));
         assert!(matches!(
-            zone.record(timer.record).claim(),
+            zone.live(timer.record).unwrap().claim(),
             carrick_sched_core::Claim::Parked { .. }
         ));
         assert_eq!(zone.expire_timer(slot, 1999, (-11i64) as u64), Ok(false));
         assert_eq!(zone.expire_timer(slot, 2000, (-11i64) as u64), Ok(true));
         let selected = zone.switch_in_full(slot).unwrap();
-        assert_eq!(selected.record, timer.record);
+        assert_eq!(zone.record_ref(selected.record), timer.record);
         let mut entry = runtime
             .enter(source, &task, words(address), &mut service)
             .unwrap();
@@ -4438,17 +4443,40 @@ mod tests {
             use carrick_personality_linux::signal::{ProcessSignals, SignalInfo};
             let forged = carrick_abi::LinuxSiginfo::kill(10, carrick_abi::LINUX_SI_USER, 42, 0);
             assert_eq!(
-                child_entry.kill(41, 0, SignalInfo::Queued(forged)),
+                child_entry.kill(
+                    carrick_personality_linux::signal::SignalProcessSelector::from_abi((41) as u64),
+                    carrick_personality_linux::signal::SignalRequest::from_abi(0).unwrap(),
+                    SignalInfo::Queued(forged)
+                ),
                 Err(carrick_abi::LinuxErrno::new(1))
             );
             let queued = carrick_abi::LinuxSiginfo::kill(10, carrick_abi::LINUX_SI_QUEUE, 42, 0);
-            assert_eq!(child_entry.kill(41, 0, SignalInfo::Queued(queued)), Ok(()));
-            assert_eq!(child_entry.kill(42, 0, SignalInfo::Queued(forged)), Ok(()));
+            assert_eq!(
+                child_entry.kill(
+                    carrick_personality_linux::signal::SignalProcessSelector::from_abi((41) as u64),
+                    carrick_personality_linux::signal::SignalRequest::from_abi(0).unwrap(),
+                    SignalInfo::Queued(queued)
+                ),
+                Ok(())
+            );
+            assert_eq!(
+                child_entry.kill(
+                    carrick_personality_linux::signal::SignalProcessSelector::from_abi((42) as u64),
+                    carrick_personality_linux::signal::SignalRequest::from_abi(0).unwrap(),
+                    SignalInfo::Queued(forged)
+                ),
+                Ok(())
+            );
             let selector = carrick_personality_linux::signal::SignalThreadSelector::from_abi(41);
             let forged_thread =
                 carrick_abi::LinuxSiginfo::kill(10, carrick_abi::LINUX_SI_TKILL, 42, 0);
             assert_eq!(
-                child_entry.tgkill(selector, selector, 0, SignalInfo::Queued(forged_thread)),
+                child_entry.tgkill(
+                    selector,
+                    selector,
+                    carrick_personality_linux::signal::SignalRequest::Probe,
+                    SignalInfo::Queued(forged_thread)
+                ),
                 Err(carrick_abi::LinuxErrno::new(1))
             );
             assert!(matches!(
@@ -4493,8 +4521,8 @@ mod tests {
             use carrick_personality_linux::signal::ProcessSignals;
             assert_eq!(
                 parent_entry.kill(
-                    42,
-                    15,
+                    carrick_personality_linux::signal::SignalProcessSelector::from_abi((42) as u64),
+                    carrick_personality_linux::signal::SignalRequest::from_abi(15).unwrap(),
                     carrick_personality_linux::signal::SignalInfo::Generated(None)
                 ),
                 Ok(()),

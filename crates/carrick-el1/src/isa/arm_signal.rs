@@ -55,7 +55,7 @@ pub(crate) fn build(
         .ok_or(ArchError::InvalidFrame)?
         & !15;
     let mut signal = CarrickSigframe::empty();
-    signal.signum = params.signum as u32;
+    signal.signum = params.signal.number() as u32;
     signal.saved_pc = frame.elr;
     signal.saved_spsr = frame.spsr;
     signal.saved_sp = params.sp.raw();
@@ -74,7 +74,7 @@ pub(crate) fn build(
         LinuxSiginfo::read_from_bytes(bytes).map_err(|_| ArchError::InvalidFrame)?
     } else {
         let mut info = LinuxSiginfo::empty();
-        info.si_signo = params.signum;
+        info.si_signo = params.signal.number();
         info.si_code = params.sigcode;
         info.si_addr = params.fault_addr;
         info
@@ -109,7 +109,7 @@ mod tests {
         let fp = LinuxFpsimdContext::empty();
         let params = SignalFrameParams {
             stack: carrick_abi::LinuxSignalStack::empty(),
-            signum: 10,
+            signal: carrick_signal_core::policy::Signal::from_number(10).unwrap(),
             sigcode: 0,
             fault_addr: 0,
             sp: UserVa::new(0x20000),

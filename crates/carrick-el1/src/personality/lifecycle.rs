@@ -555,7 +555,7 @@ impl<
             .unwrap_or(0)
     }
 
-    fn restore_signal_frame(&mut self) -> Result<u64, i32> {
+    fn restore_signal_frame(&mut self) -> Result<u64, carrick_abi::LinuxErrno> {
         let task_idx = self.frame.task_index();
         #[cfg(test)]
         if let Some(user) = &mut self.lifecycle_user {
@@ -572,7 +572,7 @@ impl<
             return self.frame.restore_signal_frame(&mut adapter);
         }
         let Some(task) = self.current_tasks.get(task_idx) else {
-            return Err(carrick_personality_linux::abi::signal::LINUX_EFAULT.get());
+            return Err(carrick_personality_linux::abi::signal::LINUX_EFAULT);
         };
         let mut copy = crate::file::ValidatedCopy {
             task,

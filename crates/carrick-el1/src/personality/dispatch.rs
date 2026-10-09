@@ -43,18 +43,18 @@ pub trait GuestDispatchFrame: SyscallFrame {
     fn restore_signal_frame(
         &mut self,
         copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
-    ) -> Result<u64, i32> {
+    ) -> Result<u64, carrick_abi::LinuxErrno> {
         let _ = copy_in;
-        Err(carrick_personality_linux::abi::signal::LINUX_ENOSYS.get())
+        Err(carrick_personality_linux::abi::signal::LINUX_ENOSYS)
     }
     fn setup_signal_frame(
         &mut self,
         params: carrick_guest_arch::SignalFrameParams,
         siginfo: Option<&[u8]>,
         copy_out: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
-    ) -> Result<carrick_guest_arch::UserVa, i32> {
+    ) -> Result<carrick_guest_arch::UserVa, carrick_abi::LinuxErrno> {
         let _ = (params, siginfo, copy_out);
-        Err(carrick_personality_linux::abi::signal::LINUX_ENOSYS.get())
+        Err(carrick_personality_linux::abi::signal::LINUX_ENOSYS)
     }
 }
 
@@ -80,7 +80,7 @@ impl GuestDispatchFrame for TrapFrame {
     fn restore_signal_frame(
         &mut self,
         copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
-    ) -> Result<u64, i32> {
+    ) -> Result<u64, carrick_abi::LinuxErrno> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
             let mut backend = crate::isa::aarch64::Aarch64Backend;
@@ -90,12 +90,12 @@ impl GuestDispatchFrame for TrapFrame {
                 &mut [],
                 &mut |dst, va| copy_in.copy_in(dst, va),
             )
-            .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT.get())
+            .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT)
         }
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         {
             let _ = copy_in;
-            Err(carrick_personality_linux::abi::signal::LINUX_ENOSYS.get())
+            Err(carrick_personality_linux::abi::signal::LINUX_ENOSYS)
         }
     }
     fn setup_signal_frame(
@@ -103,7 +103,7 @@ impl GuestDispatchFrame for TrapFrame {
         params: carrick_guest_arch::SignalFrameParams,
         siginfo: Option<&[u8]>,
         copy_out: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
-    ) -> Result<carrick_guest_arch::UserVa, i32> {
+    ) -> Result<carrick_guest_arch::UserVa, carrick_abi::LinuxErrno> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
             let mut backend = crate::isa::aarch64::Aarch64Backend;
@@ -115,12 +115,12 @@ impl GuestDispatchFrame for TrapFrame {
                 &[],
                 &mut |va, src| copy_out.copy_out(va, src),
             )
-            .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT.get())
+            .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT)
         }
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         {
             let _ = (params, siginfo, copy_out);
-            Err(carrick_personality_linux::abi::signal::LINUX_ENOSYS.get())
+            Err(carrick_personality_linux::abi::signal::LINUX_ENOSYS)
         }
     }
 }
