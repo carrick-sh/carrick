@@ -54,5 +54,8 @@ checks pass. Host hatch and production x86 context suites pass as well.
 The bare-metal x86 CPL0 compile check passes without warnings; execution on KVM
 is unavailable on this Mac and remains director-owned.
 
-Signed and real-base authority receipts will be added after completion.
+The real-base domain gate passes with 1,232 source counters and native compiler
+profiles macos-cli-default, macos-runtime-default and macos-hvf-default. Six
+Linux/BSD profiles remain pending on this Mac; this is not matrix completeness.
+Signed receipts will be added after completion.
 No Docker, full acceptance gate or runtime-ratio claim is included.
