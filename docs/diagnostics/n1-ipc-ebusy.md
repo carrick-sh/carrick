@@ -131,3 +131,128 @@ Identical batch command executed on both commits: `./scripts/test-signed.sh carr
   - When executed in isolation, `el1_ipc_two_processes_blocking` passes 5/5 times (0.62-0.65s) on `0565ec758`.
 
 **Conclusion:** Batch termination at test 15/58 is pre-existing; on `44efa24c3` the runner died at the exact same test (15/58) via `errno 14` watchdog kill (`Killed: 9`). The fix successfully resolves the IPC EBUSY/EFAULT bug.
+
+## 8. Resolution of Infallible Root Readers and Complete el1_ Suite Verification
+
+### Caller Enumeration and Classification
+
+All callers of `first_touch_owner` and `root_first_touch_pieces` (formerly `:398` and `:491`) were audited and classified:
+
+1. **`first_touch_owner` -> `try_first_touch_owner` (infallible wrapper removed):**
+   - `crates/carrick-kernel/src/dispatch/mem/host_first_touch.rs:416` (`fault_requires_mm_mutation`):
+     *Class: Pre-exclusion.* Resolves `Err(Refusal::Busy)` to `true`, routing the fault to the mutation path where exclusive MM mutation authority is held.
+   - `crates/carrick-kernel/src/dispatch/mem/host_first_touch.rs:435` (`resident_fault_plan_for_page`):
+     *Class: Pre-exclusion.* Resolves `Err(Refusal::Busy)` to `None`, bypassing the fast path.
+   - `crates/carrick-kernel/src/dispatch/mem/fault.rs:1127` (`fault_tracked`):
+     *Class: Pre-exclusion.* Resolves `Err(Refusal::Busy)` to `true`.
+   - `crates/carrick-kernel/src/dispatch/mem/fault.rs:1328` (`resident_fault_plan`):
+     *Class: Pre-exclusion.* Resolves `Err(Refusal::Busy)` to `None`.
+   - `crates/carrick-kernel/src/dispatch/mem/fault.rs:1363` (`resident_frame_grant_plan`):
+     *Class: Pre-exclusion.* Resolves `Err(Refusal::Busy)` to `None`.
+   - `crates/carrick-kernel/src/dispatch/mem/fault.rs:1512` (`publish_resident_frame_grant`):
+     *Class: Under owner's exclusion* (`begin_host_alias_dispatch(permit)`). Fails closed with `broken_root("published grant first-touch owner", refusal)` (root contention is impossible under MM mutation exclusion).
+   - `crates/carrick-kernel/src/dispatch/mem/fault.rs:1679` (`rearm_fault_pages_after_mprotect`):
+     *Class: Under exclusion.* Propagates `Err(Refusal::Busy)`.
+   - Root hole fallback at `fault.rs:416`: restricted to host-managed shared/overlay apertures (`self.shared.guest_range_has_owner` / `self.overlay.guest_range_has_owner`), ensuring that root holes inside the mmap arena correctly map to `FirstTouchOwner::Unmapped` across guest `munmap`.
+
+2. **`root_first_touch_pieces` -> `try_root_first_touch_pieces`:**
+   - `crates/carrick-kernel/src/dispatch/mem.rs:1840` (`mincore_residency_vector`):
+     *Class: Pre-exclusion.* Handles `Err(Refusal::Busy)` by computing exact residency under owner's exclusion (`ResidentFacts::is_resident`, `guest_residency`, `zero_reads`, `live_residency`, layout boundaries) without guessing `vec![1u8]`.
+   - `crates/carrick-kernel/src/dispatch/mem/fault.rs:444` (`record_resident`):
+     *Class: Under exclusion.* Fails closed with `broken_root("resident record pieces", refusal)`.
+   - `crates/carrick-kernel/src/dispatch/mem/fault.rs:728` (`adopt_completed_residency`):
+     *Class: Under exclusion.* Fails closed with `broken_root("completed residency pieces", refusal)`.
+   - `crates/carrick-kernel/src/dispatch/mem/fault.rs:785` (`tracked_nonresident_subranges`):
+     *Class: Under exclusion.* Fails closed with `broken_root("tracked nonresident pieces", refusal)`.
+   - `crates/carrick-kernel/src/dispatch/mem/anonymous.rs:470` (`seal_delegated`):
+     *Class: Under exclusion.* Fails closed with `broken_root("sealed residency pieces", refusal)`.
+   - `crates/carrick-kernel/src/dispatch/mem/anonymous.rs:1271` (`demote_root_rows`):
+     *Class: Under exclusion.* Fails closed with `broken_root("demoted residency pieces", refusal)`.
+
+### Red-First Verification
+- Unit test `delegated_first_touch_observation_under_held_root_returns_no_plan_without_aborting` in `crates/carrick-kernel/src/dispatch/mem/delegated_tests.rs`:
+  - On `0565ec758`: aborts with `SIGABRT` (`carrick fatal [dispatch::anonymous]: delegated anonymous root refused a first-touch observation: Busy`).
+  - On current code: passes cleanly (`1 passed; 0 failed`), verifying that `resident_fault_plan` and `resident_frame_grant_plan` return `None`, `first_touch_is_root_owned` returns `true`, `host_untouched_page_permits` returns `false`, and `mincore_residency_vector` returns exact matching values under contention for both untouched and resident pages.
+
+### Batch Execution Results on Signed `el1_` Filter
+- **Binary SHA-256 (`target/release/carrick`):** `0754e4953bb514b9f883418c6779dd15aa17983221c33d41521554b59355daa7`
+- **`el1_files`:** Ran all 13 tests to completion (12 passed, 1 failed: `el1_files_cross_process_readers_contract`). The abort (`delegated anonymous root refused a first-touch observation: Busy`) is completely eliminated.
+- **`el1_sched`:** Ran past test 15! Test 15 (`el1_ipc_two_processes_blocking`) passed cleanly (`ok`). All tests up to test 45 completed without any abort. At test 46 (`el1_thread_lifecycle_parked_threads_beyond_executor_pool`), the 180-second fixture watchdog timed out (`futex-flood 192`), causing scoped process cleanup. When executed under targeted filters (`el1_thread_lifecycle_`, `el1_tlb_`, `el1_sched_`), all 58 tests in `el1_sched` executed and produced deterministic verdicts.
+
+### Complete Status of All 58 Tests in `el1_sched`
+
+**Passing (37 tests):**
+1. `el1_anonymous_mapping_retirement_returns_and_reuses_frames`
+2. `el1_delegated_root_kick_then_first_read_publications` *(recovered: failed in baseline)*
+3. `el1_delegated_root_vma_owner_grant_reducer`
+4. `el1_epoll_eventfd_pingpong_stays_in_guest`
+5. `el1_ipc_inherited_descriptor_lifetime`
+6. `el1_ipc_mixed_venue_roundtrips`
+7. `el1_ipc_pipe_blocking_roundtrips`
+8. `el1_ipc_two_processes_blocking` *(recovered: previously aborted / failed with EBUSY/EFAULT)*
+9. `el1_memory_fault_entry_preserves_context`
+10. `el1_memory_first_touch_stays_in_guest`
+11. `el1_metadata_allocator_concurrent_growth`
+12. `el1_metadata_allocator_delayed_owner_parks_participants`
+13. `el1_metadata_allocator_grows_and_returns_extents`
+14. `el1_metadata_allocator_host_wait_requires_unmasked_irq`
+15. `el1_reservation_metadata_grows_beyond_bootstrap`
+16. `el1_sched_cross_vcpu_handoff_has_no_host_exits`
+17. `el1_sched_deferred_handback_capture_observes_guest_records`
+18. `el1_sched_delayed_notification_survives_parent_reap`
+19. `el1_sched_exec_from_a_sibling_with_parked_threads`
+20. `el1_sched_exit_group_with_parked_threads`
+21. `el1_sched_futex_handoff_after_self_affinity_change`
+22. `el1_sched_futex_handoff_has_no_host_exits`
+23. `el1_sched_host_blocked_read_resumes_by_guest_scheduling`
+24. `el1_sched_host_woken_thread_preempts_a_compute_loop`
+25. `el1_sched_idle_carrier_costs_no_host_cpu`
+26. `el1_sched_pipe_pingpong_stays_in_guest`
+27. `el1_sched_preemption_reaches_compute_loops`
+28. `el1_sched_pstate_seen_by_the_guest_is_unchanged`
+29. `el1_sched_signal_reaches_a_parked_thread`
+30. `el1_sched_signal_reaches_a_wfi_parked_vcpu`
+31. `el1_sched_timed_wait_times_out_in_guest`
+32. `el1_thread_lifecycle_cleartid_tid_reuse` *(recovered: failed in baseline)*
+33. `el1_thread_lifecycle_parked_threads_beyond_executor_pool`
+34. `el1_thread_lifecycle_rlimit_nproc_exact`
+35. `el1_thread_lifecycle_seccomp_clone_filter`
+36. `el1_tlb_cross_vcpu_mm_edits_leave_no_stale_translation`
+37. `el1_tlb_fork_and_exec_leave_no_stale_translation`
+
+**Failing (21 tests in `el1_sched`):**
+1. `el1_anonymous_discard_and_exit_return_frames`
+2. `el1_anonymous_permission_transitions_stay_in_guest`
+3. `el1_anonymous_reservations_stay_in_guest`
+4. `el1_delegated_root_concurrent_vma_ops`
+5. `el1_delegated_root_map_fixed_over_cow_pages`
+6. `el1_fork_cow_resolves_in_guest`
+7. `el1_ipc_pairs_blocking` (panics with exit 134 in guest stack overflow handler at n=64)
+8. `el1_sched_mm_occupancy_two_processes`
+9. `el1_sched_two_processes_share_vcpus`
+10. `el1_task_load_costs_no_host_round_trip`
+11. `el1_thread_lifecycle_exit_group_and_exec_during_clone_storm`
+12. `el1_thread_lifecycle_fork_during_clone_storm`
+13. `el1_thread_lifecycle_mask_storm_exactly_once`
+14. `el1_thread_lifecycle_ptrace_traceclone`
+15. `el1_thread_lifecycle_spawn_slope`
+16. `el1_thread_lifecycle_tgkill_right_after_clone`
+17. `el1_tlb_cross_vcpu_mm_edits_leave_no_stale_translation_on_any_thread`
+18. `el1_tlb_first_missed_ack_is_terminal`
+19. `el1_tlb_frame_grant_publication_costs_no_maintenance`
+20. `el1_tlb_mm_edit_window_excludes_sibling_allocations`
+21. `el1_tlb_running_thread_mm_edits_cost_no_maintenance`
+
+**Failures in other `el1_` binaries (3 tests):**
+22. `el1_files_cross_process_readers_contract` (in `el1_files-d0b2b8fe30b09047`)
+23. `el1_served_burst_surfaces_kicks_under_oversubscription` (in `el1_kick_served_loop-980f037a9a60acbb`)
+24. `crash_core_attributes_the_el1_parked_sibling_registers` (in `crash_parked_thread-9ae9764d388ac6aa`)
+
+### Diff Against Baseline Failure List
+- **Recovered / Left the failing list:**
+  - `el1_ipc_two_processes_blocking`: passes cleanly in batch and isolation.
+  - `el1_delegated_root_kick_then_first_read_publications`: passes cleanly.
+  - `el1_thread_lifecycle_cleartid_tid_reuse`: passes cleanly.
+- **Persistent failures remaining:** 24 total (21 in `el1_sched`, 3 in other suites).
+- **New failures:** 0.
+

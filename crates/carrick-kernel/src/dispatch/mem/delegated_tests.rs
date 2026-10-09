@@ -4396,7 +4396,7 @@ fn delegated_fork_keeps_host_owned_shared_aperture_first_touch() {
     let mem = mem.lock();
     assert_eq!(mem.shared.live().len(), 1);
     assert!(matches!(
-        mem.first_touch_owner(addr),
+        mem.try_first_touch_owner(addr).unwrap(),
         super::fault::FirstTouchOwner::Host
     ));
     assert_eq!(
@@ -4412,7 +4412,7 @@ fn delegated_fork_keeps_host_owned_shared_aperture_first_touch() {
     let authority = child.mem();
     let mem = authority.lock();
     assert!(matches!(
-        mem.first_touch_owner(addr),
+        mem.try_first_touch_owner(addr).unwrap(),
         super::fault::FirstTouchOwner::Host
     ));
 }
@@ -5506,8 +5506,21 @@ fn delegated_first_touch_observation_under_held_root_returns_no_plan_without_abo
         !dispatcher.host_untouched_page_permits(base, carrick_mmu_core::aarch64::LeafAccess::Read),
         "first-touch read permit under held root must decline without observation"
     );
+    let memory = CountingMmapMemory::new(base, PAGE as usize);
+    let contended_residency = dispatcher
+        .mincore_residency_vector(&memory, base, 1, PAGE)
+        .expect("mincore residency vector under contention");
 
     drop(held);
+
+    let uncontended_residency = dispatcher
+        .mincore_residency_vector(&memory, base, 1, PAGE)
+        .expect("mincore residency vector uncontended");
+    assert_eq!(
+        contended_residency, uncontended_residency,
+        "exact mincore vector under contention must equal uncontended answer"
+    );
+    assert_eq!(contended_residency, vec![0u8]);
 
     // Once the root is released, observations succeed again:
     assert!(
@@ -5516,4 +5529,20 @@ fn delegated_first_touch_observation_under_held_root_returns_no_plan_without_abo
             .is_some(),
         "resident frame grant plan succeeds once root is released"
     );
+
+    // Now test a resident page: mark it resident, and verify exact equality under contention
+    dispatcher.mark_range_resident(base, PAGE);
+    let held = root.lock();
+    let contended_touched = dispatcher
+        .mincore_residency_vector(&memory, base, 1, PAGE)
+        .expect("mincore residency vector under contention for touched page");
+    drop(held);
+    let uncontended_touched = dispatcher
+        .mincore_residency_vector(&memory, base, 1, PAGE)
+        .expect("mincore residency vector uncontended for touched page");
+    assert_eq!(
+        contended_touched, uncontended_touched,
+        "touched mincore vector under contention must equal uncontended answer"
+    );
+    assert_eq!(contended_touched, vec![1u8]);
 }

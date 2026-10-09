@@ -275,6 +275,14 @@ impl ResidentFacts {
             .is_some_and(|(_, &(end, fact))| page < end && fact == owner)
     }
 
+    /// Whether `page` is resident under any owner.
+    pub(crate) fn is_resident(&self, page: u64) -> bool {
+        self.facts
+            .range(..=page)
+            .next_back()
+            .is_some_and(|(_, &(end, _))| page < end)
+    }
+
     /// The parts of `[start, end)` resident under exactly `owner`, clipped,
     /// in address order: O(log n + k).
     pub(crate) fn within(&self, start: u64, end: u64, owner: ResidencyOwner) -> Vec<(u64, u64)> {
@@ -392,12 +400,6 @@ impl RootPiece {
 }
 
 impl MemState {
-    /// Who answers `page`'s first-touch facts (see [`FirstTouchOwner`]).
-    pub(in crate::dispatch) fn first_touch_owner(&self, page: u64) -> FirstTouchOwner {
-        self.try_first_touch_owner(page)
-            .unwrap_or_else(|refusal| broken_root("a first-touch observation", refusal))
-    }
-
     /// A pre-exclusion reader must preserve contention as an admission result.
     pub(in crate::dispatch::mem) fn try_first_touch_owner(
         &self,
@@ -411,7 +413,10 @@ impl MemState {
         }
         let node = root.with_root(|model| Ok(model.node(page)))?;
         Ok(match node {
-            None if self.resident_fault_ranges.prot_for_page(page).is_some() => {
+            None if self.resident_fault_ranges.prot_for_page(page).is_some()
+                && (self.shared.guest_range_has_owner(page, 1)
+                    || self.overlay.guest_range_has_owner(page, 1)) =>
+            {
                 FirstTouchOwner::Host
             }
             None => FirstTouchOwner::Unmapped,
@@ -436,7 +441,8 @@ impl MemState {
         let pieces = if self.venue_owns(start, end) {
             Vec::new()
         } else {
-            self.root_first_touch_pieces(start, end)
+            self.try_root_first_touch_pieces(start, end)
+                .unwrap_or_else(|refusal| broken_root("resident record pieces", refusal))
         };
         let mut cursor = start;
         for piece in &pieces {
@@ -457,16 +463,16 @@ impl MemState {
     /// The root-owned first-touch pieces (anonymous nodes outside the heap)
     /// overlapping `[start, end)`, clipped to it, in address order, one per
     /// node. Empty in host setup.
-    pub(in crate::dispatch) fn root_first_touch_pieces(
+    pub(in crate::dispatch::mem) fn try_root_first_touch_pieces(
         &self,
         start: u64,
         end: u64,
-    ) -> Vec<RootPiece> {
+    ) -> Result<Vec<RootPiece>, Refusal> {
         let Some(root) = self.delegated_root() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Some(range) = ReservationRange::new(start, end) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let layout = self.layout;
         let mut pieces = Vec::new();
@@ -487,9 +493,8 @@ impl MemState {
                     });
                 }
             })
-        })
-        .unwrap_or_else(|refusal| broken_root("a first-touch observation", refusal));
-        pieces
+        })?;
+        Ok(pieces)
     }
 
     fn try_root_owes_backing_at(&self, page: u64) -> Result<bool, Refusal> {
@@ -719,7 +724,10 @@ impl MemState {
     /// Facts the host venue recorded for a range its own pending proposal
     /// held now belong to the node incarnations the completion committed.
     pub(in crate::dispatch) fn adopt_completed_residency(&mut self, start: u64, end: u64) {
-        for piece in self.root_first_touch_pieces(start, end) {
+        let pieces = self
+            .try_root_first_touch_pieces(start, end)
+            .unwrap_or_else(|refusal| broken_root("completed residency pieces", refusal));
+        for piece in pieces {
             self.resident
                 .hand_over(piece.range, ResidencyOwner::Host, piece.owner());
         }
@@ -773,7 +781,9 @@ pub(crate) fn tracked_nonresident_subranges(
     range: carrick_vfs::GuestMemoryRange,
 ) -> Vec<carrick_vfs::GuestMemoryRange> {
     let (range_start, range_end) = (range.start().raw(), range.end().raw());
-    let pieces = mem.root_first_touch_pieces(range_start, range_end);
+    let pieces = mem
+        .try_root_first_touch_pieces(range_start, range_end)
+        .unwrap_or_else(|refusal| broken_root("tracked nonresident pieces", refusal));
     let mut out = Vec::new();
     let first = mem
         .resident_tracked_ranges
@@ -1498,7 +1508,10 @@ impl<'a> MemView<'a> {
         let exclusion = self.begin_host_alias_dispatch(permit);
         let mem_authority = self.mem();
         let mem = mem_authority.lock();
-        if matches!(mem.first_touch_owner(resident.va), FirstTouchOwner::Host)
+        let owner = mem
+            .try_first_touch_owner(resident.va)
+            .unwrap_or_else(|refusal| broken_root("published grant first-touch owner", refusal));
+        if matches!(owner, FirstTouchOwner::Host)
             && bus_fault_contains(&mem.bus_fault_ranges, resident.va)
         {
             return Err(PublishedFrameGrantRefusal::BusFault);
@@ -1532,7 +1545,7 @@ impl<'a> MemView<'a> {
         }
         // The authenticated publication is not a fresh allocation. EL1's
         // residency reconciliation may already have committed this page.
-        let (prot, root_owned) = match mem.first_touch_owner(resident.va) {
+        let (prot, root_owned) = match owner {
             FirstTouchOwner::Root(mapping, _) => (
                 LinuxProtFlags::from_bits_truncate(mapping.protection.bits()),
                 true,
