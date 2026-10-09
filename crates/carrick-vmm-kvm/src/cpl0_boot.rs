@@ -1145,6 +1145,21 @@ pub struct InitialTaskBinding {
     pub mm: MmGeneration,
 }
 
+/// A single movable view into metadata retained by `Cpl0HostCustody`.
+/// Deliberately neither `Clone` nor `Sync`.
+struct RetainedMetadataPtr(NonNull<u8>);
+
+impl RetainedMetadataPtr {
+    fn as_ptr(&self) -> *mut u8 {
+        self.0.as_ptr()
+    }
+}
+
+// SAFETY: only the enclosing exclusive custody can access this pointer. Its
+// GuestRam and registered backing live in that same custody, so moving this
+// non-cloneable view to another thread cannot outlive or alias its storage.
+unsafe impl Send for RetainedMetadataPtr {}
+
 /// One coordinator owns physical backing, grants and retained metadata.
 /// CPU execution leases are disjoint from this custody, so stopped host service
 /// never borrows the carrier or a simultaneously running peer CPU.
@@ -1171,19 +1186,21 @@ pub(crate) struct Cpl0HostCustody {
     anonymous_pending: [Option<anonymous_owner::PendingGrant>; 2],
     owner_grant_crossings: u64,
     root_exit_crossings: u64,
-    metadata_base: NonNull<u8>,
+    metadata_base: RetainedMetadataPtr,
     host_forwards: u64,
     host_yields: u64,
     kicks: u64,
     work_exits: u64,
 }
 
-// SAFETY: metadata_base points into the retained GuestRam owned by this
-// custody, whose backing remains registered until custody drops. The pointer
-// is only dereferenced through &self for atomic records or &mut self for
-// stopped-host service. Moving exclusive custody to another thread preserves
-// both the backing lifetime and that access discipline.
-unsafe impl Send for Cpl0HostCustody {}
+#[cfg(test)]
+static_assertions::assert_impl_all!(RetainedMetadataPtr: Send);
+#[cfg(test)]
+static_assertions::assert_not_impl_any!(RetainedMetadataPtr: Clone, Sync);
+#[cfg(test)]
+static_assertions::assert_impl_all!(Cpl0HostCustody: Send);
+#[cfg(test)]
+static_assertions::assert_not_impl_any!(Cpl0HostCustody: Clone, Sync);
 
 impl Drop for Cpl0HostCustody {
     fn drop(&mut self) {
@@ -3443,11 +3460,13 @@ impl Cpl0Carrier {
                 }
             }
         }
-        let metadata_base = NonNull::new(
-            ram.host_ptr(META_GPA, META_LEN as usize)
-                .ok_or_else(|| fail("retained metadata backing"))?,
-        )
-        .ok_or_else(|| fail("null metadata backing"))?;
+        let metadata_base = RetainedMetadataPtr(
+            NonNull::new(
+                ram.host_ptr(META_GPA, META_LEN as usize)
+                    .ok_or_else(|| fail("retained metadata backing"))?,
+            )
+            .ok_or_else(|| fail("null metadata backing"))?,
+        );
         Ok(Self {
             cpus: [a, b],
             custody: Cpl0HostCustody {
