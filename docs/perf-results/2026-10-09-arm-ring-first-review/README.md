@@ -122,3 +122,18 @@ converted to an expected failure. No COW runtime change is included here.
 No unchanged signed artifact was retried. No Docker, full acceptance gate or
 runtime-ratio claim is included. KVM execution and the stacked full gate
 remain director-owned.
+
+## Second independent review (2026-10-09)
+
+The earlier review-ready ruling is superseded pending N1-N3 corrections and
+signed loader-only evidence. Each new defect fails first in VM-free tests;
+`re-review-red-first.txt` retains the assertions. x86 now evaluates every
+forwarding completion, strict ARM refuses unported calls before owed-work
+transport, and replay conversion is restricted to effect-free ARM Forward
+with entry-saved argument zero. Handback and AccountedForward preserve
+Forward; x86 has no replay conversion. Production x86 witnesses now cover
+both pending-work settings and require counted refusals outside the eight
+crossings. The GNU fixture gains a loader-only mode without fork; its new
+signed bindings require completing libc calls, file-backed mmap forwarding,
+exit forwarding and exact getuid policy counters. Final signed verification
+and director-owned KVM comparison remain pending.

@@ -1,0 +1,72 @@
+N1
+failures:
+
+---- production_x86_family_absences_obey_eight_crossings_without_user_memory stdout ----
+
+thread 'production_x86_family_absences_obey_eight_crossings_without_user_memory' (135461898) panicked at crates/carrick-el1/tests/x86_production_forward.rs:169:9:
+assertion `left == right` failed: anonymous brk
+  left: Forward
+ right: Served
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    production_x86_family_absences_obey_eight_crossings_without_user_memory
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-el1 --test x86_production_forward`
+
+N2
+failures:
+
+---- dispatch::ring_first_tests::strict_arm_preserves_family_declines_handback_and_owed_work stdout ----
+
+thread 'dispatch::ring_first_tests::strict_arm_preserves_family_declines_handback_and_owed_work' (135586487) panicked at crates/carrick-personality-linux/src/dispatch.rs:836:17:
+assertion `left == right` failed: pending work must not leak host getuid
+  left: 42
+ right: -38
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    dispatch::ring_first_tests::strict_arm_preserves_family_declines_handback_and_owed_work
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 38 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-personality-linux --lib`
+
+N3
+failures:
+
+---- dispatch::ring_first_tests::no_effect_arm_forward_replays_saved_argument_not_mutated_frame stdout ----
+
+thread 'dispatch::ring_first_tests::no_effect_arm_forward_replays_saved_argument_not_mutated_frame' (135603289) panicked at crates/carrick-personality-linux/src/dispatch.rs:909:9:
+assertion `left == right` failed
+  left: Some(ReplayOriginal { x0: 48879 })
+ right: Some(ReplayOriginal { x0: 42 })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- dispatch::ring_first_tests::owed_work_does_not_replay_handback_accounted_forward_or_x86 stdout ----
+
+thread 'dispatch::ring_first_tests::owed_work_does_not_replay_handback_accounted_forward_or_x86' (135603291) panicked at crates/carrick-personality-linux/src/dispatch.rs:892:13:
+assertion `left == right` failed: Aarch64 Handback
+  left: WithWork
+ right: Forward
+
+---- dispatch::ring_first_tests::strict_arm_preserves_family_declines_handback_and_owed_work stdout ----
+
+thread 'dispatch::ring_first_tests::strict_arm_preserves_family_declines_handback_and_owed_work' (135603294) panicked at crates/carrick-personality-linux/src/dispatch.rs:854:13:
+assertion `left == right` failed: ordinal=98 work=true handback=true
+  left: WithWork
+ right: Forward
+
+
+failures:
+    dispatch::ring_first_tests::no_effect_arm_forward_replays_saved_argument_not_mutated_frame
+    dispatch::ring_first_tests::owed_work_does_not_replay_handback_accounted_forward_or_x86
+    dispatch::ring_first_tests::strict_arm_preserves_family_declines_handback_and_owed_work
+
+test result: FAILED. 38 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+error: test failed, to rerun pass `-p carrick-personality-linux --lib`
