@@ -191,6 +191,33 @@
         "   Compiling carrick-linux-aarch64-hello v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/fixtures/linux-aarch64-hello)",
         "    Finished `release` profile [optimized] target(s) in 0.18s"
       ]
+    },
+    {
+      "command": "CARRICK_AUTHORITY_BASE=dfc9100e277339016f537ba09e2b475470c953b6 just lint-domains",
+      "exit_code": 0,
+      "log": "target/ringswitch-review-final-domains.log",
+      "output_tail": [
+        "# Generic scalar rules here; symbol-bound task rules and mandatory owner",
+        "# discovery run in authority-debt --source-only below.",
+        "python3 scripts/migrate/check-task-participant-witnesses.py --check",
+        "task participant witness gate: ok (339 Rust leaves)",
+        "python3 scripts/migrate/check-mm-authority.py --check",
+        "mm authority gate: ok (489 Rust leaves)",
+        "python3 scripts/migrate/check-host-authority-transitions.py --static",
+        "host-authority catalog and nine-profile matrix validated; no live coverage claimed",
+        "cargo run --locked -p carrick-xtask -- authority-debt --source-only",
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.16s",
+        "     Running `target/debug/carrick-xtask authority-debt --source-only`",
+        "authority debt PR-base ratchet passed (dfc9100e277339016f537ba09e2b475470c953b6)",
+        "authority debt ceilings passed; source counters: 1232",
+        "python3 scripts/migrate/check-serial-host-tests.py",
+        "cargo run --locked -p carrick-xtask -- authority-debt",
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s",
+        "     Running `target/debug/carrick-xtask authority-debt`",
+        "live host discovery passed; executed: [\"macos-cli-default\",\"macos-runtime-default\",\"macos-hvf-default\"]; pending: [\"linux-cli\",\"linux-runtime\",\"freebsd-cli\",\"freebsd-runtime\",\"netbsd-cli\",\"netbsd-runtime\"]",
+        "authority debt PR-base ratchet passed (dfc9100e277339016f537ba09e2b475470c953b6)",
+        "authority debt ceilings passed; source counters: 1232"
+      ]
     }
   ],
   "fixture_admission_rejected": {
