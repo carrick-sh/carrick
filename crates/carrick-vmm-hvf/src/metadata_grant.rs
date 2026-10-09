@@ -24,20 +24,35 @@ fn live_fork_execution(
     cpu: carrick_guest_arch::CpuId,
     ttbr0: u64,
 ) -> Option<crate::fork_stock::GrantExecution> {
-    use carrick_core_abi::{
-        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
-    };
-    use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
-    use std::num::NonZeroU64;
-
     let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
     let zone = carrick_el1_abi::zone_tables()?;
     let record = zone
         .slot(slot)
         .current()
         .or_else(|| zone.slot(slot).host_record())?;
-    let identity = zone.record(record).identity();
-    if identity.tid == 0 || identity.mm == 0 || zone.slot(slot).mm() != identity.mm {
+    fork_execution_from_snapshot(
+        cpu,
+        ttbr0,
+        zone.slot(slot).mm(),
+        zone.record(record).identity(),
+        zone.record_ref(record).incarnation,
+    )
+}
+
+fn fork_execution_from_snapshot(
+    cpu: carrick_guest_arch::CpuId,
+    ttbr0: u64,
+    installed_mm: u64,
+    identity: carrick_sched_core::ThreadIdentity,
+    incarnation: u64,
+) -> Option<crate::fork_stock::GrantExecution> {
+    use carrick_core_abi::{
+        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+    };
+    use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
+    use std::num::NonZeroU64;
+
+    if identity.tid == 0 || identity.mm == 0 || installed_mm != identity.mm {
         return None;
     }
     let root = RootGpa::page_aligned(FrameGpa::new(
@@ -46,7 +61,7 @@ fn live_fork_execution(
     let context = AddressContext {
         root,
         mm: MmGeneration::new(NonZeroU64::new(identity.mm)?),
-        generation: ContextGeneration::new(NonZeroU64::new(zone.record_ref(record).incarnation)?),
+        generation: ContextGeneration::new(NonZeroU64::new(incarnation)?),
     };
     let binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(identity.tid),
@@ -1436,6 +1451,41 @@ fn classify_metadata_trap(op: u64, reply: [u64; 4]) -> MetadataTrapOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fork_crossing_authenticates_tagged_ttbr_as_exact_physical_context() {
+        let cpu = carrick_guest_arch::CpuId::new(3);
+        let identity = carrick_sched_core::ThreadIdentity {
+            tid: 1,
+            serial: 6,
+            mm: 2,
+            file_table: 1,
+            generation: 1,
+            affinity: 0,
+            lifecycle_page: 1,
+            control_slot: 1,
+        };
+        let physical_root = 661_424_963_584;
+        let tagged_root = (1_u64 << 48) | physical_root;
+        let parked = carrick_sched_core::Aarch64ParkedContext::from_register(
+            carrick_sched_core::ThreadCtx::ZERO,
+            tagged_root,
+            identity.mm,
+            3,
+        );
+        let execution = fork_execution_from_snapshot(cpu, parked.root(), 2, identity, 3)
+            .expect("live crossing");
+        assert_eq!(parked.root(), tagged_root);
+        assert_eq!(execution.context.root.address().raw(), physical_root);
+        assert_eq!(execution.context.mm.raw().get(), 2);
+        assert_eq!(execution.context.generation.raw().get(), 3);
+        assert_eq!(execution.binding.thread_generation.raw(), identity.serial);
+        assert!(fork_execution_from_snapshot(cpu, tagged_root, 9, identity, 3).is_none());
+        let foreign_root = tagged_root + 0x1000;
+        let foreign = fork_execution_from_snapshot(cpu, foreign_root, 2, identity, 3)
+            .expect("different live root still creates a typed context");
+        assert_ne!(foreign.context, execution.context);
+    }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
