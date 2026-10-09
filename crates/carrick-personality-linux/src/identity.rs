@@ -121,6 +121,7 @@ fn keep_or_id(raw: u64) -> Option<u32> {
     if id == u32::MAX { None } else { Some(id) }
 }
 
+#[inline(never)]
 pub fn invoke<'a>(
     call: IdentityCall,
     native: &mut dyn IdentityNative<'a>,
