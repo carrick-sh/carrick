@@ -1550,6 +1550,21 @@ fn publish_zone_slot(
             )
         });
         let host_record = zone.slot(zone_slot).host_record();
+        let retained_home = host_record.and_then(|record| {
+            let row = zone.record(record);
+            (row.claim() == carrick_el1_abi::Claim::Free
+                && loaded_home.is_some_and(|identity| row.identity() == identity))
+            .then(|| zone.record_ref(record))
+        });
+        if let Some(record) = host_record
+            && zone.record(record).claim() == carrick_el1_abi::Claim::Free
+            && retained_home.is_none()
+            && !zone.release_host_home(zone_slot, record)
+        {
+            return Err(TrapError::Hypervisor(
+                "unloaded EL1 process home could not be retired".into(),
+            ));
+        }
         let queued = zone.slot(zone_slot).queued();
         // The reset clears the slot's timer: a timed park another executor's
         // thread left on it goes to the host first.
@@ -1567,16 +1582,26 @@ fn publish_zone_slot(
         // executor loads it.
         zone.publish_slot(zone_slot, mm, bound_cpu, affinity);
         carrick_el1_abi::publish_zone_identity(slot, mm, serial);
-        return loaded_home
-            .map(|identity| {
-                zone.prepare_loaded_home(zone_slot, identity)
-                    .ok_or_else(|| {
-                        TrapError::Hypervisor(
-                            "loaded process home preparation refused exact task binding".into(),
-                        )
-                    })
-            })
-            .transpose();
+        return match loaded_home {
+            None => Ok(None),
+            Some(identity) => {
+                let prepared = match retained_home {
+                    Some(retained) => {
+                        let prepared = zone.prepare_reloaded_home(zone_slot, retained, identity);
+                        if prepared.is_none() {
+                            zone.discard_unpublished(zone_slot, retained.id);
+                        }
+                        prepared
+                    }
+                    None => zone.prepare_loaded_home(zone_slot, identity),
+                };
+                prepared.map(Some).ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "loaded process home preparation refused exact task binding".into(),
+                    )
+                })
+            }
+        };
     }
     Err(TrapError::Hypervisor(
         "loaded process has no EL1 zone slot".into(),
