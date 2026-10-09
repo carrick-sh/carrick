@@ -16,35 +16,53 @@ pub extern "C" fn main() -> libc::c_int {
     // SAFETY: all pointers below address live, correctly aligned local storage;
     // the child performs only close and _exit after fork.
     unsafe {
-        let mut ends = [-1; 2];
-        if libc::pipe(ends.as_mut_ptr()) != 0 {
+        let mut mask: libc::sigset_t = core::mem::zeroed();
+        if libc::sigemptyset(&mut mask) != 0
+            || libc::sigaddset(&mut mask, libc::SIGCHLD) != 0
+            || libc::sigprocmask(libc::SIG_BLOCK, &mask, core::ptr::null_mut()) != 0
+        {
             return 81;
+        }
+        let signal_fd = libc::signalfd(-1, &mask, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK);
+        if signal_fd < 0 {
+            return 82;
         }
         let child = libc::fork();
         if child < 0 {
-            return 82;
+            return 83;
         }
         if child == 0 {
-            libc::close(ends[0]);
+            libc::close(signal_fd);
             libc::_exit(23);
         }
-        libc::close(ends[1]);
         let mut ready = libc::pollfd {
-            fd: ends[0],
+            fd: signal_fd,
             events: libc::POLLIN,
             revents: 0,
         };
-        // Exit closes the child writer; never perform an unbounded guest wait.
-        if libc::poll(&mut ready, 1, 5000) != 1 || ready.revents & libc::POLLHUP == 0 {
-            return 83;
-        }
-        libc::close(ends[0]);
-        let mut status = 0;
-        if libc::waitpid(child, &mut status, libc::WNOHANG) != child {
+        // SIGCHLD reports child state, unlike pipe EOF (which only proves fd
+        // closure). No unbounded wait and no wait-until-ready retry loop.
+        if libc::poll(&mut ready, 1, 5000) != 1 || ready.revents & libc::POLLIN == 0 {
             return 84;
         }
-        if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 23 {
+        let mut event: libc::signalfd_siginfo = core::mem::zeroed();
+        if libc::read(
+            signal_fd,
+            (&mut event as *mut libc::signalfd_siginfo).cast(),
+            core::mem::size_of_val(&event),
+        ) != core::mem::size_of_val(&event) as isize
+            || event.ssi_signo != libc::SIGCHLD as u32
+            || event.ssi_pid != child as u32
+        {
             return 85;
+        }
+        libc::close(signal_fd);
+        let mut status = 0;
+        if libc::waitpid(child, &mut status, libc::WNOHANG) != child {
+            return 86;
+        }
+        if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 23 {
+            return 87;
         }
         let output = b"glibc fork wait 23\n";
         let mut stdout = libc::pollfd {
@@ -53,10 +71,10 @@ pub extern "C" fn main() -> libc::c_int {
             revents: 0,
         };
         if libc::poll(&mut stdout, 1, 5000) != 1 || stdout.revents & libc::POLLOUT == 0 {
-            return 86;
+            return 88;
         }
         if libc::write(1, output.as_ptr().cast(), output.len()) != output.len() as isize {
-            return 87;
+            return 89;
         }
         0
     }
