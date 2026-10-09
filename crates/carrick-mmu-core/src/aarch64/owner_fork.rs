@@ -17,7 +17,7 @@
 //! (180 GiB = `180 << 30` = `0x2D_0000_0000`, see `crates/carrick-mem/src/memory.rs:220-222`
 //! and `crates/carrick-mem/src/memory.rs:3896-3908`):
 //! - Span: exactly one 2 MiB Level-2 block (`1 << 21` = `0x20_0000`)
-//! - Stage-1 table primary alias: offset `0x2_0000`, span `0x1C_0000` (448 4 KiB pages)
+//! - Stage-1 table primary alias: offset `0x2_0000`, span `0x1B_C000` (444 4 KiB pages)
 //! - Per-process identity page: offset `0x1E_4000`, span `0x4000` (16 KiB / 4 pages)
 
 use crate::aarch64::LeafAccess;
@@ -57,8 +57,8 @@ pub const STAGE1_TABLES_ALIAS_OFFSET: u64 = 0x2_0000;
 /// Current-MM primary stage-1 table alias, mapped EL1-only.
 pub const STAGE1_TABLES_ALIAS_BASE: u64 = KERNEL_CONTROL_BASE + STAGE1_TABLES_ALIAS_OFFSET;
 
-/// Bytes available through the primary stage-1 table alias (448 pages = 0x1C_0000).
-pub const STAGE1_TABLES_PRIMARY_SIZE: u64 = 0x1C_0000;
+/// Bytes available through the primary stage-1 table alias (444 pages).
+pub const STAGE1_TABLES_PRIMARY_SIZE: u64 = 0x1B_C000;
 
 /// Offset of the per-process identity page within the kernel control region.
 pub const IDENTITY_PAGE_OFFSET: u64 = 0x1E_4000;
@@ -81,7 +81,7 @@ const _: () = {
     assert!(KERNEL_CONTROL_SPAN == 0x20_0000);
     assert!(KERNEL_CONTROL_END == 0x2D_0020_0000);
     assert!(STAGE1_TABLES_ALIAS_BASE == 0x2D_0002_0000);
-    assert!(STAGE1_TABLES_PRIMARY_SIZE == 0x1C_0000);
+    assert!(STAGE1_TABLES_PRIMARY_SIZE == 0x1B_C000);
     assert!(IDENTITY_PAGE_BASE == 0x2D_001E_4000);
     assert!(IDENTITY_PAGE_SIZE == 0x4000);
     assert!(STAGE1_TABLES_ALIAS_BASE >= KERNEL_CONTROL_BASE);
