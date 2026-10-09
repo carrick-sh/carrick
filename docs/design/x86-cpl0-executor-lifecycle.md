@@ -326,6 +326,12 @@ replaces them with fixture bootstrap values. A terminal root outcome closes
 the scheduler and joins the pool. Forwarded blocking outcomes use the
 owned-continuation route described below.
 
+The shared pool enters the no-zone physical idle branch only when its backend
+declares `has_physical_idle_lane()`. KVM declares that capability for its
+physical peer slot; the root slot and ARM/HVPatch without an active EL1 zone
+use the ordinary host run queue. This keeps the extra publish/recheck/kick
+handshake scoped to a vCPU that can actually run a guest idle entry.
+
 ### Blocking forwarded calls
 
 The readiness crossing is an internal carrier request, not a Linux syscall.
