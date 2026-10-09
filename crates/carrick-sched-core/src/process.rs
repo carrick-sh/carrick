@@ -460,6 +460,7 @@ pub struct TaskCredentials {
     pub cap_effective: LinuxCapabilitySet,
     pub cap_inheritable: LinuxCapabilitySet,
     pub cap_ambient: LinuxCapabilitySet,
+    pub cap_bounding: LinuxCapabilitySet,
 }
 
 impl TaskCredentials {
@@ -477,19 +478,22 @@ impl TaskCredentials {
         cap_effective: LinuxCapabilitySet::FULL,
         cap_inheritable: LinuxCapabilitySet::empty(),
         cap_ambient: LinuxCapabilitySet::empty(),
+        cap_bounding: LinuxCapabilitySet::FULL,
     };
 
-    /// Apply capabilities(7) exec rules:
-    /// uid 0 (ruid == 0 or euid == 0): full set
-    /// non-root: permitted and effective cleared unless ambient
+    /// Apply capabilities(7) rules for an ordinary executable without file
+    /// capabilities, set-ID bits or securebits overrides.
     pub fn apply_exec(&mut self) {
-        if self.ruid.is_root() || self.euid.is_root() {
-            self.cap_permitted = LinuxCapabilitySet::FULL;
-            self.cap_effective = LinuxCapabilitySet::FULL;
+        self.cap_permitted = if self.ruid.is_root() || self.euid.is_root() {
+            self.cap_inheritable | self.cap_bounding | self.cap_ambient
         } else {
-            self.cap_permitted = self.cap_ambient;
-            self.cap_effective = self.cap_ambient;
-        }
+            self.cap_ambient
+        };
+        self.cap_effective = if self.euid.is_root() {
+            self.cap_permitted
+        } else {
+            self.cap_ambient
+        };
     }
 
     pub fn is_privileged(&self) -> bool {

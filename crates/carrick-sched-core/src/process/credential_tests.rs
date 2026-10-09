@@ -223,3 +223,28 @@ fn on_uid_change_between_nonzero_uids_preserves_permitted_capabilities() {
         LinuxCapabilitySet::CAP_NET_BIND_SERVICE
     );
 }
+
+#[test]
+fn exec_real_root_does_not_enable_effective_capabilities() {
+    let mut creds = TaskCredentials::ROOT;
+    creds.euid = TaskUid::new(1000);
+    creds.cap_inheritable = LinuxCapabilitySet::CAP_NET_BIND_SERVICE;
+    creds.cap_ambient = LinuxCapabilitySet::CAP_NET_BIND_SERVICE;
+    creds.apply_exec();
+    assert_eq!(
+        creds.cap_effective,
+        LinuxCapabilitySet::CAP_NET_BIND_SERVICE
+    );
+}
+
+#[test]
+fn exec_root_respects_bounding_without_masking_inheritable() {
+    let mut creds = TaskCredentials::ROOT;
+    creds.cap_bounding = LinuxCapabilitySet::CAP_NET_BIND_SERVICE;
+    creds.cap_inheritable = LinuxCapabilitySet::CAP_KILL;
+    creds.apply_exec();
+    let expected = LinuxCapabilitySet::CAP_NET_BIND_SERVICE | LinuxCapabilitySet::CAP_KILL;
+    assert_eq!(creds.cap_permitted, expected);
+    assert_eq!(creds.cap_effective, expected);
+    assert_eq!(creds.cap_bounding, LinuxCapabilitySet::CAP_NET_BIND_SERVICE);
+}
