@@ -1377,9 +1377,21 @@ pub(crate) fn handle_metadata_grant_trap(
     let result = service_metadata_operation(custody, generation, cpu, active, op, arg1, arg2, arg3);
     let result = result?;
     if process_crossing && result[0] != METADATA_GRANT_SUCCESS {
+        let elr = vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(|e| {
+            TrapError::Hypervisor(format!("failed to read ELR for process crossing: {e}"))
+        })?;
+        let sp = vcpu.get_sys_reg(SysReg::SP_EL1).map_err(|e| {
+            TrapError::Hypervisor(format!("failed to read SP for process crossing: {e}"))
+        })?;
+        let record_slot = arg1
+            .checked_sub(carrick_el1_abi::EL1_STACKS_BASE)
+            .filter(|offset| {
+                *offset < carrick_el1_abi::EL1_STACK_SIZE * carrick_el1_abi::EL1_STACK_SLOTS
+            })
+            .map(|offset| offset / carrick_el1_abi::EL1_STACK_SIZE);
         return Err(TrapError::Hypervisor(format!(
-            "native process crossing denied: op={op} status={} cpu={cpu:?} arg1={arg1:#x} arg2={arg2:#x} arg3={arg3:#x} execution={active:?}",
-            result[0],
+            "native process crossing denied: op={op} status={} detail={} cpu={cpu:?} record_slot={record_slot:?} hvc_elr={elr:#x} sp_el1={sp:#x} arg1={arg1:#x} arg2={arg2:#x} arg3={arg3:#x} execution={active:?}",
+            result[0], result[1],
         )));
     }
     vcpu.set_reg(Reg::X0, result[0])
