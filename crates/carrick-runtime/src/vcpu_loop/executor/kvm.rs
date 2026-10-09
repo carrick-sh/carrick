@@ -382,8 +382,9 @@ impl PersistentExecutor for KvmPersistentExecutor {
                         .map_err(|_| TrapError::Hypervisor("KVM dispatcher poisoned".into()))?;
                     let (decision, token) =
                         self.physical.capture_forward(task, |venue, frame| {
-                            let bridge = frame.rax == 281
-                                && carrick_el1_abi::HostPollEpollBridge::is_bridge(
+                            let bridge = frame.rax
+                                == carrick_el1_abi::HostReadinessCrossing::NUMBER
+                                && carrick_el1_abi::HostReadinessCrossing::is_crossing(
                                     frame.rdi, frame.rcx,
                                 );
                             let syscall = if bridge {
