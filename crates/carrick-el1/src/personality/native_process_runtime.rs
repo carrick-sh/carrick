@@ -1467,6 +1467,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         wait_status: LinuxWaitStatus,
     ) -> Result<LifecycleOutcome, NativeProcessError> {
+        let child_pid = self.runtime.graph.lock().owner.task(self.key)
+            .map_err(|_| NativeProcessError::Stale)?.metadata().namespace_pid;
         let (page, channel) = {
             let mut graph = self.runtime.graph.lock();
             let row = graph
@@ -1618,8 +1620,30 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 };
                 let signal = carrick_signal_core::policy::Signal::from_number(signal.raw())
                     .ok_or(NativeProcessError::Invalid)?;
+                let (code, status) = if let Some(term) = wait_status.term_signal() {
+                    (
+                        if wait_status.raw() & 0x80 != 0 {
+                            carrick_abi::LINUX_CLD_DUMPED
+                        } else {
+                            carrick_abi::LINUX_CLD_KILLED
+                        },
+                        i32::from(term),
+                    )
+                } else {
+                    (
+                        carrick_abi::LINUX_CLD_EXITED,
+                        (wait_status.raw() >> 8) & 0xff,
+                    )
+                };
+                let info = carrick_abi::LinuxSiginfo::child_exit(
+                    signal.number(),
+                    child_pid as i32,
+                    0,
+                    code,
+                    status,
+                );
                 signals
-                    .enqueue(notification.parent, signal, None)
+                    .enqueue(notification.parent, signal, Some(info))
                     .map_err(|_| NativeProcessError::Stale)?;
             }
         }

@@ -2188,6 +2188,10 @@ pub const LINUX_SI_MESGQ: i32 = -3;
 pub const LINUX_SI_TKILL: i32 = -6;
 /// `si_code` for poll/fasync/dnotify signals carrying `si_fd`.
 pub const LINUX_POLL_MSG: i32 = 3;
+/// SIGCHLD causes from sigaction(2).
+pub const LINUX_CLD_EXITED: i32 = 1;
+pub const LINUX_CLD_KILLED: i32 = 2;
+pub const LINUX_CLD_DUMPED: i32 = 3;
 
 #[repr(C, packed)]
 #[derive(

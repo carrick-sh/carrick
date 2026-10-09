@@ -741,3 +741,12 @@ fn mounted_static_x86_signal_restarts_owned_wait4_matches_native() {
 fn mounted_static_x86_signal_stop_continue_matches_native() {
     compare_mounted_assembly_with_native("x86_signal_stop_continue.S", b"J\n");
 }
+
+#[test]
+fn mounted_static_x86_signal_chld_exit_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_chld_exit.S", b"C\n");
+}
+#[test]
+fn mounted_static_x86_signal_chld_killed_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_chld_killed.S", b"D\n");
+}
