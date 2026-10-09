@@ -2022,7 +2022,7 @@ mod kernel {
                     let (runtime, address) = native_process::runtime(source, task)
                         .unwrap_or_else(|_| initial_boot::fatal_boot());
                     let mut process = runtime.enter_registered(
-                        native_process::registry(), source, task, address, words, &mut service,
+                        native_process::registry(), source, task, address, rust_alloc::boxed::Box::new(words), &mut service,
                     )
                         .unwrap_or_else(|_| initial_boot::fatal_boot());
                     let mut native = NativeDispatch {
@@ -2034,7 +2034,7 @@ mod kernel {
                         &mut native, counters, core::slice::from_ref(task),
                         fd_map(), &OBJECT_TABLE, &OPEN_TABLE, &[], &EMPTY_NAME_CACHE,
                         None::<dispatch::Zone<'_, sched::HardwareCpu, sched::HardwareUserWord>>,
-                        None, Some(&GuestLifecycleVenue), Some(&mut process),
+                        None, Some(&GuestLifecycleVenue), Some(&mut *process),
                         Some(source), Some(&mut anonymous), cache_lookup,
                     );
                     if let Some(reason) = process.take_run_failure() {
