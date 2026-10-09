@@ -26,9 +26,14 @@ These are named integration dependencies, not completed signal semantics:
 | M7 production WithWork runtime | x86 fd-table executor lane must own the production WORK_PORT handler | `signal_delivery_waits_for_the_owned_completion_ledger` proves ordering only |
 
 The director accepted these owner boundaries for review. The full KVM
-suite must still report each red explicitly. The three origin/main reds
-(anonymous ELF, adjacent page journal, and arch_prctl) are separate baseline
-failures; signal witnesses are not skipped or weakened to hide dependencies.
+suite must still report each red explicitly. The three reds named in the brief (anonymous ELF, adjacent page journal,
+and arch_prctl) remain separate baseline failures. Full verification also
+found stdout poll and the authority-refusal witness red on the preserved
+origin/main plus private-ELF prerequisite artifact. Poll belongs to the
+in-zone fd-table lane. The authority fixture now checks served action
+installation/query and the exact reduced boundary counts, while retaining
+its strict refusal-family journal assertion. Signal witnesses are not
+skipped or weakened to hide dependencies.
 
 Pidfd signals retain the previous lane routing until in-ring pidfds exist:
 ARM uses the old forwarding route, while x86 retains its existing unported
@@ -39,3 +44,10 @@ looked like correct SIGSEGV. Child witnesses now require the parent to
 survive and reap the faulting child. Production fixture dispatch remains
 intact; the canonical supervisor image extent was increased after exact
 link-map measurements proved that retained code exceeded the former cap.
+
+The wait4 interruption witness validates the actual sender from siginfo and
+saved RIP/RAX for both valid signal orderings. A signal caught before wait4
+admission permits an ordinary reap; an interrupted wait requires EINTR in
+the saved context. `caught_signal_interrupts_an_already_parked_owned_child_wait`
+provides the deterministic parked-continuation proof, including retained
+restart context and no reap of the live child.

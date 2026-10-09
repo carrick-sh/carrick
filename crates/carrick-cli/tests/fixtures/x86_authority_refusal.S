@@ -1,6 +1,6 @@
 # CPL0 must not report success for guest-owned effects it cannot publish.
 # Linux native succeeds on these calls; this fixture checks the explicit
-# temporary ENOSYS contract of Carrick's incomplete CPL0 service.
+# temporary ENOSYS contract for unported effects, and signal ownership.
 .global _start
 .text
 _start:
@@ -16,9 +16,24 @@ _start:
     lea action(%rip), %rsi
     xor %rdx, %rdx
     mov $8, %r10
-    mov $13, %rax               # rt_sigaction
+    mov $13, %rax               # rt_sigaction is now guest-owned and served
     syscall
-    cmp $-38, %rax
+    test %rax, %rax
+    jne fail
+    mov $10, %rdi
+    xor %rsi, %rsi
+    lea old_action(%rip), %rdx
+    mov $8, %r10
+    mov $13, %rax
+    syscall
+    test %rax, %rax
+    jne fail
+    lea handler(%rip), %rax
+    cmp %rax, old_action(%rip)
+    jne fail
+    cmpq $0, old_action+8(%rip)
+    jne fail
+    cmpq $0, old_action+24(%rip)
     jne fail
     sub $16, %rsp
     movl $3, (%rsp)             # non-host descriptor 3
@@ -58,5 +73,6 @@ action:
     .quad 0                       # sa_flags
     .quad 0                       # sa_restorer
     .quad 0                       # sa_mask (x86_64 kernel sigset size 8)
+old_action: .zero 32
 .section .rodata
 ok: .ascii "R\n"
