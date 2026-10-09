@@ -481,6 +481,10 @@ pub fn executable_inventory(root: &Path) -> Result<BTreeMap<String, GuestTarget>
             return Err(fail("duplicate Linux fixture"));
         }
     }
+    paths.insert(
+        "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-gnu/release/carrick-linux-aarch64-ring-first-glibc".to_owned(),
+        GuestTarget::Gnu,
+    );
     for (_, name) in EMBED {
         paths.insert(
             format!("target/embed-fixtures/{name}-aarch64"),
@@ -896,7 +900,12 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
     for script in BUILD_SCRIPTS {
         run_build(
             environment
-                .configure(Command::new("bash").current_dir(&source).arg(script))
+                .configure(
+                    Command::new("bash")
+                        .current_dir(&source)
+                        .arg(script)
+                        .env("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER", linker),
+                )
                 .env("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER", &lld),
         )?;
     }

@@ -80,17 +80,20 @@ fn arm_ring_first_hatch_disabled_forward_witness() {
 fn libc_witness(policy: carrick_embed::ArmRingFirst) {
     let _guard = common::guest_lock();
     reset_el1_counters();
-    // Ubuntu dash is dynamically linked against glibc. Its subshell and wait
-    // exercise process fallback as well as ld.so's file-backed libc mappings.
+    let path = common::repo_root().join("fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-gnu/release/carrick-linux-aarch64-ring-first-glibc");
+    assert!(path.is_file(), "published GNU fixture is required");
+    // The fixture links glibc and has PT_INTERP; ld.so must map libc from host
+    // files. Its parent polls for pipe EOF for five seconds and reaps with
+    // WNOHANG exactly once. A missing child completion fails rather than waits.
     let result = common::run_or_fail(
         ContainerBuilder::from_image(common::SMOKE_IMAGE)
             .arm_ring_first(policy)
             .pull_policy(PullPolicy::Missing)
-            .command([
-                "/bin/dash",
-                "-c",
-                "(exit 23) & child=$!; wait \"$child\"; status=$?; [ \"$status\" = 23 ] || exit 91; printf 'glibc fork wait 23\\n'",
-            ])
+            .command(["/p/carrick-linux-aarch64-ring-first-glibc"])
+            .mount_readonly(
+                path.parent().expect("fixture directory").to_string_lossy(),
+                "/p",
+            )
             .run_blocking(),
     );
     assert!(
