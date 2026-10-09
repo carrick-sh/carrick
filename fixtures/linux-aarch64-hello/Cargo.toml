@@ -93,3 +93,10 @@ path = "src/crash_parked_thread.rs"
 [[bin]]
 name = "carrick-linux-aarch64-ring-first"
 path = "src/ring_first.rs"
+
+[dependencies]
+libc = "=0.2.189"
+
+[[bin]]
+name = "carrick-linux-aarch64-ring-first-glibc"
+path = "src/ring_first_glibc.rs"
