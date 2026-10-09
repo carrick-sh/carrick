@@ -498,6 +498,7 @@ dependencies = [
  "carrick-sched-core",
  "carrick-signal-core",
  "carrick-test-support",
+ "libc",
  "zerocopy",
 ]
 

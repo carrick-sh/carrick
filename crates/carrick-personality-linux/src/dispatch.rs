@@ -29,6 +29,7 @@ pub enum Family {
     FilePositioned,
     AllocatorControl,
     SignalReturn,
+    Poll,
     Unported,
 }
 
@@ -333,6 +334,9 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     fn allocator_control(&mut self) -> FamilyCompletion {
         FamilyCompletion::Forward
     }
+    fn poll(&mut self) -> FamilyCompletion {
+        FamilyCompletion::Forward
+    }
 }
 
 /// The sole ordinal routing decision and family completion owner.
@@ -407,6 +411,20 @@ fn serve_family<'a, C: EntryContext + 'a>(
         Family::FilePositioned => pending.file_positioned(ordinal),
         Family::AllocatorControl => pending.allocator_control(),
         Family::SignalReturn => FamilyCompletion::Handback,
+        Family::Poll => {
+            let original = pending.original_argument0();
+            let completion = pending.poll();
+            returned = match completion {
+                FamilyCompletion::Complete(value)
+                | FamilyCompletion::CompleteWithWork(value)
+                | FamilyCompletion::AccountedComplete(value)
+                | FamilyCompletion::CommitOwed(value) => {
+                    Some((SyscallResult::new(value), original))
+                }
+                _ => None,
+            };
+            completion
+        }
         Family::Unported => FamilyCompletion::Forward,
     };
     FamilyRun {
@@ -440,6 +458,7 @@ pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
         27 => Family::InotifyAdd,
         28 => Family::InotifyRemove,
         98 => Family::Futex,
+        73 => Family::Poll,
         93 => Family::Lifecycle(LifecycleCall::Exit),
         132 => Family::Lifecycle(LifecycleCall::SigAltStack),
         135 => Family::Lifecycle(LifecycleCall::SigProcMask),

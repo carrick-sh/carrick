@@ -120,6 +120,7 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     fn quarantine_born(&mut self, born: Self::Born);
     fn retire_mm(&mut self, mm: Self::Mm);
     fn wake_effects(&mut self, effects: WakeEffects);
+    fn fork_fd_table(&mut self, _parent_table: u64, _child_table: u64) {}
 }
 pub struct NativeClaim {
     namespace: Arc<SpinLock<NamespaceState>>,
@@ -164,6 +165,7 @@ pub struct NativeResources<'a, M, C: ProcessContext> {
     _thread_claim: NativeClaim,
     channel: Option<Arc<WaitChannel>>,
     usage: TaskRusage,
+    file_table: u64,
 }
 pub type NativeForkPreparation<'a, M, P, C> =
     PreparedFork<(), (), RetainedProcessCustody<NativeResources<'a, M, C>>, P>;
@@ -240,6 +242,9 @@ fn custody<'a, M: Clone, C: ProcessContext>(
     custody
 }
 impl<M, C: ProcessContext> NativeResources<'_, M, C> {
+    pub fn file_table(&self) -> u64 {
+        self.file_table
+    }
     fn record_identity_mm(&self) -> u64 {
         self.zone.record(self.record.id).identity().mm
     }
@@ -357,6 +362,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 .ok_or(NativeProcessError::Invalid)?,
             )
             .ok_or(NativeProcessError::Exhausted)?;
+        let file_table = if identity.file_table != 0 {
+            identity.file_table
+        } else {
+            1
+        };
         let resources = NativeResources {
             key,
             zone: source.zone,
@@ -369,6 +379,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             _thread_claim: thread_claim,
             channel: None,
             usage: TaskRusage::default(),
+            file_table,
         };
         let mut owner = Owner::new();
         owner
@@ -980,7 +991,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(NativeProcessError::Invalid);
             }
         };
-        let (parent_identity, blocked, parent_page) = {
+        let (parent_identity, blocked, parent_page, parent_file_table) = {
             let graph = self.runtime.graph.lock();
             let resources = graph
                 .owner
@@ -992,6 +1003,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.source.zone.record(resources.record.id).identity(),
                 resources.control.blocked(),
                 resources.page,
+                resources.file_table,
             )
         };
         let prepared = match self.service.prepare_mm(&parent_mm, self.words, child_mm) {
@@ -1076,11 +1088,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(error);
             }
         };
+        let child_file_table = parent_file_table.wrapping_add(1);
+        self.service
+            .fork_fd_table(parent_file_table, child_file_table);
         let thread = ThreadIdentity {
             tid: child_key.id.raw() as u64,
             serial: thread_serial.get(),
             mm: child_mm.raw().get(),
-            file_table: parent_identity.file_table,
+            file_table: child_file_table,
             generation: child_key.serial.raw(),
             affinity: parent_identity.affinity,
             lifecycle_page: page as *const _ as u64,
@@ -1111,6 +1126,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             _thread_claim: thread_claim,
             channel: None,
             usage: TaskRusage::default(),
+            file_table: child_file_table,
         };
         let child = GuestTask::new(
             GuestTaskMetadata {

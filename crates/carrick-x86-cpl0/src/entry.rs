@@ -354,7 +354,9 @@ mod kernel {
     use carrick_el1::lock::SpinLock;
     use carrick_el1::personality::thread_setup::GuestLifecycleVenue;
     use carrick_el1::personality::{dispatch, sched};
-    use carrick_el1_abi::{Counters, CurrentTask, InotifyNameCache};
+    use carrick_el1_abi::{
+        Counters, CurrentTask, DelegatedFile, DelegatedOpenFile, FdMapSlot, InotifyNameCache,
+    };
     use carrick_guest_arch::{CanonicalNr, InterruptArch, LayoutBackend, NativeReturnWord, SyscallFrame, UserVa};
     use carrick_x86_cpl0::ProductionBoundary;
     fixture_items! { use carrick_guest_arch::EntryArch; }
@@ -389,6 +391,7 @@ mod kernel {
         // this call projects only the authenticated current task as a slice.
         fn task_index(&self) -> usize { if self.slot.is_some() { 0 } else { usize::MAX } }
         fn user_sp(&self) -> Option<UserVa> { Some(self.call.stack) }
+        fn native_ordinal(&self) -> Option<u64> { Some(self.call.native.raw()) }
     }
     impl dispatch::GuestDispatchFrame for NativeDispatch<'_> {
         fn native_number(&self) -> carrick_guest_arch::NativeOrdinal { self.call.native }
@@ -408,6 +411,9 @@ mod kernel {
     }
 
     static EMPTY_NAME_CACHE: InotifyNameCache = InotifyNameCache::new();
+    pub(crate) static FD_MAP: [FdMapSlot; 64] = [const { FdMapSlot::new() }; 64];
+    pub(crate) static OPEN_TABLE: [DelegatedOpenFile; 16] = [const { DelegatedOpenFile::new() }; 16];
+    pub(crate) static OBJECT_TABLE: [DelegatedFile; 16] = [const { DelegatedFile::new() }; 16];
 
     // Count native exits across CPL0 CPUs for image/link and live diagnostics.
     // A port write exits the VM, so no lock may remain held across it: another
@@ -1902,7 +1908,7 @@ mod kernel {
                     };
                     let route = dispatch::dispatch_syscall_with_native(
                         &mut native, counters, core::slice::from_ref(task),
-                        &[], &[], &[], &[], &EMPTY_NAME_CACHE,
+                        &FD_MAP, &OBJECT_TABLE, &OPEN_TABLE, &[], &EMPTY_NAME_CACHE,
                         None::<dispatch::Zone<'_, sched::HardwareCpu, sched::HardwareUserWord>>,
                         None, Some(&GuestLifecycleVenue), Some(&mut process),
                         Some(source), Some(&mut anonymous), cache_lookup,
