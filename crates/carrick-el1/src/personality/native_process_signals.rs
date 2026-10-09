@@ -31,9 +31,13 @@ impl<S: BlockedMaskSource + ?Sized> BlockedMaskSource for Arc<S> {
         (**self).blocked_mask()
     }
 }
+use alloc::vec::Vec;
+use carrick_personality_linux::signal::PendingSignals;
+
 struct SignalResources<T> {
     actions: ActionTable,
     inbox: SignalInbox<TaskKey, T>,
+    thread_pending: Vec<(u32, PendingSignals<T>)>,
 }
 /// One actual sighand and pending owner, retained by exact task handles.
 pub struct NativeProcessSignals<T> {
@@ -62,6 +66,7 @@ impl<T> NativeProcessSignals<T> {
             resources: Arc::new(SpinLock::new(SignalResources {
                 actions: ActionTable::default(),
                 inbox: SignalInbox::new(key),
+                thread_pending: Vec::new(),
             })),
         }
     }
@@ -92,6 +97,75 @@ impl<T> NativeProcessSignals<T> {
     ) -> Result<EnqueueOutcome, StaleTarget> {
         self.resources.lock().inbox.enqueue_for(key, signal, info)
     }
+    pub fn enqueue_thread(&self, tid: u32, signal: Signal, info: Option<T>) -> EnqueueOutcome {
+        let mut res = self.resources.lock();
+        if let Some((_, p)) = res.thread_pending.iter_mut().find(|(t, _)| *t == tid) {
+            p.enqueue(signal, info)
+        } else {
+            let mut p = PendingSignals::default();
+            let outcome = p.enqueue(signal, info);
+            res.thread_pending.push((tid, p));
+            outcome
+        }
+    }
+    pub fn pending_set(&self, tid: u32) -> SignalSet {
+        let resources = self.resources.lock();
+        let proc = resources.inbox.pending().present();
+        let thread = resources
+            .thread_pending
+            .iter()
+            .find(|(t, _)| *t == tid)
+            .map_or(SignalSet::EMPTY, |(_, p)| p.present());
+        proc.union(thread)
+    }
+    pub fn take_deliverable(
+        &self,
+        tid: u32,
+        blocked: SigBlockMask,
+    ) -> Option<(Signal, Option<T>, Action)> {
+        let mut resources = self.resources.lock();
+        let actions = resources.actions.clone();
+        let idx = resources.thread_pending.iter().position(|(t, _)| *t == tid);
+        let mut thread_pending = idx
+            .map(|i| resources.thread_pending.remove(i).1)
+            .unwrap_or_default();
+        let delivery = {
+            let proc_pending = resources.inbox.pending_mut();
+            let unblocked = blocked.select(proc_pending.present().union(thread_pending.present()));
+            carrick_personality_linux::signal::take_pending(
+                &mut thread_pending,
+                proc_pending,
+                unblocked,
+            )
+        };
+        if !thread_pending.is_empty() {
+            resources.thread_pending.push((tid, thread_pending));
+        }
+        let delivery = delivery?;
+        let signal = delivery.entry.signal;
+        let action = actions.action(signal);
+        Some((signal, delivery.entry.info, action))
+    }
+    pub fn take_timedwait(&self, tid: u32, set: SignalSet) -> Option<(Signal, Option<T>)> {
+        let mut resources = self.resources.lock();
+        let idx = resources.thread_pending.iter().position(|(t, _)| *t == tid);
+        let mut thread_pending = idx
+            .map(|i| resources.thread_pending.remove(i).1)
+            .unwrap_or_default();
+        let delivery = {
+            let proc_pending = resources.inbox.pending_mut();
+            carrick_personality_linux::signal::take_pending(&mut thread_pending, proc_pending, set)
+        };
+        if !thread_pending.is_empty() {
+            resources.thread_pending.push((tid, thread_pending));
+        }
+        let delivery = delivery?;
+        Some((delivery.entry.signal, delivery.entry.info))
+    }
+    pub fn reset_for_exec(&self) {
+        let mut res = self.resources.lock();
+        res.actions = res.actions.clone_for_exec();
+    }
     pub fn pending_count(&self) -> usize {
         self.resources.lock().inbox.pending().len()
     }
@@ -107,6 +181,7 @@ impl<T> NativeProcessSignals<T> {
             resources: Arc::new(SpinLock::new(SignalResources {
                 actions,
                 inbox: source.inbox.for_fork(child),
+                thread_pending: Vec::new(),
             })),
         })
     }
