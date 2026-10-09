@@ -428,10 +428,11 @@ pub(crate) fn publish_unexpected_executor_failure_retirement(
     kernel: &Kernel,
     threads: &VcpuThreadRegistry,
     current: &continuation::LogicalJobCompletion,
+    cause: String,
 ) -> Result<(), RuntimeError> {
     let (_published, completions) = finish_persistent_process_handles(threads, current)?;
     kernel.process_physical_retirement.publish(completions)?;
-    kernel.publish_process_terminal(Err(()));
+    kernel.publish_process_terminal(Err(cause));
     Ok(())
 }
 
