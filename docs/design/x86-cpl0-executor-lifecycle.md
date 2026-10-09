@@ -258,3 +258,31 @@ requires `HvpatchTaskBinding`. The ARM-specific cancellation and exec
 replacement policy remains on the ARM resolver implementation. The KVM
 resolver can use the shared record and authority operations without adding
 another queue or thread registry.
+
+The KVM resolver now uses that directory directly. Its binding accepts only
+an x86 V1 saved CPU whose MM and ASID match the kernel `KernelContext`, whose
+task serial is the issued `TaskKey`, and whose execution generation matches
+the scheduler submission. The root witness reserves an unclaimable queue
+row, prepares the directory authority, opens the start gate, activates the
+exact row, then resolves the binding. The generic submission shape and
+activation proof carry ISA-neutral names; ARM retains aliases and its
+existing policy. This establishes root publication semantics, but the KVM
+executor still needs to load and run the physical CPU from this row.
+
+### Baseline and current fixture status
+
+The `origin/main` KVM suite already fails three memory and TLS fixtures:
+`mounted_static_x86_adjacent_anonymous_memory_keeps_existing_leaf`,
+`mounted_static_x86_arch_prctl_preserves_user_tls_bases`, and
+`mounted_static_x86_elf_matches_native_anonymous_memory`. Their execution
+report has an extra root exit; this lane does not change those contracts.
+`mounted_static_x86_guest_owned_calls_refuse_without_host_effects` also fails
+on main after the guest exits 7: its report counts one host forward while
+the fixture expected two. On this branch the same guest initially exited 99
+because its temporary `poll(fd=3)` ENOSYS expectation predates the accepted
+in-zone poll implementation. Native Linux on a closed fd returns one ready
+entry with `POLLNVAL` (32), so the fixture now requires that exact result.
+The guest still sees ENOSYS for unfinished memory and signal effects, but
+these are no longer classified as host-forward refusals in this branch. The
+new empty-stdin
+read and poll witnesses are red until the continuation and readiness work.

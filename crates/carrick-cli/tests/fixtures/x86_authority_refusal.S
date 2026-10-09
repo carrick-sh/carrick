@@ -29,7 +29,9 @@ _start:
     xor %rdx, %rdx              # timeout = 0
     mov $7, %rax                # poll
     syscall
-    cmp $-38, %rax              # ENOSYS
+    cmp $1, %rax                # absent fd reports POLLNVAL
+    jne fail
+    cmpw $32, 6(%rsp)           # POLLNVAL, independent of requested events
     jne fail
     add $16, %rsp
     mov $39, %rax               # getpid: guest-owned and served
