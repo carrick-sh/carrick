@@ -1,8 +1,12 @@
 # ARM ring-first independent review follow-up
 
-Runtime/witness checkpoint: `637fb416c` (full identity in the verification
-receipt). This evidence supersedes the earlier raw-only closure at
-`54d6b0210` for PR #132. The director owns the KVM run and stacked full gate.
+Current product/fixture checkpoint: `585e9b936ac5709d31ba9a5f1d2b6ab26fc310ab`.
+Current signed host witness: `ff633691b4b55670a3b9f0815010b123b7937f36`.
+Raw and GNU loader-only witnesses PASS under both policies; fork/wait retains
+the director-attributed main COW inventory defect. N1-N3 corrections and all
+focused native gates pass. PR #132 is ready for independent re-review; the
+director owns KVM execution and the stacked full gate. Earlier sections
+retain the first-round checkpoint `637fb416c` and its historical evidence.
 
 ## Red-first corrections
 
@@ -58,7 +62,7 @@ The real-base domain gate passes with 1,232 source counters and native compiler
 profiles macos-cli-default, macos-runtime-default and macos-hvf-default. Six
 Linux/BSD profiles remain pending on this Mac; this is not matrix completeness.
 
-## Signed review verdicts
+## First-round signed review verdicts
 
 The monitored recipe finished in 504.41 seconds, below ten minutes. Both raw
 witnesses PASS: Strict getuid refusal/forward = 1/0; OptOut = 0/1. Each has
@@ -125,8 +129,8 @@ remain director-owned.
 
 ## Second independent review (2026-10-09)
 
-The earlier review-ready ruling is superseded pending N1-N3 corrections and
-signed loader-only evidence. Each new defect fails first in VM-free tests;
+The second review supersedes the earlier raw-only closure. N1-N3 corrections
+now pass and signed loader-only evidence is complete under both policies. Each new defect fails first in VM-free tests;
 `re-review-red-first.txt` retains the assertions. x86 now evaluates every
 forwarding completion, strict ARM refuses unported calls before owed-work
 transport, and replay conversion is restricted to effect-free ARM Forward
@@ -135,8 +139,8 @@ Forward; x86 has no replay conversion. Production x86 witnesses now cover
 both pending-work settings and require counted refusals outside the eight
 crossings. The GNU fixture gains a loader-only mode without fork; its new
 signed bindings require completing libc calls, file-backed mmap forwarding,
-exit forwarding and exact getuid policy counters. Final signed verification
-and director-owned KVM comparison remain pending.
+exit forwarding and exact getuid policy counters. Current signed verification is recorded below; director-owned KVM comparison
+remains pending.
 
 ### Loader counter correction
 
@@ -156,4 +160,51 @@ identity remain unchanged. The failed artifact and dSYM are preserved as
 `0287547b7483eb522a45ba2fd5fc05234fd8f615ffebfa57ec3024cdda893774`.
 The `re-review-counter-red-*` records retain the failing assertions, exact
 counters, artifact identities, clean admission and zero-survivor cleanup.
-Signed verification of the corrected witness remains pending.
+The corrected witness now passes under both policies on the new artifact below.
+
+## Current signed verdicts after N1-N3
+
+Command and run ID are retained in `re-review-signed-result.json`:
+`CARRICK_RUN_ID=ring-switch-loader-proof-20261009-ff633691b-1
+CARRICK_CONTRACT_ID=kernel.el1.arm-ring-first-crossing
+just test-embed arm_ring_first_ --nocapture` (one shell command).
+The recipe finishes in 276.51 seconds, below ten minutes. The four completing
+witnesses PASS; the two fork witnesses FAIL with the inherited inventory
+error. Negative control and builder policy unit test PASS. Harness, CLI-suffix
+and explicit cleanup leave zero survivors, and the shared lease is released.
+
+| Witness | Strict | OptOut |
+| --- | --- | --- |
+| Raw getuid refusal / forward | PASS; 1 / 0 | PASS; 0 / 1 |
+| GNU loader-only getuid refusal / forward | PASS; 1 / 0 | PASS; 0 / 1 |
+| GNU loader-only mmap refusal / served / forward | 0 / 1 / 5 | 0 / 1 / 5 |
+| GNU loader-only openat / read / write forwards | 3 / 2 / 1 | 3 / 2 / 1 |
+| GNU loader-only exit_group refusal / forward | 0 / 1 | 0 / 1 |
+| GNU loader-only getpid dispatcher refusal / served / forward | 0 / 0 / 0 (identity shim) | 0 / 0 / 0 (identity shim) |
+| GNU loader-only clone / wait4 forwards | 0 / 0 | 0 / 0 |
+| GNU fork/wait | FAIL; main-equal child COW inventory | FAIL; main-equal child COW inventory |
+
+The GNU programs require successful clock, positive PID, /dev/null I/O,
+policy-specific UID handling, exact output and exit. Their PT_INTERP and
+libc.so.6 dependency ensure real dynamic libc startup. Their completing
+counter checks prove strict libc execution without the known fork defect.
+Fork counters remain unavailable because the child error precedes assertions.
+The current error is again:
+`HVPatch COW compound IPA 0x2e00000000 has no exact inventory coverage`.
+The first-round byte-identical main control above establishes that this
+mechanism predates the switch; its old GNU ELF hash is distinguished from the
+new fixture with loader-only mode. The ARM fork lane retains that defect.
+
+Current signed test SHA-256:
+`ec77908a088c62ad684665218581fbba41e2294841468a62b7f9e5887da85b08`.
+CLI SHA-256:
+`7cb3e12e1fbe0878d2b7e6e4bb0cb83cecb6c2c0dcb00d056fc5439a10ab4750`.
+GNU guest SHA-256:
+`69f6c577f5fe1f5cf67877804d64c9535eb1890d1d3efe96b4612a6c525dfc7d`.
+Published bundle SHA-256:
+`05c18f1c96019cde74c9de19bd26c2ec4f467e741c1cbcdc59d6ab8c1ab8397a`.
+`re-review-signed-identity.json` retains CDHash, LC_UUID, entitlement and DOF;
+`re-review-signed-fixture-validation.json` retains the clean exact input
+admission. The artifact and dSYM are preserved as
+`target/ringswitch-loader-proof-signed`. Final review readiness does not claim
+KVM execution, Linux/BSD native profile completeness or a stacked full gate.

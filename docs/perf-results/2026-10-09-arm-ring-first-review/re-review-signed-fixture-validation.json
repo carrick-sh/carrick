@@ -1,0 +1,9 @@
+{
+  "validation_method": "input_identity",
+  "checkout_head": "ff633691b4b55670a3b9f0815010b123b7937f36",
+  "checkout_tree": "c9c4602787984e5e4ed5a38b8f930dfef6efe1cd",
+  "bundle_source_head": "585e9b936ac5709d31ba9a5f1d2b6ab26fc310ab",
+  "checkout_dirty": false,
+  "manifest_sha256": "56c9681b4e0db7d4f43b7ea1a071ae5ce38f21bfde51daf19cedc326ced662cf",
+  "inputs_sha256": "ec7b5e7c720ff9ba653b6ef212da4177831150eff9a0641b75048f23266f2169"
+}
