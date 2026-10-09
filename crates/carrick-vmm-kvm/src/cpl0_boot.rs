@@ -1130,6 +1130,13 @@ pub(crate) struct Cpl0HostCustody {
     work_exits: u64,
 }
 
+// SAFETY: metadata_base points into the retained GuestRam owned by this
+// custody, whose backing remains registered until custody drops. The pointer
+// is only dereferenced through &self for atomic records or &mut self for
+// stopped-host service. Moving exclusive custody to another thread preserves
+// both the backing lifetime and that access discipline.
+unsafe impl Send for Cpl0HostCustody {}
+
 impl Drop for Cpl0HostCustody {
     fn drop(&mut self) {
         // Unwind the inventory first. Its destructor only records a refused

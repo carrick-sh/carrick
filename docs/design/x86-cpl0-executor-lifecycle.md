@@ -220,3 +220,14 @@ stopped handoff point. The carrier verifies its request pointer and CR3
 against the published root, then completes the pending PIO step before
 transferring the vCPU to a worker. This doorbell is a KVM bootstrap protocol,
 not a forwarded Linux syscall or a new host crossing.
+
+The retained custody contains a `NonNull<u8>` view of metadata inside its
+owned, registered `GuestRam`. The worker handoff needs to move custody across
+host threads. `Cpl0HostCustody: Send` is therefore an audited exclusive move:
+the RAM stays retained until custody drops; atomic metadata reads and stopped
+host service retain their existing access discipline. It is not `Sync` and
+does not permit concurrent mutation through the raw pointer. A hardware
+witness transfers the complete parts to a new host thread, loads the issued
+root image there, saves and detaches it, then checks both physical CPUs are
+idle. The production pool still has to split worker CPU ownership from this
+coordinator custody before scheduler submission.

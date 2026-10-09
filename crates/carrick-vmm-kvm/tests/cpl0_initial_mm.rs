@@ -22,6 +22,8 @@ const X86_SYS_EXIT_GROUP: u8 = 231;
 
 #[test]
 fn initial_root_uses_issued_thread_and_file_table_identity() {
+    fn assert_send<T: Send>() {}
+    assert_send::<carrick_vmm_kvm::cpl0_boot::ProductionWorkerParts>();
     let elf = tiny_elf();
     let image = prepare_static_x86_elf(&elf).expect("static ELF");
     let extent =
@@ -56,16 +58,24 @@ fn initial_root_uses_issued_thread_and_file_table_identity() {
     let mut workers = carrier.into_worker_parts(8).expect("worker handoff");
     assert_eq!(workers.root_state().binding().task().task.raw().get(), 700);
     assert_eq!(workers.root_state().state().mm_generation(), 301);
-    workers
-        .cpu_mut(0)
-        .expect("root physical CPU")
-        .audit_idle()
-        .unwrap();
-    workers
-        .cpu_mut(1)
-        .expect("peer physical CPU")
-        .audit_idle()
-        .unwrap();
+    std::thread::spawn(move || {
+        let root = workers.root_state().clone();
+        let cpu = workers.cpu_mut(0).expect("root physical CPU");
+        cpu.audit_idle().expect("stopped root CPU");
+        cpu.load(root.clone()).expect("load issued root");
+        let saved = cpu
+            .save_and_detach(root.binding().task())
+            .expect("save issued root");
+        assert_eq!(saved.state(), root.state());
+        cpu.audit_idle().expect("detached root CPU");
+        workers
+            .cpu_mut(1)
+            .expect("peer physical CPU")
+            .audit_idle()
+            .expect("stopped peer CPU");
+    })
+    .join()
+    .expect("worker ownership transfer");
 }
 
 fn image() -> PathBuf {
