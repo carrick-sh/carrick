@@ -559,7 +559,15 @@ fn finish<'a, C: EntryContext + 'a>(
     } else {
         completion_route(result, pending.host_work())
     };
-    if route == CompletionRoute::Forward && reason == ForwardReason::Unported {
+    if (route == CompletionRoute::Forward && reason == ForwardReason::Unported)
+        || (pending.crossing_set() == crate::crossing::HostCrossingSet::X86
+            && matches!(
+                result,
+                FamilyCompletion::Forward
+                    | FamilyCompletion::AccountedForward
+                    | FamilyCompletion::Handback
+            ))
+    {
         let canonical = carrick_syscall_abi::CanonicalNr::new(ordinal);
         let crossing_set = pending.crossing_set();
         let ring_first_strict = pending.ring_first_strict();
@@ -573,6 +581,10 @@ fn finish<'a, C: EntryContext + 'a>(
             |ret| pending.install_result(ret),
         );
         if decision == crate::crossing::HostCrossingDecision::Refused {
+            if pending.host_work() {
+                pending.publish_work(false);
+                return CompletionRoute::WithWork;
+            }
             return CompletionRoute::Served;
         }
     }
