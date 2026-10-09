@@ -108,6 +108,9 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     }
     fn thread_spawned(&mut self, _caller_tid: u32, _child_tid: u32) {}
     fn set_calling_tid(&mut self, _tid: u32) {}
+    fn exec_completed(&mut self, _path: &[u8]) -> Result<(), i64> {
+        Ok(())
+    }
 }
 
 pub trait UserCopy {
