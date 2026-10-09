@@ -652,7 +652,7 @@ impl Cpl0HostCustody {
             let child_base = child_tables[0].address().raw();
             let parent_base = parent_tables[0].address().raw();
             let loan = request
-                .admit_loan(child_base, parent_base, KERNEL_REGION_GPA, id, lifecycle)
+                .admit_loan(child_base, parent_base, KERNEL_REGION_GPA, id, lifecycle, 0)
                 .ok_or_else(|| fail("physical fork loan geometry"))?;
             // The one-use metadata gap is cold physical stock. The guest
             // initializes its typed lifecycle/census before claiming a task.
@@ -684,7 +684,7 @@ impl Cpl0HostCustody {
                 child_tables,
                 parent_tables,
             });
-            if !record.grant(child_base, parent_base, KERNEL_REGION_GPA, id, lifecycle) {
+            if !record.grant(child_base, parent_base, KERNEL_REGION_GPA, id, lifecycle, 0) {
                 return Err(fail("physical fork stock reply changed"));
             }
         } else {

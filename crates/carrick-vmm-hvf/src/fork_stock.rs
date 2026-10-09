@@ -122,6 +122,8 @@ pub struct ForkStockHostCustody {
     pub kernel_region_gpa: u64,
     pub lifecycle: ForkLifecycleLoan,
     pub carrier: NonZeroU64,
+    pub fork_next_asid: u16,
+    pub free_asids: Vec<u16>,
 }
 
 #[allow(dead_code)]
@@ -136,6 +138,26 @@ impl ForkStockHostCustody {
             kernel_region_gpa: carrick_mem::memory::LINUX_KERNEL_REGION_BASE,
             lifecycle: ForkLifecycleLoan::ARM_DEFAULT,
             carrier,
+            fork_next_asid: 2,
+            free_asids: Vec::new(),
+        }
+    }
+
+    pub fn allocate_asid(&mut self) -> Option<u16> {
+        if let Some(asid) = self.free_asids.pop() {
+            Some(asid)
+        } else if self.fork_next_asid < u16::MAX {
+            let asid = self.fork_next_asid;
+            self.fork_next_asid += 1;
+            Some(asid)
+        } else {
+            None
+        }
+    }
+
+    pub fn release_asid(&mut self, asid: u16) {
+        if asid != 0 && !self.free_asids.contains(&asid) {
+            self.free_asids.push(asid);
         }
     }
 
@@ -208,13 +230,21 @@ impl ForkStockHostCustody {
         self.fork_next_loan = next_loan;
         let child_base = child_tables[0].address().raw();
         let parent_base = parent_tables[0].address().raw();
+        let Some(asid) = self.allocate_asid() else {
+            self.grant_tables.extend(child_tables);
+            self.grant_tables.extend(parent_tables);
+            exchange.refuse(ForkStockRefusal::Capacity);
+            return Err(ForkStockRefusal::Capacity);
+        };
         let Some(loan) = request.admit_loan(
             child_base,
             parent_base,
             self.kernel_region_gpa,
             id,
             self.lifecycle,
+            asid,
         ) else {
+            self.release_asid(asid);
             self.grant_tables.extend(child_tables);
             self.grant_tables.extend(parent_tables);
             exchange.refuse(ForkStockRefusal::Invalid);
@@ -224,6 +254,7 @@ impl ForkStockHostCustody {
         let child_mm = match El1FrameGrantMm::new(request.child_mm.raw()) {
             Some(mm) => mm,
             None => {
+                self.release_asid(asid);
                 self.grant_tables.extend(child_tables);
                 self.grant_tables.extend(parent_tables);
                 exchange.refuse(ForkStockRefusal::Invalid);
@@ -233,6 +264,7 @@ impl ForkStockHostCustody {
         let parent_mm = match El1FrameGrantMm::new(request.operation.mm.raw()) {
             Some(mm) => mm,
             None => {
+                self.release_asid(asid);
                 self.grant_tables.extend(child_tables);
                 self.grant_tables.extend(parent_tables);
                 exchange.refuse(ForkStockRefusal::Invalid);
@@ -249,6 +281,7 @@ impl ForkStockHostCustody {
                 for granted in granted_child {
                     ledger.mark_return(granted, 4096, child_mm, false);
                 }
+                self.release_asid(asid);
                 self.grant_tables.extend(child_tables);
                 self.grant_tables.extend(parent_tables);
                 exchange.refuse(ForkStockRefusal::Capacity);
@@ -268,6 +301,7 @@ impl ForkStockHostCustody {
                 for granted in granted_parent {
                     ledger.mark_return(granted, 4096, parent_mm, false);
                 }
+                self.release_asid(asid);
                 self.grant_tables.extend(child_tables);
                 self.grant_tables.extend(parent_tables);
                 exchange.refuse(ForkStockRefusal::Capacity);
@@ -290,6 +324,7 @@ impl ForkStockHostCustody {
             self.kernel_region_gpa,
             id,
             self.lifecycle,
+            asid,
         ) {
             if let Some(pending) = self.pending_loans[cpu_index].take() {
                 for page in &pending.child_tables {
@@ -301,6 +336,7 @@ impl ForkStockHostCustody {
                 self.grant_tables.extend(pending.child_tables);
                 self.grant_tables.extend(pending.parent_tables);
             }
+            self.release_asid(asid);
             self.fork_lifecycle_available = true;
             exchange.refuse(ForkStockRefusal::Invalid);
             return Err(ForkStockRefusal::Invalid);
@@ -350,6 +386,7 @@ impl ForkStockHostCustody {
             }
             self.grant_tables.extend(pending.child_tables);
             self.grant_tables.extend(pending.parent_tables);
+            self.release_asid(loan.asid);
             self.fork_lifecycle_available = true;
             if !settlement.accept(loan) {
                 return Err(ForkStockServiceError::InvalidRecord);

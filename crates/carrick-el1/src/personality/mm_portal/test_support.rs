@@ -171,7 +171,7 @@ pub struct Tables {
 }
 impl Tables {
     pub fn new(base: u64, ipa: u64, pages: usize) -> Self {
-        let words = (0..6 * 512)
+        let words = (0..32 * 512)
             .map(|_| AtomicU64::new(0))
             .collect::<Vec<_>>()
             .into_boxed_slice();

@@ -138,12 +138,13 @@ impl<B: OwnerForkMmu> UnpublishedEl1Child<B> {
             .try_begin_edit(parent_index, parent.raw(), owner)
             .ok_or(MmError::Busy)?;
         let child_index = portal.spaces.find(child.raw()).ok_or(MmError::Stale)?;
-        let _child_editor = portal
+        let child_editor = portal
             .space_access(worker)?
             .try_begin_closed_child_edit(child_index, child.raw(), owner)
             .ok_or(MmError::Busy)?;
         let root = portal.root(parent, worker)?;
         let child_root = portal.child_root(child, worker)?;
+        drop(child_editor);
         self.inner
             .abort(words, root, child_root)
             .map_err(Into::into)
