@@ -415,21 +415,45 @@ mod kernel {
             acknowledged
         }
         fn may_serve_poll(&self) -> bool {
-            self.call.native.raw() == carrick_syscall_abi::syscall_x86_64::X86_POLL.raw()
+            self.call.native
+                == carrick_guest_arch::NativeOrdinal::new(
+                    carrick_syscall_abi::syscall_x86_64::X86_POLL.raw(),
+                )
+                || self.call.native
+                    == carrick_guest_arch::NativeOrdinal::new(
+                        carrick_syscall_abi::syscall_x86_64::X86_PPOLL.raw(),
+                    )
         }
-        fn query_host_readiness(&mut self, entries: &mut [carrick_el1_abi::HostReadinessEntry], timeout_ms: i32) -> Option<i64> {
-            if self.call.native.raw() != 7 {
+        fn poll_timeout_kind(&self) -> dispatch::PollTimeoutKind {
+            if self.call.native == carrick_guest_arch::NativeOrdinal::new(
+                carrick_syscall_abi::syscall_x86_64::X86_POLL.raw(),
+            ) {
+                dispatch::PollTimeoutKind::Milliseconds
+            } else {
+                dispatch::PollTimeoutKind::Timespec
+            }
+        }
+        fn query_host_readiness(&mut self, entries: &mut [carrick_el1_abi::HostReadinessEntry], timeout_ms: i32, sig_mask: dispatch::PollSignalMask) -> Option<i64> {
+            if !self.may_serve_poll() {
                 return None;
             }
-            let saved = (self.frame.rdi, self.frame.rsi, self.frame.rdx, self.frame.r10, self.frame.rcx);
+            let saved = (self.frame.rdi, self.frame.rsi, self.frame.rdx, self.frame.r10, self.frame.r8, self.frame.rcx);
             self.frame.rax = carrick_el1_abi::HostReadinessCrossing::NUMBER;
             self.frame.rdi = entries.as_mut_ptr() as u64;
             self.frame.rsi = entries.len() as u64;
             self.frame.rdx = timeout_ms as u64;
+            self.frame.r10 = match sig_mask {
+                dispatch::PollSignalMask::Inherit => 0,
+                dispatch::PollSignalMask::Replace(bits) => bits.bits(),
+            };
+            self.frame.r8 = match sig_mask {
+                dispatch::PollSignalMask::Replace(_) => carrick_el1_abi::HostReadinessCrossing::MASK_REPLACE,
+                dispatch::PollSignalMask::Inherit => carrick_el1_abi::HostReadinessCrossing::MASK_NONE,
+            };
             self.frame.rcx = carrick_el1_abi::HostReadinessCrossing::FRAME_TAG;
             doorbell(FORWARD_PORT, self.frame);
             let result = self.frame.rax as i64;
-            (self.frame.rdi, self.frame.rsi, self.frame.rdx, self.frame.r10, self.frame.rcx) = saved;
+            (self.frame.rdi, self.frame.rsi, self.frame.rdx, self.frame.r10, self.frame.r8, self.frame.rcx) = saved;
             Some(result)
         }
         fn arm_frame(&mut self) -> Option<&mut carrick_el1_abi::TrapFrame> { None }

@@ -448,13 +448,16 @@ pub fn host_readiness_entries(
         if handle == 0 {
             continue;
         }
-        let binding = open_table
+        let Some(binding) = open_table
             .get((handle - 1) as usize)
             .filter(|open| open.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST)
             .and_then(|open| {
                 open.host_object()
                     .or_else(|| open.host_fd().map(HostObjectBinding::from_host_fd))
-            })?;
+            })
+        else {
+            continue;
+        };
         host_entries.push(HostReadinessEntry {
             binding,
             events: entry.events,
@@ -462,7 +465,9 @@ pub fn host_readiness_entries(
             poll_index: index as u32,
         });
     }
-    (!host_entries.is_empty()).then_some(host_entries)
+    // An all-negative set still carries a timer wait through the host
+    // readiness crossing, even though it enrolls no host descriptor.
+    (!host_entries.is_empty() || pollfds.iter().all(|entry| entry.fd < 0)).then_some(host_entries)
 }
 
 /// VM-free fixture probe for host-bound descriptions. Production guest code
@@ -1197,6 +1202,42 @@ mod tests {
         assert_eq!(fds[1].revents, 0);
         assert_eq!(fds[3].revents, LINUX_POLLNVAL);
         assert!(host_readiness_entries(&fd_map, &open_table, 10, &fds[3..]).is_none());
+    }
+
+    #[test]
+    fn readiness_batch_keeps_host_entries_with_in_zone_descriptions() {
+        let (fd_map, open_table, object_table) = setup_tables();
+        admit_host_fd(
+            &fd_map,
+            &open_table,
+            &object_table,
+            10,
+            123,
+            0,
+            DELEGATED_FLAG_READABLE,
+        );
+        let in_zone = &open_table[3];
+        in_zone
+            .state
+            .store(DELEGATED_STATE_GUEST, Ordering::Release);
+        assert!(fd_map[1].try_claim());
+        fd_map[1].set(10, 124, 4, 1);
+        let fds = [
+            PollFd {
+                fd: 124,
+                events: LINUX_POLLIN,
+                revents: 0,
+            },
+            PollFd {
+                fd: 123,
+                events: LINUX_POLLIN,
+                revents: 0,
+            },
+        ];
+        let entries = host_readiness_entries(&fd_map, &open_table, 10, &fds)
+            .expect("host descriptor remains in the batch");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].poll_index, 1);
     }
 
     #[test]
