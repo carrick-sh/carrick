@@ -1011,6 +1011,9 @@ impl FutexVenue for NativeLane<'_> {
     }
 }
 impl<'a> PendingFamilies<'a> for NativeLane<'a> {
+    fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
+        carrick_personality_linux::crossing::HostCrossingSet::X86
+    }
     fn take_handoff_receipt(&mut self) -> Option<carrick_core_abi::EntryHandoffReceipt> {
         self.handoff.take()
     }
