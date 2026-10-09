@@ -7,7 +7,14 @@ retains plain Forward for mmap, futex, clone and wait4 family declines;
 The director confirmed `x86_kvm_run` on `bad35bc69` matches origin/main.
 Refused x86 family declines now increment only refused[native], no longer
 also forwarded[canonical]; refusal counting is unchanged.
-Previous signed host witness: `ff633691b4b55670a3b9f0815010b123b7937f36`.
+Current signed host source: `14ee884a37d66b794836b1204866ef50fe60c1f1`.
+Current fixture input identity: `7751fc1f63ec8a53e4dc84d2b45f3bd8121a86fb568b119ea5da39e722ee9796`.
+The new raw Strict, raw OptOut and GNU loader-only Strict/OptOut runs all
+PASS, including negative controls, with zero survivors and no lease holder
+after each run. `opt-out-*-signed-receipt.jsonl` retains authentic artifact,
+source, fixture admission, execution and cleanup receipts;
+`opt-out-signed-verdicts.json` retains counters and explicit cleanup.
+`opt-out-vmfree-verification.json` records all final green native gates.
 Raw and GNU loader-only witnesses PASS under both policies; fork/wait retains
 the director-attributed main COW inventory defect. N1-N3 corrections and all
 focused native gates pass. PR #132 is ready for independent re-review; the
