@@ -1,6 +1,6 @@
 # Design: Flip ARM EL1 to Ring-First with a Forward Allowlist
 
-- **Status:** Proposed
+- **Status:** Implemented; review verification pending
 - **Owner decision date:** 2026-10-08 (Revised per Director Review 2026-10-08)
 - **Author:** Carrick Architecture & Conformance Team
 - **Target branch:** `docs/arm-ring-first-flip`
@@ -15,7 +15,7 @@ On 2026-10-08, the owner decided that ARM EL1 moves to the **x86 CPL0 model** im
 1. **EL1 is the authority:** EL1 serves every syscall the shared kernel implements in-ring. Any syscall the shared kernel already implements on x86 CPL0 becomes `Wire-in-ring` on ARM (enabling the existing shared handler), rather than falling back or returning `-ENOSYS`.
 2. **Strict permanent forward allowlist:** Only genuine host facility crossings (host file contents/metadata, host network, CLI terminal entropy, host clock) permanently reach the host carrier per [`docs/host-facility-boundary.md`](../host-facility-boundary.md).
 3. **Temporary-forward debt tracking:** Compat-zone objects (guest pipes, fd tables, epoll, synthetic timer/signal/event descriptors) are tracked as `Temporary-forward` until the shared fd table lands (`lane x86-fdtable`), rather than permanent allowlist entries.
-4. **Counted `-ENOSYS` on the fast path (The Real Regression):** Exactly 140 unhandled syscalls return `-ENOSYS` directly from EL1 without triggering a VM exit, accounted in aperture counters (`Counters.refused`). This is the real, bounded regression accepted by the owner.
+4. **Counted `-ENOSYS` on the fast path (The Real Regression):** Exactly 134 unhandled syscalls return `-ENOSYS` directly from EL1 without triggering a VM exit, accounted in aperture counters (`Counters.refused`). This is the real, bounded regression accepted by the owner.
 5. **Ordered deletion of host paths:** Dead host emulation paths in `carrick-kernel` and `carrick-vmm-hvf` (including Step 6's N1 host fork code) are removed as their ring versions land; the landing of `lane x86-fdtable` subsequently retires the temporary forward rows.
 6. **Opt-out switch:** An exact `=0` hatch (`CARRICK_ARM_RING_FIRST=0`) is provided, defaulting to **ON (`1`)**.
 
@@ -28,8 +28,8 @@ They forward only when the native owner declines; serving them in-ring takes
 precedence over crossing evaluation. The live ARM entry on this branch does
 not yet bind Step 5 process custody, and thread exit deliberately declines
 home and last-thread exits. Refusing those terminal notifications prevents
-carrier completion. Thus the implemented set has 118 entries: the 116
-file/network/clock/fd rows plus two terminal notifications. The census below
+carrier completion. The revised set has 124 entries: the 122 permanent and temporary rows
+plus two declined terminal notifications. The census below
 still describes the primary family assignments, not fallback eligibility.
 
 Aperture control follows `ServiceCopyTable` in the shared region, with checked
@@ -39,8 +39,40 @@ service-copy L3 table and must never be used for control storage.
 
 Contract: `kernel.el1.arm-ring-first-crossing`. Its VM-free terminal-route
 witness is red before the crossing correction; its layout witness is red at
-the aliased offset. The signed raw-syscall fixture avoids unported libc startup
-and bounds descriptor readiness to five seconds.
+the aliased offset. The raw fixture bounds descriptor readiness to five seconds. The dynamic
+glibc fixture separately exercises ld.so file-backed mmap and fork/wait, with
+a five-second SIGCHLD descriptor wait followed by one WNOHANG reap.
+
+## Independent-review corrections (2026-10-09)
+
+The allowlist is applied only to genuinely unported calls. Typed family
+fallbacks (including file-backed/shared/stack memory, permission/retirement
+refusals, inotify contention and unsupported futex operations) retain their
+current carrier authority. Owed host work leaves through `WithWork`, preserving
+original-argument replay, including retained handbacks. Plain handback and
+signal return are completion transports. ARM clone/fork/wait and terminal
+calls retain carrier fallback until Step 5 owns them in-ring.
+
+The production frame chooses its ISA set. x86 is strict and never invokes the
+ARM aperture reader. Fixed ARM access exists only for bare-metal AArch64 and
+requires mapping custody; the unsafe host accessor checks bounds, alignment
+and overflow. A zero control word is strict, with an explicit opt-out bit.
+The resolved typed policy persists in `ContainerState::config` across restart;
+the public rootfs dispatcher debug entry requires its typed policy.
+
+`crossing.rs` has one classified declaration generating the identity enum and
+constant-time dense lookup. Both sets are checked exhaustively from 0 through
+512 against the TSV and the x86 eight-entry oracle. Refusals use captured
+native numbers, typed Linux errno and syscall results. ENOSYS and exit_group
+have one shared syscall-ABI source.
+
+The TSV and classified table are authoritative for the revised assignments:
+tee/vmsplice/splice, socketpair, pselect6/ppoll and anonymous-memory
+madvise/mincore/mlock operations are temporary guest-authority debt. execveat,
+readahead and fadvise64 are permanent host-file crossings. rt_sigreturn is a
+temporary completion transport and must never become counted ENOSYS.
+Earlier family narratives below describe the original proposed cut; use the
+revised census, table and typed routing for implementation eligibility.
 
 ## 1. Today's ARM Routing Table & Census
 
@@ -72,9 +104,9 @@ The 338 recognized Linux AArch64 syscalls break down into 5 mutually exclusive, 
 | Routing Category | Count | Proportion | Semantic Definition |
 |:---|:---:|:---:|:---|
 | **`Wire-in-ring`** | **17** | 5.0% | Sycalls already implemented in-ring in the shared kernel (served on x86 CPL0 today). Enabled on ARM EL1 by wiring existing shared handlers. |
-| **`Forward-Allowlist`** | **100** | 29.6% | Permanent forward allowlist: genuine host crossings only (host file content/metadata, host network, clock, hardware entropy, descriptor polling). |
-| **`Temporary-forward`** | **16** | 4.7% | Compat-zone objects (fd tables, pipes, epolls, timerfds, eventfds). Forwarded as debt until `lane x86-fdtable` lands. |
-| **`Counted-ENOSYS`** | **140** | 41.4% | **The Real Regression:** Guest authority syscalls not yet implemented in-ring, answered with `-ENOSYS` at EL1 fast path and accounted in `Counters.refused`. |
+| **`Forward-Allowlist`** | **92** | 27.2% | Permanent forward allowlist: genuine host crossings only (host file content/metadata, host network, clock, hardware entropy, descriptor polling). |
+| **`Temporary-forward`** | **30** | 8.9% | Guest fd/IPC, descriptor polling, anonymous-memory authority and signal-return transport. Forwarded as debt until each in-ring owner lands. |
+| **`Counted-ENOSYS`** | **134** | 39.6% | **The Real Regression:** Guest authority syscalls not yet implemented in-ring, answered with `-ENOSYS` at EL1 fast path and accounted in `Counters.refused`. |
 | **`Unclaimed-ENOSYS`** | **65** | 19.2% | Baseline unrouted syscalls (`SupportLevel::BringUp`); return `-ENOSYS`. |
 | **Total** | **338** | 100.0% | Complete Linux 6.x asm-generic table. |
 
@@ -93,9 +125,9 @@ print(f"Total               : {len(rows)}")
 ```
 Verification Output:
 ```
-Counted-ENOSYS      : 140
-Forward-Allowlist   : 100
-Temporary-forward   : 16
+Counted-ENOSYS      : 134
+Forward-Allowlist   : 92
+Temporary-forward   : 30
 Unclaimed-ENOSYS    : 65
 Wire-in-ring        : 17
 Total               : 338
@@ -348,13 +380,13 @@ CARRICK_ARM_RING_FIRST=0
 Because bare-metal EL1 does not access host environment variables directly, the host carrier sets a flag in the shared aperture control word during VM initialization:
 - In [`crates/carrick-el1-abi/src/lib.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-el1-abi/src/lib.rs):
   ```rust
-  pub const APERTURE_CONTROL_ARM_RING_FIRST_STRICT: u64 = 1 << 3;
+  pub const APERTURE_CONTROL_ARM_RING_FIRST_OPT_OUT: u64 = 1 << 3;
   ```
 - During boot in `carrick-vmm-hvf`:
   ```rust
   ArmRingFirstHatch::configure_aperture(aperture, image.arm_ring_first());
   ```
-- EL1 entry tests this bit: if cleared, EL1 bypasses refusal and forwards unhandled syscalls to the host carrier.
+- EL1 entry tests this bit: if set, EL1 bypasses refusal. Zero storage enforces strict admission.
 
 ### 5.3 What It Restores
 Setting `CARRICK_ARM_RING_FIRST=0`:
@@ -399,7 +431,7 @@ exit_group. The signed filter is `just test-embed arm_ring_first_ --nocapture`:
 3. **Wire-in-Ring Enabling:**
    - Ensure the 17 shared in-ring syscalls (`brk`, `mmap`, `munmap`, `mprotect`, `mremap`, `clone`, `wait4`, `exit`, `exit_group`, `getpid`, `gettid`, `set_robust_list`, `sigaltstack`, `sigprocmask`, `futex`, `inotify_add_watch`, `inotify_rm_watch`) dispatch directly to shared personality handlers on ARM EL1.
 4. **Hatch & Aperture Wiring:**
-   - Add `APERTURE_CONTROL_ARM_RING_FIRST_STRICT` flag to `carrick-el1-abi`.
+   - Add `APERTURE_CONTROL_ARM_RING_FIRST_OPT_OUT` flag to `carrick-el1-abi`.
    - Add `ArmRingFirstHatch` in `carrick-vmm-hvf` and populate aperture control flag at startup.
 5. **Verification & Testing:**
    - Unit tests in `carrick-personality-linux`.
