@@ -379,6 +379,26 @@ fn err(
     NativeProcessError::Fault
 }
 
+fn prepare_error_stage(
+    error: carrick_core::mm::transaction::MmError,
+) -> carrick_el1_abi::NativeForkFailureStage {
+    use carrick_core::mm::transaction::MmError;
+    use carrick_el1_abi::NativeForkFailureStage as Stage;
+    match error {
+        MmError::Invalid => Stage::PrepareInvalid,
+        MmError::Stale => Stage::PrepareStale,
+        MmError::Busy => Stage::PrepareBusy,
+        MmError::NoMemory => Stage::PrepareNoMemory,
+        MmError::MetadataRequired => Stage::PrepareMetadataRequired,
+        MmError::Fault => Stage::PrepareFault,
+        MmError::Core => Stage::PrepareCore,
+        MmError::Table(_) => Stage::PrepareTable,
+        MmError::Reservation(_) => Stage::PrepareReservation,
+        MmError::Wait(_) => Stage::PrepareWait,
+        MmError::UnsupportedExecutableCow => Stage::PrepareUnsupportedExecutableCow,
+    }
+}
+
 impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     for Aarch64NativeProcessService<'a, X>
 {
@@ -555,7 +575,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             Ok(plan) => plan,
             Err(e) => {
                 owner.spaces.free(index);
-                return Err(err(carrick_el1_abi::NativeForkFailureStage::Prepare, e));
+                return Err(err(prepare_error_stage(e), e));
             }
         };
         let mut custody = Vec::new();
