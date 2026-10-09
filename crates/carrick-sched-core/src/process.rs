@@ -560,6 +560,11 @@ impl TaskCredentials {
         }
     }
 
+    #[inline(always)]
+    fn id_allowed(id: Option<u32>, a: u32, b: u32, c: u32) -> bool {
+        id.is_none_or(|v| v == a || v == b || v == c)
+    }
+
     #[inline(never)]
     pub fn set_resuid(
         &mut self,
@@ -570,16 +575,12 @@ impl TaskCredentials {
         let cur_r = self.ruid.raw();
         let cur_e = self.euid.raw();
         let cur_s = self.suid.raw();
-        if !self.is_privileged() {
-            if r.is_some_and(|rv| rv != cur_r && rv != cur_e && rv != cur_s) {
-                return Err(-1);
-            }
-            if e.is_some_and(|ev| ev != cur_r && ev != cur_e && ev != cur_s) {
-                return Err(-1);
-            }
-            if s.is_some_and(|sv| sv != cur_r && sv != cur_e && sv != cur_s) {
-                return Err(-1);
-            }
+        if !self.is_privileged()
+            && (!Self::id_allowed(r, cur_r, cur_e, cur_s)
+                || !Self::id_allowed(e, cur_r, cur_e, cur_s)
+                || !Self::id_allowed(s, cur_r, cur_e, cur_s))
+        {
+            return Err(-1);
         }
         let prev_r = self.ruid;
         let prev_e = self.euid;
@@ -609,16 +610,12 @@ impl TaskCredentials {
         let cur_r = self.rgid.raw();
         let cur_e = self.egid.raw();
         let cur_s = self.sgid.raw();
-        if !self.is_gid_privileged() {
-            if r.is_some_and(|rv| rv != cur_r && rv != cur_e && rv != cur_s) {
-                return Err(-1);
-            }
-            if e.is_some_and(|ev| ev != cur_r && ev != cur_e && ev != cur_s) {
-                return Err(-1);
-            }
-            if s.is_some_and(|sv| sv != cur_r && sv != cur_e && sv != cur_s) {
-                return Err(-1);
-            }
+        if !self.is_gid_privileged()
+            && (!Self::id_allowed(r, cur_r, cur_e, cur_s)
+                || !Self::id_allowed(e, cur_r, cur_e, cur_s)
+                || !Self::id_allowed(s, cur_r, cur_e, cur_s))
+        {
+            return Err(-1);
         }
         if let Some(rv) = r {
             self.rgid = TaskGid::new(rv);
@@ -638,13 +635,11 @@ impl TaskCredentials {
         let cur_r = self.ruid.raw();
         let cur_e = self.euid.raw();
         let cur_s = self.suid.raw();
-        if !self.is_privileged() {
-            if r.is_some_and(|rv| rv != cur_r && rv != cur_e) {
-                return Err(-1);
-            }
-            if e.is_some_and(|ev| ev != cur_r && ev != cur_e && ev != cur_s) {
-                return Err(-1);
-            }
+        if !self.is_privileged()
+            && (!Self::id_allowed(r, cur_r, cur_e, cur_r)
+                || !Self::id_allowed(e, cur_r, cur_e, cur_s))
+        {
+            return Err(-1);
         }
         let set_saved = r.is_some() || (e.is_some() && e != Some(cur_r));
         let prev_r = self.ruid;
@@ -670,13 +665,11 @@ impl TaskCredentials {
         let cur_r = self.rgid.raw();
         let cur_e = self.egid.raw();
         let cur_s = self.sgid.raw();
-        if !self.is_gid_privileged() {
-            if r.is_some_and(|rv| rv != cur_r && rv != cur_e) {
-                return Err(-1);
-            }
-            if e.is_some_and(|ev| ev != cur_r && ev != cur_e && ev != cur_s) {
-                return Err(-1);
-            }
+        if !self.is_gid_privileged()
+            && (!Self::id_allowed(r, cur_r, cur_e, cur_r)
+                || !Self::id_allowed(e, cur_r, cur_e, cur_s))
+        {
+            return Err(-1);
         }
         let set_saved = r.is_some() || (e.is_some() && e != Some(cur_r));
         if let Some(rv) = r {
@@ -707,14 +700,13 @@ impl TaskCredentials {
             self.euid = target;
             self.suid = target;
             self.fsuid = target;
-            self.on_uid_change(prev_r, prev_e, prev_s, prev_f);
         } else if uid == self.ruid.raw() || uid == self.suid.raw() {
             self.euid = target;
             self.fsuid = target;
-            self.on_uid_change(prev_r, prev_e, prev_s, prev_f);
         } else {
             return Err(-1);
         }
+        self.on_uid_change(prev_r, prev_e, prev_s, prev_f);
         Ok(())
     }
 

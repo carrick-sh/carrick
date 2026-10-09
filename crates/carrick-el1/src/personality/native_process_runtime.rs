@@ -1380,6 +1380,40 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn exec_completed(&mut self, path: &[u8]) -> Result<(), i64> {
         self.exec_completed(path).map_err(|e| e.errno())
     }
+    #[inline(never)]
+    fn has_thread(&self, tid: u32) -> bool {
+        let graph = self.runtime.graph.lock();
+        if let Ok(task) = graph.owner.task(self.key) {
+            task.has_thread(tid)
+        } else {
+            false
+        }
+    }
+    #[inline(never)]
+    fn robust_list_permission(&self, tid: u32) -> Result<(), i64> {
+        let graph = self.runtime.graph.lock();
+        let caller = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
+        if caller.metadata().namespace_pid == tid || caller.has_thread(tid) {
+            return Ok(());
+        }
+        let _target = graph
+            .owner
+            .find_task_by_pid(tid)
+            .ok_or(carrick_personality_linux::identity::ESRCH)?;
+        let creds = caller.credentials_for(self.calling_tid)?;
+        if creds.is_privileged()
+            || creds
+                .cap_effective
+                .contains(carrick_sched_core::process::LinuxCapabilitySet::CAP_SYS_PTRACE)
+        {
+            Ok(())
+        } else {
+            Err(carrick_personality_linux::identity::EPERM)
+        }
+    }
 }
 
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
@@ -1440,9 +1474,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let creds = task.credentials_for_mut(caller_tid)?;
         f(creds)?;
         if is_leader {
-            let cloned = creds.clone();
-            task.metadata_mut().ruid = cloned.ruid;
-            task.metadata_mut().euid = cloned.euid;
+            let ruid = creds.ruid;
+            let euid = creds.euid;
+            task.metadata_mut().ruid = ruid;
+            task.metadata_mut().euid = euid;
         }
         Ok(())
     }
@@ -1567,16 +1602,20 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         if groups.len() > carrick_personality_linux::identity::LINUX_NGROUPS_MAX {
             return Err(carrick_personality_linux::identity::EINVAL);
         }
-        let parsed: alloc::vec::Vec<_> = groups
-            .iter()
-            .copied()
-            .map(carrick_sched_core::process::TaskGid::new)
-            .collect();
+        let mut parsed = Some(
+            groups
+                .iter()
+                .copied()
+                .map(carrick_sched_core::process::TaskGid::new)
+                .collect::<alloc::vec::Vec<_>>(),
+        );
         self.update_calling_creds(&mut |creds| {
             if !creds.is_gid_privileged() {
                 return Err(carrick_personality_linux::identity::EPERM);
             }
-            creds.groups = parsed.clone();
+            if let Some(p) = parsed.take() {
+                creds.groups = p;
+            }
             Ok(())
         })
     }
@@ -3716,5 +3755,100 @@ mod tests {
                 VisibleNamespace::new(NonZeroU32::new(99).unwrap(), NonZeroU32::new(1).unwrap());
         }
         assert_eq!(child_entry.get_ppid(), 0);
+    }
+
+    #[test]
+    fn get_robust_list_permission_checks() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let child_page = Box::new(ThreadLifecyclePage::new());
+        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        }));
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &*child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+        };
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        entry.set_calling_tid(41);
+
+        // 1. Calling thread itself is permitted
+        use carrick_personality_linux::lifecycle::ProcessNative;
+        assert_eq!(entry.robust_list_permission(41), Ok(()));
+
+        // 2. Sibling thread in caller's thread group is permitted without special capability
+        entry.thread_spawned(41, 50);
+        assert_eq!(entry.robust_list_permission(50), Ok(()));
+
+        // 3. Non-existent PID returns ESRCH
+        assert_eq!(
+            entry.robust_list_permission(999),
+            Err(carrick_personality_linux::identity::ESRCH)
+        );
+
+        // 4. Another process without ptrace capability returns EPERM
+        let child_pid = entry.fork_owned().expect("fork child succeeds") as u32;
+        // Make caller unprivileged (drop CAP_SYS_PTRACE, uid 1000)
+        use carrick_personality_linux::identity::ProcessIdentityVenue;
+        entry.set_uid(1000).unwrap();
+        assert_eq!(
+            entry.robust_list_permission(child_pid),
+            Err(carrick_personality_linux::identity::EPERM)
+        );
     }
 }

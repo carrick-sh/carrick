@@ -387,16 +387,33 @@ impl<
         thread.slot.set_clear_child_tid(address);
         true
     }
+    #[inline(never)]
     fn robust_list_for(&self, tid: i32) -> Result<(u64, u32), i64> {
         let thread = self
             .thread()
             .ok_or(carrick_personality_linux::identity::ESRCH)?;
         let cur_tid = thread.slot.visible_tid().unwrap_or(0);
         if tid == 0 || tid as u32 == cur_tid {
-            Ok(thread.slot.robust_list())
-        } else {
-            Err(carrick_personality_linux::identity::ESRCH)
+            return Ok(thread.slot.robust_list());
         }
+        let target_tid = tid as u32;
+        if let Some(process) = self.process.as_deref() {
+            process.robust_list_permission(target_tid)?;
+        }
+        if let Some(entry_ref) = thread.page.entry_ref_for_visible_tid(target_tid)
+            && let Some(child_slot) = self.born_slot(thread.page, entry_ref)
+        {
+            return Ok(child_slot.robust_list());
+        }
+        if let Some(process) = self.process.as_deref()
+            && process.has_thread(target_tid)
+        {
+            return Ok((
+                0,
+                carrick_personality_linux::thread::ROBUST_LIST_HEAD_SIZE as u32,
+            ));
+        }
+        Err(carrick_personality_linux::identity::ESRCH)
     }
     fn process_identity(
         &mut self,
