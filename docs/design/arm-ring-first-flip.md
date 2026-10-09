@@ -1,0 +1,430 @@
+# Design: Flip ARM EL1 to Ring-First with a Forward Allowlist
+
+- **Status:** Proposed
+- **Owner decision date:** 2026-10-08 (Revised per Director Review 2026-10-08)
+- **Author:** Carrick Architecture & Conformance Team
+- **Target branch:** `docs/arm-ring-first-flip`
+- **Related PRs:** ARM adoption steps 1-4 landed (PRs 124, 125, 126, 129); Step 5 wiring in progress.
+- **Companion data:** [`docs/design/arm-ring-first-flip.tsv`](arm-ring-first-flip.tsv) (338-syscall machine-readable census)
+
+---
+
+## Executive Summary & Owner Decision
+
+On 2026-10-08, the owner decided that ARM EL1 moves to the **x86 CPL0 model** immediately following Step 5:
+1. **EL1 is the authority:** EL1 serves every syscall the shared kernel implements in-ring. Any syscall the shared kernel already implements on x86 CPL0 becomes `Wire-in-ring` on ARM (enabling the existing shared handler), rather than falling back or returning `-ENOSYS`.
+2. **Strict permanent forward allowlist:** Only genuine host facility crossings (host file contents/metadata, host network, CLI terminal entropy, host clock) permanently reach the host carrier per [`docs/host-facility-boundary.md`](../host-facility-boundary.md).
+3. **Temporary-forward debt tracking:** Compat-zone objects (guest pipes, fd tables, epoll, synthetic timer/signal/event descriptors) are tracked as `Temporary-forward` until the shared fd table lands (`lane x86-fdtable`), rather than permanent allowlist entries.
+4. **Counted `-ENOSYS` on the fast path (The Real Regression):** Exactly 140 unhandled syscalls return `-ENOSYS` directly from EL1 without triggering a VM exit, accounted in aperture counters (`Counters.refused`). This is the real, bounded regression accepted by the owner.
+5. **Ordered deletion of host paths:** Dead host emulation paths in `carrick-kernel` and `carrick-vmm-hvf` (including Step 6's N1 host fork code) are removed as their ring versions land; the landing of `lane x86-fdtable` subsequently retires the temporary forward rows.
+6. **Opt-out switch:** An exact `=0` hatch (`CARRICK_ARM_RING_FIRST=0`) is provided, defaulting to **ON (`1`)**.
+
+---
+
+## 1. Today's ARM Routing Table & Census
+
+### 1.1 Methodology & Codebase Citations
+*(Methodology: READ; Mapping Analysis: READ)*
+
+Every Linux AArch64 syscall number (0 to 449 in the asm-generic ABI, totaling 338 recognized syscalls) was audited against current source code:
+- **EL1 Personality Dispatch:** [`crates/carrick-personality-linux/src/dispatch.rs:372`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L372) (`route_aarch64`).
+- **EL1 Completion & Forwarding:** [`crates/carrick-personality-linux/src/dispatch.rs:507`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L507) (`finish` records forwarded ordinals via `pending.record_forwarded(ordinal)`).
+- **Carrier Trap Loop & Dispatch:** [`crates/carrick-vmm-hvf/src/trap.rs:434`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-vmm-hvf/src/trap.rs#L434), [`crates/carrick-vmm-hvf/src/vcpu_loop/mod.rs:388`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-vmm-hvf/src/vcpu_loop/mod.rs#L388).
+- **Host SyscallDispatcher:** [`crates/carrick-kernel/src/dispatch/mod.rs:260`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/mod.rs#L260) (`dispatch`), [`crates/carrick-kernel/src/dispatch/routing.rs:38`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/routing.rs#L38) (`route_syscall` macro matching `SyscallNr::*`).
+- **Host Subsystem Handlers:**
+  - Filesystem: [`crates/carrick-kernel/src/dispatch/fs.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/fs.rs) (`fs::*`)
+  - Memory: [`crates/carrick-kernel/src/dispatch/mem.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/mem.rs) (`mem::*`)
+  - Process: [`crates/carrick-kernel/src/dispatch/proc.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/proc.rs) (`proc::*`)
+  - Signals: [`crates/carrick-kernel/src/dispatch/signal.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/signal.rs) (`signal::*`)
+  - Networking: [`crates/carrick-kernel/src/dispatch/net.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/net.rs) (`net::*`)
+  - Synchronization: [`crates/carrick-kernel/src/dispatch/sync.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/sync.rs) (`sync::*`)
+  - Time & Clocks: [`crates/carrick-kernel/src/dispatch/time.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/time.rs) (`time::*`)
+  - System: [`crates/carrick-kernel/src/dispatch/sys.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/sys.rs) (`sys::*`)
+  - Identity / Credentials: [`crates/carrick-kernel/src/dispatch/identity.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/identity.rs) (`identity::*`)
+  - IPC: [`crates/carrick-kernel/src/dispatch/ipc.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/ipc.rs) (`ipc::*`)
+- **Metadata & Deferred Support:** [`crates/carrick-abi/src/syscall.rs:188`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-abi/src/syscall.rs#L188) (`SupportLevel::BringUp`).
+
+### 1.2 Quantitative Census Summary
+
+The 338 recognized Linux AArch64 syscalls break down into 5 mutually exclusive, exhaustive categories:
+
+| Routing Category | Count | Proportion | Semantic Definition |
+|:---|:---:|:---:|:---|
+| **`Wire-in-ring`** | **17** | 5.0% | Sycalls already implemented in-ring in the shared kernel (served on x86 CPL0 today). Enabled on ARM EL1 by wiring existing shared handlers. |
+| **`Forward-Allowlist`** | **100** | 29.6% | Permanent forward allowlist: genuine host crossings only (host file content/metadata, host network, clock, hardware entropy, descriptor polling). |
+| **`Temporary-forward`** | **16** | 4.7% | Compat-zone objects (fd tables, pipes, epolls, timerfds, eventfds). Forwarded as debt until `lane x86-fdtable` lands. |
+| **`Counted-ENOSYS`** | **140** | 41.4% | **The Real Regression:** Guest authority syscalls not yet implemented in-ring, answered with `-ENOSYS` at EL1 fast path and accounted in `Counters.refused`. |
+| **`Unclaimed-ENOSYS`** | **65** | 19.2% | Baseline unrouted syscalls (`SupportLevel::BringUp`); return `-ENOSYS`. |
+| **Total** | **338** | 100.0% | Complete Linux 6.x asm-generic table. |
+
+#### Verification Command & Exact Output
+The census counts are verified mechanically against [`docs/design/arm-ring-first-flip.tsv`](arm-ring-first-flip.tsv) using Python:
+```bash
+python3 -c '
+import csv, collections
+with open("docs/design/arm-ring-first-flip.tsv") as f:
+    rows = list(csv.DictReader(f, delimiter="\t"))
+counts = collections.Counter(r["flip_routing"] for r in rows)
+for k, v in sorted(counts.items()):
+    print(f"{k:20s}: {v}")
+print(f"Total               : {len(rows)}")
+'
+```
+Verification Output:
+```
+Counted-ENOSYS      : 140
+Forward-Allowlist   : 100
+Temporary-forward   : 16
+Unclaimed-ENOSYS    : 65
+Wire-in-ring        : 17
+Total               : 338
+```
+
+---
+
+## 2. The x86 Mechanism to Reuse
+
+### 2.1 How x86 CPL0 Implements the Forward Allowlist
+*(Evidence: READ)*
+
+In x86 CPL0, the boundary is strictly enforced at native entry completion:
+- **Allowlist Definition:** [`crates/carrick-x86-cpl0/src/entry.rs:441`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-x86-cpl0/src/entry.rs#L441):
+  ```rust
+  #[repr(u64)]
+  pub enum AllowedHostCrossing {
+      Read = 0,
+      Write = 1,
+      Lseek = 8,
+      Pread64 = 17,
+      Pwrite64 = 18,
+      Exit = 60,
+      ExitGroup = 231,
+      EpollPwait = 281,
+  }
+  ```
+- **Filter and Ring Exit Gate:** [`crates/carrick-x86-cpl0/src/entry.rs:1995-2002`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-x86-cpl0/src/entry.rs#L1995-L2002):
+  ```rust
+  CompletionRoute::Forward => {
+      if AllowedHostCrossing::from_native(call.native.raw()).is_some() {
+          doorbell(FORWARD_PORT, frame);
+      } else {
+          record_refusal(counters, frame, Some(call.native.raw()));
+      }
+  }
+  ```
+- **Fast-Path Refusal & Accounting:** [`crates/carrick-x86-cpl0/src/entry.rs:468-488`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-x86-cpl0/src/entry.rs#L468-L488):
+  ```rust
+  fn record_refusal(counters: &Counters, frame: &mut NativeFrame, native: Option<u64>) {
+      frame.rax = (-38_i64) as u64; // -ENOSYS
+      let bucket = match native {
+          Some(nr) if nr < 512 => { ... nr as usize ... }
+          _ => 512,
+      };
+      counters.refused[bucket].fetch_add(1, Ordering::Relaxed);
+  }
+  ```
+- **Shared Aperture Counters:** [`crates/carrick-el1-abi/src/lib.rs:1979-2002`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-el1-abi/src/lib.rs#L1979-L2002):
+  ```rust
+  pub struct Counters {
+      pub served: [AtomicU64; 512],
+      pub forwarded: [AtomicU64; 512],
+      ...
+      pub refused: [AtomicU64; 513], // 0..511 for native ordinals, 512 for overflow/unmapped
+  }
+  ```
+
+### 2.2 What the Shared Kernel Already Serves In-Ring (`shared_inring_x86`)
+*(Evidence: READ & INFERENCE)*
+
+The shared kernel in `carrick-personality-linux` and `carrick-el1` already implements 17 syscalls in-ring for x86 CPL0. In the TSV appendix, these are recorded with `shared_inring_x86 = Yes`:
+
+| Nr | Name | Subsystem | x86 CPL0 In-Ring Evidence & Seam |
+|:---:|:---|:---|:---|
+| **27** | `inotify_add_watch` | fs | Inotify watch registration in `carrick_el1::personality::inotify` ([`dispatch.rs:384`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L384)). |
+| **28** | `inotify_rm_watch` | fs | Inotify watch removal in `carrick_el1::personality::inotify` ([`dispatch.rs:385`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L385)). |
+| **93** | `exit` | process | Thread exit in `carrick_personality_linux::lifecycle` ([`lifecycle.rs:31`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/lifecycle.rs#L31), [`dispatch.rs:387`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L387)). |
+| **94** | `exit_group` | process | Process termination in `carrick_x86_cpl0::native_process::Service` ([`lifecycle.rs:323`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/lifecycle.rs#L323), [`dispatch.rs:395`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L395)). |
+| **98** | `futex` | sched | Kernel wait/wake synchronization in `carrick_sched_core::futex` ([`dispatch.rs:386`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L386)). |
+| **99** | `set_robust_list` | process | Robust futex list registration in `carrick_personality_linux::thread` ([`thread.rs:137`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/thread.rs#L137), [`dispatch.rs:390`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L390)). |
+| **132** | `sigaltstack` | signal | Signal stack setup in `carrick_personality_linux::lifecycle` ([`lifecycle.rs:341`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/lifecycle.rs#L341), [`dispatch.rs:388`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L388)). |
+| **135** | `rt_sigprocmask` | signal | Signal mask mutation in `carrick_personality_linux::lifecycle` ([`lifecycle.rs:361`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/lifecycle.rs#L361), [`dispatch.rs:389`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L389)). |
+| **172** | `getpid` | process | PID query in `carrick_personality_linux::lifecycle` ([`lifecycle.rs:347`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/lifecycle.rs#L347), [`dispatch.rs:392`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L392)). |
+| **178** | `gettid` | process | TID query in `carrick_personality_linux::lifecycle` ([`lifecycle.rs:333`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/lifecycle.rs#L333), [`dispatch.rs:391`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L391)). |
+| **214** | `brk` | mm | Program break in `carrick_x86_cpl0::anonymous::X86AnonymousVenue` ([`anonymous.rs:11`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-x86-cpl0/src/anonymous.rs#L11), [`dispatch.rs:374`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L374)). |
+| **215** | `munmap` | mm | Address unmapping in `carrick_x86_cpl0::anonymous::X86AnonymousVenue` ([`dispatch.rs:375`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L375)). |
+| **216** | `mremap` | mm | Address remapping in `carrick_x86_cpl0::anonymous::X86AnonymousVenue` ([`dispatch.rs:376`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L376)). |
+| **220** | `clone` | process | Process/thread cloning in `carrick_x86_cpl0::native_process::Service` ([`lifecycle.rs:300`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/lifecycle.rs#L300), [`dispatch.rs:393`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L393)). |
+| **222** | `mmap` | mm | Anonymous mapping in `carrick_x86_cpl0::anonymous::X86AnonymousVenue` ([`dispatch.rs:377`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L377)). |
+| **226** | `mprotect` | mm | Memory protection in `carrick_x86_cpl0::anonymous::X86AnonymousVenue` ([`dispatch.rs:378`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L378)). |
+| **260** | `wait4` | process | Child waiting in `carrick_x86_cpl0::native_process::Service` ([`lifecycle.rs:315`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/lifecycle.rs#L315), [`dispatch.rs:394`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L394)). |
+
+Six additional syscalls have `shared_inring_x86 = Partial`:
+- `read` (63), `write` (64), `lseek` (62), `pread64` (67), `pwrite64` (68): served in-ring for delegated files / IPC ([`file.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-el1/src/personality/file.rs)), but forward to host for non-delegated host files ([`x86 entry.rs:441`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-x86-cpl0/src/entry.rs#L441)).
+- `epoll_pwait` (22): served in-ring when IPC transfers are available, but forwards to host when host descriptors or pending host work exist.
+
+On ARM, these 17 syscalls will NOT be refused with `-ENOSYS`. They are marked **`Wire-in-ring`**, binding ARM EL1 directly to the existing shared handlers (enabled via Step 5 wiring of `Aarch64Process` in [`crates/carrick-el1/src/personality/aarch64_process.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-el1/src/personality/aarch64_process.rs)).
+
+---
+
+## 3. The Proposed ARM Forward Allowlist & Debt Tracking
+
+### 3.1 Allowlist Principles per `docs/host-facility-boundary.md`
+*(Evidence: READ)*
+
+Under Carrick's architecture, host crossings are strictly permitted only for resources where the host OS is genuinely the physical authority:
+1. **Host File I/O:** Guest operations on files located within host-backed directories or cap-std sandboxes.
+2. **Host Network:** Guest network sockets bridging to host BSD sockets, loopback, or network devices.
+3. **Host Terminal / PTY:** Interactive stdin/stdout/stderr supervisor relay and hardware entropy.
+4. **Host Clock:** Monotonic and realtime wall clock time queries.
+
+All other Linux subsystems—process management, task hierarchy, credentials, credentials mapping, namespaces, anonymous memory, futexes, signals state, and IPC—belong strictly to the guest kernel authority.
+
+### 3.2 Permanent Forward Allowlist (100 syscalls)
+
+The 100 syscalls permitted to cross the host boundary permanently are:
+
+#### 1. Host File Contents & Filesystem Metadata (73 syscalls)
+- **Basic & Positioned I/O:** `read` (63), `write` (64), `lseek` (62), `pread64` (67), `pwrite64` (68), `readv` (65), `writev` (66), `preadv` (69), `pwritev` (70), `preadv2` (286), `pwritev2` (287).
+- **File Metadata & Inspection:** `fstat` (80), `newfstatat` (79), `fstatfs` (44), `statfs` (43), `statx` (291), `readlinkat` (78), `faccessat` (48), `faccessat2` (439), `getdents64` (61).
+- **VFS Topology & Links:** `openat` (56), `openat2` (437), `linkat` (37), `symlinkat` (36), `unlinkat` (35), `renameat` (38), `renameat2` (276), `mkdirat` (34), `mknodat` (33), `getcwd` (17), `chdir` (49), `fchdir` (50), `chroot` (51).
+- **File Mutation & Permissions:** `truncate` (45), `ftruncate` (46), `fallocate` (47), `fchmod` (52), `fchmodat` (53), `fchmodat2` (452), `fchown` (55), `fchownat` (54), `utimensat` (88).
+- **File Sync & Control:** `fsync` (82), `fdatasync` (83), `syncfs` (267), `sync` (81), `sync_file_range` (84), `ioctl` (29), `flock` (32).
+- **Zero-Copy & Splicing:** `sendfile` (71), `splice` (76), `tee` (77), `vmsplice` (75), `copy_file_range` (285).
+- **Host File Execution & Memory Sync:** `execve` (221), `msync` (227), `mlock` (228), `munlock` (229), `mlock2` (284), `mincore` (232), `madvise` (233).
+- **Host Extended Attributes (xattr):** `setxattr` (5), `lsetxattr` (6), `fsetxattr` (7), `getxattr` (8), `lgetxattr` (9), `fgetxattr` (10), `listxattr` (11), `llistxattr` (12), `flistxattr` (13), `removexattr` (14), `lremovexattr` (15), `fremovexattr` (16).
+
+#### 2. Host Network & BSD Sockets (18 syscalls)
+- **Socket Lifecycle:** `socket` (198), `socketpair` (199), `bind` (200), `listen` (201), `accept` (202), `accept4` (242), `connect` (203), `shutdown` (210).
+- **Addresses & Options:** `getsockname` (204), `getpeername` (205), `setsockopt` (208), `getsockopt` (209).
+- **Data Transfer:** `sendto` (206), `recvfrom` (207), `sendmsg` (211), `recvmsg` (212), `recvmmsg` (243), `sendmmsg` (269).
+
+#### 3. Host Clock & Hardware Time (6 syscalls)
+- `clock_gettime` (113), `clock_getres` (114), `clock_nanosleep` (115), `nanosleep` (101), `gettimeofday` (169), `times` (153).
+
+#### 4. Host Hardware Entropy & Descriptor Polling (3 syscalls)
+- `getrandom` (278) (hardware entropy).
+- `pselect6` (72), `ppoll` (73) (readiness polling across host descriptors).
+
+---
+
+### 3.3 Temporary-Forward Debt (16 syscalls)
+
+Per `AGENTS.md`, compat-zone objects—file descriptor tables, pipes, epolls, and synthetic descriptors—live in Carrick's kernel graph. They are NOT permanent host crossings:
+- `close` (57), `close_range` (436): descriptor table reclamation.
+- `dup` (23), `dup3` (24): descriptor table slot allocation.
+- `fcntl` (25): descriptor table manipulation and flags.
+- `pipe2` (59): in-kernel pipe buffer.
+- `epoll_create1` (20), `epoll_ctl` (21), `epoll_pwait` (22), `epoll_pwait2` (441): in-kernel epoll readiness interest lists.
+- `eventfd2` (19): synthetic counter descriptor.
+- `signalfd4` (74): synthetic signal descriptor.
+- `timerfd_create` (85), `timerfd_settime` (86), `timerfd_gettime` (87): synthetic timer descriptors.
+- `inotify_init1` (26): synthetic inotify instance creation.
+
+**Tracking Note:** All 16 syscalls are classified as **`Temporary-forward`** with the explicit notation:
+> *"Temporary-forward: compat-zone fd-table/pipe/epoll object until shared fd table lands (lane x86-fdtable)"*.
+These rows represent tracked architectural debt and will be retired into in-ring handlers when `lane x86-fdtable` lands.
+
+---
+
+### 3.4 The Real Regression: 140 Counted-ENOSYS Syscalls
+*(Evidence: READ & INFERENCE)*
+
+The real regression accepted by the owner comprises exactly **140 syscalls** that currently reach host handlers in `carrick-kernel` but belong to the guest authority. They are broken down by subsystem:
+
+1. **Credentials & Identity (20 syscalls):**
+   - `getuid` (174), `geteuid` (175), `getgid` (176), `getegid` (177), `getppid` (173), `setuid` (146), `setgid` (144), `setreuid` (145), `setregid` (143), `setresuid` (147), `getresuid` (148), `setresgid` (149), `getresgid` (150), `setfsuid` (151), `setfsgid` (152), `getgroups` (158), `setgroups` (159), `capget` (90), `capset` (91), `umask` (166).
+   - *Impact:* Identity switching and credential queries fail with `-ENOSYS`. Tests in `el1_credentials` and LTP `setuid*`/`capset*` fail until in-ring identity lands.
+2. **Process Hierarchy, Sessions & Core (8 syscalls):**
+   - `setpgid` (154), `getpgid` (155), `getsid` (156), `setsid` (157), `personality` (92), `unshare` (97), `set_tid_address` (96), `vhangup` (58).
+   - *Impact:* Daemonization and session leaders fail with `-ENOSYS`.
+3. **Inter-Task Signals (11 syscalls):**
+   - `kill` (129), `tkill` (130), `tgkill` (131), `rt_sigaction` (134), `rt_sigreturn` (139), `rt_sigpending` (136), `rt_sigtimedwait` (137), `rt_sigsuspend` (133), `rt_sigqueueinfo` (138), `rt_tgsigqueueinfo` (240), `pidfd_send_signal` (424).
+   - *Impact:* LTP `kill*` and `sigaction*` tests fail with `-ENOSYS`.
+4. **Resource Limits & Process Priority (8 syscalls):**
+   - `getrlimit` (163), `prlimit64` (261), `getrusage` (165), `setpriority` (140), `getpriority` (141), `ioprio_set` (30), `ioprio_get` (31), `prctl` (167).
+   - *Impact:* LTP `rlimit*` and `setpriority*` fail with `-ENOSYS`.
+5. **Scheduler & CPU Topology (12 syscalls):**
+   - `sched_yield` (124), `sched_setparam` (118), `sched_getparam` (121), `sched_setscheduler` (119), `sched_getscheduler` (120), `sched_get_priority_max` (125), `sched_get_priority_min` (126), `sched_rr_get_interval` (127), `sched_setaffinity` (122), `sched_getaffinity` (123), `sched_getattr` (275), `getcpu` (168).
+   - *Impact:* Sched tests flip to `TCONF`.
+6. **System V IPC & POSIX MQ (18 syscalls):**
+   - `msgget` (186), `msgsnd` (187), `msgrcv` (188), `msgctl` (189), `semget` (190), `semop` (191), `semctl` (192), `semtimedop` (193), `shmget` (194), `shmat` (195), `shmdt` (196), `shmctl` (197), `mq_open` (180), `mq_unlink` (181), `mq_timedsend` (182), `mq_timedreceive` (183), `mq_notify` (184), `mq_getsetattr` (185).
+   - *Impact:* All SysV and POSIX MQ tests report `TCONF`.
+7. **Kernel AIO & io_uring (8 syscalls):**
+   - `io_setup` (0), `io_destroy` (1), `io_submit` (2), `io_cancel` (3), `io_getevents` (4), `io_uring_setup` (425), `io_uring_enter` (426), `io_uring_register` (427).
+   - *Impact:* Async I/O LTP suites flip to `TCONF`.
+8. **Tracing, Memory Inspection & Keys (16 syscalls):**
+   - `ptrace` (117), `process_vm_readv` (270), `process_vm_writev` (271), `kcmp` (272), `membarrier` (283), `rseq` (293), `seccomp` (277), `add_key` (217), `request_key` (218), `keyctl` (219), `memfd_create` (279), `memfd_secret` (447), `process_madvise` (440), `process_mrelease` (448), `userfaultfd` (282), `bpf` (280).
+   - *Impact:* Ptrace refusal satisfies [`docs/conformance-contracts.md:741`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/docs/conformance-contracts.md#L741).
+9. **POSIX Timers & Clock Tuning (11 syscalls):**
+   - `settimeofday` (170), `adjtimex` (171), `clock_adjtime` (266), `clock_settime` (112), `timer_create` (107), `timer_gettime` (108), `timer_getoverrun` (109), `timer_settime` (110), `timer_delete` (111), `getitimer` (102), `setitimer` (103).
+   - *Impact:* Timer suites flip to `TCONF`.
+10. **System, Hostname & Mounts (28 syscalls):**
+    - `sethostname` (161), `setdomainname` (162), `syslog` (116), `reboot` (142), `uname` (160), `sysinfo` (179), `fanotify_init` (262), `fanotify_mark` (263), `name_to_handle_at` (264), `perf_event_open` (241), `readahead` (213), `fadvise64` (223), `remap_file_pages` (234), `mlockall` (230), `munlockall` (231), `execveat` (281), `waitid` (95), `get_robust_list` (100), `pidfd_open` (434), `clone3` (435), `pidfd_getfd` (438), `open_tree` (428), `move_mount` (429), `fsopen` (430), `fsconfig` (431), `fsmount` (432), `fspick` (433), `mount_setattr` (442), `futex_waitv` (449), `cachestat` (451).
+
+---
+
+## 4. Host Paths That Become Dead and Deletion Order
+
+Once the ARM flip lands, host handlers in `carrick-kernel` and `carrick-vmm-hvf` for refused syscalls will never be reached by guest execution (unless the `=0` hatch is active). They must be retired in strict dependency order:
+
+```mermaid
+flowchart TD
+    A["Step 5: ARM Ring-First Flip Lands (Allowlist Active)"] --> B["Phase 1: Delete Host Authority Stubs (Identity, IPC, AIO, Signals)"]
+    B --> C["Phase 2 (Step 6): Delete Host Fork & Quiescence Machinery"]
+    C --> D["Phase 3 (lane x86-fdtable): Retire Temporary-Forward Rows"]
+    D --> E["Phase 4: Delete Host Anonymous Memory Fallbacks"]
+    E --> F["Phase 5: Purge Dispatcher Routing Table"]
+```
+
+### 4.1 Deletion Phases
+
+#### Phase 1: Immediate Post-Flip Deletions (Unused Host Authority Stubs)
+1. **Identity & Credentials:** Delete [`crates/carrick-kernel/src/dispatch/identity.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/identity.rs) host handlers (`sys_setuid`, `sys_setgid`, `sys_setresuid`, `sys_getresuid`, `sys_capget`, `sys_capset`).
+2. **System V IPC & POSIX MQ:** Delete [`crates/carrick-kernel/src/dispatch/ipc.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/ipc.rs) (`sys_msgget`, `sys_semget`, `sys_shmget`, etc.).
+3. **Linux AIO Stubs:** Delete host stubs in [`crates/carrick-kernel/src/dispatch/fs.rs:92-96`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/fs.rs#L92-L96) (`io_setup`, `io_submit`, etc.).
+4. **Host Ptrace Stub:** Delete [`crates/carrick-kernel/src/dispatch/proc.rs:340`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/proc.rs#L340) (`sys_ptrace`).
+5. **Keyctl Stubs:** Delete [`crates/carrick-kernel/src/dispatch/sys.rs:114-125`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/sys.rs#L114-L125).
+
+#### Phase 2: Step 6 N1 Host Fork Deletion
+1. **Host Process Forking:** Delete host fork implementation in [`crates/carrick-kernel/src/dispatch/proc.rs:180-245`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/proc.rs#L180-L245) (`sys_fork`, `sys_vfork`, and host clone task emulation).
+2. **Host Fork Quiescence Barrier:** Delete [`crates/carrick-vmm-hvf/src/fork_quiesce.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-vmm-hvf/src/fork_quiesce.rs).
+3. **Host Thread Carrier Pool:** Delete host carrier thread-spawning for guest forks in [`crates/carrick-runtime/src/task_pool.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-runtime/src/task_pool.rs).
+
+#### Phase 3: Retirement of Temporary-Forward Rows (`lane x86-fdtable`)
+When the shared fd table lands:
+1. Retires all 16 `Temporary-forward` rows (`close`, `dup`, `fcntl`, `pipe2`, `epoll_*`, `timerfd_*`, `eventfd2`, `signalfd4`).
+2. Moves their routing to in-ring authority.
+3. Deletes host descriptor routing in `crates/carrick-kernel/src/dispatch/fs.rs`.
+
+#### Phase 4: Post-Memory Ring Authority Deletions
+1. **Host Mmap Arena:** Delete host anonymous memory handlers in [`crates/carrick-kernel/src/dispatch/mem.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/mem.rs) (`sys_mmap`, `sys_mprotect`, `sys_munmap`, `sys_brk`).
+2. **Host Page Allocator Fallback:** Remove carrier memory allocation fallbacks in [`crates/carrick-vmm-hvf/src/trap/cow_engine.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-vmm-hvf/src/trap/cow_engine.rs).
+
+#### Phase 5: Final Dispatcher Purge
+1. Remove all deleted syscall entries from [`crates/carrick-kernel/src/dispatch/routing.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/routing.rs).
+
+---
+
+## 5. The `=0` Opt-Out Hatch
+
+### 5.1 Single Switch Location
+*(Evidence: READ & INFERENCE)*
+
+The opt-out hatch is governed by a single environment variable:
+```bash
+CARRICK_ARM_RING_FIRST=0
+```
+- **Default value:** `1` (enabled / strict allowlist).
+- **Hatch definition location:** [`crates/carrick-vmm-hvf/src/vcpu_loop/mod.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-vmm-hvf/src/vcpu_loop/mod.rs) and communicated to EL1 via the shared aperture control word.
+
+```rust
+/// Single owner of the ARM ring-first flip opt-out policy.
+pub struct ArmRingFirstHatch;
+
+impl ArmRingFirstHatch {
+    /// Returns true if ARM EL1 enforces the strict forward allowlist (default: true).
+    /// Disabled only when CARRICK_ARM_RING_FIRST=0.
+    #[inline]
+    pub fn is_strict() -> bool {
+        match std::env::var_os("CARRICK_ARM_RING_FIRST") {
+            Some(val) => val != "0",
+            None => true,
+        }
+    }
+}
+```
+
+### 5.2 Aperture Control Word Communication
+Because bare-metal EL1 does not access host environment variables directly, the host carrier sets a flag in the shared aperture control word during VM initialization:
+- In [`crates/carrick-el1-abi/src/lib.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-el1-abi/src/lib.rs):
+  ```rust
+  pub const APERTURE_CONTROL_ARM_RING_FIRST_STRICT: u64 = 1 << 3;
+  ```
+- During boot in `carrick-vmm-hvf`:
+  ```rust
+  if ArmRingFirstHatch::is_strict() {
+      aperture.control.fetch_or(APERTURE_CONTROL_ARM_RING_FIRST_STRICT, Ordering::Release);
+  }
+  ```
+- EL1 entry tests this bit: if cleared, EL1 bypasses refusal and forwards unhandled syscalls to the host carrier.
+
+### 5.3 What It Restores
+Setting `CARRICK_ARM_RING_FIRST=0`:
+1. Restores pre-flip behavior: any syscall not implemented in EL1 generates `CompletionRoute::Forward`.
+2. The carrier takes the EL1 VM exit and calls `SyscallDispatcher::dispatch`.
+3. Allows bisecting and debugging whether an unexpected guest failure is caused by the strict allowlist refusal vs a real kernel bug.
+
+### 5.4 Test Matrix for Both Settings
+1. **Personality Unit Tests (`carrick-personality-linux`):**
+   - Test `arm_dispatch_allowlist_strict`: Asserts that `getresuid` (148) returns `CompletionRoute::Served` with result `-38` (`-ENOSYS`) and increments `counters.refused[148]`.
+   - Test `arm_dispatch_allowlist_hatch_disabled`: Asserts that when the strict flag is false, `getresuid` (148) returns `CompletionRoute::Forward` and `counters.refused[148]` remains 0.
+2. **Embed Integration Test (`crates/carrick-embed/tests/arm_ring_first_hatch.rs`):**
+   - Runs a compiled AArch64 guest binary invoking `getresuid`.
+   - Run 1 (strict / default): Validates guest gets `ENOSYS`, host dispatcher is not called, aperture `counters.refused[148] == 1`.
+   - Run 2 (`CARRICK_ARM_RING_FIRST=0`): Validates guest gets host return value, aperture `counters.refused[148] == 0`.
+
+---
+
+## 6. Ordered Implementation Plan
+
+### 6.1 Phase A: Switch, Shared Allowlist, and Counters (PR 1)
+*Goal: Minimal, tight PR to land immediately after Step 5 wiring.*
+
+1. **Shared Allowlist Definition:**
+   - Create `crates/carrick-personality-linux/src/crossing.rs`.
+   - Define `AllowedHostCrossing` with `from_native_aarch64(nr: u64)` matching the 100 allowlisted host crossings and 16 temporary forward crossings.
+   - Refactor `crates/carrick-x86-cpl0/src/entry.rs` to reuse this shared enum for x86.
+2. **ARM EL1 Refusal Hook:**
+   - In [`crates/carrick-personality-linux/src/dispatch.rs:507`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L507), intercept `CompletionRoute::Forward`.
+   - If not allowlisted and strict hatch enabled: set result to `-38` (`-ENOSYS`), increment `counters.refused[ordinal]`, return `CompletionRoute::Served`.
+3. **Wire-in-Ring Enabling:**
+   - Ensure the 17 shared in-ring syscalls (`brk`, `mmap`, `munmap`, `mprotect`, `mremap`, `clone`, `wait4`, `exit`, `exit_group`, `getpid`, `gettid`, `set_robust_list`, `sigaltstack`, `sigprocmask`, `futex`, `inotify_add_watch`, `inotify_rm_watch`) dispatch directly to shared personality handlers on ARM EL1.
+4. **Hatch & Aperture Wiring:**
+   - Add `APERTURE_CONTROL_ARM_RING_FIRST_STRICT` flag to `carrick-el1-abi`.
+   - Add `ArmRingFirstHatch` in `carrick-vmm-hvf` and populate aperture control flag at startup.
+5. **Verification & Testing:**
+   - Unit tests in `carrick-personality-linux`.
+   - Run signed embed test `just test-embed arm_ring_first_hatch`.
+
+### 6.2 Phase B: Per-Family Deletions & FD Table Landing (PRs 2 to N)
+1. **PR 2 (Host Identity & IPC Cleanup):**
+   - Delete `crates/carrick-kernel/src/dispatch/identity.rs`.
+   - Delete `crates/carrick-kernel/src/dispatch/ipc.rs`.
+2. **PR 3 (Step 6 N1 Host Fork Deletion):**
+   - Land in-ring clone/fork (Step 6).
+   - Delete `crates/carrick-vmm-hvf/src/fork_quiesce.rs`.
+   - Delete `sys_fork` and `sys_vfork` from `crates/carrick-kernel/src/dispatch/proc.rs`.
+3. **PR 4 (`lane x86-fdtable` Landing):**
+   - In-ring fd table lands.
+   - Retires the 16 `Temporary-forward` rows to `Wire-in-ring`.
+4. **PR 5 (Host Memory Fallback Deletion):**
+   - Land EL1 stage-1 mmap arena.
+   - Delete `crates/carrick-kernel/src/dispatch/mem.rs`.
+
+### 6.3 Phase C: Measurement & Audit Procedure
+
+1. **Refusal Census Diagnostic:**
+   - `carrick debug counters <run-id>` dumps `counters.refused[0..512]` and flags any non-zero buckets with their syscall names.
+2. **Workload Verification:**
+   - **`el1_` Signed Filter:** Run `just test-embed el1_`. Confirm all `el1_` suites pass.
+   - **LTP Smoke Gate:** Run `just conformance smoke`. Tabulate `TCONF` deltas; verify newly refusing tests correspond strictly to the 140 Counted-ENOSYS syscalls.
+   - **Go / CPython Ecosystem Rows:** Run `just conformance cpython` and `just conformance go`. Verify clean execution on the 100 permanent crossings, 16 temporary forward descriptors, and 17 in-ring handlers.
+
+---
+
+## 7. Evidence Citations: Read vs Inference Summary
+
+| Section | Finding / Item | Status | Primary Code Reference |
+|:---|:---|:---:|:---|
+| **1.1** | 23 EL1-first routed syscalls | **READ** | [`crates/carrick-personality-linux/src/dispatch.rs:372-401`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L372-L401) |
+| **1.1** | 250 Host dispatcher syscalls | **READ** | [`crates/carrick-kernel/src/dispatch/routing.rs:38-340`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/routing.rs#L38-L340) |
+| **1.1** | 65 Deferred BringUp syscalls | **READ** | [`crates/carrick-abi/src/syscall.rs:188-340`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-abi/src/syscall.rs#L188-L340) |
+| **2.1** | x86 `AllowedHostCrossing` & `record_refusal` | **READ** | [`crates/carrick-x86-cpl0/src/entry.rs:441-488`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-x86-cpl0/src/entry.rs#L441-L488) |
+| **2.1** | `Counters.refused: [AtomicU64; 513]` | **READ** | [`crates/carrick-el1-abi/src/lib.rs:1979-2002`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-el1-abi/src/lib.rs#L1979-L2002) |
+| **2.2** | 17 x86 shared in-ring syscalls (`shared_inring_x86 = Yes`) | **READ** | [`crates/carrick-x86-cpl0/src/entry.rs:1942-1963`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-x86-cpl0/src/entry.rs#L1942-L1963), [`crates/carrick-personality-linux/src/dispatch.rs:372-395`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L372-L395) |
+| **3.2** | 100 Permanent forward allowlist entries | **INFERENCE** | Mapped against [`docs/host-facility-boundary.md`](../host-facility-boundary.md) host facility definitions |
+| **3.3** | 16 Temporary-forward compat-zone object entries | **INFERENCE** | Derived from AGENTS compat-zone object definitions and `lane x86-fdtable` tracking |
+| **3.4** | 140 Counted-ENOSYS real regression size | **INFERENCE** | 338 total minus (17 in-ring + 100 allowlist + 16 temp-forward + 65 unclaimed) |
+| **4.1** | Step 6 N1 host fork deletion | **READ** | [`crates/carrick-vmm-hvf/src/fork_quiesce.rs:1-120`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-vmm-hvf/src/fork_quiesce.rs#L1-L120), [`crates/carrick-kernel/src/dispatch/proc.rs:180-245`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/proc.rs#L180-L245) |
+| **5.1** | `=0` Hatch naming and aperture control word | **INFERENCE** | Patterned after existing `CARRICK_DSR_ZERO_REMAP` and aperture control bitfields |
+| **6.1** | Multi-phase PR rollout ordering | **INFERENCE** | Ordered to keep each PR atomically verifiable and under review budget |
