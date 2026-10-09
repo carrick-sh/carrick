@@ -857,7 +857,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                     });
                 }
             }
-            publish_zone_slot(LoadedZoneSlot {
+            let prepared_home = publish_zone_slot(LoadedZoneSlot {
                 slot,
                 vcpu: self.raw_vcpu_id,
                 mm: task.binding().identity().mm.raw(),
@@ -867,15 +867,19 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 driver: zone_driver(self.executor_id),
                 loaded_home,
             })?;
+            if let Some(home) = prepared_home {
+                self.current
+                    .as_mut()
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor("HVPatch load lost attached engine".into())
+                    })?
+                    .install_prepared_home(home)?;
+            }
         }
         asid_load.mark_resident().map_err(|error| {
-            if let Some(slot) = self.live_mailbox_slot()
-                && let Some(zone) = carrick_kernel::el1_zone::zone()
-                && let Some(slot) = carrick_el1_abi::SlotId::from_index(slot)
-                && let Some(record) = zone.slot(slot).host_record()
-            {
-                let _ = zone.release_host_home(slot, record);
-            }
+            self.current
+                .as_mut()
+                .map(|engine| engine.discard_prepared_home());
             self.clear_live_current_task();
             TrapError::Hypervisor(format!("HVPatch ASID residence commit failed: {error}"))
         })?;
@@ -1482,7 +1486,12 @@ struct LoadedZoneSlot {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn publish_zone_slot(loaded: LoadedZoneSlot) -> Result<(), TrapError> {
+fn publish_zone_slot(
+    loaded: LoadedZoneSlot,
+) -> Result<
+    Option<carrick_sched_core::PreparedHome<'static, carrick_el1_abi::ZoneContext>>,
+    TrapError,
+> {
     let LoadedZoneSlot {
         slot,
         vcpu,
@@ -1501,7 +1510,7 @@ fn publish_zone_slot(loaded: LoadedZoneSlot) -> Result<(), TrapError> {
                 "loaded process has no EL1 zone for home publication".into(),
             ))
         } else {
-            Ok(())
+            Ok(None)
         };
     };
     if let Some(zone_slot) = carrick_el1_abi::SlotId::from_index(slot) {
@@ -1537,14 +1546,16 @@ fn publish_zone_slot(loaded: LoadedZoneSlot) -> Result<(), TrapError> {
         // executor loads it.
         zone.publish_slot(zone_slot, mm, bound_cpu, affinity);
         carrick_el1_abi::publish_zone_identity(slot, mm, serial);
-        if let Some(identity) = loaded_home
-            && zone.publish_loaded_home(zone_slot, identity).is_none()
-        {
-            return Err(TrapError::Hypervisor(
-                "loaded process home publication refused exact task binding".into(),
-            ));
-        }
-        return Ok(());
+        return loaded_home
+            .map(|identity| {
+                zone.prepare_loaded_home(zone_slot, identity)
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor(
+                            "loaded process home preparation refused exact task binding".into(),
+                        )
+                    })
+            })
+            .transpose();
     }
     Err(TrapError::Hypervisor(
         "loaded process has no EL1 zone slot".into(),

@@ -8421,12 +8421,15 @@ impl HvfInner {
                     .leased_slot()
                     .map(|slot| carrick_guest_arch::CpuId::new(u32::from(slot.raw())))
                     .unwrap_or(carrick_guest_arch::CpuId::new(u32::MAX));
-                crate::metadata_grant::handle_metadata_grant_trap(
+                let outcome = crate::metadata_grant::handle_metadata_grant_trap(
                     vcpu,
                     cpu,
                     custody,
                     vm_generation,
                 )?;
+                if let crate::metadata_grant::MetadataTrapOutcome::RootExit(status) = outcome {
+                    return Ok(Aarch64Exit::RootExit(status));
+                }
                 continue;
             }
             // Maintenance completion is a control exit, not a syscall. It

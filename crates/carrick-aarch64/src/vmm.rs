@@ -63,6 +63,10 @@ pub enum Aarch64Exit {
         current_guest_sp: Option<u64>,
     },
 
+    /// An authenticated EL1 process root exited. The VMM has accepted its
+    /// root-exit HVC; the engine carries this status to physical job teardown.
+    RootExit(carrick_sched_core::process::LinuxWaitStatus),
+
     /// An EL0 SYNCHRONOUS fault (data/instruction abort, alignment, undef, debug)
     /// the engine lowers to `TrapError::EL0Fault` then to `GuestFault`. Carries
     /// the raw architectural state both backends already build `el0_fault()`
