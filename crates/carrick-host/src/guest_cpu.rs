@@ -78,26 +78,10 @@ fn monotonic_ns() -> u64 {
 // through the same native entry).
 static NATIVE_DARWIN_PROVIDER: AtomicBool = AtomicBool::new(false);
 
-/// Switch process-total CPU readers to the native host's process accounting.
-/// Called once when a no-VMM backend enters its run loop.
-pub fn set_native_host_provider() {
-    NATIVE_DARWIN_PROVIDER.store(true, Ordering::Release);
-}
-
-/// Compatibility spelling for the Darwin native lane.
-pub fn set_native_darwin_provider() {
-    set_native_host_provider();
-}
-
 /// Whether guest CPU time is sourced from Darwin's process accounting (native
 /// exec backend) instead of the vCPU-run bracketing table.
 pub fn native_darwin_provider() -> bool {
     NATIVE_DARWIN_PROVIDER.load(Ordering::Acquire)
-}
-
-#[cfg(test)]
-pub(crate) fn clear_native_darwin_provider_for_test() {
-    NATIVE_DARWIN_PROVIDER.store(false, Ordering::Release);
 }
 
 /// The native host's process CPU total (user + system ns).
@@ -1492,39 +1476,6 @@ mod tests {
         assert_eq!(total_us(), 3000);
         reset();
         assert_eq!(total_ns(), 0);
-    }
-
-    /// Under the native provider the process totals come from Darwin's own
-    /// accounting: positive after burning CPU, monotone non-decreasing, and
-    /// identical between `total_ns` and `total_ns_including_active` (the
-    /// kernel's number has no uncommitted in-flight component). The slot table
-    /// stays empty — proof the value came from the provider, not bracketing.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn native_provider_reports_darwin_cpu_monotonically() {
-        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        reset();
-        set_native_darwin_provider();
-        let first = total_ns();
-        assert!(first > 0, "process has burned CPU before this test");
-        let mut acc: u64 = 1;
-        for _ in 0..20_000_000u64 {
-            acc = acc.wrapping_mul(6364136223846793005).wrapping_add(1);
-            acc ^= acc >> 17;
-        }
-        std::hint::black_box(acc);
-        let second = total_ns();
-        assert!(
-            second > first,
-            "Darwin CPU total must advance across a burn ({first} → {second})"
-        );
-        assert!(total_ns_including_active() >= second);
-        assert!(total_us() >= second / 1000);
-        clear_native_darwin_provider_for_test();
-        // With the provider off the slot table is authoritative again — and
-        // empty, proving the values above came from Darwin, not the slots.
-        assert_eq!(total_ns(), 0);
-        reset();
     }
 
     #[test]

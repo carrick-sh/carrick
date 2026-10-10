@@ -774,17 +774,9 @@ mod imp {
         // Linux split of "guest userspace compute" vs "kernel work on its
         // behalf". A guest that has run no vCPU (pure host bootstrap) just keeps
         // the proc_pid_rusage user time.
-        //
-        // Native provider: guest cycles ARE this process's host CPU, and
-        // `guest_cpu::total_us()` reads the SAME proc_pid_rusage counters as
-        // above — adding it would double-count. The converted user/system split
-        // is already the honest native model (guest utime = host user time,
-        // guest stime = host system time).
-        if !crate::guest_cpu::native_darwin_provider() {
-            let guest_us = crate::guest_cpu::total_us();
-            if guest_us > 0 {
-                usage.user_us = usage.user_us.saturating_add(guest_us);
-            }
+        let guest_us = crate::guest_cpu::total_us();
+        if guest_us > 0 {
+            usage.user_us = usage.user_us.saturating_add(guest_us);
         }
         Some(usage)
     }
