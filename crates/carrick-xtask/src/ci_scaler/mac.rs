@@ -30,6 +30,14 @@ pub const STATE_ROOT: &str = "/Volumes/carrick-build/carrick-ci/run";
 pub const MANIFEST: &str = "/Volumes/carrick-build/carrick-ci/runner-manifest.txt";
 /// The unprivileged account jobs run as.
 pub const RUN_USER: &str = "carrick-ci";
+/// The job home, recreated from [`SKELETON`] before every job.
+pub const JOB_HOME: &str = "/Volumes/carrick-build/carrick-ci/job-home";
+/// Root-owned skeleton for [`JOB_HOME`] (dotfiles only; no toolchains).
+pub const SKELETON: &str = "/Volumes/carrick-build/carrick-ci/skel";
+/// Root-owned, read-only toolchain: `rustup/` (RUSTUP_HOME) and `cargo/bin`.
+pub const TOOLCHAIN: &str = "/Volumes/carrick-build/carrick-ci/toolchain";
+/// macOS cron and at deny lists; both must name [`RUN_USER`].
+const SCHEDULER_DENY: [&str; 2] = ["/usr/lib/cron/cron.deny", "/usr/lib/cron/at.deny"];
 /// Runner-tree entries the runner user writes; excluded from the manifest.
 const RUNNER_WRITABLE: [&str; 2] = ["_work", "_diag"];
 /// Literal hook command in `scripts/ci/admit-job.sh` (the Willow guest path).
@@ -706,6 +714,93 @@ fn kill_all_as(user: &RunUser) {
     }
 }
 
+/// Whether a cron/at deny list names `user` on a line of its own.
+pub fn denies_user(text: &str, user: &str) -> bool {
+    text.lines().any(|line| line.trim() == user)
+}
+
+fn lchown(path: &Path, uid: u32, gid: u32) -> Result<(), ScalerError> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| ScalerError::Guard("path contains NUL"))?;
+    if unsafe { libc::lchown(c.as_ptr(), uid, gid) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// Remove a job-writable directory without following symlinks into it.
+fn wipe(path: &Path) -> Result<(), ScalerError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => Ok(std::fs::remove_dir_all(path)?),
+        Ok(_) => Ok(std::fs::remove_file(path)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn copy_tree(from: &Path, to: &Path, uid: u32, gid: u32) -> Result<(), ScalerError> {
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let source = entry.path();
+        let target = to.join(entry.file_name());
+        let meta = std::fs::symlink_metadata(&source)?;
+        if meta.file_type().is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(&source)?, &target)?;
+        } else if meta.is_dir() {
+            std::fs::DirBuilder::new()
+                .mode(meta.permissions().mode() & 0o755)
+                .create(&target)?;
+            copy_tree(&source, &target, uid, gid)?;
+        } else if meta.is_file() {
+            std::fs::copy(&source, &target)?;
+        } else {
+            return Err(ScalerError::Guard("skeleton has a special file"));
+        }
+        lchown(&target, uid, gid)?;
+    }
+    Ok(())
+}
+
+/// Before every job: recreate the job home from the `owner`-owned skeleton
+/// and empty every runner-writable work directory, all owned by the runner
+/// account. Nothing a previous job wrote (caches, launch agents, shell rc
+/// files, toolchains) survives into the next.
+pub fn reset_job_area(
+    skeleton: &Path,
+    home: &Path,
+    work: &[PathBuf],
+    owner: u32,
+    uid: u32,
+    gid: u32,
+) -> Result<(), ScalerError> {
+    let meta = std::fs::symlink_metadata(skeleton)?;
+    if !meta.is_dir() || !owner_only(&meta, owner) {
+        return Err(ScalerError::Guard(
+            "job-home skeleton must be a root-owned directory",
+        ));
+    }
+    for dir in std::iter::once(home).chain(work.iter().map(PathBuf::as_path)) {
+        wipe(dir)?;
+        std::fs::DirBuilder::new().mode(0o700).create(dir)?;
+        lchown(dir, uid, gid)?;
+    }
+    copy_tree(skeleton, home, uid, gid)
+}
+
+/// The read-only toolchain root and its rustup/cargo homes are owner-only.
+pub fn verify_toolchain(dir: &Path, owner: u32) -> Result<(), ScalerError> {
+    for path in [dir.to_path_buf(), dir.join("rustup"), dir.join("cargo/bin")] {
+        let meta = std::fs::symlink_metadata(&path)?;
+        if !meta.is_dir() || !owner_only(&meta, owner) {
+            return Err(ScalerError::Guard(
+                "toolchain must be root-owned and not group/other writable",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn quiesce(name: &str) -> Result<(), ScalerError> {
     if unsafe { libc::geteuid() } != 0 || !valid_name(name) {
         return Err(ScalerError::Guard(
@@ -725,7 +820,31 @@ pub(super) fn run_once(name: &str, binding: &RunBinding, pin: &str) -> Result<()
     }
     let runner_dir = Path::new(RUNNER_DIR);
     verify_runner_tree(runner_dir, Path::new(MANIFEST), pin, Some(0))?;
+    for list in SCHEDULER_DENY {
+        if !denies_user(&std::fs::read_to_string(list)?, RUN_USER) {
+            return Err(ScalerError::Guard(
+                "cron.deny and at.deny must both name the runner account",
+            ));
+        }
+    }
+    verify_toolchain(Path::new(TOOLCHAIN), 0)?;
     let user = run_user()?;
+    if user.home != Path::new(JOB_HOME) {
+        return Err(ScalerError::Guard(
+            "runner account's home must be the wiped job home",
+        ));
+    }
+    // Nothing from a previous job may still run, then nothing it wrote may
+    // remain: kill every runner-account process and recreate its areas.
+    kill_all_as(&user);
+    reset_job_area(
+        Path::new(SKELETON),
+        Path::new(JOB_HOME),
+        &RUNNER_WRITABLE.map(|dir| runner_dir.join(dir)),
+        0,
+        user.uid,
+        user.gid,
+    )?;
     let exe = std::env::current_exe()?;
     let state = prepare_run_once(name, &exe, Path::new(STATE_ROOT), binding, 0, user.uid)?;
     let jit = read_jit(&mut std::io::stdin().lock())?;
@@ -734,16 +853,19 @@ pub(super) fn run_once(name: &str, binding: &RunBinding, pin: &str) -> Result<()
         .write(true)
         .mode(0o600)
         .open(state.join("runner.log"))?;
+    // Read-only rustup toolchain; per-job writable CARGO_HOME in the wiped
+    // home. Jobs cannot install into, or persist anything through, PATH.
     let path = format!(
-        "{}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        user.home.display()
+        "{JOB_HOME}/.cargo/bin:{TOOLCHAIN}/cargo/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
     );
     let mut command = Command::new(runner_dir.join("run.sh"));
     command
         .current_dir(runner_dir)
         .env_clear()
         .env("PATH", path)
-        .env("HOME", &user.home)
+        .env("HOME", JOB_HOME)
+        .env("RUSTUP_HOME", format!("{TOOLCHAIN}/rustup"))
+        .env("CARGO_HOME", format!("{JOB_HOME}/.cargo"))
         .env("USER", RUN_USER)
         .env("LOGNAME", RUN_USER)
         .env("LANG", "en_US.UTF-8")
