@@ -201,6 +201,49 @@ pub trait TimerDelivery: Send + Sync {
     fn current_arm(&self, which: usize) -> Option<TimerArm>;
 }
 
+/// Shared fallback timer delivery implementation for VMM backends without an
+/// OS event pump (KVM, bhyve, NVMM). Interval timers are handled by spawning
+/// `run_fallback` (arm_itimer returns `false`), and POSIX timers spawn fallback
+/// threads via `arm_fallback_posix_timer`.
+pub struct FallbackTimerDelivery {
+    pub kicker: Arc<dyn VcpuRegistry>,
+    pub main_tid: crate::ThreadId,
+}
+
+impl FallbackTimerDelivery {
+    pub fn new(kicker: Arc<dyn VcpuRegistry>, main_tid: crate::ThreadId) -> Self {
+        Self { kicker, main_tid }
+    }
+}
+
+impl TimerDelivery for FallbackTimerDelivery {
+    fn arm_itimer(
+        &self,
+        _which: usize,
+        _spec: TimerSpecNs,
+        _needs_periodic: bool,
+        _signum: i32,
+    ) -> bool {
+        false
+    }
+
+    fn disarm_itimer(&self, which: usize) {
+        carrick_timer_core::itimer::disarm(which);
+    }
+
+    fn arm_posix(&self, id: i32, spec: TimerSpecNs) -> Option<PosixTimerSpec> {
+        arm_fallback_posix_timer(id, spec, &self.kicker)
+    }
+
+    fn disarm_posix(&self, id: i32) {
+        disarm_fallback_posix_timer(id);
+    }
+
+    fn current_arm(&self, which: usize) -> Option<TimerArm> {
+        carrick_timer_core::itimer::current_arm(which)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

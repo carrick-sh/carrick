@@ -6,15 +6,5 @@
 //! `__futex` shim existed for the retired one-host-process-per-guest-process
 //! model.
 
-use std::sync::Arc;
-
-use carrick_thread::platform_futex::{FutexTableFutex, SharedFutexTable};
-use carrick_thread::thread::FutexTable;
-
-/// The NVMM `PlatformFutex`. Construct with [`make_nvmm_futex`].
-pub type NvmmFutex = FutexTableFutex;
-
-/// Wrap the process-private `FutexTable`.
-pub fn make_nvmm_futex(table: Arc<FutexTable>, shared: SharedFutexTable) -> NvmmFutex {
-    FutexTableFutex::new(table, shared)
-}
+/// The NVMM `PlatformFutex`. Re-exported from the shared BSD futex module.
+pub use carrick_host_bsd::futex::{BsdFutex as NvmmFutex, make_bsd_futex as make_nvmm_futex};

@@ -251,17 +251,7 @@ CARRIER_SUBSTRATE_LIMITS = {
         "kill_probe",
     ): 1,
     (
-        PurePosixPath("crates/carrick-vmm-bhyve/src/bhyve_kicker.rs"),
-        "kick",
-        "pthread_kill",
-    ): 1,
-    (
-        PurePosixPath("crates/carrick-vmm-kvm/src/kvm_kicker.rs"),
-        "kick",
-        "pthread_kill",
-    ): 1,
-    (
-        PurePosixPath("crates/carrick-vmm-nvmm/src/nvmm_kicker.rs"),
+        PurePosixPath("crates/carrick-hal/src/posix_signal_kick.rs"),
         "kick",
         "pthread_kill",
     ): 1,
