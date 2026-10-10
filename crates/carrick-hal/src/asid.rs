@@ -189,6 +189,18 @@ impl AsidAllocator {
 
     /// Make a retired ASID reusable after the caller has completed the
     /// architectural invalidation for that ASID on every vCPU in the VM.
+    /// Retire a live generation whose MM the occupancy authority proved
+    /// absent from every slot; the proof is the TLB acknowledgement.
+    pub fn retire_absent(
+        &self,
+        generation: AsidGeneration,
+        absence: crate::fork_stock::SlotAbsence,
+    ) -> Result<(), AsidError> {
+        let _ = absence;
+        let retired = self.retire(generation)?;
+        self.acknowledge_tlb_flush(retired)
+    }
+
     pub fn acknowledge_tlb_flush(&self, retired: RetiredAsid) -> Result<(), AsidError> {
         let mut state = self.state.lock();
         if !state.retired.remove(&retired.generation) {

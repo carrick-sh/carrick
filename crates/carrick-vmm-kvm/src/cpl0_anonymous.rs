@@ -3,7 +3,8 @@
 use super::*;
 use carrick_el1_abi::{MmPortalSlots, PortalGrantWindow};
 use carrick_hal::fork_stock::{
-    ForkStockServiceError, GrantExecution, LifecycleWindow, NoTableLedger, lifecycle_slots,
+    ForkStockServiceError, GrantExecution, LifecycleWindow, NoTableLedger, SlotAbsence,
+    lifecycle_slots,
 };
 use carrick_mmu_core::aarch64::descriptor_txn::{
     DescriptorOp as WireOp, DescriptorTxn as WireTxn, TableGrants,
@@ -621,7 +622,7 @@ impl Cpl0HostCustody {
             .reclaim(
                 &mut NoTableLedger,
                 active,
-                |mm| !installed.contains(&mm.raw()),
+                |mm| SlotAbsence::scan(mm, installed.iter().copied()),
                 |tables| {
                     tables
                         .iter()

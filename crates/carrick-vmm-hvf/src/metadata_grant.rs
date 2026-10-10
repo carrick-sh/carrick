@@ -725,11 +725,12 @@ pub(crate) fn drain_fork_quarantine(
     let zone = zone.ok_or(ForkStockServiceError::OccupancyUnavailable)?;
     let active_mm = carrick_el1_abi::ReservationMm::new(execution.binding.mm.raw())
         .ok_or(ForkStockServiceError::StaleExecution)?;
-    let safe_to_reclaim = |mm: carrick_el1_abi::ReservationMm| {
-        (0..carrick_el1_abi::EL1_STACK_SLOTS as usize).all(|index| {
-            carrick_guest_arch::SlotId::from_index(index)
-                .is_some_and(|slot| zone.installed_space(slot) != mm.raw())
-        })
+    let installed: Vec<u64> = (0..carrick_el1_abi::EL1_STACK_SLOTS as usize)
+        .filter_map(carrick_guest_arch::SlotId::from_index)
+        .map(|slot| zone.installed_space(slot))
+        .collect();
+    let occupancy = |mm: carrick_el1_abi::ReservationMm| {
+        carrick_hal::fork_stock::SlotAbsence::scan(mm, installed.iter().copied())
     };
     let clear_tables = |pages: &[carrick_guest_arch::RootGpa]| {
         pages.iter().all(|page| {
@@ -749,7 +750,7 @@ pub(crate) fn drain_fork_quarantine(
         .reclaim_retired(
             &mut custody.el1_frame_grants.lock(),
             active_mm,
-            safe_to_reclaim,
+            occupancy,
             clear_tables,
         )
         .map(|_| ())

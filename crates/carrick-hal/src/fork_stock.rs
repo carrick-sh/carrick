@@ -82,8 +82,11 @@ pub trait ChildAddressTags {
     fn wire(tag: Self::Tag) -> Option<Asid>;
     /// Return a tag no translation was ever published under.
     fn release_unpublished(&mut self, tag: Self::Tag) -> Result<(), ForkStockServiceError>;
-    /// Retire a published tag whose invalidation the caller completed.
-    fn retire(&mut self, tag: Self::Tag) -> Result<(), ForkStockServiceError>;
+    /// Retire a published tag. `absence` proves no slot still has the MM
+    /// installed, which (installers invalidate before publishing absence)
+    /// is the TLB-invalidation acknowledgement for its tag.
+    fn retire(&mut self, tag: Self::Tag, absence: SlotAbsence)
+    -> Result<(), ForkStockServiceError>;
 }
 
 impl ChildAddressTags for AsidAllocator {
@@ -101,9 +104,12 @@ impl ChildAddressTags for AsidAllocator {
         AsidAllocator::release_unpublished(self, tag).map_err(ForkStockServiceError::Asid)
     }
 
-    fn retire(&mut self, tag: AsidGeneration) -> Result<(), ForkStockServiceError> {
-        let retired = AsidAllocator::retire(self, tag).map_err(ForkStockServiceError::Asid)?;
-        self.acknowledge_tlb_flush(retired)
+    fn retire(
+        &mut self,
+        tag: AsidGeneration,
+        absence: SlotAbsence,
+    ) -> Result<(), ForkStockServiceError> {
+        self.retire_absent(tag, absence)
             .map_err(ForkStockServiceError::Asid)
     }
 }
@@ -128,8 +134,31 @@ impl ChildAddressTags for UntaggedRoots {
         Ok(())
     }
 
-    fn retire(&mut self, (): ()) -> Result<(), ForkStockServiceError> {
+    fn retire(&mut self, (): (), _: SlotAbsence) -> Result<(), ForkStockServiceError> {
         Ok(())
+    }
+}
+
+/// Proof, from the carrier's zone occupancy authority, that no execution
+/// slot has an MM installed. Guest installers switch to the maintenance root
+/// and invalidate before publishing absence, so this is also the TLB
+/// acknowledgement a retired address tag needs. Only [`Self::scan`] mints it.
+#[derive(Debug, Eq, PartialEq)]
+pub struct SlotAbsence {
+    mm: ReservationMm,
+}
+
+impl SlotAbsence {
+    /// `installed` is every slot's installed space; `None` if any names `mm`.
+    pub fn scan(mm: ReservationMm, installed: impl IntoIterator<Item = u64>) -> Option<Self> {
+        installed
+            .into_iter()
+            .all(|space| space != mm.raw())
+            .then_some(Self { mm })
+    }
+
+    pub fn mm(&self) -> ReservationMm {
+        self.mm
     }
 }
 
@@ -781,27 +810,31 @@ impl<T: ChildAddressTags> ForkStock<T> {
     }
 
     /// Drain quarantine. A child MM is reclaimed only when it is not
-    /// `active` and `safe_to_reclaim` proves no zone slot has it installed.
+    /// `active` and `occupancy` proves no zone slot has it installed.
     /// Its tables and lifecycle record are cleared and its tag retired
     /// before anything reenters the reusable stock.
     pub fn reclaim(
         &mut self,
         ledger: &mut impl ForkTableLedger,
         active: ReservationMm,
-        safe_to_reclaim: impl Fn(ReservationMm) -> bool,
+        occupancy: impl Fn(ReservationMm) -> Option<SlotAbsence>,
         mut clear_tables: impl FnMut(&[RootGpa]) -> bool,
         mut clear_lifecycle: impl FnMut(ForkLifecycleLoan) -> bool,
         mut release: impl FnMut(ReservationMm) -> bool,
     ) -> Result<usize, ForkStockServiceError> {
         let active = MmKey::of(active);
-        let candidates: Vec<MmKey> = self
+        let candidates: Vec<(MmKey, SlotAbsence)> = self
             .quarantine
             .iter()
             .copied()
-            .filter(|key| Some(*key) != active && key.mm().is_some_and(&safe_to_reclaim))
+            .filter(|key| Some(*key) != active)
+            .filter_map(|key| {
+                let absence = occupancy(key.mm()?)?;
+                (absence.mm().raw() == key.0.get()).then_some((key, absence))
+            })
             .collect();
         let mut reclaimed = 0;
-        for key in candidates {
+        for (key, absence) in candidates {
             let mm = key.mm().ok_or(ForkStockServiceError::InvalidRecord)?;
             let child = *self
                 .children
@@ -820,7 +853,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
             if !clear_tables(pages) || !clear_lifecycle(child.lifecycle) {
                 return Err(ForkStockServiceError::MemoryAccessFailed);
             }
-            self.tags.retire(child.tag)?;
+            self.tags.retire(child.tag, absence)?;
             self.children.remove(&key);
             if let Some(pages) = self.committed_tables.remove(&key) {
                 for page in &pages {
@@ -836,17 +869,14 @@ impl<T: ChildAddressTags> ForkStock<T> {
         Ok(reclaimed)
     }
 
-    /// The container root exited: retire its tag if the root was itself a
-    /// fork child. The VM ends with the root, so its stock is not reissued.
-    pub fn retire_exited_root(&mut self, mm: ReservationMm) -> Result<(), ForkStockServiceError> {
-        let Some(key) = MmKey::of(mm) else {
-            return Ok(());
-        };
-        if let Some(child) = self.children.remove(&key) {
+    /// The container root exited and the VM ends with it: forget its custody.
+    /// Its tag is never reissued, so no absence proof (impossible while the
+    /// root is still installed on the exiting CPU) is needed.
+    pub fn retire_exited_root(&mut self, mm: ReservationMm) {
+        if let Some(key) = MmKey::of(mm) {
+            self.children.remove(&key);
             self.quarantine.remove(&key);
-            self.tags.retire(child.tag)?;
         }
-        Ok(())
     }
 }
 
