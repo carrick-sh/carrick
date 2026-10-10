@@ -120,8 +120,7 @@ pub(super) fn schedule(slot: SlotId) -> ! {
                 let mut entry = runtime
                     .enter(source, current, words, &mut service)
                     .unwrap_or_else(|_| initial_boot::fatal_boot());
-                if let Some(outcome) = entry.resume_pending_lifecycle()
-                    .unwrap_or_else(|_| initial_boot::fatal_boot()) {
+                if let Some(outcome) = entry.resume_pending_lifecycle() {
                     if let Some(reason) = entry.take_run_failure() { super::complete_run_failure(current, reason); }
                     match outcome {
                         carrick_personality_linux::lifecycle::LifecycleOutcome::Returned {
