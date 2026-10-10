@@ -48,3 +48,84 @@ runs, cause-directed fix with fork/migration and wrong-PID VM-free controls,
 two green fork witnesses, then `just test-embed el1_` compared against the
 34 explicit baseline failures plus six `el1_files` failures. The director has
 also been asked for origin/main's two Linux KVM wait4 controls; no reply yet.
+
+## Exact diagnostic artifact: f6301dc
+
+The director published the diagnostic bundle built at
+`f6301dc8256b7b8524a22ff87616961a06f549c7`, transport SHA-256
+`ac75b1195ddbe2dc8374673b373735b05a6ee7fb097f8cd372553be3f97d9cea`.
+The amended `431e556024a6acc4be24850e0b7d5bb4284d89f7` fixed a cfg(test)
+layout expectation, but fixture identity correctly refused its different ABI
+source bytes. The worktree temporarily detached at the exact committed f630
+source, restored and verified the published bundle, ran twice, then returned
+to `work/arm-adopt-step5` at 431. No other worktree was touched.
+
+Commands used the same focused filter, `--exact --nocapture`, and explicit
+`CARRICK_ARM_RING_FIRST=0`, with fresh IDs:
+`arm-step5-sol2-f630-fork-a` and `arm-step5-sol2-f630-fork-b`.
+Both failed stage 6, process refusals `[0,2,0,0,0,0]`, refused[134] zero,
+no native fork failure, unchanged parent progress, and zero survivors.
+Both unentitled controls passed. The tuple comparison was:
+
+| Identity | Run a observed | Run b observed | Registered (both) |
+|---|---:|---:|---:|
+| Task | 1 | 1 | 1 |
+| Host execution generation | 7 | 9 | 2 |
+| MM key | 2 | 2 | 2 |
+| Thread generation | 6 | 6 | 6 |
+| AddressContext generation | 9 | 9 | 3 |
+| Record id | 3 | 4 | 1 |
+| Record incarnation | 9 | 9 | 3 |
+
+Run a executable SHA-256:
+`ff7750efdb97278631182ca16ad19c912b904ffd3b8d6c8288c1b5866dac04cf`;
+CDHash `a65d801103f7bb970f1937df6930c00ad895b4b4`.
+Run b executable SHA-256:
+`68d5e5021de4b5081324fe5d2042d890ddfb7bebbb377eefb88601671ce6c071`;
+CDHash `38714715736177f1f3eafcffb1277aa4119da320`.
+Both signed executables are retained under
+`target/arm-step5-sol2/f630-{a,b}/el1_sched-3c5925ab20bafee2`.
+
+This names parent host-lane renewal, rather than a Group-stage refusal. A
+renewed host execution binding and scheduler record cannot rename the retained
+native process owner or become its AddressContext generation. The correction
+retains the canonical owner address, validates task/MM/root/lifecycle/control/
+thread identity plus the renewed execution binding, refuses a still-live old
+record, and publishes owner/member/record indices together under custody.
+Record indices retain the stable native owner key. Registered entry checks
+its exact current record independently of its host execution generation.
+The scheduler publishes visible PID from that registered record's owner.
+The group and wrong-visible-PID checks remain mandatory.
+
+`root_rehome_preserves_owner_and_migrated_child_admission` was red at the
+previous Stale rehome refusal; it now proves renewed host binding, retained
+owner and address, fork, one child migration, wrong-PID refusal, and successful
+child admission. `switched_record_publishes_its_registered_visible_pid` was
+red with PID publication removed (Some(41) versus Some(42)), and green with
+publication restored. All 323 EL1 VM-free tests and scoped all-target clippy
+passed. The exact guest stack audit remains 8176/8192 bytes.
+
+The director's KVM control on main `cb835a712` failed the same two wait4
+cases (eight passed, two failed), establishing a pre-existing main defect.
+The director requested that those defects be tracked separately; this change
+does not alter wait4 accounting.
+
+Runtime closure still needs a bundle for the correction, two focused signed
+passes on it, and then the full `el1_` comparison. These VM-free results and
+the red diagnostic artifacts do not confer signed acceptance.
+
+The first correction draft's full lint gate rejected direct personality
+registry access from the scheduler substrate. The final interface supplies a
+required selected-identity hook from the Linux scheduler client at every
+scheduler construction. The substrate invokes the hook without importing
+Linux policy. All 323 EL1 tests and scoped clippy pass with this interface;
+`check-personality-boundary` reports nine clean substrate crates, and the
+fork stack remains 8176/8192 bytes. The rejected draft is not signed evidence.
+
+Deferred integration obligation from the director: after the identity work
+lands and this branch rebases onto main, ARM scheduler resume must call
+`resume_pending_lifecycle()` and route `take_run_failure()` through
+`crate::isa::aarch64::complete_native_run_failure`, matching the x86 scheduler.
+Add the VM-free exit-parked-behind-a-birth-claim / settlement / completed-exit
+witness then. The director explicitly requested continuing rehome first;
+that later integration has not been performed or claimed here.

@@ -368,8 +368,14 @@ impl<'a, M: Clone, C: ProcessContext> Clone for NativeOwnerMember<'a, M, C> {
 struct NativeRegistryState<'a, M: Clone, C: ProcessContext> {
     members: BTreeMap<NativeExecutionKey, NativeOwnerMember<'a, M, C>>,
     groups: BTreeMap<NativeGroupKey, (Arc<NativeProcessRuntime<'a, M, C>>, TaskKey)>,
-    records: BTreeMap<NativeRecordKey, Arc<NativeProcessRuntime<'a, M, C>>>,
+    records: BTreeMap<NativeRecordKey, (Arc<NativeProcessRuntime<'a, M, C>>, TaskKey)>,
     by_process: BTreeMap<(usize, TaskKey), (NativeGroupKey, Vec<NativeExecutionKey>)>,
+}
+
+/// A renewed host lane retains this native owner and address context.
+pub struct NativeRootRehome<'a, M: Clone, C: ProcessContext> {
+    pub runtime: Arc<NativeProcessRuntime<'a, M, C>>,
+    pub address: AddressContext<RootGpa>,
 }
 
 /// Shared owner registry. Each admitted root owns an independent process
@@ -461,7 +467,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         state
             .by_process
             .insert((key.carrier, key.task), (group_key, vec![key]));
-        state.records.insert(record_key, runtime.clone());
+        state
+            .records
+            .insert(record_key, (runtime.clone(), key.task));
         *runtime.registry.lock() = Some(self);
         Ok(())
     }
@@ -491,7 +499,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .lock()
             .records
             .get(&Self::record_key(zone, record))
-            .cloned()
+            .map(|(runtime, _)| runtime.clone())
     }
 
     /// The exact admitted process address for a published thread-group
@@ -508,6 +516,140 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         runtime.task_binding(process).map(|binding| binding.address)
     }
 
+    /// Renew an authenticated host leader's execution lane without renaming
+    /// its native owner or changing the owned address-context generation.
+    #[inline(never)]
+    pub fn rehome_root(
+        &self,
+        source: BornInZoneSource<'a, C>,
+        current: &'a CurrentTask,
+        observed: AddressContext<RootGpa>,
+        page: &'a ThreadLifecyclePage,
+        control: &'a ThreadControlSlot,
+    ) -> Result<NativeRootRehome<'a, M, C>, NativeProcessError> {
+        let binding = super::common_entry::execution_binding(current);
+        let pid = current.visible_pid().ok_or(NativeProcessError::Stale)?;
+        if control.entry().is_some()
+            || current.metadata.lifecycle_page.load(Ordering::Acquire)
+                != core::ptr::from_ref(page).addr() as u64
+            || current.metadata.control_slot.load(Ordering::Acquire)
+                != core::ptr::from_ref(control).addr() as u64
+        {
+            return Err(NativeProcessError::Stale);
+        }
+        let record = source
+            .zone
+            .slot(source.slot)
+            .current()
+            .or_else(|| source.zone.slot(source.slot).host_record())
+            .ok_or(NativeProcessError::Stale)?;
+        carrick_core::entry::prepare_handoff(binding, source, record)
+            .ok_or(NativeProcessError::Stale)?;
+        let new_record = source.zone.record_ref(record);
+        let group = Self::group_key(source.zone, observed, page, pid);
+        let mut state = self.state.lock();
+        let (runtime, process) = state
+            .groups
+            .get(&group)
+            .cloned()
+            .ok_or(NativeProcessError::Stale)?;
+        let mut graph = runtime.graph.lock();
+        let row = graph
+            .owner
+            .task_mut(process)
+            .map_err(|_| NativeProcessError::Stale)?;
+        let resources = row.native_mut().resources_mut();
+        if !core::ptr::eq(resources.page, page)
+            || !core::ptr::eq(resources.control, control)
+            || process.id.raw() as u64 != binding.task.raw()
+            || resources.address.mm != observed.mm
+            || resources.address.root != observed.root
+        {
+            return Err(NativeProcessError::Stale);
+        }
+        let (_, keys) = state
+            .by_process
+            .get(&(core::ptr::from_ref(source.zone).addr(), process))
+            .ok_or(NativeProcessError::Stale)?;
+        let old_key = *keys
+            .iter()
+            .find(|key| {
+                state
+                    .members
+                    .get(key)
+                    .is_some_and(|member| member.record == resources.record)
+            })
+            .ok_or(NativeProcessError::Stale)?;
+        if old_key.thread_generation != binding.thread_generation.raw() {
+            return Err(NativeProcessError::Stale);
+        }
+        let address = resources.address;
+        let new_key = NativeExecutionKey::new(source.zone, binding, address)?;
+        let old_record = resources.record;
+        if old_key == new_key && old_record == new_record {
+            drop(graph);
+            return Ok(NativeRootRehome { runtime, address });
+        }
+        // A live or still-homed old lane cannot lend its owner to a second lane.
+        if old_record != new_record && source.zone.record_ref(old_record.id) == old_record {
+            let old = source.zone.record(old_record.id);
+            if old.claim() != carrick_sched_core::Claim::Free || old.home().is_some() {
+                return Err(NativeProcessError::Busy);
+            }
+        }
+        let new_record_key = Self::record_key(source.zone, new_record);
+        if (new_key != old_key && state.members.contains_key(&new_key))
+            || (new_record != old_record && state.records.contains_key(&new_record_key))
+        {
+            return Err(NativeProcessError::Busy);
+        }
+        let leader_index = resources
+            .members
+            .iter()
+            .position(|member| member.thread == process)
+            .ok_or(NativeProcessError::Stale)?;
+        let key_index = keys
+            .iter()
+            .position(|key| *key == old_key)
+            .ok_or(NativeProcessError::Stale)?;
+        let mut member = state
+            .members
+            .get(&old_key)
+            .cloned()
+            .ok_or(NativeProcessError::Stale)?;
+        member.record = new_record;
+        let (_, keys) = state
+            .by_process
+            .get_mut(&(new_key.carrier, process))
+            .ok_or(NativeProcessError::Stale)?;
+        // All refusing checks precede the single locked index/owner publication.
+        keys[key_index] = new_key;
+        resources.record = new_record;
+        resources.members[leader_index].record = new_record;
+        state.members.remove(&old_key);
+        state
+            .records
+            .remove(&Self::record_key(source.zone, old_record));
+        state
+            .records
+            .insert(new_record_key, (runtime.clone(), process));
+        state.members.insert(new_key, member);
+        drop(graph);
+        Ok(NativeRootRehome { runtime, address })
+    }
+
+    /// The visible process identity belongs to the registered record's owner.
+    pub fn visible_pid_for_record(&self, zone: &ZoneTables<C>, record: RecordRef) -> Option<u32> {
+        let (runtime, process) = self
+            .state
+            .lock()
+            .records
+            .get(&Self::record_key(zone, record))
+            .cloned()?;
+        let graph = runtime.graph.lock();
+        Some(graph.owner.task(process).ok()?.metadata().namespace_pid)
+    }
+
     /// Diagnostic identity of the registered leader for this exact group.
     /// Address generation remains separate from scheduler record incarnation.
     pub fn registered_group_identity(
@@ -519,11 +661,18 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
     ) -> Option<[u64; 7]> {
         let group = Self::group_key(zone, address, page, visible_pid);
         let state = self.state.lock();
-        let (_, process) = state.groups.get(&group)?;
+        let (runtime, process) = state.groups.get(&group)?;
+        let graph = runtime.graph.lock();
+        let record = graph.owner.task(*process).ok()?.native().resources().record;
         let (_, keys) = state
             .by_process
             .get(&(core::ptr::from_ref(zone).addr(), *process))?;
-        let key = keys.iter().find(|key| key.task == *process)?;
+        let key = keys.iter().find(|key| {
+            state
+                .members
+                .get(key)
+                .is_some_and(|member| member.record == record)
+        })?;
         let member = state.members.get(key)?;
         Some([
             key.task.id.raw() as u64,
@@ -593,7 +742,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             (child_key.carrier, child.child),
             (group_key, vec![child_key]),
         );
-        state.records.insert(record_key, runtime);
+        state.records.insert(record_key, (runtime, child.child));
         Ok(())
     }
 
@@ -691,7 +840,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .ok_or(NativeProcessError::Stale)?
             .1
             .push(key);
-        state.records.insert(record_key, runtime.clone());
+        state.records.insert(record_key, (runtime.clone(), process));
         Ok(runtime)
     }
 
@@ -1047,10 +1196,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         {
             return Err(NativeProcessError::Stale);
         }
-        if member.process == member_key.task {
-            if resources.record != source.zone.record_ref(record) {
-                return Err(NativeProcessError::Stale);
-            }
+        if member.record != source.zone.record_ref(record) {
+            return Err(NativeProcessError::Stale);
+        }
+        if resources.record == member.record {
             *row.context_mut() = *words;
         }
         drop(graph);
@@ -1085,6 +1234,22 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         let key = TaskKey {
             id: TaskId::from_abi_positive(i32::try_from(identity.tid).ok()?).ok()?,
             serial: TaskSerial::from_raw_u64(identity.generation)?,
+        };
+        let registry = *self.registry.lock();
+        let key = if let Some(registry) = registry {
+            let state = registry.state.lock();
+            let (runtime, process) =
+                state
+                    .records
+                    .get(&NativeProcessRegistry::<M, C>::record_key(
+                        self.zone, record,
+                    ))?;
+            if !core::ptr::eq(Arc::as_ptr(runtime), self) {
+                return None;
+            }
+            *process
+        } else {
+            key
         };
         let graph = self.graph.lock();
         let row = graph.owner.task(key).ok()?;
@@ -3222,6 +3387,184 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn root_rehome_preserves_owner_and_migrated_child_admission() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        // SAFETY: the fixture owns aligned zero-valid scheduler storage.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let registry = NativeProcessRegistry::<AddressContext<RootGpa>, ParkedContextWords>::new();
+        let page = ThreadLifecyclePage::new();
+        let control = ThreadControlSlot::new();
+        let child_page = ThreadLifecyclePage::new();
+        let child_controls = core::array::from_fn::<_, 9, _>(|_| ThreadControlSlot::new());
+        let task = CurrentTask::new();
+        let slot = carrick_sched_core::SlotId::new(0);
+        let target = carrick_sched_core::SlotId::new(1);
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(
+            core::ptr::from_ref(&page).addr() as u64,
+            core::ptr::from_ref(&control).addr() as u64,
+        );
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        let identity = ThreadIdentity {
+            tid: 41,
+            serial: 101,
+            mm: 1,
+            file_table: 5,
+            generation: 11,
+            affinity: 1,
+            lifecycle_page: core::ptr::from_ref(&page).addr() as u64,
+            control_slot: core::ptr::from_ref(&control).addr() as u64,
+        };
+        let old = zone.current_or_new(slot, identity).unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        let runtime = Arc::new(
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap(),
+        );
+        registry
+            .register_root(runtime.clone(), source, &task, address)
+            .unwrap();
+        let parent = runtime.record_binding(zone.record_ref(old)).unwrap().key;
+        assert!(zone.release_host_home(slot, old));
+        let identity = ThreadIdentity {
+            generation: 19,
+            ..identity
+        };
+        task.execution.generation.store(19, Ordering::Release);
+        let new = zone.current_or_new(slot, identity).unwrap();
+        let observed = AddressContext {
+            generation: ContextGeneration::new(
+                NonZeroU64::new(zone.record(new).incarnation()).unwrap(),
+            ),
+            ..address
+        };
+        task.publish_visible_pid(99);
+        assert!(
+            registry
+                .rehome_root(source, &task, observed, &page, &control)
+                .is_err()
+        );
+        task.publish_visible_pid(41);
+        let NativeRootRehome {
+            runtime: rehomed,
+            address: retained_address,
+        } = registry
+            .rehome_root(source, &task, observed, &page, &control)
+            .unwrap();
+        assert!(Arc::ptr_eq(&rehomed, &runtime));
+        assert_eq!(retained_address, address);
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+        };
+        let child;
+        {
+            let mut entry = runtime
+                .enter_registered(
+                    &registry,
+                    source,
+                    &task,
+                    address,
+                    Box::new(words(address)),
+                    &mut service,
+                )
+                .unwrap();
+            assert_eq!(
+                entry.key, parent,
+                "host lease renewal must not rename the owner"
+            );
+            let LifecycleOutcome::Returned { result, .. } = entry.fork() else {
+                panic!("fork");
+            };
+            assert_eq!(result.raw(), 42);
+            child = runtime.namespace_child_key(parent, 42).unwrap();
+        }
+        let binding = runtime.task_binding(child).unwrap();
+        zone.drive(target, 1);
+        zone.publish_slot(target, binding.address.mm.raw().get(), Some(0), 1);
+        zone.enter_guest(target);
+        zone.install_space(target, binding.address.mm.raw().get())
+            .unwrap();
+        assert!(!zone.enter_idle(target, false));
+        assert!(zone.enter_idle(target, true));
+        let mut effects = WakeEffects::default();
+        assert_eq!(zone.migrate_queued(slot, &mut effects), 1);
+        assert_eq!(
+            zone.switch_in_full(target).unwrap().record,
+            binding.record.id
+        );
+        let identity = zone.record(binding.record.id).identity();
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(child.id.raw()),
+            identity.generation,
+            identity.file_table,
+        );
+        task.mm
+            .key
+            .store(binding.address.mm.raw().get(), Ordering::Release);
+        task.mm
+            .thread_generation
+            .store(identity.serial, Ordering::Release);
+        task.publish_lifecycle(identity.lifecycle_page, identity.control_slot);
+        let child_source = BornInZoneSource {
+            zone: &zone,
+            slot: target,
+        };
+        assert!(matches!(
+            runtime.enter_registered(
+                &registry,
+                child_source,
+                &task,
+                binding.address,
+                Box::new(binding.words),
+                &mut service
+            ),
+            Err(NativeProcessError::Stale)
+        ));
+        task.publish_visible_pid(binding.visible_pid);
+        assert!(
+            runtime
+                .enter_registered(
+                    &registry,
+                    child_source,
+                    &task,
+                    binding.address,
+                    Box::new(binding.words),
+                    &mut service
+                )
+                .is_ok()
+        );
+    }
+
     #[test]
     fn two_roots_in_one_carrier_have_independent_fork_and_wait_authority() {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();

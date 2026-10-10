@@ -3079,6 +3079,7 @@ fn prepared_copy_el1_edit_parks_then_commit_or_cancel_wakes_exact_saved_syscall(
             let original = frame.x;
             let key = portal.prepared_wait_key(transfer.handle).unwrap();
             let mut sched = Sched {
+                selected_identity: crate::personality::sched::publish_selected_identity,
                 handoff: None,
                 zone,
                 slot,
@@ -3363,6 +3364,7 @@ fn schedulerless_settlement_preserves_prepared_permit(cancel: bool) {
     frame.elr = 0x1004;
     let original = frame.x;
     let mut sched = Sched {
+        selected_identity: crate::personality::sched::publish_selected_identity,
         handoff: None,
         zone,
         slot,

@@ -133,6 +133,8 @@ pub struct Sched<'a, C: ThreadCpu, U: UserWord> {
     pub cpu: &'a mut C,
     pub user: &'a U,
     pub counters: &'a Counters,
+    /// The client publishes its owner identity for this exact selected record.
+    pub selected_identity: fn(&ZoneTables, carrick_sched_core::RecordRef, &CurrentTask),
     pub handoff: Option<&'a mut Option<carrick_el1_abi::EntryHandoffReceipt<ZoneContext>>>,
 }
 
@@ -369,6 +371,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         if let Some(result) = switched.result {
             frame.x[0] = result;
         }
+        (self.selected_identity)(zone, zone.record_ref(switched.record), self.task);
         publish_identity(self.task, rec.identity());
         if zone.slot(slot).queued() != 0 {
             zone.slot(slot).restart_slice(self.cpu.now());

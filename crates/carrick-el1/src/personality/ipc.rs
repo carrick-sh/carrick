@@ -1108,6 +1108,7 @@ mod tests {
             {
                 let zone: &ZoneTables = &self.zone;
                 let sched = Sched {
+                    selected_identity: crate::personality::sched::publish_selected_identity,
                     handoff: None,
                     zone,
                     slot: SLOT,
@@ -1135,6 +1136,7 @@ mod tests {
         fn call(&mut self, frame: &mut TrapFrame) -> IpcServed {
             let zone: &ZoneTables = &self.zone;
             let mut sched = Sched {
+                selected_identity: crate::personality::sched::publish_selected_identity,
                 handoff: None,
                 zone,
                 slot: SLOT,

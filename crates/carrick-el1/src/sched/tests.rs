@@ -85,6 +85,7 @@ fn serve_on(
         host_publish(zone, slot, task.mm.key.load(Ordering::Relaxed), None, 0);
     }
     Sched {
+        selected_identity: crate::personality::sched::publish_selected_identity,
         handoff: None,
         zone,
         slot,
@@ -279,6 +280,7 @@ fn host_request_during_repark(kind: Handback) {
     set_op(&mut frame, uaddr, FUTEX_WAIT_PRIVATE, 0);
     let before = frame;
     let result = Sched {
+        selected_identity: crate::personality::sched::publish_selected_identity,
         handoff: None,
         zone: &zone,
         slot: SLOT,
@@ -549,6 +551,7 @@ fn a_wake_hands_a_thread_to_the_idle_vcpu_it_belongs_to() {
     // OTHER's idle loop takes the SGI and runs B.
     cpu_b.pending.push_back(GIC_RESCHED_INTID);
     let served = Sched {
+        selected_identity: crate::personality::sched::publish_selected_identity,
         handoff: None,
         zone: &zone,
         slot: OTHER,
@@ -600,6 +603,7 @@ fn the_virtual_timer_preempts_a_compute_loop() {
     let a_running = (frame, cpu.regs.clone());
     let irq = |frame: &mut TrapFrame, cpu: &mut FakeCpu| {
         Sched {
+            selected_identity: crate::personality::sched::publish_selected_identity,
             handoff: None,
             zone: &zone,
             slot: SLOT,
@@ -648,6 +652,7 @@ fn a_kick_taken_at_el0_forwards() {
     cpu.pending.push_back(GIC_KICK_INTID);
     let copy = frame;
     let action = Sched {
+        selected_identity: crate::personality::sched::publish_selected_identity,
         handoff: None,
         zone: &zone,
         slot: SLOT,
@@ -945,6 +950,7 @@ fn a_slice_ending_before_a_host_runnable_thread_leaves_for_the_host() {
     let slice = cpu.freq / 1000 * 2;
     let irq = |frame: &mut TrapFrame, cpu: &mut FakeCpu| {
         Sched {
+            selected_identity: crate::personality::sched::publish_selected_identity,
             handoff: None,
             zone: &zone,
             slot: SLOT,
@@ -994,6 +1000,7 @@ fn the_idle_entry_runs_a_queued_thread_or_leaves_for_the_host() {
     idle_task.mm.key.store(MM, Ordering::Relaxed);
     let entry = |frame: &mut TrapFrame, cpu: &mut FakeCpu, task: &CurrentTask| {
         Sched {
+            selected_identity: crate::personality::sched::publish_selected_identity,
             handoff: None,
             zone: &zone,
             slot: SLOT,
@@ -1062,6 +1069,7 @@ fn an_idle_vcpu_steals_a_queued_thread() {
     };
     let mut idle_cpu = FakeCpu::default();
     let action = Sched {
+        selected_identity: crate::personality::sched::publish_selected_identity,
         handoff: None,
         zone: &zone,
         slot: other,
@@ -1437,6 +1445,7 @@ fn el1_ipc_wait_cross_mm_resume_restores_arguments_and_owned_operation() {
     let a_pc = OperationResumePc::new(0x9000).unwrap();
     let counter = counters();
     let mut sched = Sched {
+        selected_identity: crate::personality::sched::publish_selected_identity,
         handoff: None,
         zone: &zone,
         slot: SLOT,
@@ -1541,6 +1550,7 @@ fn el1_ipc_wait_cross_slot_wake_sends_sgi_after_queue_unlock() {
     let task = task_for(101);
     let mut cpu = FakeCpu::default();
     let mut sched = Sched {
+        selected_identity: crate::personality::sched::publish_selected_identity,
         handoff: None,
         zone: &zone,
         slot: SLOT,
@@ -1630,6 +1640,7 @@ fn fresh_record_park_refusal_does_not_leak_unpublished_record_on_occupied_timer_
     let (frame, mut cpu) = live(0xa, 0x4000, FUTEX_WAIT_PRIVATE, 0);
     let counter = counters();
     let mut sched = Sched {
+        selected_identity: crate::personality::sched::publish_selected_identity,
         handoff: None,
         zone: &zone,
         slot: SLOT,
@@ -1677,4 +1688,69 @@ fn fresh_record_park_refusal_does_not_leak_unpublished_record_on_occupied_timer_
         None,
         "guard error must not leak fresh record"
     );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn switched_record_publishes_its_registered_visible_pid() {
+    use crate::personality::native_process_runtime::NativeProcessRuntime;
+    use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
+    let zone = Box::leak(zone());
+    let task = Box::leak(Box::new(task_for(202)));
+    let page = Box::leak(Box::new(carrick_el1_abi::ThreadLifecyclePage::new()));
+    let control = Box::leak(Box::new(carrick_el1_abi::ThreadControlSlot::new()));
+    task.publish_visible_pid(42);
+    task.publish_lifecycle(
+        core::ptr::from_ref(page).addr() as u64,
+        core::ptr::from_ref(control).addr() as u64,
+    );
+    publish_space(zone, MM, TTBR_MM);
+    host_publish(zone, SLOT, MM, None, 0);
+    zone.enter_guest(SLOT);
+    let identity = ThreadIdentity {
+        lifecycle_page: core::ptr::from_ref(page).addr() as u64,
+        control_slot: core::ptr::from_ref(control).addr() as u64,
+        ..identity(202)
+    };
+    let record = zone.current_or_new(SLOT, identity).unwrap();
+    let address = AddressContext {
+        root: RootGpa::page_aligned(FrameGpa::new(
+            TTBR_MM & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK,
+        ))
+        .unwrap(),
+        mm: MmGeneration::new(core::num::NonZeroU64::new(MM).unwrap()),
+        generation: ContextGeneration::new(core::num::NonZeroU64::MIN),
+    };
+    let saved = Aarch64ParkedContext::from_register(ThreadCtx::ZERO, TTBR_MM, MM, 1);
+    let source = carrick_el1_abi::BornInZoneSource { zone, slot: SLOT };
+    let runtime = std::sync::Arc::new(
+        NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::owner_mmu::Aarch64Mmu>(
+            source, task, page, control, address, address, saved,
+        )
+        .unwrap(),
+    );
+    crate::personality::aarch64_process::registry()
+        .register_root(runtime, source, task, address)
+        .unwrap();
+    // SAFETY: the fresh host home is owned by this fixture and unpublished.
+    unsafe {
+        *zone.record(record).ctx_mut() = saved;
+    }
+    zone.requeue_preempted(SLOT, record);
+    let selected = zone.switch_in_full(SLOT).unwrap();
+    task.publish_visible_pid(41); // the previous process on this carrier slot
+    let mut cpu = FakeCpu::default();
+    let mut frame = TrapFrame::default();
+    let mut sched = Sched {
+        selected_identity: crate::personality::sched::publish_selected_identity,
+        zone,
+        slot: SLOT,
+        task,
+        cpu: &mut cpu,
+        user: &HardwareUserWord,
+        counters: counters(),
+        handoff: None,
+    };
+    assert!(sched.load(&mut frame, selected));
+    assert_eq!(task.visible_pid(), Some(42));
 }
