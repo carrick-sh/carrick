@@ -1,7 +1,13 @@
 //! Linux futex decoding, timeout admission and completion values.
+use crate::dispatch::FamilyCompletion;
 use crate::entry::SyscallResult;
 use carrick_core_abi::ReservationMm;
 use carrick_guest_arch::{CounterTick, UserVa};
+use carrick_syscall_abi::{
+    LINUX_EFAULT, LINUX_EINVAL, LINUX_ESRCH, LINUX_SCHED_BATCH, LINUX_SCHED_DEADLINE,
+    LINUX_SCHED_FIFO, LINUX_SCHED_IDLE, LINUX_SCHED_OTHER, LINUX_SCHED_OTHER_SLICE_BYTES,
+    LINUX_SCHED_RR, LinuxErrno,
+};
 
 #[derive(Clone, Copy)]
 pub struct FutexFrequency(u64);
@@ -118,4 +124,79 @@ pub fn serve_futex<V: FutexVenue>(call: FutexCall, venue: &mut V) -> Option<V::S
 
 pub fn is_served_futex_op(ordinal: u64, args: [u64; 6]) -> bool {
     ordinal == SYS_FUTEX as u64 && FutexCall { args }.admitted()
+}
+
+/// Scheduling calls served directly in-ring.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchedCall {
+    GetPriorityMax,
+    GetPriorityMin,
+    RrGetInterval,
+}
+
+/// Execution venue and guest memory access for in-ring scheduling operations.
+pub trait SchedVenue {
+    fn argument(&self, index: usize) -> u64;
+    fn current_pid(&self) -> Option<u32> {
+        None
+    }
+    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool {
+        let _ = (dst, src);
+        false
+    }
+}
+
+pub fn sched_priority_min(policy: i32) -> Result<i64, LinuxErrno> {
+    match policy {
+        LINUX_SCHED_OTHER | LINUX_SCHED_BATCH | LINUX_SCHED_IDLE | LINUX_SCHED_DEADLINE => Ok(0),
+        LINUX_SCHED_FIFO | LINUX_SCHED_RR => Ok(1),
+        _ => Err(LINUX_EINVAL),
+    }
+}
+
+pub fn sched_priority_max(policy: i32) -> Result<i64, LinuxErrno> {
+    match policy {
+        LINUX_SCHED_OTHER | LINUX_SCHED_BATCH | LINUX_SCHED_IDLE | LINUX_SCHED_DEADLINE => Ok(0),
+        LINUX_SCHED_FIFO | LINUX_SCHED_RR => Ok(99),
+        _ => Err(LINUX_EINVAL),
+    }
+}
+
+pub fn serve_sched(call: SchedCall, venue: &mut dyn SchedVenue) -> FamilyCompletion {
+    match call {
+        SchedCall::GetPriorityMax => {
+            let policy = venue.argument(0) as i32;
+            match sched_priority_max(policy) {
+                Ok(max) => FamilyCompletion::Complete(max),
+                Err(err) => FamilyCompletion::Complete(err.guest_retval()),
+            }
+        }
+        SchedCall::GetPriorityMin => {
+            let policy = venue.argument(0) as i32;
+            match sched_priority_min(policy) {
+                Ok(min) => FamilyCompletion::Complete(min),
+                Err(err) => FamilyCompletion::Complete(err.guest_retval()),
+            }
+        }
+        SchedCall::RrGetInterval => {
+            let pid = venue.argument(0) as i32;
+            let interval = venue.argument(1);
+            if pid < 0 {
+                return FamilyCompletion::Complete(LINUX_EINVAL.guest_retval());
+            }
+            if interval == 0 {
+                return FamilyCompletion::Complete(LINUX_EFAULT.guest_retval());
+            }
+            if pid != 0 {
+                let self_pid = venue.current_pid().unwrap_or(0) as i32;
+                if pid != self_pid {
+                    return FamilyCompletion::Complete(LINUX_ESRCH.guest_retval());
+                }
+            }
+            if !venue.copy_out(UserVa::new(interval), &LINUX_SCHED_OTHER_SLICE_BYTES) {
+                return FamilyCompletion::Complete(LINUX_EFAULT.guest_retval());
+            }
+            FamilyCompletion::Complete(0)
+        }
+    }
 }
