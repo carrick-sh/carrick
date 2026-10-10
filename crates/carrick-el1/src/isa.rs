@@ -103,7 +103,7 @@ pub mod x86_initial_mm;
 
 /// Validate guest-controlled ARM signal resume state before register publication.
 pub const fn signal_resume_is_el0(pstate: u64) -> bool {
-    pstate & !carrick_syscall_abi::LINUX_AARCH64_SIGNAL_USER_PSTATE_MASK == 0
+    pstate & !carrick_syscall_abi::AARCH64_EL0_USER_PSTATE_MASK == 0
 }
 
 #[cfg(test)]
