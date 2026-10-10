@@ -27,13 +27,22 @@ type ActiveGuestTimers = carrick_vmm_hvf::timer_delivery::HvfGuestTimers;
 // glue, and a BSD build with no VMM crate (aarch64) resolves to
 // `carrick_host_bsd::native_glue::BsdNativeGlue`, which expresses the same
 // per-OS policy from the same single-source `carrick_host_bsd::signum` table.
-#[cfg(feature = "platform-linux")]
+#[cfg(all(target_os = "linux", feature = "platform-linux"))]
 type ActiveHostSignal = carrick_vmm_kvm::KvmHostSignal;
-#[cfg(all(feature = "platform-freebsd", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "freebsd",
+    feature = "platform-freebsd",
+    target_arch = "x86_64"
+))]
 type ActiveHostSignal = carrick_hal::GenericHostSignalBridge<carrick_vmm_bhyve::BhyveGlue>;
-#[cfg(all(feature = "platform-netbsd", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "netbsd",
+    feature = "platform-netbsd",
+    target_arch = "x86_64"
+))]
 type ActiveHostSignal = carrick_hal::GenericHostSignalBridge<carrick_vmm_nvmm::NvmmGlue>;
 #[cfg(all(
+    any(target_os = "freebsd", target_os = "netbsd"),
     any(feature = "platform-freebsd", feature = "platform-netbsd"),
     not(target_arch = "x86_64")
 ))]
@@ -44,6 +53,7 @@ type ActiveHostSignal =
     feature = "platform-freebsd",
     feature = "platform-netbsd"
 ))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
 type ActiveGuestTimers = carrick_hal::KickerGuestTimers;
 
 /// The bridges every product carrier hands its dispatchers.

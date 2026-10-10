@@ -180,6 +180,7 @@ pub use carrick_thread::{fork_quiesce, thread};
     feature = "platform-freebsd",
     feature = "platform-netbsd"
 ))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
 pub mod trap {
     pub use carrick_hal::{RawSyscall, SyscallTrap, TrapError};
     // Portable helpers the native (DSR) backend shares with the HVF trap
@@ -473,6 +474,7 @@ pub fn rosetta_available() -> bool {
     feature = "platform-freebsd",
     feature = "platform-netbsd"
 ))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
 pub mod runtime {
     pub use crate::debug_state::{DebugRegionSnapshot, DebugStateSnapshot, maybe_dump_debug_state};
     // Private: `RunResult`/`RuntimeError` are kernel types and the carrier does
