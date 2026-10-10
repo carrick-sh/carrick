@@ -373,6 +373,12 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         }
         (self.selected_identity)(zone, zone.record_ref(switched.record), self.task);
         publish_identity(self.task, rec.identity());
+        if rec.has_guest_execution() {
+            // Native children can reach EL0 directly from an idle carrier.
+            // Their entry is this selection, not their first later syscall.
+            self.counters
+                .record_native_fork_progress(carrick_el1_abi::NativeForkProgress::ChildEntered);
+        }
         if zone.slot(slot).queued() != 0 {
             zone.slot(slot).restart_slice(self.cpu.now());
         }
