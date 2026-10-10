@@ -397,11 +397,9 @@ impl<
         self.thread()?.slot.visible_tid()
     }
     fn set_clear_child_tid(&mut self, address: u64) -> bool {
-        // CPL0 exit custody is the named shared-cpl0-thread-exit-clear-tid
-        // dependency; only the ARM scheduler currently clears and wakes.
-        if !LifecycleNative::has_scheduler(self) {
-            return false;
-        }
+        // Registration and the positive tid are required by libc raise/abort.
+        // CPL0 exit custody (shared-cpl0-thread-exit-clear-tid) still owes
+        // exit-time clearing and the futex wake; ARM already honours both.
         let Some(thread) = self.thread() else {
             return false;
         };
