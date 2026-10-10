@@ -16,7 +16,7 @@ pub(super) struct InodeWriteback {
 
 impl InodeWriteback {
     pub(super) fn capture(
-        guard: &DelegatedFileGuard<'_, carrick_el1_abi::Aarch64ParkedContext>,
+        guard: &DelegatedFileGuard<'_, carrick_el1_abi::ZoneContext>,
         handle: u32,
     ) -> Self {
         let file = guard.file();
