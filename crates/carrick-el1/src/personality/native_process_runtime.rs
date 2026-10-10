@@ -9,7 +9,7 @@ use super::{
     process_owner::{GuestProcessOwner, GuestTask, GuestTaskMetadata, NativeProcessCustody},
 };
 use crate::lock::SpinLock;
-use alloc::{collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec};
 use carrick_el1_abi::{
     BornInZoneSource, CurrentTask, EntryHandoffReceipt, EntryIdentity, EntryRef, ExecutionBinding,
     Lifecycle, ThreadControlSlot, ThreadLifecyclePage,
@@ -775,7 +775,7 @@ pub struct NativeProcessEntry<
     run_failure: Option<carrick_el1_abi::NativeRunFailureReason>,
     calling_tid: u32,
     slot: Option<&'a ThreadControlSlot>,
-    interrupted_child_wait: Option<C>,
+    interrupted_child_wait: Option<Box<C>>,
 }
 fn returned(value: i64) -> LifecycleOutcome {
     LifecycleOutcome::Returned {
@@ -1141,7 +1141,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
                         );
                         if resources.signals().has_deliverable(self.record, blocked) {
-                            self.interrupted_child_wait = Some(self.words);
+                            self.interrupted_child_wait = Some(Box::new(self.words));
                             return Ok(returned(
                                 carrick_personality_linux::abi::signal::LINUX_EINTR.guest_retval(),
                             ));
@@ -1378,7 +1378,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// Original context of an interrupted, unconsumed child-wait query.
     /// Only this owned operation may be restarted after a caught handler.
     pub fn take_interrupted_child_wait(&mut self) -> Option<C> {
-        self.interrupted_child_wait.take()
+        self.interrupted_child_wait.take().map(|words| *words)
     }
     fn publish_channel(&mut self, channel: &Arc<WaitChannel>) -> Result<(), NativeProcessError> {
         let zone = self.source.zone;
@@ -3337,6 +3337,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     clippy::drop_non_drop
 )]
 mod tests {
+    #[test]
+    fn native_signal_entry_keeps_absent_restart_context_off_stack() {
+        type Entry = NativeProcessEntry<
+            'static,
+            'static,
+            AddressContext<RootGpa>,
+            ParkedContextWords,
+            Physical<'static>,
+        >;
+        assert!(
+            core::mem::size_of::<Entry>() <= core::mem::size_of::<ParkedContextWords>() + 384,
+            "an absent interrupted wait must not duplicate a full native register/XSAVE context"
+        );
+    }
+
     #[test]
     fn cpl0_clear_tid_dependency_names_the_arm_reference() {
         let design = include_str!("../../../../docs/design/arm-ring-first-flip.md");

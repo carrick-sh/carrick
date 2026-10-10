@@ -111,3 +111,15 @@ adapters require an ARM frame and forward today; nanosleep has no in-ring
 route. Before those waits move into CPL0, their timer completion must own
 its operation-specific result (ETIMEDOUT for futex, or object continuation
 expiry), rather than reusing the signal-wait errno.
+
+The optional saved restart context is heap-owned only when a wait is
+interrupted; an ordinary signal checkpoint no longer embeds a second full
+register/XSAVE context. The VM-free entry-size budget failed before this
+change and passes afterward. Linked-code inspection measures
+`signal_user_return`'s static stack allocation at 6,272 bytes before and
+4,096 afterward (`/tmp/ring-review-stack-sizes.json`). Other observed
+allocations are page-fault policy 1,336 bytes, delivery 504 bytes, and frame
+setup 1,336 bytes. These are individual static allocations, not a complete
+call-graph bound. The x86 page-fault assembly retains its hardware/GPR frame
+on the 4 KiB TSS stack, then moves XSAVE and Rust policy to the CPU's 64 KiB
+syscall stack; the ARM 16 KiB stack estimate does not describe that path.
