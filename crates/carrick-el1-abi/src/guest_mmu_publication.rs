@@ -128,6 +128,31 @@ impl GuestMmuPublication {
         .ok()?
     }
 
+    /// Authenticate an applied native AArch64 owner-grant edit.
+    pub fn from_aarch64_owner_grant(
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+    ) -> Option<Self> {
+        use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
+        txn.verify_receipt(receipt).ok()?;
+        let DescriptorOutcome::Applied(applied) = receipt.outcome else {
+            return None;
+        };
+        let span = txn.op.span();
+        Some(Self {
+            revision: Self::REVISION,
+            outcome: Self::APPLIED,
+            mm_key: txn.id.mm_key.get(),
+            root_gpa: txn.root.raw(),
+            generation: txn.id.generation.get(),
+            edit_identity: txn.digest(),
+            span_va: span.va,
+            span_len: span.len,
+            live_stores: applied.live_stores,
+            tables_linked: u32::from(applied.tables_linked),
+        })
+    }
+
     /// Bind the existing guest COW completion to physical alias settlement.
     /// The caller authenticates the pool's completed record under exact-MM
     /// exclusion; CarrierMemory separately verifies the live leaf.
@@ -216,6 +241,74 @@ mod tests {
         ReservationGeneration, ReservationMm,
     };
     use core::num::NonZeroU64;
+
+    #[test]
+    fn aarch64_owner_grant_publication_authenticates_the_exact_edit() {
+        use carrick_mmu_core::aarch64::SubstrateGpa;
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            BackingIdentity, CowRepointAccess, DescriptorApplied, DescriptorOp, DescriptorOutcome,
+            DescriptorReceipt, DescriptorTxn, DescriptorTxnId, PageSpan, ReclaimedTables,
+            TableGrants,
+        };
+        let one = NonZeroU64::MIN;
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: NonZeroU64::new(9).unwrap(),
+                generation: NonZeroU64::new(7).unwrap(),
+            },
+            root: SubstrateGpa::new(0x80_0000),
+            op: DescriptorOp::CowRepoint {
+                access: CowRepointAccess::User { writable_pages: 1 },
+                va: 0x401000,
+                len: 4096,
+                old_ipa: SubstrateGpa::new(0x21000),
+                new_ipa: SubstrateGpa::new(0x11000),
+                backing: BackingIdentity {
+                    frame_id: one,
+                    mapping_id: one,
+                    owner_generation: one,
+                    inventory_revision: one,
+                },
+            },
+            tables: TableGrants::NONE,
+        };
+        let receipt = DescriptorReceipt {
+            id: txn.id,
+            digest: txn.digest(),
+            outcome: DescriptorOutcome::Applied(DescriptorApplied {
+                pages: 1,
+                resident: PageSpan::EMPTY,
+                tables_linked: 0,
+                reclaimed: ReclaimedTables::NONE,
+                live_stores: 1,
+                flush_required: true,
+            }),
+        };
+        let publication = GuestMmuPublication::from_aarch64_owner_grant(&txn, &receipt).unwrap();
+        assert_eq!(publication.mm_key, 9);
+        assert_eq!(publication.generation, 7);
+        assert_eq!(publication.root_gpa, 0x80_0000);
+        assert_eq!(publication.edit_identity, txn.digest());
+        assert_eq!(
+            (publication.span_va, publication.span_len),
+            (0x401000, 4096)
+        );
+        assert_eq!((publication.live_stores, publication.tables_linked), (1, 0));
+        let mut foreign = txn;
+        foreign.root = SubstrateGpa::new(0x90_0000);
+        assert!(GuestMmuPublication::from_aarch64_owner_grant(&foreign, &receipt).is_none());
+        foreign = txn;
+        foreign.id.mm_key = NonZeroU64::new(10).unwrap();
+        assert!(GuestMmuPublication::from_aarch64_owner_grant(&foreign, &receipt).is_none());
+        foreign = txn;
+        foreign.id.generation = NonZeroU64::new(8).unwrap();
+        assert!(GuestMmuPublication::from_aarch64_owner_grant(&foreign, &receipt).is_none());
+        let mut malformed = receipt;
+        if let DescriptorOutcome::Applied(ref mut applied) = malformed.outcome {
+            applied.pages = 2;
+        }
+        assert!(GuestMmuPublication::from_aarch64_owner_grant(&txn, &malformed).is_none());
+    }
 
     #[test]
     fn cow_publication_refuses_foreign_source_and_backing() {

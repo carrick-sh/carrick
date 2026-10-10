@@ -126,6 +126,9 @@ pub struct ForkStockHostCustody {
     pub lifecycle_stock: Vec<ForkLifecycleLoan>,
     pub committed_lifecycle: BTreeMap<u64, ForkLifecycleLoan>,
     pub committed_tables: BTreeMap<u64, Vec<RootGpa>>,
+    /// Address authority of committed guest-only MMs. Record rehoming does
+    /// not change this generation or manufacture a host MM binding.
+    native_roots: BTreeMap<NonZeroU64, AddressContext<RootGpa>>,
     pub retired_mms: BTreeSet<u64>,
     pub kernel_region_gpa: u64,
     pub carrier: NonZeroU64,
@@ -158,6 +161,7 @@ impl ForkStockHostCustody {
             },
             committed_lifecycle: BTreeMap::new(),
             committed_tables: BTreeMap::new(),
+            native_roots: BTreeMap::new(),
             retired_mms: BTreeSet::new(),
             kernel_region_gpa: carrick_mem::memory::LINUX_KERNEL_REGION_BASE,
             carrier,
@@ -166,6 +170,10 @@ impl ForkStockHostCustody {
             run_failure: carrick_el1_abi::NativeRunFailureConsumer::default(),
             returned_children: 0,
         }
+    }
+
+    pub fn root(&self, mm: NonZeroU64) -> Option<AddressContext<RootGpa>> {
+        self.native_roots.get(&mm).copied()
     }
 
     /// Seed the same bounded stock in production and VM-free witnesses. Both
@@ -484,6 +492,20 @@ impl ForkStockHostCustody {
                 return Err(ForkStockServiceError::ExposedDirtyTable);
             }
 
+            let native_mm = NonZeroU64::new(loan.request.child_mm.raw())
+                .ok_or(ForkStockServiceError::InvalidRecord)?;
+            let native_context = AddressContext {
+                mm: carrick_guest_arch::MmGeneration::new(native_mm),
+                root: RootGpa::page_aligned(FrameGpa::new(loan.request.child_tables.base))
+                    .ok_or(ForkStockServiceError::InvalidRecord)?,
+                generation: carrick_guest_arch::ContextGeneration::new(
+                    completion.child.incarnation(),
+                ),
+            };
+            if self.native_roots.contains_key(&native_mm) {
+                return Err(ForkStockServiceError::InvalidRecord);
+            }
+
             let child_mm = El1FrameGrantMm::new(loan.request.child_mm.raw())
                 .ok_or(ForkStockServiceError::InvalidRecord)?;
             let parent_mm = El1FrameGrantMm::new(loan.request.operation.mm.raw())
@@ -496,6 +518,7 @@ impl ForkStockHostCustody {
                 .insert(pending.loan.request.child_mm.raw(), pending.asid_gen);
             self.committed_lifecycle
                 .insert(pending.loan.request.child_mm.raw(), pending.lifecycle);
+            self.native_roots.insert(native_mm, native_context);
 
             let unused_child: Vec<_> = pending.child_tables.drain(child_used..).collect();
             let unused_parent: Vec<_> = pending.parent_tables.drain(parent_used..).collect();
@@ -623,6 +646,9 @@ impl ForkStockHostCustody {
                     .map_err(ForkStockServiceError::Asid)?;
             }
             if let Some(pages) = self.committed_tables.remove(&mm) {
+                if let Some(key) = NonZeroU64::new(mm) {
+                    self.native_roots.remove(&key);
+                }
                 let owner = El1FrameGrantMm::new(mm).ok_or(ForkStockServiceError::InvalidRecord)?;
                 for page in &pages {
                     ledger.mark_return(page.address().raw(), 4096, owner, false);
@@ -840,7 +866,7 @@ mod tests {
                 carrick_el1_abi::El1MmHandle::from_admitted_owner(
                     req.operation.carrier,
                     req.child_mm,
-                    NonZeroU64::MIN,
+                    NonZeroU64::new(7).unwrap(),
                 )
             },
             parent_generation: ReservationGeneration::INITIAL,
@@ -857,6 +883,16 @@ mod tests {
         custody
             .service_settlement(&mut ledger, exec, &mut settlement, |_| true, |_| true)
             .expect("settlement commit should succeed");
+
+        let child_root = custody.root(NonZeroU64::new(302).unwrap()).unwrap();
+        assert_eq!(child_root.mm.raw().get(), 302);
+        assert_eq!(child_root.root, page(loan.request.child_tables.base));
+        assert_eq!(child_root.generation.raw(), completion.child.incarnation());
+        assert_ne!(
+            child_root.generation.raw().get(),
+            exec.binding.generation.raw()
+        );
+        assert!(custody.root(NonZeroU64::new(301).unwrap()).is_none());
 
         // Unused 3 child pages returned to stock: initial (8) - 2 used = 6 remaining
         assert_eq!(custody.grant_tables.len(), 6);
@@ -1198,6 +1234,7 @@ mod tests {
             );
             assert_eq!(custody.grant_tables.len(), pool_pages);
             assert_eq!(custody.lifecycle_stock.len(), lifecycle_slots);
+            assert!(custody.root(NonZeroU64::new(child_mm).unwrap()).is_none());
         }
     }
 
