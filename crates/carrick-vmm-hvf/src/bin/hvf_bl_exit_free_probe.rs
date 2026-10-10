@@ -23,8 +23,10 @@ mod hvpatch_probe_support;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn main() {
     use applevisor_sys::hv_reg_t;
+    use carrick_vmm_hvf::hvpatch_probe_support::{
+        ISLAND_CODE_BASE, bl_probe_guest_words, bl_probe_island_words,
+    };
     use hvpatch_probe_support::platform::{create_or_exit, print_provenance};
-    use hvpatch_probe_support::{ISLAND_CODE_BASE, bl_probe_guest_words, bl_probe_island_words};
 
     const ITERATIONS: u64 = 100_000;
 

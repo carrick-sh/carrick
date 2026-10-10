@@ -1135,3 +1135,15 @@ contracts = ["core.entry.completion"]
 path = "crates/carrick-syscall-abi/src/ipc.rs"
 contracts = ["core.entry.completion"]
 
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/hvpatch_probe_support/kernel_memory.rs"
+contracts = []
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/hvpatch_probe_support/mod.rs"
+contracts = []
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/hvpatch_probe_support/svc_tax.rs"
+contracts = []
+
