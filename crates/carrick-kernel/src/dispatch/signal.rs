@@ -2139,14 +2139,7 @@ impl<'a> SignalView<'a> {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let previous_mask = this.signal_mask_for(cx.kernel, tid);
-            if old_set != 0
-                && memory
-                    .write_bytes(old_set, &previous_mask.raw().to_le_bytes())
-                    .is_err()
-            {
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-            }
-            if new_set != 0 {
+            let new_mask = if new_set != 0 {
                 let bytes = match memory.read_bytes(new_set, LINUX_RT_SIGSET_SIZE as usize) {
                     Ok(bytes) => bytes,
                     Err(_) => {
@@ -2162,6 +2155,18 @@ impl<'a> SignalView<'a> {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     }
                 };
+                Some(mask)
+            } else {
+                None
+            };
+            if old_set != 0
+                && memory
+                    .write_bytes(old_set, &previous_mask.raw().to_le_bytes())
+                    .is_err()
+            {
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+            if let Some(mask) = new_mask {
                 this.restore_signal_mask(cx.kernel, tid, mask);
             }
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -6063,6 +6068,130 @@ mod tests {
             bounded(&mut memory),
             DispatchOutcome::errno(LINUX_EINTR),
             "redispatch after a sibling wake completes instead of waiting again"
+        );
+    }
+
+    #[test]
+    fn rt_sigprocmask_aliased_and_invalid_how() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.exact_signal_context_for_test();
+        let tid = context.thread().registry_id();
+        let reporter = crate::compat::CompatReporter::default();
+
+        // 1. Initial state: set mask to 0x10.
+        dispatcher.restore_signal_mask(&context, tid, SigSet::from_raw(0x10));
+        assert_eq!(dispatcher.signal_mask_for(&context, tid).raw(), 0x10);
+
+        // 2. Normal non-aliased SIG_BLOCK:
+        //    set at 0x100 = 0x20, oldset at 0x108 = 0.
+        let mut memory = crate::dispatch::LinearMemory::new(0, vec![0u8; 512]);
+        memory.write_bytes(0x100, &0x20u64.to_le_bytes()).unwrap();
+        memory.write_bytes(0x108, &0u64.to_le_bytes()).unwrap();
+        let mut cx = crate::dispatch::SyscallCtx {
+            host_wait: None,
+            kernel: &context,
+            request: crate::dispatch::SyscallRequest::new(
+                nr::RT_SIGPROCMASK.raw(),
+                crate::dispatch::SyscallArgs::from([
+                    crate::linux_abi::LINUX_SIG_BLOCK,
+                    0x100,
+                    0x108,
+                    LINUX_RT_SIGSET_SIZE,
+                    0,
+                    0,
+                ]),
+            ),
+            memory: &mut memory,
+            reporter: &reporter,
+            thread: None,
+            execution_lease: None,
+            mm_executor: None,
+        };
+        let outcome = dispatcher.rt_sigprocmask(&mut cx).unwrap();
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        let old_val = u64::from_le_bytes(memory.read_bytes(0x108, 8).unwrap().try_into().unwrap());
+        assert_eq!(old_val, 0x10);
+        assert_eq!(dispatcher.signal_mask_for(&context, tid).raw(), 0x30);
+
+        // 3. Invalid `how` with valid `set` and `oldset`:
+        //    oldset at 0x108 has sentinel 0xdead_beef_cafe_babe.
+        //    set at 0x100 has 0x40.
+        //    how = 999.
+        //    Linux validates `how` before writing `oldset`, so `oldset` must remain untouched!
+        let sentinel = 0xdead_beef_cafe_babe_u64;
+        memory.write_bytes(0x108, &sentinel.to_le_bytes()).unwrap();
+        memory.write_bytes(0x100, &0x40u64.to_le_bytes()).unwrap();
+        let mut cx = crate::dispatch::SyscallCtx {
+            host_wait: None,
+            kernel: &context,
+            request: crate::dispatch::SyscallRequest::new(
+                nr::RT_SIGPROCMASK.raw(),
+                crate::dispatch::SyscallArgs::from([999, 0x100, 0x108, LINUX_RT_SIGSET_SIZE, 0, 0]),
+            ),
+            memory: &mut memory,
+            reporter: &reporter,
+            thread: None,
+            execution_lease: None,
+            mm_executor: None,
+        };
+        let outcome = dispatcher.rt_sigprocmask(&mut cx).unwrap();
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINVAL));
+        let old_after_err =
+            u64::from_le_bytes(memory.read_bytes(0x108, 8).unwrap().try_into().unwrap());
+        assert_eq!(
+            old_after_err, sentinel,
+            "oldset buffer must not be mutated when how is invalid"
+        );
+        assert_eq!(
+            dispatcher.signal_mask_for(&context, tid).raw(),
+            0x30,
+            "signal mask must not change when how is invalid"
+        );
+
+        // 4. Aliased set and oldset:
+        //    Reset thread mask to 0x10.
+        dispatcher.restore_signal_mask(&context, tid, SigSet::from_raw(0x10));
+        assert_eq!(dispatcher.signal_mask_for(&context, tid).raw(), 0x10);
+        // Buffer at 0x100 has 0x20. We pass 0x100 as BOTH new_set and old_set with SIG_BLOCK.
+        // On Linux:
+        // new_set is read first (0x20), then previous mask (0x10) is written to oldset (0x100).
+        // The new mask is 0x10 | 0x20 = 0x30.
+        // In bugged Carrick:
+        // oldset is written first (0x10 to 0x100), then new_set is read (0x10), resulting in
+        // mask 0x10 | 0x10 = 0x10!
+        memory.write_bytes(0x100, &0x20u64.to_le_bytes()).unwrap();
+        let mut cx = crate::dispatch::SyscallCtx {
+            host_wait: None,
+            kernel: &context,
+            request: crate::dispatch::SyscallRequest::new(
+                nr::RT_SIGPROCMASK.raw(),
+                crate::dispatch::SyscallArgs::from([
+                    crate::linux_abi::LINUX_SIG_BLOCK,
+                    0x100,
+                    0x100,
+                    LINUX_RT_SIGSET_SIZE,
+                    0,
+                    0,
+                ]),
+            ),
+            memory: &mut memory,
+            reporter: &reporter,
+            thread: None,
+            execution_lease: None,
+            mm_executor: None,
+        };
+        let outcome = dispatcher.rt_sigprocmask(&mut cx).unwrap();
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        let aliased_buf =
+            u64::from_le_bytes(memory.read_bytes(0x100, 8).unwrap().try_into().unwrap());
+        assert_eq!(
+            aliased_buf, 0x10,
+            "aliased buffer must receive previous mask"
+        );
+        assert_eq!(
+            dispatcher.signal_mask_for(&context, tid).raw(),
+            0x30,
+            "aliased rt_sigprocmask must read new_set before writing oldset"
         );
     }
 
