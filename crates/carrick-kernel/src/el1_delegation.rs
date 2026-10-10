@@ -598,7 +598,7 @@ pub(crate) fn recall_inode(identity: InodeIdentity) -> bool {
 fn execute_recall(
     identity: InodeIdentity,
     binding: GuestBinding,
-    mut file_guard: DelegatedFileGuard<'_, carrick_el1_abi::Aarch64ParkedContext>,
+    mut file_guard: DelegatedFileGuard<'_, carrick_el1_abi::ZoneContext>,
 ) -> Vec<Arc<FileDescription>> {
     let region_ptr = get_el1_region_host_ptr();
     if region_ptr == 0 {
@@ -1149,7 +1149,7 @@ pub(crate) static YIELD_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic:
 fn lock_delegated_file(
     file: &DelegatedFile,
     handle: u32,
-) -> DelegatedFileGuard<'_, carrick_el1_abi::Aarch64ParkedContext> {
+) -> DelegatedFileGuard<'_, carrick_el1_abi::ZoneContext> {
     let authority = delegated_file_authority(file, handle);
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(30);
@@ -1189,7 +1189,7 @@ fn lock_delegated_file(
 fn delegated_file_authority(
     file: &DelegatedFile,
     handle: u32,
-) -> DelegatedFileAuthority<'_, carrick_el1_abi::Aarch64ParkedContext> {
+) -> DelegatedFileAuthority<'_, carrick_el1_abi::ZoneContext> {
     use carrick_sched_core::object_wait::{DelegatedFileWaitIndex, DelegatedReleaseVenue};
     let zone = zone_tables()
         .unwrap_or_else(|| carrick_fatal!("el1_delegation", "delegated inode has no carrier zone"));
@@ -1202,7 +1202,7 @@ fn delegated_file_authority(
         _: carrick_sched_core::Waker,
         effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
             '_,
-            carrick_el1_abi::Aarch64ParkedContext,
+            carrick_el1_abi::ZoneContext,
         >,
     ) {
         carrick_sched_core::LockWait::complete_object_wake(

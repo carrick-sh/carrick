@@ -631,7 +631,7 @@ impl SpaceTables {
     ) -> Option<
         carrick_sched_core::spaces::notification::SpaceReleaseVenue<
             'static,
-            carrick_el1_abi::Aarch64ParkedContext,
+            carrick_el1_abi::ZoneContext,
         >,
     > {
         fn deliver(
@@ -639,7 +639,7 @@ impl SpaceTables {
             _: carrick_sched_core::Waker,
             effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
                 '_,
-                carrick_el1_abi::Aarch64ParkedContext,
+                carrick_el1_abi::ZoneContext,
             >,
         ) {
             carrick_sched_core::LockWait::complete_object_wake(
