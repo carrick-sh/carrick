@@ -40,6 +40,13 @@ struct SignalResources<T> {
     thread_pending: Vec<(carrick_sched_core::RecordRef, PendingSignals<T>)>,
     forced_segv: Vec<carrick_sched_core::RecordRef>,
 }
+// Default stops await process-owner stop/wait-event custody. Both wait
+// interruption and dequeue selection must leave them pending.
+fn awaits_stop_custody(action: Action, signal: Signal) -> bool {
+    action.disposition == Disposition::Default
+        && carrick_signal_core::policy::default_delivery(signal)
+            == carrick_signal_core::policy::Delivery::Stop
+}
 /// One actual sighand and pending owner, retained by exact task handles.
 pub struct NativeProcessSignals<T> {
     key: TaskKey,
@@ -204,7 +211,7 @@ impl<T> NativeProcessSignals<T> {
                 || (action.disposition == Disposition::Default
                     && carrick_signal_core::policy::default_delivery(signal)
                         == carrick_signal_core::policy::Delivery::Ignore);
-            if !ignored {
+            if !ignored && !awaits_stop_custody(action, signal) {
                 return true;
             }
             selected = selected.without(signal);
@@ -242,10 +249,7 @@ impl<T> NativeProcessSignals<T> {
                 let Some(signal) = Signal::from_number(number) else {
                     break;
                 };
-                if resources.actions.action(signal).disposition == Disposition::Default
-                    && carrick_signal_core::policy::default_delivery(signal)
-                        == carrick_signal_core::policy::Delivery::Stop
-                {
+                if awaits_stop_custody(resources.actions.action(signal), signal) {
                     unblocked = unblocked.without(signal);
                 }
                 inspect = inspect.without(signal);
@@ -437,7 +441,13 @@ mod tests {
             id: carrick_sched_core::RecordId::from_raw(1).unwrap(),
             incarnation: 1,
         };
-        signals.enqueue(task, Signal::STOP, None).unwrap();
+        for number in [19, 20, 21, 22] {
+            let stop = Signal::from_number(number).unwrap();
+            signals.enqueue(task, stop, None).unwrap();
+            // wait4, sigsuspend and sigtimedwait use this same interruption
+            // predicate: an unowned default stop must leave each wait parked.
+            assert!(!signals.has_deliverable(record, SigBlockMask::NONE));
+        }
         assert!(
             signals
                 .take_deliverable(record, SigBlockMask::NONE)
