@@ -343,6 +343,12 @@ pub struct ForkStockCounters {
     pub loans: u64,
     /// Loans refused for capacity (the guest lowers each to `EAGAIN`).
     pub capacity_refusals: u64,
+    /// Loans refused because the request named another execution or carrier.
+    pub stale_refusals: u64,
+    /// Loans refused for a malformed request or loan geometry.
+    pub invalid_refusals: u64,
+    /// Loans refused because the issued lifecycle record was not cold.
+    pub inventory_refusals: u64,
     /// Children retired into quarantine.
     pub quarantined_children: u64,
     /// Child retirements refused with a typed reply (stock stays charged).
@@ -351,6 +357,27 @@ pub struct ForkStockCounters {
     pub withdrawn_lifecycles: u64,
     /// Quarantined children whose stock returned to the reusable pool.
     pub returned_children: u64,
+}
+
+impl ForkStockCounters {
+    /// Nonzero counters by stable family name, for run reports: every
+    /// refused fork is attributable to its typed reason.
+    pub fn families(&self) -> Vec<(&'static str, u64)> {
+        [
+            ("loan", self.loans),
+            ("capacity_refusal", self.capacity_refusals),
+            ("stale_refusal", self.stale_refusals),
+            ("invalid_refusal", self.invalid_refusals),
+            ("inventory_refusal", self.inventory_refusals),
+            ("withdrawn_lifecycle", self.withdrawn_lifecycles),
+            ("quarantined_child", self.quarantined_children),
+            ("retire_refusal", self.retire_refusals),
+            ("returned_child", self.returned_children),
+        ]
+        .into_iter()
+        .filter(|(_, count)| *count != 0)
+        .collect()
+    }
 }
 
 /// Deterministic table allocator: contiguous 4 KiB runs for child and parent.
@@ -537,9 +564,13 @@ impl<T: ChildAddressTags> ForkStock<T> {
         exchange: &mut ForkStockExchange,
         refusal: ForkStockRefusal,
     ) -> Result<ForkStockLoan, ForkStockRefusal> {
-        if refusal == ForkStockRefusal::Capacity {
-            self.counters.capacity_refusals = self.counters.capacity_refusals.saturating_add(1);
-        }
+        let counter = match refusal {
+            ForkStockRefusal::Capacity => &mut self.counters.capacity_refusals,
+            ForkStockRefusal::Stale => &mut self.counters.stale_refusals,
+            ForkStockRefusal::Invalid => &mut self.counters.invalid_refusals,
+            ForkStockRefusal::Inventory => &mut self.counters.inventory_refusals,
+        };
+        *counter = counter.saturating_add(1);
         exchange.refuse(refusal);
         Err(refusal)
     }

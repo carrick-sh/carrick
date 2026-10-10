@@ -1182,6 +1182,15 @@ impl PreparedRun {
                 physical_crossing_families,
                 host_forward_families: count_family(forward_families),
                 guest_refusal_families: count_family(refusal_families),
+                fork_stock_families: machine
+                    .fork_stock_counters()
+                    .families()
+                    .into_iter()
+                    .map(|(family, count)| crate::compat::ExecutionFamilyCount {
+                        family: family.to_owned(),
+                        count,
+                    })
+                    .collect(),
             });
             let (exit_code, terminating_signal, traps) = match outcome {
                 carrick_vmm_kvm::cpl0_boot::InitialProcessExit::Exited { code, exits } => {
