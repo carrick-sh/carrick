@@ -1,0 +1,161 @@
+[
+  {
+    "kind": "loader",
+    "artifact": {
+      "schema": "carrick.signed-embed-test.v1",
+      "record_type": "executable",
+      "executable_id": "ce78510a765714d9f70e1af84b0254ea6030c2fbe791e8a7b14a18b0fefef269:/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/arm_ring_first_hatch-49046773201fdb39",
+      "canonical_path": "/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/arm_ring_first_hatch-49046773201fdb39",
+      "sha256": "ce78510a765714d9f70e1af84b0254ea6030c2fbe791e8a7b14a18b0fefef269",
+      "cdhash": "0b32c4425943bae106c34cbfd90a4814f55c61f4",
+      "lc_uuid": "C81E1E55-6504-318A-8105-179CFB6DEA56",
+      "entitlement_digest": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+      "entitlement_present": true,
+      "dof_carrick_present": true,
+      "enabled_features": [],
+      "contract_id": "kernel.el1.arm-ring-first-crossing"
+    },
+    "executions": [
+      {
+        "schema": "carrick.signed-embed-test.v1",
+        "record_type": "execution",
+        "executable_id": "ce78510a765714d9f70e1af84b0254ea6030c2fbe791e8a7b14a18b0fefef269:/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/arm_ring_first_hatch-49046773201fdb39",
+        "test_name": "arm_ring_first_opt_out_glibc_loader_witness",
+        "requested_test_filter": "glibc_loader_witness",
+        "terminal_status": "passed"
+      },
+      {
+        "schema": "carrick.signed-embed-test.v1",
+        "record_type": "execution",
+        "executable_id": "ce78510a765714d9f70e1af84b0254ea6030c2fbe791e8a7b14a18b0fefef269:/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/arm_ring_first_hatch-49046773201fdb39",
+        "test_name": "arm_ring_first_strict_glibc_loader_witness",
+        "requested_test_filter": "glibc_loader_witness",
+        "terminal_status": "passed"
+      }
+    ],
+    "fixture_validation": {
+      "validation_method": "input_identity",
+      "checkout_head": "da45a9f6870de8ad46404a2125eab19010e07c31",
+      "checkout_tree": "f5cd365165a7946344be223a39db75b7e5b36c9a",
+      "bundle_source_head": "0bc20ef4941964aee2627c1d4097bdc42e425a06",
+      "checkout_dirty": false,
+      "manifest_sha256": "fdd016475dcb9233234bc5f1a1f706bfefec5422eebdd8332d41d57d1a00770f",
+      "inputs_sha256": "665910c3a91ccc1cf10d81a98d152f128798cec1b8b224efc5729ea1a2d0ce55",
+      "schema": "carrick.signed-embed-test.v1",
+      "record_type": "fixture_validation"
+    },
+    "verdicts": [
+      "test arm_ring_first_opt_out_glibc_loader_witness ... ring-first loader strict=false ordinal=56 refused=0 served=0 forwarded=3",
+      "ring-first loader strict=false ordinal=63 refused=0 served=0 forwarded=2",
+      "ring-first loader strict=false ordinal=64 refused=0 served=0 forwarded=1",
+      "ring-first loader strict=false ordinal=94 refused=0 served=0 forwarded=1",
+      "ring-first loader strict=false ordinal=172 refused=0 served=0 forwarded=0",
+      "ring-first loader strict=false ordinal=174 refused=0 served=0 forwarded=1",
+      "ring-first loader strict=false ordinal=222 refused=0 served=1 forwarded=5",
+      "test arm_ring_first_strict_glibc_loader_witness ... ring-first loader strict=true ordinal=56 refused=0 served=0 forwarded=3",
+      "ring-first loader strict=true ordinal=63 refused=0 served=0 forwarded=2",
+      "ring-first loader strict=true ordinal=64 refused=0 served=0 forwarded=1",
+      "ring-first loader strict=true ordinal=94 refused=0 served=0 forwarded=1",
+      "ring-first loader strict=true ordinal=172 refused=0 served=0 forwarded=0",
+      "ring-first loader strict=true ordinal=174 refused=1 served=0 forwarded=0",
+      "ring-first loader strict=true ordinal=222 refused=0 served=1 forwarded=5",
+      "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.16s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s",
+      "remaining carrick procs (run-id ring-switch-ci-loader-20261009-0bc20ef49-1) = 0",
+      "remaining carrick procs (run-id ring-switch-ci-loader-20261009-0bc20ef49-1-cli) = 0",
+      "test-signed: OK (carrick-embed: 1 invoked signed executable(s) passed, 34 signed, negative control passed)"
+    ]
+  },
+  {
+    "kind": "raw-strict",
+    "artifact": {
+      "schema": "carrick.signed-embed-test.v1",
+      "record_type": "executable",
+      "executable_id": "47ab2c80b90ca5b721a09416cb3848ba5ae2651ae1aa424d6390d69f6aab1c0a:/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/arm_ring_first_hatch-49046773201fdb39",
+      "canonical_path": "/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/arm_ring_first_hatch-49046773201fdb39",
+      "sha256": "47ab2c80b90ca5b721a09416cb3848ba5ae2651ae1aa424d6390d69f6aab1c0a",
+      "cdhash": "3b4f200adfeed827d193ddee02e54bb4afe392e2",
+      "lc_uuid": "C81E1E55-6504-318A-8105-179CFB6DEA56",
+      "entitlement_digest": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+      "entitlement_present": true,
+      "dof_carrick_present": true,
+      "enabled_features": [],
+      "contract_id": "kernel.el1.arm-ring-first-crossing"
+    },
+    "executions": [
+      {
+        "schema": "carrick.signed-embed-test.v1",
+        "record_type": "execution",
+        "executable_id": "47ab2c80b90ca5b721a09416cb3848ba5ae2651ae1aa424d6390d69f6aab1c0a:/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/arm_ring_first_hatch-49046773201fdb39",
+        "test_name": "arm_ring_first_strict_refusal_witness",
+        "requested_test_filter": "arm_ring_first_strict_refusal_witness",
+        "terminal_status": "passed"
+      }
+    ],
+    "fixture_validation": {
+      "validation_method": "input_identity",
+      "checkout_head": "da45a9f6870de8ad46404a2125eab19010e07c31",
+      "checkout_tree": "f5cd365165a7946344be223a39db75b7e5b36c9a",
+      "bundle_source_head": "0bc20ef4941964aee2627c1d4097bdc42e425a06",
+      "checkout_dirty": false,
+      "manifest_sha256": "fdd016475dcb9233234bc5f1a1f706bfefec5422eebdd8332d41d57d1a00770f",
+      "inputs_sha256": "665910c3a91ccc1cf10d81a98d152f128798cec1b8b224efc5729ea1a2d0ce55",
+      "schema": "carrick.signed-embed-test.v1",
+      "record_type": "fixture_validation"
+    },
+    "verdicts": [
+      "test arm_ring_first_strict_refusal_witness ... ring-first strict=true getuid refused=1 forwarded=0 exit_group refused=0 forwarded=1 clock_gettime forwarded=0",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.07s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s",
+      "remaining carrick procs (run-id ring-switch-ci-raw-strict-20261009-0bc20ef49-1) = 0",
+      "remaining carrick procs (run-id ring-switch-ci-raw-strict-20261009-0bc20ef49-1-cli) = 0",
+      "test-signed: OK (carrick-embed: 1 invoked signed executable(s) passed, 34 signed, negative control passed)"
+    ]
+  },
+  {
+    "kind": "raw-optout",
+    "artifact": {
+      "schema": "carrick.signed-embed-test.v1",
+      "record_type": "executable",
+      "executable_id": "331ee834a4e10c2b61c6cc8682d641d947e3b10a4d4be87e35d5a9190c2c4929:/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/arm_ring_first_hatch-49046773201fdb39",
+      "canonical_path": "/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/arm_ring_first_hatch-49046773201fdb39",
+      "sha256": "331ee834a4e10c2b61c6cc8682d641d947e3b10a4d4be87e35d5a9190c2c4929",
+      "cdhash": "17cc5b40bddf8c2f9df967783ced8f98c846f379",
+      "lc_uuid": "C81E1E55-6504-318A-8105-179CFB6DEA56",
+      "entitlement_digest": "eff01e0996b6a695a04168b27bfd0f52910d9589140788c7e22ca7cc2b58a1e6",
+      "entitlement_present": true,
+      "dof_carrick_present": true,
+      "enabled_features": [],
+      "contract_id": "kernel.el1.arm-ring-first-crossing"
+    },
+    "executions": [
+      {
+        "schema": "carrick.signed-embed-test.v1",
+        "record_type": "execution",
+        "executable_id": "331ee834a4e10c2b61c6cc8682d641d947e3b10a4d4be87e35d5a9190c2c4929:/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/target/release/deps/arm_ring_first_hatch-49046773201fdb39",
+        "test_name": "arm_ring_first_hatch_disabled_forward_witness",
+        "requested_test_filter": "arm_ring_first_hatch_disabled_forward_witness",
+        "terminal_status": "passed"
+      }
+    ],
+    "fixture_validation": {
+      "validation_method": "input_identity",
+      "checkout_head": "da45a9f6870de8ad46404a2125eab19010e07c31",
+      "checkout_tree": "f5cd365165a7946344be223a39db75b7e5b36c9a",
+      "bundle_source_head": "0bc20ef4941964aee2627c1d4097bdc42e425a06",
+      "checkout_dirty": false,
+      "manifest_sha256": "fdd016475dcb9233234bc5f1a1f706bfefec5422eebdd8332d41d57d1a00770f",
+      "inputs_sha256": "665910c3a91ccc1cf10d81a98d152f128798cec1b8b224efc5729ea1a2d0ce55",
+      "schema": "carrick.signed-embed-test.v1",
+      "record_type": "fixture_validation"
+    },
+    "verdicts": [
+      "test arm_ring_first_hatch_disabled_forward_witness ... ring-first strict=false getuid refused=0 forwarded=1 exit_group refused=0 forwarded=1 clock_gettime forwarded=0",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.10s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s",
+      "remaining carrick procs (run-id ring-switch-ci-raw-optout-20261009-0bc20ef49-1) = 0",
+      "remaining carrick procs (run-id ring-switch-ci-raw-optout-20261009-0bc20ef49-1-cli) = 0",
+      "test-signed: OK (carrick-embed: 1 invoked signed executable(s) passed, 34 signed, negative control passed)"
+    ]
+  }
+]
