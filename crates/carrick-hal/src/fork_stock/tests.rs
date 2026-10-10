@@ -829,3 +829,48 @@ fn validate_commit_refuses_before_any_carrier_publication() {
         Ok(completion)
     );
 }
+
+/// Every loan refusal is counted by its typed reason and named, so a run
+/// report says why a fork failed.
+#[test]
+fn every_refusal_reason_is_counted_and_named() {
+    let mut stock = stock(UntaggedRoots, 4, 2);
+    let exec = parent();
+    // Stale: a request naming another binding.
+    let mut foreign = exec;
+    foreign.binding.task = EntryTaskKey::from_raw(999);
+    let mut exchange = ForkStockExchange::new(request(foreign, 302, 1, 1)).unwrap();
+    assert_eq!(
+        stock.loan(&mut NoTableLedger, exec, &mut exchange, |_| true),
+        Err(ForkStockRefusal::Stale)
+    );
+    // Inventory: a dirty lifecycle record (withdrawn).
+    let mut exchange = ForkStockExchange::new(request(exec, 302, 1, 1)).unwrap();
+    assert_eq!(
+        stock.loan(&mut NoTableLedger, exec, &mut exchange, |_| false),
+        Err(ForkStockRefusal::Inventory)
+    );
+    // Capacity: more table pages than the stock holds.
+    assert_eq!(
+        loan(&mut stock, exec, 302, 8, 1),
+        Err(ForkStockRefusal::Capacity)
+    );
+    let counters = stock.counters();
+    assert_eq!(counters.stale_refusals, 1);
+    assert_eq!(counters.inventory_refusals, 1);
+    assert_eq!(counters.capacity_refusals, 1);
+    assert_eq!(counters.withdrawn_lifecycles, 1);
+    let families = counters.families();
+    for (family, count) in [
+        ("stale_refusal", 1),
+        ("inventory_refusal", 1),
+        ("capacity_refusal", 1),
+        ("withdrawn_lifecycle", 1),
+    ] {
+        assert!(
+            families.contains(&(family, count)),
+            "{family} in {families:?}"
+        );
+    }
+    assert!(families.iter().all(|(_, count)| *count != 0));
+}
