@@ -1288,6 +1288,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         pending: PendingSignalWait,
     ) -> Result<LifecycleOutcome, NativeProcessError> {
         loop {
+            // A publication after this snapshot must invalidate enrollment.
+            let observed = pending.channel.generation.generation();
             let graph = self.runtime.graph.lock();
             let row = graph
                 .owner
@@ -1328,7 +1330,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     carrick_personality_linux::abi::signal::LINUX_EAGAIN.guest_retval(),
                 ));
             }
-            let observed = pending.channel.generation.generation();
             if self.park_signal_wait(
                 pending.kind,
                 pending.channel.clone(),
@@ -3351,6 +3352,7 @@ mod tests {
         controls: &'a [ThreadControlSlot],
         copies: Vec<LinuxWaitStatus>,
         refuse_copy: bool,
+        on_signal_clock: Option<Box<dyn FnMut()>>,
     }
     impl<'a> NativeProcessService<'a, ParkedContextWords> for Physical<'a> {
         type Mm = AddressContext<RootGpa>;
@@ -3433,6 +3435,9 @@ mod tests {
             Ok(())
         }
         fn signal_now(&mut self) -> Result<carrick_guest_arch::CounterTick, NativeProcessError> {
+            if let Some(mut hook) = self.on_signal_clock.take() {
+                hook();
+            }
             let now = if self.zone.counters.el1_timeouts.load(Ordering::Acquire) == 0 {
                 1000
             } else {
@@ -3645,6 +3650,7 @@ mod tests {
             controls: &*child_controls,
             copies: Vec::new(),
             refuse_copy: false,
+            on_signal_clock: None,
         };
         use carrick_personality_linux::signal::{ProcessSignals, SignalWaitOutcome};
         let set = carrick_signal_core::SignalSet::EMPTY
@@ -3745,6 +3751,55 @@ mod tests {
                 .contains_key(&entry.record)
         );
         assert!(zone.timer_owner(slot).is_none());
+        drop(entry);
+
+        // Inject precisely after the pending check and before park enrollment.
+        // The wake must invalidate the pre-check generation, not be adopted as
+        // the generation against which this new park is admitted.
+        zone.counters.el1_timeouts.store(0, Ordering::Release);
+        control.init_blocked(carrick_el1_abi::BlockedMask(set.bits()));
+        let (signals, channel, key) = {
+            let graph = runtime.graph.lock();
+            let row = graph.owner.task(graph.root_key).unwrap();
+            (
+                row.native().resources().signals().clone(),
+                row.native().resources().channel.clone().unwrap(),
+                row.key(),
+            )
+        };
+        let wake_channel = channel.clone();
+        service.on_signal_clock = Some(Box::new(move || {
+            signals
+                .enqueue(
+                    key,
+                    carrick_signal_core::policy::Signal::from_number(
+                        carrick_syscall_abi::LINUX_SIGUSR1,
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .unwrap();
+            wake_channel.generation.publish().unwrap();
+        }));
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        let result = entry
+            .resume_signal_wait(PendingSignalWait {
+                kind: PendingSignalKind::Wait {
+                    set,
+                    info: UserVa::new(0),
+                },
+                channel,
+                deadline: Some(carrick_guest_arch::Deadline(
+                    carrick_guest_arch::CounterTick::new(2000),
+                )),
+            })
+            .unwrap();
+        assert!(
+            matches!(result, LifecycleOutcome::Returned { result, .. } if result.raw() == 10),
+            "a signal published after the queue check must prevent re-parking"
+        );
     }
 
     #[test]
@@ -3828,6 +3883,7 @@ mod tests {
             controls: &*child_controls,
             copies: Vec::new(),
             refuse_copy: false,
+            on_signal_clock: None,
         };
         assert!(zone.slot(slot).current().is_none());
         let home = zone.slot(slot).host_record().unwrap();
@@ -4390,6 +4446,7 @@ mod tests {
             controls: &*child_controls,
             copies: Vec::new(),
             refuse_copy: false,
+            on_signal_clock: None,
         };
         let parent = TaskKey {
             id: TaskId::from_abi_positive(41).unwrap(),
@@ -4762,6 +4819,7 @@ mod tests {
                 controls: &*child_controls,
                 copies: Vec::new(),
                 refuse_copy: false,
+                on_signal_clock: None,
             };
             let parent = TaskKey {
                 id: TaskId::from_abi_positive(41).unwrap(),
