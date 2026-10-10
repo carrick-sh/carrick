@@ -23,8 +23,8 @@ use super::exec::ProductionHvpatchPollError;
 use super::outcome::HvpatchLoopSuspension;
 use super::*;
 use carrick_el1_abi::{
-    Aarch64ParkedContext, CurrentHandback, CurrentRelease, Handback, RecordRef, SlotId, ThreadCtx,
-    ThreadIdentity, ZoneTables,
+    CurrentHandback, CurrentRelease, Handback, RecordRef, SlotId, ThreadCtx, ThreadIdentity,
+    ZoneContext, ZoneTables,
 };
 use carrick_hal::threaded::GuestCpuState;
 use carrick_kernel::el1_zone::HostLockWait;
@@ -110,18 +110,26 @@ fn parked_context(
     native: ThreadCtx,
     state: &GuestCpuState,
     identity: ThreadIdentity,
-) -> Result<Aarch64ParkedContext, RuntimeError> {
-    let GuestCpuState::Aarch64V1(cpu) = state else {
-        return Err(RuntimeError::Configuration(
-            "zone parked a non-AArch64 task".to_owned(),
-        ));
-    };
-    Ok(Aarch64ParkedContext::from_register(
-        native,
-        cpu.ttbr0,
-        identity.mm,
-        identity.generation,
-    ))
+) -> Result<ZoneContext, RuntimeError> {
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (state, identity);
+        return Ok(native);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let GuestCpuState::Aarch64V1(cpu) = state else {
+            return Err(RuntimeError::Configuration(
+                "zone parked a non-AArch64 task".to_owned(),
+            ));
+        };
+        Ok(ZoneContext::from_register(
+            native,
+            cpu.ttbr0,
+            identity.mm,
+            identity.generation,
+        ))
+    }
 }
 
 /// Zone saves are task projections. EL1 may leave the vCPU on a maintenance
@@ -755,12 +763,10 @@ where
             unsafe { *zone.record(record).ctx_mut() = parked_context(*ctx, state, identity)? };
         }
         let seq = zone.next_seq(record);
-        let complete = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
-            '_,
-            Aarch64ParkedContext,
-        >| {
-            carrick_sched_core::LockWait::complete_object_wake(&HostLockWait, zone, effects)
-        };
+        let complete =
+            |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, ZoneContext>| {
+                carrick_sched_core::LockWait::complete_object_wake(&HostLockWait, zone, effects)
+            };
         match enrollment.park_host(record, token, &complete) {
             Ok(()) => {
                 zone.counters
