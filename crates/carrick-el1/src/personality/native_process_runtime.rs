@@ -804,19 +804,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     fn exit_owned(&mut self, status: u8) -> Result<LifecycleOutcome, NativeProcessError> {
         let root_exit = self.is_root_process();
         let wait_status = LinuxWaitStatus::from_wait_encoding(i32::from(status) << 8);
-        let (page, control) = {
-            let graph = self.runtime.graph.lock();
-            let resources = graph
-                .owner
-                .task(self.key)
-                .map_err(|_| NativeProcessError::Stale)?
-                .native()
-                .resources();
-            if resources.page.live() != 1 {
-                return Err(NativeProcessError::Unsupported);
-            }
-            (resources.page, resources.control)
-        };
         let transaction = self
             .runtime
             .graph
@@ -824,22 +811,43 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .serials
             .allocate()
             .ok_or(NativeProcessError::Exhausted)?;
-        let (resources, published) = {
+        let (page, control, resources, published) = {
             let mut graph = self.runtime.graph.lock();
-            graph
+            let row = graph
                 .owner
                 .task_mut(self.key)
-                .map_err(|_| NativeProcessError::Stale)?
-                .select_exit_thread(self.calling_tid)
                 .map_err(|_| NativeProcessError::Stale)?;
-            native_process_entry::publish_exit(
+            row.select_exit_thread(self.calling_tid)
+                .map_err(|_| NativeProcessError::Stale)?;
+            let page = row.native().resources().page;
+            let control = row.native().resources().control;
+            // Born membership keeps this count above one until publication
+            // and nonfinal exit finish. Close claim admission before the final
+            // census: a claim predating close must finish or roll back first.
+            if page.live() != 1 {
+                return Err(NativeProcessError::Unsupported);
+            }
+            page.close_for_fork()
+                .map_err(|_| NativeProcessError::Busy)?;
+            if page.claimed_count() != 0 {
+                let _ = page.reopen_after_fork();
+                return Err(NativeProcessError::Busy);
+            }
+            let (resources, published) = match native_process_entry::publish_exit(
                 &mut graph.owner,
                 self.key,
                 None,
                 transaction,
                 wait_status,
-            )
-            .map_err(|_| NativeProcessError::Busy)?
+            ) {
+                Ok(published) => published,
+                Err(_) => {
+                    let _ = page.reopen_after_fork();
+                    return Err(NativeProcessError::Busy);
+                }
+            };
+            page.close();
+            (page, control, resources, published)
         };
         let record = self
             .source
@@ -2449,6 +2457,186 @@ mod tests {
         assert!(zone.slot(slot).host_record().is_none());
         assert!(zone.slot(slot).current().is_none());
         assert_eq!(zone.record(home).claim(), carrick_sched_core::Claim::Free);
+    }
+
+    #[test]
+    fn clone_live_membership_blocks_exit_between_graph_unlock_and_enqueue() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let child_page = Box::new(ThreadLifecyclePage::new());
+        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        }));
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
+        assert!(matches!(
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            ),
+            Err(NativeProcessError::Invalid)
+        ));
+        assert_eq!(page.live(), 2, "admission must not remove a live member");
+        page.release_live(1).unwrap(); // fixture settles its bootstrap census
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        assert_eq!(page.live(), 1);
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &*child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+        };
+        assert!(zone.slot(slot).current().is_none());
+        let home = zone.slot(slot).host_record().unwrap();
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        // An admitted clone claim must also block the terminal transaction
+        // before it has incremented the live count.
+        page.stock(
+            0,
+            carrick_el1_abi::EntryIdentity {
+                tid: 42,
+                visible_tid: 42,
+                thread_serial: 102,
+                uid_credit: 0,
+            },
+        )
+        .unwrap();
+        let claim = page.claim_any().unwrap();
+        assert!(matches!(entry.exit_owned(9), Err(NativeProcessError::Busy)));
+        assert_eq!(page.gate(), carrick_el1_abi::GateState::Open);
+        page.unclaim(claim).unwrap();
+
+        let claim = page.claim_any().unwrap();
+        assert_eq!(page.thread_born(), Some(2));
+        let child = zone
+            .alloc_record(ThreadIdentity {
+                tid: 42,
+                serial: 102,
+                mm: 1,
+                file_table: 5,
+                generation: 0,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &child_controls[1] as *const _ as u64,
+            })
+            .unwrap();
+        let child_ref = zone.record_ref(child);
+        let mut claim = Some(claim);
+        entry
+            .thread_spawned(41, 42, &mut || {
+                page.record_born(
+                    claim.take().unwrap(),
+                    carrick_el1_abi::BornRecord {
+                        caller_task: 41,
+                        caller_serial: 101,
+                        clone_flags: 0,
+                        clear_child_tid: 0,
+                        blocked: carrick_el1_abi::BlockedMask(0),
+                    },
+                )
+                .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        // Exact requested injection: the graph guard has dropped, and the
+        // child RecordRef is not yet on the scheduler queue.
+        assert_eq!(zone.slot(slot).queued(), 0);
+        assert!(matches!(
+            entry.exit_owned(9),
+            Err(NativeProcessError::Unsupported)
+        ));
+        assert!(entry.has_thread(42));
+        assert_eq!(zone.record(child).claim(), carrick_sched_core::Claim::Free);
+        zone.requeue_preempted(slot, child);
+        assert_eq!(zone.slot(slot).queued(), 1);
+        let _ = zone.claim_for_host(
+            child_ref,
+            None,
+            Handback::Cancelled,
+            &BoundedSpin(LOCK_SPINS),
+        );
+        assert_eq!(zone.slot(slot).queued(), 0);
+        zone.free_record(child);
+        page.try_exit().unwrap();
+        entry.thread_exited(42);
+        assert_eq!(page.live(), 1);
+        assert!(matches!(
+            entry.exit_group(9),
+            LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                ..
+            }
+        ));
+        assert_eq!(
+            entry.take_root_exit(),
+            Some(LinuxWaitStatus::from_wait_encoding(9 << 8))
+        );
+        assert!(entry.take_handoff_receipt().is_some());
+        assert_eq!(page.live(), 0);
+        assert!(zone.slot(slot).host_record().is_none());
+        assert!(zone.slot(slot).current().is_none());
+        assert_eq!(zone.record(home).claim(), carrick_sched_core::Claim::Free);
+        assert!(
+            zone.switch_in_full(slot).is_none(),
+            "no stale child RecordRef may run after teardown"
+        );
     }
 
     #[test]
