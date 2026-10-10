@@ -1,4 +1,7 @@
 //! Local-only PVE transport and foreground lifecycle; secrets have no Debug impl.
+use super::github::Github;
+#[cfg(test)]
+use super::github::{observed_assignment, recover_registration};
 use super::*;
 use serde_json::{Value, json};
 use std::net::Ipv4Addr;
@@ -408,237 +411,11 @@ impl Drop for ApiDeadline<'_> {
         self.0.set(None);
     }
 }
-fn string(value: &Value, field: &str) -> Result<String, ScalerError> {
-    value[field]
-        .as_str()
-        .map(str::to_owned)
-        .ok_or(ScalerError::External("missing string field"))
-}
 fn task_id(value: Value) -> Result<String, ScalerError> {
     value
         .as_str()
         .map(str::to_owned)
         .ok_or(ScalerError::External("missing PVE task ID"))
-}
-
-struct Github;
-impl Github {
-    fn request(
-        &self,
-        method: &str,
-        endpoint: &str,
-        body: Option<Value>,
-        paginate: bool,
-    ) -> Result<Value, ScalerError> {
-        let mut cmd = Command::new("gh");
-        cmd.args(["api", "--method", method, endpoint]);
-        if paginate {
-            cmd.args(["--paginate", "--slurp"]);
-        }
-        let input = if let Some(body) = body {
-            cmd.args(["--input", "-"]);
-            serde_json::to_vec(&body)?
-        } else {
-            vec![]
-        };
-        let output = execute(&mut cmd, &input, Duration::from_secs(60))?;
-        if method == "DELETE" {
-            return Ok(Value::Null);
-        }
-        Ok(serde_json::from_slice(&output)?)
-    }
-    fn runs(&self, status: &str) -> Result<Vec<Value>, ScalerError> {
-        let data = self.request(
-            "GET",
-            &format!("repos/{REPOSITORY}/actions/runs?status={status}&per_page=100"),
-            None,
-            true,
-        )?;
-        pages(&data, "workflow_runs")
-    }
-    fn jobs(&self, run: &Value) -> Result<Vec<Value>, ScalerError> {
-        let id = run["id"].as_u64().ok_or(ScalerError::External("run id"))?;
-        let attempt = run["run_attempt"]
-            .as_u64()
-            .ok_or(ScalerError::External("run attempt"))?;
-        let data = self.request(
-            "GET",
-            &format!("repos/{REPOSITORY}/actions/runs/{id}/attempts/{attempt}/jobs?per_page=100"),
-            None,
-            true,
-        )?;
-        pages(&data, "jobs")
-    }
-    fn demand(&self, sha: &str) -> Result<Vec<JobKey>, ScalerError> {
-        let mut demand = Vec::new();
-        for status in ["queued", "in_progress"] {
-            for run in self.runs(status)? {
-                if !approved_run(&run, sha) {
-                    continue;
-                }
-                for job in self.jobs(&run)? {
-                    let labels: Vec<&str> = job["labels"]
-                        .as_array()
-                        .ok_or(ScalerError::External("job labels"))?
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect();
-                    if job["status"] == "queued" && eligible_labels(&labels) {
-                        demand.push(JobKey {
-                            run: RunId(run["id"].as_u64().ok_or(ScalerError::External("run id"))?),
-                            attempt: run["run_attempt"]
-                                .as_u64()
-                                .and_then(|n| u32::try_from(n).ok())
-                                .ok_or(ScalerError::External("attempt"))?,
-                            job: JobId(job["id"].as_u64().ok_or(ScalerError::External("job id"))?),
-                        });
-                    }
-                }
-            }
-        }
-        demand.sort_by_key(|key| key.job.0);
-        demand.dedup();
-        Ok(demand)
-    }
-    fn job(&self, id: JobId) -> Result<Value, ScalerError> {
-        self.request(
-            "GET",
-            &format!("repos/{REPOSITORY}/actions/jobs/{}", id.0),
-            None,
-            false,
-        )
-    }
-    fn assignment(&self, row: &mut Record) -> Result<Assignment, ScalerError> {
-        if row.runner.is_none() {
-            let data = self.request(
-                "GET",
-                &format!("repos/{REPOSITORY}/actions/runners?per_page=100"),
-                None,
-                true,
-            )?;
-            row.runner = recover_registration(row, &pages(&data, "runners")?)?;
-        }
-        let Some(runner) = row.runner else {
-            return Ok(Assignment::Unassigned);
-        };
-        // The reservation is demand, never a job binding. Prefer the recorded
-        // actual assignment; inspect all active runs if GitHub assigned another.
-        let job = self.job(row.assigned.unwrap_or(row.key.job))?;
-        if job["runner_id"].as_u64() == Some(runner.0) {
-            row.assigned = Some(JobId(
-                job["id"]
-                    .as_u64()
-                    .ok_or(ScalerError::External("assigned id"))?,
-            ));
-            return Ok(if job["status"] == "completed" {
-                Assignment::Completed
-            } else {
-                Assignment::Busy
-            });
-        }
-        for status in ["in_progress", "completed"] {
-            for run in self.runs(status)? {
-                if let Some(assignment) = observed_assignment(row, &self.jobs(&run)?) {
-                    return Ok(assignment);
-                }
-            }
-        }
-        let runners = self.request(
-            "GET",
-            &format!("repos/{REPOSITORY}/actions/runners?per_page=100"),
-            None,
-            true,
-        )?;
-        for registered in pages(&runners, "runners")? {
-            if registered["id"].as_u64() == Some(runner.0) {
-                return Ok(if registered["busy"] == true {
-                    Assignment::Busy
-                } else {
-                    Assignment::Unassigned
-                });
-            }
-        }
-        // An absent ephemeral registration can mean a completed job missed by
-        // polling. Never infer unassigned from absence and destroy live work.
-        Ok(Assignment::Unknown)
-    }
-    fn remove_runner(&self, row: &Record) -> Result<(), ScalerError> {
-        let runners = self.request(
-            "GET",
-            &format!("repos/{REPOSITORY}/actions/runners?per_page=100"),
-            None,
-            true,
-        )?;
-        let runners = pages(&runners, "runners")?;
-        let Some(id) = row.runner.or(recover_registration(row, &runners)?) else {
-            return Ok(());
-        };
-        if let Some(runner) = runners.into_iter().find(|r| r["id"].as_u64() == Some(id.0)) {
-            if runner["name"] != row.name || runner["busy"] != false {
-                return Err(ScalerError::Guard(
-                    "runner identity changed or still busy; defer removal",
-                ));
-            }
-            self.request(
-                "DELETE",
-                &format!("repos/{REPOSITORY}/actions/runners/{}", id.0),
-                None,
-                false,
-            )?;
-        }
-        Ok(())
-    }
-}
-fn approved_run(run: &Value, sha: &str) -> bool {
-    run["event"] == "workflow_dispatch"
-        && run["head_sha"] == sha
-        && run["head_branch"] == "work/willow-pilot"
-        && run["path"] == ".github/workflows/willow-pilot.yml"
-        && run["repository"]["full_name"] == REPOSITORY
-}
-
-fn recover_registration(row: &Record, runners: &[Value]) -> Result<Option<RunnerId>, ScalerError> {
-    let matches: Vec<&Value> = runners.iter().filter(|r| r["name"] == row.name).collect();
-    match matches.as_slice() {
-        [] => Ok(None),
-        [runner] => Ok(Some(RunnerId(
-            runner["id"]
-                .as_u64()
-                .ok_or(ScalerError::External("recovered runner ID"))?,
-        ))),
-        _ => Err(ScalerError::Guard(
-            "duplicate registration identity; quarantine",
-        )),
-    }
-}
-fn observed_assignment(row: &mut Record, jobs: &[Value]) -> Option<Assignment> {
-    let runner = row.runner?;
-    let job = jobs
-        .iter()
-        .find(|job| job["runner_id"].as_u64() == Some(runner.0))?;
-    row.assigned = Some(JobId(job["id"].as_u64()?));
-    Some(if job["status"] == "completed" {
-        Assignment::Completed
-    } else {
-        Assignment::Busy
-    })
-}
-
-fn pages(data: &Value, field: &str) -> Result<Vec<Value>, ScalerError> {
-    let mut result = Vec::new();
-    for page in data
-        .as_array()
-        .ok_or(ScalerError::External("API pagination"))?
-    {
-        result.extend(
-            page[field]
-                .as_array()
-                .ok_or(ScalerError::External("API page"))?
-                .iter()
-                .cloned(),
-        );
-    }
-    Ok(result)
 }
 
 fn enforce_cpu_ceiling(busy: f64, threads: u32) -> Result<(), ScalerError> {
@@ -824,7 +601,7 @@ fn provision(
     row: &mut Record,
     dir: &Path,
     path: &Path,
-    approval: (u64, &str),
+    approval: (u64, &Admission),
 ) -> Result<(), ScalerError> {
     let (key, _) = key_paths(dir, row);
     execute(
@@ -865,9 +642,9 @@ fn boot_and_register(
     row: &mut Record,
     dir: &Path,
     path: &Path,
-    approval: (u64, &str),
+    approval: (u64, &Admission),
 ) -> Result<(), ScalerError> {
-    let (group, sha) = approval;
+    let (group, admission) = approval;
     let (key, hosts) = key_paths(dir, row);
     let key_meta = std::fs::symlink_metadata(&key)?;
     if !key_meta.is_file() || key_meta.uid() != 0 || key_meta.mode() & 0o077 != 0 {
@@ -1002,27 +779,26 @@ fn boot_and_register(
         row,
         &["/bin/sh", "-c", "rm -f /usr/local/bin/carrick-ci-admit-job"],
     )?;
-    pve.agent(row, &["/bin/sh", "-c", &format!("install -d -m 755 /etc/carrick-ci; printf '%s\\n' {sha} > /etc/carrick-ci/approved-sha; chmod 644 /etc/carrick-ci/approved-sha")])?;
+    // The job-start hook reads this root-owned policy; jobs cannot write it.
+    pve.agent(
+        row,
+        &[
+            "/bin/sh",
+            "-c",
+            &format!(
+                "install -d -m 755 /etc/carrick-ci; printf '%s\\n' {} > /etc/carrick-ci/policy; chmod 644 /etc/carrick-ci/policy",
+                crate::remote_accept::shell_quote(&admission.render())
+            ),
+        ],
+    )?;
     println!("vm={} ready; non-root KVM API 12 verified", row.vm.get());
     drop(shared_deadline);
     // Write registration intent before asking GitHub. No JIT material in ledger.
     row.state = State::Registered;
     update(ledger, row, path)?;
-    let config = gh.request(
-        "POST",
-        &format!("repos/{REPOSITORY}/actions/runners/generate-jitconfig"),
-        Some(
-            json!({"name":row.name,"runner_group_id":group,"labels":LABELS,"work_folder":"_work"}),
-        ),
-        false,
-    )?;
-    row.runner = Some(RunnerId(
-        config["runner"]["id"]
-            .as_u64()
-            .ok_or(ScalerError::External("JIT runner ID"))?,
-    ));
+    let (runner, jit) = gh.generate_jit(&row.name, group, &LABELS)?;
+    row.runner = Some(runner);
     update(ledger, row, path)?;
-    let jit = string(&config, "encoded_jit_config")?;
     let mut input = jit.into_bytes();
     input.push(b'\n');
     ssh(dir, row, &input, "/usr/local/bin/carrick-ci-run-once", None)?;
@@ -1165,22 +941,55 @@ fn cleanup(
     continue_teardown(&mut LiveTeardown { pve, gh }, ledger, row, dir, path)
 }
 
+/// One reconciliation pass over every active clone.
+struct Pass {
+    finished: usize,
+    /// Any row error or ambiguity freezes new admission until a clean pass.
+    frozen: Option<ScalerError>,
+}
+/// Reconcile every active clone. One row's error does not starve the others.
+/// Only the director's CPU ceiling stops the controller outright.
+fn reconcile_all(
+    pve: &Pve,
+    gh: &Github,
+    ledger: &mut Ledger,
+    dir: &Path,
+    path: &Path,
+    approval: (u64, &Admission),
+) -> Result<Pass, ScalerError> {
+    let active: Vec<Record> = ledger
+        .rows
+        .iter()
+        .filter(|r| r.state != State::Destroyed)
+        .cloned()
+        .collect();
+    let mut finished = 0;
+    let mut first_error = None;
+    for row in active {
+        match reconcile_one(pve, gh, ledger, dir, path, approval, row) {
+            Ok(true) => finished += 1,
+            Ok(false) => {}
+            Err(error @ ScalerError::CpuCeiling { .. }) => return Err(error),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    Ok(Pass {
+        finished,
+        frozen: first_error,
+    })
+}
+
 fn reconcile_one(
     pve: &Pve,
     gh: &Github,
     ledger: &mut Ledger,
     dir: &Path,
     path: &Path,
-    approval: (u64, &str),
+    approval: (u64, &Admission),
+    mut row: Record,
 ) -> Result<bool, ScalerError> {
-    let Some(mut row) = ledger
-        .rows
-        .iter()
-        .find(|r| r.state != State::Destroyed)
-        .cloned()
-    else {
-        return Ok(false);
-    };
     let present = pve.inventory()?.iter().any(|v| v.id == row.vm.get());
     let task = match &row.task {
         Some(task) => pve.task_state(task)?,
@@ -1193,7 +1002,9 @@ fn reconcile_one(
                 "vm={} ambiguous/missing state; admission frozen, owner inspection required",
                 row.vm.get()
             );
-            return Ok(false);
+            return Err(ScalerError::Guard(
+                "ambiguous clone state; admission frozen for owner inspection",
+            ));
         }
         Recovery::FinishAbsent => {
             if task == TaskState::Failed {
@@ -1265,7 +1076,7 @@ fn reconcile_one(
     }
     Ok(false)
 }
-fn pending_owned_job(row: &Record, job: &Value, run: &Value, sha: &str) -> bool {
+fn pending_owned_job(row: &Record, job: &Value, run: &Value, admission: &Admission) -> bool {
     let labels: Vec<&str> = job["labels"]
         .as_array()
         .map(|labels| labels.iter().filter_map(Value::as_str).collect())
@@ -1275,7 +1086,7 @@ fn pending_owned_job(row: &Record, job: &Value, run: &Value, sha: &str) -> bool 
         && eligible_labels(&labels)
         && run["id"].as_u64() == Some(row.key.run.0)
         && run["run_attempt"].as_u64() == Some(u64::from(row.key.attempt))
-        && approved_run(run, sha)
+        && admission.admits_run(run)
 }
 fn one_job_result(row: Option<&Record>) -> Result<(), ScalerError> {
     if row.is_some_and(|r| r.assigned.is_some()) {
@@ -1305,9 +1116,17 @@ fn qualified_template(config: &Value) -> bool {
             .is_some_and(|s| s.contains("bridge=vmbr0"))
 }
 
-pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<(), ScalerError> {
-    if sha.len() != 40 || !sha.bytes().all(|c| c.is_ascii_hexdigit()) {
-        return Err(ScalerError::Guard("approved SHA must be full commit hash"));
+/// Foreground Willow controller. The pilot admission always runs with one
+/// clone; standing mode is bounded by `limit` (at most two clones).
+pub(super) fn controller(
+    admission: &Admission,
+    dir: &Path,
+    group: u64,
+    one_job: bool,
+    limit: Concurrency,
+) -> Result<(), ScalerError> {
+    if matches!(admission, Admission::Pilot { .. }) && limit != Concurrency::ONE {
+        return Err(ScalerError::Guard("the pilot admission is one clone only"));
     }
     let pve = Pve::local()?;
     std::fs::create_dir_all(dir)?;
@@ -1353,22 +1172,29 @@ pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<
     let path = dir.join("ledger.json");
     let mut ledger = Ledger::load(&path)?;
     let mut reconcile = Instant::now() - Duration::from_secs(60);
+    let mut frozen = true;
     loop {
         if reconcile.elapsed() >= Duration::from_secs(60) {
-            match reconcile_one(&pve, &gh, &mut ledger, dir, &path, (group, sha)) {
-                Ok(true) if one_job => {
-                    return one_job_result(ledger.rows.last());
-                }
-                Ok(_) => {}
-                Err(error @ ScalerError::CpuCeiling { .. }) => return Err(error),
-                Err(error) => {
-                    eprintln!("reconcile failed: {error}; admission frozen for active ledger")
-                }
+            let pass = reconcile_all(&pve, &gh, &mut ledger, dir, &path, (group, admission))?;
+            if pass.finished > 0 && one_job {
+                return one_job_result(ledger.rows.last());
             }
+            frozen = match pass.frozen {
+                Some(error) => {
+                    eprintln!("reconcile failed: {error}; admission frozen for active ledger");
+                    true
+                }
+                None => false,
+            };
             reconcile = Instant::now();
         }
-        if !ledger.rows.iter().any(|r| r.state != State::Destroyed) {
-            for job in gh.demand(sha)? {
+        let active = ledger
+            .rows
+            .iter()
+            .filter(|r| r.state != State::Destroyed)
+            .count();
+        if !frozen && active < usize::from(limit.get()) {
+            for job in gh.demand(admission, &LABELS)? {
                 if ledger.rows.iter().any(|r| r.key == job) {
                     continue;
                 }
@@ -1376,18 +1202,25 @@ pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<
                     break;
                 }
                 let inventory = pve.inventory()?;
-                let mut row = ledger.reserve(job, &inventory, now()?)?;
+                let mut row = ledger.reserve(job, &inventory, now()?, limit)?;
                 ledger.save(&path)?; // Must reach durable storage before clone.
                 println!("reserved vm={} job={}", row.vm.get(), job.job.0);
-                if let Err(error) =
-                    provision(&pve, &gh, &mut ledger, &mut row, dir, &path, (group, sha))
-                {
+                if let Err(error) = provision(
+                    &pve,
+                    &gh,
+                    &mut ledger,
+                    &mut row,
+                    dir,
+                    &path,
+                    (group, admission),
+                ) {
                     row.failure = Some(error.to_string());
                     update(&mut ledger, &row, &path)?;
                     if matches!(error, ScalerError::CpuCeiling { .. }) {
                         return Err(error);
                     }
                     eprintln!("provision failed: {error}; preserving ledger for reconciliation");
+                    frozen = true;
                 }
                 break;
             }
@@ -1517,16 +1350,24 @@ mod tests {
         let sha = "a".repeat(40);
         let mut job = json!({"id":row.key.job.0,"status":"queued","labels":LABELS});
         let mut run = json!({"id":row.key.run.0,"run_attempt":row.key.attempt,"event":"workflow_dispatch","head_sha":sha,"head_branch":"work/willow-pilot","path":".github/workflows/willow-pilot.yml","repository":{"full_name":REPOSITORY}});
-        assert!(pending_owned_job(&row, &job, &run, &sha));
+        let approved = Admission::pilot(&sha).unwrap();
+        assert!(pending_owned_job(&row, &job, &run, &approved));
         job["status"] = json!("completed");
-        assert!(!pending_owned_job(&row, &job, &run, &sha));
+        assert!(!pending_owned_job(&row, &job, &run, &approved));
         job["status"] = json!("queued");
         run["run_attempt"] = json!(row.key.attempt + 1);
-        assert!(!pending_owned_job(&row, &job, &run, &sha));
+        assert!(!pending_owned_job(&row, &job, &run, &approved));
         run["run_attempt"] = json!(row.key.attempt);
-        assert!(!pending_owned_job(&row, &job, &run, &"b".repeat(40)));
+        assert!(!pending_owned_job(
+            &row,
+            &job,
+            &run,
+            &Admission::pilot(&"b".repeat(40)).unwrap()
+        ));
+        // A standing controller never resumes a pilot clone's job.
+        assert!(!pending_owned_job(&row, &job, &run, &Admission::Standing));
         job["labels"] = json!(["self-hosted", "Linux", "X64", "willow-kvm", "extra"]);
-        assert!(!pending_owned_job(&row, &job, &run, &sha));
+        assert!(!pending_owned_job(&row, &job, &run, &approved));
     }
     #[test]
     fn director_cpu_ceiling_is_a_stop_condition_above_eighty_percent() {
@@ -1681,6 +1522,7 @@ mod tests {
                 },
                 &[],
                 0,
+                Concurrency::ONE,
             )
             .unwrap()
     }

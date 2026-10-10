@@ -30,10 +30,10 @@ fn clone_range_cannot_deserialize_protected_or_template_ids() {
 #[test]
 fn ledger_reserves_before_api_and_counts_booting_and_deduplicates() {
     let mut ledger = Ledger::default();
-    let row = ledger.reserve(job(20), &[], 100).unwrap();
+    let row = ledger.reserve(job(20), &[], 100, Concurrency::ONE).unwrap();
     assert_eq!(row.vm.get(), 308);
-    assert!(ledger.reserve(job(20), &[], 101).is_err());
-    assert!(ledger.reserve(job(21), &[], 101).is_err());
+    assert!(ledger.reserve(job(20), &[], 101, Concurrency::ONE).is_err());
+    assert!(ledger.reserve(job(21), &[], 101, Concurrency::ONE).is_err());
     let saved = serde_json::to_vec(&ledger).unwrap();
     let restored: Ledger = serde_json::from_slice(&saved).unwrap();
     assert_eq!(restored.rows.len(), 1);
@@ -48,12 +48,18 @@ fn existing_unknown_clone_blocks_admission_even_without_ledger_entry() {
         pool: POOL.into(),
         template: false,
     };
-    assert!(ledger.reserve(job(1), &[unknown], 10).is_err());
+    assert!(
+        ledger
+            .reserve(job(1), &[unknown], 10, Concurrency::ONE)
+            .is_err()
+    );
 }
 
 #[test]
 fn destruction_requires_ledger_range_pool_and_exact_identity() {
-    let row = Ledger::default().reserve(job(1), &[], 0).unwrap();
+    let row = Ledger::default()
+        .reserve(job(1), &[], 0, Concurrency::ONE)
+        .unwrap();
     let mut candidate = vm(308, &row.name);
     assert!(row.guard(&candidate).is_ok());
     candidate.pool = "another-pool".into();
@@ -136,12 +142,18 @@ fn cached_template_flag_cannot_exempt_a_clone_id_from_the_budget() {
         pool: POOL.into(),
         template: true,
     };
-    assert!(Ledger::default().reserve(job(1), &[member], 10).is_err());
+    assert!(
+        Ledger::default()
+            .reserve(job(1), &[member], 10, Concurrency::ONE)
+            .is_err()
+    );
 }
 
 #[test]
 fn unassigned_reap_deadline_preserves_busy_and_unknown_assignment() {
-    let row = Ledger::default().reserve(job(1), &[], 100).unwrap();
+    let row = Ledger::default()
+        .reserve(job(1), &[], 100, Concurrency::ONE)
+        .unwrap();
     assert_eq!(reap_decision(&row, 999, Assignment::Unassigned), Reap::Keep);
     assert_eq!(
         reap_decision(&row, 1000, Assignment::Unassigned),
@@ -172,7 +184,9 @@ impl ReaperApi for MockApi {
 
 #[test]
 fn mock_api_receives_no_mutations_on_guard_failure_and_reaps_owned_clone() {
-    let row = Ledger::default().reserve(job(1), &[], 0).unwrap();
+    let row = Ledger::default()
+        .reserve(job(1), &[], 0, Concurrency::ONE)
+        .unwrap();
     let mut api = MockApi {
         stopped: vec![],
         destroyed: vec![],
@@ -187,18 +201,18 @@ fn mock_api_receives_no_mutations_on_guard_failure_and_reaps_owned_clone() {
 #[test]
 fn completed_job_remains_deduplicated_after_cleanup_and_restart() {
     let mut ledger = Ledger::default();
-    ledger.reserve(job(1), &[], 10).unwrap();
+    ledger.reserve(job(1), &[], 10, Concurrency::ONE).unwrap();
     ledger.rows[0].state = State::Destroyed;
     let mut ledger: Ledger = serde_json::from_slice(&serde_json::to_vec(&ledger).unwrap()).unwrap();
-    assert!(ledger.reserve(job(1), &[], 20).is_err());
-    assert!(ledger.reserve(job(2), &[], 20).is_ok());
+    assert!(ledger.reserve(job(1), &[], 20, Concurrency::ONE).is_err());
+    assert!(ledger.reserve(job(2), &[], 20, Concurrency::ONE).is_ok());
 }
 
 #[test]
 fn persisted_reaping_resumes_after_runner_removal_or_vm_stop() {
     for stopped in [false, true] {
         let mut ledger = Ledger::default();
-        let mut row = ledger.reserve(job(1), &[], 0).unwrap();
+        let mut row = ledger.reserve(job(1), &[], 0, Concurrency::ONE).unwrap();
         row.state = State::Reaping;
         row.runner = Some(RunnerId(30));
         row.assigned = None;
@@ -225,7 +239,9 @@ fn persisted_reaping_resumes_after_runner_removal_or_vm_stop() {
 
 #[test]
 fn persisted_reaping_finishes_absence_without_a_recorded_delete_task() {
-    let mut row = Ledger::default().reserve(job(1), &[], 0).unwrap();
+    let mut row = Ledger::default()
+        .reserve(job(1), &[], 0, Concurrency::ONE)
+        .unwrap();
     row.state = State::Reaping;
     assert_eq!(
         recovery_decision(&row, false, TaskState::Absent, 1),
@@ -235,7 +251,9 @@ fn persisted_reaping_finishes_absence_without_a_recorded_delete_task() {
 
 #[test]
 fn recovery_distinguishes_failed_absent_clone_from_ambiguous_submission() {
-    let mut row = Ledger::default().reserve(job(1), &[], 0).unwrap();
+    let mut row = Ledger::default()
+        .reserve(job(1), &[], 0, Concurrency::ONE)
+        .unwrap();
     assert_eq!(
         recovery_decision(&row, false, TaskState::Absent, 900),
         Recovery::FinishAbsent
@@ -267,7 +285,7 @@ fn recovery_distinguishes_failed_absent_clone_from_ambiguous_submission() {
 #[test]
 fn successful_owned_clone_is_resumed_in_place_without_another_reservation() {
     let mut ledger = Ledger::default();
-    let mut row = ledger.reserve(job(1), &[], 0).unwrap();
+    let mut row = ledger.reserve(job(1), &[], 0, Concurrency::ONE).unwrap();
     row.state = State::Cloning;
     assert_eq!(
         recovery_decision(&row, true, TaskState::Succeeded, 10),
@@ -277,30 +295,218 @@ fn successful_owned_clone_is_resumed_in_place_without_another_reservation() {
         recovery_decision(&row, true, TaskState::Running, 10),
         Recovery::Wait
     );
-    assert!(ledger.reserve(job(2), &[], 10).is_err());
+    assert!(ledger.reserve(job(2), &[], 10, Concurrency::ONE).is_err());
     assert_eq!(ledger.rows.len(), 1);
 }
 
 #[test]
-fn job_start_authorization_rejects_wrong_repository_event_ref_and_sha() {
+fn pilot_job_start_rejects_wrong_repository_event_ref_and_sha() {
+    let sha = "a".repeat(40);
+    let pilot = Admission::pilot(&sha).unwrap();
     let mut context = JobContext {
         repository: "carrick-sh/carrick".into(),
         event: "workflow_dispatch".into(),
         workflow_ref:
             "carrick-sh/carrick/.github/workflows/willow-pilot.yml@refs/heads/work/willow-pilot"
                 .into(),
-        sha: "a".repeat(40),
+        git_ref: "refs/heads/work/willow-pilot".into(),
+        sha: sha.clone(),
     };
-    assert!(authorize_job(&context, &"a".repeat(40)).is_ok());
-    assert!(authorize_job(&context, &"b".repeat(40)).is_err());
+    assert!(pilot.authorize(&context).is_ok());
+    assert!(
+        Admission::pilot(&"b".repeat(40))
+            .unwrap()
+            .authorize(&context)
+            .is_err()
+    );
+    // The pilot is not a standing policy and vice versa.
+    assert!(Admission::Standing.authorize(&context).is_err());
     context.event = "pull_request".into();
-    assert!(authorize_job(&context, &"a".repeat(40)).is_err());
+    assert!(pilot.authorize(&context).is_err());
     context.event = "workflow_dispatch".into();
     context.repository = "fork/carrick".into();
-    assert!(authorize_job(&context, &"a".repeat(40)).is_err());
+    assert!(pilot.authorize(&context).is_err());
     context.repository = "carrick-sh/carrick".into();
     context.workflow_ref = "carrick-sh/carrick/.github/workflows/other.yml@refs/heads/main".into();
-    assert!(authorize_job(&context, &"a".repeat(40)).is_err());
+    assert!(pilot.authorize(&context).is_err());
+}
+
+fn standing_context(event: &str, git_ref: &str) -> JobContext {
+    JobContext {
+        repository: REPOSITORY.into(),
+        event: event.into(),
+        workflow_ref: format!("{REPOSITORY}/{KERNEL_RUNTIME_WORKFLOW}@{git_ref}"),
+        git_ref: git_ref.into(),
+        sha: "c".repeat(40),
+    }
+}
+
+#[test]
+fn standing_job_start_admits_merge_queue_push_and_dispatch_on_main_only() {
+    let queue = "refs/heads/gh-readonly-queue/main/pr-42-0123456789abcdef0123456789abcdef01234567";
+    for (event, git_ref) in [
+        ("merge_group", queue),
+        ("push", "refs/heads/main"),
+        ("workflow_dispatch", "refs/heads/main"),
+    ] {
+        assert!(
+            Admission::Standing
+                .authorize(&standing_context(event, git_ref))
+                .is_ok(),
+            "{event} {git_ref}"
+        );
+    }
+    for (event, git_ref) in [
+        // Untrusted pull-request code never reaches a self-hosted runner.
+        ("pull_request", "refs/pull/42/merge"),
+        ("pull_request", "refs/heads/main"),
+        ("pull_request_target", "refs/heads/main"),
+        ("schedule", "refs/heads/main"),
+        ("push", "refs/heads/work/feature"),
+        ("workflow_dispatch", "refs/heads/work/feature"),
+        ("merge_group", "refs/heads/gh-readonly-queue/other/pr-1-abc"),
+        ("merge_group", "refs/heads/gh-readonly-queue/main/"),
+        ("merge_group", "refs/heads/main"),
+        ("push", "refs/tags/v1"),
+    ] {
+        assert!(
+            Admission::Standing
+                .authorize(&standing_context(event, git_ref))
+                .is_err(),
+            "{event} {git_ref} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn standing_job_start_rejects_a_foreign_workflow_repository_or_sha() {
+    let mut context = standing_context("push", "refs/heads/main");
+    context.workflow_ref = format!("{REPOSITORY}/.github/workflows/ci.yml@refs/heads/main");
+    assert!(Admission::Standing.authorize(&context).is_err());
+    context.workflow_ref = format!("{REPOSITORY}/{PILOT_WORKFLOW}@refs/heads/main");
+    assert!(Admission::Standing.authorize(&context).is_err());
+    // The workflow file must be read at the very ref being run.
+    context.workflow_ref = format!("{REPOSITORY}/{KERNEL_RUNTIME_WORKFLOW}@refs/heads/other");
+    assert!(Admission::Standing.authorize(&context).is_err());
+    let mut context = standing_context("push", "refs/heads/main");
+    context.repository = "fork/carrick".into();
+    assert!(Admission::Standing.authorize(&context).is_err());
+    let mut context = standing_context("push", "refs/heads/main");
+    context.workflow_ref = format!("fork/carrick/{KERNEL_RUNTIME_WORKFLOW}@refs/heads/main");
+    assert!(Admission::Standing.authorize(&context).is_err());
+    let mut context = standing_context("push", "refs/heads/main");
+    context.sha = "short".into();
+    assert!(Admission::Standing.authorize(&context).is_err());
+}
+
+fn standing_run(event: &str, branch: &str) -> serde_json::Value {
+    serde_json::json!({
+        "event": event,
+        "head_branch": branch,
+        "head_sha": "d".repeat(40),
+        "path": KERNEL_RUNTIME_WORKFLOW,
+        "repository": {"full_name": REPOSITORY},
+        "head_repository": {"full_name": REPOSITORY},
+    })
+}
+
+#[test]
+fn standing_demand_serves_only_trusted_kernel_runtime_runs() {
+    for (event, branch) in [
+        (
+            "merge_group",
+            "gh-readonly-queue/main/pr-7-0123456789abcdef",
+        ),
+        ("push", "main"),
+        ("workflow_dispatch", "main"),
+    ] {
+        assert!(Admission::Standing.admits_run(&standing_run(event, branch)));
+    }
+    for (event, branch) in [
+        ("pull_request", "main"),
+        ("pull_request", "work/x"),
+        ("schedule", "main"),
+        ("push", "work/x"),
+    ] {
+        assert!(!Admission::Standing.admits_run(&standing_run(event, branch)));
+    }
+    let mut foreign = standing_run("push", "main");
+    foreign["path"] = ".github/workflows/ci.yml".into();
+    assert!(!Admission::Standing.admits_run(&foreign));
+    let mut fork = standing_run("push", "main");
+    fork["head_repository"]["full_name"] = "fork/carrick".into();
+    assert!(!Admission::Standing.admits_run(&fork));
+    // The pilot never serves kernel-runtime demand.
+    assert!(
+        !Admission::pilot(&"d".repeat(40))
+            .unwrap()
+            .admits_run(&standing_run("push", "main"))
+    );
+}
+
+#[test]
+fn admission_policy_file_round_trips_and_rejects_unknown_text() {
+    for policy in [
+        Admission::Standing,
+        Admission::pilot(&"e".repeat(40)).unwrap(),
+    ] {
+        assert_eq!(Admission::parse(&policy.render()).unwrap(), policy);
+    }
+    for text in ["", "standing extra", "pilot", "pilot short", "anything"] {
+        assert!(Admission::parse(text).is_err(), "{text:?}");
+    }
+}
+
+#[test]
+fn serial_host_policy_file_must_be_owner_writable_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("policy");
+    std::fs::write(&path, "standing\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(read_policy(&path).unwrap(), Admission::Standing);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+    assert!(read_policy(&path).is_err());
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    assert!(read_policy(&link).is_err());
+}
+
+#[test]
+fn standing_concurrency_is_bounded_at_two_and_unknown_objects_still_block() {
+    assert!("0".parse::<Concurrency>().is_err());
+    assert!("3".parse::<Concurrency>().is_err());
+    let two: Concurrency = "2".parse().unwrap();
+    let mut ledger = Ledger::default();
+    let first = ledger.reserve(job(1), &[], 10, two).unwrap();
+    let member = |id| PoolMember {
+        id,
+        pool: POOL.into(),
+        template: false,
+    };
+    // The first clone exists in the pool; a second, distinct VMID is chosen.
+    let second = ledger
+        .reserve(job(2), &[member(first.vm.get())], 11, two)
+        .unwrap();
+    assert_ne!(first.vm, second.vm);
+    assert!(
+        ledger
+            .reserve(
+                job(3),
+                &[member(first.vm.get()), member(second.vm.get())],
+                12,
+                two
+            )
+            .is_err()
+    );
+    // One clone budget: the default.
+    let mut ledger = Ledger::default();
+    ledger.reserve(job(1), &[], 10, Concurrency::ONE).unwrap();
+    assert!(ledger.reserve(job(2), &[], 11, two).is_ok());
+    // An unknown pool object blocks admission even with spare budget.
+    let mut ledger = Ledger::default();
+    ledger.reserve(job(1), &[], 10, two).unwrap();
+    assert!(ledger.reserve(job(2), &[member(340)], 11, two).is_err());
 }
 
 #[test]
@@ -320,10 +526,10 @@ fn durable_ledger_round_trip_rejects_corruption_without_resetting_budget() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ledger.json");
     let mut ledger = Ledger::default();
-    ledger.reserve(job(1), &[], 10).unwrap();
+    ledger.reserve(job(1), &[], 10, Concurrency::ONE).unwrap();
     ledger.save(&path).unwrap();
     let mut restored = Ledger::load(&path).unwrap();
-    assert!(restored.reserve(job(2), &[], 11).is_err());
+    assert!(restored.reserve(job(2), &[], 11, Concurrency::ONE).is_err());
     std::fs::write(&path, "{broken").unwrap();
     assert!(Ledger::load(&path).is_err());
 }
