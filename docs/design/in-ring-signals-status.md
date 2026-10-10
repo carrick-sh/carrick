@@ -21,7 +21,7 @@ These are named integration dependencies, not completed signal semantics:
 | H2 repeated child suspend/wait | Shared child-MM retirement must return reusable stock | Three-round sigsuspend/sigwait and stock-reuse KVM witnesses |
 | H4 blocked read interruption | Director-owned x86 in-zone pipe/fd-table lane; pipe2 is currently ENOSYS | `mounted_static_x86_signal_kills_reading_child_matches_native` |
 | H6 stop/continue and SIGKILL member retirement | Shared process-owner lifecycle and wait events; native wait event type is still empty | `mounted_static_x86_signal_stop_continue_matches_native` |
-| M3 signal permissions, M4 RLIMIT_SIGPENDING, SIGCHLD si_uid | Identity credentials and per-process rlimits in PR #130 | No fabricated credential or quota owner introduced |
+| M3 signal permissions, M4 RLIMIT_SIGPENDING, SIGCHLD si_uid | Signal permission/quota integration with identity credentials and per-process rlimits | No fabricated credential or quota owner introduced |
 | M5 reset_for_exec | Identity/exec lane must admit a real x86 exec successor and call the existing reset hook | No new exec host crossing introduced |
 | M7 production WithWork runtime | x86 fd-table executor lane must own the production WORK_PORT handler | `signal_delivery_waits_for_the_owned_completion_ledger` proves ordering only |
 
@@ -32,8 +32,8 @@ found stdout poll and the authority-refusal witness red on the preserved
 origin/main plus private-ELF prerequisite artifact. Poll belongs to the
 in-zone fd-table lane. The authority fixture now checks served action
 installation/query and the exact reduced boundary counts, while retaining
-its strict refusal-family journal assertion. Signal witnesses are not
-skipped or weakened to hide dependencies.
+its strict refusal-family journal assertion. The five dependency witnesses now carry named ignores after the identity
+rebase, as recorded below; their comparisons and assertions remain intact.
 
 Pidfd signals retain the previous lane routing until in-ring pidfds exist:
 ARM uses the old forwarding route, while x86 retains its existing unported
@@ -59,3 +59,26 @@ Linux frame encoding/decoding lives in EL1 personality modules; ISA modules
 retain neutral machine state and privilege checks. The boundary gate was
 red with 27 violations before this relocation and clean for all nine
 substrate crates afterwards. No boundary exceptions were added.
+
+## Named KVM dependencies after identity rebase
+
+The complete KVM suite on `work/ring-identity` at `ab7caeb05` plus this
+branch still failed the following five witnesses. At the director's
+request they retain their native comparison assertions and carry explicit
+`#[ignore]` reasons. These exact dependency strings belong in the PR body;
+the director manages that body. Remove the corresponding ignores and run
+these unchanged witnesses when each mechanism lands.
+
+| Witness | Exact dependency / ignore reason | Green on `ab7caeb05`? |
+| --- | --- | --- |
+| `fork_reuses_retired_stock_matches_native` | x86 fork child-MM retirement returning reusable stock | No: exit 11 |
+| `signal_kills_reading_child_matches_native` | x86 in-ring pipe2/read fd-table continuations | No: exit 38 |
+| `signal_sigsuspend_loop_matches_native` | x86 fork child-MM retirement returning reusable stock | No: exit 11 |
+| `signal_stop_continue_matches_native` | shared process-owner stop/continue wait events | No: exit 99 |
+| `signal_wait_child_matches_native` | x86 fork child-MM retirement returning reusable stock | No: exit 11 |
+
+The pre-ignore full run is recorded at
+`/tmp/ring-on-identity-full-kvm-red.log` (38 passed, 10 failed, 5 originally
+ignored). Identity's fixture table grant derived from shared image GPA plus
+size remains present. The obsolete cancellation revert was omitted during
+rebase, so it cannot remove identity's landed boundary correction.
