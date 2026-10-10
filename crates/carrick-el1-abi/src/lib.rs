@@ -28,6 +28,8 @@ mod guest_mmu_publication;
 pub use guest_mmu_publication::*;
 mod x86_initial_boot;
 pub use x86_initial_boot::*;
+mod native_run_failure;
+pub use native_run_failure::*;
 mod fork_stock;
 pub use fork_stock::*;
 mod x86_prepare_stock;

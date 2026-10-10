@@ -13,6 +13,7 @@ const _: () = {
         carrick_el1_abi::FORK_STOCK_PORT,
         carrick_el1_abi::NATIVE_ROOT_EXIT_PORT,
         carrick_el1_abi::NATIVE_PEER_READY_PORT,
+        carrick_el1_abi::NATIVE_RUN_FAILURE_PORT,
     ];
     let existing = [
         FAULT_DOORBELL_PORT,
@@ -566,6 +567,24 @@ impl Cpl0HostCustody {
             );
         }
         Ok(bytes)
+    }
+
+    pub(super) fn service_run_failure(
+        &self,
+        lease: &StoppedCpuLease<'_>,
+    ) -> Result<carrick_el1_abi::NativeRunFailureReason, TrapError> {
+        let execution = self.physical_execution(lease)?;
+        // SAFETY: the record consists of eight initialized u64s, valid for all bit patterns.
+        let (_, record) = unsafe {
+            self.read_stack_record::<carrick_el1_abi::NativeRunFailure>(
+                lease,
+                execution.context,
+                lease.vcpu.get_gpr(X86Reg::Rax)?,
+            )
+        }?;
+        record
+            .reason_for(execution.binding)
+            .ok_or_else(|| fail("native run failure execution/reason"))
     }
 
     pub(super) fn service_root_exit(
