@@ -144,7 +144,7 @@ pub fn witness(
     let timer = words[2];
     let kick = words[3];
     let idt = carrick_x86::fault_idt_base(carrick_x86::BringupLayout {
-        trampoline_base: 0x10_0000,
+        trampoline_base: carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_GPA,
         gdt_base: 0x50_0000,
         pml4_base: FIRST_ROOT,
     });

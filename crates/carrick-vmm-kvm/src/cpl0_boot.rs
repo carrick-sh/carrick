@@ -100,12 +100,33 @@ const fn initial_copy_branch_table_credits() -> usize {
     2 * carrick_mmu_core::x86::copy_window::COW_COPY_TABLE_PAGES
 }
 
+/// Fixed physical base of the initial GDT (0x50_0000), immediately following the
+/// 1 MiB fixture process lane tables (0x30_0000..0x40_0000) and data (0x40_0000..0x50_0000).
+const GDT_BASE: u64 = 0x50_0000;
+/// Fixed physical base of the shared PML4 page-table pool and initial boot root (0x60_0000).
+/// Fixed by contract across the KVM carrier, carrick-x86 bringup, and CPL0 supervisor:
+/// - Initial boot CR3 is 0x60_0000.
+/// - The pool occupies `carrick_x86::X86_PML4_CAPACITY` bytes (0x1c_0000 bytes, 0x60_0000..0x7c_0000),
+///   followed by fault structures (IDT, stubs, TSS, stack, records) spanning 0x7c_0000..0x81_0000.
+/// - Compile-time assertion `LAYOUT.gdt_base < LAYOUT.pml4_base` strictly prevents any future
+///   image extent expansion from silently overlapping this fixed root pool.
+const PML4_BASE: u64 = 0x60_0000;
+
 const LAYOUT: BringupLayout = BringupLayout {
-    trampoline_base: 0x10_0000,
-    gdt_base: 0x50_0000,
-    pml4_base: 0x60_0000,
+    trampoline_base: IMAGE_GPA,
+    gdt_base: GDT_BASE,
+    pml4_base: PML4_BASE,
 };
-const _: () = assert!(IMAGE_GPA + IMAGE_SIZE < LAYOUT.gdt_base);
+const _: () = {
+    assert!(IMAGE_GPA.is_multiple_of(4096));
+    assert!(IMAGE_SIZE.is_multiple_of(4096));
+    assert!(IMAGE_GPA + IMAGE_SIZE <= 0x30_0000);
+    assert!(IMAGE_GPA + IMAGE_SIZE <= LAYOUT.gdt_base);
+    assert!(LAYOUT.gdt_base.is_multiple_of(4096));
+    assert!(LAYOUT.gdt_base < LAYOUT.pml4_base);
+    assert!(LAYOUT.pml4_base.is_multiple_of(4096));
+    assert!(LAYOUT.pml4_base + carrick_x86::X86_PML4_CAPACITY as u64 <= META_GPA);
+};
 const _: () = assert!(FIXTURE_PML4_CAPACITY == carrick_x86::X86_PML4_CAPACITY);
 
 fn fail(message: impl Into<String>) -> TrapError {
@@ -2226,7 +2247,7 @@ impl Cpl0Carrier {
 
     /// Inspect the stopped bootstrap's supervisor direct-window permissions.
     pub fn bootstrap_supervisor_access(&self, gpa: u64, access: Access) -> Result<bool, TrapError> {
-        if !(IMAGE_GPA + IMAGE_SIZE..0xc0_0000).contains(&gpa) {
+        if !(IMAGE_GPA + IMAGE_SIZE..META_GPA).contains(&gpa) {
             return Err(fail("supervisor access outside bootstrap window"));
         }
         let root = RootGpa::page_aligned(FrameGpa::new(LAYOUT.pml4_base))
@@ -3270,7 +3291,7 @@ impl Cpl0Carrier {
         // and exception stubs, remains the hardware authority.
         let stub_start = carrick_x86::fault_stub_base(LAYOUT);
         let stub_end = carrick_x86::fault_tss_base(LAYOUT);
-        if !(IMAGE_GPA + IMAGE_SIZE < stub_start && stub_start < stub_end && stub_end < 0xc0_0000) {
+        if !(IMAGE_GPA + IMAGE_SIZE < stub_start && stub_start < stub_end && stub_end < META_GPA) {
             return Err(fail("CPL0 stub outside direct window"));
         }
         // Retained exception stubs execute from their supervisor alias. The
@@ -3279,7 +3300,7 @@ impl Cpl0Carrier {
         for (start, end, write, exec) in [
             (IMAGE_GPA + IMAGE_SIZE, stub_start, true, false),
             (stub_start, stub_end, false, true),
-            (stub_end, 0xc0_0000, true, false),
+            (stub_end, META_GPA, true, false),
         ] {
             maps.push(Pml4MapSpec {
                 va: DIRECT_VA + start,
@@ -3291,8 +3312,8 @@ impl Cpl0Carrier {
             });
         }
         maps.push(Pml4MapSpec {
-            va: DIRECT_VA + 0xc0_0000,
-            gpa: 0xc0_0000,
+            va: DIRECT_VA + META_GPA,
+            gpa: META_GPA,
             len: if initial_extent_bytes.is_some() {
                 ((carrick_el1_abi::X86_CPL0_ZONE_OFFSET as usize + size_of::<X86Cpl0Zone>() + 4095)
                     & !4095) as u64
@@ -6027,4 +6048,39 @@ pub enum InitialProcessExit {
         record: carrick_x86::FaultDoorbellRecord,
         exits: usize,
     },
+}
+
+#[cfg(test)]
+mod cpl0_layout_tests {
+    use super::*;
+
+    #[test]
+    fn cpl0_supervisor_image_extent_ordering_alignment_and_nonoverlap() {
+        assert_eq!(IMAGE_GPA, carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_GPA);
+        assert_eq!(IMAGE_SIZE, carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_SIZE);
+        assert_eq!(IMAGE_SIZE, 0x20_0000); // 2 MiB
+
+        // Page alignment for image and layout structures
+        assert!(IMAGE_GPA.is_multiple_of(4096));
+        assert!(IMAGE_SIZE.is_power_of_two());
+        assert!(IMAGE_SIZE.is_multiple_of(4096));
+        assert!(LAYOUT.gdt_base.is_multiple_of(4096));
+        assert!(LAYOUT.pml4_base.is_multiple_of(4096));
+
+        // Strict non-overlap: image ends at or before fixture process tables (0x30_0000)
+        assert!(IMAGE_GPA + IMAGE_SIZE <= 0x30_0000);
+        // Image exclusive end <= GDT base
+        assert!(IMAGE_GPA + IMAGE_SIZE <= LAYOUT.gdt_base);
+        // Ordering: GDT base < PML4 base < fault structures < metadata
+        assert!(LAYOUT.gdt_base < LAYOUT.pml4_base);
+        assert!(LAYOUT.pml4_base + carrick_x86::X86_PML4_CAPACITY as u64 <= META_GPA);
+
+        let stub_start = carrick_x86::fault_stub_base(LAYOUT);
+        let stub_end = carrick_x86::fault_tss_base(LAYOUT);
+        let idt_base = carrick_x86::fault_idt_base(LAYOUT);
+        assert!(IMAGE_GPA + IMAGE_SIZE <= idt_base);
+        assert!(idt_base < stub_start);
+        assert!(stub_start < stub_end);
+        assert!(stub_end < META_GPA);
+    }
 }
