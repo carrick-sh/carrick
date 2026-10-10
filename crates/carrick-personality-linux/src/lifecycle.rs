@@ -114,6 +114,9 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     fn as_sysinfo_venue(&mut self) -> Option<&mut dyn crate::sysinfo::ProcessSysinfoVenue> {
         None
     }
+    fn as_ipc_venue(&mut self) -> Option<&mut dyn crate::ipc::ProcessIpcVenue> {
+        None
+    }
     fn thread_spawned(
         &mut self,
         _caller_tid: u32,
