@@ -45,4 +45,4 @@ pub use mmu::{
     execute_native_edit_intent, hardware_live_root, portal_root_is_live, resident_leaf_matches,
 };
 pub(crate) use mmu::{portal_descriptor_words, portal_invalidate_root};
-pub use transport::{fatal_entry_binding, yield_host_effect};
+pub use transport::{complete_native_run_failure, fatal_entry_binding, yield_host_effect};
