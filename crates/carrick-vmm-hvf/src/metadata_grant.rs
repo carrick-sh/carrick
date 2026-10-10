@@ -725,7 +725,10 @@ pub(crate) fn drain_fork_quarantine(
     let zone = zone.ok_or(ForkStockServiceError::OccupancyUnavailable)?;
     let active_mm = carrick_el1_abi::ReservationMm::new(execution.binding.mm.raw())
         .ok_or(ForkStockServiceError::StaleExecution)?;
-    let installed: Vec<u64> = (0..carrick_el1_abi::EL1_STACK_SLOTS as usize)
+    // The guest's retired-space drain scans the same `ZONE_SLOTS`; every
+    // zone slot has its own EL1 stack slot.
+    const _: () = assert!(carrick_el1_abi::EL1_STACK_SLOTS as usize == carrick_el1_abi::ZONE_SLOTS);
+    let installed: Vec<u64> = (0..carrick_el1_abi::ZONE_SLOTS)
         .filter_map(carrick_guest_arch::SlotId::from_index)
         .map(|slot| zone.installed_space(slot))
         .collect();

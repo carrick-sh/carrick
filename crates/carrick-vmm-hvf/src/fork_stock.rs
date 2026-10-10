@@ -101,10 +101,12 @@ impl ForkStockHostCustody {
         if !valid(lifecycle_base) || !valid(table_base) || lifecycle_base == table_base {
             return Err(ForkStockServiceError::InvalidRecord);
         }
-        // The first slot of the extent stays unused, as before.
-        let slots = extent / LIFECYCLE_SLOT_STRIDE - 1;
-        let lifecycles = lifecycle_slots(aperture, lifecycle_base + LIFECYCLE_SLOT_STRIDE, slots)
-            .ok_or(ForkStockServiceError::InvalidRecord)?;
+        let lifecycles = lifecycle_slots(
+            aperture,
+            lifecycle_base + LIFECYCLE_SLOT_STRIDE,
+            HVF_FORK_LIFECYCLE_SLOTS,
+        )
+        .ok_or(ForkStockServiceError::InvalidRecord)?;
         let tables = (table_base..table_base + extent)
             .step_by(4096)
             .map(|ipa| RootGpa::page_aligned(FrameGpa::new(ipa)))
@@ -304,6 +306,11 @@ impl ForkStockHostCustody {
         self.stock.set_carrier(carrier);
     }
 }
+
+/// Lifecycle records in the HVF stock: one metadata extent of 16 KiB slots,
+/// the first left unused. Each live fork child holds one.
+pub(crate) const HVF_FORK_LIFECYCLE_SLOTS: u64 =
+    carrick_el1_abi::EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64 / LIFECYCLE_SLOT_STRIDE - 1;
 
 #[cfg(test)]
 mod tests {
@@ -2142,5 +2149,22 @@ mod tests {
             Err(ForkStockServiceError::Asid(AsidError::NotLive(child_asid))),
             "double release must be reported as a typed error"
         );
+    }
+}
+
+#[cfg(test)]
+mod design_doc_tests {
+    /// The design doc's AArch64 live-children limit is this stock's size.
+    #[test]
+    fn design_doc_names_the_hvf_lifecycle_record_count() {
+        let doc = include_str!("../../../docs/design/arm-fork-stock-crossing.md");
+        let text = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+        let claim = format!(
+            "AArch64 has {} records (one {} KiB metadata extent, {} KiB per record",
+            super::HVF_FORK_LIFECYCLE_SLOTS,
+            carrick_el1_abi::EL1_DYNAMIC_METADATA_EXTENT_SIZE / 1024,
+            carrick_hal::fork_stock::LIFECYCLE_SLOT_STRIDE / 1024,
+        );
+        assert!(text.contains(&claim), "doc must say: {claim}");
     }
 }

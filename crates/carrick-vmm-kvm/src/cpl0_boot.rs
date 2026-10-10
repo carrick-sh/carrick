@@ -983,6 +983,22 @@ fn admit_forward_execution(
 }
 
 #[cfg(test)]
+mod design_doc_tests {
+    /// The design doc's x86 live-children limit is this stock's layout.
+    #[test]
+    fn design_doc_names_the_kvm_lifecycle_record_count_and_offset() {
+        let doc = include_str!("../../../docs/design/arm-fork-stock-crossing.md");
+        let text = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+        let claim = format!(
+            "x86 CPL0 has **{} records** at metadata offset `{:#x}`",
+            super::FORK_LIFECYCLE_SLOTS,
+            super::FORK_LIFECYCLE_OFFSET,
+        );
+        assert!(text.contains(&claim), "doc must say: {claim}");
+    }
+}
+
+#[cfg(test)]
 mod forward_execution_tests {
     use super::*;
 
