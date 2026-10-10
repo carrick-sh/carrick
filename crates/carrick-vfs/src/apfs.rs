@@ -163,30 +163,6 @@ pub fn delete_carrick_volume(operator: &mut impl ApfsOperator) -> Result<(), Apf
     Ok(())
 }
 
-/// Best-effort: ensure the carrick volume is mounted. Newly created
-/// volumes are usually auto-mounted, but a reboot leaves them mounted
-/// only if launchd is configured for them. Returns the volume's
-/// current mount point regardless.
-pub fn ensure_mounted(
-    operator: &mut impl ApfsOperator,
-    volume: &VolumeInfo,
-) -> Result<PathBuf, ApfsError> {
-    if let Some(mp) = &volume.mount_point {
-        return Ok(mp.clone());
-    }
-    let _ = operator.run_diskutil(&["mount", &volume.device])?;
-    let refreshed = find_carrick_volume(operator)?.ok_or_else(|| {
-        ApfsError::BootContainerNotFound(
-            "mount apparently succeeded but the volume disappeared".to_owned(),
-        )
-    })?;
-    refreshed.mount_point.ok_or_else(|| {
-        ApfsError::BootContainerNotFound(
-            "mount apparently succeeded but no mount point is set".to_owned(),
-        )
-    })
-}
-
 /// Parse `diskutil apfs list`'s text output for entries with the given
 /// volume name. The list format is stable in macOS 12+ (sequoia/sonoma),
 /// indented with `+-> Volume <disk> <UUID>` headers and `Name: <X> (...)`
