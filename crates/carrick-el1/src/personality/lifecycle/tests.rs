@@ -458,16 +458,17 @@ fn clone_forwards_every_other_flag_set_without_effects() {
         assert_eq!(w.zone.slot(SLOT).queued(), 0);
         assert_eq!(w.forwarded(SYS_CLONE), 1);
     }
-    // A child on the parent's stack keeps its family fallback; unported clone3
-    // is refused by the unconfigured strict aperture.
+    // A child on the parent's stack keeps its family fallback. The legacy
+    // direct dispatcher has no process owner, so typed clone3 routes to its
+    // family fallback; production ARM entry intercepts it before this wrapper.
     let mut w = World::new(LifecycleHatches::ON);
     w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
     let (action, _) = w.syscall(SYS_CLONE, &[GLIBC_FLAGS, 0, 0, 0, 0]);
     assert_eq!(action, Action::Forward);
     let (action, frame) = w.syscall(435, &[0x1000, 88]);
-    assert_eq!(action, Action::Served);
-    assert_eq!(frame.x[0] as i64, -38);
-    assert_eq!(w.counters.refused[435].load(Ordering::Relaxed), 1);
+    assert_eq!(action, Action::Forward);
+    assert_eq!(&frame.x[..2], &[0x1000, 88]);
+    assert_eq!(w.forwarded(435), 1);
     assert_eq!(w.page().state(0).unwrap().1, EntryState::Reserved);
 }
 
