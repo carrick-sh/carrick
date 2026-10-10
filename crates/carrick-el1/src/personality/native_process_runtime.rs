@@ -1831,6 +1831,26 @@ mod tests {
         copies: Vec<LinuxWaitStatus>,
         refuse_copy: bool,
         retired: Vec<AddressContext<RootGpa>>,
+        /// The child's lifecycle record bytes when its MM was retired (the
+        /// moment the guest publishes slot absence).
+        retired_records: Vec<Vec<u8>>,
+    }
+    /// Bytes of one lifecycle record: the page and its thread controls.
+    fn record_bytes(page: &ThreadLifecyclePage, controls: &[ThreadControlSlot]) -> Vec<u8> {
+        // SAFETY: both are initialized ABI records read on this one test
+        // thread; no other thread writes them.
+        unsafe {
+            let mut bytes = core::slice::from_raw_parts(
+                core::ptr::from_ref(page).cast::<u8>(),
+                core::mem::size_of::<ThreadLifecyclePage>(),
+            )
+            .to_vec();
+            bytes.extend_from_slice(core::slice::from_raw_parts(
+                controls.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(controls),
+            ));
+            bytes
+        }
     }
     impl<'a> NativeProcessService<'a, ParkedContextWords> for Physical<'a> {
         type Mm = AddressContext<RootGpa>;
@@ -1933,6 +1953,8 @@ mod tests {
         }
         fn retire_mm(&mut self, mm: Self::Mm) {
             self.retired.push(mm);
+            self.retired_records
+                .push(record_bytes(self.page, self.controls));
         }
         fn wake_effects(&mut self, _: WakeEffects) {}
     }
@@ -2058,6 +2080,7 @@ mod tests {
                 copies: Vec::new(),
                 refuse_copy: false,
                 retired: Vec::new(),
+                retired_records: Vec::new(),
             };
             let mut entry = runtime
                 .enter(source, &tasks[index], words(addresses[index]), &mut service)
@@ -2235,6 +2258,7 @@ mod tests {
             copies: Vec::new(),
             refuse_copy: false,
             retired: Vec::new(),
+            retired_records: Vec::new(),
         };
         let mut process = runtime
             .enter_registered(
@@ -2434,6 +2458,7 @@ mod tests {
             copies: Vec::new(),
             refuse_copy: false,
             retired: Vec::new(),
+            retired_records: Vec::new(),
         };
         assert!(zone.slot(slot).current().is_none());
         let home = zone.slot(slot).host_record().unwrap();
@@ -2527,6 +2552,7 @@ mod tests {
             copies: Vec::new(),
             refuse_copy: false,
             retired: Vec::new(),
+            retired_records: Vec::new(),
         };
         let parent = TaskKey {
             id: TaskId::from_abi_positive(41).unwrap(),
@@ -2607,6 +2633,12 @@ mod tests {
         // The forked child's final exit retires its MM exactly once.
         assert_eq!(service.retired, vec![child_address]);
         assert_eq!(child_page.live(), 0);
+        // Absence is published inside `retire_mm`: nothing after it (the
+        // retiring row's drop, unregistration, the Transferred handoff)
+        // writes the child's lifecycle record, so the carrier can clear and
+        // reissue it at once and never sees it dirty.
+        let at_absence = service.retired_records[0].clone();
+        assert_eq!(record_bytes(&child_page, &*child_controls), at_absence);
         assert_eq!(page.live(), 1);
         let parent_record = runtime
             .graph
@@ -2687,6 +2719,9 @@ mod tests {
         // The root (whatever pid it shows in its namespace) exits through
         // the root-exit crossing; its MM is never retired as a fork child.
         assert_eq!(service.retired, vec![child_address]);
+        // Reaping the zombie and the parent's own exit leave the retired
+        // child's record untouched too.
+        assert_eq!(record_bytes(&child_page, &*child_controls), at_absence);
     }
     fn activate<'a>(
         runtime: &NativeProcessRuntime<'a, AddressContext<RootGpa>, ParkedContextWords>,
@@ -2789,6 +2824,7 @@ mod tests {
                 copies: Vec::new(),
                 refuse_copy: false,
                 retired: Vec::new(),
+                retired_records: Vec::new(),
             };
             let parent = TaskKey {
                 id: TaskId::from_abi_positive(41).unwrap(),
