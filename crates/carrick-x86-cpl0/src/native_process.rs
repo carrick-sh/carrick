@@ -671,9 +671,11 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             roots,
             mm: ReservationMm::new(mm.mm.raw().get()).unwrap_or_else(|| fatal()),
         });
-        if drain_retired_spaces(&owner, self.worker()).is_err() {
-            fatal();
-        }
+        // A refused drain is not fatal: the failed entry and every entry
+        // after it stay queued (`RetiredSpaces::drain`), and the next drain
+        // (the next fork's `prepare_mm_start`, or the next child exit)
+        // retries them, as on the AArch64 owner.
+        let _retry_at_next_drain = drain_retired_spaces(&owner, self.worker());
     }
     fn wake_effects(&mut self, effects: WakeEffects) {
         deliver_wakes(effects);
