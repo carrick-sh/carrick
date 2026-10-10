@@ -374,10 +374,25 @@ where
                 let current_ref = zone.record_ref(current);
                 match zone.handback_current(slot, current) {
                     CurrentHandback::HandedBack => {
-                        zone.counters
-                            .exit_adoptions
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        owe_adoption(current_ref);
+                        // A stopped native guest has no host thread row to
+                        // adopt. Non-syscall exits retain its saved EL0 state
+                        // and return its exact grant to the guest queue.
+                        let retained = matches!(exit, ZoneExit::El0)
+                            && carrick_kernel::el1_zone::retain_pending_guest_adoption(
+                                zone,
+                                current_ref,
+                            )
+                            .map_err(|record| {
+                                RuntimeError::Configuration(format!(
+                                    "native zone exit {record:?} could not retain guest custody"
+                                ))
+                            })?;
+                        if !retained {
+                            zone.counters
+                                .exit_adoptions
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            owe_adoption(current_ref);
+                        }
                     }
                     CurrentHandback::Retired => {}
                     CurrentHandback::Lost => {
