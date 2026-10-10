@@ -727,7 +727,7 @@ impl CarrierVmCustody {
                 ))
             };
         }
-        retained
+        let frames = retained
             .admission
             .admit_root(execution.context)
             .map_err(|error| {
@@ -735,7 +735,7 @@ impl CarrierVmCustody {
             })?;
         self.fork_stock
             .lock()
-            .register_native_root(execution.context)
+            .register_native_root(execution.context, frames)
             .map_err(|refusal| {
                 TrapError::Hypervisor(format!("native frame root publication: {refusal:?}"))
             })?;
@@ -1702,12 +1702,19 @@ mod carrier_vm_custody_tests {
             fn admit_root(
                 &self,
                 address: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
-            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            ) -> Result<
+                carrick_hal::NativeRootFrameSnapshot,
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
                 if address != self.address {
                     return Err(Box::new(std::io::Error::other("foreign initial root")));
                 }
                 self.calls.fetch_add(1, Ordering::Relaxed);
-                Ok(())
+                Ok(carrick_hal::NativeRootFrameSnapshot {
+                    owner: address.into(),
+                    revision: core::num::NonZeroU64::MIN,
+                    mappings: Vec::new(),
+                })
             }
         }
         let custody = CarrierVmCustody::new();
@@ -1722,6 +1729,23 @@ mod carrier_vm_custody_tests {
             calls: AtomicUsize::new(0),
             source: Arc::new(Inventory),
         });
+        let foreign_frames = carrick_hal::NativeRootFrameSnapshot {
+            owner: carrick_hal::GuestFrameOwner {
+                root_generation: carrick_guest_arch::ContextGeneration::new(
+                    core::num::NonZeroU64::new(5).unwrap(),
+                ),
+                ..scope.address.into()
+            },
+            revision: core::num::NonZeroU64::MIN,
+            mappings: Vec::new(),
+        };
+        assert!(
+            custody
+                .fork_stock
+                .lock()
+                .register_native_root(scope.address, foreign_frames)
+                .is_err()
+        );
         assert!(custody.admit_native_frame_execution(execution).is_err());
         assert_eq!(custody.fork_stock.lock().root(scope.address.mm.raw()), None);
         custody
@@ -1742,6 +1766,15 @@ mod carrier_vm_custody_tests {
             custody.fork_stock.lock().root(scope.address.mm.raw()),
             Some(scope.address)
         );
+        assert_eq!(
+            custody
+                .fork_stock
+                .lock()
+                .root_frames(scope.address)
+                .unwrap()
+                .owner,
+            scope.address.into()
+        );
         custody.admit_native_frame_execution(execution).unwrap();
         assert_eq!(admission.calls.load(Ordering::Relaxed), 1);
         let stale = crate::fork_stock::GrantExecution {
@@ -1754,6 +1787,13 @@ mod carrier_vm_custody_tests {
             ..execution
         };
         assert!(custody.admit_native_frame_execution(stale).is_err());
+        assert!(
+            custody
+                .fork_stock
+                .lock()
+                .root_frames(stale.context)
+                .is_none()
+        );
         assert_eq!(admission.calls.load(Ordering::Relaxed), 1);
         assert!(custody.bind_native_frame_inventory(admission).is_err());
         assert_eq!(

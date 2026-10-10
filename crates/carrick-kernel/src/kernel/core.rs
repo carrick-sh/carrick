@@ -2405,6 +2405,7 @@ impl Kernel {
         }
         self.frame_inventory
             .transfer_mm_to_guest(&context.shared().mm(), owner)
+            .map(|_| ())
     }
 
     /// Issue one root admission without retaining its MM/backend or kernel.
