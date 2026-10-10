@@ -115,6 +115,11 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     ) -> Result<(), i64> {
         publish()
     }
+    /// Notify an owned exit only after a claim's rollback or Born enqueue has
+    /// finished. The venue releases graph ownership before publishing a wake.
+    fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
+        Ok(())
+    }
     fn thread_exited(&mut self, _tid: u32) {}
     fn set_calling_tid(&mut self, _tid: u32) {}
 
@@ -182,6 +187,10 @@ pub struct ExitRecord {
 /// ISA hooks acquire retained metadata and move real native context. They do
 /// not route, validate clone flags, lower errno or publish entry completion.
 pub trait LifecycleNative<'a>: UserCopy {
+    fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
+        Ok(())
+    }
+
     fn arguments(&self) -> [u64; 6];
     fn binding(&self) -> Option<ExecutionBinding>;
     fn task_state(&self) -> Option<&'a crate::abi::entry::LinuxTaskState>;
@@ -647,29 +656,56 @@ fn serve_clone<'a>(
 
     let state = native.task_state()?;
     let affinity = native.affinity()?;
-    let claimed = page
-        .claim_any()
-        .inspect_err(|error| {
-            if *error == TransitionError::PoolEmpty {
+    let claimed = match page.claim_any() {
+        Ok(claimed) => claimed,
+        Err(TransitionError::GateClosed(_)) => {
+            // A speculative claim may have been observed by an exit before
+            // the gate check backed it out. That rollback also owes a wake.
+            if let Err(error) = native.lifecycle_admission_settled() {
+                return Some(error);
+            }
+            return Some(-11);
+        }
+        Err(error) => {
+            if error == TransitionError::PoolEmpty {
                 native.record_decline(LifecycleDecline::ClonePoolEmpty);
             }
-        })
-        .ok()?;
+            return None;
+        }
+    };
+    // This exact owned claim is the sole authority for Claimed -> Reserved.
+    // Refusal below is an invariant failure (EIO); do not publish settlement
+    // as though the rollback succeeded.
     let entry = claimed.entry();
     // Bound at the clone instant (director ruling 2): the caller's mask and
     // affinity as they are now.
     let blocked = thread.slot.blocked();
     let (Some(identity), Some(child_slot)) = (page.identity(entry), native.born_slot(page, entry))
     else {
-        let _ = page.unclaim(claimed);
+        if page.unclaim(claimed).is_err() {
+            return Some(-5);
+        }
+        if let Err(error) = native.lifecycle_admission_settled() {
+            return Some(error);
+        }
         return None;
     };
     let Ok(visible) = i32::try_from(identity.visible_tid) else {
-        let _ = page.unclaim(claimed);
+        if page.unclaim(claimed).is_err() {
+            return Some(-5);
+        }
+        if let Err(error) = native.lifecycle_admission_settled() {
+            return Some(error);
+        }
         return None;
     };
     if !child_slot.publish_visible_tid(identity.visible_tid) {
-        let _ = page.unclaim(claimed);
+        if page.unclaim(claimed).is_err() {
+            return Some(-5);
+        }
+        if let Err(error) = native.lifecycle_admission_settled() {
+            return Some(error);
+        }
         return None;
     }
     let Ok(record) = native.allocate_record(ThreadIdentity {
@@ -684,19 +720,34 @@ fn serve_clone<'a>(
         control_slot: core::ptr::from_ref(child_slot).addr() as u64,
     }) else {
         // Exhausted: the identity goes back to the pool, the host clones.
-        let _ = page.unclaim(claimed);
+        if page.unclaim(claimed).is_err() {
+            return Some(-5);
+        }
+        if let Err(error) = native.lifecycle_admission_settled() {
+            return Some(error);
+        }
         return None;
     };
     if !outputs.publish(identity.visible_tid, native) {
         native.free_record(record);
-        let _ = page.unclaim(claimed);
+        if page.unclaim(claimed).is_err() {
+            return Some(-5);
+        }
+        if let Err(error) = native.lifecycle_admission_settled() {
+            return Some(error);
+        }
         return None;
     }
 
     if page.thread_born().is_none() {
         outputs.rollback(native);
         native.free_record(record);
-        let _ = page.unclaim(claimed);
+        if page.unclaim(claimed).is_err() {
+            return Some(-5);
+        }
+        if let Err(error) = native.lifecycle_admission_settled() {
+            return Some(error);
+        }
         return None;
     }
 
@@ -730,9 +781,17 @@ fn serve_clone<'a>(
         let _ = page.try_exit();
         outputs.rollback(native);
         native.free_record(record);
-        if let Some(claimed) = claim {
-            let _ = page.unclaim(claimed);
+        if let Some(claimed) = claim
+            && page.unclaim(claimed).is_err()
+        {
+            return Some(-5);
         }
+        if let Err(error) = native.lifecycle_admission_settled() {
+            return Some(error);
+        }
+        return Some(error);
+    }
+    if let Err(error) = native.lifecycle_admission_settled() {
         return Some(error);
     }
     Some(visible as i64)
