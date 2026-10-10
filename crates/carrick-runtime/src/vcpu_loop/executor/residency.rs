@@ -196,7 +196,10 @@ fn materialize_zone_in(
     // SAFETY: the host owns the record (checked above); its context is
     // frozen until the loader frees it.
     let parked = unsafe { *rec.ctx_mut() };
+    #[cfg(target_arch = "aarch64")]
     let ctx = parked.native;
+    #[cfg(not(target_arch = "aarch64"))]
+    let ctx = parked;
     let mut state = (**base).clone();
     state.gprs = ctx.x;
     // The task's stage-1 lease produced `base`; a parked context can carry
@@ -232,6 +235,17 @@ mod tests {
     use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken, OwnedObjectWakeEffects};
     use carrick_sched_core::{BoundedSpin, RecordRef, ThreadIdentity, Waker};
     use std::cell::RefCell;
+
+    fn parked(ctx: carrick_el1_abi::ThreadCtx) -> carrick_el1_abi::ZoneContext {
+        #[cfg(target_arch = "aarch64")]
+        {
+            carrick_el1_abi::ZoneContext::from_register(ctx, 0, 1, 1)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            ctx
+        }
+    }
 
     fn zone() -> Box<ZoneTables> {
         // SAFETY: the shared zone ABI has an all-zero initial state. Heap
@@ -303,12 +317,11 @@ mod tests {
         let zone = zone();
         let key = ObjectWaitKey::metadata_request(17).unwrap();
         let delivered = RefCell::new(Vec::new());
-        let complete =
-            |owned: OwnedObjectWakeEffects<'_, carrick_el1_abi::Aarch64ParkedContext>| {
-                let (_, effects) =
-                    owned.deliver_handbacks(&mut |record| delivered.borrow_mut().push(record));
-                assert!(!effects.queued_own);
-            };
+        let complete = |owned: OwnedObjectWakeEffects<'_, carrick_el1_abi::ZoneContext>| {
+            let (_, effects) =
+                owned.deliver_handbacks(&mut |record| delivered.borrow_mut().push(record));
+            assert!(!effects.queued_own);
+        };
         zone.bind_object_wait_with_completion(key, &BoundedSpin(0), &complete)
             .unwrap();
         let original = pending_read();
@@ -337,10 +350,7 @@ mod tests {
             )
             .expect("a repeated owner wait still owns its syscall");
             // SAFETY: this newly allocated record has not been published.
-            unsafe {
-                *zone.record(record).ctx_mut() =
-                    carrick_el1_abi::Aarch64ParkedContext::from_register(ctx, 0, 1, 1)
-            };
+            unsafe { *zone.record(record).ctx_mut() = parked(ctx) };
             {
                 let guard = zone
                     .object_wait_with_completion(key, &BoundedSpin(0), &complete)
@@ -440,10 +450,7 @@ mod tests {
         )
         .unwrap();
         // SAFETY: the freshly allocated record has not been published.
-        unsafe {
-            *zone.record(record).ctx_mut() =
-                carrick_el1_abi::Aarch64ParkedContext::from_register(ctx, 0, 1, 1)
-        };
+        unsafe { *zone.record(record).ctx_mut() = parked(ctx) };
         let GuestCpuState::Aarch64V1(cpu) = &mut saved else {
             panic!("AArch64 fixture");
         };
@@ -559,10 +566,9 @@ mod tests {
                 .unwrap();
             let zone = zone();
             let key = ObjectWaitKey::metadata_request(17).unwrap();
-            let complete =
-                |owned: OwnedObjectWakeEffects<'_, carrick_el1_abi::Aarch64ParkedContext>| {
-                    owned.deliver_handbacks(&mut |_| {});
-                };
+            let complete = |owned: OwnedObjectWakeEffects<'_, carrick_el1_abi::ZoneContext>| {
+                owned.deliver_handbacks(&mut |_| {});
+            };
             zone.bind_object_wait_with_completion(key, &BoundedSpin(0), &complete)
                 .unwrap();
             let source = zone
