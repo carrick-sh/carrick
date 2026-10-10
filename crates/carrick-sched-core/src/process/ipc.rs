@@ -9,9 +9,9 @@ use alloc::vec::Vec;
 
 use super::{LinuxCapabilitySet, TaskCredentials, TaskGid, TaskUid};
 pub use carrick_syscall_abi::ipc::{
-    IPC_CREAT, IPC_EXCL, IPC_NOWAIT, IPC_PRIVATE, LinuxIpcPerm, LinuxMsginfo, LinuxMsqidDs,
-    LinuxSembuf, LinuxSemidDs, LinuxSeminfo, MSG_EXCEPT, MSG_NOERROR, MSGMAX, MSGMNB, MSGMNI,
-    SEM_UNDO, SEMMNI, SEMMNS, SEMMSL, SEMOPM, SEMVMX,
+    IPC_CREAT, IPC_EXCL, IPC_NOWAIT, IPC_PRIVATE, IPC_STAT, LinuxIpcPerm, LinuxMsginfo,
+    LinuxMsqidDs, LinuxSembuf, LinuxSemidDs, LinuxSeminfo, MSG_EXCEPT, MSG_NOERROR, MSG_STAT,
+    MSGMAX, MSGMNB, MSGMNI, SEM_STAT, SEM_UNDO, SEMAEM, SEMMNI, SEMMNS, SEMMSL, SEMOPM, SEMVMX,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,13 +95,8 @@ impl IpcPerm {
         }
 
         let req = ((req_mode >> 6) | (req_mode >> 3) | req_mode) & 0o7;
-        let is_owner = creds.euid == self.uid || creds.euid == self.cuid;
-        let is_group = creds.egid == self.gid
-            || creds.egid == self.cgid
-            || creds
-                .groups
-                .iter()
-                .any(|g| *g == self.gid || *g == self.cgid);
+        let is_owner = creds.euid == self.uid;
+        let is_group = creds.egid == self.gid || creds.groups.contains(&self.gid);
 
         let granted = if is_owner {
             (self.mode >> 6) & 0o7
@@ -245,6 +240,7 @@ pub struct IpcNamespace {
     next_sem_idx: i32,
 
     sem_undo: Vec<SemUndoEntry>,
+    sem_waiters: Vec<(u32, i32, u16, bool)>,
     next_channel_id: u64,
     current_time: i64,
 }
@@ -267,6 +263,7 @@ impl IpcNamespace {
             next_sem_idx: 0,
 
             sem_undo: Vec::new(),
+            sem_waiters: Vec::new(),
             next_channel_id: 1,
             current_time: 1_700_000_000,
         }
@@ -397,10 +394,21 @@ impl IpcNamespace {
     pub fn msgctl_stat(
         &self,
         creds: &TaskCredentials,
-        msqid: i32,
+        msqid_or_idx: i32,
+        cmd: i32,
         out: &mut LinuxMsqidDs,
     ) -> Result<i64, IpcError> {
-        let queue = self.msg_queue(msqid)?;
+        let queue = if cmd == MSG_STAT {
+            if msqid_or_idx < 0 {
+                return Err(IpcError::InvalidArgument);
+            }
+            self.msg_slots
+                .iter()
+                .find(|q| id_to_index(q.id) == msqid_or_idx)
+                .ok_or(IpcError::InvalidArgument)?
+        } else {
+            self.msg_queue(msqid_or_idx)?
+        };
         queue.perm.check_perm(creds, 0o400)?;
 
         out.msg_perm = LinuxIpcPerm {
@@ -427,7 +435,11 @@ impl IpcNamespace {
         out.__glibc_reserved4 = 0;
         out.__glibc_reserved5 = 0;
 
-        Ok(0)
+        if cmd == MSG_STAT {
+            Ok(queue.id as i64)
+        } else {
+            Ok(0)
+        }
     }
 
     pub fn msgctl_set(
@@ -435,13 +447,14 @@ impl IpcNamespace {
         creds: &TaskCredentials,
         msqid: i32,
         ds: &LinuxMsqidDs,
-    ) -> Result<(), IpcError> {
+    ) -> Result<(bool, u64), IpcError> {
         let qbytes = ds.msg_qbytes as usize;
         let now = self.tick_time();
         let queue = self.msg_queue_mut(msqid)?;
         queue.perm.check_admin(creds)?;
 
-        if qbytes > MSGMNB
+        if qbytes > queue.qbytes
+            && qbytes > MSGMNB
             && !creds
                 .cap_effective
                 .contains(LinuxCapabilitySet::CAP_SYS_RESOURCE)
@@ -449,12 +462,14 @@ impl IpcNamespace {
             return Err(IpcError::NotPermitted);
         }
 
+        let old_qbytes = queue.qbytes;
         queue.perm.uid = TaskUid::new(ds.msg_perm.uid);
         queue.perm.gid = TaskGid::new(ds.msg_perm.gid);
         queue.perm.mode = ds.msg_perm.mode & 0o777;
         queue.qbytes = qbytes;
         queue.ctime = now;
-        Ok(())
+        let channel = queue.wait_channel;
+        Ok((qbytes > old_qbytes, channel))
     }
 
     pub fn msgctl_info(&self, out: &mut LinuxMsginfo) -> Result<i64, IpcError> {
@@ -731,10 +746,21 @@ impl IpcNamespace {
     pub fn semctl_stat(
         &self,
         creds: &TaskCredentials,
-        semid: i32,
+        semid_or_idx: i32,
+        cmd: i32,
         out: &mut LinuxSemidDs,
     ) -> Result<i64, IpcError> {
-        let set = self.sem_set(semid)?;
+        let set = if cmd == SEM_STAT {
+            if semid_or_idx < 0 {
+                return Err(IpcError::InvalidArgument);
+            }
+            self.sem_slots
+                .iter()
+                .find(|s| id_to_index(s.id) == semid_or_idx)
+                .ok_or(IpcError::InvalidArgument)?
+        } else {
+            self.sem_set(semid_or_idx)?
+        };
         set.perm.check_perm(creds, 0o400)?;
 
         out.sem_perm = LinuxIpcPerm {
@@ -758,7 +784,11 @@ impl IpcNamespace {
         out.__glibc_reserved3 = 0;
         out.__glibc_reserved4 = 0;
 
-        Ok(0)
+        if cmd == SEM_STAT {
+            Ok(set.id as i64)
+        } else {
+            Ok(0)
+        }
     }
 
     pub fn semctl_set(
@@ -834,7 +864,10 @@ impl IpcNamespace {
         set.sems[semnum as usize].semval = val as u16;
         set.sems[semnum as usize].sempid = caller_pid;
         set.ctime = now;
-        Ok(set.wait_channel)
+        let channel = set.wait_channel;
+        self.sem_undo
+            .retain(|e| !(e.semid == semid && e.semnum == semnum as u16));
+        Ok(channel)
     }
 
     pub fn semctl_getpid(
@@ -919,7 +952,9 @@ impl IpcNamespace {
             set.sems[i].sempid = caller_pid;
         }
         set.ctime = now;
-        Ok(set.wait_channel)
+        let channel = set.wait_channel;
+        self.sem_undo.retain(|e| e.semid != semid);
+        Ok(channel)
     }
 
     pub fn semop(
@@ -933,25 +968,46 @@ impl IpcNamespace {
             return Err(IpcError::TooBig);
         }
 
-        let set = self.sem_set_mut(semid)?;
-        let channel = set.wait_channel;
+        let (channel, mut scratch) = {
+            let set = self.sem_set(semid)?;
+            let channel = set.wait_channel;
 
-        // Check bounds and permissions
-        let mut req_mode = 0o400;
-        for &(num, op, _) in sops {
-            if num as usize >= set.sems.len() {
-                return Err(IpcError::InvalidArgument);
+            // Check bounds and permissions
+            let mut req_mode = 0o400;
+            for &(num, op, _) in sops {
+                if num as usize >= set.sems.len() {
+                    return Err(IpcError::InvalidArgument);
+                }
+                if op != 0 {
+                    req_mode |= 0o200;
+                }
             }
-            if op != 0 {
-                req_mode |= 0o200;
+            set.perm.check_perm(creds, req_mode)?;
+            let scratch: Vec<i32> = set.sems.iter().map(|s| s.semval as i32).collect();
+            (channel, scratch)
+        };
+
+        // Validate all SEM_UNDO adjustments before evaluating operations
+        for &(num, op, flg) in sops {
+            if flg & (SEM_UNDO as i16) != 0 && op != 0 {
+                let cur_adj = self
+                    .sem_undo
+                    .iter()
+                    .find(|e| e.pid == caller_pid && e.semid == semid && e.semnum == num)
+                    .map_or(0i32, |e| e.adj as i32);
+                let new_adj = cur_adj - (op as i32);
+                if new_adj < -(SEMAEM as i32) || new_adj > (SEMAEM as i32) {
+                    return Err(IpcError::Range);
+                }
             }
         }
-        set.perm.check_perm(creds, req_mode)?;
 
         // Cumulative evaluation against scratch buffer
-        let mut scratch: Vec<i32> = set.sems.iter().map(|s| s.semval as i32).collect();
+        let has_nowait = sops
+            .iter()
+            .any(|&(_, _, flg)| flg & (IPC_NOWAIT as i16) != 0);
 
-        for &(num, op, flg) in sops {
+        for &(num, op, _flg) in sops {
             let val = scratch[num as usize];
             if op > 0 {
                 if val + (op as i32) > (SEMVMX as i32) {
@@ -960,7 +1016,7 @@ impl IpcNamespace {
                 scratch[num as usize] = val + (op as i32);
             } else if op < 0 {
                 if val + (op as i32) < 0 {
-                    if flg & (IPC_NOWAIT as i16) != 0 {
+                    if has_nowait {
                         return Err(IpcError::Again);
                     }
                     return Ok((
@@ -973,7 +1029,7 @@ impl IpcNamespace {
                 }
                 scratch[num as usize] = val + (op as i32);
             } else if val != 0 {
-                if flg & (IPC_NOWAIT as i16) != 0 {
+                if has_nowait {
                     return Err(IpcError::Again);
                 }
                 return Ok((
@@ -996,13 +1052,14 @@ impl IpcNamespace {
 
         let now = self.current_time;
         self.current_time = self.current_time.saturating_add(1);
-        let set = self.sem_set_mut(semid)?;
-        for &(num, _, _) in sops {
-            set.sems[num as usize].semval = scratch[num as usize] as u16;
-            set.sems[num as usize].sempid = caller_pid;
+        {
+            let set = self.sem_set_mut(semid)?;
+            for &(num, _, _) in sops {
+                set.sems[num as usize].semval = scratch[num as usize] as u16;
+                set.sems[num as usize].sempid = caller_pid;
+            }
+            set.otime = now;
         }
-        set.otime = now;
-        let channel = set.wait_channel;
 
         for (num, op) in undo_ops {
             self.record_undo(caller_pid, semid, num, op);
@@ -1011,7 +1068,7 @@ impl IpcNamespace {
         Ok((SemopOutcome::Complete, channel))
     }
 
-    pub fn semop_suspend_enter(&mut self, semid: i32, sem_num: u16, is_zero: bool) {
+    pub fn semop_suspend_enter(&mut self, pid: u32, semid: i32, sem_num: u16, is_zero: bool) {
         let Ok(set) = self.sem_set_mut(semid) else {
             return;
         };
@@ -1023,10 +1080,11 @@ impl IpcNamespace {
                 set.sems[sem_num as usize].semncnt =
                     set.sems[sem_num as usize].semncnt.saturating_add(1);
             }
+            self.sem_waiters.push((pid, semid, sem_num, is_zero));
         }
     }
 
-    pub fn semop_suspend_exit(&mut self, semid: i32, sem_num: u16, is_zero: bool) {
+    pub fn semop_suspend_exit(&mut self, pid: u32, semid: i32, sem_num: u16, is_zero: bool) {
         let Ok(set) = self.sem_set_mut(semid) else {
             return;
         };
@@ -1038,6 +1096,13 @@ impl IpcNamespace {
                 set.sems[sem_num as usize].semncnt =
                     set.sems[sem_num as usize].semncnt.saturating_sub(1);
             }
+            if let Some(pos) = self
+                .sem_waiters
+                .iter()
+                .position(|&(p, s, n, z)| p == pid && s == semid && n == sem_num && z == is_zero)
+            {
+                self.sem_waiters.swap_remove(pos);
+            }
         }
     }
 
@@ -1047,19 +1112,44 @@ impl IpcNamespace {
             .iter_mut()
             .find(|e| e.pid == pid && e.semid == semid && e.semnum == semnum)
         {
-            entry.adj = entry.adj.saturating_sub(op);
+            entry.adj = (entry.adj as i32 - op as i32) as i16;
         } else {
+            let adj = (-(op as i32)) as i16;
             self.sem_undo.push(SemUndoEntry {
                 pid,
                 semid,
                 semnum,
-                adj: -op,
+                adj,
             });
         }
     }
 
     pub fn exit_process(&mut self, pid: u32) -> Vec<u64> {
         let mut channels_to_wake = Vec::new();
+
+        let mut blocked_waiters = Vec::new();
+        self.sem_waiters.retain(|&(p, semid, sem_num, is_zero)| {
+            if p == pid {
+                blocked_waiters.push((semid, sem_num, is_zero));
+                false
+            } else {
+                true
+            }
+        });
+        for (semid, sem_num, is_zero) in blocked_waiters {
+            if let Ok(set) = self.sem_set_mut(semid)
+                && (sem_num as usize) < set.sems.len()
+            {
+                if is_zero {
+                    set.sems[sem_num as usize].semzcnt =
+                        set.sems[sem_num as usize].semzcnt.saturating_sub(1);
+                } else {
+                    set.sems[sem_num as usize].semncnt =
+                        set.sems[sem_num as usize].semncnt.saturating_sub(1);
+                }
+            }
+        }
+
         let mut entries = Vec::new();
         self.sem_undo.retain(|e| {
             if e.pid == pid {
@@ -1083,6 +1173,7 @@ impl IpcNamespace {
                 }
             }
         }
+
         channels_to_wake
     }
 }
@@ -1268,9 +1359,9 @@ mod tests {
         assert_eq!(ns.sem_set(semid).unwrap().sems[0].semval, 1);
 
         // GETNCNT / GETZCNT tracking
-        ns.semop_suspend_enter(semid, 0, false);
+        ns.semop_suspend_enter(42, semid, 0, false);
         assert_eq!(ns.semctl_getncnt(&creds, semid, 0).unwrap(), 1);
-        ns.semop_suspend_exit(semid, 0, false);
+        ns.semop_suspend_exit(42, semid, 0, false);
         assert_eq!(ns.semctl_getncnt(&creds, semid, 0).unwrap(), 0);
 
         // SEM_UNDO on process exit
@@ -1297,7 +1388,7 @@ mod tests {
 
         // artifically set qbytes to 2
         let mut ds = LinuxMsqidDs::default();
-        ns.msgctl_stat(&creds, msqid, &mut ds).unwrap();
+        ns.msgctl_stat(&creds, msqid, IPC_STAT, &mut ds).unwrap();
         ds.msg_qbytes = 2;
         ns.msgctl_set(&creds, msqid, &ds).unwrap();
 
@@ -1346,5 +1437,234 @@ mod tests {
         } else {
             panic!("expected all complete");
         }
+    }
+
+    #[test]
+    fn test_finding_1_semctl_setval_and_setall_clear_semadj() {
+        let creds = TaskCredentials::ROOT;
+        let mut ns = IpcNamespace::new();
+        let semid = ns
+            .semget(&creds, IPC_PRIVATE, 2, IPC_CREAT | 0o666)
+            .unwrap();
+
+        // Process 100 acquires semaphore 0 with SEM_UNDO
+        ns.semctl_setval(&creds, 42, semid, 0, 5).unwrap();
+        ns.semop(&creds, 100, semid, &[(0, 2, SEM_UNDO as i16)])
+            .unwrap();
+        assert_eq!(ns.sem_set(semid).unwrap().sems[0].semval, 7);
+
+        // Process 200 changes semval to 10 via SETVAL
+        ns.semctl_setval(&creds, 200, semid, 0, 10).unwrap();
+        assert_eq!(ns.sem_set(semid).unwrap().sems[0].semval, 10);
+
+        // When process 100 exits, semval must REMAIN 10 because SETVAL cleared semadj
+        ns.exit_process(100);
+        assert_eq!(ns.sem_set(semid).unwrap().sems[0].semval, 10);
+
+        // Now test SETALL: process 100 does SEM_UNDO on both semaphores
+        ns.semop(
+            &creds,
+            100,
+            semid,
+            &[(0, 3, SEM_UNDO as i16), (1, 4, SEM_UNDO as i16)],
+        )
+        .unwrap();
+        assert_eq!(ns.sem_set(semid).unwrap().sems[0].semval, 13);
+        assert_eq!(ns.sem_set(semid).unwrap().sems[1].semval, 4);
+
+        // Process 200 calls SETALL
+        ns.semctl_setall(&creds, 200, semid, &[20, 30]).unwrap();
+        assert_eq!(ns.sem_set(semid).unwrap().sems[0].semval, 20);
+        assert_eq!(ns.sem_set(semid).unwrap().sems[1].semval, 30);
+
+        // Process 100 exits -> semvals must remain 20 and 30
+        ns.exit_process(100);
+        assert_eq!(ns.sem_set(semid).unwrap().sems[0].semval, 20);
+        assert_eq!(ns.sem_set(semid).unwrap().sems[1].semval, 30);
+    }
+
+    #[test]
+    fn test_finding_2_creator_loses_data_access_after_ownership_transfer() {
+        let mut creator = TaskCredentials::ROOT;
+        creator.euid = TaskUid::new(1000);
+        creator.egid = TaskGid::new(1000);
+        creator.cap_effective = LinuxCapabilitySet::empty();
+
+        let mut ns = IpcNamespace::new();
+        // Creator creates queue with 0600 (owner only)
+        let msqid = ns.msgget(&creator, IPC_PRIVATE, IPC_CREAT | 0o600).unwrap();
+        // Creator can send
+        assert!(ns.msgsnd(&creator, 1, msqid, 1, b"hello", 0).is_ok());
+
+        // Transfer ownership to UID 2000
+        let mut ds = LinuxMsqidDs::default();
+        ns.msgctl_stat(&creator, msqid, IPC_STAT, &mut ds).unwrap();
+        ds.msg_perm.uid = 2000;
+        ns.msgctl_set(&creator, msqid, &ds).unwrap();
+
+        // Creator (UID 1000) must now lose data access (EACCES)
+        assert_eq!(
+            ns.msgsnd(&creator, 1, msqid, 1, b"world", 0).unwrap_err(),
+            IpcError::PermissionDenied
+        );
+
+        // New owner (UID 2000) has access
+        let mut new_owner = TaskCredentials::ROOT;
+        new_owner.euid = TaskUid::new(2000);
+        new_owner.egid = TaskGid::new(1000);
+        new_owner.cap_effective = LinuxCapabilitySet::empty();
+        assert!(ns.msgsnd(&new_owner, 1, msqid, 1, b"world", 0).is_ok());
+    }
+
+    #[test]
+    fn test_finding_3_msgctl_set_raising_qbytes_returns_raised_flag() {
+        let root = TaskCredentials::ROOT;
+        let mut ns = IpcNamespace::new();
+        let msqid = ns.msgget(&root, IPC_PRIVATE, IPC_CREAT | 0o666).unwrap();
+
+        let mut ds = LinuxMsqidDs::default();
+        ns.msgctl_stat(&root, msqid, IPC_STAT, &mut ds).unwrap();
+        let original_qbytes = ds.msg_qbytes;
+
+        // Raising qbytes returns (true, wait_channel)
+        ds.msg_qbytes = original_qbytes + 1024;
+        let (raised, ch) = ns.msgctl_set(&root, msqid, &ds).unwrap();
+        assert!(raised);
+        assert_ne!(ch, 0);
+
+        // Setting same qbytes returns (false, wait_channel)
+        let (raised2, ch2) = ns.msgctl_set(&root, msqid, &ds).unwrap();
+        assert!(!raised2);
+        assert_eq!(ch, ch2);
+    }
+
+    #[test]
+    fn test_finding_4_semop_any_nowait_returns_eagain() {
+        let creds = TaskCredentials::ROOT;
+        let mut ns = IpcNamespace::new();
+        let semid = ns
+            .semget(&creds, IPC_PRIVATE, 2, IPC_CREAT | 0o666)
+            .unwrap();
+
+        // semval are 0.
+        // Sop 0 has NO IPC_NOWAIT (wants sem 0 >= 1).
+        // Sop 1 HAS IPC_NOWAIT (wants sem 1 >= 1).
+        // Because sop 1 has IPC_NOWAIT, the whole call must return EAGAIN immediately.
+        let res = ns.semop(&creds, 42, semid, &[(0, -1, 0), (1, -1, IPC_NOWAIT as i16)]);
+        assert_eq!(res.unwrap_err(), IpcError::Again);
+    }
+
+    #[test]
+    fn test_finding_6_msg_stat_and_sem_stat_by_index() {
+        let creds = TaskCredentials::ROOT;
+        let mut ns = IpcNamespace::new();
+
+        let msqid1 = ns.msgget(&creds, IPC_PRIVATE, IPC_CREAT | 0o666).unwrap();
+        let msqid2 = ns.msgget(&creds, IPC_PRIVATE, IPC_CREAT | 0o666).unwrap();
+
+        let mut ds = LinuxMsqidDs::default();
+        // MSG_STAT with index 0
+        let ret_id1 = ns.msgctl_stat(&creds, 0, MSG_STAT, &mut ds).unwrap();
+        assert_eq!(ret_id1, msqid1 as i64);
+
+        // MSG_STAT with index 1
+        let ret_id2 = ns.msgctl_stat(&creds, 1, MSG_STAT, &mut ds).unwrap();
+        assert_eq!(ret_id2, msqid2 as i64);
+
+        // IPC_STAT with msqid returns 0
+        let ret_stat = ns.msgctl_stat(&creds, msqid1, IPC_STAT, &mut ds).unwrap();
+        assert_eq!(ret_stat, 0);
+
+        let semid1 = ns
+            .semget(&creds, IPC_PRIVATE, 1, IPC_CREAT | 0o666)
+            .unwrap();
+        let semid2 = ns
+            .semget(&creds, IPC_PRIVATE, 1, IPC_CREAT | 0o666)
+            .unwrap();
+
+        let mut sem_ds = LinuxSemidDs::default();
+        // SEM_STAT with index 0
+        let ret_sem1 = ns.semctl_stat(&creds, 0, SEM_STAT, &mut sem_ds).unwrap();
+        assert_eq!(ret_sem1, semid1 as i64);
+
+        // SEM_STAT with index 1
+        let ret_sem2 = ns.semctl_stat(&creds, 1, SEM_STAT, &mut sem_ds).unwrap();
+        assert_eq!(ret_sem2, semid2 as i64);
+
+        // IPC_STAT with semid returns 0
+        let ret_sem_stat = ns
+            .semctl_stat(&creds, semid1, IPC_STAT, &mut sem_ds)
+            .unwrap();
+        assert_eq!(ret_sem_stat, 0);
+    }
+
+    #[test]
+    fn test_finding_7_exit_process_clears_blocked_waiter_counts() {
+        let creds = TaskCredentials::ROOT;
+        let mut ns = IpcNamespace::new();
+        let semid = ns
+            .semget(&creds, IPC_PRIVATE, 2, IPC_CREAT | 0o666)
+            .unwrap();
+
+        // Process 100 enters suspend on sem 0 (is_zero=false) and sem 1 (is_zero=true)
+        ns.semop_suspend_enter(100, semid, 0, false);
+        ns.semop_suspend_enter(100, semid, 1, true);
+
+        assert_eq!(ns.semctl_getncnt(&creds, semid, 0).unwrap(), 1);
+        assert_eq!(ns.semctl_getzcnt(&creds, semid, 1).unwrap(), 1);
+
+        // Process 100 exits unexpectedly
+        ns.exit_process(100);
+
+        // Blocked counts must be decremented back to 0
+        assert_eq!(ns.semctl_getncnt(&creds, semid, 0).unwrap(), 0);
+        assert_eq!(ns.semctl_getzcnt(&creds, semid, 1).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_finding_8_record_undo_range_and_i16_min() {
+        let creds = TaskCredentials::ROOT;
+        let mut ns = IpcNamespace::new();
+        let semid = ns
+            .semget(&creds, IPC_PRIVATE, 1, IPC_CREAT | 0o666)
+            .unwrap();
+        ns.semctl_setval(&creds, 42, semid, 0, SEMVMX as u64)
+            .unwrap();
+
+        // Operation with op = i16::MIN (-32768) must not panic and must return ERANGE
+        let res = ns.semop(&creds, 42, semid, &[(0, i16::MIN, SEM_UNDO as i16)]);
+        assert_eq!(res.unwrap_err(), IpcError::Range);
+
+        // Undo adjustment exceeding SEMAEM (32767) must return ERANGE
+        ns.semop(&creds, 42, semid, &[(0, -30000, SEM_UNDO as i16)])
+            .unwrap();
+        // Now adj is +30000. Another -10000 with SEM_UNDO would make adj = +40000 > SEMAEM
+        let res2 = ns.semop(&creds, 42, semid, &[(0, -10000, SEM_UNDO as i16)]);
+        assert_eq!(res2.unwrap_err(), IpcError::Range);
+    }
+
+    #[test]
+    fn test_finding_9_unprivileged_ipc_set_allowed_when_qbytes_not_increased() {
+        let root = TaskCredentials::ROOT;
+        let mut ns = IpcNamespace::new();
+        let msqid = ns.msgget(&root, IPC_PRIVATE, IPC_CREAT | 0o666).unwrap();
+
+        // Root sets msg_qbytes to 32768 (> MSGMNB=16384) and owner to 1000
+        let mut ds = LinuxMsqidDs::default();
+        ns.msgctl_stat(&root, msqid, IPC_STAT, &mut ds).unwrap();
+        ds.msg_qbytes = (MSGMNB * 2) as u64;
+        ds.msg_perm.uid = 1000;
+        ns.msgctl_set(&root, msqid, &ds).unwrap();
+
+        // Unprivileged owner (UID 1000, no CAP_SYS_RESOURCE) updates mode with SAME msg_qbytes
+        let mut unpriv = TaskCredentials::ROOT;
+        unpriv.euid = TaskUid::new(1000);
+        unpriv.cap_effective = LinuxCapabilitySet::empty();
+
+        let mut ds2 = LinuxMsqidDs::default();
+        ns.msgctl_stat(&unpriv, msqid, IPC_STAT, &mut ds2).unwrap();
+        ds2.msg_perm.mode = 0o660;
+        // Must succeed because msg_qbytes was not increased!
+        assert!(ns.msgctl_set(&unpriv, msqid, &ds2).is_ok());
     }
 }

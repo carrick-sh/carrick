@@ -10,9 +10,9 @@ use carrick_guest_arch::UserVa;
 pub use carrick_syscall_abi::ipc::{
     GETALL, GETNCNT, GETPID, GETVAL, GETZCNT, IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_NOWAIT,
     IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, LinuxIpcPerm, LinuxMsginfo, LinuxMsqidDs,
-    LinuxSembuf, LinuxSemidDs, LinuxSeminfo, MSG_EXCEPT, MSG_INFO, MSG_NOERROR, MSG_STAT, MSGMAX,
-    MSGMNB, MSGMNI, SEM_INFO, SEM_STAT, SEM_UNDO, SEMMNI, SEMMNS, SEMMSL, SEMOPM, SEMVMX, SETALL,
-    SETVAL,
+    LinuxSembuf, LinuxSemidDs, LinuxSemidDsAarch64, LinuxSemidDsX86_64, LinuxSeminfo, MSG_EXCEPT,
+    MSG_INFO, MSG_NOERROR, MSG_STAT, MSGMAX, MSGMNB, MSGMNI, SEM_INFO, SEM_STAT, SEM_UNDO, SEMMNI,
+    SEMMNS, SEMMSL, SEMOPM, SEMVMX, SETALL, SETVAL,
 };
 use carrick_syscall_abi::{LINUX_E2BIG, LINUX_EFAULT, LINUX_EINVAL, LINUX_ENOSYS, LinuxErrno};
 
@@ -101,6 +101,9 @@ pub trait ProcessIpcVenue {
 pub trait IpcNative<'a>: UserCopy {
     fn arguments(&self) -> [u64; 6];
     fn process_ipc(&mut self) -> Option<&mut dyn ProcessIpcVenue>;
+    fn guest_isa(&self) -> carrick_guest_arch::GuestIsa {
+        carrick_guest_arch::GuestIsa::Aarch64
+    }
 }
 
 #[inline(always)]
@@ -342,7 +345,15 @@ fn invoke_sem<'a>(call: IpcCall, args: &[u64; 6], native: &mut dyn IpcNative<'a>
                     };
                     match res {
                         Ok(val) => {
-                            if !copy_val_out(native, arg_ptr, &ds) {
+                            let ok = match native.guest_isa() {
+                                carrick_guest_arch::GuestIsa::X86_64 => {
+                                    copy_val_out(native, arg_ptr, &ds)
+                                }
+                                carrick_guest_arch::GuestIsa::Aarch64 => {
+                                    copy_val_out(native, arg_ptr, &ds.to_aarch64())
+                                }
+                            };
+                            if !ok {
                                 return ret_errno(LINUX_EFAULT);
                             }
                             ret(val)
@@ -355,8 +366,21 @@ fn invoke_sem<'a>(call: IpcCall, args: &[u64; 6], native: &mut dyn IpcNative<'a>
                     if arg_ptr.raw() == 0 {
                         return ret_errno(LINUX_EFAULT);
                     }
-                    let Some(ds) = copy_val_in::<LinuxSemidDs>(native, arg_ptr) else {
-                        return ret_errno(LINUX_EFAULT);
+                    let ds = match native.guest_isa() {
+                        carrick_guest_arch::GuestIsa::X86_64 => {
+                            let Some(ds) = copy_val_in::<LinuxSemidDsX86_64>(native, arg_ptr)
+                            else {
+                                return ret_errno(LINUX_EFAULT);
+                            };
+                            ds
+                        }
+                        carrick_guest_arch::GuestIsa::Aarch64 => {
+                            let Some(ds) = copy_val_in::<LinuxSemidDsAarch64>(native, arg_ptr)
+                            else {
+                                return ret_errno(LINUX_EFAULT);
+                            };
+                            ds.to_x86_64()
+                        }
                     };
                     let Some(venue) = native.process_ipc() else {
                         return ret_errno(LINUX_ENOSYS);
