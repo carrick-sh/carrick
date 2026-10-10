@@ -1332,6 +1332,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 );
             }
         });
+        // Only fork-born processes own stock to retire. The root is known by
+        // graph position, not by the pid it shows in its namespace (a child
+        // in a new PID namespace may show pid 1); it uses the root-exit
+        // crossing instead. The MM is retired (stock quarantined, slot
+        // absence published) before the parent is signalled or its wait
+        // woken, as Linux releases the mm in exit_mm before exit_notify:
+        // a parent that forks again as soon as its wait returns must find
+        // this child's stock reclaimable, not still charged to a live MM.
+        if let Some(mm) = resources
+            && !root_exit
+        {
+            arm_fork_progress(carrick_el1_abi::NativeForkProgress::ChildExit);
+            self.service.retire_mm(mm)
+        }
         let (target, channels) = {
             let graph = self.runtime.graph.lock();
             let target = graph.owner.select_exit_parent(&permit);
@@ -1372,16 +1386,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         for channel in channels {
             self.publish_channel(&channel)?;
-        }
-        // Only fork-born processes own stock to retire. The root is known by
-        // graph position, not by the pid it shows in its namespace (a child
-        // in a new PID namespace may show pid 1); it uses the root-exit
-        // crossing instead.
-        if let Some(mm) = resources
-            && !root_exit
-        {
-            arm_fork_progress(carrick_el1_abi::NativeForkProgress::ChildExit);
-            self.service.retire_mm(mm)
         }
         drop(published.retiring);
         drop(published.autoreaped_receipt);
@@ -1834,6 +1838,10 @@ mod tests {
         /// The child's lifecycle record bytes when its MM was retired (the
         /// moment the guest publishes slot absence).
         retired_records: Vec<Vec<u8>>,
+        /// Records queued to run on slot 0 when the MM was retired: a
+        /// waiting parent woken before its child's stock is retired can
+        /// fork again before that stock is reclaimable.
+        queued_at_retire: Vec<usize>,
     }
     /// Bytes of one lifecycle record: the page and its thread controls.
     fn record_bytes(page: &ThreadLifecyclePage, controls: &[ThreadControlSlot]) -> Vec<u8> {
@@ -1955,6 +1963,8 @@ mod tests {
             self.retired.push(mm);
             self.retired_records
                 .push(record_bytes(self.page, self.controls));
+            self.queued_at_retire
+                .push(self.zone.slot(carrick_sched_core::SlotId::new(0)).queued());
         }
         fn wake_effects(&mut self, _: WakeEffects) {}
     }
@@ -2081,6 +2091,7 @@ mod tests {
                 refuse_copy: false,
                 retired: Vec::new(),
                 retired_records: Vec::new(),
+                queued_at_retire: Vec::new(),
             };
             let mut entry = runtime
                 .enter(source, &tasks[index], words(addresses[index]), &mut service)
@@ -2259,6 +2270,7 @@ mod tests {
             refuse_copy: false,
             retired: Vec::new(),
             retired_records: Vec::new(),
+            queued_at_retire: Vec::new(),
         };
         let mut process = runtime
             .enter_registered(
@@ -2459,6 +2471,7 @@ mod tests {
             refuse_copy: false,
             retired: Vec::new(),
             retired_records: Vec::new(),
+            queued_at_retire: Vec::new(),
         };
         assert!(zone.slot(slot).current().is_none());
         let home = zone.slot(slot).host_record().unwrap();
@@ -2553,6 +2566,7 @@ mod tests {
             refuse_copy: false,
             retired: Vec::new(),
             retired_records: Vec::new(),
+            queued_at_retire: Vec::new(),
         };
         let parent = TaskKey {
             id: TaskId::from_abi_positive(41).unwrap(),
@@ -2638,6 +2652,11 @@ mod tests {
         // writes the child's lifecycle record, so the carrier can clear and
         // reissue it at once and never sees it dirty.
         let at_absence = service.retired_records[0].clone();
+        // The child's MM (and so its fork stock) is retired before its
+        // exit wakes the waiting parent, as Linux releases the mm in
+        // exit_mm before exit_notify: a parent that forks again right
+        // after its wait returns finds the stock reclaimable.
+        assert_eq!(service.queued_at_retire, vec![0]);
         assert_eq!(record_bytes(&child_page, &*child_controls), at_absence);
         assert_eq!(page.live(), 1);
         let parent_record = runtime
@@ -2825,6 +2844,7 @@ mod tests {
                 refuse_copy: false,
                 retired: Vec::new(),
                 retired_records: Vec::new(),
+                queued_at_retire: Vec::new(),
             };
             let parent = TaskKey {
                 id: TaskId::from_abi_positive(41).unwrap(),
