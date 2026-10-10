@@ -245,3 +245,48 @@ to an idle target, switches OnCpu and admits it, retaining the negative
 visible-pid control. The second exercises actual carrier handback routing
 while no guest slot is available, preserving queue custody until entry.
 Signed confirmation and the thread-clone crossing remain open.
+
+## eae595 pending-adoption core decider
+
+The independent fork-retirement review predicted an exit adoption followed by
+a failed host-thread adoption. Offline LLDB reads of the retained exact A/B
+cores confirm that counter pattern. DWARF independently reports offsets 264,
+272 and 280 for exit_adoptions, host_handbacks and lost_adoptions.
+
+| Run | exit_adoptions | host_handbacks | lost_adoptions |
+| --- | ---: | ---: | ---: |
+| eae595-a | 3 | 7 | 1 |
+| eae595-b | 3 | 5 | 1 |
+
+Receipts are `target/arm-step5-sol2/eae595-{a,b}/adoption-counters.log`.
+Both records retain Host/Resumed custody and an incarnation-matching native
+grant, as reported above. This supports H1; the counter values alone do not
+identify every exit producer. The A saved context has x8=220 and x0=0, with
+PC 0x29fdb4. Disassembly of the restored fixture identifies that instruction
+as `__post_Fork+4` (`stp x29, x30, [sp, #-0x10]!`), before libc sets x8=96
+for set_tid_address. A stale x8=220 is not evidence of a newly forwarded clone.
+The additional receipt is `eae595-a/child-context.log`; the fixture
+disassembly is `/tmp/arm-step5-child-pc-disassembly.log`.
+
+The VM-free `native_current_pending_adoption_returns_to_guest_custody`
+allocates a native record, authorizes its grant, queues and switches it OnCpu,
+then hands it back Host/Resumed and runs the factored pending-adoption step.
+Before correction it fails `Ok(false) != Ok(true)`. With the backstop it
+returns Queued, counts one host handback and leaves lost_adoptions at zero.
+An OnCpu negative control refuses the pending-adoption step without changing
+the claim. Runtime pending adoption now invokes this step before host thread
+lookup, after ordinary Born-thread activation. Unplaceable native custody
+returns an explicit error rather than falling through to an absent host row.
+Non-syscall current exits use the same route directly without owing adoption.
+
+This is a partial correction, not signed fork closure. A current native child
+that forwards an incomplete syscall still needs service for its exact native
+binding and in-place resume. The host dispatcher captures a KernelContext
+from its host thread graph; that graph has no native-child row. The guest
+image-local NativeProcessRegistry cannot be substituted with the host binary
+registry, and the parent KernelContext is not the child context. The existing
+x86 KVM crossing authenticates a stopped native binding in ForwardVenue and
+serves a retained frame in place; ARM has not yet been wired to an equivalent
+service here. Requeueing an incomplete syscall is not accepted as completion.
+The requested runtime syscall-service test and signed artifact runs remain
+open, as does the forwarded parent thread clone. No watchdog was changed.

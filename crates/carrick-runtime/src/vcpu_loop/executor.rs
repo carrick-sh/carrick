@@ -1576,12 +1576,22 @@ fn next_runnable<F: PersistentExecutor>(
         if adopt_born_record(scheduler, zone, record)? {
             return Ok(scheduler.try_take(registration)?);
         }
-        if let Some(running) = scheduler.adopt_zone_handback(registration, record)? {
+        let retained = carrick_kernel::el1_zone::retain_pending_guest_adoption(zone, record)
+            .map_err(|record| {
+                NextError::Fatal(format!(
+                    "native zone adoption {record:?} could not retain guest custody"
+                ))
+            })?;
+        if retained {
+            // No host continuation exists for a native grant. Its next run
+            // belongs to the guest queue, even when this executor is a spare.
+        } else if let Some(running) = scheduler.adopt_zone_handback(registration, record)? {
             return Ok(Some(running));
+        } else {
+            zone.counters
+                .lost_adoptions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        zone.counters
-            .lost_adoptions
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     zone.sweep_cancelled(slot);
     carrick_kernel::el1_zone::hand_back_wanted(slot);
