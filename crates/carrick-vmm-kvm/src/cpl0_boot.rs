@@ -237,12 +237,14 @@ pub enum InitialSyscallDisposition {
 pub enum PhysicalCrossingFamily {
     OwnerGrant,
     RootExit,
+    ChildRetire,
 }
 impl PhysicalCrossingFamily {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OwnerGrant => "owner_grant",
             Self::RootExit => "root_exit",
+            Self::ChildRetire => "child_retire",
         }
     }
 }
@@ -1076,6 +1078,7 @@ pub(crate) struct Cpl0HostCustody {
     anonymous_pending: [Option<anonymous_owner::PendingGrant>; 2],
     owner_grant_crossings: u64,
     root_exit_crossings: u64,
+    child_retire_crossings: u64,
     metadata_base: NonNull<u8>,
     host_forwards: u64,
     host_yields: u64,
@@ -2381,8 +2384,8 @@ impl Cpl0Carrier {
                         ..
                     }
                 ) {
-                    custody.owner_grant_crossings = custody
-                        .owner_grant_crossings
+                    custody.child_retire_crossings = custody
+                        .child_retire_crossings
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
                     let lease = StoppedCpuLease {
@@ -2541,7 +2544,7 @@ impl Cpl0Carrier {
         self.custody.fork_stock_counters()
     }
 
-    pub fn physical_crossing_counts(&self) -> [(PhysicalCrossingFamily, u64); 2] {
+    pub fn physical_crossing_counts(&self) -> [(PhysicalCrossingFamily, u64); 3] {
         [
             (
                 PhysicalCrossingFamily::OwnerGrant,
@@ -2550,6 +2553,10 @@ impl Cpl0Carrier {
             (
                 PhysicalCrossingFamily::RootExit,
                 self.custody.root_exit_crossings,
+            ),
+            (
+                PhysicalCrossingFamily::ChildRetire,
+                self.custody.child_retire_crossings,
             ),
         ]
     }
@@ -3269,6 +3276,7 @@ impl Cpl0Carrier {
                 anonymous_pending: [None, None],
                 owner_grant_crossings: 0,
                 root_exit_crossings: 0,
+                child_retire_crossings: 0,
                 metadata_base,
                 host_forwards: 0,
                 host_yields: 0,
