@@ -1,16 +1,21 @@
 name: Kernel runtime · trusted hardware
 
+# Self-hosted jobs here run only trusted refs: a merge group into main, a
+# push to main, or an owner-triggered dispatch on main. There is no
+# pull_request trigger, and the JIT controllers (`carrick-xtask ci-scaler
+# standing|mac-jit`) plus each runner's job-start hook admit exactly these
+# events for this workflow file (docs/ci/mac-jit.md, docs/ci/willow-pilot.md).
 on:
   push:
     branches: [main]
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
-  schedule:
-    - cron: "0 9 * * *"
 
 permissions:
   contents: read
+  # Read per-SHA receipt artifacts of earlier runs (baselines).
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,7 +27,9 @@ env:
 jobs:
   signed-fixtures:
     name: Linux ARM64 · exact-SHA signed fixtures
-    if: ${{ vars.CARRICK_SELF_HOSTED == 'true' && github.event_name != 'merge_group' }}
+    if: >-
+      ${{ vars.CARRICK_SELF_HOSTED == 'true' &&
+          (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:
@@ -57,18 +64,19 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
-  # Focused signed execution on physical Apple Silicon. This is deliberately
+  # Focused signed execution on physical Apple Silicon (cloudmac, one JIT
+  # ephemeral runner per job from `ci-scaler mac-jit`). This is deliberately
   # separate from public pull-request CI: hosted macOS Arm64 does not support
-  # the nested virtualization HVPatch requires.
+  # the nested virtualization HVPatch requires. No workflow-level concurrency
+  # group: a pending job in a group is replaced by a newer one, which would
+  # cancel queued merge-group checks. The controller runs one cloudmac runner
+  # at a time, so jobs wait in GitHub's queue instead.
   hvf-kernel:
     name: HVF · signed embed + cached probes
-    if: ${{ vars.CARRICK_SELF_HOSTED == 'true' && github.event_name != 'merge_group' }}
+    if: ${{ !cancelled() && needs.signed-fixtures.result == 'success' }}
     needs: [signed-fixtures]
-    runs-on: [self-hosted, macos, arm64, carrick-hvf]
+    runs-on: [self-hosted, macOS, ARM64, carrick-hvf]
     timeout-minutes: 180
-    concurrency:
-      group: carrick-hvf-${{ github.repository }}
-      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
@@ -99,13 +107,58 @@ jobs:
         with:
           tool: just,cargo-deny
 
+      # The landing gate's signed phase (`xtask accept`): build + artifact
+      # identity, el1 embed, fresh executable page, probe shards and cases,
+      # with scoped cleanup per step. Its receipt is the lane's per-SHA
+      # record; a FAIL receipt is still a receipt. Main is not green under
+      # the strict signed gate, so this lane gates on NEW failures against
+      # the base SHA's receipt (below), not on the absolute verdict.
+      - name: Signed acceptance receipt
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bundles=(target/fixtures/incoming/*.tar.gz)
+          test "${#bundles[@]}" -eq 1
+          just lease gate just fixtures-restore "${bundles[0]}"
+          # Persistent workspaces: a stale receipt must not stand in for this run.
+          rm -rf target/ci-receipts
+          mkdir -p target/ci-receipts
+          status=0
+          just accept --phase signed --receipt target/ci-receipts/receipt.json || status=$?
+          echo "xtask accept exited $status"
+          test -s target/ci-receipts/receipt.json
+
+      - name: Upload per-SHA receipt
+        if: ${{ !cancelled() && hashFiles('target/ci-receipts/receipt.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: receipt-hvf-${{ github.sha }}
+          path: target/ci-receipts/receipt.json
+          if-no-files-found: error
+
+      - name: Gate on NEW failures against the merge group base
+        if: ${{ github.event_name == 'merge_group' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          cargo run -q --locked -p carrick-xtask -- ci-receipt gate --lane hvf
+          --base-sha "${{ github.event.merge_group.base_sha }}"
+          --candidate target/ci-receipts/receipt.json
+
+      # After the receipt is published, so a red absolute gate cannot prevent
+      # the per-SHA baseline from existing. Not on the merge queue: main is not
+      # green under these absolute verdicts, so the queue gates on the receipt
+      # (NEW failures) above; push and dispatch keep the full signed coverage.
       - name: Install Semgrep
+        if: ${{ github.event_name != 'merge_group' }}
         run: brew install semgrep || python3 -m pip install semgrep
 
       - name: Host-only source gate
+        if: ${{ github.event_name != 'merge_group' }}
         run: RUST_TEST_THREADS=1 just lease gate just ci
 
       - name: Signed embedded guest tests
+        if: ${{ github.event_name != 'merge_group' }}
         run: |
           shopt -s nullglob
           bundles=(target/fixtures/incoming/*.tar.gz)
@@ -141,13 +194,10 @@ jobs:
     if: >-
       ${{ vars.CARRICK_SELF_HOSTED == 'true' &&
           vars.CARRICK_SELF_HOSTED_FULL_CONFORMANCE == 'true' &&
-          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+          github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     needs: hvf-kernel
-    runs-on: [self-hosted, macos, arm64, carrick-hvf]
+    runs-on: [self-hosted, macOS, ARM64, carrick-hvf]
     timeout-minutes: 1440
-    concurrency:
-      group: carrick-hvf-${{ github.repository }}
-      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
@@ -186,17 +236,17 @@ jobs:
 
   # A real KVM device is the contract. An incidental or software-emulated
   # hosted environment is not accepted as this lane. Every `kvm`-lane test
-  # target runs (`just test-kvm`, derived from Cargo metadata), on every event
-  # this workflow sees, merge queue included. Pull requests are not run here:
-  # this is a self-hosted runner and fork PR code must not reach it.
+  # target runs (`just test-kvm`, derived from Cargo metadata) on Willow JIT
+  # clones (`ci-scaler standing`), merge queue included. Pull requests are not
+  # run here: this is a self-hosted runner and fork PR code must not reach it.
+  # The labels are `ci_scaler::LABELS`; a test keeps them identical.
   kvm-tests:
     name: KVM · x86 kvm-lane tests
-    if: ${{ vars.CARRICK_SELF_HOSTED_KVM == 'true' }}
-    runs-on: [self-hosted, linux, x64, kvm, carrick-kvm]
+    if: >-
+      ${{ vars.CARRICK_SELF_HOSTED_KVM == 'true' &&
+          (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
+    runs-on: [self-hosted, Linux, X64, willow-kvm]
     timeout-minutes: 90
-    concurrency:
-      group: carrick-kvm-${{ github.repository }}
-      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
@@ -224,5 +274,33 @@ jobs:
       - name: Install x86 image and fixture targets
         run: rustup target add x86_64-unknown-none x86_64-unknown-linux-musl
 
-      - name: KVM-lane tests (CARRICK_REQUIRE_KVM=1)
-        run: just test-kvm
+      # `xtask accept --profile kvm` runs `just test-kvm` and records every
+      # failing `<test-binary>::<test>` in the receipt (one format with the
+      # signed lane).
+      - name: KVM-lane receipt (CARRICK_REQUIRE_KVM=1)
+        run: |
+          set -euo pipefail
+          # Persistent workspaces: a stale receipt must not stand in for this run.
+          rm -rf target/ci-receipts
+          mkdir -p target/ci-receipts
+          status=0
+          just accept --profile kvm --receipt target/ci-receipts/receipt.json || status=$?
+          echo "xtask accept exited $status"
+          test -s target/ci-receipts/receipt.json
+
+      - name: Upload per-SHA receipt
+        if: ${{ !cancelled() && hashFiles('target/ci-receipts/receipt.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: receipt-kvm-${{ github.sha }}
+          path: target/ci-receipts/receipt.json
+          if-no-files-found: error
+
+      - name: Gate on NEW failures against the merge group base
+        if: ${{ github.event_name == 'merge_group' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          cargo run -q --locked -p carrick-xtask -- ci-receipt gate --lane kvm
+          --base-sha "${{ github.event.merge_group.base_sha }}"
+          --candidate target/ci-receipts/receipt.json
