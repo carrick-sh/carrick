@@ -3519,6 +3519,31 @@ mod tests {
             child = runtime.namespace_child_key(parent, 42).unwrap();
         }
         let binding = runtime.task_binding(child).unwrap();
+        // A stopped executor can evacuate this real fork child's queue
+        // before an idle vCPU is available. Native custody has no host
+        // continuation: its handback must remain guest-runnable.
+        let mut handed = Vec::new();
+        zone.drain_slot(slot, &mut |record, discard| {
+            assert!(!discard);
+            handed.push(record);
+        });
+        assert_eq!(handed, vec![binding.record]);
+        let rec = zone.record(binding.record.id);
+        assert!(matches!(
+            rec.claim(),
+            carrick_sched_core::Claim::Host { .. }
+        ));
+        assert!(rec.has_guest_execution());
+        assert!(!rec.is_unadopted_birth());
+        assert!(
+            rec.requires_guest_handback(),
+            "native fork child must bypass host continuation lookup"
+        );
+        assert!(zone.requeue_on(slot, binding.record.id));
+        assert!(matches!(
+            rec.claim(),
+            carrick_sched_core::Claim::Queued { .. }
+        ));
         zone.drive(target, 1);
         zone.publish_slot(target, 0, Some(0), 1);
         zone.enter_guest(target);

@@ -687,6 +687,12 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
             && self.control_slot.load(Ordering::Relaxed) != 0
     }
 
+    /// A host handback that has no host continuation must retain guest
+    /// scheduler custody instead of being offered to a host task lookup.
+    pub fn requires_guest_handback(&self) -> bool {
+        self.is_unadopted_birth() || (self.has_guest_execution() && !self.needs_host())
+    }
+
     pub fn needs_host(&self) -> bool {
         self.handback() == Some(Handback::Service)
             || self.host_wanted()
