@@ -3918,7 +3918,7 @@ mod tests {
         let graph = runtime.graph.lock();
         let p_task = graph.owner.task(parent_key).unwrap();
         assert_eq!(p_task.threads.threads.len(), 1);
-        assert_eq!(p_task.has_execed, true);
+        assert!(p_task.has_execed);
     }
 
     #[test]
@@ -4006,7 +4006,7 @@ mod tests {
         let t = graph.owner.task(key).unwrap();
         // The list must stay bounded to just the leader thread.
         assert_eq!(t.threads.threads.len(), 1);
-        assert_eq!(t.has_thread(1050), false);
+        assert!(!t.has_thread(1050));
     }
 
     #[test]
@@ -4208,16 +4208,16 @@ mod tests {
 
         // capset on another thread (leader 41) must fail with EPERM
         assert_eq!(
-            entry.capset(41, caps.clone()),
+            entry.capset(41, caps),
             Err(carrick_personality_linux::identity::EPERM)
         );
         // capset on negative pid must fail with EPERM
         assert_eq!(
-            entry.capset(-1, caps.clone()),
+            entry.capset(-1, caps),
             Err(carrick_personality_linux::identity::EPERM)
         );
         // capset on own tid 42 and pid 0 must succeed
-        assert_eq!(entry.capset(42, caps.clone()), Ok(()));
+        assert_eq!(entry.capset(42, caps), Ok(()));
         assert_eq!(entry.capset(0, caps), Ok(()));
     }
 

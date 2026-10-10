@@ -43,7 +43,7 @@ impl IpcError {
             Self::BadAddress => -14,
             Self::AlreadyExists => -17,
             Self::InvalidArgument => -22,
-            Self::TooBig => -27,
+            Self::TooBig => -7,
             Self::NoSpace => -28,
             Self::Range => -34,
             Self::NoMsg => -42,

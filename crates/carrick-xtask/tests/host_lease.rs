@@ -1000,12 +1000,14 @@ fn zombie_process_is_reported_dead_by_liveness_helper() {
         }
         #[cfg(target_os = "linux")]
         {
-            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-                if let Some(after_comm) = stat.rfind(')').and_then(|idx| stat.get(idx + 1..)) {
-                    if after_comm.split_whitespace().next() == Some("Z") {
-                        break;
-                    }
-                }
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                && stat
+                    .rfind(')')
+                    .and_then(|idx| stat.get(idx + 1..))
+                    .and_then(|after_comm| after_comm.split_whitespace().next())
+                    == Some("Z")
+            {
+                break;
             }
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]

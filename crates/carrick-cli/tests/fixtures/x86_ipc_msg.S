@@ -8,6 +8,8 @@
 .global _start
 .text
 _start:
+    mov $-1, %r12
+    mov $-1, %r13
     # 1. Create main data queue: msgget(IPC_PRIVATE, IPC_CREAT | 0666)
     xor %rdi, %rdi              # key = IPC_PRIVATE
     mov $950, %rsi              # IPC_CREAT | 0666
@@ -216,7 +218,7 @@ _start:
     jz child_ok
     # Child failed: exit with child's exit code
     mov %rax, %rdi
-    jmp exit
+    jmp fail_cleanup
 child_ok:
 
     cmp $4, %r14
@@ -301,48 +303,67 @@ child_fail:
 
 fail_msgget:
     mov $91, %rdi
-    jmp exit
+    jmp fail_cleanup
 fail_fork:
     mov $92, %rdi
-    jmp exit
+    jmp fail_cleanup
 fail_msgsnd:
     mov $93, %rdi
-    jmp exit
+    jmp fail_cleanup
 fail_msgrcv:
     mov $94, %rdi
-    jmp exit
+    jmp fail_cleanup
 fail_mtype:
     mov $95, %rdi
-    jmp exit
+    jmp fail_cleanup
 fail_mtext:
     mov $96, %rdi
-    jmp exit
+    jmp fail_cleanup
 fail_wait:
     mov $97, %rdi
-    jmp exit
+    jmp fail_cleanup
 fail_child_exit:
     mov $98, %rdi
-    jmp exit
+    jmp fail_cleanup
 fail_msgctl:
     mov $99, %rdi
-    jmp exit
+    jmp fail_cleanup
 fail_e2big:
     mov $100, %rdi
-    jmp exit
+    jmp fail_cleanup
 fail_noerror:
     mov $101, %rdi
-    jmp exit
+    jmp fail_cleanup
 fail_noerror_data:
     mov $102, %rdi
-    jmp exit
+    jmp fail_cleanup
 fail_msg_except:
     mov $103, %rdi
-    jmp exit
+    jmp fail_cleanup
 fail_consume:
     mov $104, %rdi
-    jmp exit
+    jmp fail_cleanup
 fail_neg_type:
     mov $105, %rdi
+    jmp fail_cleanup
+
+fail_cleanup:
+    push %rdi
+    cmp $0, %r12
+    jl 1f
+    mov %r12, %rdi
+    xor %rsi, %rsi              # IPC_RMID = 0
+    xor %rdx, %rdx
+    mov $71, %rax               # SYS_msgctl
+    syscall
+1:  cmp $0, %r13
+    jl 2f
+    mov %r13, %rdi
+    xor %rsi, %rsi              # IPC_RMID = 0
+    xor %rdx, %rdx
+    mov $71, %rax               # SYS_msgctl
+    syscall
+2:  pop %rdi
     jmp exit
 
 exit:
