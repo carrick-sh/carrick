@@ -2632,7 +2632,7 @@ where
             runtime: Arc::downgrade(&self.kernel),
             deferred_anonymous: self.kernel.dispatcher.deferred_anonymous_state(mm),
             kernel: Arc::clone(child_context.kernel()),
-            mm,
+            inventory_owner: child_context.shared().mm().frame_owner_authority(),
             owner_inventory: ops.frame_cow_owner_inventory(&task_backend),
             tid,
             identity: cow_identity,
@@ -6505,7 +6505,7 @@ pub(crate) fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
                 runtime: Arc::downgrade(kernel),
                 deferred_anonymous: kernel.dispatcher.deferred_anonymous_state(mm),
                 kernel: Arc::clone(context.kernel()),
-                mm,
+                inventory_owner: context.shared().mm().frame_owner_authority(),
                 owner_inventory,
                 tid: this_tid,
                 identity: carrick_hal::FrameCowIdentity {

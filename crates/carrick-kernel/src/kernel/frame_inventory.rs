@@ -58,7 +58,8 @@ impl From<MmId> for FrameOwner {
     }
 }
 impl FrameOwner {
-    fn wire_key(self) -> NonZeroU64 {
+    /// Wire MM identity for inventory receipts; owner checks retain the full typed key.
+    pub fn receipt_mm(self) -> NonZeroU64 {
         match self {
             Self::HostMm(mm) => mm.nonzero(),
             Self::GuestMm(owner) => owner.native_mm.raw(),
@@ -209,7 +210,7 @@ impl carrick_hal::FrameCowAuthority for PhysicalInventoryBinding {
         &self,
         receipt: &FrameInventoryApplyReceipt,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if receipt.mm().get() != self.mm.wire_key().get()
+        if receipt.mm().get() != self.mm.receipt_mm().get()
             || receipt
                 .mapping_set()
                 .iter()
@@ -591,7 +592,7 @@ impl FrameInventoryAuthority {
         mappings.dedup();
         let mm_id = mm;
         let (outcome, revision, _) = self.apply_inner(mm_id, commit, None, grant)?;
-        let mm = NonZeroU64::new(mm.wire_key().get()).unwrap_or_else(|| {
+        let mm = NonZeroU64::new(mm.receipt_mm().get()).unwrap_or_else(|| {
             carrick_fatal!(
                 "kernel::frame_inventory",
                 "zero mm ID encountered in apply_with_receipt"
@@ -630,7 +631,7 @@ impl FrameInventoryAuthority {
             .get(&first_mapping)
             .ok_or(FrameInventoryError::RollbackReceiptMismatch(first_mapping))?
             .mm;
-        if mm.wire_key() != receipt.mm() {
+        if mm.receipt_mm() != receipt.mm() {
             return Err(FrameInventoryError::RollbackReceiptMmInvalid);
         }
         let next_revision = state
@@ -778,7 +779,7 @@ impl FrameInventoryAuthority {
         let mm_id = mm;
         let (outcome, revision, mm_empty_at_revision) =
             self.apply_inner(mm_id, commit, None, None)?;
-        let mm = NonZeroU64::new(mm.wire_key().get()).unwrap_or_else(|| {
+        let mm = NonZeroU64::new(mm.receipt_mm().get()).unwrap_or_else(|| {
             carrick_fatal!(
                 "kernel::frame_inventory",
                 "zero mm ID encountered in apply_retirement_with_receipt"

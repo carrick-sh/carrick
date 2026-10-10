@@ -2215,7 +2215,7 @@ where
                     runtime: std::sync::Arc::downgrade(kernel),
                     deferred_anonymous: kernel.dispatcher.deferred_anonymous_state(committed_mm),
                     kernel: std::sync::Arc::clone(committed_context.kernel()),
-                    mm: committed_mm,
+                    inventory_owner: committed_context.shared().mm().frame_owner_authority(),
                     owner_inventory,
                     tid: self.this_tid,
                     identity: carrick_hal::FrameCowIdentity {
