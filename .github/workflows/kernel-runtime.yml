@@ -320,10 +320,12 @@ jobs:
         with:
           ref: ${{ github.event.merge_group.base_sha }}
           persist-credentials: false
-      - name: Download the candidate receipt
+      # Every attempt's receipt; the gate takes the newest attempt <= its own
+      # (a "re-run failed jobs" may re-run only this gate).
+      - name: Download the candidate receipts
         uses: actions/download-artifact@v4
         with:
-          name: receipt-hvf-${{ github.sha }}-${{ github.run_attempt }}
+          pattern: receipt-hvf-${{ github.sha }}-*
           path: ${{ runner.temp }}/candidate
       - name: Build the base xtask
         run: cargo build --locked --release -p carrick-xtask
@@ -333,7 +335,8 @@ jobs:
           BASE_SHA: ${{ github.event.merge_group.base_sha }}
         run: >-
           target/release/carrick-xtask ci-receipt gate --lane hvf
-          --base-sha "$BASE_SHA" --candidate "$RUNNER_TEMP/candidate/receipt.json"
+          --base-sha "$BASE_SHA" --candidate-dir "$RUNNER_TEMP/candidate"
+          --candidate-sha "$GITHUB_SHA" --run-attempt "$GITHUB_RUN_ATTEMPT"
           --download-dir "$RUNNER_TEMP/baseline" --wait-minutes 90 --poll-seconds 60
 
   kvm-gate:
@@ -348,10 +351,12 @@ jobs:
         with:
           ref: ${{ github.event.merge_group.base_sha }}
           persist-credentials: false
-      - name: Download the candidate receipt
+      # Every attempt's receipt; the gate takes the newest attempt <= its own
+      # (a "re-run failed jobs" may re-run only this gate).
+      - name: Download the candidate receipts
         uses: actions/download-artifact@v4
         with:
-          name: receipt-kvm-${{ github.sha }}-${{ github.run_attempt }}
+          pattern: receipt-kvm-${{ github.sha }}-*
           path: ${{ runner.temp }}/candidate
       - name: Build the base xtask
         run: cargo build --locked --release -p carrick-xtask
@@ -361,7 +366,8 @@ jobs:
           BASE_SHA: ${{ github.event.merge_group.base_sha }}
         run: >-
           target/release/carrick-xtask ci-receipt gate --lane kvm
-          --base-sha "$BASE_SHA" --candidate "$RUNNER_TEMP/candidate/receipt.json"
+          --base-sha "$BASE_SHA" --candidate-dir "$RUNNER_TEMP/candidate"
+          --candidate-sha "$GITHUB_SHA" --run-attempt "$GITHUB_RUN_ATTEMPT"
           --download-dir "$RUNNER_TEMP/baseline" --wait-minutes 90 --poll-seconds 60
 
   # The single required check. `if: always()` so a skipped or cancelled lane

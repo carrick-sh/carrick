@@ -80,8 +80,14 @@ Not performed by the repository change.
    `sccache` in `cargo/bin`, then `sudo chown -R root:wheel` and
    `sudo chmod -R go-w` it. Jobs get `RUSTUP_HOME=.../toolchain/rustup`
    (read-only) and a fresh writable `CARGO_HOME` in the job home; tools a
-   workflow installs (`just`, `cargo-deny`) land there and are wiped. A
-   toolchain change is an owner step: update this directory.
+   workflow installs (`just`, `cargo-deny`) land there and are wiped.
+
+   **Toolchain bumps need the owner first.** Jobs cannot install a
+   toolchain, so a change to `rust-toolchain.toml` (version, component or
+   target) fails `hvf-kernel` until the owner has installed the new
+   toolchain into this read-only directory on cloudmac. Install it before
+   the bump lands (both versions can coexist). Automating this from a
+   reviewed commit is an open follow-up.
 
 2. **Runner tree, root-owned.** Download the macOS ARM64 runner from
    <https://github.com/actions/runner/releases>, verify the SHA-256 from that
