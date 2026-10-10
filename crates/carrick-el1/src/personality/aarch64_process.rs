@@ -32,6 +32,7 @@ use super::native_process_runtime::{
     NativeForkPreparation, NativeLifecycleResources, NativeProcessError, NativeProcessRegistry,
     NativeProcessRuntime, NativeProcessService,
 };
+use crate::lock::SpinLock;
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 use crate::memory::reservations;
 use crate::memory::reservations::{NativeReservationGeometry, SharedReservations};
@@ -70,6 +71,58 @@ impl<'a> core::ops::Deref for PreparedWords<'a> {
 type Runtime = NativeProcessRuntime<'static, Mm, Aarch64ParkedContext>;
 static REGISTRY: NativeProcessRegistry<'static, Mm, Aarch64ParkedContext> =
     NativeProcessRegistry::new();
+#[derive(Clone, Copy)]
+struct RetiredSpace {
+    carrier: NonZeroU64,
+    zone: usize,
+    roots: usize,
+    mm: Mm,
+}
+static RETIRED_SPACES: SpinLock<Vec<RetiredSpace>> = SpinLock::new(Vec::new());
+
+fn space_has_resident_slot(zone: &ZoneTables<Aarch64ParkedContext>, mm: Mm) -> bool {
+    (0..carrick_el1_abi::ZONE_SLOTS).any(|slot| {
+        SlotId::from_index(slot).is_some_and(|slot| zone.installed_space(slot) == mm.mm.raw().get())
+    })
+}
+
+fn retire_closed_space(owner: &Portal<'_>, mm: Mm, worker: u32) -> Result<(), NativeProcessError> {
+    let key = ReservationMm::new(mm.mm.raw().get()).ok_or(NativeProcessError::Stale)?;
+    let index = owner
+        .spaces
+        .find(key.raw())
+        .ok_or(NativeProcessError::Stale)?;
+    owner.spaces.close(index);
+    owner
+        .root_any(key, worker)
+        .map_err(|_| NativeProcessError::Stale)?
+        .retire()
+        .map_err(|_| NativeProcessError::Busy)?;
+    owner.spaces.free(index);
+    Ok(())
+}
+
+fn drain_retired_spaces(
+    owner: &Portal<'_>,
+    zone: &ZoneTables<Aarch64ParkedContext>,
+    worker: u32,
+) -> Result<(), NativeProcessError> {
+    let pending = core::mem::take(&mut *RETIRED_SPACES.lock());
+    let mut deferred = Vec::new();
+    for retired in pending {
+        if retired.carrier != owner.carrier
+            || retired.zone != core::ptr::from_ref(zone).addr()
+            || retired.roots != core::ptr::from_ref(owner.roots).addr()
+            || space_has_resident_slot(zone, retired.mm)
+        {
+            deferred.push(retired);
+        } else {
+            retire_closed_space(owner, retired.mm, worker)?;
+        }
+    }
+    RETIRED_SPACES.lock().extend(deferred);
+    Ok(())
+}
 
 pub fn registry() -> &'static NativeProcessRegistry<'static, Mm, Aarch64ParkedContext> {
     &REGISTRY
@@ -468,6 +521,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             return Err(NativeProcessError::Stale);
         }
         let owner = self.portal()?;
+        drain_retired_spaces(&owner, self.zone, self.worker())?;
         let mm = ReservationMm::new(parent.mm.raw().get()).ok_or(NativeProcessError::Stale)?;
         let live = if let Some(words) = self.words {
             PreparedWords::Borrowed(words)
@@ -937,6 +991,12 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         if mm.mm.raw().get() != self.task.mm.key.load(Ordering::Acquire) {
             fatal();
         }
+        let owner = self.portal().unwrap_or_else(|_| fatal());
+        let index = owner
+            .spaces
+            .find(mm.mm.raw().get())
+            .unwrap_or_else(|| fatal());
+        owner.spaces.close(index);
         let binding = common_entry::execution_binding(self.task);
         let Some(retire) = carrick_el1_abi::NativeChildRetire::new(binding, mm) else {
             fatal();
@@ -965,6 +1025,15 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             // host can drain this MM's quarantined stock on any later request.
             self.zone.release_space(self.slot);
         }
+        RETIRED_SPACES.lock().push(RetiredSpace {
+            carrier: self.carrier,
+            zone: core::ptr::from_ref(self.zone).addr(),
+            roots: core::ptr::from_ref(self.roots).addr(),
+            mm,
+        });
+        if drain_retired_spaces(&owner, self.zone, self.worker()).is_err() {
+            fatal();
+        }
     }
 
     fn wake_effects(&mut self, effects: WakeEffects) {
@@ -986,4 +1055,97 @@ pub fn cross_root_exit<X: ForkStockCrossing>(
 
 fn fatal() -> ! {
     panic!("native aarch64 process service failure")
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+    use crate::memory::reservations::Layout;
+    use carrick_el1_abi::ReservationRange;
+
+    struct Crossing;
+    impl ForkStockCrossing for Crossing {
+        fn cross_fork_stock(&self, _: u64, _: u64) -> Result<(), NativeProcessError> {
+            Ok(())
+        }
+        fn cross_root_exit(&self, _: u64, _: u64) -> Result<(), NativeProcessError> {
+            Ok(())
+        }
+        fn cross_child_retire(&self, _: u64, _: u64) -> Result<(), NativeProcessError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn retired_child_releases_space_and_reservation_slot_beyond_capacity() {
+        let region = carrick_test_support::TestEl1Region::zeroed();
+        let base = region.as_ptr() as usize;
+        // SAFETY: the typed fixture owns aligned, zeroed EL1 storage for the
+        // complete test lifetime; both offsets name disjoint ABI records.
+        let zone = unsafe {
+            &*((base + carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+                as *const ZoneTables<Aarch64ParkedContext>)
+        };
+        let roots = unsafe {
+            &*((base + carrick_el1_abi::EL1_RESERVATIONS_OFFSET as usize)
+                as *const SharedReservations)
+        };
+        let task = CurrentTask::new();
+        task.execution.task.store(2, Ordering::Release);
+        task.execution.generation.store(1, Ordering::Release);
+        task.mm.thread_generation.store(1, Ordering::Release);
+        task.publish_visible_pid(2);
+        let slot = SlotId::new(0);
+        let layout = Layout {
+            heap: ReservationRange::new(0x1000, 0x100000).unwrap(),
+            arena: ReservationRange::new(0x100000, 0x1000000).unwrap(),
+            brk: 0x1000,
+            address_limit: u64::MAX,
+            data_limit: u64::MAX,
+            external_address_bytes: 0,
+            external_data_bytes: 0,
+        };
+        let mut service = Aarch64NativeProcessService::with_crossing(
+            &task,
+            slot,
+            zone,
+            roots,
+            NonZeroU64::MIN,
+            Crossing,
+        );
+        for cycle in 1..=carrick_sched_core::spaces::ADDRESS_SPACES + 1 {
+            let mm = cycle as u64 + 1;
+            task.mm.key.store(mm, Ordering::Release);
+            let context = AddressContext {
+                mm: MmGeneration::new(NonZeroU64::new(mm).unwrap()),
+                root: RootGpa::page_aligned(FrameGpa::new(0x4000)).unwrap(),
+                generation: ContextGeneration::new(NonZeroU64::MIN),
+            };
+            let index = zone
+                .spaces
+                .publish_closed(mm, 0x4000, 0x4000)
+                .expect("retired child must not consume all space slots");
+            roots
+                .publish(index.index(), ReservationMm::new(mm).unwrap(), layout)
+                .unwrap();
+            if cycle == 1 {
+                assert!(zone.occupancy.replace(
+                    carrick_sched_core::ExecutionSlot::zone(slot),
+                    0,
+                    mm
+                ));
+            }
+            service.retire_mm(context);
+            if cycle == 1 {
+                assert!(
+                    zone.spaces.find(mm).is_some(),
+                    "resident MM stays quarantined"
+                );
+                zone.release_space(slot);
+                let owner = service.portal().unwrap();
+                drain_retired_spaces(&owner, zone, u32::from(slot.raw())).unwrap();
+            }
+            assert!(zone.spaces.find(mm).is_none());
+        }
+    }
 }
