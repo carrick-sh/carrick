@@ -758,4 +758,43 @@ mod tests {
             0xee
         );
     }
+
+    #[test]
+    fn stub_sizes_fit_128_byte_stride_and_exceed_64_byte_stride() {
+        let layout = test_layout();
+        let stub_base = fault_stub_base(layout);
+        let record_gpa = fault_record_base(layout);
+
+        for &vector in X86_FAULT_VECTORS {
+            let off = u64::from(vector) * X86_FAULT_STUB_STRIDE;
+            let pio_stub = fault_stub_for_vector(vector).expect("pio stub");
+            let mem_stub = fault_memory_record_stub_for_vector(stub_base + off, record_gpa, vector)
+                .expect("memory stub");
+
+            // Both full state preserving stubs (PIO and memory-record) exceed 64 bytes.
+            // If placed in a 64-byte stride, they would overrun into the adjacent stub.
+            assert!(
+                pio_stub.len() > 64,
+                "vector {vector} pio stub length {} does not exceed 64B",
+                pio_stub.len()
+            );
+            assert!(
+                mem_stub.len() > 64,
+                "vector {vector} mem stub length {} does not exceed 64B",
+                mem_stub.len()
+            );
+
+            // Both fit within the 128-byte stride.
+            assert!(
+                pio_stub.len() <= X86_FAULT_STUB_STRIDE as usize,
+                "vector {vector} pio stub length {} exceeds 128B stride",
+                pio_stub.len()
+            );
+            assert!(
+                mem_stub.len() <= X86_FAULT_STUB_STRIDE as usize,
+                "vector {vector} mem stub length {} exceeds 128B stride",
+                mem_stub.len()
+            );
+        }
+    }
 }
