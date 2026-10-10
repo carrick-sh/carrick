@@ -148,7 +148,8 @@ pub struct ChildContext {
     pub visible_tid: u32,
 }
 
-/// Credential admission and runnable publication share the owner's transaction.
+/// Credential admission and the Born record share the owner's transaction;
+/// runnable publication follows after its graph guard is released.
 pub struct ThreadBirth<'a, 'b> {
     pub page: &'a ThreadLifecyclePage,
     pub claim: &'b mut Option<carrick_core::lifecycle::ClaimedEntry>,
@@ -156,6 +157,21 @@ pub struct ThreadBirth<'a, 'b> {
     pub record: RecordRef,
     pub caller_tid: Option<u32>,
     pub child_tid: u32,
+}
+
+impl ThreadBirth<'_, '_> {
+    /// Restore the claim on refusal so the enclosing clone rollback owns it.
+    pub fn record(&mut self) -> Result<(), i64> {
+        let claim = self.claim.take().ok_or(crate::identity::EINVAL)?;
+        match self.page.record_born(claim, self.born) {
+            Ok(_) => Ok(()),
+            Err(refusal) => {
+                let (_, claim) = refusal.into_parts();
+                *self.claim = Some(claim);
+                Err(crate::identity::EINVAL)
+            }
+        }
+    }
 }
 
 pub struct ExitRecord {
@@ -234,14 +250,8 @@ pub trait LifecycleNative<'a>: UserCopy {
     fn process_exit_group(&mut self, _status: u8) -> Option<LifecycleOutcome> {
         None
     }
-    fn publish_born(&mut self, birth: ThreadBirth<'a, '_>) -> Result<(), i64> {
-        birth
-            .page
-            .record_born(
-                birth.claim.take().ok_or(crate::identity::EINVAL)?,
-                birth.born,
-            )
-            .map_err(|_| crate::identity::EINVAL)?;
+    fn publish_born(&mut self, mut birth: ThreadBirth<'a, '_>) -> Result<(), i64> {
+        birth.record()?;
         self.enqueue_born(birth.record);
         Ok(())
     }

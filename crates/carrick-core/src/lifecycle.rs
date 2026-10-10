@@ -229,7 +229,7 @@ pub trait Lifecycle {
     }
 
     /// EL1 clone: record the Born payload and move `Claimed -> Born`.
-    fn complete_birth(&self, claim: ClaimedEntry) -> Result<EntryRef, TransitionError> {
+    fn complete_birth(&self, claim: ClaimedEntry) -> Result<EntryRef, BirthRefusal> {
         let r = claim.0;
         let activity = self.activity();
         if let Some(activity) = activity {
@@ -246,8 +246,10 @@ pub trait Lifecycle {
         {
             let _ = activity.complete(1);
         }
-        result?;
-        Ok(r)
+        match result {
+            Ok(()) => Ok(r),
+            Err(error) => Err(BirthRefusal::new(error, claim)),
+        }
     }
 
     /// Host settle: `Born -> Published`.
@@ -391,5 +393,20 @@ pub struct ClaimedEntry(EntryRef);
 impl ClaimedEntry {
     pub const fn entry(&self) -> EntryRef {
         self.0
+    }
+}
+
+/// A refused Born transition returns custody of the claim to its caller.
+#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
+pub struct BirthRefusal {
+    error: TransitionError,
+    claim: ClaimedEntry,
+}
+impl BirthRefusal {
+    pub const fn new(error: TransitionError, claim: ClaimedEntry) -> Self {
+        Self { error, claim }
+    }
+    pub fn into_parts(self) -> (TransitionError, ClaimedEntry) {
+        (self.error, self.claim)
     }
 }

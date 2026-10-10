@@ -27,6 +27,14 @@ impl<T> SpinLock<T> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
+        self.locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| SpinLockGuard { lock: self })
+    }
+
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
         while self.locked.swap(true, Ordering::Acquire) {
             while self.locked.load(Ordering::Relaxed) {

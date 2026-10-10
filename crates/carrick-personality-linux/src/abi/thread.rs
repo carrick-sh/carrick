@@ -726,9 +726,12 @@ impl ThreadLifecyclePage {
         &self,
         claim: ClaimedEntry,
         record: BornRecord,
-    ) -> Result<EntryRef, TransitionError> {
+    ) -> Result<EntryRef, carrick_core::lifecycle::BirthRefusal> {
         let r = claim.entry();
-        let e = self.entry(r.index())?;
+        let e = match self.entry(r.index()) {
+            Ok(entry) => entry,
+            Err(error) => return Err(carrick_core::lifecycle::BirthRefusal::new(error, claim)),
+        };
         e.caller_task.store(record.caller_task, Ordering::Relaxed);
         e.caller_serial
             .store(record.caller_serial, Ordering::Relaxed);
