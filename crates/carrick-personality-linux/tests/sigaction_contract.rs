@@ -44,6 +44,18 @@ impl<'a> SignalNative<'a> for Native {
     }
 }
 impl ProcessSignals for Native {
+    fn take_deliverable(
+        &mut self,
+        blocked: SigBlockMask,
+    ) -> Option<(
+        carrick_signal_core::policy::Signal,
+        Option<carrick_personality_linux::abi::signal::LinuxSiginfo>,
+        Action,
+    )> {
+        self.calls += 1;
+        let signal = carrick_signal_core::policy::Signal::from_number(10).unwrap();
+        (!blocked.signals().contains(signal)).then_some((signal, None, Action::default()))
+    }
     fn force_sigsegv(&mut self, _: SigBlockMask) -> Result<(), carrick_syscall_abi::LinuxErrno> {
         Err(carrick_syscall_abi::LinuxErrno::new(22))
     }
@@ -193,4 +205,48 @@ fn queued_siginfo_carries_the_admitted_signal_number() {
         .unwrap();
     let number = payload.si_signo;
     assert_eq!(number, 10);
+}
+
+#[test]
+fn suspend_restore_rechecks_delivery_at_the_same_user_return() {
+    let mut native = Native {
+        args: [0; 6],
+        calls: 0,
+        fail: false,
+    };
+    let usr1 = carrick_signal_core::policy::Signal::from_number(10).unwrap();
+    let temporary = SigBlockMask::blocking_all_of(SignalSet::EMPTY.with(usr1));
+    let mut selected_mask = temporary;
+    assert_eq!(
+        native
+            .take_deliverable_after_suspend(&mut selected_mask, SigBlockMask::NONE)
+            .unwrap()
+            .0,
+        usr1
+    );
+    assert_eq!(
+        selected_mask,
+        SigBlockMask::NONE,
+        "handler mask uses the restored selection mask"
+    );
+    assert_eq!(native.calls, 2);
+    native.calls = 0;
+    selected_mask = SigBlockMask::NONE;
+    assert!(
+        native
+            .take_deliverable_after_suspend(&mut selected_mask, temporary)
+            .is_some()
+    );
+    assert_eq!(
+        native.calls, 1,
+        "one checkpoint selects at most one handler"
+    );
+    native.calls = 0;
+    selected_mask = temporary;
+    assert!(
+        native
+            .take_deliverable_after_suspend(&mut selected_mask, temporary)
+            .is_none()
+    );
+    assert_eq!(native.calls, 1, "unchanged masks need no second pass");
 }

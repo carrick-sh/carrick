@@ -1173,13 +1173,13 @@ mod kernel {
             carrick_personality_linux::dispatch::CompletionRoute::Served, &task.linux,
         ) { return None; }
         let thread = GuestLifecycleVenue.thread(task)?;
-        let thread_blocked = SigBlockMask::blocking_all_of(
+        let mut thread_blocked = SigBlockMask::blocking_all_of(
             carrick_personality_linux::signal::SignalSet::from_bits(thread.slot.blocked().0),
         );
 
         let saved_mask = process.take_suspend_mask().unwrap_or(thread_blocked);
         thread.slot.init_blocked(carrick_el1_abi::BlockedMask(saved_mask.signals().bits()));
-        let (sig, info, action) = process.take_deliverable(thread_blocked)?;
+        let (sig, info, action) = process.take_deliverable_after_suspend(&mut thread_blocked, saved_mask)?;
         match action.disposition {
             policy::Disposition::Ignore => None,
             policy::Disposition::Default => {
