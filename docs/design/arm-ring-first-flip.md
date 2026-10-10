@@ -518,6 +518,12 @@ Existing credential transformation unit tests prove only ordinary executable
 semantics without file capabilities or securebits; ARM signed integration and
 CPL0 exec remain named dependencies rather than accepted behavior.
 
+## Shared identity review baseline
+
+The shared identity branch inherits main's CPL0 XSAVE reserved-header fix and
+`mm.initial.elf-private` publication contract. These are loader and execution
+prerequisites, not parallel implementations in the identity port.
+
 ## CPL0 thread-exit dependency (`shared-cpl0-thread-exit-clear-tid`)
 
 Production shared CPL0 thread exit needs native lifecycle scheduler/context
