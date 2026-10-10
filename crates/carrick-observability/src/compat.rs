@@ -554,6 +554,10 @@ pub struct ExecutionWitness {
     /// CPL0-owned or unclassified calls that did not enter host dispatch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub guest_refusal_families: Vec<ExecutionFamilyCount>,
+    /// In-kernel fork stock outcomes by family: loans, each typed loan
+    /// refusal reason, withdrawn lifecycle records, child retirement.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fork_stock_families: Vec<ExecutionFamilyCount>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
