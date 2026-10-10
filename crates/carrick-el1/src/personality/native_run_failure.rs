@@ -21,10 +21,9 @@ pub fn complete_native_run_failure(binding: ExecutionBinding, reason: NativeRunF
     }
     #[cfg(all(not(target_os = "none"), not(test)))]
     {
-        carrick_fatal::carrick_fatal!(
-            "el1::native_run_failure",
-            "native run failed: {} ({binding:?})",
-            reason.as_str()
+        let _ = binding;
+        crate::personality::dispatch::invalid_completion(
+            crate::personality::dispatch::NativeInvariant::PhysicalCustody(reason.as_str()),
         )
     }
 }

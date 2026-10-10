@@ -60,9 +60,16 @@ fn fixture_handled(
     {
         // SAFETY: stopped-host bootstrap published and retains the aligned
         // native lane/zone/page custody for this exact CPU binding.
-        let Some(mut lane) =
-            (unsafe { crate::lifecycle::acquire(frame, binding, task, counters, call.args) })
-        else {
+        let Some(mut lane) = (unsafe {
+            crate::lifecycle::acquire(
+                frame,
+                binding,
+                task,
+                counters,
+                call.args,
+                carrick_el1::personality::native_run_failure::complete_native_run_failure,
+            )
+        }) else {
             doorbell(FATAL_PORT, frame);
             halt();
         };
