@@ -4,9 +4,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// The 12 KiB mapped stack retains 2 KiB for interrupt frames and indirect
-// calls that the linked direct-call graph cannot resolve.
-const LIMIT: u64 = 10 * 1024;
+// The 12 KiB mapped stack retains 4 KiB for indirect calls and interrupt
+// nesting that the linked direct-call graph cannot resolve.
+const LIMIT: u64 = 8 * 1024;
 const VECTOR_FRAME: u64 = 288; // TrapFrame, asserted in carrick-el1-abi.
 
 #[derive(clap::Args, Debug, Clone)]
