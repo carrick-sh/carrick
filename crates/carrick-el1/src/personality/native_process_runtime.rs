@@ -530,6 +530,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             handoff: None,
             root_exit: None,
             run_failure: None,
+            #[cfg(test)]
+            publication_wait_probe: None,
             calling_tid,
             slot,
         })
@@ -596,8 +598,28 @@ pub struct NativeProcessEntry<
     handoff: Option<EntryHandoffReceipt<C>>,
     root_exit: Option<LinuxWaitStatus>,
     run_failure: Option<carrick_el1_abi::NativeRunFailureReason>,
+    #[cfg(test)]
+    publication_wait_probe: Option<&'r (dyn Fn(u32) + Sync)>,
     calling_tid: u32,
     slot: Option<&'a ThreadControlSlot>,
+}
+// A committed exit/settlement owes its wake. Acquire the short bucket lock
+// unconditionally, as scheduler wake placement does, after releasing the graph.
+// Contention is not a guest admission failure and cannot terminate the run.
+struct CommittedWakeWait<'a> {
+    lifetime: core::marker::PhantomData<&'a ()>,
+    #[cfg(test)]
+    probe: Option<&'a (dyn Fn(u32) + Sync)>,
+}
+impl<C: ProcessContext> carrick_sched_core::LockWait<C> for CommittedWakeWait<'_> {
+    fn wait(&self, _attempt: u32) -> bool {
+        #[cfg(test)]
+        if let Some(probe) = self.probe {
+            probe(_attempt);
+        }
+        core::hint::spin_loop();
+        true
+    }
 }
 fn returned(value: i64) -> LifecycleOutcome {
     LifecycleOutcome::Returned {
@@ -846,9 +868,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let guard = zone
             .lock(
                 ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
-                &BoundedSpin(LOCK_SPINS),
+                &CommittedWakeWait {
+                    lifetime: core::marker::PhantomData,
+                    #[cfg(test)]
+                    probe: self.publication_wait_probe,
+                },
             )
-            .ok_or(NativeProcessError::Busy)?;
+            .ok_or(NativeProcessError::Quarantined)?;
         channel
             .generation
             .publish()
@@ -866,7 +892,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             &mut [],
             &mut effects,
         )
-        .map_err(|_| NativeProcessError::Busy)?;
+        .map_err(|_| NativeProcessError::Quarantined)?;
         drop(guard);
         self.service.wake_effects(effects);
         Ok(())
@@ -2849,7 +2875,7 @@ mod tests {
     }
     #[test]
     fn exit_group_holds_terminal_custody_until_pre_live_claim_settles() {
-        for (claim_live, wake_failure, resume_stale) in [
+        for (claim_live, wake_contention, resume_stale) in [
             (false, false, false),
             (true, false, false),
             (false, true, false),
@@ -2937,6 +2963,14 @@ mod tests {
             };
             assert!(zone.slot(slot).current().is_none());
             let home = zone.slot(slot).host_record().unwrap();
+            let reached = std::sync::Barrier::new(2);
+            let released = std::sync::Barrier::new(2);
+            let probe = |attempt| {
+                if attempt == LOCK_SPINS {
+                    reached.wait();
+                    released.wait();
+                }
+            };
             let mut entry = runtime
                 .enter(source, &task, words(address), &mut service)
                 .unwrap();
@@ -2974,7 +3008,7 @@ mod tests {
             page.unclaim(claim).unwrap();
             // Claim owners deliver their settlement only after rollback is complete.
             // Direct hook invocation models that production lifecycle notification.
-            if wake_failure {
+            if wake_contention {
                 let channel = runtime
                     .graph
                     .lock()
@@ -2992,17 +3026,18 @@ mod tests {
                         &BoundedSpin(LOCK_SPINS),
                     )
                     .unwrap();
-                assert_eq!(entry.lifecycle_admission_settled(), Err(-11));
-                assert_eq!(
-                    entry.take_run_failure(),
-                    Some(carrick_el1_abi::NativeRunFailureReason::BirthSettlement)
-                );
-                assert!(entry.take_root_exit().is_none());
-                assert_eq!(zone.slot(slot).queued(), 0);
-                assert_eq!(page.live(), 1);
-                assert!(runtime.graph.lock().pending_exit.contains_key(&entry.key));
-                drop(guard);
-                continue;
+                std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        let guard = guard;
+                        reached.wait();
+                        drop(guard);
+                        released.wait();
+                    });
+                    entry.publication_wait_probe = Some(&probe);
+                    entry.lifecycle_admission_settled().unwrap();
+                    entry.publication_wait_probe = None;
+                });
+                assert_eq!(entry.take_run_failure(), None);
             }
             entry.lifecycle_admission_settled().unwrap();
             assert_eq!(zone.slot(slot).queued(), 1);
@@ -3471,6 +3506,178 @@ mod tests {
         task.publish_visible_pid(row.metadata().namespace_pid);
         task.publish_lifecycle(identity.lifecycle_page, identity.control_slot);
     }
+    #[test]
+    fn child_exit_group_waits_for_parent_bucket_and_delivers_status() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let child_page = Box::new(ThreadLifecyclePage::new());
+        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        }));
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
+        page.release_live(1).unwrap(); // fixture settles its bootstrap census
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        assert_eq!(page.live(), 1);
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &*child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+        };
+        let parent = TaskKey {
+            id: TaskId::from_abi_positive(41).unwrap(),
+            serial: TaskSerial::from_raw_u64(11).unwrap(),
+        };
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        let LifecycleOutcome::Returned { result, .. } = entry.fork() else {
+            panic!("fork")
+        };
+        let child_pid = result.raw();
+        let child = runtime
+            .namespace_child_key(parent, child_pid as u32)
+            .unwrap();
+        assert!(matches!(
+            entry.wait4(
+                ProcessWaitPid::from_syscall_argument(child_pid as u64),
+                UserVa::new(0x8000),
+                LinuxWaitOptions::empty(),
+                UserVa::new(0)
+            ),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+        drop(entry);
+        let channel = runtime
+            .graph
+            .lock()
+            .owner
+            .task(parent)
+            .unwrap()
+            .native()
+            .resources()
+            .channel
+            .clone()
+            .unwrap();
+        let before = channel.generation.generation();
+        activate(&runtime, source, &task, child);
+        let child_address = runtime
+            .graph
+            .lock()
+            .owner
+            .task(child)
+            .unwrap()
+            .native()
+            .resources()
+            .address;
+        let guard = zone
+            .lock(
+                ZoneTables::<ParkedContextWords>::bucket_of_with_context(
+                    channel.mm,
+                    WaitChannel::address(&channel),
+                ),
+                &BoundedSpin(LOCK_SPINS),
+            )
+            .unwrap();
+        let reached = std::sync::Barrier::new(2);
+        let released = std::sync::Barrier::new(2);
+        let probe = |attempt| {
+            if attempt == LOCK_SPINS {
+                reached.wait();
+                released.wait();
+            }
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let guard = guard;
+                reached.wait();
+                assert_eq!(channel.generation.generation(), before);
+                drop(guard);
+                released.wait();
+            });
+            let mut entry = runtime
+                .enter(source, &task, words(child_address), &mut service)
+                .unwrap();
+            entry.publication_wait_probe = Some(&probe);
+            assert!(matches!(
+                entry.exit_group(19),
+                LifecycleOutcome::Transferred { .. }
+            ));
+            assert_eq!(
+                entry.take_run_failure(),
+                None,
+                "bucket contention cannot terminate the run"
+            );
+            assert!(entry.take_handoff_receipt().is_some());
+        });
+        assert_eq!(channel.generation.generation().raw(), before.raw() + 1);
+        assert_eq!(child_page.live(), 0);
+        activate(&runtime, source, &task, parent);
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        let Some(LifecycleOutcome::Returned { result, .. }) = entry.resume_pending_wait() else {
+            panic!("parent resume")
+        };
+        assert_eq!(result.raw(), child_pid);
+        assert_eq!(
+            service.copies.last(),
+            Some(&LinuxWaitStatus::from_wait_encoding(19 << 8))
+        );
+    }
+
     #[test]
     fn blocked_adopter_wait_resumes_with_an_inherited_zombie() {
         for depth_count in [2, 3] {
