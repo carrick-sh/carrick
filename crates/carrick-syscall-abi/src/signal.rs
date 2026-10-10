@@ -962,3 +962,7 @@ pub const LINUX_RT_SIGSET_SIZE: u64 = 8;
 pub const LINUX_SS_ONSTACK: u64 = 1;
 pub const LINUX_SS_DISABLE: u64 = 2;
 pub const LINUX_SS_AUTODISARM: u64 = 0x8000_0000;
+
+/// EL0 signal-return PSTATE: NZCV, SSBS and DIT are user-modifiable. All mode,
+/// interrupt-mask and privileged state bits must remain clear.
+pub const LINUX_AARCH64_SIGNAL_USER_PSTATE_MASK: u64 = 0xf000_0000 | (1 << 12) | (1 << 24);

@@ -103,8 +103,7 @@ pub mod x86_initial_mm;
 
 /// Validate guest-controlled ARM signal resume state before register publication.
 pub const fn signal_resume_is_el0(pstate: u64) -> bool {
-    // M[4:0] must select AArch64 EL0t and DAIF must not mask exceptions.
-    pstate & (0x1f | (0xf << 6)) == 0
+    pstate & !carrick_syscall_abi::LINUX_AARCH64_SIGNAL_USER_PSTATE_MASK == 0
 }
 
 #[cfg(test)]
@@ -112,11 +111,24 @@ mod signal_resume_tests {
     #[test]
     fn forged_supervisor_or_masked_pstate_is_refused() {
         assert!(!super::signal_resume_is_el0(0b0101));
-        for mask in [1 << 6, 1 << 7, 1 << 8, 1 << 9] {
+        for mask in [
+            1 << 4,
+            1 << 6,
+            1 << 7,
+            1 << 8,
+            1 << 9,
+            1 << 10,
+            1 << 20,
+            1 << 21,
+            1 << 22,
+            1 << 23,
+            1 << 25,
+        ] {
             assert!(!super::signal_resume_is_el0(mask));
         }
         assert!(super::signal_resume_is_el0(0));
         assert!(super::signal_resume_is_el0(0xf000_0000));
+        assert!(super::signal_resume_is_el0((1 << 12) | (1 << 24)));
     }
 }
 

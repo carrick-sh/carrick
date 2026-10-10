@@ -454,9 +454,8 @@ mod tests {
         e.sp = 0x20_0000; // 16-aligned user stack
         e.elr_el1 = 0xDEAD_BEE0; // becomes saved_pc (interrupted_pc == None)
         // EL0t PSTATE: mode bits [3:0] == 0, NZCV all set to prove the condition
-        // flags survive verbatim through the frame, DAIF set as Carrick always
-        // shows the guest.
-        let pstate = 0xF000_03C0u64;
+        // flags, SSBS and DIT survive; hardware DAIF does not enter the frame.
+        let pstate = 0xF100_13C0u64;
         for i in 0..32 {
             e.vregs[i] = ((i as u128) << 64) | 0xCAFE_F00D_ABCD;
         }
@@ -486,7 +485,11 @@ mod tests {
         assert_eq!(e.x, saved_x, "x0..x30 must round-trip through the sigframe");
         assert_eq!(e.sp, saved_sp, "SP_EL0 must round-trip");
         assert_eq!(e.elr_el1, saved_pc, "resume PC (ELR_EL1) must round-trip");
-        assert_eq!(e.spsr_el1, pstate, "PSTATE (incl. NZCV) must round-trip");
+        assert_eq!(
+            e.spsr_el1,
+            pstate & carrick_abi::LINUX_AARCH64_SIGNAL_USER_PSTATE_MASK,
+            "user PSTATE must round-trip"
+        );
         assert_eq!(restore.saved_pc, saved_pc, "reported saved_pc matches");
         assert_eq!(
             restore.sigmask, 0x00FF,
@@ -496,11 +499,10 @@ mod tests {
     }
 
     /// EL0 runs with IRQs unmasked under the in-kernel GIC (the in-guest
-    /// scheduler's timer and SGIs); the frame the guest reads shows DAIF set
-    /// as it always has, and rt_sigreturn restores what the guest's frame
-    /// says.
+    /// scheduler's timer and SGIs). The public frame carries only user fields;
+    /// a handler cannot restore interrupt masks or privileged PSTATE.
     #[test]
-    fn aarch64_sigframe_shows_the_guest_its_historical_daif() {
+    fn aarch64_sigframe_excludes_hardware_daif_from_user_resume_state() {
         let mut e = empty_engine();
         e.sp = 0x20_0000;
         e.elr_el1 = 0xDEAD_BEE0;
@@ -509,14 +511,33 @@ mod tests {
             .expect("build_sigframe writes the frame");
         e.x = [0; 31];
         Aarch64GuestArch::restore_sigframe(&mut e, true).expect("restore_sigframe");
-        assert_eq!(
-            e.spsr_el1, 0x6000_03C0,
-            "NZCV kept, DAIF as the guest saw it"
-        );
+        assert_eq!(e.spsr_el1, 0x6000_0000, "NZCV kept, hardware DAIF excluded");
     }
 
     #[test]
     fn aarch64_sigframe_rejects_non_el0_pstate() {
+        assert_invalid_signal_pstate(0b0101);
+    }
+
+    #[test]
+    fn aarch64_sigframe_rejects_masked_or_privileged_pstate_before_register_writes() {
+        for pstate in [
+            1 << 4,
+            1 << 6,
+            1 << 7,
+            1 << 8,
+            1 << 9,
+            1 << 10,
+            1 << 20,
+            1 << 21,
+            1 << 22,
+            1 << 23,
+            1 << 25,
+        ] {
+            assert_invalid_signal_pstate(pstate);
+        }
+    }
+    fn assert_invalid_signal_pstate(pstate: u64) {
         use carrick_guest_mem::GuestMemory;
         use zerocopy::IntoBytes;
         // A readable-but-INVALID frame: the restored PSTATE selects a non-EL0
@@ -532,7 +553,7 @@ mod tests {
         // Build the bad frame via whole-substruct assignment (the packed structs
         // forbid taking references to nested fields).
         let mut mc = carrick_abi::LinuxSignalContext::empty();
-        mc.pstate = 0b0101; // EL1h: low nibble != 0 → must be rejected
+        mc.pstate = pstate;
         mc.regs = [0xBAD0_0000; 31]; // values that MUST NOT be applied
         mc.sp = 0xDEAD;
         mc.pc = 0xBEEF;
