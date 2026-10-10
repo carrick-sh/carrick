@@ -32,6 +32,32 @@ _start:
  syscall
  cmp $-3, %rax
  jne failed_83
+ mov $200, %eax
+ xor %edi, %edi
+ xor %esi, %esi
+ syscall
+ cmp $-22, %rax
+ jne failed_84
+ mov $200, %eax
+ mov $-1, %rdi
+ xor %esi, %esi
+ syscall
+ cmp $-22, %rax
+ jne failed_84
+ mov $234, %eax
+ mov %r12, %rdi
+ xor %esi, %esi
+ xor %edx, %edx
+ syscall
+ cmp $-22, %rax
+ jne failed_85
+ mov $129, %eax
+ xor %edi, %edi
+ mov $10, %esi
+ lea queued(%rip), %rdx
+ syscall
+ cmp $-3, %rax
+ jne failed_86
  mov $1, %eax
  mov $1, %edi
  lea message(%rip), %rsi
@@ -61,3 +87,18 @@ failed_82:
 failed_83:
  mov $83, %edi
  jmp exit
+
+failed_84:
+ mov $84, %edi
+ jmp exit
+failed_85:
+ mov $85, %edi
+ jmp exit
+failed_86:
+ mov $86, %edi
+ jmp exit
+.data
+.align 8
+queued:
+ .long 10, 0, -1, 0
+ .space 112

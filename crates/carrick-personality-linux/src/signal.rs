@@ -462,8 +462,8 @@ pub trait SignalNative<'a>: crate::lifecycle::UserCopy {
 
 pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<SignalOutcome> {
     use crate::abi::signal::{
-        LINUX_EFAULT, LINUX_EINTR, LINUX_EINVAL, LINUX_SI_TKILL, LINUX_SI_USER, LinuxSigaction,
-        LinuxSiginfo, RT_SIGSET_SIZE,
+        LINUX_EFAULT, LINUX_EINTR, LINUX_EINVAL, LINUX_ESRCH, LINUX_SI_TKILL, LINUX_SI_USER,
+        LinuxSigaction, LinuxSiginfo, RT_SIGSET_SIZE,
     };
     use zerocopy::{FromBytes, IntoBytes};
     let args = native.arguments();
@@ -702,7 +702,7 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 Err(errno) => return returned(errno.guest_retval(), false),
             };
             if tgid.abi_number() <= 0 {
-                return returned(LINUX_EINVAL.guest_retval(), false);
+                return returned(LINUX_ESRCH.guest_retval(), false);
             }
             let mut bytes = [0u8; core::mem::size_of::<LinuxSiginfo>()];
             if !native.copy_in(&mut bytes, carrick_guest_arch::UserVa::new(uinfo_ptr)) {
