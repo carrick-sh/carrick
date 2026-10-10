@@ -93,45 +93,26 @@ impl<
     fn process_exit_group(&mut self, status: u8) -> Option<LifecycleOutcome> {
         Some(self.process_venue()?.exit_group(status))
     }
-    fn publish_born(&mut self, birth: ThreadBirth<'a, '_>) -> Result<(), i64> {
+    fn publish_born(&mut self, mut birth: ThreadBirth<'a, '_>) -> Result<(), i64> {
         let mut process = self.process.take();
         let result = if let Some(venue) = process.as_deref_mut() {
             if Some(venue.binding()) != LifecycleNative::binding(self) {
                 Err(carrick_personality_linux::identity::ESRCH)
             } else if let Some(caller_tid) = birth.caller_tid {
-                venue.thread_spawned(caller_tid, birth.child_tid, &mut || {
-                    birth
-                        .page
-                        .record_born(
-                            birth
-                                .claim
-                                .take()
-                                .ok_or(carrick_personality_linux::identity::EINVAL)?,
-                            birth.born,
-                        )
-                        .map_err(|_| carrick_personality_linux::identity::EINVAL)?;
-                    self.enqueue_born(birth.record);
-                    Ok(())
-                })
+                venue.thread_spawned(caller_tid, birth.child_tid, &mut || birth.record())
             } else {
                 Err(carrick_personality_linux::identity::ESRCH)
             }
         } else {
-            birth
-                .page
-                .record_born(
-                    birth
-                        .claim
-                        .take()
-                        .ok_or(carrick_personality_linux::identity::EINVAL)?,
-                    birth.born,
-                )
-                .map_err(|_| carrick_personality_linux::identity::EINVAL)?;
-            self.enqueue_born(birth.record);
-            Ok(())
+            birth.record()
         };
         self.process = process;
-        result
+        result?;
+        // Credentials and Born are committed under the graph guard. Runnable
+        // publication takes scheduler locks only after that guard is dropped.
+        // It cannot fail; the clone gate retains parent/live-count custody.
+        self.enqueue_born(birth.record);
+        Ok(())
     }
     fn thread_exited(&mut self, tid: u32) {
         if let Some(venue) = self.process_venue() {

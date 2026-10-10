@@ -1155,6 +1155,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .map_err(|_| NativeProcessError::Busy)?;
             control.reset_for_birth(blocked, 0, lifecycle_entry);
             if !control.publish_visible_tid(visible.get()) {
+                page.unclaim(claim)
+                    .map_err(|_| NativeProcessError::Quarantined)?;
                 return Err(NativeProcessError::Invalid);
             }
             let born = page
@@ -1168,7 +1170,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         blocked,
                     },
                 )
-                .map_err(|_| NativeProcessError::Invalid)?;
+                .map_err(|refusal| {
+                    let (_, claim) = refusal.into_parts();
+                    match page.unclaim(claim) {
+                        Ok(_) => NativeProcessError::Invalid,
+                        Err(_) => NativeProcessError::Quarantined,
+                    }
+                })?;
             page.publish(born)
                 .map_err(|_| NativeProcessError::Invalid)?;
             Ok(control)
