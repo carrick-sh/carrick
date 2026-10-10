@@ -371,7 +371,7 @@ pub unsafe fn cow_scope_for_record(
     }
     let address =
         registered.or_else(|| (source.mm == mm && source.root == root).then_some(source))?;
-    (address.mm == mm && address.root == root)
+    (address.mm == mm && address.root == root && (source.mm != address.mm || source == address))
         .then(|| carrick_el1_abi::CowGrantScope::checked(binding, address))
         .flatten()
 }
@@ -1686,6 +1686,73 @@ mod tests {
         EL1_FRAME_GRANT_TARGET_SIZE, FRAME_GRANT_ERR_DENIED, FrameGrantMailbox, FrameGrantReady,
     };
     use carrick_sched_core::AddressSpaces;
+
+    #[test]
+    fn arm_cow_scope_refuses_a_recycled_root_for_the_stopped_execution() {
+        use carrick_guest_arch::{
+            AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa,
+        };
+        use carrick_sched_core::{Aarch64ParkedContext, SlotId, ThreadIdentity, ZoneTables};
+        let region = carrick_test_support::TestEl1Region::zeroed();
+        // SAFETY: typed fixture storage retains the aligned shared ABI zone.
+        let zone = unsafe {
+            &*((region.as_ptr() as usize + carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+                as *const ZoneTables<Aarch64ParkedContext>)
+        };
+        let address = AddressContext {
+            mm: MmGeneration::new(NonZeroU64::new(9).unwrap()),
+            root: RootGpa::page_aligned(FrameGpa::new(0x9000)).unwrap(),
+            generation: ContextGeneration::new(NonZeroU64::new(4).unwrap()),
+        };
+        let slot = SlotId::new(0);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 9, Some(0), 1);
+        let space = zone.spaces.publish_closed(9, 0x9000, 0).unwrap();
+        zone.spaces.open(space);
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                tid: 2,
+                serial: 3,
+                mm: 9,
+                generation: 7,
+                affinity: 1,
+                file_table: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
+            })
+            .unwrap();
+        // SAFETY: the newly allocated unpublished record has exclusive fixture custody.
+        unsafe {
+            *zone.record(record).ctx_mut() =
+                Aarch64ParkedContext::from_parts(carrick_sched_core::ThreadCtx::ZERO, address);
+        }
+        assert!(zone.authorize_guest_execution(zone.record_ref(record)));
+        zone.requeue_preempted(slot, record);
+        zone.enter_guest(slot);
+        assert_eq!(zone.switch_in_full(slot).unwrap().record, record);
+        let task = CurrentTask::new();
+        task.execution.task.store(2, Ordering::Release);
+        task.execution.generation.store(7, Ordering::Release);
+        task.mm.key.store(9, Ordering::Release);
+        task.mm.thread_generation.store(3, Ordering::Release);
+        // SAFETY: the fixture retains this stopped slot and exact save area.
+        let observed = unsafe {
+            cow_scope_for_record(zone, &task, slot, address.mm, address.root, Some(address))
+        };
+        assert_eq!(observed.unwrap().address, address);
+        let recycled = AddressContext {
+            generation: ContextGeneration::new(NonZeroU64::new(5).unwrap()),
+            ..address
+        };
+        // SAFETY: no scheduler can mutate this fixture's stopped slot.
+        assert!(
+            unsafe {
+                cow_scope_for_record(zone, &task, slot, address.mm, address.root, Some(recycled))
+            }
+            .is_none(),
+            "a new registry incarnation cannot license an old stopped context"
+        );
+    }
 
     #[test]
     fn instruction_translation_fault_can_request_owner_file_grant() {
