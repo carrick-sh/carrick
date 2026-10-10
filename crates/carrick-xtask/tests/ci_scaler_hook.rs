@@ -103,7 +103,7 @@ fn serial_host_rejected_hook_kills_worker_before_always_and_failure_steps() {
     assert!(control.path().join("always-ran").exists());
     assert!(control.path().join("failure-ran").exists());
     let source = include_str!("../../../scripts/ci/admit-job.sh");
-    // Substitute only the policy decision: authorize_job has its own tests.
+    // Substitute only the policy decision: Admission::authorize has its own tests.
     // The complete production rejection wrapper executes unchanged.
     let hook = source.replace(
         "/usr/local/bin/carrick-xtask ci-scaler admit-job",
@@ -135,4 +135,37 @@ fn serial_host_rejected_hook_kills_worker_before_always_and_failure_steps() {
 fn launch_isolates_the_runner_group_before_it_can_receive_a_job() {
     let source = include_str!("../../../scripts/ci/runner-once.sh");
     assert!(source.contains("setsid --wait ./run.sh --jitconfig"));
+}
+
+#[test]
+fn serial_host_cloudmac_hook_is_the_same_terminal_wrapper() {
+    let state = tempfile::tempdir().unwrap();
+    // The cloudmac hook is the shared script with only its xtask/policy/state
+    // paths substituted; the decision itself is substituted here as above.
+    let rejected = carrick_xtask::ci_scaler::mac_hook_script(
+        std::path::Path::new("/usr/bin/false"),
+        state.path(),
+    )
+    .unwrap();
+    assert!(rejected.contains("--state-dir"));
+    let (dir, status) = fixture_run(&rejected);
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    assert!(!dir.path().join("always-ran").exists());
+    assert!(!dir.path().join("failure-ran").exists());
+    assert!(!dir.path().join("listener-survived").exists());
+    let admitted = carrick_xtask::ci_scaler::mac_hook_script(
+        std::path::Path::new("/usr/bin/true"),
+        state.path(),
+    )
+    .unwrap();
+    let (dir, status) = fixture_run(&admitted);
+    assert!(status.success());
+    assert!(dir.path().join("always-ran").exists());
+}
+
+#[test]
+fn cloudmac_launch_isolates_the_runner_session_before_it_can_receive_a_job() {
+    let source = include_str!("../src/ci_scaler/mac.rs");
+    assert!(source.contains("libc::setsid()"));
+    assert!(source.contains("ACTIONS_RUNNER_HOOK_JOB_STARTED"));
 }

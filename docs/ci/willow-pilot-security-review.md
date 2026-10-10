@@ -95,3 +95,66 @@ receipt explicitly leaves other host profiles pending. Batch acceptance
 remains with the director. Full `just ci` retains the separately disclosed
 inherited MMU/signal/EL1 rustdoc red owned by PR #3. Local red and green logs
 are in `/tmp/willow-pilot-review/`.
+
+## Standing admission surface
+
+The pilot admitted one workflow (`willow-pilot.yml`, `workflow_dispatch`,
+`work/willow-pilot`, one approved SHA). The merge-queue gate adds a second,
+bounded policy for Willow (`ci-scaler standing`) and cloudmac
+(`ci-scaler mac-jit`). Both are one `Admission::Standing` value in
+`crates/carrick-xtask/src/ci_scaler.rs`, used for demand detection and in the
+job-start hook; there is no second copy of the rules.
+
+| Check | Pilot | Standing |
+|---|---|---|
+| Repository (run and head repository) | `carrick-sh/carrick` | `carrick-sh/carrick` |
+| Workflow file | `willow-pilot.yml` | `kernel-runtime.yml`, at the ref being run |
+| Events and refs | `workflow_dispatch` on `work/willow-pilot` | `merge_group` on `gh-readonly-queue/main/*`; `push` or `workflow_dispatch` on `main` |
+| SHA | one approved SHA | any full SHA reachable by those refs |
+| Labels | `ci_scaler::LABELS` | `LABELS` (Willow), `HVF_LABELS` (cloudmac) |
+| Concurrency | one clone | Willow 1 by default, `--max-concurrency 2` at most; cloudmac 1 |
+
+Not admitted, by test (`tests/ci_scaler.rs`): `pull_request` (including a
+`pull_request` event claiming `refs/heads/main`), `pull_request_target`,
+`schedule`, other branches and tags, an empty or foreign merge-queue prefix,
+a foreign workflow file (`ci.yml`, `willow-pilot.yml`), a workflow file read
+at a different ref, a fork repository, and a short SHA. The pilot policy and
+the standing policy do not admit each other's runs or jobs.
+`kernel-runtime.yml` has no `pull_request` trigger; a test fails if one is
+added.
+
+Unchanged properties, retained by construction and tests:
+
+- **JIT one-use registration.** Each runner is minted by
+  `generate-jitconfig` for one ledger name; Willow runners consume a
+  `mkdir` marker in the guest, cloudmac runners a `mkdir`'d per-name state
+  directory. The JIT never enters a ledger, log or disk file.
+- **Willow budget.** Clone range 308-349 (typed `CloneId`), pool
+  `carrick-ci`, the protected-VM permission census, the 80% projected CPU
+  ceiling, 10 GiB available memory, 150 GiB thin-pool data headroom and
+  metadata below 80% apply before every clone. With two clones, every
+  non-template pool member must be an active ledger clone; any unknown object
+  blocks all admission. A reconcile error or ambiguous clone freezes new
+  admission until a clean pass; the CPU ceiling still stops the controller.
+- **Job-start hook.** Repository, event, workflow file and ref are verified
+  before any step; rejection runs `exec /bin/kill -KILL 0` on the runner's
+  dedicated session (`setsid --wait` on Willow, `setsid()` in
+  `mac-run-once`). `tests/ci_scaler_hook.rs` proves process death for both
+  hook variants against `always()`/`failure()` steps. The policy is read from
+  a controller-written file that must be a regular file writable only by its
+  owner (`/etc/carrick-ci/policy`, root 0644, on Willow; `run/<name>/policy`,
+  0600, on cloudmac); the hook reads no environment variable a workflow could
+  set.
+- **Secrets.** The PVE token stays in `/root/carrick-ci-token.json` on Willow.
+  The GitHub credential stays in `gh` on the director's Mac for cloudmac and
+  is forwarded over SSH stdin to the Willow controller's memory as before;
+  cloudmac receives only JIT material. External command output is parsed in
+  memory and never logged (`ScalerError::External` carries static text only).
+
+Residual risk, stated plainly: standing mode admits any commit that reaches
+main or the merge queue. Those jobs run as the runner user; on cloudmac that
+user persists between jobs and can modify the runner directory and future
+state directories, so an admitted job is trusted code. The cloudmac hook
+binary must be root-owned (`mac-run-once` refuses otherwise) so the admission
+decision cannot be replaced from a job. No live Willow, cloudmac or GitHub
+operation was performed for this review; the director qualifies it live.
