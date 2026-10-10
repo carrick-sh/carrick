@@ -712,7 +712,7 @@ impl Cpl0HostCustody {
         &mut self,
         lease: &StoppedCpuLease<'_>,
     ) -> Result<(), TrapError> {
-        use carrick_el1_abi::{ForkStockExchange, ForkStockRefusal};
+        use carrick_el1_abi::ForkStockExchange;
         let execution = self.physical_execution(lease)?;
         self.drain_fork_quarantine(execution)?;
         let address = lease.vcpu.get_gpr(X86Reg::Rax)?;
@@ -747,18 +747,14 @@ impl Cpl0HostCustody {
             return Err(fail("physical fork stock malformed request"));
         }
         // Lifecycle stock is cold zero storage until the guest initializes
-        // its typed census; a dirty record is a custody fault, not capacity.
+        // its typed census. The shared policy withdraws a dirty record and
+        // answers with a typed Inventory refusal (same on every carrier).
         let window = self.lifecycle_window();
-        let fresh = std::cell::Cell::new(true);
-        let result =
-            self.fork_stock
-                .loan(&mut NoTableLedger, execution, &mut record, |lifecycle| {
-                    fresh.set(window.is_zero(lifecycle));
-                    fresh.get()
-                });
-        if result == Err(ForkStockRefusal::Inventory) && !fresh.get() {
-            return Err(fail("physical fork lifecycle stock is not fresh"));
-        }
+        let _ = self
+            .fork_stock
+            .loan(&mut NoTableLedger, execution, &mut record, |lifecycle| {
+                window.is_zero(lifecycle)
+            });
         // SAFETY: expose only initialized u64 fields/padding in the copied ABI
         // record. The stopped CPU exclusively owns these validated stack bytes.
         let bytes = unsafe {
