@@ -498,11 +498,13 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
     match call {
         SignalCall::RtSigaction => {
             let [signum, act_ptr, oldact_ptr, size, _, _] = args;
-            let signum = signum as i32;
             if size != RT_SIGSET_SIZE {
                 return returned(LINUX_EINVAL.guest_retval(), false);
             }
-            if signum <= 0 || signum > 64 || (act_ptr != 0 && (signum == 9 || signum == 19)) {
+            let Some(signum) = Signal::from_number(signum as i32) else {
+                return returned(LINUX_EINVAL.guest_retval(), false);
+            };
+            if act_ptr != 0 && signum.uncatchable() {
                 return returned(LINUX_EINVAL.guest_retval(), false);
             }
             let new_action = if act_ptr != 0 {
@@ -551,10 +553,7 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
             // The owner exchanges old/new under one sighand admission.
             let current = {
                 let signals = native.process_signals()?;
-                match signals.rt_sigaction(
-                    carrick_signal_core::policy::Signal::from_number(signum)?,
-                    new_action,
-                ) {
+                match signals.rt_sigaction(signum, new_action) {
                     Ok(action) => action,
                     Err(error) => {
                         return returned(error.guest_retval(), false);
