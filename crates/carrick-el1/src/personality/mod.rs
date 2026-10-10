@@ -9,6 +9,7 @@ pub mod common_entry;
 pub mod dispatch;
 pub mod file;
 pub mod file_table;
+pub mod fork_loan;
 pub mod inotify;
 pub mod ipc;
 pub mod lifecycle;
@@ -19,6 +20,7 @@ pub mod native_process_runtime;
 pub mod native_process_signals;
 pub mod native_run_failure;
 pub mod process_owner;
+pub mod retired_spaces;
 pub mod sched;
 pub mod thread_setup;
 

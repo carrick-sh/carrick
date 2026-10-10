@@ -80,13 +80,36 @@ pub(super) fn publish_root_exit(
     super::halt();
 }
 
+/// Leave the installed process root for the carrier's maintenance root, then
+/// publish the slot's absence. In that order, an MM no slot names is an MM
+/// whose tables no CPU walks: its quarantined fork stock may be reclaimed.
+/// The carrier publishes the maintenance root together with its fork stock;
+/// without either (false) nothing is ever reclaimed, so absence alone is safe.
+pub(super) fn leave_space(source: BornInZoneSource<'static, ParkedContextWords>) -> bool {
+    let maintenance = source.zone.spaces.idle_ttbr();
+    if maintenance != 0 {
+        let Some(root) =
+            carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(maintenance))
+        else {
+            initial_boot::fatal_boot();
+        };
+        // Already parked on the maintenance root: no second CR3 write.
+        if x86::hardware_live_root().ok() != Some(root)
+            && x86::interrupt::install_maintenance_root(root).is_err()
+        {
+            initial_boot::fatal_boot();
+        }
+    }
+    source.zone.release_space(source.slot);
+    maintenance != 0
+}
+
 /// Run a queued record or sleep under the shared queue's lost-wakeup guard.
 /// A guest wait releases its record and installed-space membership before
 /// this function selects another runnable task or enters architectural HLT.
 pub(super) fn schedule(slot: SlotId) -> ! {
     let source = source(slot);
     let current = task();
-    source.zone.release_space(slot);
     loop {
         expire_signal_timer(slot);
         if let Some(selected) = source.zone.switch_in_full(slot) {
@@ -99,6 +122,11 @@ pub(super) fn schedule(slot: SlotId) -> ! {
                 continue;
             };
             let identity = source.zone.record(selected.record).identity();
+            // Resuming the MM already installed here needs no detour through
+            // the maintenance root (the context install reloads CR3 once).
+            if source.zone.installed_space(slot) != state.address.mm.raw().get() {
+                leave_space(source);
+            }
             source
                 .zone
                 .install_space(slot, state.address.mm.raw().get())
@@ -199,6 +227,8 @@ pub(super) fn schedule(slot: SlotId) -> ! {
                 Err(_) => initial_boot::fatal_boot(),
             }
         }
+        // Idle off every process root, so an idle CPU walks no MM's tables.
+        leave_space(source);
         let dl = source.zone.timer_deadline(slot);
         if let Some(dl) = dl {
             use carrick_guest_arch::{CounterTick, Deadline, InterruptBackend};

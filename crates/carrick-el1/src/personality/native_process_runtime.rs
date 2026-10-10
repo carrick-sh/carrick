@@ -2632,6 +2632,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 );
             }
         });
+        // Only fork-born processes own stock to retire. The root is known by
+        // graph position, not by the pid it shows in its namespace (a child
+        // in a new PID namespace may show pid 1); it uses the root-exit
+        // crossing instead. The MM is retired (stock quarantined, slot
+        // absence published) before the parent is signalled or its wait
+        // woken, as Linux releases the mm in exit_mm before exit_notify:
+        // a parent that forks again as soon as its wait returns must find
+        // this child's stock reclaimable, not still charged to a live MM.
+        if let Some(mm) = resources
+            && !root_exit
+        {
+            self.service.retire_mm(mm);
+        }
         let (target, channels) = {
             let graph = self.runtime.graph.lock();
             let target = graph.owner.select_exit_parent(&permit);
@@ -2694,9 +2707,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         for channel in channels {
             self.publish_channel(&channel)?;
-        }
-        if let Some(mm) = resources {
-            self.service.retire_mm(mm)
         }
         self.service.retire_fd_table(file_table);
         drop(published.retiring);
