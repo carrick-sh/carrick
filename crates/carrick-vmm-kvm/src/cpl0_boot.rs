@@ -235,16 +235,13 @@ pub enum InitialSyscallDisposition {
     ::core::cmp::PartialEq,
 )]
 pub enum PhysicalProcessExit {
-    Exited(GuestExitStatus),
+    Exited(carrick_sched_core::process::LinuxWaitStatus),
     RunFailed(carrick_el1_abi::NativeRunFailureReason),
 }
 impl PhysicalProcessExit {
     pub fn into_initial_process_exit(self, exits: usize) -> InitialProcessExit {
         match self {
-            Self::Exited(status) => InitialProcessExit::Exited {
-                code: status.code(),
-                exits,
-            },
+            Self::Exited(status) => InitialProcessExit::OwnedExit { status, exits },
             Self::RunFailed(reason) => InitialProcessExit::RunFailed { reason, exits },
         }
     }
@@ -6036,6 +6033,10 @@ impl Cpl0Carrier {
 /// A guest exception is an owned process outcome, separate from carrier failure.
 #[derive(::core::fmt::Debug)]
 pub enum InitialProcessExit {
+    OwnedExit {
+        status: carrick_sched_core::process::LinuxWaitStatus,
+        exits: usize,
+    },
     RunFailed {
         reason: carrick_el1_abi::NativeRunFailureReason,
         exits: usize,
