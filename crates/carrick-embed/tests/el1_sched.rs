@@ -302,6 +302,15 @@ struct Measured {
 }
 
 fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured {
+    run_fixture_with_policy(carrier, args, timeout, carrick_spec::ArmRingFirst::Strict)
+}
+
+fn run_fixture_with_policy(
+    carrier: &Carrier,
+    args: &[&str],
+    timeout: Duration,
+    policy: carrick_spec::ArmRingFirst,
+) -> Measured {
     let mut command = vec![FIXTURE.to_owned()];
     command.extend(args.iter().map(|arg| (*arg).to_owned()));
     let watchdog = common::Watchdog::start(timeout);
@@ -338,6 +347,7 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
     let start = std::time::Instant::now();
     let mut builder = carrier
         .container(common::SMOKE_IMAGE)
+        .arm_ring_first(policy)
         .pull_policy(PullPolicy::Missing)
         .command(command)
         .vfs_mount("/opt/carrick", Box::new(el1_sched_vfs()));
@@ -3477,7 +3487,15 @@ fn el1_fork_cow_resolves_in_guest() {
     // container run. Baselines taken before that read incomplete and must
     // never be differenced, so warm the carrier with a one-fork workload
     // first; every measured delta then lies inside one live ledger.
-    let warmup = run_fixture(&carrier, &["fork-cow", "1", "1"], Duration::from_secs(120));
+    // Rust startup calls rt_sigaction, still Counted-ENOSYS under Strict until
+    // the ARM signal family is served in-ring. This run-scoped opt-out only
+    // relaxes the crossing policy; the assertions below require in-ring fork.
+    let warmup = run_fixture_with_policy(
+        &carrier,
+        &["fork-cow", "1", "1"],
+        Duration::from_secs(120),
+        carrick_spec::ArmRingFirst::OptOut,
+    );
     assert!(
         warmup.result.success(),
         "warm-up fork failed: {}; rt_sigaction (served, forwarded, refused)={:?}; owner process refusal stages={:?}; first process admission root={:?}; first process service root={:?}; first native fork failure={:?}; fork progress={:?}; returned child stock delta={}",
@@ -3505,6 +3523,18 @@ fn el1_fork_cow_resolves_in_guest() {
             .map(|n| n.load(std::sync::atomic::Ordering::Relaxed))),
         carrick_vmm_hvf::fork_stock_returned().saturating_sub(returned_before),
     );
+    let counters = read_el1_counters().expect("EL1 counters after fork warm-up");
+    assert!(
+        counters.native_fork_progress[carrick_el1_abi::NativeForkProgress::ParentResumed as usize]
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0,
+        "opt-out must still serve fork in-ring"
+    );
+    assert_eq!(
+        counters.forwarded[220].load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "opt-out must not forward clone to host fork orchestration"
+    );
     assert!(
         carrick_embed::host_cow_snapshot().complete,
         "warm-up must publish the carrier's host COW ledger"
@@ -3518,10 +3548,11 @@ fn el1_fork_cow_resolves_in_guest() {
         let faults_before = read_el1_counters().map_or(0, |c| {
             c.fault_taken.load(std::sync::atomic::Ordering::Relaxed)
         });
-        let measured = run_fixture(
+        let measured = run_fixture_with_policy(
             &carrier,
             &["fork-cow", &FORKS.to_string(), &pages.to_string()],
             Duration::from_secs(120),
+            carrick_spec::ArmRingFirst::OptOut,
         );
         let cow = carrick_embed::host_cow_snapshot()
             .checked_delta(&cow_before)
