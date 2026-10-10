@@ -136,7 +136,6 @@ pub(super) fn schedule(slot: SlotId) -> ! {
                             let _receipt = entry.take_handoff_receipt()
                                 .unwrap_or_else(|| initial_boot::fatal_boot());
                             let root_exit = entry.take_root_exit();
-                            drop(entry);
                             if let Some(status) = root_exit { publish_root_exit(current, status); }
                             source.zone.release_space(slot);
                             continue;
