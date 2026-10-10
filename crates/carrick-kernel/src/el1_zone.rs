@@ -827,6 +827,27 @@ fn route_guest_custody_in_zone(zone: &ZoneTables, record: RecordRef) -> bool {
     last_slot.is_some_and(|slot| zone.requeue_on(slot, record.id))
 }
 
+/// Retain a pending adoption that has guest custody. A native record must
+/// never fall through to host-thread lookup when placement is unavailable.
+pub fn retain_pending_guest_adoption(
+    zone: &ZoneTables,
+    record: RecordRef,
+) -> Result<bool, RecordRef> {
+    if !zone
+        .live(record)
+        .is_some_and(|rec| rec.requires_guest_handback() && !rec.is_cancelled())
+    {
+        return Ok(false);
+    }
+    if !route_guest_custody_in_zone(zone, record) {
+        return Err(record);
+    }
+    zone.counters
+        .host_handbacks
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(true)
+}
+
 fn deliver_handback_event(event: HandbackEvent<'_>) {
     // An auditor may hold a deferred delivery while another execution lane
     // progresses. Never retain the registration lock across its callback.
@@ -1455,6 +1476,54 @@ mod tests {
         zone.enter_guest(slot);
         assert_eq!(zone.switch_in_full(slot).unwrap().record, id);
         assert!(matches!(zone.record(id).claim(), Claim::OnCpu { .. }));
+    }
+
+    #[test]
+    fn native_current_pending_adoption_returns_to_guest_custody() {
+        let zone = heap_zone();
+        let slot = SlotId::new(0);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 0, Some(0), 0);
+        let space = zone.spaces.publish_closed(9, 0x9000, 0).unwrap();
+        zone.spaces.open(space);
+        let id = zone
+            .alloc_record(ThreadIdentity {
+                mm: 9,
+                generation: 7,
+                affinity: 1,
+                ..identity(2)
+            })
+            .unwrap();
+        let record = zone.record_ref(id);
+        assert!(zone.authorize_guest_execution(record));
+        zone.requeue_preempted(slot, id);
+        zone.enter_guest(slot);
+        assert_eq!(zone.switch_in_full(slot).unwrap().record, id);
+        assert_eq!(retain_pending_guest_adoption(&zone, record), Err(record));
+        assert!(matches!(zone.record(id).claim(), Claim::OnCpu { .. }));
+        assert_eq!(
+            zone.handback_current(slot, id),
+            carrick_el1_abi::CurrentHandback::HandedBack
+        );
+        assert!(matches!(zone.record(id).claim(), Claim::Host { .. }));
+        assert_eq!(
+            zone.record(id).handback(),
+            Some(carrick_el1_abi::Handback::Resumed)
+        );
+        assert_eq!(retain_pending_guest_adoption(&zone, record), Ok(true));
+        assert!(matches!(zone.record(id).claim(), Claim::Queued { .. }));
+        assert_eq!(
+            zone.counters
+                .lost_adoptions
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            zone.counters
+                .host_handbacks
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
