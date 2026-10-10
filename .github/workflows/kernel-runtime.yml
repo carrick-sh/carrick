@@ -87,15 +87,18 @@ jobs:
           command -v codesign
           command -v otool
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # cloudmac provides a root-owned, read-only rustup toolchain (pinned by
+      # rust-toolchain.toml, with sccache) and a fresh per-job CARGO_HOME;
+      # jobs never install or update toolchains there (docs/ci/mac-jit.md).
+      - name: Verify the read-only toolchain
+        run: |
+          test -n "$RUSTUP_HOME"
+          test ! -w "$RUSTUP_HOME"
+          rustup show active-toolchain
+          command -v sccache
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
       - name: Download exact-SHA fixture bundle
         uses: actions/download-artifact@v4
         with:
@@ -112,7 +115,7 @@ jobs:
       # with scoped cleanup per step. Its receipt is the lane's per-SHA
       # record; a FAIL receipt is still a receipt. Main is not green under
       # the strict signed gate, so this lane gates on NEW failures against
-      # the base SHA's receipt (below), not on the absolute verdict.
+      # the base SHA's receipt (hosted hvf-gate job), not on the absolute verdict.
       - name: Signed acceptance receipt
         run: |
           set -euo pipefail
@@ -128,6 +131,9 @@ jobs:
           echo "xtask accept exited $status"
           test -s target/ci-receipts/receipt.json
 
+      # Lane jobs only produce and upload receipts; they never wait for a
+      # base receipt, so a queued entry can never hold the runner its base
+      # entry needs. The hosted `*-gate` jobs compare.
       - name: Upload per-SHA receipt
         if: ${{ !cancelled() && hashFiles('target/ci-receipts/receipt.json') != '' }}
         uses: actions/upload-artifact@v4
@@ -137,25 +143,6 @@ jobs:
           name: receipt-hvf-${{ github.sha }}-${{ github.run_attempt }}
           path: target/ci-receipts/receipt.json
           if-no-files-found: error
-
-      # The gate binary is built from the BASE commit, in its own worktree
-      # and target dir, so a pull request cannot change the gate it is judged
-      # by. The base SHA comes through env, never interpolated into the shell.
-      - name: Gate on NEW failures against the merge group base
-        if: ${{ github.event_name == 'merge_group' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BASE_SHA: ${{ github.event.merge_group.base_sha }}
-        run: |
-          set -euo pipefail
-          base="$RUNNER_TEMP/gate-base"
-          git fetch --no-tags --depth=1 origin "$BASE_SHA"
-          git worktree add --detach "$base" "$BASE_SHA"
-          trap 'git worktree remove --force "$base"' EXIT
-          cargo build --locked --release -p carrick-xtask \
-            --manifest-path "$base/Cargo.toml" --target-dir "$RUNNER_TEMP/gate-target"
-          "$RUNNER_TEMP/gate-target/release/carrick-xtask" ci-receipt gate --lane hvf \
-            --base-sha "$BASE_SHA" --candidate target/ci-receipts/receipt.json
 
       # After the receipt is published, so a red absolute gate cannot prevent
       # the per-SHA baseline from existing. Not on the merge queue: main is not
@@ -302,6 +289,9 @@ jobs:
           echo "xtask accept exited $status"
           test -s target/ci-receipts/receipt.json
 
+      # Lane jobs only produce and upload receipts; they never wait for a
+      # base receipt, so a queued entry can never hold the runner its base
+      # entry needs. The hosted `*-gate` jobs compare.
       - name: Upload per-SHA receipt
         if: ${{ !cancelled() && hashFiles('target/ci-receipts/receipt.json') != '' }}
         uses: actions/upload-artifact@v4
@@ -312,24 +302,67 @@ jobs:
           path: target/ci-receipts/receipt.json
           if-no-files-found: error
 
-      # The gate binary is built from the BASE commit, in its own worktree
-      # and target dir, so a pull request cannot change the gate it is judged
-      # by. The base SHA comes through env, never interpolated into the shell.
-      - name: Gate on NEW failures against the merge group base
-        if: ${{ github.event_name == 'merge_group' }}
+  # Hosted merge-queue gates. They run the BASE commit's xtask in a clean
+  # checkout of the base (its own .cargo config, working directory and
+  # lockfile), download only the candidate's receipt artifact, and execute no
+  # candidate code. The bounded wait for an in-progress base run happens
+  # here, on a hosted runner, never on the trusted hardware. The job timeout
+  # exceeds the wait bound so the actionable message always prints.
+  hvf-gate:
+    name: HVF · receipt gate vs merge-group base
+    needs: [hvf-kernel]
+    if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.hvf-kernel.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - name: Check out the base commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.merge_group.base_sha }}
+          persist-credentials: false
+      - name: Download the candidate receipt
+        uses: actions/download-artifact@v4
+        with:
+          name: receipt-hvf-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/candidate
+      - name: Build the base xtask
+        run: cargo build --locked --release -p carrick-xtask
+      - name: Gate on NEW failures (waits up to 90 min for the base receipt)
         env:
           GH_TOKEN: ${{ github.token }}
           BASE_SHA: ${{ github.event.merge_group.base_sha }}
-        run: |
-          set -euo pipefail
-          base="$RUNNER_TEMP/gate-base"
-          git fetch --no-tags --depth=1 origin "$BASE_SHA"
-          git worktree add --detach "$base" "$BASE_SHA"
-          trap 'git worktree remove --force "$base"' EXIT
-          cargo build --locked --release -p carrick-xtask \
-            --manifest-path "$base/Cargo.toml" --target-dir "$RUNNER_TEMP/gate-target"
-          "$RUNNER_TEMP/gate-target/release/carrick-xtask" ci-receipt gate --lane kvm \
-            --base-sha "$BASE_SHA" --candidate target/ci-receipts/receipt.json
+        run: >-
+          target/release/carrick-xtask ci-receipt gate --lane hvf
+          --base-sha "$BASE_SHA" --candidate "$RUNNER_TEMP/candidate/receipt.json"
+          --download-dir "$RUNNER_TEMP/baseline" --wait-minutes 90 --poll-seconds 60
+
+  kvm-gate:
+    name: KVM · receipt gate vs merge-group base
+    needs: [kvm-tests]
+    if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.kvm-tests.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - name: Check out the base commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.merge_group.base_sha }}
+          persist-credentials: false
+      - name: Download the candidate receipt
+        uses: actions/download-artifact@v4
+        with:
+          name: receipt-kvm-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/candidate
+      - name: Build the base xtask
+        run: cargo build --locked --release -p carrick-xtask
+      - name: Gate on NEW failures (waits up to 90 min for the base receipt)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: >-
+          target/release/carrick-xtask ci-receipt gate --lane kvm
+          --base-sha "$BASE_SHA" --candidate "$RUNNER_TEMP/candidate/receipt.json"
+          --download-dir "$RUNNER_TEMP/baseline" --wait-minutes 90 --poll-seconds 60
 
   # The single required check. `if: always()` so a skipped or cancelled lane
   # reports a failure here instead of letting a required check pass by
@@ -337,15 +370,22 @@ jobs:
   trusted-hardware-ok:
     name: Trusted hardware OK
     if: ${{ always() }}
-    needs: [signed-fixtures, hvf-kernel, kvm-tests]
+    needs: [signed-fixtures, hvf-kernel, kvm-tests, hvf-gate, kvm-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Require both trusted-hardware lanes
+      - name: Require both trusted-hardware lanes (and their gates in the queue)
         env:
           HVF: ${{ needs.hvf-kernel.result }}
           KVM: ${{ needs.kvm-tests.result }}
+          HVF_GATE: ${{ needs.hvf-gate.result }}
+          KVM_GATE: ${{ needs.kvm-gate.result }}
+          EVENT: ${{ github.event_name }}
         run: |
-          echo "hvf-kernel=$HVF kvm-tests=$KVM"
+          echo "hvf-kernel=$HVF kvm-tests=$KVM hvf-gate=$HVF_GATE kvm-gate=$KVM_GATE"
           test "$HVF" = success
           test "$KVM" = success
+          if [ "$EVENT" = merge_group ]; then
+            test "$HVF_GATE" = success
+            test "$KVM_GATE" = success
+          fi
