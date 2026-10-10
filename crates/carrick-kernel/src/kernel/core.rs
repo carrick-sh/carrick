@@ -2407,6 +2407,38 @@ impl Kernel {
             .transfer_mm_to_guest(&context.shared().mm(), owner)
     }
 
+    /// Issue one root admission without retaining its MM/backend or kernel.
+    pub fn native_frame_inventory_admission(
+        &self,
+        context: &KernelContext,
+        deadline: std::time::Instant,
+    ) -> Result<
+        Arc<dyn carrick_hal::NativeFrameInventoryAdmission>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        if !std::ptr::eq(self, context.kernel().as_ref()) {
+            return Err(Box::new(
+                super::FrameInventoryError::ForeignFrameOwnerContext,
+            ));
+        }
+        let mm = context.shared().mm();
+        let backend = mm
+            .backend()
+            .ok_or_else(|| std::io::Error::other("root admission has no backend"))?;
+        let binding = backend.snapshot(deadline)?.binding;
+        let root = carrick_hal::guest_arch_binding::core_arch::RootGpa::page_aligned(
+            carrick_hal::guest_arch_binding::core_arch::FrameGpa::new(
+                binding.stage1_root.gpa().raw(),
+            ),
+        )
+        .ok_or_else(|| std::io::Error::other("root admission has an invalid physical root"))?;
+        Ok(Arc::new(super::frame_inventory::NativeRootFrameAdmission {
+            kernel: Arc::downgrade(context.kernel()),
+            mm: Arc::downgrade(&mm),
+            root,
+        }))
+    }
+
     /// Project this carrier's sole physical inventory and ID source.
     pub fn physical_frame_inventory(&self) -> Arc<dyn carrick_hal::PhysicalFrameInventory> {
         self.frame_inventory
