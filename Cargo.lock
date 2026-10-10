@@ -657,6 +657,7 @@ dependencies = [
  "carrick-hal",
  "carrick-host",
  "carrick-signal-linux",
+ "carrick-thread",
  "libc",
 ]
 

@@ -26,3 +26,9 @@ pub mod signum;
 /// FreeBSD/NetBSD build with no VMM crate (i.e. aarch64) resolves to. Empty on
 /// macOS, whose native lane runs under the HVF crate's own glue.
 pub mod native_glue;
+
+pub mod futex;
+pub use futex::{BsdFutex, make_bsd_futex};
+
+pub mod signal_backend;
+pub use signal_backend::BsdSignalGlue;

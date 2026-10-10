@@ -4,51 +4,10 @@
 //! The irreducible vCPU KICK lives in [`crate::nvmm_kicker`] (NetBSD `SIGRTMIN` =
 //! 33); only its signal NUMBER is named here.
 
-use carrick_signal_linux::HostSignalGlue;
+use crate::nvmm_kicker::NETBSD_SIGRTMIN;
 
-/// Zero-sized marker carrying NVMM's host-signal policy.
-pub struct NvmmGlue;
-
-impl HostSignalGlue for NvmmGlue {
-    fn kick_signal() -> i32 {
-        crate::nvmm_kicker::kick_signal()
-    }
-
-    fn host_to_linux(host_signum: i32) -> i32 {
-        crate::nvmm_signum::host_to_linux_signum(host_signum)
-    }
-
-    fn linux_to_host(linux_signum: i32) -> i32 {
-        crate::nvmm_signum::linux_to_host_signum(linux_signum)
-    }
-
-    /// The old `nvmm_disposition::is_nvmm_claimed` body: the four pumped signals,
-    /// the SIGCHLD reaper + SIGPIPE (by LINUX number), and the kick/nudge.
-    fn is_claimed(linux_signum: i32) -> bool {
-        if !carrick_host_bsd::signum::linux_signum_has_host_carrier(linux_signum) {
-            return true;
-        }
-        if matches!(linux_signum, 1 | 2 | 3 | 15) {
-            return true;
-        }
-        if linux_signum == carrick_abi::LINUX_SIGCHLD {
-            return true;
-        }
-        if linux_signum == carrick_abi::LINUX_SIGPIPE {
-            return true;
-        }
-        let kick = crate::nvmm_kicker::kick_signal();
-        linux_signum == kick || linux_signum == kick + 1
-    }
-
-    fn poke() {
-        carrick_hal::signal_pump::poke();
-    }
-
-    fn install_kick_handler() {
-        crate::nvmm_kicker::install_nvmm_kick_handler();
-    }
-}
+/// Marker carrying NVMM's host-signal policy.
+pub type NvmmGlue = carrick_host_bsd::signal_backend::BsdSignalGlue<NETBSD_SIGRTMIN>;
 
 #[cfg(test)]
 mod tests {

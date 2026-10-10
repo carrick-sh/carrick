@@ -13,67 +13,20 @@
 //! is the platform-neutral [`carrick_hal::GenericVcpuRegistry`] (same as KVM);
 //! only [`NvmmKickHandle`] (the `pthread_kill` mechanism) is NVMM-specific.
 
-use std::sync::Once;
+/// NetBSD's `<sys/signal.h>` defines `SIGRTMIN` as 33.
+pub const NETBSD_SIGRTMIN: i32 = 33;
 
-/// NetBSD's `<sys/signal.h>` defines `SIGRTMIN` as 33. The Rust `libc` crate does
-/// not expose that constant consistently, so keep the backend-local value here.
-/// A real-time signal is reserved for carrick's own vCPU kick so it does not
-/// collide with standard guest-routable signals like SIGUSR1/SIGUSR2.
-const NETBSD_SIGRTMIN: i32 = 33;
-
-/// The signal NVMM uses to force a vCPU out of `nvmm_vcpu_run`.
 #[inline]
 pub fn kick_signal() -> i32 {
-    NETBSD_SIGRTMIN
+    carrick_hal::posix_signal_kick::resolve_kick_signal::<NETBSD_SIGRTMIN>()
 }
 
-/// Empty handler: its only purpose is to interrupt an in-progress
-/// `nvmm_vcpu_run` (no `SA_RESTART`).
-extern "C" fn nvmm_kick_noop(_signum: libc::c_int) {}
-
-static KICK_HANDLER_INSTALLED: Once = Once::new();
-
 pub fn install_nvmm_kick_handler() {
-    KICK_HANDLER_INSTALLED.call_once(|| {
-        // SAFETY: a zeroed sigaction is the documented "no flags, empty mask"
-        // form; we set the handler fn, an empty mask, and sa_flags = 0 (NO
-        // SA_RESTART). `nvmm_kick_noop` is a valid `extern "C"` handler.
-        unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = nvmm_kick_noop as *const () as libc::sighandler_t;
-            libc::sigemptyset(&mut action.sa_mask);
-            action.sa_flags = 0;
-            libc::sigaction(kick_signal(), &action, std::ptr::null_mut());
-        }
-    });
+    carrick_hal::posix_signal_kick::install_posix_kick_handler::<NETBSD_SIGRTMIN>();
 }
 
 /// A `Send`/`Sync` kick handle holding the owning vCPU thread's `pthread_t`.
-#[derive(Clone)]
-pub struct NvmmKickHandle {
-    tid: libc::pthread_t,
-}
+pub type NvmmKickHandle = carrick_hal::PosixSignalKick<NETBSD_SIGRTMIN>;
 
-impl NvmmKickHandle {
-    /// Build a handle for the CURRENT thread (call on the owning vCPU thread).
-    pub fn for_current_thread() -> Self {
-        install_nvmm_kick_handler();
-        // SAFETY: `pthread_self` is always safe; returns this thread's id.
-        let tid = unsafe { libc::pthread_self() };
-        Self { tid }
-    }
-}
-
-impl carrick_hal::VcpuKick for NvmmKickHandle {
-    fn kick(&self) {
-        // SAFETY: pthread_kill with a live id + valid signal; ESRCH on a dead
-        // thread is ignored (a missed kick is caught at the next trap boundary).
-        unsafe {
-            libc::pthread_kill(self.tid, kick_signal());
-        }
-    }
-}
-
-/// The NVMM vCPU-kick registry — the platform-neutral
-/// [`carrick_hal::GenericVcpuRegistry`] (no NVMM-specific registry logic).
+/// The NVMM vCPU-kick registry.
 pub type NvmmKicker = carrick_hal::GenericVcpuRegistry;

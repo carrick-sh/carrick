@@ -6,48 +6,5 @@
 //! delegated to `carrick_timer_core::posix::arm`, then a wall-clock thread
 //! publishes the signal into the per-thread pending store and KICKS the target
 //! vCPU — the SAME publish+kick the runtime's `timer_delivery::deliver` performs.
-use std::sync::Arc;
-
-use carrick_hal::{PosixTimerSpec, ThreadId, TimerArm, TimerDelivery, TimerSpecNs, VcpuRegistry};
-
-pub struct KvmTimerDelivery {
-    /// The live-vCPU registry used to force the target out of `KVM_RUN` on a
-    /// timer expiry (the firing thread publishes pending, then kicks).
-    pub kicker: Arc<dyn VcpuRegistry>,
-    /// The guest's main thread id. Wall-clock interval/POSIX timer signals are
-    /// PROCESS-directed and now fan out via the shared PROC_PENDING mask +
-    /// `kick_all` (so a blocked main thread does not drop the timer), so this is
-    /// retained only as the canonical main-thread handle for the construction
-    /// site; the firing thread no longer pins delivery to it.
-    pub main_tid: ThreadId,
-}
-
-impl TimerDelivery for KvmTimerDelivery {
-    /// KVM has no pump kqueue → the caller spawns `run_fallback`. The neutral
-    /// slot state was already written by the dispatch arm (timer-core::arm).
-    fn arm_itimer(
-        &self,
-        _which: usize,
-        _spec: TimerSpecNs,
-        _needs_periodic: bool,
-        _signum: i32,
-    ) -> bool {
-        false
-    }
-
-    fn disarm_itimer(&self, which: usize) {
-        carrick_timer_core::itimer::disarm(which);
-    }
-
-    fn arm_posix(&self, id: i32, spec: TimerSpecNs) -> Option<PosixTimerSpec> {
-        carrick_hal::timer_delivery::arm_fallback_posix_timer(id, spec, &self.kicker)
-    }
-
-    fn disarm_posix(&self, id: i32) {
-        carrick_hal::timer_delivery::disarm_fallback_posix_timer(id);
-    }
-
-    fn current_arm(&self, which: usize) -> Option<TimerArm> {
-        carrick_timer_core::itimer::current_arm(which)
-    }
-}
+/// KVM's `TimerDelivery`: alias to [`carrick_hal::FallbackTimerDelivery`].
+pub type KvmTimerDelivery = carrick_hal::FallbackTimerDelivery;

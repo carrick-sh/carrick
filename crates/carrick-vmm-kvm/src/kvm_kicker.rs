@@ -19,140 +19,23 @@
 //! the Dekker handshake with the fork / page-table coordinators is SeqCst on
 //! both sides.
 
-use std::sync::{
-    Arc, Mutex, Once,
-    atomic::{AtomicU8, Ordering},
-};
-
-#[derive(Clone, Copy)]
-struct IdleRunExitByte(*mut u8);
-
-// SAFETY: the mapped KVM byte is installed and removed under the idle-kick
-// mutex. Its owner does not recycle the vCPU until after removal.
-unsafe impl Send for IdleRunExitByte {}
-
-/// The signal carrick uses to force a vCPU out of `KVM_RUN`.
-///
-/// `SIGRTMIN` (computed at RUNTIME — glibc reserves the first few real-time
-/// signals for its own threading internals, so `SIGRTMIN` is NOT the raw
-/// `__SIGRTMIN`/34 macro; never hardcode it). A real-time signal is chosen so
-/// it never collides with a signal carrick routes to the guest (the runtime
-/// maps guest signals through its own `host_signal` layer; it never installs a
-/// disposition for `SIGRTMIN`).
+/// The signal carrick uses to force a vCPU out of `KVM_RUN` (dynamic `SIGRTMIN` on Linux).
 #[inline]
 pub fn kick_signal() -> i32 {
-    libc::SIGRTMIN()
+    carrick_hal::posix_signal_kick::resolve_kick_signal::<0>()
 }
 
-/// Empty signal handler. Its ONLY purpose is to interrupt an in-progress
-/// `KVM_RUN` (delivering ANY caught signal makes the ioctl return `EINTR` when
-/// the handler is installed without `SA_RESTART`). It does no work.
-extern "C" fn kvm_kick_noop(_signum: libc::c_int) {}
-
-static KICK_HANDLER_INSTALLED: Once = Once::new();
-
-/// Install the process-wide [`kick_signal`] handler ONCE (idempotent). The
-/// handler is empty and installed with `sa_flags = 0` — crucially WITHOUT
-/// `SA_RESTART`, so a delivered kick makes the target vCPU thread's `KVM_RUN`
-/// return `EINTR` (-> [`carrick_hal::VcpuExit::Kicked`]) instead of being
-/// transparently restarted by the kernel.
-///
-/// Safe to call from any thread at any time; only the first call installs.
+/// Install the process-wide [`kick_signal`] handler ONCE (idempotent).
 pub fn install_kvm_kick_handler() {
-    KICK_HANDLER_INSTALLED.call_once(|| {
-        // SAFETY: a zeroed `sigaction` is the documented "no flags, empty mask"
-        // form; we set the handler fn, an empty mask, and sa_flags = 0 (NO
-        // SA_RESTART). `kvm_kick_noop` is a valid `extern "C"` handler.
-        unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = kvm_kick_noop as *const () as libc::sighandler_t;
-            libc::sigemptyset(&mut action.sa_mask);
-            action.sa_flags = 0; // NO SA_RESTART — KVM_RUN must return EINTR.
-            libc::sigaction(kick_signal(), &action, std::ptr::null_mut());
-        }
-    });
+    carrick_hal::posix_signal_kick::install_posix_kick_handler::<0>();
 }
 
 /// A `Send`/`Sync` handle to a guest thread's vCPU, usable from any thread to
-/// kick it. Holds the target's `pthread_t` so a `pthread_kill(tid, SIGRTMIN)`
-/// forces it out of `KVM_RUN`. Cloneable (the registry stores it object-safe and
-/// the engine hands a fresh clone out per [`carrick_hal::ThreadedEngine::kick_handle`]).
-#[derive(Clone)]
-pub struct KvmKickHandle {
-    /// The owning vCPU thread's pthread id (the kick target).
-    tid: libc::pthread_t,
-    idle_exit: Arc<Mutex<Option<IdleRunExitByte>>>,
-}
+/// kick it via `carrick_hal::PosixSignalKick<0>`.
+pub type KvmKickHandle = carrick_hal::PosixSignalKick<0>;
 
-impl KvmKickHandle {
-    /// Build a handle for the CURRENT thread (call on the owning vCPU thread).
-    pub fn for_current_thread() -> Self {
-        // Install the SIGRTMIN kick-signal handler here (idempotent `Once`): a
-        // thread becomes a kick TARGET only once it has registered a handle, so
-        // installing on handle creation guarantees the handler is live process-
-        // wide before any kick can be issued. (The shared `GenericVcpuRegistry`
-        // used as `KvmKicker` has no constructor hook, and the fork coordinator
-        // also installs it defensively — both are idempotent.)
-        install_kvm_kick_handler();
-        // SAFETY: `pthread_self` is always safe and returns this thread's id.
-        let tid = unsafe { libc::pthread_self() };
-        Self {
-            tid,
-            idle_exit: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    /// Publish the KVM_RUN byte before the scheduler's last runnable check.
-    /// A kick after this point survives even if its signal precedes KVM_RUN.
-    pub(crate) fn arm_idle_run(&self, immediate_exit: &mut u8) {
-        let mut armed = self
-            .idle_exit
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        *immediate_exit = 0;
-        *armed = Some(IdleRunExitByte(immediate_exit as *mut u8));
-    }
-
-    /// Revoke the mapped-byte publication after KVM_RUN returns or idle is cancelled.
-    pub fn disarm_idle_run(&self) {
-        let mut armed = self
-            .idle_exit
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(byte) = armed.take() {
-            // SAFETY: the pointer was published from the live vCPU's mmap and
-            // the owner disarms it before that mapping can be recycled.
-            unsafe { AtomicU8::from_ptr(byte.0).store(0, Ordering::SeqCst) };
-        }
-    }
-}
-
-impl carrick_hal::VcpuKick for KvmKickHandle {
-    fn kick(&self) {
-        let armed = self
-            .idle_exit
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(byte) = *armed {
-            // SAFETY: the arm holds the vCPU mapping alive through disarm;
-            // the mutex serializes this write with disarm and recycling.
-            unsafe { AtomicU8::from_ptr(byte.0).store(1, Ordering::SeqCst) };
-        }
-        // SAFETY: `pthread_kill` with a live pthread id + a valid signal. A kick
-        // to a thread that has already exited returns ESRCH, which we ignore (a
-        // missed kick is caught at the next syscall boundary, never UB).
-        unsafe {
-            libc::pthread_kill(self.tid, kick_signal());
-        }
-    }
-}
-
-/// The KVM vCPU-kick registry. The bookkeeping (the two maps + the SeqCst Dekker
-/// handshake) is the platform-neutral [`carrick_hal::GenericVcpuRegistry`],
-/// shared with HVF/bhyve; the only KVM-specific piece is [`KvmKickHandle`] (the
-/// `pthread_kill` kick mechanism) + the SIGRTMIN handler install, which now
-/// happens in [`KvmKickHandle::for_current_thread`] (the registry has no
-/// constructor hook). So this is a plain alias — no duplicated registry logic.
+/// The KVM vCPU-kick registry. The bookkeeping is the platform-neutral
+/// [`carrick_hal::GenericVcpuRegistry`].
 pub type KvmKicker = carrick_hal::GenericVcpuRegistry;
 
 #[cfg(test)]
