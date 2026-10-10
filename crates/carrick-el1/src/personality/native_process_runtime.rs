@@ -1473,6 +1473,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let credentials = caller.credentials_for(self.calling_tid)?;
         let target = owner
             .find_task_by_thread(caller.metadata().container, tid)
+            .filter(|row| row.native().resources().control.visible_tid().is_some())
             .ok_or(ESRCH)?;
         if target.key() == self.key {
             return Ok(target);
@@ -1704,6 +1705,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         let target = graph
             .owner
             .find_task_by_pid(target_tid)
+            .filter(|row| row.native().resources().control.visible_tid().is_some())
             .ok_or(carrick_personality_linux::identity::ESRCH)?;
         let creds = target.credentials_for(target_tid)?;
         Ok(carrick_personality_linux::identity::TaskCapabilities {
@@ -1777,7 +1779,11 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
         if pid == 0 || pid as u32 == caller.metadata().namespace_pid {
             Ok(caller.metadata().namespace_process_group)
-        } else if let Some(target) = graph.owner.find_task_by_pid(pid as u32) {
+        } else if let Some(target) = graph
+            .owner
+            .find_task_by_pid(pid as u32)
+            .filter(|row| row.native().resources().control.visible_tid().is_some())
+        {
             Ok(target.metadata().namespace_process_group)
         } else {
             Err(carrick_personality_linux::identity::ESRCH)
@@ -1803,6 +1809,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             let target = graph
                 .owner
                 .find_task_by_pid(target_pid)
+                .filter(|row| row.native().resources().control.visible_tid().is_some())
                 .ok_or(carrick_personality_linux::identity::ESRCH)?;
             if target.parent() != Some(caller_key) {
                 return Err(carrick_personality_linux::identity::ESRCH);
@@ -1819,6 +1826,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
                 graph
                     .owner
                     .find_task_by_pid(target_pid)
+                    .filter(|row| row.native().resources().control.visible_tid().is_some())
                     .ok_or(carrick_personality_linux::identity::ESRCH)?
             };
             (
@@ -1850,6 +1858,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             graph
                 .owner
                 .find_task_by_pid_mut(target_pid)
+                .filter(|row| row.native().resources().control.visible_tid().is_some())
                 .ok_or(carrick_personality_linux::identity::ESRCH)?
         };
         target.metadata_mut().namespace_process_group = new_pgid;
@@ -1869,7 +1878,11 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
         if pid == 0 || pid as u32 == caller.metadata().namespace_pid {
             Ok(caller.metadata().namespace_session)
-        } else if let Some(target) = graph.owner.find_task_by_pid(pid as u32) {
+        } else if let Some(target) = graph
+            .owner
+            .find_task_by_pid(pid as u32)
+            .filter(|row| row.native().resources().control.visible_tid().is_some())
+        {
             Ok(target.metadata().namespace_session)
         } else {
             Err(carrick_personality_linux::identity::ESRCH)
@@ -2110,6 +2123,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             let target = graph
                 .owner
                 .find_task_by_pid(target_pid)
+                .filter(|row| row.native().resources().control.visible_tid().is_some())
                 .ok_or(carrick_personality_linux::sysinfo::ESRCH)?;
             let target_creds = target
                 .credentials_for(target.metadata().namespace_pid)
@@ -2128,6 +2142,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             graph
                 .owner
                 .find_task_by_pid_mut(target_pid)
+                .filter(|row| row.native().resources().control.visible_tid().is_some())
                 .ok_or(carrick_personality_linux::sysinfo::ESRCH)?
         };
         let old = target
@@ -4173,6 +4188,21 @@ mod tests {
         assert_eq!(
             entry.read_robust_list(child_pid, &mut |_, _| None),
             Ok((0xbeef, 24))
+        );
+        // A predecessor of a host-completed exec has lost its control stamp.
+        // Peer queries must not expose its stale shared owner, even with caps.
+        child_controls[1].retire_identity();
+        assert_eq!(
+            entry.read_robust_list(987, &mut |_, _| Some((0xcafe, 24))),
+            Err(carrick_personality_linux::identity::ESRCH)
+        );
+        assert_eq!(
+            carrick_personality_linux::identity::ProcessIdentityVenue::set_pgid(
+                &mut entry,
+                child_pid as i32,
+                child_pid as i32
+            ),
+            Err(carrick_personality_linux::identity::ESRCH)
         );
     }
 

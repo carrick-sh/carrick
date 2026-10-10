@@ -103,6 +103,7 @@ carrick-host-bsd = { path = "../carrick-host-bsd" }
 carrick-host-linux = { path = "../carrick-host-linux" }
 
 [dev-dependencies]
+carrick-guest-arch = { path = "../carrick-guest-arch" }
 loom = "=0.7.2"
 carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }

@@ -138,6 +138,11 @@ pub fn invoke<'a>(
     call: IdentityCall,
     native: &mut dyn IdentityNative<'a>,
 ) -> Option<SyscallResult> {
+    // Missing or exec-retired identity must never expose an old shared owner.
+    // A replacement needs an independently authenticated control slot/owner.
+    if native.visible_tid().is_none() {
+        return Some(SyscallResult::new(ESRCH));
+    }
     let args = native.arguments();
     match call {
         IdentityCall::SetTidAddress => {

@@ -504,6 +504,18 @@ carrier to run the other setting.
 The shared in-ring process owner has no production exec-completion ingress.
 ARM exec is completed by the host runtime and rebinds its host kernel owner,
 not `NativeProcessRuntime`; the CPL0 owner currently has no exec implementation.
+A committed host exec now revokes every predecessor control-slot identity
+stamp in `Kernel::commit_exec_transition`. Shared identity dispatch returns
+ESRCH for an absent stamp, and peer identity/resource lookups reject retired
+owners. Replacement entry authenticates its distinct control slot against the
+retained owner, so the predecessor owner cannot answer for the new image.
+Failed or merely prepared exec preserves the stamp. The real kernel commit
+witness `committed_exec_revokes_predecessor_shared_identity_dispatch` checks
+comm, capabilities, setpgid, clear-tid and robust-list refusal after commit;
+the foreign-process dispatch witness also rejects retired peer state.
+CPL0 has no exec completion path and refuses execve before replacement, proven
+against native self-exec by `mounted_static_x86_exec_refuses_before_replacement_identity`.
+
 The unused shared `exec_completed` surface and its direct-call tests are removed.
 Identity retirement cannot claim exec integration until a committed-image receipt
 reaches the exact shared process and executing thread in the real syscall path.
@@ -529,16 +541,16 @@ prerequisites, not parallel implementations in the identity port.
 Production shared CPL0 thread exit needs native lifecycle scheduler/context
 integration, owned by the x86 executor-pool lane. It is not implemented by this
 identity port. Production dispatch supplies no ARM scheduler zone
-(`crates/carrick-x86-cpl0/src/entry.rs:1961`), and the common adapter requires
-`arm_scheduler()` plus a zone (`crates/carrick-el1/src/personality/lifecycle.rs:182`).
-Its wake hook requires an ARM frame (`lifecycle.rs:298`). The x86 wake adapter at
+(`crates/carrick-x86-cpl0/src/entry.rs:1923`), and the common adapter requires
+`arm_scheduler()` plus a zone (`crates/carrick-el1/src/personality/lifecycle.rs:184`).
+Its wake hook requires an ARM frame (`lifecycle.rs:299`). The x86 wake adapter at
 `crates/carrick-x86/src/cpl0_lifecycle.rs:615` is included by the fixture lane
 (`crates/carrick-x86-cpl0/src/fixture.rs:24`); that is not a production binding.
 
 ARM's existing reference clears the four-byte user word at
 `crates/carrick-personality-linux/src/lifecycle.rs:827` and invokes the single
 futex wake at `lifecycle.rs:829`. The real ARM adapter selects the MM-scoped
-scheduler wake at `crates/carrick-el1/src/personality/lifecycle.rs:285`, using
+scheduler wake at `crates/carrick-el1/src/personality/lifecycle.rs:287`, using
 `crates/carrick-el1/src/sched.rs:151`. The VM-free production-dispatch test
 `exit_of_a_born_thread_clears_cleartid_wakes_the_joiner_and_runs_it`
 (`crates/carrick-el1/src/personality/lifecycle/tests.rs:960`) starts a thread,
