@@ -1,9 +1,12 @@
 # Shared in-ring signals: review scope and remaining owners
 
-The ARM host still owns signal delivery and rt_sigreturn. ARM syscalls
-129 through 139 and 240 must remain unported; its dormant native frame builder/restorer is checked
-against canonical ABI records in VM-free tests. No signed ARM runtime
-verification was possible on the Linux worker.
+The ARM host still owns signal delivery and rt_sigreturn frames. ARM keeps
+main's in-ring lifecycle routes for sigaltstack (132) and rt_sigprocmask
+(135), and its SignalReturn carrier handback for 139. Calls 129–131, 133,
+134, 136–138 and 240 remain unported and are refused by strict crossing
+admission. Its dormant native frame builder/restorer is checked against
+canonical ABI records in VM-free tests. No signed ARM runtime verification
+was possible on the Linux worker.
 
 The x86 witnesses compare the same static ELF against native Linux, with
 five-second process bounds. They cover preserved syscall and FP/SIMD state,

@@ -85,7 +85,7 @@ fn x86_sched_calls_route_to_neutral_sched_family() {
 
 #[test]
 fn arm_sigreturn_stays_with_host_frame_owner() {
-    assert_eq!(route_aarch64(139, u64::MAX), Family::Unported);
+    assert_eq!(route_aarch64(139, u64::MAX), Family::SignalReturn);
     assert_eq!(
         carrick_personality_linux::dispatch::route_x86_64(139, u64::MAX),
         Family::Signal(carrick_personality_linux::signal::SignalCall::RtSigreturn)
@@ -102,12 +102,18 @@ fn pidfds_remain_unported_until_the_native_owner_exists() {
 }
 
 #[test]
-fn arm_signal_calls_stay_with_host_delivery_owner() {
+fn arm_signal_routes_preserve_main_lifecycle_and_host_frame_owner() {
     for ordinal in (129..=139).chain(core::iter::once(240)) {
+        let expected = match ordinal {
+            132 => Family::Lifecycle(LifecycleCall::SigAltStack),
+            135 => Family::Lifecycle(LifecycleCall::SigProcMask),
+            139 => Family::SignalReturn,
+            _ => Family::Unported,
+        };
         assert_eq!(
             route_aarch64(ordinal, u64::MAX),
-            Family::Unported,
-            "ARM signal ordinal {ordinal} must use its host action and delivery owner"
+            expected,
+            "ARM ordinal {ordinal}"
         );
     }
 }
