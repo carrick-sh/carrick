@@ -2237,6 +2237,211 @@ fn birth_record_refusal_retains_the_claim_for_rollback() {
     assert_eq!(w.zone.slot(SLOT).queued(), 0);
 }
 
+fn clone_terminal_failure_witness(mode: u8) {
+    // ProcessNative's Born callback is under its graph guard. The real queue
+    // and timer path must run after that guard, even if it reenters the graph.
+    struct GraphOwner<'a> {
+        binding: carrick_el1_abi::ExecutionBinding,
+        graph: &'a crate::lock::SpinLock<()>,
+        page: &'a ThreadLifecyclePage,
+        zone: &'a ZoneTables,
+        settlements: &'a core::cell::Cell<u32>,
+        refuse_birth: bool,
+        mode: u8,
+    }
+    impl ProcessNative for GraphOwner<'_> {
+        fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
+            self.binding
+        }
+        fn fork(&mut self) -> LifecycleOutcome {
+            panic!("unexpected fork")
+        }
+        fn wait4(
+            &mut self,
+            _: ProcessWaitPid,
+            _: UserVa,
+            _: LinuxWaitOptions,
+            _: UserVa,
+        ) -> LifecycleOutcome {
+            panic!("unexpected wait")
+        }
+        fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
+            panic!("unexpected exit")
+        }
+        fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
+            let _guard = self
+                .graph
+                .try_lock()
+                .expect("settlement retains graph guard");
+            assert_eq!(self.page.claimed_count(), 0);
+            if self.refuse_birth {
+                assert_eq!(self.page.live(), 1, "wake preceded live rollback");
+                assert_eq!(self.zone.slot(SLOT).queued(), 0);
+            } else {
+                assert_eq!(self.page.live(), 2);
+                assert_eq!(
+                    self.zone.slot(SLOT).queued(),
+                    1,
+                    "wake preceded Born enqueue"
+                );
+            }
+            self.settlements.set(self.settlements.get() + 1);
+            Err(-5)
+        }
+        fn thread_spawned(
+            &mut self,
+            caller: u32,
+            child: u32,
+            publish: &mut dyn FnMut() -> Result<(), i64>,
+        ) -> Result<(), i64> {
+            assert_eq!(caller, PARENT_TID as u32);
+            assert_eq!(child, CHILD_VISIBLE);
+            let _guard = self.graph.lock();
+            if self.refuse_birth {
+                assert_eq!(self.page.claimed_count(), 1);
+                assert_eq!(self.page.live(), 2);
+                self.page.close();
+                if self.mode == 1 {
+                    let entry = self.page.entry_ref_for_visible_tid(CHILD_VISIBLE).unwrap();
+                    self.page
+                        .transition(
+                            entry,
+                            &[EntryState::Claimed],
+                            EntryState::Born,
+                            Ordering::SeqCst,
+                        )
+                        .unwrap();
+                }
+                return Err(-11);
+            }
+            publish()
+        }
+    }
+    let settlements = core::cell::Cell::new(0);
+    let w = World::new(LifecycleHatches::ON);
+    assert!(w.venue.leader_slot().publish_visible_tid(PARENT_TID as u32));
+    w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
+    // An exiting sibling is already parked when rollback loses its claim.
+    // The injected native owner below runs through the real serve_clone path.
+    let parked_exit = if mode == 1 {
+        let record = w
+            .zone
+            .alloc_record(ThreadIdentity {
+                tid: 99,
+                serial: 1099,
+                mm: MM,
+                file_table: 5,
+                generation: 1,
+                affinity: 1 << SLOT_IDX,
+                lifecycle_page: w.page() as *const _ as u64,
+                control_slot: w.venue.leader_slot() as *const _ as u64,
+            })
+            .unwrap();
+        let guard = w
+            .zone
+            .lock(
+                ZoneTables::bucket_of(MM, 0xfe00),
+                &carrick_sched_core::BoundedSpin(100),
+            )
+            .unwrap();
+        let sequence = w.zone.next_seq(record);
+        w.zone
+            .enqueue(&guard, record, sequence, MM, 0xfe00, u32::MAX, 0)
+            .unwrap();
+        w.zone.publish_park(record, sequence);
+        Some(record)
+    } else {
+        None
+    };
+    let graph = crate::lock::SpinLock::new(());
+    let checks = core::cell::Cell::new(0_u32);
+    let probe = || {
+        if w.zone.slot(SLOT).queued() != 0 {
+            let _guard = graph
+                .try_lock()
+                .expect("scheduler publication retained the process graph lock");
+            checks.set(checks.get() + 1);
+        }
+    };
+    let mut cpu = QueueLockProbeCpu {
+        inner: w.cpu.clone(),
+        probe: &probe,
+    };
+    let mut owner = GraphOwner {
+        binding: crate::personality::common_entry::execution_binding(w.task()),
+        graph: &graph,
+        page: w.page(),
+        zone: &w.zone,
+        settlements: &settlements,
+        refuse_birth: mode == 1,
+        mode,
+    };
+    let mut frame = TrapFrame {
+        slot: SLOT_IDX as u64,
+        ..Default::default()
+    };
+    frame.x[..5].copy_from_slice(&clone_args(GO_FLAGS, 0, 0));
+    let names = InotifyNameCache::new();
+    let mut native = super::El1PendingFamilies {
+        handoff: None,
+        lifecycle_user: None,
+        frame: &mut frame,
+        counters: &w.counters,
+        current_tasks: &w.tasks,
+        fd_map: &[],
+        object_table: &[],
+        open_table: &[],
+        inotify_table: &[],
+        name_cache: &names,
+        zone: Some(Zone {
+            tables: &w.zone,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+        }),
+        ipc: None,
+        lifecycle: Some(&*w.venue),
+        process: Some(&mut owner),
+        source: None,
+        anonymous: None,
+        cache_lookup: |_| core::ptr::null_mut(),
+    };
+    let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        invoke(LifecycleCall::Clone, &mut native)
+    }));
+    let payload = stopped
+        .err()
+        .expect("clone must stop the run rather than return an errno");
+    let failure = payload
+        .downcast::<crate::personality::native_run_failure::NativeRunFailurePanic>()
+        .expect("typed terminal cause");
+    assert_eq!(failure.binding, owner.binding);
+    assert_eq!(
+        failure.reason,
+        if mode == 0 {
+            carrick_el1_abi::NativeRunFailureReason::BirthSettlement
+        } else {
+            carrick_el1_abi::NativeRunFailureReason::ClaimRollback
+        }
+    );
+    assert_eq!(w.zone.slot(SLOT).queued(), if mode == 0 { 1 } else { 0 });
+    if let Some(record) = parked_exit {
+        assert!(matches!(
+            w.zone.record(record).claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ));
+    }
+}
+
+#[test]
+fn clone_settlement_failure_after_born_never_returns_errno() {
+    clone_terminal_failure_witness(0);
+}
+
+#[test]
+fn clone_unclaim_failure_never_leaves_exit_waiting() {
+    clone_terminal_failure_witness(1);
+}
+
 #[test]
 fn arm_dispatch_consumes_native_run_failure_before_return() {
     struct Failed {
