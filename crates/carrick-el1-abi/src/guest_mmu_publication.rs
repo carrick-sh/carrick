@@ -153,6 +153,65 @@ impl GuestMmuPublication {
         })
     }
 
+    /// Authenticate the completed native ARM COW edit before physical projection.
+    /// The exact-root pending grant authenticates the root independently. The
+    /// caller verifies `live_stores` against the live descriptor postcondition;
+    /// sparse compounds may retain invalid neighbors without storing them.
+    pub fn from_aarch64_cow_completion(
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        completion: &crate::CowGrantCompletion,
+        live_stores: u32,
+    ) -> Option<Self> {
+        use carrick_mmu_core::aarch64::descriptor_txn::{CowRepointAccess, DescriptorOp};
+        let DescriptorOp::CowRepoint {
+            access,
+            va,
+            len,
+            old_ipa,
+            new_ipa,
+            backing,
+        } = txn.op
+        else {
+            return None;
+        };
+        if !completion.is_well_formed()
+            || completion.purpose != crate::CowGrantPurpose::UserWrite
+            || completion.grant.mm_key != txn.id.mm_key.get()
+            || completion.grant.epoch != txn.id.generation.get()
+            || completion.span_va != va
+            || completion.span_len != len
+            || completion.old_ipa != old_ipa.raw()
+            || completion.new_ipa != new_ipa.raw()
+            || completion.grant.backing != backing
+            || old_ipa.raw() & !(crate::COW_GRANT_SIZE - 1) == completion.grant.physical_ipa
+            || !matches!(
+                access,
+                CowRepointAccess::RecordedPrivate
+                    | CowRepointAccess::User {
+                        writable_pages: 1..=15
+                    }
+            )
+            || txn.root.raw() & 4095 != 0
+            || live_stores == 0
+            || u64::from(live_stores) > len / 4096
+            || !txn.tables.is_empty()
+        {
+            return None;
+        }
+        Some(Self {
+            revision: Self::REVISION,
+            outcome: Self::APPLIED,
+            mm_key: txn.id.mm_key.get(),
+            root_gpa: txn.root.raw(),
+            generation: txn.id.generation.get(),
+            edit_identity: txn.digest(),
+            span_va: va,
+            span_len: len,
+            live_stores,
+            tables_linked: 0,
+        })
+    }
+
     /// Bind the existing guest COW completion to physical alias settlement.
     /// The caller authenticates the pool's completed record under exact-MM
     /// exclusion; CarrierMemory separately verifies the live leaf.
@@ -308,6 +367,105 @@ mod tests {
             applied.pages = 2;
         }
         assert!(GuestMmuPublication::from_aarch64_owner_grant(&txn, &malformed).is_none());
+    }
+
+    #[test]
+    fn aarch64_cow_publication_authenticates_compound_completion() {
+        use carrick_mmu_core::aarch64::SubstrateGpa;
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            BackingIdentity, CowRepointAccess, DescriptorOp, DescriptorTxn, DescriptorTxnId,
+            TableGrants,
+        };
+        let one = NonZeroU64::MIN;
+        let backing = BackingIdentity {
+            frame_id: one,
+            mapping_id: one,
+            owner_generation: one,
+            inventory_revision: one,
+        };
+        let grant = crate::CowGrant {
+            slot: 0,
+            epoch: 8,
+            mm_key: 77,
+            physical_ipa: 0x10000,
+            backing,
+        };
+        let completion = crate::CowGrantCompletion {
+            purpose: crate::CowGrantPurpose::UserWrite,
+            grant,
+            span_va: 0x400000,
+            span_len: 0x4000,
+            old_ipa: 0x20000,
+            new_ipa: 0x10000,
+        };
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: NonZeroU64::new(77).unwrap(),
+                generation: NonZeroU64::new(grant.epoch).unwrap(),
+            },
+            root: SubstrateGpa::new(0x30000),
+            op: DescriptorOp::CowRepoint {
+                access: CowRepointAccess::RecordedPrivate,
+                va: 0x400000,
+                len: 0x4000,
+                old_ipa: SubstrateGpa::new(0x20000),
+                new_ipa: SubstrateGpa::new(0x10000),
+                backing,
+            },
+            tables: TableGrants::NONE,
+        };
+        let publication =
+            GuestMmuPublication::from_aarch64_cow_completion(&txn, &completion, 4).unwrap();
+        assert_eq!(publication.root_gpa, txn.root.raw());
+        assert_eq!(publication.edit_identity, txn.digest());
+        assert_eq!(publication.live_stores, 4);
+        assert_eq!(publication.tables_linked, 0);
+        let mut wrong = completion;
+        wrong.old_ipa = 0x31000;
+        assert!(GuestMmuPublication::from_aarch64_cow_completion(&txn, &wrong, 4).is_none());
+        let mut wrong = completion;
+        wrong.grant.backing.mapping_id = NonZeroU64::new(2).unwrap();
+        assert!(GuestMmuPublication::from_aarch64_cow_completion(&txn, &wrong, 4).is_none());
+        let mut wrong = completion;
+        wrong.grant.mm_key += 1;
+        assert!(GuestMmuPublication::from_aarch64_cow_completion(&txn, &wrong, 4).is_none());
+        let mut wrong = completion;
+        wrong.purpose = crate::CowGrantPurpose::RetiredBacking;
+        assert!(GuestMmuPublication::from_aarch64_cow_completion(&txn, &wrong, 4).is_none());
+        assert!(GuestMmuPublication::from_aarch64_cow_completion(&txn, &completion, 0).is_none());
+        assert!(GuestMmuPublication::from_aarch64_cow_completion(&txn, &completion, 5).is_none());
+        assert_eq!(
+            GuestMmuPublication::from_aarch64_cow_completion(&txn, &completion, 1)
+                .unwrap()
+                .live_stores,
+            1,
+            "invalid compound neighbors do not manufacture descriptor stores"
+        );
+        let mut wrong = completion;
+        wrong.grant.epoch += 1;
+        assert!(GuestMmuPublication::from_aarch64_cow_completion(&txn, &wrong, 4).is_none());
+        let mut wrong_txn = txn;
+        wrong_txn.root = SubstrateGpa::new(txn.root.raw() + 1);
+        assert!(
+            GuestMmuPublication::from_aarch64_cow_completion(&wrong_txn, &completion, 4).is_none()
+        );
+        for access in [
+            CowRepointAccess::Kernel,
+            CowRepointAccess::Retired,
+            CowRepointAccess::User { writable_pages: 0 },
+        ] {
+            wrong_txn = txn;
+            if let DescriptorOp::CowRepoint {
+                access: current, ..
+            } = &mut wrong_txn.op
+            {
+                *current = access;
+            }
+            assert!(
+                GuestMmuPublication::from_aarch64_cow_completion(&wrong_txn, &completion, 4)
+                    .is_none()
+            );
+        }
     }
 
     #[test]
