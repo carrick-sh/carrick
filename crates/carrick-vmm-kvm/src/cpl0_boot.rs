@@ -205,6 +205,21 @@ pub enum InitialSyscallDisposition {
 }
 
 /// Physical services carry no guest Linux policy or host dispatch authority.
+/// Authenticated terminal outcome from a stopped production CPU.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalProcessExit {
+    Exited(GuestExitStatus),
+    RunFailed(carrick_el1_abi::NativeRunFailureReason),
+}
+impl PhysicalProcessExit {
+    pub fn into_initial_process_exit(self, exits: usize) -> InitialProcessExit {
+        match self {
+            Self::Exited(status) => InitialProcessExit::Exited { code: status.code(), exits },
+            Self::RunFailed(reason) => InitialProcessExit::RunFailed { reason, exits },
+        }
+    }
+}
+
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,
@@ -215,12 +230,14 @@ pub enum InitialSyscallDisposition {
 pub enum PhysicalCrossingFamily {
     OwnerGrant,
     RootExit,
+    RunFailure,
 }
 impl PhysicalCrossingFamily {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OwnerGrant => "owner_grant",
             Self::RootExit => "root_exit",
+            Self::RunFailure => "run_failure",
         }
     }
 }
@@ -1253,7 +1270,7 @@ impl ProductionCpuLease {
     pub fn service_idle_peer_doorbell(
         &mut self,
         exit: &CarrierRunExit,
-    ) -> Result<Option<GuestExitStatus>, TrapError> {
+    ) -> Result<Option<PhysicalProcessExit>, TrapError> {
         let CarrierRunExit::PhysicalDoorbell { port, .. } = exit else {
             return Err(fail("idle peer service requires physical doorbell"));
         };
@@ -1283,12 +1300,19 @@ impl ProductionCpuLease {
                     custody.service_fork_stock(&lease)?;
                     Ok(None)
                 }
+                carrick_el1_abi::NATIVE_RUN_FAILURE_PORT => {
+                    let reason = custody.service_run_failure(&lease)?;
+                    custody.run_failure_crossings = custody.run_failure_crossings
+                        .checked_add(1)
+                        .ok_or_else(|| fail("physical crossing counter exhausted"))?;
+                    Ok(Some(PhysicalProcessExit::RunFailed(reason)))
+                }
                 carrick_el1_abi::NATIVE_ROOT_EXIT_PORT => {
                     custody.root_exit_crossings = custody
                         .root_exit_crossings
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
-                    custody.service_root_exit(&lease).map(Some)
+                    custody.service_root_exit(&lease).map(|status| Some(PhysicalProcessExit::Exited(status)))
                 }
                 _ => Err(fail("unexpected idle peer physical doorbell")),
             }
@@ -1434,7 +1458,7 @@ impl ProductionCpuLease {
         &mut self,
         task: carrick_guest_arch::TaskIdentity,
         exit: &CarrierRunExit,
-    ) -> Result<Option<GuestExitStatus>, TrapError> {
+    ) -> Result<Option<PhysicalProcessExit>, TrapError> {
         let CarrierRunExit::PhysicalDoorbell { port, .. } = exit else {
             return Err(fail("physical service requires a doorbell exit"));
         };
@@ -1464,12 +1488,19 @@ impl ProductionCpuLease {
                     custody.service_fork_stock(&lease)?;
                     Ok(None)
                 }
+                carrick_el1_abi::NATIVE_RUN_FAILURE_PORT => {
+                    let reason = custody.service_run_failure(&lease)?;
+                    custody.run_failure_crossings = custody.run_failure_crossings
+                        .checked_add(1)
+                        .ok_or_else(|| fail("physical crossing counter exhausted"))?;
+                    Ok(Some(PhysicalProcessExit::RunFailed(reason)))
+                }
                 carrick_el1_abi::NATIVE_ROOT_EXIT_PORT => {
                     custody.root_exit_crossings = custody
                         .root_exit_crossings
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
-                    custody.service_root_exit(&lease).map(Some)
+                    custody.service_root_exit(&lease).map(|status| Some(PhysicalProcessExit::Exited(status)))
                 }
                 _ => {
                     let binding = custody.binding(slot);
@@ -1619,7 +1650,7 @@ impl ProductionCpuFactory {
 
     pub fn physical_crossing_counts(
         &self,
-    ) -> Result<[(PhysicalCrossingFamily, u64); 2], TrapError> {
+    ) -> Result<[(PhysicalCrossingFamily, u64); 3], TrapError> {
         let custody = self
             .custody
             .lock()
@@ -1633,6 +1664,7 @@ impl ProductionCpuFactory {
                 PhysicalCrossingFamily::RootExit,
                 custody.root_exit_crossings,
             ),
+            (PhysicalCrossingFamily::RunFailure, custody.run_failure_crossings),
         ])
     }
 
@@ -1727,6 +1759,7 @@ pub(crate) struct Cpl0HostCustody {
     anonymous_pending: [Option<anonymous_owner::PendingGrant>; 2],
     owner_grant_crossings: u64,
     root_exit_crossings: u64,
+    run_failure_crossings: u64,
     metadata_base: RetainedMetadataPtr,
     host_forwards: u64,
     host_yields: u64,
@@ -3102,7 +3135,7 @@ impl Cpl0Carrier {
         self.custody.private_anonymous_witness.private_pages()
     }
 
-    pub fn physical_crossing_counts(&self) -> [(PhysicalCrossingFamily, u64); 2] {
+    pub fn physical_crossing_counts(&self) -> [(PhysicalCrossingFamily, u64); 3] {
         [
             (
                 PhysicalCrossingFamily::OwnerGrant,
@@ -3111,6 +3144,10 @@ impl Cpl0Carrier {
             (
                 PhysicalCrossingFamily::RootExit,
                 self.custody.root_exit_crossings,
+            ),
+            (
+                PhysicalCrossingFamily::RunFailure,
+                self.custody.run_failure_crossings,
             ),
         ]
     }
@@ -3832,6 +3869,7 @@ impl Cpl0Carrier {
                 anonymous_pending: [None, None],
                 owner_grant_crossings: 0,
                 root_exit_crossings: 0,
+                run_failure_crossings: 0,
                 metadata_base,
                 host_forwards: 0,
                 host_yields: 0,
@@ -5962,6 +6000,10 @@ impl Cpl0Carrier {
 /// A guest exception is an owned process outcome, separate from carrier failure.
 #[derive(::core::fmt::Debug)]
 pub enum InitialProcessExit {
+    RunFailed {
+        reason: carrick_el1_abi::NativeRunFailureReason,
+        exits: usize,
+    },
     Exited {
         code: i32,
         exits: usize,

@@ -723,10 +723,7 @@ impl PersistentExecutor for KvmPersistentExecutor {
                         .service_physical_doorbell(task, &stopped.exit)?;
                     self.scheduler.poke_executor_control();
                     if let Some(status) = status {
-                        self.publish_exit(InitialProcessExit::Exited {
-                            code: status.code(),
-                            exits: exited,
-                        })?;
+                        self.publish_exit(status.into_initial_process_exit(exited))?;
                         Ok(ExecutorExit::Exited)
                     } else {
                         Ok(ExecutorExit::ResumeEl1)
@@ -1123,10 +1120,7 @@ impl PersistentExecutor for KvmPersistentExecutor {
             exit @ CarrierRunExit::PhysicalDoorbell { .. } => {
                 if let Some(status) = self.physical.service_idle_peer_doorbell(&exit)? {
                     let exits = self.exits.load(Ordering::Acquire);
-                    self.publish_exit(InitialProcessExit::Exited {
-                        code: status.code(),
-                        exits,
-                    })?;
+                    self.publish_exit(status.into_initial_process_exit(exits))?;
                 }
                 Ok(GuestIdleExit::Idle)
             }

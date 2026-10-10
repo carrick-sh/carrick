@@ -265,9 +265,12 @@ pub fn run_prepared_kvm_pool(
         host_forward_families: count_family(forward_families),
         guest_refusal_families: count_family(refusal_families),
     });
-    let (exit_code, terminating_signal, traps, fault_record) = match outcome {
+    let (exit_code, terminating_signal, traps, fault_record, run_failure) = match outcome {
+        carrick_vmm_kvm::cpl0_boot::InitialProcessExit::RunFailed { reason, exits } => {
+            (125, None, exits, None, Some(reason))
+        }
         carrick_vmm_kvm::cpl0_boot::InitialProcessExit::Exited { code, exits } => {
-            (code, None, exits, None)
+            (code, None, exits, None, None)
         }
         carrick_vmm_kvm::cpl0_boot::InitialProcessExit::Fault { record, exits } => {
             if record.cs & 3 != 3 {
@@ -278,15 +281,19 @@ pub fn run_prepared_kvm_pool(
             let (signal, _) = record.linux_signal().ok_or_else(|| {
                 RuntimeError::Unsupported(format!("unclassified x86 user fault: {record:?}"))
             })?;
-            (128 + signal, Some(signal), exits, Some(record))
+            (128 + signal, Some(signal), exits, Some(record), None)
         }
     };
-    let (stdout, stderr) = {
+    let (stdout, mut stderr) = {
         let dispatcher = dispatcher
             .lock()
             .map_err(|_| RuntimeError::Configuration("KVM dispatcher poisoned".into()))?;
         (dispatcher.stdout(), dispatcher.stderr())
     };
+    if let Some(reason) = run_failure {
+        stderr.extend_from_slice(reason.diagnostic().as_bytes());
+        stderr.push(b'\n');
+    }
     Ok(PreparedKvmPoolOutcome {
         run: RunResult {
             exit_code,
