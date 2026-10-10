@@ -70,6 +70,7 @@ fn carrick_x86_cpl0_sources_and_build_config_are_inputs() {
     // The original target-filtered closure plus the conservative host-only
     // carrick-el1 -> carrick-fatal edge.
     let packages = [
+        "carrick-abi",
         "carrick-core",
         "carrick-core-abi",
         "carrick-el1",
