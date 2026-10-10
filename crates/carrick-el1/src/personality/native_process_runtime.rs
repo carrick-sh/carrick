@@ -409,6 +409,12 @@ struct PendingIpc {
     payload: PendingIpcPayload,
 }
 
+enum ContinuationPark {
+    Parked,
+    Rescan,
+    Interrupted,
+}
+
 enum PendingContinuation {
     Wait(PendingWait),
     Ipc(PendingIpc),
@@ -1054,7 +1060,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 )
             });
         let interrupt = blocked.is_some_and(|blocked| signals.has_deliverable(record, blocked));
+        let ipc_channel = if interrupt {
+            match graph.pending.get(&target_key) {
+                Some(PendingContinuation::Ipc(pending)) => Some(pending.channel.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
         drop(graph);
+        if let Some(channel) = ipc_channel {
+            self.publish_channel(&channel)
+                .map_err(|e| carrick_syscall_abi::LinuxErrno::new(-e.errno() as i32))?;
+        }
         if interrupt {
             self.interrupt_signal_record(record);
         }
@@ -1210,7 +1228,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         return Ok(returned(0));
                     }
                     let ch = channel.clone();
-                    if !self.park_continuation(
+                    match self.park_continuation(
                         &ch,
                         precheck.wake_generation(),
                         PendingContinuation::Wait(PendingWait {
@@ -1221,7 +1239,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             channel,
                         }),
                     )? {
-                        continue;
+                        ContinuationPark::Rescan => continue,
+                        ContinuationPark::Interrupted => {
+                            return Ok(returned(carrick_syscall_abi::LINUX_EINTR.guest_retval()));
+                        }
+                        ContinuationPark::Parked => {}
                     }
                     return Ok(LifecycleOutcome::Transferred {
                         progress: carrick_core::Served::Idle,
@@ -1437,7 +1459,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         channel: &Arc<WaitChannel>,
         precheck_gen: TaskWakeGeneration,
         continuation: PendingContinuation,
-    ) -> Result<bool, NativeProcessError> {
+    ) -> Result<ContinuationPark, NativeProcessError> {
         let zone = self.source.zone;
         let record = zone
             .slot(self.source.slot)
@@ -1455,13 +1477,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .ok_or(NativeProcessError::Busy)?;
         if channel.generation.generation() != precheck_gen {
             drop(guard);
-            return Ok(false);
+            return Ok(ContinuationPark::Rescan);
         }
         {
             let graph = self.runtime.graph.lock();
             if graph.pending.contains_key(&self.key) {
                 return Err(NativeProcessError::Busy);
             }
+        }
+        if self.signal_interrupts_current() {
+            self.interrupted_child_wait = Some(Box::new(self.words));
+            return Ok(ContinuationPark::Interrupted);
         }
         let sequence = zone.next_seq(record);
         zone.enqueue(&guard, record, sequence, channel.mm, address, u32::MAX, 0)
@@ -1484,7 +1510,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         drop(guard);
         zone.clear_current(self.source.slot);
         self.handoff = receipt;
-        Ok(true)
+        Ok(ContinuationPark::Parked)
+    }
+
+    fn signal_interrupts_current(&self) -> bool {
+        let graph = self.runtime.graph.lock();
+        let Ok(row) = graph.owner.task(self.key) else {
+            return false;
+        };
+        let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+            carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
+        );
+        row.native()
+            .resources()
+            .signals()
+            .has_deliverable(self.record, blocked)
     }
 
     fn ipc_env(
@@ -1599,11 +1639,26 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             drop(guard);
             return Ok(false);
         }
+        // Signal publication and enrollment share graph custody. A sender either
+        // observes this continuation or this check observes its pending signal.
+        let mut graph = self.runtime.graph.lock();
+        let row = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale.errno())?;
+        let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+            carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
+        );
+        if row
+            .native()
+            .resources()
+            .signals()
+            .has_deliverable(self.record, blocked)
         {
-            let graph = self.runtime.graph.lock();
-            if graph.pending.contains_key(&self.key) {
-                return Err(NativeProcessError::Busy.errno());
-            }
+            return Err(carrick_syscall_abi::LINUX_EINTR.guest_retval());
+        }
+        if graph.pending.contains_key(&self.key) {
+            return Err(NativeProcessError::Busy.errno());
         }
         let sequence = zone.next_seq(record);
         if let Some(dl) = deadline_tsc {
@@ -1613,7 +1668,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         zone.enqueue(&guard, record, sequence, ch.mm, address, u32::MAX, 0)
             .map_err(|_| NativeProcessError::Exhausted.errno())?;
         unsafe { *zone.record(record).ctx_mut() = self.words };
-        self.runtime.graph.lock().pending.insert(
+        graph.pending.insert(
             self.key,
             PendingContinuation::Ipc(PendingIpc {
                 caller: self.key,
@@ -1622,6 +1677,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 payload,
             }),
         );
+        drop(graph);
         let receipt = carrick_core::entry::publish_handoff_park(
             start,
             &guard,
@@ -1638,11 +1694,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
 
     fn resume_ipc(&mut self, pending: PendingIpc) -> LifecycleOutcome {
+        let interrupted = self.signal_interrupts_current();
         let is_timed_out = matches!(
             &pending.payload,
             PendingIpcPayload::Semop { timeout_deadline: Some(dl), .. } if self.read_tsc() >= *dl
         );
-        if is_timed_out {
+        if interrupted || is_timed_out {
             if let PendingIpcPayload::Semop {
                 semid,
                 blocking_sem: Some((sem_num, is_zero)),
@@ -1654,7 +1711,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .semop_suspend_exit(pid, *semid, *sem_num, *is_zero)
                 });
             }
-            return returned(carrick_syscall_abi::LINUX_EAGAIN.guest_retval());
+            return returned(if interrupted {
+                carrick_syscall_abi::LINUX_EINTR.guest_retval()
+            } else {
+                carrick_syscall_abi::LINUX_EAGAIN.guest_retval()
+            });
         }
 
         let (_creds, pid, ipc) = match self.ipc_env() {
@@ -3977,6 +4038,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let mut wake_channels = Vec::new();
         let mut interrupts = Vec::new();
         for (target_key, target_signals, _) in targets {
+            let before = interrupts.len();
             let _ = target_signals.enqueue(target_key, signal, Some(info));
             if let Ok(row) = graph.owner.task(target_key) {
                 let resources = row.native().resources();
@@ -4012,6 +4074,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         }
                     }
                 }
+            }
+            if interrupts.len() != before
+                && let Some(PendingContinuation::Ipc(pending)) = graph.pending.get(&target_key)
+            {
+                wake_channels.push(pending.channel.clone());
             }
             if let Some(channel) = graph
                 .owner
@@ -7555,9 +7622,166 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "blocked IPC interrupted by signal delivery requires in-ring signal delivery from PR 131"]
     fn test_blocked_ipc_returns_eintr_on_signal() {
-        // Follow-up for PR 131: parked continuations in msgsnd/msgrcv/semop/semtimedop
-        // must resume with LINUX_EINTR when interrupted by an unblocked signal.
+        for operation in 0..4 {
+            blocked_ipc_signal_contract(operation);
+        }
+    }
+    fn blocked_ipc_signal_contract(operation: u8) {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let child_page = Box::new(ThreadLifecyclePage::new());
+        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        }));
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
+        assert!(matches!(
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            ),
+            Err(NativeProcessError::Invalid)
+        ));
+        assert_eq!(page.live(), 2, "admission must not remove a live member");
+        page.release_live(1).unwrap(); // fixture settles its bootstrap census
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        assert_eq!(page.live(), 1);
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &*child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+            on_signal_clock: None,
+        };
+        use carrick_personality_linux::ipc::{IpcOutcome, ProcessIpcVenue};
+        use carrick_personality_linux::signal::{
+            ProcessSignals, SignalInfo, SignalProcessSelector, SignalRequest,
+        };
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        let queue = entry.msgget(0, 0o600).unwrap();
+        let sem = entry.semget(0, 1, 0o600).unwrap();
+        match operation {
+            0 => assert!(matches!(
+                entry.msgrcv(queue, UserVa::new(0), 0, 0, 8),
+                Ok((IpcOutcome::Suspended, None))
+            )),
+            1 => {
+                let mut ds = carrick_syscall_abi::ipc::LinuxMsqidDs::default();
+                entry
+                    .msgctl(queue, carrick_syscall_abi::ipc::IPC_STAT, Some(&mut ds))
+                    .unwrap();
+                ds.msg_qbytes = 1;
+                entry
+                    .msgctl(queue, carrick_syscall_abi::ipc::IPC_SET, Some(&mut ds))
+                    .unwrap();
+                assert!(matches!(
+                    entry.msgsnd(queue, 1, &[1], 0),
+                    Ok(IpcOutcome::Returned(_))
+                ));
+                assert!(matches!(
+                    entry.msgsnd(queue, 2, &[2], 0),
+                    Ok(IpcOutcome::Suspended)
+                ));
+            }
+            _ => {
+                let ops = [carrick_personality_linux::ipc::LinuxSembuf {
+                    sem_num: 0,
+                    sem_op: -1,
+                    sem_flg: 0,
+                }];
+                let timeout = (operation == 3).then_some(core::time::Duration::from_secs(1));
+                assert!(matches!(
+                    entry.semop(sem, &ops, timeout),
+                    Ok(IpcOutcome::Suspended)
+                ));
+                assert_eq!(entry.semctl_getncnt(sem, 0), Ok(1));
+            }
+        }
+        assert!(entry.take_handoff_receipt().is_some());
+        assert!(zone.slot(slot).current().is_none());
+        // Publish through the signal owner while execution capacity is released.
+        entry
+            .kill(
+                SignalProcessSelector::from_abi(41),
+                SignalRequest::from_abi(10).unwrap(),
+                SignalInfo::Generated(None),
+            )
+            .unwrap();
+        let selected = zone
+            .switch_in_full(slot)
+            .expect("signal must wake the owned IPC continuation");
+        assert_eq!(zone.record_ref(selected.record), entry.record);
+        assert!(
+            matches!(entry.resume_pending_wait(), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == carrick_syscall_abi::LINUX_EINTR.guest_retval())
+        );
+        assert!(!runtime.graph.lock().pending.contains_key(&entry.key));
+        if operation >= 2 {
+            assert_eq!(entry.semctl_getncnt(sem, 0), Ok(0));
+        }
+        assert!(zone.timer_owner(slot).is_none());
+        if operation == 1 {
+            assert!(
+                matches!(entry.msgrcv(queue, UserVa::new(0), 0, carrick_syscall_abi::ipc::IPC_NOWAIT, 8),
+                Ok((IpcOutcome::Returned(_), Some((_, 1, data)))) if data == [1])
+            );
+        }
     }
 }
