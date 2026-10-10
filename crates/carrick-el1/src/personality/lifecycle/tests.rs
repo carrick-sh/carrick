@@ -1670,3 +1670,170 @@ fn clone_stamped_nonleader_inherits_the_calling_thread() {
     assert_eq!(w.page().live(), 2);
     assert_eq!(w.zone.slot(SLOT).queued(), 1);
 }
+struct IdentityOwner(carrick_el1_abi::ExecutionBinding);
+impl ProcessNative for IdentityOwner {
+    fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
+        self.0
+    }
+    fn fork(&mut self) -> LifecycleOutcome {
+        panic!("unexpected fork")
+    }
+    fn wait4(
+        &mut self,
+        _: ProcessWaitPid,
+        _: UserVa,
+        _: LinuxWaitOptions,
+        _: UserVa,
+    ) -> LifecycleOutcome {
+        panic!("unexpected wait")
+    }
+    fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
+        panic!("unexpected exit")
+    }
+}
+/// Host-test frame with the production CPL0 scheduler capability boundary.
+struct Cpl0IdentityFrame(TrapFrame);
+impl carrick_guest_arch::SyscallFrame for Cpl0IdentityFrame {
+    fn canonical_ordinal(&self) -> carrick_guest_arch::CanonicalNr {
+        carrick_guest_arch::SyscallFrame::canonical_ordinal(&self.0)
+    }
+    fn argument(&self, index: usize) -> Option<u64> {
+        carrick_guest_arch::SyscallFrame::argument(&self.0, index)
+    }
+    fn result(&self) -> carrick_guest_arch::NativeReturnWord {
+        carrick_guest_arch::SyscallFrame::result(&self.0)
+    }
+    fn set_result(&mut self, result: carrick_guest_arch::NativeReturnWord) {
+        carrick_guest_arch::SyscallFrame::set_result(&mut self.0, result);
+    }
+    fn slot(&self) -> Option<carrick_guest_arch::SlotId> {
+        carrick_guest_arch::SyscallFrame::slot(&self.0)
+    }
+    fn user_sp(&self) -> Option<UserVa> {
+        carrick_guest_arch::SyscallFrame::user_sp(&self.0)
+    }
+}
+impl crate::personality::dispatch::GuestDispatchFrame for Cpl0IdentityFrame {
+    fn arm_frame(&mut self) -> Option<&mut TrapFrame> {
+        None
+    }
+    fn arm_frame_ref(&self) -> Option<&TrapFrame> {
+        None
+    }
+    fn arm_scheduler(&self) -> bool {
+        false
+    }
+    fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
+        None
+    }
+}
+
+#[test]
+fn set_tid_address_cpl0_without_exit_custody_forwards_without_registration() {
+    let w = World::new(LifecycleHatches::ON);
+    assert!(w.venue.leader_slot().publish_visible_tid(40));
+    w.venue.leader_slot().set_clear_child_tid(0x6000);
+    let mut owner = IdentityOwner(crate::personality::common_entry::execution_binding(
+        w.task(),
+    ));
+    let mut frame = Cpl0IdentityFrame(TrapFrame {
+        slot: SLOT_IDX as u64,
+        ..Default::default()
+    });
+    frame.0.x[0] = 0x7000;
+    frame.0.x[8] = carrick_syscall_abi::nr::SET_TID_ADDRESS.raw() as u64;
+    let names = InotifyNameCache::new();
+    let route = crate::personality::dispatch::dispatch_syscall_with_native::<
+        _,
+        FakeCpu,
+        HardwareUserWord,
+        _,
+        ThreadCtx,
+    >(
+        &mut frame,
+        &w.counters,
+        &w.tasks,
+        &[],
+        &[],
+        &[],
+        &[],
+        &names,
+        None,
+        None,
+        Some(&*w.venue),
+        Some(&mut owner),
+        None,
+        None,
+        |_| core::ptr::null_mut(),
+    );
+    assert!(matches!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Forward
+    ));
+    assert_eq!(w.venue.leader_slot().clear_child_tid(), 0x6000);
+}
+
+#[test]
+fn set_tid_address_arm_child_registers_the_word_that_exit_clears_and_wakes() {
+    let mut w = World::new(LifecycleHatches::ON);
+    let word = Box::new(CHILD_VISIBLE);
+    w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
+    let (action, _) = w.syscall(SYS_CLONE, &clone_args(GO_FLAGS, 0, 0));
+    assert_eq!(action, Action::Served);
+    let mut frame = TrapFrame {
+        elr: 0x5000,
+        ..Default::default()
+    };
+    assert_eq!(
+        w.call(
+            &mut frame,
+            SYS_FUTEX,
+            &[addr(&*word), 128, u64::from(CHILD_VISIBLE), 0]
+        ),
+        Action::Served
+    );
+    assert_eq!(
+        w.task().execution.task.load(Ordering::Relaxed),
+        u64::from(CHILD_TID)
+    );
+    assert_eq!(w.venue.child_slot(0).clear_child_tid(), 0);
+    let mut owner = IdentityOwner(crate::personality::common_entry::execution_binding(
+        w.task(),
+    ));
+    frame.slot = SLOT_IDX as u64;
+    frame.x[0] = addr(&*word);
+    frame.x[8] = carrick_syscall_abi::nr::SET_TID_ADDRESS.raw() as u64;
+    let names = InotifyNameCache::new();
+    let route = crate::personality::dispatch::dispatch_syscall_with_native(
+        &mut frame,
+        &w.counters,
+        &w.tasks,
+        &[],
+        &[],
+        &[],
+        &[],
+        &names,
+        Some(Zone {
+            tables: &w.zone,
+            cpu: &mut w.cpu,
+            user: &HardwareUserWord,
+        }),
+        None,
+        Some(&*w.venue),
+        Some(&mut owner),
+        None,
+        None,
+        |_| core::ptr::null_mut(),
+    );
+    assert!(matches!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Served
+    ));
+    assert_eq!(frame.x[0], u64::from(CHILD_VISIBLE));
+    assert_eq!(w.venue.child_slot(0).clear_child_tid(), addr(&*word));
+    assert_eq!(w.call(&mut frame, SYS_EXIT, &[0]), Action::Served);
+    assert_eq!(*word, 0);
+    assert_eq!(w.task().execution.task.load(Ordering::Relaxed), PARENT_TID);
+    assert_eq!(frame.x[0], 0);
+    assert_eq!(w.zone.slot(SLOT).queued(), 0);
+}
