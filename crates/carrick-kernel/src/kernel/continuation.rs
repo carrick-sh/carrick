@@ -89,6 +89,88 @@ pub enum RestartClass {
     RestartBlock,
 }
 
+impl RestartClass {
+    pub fn for_syscall(nr: u64) -> Self {
+        if is_restartable_syscall(nr) {
+            Self::RestartSyscall
+        } else {
+            Self::Never
+        }
+    }
+}
+
+/// Request descriptor for building a blocked continuation.
+#[derive(Clone, Copy, Debug)]
+pub enum BlockedContinuationRequest {
+    Syscall(SyscallRequest),
+    HostReadiness,
+}
+
+impl BlockedContinuationRequest {
+    pub fn restart_class(self) -> RestartClass {
+        match self {
+            Self::Syscall(request) => RestartClass::for_syscall(request.number.raw()),
+            Self::HostReadiness => RestartClass::Never,
+        }
+    }
+}
+
+impl From<SyscallRequest> for BlockedContinuationRequest {
+    fn from(request: SyscallRequest) -> Self {
+        Self::Syscall(request)
+    }
+}
+
+/// Outcome or vfork parent input for building a blocked continuation.
+#[derive(Debug)]
+pub enum BlockedContinuationInput {
+    Dispatch(DispatchOutcome),
+    Vfork {
+        child: TaskKey,
+        wait: VforkParentWait,
+    },
+}
+
+impl From<DispatchOutcome> for BlockedContinuationInput {
+    fn from(outcome: DispatchOutcome) -> Self {
+        Self::Dispatch(outcome)
+    }
+}
+
+/// Prepare a blocked continuation from an active execution lease, binding its
+/// optional product futex table and installing any temporary signal mask into
+/// the kernel context.
+pub fn prepare_blocked_continuation(
+    context: &KernelContext,
+    lease: &crate::kernel::objects::ThreadExecutionLease,
+    request: impl Into<BlockedContinuationRequest>,
+    input: impl Into<BlockedContinuationInput>,
+    futex: Option<&Arc<FutexTable>>,
+) -> Result<BlockedContinuation, ContinuationBuildError> {
+    let request = request.into();
+    let capture = match request {
+        BlockedContinuationRequest::Syscall(syscall) => {
+            ContinuationCapture::from_lease(context, lease, syscall, request.restart_class())?
+        }
+        BlockedContinuationRequest::HostReadiness => {
+            ContinuationCapture::from_host_readiness_lease(context, lease)?
+        }
+    };
+    let mut continuation = match input.into() {
+        BlockedContinuationInput::Dispatch(outcome) => {
+            BlockedContinuation::from_dispatch_outcome(outcome, capture)?
+        }
+        BlockedContinuationInput::Vfork { child, wait } => {
+            BlockedContinuation::from_vfork_parent(capture, child, wait)?
+        }
+    };
+    if let Some(futex) = futex {
+        continuation.bind_product_futex(futex);
+    }
+    continuation.install_temporary_signal_mask(context);
+    Ok(continuation)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SyscallFrame {
     request: SyscallRequest,
@@ -1841,6 +1923,10 @@ impl BlockedContinuation {
 
     pub fn bind_product_futex(&mut self, futex: &Arc<FutexTable>) {
         self.state_mut().private_futex = Some(FutexSource(Arc::clone(futex)));
+    }
+
+    pub fn has_product_futex(&self) -> bool {
+        self.state().private_futex.is_some()
     }
 
     fn resource_fingerprint(&self) -> u64 {
