@@ -91,8 +91,8 @@ pub(super) fn schedule(slot: SlotId) -> ! {
         expire_signal_timer(slot);
         if let Some(selected) = source.zone.switch_in_full(slot) {
             source.zone.leave_idle(slot);
-            let runtime = native_process::runtime();
             let record = source.zone.record_ref(selected.record);
+            let runtime = native_process::runtime_for_record(source.zone, record);
             // SAFETY: switch_in_full transferred this exact record to this slot.
             let Some(state) = (unsafe { runtime.record_binding(record) }) else {
                 source.zone.clear_current(slot);
@@ -224,7 +224,7 @@ pub(crate) fn expire_signal_timer(slot: SlotId) {
     use carrick_guest_arch::{CounterTick, Deadline, InterruptBackend};
     // A native IRQ can arrive before process admission, and timer-only
     // fixtures do not admit the production scheduler zone at all.
-    if native_process::runtime_opt().is_none() {
+    if !native_process::is_admitted() {
         return;
     }
     let zone = source(slot).zone;

@@ -1383,7 +1383,7 @@ mod kernel {
     ) -> bool {
         use carrick_el1::isa::x86::context;
         use carrick_personality_linux::dispatch::CompletionRoute;
-        if native_process::runtime_opt().is_none() { return false; }
+        if !native_process::is_admitted() { return false; }
         let binding = context::current_cpu_binding().unwrap_or_else(|| initial_boot::fatal_boot());
         let slot = carrick_sched_core::SlotId::from_index(binding.cpu_slot as usize).unwrap_or_else(|| initial_boot::fatal_boot());
         let source = native_execution::source(slot);
@@ -1395,7 +1395,18 @@ mod kernel {
             let _copy_gate = crate::user_fault_gate::install();
             let words = native_execution::capture(frame, xsave);
             let mut service = native_process::Service::new(task, slot);
-            let mut process = native_process::runtime().enter(source, task, words, &mut service).unwrap_or_else(|_| initial_boot::fatal_boot());
+            let (process_runtime, address) = native_process::runtime(source, task)
+                .unwrap_or_else(|_| initial_boot::fatal_boot());
+            let mut process = process_runtime
+                .enter_registered(
+                    native_process::registry(),
+                    source,
+                    task,
+                    address,
+                    words,
+                    &mut service,
+                )
+                .unwrap_or_else(|_| initial_boot::fatal_boot());
             if let Some(info) = forced {
                 use carrick_el1::personality::thread_setup::LifecycleVenue;
                 use carrick_personality_linux::signal::policy::{SigBlockMask, Signal};
@@ -1433,7 +1444,7 @@ mod kernel {
         let binding = context::current_cpu_binding().unwrap_or_else(|| initial_boot::fatal_boot());
         let slot = carrick_sched_core::SlotId::from_index(binding.cpu_slot as usize).unwrap_or_else(|| initial_boot::fatal_boot());
         let source = native_execution::source(slot);
-        if native_process::runtime_opt().is_none() { return; }
+        if !native_process::is_admitted() { return; }
         // SAFETY: this CPU owns its retained current-task binding during IRQ entry.
         let task = unsafe { &*(binding.task_address as *const CurrentTask) };
         let mm = carrick_el1_abi::ReservationMm::new(task.mm.key.load(Ordering::Acquire)).unwrap_or_else(|| initial_boot::fatal_boot());
@@ -1451,7 +1462,18 @@ mod kernel {
         {
             let _copy_gate = crate::user_fault_gate::install();
             let mut service = native_process::Service::new(task, slot);
-            let mut process = native_process::runtime().enter(source, task, context::context_words::from_native(&native), &mut service).unwrap_or_else(|_| initial_boot::fatal_boot());
+            let (process_runtime, runtime_address) = native_process::runtime(source, task)
+                .unwrap_or_else(|_| initial_boot::fatal_boot());
+            let mut process = process_runtime
+                .enter_registered(
+                    native_process::registry(),
+                    source,
+                    task,
+                    runtime_address,
+                    context::context_words::from_native(&native),
+                    &mut service,
+                )
+                .unwrap_or_else(|_| initial_boot::fatal_boot());
             if let Some(route) = deliver_signal_on_syscall_return(task, &mut process, &mut returned, xsave) {
                 if route != CompletionRoute::Suspended { initial_boot::fatal_boot(); }
                 suspended = true;
@@ -2336,7 +2358,11 @@ mod kernel {
                 }
                 let mut service = native_process::Service::new(task, slot);
                 let route = {
-                    let mut process = native_process::runtime().enter(source, task, words, &mut service)
+                    let (runtime, address) = native_process::runtime(source, task)
+                        .unwrap_or_else(|_| initial_boot::fatal_boot());
+                    let mut process = runtime.enter_registered(
+                        native_process::registry(), source, task, address, words, &mut service,
+                    )
                         .unwrap_or_else(|_| initial_boot::fatal_boot());
                     let mut native = NativeDispatch {
                         frame, fpstate: _early_xstate, call, publications: &binding.publications,
