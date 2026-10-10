@@ -363,8 +363,19 @@ fn mounted_static_x86_sched_unported_refusal_returns_enosys() {
     let elf = dir.path().join("sched-refusal");
     compile_assembly("x86_sched_refusal.S", &elf);
     let run = run_mounted_binary(&elf, "sched-refusal", false);
-    assert_eq!(run.stdout, b"R\n", "status: {:?}; stderr: {}", run.status, String::from_utf8_lossy(&run.stderr));
-    assert_eq!(run.status.code(), Some(7), "stderr: {}", String::from_utf8_lossy(&run.stderr));
+    assert_eq!(
+        run.stdout,
+        b"R\n",
+        "status: {:?}; stderr: {}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        run.status.code(),
+        Some(7),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
 }
 
 #[test]
