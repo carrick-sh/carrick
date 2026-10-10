@@ -53,7 +53,7 @@ impl ProcessSignals for Native {
         Action,
     )> {
         self.calls += 1;
-        let signal = carrick_signal_core::policy::Signal::from_number(10).unwrap();
+        let signal = carrick_signal_core::policy::Signal::from_number(10)?;
         (!blocked.signals().contains(signal)).then_some((signal, None, Action::default()))
     }
     fn force_sigsegv(&mut self, _: SigBlockMask) -> Result<(), carrick_syscall_abi::LinuxErrno> {

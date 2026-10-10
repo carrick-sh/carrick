@@ -4600,7 +4600,7 @@ mod tests {
         control.init_blocked(carrick_el1_abi::BlockedMask(set.bits()));
         entry
             .kill(
-                carrick_personality_linux::signal::SignalProcessSelector::from_abi((41) as u64),
+                carrick_personality_linux::signal::SignalProcessSelector::from_abi(41),
                 carrick_personality_linux::signal::SignalRequest::from_abi(10).unwrap(),
                 carrick_personality_linux::signal::SignalInfo::Generated(None),
             )
@@ -5611,7 +5611,7 @@ mod tests {
             );
             assert_eq!(
                 child_entry.kill(
-                    carrick_personality_linux::signal::SignalProcessSelector::from_abi((41) as u64),
+                    carrick_personality_linux::signal::SignalProcessSelector::from_abi(41),
                     carrick_personality_linux::signal::SignalRequest::from_abi(0).unwrap(),
                     SignalInfo::Queued(forged)
                 ),
@@ -5625,7 +5625,7 @@ mod tests {
             );
             assert_eq!(
                 child_entry.kill(
-                    carrick_personality_linux::signal::SignalProcessSelector::from_abi((41) as u64),
+                    carrick_personality_linux::signal::SignalProcessSelector::from_abi(41),
                     carrick_personality_linux::signal::SignalRequest::from_abi(0).unwrap(),
                     SignalInfo::Queued(queued)
                 ),
@@ -5633,7 +5633,7 @@ mod tests {
             );
             assert_eq!(
                 child_entry.kill(
-                    carrick_personality_linux::signal::SignalProcessSelector::from_abi((42) as u64),
+                    carrick_personality_linux::signal::SignalProcessSelector::from_abi(42),
                     carrick_personality_linux::signal::SignalRequest::from_abi(0).unwrap(),
                     SignalInfo::Queued(forged)
                 ),
@@ -5784,7 +5784,7 @@ mod tests {
             }
             assert_eq!(
                 parent_entry.kill(
-                    carrick_personality_linux::signal::SignalProcessSelector::from_abi((42) as u64),
+                    carrick_personality_linux::signal::SignalProcessSelector::from_abi(42),
                     carrick_personality_linux::signal::SignalRequest::from_abi(15).unwrap(),
                     carrick_personality_linux::signal::SignalInfo::Generated(None)
                 ),
