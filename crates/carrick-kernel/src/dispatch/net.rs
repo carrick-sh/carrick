@@ -91,16 +91,78 @@ use crate::dispatch::wait_plan::{
 use crate::dispatch::wait_source::{
     HostProxyCoverage, HostWaitTarget, WaitInterest, WaitRegistration, WaitSource,
 };
-#[cfg(test)]
-use crate::linux_abi::LINUX_POLLHUP;
 use crate::linux_abi::{
     LINUX_ICMP_ECHO_REPLY, LINUX_ICMP_ECHO_REQUEST, LINUX_IPPROTO_ICMP, LINUX_IPPROTO_TCP,
-    LINUX_MSG_NOSIGNAL, LINUX_POLLRDHUP,
+    LINUX_MSG_NOSIGNAL, LINUX_POLLERR, LINUX_POLLHUP, LINUX_POLLRDBAND, LINUX_POLLRDHUP,
+    LINUX_POLLRDNORM, LINUX_POLLWRBAND, LINUX_POLLWRNORM,
 };
 use crate::network::{BindTarget, ConnectTarget, GuestSocketAddr, HostSocketAddr};
 use carrick_abi::LinuxPollEvents;
 use carrick_abi::syscall::nr;
 use carrick_vfs::errno::HostSyscallResult as _;
+
+fn host_poll_interest(requested: i16) -> i16 {
+    let mut host = 0;
+    for (linux, native) in [
+        (LINUX_POLLIN, libc::POLLIN),
+        (LINUX_POLLOUT, libc::POLLOUT),
+        (LINUX_POLLRDNORM, libc::POLLRDNORM),
+        (LINUX_POLLRDBAND, libc::POLLRDBAND),
+        (LINUX_POLLWRNORM, libc::POLLWRNORM),
+        (LINUX_POLLWRBAND, libc::POLLWRBAND),
+        (libc::POLLPRI, libc::POLLPRI),
+    ] {
+        if requested & linux != 0 {
+            host |= native;
+        }
+    }
+    host
+}
+
+fn linux_poll_revents(native_events: i16, requested: i16) -> i16 {
+    let mut linux = 0;
+    for (guest, native) in [
+        (LINUX_POLLIN, libc::POLLIN),
+        (LINUX_POLLOUT, libc::POLLOUT),
+        (LINUX_POLLRDNORM, libc::POLLRDNORM),
+        (LINUX_POLLRDBAND, libc::POLLRDBAND),
+        (LINUX_POLLWRNORM, libc::POLLWRNORM),
+        (LINUX_POLLWRBAND, libc::POLLWRBAND),
+        (libc::POLLPRI, libc::POLLPRI),
+    ] {
+        if requested & guest != 0 && native_events & native != 0 {
+            linux |= guest;
+        }
+    }
+    for (guest, native) in [
+        (LINUX_POLLERR, libc::POLLERR),
+        (LINUX_POLLHUP, libc::POLLHUP),
+        (LINUX_POLLNVAL, libc::POLLNVAL),
+    ] {
+        if native_events & native != 0 {
+            linux |= guest;
+        }
+    }
+    linux
+}
+
+#[cfg(test)]
+mod bare_stdio_poll_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn poll_normal_and_band_bits_follow_host_encoding() {
+        assert_eq!(host_poll_interest(LINUX_POLLWRNORM), libc::POLLWRNORM);
+        assert_eq!(host_poll_interest(LINUX_POLLWRBAND), libc::POLLWRBAND);
+        assert_eq!(
+            linux_poll_revents(libc::POLLWRNORM, LINUX_POLLWRNORM),
+            LINUX_POLLWRNORM
+        );
+        assert_eq!(linux_poll_revents(libc::POLLWRBAND, LINUX_POLLWRNORM), 0);
+        assert_eq!(linux_poll_revents(libc::POLLHUP, 0), LINUX_POLLHUP);
+        assert_eq!(host_poll_interest(LINUX_POLLRDHUP), 0);
+    }
+}
 
 syscall_table! {
     /// Per-module syscall routing for the `net` subsystem (Task A1).
@@ -1003,11 +1065,23 @@ impl<'a> NetView<'a> {
                 Some(super::fs::state::StdioReadiness::Host(host_fd)) => {
                     let mut pfd = libc::pollfd {
                         fd: host_fd.raw(),
-                        events: requested_events,
+                        events: host_poll_interest(requested_events),
                         revents: 0,
                     };
                     let n = unsafe { libc::poll(&mut pfd as *mut _, 1, 0) };
-                    if n > 0 { pfd.revents } else { 0 }
+                    let revents = if n > 0 {
+                        linux_poll_revents(pfd.revents, requested_events)
+                    } else {
+                        0
+                    };
+                    // The established bare-stdio contract reports writable
+                    // stdin even if the carrier's fd 0 is read-only.
+                    revents
+                        | if fd == 0 {
+                            requested_events & LINUX_POLLOUT
+                        } else {
+                            0
+                        }
                 }
                 None => LINUX_POLLNVAL,
             }
