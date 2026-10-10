@@ -6,15 +6,5 @@
 //! `_umtx_op` shim existed for the retired one-host-process-per-guest-process
 //! model, where a shared page had to survive a real host `fork`.
 
-use std::sync::Arc;
-
-use carrick_thread::platform_futex::{FutexTableFutex, SharedFutexTable};
-use carrick_thread::thread::FutexTable;
-
-/// The bhyve `PlatformFutex`. Construct with [`make_bhyve_futex`].
-pub type BhyveFutex = FutexTableFutex;
-
-/// Wrap the process-private `FutexTable`.
-pub fn make_bhyve_futex(table: Arc<FutexTable>, shared: SharedFutexTable) -> BhyveFutex {
-    FutexTableFutex::new(table, shared)
-}
+/// The bhyve `PlatformFutex`. Re-exported from the shared BSD futex module.
+pub use carrick_host_bsd::futex::{BsdFutex as BhyveFutex, make_bsd_futex as make_bhyve_futex};

@@ -93,9 +93,13 @@ pub mod signal_pump;
 /// The pluggable M:N admission scheduler bounding guest threads onto N vCPU slots.
 pub mod vcpu_sched;
 pub use vcpu_sched::{SlotId, SlotLease, VcpuScheduler, Yield};
+pub mod posix_signal_kick;
+pub use posix_signal_kick::PosixSignalKick;
 pub mod posix_timer;
 pub mod timer_delivery;
-pub use timer_delivery::{PosixTimerSpec, TimerArm, TimerDelivery, TimerSpecNs};
+pub use timer_delivery::{
+    FallbackTimerDelivery, PosixTimerSpec, TimerArm, TimerDelivery, TimerSpecNs,
+};
 /// The dispatcher's seam onto the backend's timer registry and firing mechanism.
 pub mod guest_timer_bridge;
 pub use guest_timer_bridge::{
