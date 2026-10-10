@@ -3695,9 +3695,9 @@ const _: () = {
     );
 };
 #[cfg(target_arch = "aarch64")]
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0xa27e_c1a8_9c85_4cd7);
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0xd26b_93dc_d8d3_8efe);
 #[cfg(not(target_arch = "aarch64"))]
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0xf9e1_467b_7ce8_27db);
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x2fa8_0cac_89ec_4ca2);
 
 #[cfg(test)]
 mod tests {
@@ -3741,7 +3741,6 @@ mod tests {
                 snapshot.first_native_fork_failure.load(Ordering::Acquire)
             ),
             Some(NativeForkFailureStage::Census)
-
         );
     }
 
