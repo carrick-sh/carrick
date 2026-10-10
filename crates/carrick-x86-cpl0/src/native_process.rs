@@ -412,10 +412,33 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                 .abort(&owner, &p.words, self.worker())
                 .map_err(error)
         });
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) => Err((e, p)),
+        if let Err(e) = result {
+            return Err((e, p));
         }
+        // SAFETY: the aborted child never published these exclusive extents;
+        // the graph rollback has removed its only guest-side readers.
+        unsafe {
+            core::ptr::write_bytes(
+                p.loan.lifecycle.page.raw() as *mut u8,
+                0,
+                core::mem::size_of::<ThreadLifecyclePage>(),
+            );
+            core::ptr::write_bytes(
+                p.loan.lifecycle.controls.raw() as *mut u8,
+                0,
+                core::mem::size_of::<ThreadControlSlot>() * (carrick_el1_abi::THREAD_POOL_ENTRIES + 1),
+            );
+        }
+        let mut settlement = ForkStockSettlement::abort(p.loan);
+        // SAFETY: the aborted loan is still exclusively owned across this
+        // stopped crossing; the host authenticates its exact execution key.
+        unsafe {
+            core::arch::asm!("out dx, eax", in("dx") FORK_STOCK_PORT, in("rax") &raw mut settlement, options(nostack));
+        }
+        if !matches!(settlement.take(p.loan), Some(Ok(()))) {
+            return Err((NativeProcessError::Quarantined, p));
+        }
+        Ok(())
     }
     fn settle_mm(&mut self, born: Box<Born>) -> Result<(), (NativeProcessError, Box<Born>)> {
         settle(born, self.worker())
