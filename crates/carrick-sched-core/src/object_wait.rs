@@ -1693,10 +1693,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     pub(super) fn expire_object_park(
         &self,
         slot: SlotId,
-        record: RecordId,
+        exact: RecordRef,
         seq: u32,
     ) -> Result<bool, ()> {
-        let rec = self.record(record);
+        let record = exact.id;
+        let Some(rec) = self.live(exact) else {
+            return Ok(false);
+        };
         let index = rec.object.queue.load(Ordering::Acquire);
         let Some(key) = ObjectWaitKey::from_retained_registration(
             index,
@@ -1712,7 +1715,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         let Some(slot_guard) = self.slot_lock(slot, &SpinForever) else {
             return Err(());
         };
-        if rec.object.queue.load(Ordering::Acquire) != index
+        if self.live(exact).is_none()
+            || rec.object.queue.load(Ordering::Acquire) != index
             || !rec.cas(Claim::Parked { seq }, Claim::Queued { slot, seq })
         {
             return Ok(false);
@@ -2799,6 +2803,7 @@ mod host_tests {
             )
             .unwrap();
         let seq = zone.next_seq(record);
+        zone.arm_timer(SLOT, record, seq).unwrap();
         let guard = zone.object_wait(key(index), &SpinForever).unwrap();
         guard
             .park_until(
@@ -2808,7 +2813,6 @@ mod host_tests {
                 deadline,
             )
             .unwrap();
-        zone.arm_timer(SLOT, record, seq).unwrap();
         drop(guard);
         zone.clear_current(SLOT);
         record
@@ -2909,6 +2913,21 @@ mod host_tests {
         record
     }
 
+    #[test]
+    fn concurrent_timed_parks_share_the_slot_timer() {
+        let zone = fixture(true);
+        let later = park_foreign_until(&zone, 1, 310, 2_000);
+        let earlier = park_foreign_until(&zone, 2, 311, 1_000);
+        assert_eq!(zone.timer_deadline(SLOT), Some(1_000));
+        assert_eq!(zone.expire_timer(SLOT, 1_000, 0), Ok(true));
+        assert!(matches!(zone.record(earlier).claim(), Claim::Queued { .. }));
+        assert!(matches!(zone.record(later).claim(), Claim::Parked { .. }));
+        assert_eq!(zone.timer_deadline(SLOT), Some(2_000));
+        assert_eq!(zone.expire_timer(SLOT, 2_000, 0), Ok(true));
+        assert!(matches!(zone.record(later).claim(), Claim::Queued { .. }));
+        assert_eq!(zone.timer_deadline(SLOT), None);
+    }
+
     /// A slot's timer has exactly one owner, and whichever record owns it
     /// is handed to the host at every way the slot's executor leaves EL1:
     /// with its own thread running (a plain exit), with its own thread
@@ -2921,7 +2940,7 @@ mod host_tests {
         let zone = fixture(true);
         let foreign = park_foreign_until(&zone, 1, 300, 1_000);
         let owner = zone.timer_owner(SLOT).unwrap();
-        assert_eq!(owner.record, foreign);
+        assert_eq!(owner.record, zone.record_ref(foreign));
         let taken = zone.take_foreign_timer(SLOT).unwrap();
         assert_eq!(taken.record, zone.record_ref(foreign));
         assert_eq!(taken.seq, owner.seq);
@@ -2938,17 +2957,16 @@ mod host_tests {
         );
         assert_eq!(notify(&zone, 1).0.visited, 0, "the claim unlinked it");
 
-        // One owner: while it is live, no other park may take the timer;
-        // the home record's timed park is refused (it forwards) too.
+        // A pending reservation cannot displace another live timed park.
         let zone = fixture(true);
         let foreign = park_foreign_until(&zone, 1, 301, 1_000);
         let other = allocate(&zone, 302);
+        assert_eq!(zone.arm_timer(SLOT, other, zone.next_seq(other)), Ok(()));
+        assert!(zone.timer_admission_available(SLOT));
         assert_eq!(
-            zone.arm_timer(SLOT, other, zone.next_seq(other)),
-            Err(TimerBusy)
+            zone.timer_owner(SLOT).unwrap().record,
+            zone.record_ref(foreign)
         );
-        assert!(!zone.timer_free(SLOT));
-        assert_eq!(zone.timer_owner(SLOT).unwrap().record, foreign);
 
         // Settle path: the home record parked untimed, the foreign record
         // owns the timer. The foreign park is handed back; `unhome` returns
@@ -3001,7 +3019,7 @@ mod host_tests {
         let _ = park_foreign_until(&zone, 1, 304, 1_000);
         assert_eq!(notify(&zone, 1).0.queued, 1);
         assert_eq!(zone.take_foreign_timer(SLOT), None);
-        assert!(zone.timer_free(SLOT));
+        assert!(zone.timer_admission_available(SLOT));
     }
 
     #[test]

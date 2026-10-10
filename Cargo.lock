@@ -497,6 +497,7 @@ dependencies = [
  "carrick-personality-linux",
  "carrick-sched-core",
  "carrick-signal-core",
+ "carrick-syscall-abi",
  "carrick-test-support",
  "zerocopy",
 ]
@@ -594,6 +595,7 @@ dependencies = [
 name = "carrick-guest-arch"
 version = "0.1.0"
 dependencies = [
+ "carrick-signal-core",
  "carrick-syscall-abi",
  "zerocopy",
 ]
@@ -717,6 +719,7 @@ dependencies = [
  "carrick-el1",
  "carrick-el1-abi",
  "carrick-fatal",
+ "carrick-guest-arch",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",
@@ -846,6 +849,7 @@ dependencies = [
  "carrick-signal-core",
  "carrick-syscall-abi",
  "carrick-x86",
+ "zerocopy",
 ]
 
 [[package]]
@@ -976,6 +980,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.11.1",
  "serde",
+ "zerocopy",
 ]
 
 [[package]]
@@ -1167,6 +1172,7 @@ dependencies = [
 name = "carrick-x86-cpl0"
 version = "0.1.0"
 dependencies = [
+ "carrick-abi",
  "carrick-core",
  "carrick-core-abi",
  "carrick-el1",

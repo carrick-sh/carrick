@@ -3,16 +3,90 @@
 
 use bitflags::bitflags;
 
+mod capability;
 mod errno;
 pub mod syscall_x86_64;
-pub use errno::{LINUX_EAGAIN, LINUX_ECHILD, LINUX_EFAULT, LINUX_EINVAL, LINUX_ENOSYS, LinuxErrno};
+pub use capability::{
+    CAP_AUDIT_CONTROL, CAP_AUDIT_READ, CAP_AUDIT_WRITE, CAP_BLOCK_SUSPEND, CAP_BPF,
+    CAP_CHECKPOINT_RESTORE, CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER,
+    CAP_FSETID, CAP_IPC_LOCK, CAP_IPC_OWNER, CAP_KILL, CAP_LAST_CAP, CAP_LEASE,
+    CAP_LINUX_IMMUTABLE, CAP_MAC_ADMIN, CAP_MAC_OVERRIDE, CAP_MKNOD, CAP_NET_ADMIN,
+    CAP_NET_BIND_SERVICE, CAP_NET_BROADCAST, CAP_NET_RAW, CAP_PERFMON, CAP_SETFCAP, CAP_SETGID,
+    CAP_SETPCAP, CAP_SETUID, CAP_SYS_ADMIN, CAP_SYS_BOOT, CAP_SYS_CHROOT, CAP_SYS_MODULE,
+    CAP_SYS_NICE, CAP_SYS_PACCT, CAP_SYS_PTRACE, CAP_SYS_RAWIO, CAP_SYS_RESOURCE, CAP_SYS_TIME,
+    CAP_SYS_TTY_CONFIG, CAP_SYSLOG, CAP_WAKE_ALARM, LinuxCapabilitySet,
+};
+pub use errno::{
+    LINUX_EAGAIN, LINUX_EBADF, LINUX_ECHILD, LINUX_EFAULT, LINUX_EINTR, LINUX_EINVAL, LINUX_ENOSYS,
+    LINUX_EPERM, LINUX_ESRCH, LinuxErrno,
+};
+mod signal;
+pub use signal::{
+    AARCH64_EL0_USER_PSTATE_MASK, CARRICK_SIGFRAME_MAGIC, CARRICK_X8664_XSTATE_TRAILER_MAGIC,
+    CARRICK_X8664_XSTATE_TRAILER_VERSION, CarrickSigframe, CarrickX8664XstateTrailer,
+    LINUX_AARCH64_SIGCONTEXT_RESERVED_BYTES, LINUX_BUS_ADRALN, LINUX_BUS_ADRERR, LINUX_CLD_DUMPED,
+    LINUX_CLD_EXITED, LINUX_CLD_KILLED, LINUX_FPSIMD_MAGIC, LINUX_KERNEL_SIGSET_SIZE,
+    LINUX_POLL_MSG, LINUX_RT_SIGSET_SIZE, LINUX_SA_NOCLDSTOP, LINUX_SA_NOCLDWAIT, LINUX_SA_NODEFER,
+    LINUX_SA_ONSTACK, LINUX_SA_RESETHAND, LINUX_SA_RESTART, LINUX_SA_RESTORER, LINUX_SA_SIGINFO,
+    LINUX_SEGV_ACCERR, LINUX_SEGV_MAPERR, LINUX_SI_KERNEL, LINUX_SI_MESGQ, LINUX_SI_QUEUE,
+    LINUX_SI_TIMER, LINUX_SI_TKILL, LINUX_SI_USER, LINUX_SIG_DFL, LINUX_SIG_IGN, LINUX_SIGABRT,
+    LINUX_SIGALRM, LINUX_SIGBUS, LINUX_SIGCHLD, LINUX_SIGCONT, LINUX_SIGFPE, LINUX_SIGHUP,
+    LINUX_SIGILL, LINUX_SIGINFO_SIZE, LINUX_SIGINT, LINUX_SIGIO, LINUX_SIGKILL, LINUX_SIGPIPE,
+    LINUX_SIGPROF, LINUX_SIGPWR, LINUX_SIGQUIT, LINUX_SIGSEGV, LINUX_SIGSET_WORDS, LINUX_SIGSTKFLT,
+    LINUX_SIGSTOP, LINUX_SIGSYS, LINUX_SIGTERM, LINUX_SIGTRAP, LINUX_SIGTSTP, LINUX_SIGTTIN,
+    LINUX_SIGTTOU, LINUX_SIGURG, LINUX_SIGUSR1, LINUX_SIGUSR2, LINUX_SIGVTALRM, LINUX_SIGWINCH,
+    LINUX_SIGXCPU, LINUX_SIGXFSZ, LINUX_SS_AUTODISARM, LINUX_SS_DISABLE, LINUX_SS_ONSTACK,
+    LINUX_UCONTEXT_SIGMASK_PAD_BYTES, LINUX_X8664_USER_CS, LINUX_X8664_USER_DS, LinuxFpsimdContext,
+    LinuxSigaction, LinuxSigaltstack, LinuxSiginfo, LinuxSignalContext, LinuxSignalStack,
+    LinuxUcontext, X8664_FP_XSTATE_MAGIC1, X8664_FP_XSTATE_MAGIC2, X8664_FP_XSTATE_MAGIC2_SIZE,
+    X8664_FP_XSTATE_SW_BYTES_OFFSET, X8664_RTSIGFRAME_FPSTATE_OFFSET, X8664_XFEATURE_PKRU,
+    X8664_XSAVE_AREA_MAX_LEN, X8664_XSAVE_HEADER_LEN, X8664_XSAVE_LEGACY_LEN, X8664_XSAVE_MIN_LEN,
+    X8664Fpstate, X8664FpxSwBytes, X8664Rtsigframe, X8664Sigcontext, X8664Ucontext,
+    X8664XsaveHeader,
+};
 
 /// Canonical numbers served by the shared guest lifecycle owner.
 pub mod nr {
     use super::CanonicalNr;
 
+    pub const CAPGET: CanonicalNr = CanonicalNr(90);
+    pub const CAPSET: CanonicalNr = CanonicalNr(91);
+    pub const PERSONALITY: CanonicalNr = CanonicalNr(92);
     pub const EXIT_GROUP: CanonicalNr = CanonicalNr(94);
+    pub const SET_TID_ADDRESS: CanonicalNr = CanonicalNr(96);
+    pub const GET_ROBUST_LIST: CanonicalNr = CanonicalNr(100);
+    pub const SETREGID: CanonicalNr = CanonicalNr(143);
+    pub const SETGID: CanonicalNr = CanonicalNr(144);
+    pub const SETREUID: CanonicalNr = CanonicalNr(145);
+    pub const SETUID: CanonicalNr = CanonicalNr(146);
+    pub const SETRESUID: CanonicalNr = CanonicalNr(147);
+    pub const GETRESUID: CanonicalNr = CanonicalNr(148);
+    pub const SETRESGID: CanonicalNr = CanonicalNr(149);
+    pub const GETRESGID: CanonicalNr = CanonicalNr(150);
+    pub const SETFSUID: CanonicalNr = CanonicalNr(151);
+    pub const SETFSGID: CanonicalNr = CanonicalNr(152);
+    pub const SETPGID: CanonicalNr = CanonicalNr(154);
+    pub const GETPGID: CanonicalNr = CanonicalNr(155);
+    pub const GETSID: CanonicalNr = CanonicalNr(156);
+    pub const SETSID: CanonicalNr = CanonicalNr(157);
+    pub const GETGROUPS: CanonicalNr = CanonicalNr(158);
+    pub const SETGROUPS: CanonicalNr = CanonicalNr(159);
+    pub const UNAME: CanonicalNr = CanonicalNr(160);
+    pub const SETHOSTNAME: CanonicalNr = CanonicalNr(161);
+    pub const SETDOMAINNAME: CanonicalNr = CanonicalNr(162);
+    pub const GETRLIMIT: CanonicalNr = CanonicalNr(163);
+    pub const SETRLIMIT: CanonicalNr = CanonicalNr(164);
+    pub const GETRUSAGE: CanonicalNr = CanonicalNr(165);
+    pub const UMASK: CanonicalNr = CanonicalNr(166);
+    pub const PRCTL: CanonicalNr = CanonicalNr(167);
+    pub const GETPPID: CanonicalNr = CanonicalNr(173);
+    pub const GETUID: CanonicalNr = CanonicalNr(174);
+    pub const GETEUID: CanonicalNr = CanonicalNr(175);
+    pub const GETGID: CanonicalNr = CanonicalNr(176);
+    pub const GETEGID: CanonicalNr = CanonicalNr(177);
+    pub const SYSINFO: CanonicalNr = CanonicalNr(179);
     pub const WAIT4: CanonicalNr = CanonicalNr(260);
+    pub const PRLIMIT64: CanonicalNr = CanonicalNr(261);
 }
 
 /// A CANONICAL syscall number — the asm-generic/aarch64 numbering every guest

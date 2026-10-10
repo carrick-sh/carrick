@@ -46,3 +46,32 @@ fn x86_process_calls_route_to_neutral_lifecycle_hooks() {
         Family::Lifecycle(LifecycleCall::ExitGroup)
     );
 }
+
+#[test]
+fn arm_sigreturn_stays_with_host_frame_owner() {
+    assert_eq!(route_aarch64(139, u64::MAX), Family::Unported);
+    assert_eq!(
+        carrick_personality_linux::dispatch::route_x86_64(139, u64::MAX),
+        Family::Signal(carrick_personality_linux::signal::SignalCall::RtSigreturn)
+    );
+}
+
+#[test]
+fn pidfds_remain_unported_until_the_native_owner_exists() {
+    assert_eq!(route_aarch64(424, u64::MAX), Family::Unported);
+    assert_eq!(
+        carrick_personality_linux::dispatch::route_x86_64(424, u64::MAX),
+        Family::Unported
+    );
+}
+
+#[test]
+fn arm_signal_calls_stay_with_host_delivery_owner() {
+    for ordinal in (129..=139).chain(core::iter::once(240)) {
+        assert_eq!(
+            route_aarch64(ordinal, u64::MAX),
+            Family::Unported,
+            "ARM signal ordinal {ordinal} must use its host action and delivery owner"
+        );
+    }
+}

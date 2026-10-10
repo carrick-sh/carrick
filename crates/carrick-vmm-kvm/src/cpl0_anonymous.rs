@@ -13,6 +13,7 @@ const _: () = {
         carrick_el1_abi::FORK_STOCK_PORT,
         carrick_el1_abi::NATIVE_ROOT_EXIT_PORT,
         carrick_el1_abi::NATIVE_PEER_READY_PORT,
+        carrick_el1_abi::NATIVE_RUN_FAILURE_PORT,
     ];
     let existing = [
         FAULT_DOORBELL_PORT,
@@ -71,7 +72,7 @@ impl KernelPodStorage {
             || segment.perms.execute
             || segment.memory_size == 0
             || segment.virtual_address < IMAGE_VA
-            || end > IMAGE_VA + 0x10_0000
+            || end > IMAGE_VA + IMAGE_SIZE
         {
             return None;
         }
@@ -568,6 +569,24 @@ impl Cpl0HostCustody {
         Ok(bytes)
     }
 
+    pub(super) fn service_run_failure(
+        &self,
+        lease: &StoppedCpuLease<'_>,
+    ) -> Result<carrick_el1_abi::NativeRunFailureReason, TrapError> {
+        let execution = self.physical_execution(lease)?;
+        // SAFETY: the record consists of eight initialized u64s, valid for all bit patterns.
+        let (_, record) = unsafe {
+            self.read_stack_record::<carrick_el1_abi::NativeRunFailure>(
+                lease,
+                execution.context,
+                lease.vcpu.get_gpr(X86Reg::Rax)?,
+            )
+        }?;
+        record
+            .reason_for(execution.binding)
+            .ok_or_else(|| fail("native run failure execution/reason"))
+    }
+
     pub(super) fn service_root_exit(
         &self,
         lease: &StoppedCpuLease<'_>,
@@ -584,7 +603,11 @@ impl Cpl0HostCustody {
         let status = record
             .status_for(execution.binding)
             .ok_or_else(|| fail("native root exit execution/status"))?;
-        Ok(GuestExitStatus::from_linux_code(status.raw() >> 8))
+        Ok(GuestExitStatus::from_linux_code(
+            status
+                .term_signal()
+                .map_or(status.raw() >> 8, |signal| 128 + i32::from(signal)),
+        ))
     }
 
     pub(super) fn service_fork_stock(
@@ -1571,6 +1594,26 @@ mod custody_tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn kernel_pod_storage_enforces_shared_supervisor_extent() {
+        use carrick_mem::elf::{LoadSegment, SegmentPerms};
+        let mut segment = LoadSegment {
+            file_offset: 0,
+            virtual_address: IMAGE_VA + IMAGE_SIZE - 4096,
+            file_size: 0,
+            memory_size: 4096,
+            alignment: 4096,
+            perms: SegmentPerms {
+                read: true,
+                write: true,
+                execute: false,
+            },
+        };
+        assert!(KernelPodStorage::from_load(&segment).is_some());
+        segment.memory_size += 1;
+        assert!(KernelPodStorage::from_load(&segment).is_none());
     }
 
     #[test]

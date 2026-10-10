@@ -28,8 +28,8 @@ use carrick_sched_core::process::wait::{
     WaitLive, WaitQuery, WaitReadiness, WaitSelection, WaitZombie,
 };
 use carrick_sched_core::process::{
-    ChildExitSignal, LinuxWaitStatus, ProcessContext, ProcessRelations, SessionId, TaskId,
-    TaskIdentity, TaskKey, TaskLifecycle, TaskRusage, Zombie,
+    ChildExitSignal, LinuxWaitStatus, ProcessContext, ProcessRelations, RlimitSet, SessionId,
+    TaskCredentials, TaskId, TaskIdentity, TaskKey, TaskLifecycle, TaskRusage, Zombie,
 };
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -69,14 +69,15 @@ pub struct GuestTaskMetadata<C, U> {
     pub identity: TaskIdentity,
     pub namespace_process_group: u32,
     pub namespace_session: u32,
-    pub ruid: U,
-    pub euid: U,
+    /// Encode a UID into the immutable zombie receipt's presentation domain.
+    pub receipt_uid: fn(carrick_sched_core::process::TaskUid) -> U,
     pub exit_signal: ChildExitSignal,
     pub diagnostic_name: String,
 }
 
 pub struct GuestTask<C, U, N: NativeProcessCustody> {
     metadata: GuestTaskMetadata<C, U>,
+    exit_tid: u32,
     relations: ProcessRelations,
     revision: TaskRevision,
     exiting: AtomicBool,
@@ -86,7 +87,121 @@ pub struct GuestTask<C, U, N: NativeProcessCustody> {
     tracer: Option<TaskKey>,
     tracees: BTreeSet<TaskKey>,
     children_rusage: TaskRusage,
+    pub rlimits: RlimitSet,
+    pub umask: u32,
+    pub personality: u64,
+    pub pdeathsig: u8,
+    pub dumpable: u32,
+    pub no_new_privs: bool,
+    pub child_subreaper: bool,
+    pub has_execed: bool,
+    pub threads: GuestThreads,
 }
+
+#[derive(Clone)]
+pub struct GuestThreadState {
+    pub tid: u32,
+    pub credentials: TaskCredentials,
+    pub comm: [u8; 16],
+}
+
+#[derive(Clone)]
+pub struct GuestThreads {
+    pub threads: Vec<GuestThreadState>,
+}
+
+impl GuestThreads {
+    #[inline(never)]
+    pub fn new(leader_tid: u32) -> Self {
+        Self {
+            threads: alloc::vec![GuestThreadState {
+                tid: leader_tid,
+                credentials: TaskCredentials::ROOT,
+                comm: [0u8; 16],
+            }],
+        }
+    }
+
+    #[inline(never)]
+    pub fn has_thread(&self, tid: u32) -> bool {
+        self.threads.iter().any(|t| t.tid == tid)
+    }
+
+    #[inline(never)]
+    pub fn credentials_for(&self, tid: u32) -> Result<&TaskCredentials, i64> {
+        self.threads
+            .iter()
+            .find(|t| t.tid == tid)
+            .map(|t| &t.credentials)
+            .ok_or(carrick_personality_linux::identity::ESRCH)
+    }
+
+    #[inline(never)]
+    pub fn credentials_for_mut(&mut self, tid: u32) -> Result<&mut TaskCredentials, i64> {
+        self.threads
+            .iter_mut()
+            .find(|t| t.tid == tid)
+            .map(|t| &mut t.credentials)
+            .ok_or(carrick_personality_linux::identity::ESRCH)
+    }
+
+    #[inline(never)]
+    pub fn comm_for(&self, tid: u32) -> Result<&[u8; 16], i64> {
+        self.threads
+            .iter()
+            .find(|t| t.tid == tid)
+            .map(|t| &t.comm)
+            .ok_or(carrick_personality_linux::identity::ESRCH)
+    }
+
+    #[inline(never)]
+    pub fn comm_for_mut(&mut self, tid: u32) -> Result<&mut [u8; 16], i64> {
+        self.threads
+            .iter_mut()
+            .find(|t| t.tid == tid)
+            .map(|t| &mut t.comm)
+            .ok_or(carrick_personality_linux::identity::ESRCH)
+    }
+
+    #[inline(never)]
+    pub fn spawn_thread(&mut self, caller_tid: u32, child_tid: u32) -> Result<(), i64> {
+        let (creds, comm) = {
+            let caller = self
+                .threads
+                .iter()
+                .find(|t| t.tid == caller_tid)
+                .ok_or(carrick_personality_linux::identity::ESRCH)?;
+            (caller.credentials.clone(), caller.comm)
+        };
+        if let Some(entry) = self.threads.iter_mut().find(|t| t.tid == child_tid) {
+            entry.credentials = creds;
+            entry.comm = comm;
+        } else {
+            self.threads.push(GuestThreadState {
+                tid: child_tid,
+                credentials: creds,
+                comm,
+            });
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    pub fn remove_thread(&mut self, tid: u32) {
+        self.threads.retain(|t| t.tid != tid);
+    }
+
+    #[inline(never)]
+    pub fn reset_single(&mut self, tid: u32, creds: TaskCredentials, comm: [u8; 16]) {
+        self.threads.clear();
+        self.threads.push(GuestThreadState {
+            tid,
+            credentials: creds,
+            comm,
+        });
+    }
+}
+
 impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
     pub fn new(
         metadata: GuestTaskMetadata<C, U>,
@@ -95,8 +210,10 @@ impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
         native: N,
         claim: N::Claim,
     ) -> Self {
+        let leader_tid = metadata.namespace_pid;
         Self {
             metadata,
+            exit_tid: leader_tid,
             relations: ProcessRelations::new(parent),
             revision: TaskRevision::INITIAL,
             exiting: AtomicBool::new(false),
@@ -106,13 +223,69 @@ impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
             tracer: None,
             tracees: BTreeSet::new(),
             children_rusage: TaskRusage::default(),
+            rlimits: RlimitSet::DEFAULT,
+            umask: 0o022,
+            personality: 0,
+            pdeathsig: 0,
+            dumpable: 1,
+            no_new_privs: false,
+            child_subreaper: false,
+            has_execed: false,
+            threads: GuestThreads::new(leader_tid),
         }
+    }
+    #[inline]
+    pub fn init_leader(&mut self, tid: u32, creds: TaskCredentials, comm: [u8; 16]) {
+        self.threads.reset_single(tid, creds, comm);
+    }
+    #[inline]
+    pub fn has_thread(&self, tid: u32) -> bool {
+        self.threads.has_thread(tid)
+    }
+    #[inline]
+    pub fn credentials_for(&self, tid: u32) -> Result<&TaskCredentials, i64> {
+        self.threads.credentials_for(tid)
+    }
+    #[inline]
+    pub fn credentials_for_mut(&mut self, tid: u32) -> Result<&mut TaskCredentials, i64> {
+        self.threads.credentials_for_mut(tid)
+    }
+    #[inline]
+    pub fn comm_for(&self, tid: u32) -> Result<&[u8; 16], i64> {
+        self.threads.comm_for(tid)
+    }
+    #[inline]
+    pub fn comm_for_mut(&mut self, tid: u32) -> Result<&mut [u8; 16], i64> {
+        self.threads.comm_for_mut(tid)
+    }
+    #[inline]
+    pub fn spawn_thread(&mut self, caller_tid: u32, child_tid: u32) -> Result<(), i64> {
+        self.threads.spawn_thread(caller_tid, child_tid)
+    }
+    #[inline]
+    pub fn remove_thread(&mut self, tid: u32) {
+        if tid != self.metadata.namespace_pid {
+            self.threads.remove_thread(tid);
+        }
+    }
+    #[inline]
+    pub fn select_exit_thread(&mut self, tid: u32) -> Result<(), i64> {
+        self.credentials_for(tid)?;
+        self.exit_tid = tid;
+        Ok(())
+    }
+    #[inline]
+    pub fn leader_credentials(&self) -> Result<&TaskCredentials, i64> {
+        self.credentials_for(self.metadata.namespace_pid)
     }
     pub fn key(&self) -> TaskKey {
         self.metadata.key
     }
     pub fn metadata(&self) -> &GuestTaskMetadata<C, U> {
         &self.metadata
+    }
+    pub fn metadata_mut(&mut self) -> &mut GuestTaskMetadata<C, U> {
+        &mut self.metadata
     }
     pub fn parent(&self) -> Option<TaskKey> {
         self.relations.parent()
@@ -478,6 +651,41 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
         }
         Ok(task)
     }
+    pub fn find_task_by_pid(&self, pid: u32) -> Option<&GuestTask<C, U, N>> {
+        self.registry
+            .tasks
+            .values()
+            .find(|row| row.metadata.namespace_pid == pid && row.lifecycle() == TaskLifecycle::Live)
+    }
+    pub fn find_task_by_thread(&self, container: C, tid: u32) -> Option<&GuestTask<C, U, N>> {
+        self.registry.tasks.values().find(|row| {
+            row.metadata.container == container
+                && row.lifecycle() == TaskLifecycle::Live
+                && row.has_thread(tid)
+        })
+    }
+    pub fn find_task_by_pid_mut(&mut self, pid: u32) -> Option<&mut GuestTask<C, U, N>> {
+        self.registry
+            .tasks
+            .values_mut()
+            .find(|row| row.metadata.namespace_pid == pid && row.lifecycle() == TaskLifecycle::Live)
+    }
+    pub fn group_exists_in_session(&self, session: u32, pgid: u32) -> bool {
+        self.registry.tasks.values().any(|row| {
+            row.lifecycle() == TaskLifecycle::Live
+                && row.metadata.namespace_session == session
+                && row.metadata.namespace_process_group == pgid
+        })
+    }
+    pub fn tasks(&self) -> &BTreeMap<TaskId, GuestTask<C, U, N>> {
+        &self.registry.tasks
+    }
+    pub fn tasks_mut(&mut self) -> &mut BTreeMap<TaskId, GuestTask<C, U, N>> {
+        &mut self.registry.tasks
+    }
+    pub fn zombies(&self) -> &BTreeMap<TaskId, GuestZombie<C, U, N::Claim>> {
+        &self.registry.zombies
+    }
     pub fn namespace_child_key(
         &self,
         caller: TaskKey,
@@ -786,6 +994,9 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
             .get(&task.id)
             .ok_or(GuestProcessError::Unknown(task.id))?;
         let identity = record.wait_identity();
+        let credentials = record
+            .credentials_for(record.exit_tid)
+            .map_err(|_| GuestProcessError::Stale(task))?;
         let observation = Zombie {
             key: record.metadata.key,
             namespace_pid: record.metadata.namespace_pid,
@@ -796,8 +1007,8 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
             namespace_process_group: record.metadata.namespace_process_group,
             namespace_session: record.metadata.namespace_session,
             status: self.status,
-            ruid: record.metadata.ruid.clone(),
-            euid: record.metadata.euid.clone(),
+            ruid: (record.metadata.receipt_uid)(credentials.ruid),
+            euid: (record.metadata.receipt_uid)(credentials.euid),
             rusage: record.native.own_rusage(),
             children_rusage: record.children_rusage,
             exit_signal: record.metadata.exit_signal,

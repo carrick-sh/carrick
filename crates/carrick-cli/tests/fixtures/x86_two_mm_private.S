@@ -1,10 +1,38 @@
 # Linux fork isolation witness. Both live tasks first-touch the same fresh
-# anonymous VA; no parent-private page is populated before fork. The KVM
+# anonymous VA; no page in that range is populated before fork. The KVM
 # receipt additionally requires an overlap of the two production CPU lanes.
+# Signal rendezvous keeps the peer busy while each mm touches its pages;
+# both touch phases run concurrently; neither actor exits before the other
+# acknowledges completing its own stores. Distinct signals for each phase
+# avoid standard-signal coalescing; first-phase waits allow later progress.
 # Exit 91 identifies fork refusal separately from grant/leaf failures.
 .global _start
 .text
 _start:
+    lea handler(%rip), %rax
+    mov %rax, action(%rip)
+    movq $0x04000000, action+8(%rip)
+    lea restorer(%rip), %rax
+    mov %rax, action+16(%rip)
+    mov $13, %eax
+    mov $10, %edi
+    lea action(%rip), %rsi
+    xor %edx, %edx
+    mov $8, %r10d
+    syscall
+    test %rax, %rax
+    jne wait_fail
+    mov $13, %eax
+    mov $12, %edi
+    lea action(%rip), %rsi
+    xor %edx, %edx
+    mov $8, %r10d
+    syscall
+    test %rax, %rax
+    jne wait_fail
+    mov $39, %eax
+    syscall
+    mov %rax, %rbp
     mov $57, %rax
     syscall
     cmp $-4095, %rax
@@ -12,8 +40,28 @@ _start:
     mov %rax, %r12
     mov $0x51, %r13
     test %r12, %r12
-    jnz map
+    jz child_ready
+parent_ready_wait:
+    cmpq $1, ready(%rip)
+    jb parent_ready_wait
+    mov $62, %eax
+    mov %r12, %rdi
+    mov $12, %esi
+    syscall
+    test %rax, %rax
+    jne wait_fail
+    jmp map
+child_ready:
     mov $0xa2, %r13
+    mov $62, %eax
+    mov %rbp, %rdi
+    mov $10, %esi
+    syscall
+    test %rax, %rax
+    jne wait_fail
+child_go_wait:
+    cmpq $1, ready(%rip)
+    jb child_go_wait
 map:
     mov $0x40000000, %rdi
     mov $65536, %rsi
@@ -43,6 +91,15 @@ verify:
     jne verify
     test %r12, %r12
     jz child_exit
+    mov $62, %eax
+    mov %r12, %rdi
+    mov $10, %esi
+    syscall
+    test %rax, %rax
+    jne wait_fail
+parent_done_wait:
+    cmpq $2, ready(%rip)
+    jne parent_done_wait
     sub $16, %rsp
     mov %r12, %rdi
     mov %rsp, %rsi
@@ -70,6 +127,15 @@ final_verify:
     mov $7, %rdi
     jmp exit
 child_exit:
+    mov $62, %eax
+    mov %rbp, %rdi
+    mov $12, %esi
+    syscall
+    test %rax, %rax
+    jne wait_fail
+child_done_wait:
+    cmpq $2, ready(%rip)
+    jne child_done_wait
     xor %rdi, %rdi
     jmp exit
 fork_fail:
@@ -87,5 +153,16 @@ exit:
     mov $231, %rax
     syscall
     ud2
+handler:
+    incq ready(%rip)
+    ret
+restorer:
+    mov $15, %eax
+    syscall
+    ud2
+.section .data
+.align 8
+ready: .quad 0
+action: .space 32
 .section .rodata
 ok: .ascii "Q\n"

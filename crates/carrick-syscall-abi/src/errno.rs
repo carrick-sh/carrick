@@ -56,4 +56,12 @@ pub const LINUX_EAGAIN: LinuxErrno = LinuxErrno::new(11);
 pub const LINUX_EFAULT: LinuxErrno = LinuxErrno::new(14);
 pub const LINUX_EINVAL: LinuxErrno = LinuxErrno::new(22);
 
+pub const LINUX_EBADF: LinuxErrno = LinuxErrno::new(9);
+
+pub const LINUX_EINTR: LinuxErrno = LinuxErrno::new(4);
+
 pub const LINUX_ENOSYS: LinuxErrno = LinuxErrno::new(38);
+
+pub const LINUX_EPERM: LinuxErrno = LinuxErrno::new(1);
+
+pub const LINUX_ESRCH: LinuxErrno = LinuxErrno::new(3);

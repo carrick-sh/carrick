@@ -286,3 +286,38 @@ impl CrossingBackend for Aarch64Backend {
         hw::fatal_entry_binding()
     }
 }
+
+/// Authenticated terminal crossing; the carrier owns run cleanup and exit 125.
+pub fn complete_native_run_failure(
+    binding: carrick_el1_abi::ExecutionBinding,
+    reason: carrick_el1_abi::NativeRunFailureReason,
+) -> ! {
+    let record = carrick_el1_abi::NativeRunFailure::new(binding, reason);
+    // SAFETY: EL1 retains this initialized supervisor-stack record until the
+    // stopped CPU's exact execution is authenticated and the carrier stops.
+    unsafe {
+        core::arch::asm!("hvc #3",
+            in("x0") carrick_el1_abi::NATIVE_RUN_FAILURE_SENTINEL,
+            in("x1") &record as *const _ as u64,
+            options(nostack));
+    }
+    hw::fatal_entry_binding()
+}
+
+/// Read the EL0 stack register at the native trap boundary.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub(crate) unsafe fn signal_stack() -> carrick_guest_arch::UserVa {
+    let sp: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, sp_el0", out(reg) sp, options(nomem, nostack));
+    }
+    carrick_guest_arch::UserVa::new(sp)
+}
+
+/// Publish a validated EL0 stack register at the native trap boundary.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub(crate) unsafe fn set_signal_stack(sp: carrick_guest_arch::UserVa) {
+    unsafe {
+        core::arch::asm!("msr sp_el0, {}", in(reg) sp.raw(), options(nomem, nostack));
+    }
+}

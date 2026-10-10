@@ -28,6 +28,8 @@ mod guest_mmu_publication;
 pub use guest_mmu_publication::*;
 mod x86_initial_boot;
 pub use x86_initial_boot::*;
+mod native_run_failure;
+pub use native_run_failure::*;
 mod fork_stock;
 pub use fork_stock::*;
 mod x86_prepare_stock;
@@ -200,6 +202,11 @@ pub const EL1_BOOTSTRAP_METADATA_BASE: u64 = EL1_REGION_BASE + EL1_BOOTSTRAP_MET
 
 /// Base guest virtual address of the x86 CPL0 bootstrap metadata allocator arena.
 pub const X86_CPL0_BOOTSTRAP_METADATA_BASE: u64 = 0xffff_ffff_a800_0000;
+/// Checked extent shared by the CPL0 linker and host ELF admission.
+pub const X86_CPL0_SUPERVISOR_IMAGE_BASE: u64 = 0xffff_ffff_8000_0000;
+/// Guest-physical base shared by the CPL0 image loader and fixture table grant.
+pub const X86_CPL0_SUPERVISOR_IMAGE_GPA: u64 = 0x10_0000;
+pub const X86_CPL0_SUPERVISOR_IMAGE_SIZE: u64 = 0x12_0000;
 /// CPL0's one upper-half supervisor window for retained physical pages.
 pub const X86_CPL0_DIRECT_VA: u64 = 0xffff_ffff_9000_0000;
 /// Retained initial-image frames use their own supervisor alias, never the
@@ -230,7 +237,10 @@ const _: () = {
     // capacity, must be disjoint. This is checked at compile time for both
     // guest and host builds so a new map cannot silently replace another PTE.
     const WINDOWS: [(u64, u64); 9] = [
-        (0xffff_ffff_8000_0000, 0x10_0000), // executable image
+        (
+            X86_CPL0_SUPERVISOR_IMAGE_BASE,
+            X86_CPL0_SUPERVISOR_IMAGE_SIZE,
+        ),
         (X86_CPL0_COW_COPY_BASE, X86_CPL0_COW_COPY_SIZE),
         (X86_CPL0_DIRECT_VA, 0x0200_0000), // bootstrap direct window
         (X86_CPL0_DYNAMIC_METADATA_BASE, 0x0400_0000),
@@ -573,6 +583,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         TRANSFER_PIN_RETIRED,
         EL1_ZONE_OFFSET,
         carrick_sched_core::HOST_REQUEST_PROTOCOL,
+        carrick_sched_core::TIMER_INDEX_PROTOCOL,
         carrick_sched_core::Claim::OnCpuRequested {
             slot: SlotId::new(0),
             seq: 0,
@@ -3392,7 +3403,7 @@ impl Default for InotifyNameCache {
 const _: () = {
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
-    assert!(EL1_ABI_LAYOUT_HASH == 0x5933de4bbe84f119);
+    assert!(EL1_ABI_LAYOUT_HASH == 0xdf1ca2b1119fce67);
     assert!(
         EL1_APERTURE_CONTROL_OFFSET.is_multiple_of(core::mem::align_of::<ApertureControl>() as u64)
     );

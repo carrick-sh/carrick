@@ -220,16 +220,6 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         }
         let fresh = zone.slot(slot).current().is_none();
         let record = self.current_record().ok()?;
-        if deadline.is_some()
-            && (zone.slot(slot).host_record() != Some(record) || !zone.timer_free(slot))
-        {
-            // Never time a record the host cannot take over, nor take the
-            // timer from another live timed park (a slot has one owner).
-            if fresh {
-                zone.discard_unpublished(slot, record);
-            }
-            return None;
-        }
         let Some(start) = carrick_core::entry::prepare_handoff(
             carrick_core::entry::binding(&self.task.execution, &self.task.mm),
             carrick_el1_abi::BornInZoneSource { zone, slot },
@@ -247,8 +237,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         self.cpu
             .save(frame, unsafe { zone.record(record).ctx_mut() });
         let seq = zone.next_seq(record);
-        // The timer is free (checked above) and only this vCPU arms it; an
-        // owner whose park is never published is dropped as stale.
+        // Reserve one exact record lease before publishing its timed park.
         if deadline.is_some() && zone.arm_timer(slot, record, seq).is_err() {
             drop(guard);
             if fresh {
@@ -260,6 +249,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             .enqueue(&guard, record, seq, mm, uaddr, bitset, 0)
             .is_err()
         {
+            zone.cancel_timer_admission(zone.record_ref(record));
             drop(guard);
             if fresh {
                 zone.discard_unpublished(slot, record);

@@ -7,7 +7,7 @@
 ))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::time::Duration;
 
 use assert_cmd::Command;
@@ -293,6 +293,90 @@ fn mounted_static_x86_getpid_matches_guest_gettid() {
 }
 
 #[test]
+fn mounted_static_x86_startup_sequence_matches_native() {
+    compare_mounted_assembly_with_native("x86_startup_sequence.S", b"S\n");
+}
+
+#[test]
+fn mounted_static_x86_set_tid_address_returns_native_positive_tid() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("clear-tid-dependency");
+    compile_assembly("x86_clear_tid_dependency.S", &elf);
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .expect("run native set_tid_address oracle");
+    assert_eq!(native.status.code(), Some(7));
+    assert_eq!(native.stdout, b"T\n");
+    assert!(native.stderr.is_empty());
+    let run = run_mounted_binary(&elf, "clear-tid-dependency", false);
+    assert_eq!(
+        run.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        run.stdout, b"T\n",
+        "CPL0 must serve set_tid_address despite the exit custody gap"
+    );
+    assert!(run.stderr.is_empty());
+}
+
+#[test]
+#[ignore = "cpl0 exit custody: production thread exit must clear and futex-wake"]
+fn mounted_static_x86_thread_exit_clears_and_wakes_clear_tid() {
+    compare_mounted_assembly_with_native("x86_clear_tid_exit.S", b"J\n");
+}
+
+#[test]
+fn mounted_static_x86_raise_uses_set_tid_address_returned_tid() {
+    compare_mounted_assembly_with_native("x86_clear_tid_raise.S", b"S\n");
+}
+
+#[test]
+fn mounted_static_x86_exec_refuses_before_replacement_identity() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("exec-dependency");
+    compile_assembly("x86_exec_dependency.S", &elf);
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), Some(7));
+    assert_eq!(native.stdout, b"E\n");
+    assert!(native.stderr.is_empty());
+    let guest = run_mounted_binary(&elf, "exec-dependency", false);
+    assert_eq!(
+        guest.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+    assert_eq!(
+        guest.stdout, b"F\n",
+        "shared-owner-exec-completion: CPL0 must refuse exec before replacement"
+    );
+    assert!(guest.stderr.is_empty());
+}
+
+#[test]
+fn mounted_static_x86_identity_eperm_matches_native() {
+    compare_mounted_assembly_with_native("x86_identity_eperm.S", b"P\n");
+}
+
+#[test]
+fn mounted_static_x86_identity_fork_matches_native() {
+    compare_mounted_assembly_with_native("x86_identity_fork.S", b"K\n");
+}
+
+#[test]
 fn mounted_static_x86_guest_owned_calls_refuse_without_host_effects() {
     if skip_without_kvm() {
         return;
@@ -313,13 +397,12 @@ fn mounted_static_x86_guest_owned_calls_refuse_without_host_effects() {
         .expect("guest refusal witness");
     let report: serde_json::Value = serde_json::from_slice(envelope).unwrap();
     let witness = &report["report"]["execution_witness"];
-    assert_eq!(witness["host_forwards"], 2); // write and exit_group only
-    assert_eq!(witness["portal_exits"], 5);
+    assert_eq!(witness["host_forwards"], 1); // write only; exit uses its owned receipt
+    assert_eq!(witness["portal_exits"], 2); // write and the owned root-exit receipt
     assert_eq!(
         witness["guest_refusal_families"],
         serde_json::json!([
             {"family": "memory", "count": 1},
-            {"family": "signal", "count": 1},
             {"family": "unclassified", "count": 1}
         ])
     );
@@ -378,6 +461,31 @@ fn mounted_static_x86_musl_hello_matches_native() {
 #[ignore = "fork returns a CPL0 lifecycle handoff; production fork wiring awaits #82"]
 fn mounted_static_x86_memory_and_fork_wait_match_native() {
     compare_mounted_assembly_with_native("x86_memory_fork_wait.S", b"F\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_handler_and_rt_sigreturn_match_native() {
+    compare_mounted_assembly_with_native("x86_signal_handler.S", b"HK\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_block_pending_and_unblock_match_native() {
+    compare_mounted_assembly_with_native("x86_signal_block_pending.S", b"BHU\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_kill_child_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_kill_child.S", b"W\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_timedwait_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_timedwait.S", b"PT\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_segv_fault_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_segv_fault.S", b"SC\n");
 }
 
 fn skip_without_kvm() -> bool {
@@ -459,7 +567,24 @@ fn compare_mounted_binary_with_native(
     expected_exit: i32,
     run_id: &str,
 ) {
-    let native = Command::new(elf)
+    let mut native_command = std::process::Command::new(elf);
+    if run_id == "x86_signal_abort.S" {
+        // Only the native oracle child changes its limit. A core-class signal
+        // must not imply that a core file was actually written.
+        unsafe {
+            native_command.pre_exec(|| {
+                let limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::setrlimit(libc::RLIMIT_CORE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let native = Command::from_std(native_command)
         .timeout(Duration::from_secs(5))
         .output()
         .expect("run native x86 Linux oracle");
@@ -523,4 +648,194 @@ fn run_mounted_binary(elf: &std::path::Path, run_id: &str, json: bool) -> std::p
     command
         .output()
         .expect("run mounted x86 Linux binary through carrick")
+}
+
+#[test]
+fn mounted_static_x86_signal_return_flags_match_native() {
+    compare_mounted_assembly_with_native("x86_signal_return_flags.S", b"HK\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_return_badframe_matches_native() {
+    compare_mounted_fault_with_native("x86_signal_return_badframe.S");
+}
+
+#[test]
+fn mounted_static_x86_signal_sse_state_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_sse.S", b"HK\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_nested_without_nodefer_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_nested.S", b"HHK\n");
+}
+#[test]
+fn mounted_static_x86_signal_handler_direction_flag_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_direction_flag.S", b"HK\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_altstack_overflow_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_altstack.S", b"S\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_failed_frame_setup_matches_native() {
+    compare_mounted_fault_with_native("x86_signal_badstack.S");
+}
+
+#[test]
+fn mounted_static_x86_signal_resethand_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_resethand.S", b"HK\n");
+}
+
+#[test]
+#[ignore = "x86 child-MM retirement"]
+fn mounted_static_x86_signal_sigsuspend_loop_matches_native() {
+    // Three fork rounds also expose the shared child-MM stock retirement debt.
+    compare_mounted_assembly_with_native("x86_signal_sigsuspend.S", b"S\n");
+}
+#[test]
+#[ignore = "x86 child-MM retirement"]
+fn mounted_static_x86_signal_wait_child_matches_native() {
+    // Repeated child creation depends on shared child-MM stock retirement.
+    compare_mounted_assembly_with_native("x86_signal_wait_child.S", b"W\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_wait_copyfault_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_wait_copyfault.S", b"F\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_sigsuspend_pingpong_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_sigsuspend_pingpong.S", b"S\n");
+}
+#[test]
+fn mounted_static_x86_signal_wait_pingpong_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_wait_pingpong.S", b"W\n");
+}
+
+#[test]
+#[ignore = "x86 child-MM retirement"]
+fn mounted_static_x86_fork_reuses_retired_stock_matches_native() {
+    compare_mounted_assembly_with_native("x86_fork_stock_reuse.S", b"R\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_thread_identity_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_thread_identity.S", b"T\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_thread_child_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_thread_child.S", b"T\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_kills_busy_child_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_kill_loop.S", b"K\n");
+}
+
+#[test]
+#[ignore = "x86 in-ring pipe2/read fd-table continuations"]
+fn mounted_static_x86_signal_kills_reading_child_matches_native() {
+    // Red until the director-owned x86 in-zone pipe/fd-table lane admits pipe2.
+    compare_mounted_assembly_with_native("x86_signal_kill_read.S", b"K\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_segv_resume_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_segv_resume.S", b"S\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_interrupts_owned_wait4_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_wait4_interrupt.S", b"I\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_restarts_owned_wait4_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_wait4_restart.S", b"R\n");
+}
+
+#[test]
+#[ignore = "shared process-owner stop/continue wait events"]
+fn mounted_static_x86_signal_stop_continue_matches_native() {
+    // Red until shared process owners publish stop/continue wait events.
+    compare_mounted_assembly_with_native("x86_signal_stop_continue.S", b"J\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_chld_exit_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_chld_exit.S", b"C\n");
+}
+#[test]
+fn mounted_static_x86_signal_chld_killed_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_chld_killed.S", b"D\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_concurrent_timeouts_match_native() {
+    compare_mounted_assembly_with_native("x86_signal_wait_concurrent.S", b"T\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_blocked_fault_forces_segv() {
+    compare_mounted_assembly_with_native("x86_signal_blocked.S", b"F\n");
+}
+#[test]
+fn mounted_static_x86_signal_ignored_fault_forces_segv() {
+    compare_mounted_assembly_with_native("x86_signal_ignored.S", b"F\n");
+}
+#[test]
+fn mounted_static_x86_signal_fault_badstack_forces_segv() {
+    compare_mounted_assembly_with_native("x86_signal_fault_badstack.S", b"F\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_segv_child_action_and_resume_match_native() {
+    compare_mounted_assembly_with_native("x86_signal_segv_child.S", b"S\nP");
+}
+
+#[test]
+fn mounted_static_x86_signal_abort_without_core_matches_native() {
+    compare_mounted_assembly_with_native("x86_signal_abort.S", b"A\n");
+}
+
+#[test]
+fn mounted_static_x86_signal_noncanonical_handler_matches_native() {
+    compare_mounted_fault_with_native("x86_signal_bad_handler.S");
+    compare_mounted_fault_with_native("x86_signal_bad_fault_handler.S");
+}
+
+#[test]
+#[ignore = "x86 CLONE_THREAD admission"]
+fn mounted_static_x86_signal_group_exit_names_its_custody_dependency() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("group-exit");
+    let fixture = "x86_signal_group_exit_dependency.S";
+    compile_assembly(fixture, &elf);
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .unwrap();
+    assert_eq!(native.status.signal(), Some(libc::SIGTERM));
+    let run = run_mounted_binary(&elf, fixture, false);
+    assert_eq!(run.status.code(), Some(125));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stderr.contains("x86 group exit custody"), "{stderr}");
+    assert!(!stderr.contains("unexpected initial process port"));
+    let run = run_mounted_binary(&elf, fixture, true);
+    let json: serde_json::Value = serde_json::from_slice(&run.stdout).unwrap();
+    assert!(
+        json["report"]["execution_witness"]["physical_crossing_families"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["family"] == "run_failure" && row["count"] == 1)
+    );
 }

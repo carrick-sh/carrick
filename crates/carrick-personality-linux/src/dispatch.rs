@@ -1,6 +1,8 @@
 //! The single Linux ordinal-to-family routing table.
 use crate::abi::entry::SyscallResult;
+use crate::identity::IdentityCall;
 use crate::lifecycle::{LifecycleCall, LifecycleOutcome};
+use crate::sysinfo::SysinfoCall;
 use carrick_core_abi::EntryContext;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -19,6 +21,7 @@ pub enum Family {
     Write,
     EpollWait,
     Lifecycle(LifecycleCall),
+    Signal(crate::signal::SignalCall),
     Futex,
     InotifyAdd,
     InotifyRemove,
@@ -26,6 +29,8 @@ pub enum Family {
     FilePositioned,
     AllocatorControl,
     SignalReturn,
+    Identity(IdentityCall),
+    Sysinfo(SysinfoCall),
     Unported,
 }
 
@@ -33,6 +38,7 @@ pub enum Family {
 /// turns it into the entry's completion/continuation decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FamilyCompletion {
+    FrameRestored,
     Complete(i64),
     CompleteWithWork(i64),
     Switched(i64),
@@ -272,6 +278,15 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     fn lifecycle_native(&mut self) -> Option<&mut dyn crate::lifecycle::LifecycleNative<'a>> {
         None
     }
+    fn identity_native(&mut self) -> Option<&mut dyn crate::identity::IdentityNative<'a>> {
+        None
+    }
+    fn sysinfo_native(&mut self) -> Option<&mut dyn crate::sysinfo::SysinfoNative<'a>> {
+        None
+    }
+    fn signal_native(&mut self) -> Option<&mut dyn crate::signal::SignalNative<'a>> {
+        None
+    }
     fn original_argument0(&self) -> u64;
     fn install_result(&mut self, result: SyscallResult);
     /// Removed by order 8.
@@ -352,6 +367,64 @@ fn serve_family<'a, C: EntryContext + 'a>(
                 }
             });
     }
+    if let Family::Identity(call) = family {
+        let original = pending.original_argument0();
+        return pending
+            .identity_native()
+            .and_then(|native| crate::identity::invoke(call, native))
+            .map_or(
+                FamilyRun {
+                    completion: FamilyCompletion::Forward,
+                    returned: None,
+                    // An absent/unported owner must still enter crossing policy.
+                    forward_reason: ForwardReason::Unported,
+                },
+                |result| FamilyRun {
+                    completion: FamilyCompletion::Complete(result.raw()),
+                    returned: Some((result, original)),
+                    forward_reason: ForwardReason::FamilyFallback,
+                },
+            );
+    }
+    if let Family::Sysinfo(call) = family {
+        let original = pending.original_argument0();
+        return pending
+            .sysinfo_native()
+            .and_then(|native| crate::sysinfo::invoke(call, native))
+            .map_or(
+                FamilyRun {
+                    completion: FamilyCompletion::Forward,
+                    returned: None,
+                    // An absent/unported owner must still enter crossing policy.
+                    forward_reason: ForwardReason::Unported,
+                },
+                |result| FamilyRun {
+                    completion: FamilyCompletion::Complete(result.raw()),
+                    returned: Some((result, original)),
+                    forward_reason: ForwardReason::FamilyFallback,
+                },
+            );
+    }
+    if let Family::Signal(call) = family {
+        let original = pending.original_argument0();
+        return pending
+            .signal_native()
+            .and_then(|native| crate::signal::invoke(call, native))
+            .map_or(FamilyCompletion::Forward.into(), |outcome| {
+                let returned = match outcome {
+                    crate::signal::SignalOutcome::Returned { result, .. } => {
+                        Some((result, original))
+                    }
+                    crate::signal::SignalOutcome::Transferred { .. }
+                    | crate::signal::SignalOutcome::Restored => None,
+                };
+                FamilyRun {
+                    completion: crate::signal::signal_effect(&outcome),
+                    returned,
+                    forward_reason: ForwardReason::FamilyFallback,
+                }
+            });
+    }
     let mut returned = None;
     let completion = match family {
         Family::Anonymous(call) => {
@@ -375,6 +448,9 @@ fn serve_family<'a, C: EntryContext + 'a>(
         Family::Write => pending.write(),
         Family::EpollWait => pending.epoll_wait(),
         Family::Lifecycle(_) => FamilyCompletion::Forward,
+        Family::Identity(_) => FamilyCompletion::Forward,
+        Family::Sysinfo(_) => FamilyCompletion::Forward,
+        Family::Signal(_) => FamilyCompletion::Forward,
         Family::Futex => pending.futex(),
         Family::InotifyAdd => pending.inotify_add(),
         Family::InotifyRemove => pending.inotify_remove(),
@@ -399,6 +475,19 @@ fn serve_family<'a, C: EntryContext + 'a>(
 /// EL1 traits until orders 6-9 move their semantic bodies; they never choose
 /// another family or own completion.
 pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
+    // ARM delivery still belongs to the carrier, which owns the frame ABI.
+    if matches!(ordinal, 129..=139 | 240) {
+        return Family::Unported;
+    }
+    route_shared(ordinal, allocator_control)
+}
+
+/// Route canonical Linux ordinals for the x86 in-ring frame owner.
+pub const fn route_x86_64(ordinal: u64, allocator_control: u64) -> Family {
+    route_shared(ordinal, allocator_control)
+}
+
+const fn route_shared(ordinal: u64, allocator_control: u64) -> Family {
     match ordinal {
         214 => Family::Anonymous(AnonymousCall::Brk),
         215 => Family::Anonymous(AnonymousCall::Munmap),
@@ -414,9 +503,18 @@ pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
         28 => Family::InotifyRemove,
         98 => Family::Futex,
         93 => Family::Lifecycle(LifecycleCall::Exit),
+        129 => Family::Signal(crate::signal::SignalCall::Kill),
+        130 => Family::Signal(crate::signal::SignalCall::Tkill),
+        131 => Family::Signal(crate::signal::SignalCall::Tgkill),
         132 => Family::Lifecycle(LifecycleCall::SigAltStack),
+        133 => Family::Signal(crate::signal::SignalCall::RtSigsuspend),
+        134 => Family::Signal(crate::signal::SignalCall::RtSigaction),
         135 => Family::Lifecycle(LifecycleCall::SigProcMask),
-        139 => Family::SignalReturn,
+        136 => Family::Signal(crate::signal::SignalCall::RtSigpending),
+        137 => Family::Signal(crate::signal::SignalCall::RtSigtimedwait),
+        138 => Family::Signal(crate::signal::SignalCall::RtSigqueueinfo),
+        139 => Family::Signal(crate::signal::SignalCall::RtSigreturn),
+        240 => Family::Signal(crate::signal::SignalCall::RtTgsigqueueinfo),
         99 => Family::Lifecycle(LifecycleCall::SetRobustList),
         178 => Family::Lifecycle(LifecycleCall::GetTid),
         172 => Family::Lifecycle(LifecycleCall::GetPid),
@@ -424,6 +522,90 @@ pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
         nr if nr == carrick_syscall_abi::nr::WAIT4.raw() => Family::Lifecycle(LifecycleCall::Wait4),
         nr if nr == carrick_syscall_abi::nr::EXIT_GROUP.raw() => {
             Family::Lifecycle(LifecycleCall::ExitGroup)
+        }
+        nr if nr == carrick_syscall_abi::nr::CAPGET.raw() => Family::Identity(IdentityCall::CapGet),
+        nr if nr == carrick_syscall_abi::nr::CAPSET.raw() => Family::Identity(IdentityCall::CapSet),
+        nr if nr == carrick_syscall_abi::nr::PERSONALITY.raw() => {
+            Family::Identity(IdentityCall::Personality)
+        }
+        nr if nr == carrick_syscall_abi::nr::SET_TID_ADDRESS.raw() => {
+            Family::Identity(IdentityCall::SetTidAddress)
+        }
+        nr if nr == carrick_syscall_abi::nr::GET_ROBUST_LIST.raw() => {
+            Family::Identity(IdentityCall::GetRobustList)
+        }
+        nr if nr == carrick_syscall_abi::nr::SETREGID.raw() => {
+            Family::Identity(IdentityCall::SetReGid)
+        }
+        nr if nr == carrick_syscall_abi::nr::SETGID.raw() => Family::Identity(IdentityCall::SetGid),
+        nr if nr == carrick_syscall_abi::nr::SETREUID.raw() => {
+            Family::Identity(IdentityCall::SetReUid)
+        }
+        nr if nr == carrick_syscall_abi::nr::SETUID.raw() => Family::Identity(IdentityCall::SetUid),
+        nr if nr == carrick_syscall_abi::nr::SETRESUID.raw() => {
+            Family::Identity(IdentityCall::SetResUid)
+        }
+        nr if nr == carrick_syscall_abi::nr::GETRESUID.raw() => {
+            Family::Identity(IdentityCall::GetResUid)
+        }
+        nr if nr == carrick_syscall_abi::nr::SETRESGID.raw() => {
+            Family::Identity(IdentityCall::SetResGid)
+        }
+        nr if nr == carrick_syscall_abi::nr::GETRESGID.raw() => {
+            Family::Identity(IdentityCall::GetResGid)
+        }
+        nr if nr == carrick_syscall_abi::nr::SETFSUID.raw() => {
+            Family::Identity(IdentityCall::SetFsUid)
+        }
+        nr if nr == carrick_syscall_abi::nr::SETFSGID.raw() => {
+            Family::Identity(IdentityCall::SetFsGid)
+        }
+        nr if nr == carrick_syscall_abi::nr::SETPGID.raw() => {
+            Family::Identity(IdentityCall::SetPgid)
+        }
+        nr if nr == carrick_syscall_abi::nr::GETPGID.raw() => {
+            Family::Identity(IdentityCall::GetPgid)
+        }
+        nr if nr == carrick_syscall_abi::nr::GETSID.raw() => Family::Identity(IdentityCall::GetSid),
+        nr if nr == carrick_syscall_abi::nr::SETSID.raw() => Family::Identity(IdentityCall::SetSid),
+        nr if nr == carrick_syscall_abi::nr::GETGROUPS.raw() => {
+            Family::Identity(IdentityCall::GetGroups)
+        }
+        nr if nr == carrick_syscall_abi::nr::SETGROUPS.raw() => {
+            Family::Identity(IdentityCall::SetGroups)
+        }
+        nr if nr == carrick_syscall_abi::nr::UNAME.raw() => Family::Sysinfo(SysinfoCall::Uname),
+        nr if nr == carrick_syscall_abi::nr::SETHOSTNAME.raw() => {
+            Family::Sysinfo(SysinfoCall::SetHostname)
+        }
+        nr if nr == carrick_syscall_abi::nr::SETDOMAINNAME.raw() => {
+            Family::Sysinfo(SysinfoCall::SetDomainname)
+        }
+        nr if nr == carrick_syscall_abi::nr::GETRLIMIT.raw() => {
+            Family::Sysinfo(SysinfoCall::GetRlimit)
+        }
+        nr if nr == carrick_syscall_abi::nr::SETRLIMIT.raw() => {
+            Family::Sysinfo(SysinfoCall::SetRlimit)
+        }
+        nr if nr == carrick_syscall_abi::nr::GETRUSAGE.raw() => {
+            Family::Sysinfo(SysinfoCall::GetRusage)
+        }
+        nr if nr == carrick_syscall_abi::nr::UMASK.raw() => Family::Sysinfo(SysinfoCall::Umask),
+        nr if nr == carrick_syscall_abi::nr::PRCTL.raw() => Family::Identity(IdentityCall::Prctl),
+        nr if nr == carrick_syscall_abi::nr::GETPPID.raw() => {
+            Family::Identity(IdentityCall::GetPpid)
+        }
+        nr if nr == carrick_syscall_abi::nr::GETUID.raw() => Family::Identity(IdentityCall::GetUid),
+        nr if nr == carrick_syscall_abi::nr::GETEUID.raw() => {
+            Family::Identity(IdentityCall::GetEuid)
+        }
+        nr if nr == carrick_syscall_abi::nr::GETGID.raw() => Family::Identity(IdentityCall::GetGid),
+        nr if nr == carrick_syscall_abi::nr::GETEGID.raw() => {
+            Family::Identity(IdentityCall::GetEgid)
+        }
+        nr if nr == carrick_syscall_abi::nr::SYSINFO.raw() => Family::Sysinfo(SysinfoCall::Sysinfo),
+        nr if nr == carrick_syscall_abi::nr::PRLIMIT64.raw() => {
+            Family::Sysinfo(SysinfoCall::Prlimit64)
         }
         nr if allocator_control != u64::MAX && nr == allocator_control => Family::AllocatorControl,
         _ => Family::Unported,
@@ -443,10 +625,15 @@ pub enum CompletionRoute {
 /// Linux return-work ordering, shared by common entry and pending families.
 pub fn completion_route(completion: FamilyCompletion, pending: bool) -> CompletionRoute {
     match completion {
-        FamilyCompletion::Complete(_) | FamilyCompletion::Switched(_) if pending => {
+        FamilyCompletion::Complete(_)
+        | FamilyCompletion::Switched(_)
+        | FamilyCompletion::FrameRestored
+            if pending =>
+        {
             CompletionRoute::WithWork
         }
-        FamilyCompletion::Complete(_)
+        FamilyCompletion::FrameRestored
+        | FamilyCompletion::Complete(_)
         | FamilyCompletion::AccountedComplete(_)
         | FamilyCompletion::Switched(_)
         | FamilyCompletion::AccountedSwitched(_) => CompletionRoute::Served,
@@ -607,7 +794,10 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
     pending: &mut dyn PendingFamilies<'a, C>,
 ) -> CompletionRoute {
     let original_argument0 = pending.original_argument0();
+    #[cfg(target_arch = "aarch64")]
     let family = route_aarch64(ordinal, control);
+    #[cfg(not(target_arch = "aarch64"))]
+    let family = route_x86_64(ordinal, control);
     let completion = match pending.binding().and_then(|binding| {
         if let Some(token) = carrick_core::entry::admit(binding, pending.record_source()) {
             Some(CompletionAuthority::Entry(token))
@@ -655,7 +845,12 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
         && matches!(ordinal, 99 | 132 | 135);
     let transfer = pending.ipc_available()
         && matches!(family, Family::Read | Family::Write | Family::EpollWait);
-    if pending.host_work() && !pending.resumes_operation() && !transfer && !setup {
+    // Identity/resource operations complete synchronously under their owner.
+    // Serve them before handing back metadata work; an absent owner still
+    // declines through Unported crossing policy, never host identity replay.
+    let owned_identity = matches!(family, Family::Identity(_) | Family::Sysinfo(_));
+    if pending.host_work() && !pending.resumes_operation() && !transfer && !setup && !owned_identity
+    {
         pending.declined_for_work(ordinal);
         return finish(
             ordinal,
@@ -913,7 +1108,7 @@ mod ring_first_tests {
 
     #[test]
     fn opt_out_arm_family_declines_with_work_keep_plain_forward() {
-        for ordinal in [222, 98, 220, 260] {
+        for ordinal in [222, 98, 220, 260, 174, 160] {
             let refused = [const { AtomicU64::new(0) }; 513];
             let mut pending = CarrierOwned {
                 set: HostCrossingSet::Aarch64,
@@ -940,6 +1135,7 @@ mod ring_first_tests {
             );
             assert_eq!(pending.refused[ordinal as usize].load(Ordering::Relaxed), 0);
             assert_eq!(pending.result, 42);
+            assert!(pending.host_work(), "forward must retain owed host work");
         }
     }
 

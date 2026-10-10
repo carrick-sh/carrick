@@ -509,7 +509,7 @@ impl Kernel {
         }
         let transaction = reservation.transaction;
         let leader_tid = LinuxTid::for_task_leader(prepared.task.id);
-        let (task, revision) = {
+        let (task, revision, replacement_tid) = {
             let state = self.registry().settled().write();
             if state
                 .reservations
@@ -549,12 +549,26 @@ impl Kernel {
                 .next_revision(record.revision)
                 .ok_or(ExecError::RevisionExhausted)?;
             let task = Arc::clone(&record.task);
+            // Exec promotes a nonleader to the task leader, whose namespace
+            // identity is retained by the task's PID claim. Resolve that exact
+            // replacement identity before the irreversible sibling drain.
+            let replacement_tid =
+                crate::namespace::pid::ns_visible_thread_tid(&prepared.replacement)
+                    .ok_or(ExecError::StalePreparation)?;
+            if prepared
+                .replacement
+                .control_slot()
+                .visible_tid()
+                .is_some_and(|tid| tid != replacement_tid)
+            {
+                return Err(ExecError::StalePreparation);
+            }
             state
                 .retired_threads
                 .try_reserve_exact(retired_count)
                 .map_err(|_| ExecError::RetiredThreadCapacity(retired_count))?;
             check_exec_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
-            (task, revision)
+            (task, revision, replacement_tid)
         };
 
         // This is the only blocking part of commit and happens with no kernel
@@ -581,6 +595,17 @@ impl Kernel {
         debug_assert_eq!(record.task.key(), prepared.task);
         debug_assert_eq!(record.revision, prepared.revision);
 
+        // The successor is still private and cannot execute. Stamp it under
+        // the same registry authority that publishes the replacement and
+        // revokes its predecessors below: neither peers nor the successor can
+        // observe a committed process without a live leader identity.
+        if !prepared
+            .replacement
+            .control_slot()
+            .publish_visible_tid(replacement_tid)
+        {
+            return Err(ExecError::StalePreparation);
+        }
         // The predecessor image is quiesced and admission is still closed.
         record.thread_pool.revoke_unused();
         record.task.clear_thread_adoption_factory();
@@ -594,6 +619,10 @@ impl Kernel {
             .replace_process_credentials(prepared.resources.credentials());
         record.task.reset_dumpable_for_exec();
         for (tid, (_, thread)) in &old_threads {
+            // The host owner completes exec; the shared in-ring owner has no
+            // replacement receipt. Revoke every predecessor stamp, including
+            // the old leader, so stale shared identity dispatch fails closed.
+            thread.control_slot().retire_identity();
             if *tid == leader_tid {
                 continue;
             }
@@ -965,6 +994,205 @@ mod tests {
         )
         .expect("bootstrap input");
         Kernel::bootstrap_root(input).expect("kernel")
+    }
+
+    #[test]
+    fn committed_exec_revokes_predecessor_shared_identity_dispatch() {
+        use carrick_guest_arch::UserVa;
+        use carrick_personality_linux::identity::{
+            IdentityCall, IdentityNative, ProcessIdentityVenue,
+        };
+        use carrick_personality_linux::lifecycle::UserCopy;
+        struct Predecessor<'a>(&'a carrick_el1_abi::ThreadControlSlot);
+        impl UserCopy for Predecessor<'_> {
+            fn copy_in(&mut self, _: &mut [u8], _: UserVa) -> bool {
+                panic!("stale identity read user memory")
+            }
+            fn copy_out(&mut self, _: UserVa, _: &[u8]) -> bool {
+                panic!("stale identity wrote user memory")
+            }
+        }
+        impl<'a> IdentityNative<'a> for Predecessor<'a> {
+            fn arguments(&self) -> [u64; 6] {
+                [16, 0, 0, 0, 0, 0]
+            }
+            fn visible_tid(&self) -> Option<u32> {
+                self.0.visible_tid()
+            }
+            fn set_clear_child_tid(&mut self, _: u64) -> bool {
+                panic!("stale registration")
+            }
+            fn robust_list_for(&self, _: i32) -> Result<(u64, u32), i64> {
+                panic!("stale robust list")
+            }
+            fn process_identity(&mut self) -> Option<&mut dyn ProcessIdentityVenue> {
+                panic!("stale shared owner")
+            }
+        }
+        let (kernel, root) = bootstrap(9090);
+        let predecessor = root.thread().control_lease();
+        assert!(predecessor.publish_visible_tid(9090));
+        let prepared = kernel.prepare_exec(&root, None).unwrap();
+        assert_eq!(
+            predecessor.visible_tid(),
+            Some(9090),
+            "failed/prepared exec must preserve identity"
+        );
+        let replacement = kernel.commit_exec(prepared, None).unwrap();
+        assert_eq!(
+            replacement.thread().control_slot().visible_tid(),
+            Some(9090),
+            "exec must publish replacement identity before retiring its predecessor"
+        );
+        assert_eq!(
+            predecessor.visible_tid(),
+            None,
+            "exec must revoke the predecessor stamp"
+        );
+        assert!(!std::ptr::eq(
+            root.thread().control_slot(),
+            replacement.thread().control_slot()
+        ));
+        let mut stale = Predecessor(&predecessor);
+        for call in [
+            IdentityCall::Prctl,
+            IdentityCall::CapGet,
+            IdentityCall::SetPgid,
+            IdentityCall::SetTidAddress,
+            IdentityCall::GetRobustList,
+        ] {
+            assert_eq!(
+                carrick_personality_linux::identity::invoke(call, &mut stale)
+                    .unwrap()
+                    .raw(),
+                carrick_personality_linux::identity::ESRCH
+            );
+        }
+    }
+
+    #[test]
+    fn committed_exec_preserves_replacement_identity_and_peer_pid_lookup() {
+        use crate::compat::{CompatReporter, SyscallArgs};
+        use crate::dispatch::{
+            DispatchOutcome, GuestMemory, LinearMemory, SyscallDispatcher, SyscallRequest,
+        };
+        use carrick_abi::syscall::nr;
+
+        fn call(
+            dispatcher: &mut SyscallDispatcher,
+            context: &KernelContext,
+            memory: &mut LinearMemory,
+            number: carrick_abi::CanonicalNr,
+            args: [u64; 6],
+        ) -> i64 {
+            let current = context
+                .kernel()
+                .context(context.task().key().id, context.thread().key().tid)
+                .unwrap();
+            match dispatcher
+                .dispatch(
+                    &current,
+                    SyscallRequest::new(number.0, SyscallArgs(args)),
+                    memory,
+                    &CompatReporter::default(),
+                )
+                .unwrap()
+            {
+                DispatchOutcome::Returned { value } => value,
+                other => panic!("identity call {number:?} did not return: {other:?}"),
+            }
+        }
+        let (kernel, parent) = bootstrap(9095);
+        let child = kernel
+            .fork_task(
+                &parent,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).unwrap(),
+                ThreadId::synthetic_for_tests(9096),
+                "exec identity child".to_owned(),
+                None,
+            )
+            .unwrap();
+        let child_pid = crate::namespace::pid::ns_visible_guest_tid(&child).unwrap();
+        let predecessor = child.thread().control_lease();
+        assert!(predecessor.publish_visible_tid(child_pid));
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = LinearMemory::new(0x4000, vec![0; 1024]);
+        assert_eq!(
+            call(&mut dispatcher, &child, &mut memory, nr::SETPGID, [0; 6]),
+            0
+        );
+        assert_eq!(
+            call(
+                &mut dispatcher,
+                &child,
+                &mut memory,
+                nr::UMASK,
+                [0o027, 0, 0, 0, 0, 0]
+            ),
+            0o022
+        );
+        assert_eq!(
+            call(
+                &mut dispatcher,
+                &child,
+                &mut memory,
+                nr::SETRESUID,
+                [1001, 1001, 1001, 0, 0, 0]
+            ),
+            0
+        );
+        let current = kernel
+            .context(child.task().key().id, child.thread().key().tid)
+            .unwrap();
+        let prepared = kernel.prepare_exec(&current, None).unwrap();
+        assert_eq!(predecessor.visible_tid(), Some(child_pid));
+        let replacement = kernel.commit_exec(prepared, None).unwrap();
+        assert_eq!(
+            replacement.thread().control_slot().visible_tid(),
+            Some(child_pid)
+        );
+        assert_eq!(predecessor.visible_tid(), None);
+        assert_eq!(
+            call(
+                &mut dispatcher,
+                &replacement,
+                &mut memory,
+                nr::GETUID,
+                [0; 6]
+            ),
+            1001
+        );
+        assert_eq!(
+            call(
+                &mut dispatcher,
+                &replacement,
+                &mut memory,
+                nr::UNAME,
+                [0x4000, 0, 0, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(memory.read_bytes(0x4000, 6).unwrap(), b"Linux\0");
+        assert_eq!(
+            call(
+                &mut dispatcher,
+                &replacement,
+                &mut memory,
+                nr::UMASK,
+                [0o077, 0, 0, 0, 0, 0]
+            ),
+            0o027
+        );
+        assert_eq!(
+            call(
+                &mut dispatcher,
+                &parent,
+                &mut memory,
+                nr::GETPGID,
+                [u64::from(child_pid), 0, 0, 0, 0, 0]
+            ),
+            i64::from(child_pid)
+        );
     }
 
     #[test]

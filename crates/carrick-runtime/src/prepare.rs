@@ -1183,7 +1183,14 @@ impl PreparedRun {
                 host_forward_families: count_family(forward_families),
                 guest_refusal_families: count_family(refusal_families),
             });
+            let mut stderr = dispatcher.stderr();
             let (exit_code, terminating_signal, traps) = match outcome {
+                carrick_vmm_kvm::cpl0_boot::InitialProcessExit::RunFailed { reason, exits } => {
+                    stderr.extend_from_slice(
+                        format!("carrick: run failed: {}\n", reason.as_str()).as_bytes(),
+                    );
+                    (125, None, exits)
+                }
                 carrick_vmm_kvm::cpl0_boot::InitialProcessExit::Exited { code, exits } => {
                     (code, None, exits)
                 }
@@ -1205,7 +1212,7 @@ impl PreparedRun {
                 exit_code,
                 terminating_signal,
                 stdout: dispatcher.stdout(),
-                stderr: dispatcher.stderr(),
+                stderr,
                 traps,
                 report,
                 trap_limit_hit: false,

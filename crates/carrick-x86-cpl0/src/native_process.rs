@@ -36,6 +36,9 @@ static RETIRED: SpinLock<Vec<Mm>> = SpinLock::new(Vec::new());
 pub(super) fn runtime() -> &'static Runtime {
     RUNTIME.lock().as_ref().copied().unwrap_or_else(|| fatal())
 }
+pub(super) fn runtime_opt() -> Option<&'static Runtime> {
+    RUNTIME.lock().as_ref().copied()
+}
 pub(super) fn admit_root(
     words: ParkedContextWords,
     source: BornInZoneSource<'static, ParkedContextWords>,
@@ -383,11 +386,14 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
     fn settle_mm(&mut self, born: Box<Born>) -> Result<(), (NativeProcessError, Box<Born>)> {
         settle(born, self.worker())
     }
-    fn copy_status(
+    fn copy_status(&mut self, mm: &Mm, address: UserVa, status: LinuxWaitStatus) -> Result<(), NativeProcessError> {
+        self.copy_signal_bytes(mm, address, &status.raw().to_ne_bytes())
+    }
+    fn copy_signal_bytes(
         &mut self,
         mm: &Mm,
         address: UserVa,
-        status: LinuxWaitStatus,
+        bytes: &[u8],
     ) -> Result<(), NativeProcessError> {
         if carrick_el1::isa::x86::hardware_live_root().map_err(error)? != mm.root {
             return Err(NativeProcessError::Stale);
@@ -402,7 +408,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             .begin(
                 handle,
                 carrick_core::mm::transfer::GuestVa::new(address.raw()),
-                4,
+                bytes.len() as u64,
                 carrick_el1_abi::PortalTransferIntent::UserWrite,
                 self.worker(),
             )
@@ -419,7 +425,6 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                 &*(carrick_el1::isa::x86_kernel_layout().portal.raw() as *const MmPortalSlots),
             )
         };
-        let bytes = status.raw().to_ne_bytes();
         while !continuation.is_complete() {
             // SAFETY: select acquires the exact editor before using this leaf.
             let mut prepared = unsafe {
@@ -505,7 +510,13 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
     fn retire_mm(&mut self, mm: Mm) {
         RETIRED.lock().push(mm);
     }
-    fn wake_effects(&mut self, effects: WakeEffects) {
+    fn copy_siginfo(&mut self, mm: &Self::Mm, address: UserVa, info: &carrick_abi::LinuxSiginfo) -> Result<(), NativeProcessError> {
+        // SAFETY: the canonical ABI record has a fully initialized wire image.
+        let bytes = unsafe { core::slice::from_raw_parts(info as *const _ as *const u8, core::mem::size_of_val(info)) };
+        self.copy_signal_bytes(mm, address, bytes)
+    }
+    fn wake_effects(&mut self, mut effects: WakeEffects) {
+        if effects.queued_own { effects.request_reschedule(self.slot); }
         deliver_wakes(effects);
     }
 }

@@ -807,3 +807,123 @@ transaction, live-descriptor or inventory authentication.
 This changes no population or work budget: one frame initialization,
 descriptor edit and publication per initial page. A forked signal wait found
 the defect when a COW write correctly refused an unowned source descriptor.
+
+## ARM signal return privilege boundary
+
+`signal.arm.resume-privilege` owns ARM `rt_sigreturn` routing and the
+supervisor resume-state publication boundary. Linux authority is
+`sigreturn(2)`: return restores a userspace context, never a supervisor
+execution context. Until ARM delivery moves in-ring, syscall 139 forwards
+to the carrier that owns the delivered frame ABI.
+
+VM-free bindings are `arm_sigreturn_stays_with_host_frame_owner` in
+`carrick-personality-linux` and
+`forged_supervisor_or_masked_pstate_is_refused` in `carrick-el1`. The latter
+rejects EL1 and each DAIF masking bit, while accepting EL0 with NZCV.
+The structural budget is one constant-time PSTATE check before any register
+publication, with no additional copies, waits, or allocations. Both tests
+were red before the routing and validation corrections.
+
+Signed ARM execution and same-image oracle bindings remain outstanding;
+VM-free evidence does not establish full signal frame compatibility. The
+in-ring ARM restore path remains unrouted until Linux ucontext and FPSIMD
+restore and forced SIGSEGV on invalid frames are implemented together.
+
+## Signal return result ownership
+
+`signal.return.no-result` owns successful in-ring `rt_sigreturn` completion.
+Authority is [sigreturn(2)](https://man7.org/linux/man-pages/man2/sigreturn.2.html):
+the operation restores the interrupted context and never returns a syscall
+result. Its completion settles the same entry without a scheduler handoff or
+result installation, including when carrier return work is pending.
+
+VM-free binding: `signal_return_contract` in `carrick-personality-linux`.
+Native x86/KVM binding: `x86_signal_handler.S` compares a nonzero restored
+accumulator against native execution. The VM-free result-ownership assertion
+failed before correction. Completion adds no memory copies, allocation, or
+waits; result publication count is zero. Signed ARM binding is unavailable on
+Linux and ARM still uses its host frame owner.
+
+## x86 signal resume validation
+
+`signal.x86.resume-validation` owns x86 signal-context publication and
+invalid-frame SIGSEGV. Authority: sigreturn(2), sigaction(2), and signal(7).
+The VM-free return contract rejects a normal errno outcome on frame failure;
+scheduler tests check the RFLAGS privilege boundary. The native/KVM flags and
+bad-RIP witnesses both failed before correction and compare to native Linux.
+The bad-RIP witness also found that root completion rejected signal wait
+statuses; its ABI test now admits only exited or signaled terminal states.
+
+Publication validates RIP/RSP and flags before writing any saved register.
+Frame failure queues one exact-thread forced SIGSEGV; disposition and queue
+changes use the retained task's sighand lock. The budget is constant-time
+validation and one queue admission, without retry, polling or timeout growth.
+C3's native/KVM fault witness additionally checks architectural RIP, MAPERR,
+saved mask, handler mask, and mask restoration. Its synchronous-SEGV policy
+binding checks blocked and ignored actions in the VM-free EL1 library.
+Signed ARM acceptance remains outstanding and these witnesses do not claim it.
+
+## x86 signal FP state custody
+
+`signal.x86.fp-custody` owns signal XSAVE save/restore for the admitted
+XCR0=7 native lane. Authority: sigreturn(2), signal(7), and the existing
+clean-room Linux XSAVE wire records in `carrick-abi`. The native/KVM SSE
+witness failed before correction; it compares preservation across a handler
+that overwrites XMM0 and checks both FP_XSTATE_MAGIC markers.
+
+Entry, fault and IRQ captures initialize their 832-byte storage before XSAVE.
+Delivery copies one bounded XSAVE image and emits the Linux software extent
+descriptor. Restore validates lengths, feature bits, compact/reserved header
+words, trailing magic and MXCSR before publishing the FP image or GPRs.
+No wait, retry or allocation occurs. The deterministic bound is one fixed
+832-byte capture initialization plus at most 836 FP wire bytes per delivery
+or restore; the ucontext and GPR-frame copies are independently fixed-size.
+ARM delivery remains host-owned; this does not enable an ARM signal frame.
+The shared wire crate now builds for `x86_64-unknown-none`; host and ring
+signal records refer to that one definition. Signed ARM acceptance and
+runtime-ratio measurement remain outstanding.
+
+## In-ring signal handler admission
+
+`signal.handler.admission` owns handler masks, reset disposition, alternate
+stack selection and failed-frame escalation. Authority: sigaction(2) and
+sigaltstack(2). Native/KVM witnesses check nested delivery with SA_NODEFER
+clear, SA_RESETHAND publication, DF clearing/restoration, a SIGSEGV handler
+on the retained alternate stack after stack overflow, and default SIGSEGV
+when handler frame construction fails. The first four admission witnesses
+failed before correction; the VM-free reset-action contract failed before
+the action was committed at selection.
+
+Action selection and reset share the sighand lock. Frame publication saves
+the old mask and stack before applying the handler mask. Stack selection is
+constant work; failure admits at most one forced SIGSEGV frame, whose own
+failure terminates the task. No allocation, sleep or polling is introduced
+in successful frame construction. Signed ARM acceptance remains outstanding.
+
+## Initial ELF private-page ownership
+
+`mm.initial.elf-private` owns private frame publication for the initial x86
+ELF image, including data and text. The initial anonymous stack already
+used this ownership. Authority: mmap(2) MAP_PRIVATE and fork(2). The VM-free
+`fresh_owner_maps_static_text_data_and_stack_with_publications` test failed
+with PRIVATE=0 on the data leaf before correction. The initial builder now
+uses the private descriptor operation for every owned initial page; the KVM
+receipt reconstruction mirrors that exact operation without relaxing any
+transaction, live-descriptor or inventory authentication.
+
+This changes no population or work budget: one frame initialization,
+descriptor edit and publication per initial page. A forked signal wait found
+the defect when a COW write correctly refused an unowned source descriptor.
+
+### Owned in-ring signal waits
+
+`signal_wait_owns_context_and_shared_deadline` checks that a finite signal
+wait retains its saved context, releases its executor and completes only
+when the shared timer reaches its deadline. The mounted native/KVM
+`sigsuspend` and `sigtimedwait` witnesses retain three fork/reap iterations;
+they must not be shortened to hide fork-stock exhaustion. Their second fork
+currently depends on the separately owned shared child-MM retirement work.
+The signal-free `x86_fork_stock_reuse.S` reduction records this dependency.
+
+The current single-owner timer still refuses a concurrent finite wait on
+that slot; this is unfinished admission work, not Linux timeout semantics.

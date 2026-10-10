@@ -6,10 +6,10 @@ use super::{
     native_process_custody::{ProcessResources, ProcessWake, RetainedProcessCustody},
     native_process_entry::{self, CopiedWaitOutcome, ForkTryError, PreparedFork, WaitWork},
     native_process_signals::{NativeExitSignals, NativeProcessSignals},
-    process_owner::*,
+    process_owner::{GuestProcessOwner, GuestTask, GuestTaskMetadata, NativeProcessCustody},
 };
 use crate::lock::SpinLock;
-use alloc::{collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec};
 use carrick_el1_abi::{
     BornInZoneSource, CurrentTask, EntryHandoffReceipt, EntryIdentity, EntryRef, ExecutionBinding,
     Lifecycle, ThreadControlSlot, ThreadLifecyclePage,
@@ -40,6 +40,45 @@ use core::{
     sync::atomic::Ordering,
 };
 const LOCK_SPINS: u32 = 100_000;
+fn signal_record_exists<C: ProcessContext>(zone: &ZoneTables<C>, record: RecordRef) -> bool {
+    if zone.live(record).is_some() {
+        return true;
+    }
+    let retained = zone.record(record.id);
+    retained.incarnation() == record.incarnation
+        && retained.claim() == carrick_sched_core::Claim::Free
+        && retained.home().is_some_and(|slot| {
+            zone.slot(slot).current().is_none() && zone.slot(slot).host_record() == Some(record.id)
+        })
+}
+
+fn owned_control<'a>(
+    page: &'a ThreadLifecyclePage,
+    leader: &'a ThreadControlSlot,
+    address: u64,
+) -> Option<&'a ThreadControlSlot> {
+    if leader as *const _ as u64 == address {
+        return Some(leader);
+    }
+    for index in 0..page.entry_count() {
+        let (generation, state) = page.state(index)?;
+        if !matches!(
+            state,
+            carrick_el1_abi::EntryState::Born | carrick_el1_abi::EntryState::Published
+        ) {
+            continue;
+        }
+        let entry = EntryRef::new(index as u32, generation);
+        if page.control_address(entry) == Some(address) {
+            // SAFETY: the retained lifecycle owner licenses this address for
+            // this live entry. Stock is not reclaimed while the entry is live.
+            let control = unsafe { &*(address as *const ThreadControlSlot) };
+            return (control.entry() == Some(entry)).then_some(control);
+        }
+    }
+    None
+}
+
 /// Retained private task metadata. Slot zero belongs to a host-admitted leader;
 /// shared pool births use the exact entry index plus one, including fork leaders.
 pub struct NativeLifecycleResources<'a> {
@@ -64,17 +103,32 @@ pub enum NativeProcessError {
     Exhausted,
     Fault,
     Unsupported,
+    GroupExitCustody,
     Busy,
     Quarantined,
     NoChild,
 }
 impl NativeProcessError {
+    pub fn run_failure_reason(self) -> carrick_el1_abi::NativeRunFailureReason {
+        use carrick_el1_abi::NativeRunFailureReason as R;
+        match self {
+            Self::Invalid => R::NativeInvalid,
+            Self::Stale => R::NativeStale,
+            Self::Exhausted => R::NativeExhausted,
+            Self::Fault => R::NativeFault,
+            Self::Unsupported => R::NativeUnsupported,
+            Self::Busy => R::NativeBusy,
+            Self::Quarantined => R::NativeQuarantined,
+            Self::NoChild => R::NativeNoChild,
+            Self::GroupExitCustody => R::X86GroupExitCustody,
+        }
+    }
     pub fn errno(self) -> i64 {
         match self {
             Self::Invalid | Self::Stale => -22,
             Self::Exhausted | Self::Busy => -11,
             Self::Fault => -14,
-            Self::Unsupported => -38,
+            Self::Unsupported | Self::GroupExitCustody => -38,
             Self::Quarantined => -5,
             Self::NoChild => -10,
         }
@@ -120,6 +174,81 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     fn quarantine_born(&mut self, born: Self::Born);
     fn retire_mm(&mut self, mm: Self::Mm);
     fn wake_effects(&mut self, effects: WakeEffects);
+    fn signal_deadline(
+        &mut self,
+        nanos: u64,
+    ) -> Result<carrick_guest_arch::Deadline, NativeProcessError> {
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = nanos;
+            Err(NativeProcessError::Unsupported)
+        }
+        #[cfg(target_os = "none")]
+        {
+            let mut backend = crate::isa::signal_clock();
+            use carrick_guest_arch::InterruptBackend;
+            let now = backend
+                .counter()
+                .map_err(|_| NativeProcessError::Unsupported)?
+                .raw();
+            let frequency = backend
+                .frequency()
+                .map_err(|_| NativeProcessError::Unsupported)?
+                .raw()
+                .get();
+            let ticks = (u128::from(nanos) * u128::from(frequency)).div_ceil(1_000_000_000);
+            let ticks = u64::try_from(ticks).map_err(|_| NativeProcessError::Invalid)?;
+            Ok(carrick_guest_arch::Deadline(
+                carrick_guest_arch::CounterTick::new(now.saturating_add(ticks)),
+            ))
+        }
+    }
+    fn arm_signal_timer(
+        &mut self,
+        deadline: carrick_guest_arch::Deadline,
+    ) -> Result<(), NativeProcessError> {
+        #[cfg(not(target_os = "none"))]
+        {
+            let _ = deadline;
+            Err(NativeProcessError::Unsupported)
+        }
+        #[cfg(target_os = "none")]
+        {
+            use carrick_guest_arch::InterruptBackend;
+            crate::isa::signal_clock()
+                .arm_timer(Some(deadline))
+                .map_err(|_| NativeProcessError::Unsupported)
+        }
+    }
+    fn signal_now(&mut self) -> Result<carrick_guest_arch::CounterTick, NativeProcessError> {
+        #[cfg(not(target_os = "none"))]
+        {
+            Err(NativeProcessError::Unsupported)
+        }
+        #[cfg(target_os = "none")]
+        {
+            use carrick_guest_arch::InterruptBackend;
+            crate::isa::signal_clock()
+                .counter()
+                .map_err(|_| NativeProcessError::Unsupported)
+        }
+    }
+    fn copy_signal_bytes(
+        &mut self,
+        _mm: &Self::Mm,
+        _address: UserVa,
+        _bytes: &[u8],
+    ) -> Result<(), NativeProcessError> {
+        Err(NativeProcessError::Unsupported)
+    }
+    fn copy_siginfo(
+        &mut self,
+        _mm: &Self::Mm,
+        _address: UserVa,
+        _info: &carrick_syscall_abi::LinuxSiginfo,
+    ) -> Result<(), NativeProcessError> {
+        Err(NativeProcessError::Unsupported)
+    }
 }
 pub struct NativeClaim {
     namespace: Arc<SpinLock<NamespaceState>>,
@@ -160,13 +289,17 @@ pub struct NativeResources<'a, M, C: ProcessContext> {
     page: &'a ThreadLifecyclePage,
     mm: M,
     address: AddressContext<RootGpa>,
-    signals: NativeProcessSignals<()>,
+    signals: NativeProcessSignals<carrick_personality_linux::abi::signal::LinuxSiginfo>,
     _thread_claim: NativeClaim,
     channel: Option<Arc<WaitChannel>>,
     usage: TaskRusage,
 }
-pub type NativeForkPreparation<'a, M, P, C> =
-    PreparedFork<(), (), RetainedProcessCustody<NativeResources<'a, M, C>>, P>;
+pub type NativeForkPreparation<'a, M, P, C> = PreparedFork<
+    VisibleNamespace,
+    carrick_sched_core::process::TaskUid,
+    RetainedProcessCustody<NativeResources<'a, M, C>>,
+    P,
+>;
 impl<'a, M: Clone, C: ProcessContext> ProcessResources for NativeResources<'a, M, C> {
     type Context = C;
     type Claim = NativeClaim;
@@ -174,7 +307,10 @@ impl<'a, M: Clone, C: ProcessContext> ProcessResources for NativeResources<'a, M
     type Transaction = NonZeroU64;
     type Member = NativeMember<'a, C>;
     type Resources = M;
-    type SignalTarget = NativeExitSignals<(), &'a ThreadControlSlot>;
+    type SignalTarget = NativeExitSignals<
+        carrick_personality_linux::abi::signal::LinuxSiginfo,
+        &'a ThreadControlSlot,
+    >;
     fn wait_event(&self, _: WaitJobControl, _: bool) -> Option<()> {
         None
     }
@@ -199,13 +335,37 @@ impl<'a, M: Clone, C: ProcessContext> ProcessResources for NativeResources<'a, M
     }
 }
 type Custody<'a, M, C> = RetainedProcessCustody<NativeResources<'a, M, C>>;
-type Owner<'a, M, C> = GuestProcessOwner<(), (), Custody<'a, M, C>>;
+type NativeIdentityTask<'a, M, C> =
+    GuestTask<VisibleNamespace, carrick_sched_core::process::TaskUid, Custody<'a, M, C>>;
+type Owner<'a, M, C> =
+    GuestProcessOwner<VisibleNamespace, carrick_sched_core::process::TaskUid, Custody<'a, M, C>>;
 struct PendingWait {
     caller: TaskKey,
     query: WaitQuery,
     status: UserVa,
     precheck: WaitPrecheck,
     channel: Arc<WaitChannel>,
+}
+struct ExitWakeCustody {
+    channel: Arc<WaitChannel>,
+}
+struct PendingExit {
+    status: LinuxWaitStatus,
+    channel: Arc<WaitChannel>,
+    wake: Option<ExitWakeCustody>,
+}
+#[derive(Clone, Copy)]
+enum PendingSignalKind {
+    Suspend,
+    Wait {
+        set: carrick_signal_core::SignalSet,
+        info: UserVa,
+    },
+}
+struct PendingSignalWait {
+    kind: PendingSignalKind,
+    channel: Arc<WaitChannel>,
+    deadline: Option<carrick_guest_arch::Deadline>,
 }
 struct Graph<'a, M: Clone, C: ProcessContext> {
     owner: Owner<'a, M, C>,
@@ -214,11 +374,17 @@ struct Graph<'a, M: Clone, C: ProcessContext> {
     visible_namespace: VisibleNamespace,
     serials: SerialAllocator,
     pending: BTreeMap<TaskKey, PendingWait>,
+    pending_exit: BTreeMap<TaskKey, PendingExit>,
+    signal_waits: BTreeMap<RecordRef, PendingSignalWait>,
+    suspend_masks: BTreeMap<RecordRef, carrick_signal_core::policy::SigBlockMask>,
     _root_roles: NativeClaim,
+    uts: carrick_personality_linux::sysinfo::LinuxUtsname,
 }
 pub struct NativeProcessRuntime<'a, M: Clone, C: ProcessContext> {
     graph: SpinLock<Graph<'a, M, C>>,
     zone: &'a ZoneTables<C>,
+    #[cfg(test)]
+    signal_check_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
 }
 pub struct NativeRecordBinding<M, C: ProcessContext> {
     pub key: TaskKey,
@@ -243,10 +409,50 @@ impl<M, C: ProcessContext> NativeResources<'_, M, C> {
     fn record_identity_mm(&self) -> u64 {
         self.zone.record(self.record.id).identity().mm
     }
+    pub fn signals(
+        &self,
+    ) -> &NativeProcessSignals<carrick_personality_linux::abi::signal::LinuxSiginfo> {
+        &self.signals
+    }
+    pub fn signals_mut(
+        &mut self,
+    ) -> &mut NativeProcessSignals<carrick_personality_linux::abi::signal::LinuxSiginfo> {
+        &mut self.signals
+    }
 }
 impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
     pub fn zone(&self) -> &'a ZoneTables<C> {
         self.zone
+    }
+    /// Snapshot the sighand of the exact faulting task incarnation.
+    pub fn current_signals(
+        &self,
+        current: &CurrentTask,
+    ) -> Option<NativeProcessSignals<carrick_personality_linux::abi::signal::LinuxSiginfo>> {
+        let binding = super::common_entry::execution_binding(current);
+        let page = current.metadata.lifecycle_page.load(Ordering::Acquire);
+        let control_address = current.metadata.control_slot.load(Ordering::Acquire);
+        let graph = self.graph.lock();
+        let (_, row) = graph.owner.tasks().iter().find(|(_, row)| {
+            let resources = row.native().resources();
+            resources.address.mm.raw().get() == binding.mm.raw()
+                && resources.page as *const _ as u64 == page
+        })?;
+        let resources = row.native().resources();
+        let control = owned_control(resources.page, resources.control, control_address)?;
+        let record = control
+            .zone_record()
+            .or_else(|| core::ptr::eq(resources.control, control).then_some(resources.record))?;
+        if !signal_record_exists(self.zone, record) {
+            return None;
+        }
+        let thread = self.zone.record(record.id).identity();
+        (thread.tid == binding.task.raw()
+            && thread.serial == binding.thread_generation.raw()
+            && thread.generation == binding.generation.raw()
+            && thread.mm == binding.mm.raw()
+            && thread.control_slot == control as *const _ as u64)
+            .then(|| resources.signals().clone())
     }
     #[allow(clippy::too_many_arguments)]
     pub fn admit_fresh_root<B: carrick_mmu_core::owner_mmu::OwnerForkMmu>(
@@ -375,13 +581,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .seed_initial(GuestTask::new(
                 GuestTaskMetadata {
                     key,
-                    container: (),
+                    container: visible_namespace,
                     namespace_pid: visible.get(),
                     identity: TaskIdentity::led_by(id),
                     namespace_process_group: visible.get(),
                     namespace_session: visible.get(),
-                    ruid: (),
-                    euid: (),
+                    receipt_uid: |uid| uid,
                     exit_signal: ChildExitSignal::SIGCHLD,
                     diagnostic_name: String::from("native-root"),
                 },
@@ -391,6 +596,13 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 task_claim,
             ))
             .map_err(|_| NativeProcessError::Invalid)?;
+        #[cfg(target_arch = "x86_64")]
+        let uts = carrick_personality_linux::sysinfo::LinuxUtsname::carrick_x86_64();
+        #[cfg(not(target_arch = "x86_64"))]
+        let uts = carrick_personality_linux::sysinfo::LinuxUtsname::carrick_aarch64();
+        if !control.publish_visible_tid(visible.get()) {
+            return Err(NativeProcessError::Stale);
+        }
         Ok(Self {
             graph: SpinLock::new(Graph {
                 owner,
@@ -399,9 +611,15 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 visible_namespace,
                 serials,
                 pending: BTreeMap::new(),
+                pending_exit: BTreeMap::new(),
+                signal_waits: BTreeMap::new(),
+                suspend_masks: BTreeMap::new(),
                 _root_roles: root_roles,
+                uts,
             }),
             zone: source.zone,
+            #[cfg(test)]
+            signal_check_hook: SpinLock::new(None),
         })
     }
     pub fn enter<'r, S: NativeProcessService<'a, C, Mm = M>>(
@@ -423,35 +641,65 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .ok_or(NativeProcessError::Stale)?;
         carrick_core::entry::prepare_handoff(binding, source, record)
             .ok_or(NativeProcessError::Stale)?;
-        let key = TaskKey {
-            id: TaskId::from_abi_positive(
-                i32::try_from(binding.task.raw()).map_err(|_| NativeProcessError::Invalid)?,
-            )
-            .map_err(|_| NativeProcessError::Invalid)?,
-            serial: TaskSerial::from_raw_u64(binding.generation.raw())
-                .ok_or(NativeProcessError::Invalid)?,
-        };
+        let thread = source.zone.record(record).identity();
         let mut graph = self.graph.lock();
+        let key = graph
+            .owner
+            .tasks()
+            .iter()
+            .find_map(|(_, row)| {
+                let resources = row.native().resources();
+                (resources.address.mm.raw().get() == thread.mm
+                    && resources.page as *const _ as u64 == thread.lifecycle_page)
+                    .then_some(row.key())
+            })
+            .ok_or(NativeProcessError::Stale)?;
         let row = graph
             .owner
             .task_mut(key)
             .map_err(|_| NativeProcessError::Stale)?;
-        if row.native().resources().record != source.zone.record_ref(record)
-            || !words.authenticates(row.native().resources().address)
+        if !words.authenticates(row.native().resources().address) {
+            return Err(NativeProcessError::Stale);
+        }
+        let control = owned_control(
+            row.native().resources().page,
+            row.native().resources().control,
+            thread.control_slot,
+        )
+        .ok_or(NativeProcessError::Stale)?;
+        control.bind_zone_record(source.zone.record_ref(record));
+        *row.context_mut() = words;
+        let resources = row.native().resources();
+        if current.metadata.lifecycle_page.load(Ordering::Acquire)
+            != resources.page as *const _ as u64
+            || current.metadata.control_slot.load(Ordering::Acquire)
+                != resources.control as *const _ as u64
         {
             return Err(NativeProcessError::Stale);
         }
-        *row.context_mut() = words;
+        let slot = Some(resources.control);
+        let calling_tid = resources
+            .control
+            .visible_tid()
+            .ok_or(NativeProcessError::Stale)?;
+        row.credentials_for(calling_tid)
+            .map_err(|_| NativeProcessError::Stale)?;
         drop(graph);
         Ok(NativeProcessEntry {
             runtime: self,
             source,
             binding,
+            record: source.zone.record_ref(record),
+            control,
             key,
             words,
             service,
             handoff: None,
             root_exit: None,
+            run_failure: None,
+            calling_tid,
+            slot,
+            interrupted_child_wait: None,
         })
     }
     pub fn namespace_child_key(&self, caller: TaskKey, visible: u32) -> Option<TaskKey> {
@@ -462,23 +710,31 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .ok()
             .flatten()
     }
-    /// Resolve the sole owned live row from an authenticated scheduler record.
-    pub fn record_binding(&self, record: RecordRef) -> Option<NativeRecordBinding<M, C>> {
-        let identity = self.zone.record(record.id).identity();
-        let key = TaskKey {
-            id: TaskId::from_abi_positive(i32::try_from(identity.tid).ok()?).ok()?,
-            serial: TaskSerial::from_raw_u64(identity.generation)?,
-        };
+    /// Resolve the process and exact saved thread context.
+    ///
+    /// # Safety
+    /// The caller must hold exclusive execution custody of this record after
+    /// scheduler selection, so no other executor can mutate its saved context.
+    pub unsafe fn record_binding(&self, record: RecordRef) -> Option<NativeRecordBinding<M, C>> {
+        let live = self.zone.live(record)?;
+        let identity = live.identity();
         let graph = self.graph.lock();
-        let row = graph.owner.task(key).ok()?;
+        let (_, row) = graph.owner.tasks().iter().find(|(_, row)| {
+            let resources = row.native().resources();
+            resources.address.mm.raw().get() == identity.mm
+                && resources.page as *const _ as u64 == identity.lifecycle_page
+        })?;
         let resources = row.native().resources();
-        (resources.record == record).then(|| NativeRecordBinding {
-            key,
+        // SAFETY: the caller selected this exact Queued/OnCpu record after the
+        // scheduler handed it exclusive context custody. Fresh births initialized it.
+        let words = unsafe { *live.ctx_mut() };
+        Some(NativeRecordBinding {
+            key: row.key(),
             visible_pid: row.metadata().namespace_pid,
             mm: resources.mm.clone(),
             address: resources.address,
-            words: *row.context(),
-            record: resources.record,
+            words,
+            record,
         })
     }
     pub fn task_binding(&self, key: TaskKey) -> Option<NativeRecordBinding<M, C>> {
@@ -510,11 +766,17 @@ pub struct NativeProcessEntry<
     runtime: &'r NativeProcessRuntime<'a, M, C>,
     source: BornInZoneSource<'a, C>,
     binding: ExecutionBinding,
+    record: RecordRef,
+    control: &'a ThreadControlSlot,
     key: TaskKey,
     words: C,
     service: &'r mut S,
     handoff: Option<EntryHandoffReceipt<C>>,
     root_exit: Option<LinuxWaitStatus>,
+    run_failure: Option<carrick_el1_abi::NativeRunFailureReason>,
+    calling_tid: u32,
+    slot: Option<&'a ThreadControlSlot>,
+    interrupted_child_wait: Option<Box<C>>,
 }
 fn returned(value: i64) -> LifecycleOutcome {
     LifecycleOutcome::Returned {
@@ -525,8 +787,208 @@ fn returned(value: i64) -> LifecycleOutcome {
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     NativeProcessEntry<'_, 'a, M, C, S>
 {
+    pub fn calling_tid(&self) -> u32 {
+        self.calling_tid
+    }
+    pub fn set_calling_tid(&mut self, tid: u32) {
+        self.calling_tid = tid;
+    }
+    pub fn set_slot_for_test(&mut self, slot: &'a ThreadControlSlot) {
+        self.slot = Some(slot);
+    }
+    pub fn take_run_failure(&mut self) -> Option<carrick_el1_abi::NativeRunFailureReason> {
+        self.run_failure.take()
+    }
+    fn run_failed(&mut self, reason: carrick_el1_abi::NativeRunFailureReason) -> LifecycleOutcome {
+        self.run_failure = Some(reason);
+        if let Some(record) = self
+            .source
+            .zone
+            .slot(self.source.slot)
+            .current()
+            .or_else(|| self.source.zone.slot(self.source.slot).host_record())
+        {
+            self.handoff =
+                carrick_core::entry::retire_current(self.binding, self.source, record, LOCK_SPINS);
+        }
+        // No graph exit or MM retirement is claimed. Even if lane retirement
+        // refuses, the authenticated carrier report stops this incomplete run.
+        LifecycleOutcome::Transferred {
+            progress: carrick_core::Served::Idle,
+            result: SyscallResult::new(0),
+        }
+    }
+    fn send_thread_signal(
+        &mut self,
+        group: Option<NonZeroU32>,
+        selector: carrick_personality_linux::signal::SignalThreadSelector,
+        request: carrick_personality_linux::signal::SignalRequest,
+        info: carrick_personality_linux::signal::SignalInfo,
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
+        use carrick_personality_linux::abi::signal::LINUX_ESRCH;
+        let sig = request.number();
+        let visible = selector
+            .positive()
+            .ok_or(carrick_syscall_abi::LINUX_EINVAL)?;
+        let graph = self.runtime.graph.lock();
+        let mut selected = None;
+        for row in graph.owner.tasks().values() {
+            if group.is_some_and(|group| group.get() != row.metadata().namespace_pid) {
+                continue;
+            }
+            let resources = row.native().resources();
+            if visible.get() == row.metadata().namespace_pid {
+                let record = if row.key() == self.key {
+                    self.record
+                } else {
+                    resources.control.zone_record().unwrap_or(resources.record)
+                };
+                if signal_record_exists(self.source.zone, record) {
+                    selected = Some((
+                        row.key(),
+                        record,
+                        resources.signals().clone(),
+                        resources.channel.clone(),
+                    ));
+                    break;
+                }
+            }
+            for index in 0..resources.page.entry_count() {
+                let Some((generation, state)) = resources.page.state(index) else {
+                    continue;
+                };
+                if !matches!(
+                    state,
+                    carrick_el1_abi::EntryState::Born | carrick_el1_abi::EntryState::Published
+                ) {
+                    continue;
+                }
+                let entry = EntryRef::new(index as u32, generation);
+                let Some(identity) = resources.page.identity(entry) else {
+                    continue;
+                };
+                if identity.visible_tid != visible.get() {
+                    continue;
+                }
+                let Some(address) = resources.page.control_address(entry) else {
+                    continue;
+                };
+                // SAFETY: the lifecycle owner retains and authenticates this control
+                // address for this exact nonretired entry incarnation.
+                let control = unsafe { &*(address as *const ThreadControlSlot) };
+                if control.entry() != Some(entry) {
+                    continue;
+                }
+                let Some(record) = control.zone_record() else {
+                    continue;
+                };
+                let Some(live) = self.source.zone.live(record) else {
+                    continue;
+                };
+                let thread = live.identity();
+                if thread.tid != u64::from(identity.tid)
+                    || thread.serial != identity.thread_serial
+                    || thread.mm != resources.address.mm.raw().get()
+                    || thread.lifecycle_page != resources.page as *const _ as u64
+                    || thread.control_slot != address
+                {
+                    continue;
+                }
+                selected = Some((
+                    row.key(),
+                    record,
+                    resources.signals().clone(),
+                    resources.channel.clone(),
+                ));
+                break;
+            }
+            if selected.is_some() {
+                break;
+            }
+        }
+        let (target_key, record, signals, channel) = selected.ok_or(LINUX_ESRCH)?;
+        use carrick_personality_linux::signal::SignalTargetScope;
+        info.check_target(if target_key == self.key {
+            SignalTargetScope::CallingProcess
+        } else {
+            SignalTargetScope::OtherProcess
+        })?;
+        if sig == 0 {
+            return Ok(());
+        }
+        let Some(signal) = request.signal() else {
+            return Ok(());
+        };
+        let sender = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| LINUX_ESRCH)?
+            .metadata()
+            .namespace_pid;
+        let info = info.payload(signal).unwrap_or_else(|| {
+            carrick_personality_linux::abi::signal::LinuxSiginfo::kill(
+                sig,
+                carrick_personality_linux::abi::signal::LINUX_SI_TKILL,
+                sender as i32,
+                0,
+            )
+        });
+        signals.enqueue_thread(record, signal, Some(info));
+        let target = self.source.zone.record(record.id).identity();
+        let blocked = graph
+            .owner
+            .tasks()
+            .iter()
+            .find_map(|(_, row)| {
+                let resources = row.native().resources();
+                (resources.address.mm.raw().get() == target.mm
+                    && resources.page as *const _ as u64 == target.lifecycle_page)
+                    .then(|| owned_control(resources.page, resources.control, target.control_slot))
+                    .flatten()
+            })
+            .map(|control| {
+                carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                    carrick_signal_core::SignalSet::from_bits(control.blocked().0),
+                )
+            });
+        let interrupt = blocked.is_some_and(|blocked| signals.has_deliverable(record, blocked));
+        drop(graph);
+        if interrupt {
+            self.interrupt_signal_record(record);
+        }
+        if let Some(channel) = channel {
+            self.publish_channel(&channel)
+                .map_err(|e| carrick_syscall_abi::LinuxErrno::new(-e.errno() as i32))?;
+        }
+        Ok(())
+    }
+
+    // Dependency: owned interrupt cancellation. Parked futex/object operations
+    // retain their pending signals until their owner resumes; an IPI does not
+    // cancel their operation or release its queue/timer custody.
+    fn interrupt_signal_record(&mut self, record: RecordRef) {
+        if !signal_record_exists(self.source.zone, record) {
+            return;
+        }
+        let owned = self.source.zone.record(record.id);
+        let target = match owned.claim() {
+            carrick_sched_core::Claim::OnCpu { slot, .. }
+            | carrick_sched_core::Claim::OnCpuRequested { slot, .. } => Some(slot),
+            carrick_sched_core::Claim::Free => owned.home(),
+            _ => None,
+        };
+        if let Some(slot) = target {
+            let mut effects = WakeEffects::default();
+            effects.request_reschedule(slot);
+            self.service.wake_effects(effects);
+        }
+    }
+
     pub fn take_root_exit(&mut self) -> Option<LinuxWaitStatus> {
         self.root_exit.take()
+    }
+    pub fn task_id(&self) -> u32 {
+        self.key.id.raw() as u32
     }
     pub fn is_root_process(&self) -> bool {
         let graph = self.runtime.graph.lock();
@@ -672,6 +1134,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         if graph.pending.contains_key(&self.key) {
                             return Err(NativeProcessError::Busy);
                         }
+                        let resources = graph
+                            .owner
+                            .task(self.key)
+                            .map_err(|_| NativeProcessError::Stale)?
+                            .native()
+                            .resources();
+                        let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                            carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
+                        );
+                        if resources.signals().has_deliverable(self.record, blocked) {
+                            self.interrupted_child_wait = Some(Box::new(self.words));
+                            return Ok(returned(
+                                carrick_personality_linux::abi::signal::LINUX_EINTR.guest_retval(),
+                            ));
+                        }
                     }
                     let sequence = zone.next_seq(record);
                     zone.enqueue(&guard, record, sequence, channel.mm, address, u32::MAX, 0)
@@ -709,9 +1186,184 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         }
     }
+    /// Publish a synchronous fault payload through this exact process owner.
+    pub fn force_sigsegv_info(
+        &mut self,
+        blocked: carrick_signal_core::policy::SigBlockMask,
+        mut info: carrick_syscall_abi::LinuxSiginfo,
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
+        info.si_signo = carrick_signal_core::policy::Signal::SEGV.number();
+        let graph = self.runtime.graph.lock();
+        let row = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_syscall_abi::LINUX_ESRCH)?;
+        row.native()
+            .resources()
+            .signals()
+            .force_sigsegv(self.record, blocked, Some(info));
+        Ok(())
+    }
+
+    /// Copy a signal frame through the same exact-MM COW authority as wait status.
+    pub fn copy_signal_frame(
+        &mut self,
+        address: UserVa,
+        bytes: &[u8],
+    ) -> Result<(), NativeProcessError> {
+        let mm = self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale)?
+            .native()
+            .resources()
+            .mm
+            .clone();
+        self.service.copy_signal_bytes(&mm, address, bytes)
+    }
+    fn park_signal_wait(
+        &mut self,
+        kind: PendingSignalKind,
+        channel: Arc<WaitChannel>,
+        observed: carrick_sched_core::process::wait::TaskWakeGeneration,
+        deadline: Option<carrick_guest_arch::Deadline>,
+    ) -> Result<bool, NativeProcessError> {
+        let zone = self.source.zone;
+        let record = zone
+            .slot(self.source.slot)
+            .current()
+            .or_else(|| zone.slot(self.source.slot).host_record())
+            .ok_or(NativeProcessError::Stale)?;
+        let start = carrick_core::entry::prepare_handoff(self.binding, self.source, record)
+            .ok_or(NativeProcessError::Stale)?;
+        let address = WaitChannel::address(&channel);
+        let guard = zone
+            .lock(
+                ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
+                &BoundedSpin(LOCK_SPINS),
+            )
+            .ok_or(NativeProcessError::Busy)?;
+        if channel.generation.generation() != observed {
+            return Ok(false);
+        }
+        if deadline.is_some() && !zone.timer_admission_available(self.source.slot) {
+            return Err(NativeProcessError::Busy);
+        }
+        let sequence = zone.next_seq(record);
+        zone.set_deadline(record, deadline.map_or(0, |deadline| deadline.0.raw()));
+        if let Some(deadline) = deadline {
+            // Program the same shared timer to the earliest owned deadline.
+            let earliest = zone
+                .timer_deadline(self.source.slot)
+                .map_or(deadline.0.raw(), |owned| owned.min(deadline.0.raw()));
+            self.service.arm_signal_timer(carrick_guest_arch::Deadline(
+                carrick_guest_arch::CounterTick::new(earliest),
+            ))?;
+            zone.arm_timer(self.source.slot, record, sequence)
+                .map_err(|_| NativeProcessError::Busy)?;
+        }
+        zone.enqueue(&guard, record, sequence, channel.mm, address, u32::MAX, 0)
+            .map_err(|_| {
+                zone.cancel_timer_admission(self.record);
+                NativeProcessError::Exhausted
+            })?;
+        // SAFETY: this exact record is still authenticated OnCpu under its bucket guard.
+        unsafe { *zone.record(record).ctx_mut() = self.words };
+        self.runtime.graph.lock().signal_waits.insert(
+            self.record,
+            PendingSignalWait {
+                kind,
+                channel,
+                deadline,
+            },
+        );
+        let receipt = carrick_core::entry::publish_handoff_park(
+            start,
+            &guard,
+            carrick_el1_abi::EntryRecordGeneration(sequence),
+        );
+        if receipt.is_none() {
+            self.runtime.graph.lock().signal_waits.remove(&self.record);
+            return Err(NativeProcessError::Busy);
+        }
+        drop(guard);
+        zone.clear_current(self.source.slot);
+        self.handoff = receipt;
+        Ok(true)
+    }
+    fn resume_signal_wait(
+        &mut self,
+        pending: PendingSignalWait,
+    ) -> Result<LifecycleOutcome, NativeProcessError> {
+        loop {
+            // A publication after this snapshot must invalidate enrollment.
+            let observed = pending.channel.generation.generation();
+            let graph = self.runtime.graph.lock();
+            let row = graph
+                .owner
+                .task(self.key)
+                .map_err(|_| NativeProcessError::Stale)?;
+            let resources = row.native().resources();
+            let signals = resources.signals().clone();
+            let mm = resources.mm.clone();
+            let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
+            );
+            drop(graph);
+            if let PendingSignalKind::Wait { set, info } = pending.kind
+                && let Some((signal, payload)) = signals.take_timedwait(self.record, set)
+            {
+                if info.raw() != 0 {
+                    let payload = payload.unwrap_or_else(|| {
+                        carrick_syscall_abi::LinuxSiginfo::kill(
+                            signal.number(),
+                            carrick_syscall_abi::LINUX_SI_USER,
+                            0,
+                            0,
+                        )
+                    });
+                    self.service.copy_siginfo(&mm, info, &payload)?;
+                }
+                return Ok(returned(i64::from(signal.number())));
+            }
+            if signals.has_deliverable(self.record, blocked) {
+                return Ok(returned(
+                    carrick_personality_linux::abi::signal::LINUX_EINTR.guest_retval(),
+                ));
+            }
+            if let Some(deadline) = pending.deadline
+                && self.service.signal_now()?.raw() >= deadline.0.raw()
+            {
+                return Ok(returned(
+                    carrick_personality_linux::abi::signal::LINUX_EAGAIN.guest_retval(),
+                ));
+            }
+            if self.park_signal_wait(
+                pending.kind,
+                pending.channel.clone(),
+                observed,
+                pending.deadline,
+            )? {
+                return Ok(LifecycleOutcome::Transferred {
+                    progress: carrick_core::Served::Idle,
+                    result: SyscallResult::new(0),
+                });
+            }
+        }
+    }
     /// The execution lane calls this before returning a woken saved syscall to
     /// userspace. It consumes the retained wait operation instead of replaying it.
     pub fn resume_pending_wait(&mut self) -> Option<LifecycleOutcome> {
+        let signal_wait = self.runtime.graph.lock().signal_waits.remove(&self.record);
+        if let Some(pending) = signal_wait {
+            return Some(match self.resume_signal_wait(pending) {
+                Ok(outcome) => outcome,
+                Err(error) => self.fail(error),
+            });
+        }
         let pending = self.runtime.graph.lock().pending.remove(&self.key)?;
         if pending.caller != self.key
             || pending.channel.generation.generation() == pending.precheck.wake_generation()
@@ -725,6 +1377,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Err(error) => self.fail(error),
             },
         )
+    }
+    /// Original context of an interrupted, unconsumed child-wait query.
+    /// Only this owned operation may be restarted after a caught handler.
+    pub fn take_interrupted_child_wait(&mut self) -> Option<C> {
+        self.interrupted_child_wait.take().map(|words| *words)
     }
     fn publish_channel(&mut self, channel: &Arc<WaitChannel>) -> Result<(), NativeProcessError> {
         let zone = self.source.zone;
@@ -757,22 +1414,166 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.service.wake_effects(effects);
         Ok(())
     }
+    /// Resume owned lifecycle custody before the execution lane returns to EL0.
+    /// Exit keeps its original status and cannot become a guest syscall return.
+    pub fn resume_pending_lifecycle(&mut self) -> Option<LifecycleOutcome> {
+        let status = self
+            .runtime
+            .graph
+            .lock()
+            .pending_exit
+            .get(&self.key)
+            .map(|p| p.status);
+        if let Some(status) = status {
+            return Some(match self.exit_with_status(status) {
+                Ok(outcome) => outcome,
+                Err(error) => self.run_failed(error.run_failure_reason()),
+            });
+        }
+        self.resume_pending_wait()
+    }
+
+    fn park_pending_exit(
+        &mut self,
+        page: &ThreadLifecyclePage,
+        channel: &Arc<WaitChannel>,
+    ) -> Result<Option<LifecycleOutcome>, NativeProcessError> {
+        let zone = self.source.zone;
+        let record = zone
+            .slot(self.source.slot)
+            .current()
+            .or_else(|| zone.slot(self.source.slot).host_record())
+            .ok_or(NativeProcessError::Quarantined)?;
+        let start = carrick_core::entry::prepare_handoff(self.binding, self.source, record)
+            .ok_or(NativeProcessError::Quarantined)?;
+        let address = WaitChannel::address(channel);
+        let guard = zone
+            .lock(
+                ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
+                &BoundedSpin(LOCK_SPINS),
+            )
+            .ok_or(NativeProcessError::Quarantined)?;
+        // Settlement publishes under this same bucket. A claim which settled
+        // before enrollment needs no wake; a later settlement owns our wake.
+        if page.claimed_count() == 0 {
+            return Ok(None);
+        }
+        let sequence = zone.next_seq(record);
+        zone.enqueue(&guard, record, sequence, channel.mm, address, u32::MAX, 0)
+            .map_err(|_| NativeProcessError::Quarantined)?;
+        // SAFETY: the current record remains owned until its guarded park CAS.
+        unsafe { *zone.record(record).ctx_mut() = self.words };
+        let receipt = carrick_core::entry::publish_handoff_park(
+            start,
+            &guard,
+            carrick_el1_abi::EntryRecordGeneration(sequence),
+        )
+        .ok_or(NativeProcessError::Quarantined)?;
+        drop(guard);
+        zone.clear_current(self.source.slot);
+        self.handoff = Some(receipt);
+        Ok(Some(LifecycleOutcome::Transferred {
+            progress: carrick_core::Served::Idle,
+            result: SyscallResult::new(0),
+        }))
+    }
+
+    #[inline(never)]
     fn exit_owned(&mut self, status: u8) -> Result<LifecycleOutcome, NativeProcessError> {
-        let root_exit = self.is_root_process();
-        let wait_status = LinuxWaitStatus::from_wait_encoding(i32::from(status) << 8);
-        let (page, control) = {
-            let graph = self.runtime.graph.lock();
-            let resources = graph
+        self.exit_with_status(LinuxWaitStatus::exited(status))
+    }
+    pub fn exit_with_signal(&mut self, sig: u8) -> Result<LifecycleOutcome, NativeProcessError> {
+        if self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale)?
+            .native()
+            .resources()
+            .page
+            .live()
+            != 1
+        {
+            return Err(NativeProcessError::GroupExitCustody);
+        }
+        let wait_status = LinuxWaitStatus::signaled(sig, false);
+        self.exit_with_status(wait_status)
+    }
+    pub fn exit_with_status(
+        &mut self,
+        wait_status: LinuxWaitStatus,
+    ) -> Result<LifecycleOutcome, NativeProcessError> {
+        let child_pid = self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale)?
+            .metadata()
+            .namespace_pid;
+        let (page, channel) = {
+            let mut graph = self.runtime.graph.lock();
+            let row = graph
                 .owner
-                .task(self.key)
-                .map_err(|_| NativeProcessError::Stale)?
-                .native()
-                .resources();
-            if resources.page.live() != 1 {
-                return Err(NativeProcessError::Unsupported);
+                .task_mut(self.key)
+                .map_err(|_| NativeProcessError::Stale)?;
+            row.select_exit_thread(self.calling_tid)
+                .map_err(|_| NativeProcessError::Stale)?;
+            let page = row.native().resources().page;
+            if !graph.pending_exit.contains_key(&self.key) {
+                // Already admitted sibling retirement still needs its own
+                // exact-record cancellation binding. Pre-live claims are
+                // refused by thread_spawned after this terminal close.
+                if page.live() == 0 {
+                    return Err(NativeProcessError::Quarantined);
+                }
+                if page.live() > 1 && page.claimed_count() == 0 {
+                    drop(graph);
+                    return Ok(self
+                        .run_failed(carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody));
+                }
+                page.close();
+                let channel = Arc::new(WaitChannel {
+                    generation: ProcessWake::new(),
+                    mm: self.binding.mm.raw(),
+                });
+                let wake = Some(ExitWakeCustody {
+                    channel: channel.clone(),
+                });
+                graph.pending_exit.insert(
+                    self.key,
+                    PendingExit {
+                        status: wait_status,
+                        channel,
+                        wake,
+                    },
+                );
             }
-            (resources.page, resources.control)
+            (
+                page,
+                graph
+                    .pending_exit
+                    .get(&self.key)
+                    .ok_or(NativeProcessError::Quarantined)?
+                    .channel
+                    .clone(),
+            )
         };
+        if let Some(outcome) = self.park_pending_exit(page, &channel)? {
+            return Ok(outcome);
+        }
+        if page.live() == 0 {
+            return Err(NativeProcessError::Quarantined);
+        }
+        if page.live() > 1 {
+            return Ok(
+                self.run_failed(carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody)
+            );
+        }
+        let root_exit = self.is_root_process();
         let transaction = self
             .runtime
             .graph
@@ -780,16 +1581,28 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .serials
             .allocate()
             .ok_or(NativeProcessError::Exhausted)?;
-        let (resources, published) = {
+        let (page, control, resources, published) = {
             let mut graph = self.runtime.graph.lock();
-            native_process_entry::publish_exit(
+            let row = graph
+                .owner
+                .task_mut(self.key)
+                .map_err(|_| NativeProcessError::Stale)?;
+            row.select_exit_thread(self.calling_tid)
+                .map_err(|_| NativeProcessError::Stale)?;
+            let page = row.native().resources().page;
+            let control = row.native().resources().control;
+            let (resources, published) = match native_process_entry::publish_exit(
                 &mut graph.owner,
                 self.key,
                 None,
                 transaction,
                 wait_status,
-            )
-            .map_err(|_| NativeProcessError::Busy)?
+            ) {
+                Ok(published) => published,
+                Err(_) => return Err(NativeProcessError::Quarantined),
+            };
+            graph.pending_exit.remove(&self.key);
+            (page, control, resources, published)
         };
         let record = self
             .source
@@ -852,8 +1665,30 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 };
                 let signal = carrick_signal_core::policy::Signal::from_number(signal.raw())
                     .ok_or(NativeProcessError::Invalid)?;
+                let (code, status) = if let Some(term) = wait_status.term_signal() {
+                    (
+                        if wait_status.raw() & 0x80 != 0 {
+                            carrick_syscall_abi::LINUX_CLD_DUMPED
+                        } else {
+                            carrick_syscall_abi::LINUX_CLD_KILLED
+                        },
+                        i32::from(term),
+                    )
+                } else {
+                    (
+                        carrick_syscall_abi::LINUX_CLD_EXITED,
+                        (wait_status.raw() >> 8) & 0xff,
+                    )
+                };
+                let info = carrick_syscall_abi::LinuxSiginfo::child_exit(
+                    signal.number(),
+                    child_pid as i32,
+                    0,
+                    code,
+                    status,
+                );
                 signals
-                    .enqueue(notification.parent, signal, None)
+                    .enqueue(notification.parent, signal, Some(info))
                     .map_err(|_| NativeProcessError::Stale)?;
             }
         }
@@ -873,6 +1708,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             result: SyscallResult::new(0),
         })
     }
+    #[inline(never)]
     fn fork_owned(&mut self) -> Result<u32, NativeProcessError> {
         let (
             snapshot,
@@ -888,17 +1724,42 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             group,
             session,
             signals,
+            parent_creds,
+            parent_rlimits,
+            parent_umask,
+            parent_personality,
+            parent_dumpable,
+            parent_no_new_privs,
+            parent_comm,
+            parent_container,
         ) = {
             let mut graph = self.runtime.graph.lock();
             let row = graph
                 .owner
                 .task(self.key)
                 .map_err(|_| NativeProcessError::Stale)?;
+            if row.native().resources().page.gate() != carrick_el1_abi::GateState::Open {
+                return Err(NativeProcessError::Busy);
+            }
             let parent_mm = row.native().resources().mm.clone();
             let identity = row.identity();
             let group = row.metadata().namespace_process_group;
             let session = row.metadata().namespace_session;
             let signals = row.native().resources().signals.clone();
+            let caller_tid = self.calling_tid;
+            let parent_container = row.metadata().container;
+            let parent_creds = row
+                .credentials_for(caller_tid)
+                .map_err(|_| NativeProcessError::Stale)?
+                .clone();
+            let parent_rlimits = row.rlimits;
+            let parent_umask = row.umask;
+            let parent_personality = row.personality;
+            let parent_dumpable = row.dumpable;
+            let parent_no_new_privs = row.no_new_privs;
+            let parent_comm = *row
+                .comm_for(caller_tid)
+                .map_err(|_| NativeProcessError::Stale)?;
             let snapshot = graph
                 .owner
                 .capture_parent(self.key)
@@ -971,6 +1832,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 group,
                 session,
                 signals,
+                parent_creds,
+                parent_rlimits,
+                parent_umask,
+                parent_personality,
+                parent_dumpable,
+                parent_no_new_privs,
+                parent_comm,
+                parent_container,
             )
         };
         let signals = match signals.for_fork(child_key) {
@@ -1048,6 +1917,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .map_err(|_| NativeProcessError::Busy)?;
             control.reset_for_birth(blocked, 0, lifecycle_entry);
             if !control.publish_visible_tid(visible.get()) {
+                page.unclaim(claim)
+                    .map_err(|_| NativeProcessError::Quarantined)?;
                 return Err(NativeProcessError::Invalid);
             }
             let born = page
@@ -1061,7 +1932,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         blocked,
                     },
                 )
-                .map_err(|_| NativeProcessError::Invalid)?;
+                .map_err(|refusal| {
+                    let (_, claim) = refusal.into_parts();
+                    match page.unclaim(claim) {
+                        Ok(_) => NativeProcessError::Invalid,
+                        Err(_) => NativeProcessError::Quarantined,
+                    }
+                })?;
             page.publish(born)
                 .map_err(|_| NativeProcessError::Invalid)?;
             Ok(control)
@@ -1112,16 +1989,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             channel: None,
             usage: TaskRusage::default(),
         };
-        let child = GuestTask::new(
+        let mut child = GuestTask::new(
             GuestTaskMetadata {
                 key: child_key,
-                container: (),
+                container: parent_container,
                 namespace_pid: visible.get(),
                 identity,
                 namespace_process_group: group,
                 namespace_session: session,
-                ruid: (),
-                euid: (),
+                receipt_uid: |uid| uid,
                 exit_signal: ChildExitSignal::SIGCHLD,
                 diagnostic_name: String::from("native-child"),
             },
@@ -1130,6 +2006,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             custody(resources),
             claim,
         );
+        child.init_leader(visible.get(), parent_creds, parent_comm);
+        child.rlimits = parent_rlimits;
+        child.umask = parent_umask;
+        child.personality = parent_personality;
+        child.dumpable = parent_dumpable;
+        child.no_new_privs = parent_no_new_privs;
         let prep = PreparedFork::from_reserved(
             snapshot,
             snapshot,
@@ -1193,6 +2075,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> ProcessNative<C>
     for NativeProcessEntry<'_, 'a, M, C, S>
 {
+    fn take_run_failure(&mut self) -> Option<carrick_el1_abi::NativeRunFailureReason> {
+        self.run_failure.take()
+    }
+    fn copy_out_owned(&mut self, dst: UserVa, bytes: &[u8]) -> Option<bool> {
+        Some(self.copy_signal_frame(dst, bytes).is_ok())
+    }
     fn binding(&self) -> ExecutionBinding {
         self.binding
     }
@@ -1227,8 +2115,1230 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn exit_group(&mut self, status: u8) -> LifecycleOutcome {
         match self.exit_owned(status) {
             Ok(outcome) => outcome,
-            Err(error) => self.fail(error),
+            Err(error) => self.run_failed(error.run_failure_reason()),
         }
+    }
+    fn as_identity_venue(
+        &mut self,
+    ) -> Option<&mut dyn carrick_personality_linux::identity::ProcessIdentityVenue> {
+        Some(self)
+    }
+    fn as_sysinfo_venue(
+        &mut self,
+    ) -> Option<&mut dyn carrick_personality_linux::sysinfo::ProcessSysinfoVenue> {
+        Some(self)
+    }
+    fn thread_spawned(
+        &mut self,
+        caller_tid: u32,
+        child_tid: u32,
+        publish: &mut dyn FnMut() -> Result<(), i64>,
+    ) -> Result<(), i64> {
+        let mut graph = self.runtime.graph.lock();
+        let task = graph
+            .owner
+            .task_mut(self.key)
+            .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
+        if task.native().resources().page.gate() == carrick_el1_abi::GateState::Closed {
+            return Err(-11);
+        }
+        if task.has_thread(child_tid) {
+            return Err(carrick_personality_linux::identity::EINVAL);
+        }
+        task.spawn_thread(caller_tid, child_tid)?;
+        if let Err(error) = publish() {
+            task.remove_thread(child_tid);
+            return Err(error);
+        }
+        Ok(())
+    }
+    fn thread_exited(&mut self, tid: u32) {
+        self.thread_exited(tid);
+    }
+    fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
+        let wake = {
+            let mut graph = self.runtime.graph.lock();
+            if graph.pending_exit.contains_key(&self.key) {
+                let settled = graph
+                    .owner
+                    .task(self.key)
+                    .map_err(|_| NativeProcessError::Quarantined)
+                    .map(|row| row.native().resources().page.claimed_count() == 0);
+                settled.map(|settled| {
+                    if settled {
+                        graph
+                            .pending_exit
+                            .get_mut(&self.key)
+                            .and_then(|pending| pending.wake.take())
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                Ok(None)
+            }
+        };
+        // Graph ownership is released before acquiring any scheduler bucket.
+        let published = wake.and_then(|wake| {
+            if let Some(wake) = wake {
+                self.publish_channel(&wake.channel)?;
+            }
+            Ok(())
+        });
+        if let Err(error) = published {
+            // The sole pending-exit wake cannot be retried or discarded. The
+            // active clone lane reports typed run failure before guest return.
+            self.run_failure = Some(carrick_el1_abi::NativeRunFailureReason::BirthSettlement);
+            return Err(error.errno());
+        }
+        Ok(())
+    }
+    fn set_calling_tid(&mut self, tid: u32) {
+        self.calling_tid = tid;
+    }
+
+    #[inline(never)]
+    fn has_thread(&self, tid: u32) -> bool {
+        let graph = self.runtime.graph.lock();
+        if let Ok(task) = graph.owner.task(self.key) {
+            task.has_thread(tid)
+        } else {
+            false
+        }
+    }
+    fn read_robust_list(
+        &self,
+        tid: u32,
+        read_slot: &mut carrick_personality_linux::lifecycle::RobustSlotReader<'_>,
+    ) -> Result<(u64, u32), i64> {
+        let graph = self.runtime.graph.lock();
+        let target = self.robust_target(&graph.owner, tid)?;
+        let resources = target.native().resources();
+        if tid == target.metadata().namespace_pid {
+            return Ok(resources.control.robust_list());
+        }
+        let entry = resources
+            .page
+            .entry_ref_for_visible_tid(tid)
+            .ok_or(carrick_personality_linux::identity::ESRCH)?;
+        read_slot(resources.page, entry).ok_or(carrick_personality_linux::identity::ESRCH)
+    }
+    fn signal_venue(
+        &mut self,
+    ) -> Option<&mut dyn carrick_personality_linux::signal::ProcessSignals> {
+        Some(self)
+    }
+}
+
+impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
+    NativeProcessEntry<'_, 'a, M, C, S>
+{
+    #[inline(never)]
+    pub fn thread_exited(&mut self, tid: u32) {
+        let mut graph = self.runtime.graph.lock();
+        if let Ok(task) = graph.owner.task_mut(self.key) {
+            task.remove_thread(tid);
+        }
+    }
+
+    fn robust_target<'g>(
+        &self,
+        owner: &'g Owner<'a, M, C>,
+        tid: u32,
+    ) -> Result<&'g NativeIdentityTask<'a, M, C>, i64> {
+        use carrick_personality_linux::identity::{EPERM, ESRCH};
+        use carrick_sched_core::process::LinuxCapabilitySet;
+        let caller = owner.task(self.key).map_err(|_| ESRCH)?;
+        let credentials = caller.credentials_for(self.calling_tid)?;
+        let target = owner
+            .find_task_by_thread(caller.metadata().container, tid)
+            .filter(|row| row.native().resources().control.visible_tid().is_some())
+            .ok_or(ESRCH)?;
+        if target.key() == self.key {
+            return Ok(target);
+        }
+        if credentials
+            .cap_effective
+            .contains(LinuxCapabilitySet::CAP_SYS_PTRACE)
+        {
+            return Ok(target);
+        }
+        let peer = target.credentials_for(tid)?;
+        let uid_matches = peer.ruid == credentials.fsuid
+            && peer.euid == credentials.fsuid
+            && peer.suid == credentials.fsuid;
+        let gid_matches = peer.rgid == credentials.fsgid
+            && peer.egid == credentials.fsgid
+            && peer.sgid == credentials.fsgid;
+        if uid_matches
+            && gid_matches
+            && target.dumpable == 1
+            && credentials.cap_permitted.contains(peer.cap_permitted)
+        {
+            Ok(target)
+        } else {
+            Err(EPERM)
+        }
+    }
+
+    #[inline(never)]
+    fn update_calling_creds(
+        &mut self,
+        f: &mut dyn FnMut(&mut carrick_sched_core::process::TaskCredentials) -> Result<(), i64>,
+    ) -> Result<(), i64> {
+        let mut graph = self.runtime.graph.lock();
+        let task = graph
+            .owner
+            .task_mut(self.key)
+            .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
+        f(task.credentials_for_mut(self.calling_tid)?)?;
+        Ok(())
+    }
+}
+
+impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
+    carrick_personality_linux::identity::ProcessIdentityVenue
+    for NativeProcessEntry<'r, 'a, M, C, S>
+{
+    fn get_uids(
+        &self,
+    ) -> Result<(u32, u32, u32, u32), carrick_personality_linux::identity::IdentityReadError> {
+        let graph = self.runtime.graph.lock();
+        let task = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_personality_linux::identity::IdentityReadError::MissingThread)?;
+        let creds = task
+            .credentials_for(self.calling_tid)
+            .map_err(|_| carrick_personality_linux::identity::IdentityReadError::MissingThread)?;
+        Ok((
+            creds.ruid.raw(),
+            creds.euid.raw(),
+            creds.suid.raw(),
+            creds.fsuid.raw(),
+        ))
+    }
+    fn get_gids(
+        &self,
+    ) -> Result<(u32, u32, u32, u32), carrick_personality_linux::identity::IdentityReadError> {
+        let graph = self.runtime.graph.lock();
+        let task = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_personality_linux::identity::IdentityReadError::MissingThread)?;
+        let creds = task
+            .credentials_for(self.calling_tid)
+            .map_err(|_| carrick_personality_linux::identity::IdentityReadError::MissingThread)?;
+        Ok((
+            creds.rgid.raw(),
+            creds.egid.raw(),
+            creds.sgid.raw(),
+            creds.fsgid.raw(),
+        ))
+    }
+
+    fn set_resuid(&mut self, r: Option<u32>, e: Option<u32>, s: Option<u32>) -> Result<(), i64> {
+        self.update_calling_creds(&mut |creds| creds.set_resuid(r, e, s))
+    }
+
+    fn set_resgid(&mut self, r: Option<u32>, e: Option<u32>, s: Option<u32>) -> Result<(), i64> {
+        self.update_calling_creds(&mut |creds| creds.set_resgid(r, e, s))
+    }
+
+    fn set_reuid(&mut self, r: Option<u32>, e: Option<u32>) -> Result<(), i64> {
+        self.update_calling_creds(&mut |creds| creds.set_reuid(r, e))
+    }
+
+    fn set_regid(&mut self, r: Option<u32>, e: Option<u32>) -> Result<(), i64> {
+        self.update_calling_creds(&mut |creds| creds.set_regid(r, e))
+    }
+
+    fn set_uid(&mut self, uid: u32) -> Result<(), i64> {
+        self.update_calling_creds(&mut |creds| creds.set_uid(uid))
+    }
+
+    fn set_gid(&mut self, gid: u32) -> Result<(), i64> {
+        self.update_calling_creds(&mut |creds| creds.set_gid(gid))
+    }
+
+    fn set_fsuid(
+        &mut self,
+        fsuid: u32,
+    ) -> Result<u32, carrick_personality_linux::identity::IdentityReadError> {
+        let mut prev = None;
+        self.update_calling_creds(&mut |creds| {
+            prev = Some(creds.set_fsuid(fsuid));
+            Ok(())
+        })
+        .map_err(|_| carrick_personality_linux::identity::IdentityReadError::MissingThread)?;
+        prev.ok_or(carrick_personality_linux::identity::IdentityReadError::MissingThread)
+    }
+
+    fn set_fsgid(
+        &mut self,
+        fsgid: u32,
+    ) -> Result<u32, carrick_personality_linux::identity::IdentityReadError> {
+        let mut prev = None;
+        self.update_calling_creds(&mut |creds| {
+            prev = Some(creds.set_fsgid(fsgid));
+            Ok(())
+        })
+        .map_err(|_| carrick_personality_linux::identity::IdentityReadError::MissingThread)?;
+        prev.ok_or(carrick_personality_linux::identity::IdentityReadError::MissingThread)
+    }
+
+    fn can_set_groups(&self) -> Result<(), i64> {
+        let graph = self.runtime.graph.lock();
+        let task = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
+        let creds = task
+            .credentials_for(self.calling_tid)
+            .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
+        if !creds.is_gid_privileged() {
+            return Err(carrick_personality_linux::identity::EPERM);
+        }
+        Ok(())
+    }
+
+    fn get_groups_count(
+        &self,
+    ) -> Result<usize, carrick_personality_linux::identity::IdentityReadError> {
+        let graph = self.runtime.graph.lock();
+        let task = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_personality_linux::identity::IdentityReadError::MissingThread)?;
+        Ok(task
+            .credentials_for(self.calling_tid)
+            .map_err(|_| carrick_personality_linux::identity::IdentityReadError::MissingThread)?
+            .groups
+            .len())
+    }
+    fn get_groups(
+        &self,
+        out: &mut alloc::vec::Vec<u32>,
+    ) -> Result<(), carrick_personality_linux::identity::IdentityReadError> {
+        let graph = self.runtime.graph.lock();
+        let task = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_personality_linux::identity::IdentityReadError::MissingThread)?;
+        let creds = task
+            .credentials_for(self.calling_tid)
+            .map_err(|_| carrick_personality_linux::identity::IdentityReadError::MissingThread)?;
+        out.clear();
+        out.extend(creds.groups.iter().map(|g| g.raw()));
+        Ok(())
+    }
+
+    fn set_groups(&mut self, groups: &[u32]) -> Result<(), i64> {
+        if groups.len() > carrick_personality_linux::identity::LINUX_NGROUPS_MAX {
+            return Err(carrick_personality_linux::identity::EINVAL);
+        }
+        let mut parsed = Some(
+            groups
+                .iter()
+                .copied()
+                .map(carrick_sched_core::process::TaskGid::new)
+                .collect::<alloc::vec::Vec<_>>(),
+        );
+        self.update_calling_creds(&mut |creds| {
+            if !creds.is_gid_privileged() {
+                return Err(carrick_personality_linux::identity::EPERM);
+            }
+            if let Some(p) = parsed.take() {
+                creds.groups = p;
+            }
+            Ok(())
+        })
+    }
+
+    fn capget(
+        &self,
+        pid: i32,
+    ) -> Result<carrick_personality_linux::identity::TaskCapabilities, i64> {
+        let graph = self.runtime.graph.lock();
+        let caller = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
+        if pid == 0 {
+            let creds = caller.credentials_for(self.calling_tid)?;
+            return Ok(carrick_personality_linux::identity::TaskCapabilities {
+                effective: creds.cap_effective,
+                permitted: creds.cap_permitted,
+                inheritable: creds.cap_inheritable,
+            });
+        }
+        let target_tid = pid as u32;
+        if target_tid == caller.metadata().namespace_pid || caller.has_thread(target_tid) {
+            let creds = caller.credentials_for(target_tid)?;
+            return Ok(carrick_personality_linux::identity::TaskCapabilities {
+                effective: creds.cap_effective,
+                permitted: creds.cap_permitted,
+                inheritable: creds.cap_inheritable,
+            });
+        }
+        let target = graph
+            .owner
+            .find_task_by_pid(target_tid)
+            .filter(|row| row.native().resources().control.visible_tid().is_some())
+            .ok_or(carrick_personality_linux::identity::ESRCH)?;
+        let creds = target.credentials_for(target_tid)?;
+        Ok(carrick_personality_linux::identity::TaskCapabilities {
+            effective: creds.cap_effective,
+            permitted: creds.cap_permitted,
+            inheritable: creds.cap_inheritable,
+        })
+    }
+
+    fn capset(
+        &mut self,
+        pid: i32,
+        caps: carrick_personality_linux::identity::TaskCapabilities,
+    ) -> Result<(), i64> {
+        let mut graph = self.runtime.graph.lock();
+        let caller_tid = self.calling_tid;
+        let task = graph
+            .owner
+            .task_mut(self.key)
+            .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
+        if pid < 0 || (pid != 0 && pid as u32 != caller_tid) {
+            return Err(carrick_personality_linux::identity::EPERM);
+        }
+        let caller_creds = task.credentials_for(caller_tid)?;
+        if !caller_creds.cap_permitted.contains(caps.permitted) {
+            return Err(carrick_personality_linux::identity::EPERM);
+        }
+        let has_setpcap = caller_creds
+            .cap_effective
+            .contains(carrick_personality_linux::identity::LinuxCapabilitySet::CAP_SETPCAP);
+        if !has_setpcap {
+            let allowed_inh = caller_creds
+                .cap_inheritable
+                .union(caller_creds.cap_permitted);
+            if !allowed_inh.contains(caps.inheritable) {
+                return Err(carrick_personality_linux::identity::EPERM);
+            }
+        }
+        let target_creds = task.credentials_for_mut(caller_tid)?;
+        target_creds.cap_effective = caps.effective;
+        target_creds.cap_permitted = caps.permitted;
+        target_creds.cap_inheritable = caps.inheritable;
+        Ok(())
+    }
+
+    fn get_ppid(&self) -> u32 {
+        let graph = self.runtime.graph.lock();
+        let Ok(task) = graph.owner.task(self.key) else {
+            return 0;
+        };
+        if task.metadata().namespace_pid == 1 {
+            return 0;
+        }
+        let Some(parent_key) = task.parent() else {
+            return 0;
+        };
+        let Ok(parent) = graph.owner.task(parent_key) else {
+            return 0;
+        };
+        if parent.metadata().container != task.metadata().container {
+            return 0;
+        }
+        parent.metadata().namespace_pid
+    }
+
+    fn get_pgid(&self, pid: i32) -> Result<u32, i64> {
+        let graph = self.runtime.graph.lock();
+        let caller = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
+        if pid == 0 || pid as u32 == caller.metadata().namespace_pid {
+            Ok(caller.metadata().namespace_process_group)
+        } else if let Some(target) = graph
+            .owner
+            .find_task_by_pid(pid as u32)
+            .filter(|row| row.native().resources().control.visible_tid().is_some())
+        {
+            Ok(target.metadata().namespace_process_group)
+        } else {
+            Err(carrick_personality_linux::identity::ESRCH)
+        }
+    }
+
+    fn set_pgid(&mut self, pid: i32, pgid: i32) -> Result<(), i64> {
+        if pgid < 0 {
+            return Err(carrick_personality_linux::identity::EINVAL);
+        }
+        let mut graph = self.runtime.graph.lock();
+        let caller = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
+        let caller_pid = caller.metadata().namespace_pid;
+        let caller_session = caller.metadata().namespace_session;
+        let caller_key = self.key;
+        let target_pid = if pid == 0 { caller_pid } else { pid as u32 };
+        let new_pgid = if pgid == 0 { target_pid } else { pgid as u32 };
+
+        if target_pid != caller_pid {
+            let target = graph
+                .owner
+                .find_task_by_pid(target_pid)
+                .filter(|row| row.native().resources().control.visible_tid().is_some())
+                .ok_or(carrick_personality_linux::identity::ESRCH)?;
+            if target.parent() != Some(caller_key) {
+                return Err(carrick_personality_linux::identity::ESRCH);
+            }
+            if target.has_execed {
+                return Err(carrick_personality_linux::identity::EACCES);
+            }
+        }
+
+        let (target_session, is_session_leader) = {
+            let target = if target_pid == caller_pid {
+                caller
+            } else {
+                graph
+                    .owner
+                    .find_task_by_pid(target_pid)
+                    .filter(|row| row.native().resources().control.visible_tid().is_some())
+                    .ok_or(carrick_personality_linux::identity::ESRCH)?
+            };
+            (
+                target.metadata().namespace_session,
+                target.metadata().namespace_session == target.metadata().namespace_pid,
+            )
+        };
+
+        if target_session != caller_session {
+            return Err(carrick_personality_linux::identity::EPERM);
+        }
+        if is_session_leader {
+            return Err(carrick_personality_linux::identity::EPERM);
+        }
+        if new_pgid != target_pid
+            && !graph
+                .owner
+                .group_exists_in_session(caller_session, new_pgid)
+        {
+            return Err(carrick_personality_linux::identity::EPERM);
+        }
+
+        let target = if target_pid == caller_pid {
+            graph
+                .owner
+                .task_mut(self.key)
+                .map_err(|_| carrick_personality_linux::identity::ESRCH)?
+        } else {
+            graph
+                .owner
+                .find_task_by_pid_mut(target_pid)
+                .filter(|row| row.native().resources().control.visible_tid().is_some())
+                .ok_or(carrick_personality_linux::identity::ESRCH)?
+        };
+        target.metadata_mut().namespace_process_group = new_pgid;
+        if let Ok(gid) =
+            carrick_sched_core::process::ProcessGroupId::from_abi_positive(new_pgid as i32)
+        {
+            target.metadata_mut().identity.process_group = gid;
+        }
+        Ok(())
+    }
+
+    fn get_sid(&self, pid: i32) -> Result<u32, i64> {
+        let graph = self.runtime.graph.lock();
+        let caller = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
+        if pid == 0 || pid as u32 == caller.metadata().namespace_pid {
+            Ok(caller.metadata().namespace_session)
+        } else if let Some(target) = graph
+            .owner
+            .find_task_by_pid(pid as u32)
+            .filter(|row| row.native().resources().control.visible_tid().is_some())
+        {
+            Ok(target.metadata().namespace_session)
+        } else {
+            Err(carrick_personality_linux::identity::ESRCH)
+        }
+    }
+
+    fn set_sid(&mut self) -> Result<u32, i64> {
+        let mut graph = self.runtime.graph.lock();
+        let task = graph
+            .owner
+            .task_mut(self.key)
+            .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
+        let pid = task.metadata().namespace_pid;
+        if pid == task.metadata().namespace_process_group {
+            return Err(carrick_personality_linux::identity::EPERM);
+        }
+        task.metadata_mut().namespace_session = pid;
+        task.metadata_mut().namespace_process_group = pid;
+        if let Ok(sid) = carrick_sched_core::process::SessionId::from_abi_positive(pid as i32) {
+            task.metadata_mut().identity.session = sid;
+        }
+        if let Ok(gid) = carrick_sched_core::process::ProcessGroupId::from_abi_positive(pid as i32)
+        {
+            task.metadata_mut().identity.process_group = gid;
+        }
+        Ok(pid)
+    }
+
+    fn personality(&mut self, persona: u64) -> u64 {
+        let mut graph = self.runtime.graph.lock();
+        let Ok(task) = graph.owner.task_mut(self.key) else {
+            return 0;
+        };
+        if persona == 0xffff_ffff {
+            task.personality
+        } else {
+            let old = task.personality;
+            task.personality = persona;
+            old
+        }
+    }
+
+    fn prctl_get_name(
+        &self,
+        buf: &mut [u8; 16],
+    ) -> Result<(), carrick_personality_linux::identity::IdentityReadError> {
+        use carrick_personality_linux::identity::IdentityReadError;
+        let graph = self.runtime.graph.lock();
+        let task = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| IdentityReadError::MissingThread)?;
+        let comm = task
+            .comm_for(self.calling_tid)
+            .map_err(|_| IdentityReadError::MissingThread)?;
+        *buf = *comm;
+        Ok(())
+    }
+
+    fn prctl_set_name(&mut self, name: &[u8; 16]) {
+        let mut bounded = *name;
+        bounded[15] = 0;
+        let mut graph = self.runtime.graph.lock();
+        if let Ok(task) = graph.owner.task_mut(self.key) {
+            let caller_tid = self.calling_tid;
+            let is_leader = caller_tid == task.metadata().namespace_pid;
+            if let Ok(comm) = task.comm_for_mut(caller_tid) {
+                *comm = bounded;
+            }
+            if is_leader {
+                let len = bounded.iter().position(|&b| b == 0).unwrap_or(15);
+                if let Ok(s) = core::str::from_utf8(&bounded[..len]) {
+                    task.metadata_mut().diagnostic_name = alloc::string::String::from(s);
+                }
+            }
+        }
+    }
+
+    fn prctl_get_pdeathsig(&self) -> u8 {
+        let graph = self.runtime.graph.lock();
+        graph.owner.task(self.key).map(|t| t.pdeathsig).unwrap_or(0)
+    }
+
+    fn prctl_set_pdeathsig(&mut self, sig: u8) -> Result<(), i64> {
+        let mut graph = self.runtime.graph.lock();
+        let task = graph
+            .owner
+            .task_mut(self.key)
+            .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
+        task.pdeathsig = sig;
+        Ok(())
+    }
+
+    fn prctl_get_dumpable(&self) -> u32 {
+        let graph = self.runtime.graph.lock();
+        graph.owner.task(self.key).map(|t| t.dumpable).unwrap_or(1)
+    }
+
+    fn prctl_set_dumpable(&mut self, dumpable: u32) -> Result<(), i64> {
+        let mut graph = self.runtime.graph.lock();
+        let task = graph
+            .owner
+            .task_mut(self.key)
+            .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
+        if dumpable > 2 {
+            return Err(carrick_personality_linux::identity::EINVAL);
+        }
+        task.dumpable = dumpable;
+        Ok(())
+    }
+
+    fn prctl_get_no_new_privs(&self) -> bool {
+        let graph = self.runtime.graph.lock();
+        graph
+            .owner
+            .task(self.key)
+            .map(|t| t.no_new_privs)
+            .unwrap_or(false)
+    }
+
+    fn prctl_set_no_new_privs(&mut self, no_new_privs: bool) -> Result<(), i64> {
+        let mut graph = self.runtime.graph.lock();
+        let task = graph
+            .owner
+            .task_mut(self.key)
+            .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
+        if task.no_new_privs && !no_new_privs {
+            return Err(carrick_personality_linux::identity::EPERM);
+        }
+        task.no_new_privs = no_new_privs;
+        Ok(())
+    }
+
+    fn prctl_get_child_subreaper(&self) -> bool {
+        let graph = self.runtime.graph.lock();
+        graph
+            .owner
+            .task(self.key)
+            .map(|t| t.child_subreaper)
+            .unwrap_or(false)
+    }
+
+    fn prctl_set_child_subreaper(&mut self, subreaper: bool) {
+        let mut graph = self.runtime.graph.lock();
+        if let Ok(task) = graph.owner.task_mut(self.key) {
+            task.child_subreaper = subreaper;
+        }
+    }
+}
+
+impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
+    carrick_personality_linux::sysinfo::ProcessSysinfoVenue
+    for NativeProcessEntry<'r, 'a, M, C, S>
+{
+    fn get_uts(&self) -> carrick_personality_linux::sysinfo::LinuxUtsname {
+        self.runtime.graph.lock().uts
+    }
+
+    fn can_set_hostname(&self) -> Result<(), i64> {
+        let graph = self.runtime.graph.lock();
+        let task = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
+        let creds = task
+            .credentials_for(self.calling_tid)
+            .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
+        if !creds.is_admin_privileged() {
+            return Err(carrick_personality_linux::sysinfo::EPERM);
+        }
+        Ok(())
+    }
+
+    fn set_hostname(&mut self, name: &[u8]) -> Result<(), i64> {
+        self.can_set_hostname()?;
+        self.runtime.graph.lock().uts.set_nodename(name);
+        Ok(())
+    }
+
+    fn can_set_domainname(&self) -> Result<(), i64> {
+        self.can_set_hostname()
+    }
+
+    fn set_domainname(&mut self, name: &[u8]) -> Result<(), i64> {
+        self.can_set_hostname()?;
+        self.runtime.graph.lock().uts.set_domainname(name);
+        Ok(())
+    }
+
+    fn get_rlimit(
+        &self,
+        resource: usize,
+    ) -> Result<carrick_personality_linux::sysinfo::LinuxRlimit, i64> {
+        let graph = self.runtime.graph.lock();
+        let task = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
+        task.rlimits
+            .get(resource)
+            .ok_or(carrick_personality_linux::sysinfo::EINVAL)
+    }
+
+    fn set_rlimit(
+        &mut self,
+        resource: usize,
+        limit: carrick_personality_linux::sysinfo::LinuxRlimit,
+    ) -> Result<(), i64> {
+        self.prlimit64(0, resource, Some(limit)).map(|_| ())
+    }
+
+    #[inline(never)]
+    fn prlimit64(
+        &mut self,
+        pid: i32,
+        resource: usize,
+        new_limit: Option<carrick_personality_linux::sysinfo::LinuxRlimit>,
+    ) -> Result<carrick_personality_linux::sysinfo::LinuxRlimit, i64> {
+        if new_limit.is_some_and(|limit| limit.rlim_cur > limit.rlim_max) {
+            return Err(carrick_personality_linux::sysinfo::EINVAL);
+        }
+        let mut graph = self.runtime.graph.lock();
+        let caller = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
+        let caller_pid = caller.metadata().namespace_pid;
+        let caller_creds = caller
+            .credentials_for(self.calling_tid)
+            .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
+        let caller_privileged = caller_creds.is_resource_privileged();
+        let caller_ruid = caller_creds.ruid;
+        let caller_rgid = caller_creds.rgid;
+
+        let target_pid = if pid == 0 { caller_pid } else { pid as u32 };
+        let is_self_process = target_pid == caller_pid || caller.has_thread(target_pid);
+        if !is_self_process && !caller_privileged {
+            let target = graph
+                .owner
+                .find_task_by_pid(target_pid)
+                .filter(|row| row.native().resources().control.visible_tid().is_some())
+                .ok_or(carrick_personality_linux::sysinfo::ESRCH)?;
+            let target_creds = target
+                .credentials_for(target.metadata().namespace_pid)
+                .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
+            if !target_creds.allows_prlimit_from(caller_ruid, caller_rgid) {
+                return Err(carrick_personality_linux::sysinfo::EPERM);
+            }
+        }
+
+        let target = if is_self_process {
+            graph
+                .owner
+                .task_mut(self.key)
+                .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?
+        } else {
+            graph
+                .owner
+                .find_task_by_pid_mut(target_pid)
+                .filter(|row| row.native().resources().control.visible_tid().is_some())
+                .ok_or(carrick_personality_linux::sysinfo::ESRCH)?
+        };
+        let old = target
+            .rlimits
+            .get(resource)
+            .ok_or(carrick_personality_linux::sysinfo::EINVAL)?;
+        if let Some(limit) = new_limit {
+            if limit.rlim_cur > limit.rlim_max {
+                return Err(carrick_personality_linux::sysinfo::EINVAL);
+            }
+            if limit.rlim_max > old.rlim_max && !caller_privileged {
+                return Err(carrick_personality_linux::sysinfo::EPERM);
+            }
+            target.rlimits.set(resource, limit);
+        }
+        Ok(old)
+    }
+
+    fn umask(&mut self, mask: u32) -> u32 {
+        let mut graph = self.runtime.graph.lock();
+        let Ok(task) = graph.owner.task_mut(self.key) else {
+            return 0o022;
+        };
+        let old = task.umask;
+        task.umask = mask & 0o777;
+        old
+    }
+
+    fn sysinfo(&self) -> carrick_personality_linux::sysinfo::LinuxSysinfo {
+        carrick_personality_linux::sysinfo::LinuxSysinfo::default_info()
+    }
+
+    fn getrusage(&self, who: i32) -> Result<carrick_personality_linux::sysinfo::LinuxRusage, i64> {
+        let graph = self.runtime.graph.lock();
+        let task = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_personality_linux::sysinfo::ESRCH)?;
+        let usage = match who {
+            0 | 1 => task.native().own_rusage(),
+            -1 => task.children_rusage(),
+            _ => return Err(carrick_personality_linux::sysinfo::EINVAL),
+        };
+        let mut ru = carrick_personality_linux::sysinfo::LinuxRusage::zeroed();
+        ru.ru_utime.tv_sec = usage.user_time.as_secs() as i64;
+        ru.ru_utime.tv_usec = usage.user_time.subsec_micros() as i64;
+        ru.ru_stime.tv_sec = usage.system_time.as_secs() as i64;
+        ru.ru_stime.tv_usec = usage.system_time.subsec_micros() as i64;
+        Ok(ru)
+    }
+}
+
+impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
+    carrick_personality_linux::signal::ProcessSignals for NativeProcessEntry<'_, 'a, M, C, S>
+{
+    fn force_sigsegv(
+        &mut self,
+        blocked: carrick_signal_core::policy::SigBlockMask,
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
+        self.force_sigsegv_info(
+            blocked,
+            carrick_syscall_abi::LinuxSiginfo::kernel(
+                carrick_signal_core::policy::Signal::SEGV.number(),
+            ),
+        )
+    }
+    fn rt_sigaction(
+        &mut self,
+        signal: carrick_signal_core::policy::Signal,
+        act: Option<carrick_signal_core::policy::Action>,
+    ) -> Result<carrick_signal_core::policy::Action, carrick_syscall_abi::LinuxErrno> {
+        let einval = carrick_personality_linux::abi::signal::LINUX_EINVAL;
+        let esrch = carrick_personality_linux::abi::signal::LINUX_ESRCH;
+        let graph = self.runtime.graph.lock();
+        let row = graph.owner.task(self.key).map_err(|_| esrch)?;
+        let signals = row.native().resources().signals();
+        if let Some(new_action) = act {
+            signals
+                .install_action(self.key, signal, new_action)
+                .map_err(|_| einval)
+        } else {
+            Ok(signals.action(signal))
+        }
+    }
+
+    fn rt_sigpending(&self, blocked: carrick_signal_core::policy::SigBlockMask) -> u64 {
+        let graph = self.runtime.graph.lock();
+        let Ok(row) = graph.owner.task(self.key) else {
+            return 0;
+        };
+        let pending = row.native().resources().signals().pending_set(self.record);
+        let blocked_pending = pending.intersect(blocked.signals());
+        blocked_pending.bits()
+    }
+
+    fn kill(
+        &mut self,
+        pid: carrick_personality_linux::signal::SignalProcessSelector,
+        request: carrick_personality_linux::signal::SignalRequest,
+        info: carrick_personality_linux::signal::SignalInfo,
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
+        let esrch = carrick_personality_linux::abi::signal::LINUX_ESRCH;
+        let pid = pid.abi_number();
+        let sig = request.number();
+        let signal = request.signal();
+
+        let graph = self.runtime.graph.lock();
+        let caller_row = graph.owner.task(self.key).map_err(|_| esrch)?;
+        let caller_pgid = caller_row.metadata().namespace_process_group;
+        let caller_pid = caller_row.metadata().namespace_pid;
+
+        let mut targets = alloc::vec::Vec::new();
+        if pid > 0 {
+            let target_pid = pid as u32;
+            for (&_id, task) in graph.owner.tasks() {
+                if task.metadata().namespace_pid == target_pid {
+                    targets.push((
+                        task.key(),
+                        task.native().resources().signals().clone(),
+                        task.parent(),
+                    ));
+                    break;
+                }
+            }
+            if targets.is_empty() {
+                if let Some(zombie) = graph
+                    .owner
+                    .zombies()
+                    .values()
+                    .find(|z| z.receipt.namespace_pid == target_pid)
+                {
+                    use carrick_personality_linux::signal::SignalTargetScope;
+                    info.check_target(if zombie.receipt.key == self.key {
+                        SignalTargetScope::CallingProcess
+                    } else {
+                        SignalTargetScope::OtherProcess
+                    })?;
+                    return Ok(());
+                }
+                return Err(esrch);
+            }
+        } else if pid == 0 {
+            for (&_id, task) in graph.owner.tasks() {
+                if task.metadata().namespace_process_group == caller_pgid {
+                    targets.push((
+                        task.key(),
+                        task.native().resources().signals().clone(),
+                        task.parent(),
+                    ));
+                }
+            }
+            if targets.is_empty() {
+                return Err(esrch);
+            }
+        } else if pid == -1 {
+            for (&_id, task) in graph.owner.tasks() {
+                if task.metadata().namespace_pid != 1 && task.key() != self.key {
+                    targets.push((
+                        task.key(),
+                        task.native().resources().signals().clone(),
+                        task.parent(),
+                    ));
+                }
+            }
+            if targets.is_empty() {
+                return Err(esrch);
+            }
+        } else {
+            let target_pgid = pid.checked_abs().ok_or(esrch)? as u32;
+            for (&_id, task) in graph.owner.tasks() {
+                if task.metadata().namespace_process_group == target_pgid {
+                    targets.push((
+                        task.key(),
+                        task.native().resources().signals().clone(),
+                        task.parent(),
+                    ));
+                }
+            }
+            if targets.is_empty() {
+                return Err(esrch);
+            }
+        }
+
+        use carrick_personality_linux::signal::SignalTargetScope;
+        for (key, _, _) in &targets {
+            info.check_target(if *key == self.key {
+                SignalTargetScope::CallingProcess
+            } else {
+                SignalTargetScope::OtherProcess
+            })?;
+        }
+        if sig == 0 {
+            return Ok(());
+        }
+
+        let Some(signal) = signal else {
+            return Ok(());
+        };
+        let info = info.payload(signal).unwrap_or_else(|| {
+            carrick_personality_linux::abi::signal::LinuxSiginfo::kill(
+                sig,
+                carrick_personality_linux::abi::signal::LINUX_SI_USER,
+                caller_pid as i32,
+                0,
+            )
+        });
+
+        let mut wake_channels = Vec::new();
+        let mut interrupts = Vec::new();
+        for (target_key, target_signals, _) in targets {
+            let _ = target_signals.enqueue(target_key, signal, Some(info));
+            if let Ok(row) = graph.owner.task(target_key) {
+                let resources = row.native().resources();
+                let leader = resources.control.zone_record().unwrap_or(resources.record);
+                let leader_mask = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                    carrick_signal_core::SignalSet::from_bits(resources.control.blocked().0),
+                );
+                if target_signals.has_deliverable(leader, leader_mask) {
+                    interrupts.push(leader);
+                }
+                for index in 0..resources.page.entry_count() {
+                    let Some((generation, state)) = resources.page.state(index) else {
+                        continue;
+                    };
+                    if !matches!(
+                        state,
+                        carrick_el1_abi::EntryState::Born | carrick_el1_abi::EntryState::Published
+                    ) {
+                        continue;
+                    }
+                    let entry = EntryRef::new(index as u32, generation);
+                    if let Some(address) = resources.page.control_address(entry)
+                        && let Some(control) =
+                            owned_control(resources.page, resources.control, address)
+                        && let Some(record) = control.zone_record()
+                        && record != leader
+                    {
+                        let mask = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                            carrick_signal_core::SignalSet::from_bits(control.blocked().0),
+                        );
+                        if target_signals.has_deliverable(record, mask) {
+                            interrupts.push(record);
+                        }
+                    }
+                }
+            }
+            if let Some(channel) = graph
+                .owner
+                .task(target_key)
+                .ok()
+                .and_then(|t| t.native().resources().channel.clone())
+            {
+                wake_channels.push(channel);
+            }
+        }
+        drop(graph);
+        for record in interrupts {
+            self.interrupt_signal_record(record);
+        }
+        for channel in wake_channels {
+            self.publish_channel(&channel)
+                .map_err(|error| carrick_syscall_abi::LinuxErrno::new(-error.errno() as i32))?;
+        }
+        Ok(())
+    }
+
+    fn tkill(
+        &mut self,
+        tid: carrick_personality_linux::signal::SignalThreadSelector,
+        request: carrick_personality_linux::signal::SignalRequest,
+        info: carrick_personality_linux::signal::SignalInfo,
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
+        self.send_thread_signal(None, tid, request, info)
+    }
+
+    fn tgkill(
+        &mut self,
+        tgid: carrick_personality_linux::signal::SignalThreadSelector,
+        tid: carrick_personality_linux::signal::SignalThreadSelector,
+        request: carrick_personality_linux::signal::SignalRequest,
+        info: carrick_personality_linux::signal::SignalInfo,
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
+        let group = tgid.positive().ok_or(carrick_syscall_abi::LINUX_EINVAL)?;
+        self.send_thread_signal(Some(group), tid, request, info)
+    }
+
+    fn rt_sigtimedwait(
+        &mut self,
+        set: carrick_signal_core::SignalSet,
+        timeout_ns: Option<u64>,
+        info: UserVa,
+    ) -> Result<carrick_personality_linux::signal::SignalWaitOutcome, carrick_syscall_abi::LinuxErrno>
+    {
+        use carrick_personality_linux::signal::SignalWaitOutcome;
+        use carrick_signal_core::policy::Signal;
+        let set = set.without(Signal::KILL).without(Signal::STOP);
+        let mut deadline = None;
+        loop {
+            let graph = self.runtime.graph.lock();
+            let row = graph
+                .owner
+                .task(self.key)
+                .map_err(|_| carrick_personality_linux::abi::signal::LINUX_ESRCH)?;
+            let resources = row.native().resources();
+            let signals = resources.signals();
+            let channel = resources
+                .channel
+                .clone()
+                .ok_or(carrick_personality_linux::abi::signal::LINUX_ESRCH)?;
+            let generation = channel.generation.generation();
+            if let Some((signal, payload)) = signals.take_timedwait(self.record, set) {
+                return Ok(SignalWaitOutcome::Ready(signal, payload));
+            }
+            if timeout_ns == Some(0) {
+                return Err(carrick_personality_linux::abi::signal::LINUX_EAGAIN);
+            }
+            let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
+            );
+            if signals.has_deliverable(self.record, blocked) {
+                return Err(carrick_personality_linux::abi::signal::LINUX_EINTR);
+            }
+            #[cfg(test)]
+            if let Some(hook) = self.runtime.signal_check_hook.lock().take() {
+                hook();
+            }
+            drop(graph);
+            if deadline.is_none() {
+                deadline = timeout_ns
+                    .map(|nanos| self.service.signal_deadline(nanos))
+                    .transpose()
+                    .map_err(|error| carrick_syscall_abi::LinuxErrno::new(-error.errno() as i32))?;
+            }
+            if let Some(deadline) = deadline
+                && self
+                    .service
+                    .signal_now()
+                    .map_err(|error| carrick_syscall_abi::LinuxErrno::new(-error.errno() as i32))?
+                    .raw()
+                    >= deadline.0.raw()
+            {
+                return Err(carrick_personality_linux::abi::signal::LINUX_EAGAIN);
+            }
+            if self
+                .park_signal_wait(
+                    PendingSignalKind::Wait { set, info },
+                    channel,
+                    generation,
+                    deadline,
+                )
+                .map_err(|error| carrick_syscall_abi::LinuxErrno::new(-error.errno() as i32))?
+            {
+                return Ok(SignalWaitOutcome::Pending);
+            }
+        }
+    }
+    fn rt_sigsuspend(
+        &mut self,
+        mask: carrick_signal_core::policy::SigBlockMask,
+        original: carrick_signal_core::policy::SigBlockMask,
+    ) -> Result<bool, carrick_syscall_abi::LinuxErrno> {
+        self.runtime
+            .graph
+            .lock()
+            .suspend_masks
+            .insert(self.record, original);
+        loop {
+            let graph = self.runtime.graph.lock();
+            let row = graph
+                .owner
+                .task(self.key)
+                .map_err(|_| carrick_personality_linux::abi::signal::LINUX_ESRCH)?;
+            let signals = row.native().resources().signals();
+            let channel = row
+                .native()
+                .resources()
+                .channel
+                .clone()
+                .ok_or(carrick_personality_linux::abi::signal::LINUX_ESRCH)?;
+            let generation = channel.generation.generation();
+            let available = signals.has_deliverable(self.record, mask);
+            #[cfg(test)]
+            if let Some(hook) = self.runtime.signal_check_hook.lock().take() {
+                hook();
+            }
+            drop(graph);
+            if available {
+                return Ok(false);
+            }
+            match self.park_signal_wait(PendingSignalKind::Suspend, channel, generation, None) {
+                Ok(true) => return Ok(true),
+                Ok(false) => continue,
+                Err(error) => {
+                    self.runtime.graph.lock().suspend_masks.remove(&self.record);
+                    return Err(carrick_syscall_abi::LinuxErrno::new(-error.errno() as i32));
+                }
+            }
+        }
+    }
+    fn take_suspend_mask(&mut self) -> Option<carrick_signal_core::policy::SigBlockMask> {
+        self.runtime.graph.lock().suspend_masks.remove(&self.record)
+    }
+
+    fn take_deliverable(
+        &mut self,
+        blocked: carrick_signal_core::policy::SigBlockMask,
+    ) -> Option<(
+        carrick_signal_core::policy::Signal,
+        Option<carrick_personality_linux::abi::signal::LinuxSiginfo>,
+        carrick_signal_core::policy::Action,
+    )> {
+        let graph = self.runtime.graph.lock();
+        let row = graph.owner.task(self.key).ok()?;
+        row.native()
+            .resources()
+            .signals()
+            .take_deliverable(self.record, blocked)
     }
 }
 
@@ -1240,6 +3350,40 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     clippy::drop_non_drop
 )]
 mod tests {
+    #[test]
+    fn native_signal_entry_keeps_absent_restart_context_off_stack() {
+        type Entry = NativeProcessEntry<
+            'static,
+            'static,
+            AddressContext<RootGpa>,
+            ParkedContextWords,
+            Physical<'static>,
+        >;
+        assert!(
+            core::mem::size_of::<Entry>() <= core::mem::size_of::<ParkedContextWords>() + 384,
+            "an absent interrupted wait must not duplicate a full native register/XSAVE context"
+        );
+    }
+
+    #[test]
+    fn cpl0_clear_tid_dependency_names_the_arm_reference() {
+        let design = include_str!("../../../../docs/design/arm-ring-first-flip.md");
+        assert!(design.contains("shared-cpl0-thread-exit-clear-tid"));
+        assert!(
+            design.contains("exit_of_a_born_thread_clears_cleartid_wakes_the_joiner_and_runs_it")
+        );
+    }
+    #[test]
+    fn unsupported_exec_has_no_completion_surface() {
+        let source = include_str!("native_process_runtime.rs");
+        let production = source.split("mod tests {").next().unwrap();
+        assert!(!production.contains(concat!("fn exec", "_completed(")));
+        assert!(
+            include_str!("../../../../docs/design/arm-ring-first-flip.md")
+                .contains("shared-owner-exec-completion")
+        );
+    }
+
     use super::*;
     use carrick_guest_arch::{ContextGeneration, FrameGpa};
     use carrick_sched_core::ParkedContextWords;
@@ -1249,6 +3393,7 @@ mod tests {
         controls: &'a [ThreadControlSlot],
         copies: Vec<LinuxWaitStatus>,
         refuse_copy: bool,
+        on_signal_clock: Option<Box<dyn FnMut()>>,
     }
     impl<'a> NativeProcessService<'a, ParkedContextWords> for Physical<'a> {
         type Mm = AddressContext<RootGpa>;
@@ -1315,6 +3460,31 @@ mod tests {
             };
             self.copies.push(status);
             Ok(())
+        }
+        fn signal_deadline(
+            &mut self,
+            nanos: u64,
+        ) -> Result<carrick_guest_arch::Deadline, NativeProcessError> {
+            Ok(carrick_guest_arch::Deadline(
+                carrick_guest_arch::CounterTick::new(1000 + nanos),
+            ))
+        }
+        fn arm_signal_timer(
+            &mut self,
+            _: carrick_guest_arch::Deadline,
+        ) -> Result<(), NativeProcessError> {
+            Ok(())
+        }
+        fn signal_now(&mut self) -> Result<carrick_guest_arch::CounterTick, NativeProcessError> {
+            if let Some(mut hook) = self.on_signal_clock.take() {
+                hook();
+            }
+            let now = if self.zone.counters.el1_timeouts.load(Ordering::Acquire) == 0 {
+                1000
+            } else {
+                2000
+            };
+            Ok(carrick_guest_arch::CounterTick::new(now))
         }
         fn quarantine_prepared(&mut self, _: Self::PreparedMm) {
             panic!("unexpected quarantine")
@@ -1441,6 +3611,359 @@ mod tests {
         }
     }
     #[test]
+    fn signal_wait_owns_context_and_shared_deadline() {
+        signal_wait_contract(false, false);
+    }
+    #[test]
+    fn pending_default_stop_does_not_interrupt_sigtimedwait_or_sigsuspend() {
+        signal_wait_contract(true, false);
+    }
+    #[test]
+    fn pending_default_stop_does_not_interrupt_sigsuspend() {
+        signal_wait_contract(true, true);
+    }
+    fn signal_wait_contract(default_stop: bool, suspend_only: bool) {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let child_page = Box::new(ThreadLifecyclePage::new());
+        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        }));
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
+        assert!(matches!(
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            ),
+            Err(NativeProcessError::Invalid)
+        ));
+        assert_eq!(page.live(), 2, "admission must not remove a live member");
+        page.release_live(1).unwrap(); // fixture settles its bootstrap census
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        assert_eq!(page.live(), 1);
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &*child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+            on_signal_clock: None,
+        };
+        use carrick_personality_linux::signal::{ProcessSignals, SignalWaitOutcome};
+        let set = carrick_signal_core::SignalSet::EMPTY
+            .with(carrick_signal_core::policy::Signal::from_number(10).unwrap());
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        let selector = carrick_personality_linux::signal::SignalThreadSelector::from_abi(41);
+        assert_eq!(
+            entry.tgkill(
+                selector,
+                selector,
+                carrick_personality_linux::signal::SignalRequest::Probe,
+                carrick_personality_linux::signal::SignalInfo::Generated(None)
+            ),
+            Ok(())
+        );
+        // kill(2): INT_MIN selects no representable process group.
+        assert_eq!(
+            entry.kill(
+                carrick_personality_linux::signal::SignalProcessSelector::from_abi(
+                    (i32::MIN) as u64
+                ),
+                carrick_personality_linux::signal::SignalRequest::from_abi(0).unwrap(),
+                carrick_personality_linux::signal::SignalInfo::Generated(None)
+            ),
+            Err(carrick_syscall_abi::LinuxErrno::new(3))
+        );
+        assert_eq!(
+            entry.kill(
+                carrick_personality_linux::signal::SignalProcessSelector::from_abi((-1_i32) as u64),
+                carrick_personality_linux::signal::SignalRequest::from_abi(0).unwrap(),
+                carrick_personality_linux::signal::SignalInfo::Generated(None)
+            ),
+            Err(carrick_syscall_abi::LinuxErrno::new(3)),
+            "kill(-1) excludes caller"
+        );
+        let ignored = carrick_signal_core::policy::Action {
+            disposition: carrick_signal_core::policy::Disposition::Ignore,
+            ..Default::default()
+        };
+        entry
+            .rt_sigaction(
+                carrick_signal_core::policy::Signal::from_number(10).unwrap(),
+                Some(ignored),
+            )
+            .unwrap();
+        let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(set);
+        control.init_blocked(carrick_el1_abi::BlockedMask(set.bits()));
+        entry
+            .kill(
+                carrick_personality_linux::signal::SignalProcessSelector::from_abi((41) as u64),
+                carrick_personality_linux::signal::SignalRequest::from_abi(10).unwrap(),
+                carrick_personality_linux::signal::SignalInfo::Generated(None),
+            )
+            .unwrap();
+        assert_eq!(
+            entry.rt_sigpending(blocked),
+            set.bits(),
+            "blocked ignored signal remains queued"
+        );
+        entry
+            .rt_sigaction(
+                carrick_signal_core::policy::Signal::from_number(10).unwrap(),
+                Some(ignored),
+            )
+            .unwrap();
+        assert_eq!(entry.rt_sigpending(blocked), 0);
+        control.init_blocked(carrick_el1_abi::BlockedMask(0));
+        if default_stop {
+            entry
+                .kill(
+                    carrick_personality_linux::signal::SignalProcessSelector::from_abi(41),
+                    carrick_personality_linux::signal::SignalRequest::Deliver(
+                        carrick_signal_core::policy::Signal::STOP,
+                    ),
+                    carrick_personality_linux::signal::SignalInfo::Generated(None),
+                )
+                .unwrap();
+        }
+        if suspend_only {
+            assert!(
+                matches!(
+                    entry.rt_sigsuspend(
+                        carrick_signal_core::policy::SigBlockMask::NONE,
+                        carrick_signal_core::policy::SigBlockMask::NONE,
+                    ),
+                    Ok(true)
+                ),
+                "default stop must park sigsuspend, not return EINTR"
+            );
+            assert!(entry.take_handoff_receipt().is_some());
+            drop(entry);
+            assert!(zone.slot(slot).current().is_none());
+            return;
+        }
+        assert!(matches!(
+            entry.rt_sigtimedwait(set, Some(1000), UserVa::new(0)),
+            Ok(SignalWaitOutcome::Pending)
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+        drop(entry);
+        assert!(zone.slot(slot).current().is_none());
+        let timer = zone.timer_owner(slot).unwrap();
+        assert_eq!(zone.timer_deadline(slot), Some(2000));
+        assert!(matches!(
+            zone.live(timer.record).unwrap().claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ));
+        assert_eq!(zone.expire_timer(slot, 1999, (-11i64) as u64), Ok(false));
+        assert_eq!(zone.expire_timer(slot, 2000, (-11i64) as u64), Ok(true));
+        let selected = zone.switch_in_full(slot).unwrap();
+        assert_eq!(zone.record_ref(selected.record), timer.record);
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        assert!(
+            matches!(entry.resume_pending_wait(), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == -11)
+        );
+        assert!(
+            !runtime
+                .graph
+                .lock()
+                .signal_waits
+                .contains_key(&entry.record)
+        );
+        assert!(zone.timer_owner(slot).is_none());
+        if default_stop {
+            assert!(
+                matches!(
+                    entry.rt_sigsuspend(
+                        carrick_signal_core::policy::SigBlockMask::NONE,
+                        carrick_signal_core::policy::SigBlockMask::NONE,
+                    ),
+                    Ok(true)
+                ),
+                "default stop must park sigsuspend, not return EINTR"
+            );
+            assert!(entry.take_handoff_receipt().is_some());
+            drop(entry);
+            assert!(zone.slot(slot).current().is_none());
+            return;
+        }
+        drop(entry);
+
+        // Inject precisely after the pending check and before park enrollment.
+        // The wake must invalidate the pre-check generation, not be adopted as
+        // the generation against which this new park is admitted.
+        zone.counters.el1_timeouts.store(0, Ordering::Release);
+        control.init_blocked(carrick_el1_abi::BlockedMask(set.bits()));
+        let (signals, channel, key) = {
+            let graph = runtime.graph.lock();
+            let row = graph.owner.task(graph.root_key).unwrap();
+            (
+                row.native().resources().signals().clone(),
+                row.native().resources().channel.clone().unwrap(),
+                row.key(),
+            )
+        };
+        let wake_channel = channel.clone();
+        service.on_signal_clock = Some(Box::new(move || {
+            signals
+                .enqueue(
+                    key,
+                    carrick_signal_core::policy::Signal::from_number(
+                        carrick_syscall_abi::LINUX_SIGUSR1,
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .unwrap();
+            wake_channel.generation.publish().unwrap();
+        }));
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        let result = entry
+            .resume_signal_wait(PendingSignalWait {
+                kind: PendingSignalKind::Wait {
+                    set,
+                    info: UserVa::new(0),
+                },
+                channel,
+                deadline: Some(carrick_guest_arch::Deadline(
+                    carrick_guest_arch::CounterTick::new(2000),
+                )),
+            })
+            .unwrap();
+        assert!(
+            matches!(result, LifecycleOutcome::Returned { result, .. } if result.raw() == 10),
+            "a signal published after the queue check must prevent re-parking"
+        );
+        drop(entry);
+        let (signals, channel, key) = {
+            let graph = runtime.graph.lock();
+            let row = graph.owner.task(graph.root_key).unwrap();
+            (
+                row.native().resources().signals().clone(),
+                row.native().resources().channel.clone().unwrap(),
+                row.key(),
+            )
+        };
+        *runtime.signal_check_hook.lock() = Some(Box::new(move || {
+            signals
+                .enqueue(
+                    key,
+                    carrick_signal_core::policy::Signal::from_number(10).unwrap(),
+                    None,
+                )
+                .unwrap();
+            channel.generation.publish().unwrap();
+        }));
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        assert!(
+            matches!(entry.rt_sigtimedwait(set, Some(1000), UserVa::new(0)),
+            Ok(SignalWaitOutcome::Ready(signal, _)) if signal.number() == 10),
+            "publication after the initial pending check must not become the park generation"
+        );
+        drop(entry);
+        let (signals, channel, key) = {
+            let graph = runtime.graph.lock();
+            let row = graph.owner.task(graph.root_key).unwrap();
+            (
+                row.native().resources().signals().clone(),
+                row.native().resources().channel.clone().unwrap(),
+                row.key(),
+            )
+        };
+        let usr1 = carrick_signal_core::policy::Signal::from_number(10).unwrap();
+        signals
+            .install_action(
+                key,
+                usr1,
+                carrick_signal_core::policy::Action {
+                    disposition: carrick_signal_core::policy::Disposition::Handler(
+                        carrick_signal_core::policy::HandlerAddress(0x4000),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        *runtime.signal_check_hook.lock() = Some(Box::new(move || {
+            signals.enqueue(key, usr1, None).unwrap();
+            channel.generation.publish().unwrap();
+        }));
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        assert_eq!(
+            entry.rt_sigsuspend(
+                carrick_signal_core::policy::SigBlockMask::NONE,
+                carrick_signal_core::policy::SigBlockMask::NONE
+            ),
+            Ok(false),
+            "suspend must also retry a publication after its initial pending check"
+        );
+    }
+
+    #[test]
     fn actual_compact_root_can_exit_before_its_first_park() {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
@@ -1521,12 +4044,27 @@ mod tests {
             controls: &*child_controls,
             copies: Vec::new(),
             refuse_copy: false,
+            on_signal_clock: None,
         };
         assert!(zone.slot(slot).current().is_none());
         let home = zone.slot(slot).host_record().unwrap();
         let mut entry = runtime
             .enter(source, &task, words(address), &mut service)
             .unwrap();
+        assert_eq!(page.thread_born(), Some(2));
+        assert!(
+            matches!(
+                entry.exit_with_signal(15),
+                Err(NativeProcessError::GroupExitCustody)
+            ),
+            "two-live-member signal termination must name its custody dependency"
+        );
+        assert_eq!(
+            page.live(),
+            2,
+            "a refused group exit cannot retire shared memory"
+        );
+        page.release_live(1).unwrap();
         assert!(matches!(
             entry.exit_group(9),
             LifecycleOutcome::Transferred {
@@ -1546,7 +4084,505 @@ mod tests {
     }
 
     #[test]
+    fn exit_failure_preserves_stale_cause() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let child_page = Box::new(ThreadLifecyclePage::new());
+        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        }));
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
+        assert!(matches!(
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            ),
+            Err(NativeProcessError::Invalid)
+        ));
+        assert_eq!(page.live(), 2, "admission must not remove a live member");
+        page.release_live(1).unwrap(); // fixture settles its bootstrap census
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        assert_eq!(page.live(), 1);
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &*child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+            on_signal_clock: None,
+        };
+        assert!(zone.slot(slot).current().is_none());
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        entry.set_calling_tid(9999);
+        assert!(matches!(
+            entry.exit_group(9),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert_eq!(
+            entry.take_run_failure(),
+            Some(carrick_el1_abi::NativeRunFailureReason::NativeStale),
+            "stale caller retains its true cause"
+        );
+    }
+    #[test]
+    fn exit_group_holds_terminal_custody_until_pre_live_claim_settles() {
+        for (claim_live, wake_failure, resume_stale, signal_exit) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ] {
+            let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+            // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+            let zone = unsafe {
+                let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+                assert!(!ptr.is_null());
+                Box::from_raw(ptr)
+            };
+            let page = Box::new(ThreadLifecyclePage::new());
+            let control = Box::new(ThreadControlSlot::new());
+            let child_page = Box::new(ThreadLifecyclePage::new());
+            let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+                ThreadControlSlot::new()
+            }));
+            let task = CurrentTask::new();
+            task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+            task.mm.key.store(1, Ordering::Release);
+            task.mm.thread_generation.store(101, Ordering::Release);
+            task.publish_visible_pid(41);
+            task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+            let address = AddressContext {
+                root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+                mm: MmGeneration::new(NonZeroU64::MIN),
+                generation: ContextGeneration::new(NonZeroU64::MIN),
+            };
+            let slot = carrick_sched_core::SlotId::new(0);
+            let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+            zone.spaces.open(space);
+            zone.drive(slot, 1);
+            zone.publish_slot(slot, 1, Some(0), 1);
+            zone.enter_guest(slot);
+            zone.install_space(slot, 1).unwrap();
+            zone.current_or_new(
+                slot,
+                ThreadIdentity {
+                    tid: 41,
+                    serial: 101,
+                    mm: 1,
+                    file_table: 5,
+                    generation: 11,
+                    affinity: 1,
+                    lifecycle_page: &*page as *const _ as u64,
+                    control_slot: &*control as *const _ as u64,
+                },
+            )
+            .unwrap();
+            let source = BornInZoneSource { zone: &zone, slot };
+            assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
+            assert!(matches!(
+                NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                    source,
+                    &task,
+                    &page,
+                    &control,
+                    address,
+                    address,
+                    words(address),
+                ),
+                Err(NativeProcessError::Invalid)
+            ));
+            assert_eq!(page.live(), 2, "admission must not remove a live member");
+            page.release_live(1).unwrap(); // fixture settles its bootstrap census
+            let runtime =
+                NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                    source,
+                    &task,
+                    &page,
+                    &control,
+                    address,
+                    address,
+                    words(address),
+                )
+                .unwrap();
+            assert_eq!(page.live(), 1);
+            let mut service = Physical {
+                zone: &zone,
+                page: &child_page,
+                controls: &*child_controls,
+                copies: Vec::new(),
+                refuse_copy: false,
+                on_signal_clock: None,
+            };
+            assert!(zone.slot(slot).current().is_none());
+            let home = zone.slot(slot).host_record().unwrap();
+            let mut entry = runtime
+                .enter(source, &task, words(address), &mut service)
+                .unwrap();
+            page.stock(
+                0,
+                EntryIdentity {
+                    tid: 42,
+                    visible_tid: 42,
+                    thread_serial: 102,
+                    uid_credit: 0,
+                },
+            )
+            .unwrap();
+            let claim = page.claim_any().unwrap();
+            if claim_live {
+                assert_eq!(page.thread_born(), Some(2));
+            }
+            let expected_status = if signal_exit {
+                LinuxWaitStatus::signaled(15, false)
+            } else {
+                LinuxWaitStatus::from_wait_encoding(9 << 8)
+            };
+            let outcome = if signal_exit {
+                entry.exit_with_signal(15).unwrap()
+            } else {
+                entry.exit_group(9)
+            };
+            assert!(
+                matches!(outcome, LifecycleOutcome::Transferred { .. }),
+                "exit must suspend, never return guest EAGAIN"
+            );
+            assert_eq!(page.gate(), carrick_el1_abi::GateState::Closed);
+            assert_eq!(page.live(), if claim_live { 2 } else { 1 });
+            assert!(entry.take_run_failure().is_none());
+            assert!(entry.take_root_exit().is_none());
+            assert!(entry.take_handoff_receipt().is_some());
+            assert_eq!(zone.slot(slot).queued(), 0);
+            assert_eq!(
+                entry.thread_spawned(41, 42, &mut || panic!("terminal close admitted Born")),
+                Err(-11)
+            );
+            if claim_live {
+                assert_eq!(page.try_exit(), Ok(1));
+            }
+            page.unclaim(claim).unwrap();
+            // Claim owners deliver their settlement only after rollback is complete.
+            // Direct hook invocation models that production lifecycle notification.
+            if wake_failure {
+                let channel = runtime
+                    .graph
+                    .lock()
+                    .pending_exit
+                    .get(&entry.key)
+                    .unwrap()
+                    .channel
+                    .clone();
+                let guard = zone
+                    .lock(
+                        ZoneTables::<ParkedContextWords>::bucket_of_with_context(
+                            channel.mm,
+                            WaitChannel::address(&channel),
+                        ),
+                        &BoundedSpin(LOCK_SPINS),
+                    )
+                    .unwrap();
+                assert_eq!(entry.lifecycle_admission_settled(), Err(-11));
+                assert_eq!(
+                    entry.take_run_failure(),
+                    Some(carrick_el1_abi::NativeRunFailureReason::BirthSettlement)
+                );
+                assert!(entry.take_root_exit().is_none());
+                assert_eq!(zone.slot(slot).queued(), 0);
+                assert_eq!(page.live(), 1);
+                assert!(runtime.graph.lock().pending_exit.contains_key(&entry.key));
+                drop(guard);
+                continue;
+            }
+            entry.lifecycle_admission_settled().unwrap();
+            assert_eq!(zone.slot(slot).queued(), 1);
+            let channel = runtime
+                .graph
+                .lock()
+                .pending_exit
+                .get(&entry.key)
+                .unwrap()
+                .channel
+                .clone();
+            let published = channel.generation.generation();
+            entry.lifecycle_admission_settled().unwrap();
+            assert_eq!(
+                channel.generation.generation(),
+                published,
+                "wake custody has one publisher"
+            );
+            assert_eq!(zone.slot(slot).queued(), 1);
+            assert!(matches!(
+                page.claim_any(),
+                Err(carrick_el1_abi::TransitionError::GateClosed(_))
+            ));
+            assert!(
+                matches!(entry.fork(), LifecycleOutcome::Returned { result, .. } if result.raw() == -11)
+            );
+            drop(entry);
+            let selected = zone.switch_in_full(slot).unwrap();
+            assert_eq!(selected.record, home);
+            let mut entry = runtime
+                .enter(source, &task, words(address), &mut service)
+                .unwrap();
+            if resume_stale {
+                entry.set_calling_tid(9999);
+            }
+            assert!(matches!(
+                entry.resume_pending_lifecycle(),
+                Some(LifecycleOutcome::Transferred { .. })
+            ));
+            if resume_stale {
+                assert_eq!(
+                    entry.take_run_failure(),
+                    Some(carrick_el1_abi::NativeRunFailureReason::NativeStale)
+                );
+                assert!(entry.take_root_exit().is_none());
+                assert_eq!(page.live(), 1);
+                continue;
+            }
+            assert_eq!(entry.take_root_exit(), Some(expected_status));
+            assert!(entry.take_handoff_receipt().is_some());
+            assert_eq!(page.live(), 0);
+            assert_eq!(zone.slot(slot).queued(), 0);
+            assert_eq!(zone.record(home).claim(), carrick_sched_core::Claim::Free);
+        }
+    }
+    #[test]
+    fn clone_live_membership_blocks_exit_between_graph_unlock_and_enqueue() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let child_page = Box::new(ThreadLifecyclePage::new());
+        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        }));
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
+        assert!(matches!(
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            ),
+            Err(NativeProcessError::Invalid)
+        ));
+        assert_eq!(page.live(), 2, "admission must not remove a live member");
+        page.release_live(1).unwrap(); // fixture settles its bootstrap census
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        assert_eq!(page.live(), 1);
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &*child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+            on_signal_clock: None,
+        };
+        assert!(zone.slot(slot).current().is_none());
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        // An admitted clone claim must also block the terminal transaction
+        // before it has incremented the live count.
+        page.stock(
+            0,
+            carrick_el1_abi::EntryIdentity {
+                tid: 42,
+                visible_tid: 42,
+                thread_serial: 102,
+                uid_credit: 0,
+            },
+        )
+        .unwrap();
+        let claim = page.claim_any().unwrap();
+        assert_eq!(page.thread_born(), Some(2));
+        let child = zone
+            .alloc_record(ThreadIdentity {
+                tid: 42,
+                serial: 102,
+                mm: 1,
+                file_table: 5,
+                generation: 0,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &child_controls[1] as *const _ as u64,
+            })
+            .unwrap();
+        let child_ref = zone.record_ref(child);
+        let mut claim = Some(claim);
+        entry
+            .thread_spawned(41, 42, &mut || {
+                page.record_born(
+                    claim.take().unwrap(),
+                    carrick_el1_abi::BornRecord {
+                        caller_task: 41,
+                        caller_serial: 101,
+                        clone_flags: 0,
+                        clear_child_tid: 0,
+                        blocked: carrick_el1_abi::BlockedMask(0),
+                    },
+                )
+                .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        // The child owns Born membership but has not been enqueued yet.
+        // Group cancellation is not wired: fail the run with typed custody,
+        // preserving graph membership and MM ownership rather than guest errno.
+        assert_eq!(zone.slot(slot).queued(), 0);
+        assert!(matches!(
+            entry.exit_owned(9),
+            Ok(LifecycleOutcome::Transferred { .. })
+        ));
+        assert_eq!(
+            entry.take_run_failure(),
+            Some(carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody)
+        );
+        assert!(entry.take_handoff_receipt().is_some());
+        assert!(entry.take_root_exit().is_none());
+        assert!(entry.has_thread(42));
+        assert_eq!(page.live(), 2);
+        assert_eq!(zone.record(child).claim(), carrick_sched_core::Claim::Free);
+        assert!(runtime.graph.lock().owner.task(entry.key).is_ok());
+        assert_eq!(zone.record_ref(child), child_ref);
+        assert_eq!(zone.record(child).identity().tid, 42);
+        assert_eq!(page.state(0).unwrap().1, carrick_el1_abi::EntryState::Born);
+    }
+    #[test]
     fn actual_compact_root_forks_a_shared_owner_child_with_distinct_visible_identity() {
+        compact_root_fork_wait_contract(false, false, false, false);
+    }
+    #[test]
+    fn caught_signal_interrupts_an_already_parked_owned_child_wait() {
+        compact_root_fork_wait_contract(true, false, false, false);
+    }
+    #[test]
+    fn reapable_child_wins_over_its_caught_sigchld() {
+        compact_root_fork_wait_contract(false, true, false, false);
+    }
+    #[test]
+    fn pending_default_stop_does_not_interrupt_wait4() {
+        compact_root_fork_wait_contract(false, false, true, false);
+    }
+    #[test]
+    fn child_signal_exit_preserves_status_across_birth_claim_settlement() {
+        compact_root_fork_wait_contract(false, true, false, true);
+    }
+    fn compact_root_fork_wait_contract(
+        interrupt_wait: bool,
+        catch_child_exit: bool,
+        default_stop: bool,
+        signal_exit_continuation: bool,
+    ) {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
         let zone = unsafe {
@@ -1613,6 +4649,7 @@ mod tests {
             controls: &*child_controls,
             copies: Vec::new(),
             refuse_copy: false,
+            on_signal_clock: None,
         };
         let parent = TaskKey {
             id: TaskId::from_abi_positive(41).unwrap(),
@@ -1623,6 +4660,19 @@ mod tests {
             let mut entry = runtime
                 .enter(source, &task, words(address), &mut service)
                 .unwrap();
+            if interrupt_wait || catch_child_exit {
+                use carrick_personality_linux::signal::ProcessSignals;
+                use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
+                entry
+                    .rt_sigaction(
+                        Signal::from_number(if catch_child_exit { 17 } else { 10 }).unwrap(),
+                        Some(Action {
+                            disposition: Disposition::Handler(HandlerAddress(0x4000)),
+                            ..Action::default()
+                        }),
+                    )
+                    .unwrap();
+            }
             let LifecycleOutcome::Returned { result, .. } = entry.fork() else {
                 panic!("fork return")
             };
@@ -1637,6 +4687,18 @@ mod tests {
                 runtime.graph.lock().owner.task(child).unwrap().parent(),
                 Some(parent)
             );
+            if default_stop {
+                use carrick_personality_linux::signal::ProcessSignals;
+                entry
+                    .kill(
+                        carrick_personality_linux::signal::SignalProcessSelector::from_abi(41),
+                        carrick_personality_linux::signal::SignalRequest::Deliver(
+                            carrick_signal_core::policy::Signal::STOP,
+                        ),
+                        carrick_personality_linux::signal::SignalInfo::Generated(None),
+                    )
+                    .unwrap();
+            }
             assert!(matches!(
                 entry.wait4(
                     ProcessWaitPid::from_syscall_argument(u64::MAX),
@@ -1681,14 +4743,143 @@ mod tests {
             let mut child_entry = runtime
                 .enter(source, &task, child_words, &mut service)
                 .unwrap();
-            assert!(matches!(
-                child_entry.exit_group(7),
-                LifecycleOutcome::Transferred {
-                    progress: carrick_core::Served::Idle,
-                    ..
-                }
-            ));
-            assert!(child_entry.take_handoff_receipt().is_some());
+            use carrick_personality_linux::signal::{ProcessSignals, SignalInfo};
+            let forged = carrick_syscall_abi::LinuxSiginfo::kill(
+                10,
+                carrick_syscall_abi::LINUX_SI_USER,
+                42,
+                0,
+            );
+            assert_eq!(
+                child_entry.kill(
+                    carrick_personality_linux::signal::SignalProcessSelector::from_abi((41) as u64),
+                    carrick_personality_linux::signal::SignalRequest::from_abi(0).unwrap(),
+                    SignalInfo::Queued(forged)
+                ),
+                Err(carrick_syscall_abi::LinuxErrno::new(1))
+            );
+            let queued = carrick_syscall_abi::LinuxSiginfo::kill(
+                10,
+                carrick_syscall_abi::LINUX_SI_QUEUE,
+                42,
+                0,
+            );
+            assert_eq!(
+                child_entry.kill(
+                    carrick_personality_linux::signal::SignalProcessSelector::from_abi((41) as u64),
+                    carrick_personality_linux::signal::SignalRequest::from_abi(0).unwrap(),
+                    SignalInfo::Queued(queued)
+                ),
+                Ok(())
+            );
+            assert_eq!(
+                child_entry.kill(
+                    carrick_personality_linux::signal::SignalProcessSelector::from_abi((42) as u64),
+                    carrick_personality_linux::signal::SignalRequest::from_abi(0).unwrap(),
+                    SignalInfo::Queued(forged)
+                ),
+                Ok(())
+            );
+            let selector = carrick_personality_linux::signal::SignalThreadSelector::from_abi(41);
+            let forged_thread = carrick_syscall_abi::LinuxSiginfo::kill(
+                10,
+                carrick_syscall_abi::LINUX_SI_TKILL,
+                42,
+                0,
+            );
+            assert_eq!(
+                child_entry.tgkill(
+                    selector,
+                    selector,
+                    carrick_personality_linux::signal::SignalRequest::Probe,
+                    SignalInfo::Queued(forged_thread)
+                ),
+                Err(carrick_syscall_abi::LinuxErrno::new(1))
+            );
+            if interrupt_wait {
+                use carrick_personality_linux::signal::{SignalProcessSelector, SignalRequest};
+                child_entry
+                    .kill(
+                        SignalProcessSelector::from_abi(41),
+                        SignalRequest::from_abi(10).unwrap(),
+                        SignalInfo::Generated(None),
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    child_entry.rt_sigsuspend(
+                        carrick_signal_core::policy::SigBlockMask::NONE,
+                        carrick_signal_core::policy::SigBlockMask::NONE
+                    ),
+                    Ok(true)
+                ));
+                assert!(child_entry.take_handoff_receipt().is_some());
+                drop(child_entry);
+                activate(&runtime, source, &task, parent);
+                let mut parent_entry = runtime
+                    .enter(source, &task, words(address), &mut service)
+                    .unwrap();
+                let Some(LifecycleOutcome::Returned { result, .. }) =
+                    parent_entry.resume_pending_wait()
+                else {
+                    panic!("caught signal must resume the parked child wait");
+                };
+                assert_eq!(
+                    result.raw(),
+                    carrick_syscall_abi::LINUX_EINTR.guest_retval()
+                );
+                assert_eq!(
+                    parent_entry.take_interrupted_child_wait(),
+                    Some(words(address))
+                );
+                assert!(
+                    runtime.namespace_child_key(parent, 42).is_some(),
+                    "interruption cannot reap the live child"
+                );
+                return;
+            }
+            if signal_exit_continuation {
+                child_page
+                    .stock(
+                        1,
+                        EntryIdentity {
+                            tid: 43,
+                            visible_tid: 43,
+                            thread_serial: 103,
+                            uid_credit: 0,
+                        },
+                    )
+                    .unwrap();
+                let claim = child_page.claim_any().unwrap();
+                assert!(matches!(
+                    child_entry.exit_with_signal(15).unwrap(),
+                    LifecycleOutcome::Transferred { .. }
+                ));
+                assert!(child_entry.take_handoff_receipt().is_some());
+                assert!(child_entry.take_root_exit().is_none());
+                assert_eq!(child_page.live(), 1);
+                child_page.unclaim(claim).unwrap();
+                child_entry.lifecycle_admission_settled().unwrap();
+                drop(child_entry);
+                activate(&runtime, source, &task, child);
+                let mut resumed = runtime
+                    .enter(source, &task, child_words, &mut service)
+                    .unwrap();
+                assert!(matches!(
+                    resumed.resume_pending_lifecycle(),
+                    Some(LifecycleOutcome::Transferred { .. })
+                ));
+                assert!(resumed.take_root_exit().is_none());
+                assert!(resumed.take_handoff_receipt().is_some());
+            } else {
+                assert!(matches!(
+                    child_entry.exit_group(7),
+                    LifecycleOutcome::Transferred {
+                        progress: carrick_core::Served::Idle,
+                        ..
+                    }
+                ));
+                assert!(child_entry.take_handoff_receipt().is_some());
+            }
         }
         assert_eq!(child_page.live(), 0);
         assert_eq!(page.live(), 1);
@@ -1720,6 +4911,27 @@ mod tests {
             let mut parent_entry = runtime
                 .enter(source, &task, words(address), &mut service)
                 .unwrap();
+            use carrick_personality_linux::signal::ProcessSignals;
+            if signal_exit_continuation {
+                let (signal, info, _) = parent_entry
+                    .take_deliverable(carrick_signal_core::policy::SigBlockMask::NONE)
+                    .expect("child termination must notify its parent");
+                assert_eq!(signal.number(), 17);
+                let info = info.unwrap();
+                let code = info.si_code;
+                assert_eq!(code, carrick_syscall_abi::LINUX_CLD_KILLED);
+                assert_eq!(info.si_addr as u32, 42);
+                assert_eq!(i32::from_le_bytes(info._pad[..4].try_into().unwrap()), 15);
+            }
+            assert_eq!(
+                parent_entry.kill(
+                    carrick_personality_linux::signal::SignalProcessSelector::from_abi((42) as u64),
+                    carrick_personality_linux::signal::SignalRequest::from_abi(15).unwrap(),
+                    carrick_personality_linux::signal::SignalInfo::Generated(None)
+                ),
+                Ok(()),
+                "zombie target exists"
+            );
             let Some(LifecycleOutcome::Returned { result, .. }) =
                 parent_entry.resume_pending_wait()
             else {
@@ -1751,6 +4963,10 @@ mod tests {
             panic!("reap return")
         };
         assert_eq!(result.raw(), 42);
+        if signal_exit_continuation {
+            let copied = parent_entry.service.copies.last().unwrap();
+            assert_eq!(*copied, LinuxWaitStatus::signaled(15, false));
+        }
         assert!(runtime.namespace_child_key(parent, 42).is_none());
         assert!(parent_entry.take_root_exit().is_none());
         assert!(matches!(
@@ -1868,6 +5084,7 @@ mod tests {
                 controls: &*child_controls,
                 copies: Vec::new(),
                 refuse_copy: false,
+                on_signal_clock: None,
             };
             let parent = TaskKey {
                 id: TaskId::from_abi_positive(41).unwrap(),
@@ -2023,5 +5240,1124 @@ mod tests {
                 Some(&LinuxWaitStatus::from_wait_encoding(7 << 8))
             );
         }
+    }
+
+    #[test]
+    fn two_threads_raw_setresuid_on_one_leaves_other_unchanged() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let child_page = Box::new(ThreadLifecyclePage::new());
+        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        }));
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &*child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+            on_signal_clock: None,
+        };
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        use carrick_personality_linux::identity::ProcessIdentityVenue;
+        use carrick_personality_linux::lifecycle::ProcessNative;
+
+        entry.set_calling_tid(999);
+        assert_eq!(
+            entry.get_uids(),
+            Err(carrick_personality_linux::identity::IdentityReadError::MissingThread)
+        );
+        assert_eq!(
+            entry.get_gids(),
+            Err(carrick_personality_linux::identity::IdentityReadError::MissingThread)
+        );
+        assert_eq!(
+            entry.get_groups_count(),
+            Err(carrick_personality_linux::identity::IdentityReadError::MissingThread)
+        );
+        assert_eq!(
+            entry.set_fsuid(1234),
+            Err(carrick_personality_linux::identity::IdentityReadError::MissingThread)
+        );
+        assert_eq!(
+            entry.set_fsgid(1234),
+            Err(carrick_personality_linux::identity::IdentityReadError::MissingThread)
+        );
+        let mut groups = alloc::vec![1234];
+        assert_eq!(
+            entry.get_groups(&mut groups),
+            Err(carrick_personality_linux::identity::IdentityReadError::MissingThread)
+        );
+        assert_eq!(groups, alloc::vec![1234]);
+        let mut published = false;
+        assert_eq!(
+            entry.thread_spawned(999, 88, &mut || {
+                published = true;
+                Ok(())
+            }),
+            Err(carrick_personality_linux::identity::ESRCH)
+        );
+        assert!(!published);
+        assert_eq!(entry.thread_spawned(41, 88, &mut || Err(-14)), Err(-14));
+        assert!(!entry.has_thread(88));
+        // Comm per thread
+        let mut comm_leader = [0u8; 16];
+        let mut comm_worker = [0u8; 16];
+        entry.set_calling_tid(41);
+        entry.prctl_set_name(b"leader\0\0\0\0\0\0\0\0\0\0");
+        entry.thread_spawned(41, 42, &mut || Ok(())).unwrap();
+        entry.set_calling_tid(42);
+        entry.prctl_set_name(b"worker\0\0\0\0\0\0\0\0\0\0");
+
+        entry.set_calling_tid(41);
+        entry.prctl_get_name(&mut comm_leader).unwrap();
+        assert_eq!(&comm_leader[..7], b"leader\0");
+
+        entry.set_calling_tid(42);
+        entry.prctl_get_name(&mut comm_worker).unwrap();
+        assert_eq!(&comm_worker[..7], b"worker\0");
+
+        // Calling from thread 42: change UIDs to 1000
+        entry.set_calling_tid(42);
+        entry
+            .set_resuid(Some(1000), Some(1000), Some(1000))
+            .unwrap();
+        assert_eq!(entry.get_uids().unwrap(), (1000, 1000, 1000, 1000));
+
+        // Calling from thread 41 (leader): UIDs must still be root (0, 0, 0, 0)
+        entry.set_calling_tid(41);
+        assert_eq!(
+            entry.get_uids().unwrap(),
+            (0, 0, 0, 0),
+            "thread 1 credentials must remain unchanged when thread 2 changes its UID"
+        );
+
+        // Spawn thread 43 from thread 42: inherits thread 42's credentials and comm
+        entry.thread_spawned(42, 43, &mut || Ok(())).unwrap();
+        entry.set_calling_tid(43);
+        assert_eq!(entry.get_uids().unwrap(), (1000, 1000, 1000, 1000));
+        let mut comm_child = [0u8; 16];
+        entry.prctl_get_name(&mut comm_child).unwrap();
+        assert_eq!(&comm_child[..7], b"worker\0");
+
+        // Fork from thread 42: child process inherits thread 42's credentials and comm
+        entry.set_calling_tid(42);
+        let child_pid = entry.fork_owned().expect("fork from thread 42 succeeds");
+        drop(entry);
+
+        let graph = runtime.graph.lock();
+        let child_task = graph
+            .owner
+            .find_task_by_pid(child_pid)
+            .expect("child task found");
+        let child_creds = child_task.credentials_for(child_pid).unwrap();
+        assert_eq!(
+            (
+                child_creds.ruid.raw(),
+                child_creds.euid.raw(),
+                child_creds.suid.raw(),
+                child_creds.fsuid.raw(),
+            ),
+            (1000, 1000, 1000, 1000)
+        );
+        let child_comm = child_task.comm_for(child_pid).unwrap();
+        assert_eq!(&child_comm[..7], b"worker\0");
+    }
+
+    #[test]
+    fn thread_exit_removes_thread_state_and_stays_bounded() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let child_page = Box::new(ThreadLifecyclePage::new());
+        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        }));
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        let key = TaskKey {
+            id: TaskId::from_abi_positive(41).unwrap(),
+            serial: TaskSerial::from_raw_u64(11).unwrap(),
+        };
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &*child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+            on_signal_clock: None,
+        };
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+
+        // Spawn 100 short-lived threads and exit them.
+        for i in 0..100 {
+            let tid = 1000 + i;
+            entry.thread_spawned(41, tid, &mut || Ok(())).unwrap();
+            entry.thread_exited(tid);
+        }
+
+        drop(entry);
+        let graph = runtime.graph.lock();
+        let t = graph.owner.task(key).unwrap();
+        // The list must stay bounded to just the leader thread.
+        assert_eq!(t.threads.threads.len(), 1);
+        assert_eq!(t.has_thread(1050), false);
+    }
+
+    #[test]
+    fn non_leader_credential_changes_and_calling_thread_authority() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let child_page = Box::new(ThreadLifecyclePage::new());
+        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        }));
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        let key = TaskKey {
+            id: TaskId::from_abi_positive(41).unwrap(),
+            serial: TaskSerial::from_raw_u64(11).unwrap(),
+        };
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &*child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+            on_signal_clock: None,
+        };
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        use carrick_personality_linux::identity::ProcessIdentityVenue;
+
+        // 1. Unregistered TID lookup must be an explicit error, not silent fallback to leader
+        {
+            let graph = runtime.graph.lock();
+            let t = graph.owner.task(key).unwrap();
+            assert_eq!(
+                t.credentials_for(9999),
+                Err(carrick_personality_linux::identity::ESRCH)
+            );
+        }
+
+        // 2. Caller TID 9999 attempting modify_credentials returns ESRCH
+        entry.set_calling_tid(9999);
+        let mut missing_name = [0xa5; 16];
+        assert_eq!(
+            entry.prctl_get_name(&mut missing_name),
+            Err(carrick_personality_linux::identity::IdentityReadError::MissingThread)
+        );
+        assert_eq!(
+            missing_name, [0xa5; 16],
+            "missing comm must not manufacture an empty name"
+        );
+
+        assert_eq!(
+            entry.set_uid(1000),
+            Err(carrick_personality_linux::identity::ESRCH)
+        );
+
+        // 3. Spawning thread 42 from leader 41
+        entry.set_calling_tid(41);
+        entry.thread_spawned(41, 42, &mut || Ok(())).unwrap();
+
+        // 4. Thread 42 changes credentials to uid 1000
+        entry.set_calling_tid(42);
+        entry.set_uid(1000).unwrap();
+        assert_eq!(entry.get_uids().unwrap().0, 1000);
+
+        // Leader 41 credentials remain root (0)
+        entry.set_calling_tid(41);
+        assert_eq!(entry.get_uids().unwrap().0, 0);
+
+        // 5. Thread 43 spawned from thread 42 inherits thread 42 credentials (uid 1000)
+        entry.thread_spawned(42, 43, &mut || Ok(())).unwrap();
+        entry.set_calling_tid(43);
+        assert_eq!(entry.get_uids().unwrap().0, 1000);
+
+        // 6. Spawning from unknown caller TID 8888 fails with ESRCH
+        {
+            let mut graph = runtime.graph.lock();
+            let t = graph.owner.task_mut(key).unwrap();
+            assert_eq!(
+                t.spawn_thread(8888, 44),
+                Err(carrick_personality_linux::identity::ESRCH)
+            );
+        }
+    }
+
+    #[test]
+    fn capset_restricted_to_pid_zero_and_caller_own_tid() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let child_page = Box::new(ThreadLifecyclePage::new());
+        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        }));
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &*child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+            on_signal_clock: None,
+        };
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        use carrick_personality_linux::identity::ProcessIdentityVenue;
+
+        entry.set_calling_tid(41);
+        entry.thread_spawned(41, 42, &mut || Ok(())).unwrap();
+
+        // From thread 42:
+        entry.set_calling_tid(42);
+        let caps = entry.capget(0).unwrap();
+
+        // capset on another thread (leader 41) must fail with EPERM
+        assert_eq!(
+            entry.capset(41, caps.clone()),
+            Err(carrick_personality_linux::identity::EPERM)
+        );
+        // capset on negative pid must fail with EPERM
+        assert_eq!(
+            entry.capset(-1, caps.clone()),
+            Err(carrick_personality_linux::identity::EPERM)
+        );
+        // capset on own tid 42 and pid 0 must succeed
+        assert_eq!(entry.capset(42, caps.clone()), Ok(()));
+        assert_eq!(entry.capset(0, caps), Ok(()));
+    }
+
+    #[test]
+    fn getppid_returns_zero_when_parent_outside_pid_namespace() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let child_page = Box::new(ThreadLifecyclePage::new());
+        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        }));
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &*child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+            on_signal_clock: None,
+        };
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        use carrick_personality_linux::identity::ProcessIdentityVenue;
+
+        let parent_key = TaskKey {
+            id: TaskId::from_abi_positive(41).unwrap(),
+            serial: TaskSerial::from_raw_u64(11).unwrap(),
+        };
+        let parent_record = runtime
+            .graph
+            .lock()
+            .owner
+            .task(parent_key)
+            .unwrap()
+            .native()
+            .resources()
+            .record;
+
+        entry.set_calling_tid(41);
+        let child_pid = entry.fork_owned().expect("fork child succeeds") as i32;
+        drop(entry);
+
+        zone.requeue_preempted(slot, parent_record.id);
+        let child_key = {
+            let graph = runtime.graph.lock();
+            graph
+                .owner
+                .find_task_by_pid(child_pid as u32)
+                .unwrap()
+                .key()
+        };
+        let (child_address, child_words, child_record) = {
+            let graph = runtime.graph.lock();
+            let row = graph.owner.task(child_key).unwrap();
+            (
+                row.native().resources().address,
+                *row.context(),
+                row.native().resources().record,
+            )
+        };
+        assert_eq!(zone.switch_in_full(slot).unwrap().record, child_record.id);
+        zone.install_space(slot, child_address.mm.raw().get())
+            .unwrap();
+        let child_identity = zone.record(child_record.id).identity();
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(child_key.id.raw()),
+            child_key.serial.raw(),
+            child_identity.file_table,
+        );
+        task.mm
+            .key
+            .store(child_address.mm.raw().get(), Ordering::Release);
+        task.mm
+            .thread_generation
+            .store(child_identity.serial, Ordering::Release);
+        task.publish_visible_pid(child_pid as u32);
+        task.publish_lifecycle(child_identity.lifecycle_page, child_identity.control_slot);
+
+        let child_entry = runtime
+            .enter(source, &task, child_words, &mut service)
+            .unwrap();
+
+        // 1. Same namespace: child get_ppid returns parent's pid (41)
+        assert_eq!(child_entry.get_ppid(), 41);
+
+        // 2. Parent placed outside caller's pid namespace: get_ppid returns 0
+        {
+            let mut graph = runtime.graph.lock();
+            let parent_task = graph.owner.task_mut(parent_key).unwrap();
+            parent_task.metadata_mut().container =
+                VisibleNamespace::new(NonZeroU32::new(99).unwrap(), NonZeroU32::new(1).unwrap());
+        }
+        assert_eq!(child_entry.get_ppid(), 0);
+    }
+
+    #[test]
+    fn get_robust_list_foreign_nonleader_dispatch_checks() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let child_page = Box::new(ThreadLifecyclePage::new());
+        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        }));
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &*child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+            on_signal_clock: None,
+        };
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        entry.set_calling_tid(41);
+
+        // 1. Calling thread itself is permitted
+        use carrick_personality_linux::lifecycle::ProcessNative;
+        assert_eq!(
+            entry.read_robust_list(41, &mut |_, _| None).map(|_| ()),
+            Ok(())
+        );
+
+        // 2. Sibling thread in caller's thread group is permitted without special capability
+        entry.thread_spawned(41, 50, &mut || Ok(())).unwrap();
+        assert!(entry.has_thread(50));
+        assert_eq!(
+            entry.read_robust_list(50, &mut |_, _| None),
+            Err(carrick_personality_linux::identity::ESRCH)
+        );
+
+        // 3. Non-existent PID returns ESRCH
+        assert_eq!(
+            entry.read_robust_list(999, &mut |_, _| None).map(|_| ()),
+            Err(carrick_personality_linux::identity::ESRCH)
+        );
+
+        // 4. Another process without ptrace capability returns EPERM
+        let child_pid = entry.fork_owned().expect("fork child succeeds") as u32;
+        // Make caller unprivileged (drop CAP_SYS_PTRACE, uid 1000)
+        use carrick_personality_linux::identity::ProcessIdentityVenue;
+        entry.set_uid(1000).unwrap();
+        assert_eq!(
+            entry
+                .read_robust_list(child_pid, &mut |_, _| None)
+                .map(|_| ()),
+            Err(carrick_personality_linux::identity::EPERM)
+        );
+        {
+            let mut graph = runtime.graph.lock();
+            let credentials = graph
+                .owner
+                .task(entry.key)
+                .unwrap()
+                .credentials_for(41)
+                .unwrap()
+                .clone();
+            let peer = graph.owner.find_task_by_pid_mut(child_pid).unwrap();
+            *peer.credentials_for_mut(child_pid).unwrap() = credentials;
+            peer.spawn_thread(child_pid, 987).unwrap();
+        }
+        assert_eq!(
+            entry
+                .read_robust_list(child_pid, &mut |_, _| None)
+                .map(|_| ()),
+            Ok(())
+        );
+        assert_eq!(
+            entry.read_robust_list(987, &mut |_, _| None),
+            Err(carrick_personality_linux::identity::ESRCH)
+        );
+        child_controls[1].set_robust_list(0xbeef, 24);
+        assert_eq!(
+            entry.read_robust_list(child_pid, &mut |_, _| None),
+            Ok((0xbeef, 24))
+        );
+        assert_eq!(
+            entry.read_robust_list(987, &mut |_, _| None),
+            Err(carrick_personality_linux::identity::ESRCH)
+        );
+        let peer_entry = child_page
+            .stock(
+                1,
+                carrick_el1_abi::EntryIdentity {
+                    tid: 987,
+                    visible_tid: 987,
+                    thread_serial: 987,
+                    uid_credit: 1,
+                },
+            )
+            .unwrap();
+        child_page
+            .bind_control_address(peer_entry, &child_controls[2] as *const _ as u64)
+            .unwrap();
+        child_controls[2].reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, peer_entry);
+        assert!(child_controls[2].publish_visible_tid(987));
+        use carrick_el1_abi::Lifecycle;
+        child_page.thread_born().unwrap();
+        let born = child_page
+            .record_born(
+                child_page.claim(peer_entry).unwrap(),
+                carrick_el1_abi::BornRecord {
+                    caller_task: u64::from(child_pid),
+                    caller_serial: 1,
+                    clone_flags: 0,
+                    clear_child_tid: 0,
+                    blocked: carrick_el1_abi::BlockedMask(0),
+                },
+            )
+            .unwrap();
+        child_page.publish(born).unwrap();
+        child_controls[2].set_robust_list(0xcafe, 24);
+        assert_eq!(
+            entry.read_robust_list(987, &mut |page, reference| {
+                assert!(core::ptr::eq(page, &*child_page));
+                assert_eq!(reference, peer_entry);
+                Some(child_controls[2].robust_list())
+            }),
+            Ok((0xcafe, 24))
+        );
+        // PTRACE_MODE_READ_FSCREDS compares filesystem credentials, not the
+        // caller's real ids. Read a peer nonleader through the shared router.
+        entry
+            .update_calling_creds(&mut |c| {
+                c.fsuid = carrick_sched_core::process::TaskUid::new(2000);
+                c.fsgid = carrick_sched_core::process::TaskGid::new(2000);
+                Ok(())
+            })
+            .unwrap();
+        {
+            let mut graph = runtime.graph.lock();
+            let peer = graph.owner.find_task_by_pid_mut(child_pid).unwrap();
+            for tid in [child_pid, 987] {
+                let c = peer.credentials_for_mut(tid).unwrap();
+                c.ruid = carrick_sched_core::process::TaskUid::new(2000);
+                c.euid = c.ruid;
+                c.suid = c.ruid;
+                c.rgid = carrick_sched_core::process::TaskGid::new(2000);
+                c.egid = c.rgid;
+                c.sgid = c.rgid;
+            }
+        }
+        struct RetainedVenue<'a> {
+            page: &'a ThreadLifecyclePage,
+            control: &'a ThreadControlSlot,
+            peer: NativeLifecycleResources<'a>,
+            foreign_reads: core::cell::Cell<u32>,
+        }
+        impl super::super::thread_setup::LifecycleVenue for RetainedVenue<'_> {
+            fn thread<'a>(
+                &'a self,
+                _: &'a CurrentTask,
+            ) -> Option<carrick_personality_linux::thread::LifecycleThread<'a>> {
+                Some(carrick_personality_linux::thread::LifecycleThread {
+                    page: self.page,
+                    slot: self.control,
+                })
+            }
+            fn born_slot(
+                &self,
+                page: &ThreadLifecyclePage,
+                entry: EntryRef,
+            ) -> Option<&ThreadControlSlot> {
+                assert!(
+                    core::ptr::eq(page, self.peer.page),
+                    "foreign lifecycle page must reach born_slot"
+                );
+                self.foreign_reads.set(self.foreign_reads.get() + 1);
+                let slot = self.peer.born_slot(entry)?;
+                assert_eq!(page.control_address(entry), Some(slot as *const _ as u64));
+                Some(slot)
+            }
+        }
+        struct HostCopy;
+        impl crate::file::UserCopy for HostCopy {
+            fn copy_in(&mut self, _: &mut [u8], _: u64) -> bool {
+                false
+            }
+            fn copy_out(&mut self, address: u64, bytes: &[u8]) -> bool {
+                // SAFETY: this fixture supplies live aligned u64 output words.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len());
+                }
+                true
+            }
+        }
+        let venue = RetainedVenue {
+            page: &page,
+            control: &control,
+            peer: NativeLifecycleResources {
+                page: &child_page,
+                controls: &*child_controls,
+            },
+            foreign_reads: core::cell::Cell::new(0),
+        };
+        let mut head = 0_u64;
+        let mut len = 0_u64;
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[0] = 987;
+        frame.x[1] = &mut head as *mut u64 as u64;
+        frame.x[2] = &mut len as *mut u64 as u64;
+        frame.x[8] = carrick_syscall_abi::nr::GET_ROBUST_LIST.raw() as u64;
+        let names = carrick_el1_abi::InotifyNameCache::new();
+        let mut copy = HostCopy;
+        let mut pending: super::super::dispatch::El1PendingFamilies<
+            '_,
+            _,
+            super::super::sched::FakeCpu,
+            super::super::sched::HardwareUserWord,
+            _,
+            ParkedContextWords,
+        > = super::super::dispatch::El1PendingFamilies {
+            handoff: None,
+            lifecycle_user: Some(&mut copy),
+            frame: &mut frame,
+            counters: &carrick_el1_abi::Counters::new(),
+            current_tasks: core::slice::from_ref(&task),
+            fd_map: &[],
+            object_table: &[],
+            open_table: &[],
+            inotify_table: &[],
+            name_cache: &names,
+            zone: None,
+            ipc: None,
+            lifecycle: Some(&venue),
+            process: Some(&mut entry),
+            source: Some(source),
+            anonymous: None,
+            cache_lookup: |_| core::ptr::null_mut(),
+        };
+        assert_eq!(
+            carrick_personality_linux::dispatch::dispatch(
+                carrick_syscall_abi::nr::GET_ROBUST_LIST.raw() as u64,
+                u64::MAX,
+                &mut pending
+            ),
+            carrick_personality_linux::dispatch::CompletionRoute::Served
+        );
+        drop(pending);
+        assert_eq!(
+            frame.x[0] as i64, 0,
+            "filesystem credential match must permit the peer read"
+        );
+        assert_eq!((head, len), (0xcafe, 24));
+        assert_eq!(venue.foreign_reads.get(), 1);
+        {
+            let mut graph = runtime.graph.lock();
+            graph
+                .owner
+                .find_task_by_pid_mut(child_pid)
+                .unwrap()
+                .dumpable = 0;
+        }
+        assert_eq!(
+            entry.read_robust_list(987, &mut |_, _| Some((0xcafe, 24))),
+            Err(carrick_personality_linux::identity::EPERM)
+        );
+        {
+            let mut graph = runtime.graph.lock();
+            let peer = graph.owner.find_task_by_pid_mut(child_pid).unwrap();
+            peer.dumpable = 1;
+            peer.credentials_for_mut(987).unwrap().cap_permitted =
+                carrick_sched_core::process::LinuxCapabilitySet::CAP_SETUID;
+        }
+        assert_eq!(
+            entry.read_robust_list(987, &mut |_, _| Some((0xcafe, 24))),
+            Err(carrick_personality_linux::identity::EPERM)
+        );
+        {
+            let mut graph = runtime.graph.lock();
+            graph
+                .owner
+                .find_task_by_pid_mut(child_pid)
+                .unwrap()
+                .credentials_for_mut(987)
+                .unwrap()
+                .cap_permitted = carrick_sched_core::process::LinuxCapabilitySet::empty();
+        }
+        // A matching real uid cannot bypass mismatched filesystem credentials.
+        entry
+            .update_calling_creds(&mut |c| {
+                c.ruid = carrick_sched_core::process::TaskUid::new(2000);
+                c.rgid = carrick_sched_core::process::TaskGid::new(2000);
+                c.fsuid = carrick_sched_core::process::TaskUid::new(1000);
+                c.fsgid = carrick_sched_core::process::TaskGid::new(1000);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            entry.read_robust_list(987, &mut |_, _| Some((0xcafe, 24))),
+            Err(carrick_personality_linux::identity::EPERM)
+        );
+        {
+            let mut graph = runtime.graph.lock();
+            let peer = graph.owner.find_task_by_pid_mut(child_pid).unwrap();
+            *peer.credentials_for_mut(child_pid).unwrap() =
+                carrick_sched_core::process::TaskCredentials::ROOT;
+        }
+        entry
+            .update_calling_creds(&mut |c| {
+                c.cap_effective = carrick_sched_core::process::LinuxCapabilitySet::CAP_SETUID;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            entry
+                .read_robust_list(child_pid, &mut |_, _| None)
+                .map(|_| ()),
+            Err(carrick_personality_linux::identity::EPERM)
+        );
+        entry
+            .update_calling_creds(&mut |c| {
+                c.cap_effective = carrick_sched_core::process::LinuxCapabilitySet::CAP_SYS_PTRACE;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            entry.read_robust_list(child_pid, &mut |_, _| None),
+            Ok((0xbeef, 24))
+        );
+        // A predecessor of a host-completed exec has lost its control stamp.
+        // Peer queries must not expose its stale shared owner, even with caps.
+        child_controls[1].retire_identity();
+        assert_eq!(
+            entry.read_robust_list(987, &mut |_, _| Some((0xcafe, 24))),
+            Err(carrick_personality_linux::identity::ESRCH)
+        );
+        assert_eq!(
+            carrick_personality_linux::identity::ProcessIdentityVenue::set_pgid(
+                &mut entry,
+                child_pid as i32,
+                child_pid as i32
+            ),
+            Err(carrick_personality_linux::identity::ESRCH)
+        );
+    }
+
+    #[test]
+    fn prlimit64_resolves_non_leader_tid_of_own_process() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let child_page = Box::new(ThreadLifecyclePage::new());
+        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        }));
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &*child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+            on_signal_clock: None,
+        };
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        entry.set_calling_tid(41);
+
+        // Spawn a non-leader thread TID 50 in caller process 41
+        entry.thread_spawned(41, 50, &mut || Ok(())).unwrap();
+
+        use carrick_personality_linux::sysinfo::ProcessSysinfoVenue;
+        // Calling prlimit64 on non-leader TID 50 should resolve to own process limits (not ESRCH)
+        let res = entry.prlimit64(50, 7, None);
+        assert!(
+            res.is_ok(),
+            "prlimit64 on non-leader tid should succeed: {:?}",
+            res
+        );
+
+        // Unprivileged caller on non-leader TID 50 also succeeds because it's own process
+        use carrick_personality_linux::identity::ProcessIdentityVenue;
+        entry.set_uid(1000).unwrap();
+        let res_unpriv = entry.prlimit64(50, 7, None);
+        assert!(
+            res_unpriv.is_ok(),
+            "prlimit64 unprivileged on own non-leader tid should succeed: {:?}",
+            res_unpriv
+        );
+
+        // Calling prlimit64 on truly nonexistent TID 999 still returns ESRCH
+        let res_missing = entry.prlimit64(999, 7, None);
+        assert_eq!(res_missing, Err(carrick_personality_linux::sysinfo::ESRCH));
     }
 }

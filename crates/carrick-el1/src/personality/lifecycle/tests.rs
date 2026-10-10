@@ -471,15 +471,18 @@ fn clone_forwards_every_other_flag_set_without_effects() {
 }
 
 #[test]
-fn clone_forwards_behind_a_closed_gate_or_the_threads_hatch() {
-    let run = |w: &mut World| {
+fn clone_closed_gate_returns_eagain_and_threads_hatch_forwards() {
+    let run = |w: &mut World, expected: Action| {
         let entry = w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
         let word = Box::new(0xaaaa_u32);
-        let (action, _) = w.syscall(
+        let (action, frame) = w.syscall(
             SYS_CLONE,
             &clone_args(GLIBC_FLAGS, addr(&*word), addr(&*word)),
         );
-        assert_eq!(action, Action::Forward);
+        assert_eq!(action, expected);
+        if expected == Action::Served {
+            assert_eq!(frame.x[0] as i64, -11);
+        }
         assert_eq!(*word, 0xaaaa);
         assert_eq!(
             w.page().state(0).unwrap(),
@@ -490,16 +493,16 @@ fn clone_forwards_behind_a_closed_gate_or_the_threads_hatch() {
     };
     let mut w = World::new(LifecycleHatches::ON);
     w.page().close_for_fork().unwrap();
-    run(&mut w);
+    run(&mut w, Action::Served);
     let mut w = World::new(LifecycleHatches::ON);
     w.page().close();
-    run(&mut w);
+    run(&mut w, Action::Served);
     // CARRICK_EL1_THREADS=0.
     let mut w = World::new(LifecycleHatches {
         threads: false,
         sigmask: true,
     });
-    run(&mut w);
+    run(&mut w, Action::Forward);
 }
 
 #[test]
@@ -1340,4 +1343,1174 @@ fn arm_frame_rejects_slot_outside_mailbox_capacity() {
         ..Default::default()
     };
     assert_eq!(frame.slot(), None);
+}
+
+#[test]
+fn clone_uses_the_exact_stamped_dispatch_identity() {
+    struct BirthProbe {
+        binding: carrick_el1_abi::ExecutionBinding,
+    }
+    impl ProcessNative for BirthProbe {
+        fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
+            self.binding
+        }
+        fn fork(&mut self) -> LifecycleOutcome {
+            panic!("unexpected fork")
+        }
+        fn wait4(
+            &mut self,
+            _: ProcessWaitPid,
+            _: UserVa,
+            _: LinuxWaitOptions,
+            _: UserVa,
+        ) -> LifecycleOutcome {
+            panic!("unexpected wait")
+        }
+        fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
+            panic!("unexpected exit")
+        }
+        fn thread_spawned(
+            &mut self,
+            caller: u32,
+            child: u32,
+            publish: &mut dyn FnMut() -> Result<(), i64>,
+        ) -> Result<(), i64> {
+            if caller != 41 {
+                return Err(-3);
+            }
+            assert_eq!(child, CHILD_VISIBLE);
+            publish()
+        }
+    }
+    let mut w = World::new(LifecycleHatches::ON);
+    w.task().publish_visible_pid(41);
+    w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
+    assert!(w.venue.leader_slot().publish_visible_tid(41));
+    let mut probe = BirthProbe {
+        binding: crate::personality::common_entry::execution_binding(w.task()),
+    };
+    let mut frame = TrapFrame {
+        slot: SLOT_IDX as u64,
+        ..Default::default()
+    };
+    frame.x[..5].copy_from_slice(&clone_args(GO_FLAGS, 0, 0));
+    let names = InotifyNameCache::new();
+    let mut native = super::El1PendingFamilies {
+        handoff: None,
+        lifecycle_user: None,
+        frame: &mut frame,
+        counters: &w.counters,
+        current_tasks: &w.tasks,
+        fd_map: &[],
+        object_table: &[],
+        open_table: &[],
+        inotify_table: &[],
+        name_cache: &names,
+        zone: Some(Zone {
+            tables: &w.zone,
+            cpu: &mut w.cpu,
+            user: &HardwareUserWord,
+        }),
+        ipc: None,
+        lifecycle: Some(&*w.venue),
+        process: Some(&mut probe),
+        source: None,
+        anonymous: None,
+        cache_lookup: |_| core::ptr::null_mut(),
+    };
+    assert!(
+        matches!(invoke(LifecycleCall::Clone, &mut native), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == i64::from(CHILD_VISIBLE))
+    );
+    assert_eq!(w.page().live(), 2);
+    assert_eq!(w.zone.slot(SLOT).queued(), 1);
+}
+
+#[test]
+fn clone_refuses_missing_dispatch_identity_without_registering() {
+    struct BirthProbe {
+        binding: carrick_el1_abi::ExecutionBinding,
+    }
+    impl ProcessNative for BirthProbe {
+        fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
+            self.binding
+        }
+        fn fork(&mut self) -> LifecycleOutcome {
+            panic!("unexpected fork")
+        }
+        fn wait4(
+            &mut self,
+            _: ProcessWaitPid,
+            _: UserVa,
+            _: LinuxWaitOptions,
+            _: UserVa,
+        ) -> LifecycleOutcome {
+            panic!("unexpected wait")
+        }
+        fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
+            panic!("unexpected exit")
+        }
+        fn thread_spawned(
+            &mut self,
+            caller: u32,
+            child: u32,
+            publish: &mut dyn FnMut() -> Result<(), i64>,
+        ) -> Result<(), i64> {
+            assert_eq!(caller, PARENT_TID as u32);
+            assert_eq!(child, CHILD_VISIBLE);
+            publish()
+        }
+    }
+    let mut w = World::new(LifecycleHatches::ON);
+    w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
+    assert_eq!(w.venue.leader_slot().visible_tid(), None);
+    let mut probe = BirthProbe {
+        binding: crate::personality::common_entry::execution_binding(w.task()),
+    };
+    let mut frame = TrapFrame {
+        slot: SLOT_IDX as u64,
+        ..Default::default()
+    };
+    frame.x[..5].copy_from_slice(&clone_args(GO_FLAGS, 0, 0));
+    let names = InotifyNameCache::new();
+    let mut native = super::El1PendingFamilies {
+        handoff: None,
+        lifecycle_user: None,
+        frame: &mut frame,
+        counters: &w.counters,
+        current_tasks: &w.tasks,
+        fd_map: &[],
+        object_table: &[],
+        open_table: &[],
+        inotify_table: &[],
+        name_cache: &names,
+        zone: Some(Zone {
+            tables: &w.zone,
+            cpu: &mut w.cpu,
+            user: &HardwareUserWord,
+        }),
+        ipc: None,
+        lifecycle: Some(&*w.venue),
+        process: Some(&mut probe),
+        source: None,
+        anonymous: None,
+        cache_lookup: |_| core::ptr::null_mut(),
+    };
+    assert!(
+        matches!(invoke(LifecycleCall::Clone, &mut native), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == carrick_personality_linux::identity::ESRCH)
+    );
+    assert_eq!(w.page().live(), 1);
+    assert_eq!(w.zone.slot(SLOT).queued(), 0);
+}
+
+#[test]
+fn clone_missing_nonleader_identity_cannot_inherit_leader() {
+    struct BirthProbe {
+        binding: carrick_el1_abi::ExecutionBinding,
+    }
+    impl ProcessNative for BirthProbe {
+        fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
+            self.binding
+        }
+        fn fork(&mut self) -> LifecycleOutcome {
+            panic!("unexpected fork")
+        }
+        fn wait4(
+            &mut self,
+            _: ProcessWaitPid,
+            _: UserVa,
+            _: LinuxWaitOptions,
+            _: UserVa,
+        ) -> LifecycleOutcome {
+            panic!("unexpected wait")
+        }
+        fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
+            panic!("unexpected exit")
+        }
+        fn thread_spawned(
+            &mut self,
+            caller: u32,
+            child: u32,
+            publish: &mut dyn FnMut() -> Result<(), i64>,
+        ) -> Result<(), i64> {
+            assert_eq!(
+                caller, 42,
+                "a nonleader child must inherit the calling thread"
+            );
+            assert_eq!(child, CHILD_VISIBLE);
+            publish()
+        }
+    }
+    let mut w = World::new(LifecycleHatches::ON);
+    w.task().publish_visible_pid(41);
+    w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
+    let running = w.venue.stock(1, 70, 42);
+    w.venue
+        .child_slot(1)
+        .reset_for_birth(BlockedMask(0), 0, running);
+    w.task().set(El1TaskId::from_linux_tid(70), 1, 5);
+    assert_eq!(w.venue.child_slot(1).visible_tid(), None);
+    let mut probe = BirthProbe {
+        binding: crate::personality::common_entry::execution_binding(w.task()),
+    };
+    let mut frame = TrapFrame {
+        slot: SLOT_IDX as u64,
+        ..Default::default()
+    };
+    frame.x[..5].copy_from_slice(&clone_args(GO_FLAGS, 0, 0));
+    let names = InotifyNameCache::new();
+    let mut native = super::El1PendingFamilies {
+        handoff: None,
+        lifecycle_user: None,
+        frame: &mut frame,
+        counters: &w.counters,
+        current_tasks: &w.tasks,
+        fd_map: &[],
+        object_table: &[],
+        open_table: &[],
+        inotify_table: &[],
+        name_cache: &names,
+        zone: Some(Zone {
+            tables: &w.zone,
+            cpu: &mut w.cpu,
+            user: &HardwareUserWord,
+        }),
+        ipc: None,
+        lifecycle: Some(&*w.venue),
+        process: Some(&mut probe),
+        source: None,
+        anonymous: None,
+        cache_lookup: |_| core::ptr::null_mut(),
+    };
+    assert!(
+        matches!(invoke(LifecycleCall::Clone, &mut native), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == carrick_personality_linux::identity::ESRCH)
+    );
+    assert_eq!(w.page().live(), 1);
+    assert_eq!(w.zone.slot(SLOT).queued(), 0);
+}
+
+#[test]
+fn clone_stamped_nonleader_inherits_the_calling_thread() {
+    struct BirthProbe {
+        binding: carrick_el1_abi::ExecutionBinding,
+    }
+    impl ProcessNative for BirthProbe {
+        fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
+            self.binding
+        }
+        fn fork(&mut self) -> LifecycleOutcome {
+            panic!("unexpected fork")
+        }
+        fn wait4(
+            &mut self,
+            _: ProcessWaitPid,
+            _: UserVa,
+            _: LinuxWaitOptions,
+            _: UserVa,
+        ) -> LifecycleOutcome {
+            panic!("unexpected wait")
+        }
+        fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
+            panic!("unexpected exit")
+        }
+        fn thread_spawned(
+            &mut self,
+            caller: u32,
+            child: u32,
+            publish: &mut dyn FnMut() -> Result<(), i64>,
+        ) -> Result<(), i64> {
+            assert_eq!(
+                caller, 42,
+                "a nonleader child must inherit the calling thread"
+            );
+            assert_eq!(child, CHILD_VISIBLE);
+            publish()
+        }
+    }
+    let mut w = World::new(LifecycleHatches::ON);
+    w.task().publish_visible_pid(41);
+    w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
+    let running = w.venue.stock(1, 70, 42);
+    w.venue
+        .child_slot(1)
+        .reset_for_birth(BlockedMask(0), 0, running);
+    w.task().set(El1TaskId::from_linux_tid(70), 1, 5);
+    assert!(w.venue.child_slot(1).publish_visible_tid(42));
+    let mut probe = BirthProbe {
+        binding: crate::personality::common_entry::execution_binding(w.task()),
+    };
+    let mut frame = TrapFrame {
+        slot: SLOT_IDX as u64,
+        ..Default::default()
+    };
+    frame.x[..5].copy_from_slice(&clone_args(GO_FLAGS, 0, 0));
+    let names = InotifyNameCache::new();
+    let mut native = super::El1PendingFamilies {
+        handoff: None,
+        lifecycle_user: None,
+        frame: &mut frame,
+        counters: &w.counters,
+        current_tasks: &w.tasks,
+        fd_map: &[],
+        object_table: &[],
+        open_table: &[],
+        inotify_table: &[],
+        name_cache: &names,
+        zone: Some(Zone {
+            tables: &w.zone,
+            cpu: &mut w.cpu,
+            user: &HardwareUserWord,
+        }),
+        ipc: None,
+        lifecycle: Some(&*w.venue),
+        process: Some(&mut probe),
+        source: None,
+        anonymous: None,
+        cache_lookup: |_| core::ptr::null_mut(),
+    };
+    assert!(
+        matches!(invoke(LifecycleCall::Clone, &mut native), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == i64::from(CHILD_VISIBLE))
+    );
+    assert_eq!(w.page().live(), 2);
+    assert_eq!(w.zone.slot(SLOT).queued(), 1);
+}
+struct IdentityOwner(carrick_el1_abi::ExecutionBinding);
+impl ProcessNative for IdentityOwner {
+    fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
+        self.0
+    }
+    fn fork(&mut self) -> LifecycleOutcome {
+        panic!("unexpected fork")
+    }
+    fn wait4(
+        &mut self,
+        _: ProcessWaitPid,
+        _: UserVa,
+        _: LinuxWaitOptions,
+        _: UserVa,
+    ) -> LifecycleOutcome {
+        panic!("unexpected wait")
+    }
+    fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
+        panic!("unexpected exit")
+    }
+}
+/// Host-test frame with the production CPL0 scheduler capability boundary.
+struct Cpl0IdentityFrame(TrapFrame);
+impl carrick_guest_arch::SyscallFrame for Cpl0IdentityFrame {
+    fn canonical_ordinal(&self) -> carrick_guest_arch::CanonicalNr {
+        carrick_guest_arch::SyscallFrame::canonical_ordinal(&self.0)
+    }
+    fn argument(&self, index: usize) -> Option<u64> {
+        carrick_guest_arch::SyscallFrame::argument(&self.0, index)
+    }
+    fn result(&self) -> carrick_guest_arch::NativeReturnWord {
+        carrick_guest_arch::SyscallFrame::result(&self.0)
+    }
+    fn set_result(&mut self, result: carrick_guest_arch::NativeReturnWord) {
+        carrick_guest_arch::SyscallFrame::set_result(&mut self.0, result);
+    }
+    fn slot(&self) -> Option<carrick_guest_arch::SlotId> {
+        carrick_guest_arch::SyscallFrame::slot(&self.0)
+    }
+    fn user_sp(&self) -> Option<UserVa> {
+        carrick_guest_arch::SyscallFrame::user_sp(&self.0)
+    }
+}
+impl crate::personality::dispatch::GuestDispatchFrame for Cpl0IdentityFrame {
+    fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
+        carrick_guest_arch::NativeOrdinal::new(218)
+    }
+    fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
+        carrick_personality_linux::crossing::HostCrossingSet::X86
+    }
+    fn arm_frame(&mut self) -> Option<&mut TrapFrame> {
+        None
+    }
+    fn arm_frame_ref(&self) -> Option<&TrapFrame> {
+        None
+    }
+    fn arm_scheduler(&self) -> bool {
+        false
+    }
+    fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
+        None
+    }
+}
+
+#[test]
+fn set_tid_address_cpl0_records_word_and_returns_the_exact_tid() {
+    for work in [false, true] {
+        let w = World::new(LifecycleHatches::ON);
+        if work {
+            w.task().linux.mark_pending_host_work();
+        }
+        assert!(w.venue.leader_slot().publish_visible_tid(40));
+        w.venue.leader_slot().set_clear_child_tid(0x6000);
+        let mut owner = IdentityOwner(crate::personality::common_entry::execution_binding(
+            w.task(),
+        ));
+        let mut frame = Cpl0IdentityFrame(TrapFrame {
+            slot: SLOT_IDX as u64,
+            ..Default::default()
+        });
+        frame.0.x[0] = 0x7000;
+        frame.0.x[8] = carrick_syscall_abi::nr::SET_TID_ADDRESS.raw() as u64;
+        let names = InotifyNameCache::new();
+        let route = crate::personality::dispatch::dispatch_syscall_with_native::<
+            _,
+            FakeCpu,
+            HardwareUserWord,
+            _,
+            ThreadCtx,
+        >(
+            &mut frame,
+            &w.counters,
+            &w.tasks,
+            &[],
+            &[],
+            &[],
+            &[],
+            &names,
+            None,
+            None,
+            Some(&*w.venue),
+            Some(&mut owner),
+            None,
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        assert_eq!(
+            route,
+            if work {
+                carrick_personality_linux::dispatch::CompletionRoute::WithWork
+            } else {
+                carrick_personality_linux::dispatch::CompletionRoute::Served
+            }
+        );
+        assert_eq!(frame.0.x[0], 40);
+        assert_eq!(w.venue.leader_slot().clear_child_tid(), 0x7000);
+    }
+}
+
+#[test]
+fn set_tid_address_arm_child_registers_the_word_that_exit_clears_and_wakes() {
+    let mut w = World::new(LifecycleHatches::ON);
+    let word = Box::new(CHILD_VISIBLE);
+    w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
+    let (action, _) = w.syscall(SYS_CLONE, &clone_args(GO_FLAGS, 0, 0));
+    assert_eq!(action, Action::Served);
+    let mut frame = TrapFrame {
+        elr: 0x5000,
+        ..Default::default()
+    };
+    assert_eq!(
+        w.call(
+            &mut frame,
+            SYS_FUTEX,
+            &[addr(&*word), 128, u64::from(CHILD_VISIBLE), 0]
+        ),
+        Action::Served
+    );
+    assert_eq!(
+        w.task().execution.task.load(Ordering::Relaxed),
+        u64::from(CHILD_TID)
+    );
+    assert_eq!(w.venue.child_slot(0).clear_child_tid(), 0);
+    let mut owner = IdentityOwner(crate::personality::common_entry::execution_binding(
+        w.task(),
+    ));
+    frame.slot = SLOT_IDX as u64;
+    frame.x[0] = addr(&*word);
+    frame.x[8] = carrick_syscall_abi::nr::SET_TID_ADDRESS.raw() as u64;
+    let names = InotifyNameCache::new();
+    let route = crate::personality::dispatch::dispatch_syscall_with_native(
+        &mut frame,
+        &w.counters,
+        &w.tasks,
+        &[],
+        &[],
+        &[],
+        &[],
+        &names,
+        Some(Zone {
+            tables: &w.zone,
+            cpu: &mut w.cpu,
+            user: &HardwareUserWord,
+        }),
+        None,
+        Some(&*w.venue),
+        Some(&mut owner),
+        None,
+        None,
+        |_| core::ptr::null_mut(),
+    );
+    assert!(matches!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Served
+    ));
+    assert_eq!(frame.x[0], u64::from(CHILD_VISIBLE));
+    assert_eq!(w.venue.child_slot(0).clear_child_tid(), addr(&*word));
+    assert_eq!(w.call(&mut frame, SYS_EXIT, &[0]), Action::Served);
+    assert_eq!(*word, 0);
+    assert_eq!(w.task().execution.task.load(Ordering::Relaxed), PARENT_TID);
+    assert_eq!(frame.x[0], 0);
+    assert_eq!(w.zone.slot(SLOT).queued(), 0);
+}
+struct QueueLockProbeCpu<'a> {
+    inner: FakeCpu,
+    probe: &'a dyn Fn(),
+}
+impl crate::sched::ThreadCpu for QueueLockProbeCpu<'_> {
+    fn save(&mut self, f: &TrapFrame, c: &mut carrick_sched_core::ThreadCtx) {
+        self.inner.save(f, c);
+    }
+    fn load(&mut self, f: &mut TrapFrame, c: &carrick_sched_core::ThreadCtx) {
+        self.inner.load(f, c);
+    }
+    fn set_translation(&mut self, a: u64, b: u64) {
+        self.inner.set_translation(a, b);
+    }
+    fn invalidate_asid(&mut self, a: u64) {
+        self.inner.invalidate_asid(a);
+    }
+    fn now(&self) -> u64 {
+        (self.probe)();
+        self.inner.now()
+    }
+    fn freq(&self) -> u64 {
+        self.inner.freq()
+    }
+    fn set_timer(&mut self, t: Option<u64>) {
+        self.inner.set_timer(t);
+    }
+    fn send_sgi(&mut self, s: u64) {
+        self.inner.send_sgi(s);
+    }
+    fn ack_irq(&mut self) -> u32 {
+        self.inner.ack_irq()
+    }
+    fn end_irq(&mut self, i: u32) {
+        self.inner.end_irq(i);
+    }
+    fn wait_for_interrupt(&mut self) {
+        self.inner.wait_for_interrupt();
+    }
+    fn spin(&mut self) {
+        self.inner.spin();
+    }
+    fn own_sgi_target(&self) -> u64 {
+        self.inner.own_sgi_target()
+    }
+}
+
+#[test]
+fn clone_terminal_close_rolls_back_before_owned_exit_settlement() {
+    // ProcessNative's Born callback is under its graph guard. The real queue
+    // and timer path must run after that guard, even if it reenters the graph.
+    struct GraphOwner<'a> {
+        binding: carrick_el1_abi::ExecutionBinding,
+        graph: &'a crate::lock::SpinLock<()>,
+        page: &'a ThreadLifecyclePage,
+        zone: &'a ZoneTables,
+        settlements: &'a core::cell::Cell<u32>,
+        refuse_birth: bool,
+    }
+    impl ProcessNative for GraphOwner<'_> {
+        fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
+            self.binding
+        }
+        fn fork(&mut self) -> LifecycleOutcome {
+            panic!("unexpected fork")
+        }
+        fn wait4(
+            &mut self,
+            _: ProcessWaitPid,
+            _: UserVa,
+            _: LinuxWaitOptions,
+            _: UserVa,
+        ) -> LifecycleOutcome {
+            panic!("unexpected wait")
+        }
+        fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
+            panic!("unexpected exit")
+        }
+        fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
+            let _guard = self
+                .graph
+                .try_lock()
+                .expect("settlement retains graph guard");
+            assert_eq!(self.page.claimed_count(), 0);
+            if self.refuse_birth {
+                assert_eq!(self.page.live(), 1, "wake preceded live rollback");
+                assert_eq!(self.zone.slot(SLOT).queued(), 0);
+            } else {
+                assert_eq!(self.page.live(), 2);
+                assert_eq!(
+                    self.zone.slot(SLOT).queued(),
+                    1,
+                    "wake preceded Born enqueue"
+                );
+            }
+            self.settlements.set(self.settlements.get() + 1);
+            Ok(())
+        }
+        fn thread_spawned(
+            &mut self,
+            caller: u32,
+            child: u32,
+            publish: &mut dyn FnMut() -> Result<(), i64>,
+        ) -> Result<(), i64> {
+            assert_eq!(caller, PARENT_TID as u32);
+            assert_eq!(child, CHILD_VISIBLE);
+            let _guard = self.graph.lock();
+            if self.refuse_birth {
+                assert_eq!(self.page.claimed_count(), 1);
+                assert_eq!(self.page.live(), 2);
+                self.page.close();
+                return Err(-11);
+            }
+            publish()
+        }
+    }
+    let settlements = core::cell::Cell::new(0);
+    let w = World::new(LifecycleHatches::ON);
+    assert!(w.venue.leader_slot().publish_visible_tid(PARENT_TID as u32));
+    w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
+    let graph = crate::lock::SpinLock::new(());
+    let checks = core::cell::Cell::new(0_u32);
+    let probe = || {
+        if w.zone.slot(SLOT).queued() != 0 {
+            let _guard = graph
+                .try_lock()
+                .expect("scheduler publication retained the process graph lock");
+            checks.set(checks.get() + 1);
+        }
+    };
+    let mut cpu = QueueLockProbeCpu {
+        inner: w.cpu.clone(),
+        probe: &probe,
+    };
+    let mut owner = GraphOwner {
+        binding: crate::personality::common_entry::execution_binding(w.task()),
+        graph: &graph,
+        page: w.page(),
+        zone: &w.zone,
+        settlements: &settlements,
+        refuse_birth: true,
+    };
+    let mut frame = TrapFrame {
+        slot: SLOT_IDX as u64,
+        ..Default::default()
+    };
+    frame.x[..5].copy_from_slice(&clone_args(GO_FLAGS, 0, 0));
+    let names = InotifyNameCache::new();
+    let mut native = super::El1PendingFamilies {
+        handoff: None,
+        lifecycle_user: None,
+        frame: &mut frame,
+        counters: &w.counters,
+        current_tasks: &w.tasks,
+        fd_map: &[],
+        object_table: &[],
+        open_table: &[],
+        inotify_table: &[],
+        name_cache: &names,
+        zone: Some(Zone {
+            tables: &w.zone,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+        }),
+        ipc: None,
+        lifecycle: Some(&*w.venue),
+        process: Some(&mut owner),
+        source: None,
+        anonymous: None,
+        cache_lookup: |_| core::ptr::null_mut(),
+    };
+    assert!(
+        matches!(invoke(LifecycleCall::Clone,&mut native),Some(LifecycleOutcome::Returned {result,..}) if result.raw()==-11)
+    );
+    assert_eq!(checks.get(), 0);
+    assert_eq!(settlements.get(), 1);
+    assert_eq!(w.page().live(), 1);
+    assert_eq!(w.page().claimed_count(), 0);
+    assert_eq!(w.page().gate(), carrick_el1_abi::GateState::Closed);
+    assert_eq!(w.zone.slot(SLOT).queued(), 0);
+}
+
+#[test]
+fn clone_queue_publication_can_reenter_the_process_graph_after_unlock() {
+    // ProcessNative's Born callback is under its graph guard. The real queue
+    // and timer path must run after that guard, even if it reenters the graph.
+    struct GraphOwner<'a> {
+        binding: carrick_el1_abi::ExecutionBinding,
+        graph: &'a crate::lock::SpinLock<()>,
+        page: &'a ThreadLifecyclePage,
+        zone: &'a ZoneTables,
+        settlements: &'a core::cell::Cell<u32>,
+        refuse_birth: bool,
+    }
+    impl ProcessNative for GraphOwner<'_> {
+        fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
+            self.binding
+        }
+        fn fork(&mut self) -> LifecycleOutcome {
+            panic!("unexpected fork")
+        }
+        fn wait4(
+            &mut self,
+            _: ProcessWaitPid,
+            _: UserVa,
+            _: LinuxWaitOptions,
+            _: UserVa,
+        ) -> LifecycleOutcome {
+            panic!("unexpected wait")
+        }
+        fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
+            panic!("unexpected exit")
+        }
+        fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
+            let _guard = self
+                .graph
+                .try_lock()
+                .expect("settlement retains graph guard");
+            assert_eq!(self.page.claimed_count(), 0);
+            if self.refuse_birth {
+                assert_eq!(self.page.live(), 1, "wake preceded live rollback");
+                assert_eq!(self.zone.slot(SLOT).queued(), 0);
+            } else {
+                assert_eq!(self.page.live(), 2);
+                assert_eq!(
+                    self.zone.slot(SLOT).queued(),
+                    1,
+                    "wake preceded Born enqueue"
+                );
+            }
+            self.settlements.set(self.settlements.get() + 1);
+            Ok(())
+        }
+        fn thread_spawned(
+            &mut self,
+            caller: u32,
+            child: u32,
+            publish: &mut dyn FnMut() -> Result<(), i64>,
+        ) -> Result<(), i64> {
+            assert_eq!(caller, PARENT_TID as u32);
+            assert_eq!(child, CHILD_VISIBLE);
+            let _guard = self.graph.lock();
+            if self.refuse_birth {
+                assert_eq!(self.page.claimed_count(), 1);
+                assert_eq!(self.page.live(), 2);
+                self.page.close();
+                return Err(-11);
+            }
+            publish()
+        }
+    }
+    let settlements = core::cell::Cell::new(0);
+    let w = World::new(LifecycleHatches::ON);
+    assert!(w.venue.leader_slot().publish_visible_tid(PARENT_TID as u32));
+    w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
+    let graph = crate::lock::SpinLock::new(());
+    let checks = core::cell::Cell::new(0_u32);
+    let probe = || {
+        if w.zone.slot(SLOT).queued() != 0 {
+            let _guard = graph
+                .try_lock()
+                .expect("scheduler publication retained the process graph lock");
+            checks.set(checks.get() + 1);
+        }
+    };
+    let mut cpu = QueueLockProbeCpu {
+        inner: w.cpu.clone(),
+        probe: &probe,
+    };
+    let mut owner = GraphOwner {
+        binding: crate::personality::common_entry::execution_binding(w.task()),
+        graph: &graph,
+        page: w.page(),
+        zone: &w.zone,
+        settlements: &settlements,
+        refuse_birth: false,
+    };
+    let mut frame = TrapFrame {
+        slot: SLOT_IDX as u64,
+        ..Default::default()
+    };
+    frame.x[..5].copy_from_slice(&clone_args(GO_FLAGS, 0, 0));
+    let names = InotifyNameCache::new();
+    let mut native = super::El1PendingFamilies {
+        handoff: None,
+        lifecycle_user: None,
+        frame: &mut frame,
+        counters: &w.counters,
+        current_tasks: &w.tasks,
+        fd_map: &[],
+        object_table: &[],
+        open_table: &[],
+        inotify_table: &[],
+        name_cache: &names,
+        zone: Some(Zone {
+            tables: &w.zone,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+        }),
+        ipc: None,
+        lifecycle: Some(&*w.venue),
+        process: Some(&mut owner),
+        source: None,
+        anonymous: None,
+        cache_lookup: |_| core::ptr::null_mut(),
+    };
+    assert!(
+        matches!(invoke(LifecycleCall::Clone,&mut native),Some(LifecycleOutcome::Returned {result,..}) if result.raw()==i64::from(CHILD_VISIBLE))
+    );
+    assert!(
+        checks.get() > 0,
+        "queue publication must exercise the graph reentry witness"
+    );
+    assert_eq!(w.zone.slot(SLOT).queued(), 1);
+    assert_eq!(settlements.get(), 1);
+}
+
+#[test]
+fn birth_record_refusal_retains_the_claim_for_rollback() {
+    let mut w = World::new(LifecycleHatches::ON);
+    let entry = w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
+    let mut claim = Some(w.page().claim(entry).unwrap());
+    // A refused destination page must not eat the caller's owned claim.
+    let refused = ThreadLifecyclePage::new();
+    let mut frame = TrapFrame {
+        slot: SLOT_IDX as u64,
+        ..Default::default()
+    };
+    let names = InotifyNameCache::new();
+    let mut native: super::El1PendingFamilies<'_, _, FakeCpu, HardwareUserWord> =
+        super::El1PendingFamilies {
+            handoff: None,
+            lifecycle_user: None,
+            frame: &mut frame,
+            counters: &w.counters,
+            current_tasks: &w.tasks,
+            fd_map: &[],
+            object_table: &[],
+            open_table: &[],
+            inotify_table: &[],
+            name_cache: &names,
+            zone: Some(Zone {
+                tables: &w.zone,
+                cpu: &mut w.cpu,
+                user: &HardwareUserWord,
+            }),
+            ipc: None,
+            lifecycle: Some(&*w.venue),
+            process: None,
+            source: None,
+            anonymous: None,
+            cache_lookup: |_| core::ptr::null_mut(),
+        };
+    let result = LifecycleNative::publish_born(
+        &mut native,
+        ThreadBirth {
+            page: &refused,
+            claim: &mut claim,
+            born: BornRecord {
+                caller_task: PARENT_TID,
+                caller_serial: 1040,
+                clone_flags: GO_FLAGS,
+                clear_child_tid: 0,
+                blocked: BlockedMask(0),
+            },
+            record: carrick_sched_core::RecordRef::PLACEHOLDER,
+            caller_tid: Some(PARENT_TID as u32),
+            child_tid: CHILD_VISIBLE,
+        },
+    );
+    assert_eq!(result, Err(carrick_personality_linux::identity::EINVAL));
+    assert!(
+        claim.is_some(),
+        "record_born refusal lost the consumed claim"
+    );
+    drop(native);
+    assert_eq!(w.page().unclaim(claim.take().unwrap()), Ok(entry));
+    assert_eq!(w.page().claimed_count(), 0);
+    assert_eq!(w.zone.slot(SLOT).queued(), 0);
+}
+
+fn clone_terminal_failure_witness(mode: u8) {
+    // ProcessNative's Born callback is under its graph guard. The real queue
+    // and timer path must run after that guard, even if it reenters the graph.
+    struct GraphOwner<'a> {
+        binding: carrick_el1_abi::ExecutionBinding,
+        graph: &'a crate::lock::SpinLock<()>,
+        page: &'a ThreadLifecyclePage,
+        zone: &'a ZoneTables,
+        settlements: &'a core::cell::Cell<u32>,
+        refuse_birth: bool,
+        mode: u8,
+    }
+    impl ProcessNative for GraphOwner<'_> {
+        fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
+            self.binding
+        }
+        fn fork(&mut self) -> LifecycleOutcome {
+            panic!("unexpected fork")
+        }
+        fn wait4(
+            &mut self,
+            _: ProcessWaitPid,
+            _: UserVa,
+            _: LinuxWaitOptions,
+            _: UserVa,
+        ) -> LifecycleOutcome {
+            panic!("unexpected wait")
+        }
+        fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
+            panic!("unexpected exit")
+        }
+        fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
+            let _guard = self
+                .graph
+                .try_lock()
+                .expect("settlement retains graph guard");
+            assert_eq!(self.page.claimed_count(), 0);
+            if self.refuse_birth {
+                assert_eq!(self.page.live(), 1, "wake preceded live rollback");
+                assert_eq!(self.zone.slot(SLOT).queued(), 0);
+            } else {
+                assert_eq!(self.page.live(), 2);
+                assert_eq!(
+                    self.zone.slot(SLOT).queued(),
+                    1,
+                    "wake preceded Born enqueue"
+                );
+            }
+            self.settlements.set(self.settlements.get() + 1);
+            Err(-5)
+        }
+        fn thread_spawned(
+            &mut self,
+            caller: u32,
+            child: u32,
+            publish: &mut dyn FnMut() -> Result<(), i64>,
+        ) -> Result<(), i64> {
+            assert_eq!(caller, PARENT_TID as u32);
+            assert_eq!(child, CHILD_VISIBLE);
+            let _guard = self.graph.lock();
+            if self.refuse_birth {
+                assert_eq!(self.page.claimed_count(), 1);
+                assert_eq!(self.page.live(), 2);
+                self.page.close();
+                if self.mode == 1 {
+                    let entry = self.page.entry_ref_for_visible_tid(CHILD_VISIBLE).unwrap();
+                    self.page
+                        .transition(
+                            entry,
+                            &[EntryState::Claimed],
+                            EntryState::Born,
+                            Ordering::SeqCst,
+                        )
+                        .unwrap();
+                }
+                return Err(-11);
+            }
+            publish()
+        }
+    }
+    let settlements = core::cell::Cell::new(0);
+    let w = World::new(LifecycleHatches::ON);
+    assert!(w.venue.leader_slot().publish_visible_tid(PARENT_TID as u32));
+    w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
+    // An exiting sibling is already parked when rollback loses its claim.
+    // The injected native owner below runs through the real serve_clone path.
+    let parked_exit = if mode == 1 {
+        let record = w
+            .zone
+            .alloc_record(ThreadIdentity {
+                tid: 99,
+                serial: 1099,
+                mm: MM,
+                file_table: 5,
+                generation: 1,
+                affinity: 1 << SLOT_IDX,
+                lifecycle_page: w.page() as *const _ as u64,
+                control_slot: w.venue.leader_slot() as *const _ as u64,
+            })
+            .unwrap();
+        let guard = w
+            .zone
+            .lock(
+                ZoneTables::bucket_of(MM, 0xfe00),
+                &carrick_sched_core::BoundedSpin(100),
+            )
+            .unwrap();
+        let sequence = w.zone.next_seq(record);
+        w.zone
+            .enqueue(&guard, record, sequence, MM, 0xfe00, u32::MAX, 0)
+            .unwrap();
+        w.zone.publish_park(record, sequence);
+        Some(record)
+    } else {
+        None
+    };
+    let graph = crate::lock::SpinLock::new(());
+    let checks = core::cell::Cell::new(0_u32);
+    let probe = || {
+        if w.zone.slot(SLOT).queued() != 0 {
+            let _guard = graph
+                .try_lock()
+                .expect("scheduler publication retained the process graph lock");
+            checks.set(checks.get() + 1);
+        }
+    };
+    let mut cpu = QueueLockProbeCpu {
+        inner: w.cpu.clone(),
+        probe: &probe,
+    };
+    let mut owner = GraphOwner {
+        binding: crate::personality::common_entry::execution_binding(w.task()),
+        graph: &graph,
+        page: w.page(),
+        zone: &w.zone,
+        settlements: &settlements,
+        refuse_birth: mode == 1,
+        mode,
+    };
+    let mut frame = TrapFrame {
+        slot: SLOT_IDX as u64,
+        ..Default::default()
+    };
+    frame.x[..5].copy_from_slice(&clone_args(GO_FLAGS, 0, 0));
+    let names = InotifyNameCache::new();
+    let mut native = super::El1PendingFamilies {
+        handoff: None,
+        lifecycle_user: None,
+        frame: &mut frame,
+        counters: &w.counters,
+        current_tasks: &w.tasks,
+        fd_map: &[],
+        object_table: &[],
+        open_table: &[],
+        inotify_table: &[],
+        name_cache: &names,
+        zone: Some(Zone {
+            tables: &w.zone,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+        }),
+        ipc: None,
+        lifecycle: Some(&*w.venue),
+        process: Some(&mut owner),
+        source: None,
+        anonymous: None,
+        cache_lookup: |_| core::ptr::null_mut(),
+    };
+    let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        invoke(LifecycleCall::Clone, &mut native)
+    }));
+    let payload = stopped
+        .err()
+        .expect("clone must stop the run rather than return an errno");
+    let failure = payload
+        .downcast::<crate::personality::native_run_failure::NativeRunFailurePanic>()
+        .expect("typed terminal cause");
+    assert_eq!(failure.binding, owner.binding);
+    assert_eq!(
+        failure.reason,
+        if mode == 0 {
+            carrick_el1_abi::NativeRunFailureReason::BirthSettlement
+        } else {
+            carrick_el1_abi::NativeRunFailureReason::ClaimRollback
+        }
+    );
+    assert_eq!(w.zone.slot(SLOT).queued(), if mode == 0 { 1 } else { 0 });
+    if let Some(record) = parked_exit {
+        assert!(matches!(
+            w.zone.record(record).claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ));
+    }
+}
+
+#[test]
+fn clone_settlement_failure_after_born_never_returns_errno() {
+    clone_terminal_failure_witness(0);
+}
+
+#[test]
+fn clone_unclaim_failure_never_leaves_exit_waiting() {
+    clone_terminal_failure_witness(1);
+}
+
+#[test]
+fn arm_dispatch_consumes_native_run_failure_before_return() {
+    struct Failed {
+        binding: carrick_el1_abi::ExecutionBinding,
+    }
+    impl ProcessNative for Failed {
+        fn take_run_failure(&mut self) -> Option<carrick_el1_abi::NativeRunFailureReason> {
+            Some(carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody)
+        }
+        fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
+            self.binding
+        }
+        fn fork(&mut self) -> LifecycleOutcome {
+            panic!("unexpected fork")
+        }
+        fn wait4(
+            &mut self,
+            _: ProcessWaitPid,
+            _: UserVa,
+            _: LinuxWaitOptions,
+            _: UserVa,
+        ) -> LifecycleOutcome {
+            panic!("unexpected wait")
+        }
+        fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
+            LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                result: SyscallResult::new(0),
+            }
+        }
+    }
+    let mut w = World::new(LifecycleHatches::ON);
+    let binding = crate::personality::common_entry::execution_binding(w.task());
+    let mut failed = Failed { binding };
+    let mut frame = TrapFrame {
+        slot: SLOT_IDX as u64,
+        ..Default::default()
+    };
+    frame.x[8] = 94;
+    let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::personality::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &w.counters,
+            &w.tasks,
+            &[],
+            &[],
+            &[],
+            &[],
+            &InotifyNameCache::new(),
+            Some(Zone {
+                tables: &w.zone,
+                cpu: &mut w.cpu,
+                user: &HardwareUserWord,
+            }),
+            None,
+            Some(&*w.venue),
+            Some(&mut failed),
+            None,
+            None,
+            |_| core::ptr::null_mut(),
+        )
+    }));
+    let payload = stopped.expect_err("ARM must consume the terminal failure before returning Idle");
+    let failure = payload
+        .downcast::<crate::personality::native_run_failure::NativeRunFailurePanic>()
+        .expect("typed ARM completion cause");
+    assert_eq!(failure.binding, binding);
+    assert_eq!(
+        failure.reason,
+        carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody
+    );
 }

@@ -129,6 +129,7 @@ pub struct ForkStockHostCustody {
     pub carrier: NonZeroU64,
     pub asids: AsidAllocator,
     pub committed_asids: BTreeMap<u64, AsidGeneration>,
+    run_failure: carrick_el1_abi::NativeRunFailureConsumer,
 }
 
 #[allow(dead_code)]
@@ -153,6 +154,7 @@ impl ForkStockHostCustody {
             carrier,
             asids,
             committed_asids: BTreeMap::new(),
+            run_failure: carrick_el1_abi::NativeRunFailureConsumer::default(),
         }
     }
 
@@ -462,6 +464,23 @@ impl ForkStockHostCustody {
         }
     }
 
+    /// Authenticate a terminal native failure against this stopped CPU's lane.
+    pub(crate) fn service_run_failure(
+        &mut self,
+        cpu: CpuId,
+        record: &carrick_el1_abi::NativeRunFailure,
+    ) -> Result<(carrick_el1_abi::NativeRunFailureReason, u64), ForkStockServiceError> {
+        let execution = self
+            .active_execution_for_cpu(cpu)
+            .ok_or(ForkStockServiceError::StaleExecution)?;
+        let result = self
+            .run_failure
+            .consume(record, execution.binding)
+            .ok_or(ForkStockServiceError::StaleExecution)?;
+        self.clear_active_execution(cpu);
+        Ok(result)
+    }
+
     /// Service a container root exit notification.
     ///
     /// Validates the executing task binding against the record, retires the child's ASID
@@ -569,6 +588,29 @@ mod tests {
             child_bytes: child_pages * 4096,
             parent_bytes: parent_pages * 4096,
         }
+    }
+
+    #[test]
+    fn native_run_failure_authenticates_arm_lane_and_counts_only_terminal_crossing() {
+        let mut custody = ForkStockHostCustody::new(NonZeroU64::new(7).unwrap());
+        let execution = test_execution(41, 0, 301);
+        let reason = carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody;
+        let record = carrick_el1_abi::NativeRunFailure::new(execution.binding, reason);
+        custody.set_active_execution(execution);
+        assert_eq!(
+            custody.service_run_failure(CpuId::new(1), &record),
+            Err(ForkStockServiceError::StaleExecution)
+        );
+        assert_eq!(custody.run_failure.crossings(), 0);
+        assert_eq!(
+            custody.service_run_failure(execution.cpu, &record),
+            Ok((reason, 1))
+        );
+        assert_eq!(
+            custody.service_run_failure(execution.cpu, &record),
+            Err(ForkStockServiceError::StaleExecution)
+        );
+        assert_eq!(custody.run_failure.crossings(), 1);
     }
 
     #[test]

@@ -39,6 +39,26 @@ fn carrick_x86_fixture_dispatch_witness() -> bool {
         )
     }) == 0x7bd6_8a91_c4e2_5f03
 }
+#[cfg(target_os = "none")]
+macro_rules! production_items {
+    ($($item:item)*) => {};
+}
+#[cfg(target_os = "none")]
+fn signal_irq_return(
+    frame: &mut carrick_el1::isa::x86::context::scheduler::InterruptFrame,
+    xsave: &mut carrick_el1::isa::x86::context::scheduler::XsaveArea,
+) {
+    let _ = (frame, xsave);
+}
+
+#[cfg(target_os = "none")]
+fn signal_syscall_return(
+    frame: &mut carrick_el1::isa::x86::context::native::NativeFrame,
+    xsave: &mut carrick_el1::isa::x86::context::scheduler::XsaveArea,
+) {
+    let _ = (frame, xsave);
+}
+
 include!("entry.rs");
 
 #[cfg(target_os = "none")]
@@ -60,9 +80,16 @@ fn fixture_handled(
     {
         // SAFETY: stopped-host bootstrap published and retains the aligned
         // native lane/zone/page custody for this exact CPU binding.
-        let Some(mut lane) =
-            (unsafe { crate::lifecycle::acquire(frame, binding, task, counters, call.args) })
-        else {
+        let Some(mut lane) = (unsafe {
+            crate::lifecycle::acquire(
+                frame,
+                binding,
+                task,
+                counters,
+                call.args,
+                carrick_el1::personality::native_run_failure::complete_native_run_failure,
+            )
+        }) else {
             doorbell(FATAL_PORT, frame);
             halt();
         };

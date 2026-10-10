@@ -29,9 +29,9 @@ pub fn observe_object(
 }
 
 /// Whether a park of the running thread on `slot` may carry a deadline:
-/// the slot's timer has no other live owner.
+/// admitted records each own capacity in the shared deadline index.
 pub fn may_time_park(zone: &ZoneTables, slot: SlotId) -> bool {
-    zone.timer_free(slot)
+    zone.timer_admission_available(slot)
 }
 
 /// Whether the switched-in record's last object park ended at its deadline.
@@ -97,6 +97,7 @@ where
     if let Err(error) =
         guard.park_until(request.snapshot, record, request.operation, deadline_ticks)
     {
+        zone.cancel_timer_admission(zone.record_ref(record));
         drop(guard);
         if fresh {
             zone.discard_unpublished(slot, record);

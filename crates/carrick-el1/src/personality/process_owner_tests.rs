@@ -232,8 +232,7 @@ fn task(
             identity: TaskIdentity::led_by(key(1, 1).id),
             namespace_process_group: 1,
             namespace_session: 1,
-            ruid: Uid(0),
-            euid: Uid(0),
+            receipt_uid: |uid| Uid(uid.raw()),
             exit_signal: ChildExitSignal::SIGCHLD,
             diagnostic_name: "native".into(),
         },
@@ -1415,8 +1414,7 @@ fn owner_instantiated_with_aarch64_context_checks_fork_child_and_syscall_return(
             identity: TaskIdentity::led_by(key(1, 1).id),
             namespace_process_group: 1,
             namespace_session: 1,
-            ruid: Uid(0),
-            euid: Uid(0),
+            receipt_uid: |uid| Uid(uid.raw()),
             exit_signal: ChildExitSignal::SIGCHLD,
             diagnostic_name: "native_arm".into(),
         },
@@ -1437,4 +1435,41 @@ fn owner_instantiated_with_aarch64_context_checks_fork_child_and_syscall_return(
     assert_eq!(row.context().native.x[0], 42);
     assert!(row.context().authenticates(parent_addr));
     assert!(!row.context().authenticates(child_addr));
+}
+
+#[test]
+fn group_exists_in_session_checks_live_tasks() {
+    let o = owner();
+    assert!(o.group_exists_in_session(1, 1));
+    assert!(!o.group_exists_in_session(1, 2));
+    assert!(!o.group_exists_in_session(2, 1));
+}
+
+#[test]
+fn exit_uid_receipt_reads_thread_credentials_without_a_metadata_mirror() {
+    for exit_tid in [2, 50] {
+        let mut owner = owner();
+        let child = key(2, 2);
+        birth(&mut owner, key(1, 1), child, Rc::new(Cell::new(0)));
+        let row = owner.task_mut(child).unwrap();
+        if exit_tid != 2 {
+            row.spawn_thread(2, exit_tid).unwrap();
+        }
+        row.credentials_for_mut(exit_tid).unwrap().ruid =
+            carrick_sched_core::process::TaskUid::new(1000);
+        row.select_exit_thread(exit_tid).unwrap();
+        let done = exit(&mut owner, child, None);
+        done.effects.cancel_members(Member::cancel);
+        assert_eq!(owner.registry.zombies[&child.id].receipt.ruid, Uid(1000));
+        assert_eq!(
+            owner
+                .task(key(1, 1))
+                .unwrap()
+                .credentials_for(1)
+                .unwrap()
+                .ruid
+                .raw(),
+            0
+        );
+    }
 }

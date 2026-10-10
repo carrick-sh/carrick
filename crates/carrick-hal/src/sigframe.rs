@@ -147,9 +147,9 @@ pub fn build_sigframe<E: RegAccess + CurrentMmMemory>(
     //     which is exactly Go's async-preemption (SIGURG) corruption.
     //
     // The engine pre-selected the authoritative source into `pstate_source`.
-    // The guest sees it with DAIF set, as Carrick has always run EL0: the
-    // in-guest scheduler's EL0 interrupt unmask is not guest state.
-    frame.saved_spsr = crate::aarch64::el0_visible_pstate(p.pstate_source);
+    // Publish only user-modifiable Linux signal PSTATE. Execution interrupt
+    // masks and privilege fields cannot become guest-owned resume authority.
+    frame.saved_spsr = p.pstate_source & carrick_abi::AARCH64_EL0_USER_PSTATE_MASK;
 
     // A queued siginfo (rt_sigqueueinfo / sigqueue) wins over synthesis: it
     // carries the caller's si_value payload and the kernel-set si_code
@@ -431,7 +431,7 @@ pub fn restore_sigframe<E: RegAccess + CurrentMmMemory>(
     // This replaces the private-magic gate, which Rosetta's reconstructed
     // frame legitimately lacks.
     let resume_pstate = mcontext.pstate;
-    if resume_pstate & 0b1111 != 0 {
+    if resume_pstate & !carrick_abi::AARCH64_EL0_USER_PSTATE_MASK != 0 {
         // Guest-controlled frame: a corrupt/forged resume PSTATE (rt_sigreturn
         // outside a handler, or a bad SP) is a guest fault (force_sigsegv), not
         // a runtime abort.

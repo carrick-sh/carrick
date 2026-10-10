@@ -1,6 +1,7 @@
 //! Linux lifecycle policy over neutral pool transitions and native context hooks.
 use crate::abi::entry::SyscallResult;
 use crate::abi::thread::*;
+use crate::native_run_failure::NativeRunFailureReason;
 pub use carrick_syscall_abi::LinuxWaitOptions;
 
 /// Linux `pid_t` selector carried by wait4 (including negative selectors).
@@ -81,10 +82,22 @@ use carrick_guest_arch::UserVa;
 use carrick_sched_core::{RecordRef, ThreadIdentity};
 use core::sync::atomic::Ordering;
 
+/// A retained native slot reader returns owned scalar state, never a borrowed slot.
+pub type RobustSlotReader<'r> =
+    dyn FnMut(&ThreadLifecyclePage, EntryRef) -> Option<(u64, u32)> + 'r;
+
 /// Native process custody supplied by the execution lane. Registry decisions
 /// remain in the shared scheduler owner; this adapter retains machine context.
 pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::ThreadCtx> {
     fn take_handoff_receipt(&mut self) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
+        None
+    }
+    fn take_run_failure(&mut self) -> Option<NativeRunFailureReason> {
+        None
+    }
+    /// An admitted process may retain an exact-MM write authority (including COW).
+    /// None means this venue does not own user transfers.
+    fn copy_out_owned(&mut self, _dst: UserVa, _bytes: &[u8]) -> Option<bool> {
         None
     }
     fn binding(&self) -> ExecutionBinding;
@@ -97,6 +110,41 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
         rusage: UserVa,
     ) -> LifecycleOutcome;
     fn exit_group(&mut self, status: u8) -> LifecycleOutcome;
+    fn as_identity_venue(&mut self) -> Option<&mut dyn crate::identity::ProcessIdentityVenue> {
+        None
+    }
+    fn as_sysinfo_venue(&mut self) -> Option<&mut dyn crate::sysinfo::ProcessSysinfoVenue> {
+        None
+    }
+    fn thread_spawned(
+        &mut self,
+        _caller_tid: u32,
+        _child_tid: u32,
+        publish: &mut dyn FnMut() -> Result<(), i64>,
+    ) -> Result<(), i64> {
+        publish()
+    }
+    /// Notify an owned exit only after a claim's rollback or Born enqueue has
+    /// finished. The venue releases graph ownership before publishing a wake.
+    fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
+        Ok(())
+    }
+    fn thread_exited(&mut self, _tid: u32) {}
+    fn set_calling_tid(&mut self, _tid: u32) {}
+
+    fn has_thread(&self, _tid: u32) -> bool {
+        false
+    }
+    fn read_robust_list(
+        &self,
+        _tid: u32,
+        _read_slot: &mut RobustSlotReader<'_>,
+    ) -> Result<(u64, u32), i64> {
+        Err(crate::identity::ESRCH)
+    }
+    fn signal_venue(&mut self) -> Option<&mut dyn crate::signal::ProcessSignals> {
+        None
+    }
 }
 
 pub trait UserCopy {
@@ -109,6 +157,32 @@ pub struct ChildContext {
     pub stack: UserVa,
     pub tls: Option<UserVa>,
     pub visible_tid: u32,
+}
+
+/// Credential admission and the Born record share the owner's transaction;
+/// runnable publication follows after its graph guard is released.
+pub struct ThreadBirth<'a, 'b> {
+    pub page: &'a ThreadLifecyclePage,
+    pub claim: &'b mut Option<carrick_core::lifecycle::ClaimedEntry>,
+    pub born: BornRecord,
+    pub record: RecordRef,
+    pub caller_tid: Option<u32>,
+    pub child_tid: u32,
+}
+
+impl ThreadBirth<'_, '_> {
+    /// Restore the claim on refusal so the enclosing clone rollback owns it.
+    pub fn record(&mut self) -> Result<(), i64> {
+        let claim = self.claim.take().ok_or(crate::identity::EINVAL)?;
+        match self.page.record_born(claim, self.born) {
+            Ok(_) => Ok(()),
+            Err(refusal) => {
+                let (_, claim) = refusal.into_parts();
+                *self.claim = Some(claim);
+                Err(crate::identity::EINVAL)
+            }
+        }
+    }
 }
 
 pub struct ExitRecord {
@@ -125,6 +199,12 @@ pub struct ExitRecord {
 /// ISA hooks acquire retained metadata and move real native context. They do
 /// not route, validate clone flags, lower errno or publish entry completion.
 pub trait LifecycleNative<'a>: UserCopy {
+    /// Terminal custody loss must never become a guest errno or leave exit parked.
+    fn fail_lifecycle(&mut self, reason: NativeRunFailureReason) -> !;
+    fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
+        Ok(())
+    }
+
     fn arguments(&self) -> [u64; 6];
     fn binding(&self) -> Option<ExecutionBinding>;
     fn task_state(&self) -> Option<&'a crate::abi::entry::LinuxTaskState>;
@@ -187,6 +267,12 @@ pub trait LifecycleNative<'a>: UserCopy {
     fn process_exit_group(&mut self, _status: u8) -> Option<LifecycleOutcome> {
         None
     }
+    fn publish_born(&mut self, mut birth: ThreadBirth<'a, '_>) -> Result<(), i64> {
+        birth.record()?;
+        self.enqueue_born(birth.record);
+        Ok(())
+    }
+    fn thread_exited(&mut self, _tid: u32) {}
 }
 /// Linux aarch64 syscall numbers served here (`SYS_SET_ROBUST_LIST` is the
 /// shared canonical number from [`crate::thread`]).
@@ -350,7 +436,7 @@ pub fn invoke<'a>(
         }
         LifecycleCall::Clone => {
             let visible = serve_clone(args, thread, native)?;
-            Some(returned(SyscallResult::new(i64::from(visible)), false))
+            Some(returned(SyscallResult::new(visible), false))
         }
         LifecycleCall::Exit => {
             if !native.has_scheduler() {
@@ -550,7 +636,7 @@ fn serve_clone<'a>(
     args: [u64; 6],
     thread: LifecycleThread<'a>,
     native: &mut dyn LifecycleNative<'a>,
-) -> Option<u32> {
+) -> Option<i64> {
     if !native.has_scheduler() {
         return None;
     }
@@ -570,6 +656,7 @@ fn serve_clone<'a>(
         return None;
     }
     let binding = native.binding()?;
+    let caller_tid = native.visible_tid().or_else(|| thread.slot.visible_tid());
     let mm = binding.mm.raw();
     if mm == 0 {
         return None;
@@ -583,29 +670,56 @@ fn serve_clone<'a>(
 
     let state = native.task_state()?;
     let affinity = native.affinity()?;
-    let claimed = page
-        .claim_any()
-        .inspect_err(|error| {
-            if *error == TransitionError::PoolEmpty {
+    let claimed = match page.claim_any() {
+        Ok(claimed) => claimed,
+        Err(TransitionError::GateClosed(_)) => {
+            // A speculative claim may have been observed by an exit before
+            // the gate check backed it out. That rollback also owes a wake.
+            if native.lifecycle_admission_settled().is_err() {
+                native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+            }
+            return Some(-11);
+        }
+        Err(error) => {
+            if error == TransitionError::PoolEmpty {
                 native.record_decline(LifecycleDecline::ClonePoolEmpty);
             }
-        })
-        .ok()?;
+            return None;
+        }
+    };
+    // This exact owned claim is the sole authority for Claimed -> Reserved.
+    // A refused rollback is terminal; a parked exit must not be stranded, and
+    // settlement must never be published as though the rollback succeeded.
     let entry = claimed.entry();
     // Bound at the clone instant (director ruling 2): the caller's mask and
     // affinity as they are now.
     let blocked = thread.slot.blocked();
     let (Some(identity), Some(child_slot)) = (page.identity(entry), native.born_slot(page, entry))
     else {
-        let _ = page.unclaim(claimed);
+        if page.unclaim(claimed).is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
+        }
+        if native.lifecycle_admission_settled().is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+        }
         return None;
     };
     let Ok(visible) = i32::try_from(identity.visible_tid) else {
-        let _ = page.unclaim(claimed);
+        if page.unclaim(claimed).is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
+        }
+        if native.lifecycle_admission_settled().is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+        }
         return None;
     };
     if !child_slot.publish_visible_tid(identity.visible_tid) {
-        let _ = page.unclaim(claimed);
+        if page.unclaim(claimed).is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
+        }
+        if native.lifecycle_admission_settled().is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+        }
         return None;
     }
     let Ok(record) = native.allocate_record(ThreadIdentity {
@@ -620,19 +734,34 @@ fn serve_clone<'a>(
         control_slot: core::ptr::from_ref(child_slot).addr() as u64,
     }) else {
         // Exhausted: the identity goes back to the pool, the host clones.
-        let _ = page.unclaim(claimed);
+        if page.unclaim(claimed).is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
+        }
+        if native.lifecycle_admission_settled().is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+        }
         return None;
     };
     if !outputs.publish(identity.visible_tid, native) {
         native.free_record(record);
-        let _ = page.unclaim(claimed);
+        if page.unclaim(claimed).is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
+        }
+        if native.lifecycle_admission_settled().is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+        }
         return None;
     }
 
     if page.thread_born().is_none() {
         outputs.rollback(native);
         native.free_record(record);
-        let _ = page.unclaim(claimed);
+        if page.unclaim(claimed).is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
+        }
+        if native.lifecycle_admission_settled().is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+        }
         return None;
     }
 
@@ -654,15 +783,32 @@ fn serve_clone<'a>(
         clear_child_tid,
         blocked,
     };
-    if page.record_born(claimed, born).is_err() {
-        // Unreachable: only this claimant moves a Claimed entry.
+    let mut claim = Some(claimed);
+    if let Err(error) = native.publish_born(ThreadBirth {
+        page,
+        claim: &mut claim,
+        born,
+        record,
+        caller_tid,
+        child_tid: identity.visible_tid,
+    }) {
         let _ = page.try_exit();
         outputs.rollback(native);
         native.free_record(record);
-        return None;
+        if let Some(claimed) = claim
+            && page.unclaim(claimed).is_err()
+        {
+            native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
+        }
+        if native.lifecycle_admission_settled().is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+        }
+        return Some(error);
     }
-    native.enqueue_born(record);
-    Some(visible as u32)
+    if native.lifecycle_admission_settled().is_err() {
+        native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+    }
+    Some(visible as i64)
 }
 
 /// `exit(status)` of a non-leader thread that EL1 switched in, when it is
@@ -766,6 +912,10 @@ fn serve_exit<'a>(
             });
         }
     }
+    let exiting_tid = slot
+        .visible_tid()
+        .or_else(|| page.identity(entry).map(|id| id.visible_tid))
+        .unwrap_or(record.identity.tid as u32);
     if !native.release_current(record.reference) {
         let _ = page.thread_born();
         return None;
@@ -775,6 +925,7 @@ fn serve_exit<'a>(
         // Published that way): the host must look at this process.
         native.task_state()?.mark_pending_host_work();
     }
+    native.thread_exited(exiting_tid);
     Some(native.run_next(SyscallResult::new(crate::sched::ETIMEDOUT_RESULT as i64)))
         .map(|(served, result)| (served, result.raw()))
 }

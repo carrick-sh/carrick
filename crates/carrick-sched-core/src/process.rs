@@ -1,5 +1,6 @@
 //! Shared process identity and exit receipts. These are the same domains
 //! used by host kernel graph consumers and guest lifecycle owners.
+pub use carrick_syscall_abi::LinuxCapabilitySet;
 use carrick_syscall_abi::LinuxWaitOptions;
 use core::num::{NonZeroI32, NonZeroU64};
 use core::time::Duration;
@@ -220,6 +221,35 @@ impl LinuxWaitStatus {
         Self(raw)
     }
 
+    pub const fn signaled(sig: u8, core_dumped: bool) -> Self {
+        let core_bit = if core_dumped { 0x80 } else { 0 };
+        Self((sig as i32 & 0x7f) | core_bit)
+    }
+
+    pub const fn exited(status: u8) -> Self {
+        Self((status as i32) << 8)
+    }
+
+    pub const fn stopped(sig: u8) -> Self {
+        Self(((sig as i32) << 8) | 0x7f)
+    }
+
+    pub const fn continued() -> Self {
+        Self(0xffff)
+    }
+
+    pub const fn is_signaled(self) -> bool {
+        (self.0 & 0x7f) != 0 && (self.0 & 0x7f) != 0x7f
+    }
+
+    pub const fn term_signal(self) -> Option<u8> {
+        if self.is_signaled() {
+            Some((self.0 & 0x7f) as u8)
+        } else {
+            None
+        }
+    }
+
     pub const fn raw(self) -> i32 {
         self.0
     }
@@ -403,5 +433,442 @@ impl<Container, Uid> Zombie<Container, Uid> {
     }
 }
 
+/// Typed user identity within a namespace.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TaskUid(u32);
+
+impl TaskUid {
+    pub const ROOT: Self = Self(0);
+
+    pub const fn new(uid: u32) -> Self {
+        Self(uid)
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    pub const fn is_root(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// Typed group identity within a namespace.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TaskGid(u32);
+
+impl TaskGid {
+    pub const ROOT: Self = Self(0);
+
+    pub const fn new(gid: u32) -> Self {
+        Self(gid)
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    pub const fn is_root(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// Linux credential set for a process/task.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskCredentials {
+    pub ruid: TaskUid,
+    pub euid: TaskUid,
+    pub suid: TaskUid,
+    pub fsuid: TaskUid,
+    pub rgid: TaskGid,
+    pub egid: TaskGid,
+    pub sgid: TaskGid,
+    pub fsgid: TaskGid,
+    pub groups: alloc::vec::Vec<TaskGid>,
+    pub cap_permitted: LinuxCapabilitySet,
+    pub cap_effective: LinuxCapabilitySet,
+    pub cap_inheritable: LinuxCapabilitySet,
+    pub cap_ambient: LinuxCapabilitySet,
+    pub cap_bounding: LinuxCapabilitySet,
+}
+
+impl TaskCredentials {
+    pub const ROOT: Self = Self {
+        ruid: TaskUid::ROOT,
+        euid: TaskUid::ROOT,
+        suid: TaskUid::ROOT,
+        fsuid: TaskUid::ROOT,
+        rgid: TaskGid::ROOT,
+        egid: TaskGid::ROOT,
+        sgid: TaskGid::ROOT,
+        fsgid: TaskGid::ROOT,
+        groups: alloc::vec::Vec::new(),
+        cap_permitted: LinuxCapabilitySet::FULL,
+        cap_effective: LinuxCapabilitySet::FULL,
+        cap_inheritable: LinuxCapabilitySet::empty(),
+        cap_ambient: LinuxCapabilitySet::empty(),
+        cap_bounding: LinuxCapabilitySet::FULL,
+    };
+
+    /// Apply capabilities(7) rules for an ordinary executable without file
+    /// capabilities, set-ID bits or securebits overrides.
+    pub fn apply_exec(&mut self) {
+        self.cap_permitted = if self.ruid.is_root() || self.euid.is_root() {
+            self.cap_inheritable | self.cap_bounding | self.cap_ambient
+        } else {
+            self.cap_ambient
+        };
+        self.cap_effective = if self.euid.is_root() {
+            self.cap_permitted
+        } else {
+            self.cap_ambient
+        };
+    }
+
+    pub fn is_privileged(&self) -> bool {
+        self.cap_effective.contains(LinuxCapabilitySet::CAP_SETUID)
+    }
+
+    pub fn is_gid_privileged(&self) -> bool {
+        self.cap_effective.contains(LinuxCapabilitySet::CAP_SETGID)
+    }
+
+    pub fn is_admin_privileged(&self) -> bool {
+        self.cap_effective
+            .contains(LinuxCapabilitySet::CAP_SYS_ADMIN)
+    }
+
+    pub fn is_resource_privileged(&self) -> bool {
+        self.cap_effective
+            .contains(LinuxCapabilitySet::CAP_SYS_RESOURCE)
+    }
+
+    pub fn allows_prlimit_from(&self, caller_ruid: TaskUid, caller_rgid: TaskGid) -> bool {
+        self.ruid == caller_ruid
+            && self.euid == caller_ruid
+            && self.suid == caller_ruid
+            && self.rgid == caller_rgid
+            && self.egid == caller_rgid
+            && self.sgid == caller_rgid
+    }
+
+    /// Effect of user ID changes on capabilities per capabilities(7).
+    pub fn on_uid_change(
+        &mut self,
+        prev_ruid: TaskUid,
+        prev_euid: TaskUid,
+        prev_suid: TaskUid,
+        prev_fsuid: TaskUid,
+    ) {
+        let had_root =
+            prev_ruid == TaskUid::ROOT || prev_euid == TaskUid::ROOT || prev_suid == TaskUid::ROOT;
+        let has_no_root =
+            self.ruid != TaskUid::ROOT && self.euid != TaskUid::ROOT && self.suid != TaskUid::ROOT;
+
+        // Rule 1: If one or more of real, effective, or saved UIDs was 0,
+        // and as a result of UID changes all IDs are non-zero, clear permitted and effective.
+        if had_root && has_no_root {
+            self.cap_permitted = LinuxCapabilitySet::empty();
+            self.cap_effective = LinuxCapabilitySet::empty();
+        }
+
+        // Rule 2: If effective UID is changed from 0 to non-zero, clear effective.
+        if prev_euid == TaskUid::ROOT && self.euid != TaskUid::ROOT {
+            self.cap_effective = LinuxCapabilitySet::empty();
+        }
+
+        // Rule 3: If effective UID is changed from non-zero to 0, copy permitted to effective.
+        if prev_euid != TaskUid::ROOT && self.euid == TaskUid::ROOT {
+            self.cap_effective = self.cap_permitted;
+        }
+
+        // Rule 4: If filesystem UID is changed from 0 to non-zero, clear FS capabilities from effective.
+        // If filesystem UID is changed from non-zero to 0, restore FS capabilities enabled in permitted.
+        if prev_fsuid == TaskUid::ROOT && self.fsuid != TaskUid::ROOT {
+            self.cap_effective.remove(LinuxCapabilitySet::FS_MASK);
+        } else if prev_fsuid != TaskUid::ROOT && self.fsuid == TaskUid::ROOT {
+            self.cap_effective
+                .insert(self.cap_permitted & LinuxCapabilitySet::FS_MASK);
+        }
+    }
+
+    /// Effect of filesystem user ID changes on capabilities per capabilities(7).
+    pub fn on_fsuid_change(&mut self, prev_fsuid: TaskUid) {
+        if prev_fsuid == TaskUid::ROOT && self.fsuid != TaskUid::ROOT {
+            self.cap_effective.remove(LinuxCapabilitySet::FS_MASK);
+        } else if prev_fsuid != TaskUid::ROOT && self.fsuid == TaskUid::ROOT {
+            self.cap_effective
+                .insert(self.cap_permitted & LinuxCapabilitySet::FS_MASK);
+        }
+    }
+
+    #[inline(always)]
+    fn id_allowed(id: Option<u32>, a: u32, b: u32, c: u32) -> bool {
+        id.is_none_or(|v| v == a || v == b || v == c)
+    }
+
+    #[inline(never)]
+    pub fn set_resuid(
+        &mut self,
+        r: Option<u32>,
+        e: Option<u32>,
+        s: Option<u32>,
+    ) -> Result<(), i64> {
+        let cur_r = self.ruid.raw();
+        let cur_e = self.euid.raw();
+        let cur_s = self.suid.raw();
+        if !self.is_privileged()
+            && (!Self::id_allowed(r, cur_r, cur_e, cur_s)
+                || !Self::id_allowed(e, cur_r, cur_e, cur_s)
+                || !Self::id_allowed(s, cur_r, cur_e, cur_s))
+        {
+            return Err(-1);
+        }
+        let prev_r = self.ruid;
+        let prev_e = self.euid;
+        let prev_s = self.suid;
+        let prev_f = self.fsuid;
+        if let Some(rv) = r {
+            self.ruid = TaskUid::new(rv);
+        }
+        if let Some(ev) = e {
+            self.euid = TaskUid::new(ev);
+            self.fsuid = self.euid;
+        }
+        if let Some(sv) = s {
+            self.suid = TaskUid::new(sv);
+        }
+        self.on_uid_change(prev_r, prev_e, prev_s, prev_f);
+        Ok(())
+    }
+
+    #[inline(never)]
+    pub fn set_resgid(
+        &mut self,
+        r: Option<u32>,
+        e: Option<u32>,
+        s: Option<u32>,
+    ) -> Result<(), i64> {
+        let cur_r = self.rgid.raw();
+        let cur_e = self.egid.raw();
+        let cur_s = self.sgid.raw();
+        if !self.is_gid_privileged()
+            && (!Self::id_allowed(r, cur_r, cur_e, cur_s)
+                || !Self::id_allowed(e, cur_r, cur_e, cur_s)
+                || !Self::id_allowed(s, cur_r, cur_e, cur_s))
+        {
+            return Err(-1);
+        }
+        if let Some(rv) = r {
+            self.rgid = TaskGid::new(rv);
+        }
+        if let Some(ev) = e {
+            self.egid = TaskGid::new(ev);
+            self.fsgid = self.egid;
+        }
+        if let Some(sv) = s {
+            self.sgid = TaskGid::new(sv);
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    pub fn set_reuid(&mut self, r: Option<u32>, e: Option<u32>) -> Result<(), i64> {
+        let cur_r = self.ruid.raw();
+        let cur_e = self.euid.raw();
+        let cur_s = self.suid.raw();
+        if !self.is_privileged()
+            && (!Self::id_allowed(r, cur_r, cur_e, cur_r)
+                || !Self::id_allowed(e, cur_r, cur_e, cur_s))
+        {
+            return Err(-1);
+        }
+        let set_saved = r.is_some() || (e.is_some() && e != Some(cur_r));
+        let prev_r = self.ruid;
+        let prev_e = self.euid;
+        let prev_s = self.suid;
+        let prev_f = self.fsuid;
+        if let Some(rv) = r {
+            self.ruid = TaskUid::new(rv);
+        }
+        if let Some(ev) = e {
+            self.euid = TaskUid::new(ev);
+            self.fsuid = self.euid;
+        }
+        if set_saved {
+            self.suid = self.euid;
+        }
+        self.on_uid_change(prev_r, prev_e, prev_s, prev_f);
+        Ok(())
+    }
+
+    #[inline(never)]
+    pub fn set_regid(&mut self, r: Option<u32>, e: Option<u32>) -> Result<(), i64> {
+        let cur_r = self.rgid.raw();
+        let cur_e = self.egid.raw();
+        let cur_s = self.sgid.raw();
+        if !self.is_gid_privileged()
+            && (!Self::id_allowed(r, cur_r, cur_e, cur_r)
+                || !Self::id_allowed(e, cur_r, cur_e, cur_s))
+        {
+            return Err(-1);
+        }
+        let set_saved = r.is_some() || (e.is_some() && e != Some(cur_r));
+        if let Some(rv) = r {
+            self.rgid = TaskGid::new(rv);
+        }
+        if let Some(ev) = e {
+            self.egid = TaskGid::new(ev);
+            self.fsgid = self.egid;
+        }
+        if set_saved {
+            self.sgid = self.egid;
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    pub fn set_uid(&mut self, uid: u32) -> Result<(), i64> {
+        if uid == u32::MAX {
+            return Err(-22);
+        }
+        let target = TaskUid::new(uid);
+        let prev_r = self.ruid;
+        let prev_e = self.euid;
+        let prev_s = self.suid;
+        let prev_f = self.fsuid;
+        if self.is_privileged() {
+            self.ruid = target;
+            self.euid = target;
+            self.suid = target;
+            self.fsuid = target;
+        } else if uid == self.ruid.raw() || uid == self.suid.raw() {
+            self.euid = target;
+            self.fsuid = target;
+        } else {
+            return Err(-1);
+        }
+        self.on_uid_change(prev_r, prev_e, prev_s, prev_f);
+        Ok(())
+    }
+
+    #[inline(never)]
+    pub fn set_gid(&mut self, gid: u32) -> Result<(), i64> {
+        if gid == u32::MAX {
+            return Err(-22);
+        }
+        let target = TaskGid::new(gid);
+        if self.is_gid_privileged() {
+            self.rgid = target;
+            self.egid = target;
+            self.sgid = target;
+            self.fsgid = target;
+        } else if gid == self.rgid.raw() || gid == self.sgid.raw() {
+            self.egid = target;
+            self.fsgid = target;
+        } else {
+            return Err(-1);
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    pub fn set_fsuid(&mut self, fsuid: u32) -> u32 {
+        let prev = self.fsuid.raw();
+        if fsuid == u32::MAX {
+            return prev;
+        }
+        if self.is_privileged()
+            || fsuid == self.ruid.raw()
+            || fsuid == self.euid.raw()
+            || fsuid == self.suid.raw()
+            || fsuid == prev
+        {
+            let prev_uid = self.fsuid;
+            self.fsuid = TaskUid::new(fsuid);
+            self.on_fsuid_change(prev_uid);
+        }
+        prev
+    }
+
+    #[inline(never)]
+    pub fn set_fsgid(&mut self, fsgid: u32) -> u32 {
+        let prev = self.fsgid.raw();
+        if fsgid == u32::MAX {
+            return prev;
+        }
+        if self.is_gid_privileged()
+            || fsgid == self.rgid.raw()
+            || fsgid == self.egid.raw()
+            || fsgid == self.sgid.raw()
+            || fsgid == prev
+        {
+            self.fsgid = TaskGid::new(fsgid);
+        }
+        prev
+    }
+}
+
+/// Linux resource limit specification.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinuxRlimit {
+    pub rlim_cur: u64,
+    pub rlim_max: u64,
+}
+
+impl LinuxRlimit {
+    pub const INFINITY: u64 = u64::MAX;
+
+    pub const fn new(rlim_cur: u64, rlim_max: u64) -> Self {
+        Self { rlim_cur, rlim_max }
+    }
+
+    pub const fn unlimited() -> Self {
+        Self {
+            rlim_cur: Self::INFINITY,
+            rlim_max: Self::INFINITY,
+        }
+    }
+}
+
+/// The 16 Linux resource limits per process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RlimitSet {
+    pub limits: [LinuxRlimit; 16],
+}
+
+impl RlimitSet {
+    pub const DEFAULT: Self = Self::new_default();
+
+    pub const fn new_default() -> Self {
+        let inf = LinuxRlimit::unlimited();
+        let mut limits = [inf; 16];
+        limits[3] = LinuxRlimit::new(8 * 1024 * 1024, LinuxRlimit::INFINITY); // STACK = 8 MiB
+        limits[6] = LinuxRlimit::new(8192, 8192); // NPROC = 8192
+        limits[7] = LinuxRlimit::new(1_048_576, 1_048_576); // NOFILE = 1 Mi
+        limits[11] = LinuxRlimit::new(63880, 63880); // SIGPENDING
+        limits[12] = LinuxRlimit::new(819_200, 819_200); // MSGQUEUE
+        limits[13] = LinuxRlimit::new(0, 0); // NICE
+        limits[14] = LinuxRlimit::new(0, 0); // RTPRIO
+        Self { limits }
+    }
+
+    pub fn get(&self, resource: usize) -> Option<LinuxRlimit> {
+        self.limits.get(resource).copied()
+    }
+
+    pub fn set(&mut self, resource: usize, limit: LinuxRlimit) -> bool {
+        if let Some(slot) = self.limits.get_mut(resource) {
+            *slot = limit;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod credential_tests;
 #[cfg(test)]
 mod wait_tests;

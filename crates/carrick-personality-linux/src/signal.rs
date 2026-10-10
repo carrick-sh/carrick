@@ -5,8 +5,9 @@
 
 use alloc::collections::{BTreeMap, VecDeque};
 
+use carrick_signal_core::StandardSignalSlot;
 use carrick_signal_core::policy::Signal;
-use carrick_signal_core::{SignalSet, StandardSignalSlot};
+pub use carrick_signal_core::{SignalSet, policy};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnqueueOutcome {
@@ -188,4 +189,709 @@ impl<K: Eq, T> SignalInbox<K, T> {
         Self::new(child)
     }
     // Exec keeps this owner and its pending queue unchanged.
+}
+
+pub const RT_SIGSET_SIZE: u64 = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignalCall {
+    Kill,
+    Tkill,
+    Tgkill,
+    RtSigsuspend,
+    RtSigaction,
+    RtSigpending,
+    RtSigtimedwait,
+    RtSigqueueinfo,
+    RtSigreturn,
+    RtTgsigqueueinfo,
+    PidfdSendSignal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignalOutcome {
+    /// The same task resumes a restored context without a result word.
+    Restored,
+    Returned {
+        result: crate::abi::entry::SyscallResult,
+        work: bool,
+    },
+    Transferred {
+        progress: carrick_core_abi::Served,
+        result: crate::abi::entry::SyscallResult,
+    },
+}
+
+/// Whether the completed entry may consume pending delivery before its
+/// executor completes the return work ledger.
+pub fn signal_delivery_before_work(
+    route: crate::dispatch::CompletionRoute,
+    task: &crate::abi::entry::LinuxTaskState,
+) -> bool {
+    route == crate::dispatch::CompletionRoute::Served && !task.has_pending_host_work()
+}
+
+pub fn signal_effect(outcome: &SignalOutcome) -> crate::dispatch::FamilyCompletion {
+    use crate::dispatch::FamilyCompletion;
+    match *outcome {
+        SignalOutcome::Restored => FamilyCompletion::FrameRestored,
+        SignalOutcome::Returned { result, work: true } => {
+            FamilyCompletion::CompleteWithWork(result.raw())
+        }
+        SignalOutcome::Returned {
+            result,
+            work: false,
+        } => FamilyCompletion::Complete(result.raw()),
+        SignalOutcome::Transferred {
+            progress: carrick_core_abi::Served::Returned { .. },
+            result,
+        } => FamilyCompletion::Switched(result.raw()),
+        SignalOutcome::Transferred {
+            progress: carrick_core_abi::Served::Idle,
+            ..
+        } => FamilyCompletion::Suspended,
+    }
+}
+
+pub enum SignalWaitOutcome {
+    Ready(
+        carrick_signal_core::policy::Signal,
+        Option<crate::abi::signal::LinuxSiginfo>,
+    ),
+    Pending,
+}
+
+/// A Linux-visible thread selector decoded from the syscall ABI, not an
+/// admitted identity. Resolution must return an exact live scheduler record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignalThreadSelector(i32);
+impl SignalThreadSelector {
+    pub const fn from_abi(raw: u64) -> Self {
+        Self(raw as i32)
+    }
+    pub const fn positive(self) -> Option<core::num::NonZeroU32> {
+        if self.0 > 0 {
+            core::num::NonZeroU32::new(self.0 as u32)
+        } else {
+            None
+        }
+    }
+}
+
+/// A validated signal send, with signal zero represented as an existence probe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignalRequest {
+    Probe,
+    Deliver(carrick_signal_core::policy::Signal),
+}
+impl SignalRequest {
+    pub fn from_abi(raw: u64) -> Result<Self, carrick_syscall_abi::LinuxErrno> {
+        let number = raw as i32;
+        if number == 0 {
+            return Ok(Self::Probe);
+        }
+        carrick_signal_core::policy::Signal::from_number(number)
+            .map(Self::Deliver)
+            .ok_or(carrick_syscall_abi::LINUX_EINVAL)
+    }
+    pub const fn signal(self) -> Option<carrick_signal_core::policy::Signal> {
+        match self {
+            Self::Probe => None,
+            Self::Deliver(signal) => Some(signal),
+        }
+    }
+    pub const fn number(self) -> i32 {
+        match self {
+            Self::Probe => 0,
+            Self::Deliver(signal) => signal.number(),
+        }
+    }
+}
+
+/// Signed kill(2) namespace selection, distinct from an admitted task key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignalProcessSelector(i32);
+impl SignalProcessSelector {
+    pub const fn from_abi(raw: u64) -> Self {
+        Self(raw as i32)
+    }
+    pub const fn abi_number(self) -> i32 {
+        self.0
+    }
+}
+
+/// Generated sender metadata cannot be confused with a user-supplied queue
+/// record. Only queued records need the rt_sigqueueinfo forging restriction.
+#[derive(Clone, Copy)]
+pub enum SignalInfo {
+    Generated(Option<crate::abi::signal::LinuxSiginfo>),
+    Queued(crate::abi::signal::LinuxSiginfo),
+}
+#[derive(Clone, Copy)]
+pub enum SignalTargetScope {
+    CallingProcess,
+    OtherProcess,
+}
+impl SignalInfo {
+    /// rt_sigqueueinfo(2): only the calling process may receive forged
+    /// kernel/ordinary-send codes. Generated kill/tgkill metadata is distinct.
+    pub fn check_target(
+        self,
+        scope: SignalTargetScope,
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
+        if let Self::Queued(info) = self
+            && matches!(scope, SignalTargetScope::OtherProcess)
+            && (info.si_code >= 0 || info.si_code == carrick_syscall_abi::LINUX_SI_TKILL)
+        {
+            return Err(carrick_syscall_abi::LINUX_EPERM);
+        }
+        Ok(())
+    }
+    pub fn payload(
+        self,
+        signal: carrick_signal_core::policy::Signal,
+    ) -> Option<crate::abi::signal::LinuxSiginfo> {
+        let payload = match self {
+            Self::Generated(info) => info,
+            Self::Queued(info) => Some(info),
+        };
+        // rt_sigqueueinfo(2): si_signo names the admitted signal, not a
+        // caller-controlled header field in the queue payload.
+        payload.map(|mut info| {
+            info.si_signo = signal.number();
+            info
+        })
+    }
+}
+
+pub trait ProcessSignals {
+    fn force_sigsegv(
+        &mut self,
+        blocked: carrick_signal_core::policy::SigBlockMask,
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno>;
+
+    fn rt_sigaction(
+        &mut self,
+        signum: carrick_signal_core::policy::Signal,
+        act: Option<carrick_signal_core::policy::Action>,
+    ) -> Result<carrick_signal_core::policy::Action, carrick_syscall_abi::LinuxErrno>;
+
+    fn rt_sigpending(&self, blocked: carrick_signal_core::policy::SigBlockMask) -> u64;
+
+    fn kill(
+        &mut self,
+        pid: SignalProcessSelector,
+        sig: SignalRequest,
+        info: SignalInfo,
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno>;
+
+    fn tkill(
+        &mut self,
+        tid: SignalThreadSelector,
+        sig: SignalRequest,
+        info: SignalInfo,
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno>;
+
+    fn tgkill(
+        &mut self,
+        tgid: SignalThreadSelector,
+        tid: SignalThreadSelector,
+        sig: SignalRequest,
+        info: SignalInfo,
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno>;
+
+    fn rt_sigtimedwait(
+        &mut self,
+        set: carrick_signal_core::SignalSet,
+        timeout_ns: Option<u64>,
+        info: carrick_guest_arch::UserVa,
+    ) -> Result<SignalWaitOutcome, carrick_syscall_abi::LinuxErrno>;
+
+    /// true means this entry transferred its owned continuation to the scheduler.
+    fn rt_sigsuspend(
+        &mut self,
+        mask: carrick_signal_core::policy::SigBlockMask,
+        original: carrick_signal_core::policy::SigBlockMask,
+    ) -> Result<bool, carrick_syscall_abi::LinuxErrno>;
+
+    fn take_suspend_mask(&mut self) -> Option<carrick_signal_core::policy::SigBlockMask> {
+        None
+    }
+
+    /// A restored suspend mask can expose a different pending signal at this
+    /// same user-return checkpoint. Never select a second handler after one
+    /// was already selected under the temporary mask.
+    fn take_deliverable_after_suspend(
+        &mut self,
+        temporary: &mut carrick_signal_core::policy::SigBlockMask,
+        restored: carrick_signal_core::policy::SigBlockMask,
+    ) -> Option<(
+        carrick_signal_core::policy::Signal,
+        Option<crate::abi::signal::LinuxSiginfo>,
+        carrick_signal_core::policy::Action,
+    )> {
+        self.take_deliverable(*temporary).or_else(|| {
+            if restored != *temporary {
+                *temporary = restored;
+                self.take_deliverable(restored)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn take_deliverable(
+        &mut self,
+        blocked: carrick_signal_core::policy::SigBlockMask,
+    ) -> Option<(
+        carrick_signal_core::policy::Signal,
+        Option<crate::abi::signal::LinuxSiginfo>,
+        carrick_signal_core::policy::Action,
+    )> {
+        let _ = blocked;
+        None
+    }
+}
+
+pub trait SignalNative<'a>: crate::lifecycle::UserCopy {
+    fn arguments(&self) -> [u64; 6];
+    fn process_signals(&mut self) -> Option<&mut dyn ProcessSignals>;
+    fn current_blocked(&self) -> carrick_signal_core::policy::SigBlockMask;
+    fn set_current_blocked(&mut self, mask: carrick_signal_core::policy::SigBlockMask);
+    fn current_pid(&self) -> u32;
+    fn current_tid(&self) -> u32;
+    fn current_uid(&self) -> u32 {
+        0
+    }
+    fn restore_signal_frame(
+        &mut self,
+    ) -> Result<carrick_signal_core::policy::SigBlockMask, carrick_syscall_abi::LinuxErrno>;
+    fn force_sigsegv(&mut self) -> bool {
+        let blocked = self.current_blocked();
+        let forced = self
+            .process_signals()
+            .is_some_and(|p| p.force_sigsegv(blocked).is_ok());
+        if forced {
+            self.set_current_blocked(carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                blocked
+                    .signals()
+                    .without(carrick_signal_core::policy::Signal::SEGV),
+            ));
+        }
+        forced
+    }
+}
+
+pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<SignalOutcome> {
+    use crate::abi::signal::{
+        LINUX_EFAULT, LINUX_EINTR, LINUX_EINVAL, LINUX_ESRCH, LINUX_SI_TKILL, LINUX_SI_USER,
+        LinuxSigaction, LinuxSiginfo, RT_SIGSET_SIZE,
+    };
+    use zerocopy::{FromBytes, IntoBytes};
+    let args = native.arguments();
+    let returned = |val: i64, work: bool| {
+        Some(SignalOutcome::Returned {
+            result: crate::abi::entry::SyscallResult::new(val),
+            work,
+        })
+    };
+    match call {
+        SignalCall::RtSigaction => {
+            let [signum, act_ptr, oldact_ptr, size, _, _] = args;
+            let signum = signum as i32;
+            if size != RT_SIGSET_SIZE {
+                return returned(LINUX_EINVAL.guest_retval(), false);
+            }
+            if signum <= 0 || signum > 64 || (act_ptr != 0 && (signum == 9 || signum == 19)) {
+                return returned(LINUX_EINVAL.guest_retval(), false);
+            }
+            let new_action = if act_ptr != 0 {
+                let mut bytes = [0u8; core::mem::size_of::<LinuxSigaction>()];
+                if !native.copy_in(&mut bytes, carrick_guest_arch::UserVa::new(act_ptr)) {
+                    return returned(LINUX_EFAULT.guest_retval(), false);
+                }
+                let Ok(newact) = LinuxSigaction::ref_from_bytes(&bytes) else {
+                    return returned(LINUX_EFAULT.guest_retval(), false);
+                };
+                let disposition = match newact.sa_handler {
+                    0 => carrick_signal_core::policy::Disposition::Default,
+                    1 => carrick_signal_core::policy::Disposition::Ignore,
+                    addr => carrick_signal_core::policy::Disposition::Handler(
+                        carrick_signal_core::policy::HandlerAddress(addr),
+                    ),
+                };
+                let flags = carrick_signal_core::policy::ActionFlags {
+                    on_stack: newact.sa_flags & carrick_syscall_abi::LINUX_SA_ONSTACK != 0,
+                    reset_hand: newact.sa_flags & carrick_syscall_abi::LINUX_SA_RESETHAND != 0,
+                    nodefer: newact.sa_flags & carrick_syscall_abi::LINUX_SA_NODEFER != 0,
+                    restart: newact.sa_flags & carrick_syscall_abi::LINUX_SA_RESTART != 0,
+                    siginfo: newact.sa_flags & carrick_syscall_abi::LINUX_SA_SIGINFO != 0,
+                    no_child_wait: newact.sa_flags & carrick_syscall_abi::LINUX_SA_NOCLDWAIT != 0,
+                    no_child_stop: newact.sa_flags & carrick_syscall_abi::LINUX_SA_NOCLDSTOP != 0,
+                };
+                let restorer = if newact.sa_flags & carrick_syscall_abi::LINUX_SA_RESTORER != 0 {
+                    Some(carrick_signal_core::policy::RestorerAddress(
+                        newact.sa_restorer,
+                    ))
+                } else {
+                    None
+                };
+                let mask = carrick_signal_core::SignalSet::from_bits(newact.sa_mask[0])
+                    .without(carrick_signal_core::policy::Signal::KILL)
+                    .without(carrick_signal_core::policy::Signal::STOP);
+                Some(carrick_signal_core::policy::Action {
+                    disposition,
+                    flags,
+                    mask,
+                    restorer,
+                })
+            } else {
+                None
+            };
+            // The owner exchanges old/new under one sighand admission.
+            let current = {
+                let signals = native.process_signals()?;
+                match signals.rt_sigaction(
+                    carrick_signal_core::policy::Signal::from_number(signum)?,
+                    new_action,
+                ) {
+                    Ok(action) => action,
+                    Err(error) => {
+                        return returned(error.guest_retval(), false);
+                    }
+                }
+            };
+            if oldact_ptr != 0 {
+                let mut oldact = LinuxSigaction::empty();
+                oldact.sa_handler = match current.disposition {
+                    carrick_signal_core::policy::Disposition::Default => 0,
+                    carrick_signal_core::policy::Disposition::Ignore => 1,
+                    carrick_signal_core::policy::Disposition::Handler(addr) => addr.0,
+                };
+                let mut flags = 0u64;
+                if current.flags.on_stack {
+                    flags |= carrick_syscall_abi::LINUX_SA_ONSTACK;
+                }
+                if current.flags.siginfo {
+                    flags |= carrick_syscall_abi::LINUX_SA_SIGINFO; // SA_SIGINFO
+                }
+                if current.flags.nodefer {
+                    flags |= carrick_syscall_abi::LINUX_SA_NODEFER; // SA_NODEFER
+                }
+                if current.flags.reset_hand {
+                    flags |= carrick_syscall_abi::LINUX_SA_RESETHAND; // SA_RESETHAND
+                }
+                if current.flags.restart {
+                    flags |= carrick_syscall_abi::LINUX_SA_RESTART; // SA_RESTART
+                }
+                if current.flags.no_child_stop {
+                    flags |= carrick_syscall_abi::LINUX_SA_NOCLDSTOP; // SA_NOCLDSTOP
+                }
+                if current.flags.no_child_wait {
+                    flags |= carrick_syscall_abi::LINUX_SA_NOCLDWAIT; // SA_NOCLDWAIT
+                }
+                if let Some(restorer) = current.restorer {
+                    flags |= carrick_syscall_abi::LINUX_SA_RESTORER; // SA_RESTORER
+                    oldact.sa_restorer = restorer.0;
+                }
+                if current.flags.on_stack {
+                    flags |= carrick_syscall_abi::LINUX_SA_ONSTACK;
+                }
+                oldact.sa_flags = flags;
+                oldact.sa_mask = [current.mask.bits()];
+                let bytes = IntoBytes::as_bytes(&oldact);
+                if !native.copy_out(carrick_guest_arch::UserVa::new(oldact_ptr), bytes) {
+                    return returned(LINUX_EFAULT.guest_retval(), false);
+                }
+            }
+            returned(0, false)
+        }
+        SignalCall::RtSigpending => {
+            let [set_ptr, size, _, _, _, _] = args;
+            if size != RT_SIGSET_SIZE {
+                return returned(LINUX_EINVAL.guest_retval(), false);
+            }
+            if set_ptr == 0 {
+                return returned(LINUX_EFAULT.guest_retval(), false);
+            }
+            let blocked = native.current_blocked();
+            let pending = {
+                let signals = native.process_signals()?;
+                signals.rt_sigpending(blocked)
+            };
+            if !native.copy_out(
+                carrick_guest_arch::UserVa::new(set_ptr),
+                &pending.to_le_bytes(),
+            ) {
+                return returned(LINUX_EFAULT.guest_retval(), false);
+            }
+            returned(0, false)
+        }
+        SignalCall::RtSigreturn => {
+            let res = native.restore_signal_frame();
+            match res {
+                Ok(new_mask) => {
+                    native.set_current_blocked(new_mask);
+                    Some(SignalOutcome::Restored)
+                }
+                Err(_) => native.force_sigsegv().then_some(SignalOutcome::Restored),
+            }
+        }
+        SignalCall::Kill => {
+            let [pid, sig, _, _, _, _] = args;
+            let pid = SignalProcessSelector::from_abi(pid);
+            let sig = match SignalRequest::from_abi(sig) {
+                Ok(request) => request,
+                Err(errno) => return returned(errno.guest_retval(), false),
+            };
+            let sender_pid = native.current_pid() as i32;
+            let sender_uid = native.current_uid();
+            let info = if sig.signal().is_some() {
+                Some(LinuxSiginfo::kill(
+                    sig.number(),
+                    LINUX_SI_USER,
+                    sender_pid,
+                    sender_uid,
+                ))
+            } else {
+                None
+            };
+            let signals = native.process_signals()?;
+            match signals.kill(pid, sig, SignalInfo::Generated(info)) {
+                Ok(()) => returned(0, false),
+                Err(e) => returned(e.guest_retval(), false),
+            }
+        }
+        SignalCall::Tkill => {
+            let [tid, sig, _, _, _, _] = args;
+            let tid = SignalThreadSelector::from_abi(tid);
+            let sig = match SignalRequest::from_abi(sig) {
+                Ok(request) => request,
+                Err(errno) => return returned(errno.guest_retval(), false),
+            };
+            let sender_pid = native.current_pid() as i32;
+            let sender_uid = native.current_uid();
+            let info = if sig.signal().is_some() {
+                Some(LinuxSiginfo::kill(
+                    sig.number(),
+                    LINUX_SI_TKILL,
+                    sender_pid,
+                    sender_uid,
+                ))
+            } else {
+                None
+            };
+            let signals = native.process_signals()?;
+            match signals.tkill(tid, sig, SignalInfo::Generated(info)) {
+                Ok(()) => returned(0, false),
+                Err(e) => returned(e.guest_retval(), false),
+            }
+        }
+        SignalCall::Tgkill => {
+            let [tgid, tid, sig, _, _, _] = args;
+            let tgid = SignalThreadSelector::from_abi(tgid);
+            if tgid.positive().is_none() {
+                return returned(LINUX_EINVAL.guest_retval(), false);
+            }
+            let tid = SignalThreadSelector::from_abi(tid);
+            let sig = match SignalRequest::from_abi(sig) {
+                Ok(request) => request,
+                Err(errno) => return returned(errno.guest_retval(), false),
+            };
+            let sender_pid = native.current_pid() as i32;
+            let sender_uid = native.current_uid();
+            let info = if sig.signal().is_some() {
+                Some(LinuxSiginfo::kill(
+                    sig.number(),
+                    LINUX_SI_TKILL,
+                    sender_pid,
+                    sender_uid,
+                ))
+            } else {
+                None
+            };
+            let signals = native.process_signals()?;
+            match signals.tgkill(tgid, tid, sig, SignalInfo::Generated(info)) {
+                Ok(()) => returned(0, false),
+                Err(e) => returned(e.guest_retval(), false),
+            }
+        }
+        SignalCall::RtSigqueueinfo => {
+            let [tgid, sig, uinfo_ptr, _, _, _] = args;
+            let tgid = SignalProcessSelector::from_abi(tgid);
+            let sig = match SignalRequest::from_abi(sig) {
+                Ok(request) => request,
+                Err(errno) => return returned(errno.guest_retval(), false),
+            };
+            if tgid.abi_number() <= 0 {
+                return returned(LINUX_ESRCH.guest_retval(), false);
+            }
+            let mut bytes = [0u8; core::mem::size_of::<LinuxSiginfo>()];
+            if !native.copy_in(&mut bytes, carrick_guest_arch::UserVa::new(uinfo_ptr)) {
+                return returned(LINUX_EFAULT.guest_retval(), false);
+            }
+            let Ok(info) = LinuxSiginfo::ref_from_bytes(&bytes) else {
+                return returned(LINUX_EFAULT.guest_retval(), false);
+            };
+            let signals = native.process_signals()?;
+            match signals.kill(tgid, sig, SignalInfo::Queued(*info)) {
+                Ok(()) => returned(0, false),
+                Err(e) => returned(e.guest_retval(), false),
+            }
+        }
+        SignalCall::RtTgsigqueueinfo => {
+            let [tgid, tid, sig, uinfo_ptr, _, _] = args;
+            let tgid = SignalThreadSelector::from_abi(tgid);
+            if tgid.positive().is_none() {
+                return returned(LINUX_EINVAL.guest_retval(), false);
+            }
+            let tid = SignalThreadSelector::from_abi(tid);
+            let sig = match SignalRequest::from_abi(sig) {
+                Ok(request) => request,
+                Err(errno) => return returned(errno.guest_retval(), false),
+            };
+            let mut bytes = [0u8; core::mem::size_of::<LinuxSiginfo>()];
+            if !native.copy_in(&mut bytes, carrick_guest_arch::UserVa::new(uinfo_ptr)) {
+                return returned(LINUX_EFAULT.guest_retval(), false);
+            }
+            let Ok(info) = LinuxSiginfo::ref_from_bytes(&bytes) else {
+                return returned(LINUX_EFAULT.guest_retval(), false);
+            };
+            let signals = native.process_signals()?;
+            match signals.tgkill(tgid, tid, sig, SignalInfo::Queued(*info)) {
+                Ok(()) => returned(0, false),
+                Err(e) => returned(e.guest_retval(), false),
+            }
+        }
+        // pidfd descriptors are still owned by the host dispatcher. Preserve
+        // its validation, identity mapping, and signaling semantics.
+        SignalCall::PidfdSendSignal => None,
+        SignalCall::RtSigsuspend => {
+            let [mask_ptr, size, _, _, _, _] = args;
+            if size != RT_SIGSET_SIZE {
+                return returned(LINUX_EINVAL.guest_retval(), false);
+            }
+            let mut bytes = [0u8; 8];
+            if !native.copy_in(&mut bytes, carrick_guest_arch::UserVa::new(mask_ptr)) {
+                return returned(LINUX_EFAULT.guest_retval(), false);
+            }
+            let mask_bits = u64::from_le_bytes(bytes);
+            let mask = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                carrick_signal_core::SignalSet::from_bits(mask_bits),
+            );
+            native.process_signals()?;
+            let original = native.current_blocked();
+            native.set_current_blocked(mask);
+            let signals = native.process_signals()?;
+            match signals.rt_sigsuspend(mask, original) {
+                Ok(true) => Some(SignalOutcome::Transferred {
+                    progress: carrick_core_abi::Served::Idle,
+                    result: crate::abi::entry::SyscallResult::new(LINUX_EINTR.guest_retval()),
+                }),
+                Ok(false) => returned(LINUX_EINTR.guest_retval(), false),
+                Err(e) => {
+                    native.set_current_blocked(original);
+                    returned(e.guest_retval(), false)
+                }
+            }
+        }
+        SignalCall::RtSigtimedwait => {
+            let [uthese_ptr, uinfo_ptr, uts_ptr, size, _, _] = args;
+            if size != RT_SIGSET_SIZE {
+                return returned(LINUX_EINVAL.guest_retval(), false);
+            }
+            let mut bytes = [0u8; 8];
+            if !native.copy_in(&mut bytes, carrick_guest_arch::UserVa::new(uthese_ptr)) {
+                return returned(LINUX_EFAULT.guest_retval(), false);
+            }
+            let set = carrick_signal_core::SignalSet::from_bits(u64::from_le_bytes(bytes))
+                .without(carrick_signal_core::policy::Signal::KILL)
+                .without(carrick_signal_core::policy::Signal::STOP);
+            let timeout_ns = if uts_ptr != 0 {
+                let mut ts_bytes = [0u8; 16];
+                if !native.copy_in(&mut ts_bytes, carrick_guest_arch::UserVa::new(uts_ptr)) {
+                    return returned(LINUX_EFAULT.guest_retval(), false);
+                }
+                let mut sec_bytes = [0u8; 8];
+                sec_bytes.copy_from_slice(&ts_bytes[0..8]);
+                let sec = i64::from_le_bytes(sec_bytes);
+                let mut nsec_bytes = [0u8; 8];
+                nsec_bytes.copy_from_slice(&ts_bytes[8..16]);
+                let nsec = i64::from_le_bytes(nsec_bytes);
+                if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+                    return returned(LINUX_EINVAL.guest_retval(), false);
+                }
+                Some(
+                    (sec as u64)
+                        .saturating_mul(1_000_000_000)
+                        .saturating_add(nsec as u64),
+                )
+            } else {
+                None
+            };
+            let timedwait_res = {
+                let signals = native.process_signals()?;
+                signals.rt_sigtimedwait(set, timeout_ns, carrick_guest_arch::UserVa::new(uinfo_ptr))
+            };
+            match timedwait_res {
+                Ok(SignalWaitOutcome::Pending) => Some(SignalOutcome::Transferred {
+                    progress: carrick_core_abi::Served::Idle,
+                    result: crate::abi::entry::SyscallResult::new(0),
+                }),
+                Ok(SignalWaitOutcome::Ready(sig, info)) => {
+                    if uinfo_ptr != 0 {
+                        let info = info.unwrap_or_else(|| {
+                            LinuxSiginfo::kill(sig.number(), LINUX_SI_USER, 0, 0)
+                        });
+                        let bytes = IntoBytes::as_bytes(&info);
+                        if !native.copy_out(carrick_guest_arch::UserVa::new(uinfo_ptr), bytes) {
+                            return returned(LINUX_EFAULT.guest_retval(), false);
+                        }
+                    }
+                    returned(sig.number() as i64, false)
+                }
+                Err(e) => returned(e.guest_retval(), false),
+            }
+        }
+    }
+}
+
+/// Snapshot uc_stack and choose the handler stack without changing the saved SP.
+pub fn delivery_stack(
+    stack: crate::abi::thread::AltStack,
+    interrupted_sp: carrick_guest_arch::UserVa,
+    on_stack: bool,
+) -> Option<(
+    carrick_guest_arch::UserVa,
+    carrick_syscall_abi::LinuxSignalStack,
+)> {
+    if stack.is_disabled() {
+        return Some((
+            interrupted_sp,
+            carrick_syscall_abi::LinuxSignalStack {
+                ss_flags: carrick_syscall_abi::LINUX_SS_DISABLE as i32,
+                ..carrick_syscall_abi::LinuxSignalStack::empty()
+            },
+        ));
+    }
+    let top = stack.sp.checked_add(stack.size)?;
+    let already_on = interrupted_sp.raw() >= stack.sp && interrupted_sp.raw() < top;
+    let flags = stack.flags
+        | if already_on {
+            carrick_syscall_abi::LINUX_SS_ONSTACK as u32
+        } else {
+            0
+        };
+    let record = carrick_syscall_abi::LinuxSignalStack {
+        ss_sp: stack.sp,
+        ss_flags: flags as i32,
+        _pad0: 0,
+        ss_size: stack.size,
+    };
+    let selected = if on_stack && !already_on {
+        carrick_guest_arch::UserVa::new(top)
+    } else {
+        interrupted_sp
+    };
+    Some((selected, record))
 }

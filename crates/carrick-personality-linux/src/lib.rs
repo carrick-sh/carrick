@@ -17,3 +17,8 @@ pub mod pending_anonymous;
 
 pub mod lifecycle;
 pub mod thread;
+
+pub mod identity;
+pub mod sysinfo;
+
+pub mod native_run_failure;

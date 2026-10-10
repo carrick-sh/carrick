@@ -40,6 +40,22 @@ pub trait GuestDispatchFrame: SyscallFrame {
     fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64>;
     /// Distinguish an ISA-only refusal from a family or venue refusal.
     fn record_isa_unsupported_forward(&self) {}
+    fn restore_signal_frame(
+        &mut self,
+        copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
+    ) -> Result<carrick_signal_core::policy::SigBlockMask, carrick_syscall_abi::LinuxErrno> {
+        let _ = copy_in;
+        Err(carrick_personality_linux::abi::signal::LINUX_ENOSYS)
+    }
+    fn setup_signal_frame(
+        &mut self,
+        params: carrick_guest_arch::SignalFrameParams,
+        siginfo: Option<&[u8]>,
+        copy_out: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
+    ) -> Result<carrick_guest_arch::UserVa, carrick_syscall_abi::LinuxErrno> {
+        let _ = (params, siginfo, copy_out);
+        Err(carrick_personality_linux::abi::signal::LINUX_ENOSYS)
+    }
 }
 
 impl GuestDispatchFrame for TrapFrame {
@@ -474,7 +490,14 @@ where
     } else {
         u64::MAX
     };
-    carrick_personality_linux::dispatch::dispatch(ordinal, control, &mut pending)
+    let route = carrick_personality_linux::dispatch::dispatch(ordinal, control, &mut pending);
+    if pending.frame.arm_frame_ref().is_some()
+        && let Some(process) = pending.process.as_deref_mut()
+        && let Some(reason) = process.take_run_failure()
+    {
+        super::native_run_failure::complete_native_run_failure(process.binding(), reason);
+    }
+    route
 }
 
 /// Native preparation, scheduling and completion retain an exact execution
@@ -587,6 +610,15 @@ impl<
     fn file_venue(&mut self) -> Option<&mut dyn PendingFileVenue> {
         Some(self)
     }
+    fn signal_native(
+        &mut self,
+    ) -> Option<&mut dyn carrick_personality_linux::signal::SignalNative<'a>> {
+        if self.frame.arm_scheduler() {
+            None
+        } else {
+            Some(self)
+        }
+    }
     fn task_state(&self) -> Option<&LinuxTaskState> {
         self.task().map(|task| &task.linux)
     }
@@ -645,6 +677,20 @@ impl<
         if self.lifecycle.is_none() && self.process.is_none() {
             return None;
         }
+        self.current_tasks.get(self.frame.task_index())?;
+        Some(self)
+    }
+    fn identity_native(
+        &mut self,
+    ) -> Option<&mut dyn carrick_personality_linux::identity::IdentityNative<'a>> {
+        self.process.as_ref()?;
+        self.current_tasks.get(self.frame.task_index())?;
+        Some(self)
+    }
+    fn sysinfo_native(
+        &mut self,
+    ) -> Option<&mut dyn carrick_personality_linux::sysinfo::SysinfoNative<'a>> {
+        self.process.as_ref()?;
         self.current_tasks.get(self.frame.task_index())?;
         Some(self)
     }

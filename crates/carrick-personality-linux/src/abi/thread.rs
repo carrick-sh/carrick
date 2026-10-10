@@ -366,6 +366,12 @@ impl ThreadControlSlot {
                 .map_or_else(|current| current == tid, |_| true)
     }
 
+    /// Retire this predecessor incarnation after a committed exec. Its
+    /// shared owner cannot authenticate the replacement control slot.
+    pub fn retire_identity(&self) {
+        self.visible_tid.store(0, Ordering::Release);
+    }
+
     pub fn visible_tid(&self) -> Option<u32> {
         let tid = self.visible_tid.load(Ordering::Acquire);
         (tid != 0).then_some(tid)
@@ -726,9 +732,12 @@ impl ThreadLifecyclePage {
         &self,
         claim: ClaimedEntry,
         record: BornRecord,
-    ) -> Result<EntryRef, TransitionError> {
+    ) -> Result<EntryRef, carrick_core::lifecycle::BirthRefusal> {
         let r = claim.entry();
-        let e = self.entry(r.index())?;
+        let e = match self.entry(r.index()) {
+            Ok(entry) => entry,
+            Err(error) => return Err(carrick_core::lifecycle::BirthRefusal::new(error, claim)),
+        };
         e.caller_task.store(record.caller_task, Ordering::Relaxed);
         e.caller_serial
             .store(record.caller_serial, Ordering::Relaxed);
@@ -755,6 +764,23 @@ impl ThreadLifecyclePage {
             thread_serial: e.thread_serial.load(Ordering::Relaxed),
             uid_credit: e.uid_credit.load(Ordering::Relaxed),
         })
+    }
+
+    #[inline(never)]
+    pub fn entry_ref_for_visible_tid(&self, visible_tid: u32) -> Option<EntryRef> {
+        if visible_tid == 0 {
+            return None;
+        }
+        for (index, entry) in self.entries.iter().enumerate() {
+            let (generation, state) = unpack(entry.state.load(Ordering::Acquire));
+            if matches!(state, EntryState::Vacant | EntryState::Stocking) {
+                continue;
+            }
+            if entry.visible_tid.load(Ordering::Relaxed) == visible_tid {
+                return Some(EntryRef::new(index as u32, generation));
+            }
+        }
+        None
     }
 
     /// Born record of a `Born`, `Published`, `ExitedInZone` or `Reaped`

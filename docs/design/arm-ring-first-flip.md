@@ -498,3 +498,132 @@ The aperture policy is carrier-wide. Later roots in an explicit carrier must
 request the already-held policy; conflicting roots fail admission before
 mapping, and leave the live carrier's control word unchanged. Use a separate
 carrier to run the other setting.
+
+## Shared identity exec dependency (`shared-owner-exec-completion`)
+
+The shared in-ring process owner has no production exec-completion ingress.
+ARM production dispatch currently passes `process=None`: identity and resource
+calls stay Unported (ENOSYS under default strict ring-first) until the ARM fork
+lane admits `NativeProcessRuntime`. ARM exec is completed by the host runtime
+and rebinds its host kernel owner; the CPL0 owner has no exec implementation.
+
+`Kernel::commit_exec_transition` stamps the private replacement leader with its
+retained namespace TID under the registry publication guard, before revoking
+every predecessor stamp. The process PID, group, credentials and resources
+remain resolvable through that kernel authority; there is no committed interval
+with neither leader stamped. Failed or merely prepared exec preserves the
+predecessor stamp. `committed_exec_preserves_replacement_identity_and_peer_pid_lookup`
+execs a child and checks replacement getuid, uname and umask through kernel
+dispatch, plus its parent's getpgid(child). The separate
+`committed_exec_revokes_predecessor_shared_identity_dispatch` witness refuses
+comm, capabilities, setpgid, clear-tid and robust-list access through retired
+predecessor slots. These kernel witnesses do not claim ARM shared-owner admission.
+CPL0 has no exec completion path and refuses execve before replacement, proven
+against native self-exec by `mounted_static_x86_exec_refuses_before_replacement_identity`.
+
+The unused shared `exec_completed` surface and its direct-call tests are removed.
+Identity retirement cannot claim exec integration until a committed-image receipt
+reaches the exact shared process and executing thread in the real syscall path.
+
+That receipt must atomically mark `has_execed` (setpgid EACCES), retain only the
+execing thread under the promoted leader identity, set comm to the executable
+basename, reset clear_child_tid and robust-list registration, and apply the
+capabilities(7) transformation including the calling thread's bounding set.
+Required witnesses use nonleader exec with distinct credentials and two live
+processes through production dispatch and rebind, not direct helper calls.
+Existing credential transformation unit tests prove only ordinary executable
+semantics without file capabilities or securebits; ARM signed integration and
+CPL0 exec remain named dependencies rather than accepted behavior.
+
+## Shared identity review baseline
+
+The shared identity branch inherits main's CPL0 XSAVE reserved-header fix and
+`mm.initial.elf-private` publication contract. These are loader and execution
+prerequisites, not parallel implementations in the identity port.
+
+## CPL0 thread-exit dependency (`shared-cpl0-thread-exit-clear-tid`)
+
+Production shared CPL0 thread exit needs native lifecycle scheduler/context
+integration, owned by the x86 executor-pool lane. It is not implemented by this
+identity port. Production dispatch supplies no ARM scheduler zone
+(`crates/carrick-x86-cpl0/src/entry.rs:1924`), and the common adapter requires
+`arm_scheduler()` plus a zone (`crates/carrick-el1/src/personality/lifecycle.rs:197`).
+Its wake hook requires an ARM frame (`lifecycle.rs:312`). The x86 wake adapter at
+`crates/carrick-x86/src/cpl0_lifecycle.rs:615` is included by the fixture lane
+(`crates/carrick-x86-cpl0/src/fixture.rs:24`); that is not a production binding.
+
+ARM's existing reference clears the four-byte user word at
+`crates/carrick-personality-linux/src/lifecycle.rs:892` and invokes the single
+futex wake at `lifecycle.rs:894`. The real ARM adapter selects the MM-scoped
+scheduler wake at `crates/carrick-el1/src/personality/lifecycle.rs:300`, using
+`crates/carrick-el1/src/sched.rs:151`. The VM-free production-dispatch test
+`exit_of_a_born_thread_clears_cleartid_wakes_the_joiner_and_runs_it`
+(`crates/carrick-el1/src/personality/lifecycle/tests.rs:969`) starts a thread,
+parks its joiner, checks the word becomes zero and verifies the joiner resumes.
+The signed ARM binding remains director-owned.
+
+Production CPL0 `set_tid_address` records the clear-child-tid word and returns
+its caller's positive tid, as required for libc raise/abort/pthread_kill.
+`mounted_static_x86_set_tid_address_returns_native_positive_tid` compares the
+same ELF with native Linux and also checks the result equals gettid. Only the
+exit-time clear and futex wake remain the **cpl0 exit custody** gap.
+`mounted_static_x86_thread_exit_clears_and_wakes_clear_tid` is ignored by that
+named dependency and requires actual clear-and-wake parity when enabled.
+The raw libc raise-shaped witness is retained with the separate CPL0 signal
+entry dependency (rt_sigaction and delivery); it is not claimed as passing
+production CPL0 signal integration.
+
+Per set_tid_address(2), production CPL0 acceptance must witness that same
+clear-before-wake/observable-exit order through the native execution context,
+including a sleeping joiner. It must preserve exact thread/MM custody and the
+one-clear/one-wake work budget of `kernel.thread.clear-tid-custody`; the fixture
+adapter and successful identity queries cannot substitute for that witness.
+
+### Clone publication versus shared terminal exit
+
+`serve_clone` takes its lifecycle claim and increments `page.live()` before
+`thread_spawned` commits credentials and Born under the graph guard.
+`exit_owned` closes admission under the graph guard and retains the exit status
+in an owned pending exit while a pre-close claim settles. The exiting record
+parks on its exact wait channel; clone rollback or completed Born publication
+publishes the settlement wake after dropping graph ownership. The scheduler
+resumes exit custody before it can restore a guest frame. No EAGAIN is returned
+from exit, and no polling or retry loop substitutes for the wake. New claims
+against the terminal gate lose with EAGAIN. Scheduler publication therefore
+runs after graph unlock without a graph-to-queue lock edge.
+`exit_group_holds_terminal_custody_until_pre_live_claim_settles` witnesses
+claim settlement, terminal admission refusal and resumed exit completion.
+`clone_queue_publication_can_reenter_the_process_graph_after_unlock` drives
+the real Born publication callback through graph reentry and settlement;
+`clone_live_membership_blocks_exit_between_graph_unlock_and_enqueue` names
+the distinct already-live-sibling refusal. Already admitted
+live siblings require the same **x86 group exit custody** dependency as the
+signals lane. This is a typed authenticated `NativeRunFailure`, ending the run
+with exit 125 and a named diagnostic, never a guest-visible exit_group errno.
+The live>1 guard is unreachable in production x86 while CPL0 does not admit
+CLONE_THREAD. It does not pretend to perform group-wide cancellation.
+
+ARM native dispatch consumes retained run failures before returning any action.
+Its HVC fatal transport authenticates the retained supervisor record against
+that CPU's active execution, counts the crossing once, and propagates the named
+failure through carrier cleanup with exit 125. The ARM owner-admission lane
+can therefore reuse the shared lifecycle owner without stranding a retired
+lane. Signed ARM transport validation remains director-owned.
+
+Only live sibling custody uses the group-exit dependency reason. Stale,
+quarantined, exhausted and other process failures retain distinct typed causes,
+including resumed exit failures. A failed claim rollback or settlement stops
+the run through the same authenticated terminal transport: clone never returns
+an errno for a child already queued, and a parked exit is never left waiting
+for a settlement that cannot be published. The real serve_clone witnesses cover
+both terminal paths.
+
+### Known strict identity refusals and owed work
+
+Unmodelled prctl options are Unported, so strict ARM returns ENOSYS, as on main.
+An absent identity/resource owner also declines as Unported. On the ARM opt-out
+lane, owed work retains the original argument and plain Forward transport; it
+is not converted into a completed syscall or consumed by identity dispatch.
+The existing opt-out transport witness includes getuid and uname and checks
+that the pending work remains. There is no identity-specific declined-for-work
+counter; the generic decline hook only accounts lifecycle/anonymous operations.
