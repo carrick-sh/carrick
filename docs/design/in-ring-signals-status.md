@@ -123,3 +123,12 @@ setup 1,336 bytes. These are individual static allocations, not a complete
 call-graph bound. The x86 page-fault assembly retains its hardware/GPR frame
 on the 4 KiB TSS stack, then moves XSAVE and Rust policy to the CPU's 64 KiB
 syscall stack; the ARM 16 KiB stack estimate does not describe that path.
+
+The full-suite signal rendezvous exposed a separate IRQ stack overflow:
+`signal_irq_return` alone reserved 5,120 bytes, in addition to the IRQ
+entry's 896-byte XSAVE scratch, on the 4 KiB TSS stack. It corrupted a
+subsequent retained page-fault IRET frame. User-origin IRQs now retain only
+the hardware/GPR frame on TSS and move XSAVE/Rust to the 64 KiB syscall
+stack, matching page faults. Kernel-origin IRQs keep the interrupted
+kernel stack so an outer syscall/fault operation cannot be overwritten.
+The unchanged concurrent two-MM witness is the runtime regression test.
