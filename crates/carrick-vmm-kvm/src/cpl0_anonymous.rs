@@ -375,6 +375,44 @@ fn release_retired_child(
         .map_err(|e| fail(e.to_string()))
 }
 
+/// The fork stock exactly as KVM boot stocks it.
+pub(super) struct BootForkStock {
+    /// The dedicated maintenance-root grant (`MAINTENANCE_ROOT_TABLE_CREDITS`).
+    pub(super) maintenance: RootGpa,
+    /// The remaining unused initial table grants.
+    pub(super) tables: Vec<RootGpa>,
+    /// `FORK_LIFECYCLE_SLOTS` records in the metadata window.
+    pub(super) lifecycles: Vec<carrick_el1_abi::ForkLifecycleLoan>,
+}
+
+/// Split the unused initial table grants into the maintenance root (the
+/// first, which boot counted as its own credit) and the fork table stock,
+/// and lay out the lifecycle records.
+pub(super) fn boot_fork_stock(mut unused: Vec<RootGpa>) -> Result<BootForkStock, TrapError> {
+    if unused.len() <= super::MAINTENANCE_ROOT_TABLE_CREDITS {
+        return Err(fail(
+            "no initial table grant left after the maintenance root",
+        ));
+    }
+    let maintenance = unused.remove(0);
+    // The guest reads both roots through their retained supervisor aliases
+    // to verify the shared entries before every maintenance install.
+    if !maintenance_root_admitted(maintenance) {
+        return Err(fail("maintenance root has no CPL0 supervisor alias"));
+    }
+    let lifecycles = lifecycle_slots(
+        METADATA_VA,
+        METADATA_VA + FORK_LIFECYCLE_OFFSET,
+        FORK_LIFECYCLE_SLOTS,
+    )
+    .ok_or_else(|| fail("fork lifecycle stock layout"))?;
+    Ok(BootForkStock {
+        maintenance,
+        tables: unused,
+        lifecycles,
+    })
+}
+
 /// The guest must reach the maintenance root through a retained supervisor
 /// alias (the shared CPL0 table-alias rule) to verify it.
 fn maintenance_root_admitted(root: RootGpa) -> bool {
@@ -583,18 +621,22 @@ impl Cpl0HostCustody {
     pub(super) fn install_fork_stock(
         &mut self,
         initial_root: RootGpa,
-        mut unused: Vec<RootGpa>,
+        unused: Vec<RootGpa>,
     ) -> Result<(), TrapError> {
         use carrick_mmu_core::owner_mmu::OwnerForkMmu;
-        if unused.is_empty() {
-            return Err(fail("no initial table grant for the maintenance root"));
-        }
-        let maintenance = unused.remove(0);
-        // The guest reads both roots through their retained supervisor
-        // aliases to verify the shared entries before every maintenance
-        // install; the root must be reachable by that same rule.
-        if !maintenance_root_admitted(maintenance) {
-            return Err(fail("maintenance root has no CPL0 supervisor alias"));
+        let BootForkStock {
+            maintenance,
+            tables,
+            lifecycles,
+        } = boot_fork_stock(unused)?;
+        // Every issued record must be provably cold; a record that is not
+        // zero at boot is a stocking fault, named here, never a refused fork.
+        let window = self.lifecycle_window();
+        if let Some(dirty) = lifecycles.iter().find(|life| !window.is_zero(**life)) {
+            return Err(fail(format!(
+                "fork lifecycle stock at {:#x} is not zero storage",
+                dirty.page.raw()
+            )));
         }
         let source = self
             ._vm
@@ -619,14 +661,8 @@ impl Cpl0HostCustody {
         retained_cow_zone(&self.ram)?
             .spaces
             .set_idle_ttbr(maintenance.address().raw());
-        let lifecycles = lifecycle_slots(
-            METADATA_VA,
-            METADATA_VA + FORK_LIFECYCLE_OFFSET,
-            FORK_LIFECYCLE_SLOTS,
-        )
-        .ok_or_else(|| fail("fork lifecycle stock layout"))?;
         self.fork_stock
-            .install(unused, lifecycles)
+            .install(tables, lifecycles)
             .map_err(|e| fail(format!("fork stock install: {e:?}")))
     }
 
@@ -1674,6 +1710,67 @@ mod custody_tests {
             })
             .is_none()
         );
+    }
+
+    /// The real KVM boot stock, in the worst case the credits are sized for
+    /// (the initial MM used its whole worst-case tables and its own COW
+    /// branch), still serves the first fork's COW branch after the
+    /// maintenance root is taken. Without the dedicated credit this loan
+    /// was refused for capacity.
+    #[test]
+    fn real_boot_stock_serves_the_first_fork_after_the_maintenance_root() {
+        use carrick_el1_abi::{
+            ForkStockExchange, ForkStockRequest, PortalOperation, ReservationGeneration,
+        };
+        use carrick_hal::fork_stock::{ForkStock, UntaggedRoots};
+        let data_pages = 2;
+        let table_grants = super::initial_table_grant_count(data_pages).unwrap();
+        let first_fork_branch = carrick_mmu_core::x86::copy_window::COW_COPY_TABLE_PAGES;
+        let used = table_grants - first_fork_branch - super::MAINTENANCE_ROOT_TABLE_CREDITS;
+        let frame_offset = 0x3000;
+        let unused: Vec<RootGpa> = (used..table_grants)
+            .map(|index| {
+                RootGpa::page_aligned(super::initial_grant_gpa(frame_offset, index)).unwrap()
+            })
+            .collect();
+        let boot = boot_fork_stock(unused).unwrap();
+        assert_eq!(boot.tables.len(), first_fork_branch);
+        let mut metadata = vec![0u64; (META_LEN / 8) as usize];
+        // SAFETY: the zeroed vector outlives every use of the window.
+        let window = unsafe {
+            LifecycleWindow::new(
+                core::ptr::NonNull::new(metadata.as_mut_ptr().cast::<u8>()).unwrap(),
+                METADATA_VA,
+                META_LEN,
+            )
+        };
+        assert!(boot.lifecycles.iter().all(|life| window.is_zero(*life)));
+        let carrier = NonZeroU64::new(7).unwrap();
+        let mut stock = ForkStock::new(carrier, KERNEL_REGION_GPA, UntaggedRoots);
+        stock.install(boot.tables, boot.lifecycles).unwrap();
+        let exec = execution();
+        let request = ForkStockRequest {
+            binding: exec.binding,
+            context: exec.context,
+            operation: PortalOperation {
+                carrier,
+                mm: ReservationMm::new(302).unwrap(),
+                incarnation: NonZeroU64::MIN,
+                sequence: NonZeroU64::new(2).unwrap(),
+            },
+            parent_generation: ReservationGeneration::INITIAL,
+            child_mm: ReservationMm::new(303).unwrap(),
+            child_bytes: (first_fork_branch as u64 - 1) * 4096,
+            parent_bytes: 4096,
+        };
+        let mut exchange = ForkStockExchange::new(request).unwrap();
+        let loan = stock
+            .loan(&mut NoTableLedger, exec, &mut exchange, |life| {
+                window.is_zero(life)
+            })
+            .unwrap();
+        assert_eq!(exchange.take(request), Some(Ok(loan)));
+        assert_eq!(stock.counters().loans, 1);
     }
 
     #[test]

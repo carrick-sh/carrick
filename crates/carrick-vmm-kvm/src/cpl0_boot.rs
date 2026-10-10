@@ -122,6 +122,24 @@ pub(crate) use carrick_x86::cpl0_entry::DIRECT_VA;
 const fn initial_copy_branch_table_credits() -> usize {
     2 * carrick_mmu_core::x86::copy_window::COW_COPY_TABLE_PAGES
 }
+/// The carrier's maintenance root is one dedicated initial table grant. It
+/// is counted on top of the copy-branch credits so taking it never shrinks
+/// the fork table stock the first fork was sized against.
+pub(crate) const MAINTENANCE_ROOT_TABLE_CREDITS: usize = 1;
+const fn initial_carrier_table_credits() -> usize {
+    initial_copy_branch_table_credits() + MAINTENANCE_ROOT_TABLE_CREDITS
+}
+/// Initial table grants for `data_pages` user pages: the initial MM's worst
+/// case (three tables per page plus its root) and the carrier credits.
+pub(crate) const fn initial_table_grant_count(data_pages: usize) -> Option<usize> {
+    let Some(tables) = data_pages.checked_mul(3) else {
+        return None;
+    };
+    let Some(tables) = tables.checked_add(1) else {
+        return None;
+    };
+    tables.checked_add(initial_carrier_table_credits())
+}
 
 const LAYOUT: BringupLayout = BringupLayout {
     trampoline_base: 0x10_0000,
@@ -1236,10 +1254,7 @@ impl Cpl0Carrier {
         let user_pages = image_pages
             .checked_add(initial_stack_pages(image, argv, env)?)
             .ok_or_else(|| fail("initial user pages"))?;
-        let table_pages = user_pages
-            .checked_mul(3)
-            .and_then(|n| n.checked_add(1))
-            .and_then(|n| n.checked_add(initial_copy_branch_table_credits()))
+        let table_pages = initial_table_grant_count(user_pages)
             .ok_or_else(|| fail("initial table grant count"))?;
         let grants = table_pages
             .checked_add(user_pages)
@@ -1633,11 +1648,8 @@ impl Cpl0Carrier {
         let data_grants = image_pages
             .checked_add(initial_stack_pages(image, argv, env)?)
             .ok_or_else(|| fail("initial data grants"))?;
-        let table_grants = data_grants
-            .checked_mul(3)
-            .and_then(|n| n.checked_add(1))
-            .and_then(|n| n.checked_add(initial_copy_branch_table_credits()))
-            .ok_or_else(|| fail("initial table grants"))?;
+        let table_grants =
+            initial_table_grant_count(data_grants).ok_or_else(|| fail("initial table grants"))?;
         let grant_count = table_grants
             .checked_add(data_grants)
             .ok_or_else(|| fail("initial grants"))?;
