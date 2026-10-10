@@ -6,8 +6,8 @@ use bitflags::bitflags;
 mod errno;
 pub mod syscall_x86_64;
 pub use errno::{
-    LINUX_EAGAIN, LINUX_ECHILD, LINUX_EFAULT, LINUX_EINVAL, LINUX_ENOSYS, LINUX_EPERM, LINUX_ESRCH,
-    LinuxErrno,
+    LINUX_EAGAIN, LINUX_EBADF, LINUX_ECHILD, LINUX_EFAULT, LINUX_EINVAL, LINUX_EIO, LINUX_EMFILE,
+    LINUX_ENOSYS, LINUX_EPERM, LINUX_ESRCH, LinuxErrno,
 };
 
 /// Canonical numbers served by the shared guest lifecycle owner.
@@ -120,6 +120,7 @@ pub const LINUX_POLLRDBAND: i16 = 0x0080;
 pub const LINUX_POLLWRNORM: i16 = 0x0100;
 pub const LINUX_POLLWRBAND: i16 = 0x0200;
 pub const LINUX_POLLRDHUP: i16 = 0x2000;
+pub const LINUX_O_CLOEXEC: u64 = 0o2000000;
 
 /// Linux poll interest/result bits after decoding the wire `i16` field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

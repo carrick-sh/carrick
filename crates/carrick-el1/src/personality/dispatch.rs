@@ -884,11 +884,18 @@ impl<
         let ordinal = self.frame.canonical_ordinal().raw();
         let old = self.frame.argument(0).unwrap_or(0) as i32;
         let result = match ordinal {
-            23 => super::file_table::dup_host_binding(self.fd_map, file_table, old, 0, 1024, false),
+            23 => super::file_table::dup_host_binding(
+                self.fd_map,
+                file_table,
+                old,
+                0,
+                super::file_table::GUEST_FD_LIMIT,
+                false,
+            ),
             24 => {
                 let new = self.frame.argument(1).unwrap_or(0) as i32;
                 let flags = self.frame.argument(2).unwrap_or(0);
-                if flags & !0x80000 != 0 || old == new {
+                if flags & !carrick_syscall_abi::LINUX_O_CLOEXEC != 0 || old == new {
                     return FamilyCompletion::Complete(
                         carrick_syscall_abi::LINUX_EINVAL.guest_retval(),
                     );
@@ -903,18 +910,23 @@ impl<
             _ => return FamilyCompletion::Forward,
         };
         let Some(change) = result else {
-            return FamilyCompletion::Complete(-9);
+            let errno = if ordinal == 23 && fd_map_lookup(self.fd_map, file_table, old).is_some() {
+                carrick_syscall_abi::LINUX_EMFILE
+            } else {
+                carrick_syscall_abi::LINUX_EBADF
+            };
+            return FamilyCompletion::Complete(errno.guest_retval());
         };
         if let Some(release) = change.release {
             let binding = self
                 .open_table
-                .get(release.handle as usize - 1)
+                .get(release.handle.checked_sub(1).unwrap_or(u32::MAX) as usize)
                 .and_then(DelegatedOpenFile::host_object);
             if !binding.is_some_and(|binding| {
                 self.frame
                     .release_host_object(binding, release.handle, release.incarnation)
             }) {
-                return FamilyCompletion::Forward;
+                return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EIO.guest_retval());
             }
         }
         FamilyCompletion::Complete(if ordinal == 57 {

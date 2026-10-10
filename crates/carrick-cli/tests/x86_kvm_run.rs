@@ -363,19 +363,54 @@ fn mounted_static_x86_sched_unported_refusal_returns_enosys() {
     let elf = dir.path().join("sched-refusal");
     compile_assembly("x86_sched_refusal.S", &elf);
     let run = run_mounted_binary(&elf, "sched-refusal", false);
+    assert_eq!(run.stdout, b"R\n", "status: {:?}; stderr: {}", run.status, String::from_utf8_lossy(&run.stderr));
+    assert_eq!(run.status.code(), Some(7), "stderr: {}", String::from_utf8_lossy(&run.stderr));
+}
+
+#[test]
+fn mounted_static_x86_descriptor_stdio_matches_native() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("descriptor-stdio");
+    compile_assembly("x86_descriptor_stdio.S", &elf);
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .unwrap();
+    assert_eq!(native.stdout, b"D\n");
+    assert!(native.stderr.is_empty());
+    assert_eq!(native.status.code(), Some(7));
+    let run = run_mounted_binary(&elf, "descriptor-stdio", false);
     assert_eq!(
-        run.stdout,
-        b"R\n",
-        "status: {:?}; stderr: {}",
-        run.status,
-        String::from_utf8_lossy(&run.stderr)
+        run.stdout, native.stdout,
+        "status: {:?}; stderr: {:?}",
+        run.status, run.stderr
     );
-    assert_eq!(
-        run.status.code(),
-        Some(7),
-        "stderr: {}",
-        String::from_utf8_lossy(&run.stderr)
-    );
+    assert_eq!(run.stderr, native.stderr);
+    assert_eq!(run.status.code(), native.status.code());
+}
+
+#[test]
+fn mounted_static_x86_remapped_writev_is_refused_without_wrong_stream() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("descriptor-writev");
+    compile_assembly("x86_descriptor_writev_refusal.S", &elf);
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .unwrap();
+    assert!(native.stdout.is_empty());
+    assert_eq!(native.stderr, b"V\n");
+    assert_eq!(native.status.code(), Some(7));
+    let run = run_mounted_binary(&elf, "descriptor-writev", false);
+    assert!(run.stdout.is_empty());
+    assert!(run.stderr.is_empty());
+    assert_eq!(run.status.code(), Some(8));
 }
 
 #[test]

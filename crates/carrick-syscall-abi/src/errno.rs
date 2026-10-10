@@ -54,6 +54,9 @@ impl LinuxErrno {
 pub const LINUX_EPERM: LinuxErrno = LinuxErrno::new(1);
 pub const LINUX_ESRCH: LinuxErrno = LinuxErrno::new(3);
 pub const LINUX_ECHILD: LinuxErrno = LinuxErrno::new(10);
+pub const LINUX_EBADF: LinuxErrno = LinuxErrno::new(9);
+pub const LINUX_EIO: LinuxErrno = LinuxErrno::new(5);
+pub const LINUX_EMFILE: LinuxErrno = LinuxErrno::new(24);
 pub const LINUX_EAGAIN: LinuxErrno = LinuxErrno::new(11);
 pub const LINUX_EFAULT: LinuxErrno = LinuxErrno::new(14);
 pub const LINUX_EINVAL: LinuxErrno = LinuxErrno::new(22);
