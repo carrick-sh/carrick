@@ -419,6 +419,35 @@ fn maintenance_root_admitted(root: RootGpa) -> bool {
     carrick_el1_abi::x86_cpl0_table_alias(root.address()).is_some()
 }
 
+/// One PML4 page as its 512 descriptor words.
+fn root_words(page: &[u8]) -> Option<[u64; 512]> {
+    if page.len() != 4096 {
+        return None;
+    }
+    let mut words = [0u64; 512];
+    for (word, bytes) in words.iter_mut().zip(page.chunks_exact(8)) {
+        *word = u64::from_le_bytes(bytes.try_into().ok()?);
+    }
+    Some(words)
+}
+
+/// The carrier maintenance root for `initial`: only its shared supervisor
+/// entries. The copy is taken once, at fork-stock installation. That is
+/// sound because shared PML4 entries are fixed at boot: every MM root
+/// already holds its own by-value copy of them (`initial_mm`, fork), so a
+/// shared entry published later would have to update every root, this one
+/// included; the guest's `install_maintenance_root` refuses a stale copy.
+fn maintenance_root_page(initial: &[u8]) -> Option<Vec<u8>> {
+    use carrick_mmu_core::owner_mmu::OwnerForkMmu;
+    let live = root_words(initial)?;
+    let mut root = vec![0u8; 4096];
+    for index in (256..512).filter(|index| X86Mmu::is_shared_root_entry(*index)) {
+        root[index * 8..index * 8 + 8].copy_from_slice(&live[index].to_le_bytes());
+    }
+    carrick_mmu_core::x86::owner_mmu::maintenance_root_matches(&live, &root_words(&root)?)
+        .then_some(root)
+}
+
 fn tables_resolve(memory: &CarrierMemory, pages: &[RootGpa]) -> bool {
     pages
         .iter()
@@ -623,7 +652,6 @@ impl Cpl0HostCustody {
         initial_root: RootGpa,
         unused: Vec<RootGpa>,
     ) -> Result<(), TrapError> {
-        use carrick_mmu_core::owner_mmu::OwnerForkMmu;
         let BootForkStock {
             maintenance,
             tables,
@@ -642,10 +670,8 @@ impl Cpl0HostCustody {
             ._vm
             .read(initial_root.address(), 4096)
             .map_err(|e| fail(e.to_string()))?;
-        let mut root = vec![0u8; 4096];
-        for index in (256..512).filter(|index| X86Mmu::is_shared_root_entry(*index)) {
-            root[index * 8..index * 8 + 8].copy_from_slice(&source[index * 8..index * 8 + 8]);
-        }
+        let root = maintenance_root_page(&source)
+            .ok_or_else(|| fail("maintenance root does not match the initial root"))?;
         if self
             ._vm
             .read(maintenance.address(), 4096)
@@ -658,6 +684,23 @@ impl Cpl0HostCustody {
         self._vm
             .write(maintenance.address(), &root)
             .map_err(|e| fail(e.to_string()))?;
+        // Boot-time assertion of the invariant each guest exit re-checks:
+        // the published copy holds exactly the initial root's shared
+        // entries (see `maintenance_root_page`).
+        let published = self
+            ._vm
+            .read(maintenance.address(), 4096)
+            .map_err(|e| fail(e.to_string()))?;
+        if !root_words(&source)
+            .zip(root_words(&published))
+            .is_some_and(|(live, copy)| {
+                carrick_mmu_core::x86::owner_mmu::maintenance_root_matches(&live, &copy)
+            })
+        {
+            return Err(fail(
+                "published maintenance root diverged from the initial root",
+            ));
+        }
         retained_cow_zone(&self.ram)?
             .spaces
             .set_idle_ttbr(maintenance.address().raw());
@@ -1794,6 +1837,35 @@ mod custody_tests {
         ))
         .unwrap();
         assert!(!maintenance_root_admitted(outside));
+    }
+
+    #[test]
+    fn maintenance_root_copies_only_the_shared_supervisor_entries() {
+        let mut initial = vec![0u8; 4096];
+        for (index, word) in [
+            (0usize, 0x1003u64),
+            (255, 0x2003),
+            (256, 0x3003),
+            (508, 0x4003),
+            (511, 0x5003),
+        ] {
+            initial[index * 8..index * 8 + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        let root = root_words(&maintenance_root_page(&initial).unwrap()).unwrap();
+        // User half and the MM-private COW copy branch stay zero.
+        assert_eq!((root[0], root[255], root[508]), (0, 0, 0));
+        assert_eq!((root[256], root[511]), (0x3003, 0x5003));
+        // A shared entry published after the copy is detected.
+        let live = root_words(&initial).unwrap();
+        let mut changed = live;
+        changed[300] = 0x6003;
+        assert!(carrick_mmu_core::x86::owner_mmu::maintenance_root_matches(
+            &live, &root
+        ));
+        assert!(!carrick_mmu_core::x86::owner_mmu::maintenance_root_matches(
+            &changed, &root
+        ));
+        assert!(maintenance_root_page(&initial[..4088]).is_none());
     }
 
     #[test]

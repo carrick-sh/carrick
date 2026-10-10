@@ -35,6 +35,10 @@ pub fn maintenance_root_matches(live: &[u64; 512], maintenance: &[u64; 512]) -> 
 pub struct X86Mmu;
 impl OwnerForkMmu for X86Mmu {
     const ADDRESS_MASK: u64 = ADDRESS;
+    /// Shared supervisor PML4 entries are fixed at boot and copied by
+    /// value into every root (each MM's and the carrier maintenance root),
+    /// which `maintenance_root_matches` relies on: publishing a new shared
+    /// entry after boot must update every copy.
     fn is_shared_root_entry(index: usize) -> bool {
         index >= 256 && index != COW_COPY_ROOT_INDEX
     }
