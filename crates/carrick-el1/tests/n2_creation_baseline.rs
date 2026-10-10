@@ -1,16 +1,27 @@
 //! VM-free evidence for the N2 plan, not a signed exit-count measurement.
 use carrick_el1::fault::{GrantMailboxes, NoopCowResolver, dispatch_fault_with_regions};
-use carrick_el1::{Zone, dispatch_syscall_with_regions, sched};
+use carrick_el1::{Zone, dispatch_syscall_with_lifecycle, sched};
 use carrick_el1_abi::{
     Action, Counters, CurrentTask, FrameGrantMailbox, InotifyNameCache, TrapFrame,
 };
 use carrick_sched_core::AddressSpaces;
 use core::sync::atomic::Ordering;
 
+#[path = "support/policy.rs"]
+mod policy;
+use carrick_guest_mem::ArmRingFirst;
+
 #[test]
-fn creation_host_routes_preserve_arguments_and_count_each_forward() {
-    // These calls have no serving arm in the current table. This exercises the
-    // real region-based dispatcher, not dispatch_syscall's host-only stub.
+fn creation_host_routes_preserve_arguments_and_count_each_forward_opt_out() {
+    creation_host_routes(ArmRingFirst::OptOut);
+}
+#[test]
+fn creation_host_routes_refuse_and_count_nonadmitted_calls_strict() {
+    creation_host_routes(ArmRingFirst::Strict);
+}
+fn creation_host_routes(policy: ArmRingFirst) {
+    // This exercises the production dispatcher with explicit tables and policy,
+    // not dispatch_syscall's host-only stub.
     // No scheduler/lifecycle/IPC admission is supplied: this does not measure
     // admitted thread clone, futex, or memory service.
     let counters = Counters::default();
@@ -21,10 +32,18 @@ fn creation_host_routes_preserve_arguments_and_count_each_forward() {
             let mut frame = TrapFrame::default();
             frame.x[..6].copy_from_slice(&[17, 23, 31, 41, 47, 53]);
             frame.x[8] = nr;
-            let original = frame.x;
+            let mut original = frame.x;
+            let refused = policy.is_strict() && matches!(nr, 96 | 103 | 122 | 134 | 178 | 260);
+            if refused {
+                original[0] =
+                    carrick_personality_linux::crossing::LINUX_ENOSYS.guest_retval() as u64;
+            }
             assert_eq!(
-                dispatch_syscall_with_regions(
-                    &mut frame,
+                dispatch_syscall_with_lifecycle(
+                    &mut policy::PolicyFrame {
+                        frame: &mut frame,
+                        policy
+                    },
                     &counters,
                     &tasks,
                     &[],
@@ -33,17 +52,28 @@ fn creation_host_routes_preserve_arguments_and_count_each_forward() {
                     &[],
                     &names,
                     None::<Zone<'_, NoCpu, sched::HardwareUserWord>>,
+                    None,
+                    None,
+                    None,
                     |_| core::ptr::null_mut(),
                 ),
-                Action::Forward,
+                if refused {
+                    Action::Served
+                } else {
+                    Action::Forward
+                },
                 "syscall {nr}"
             );
             assert_eq!(frame.x, original);
             assert_eq!(
                 counters.forwarded[nr as usize].load(Ordering::Relaxed),
-                count
+                if refused { 0 } else { count }
             );
             assert_eq!(counters.served[nr as usize].load(Ordering::Relaxed), 0);
+            assert_eq!(
+                counters.refused[nr as usize].load(Ordering::Relaxed),
+                if refused { count } else { 0 }
+            );
         }
     }
 }

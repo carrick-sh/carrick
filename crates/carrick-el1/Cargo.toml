@@ -29,6 +29,7 @@ path = "src/entry.rs"
 path = "src/lib.rs"
 
 [dev-dependencies]
+carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-test-support = { path = "../carrick-test-support" }
 carrick-core = { path = "../carrick-core", features = ["host-test"] }
 carrick-aarch64 = { path = "../carrick-aarch64" }
