@@ -301,7 +301,7 @@ fn mounted_static_x86_startup_sequence_matches_native() {
 }
 
 #[test]
-fn mounted_static_x86_set_tid_address_names_the_exit_custody_dependency() {
+fn mounted_static_x86_set_tid_address_returns_native_positive_tid() {
     if skip_without_kvm() {
         return;
     }
@@ -323,10 +323,22 @@ fn mounted_static_x86_set_tid_address_names_the_exit_custody_dependency() {
         String::from_utf8_lossy(&run.stderr)
     );
     assert_eq!(
-        run.stdout, b"F\n",
-        "CPL0 must return ENOSYS until shared-cpl0-thread-exit-clear-tid closes"
+        run.stdout, b"T\n",
+        "CPL0 must serve set_tid_address despite the exit custody gap"
     );
     assert!(run.stderr.is_empty());
+}
+
+#[test]
+#[ignore = "cpl0 exit custody: production thread exit must clear and futex-wake"]
+fn mounted_static_x86_thread_exit_clears_and_wakes_clear_tid() {
+    compare_mounted_assembly_with_native("x86_clear_tid_exit.S", b"J\n");
+}
+
+#[test]
+#[ignore = "CPL0 signal-entry dependency: rt_sigaction and handler delivery"]
+fn mounted_static_x86_raise_uses_set_tid_address_returned_tid() {
+    compare_mounted_assembly_with_native("x86_clear_tid_raise.S", b"S\n");
 }
 
 #[test]

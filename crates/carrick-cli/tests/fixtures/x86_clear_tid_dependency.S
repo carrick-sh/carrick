@@ -1,5 +1,5 @@
 # Same ELF on native Linux and CPL0. Native prints T after a positive tid;
-# CPL0 prints F only for ENOSYS until shared-cpl0-thread-exit-clear-tid closes.
+# CPL0 must also return a positive tid; cpl0 exit custody is a separate gap.
 .global _start
 .text
 _start:
@@ -10,6 +10,11 @@ _start:
     je refused
     test %rax, %rax
     jle failed
+    mov %rax, %r12
+    mov $186, %rax
+    syscall
+    cmp %r12, %rax
+    jne failed
     lea native_ok(%rip), %rsi
     jmp output
 refused:

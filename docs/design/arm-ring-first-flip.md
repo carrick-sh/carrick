@@ -545,12 +545,16 @@ scheduler wake at `crates/carrick-el1/src/personality/lifecycle.rs:285`, using
 parks its joiner, checks the word becomes zero and verifies the joiner resumes.
 The signed ARM binding remains director-owned.
 
-Production CPL0 `set_tid_address` therefore remains refused with ENOSYS;
-ARM keeps its in-ring setter and exit wake. The KVM witness
-`mounted_static_x86_set_tid_address_names_the_exit_custody_dependency`
-uses the same ELF on native Linux (positive tid) and CPL0 (ENOSYS), checking
-that the user word is unchanged on registration/refusal. This witness must
-flip red when the named dependency closes; startup parity covers served calls.
+Production CPL0 `set_tid_address` records the clear-child-tid word and returns
+its caller's positive tid, as required for libc raise/abort/pthread_kill.
+`mounted_static_x86_set_tid_address_returns_native_positive_tid` compares the
+same ELF with native Linux and also checks the result equals gettid. Only the
+exit-time clear and futex wake remain the **cpl0 exit custody** gap.
+`mounted_static_x86_thread_exit_clears_and_wakes_clear_tid` is ignored by that
+named dependency and requires actual clear-and-wake parity when enabled.
+The raw libc raise-shaped witness is retained with the separate CPL0 signal
+entry dependency (rt_sigaction and delivery); it is not claimed as passing
+production CPL0 signal integration.
 
 Per set_tid_address(2), production CPL0 acceptance must witness that same
 clear-before-wake/observable-exit order through the native execution context,

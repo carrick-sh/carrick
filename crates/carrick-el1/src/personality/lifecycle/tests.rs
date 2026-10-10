@@ -1714,6 +1714,12 @@ impl carrick_guest_arch::SyscallFrame for Cpl0IdentityFrame {
     }
 }
 impl crate::personality::dispatch::GuestDispatchFrame for Cpl0IdentityFrame {
+    fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
+        carrick_guest_arch::NativeOrdinal::new(218)
+    }
+    fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
+        carrick_personality_linux::crossing::HostCrossingSet::X86
+    }
     fn arm_frame(&mut self) -> Option<&mut TrapFrame> {
         None
     }
@@ -1729,7 +1735,7 @@ impl crate::personality::dispatch::GuestDispatchFrame for Cpl0IdentityFrame {
 }
 
 #[test]
-fn set_tid_address_cpl0_without_exit_custody_forwards_without_registration() {
+fn set_tid_address_cpl0_records_word_and_returns_the_exact_tid() {
     let w = World::new(LifecycleHatches::ON);
     assert!(w.venue.leader_slot().publish_visible_tid(40));
     w.venue.leader_slot().set_clear_child_tid(0x6000);
@@ -1768,9 +1774,10 @@ fn set_tid_address_cpl0_without_exit_custody_forwards_without_registration() {
     );
     assert!(matches!(
         route,
-        carrick_personality_linux::dispatch::CompletionRoute::Forward
+        carrick_personality_linux::dispatch::CompletionRoute::Served
     ));
-    assert_eq!(w.venue.leader_slot().clear_child_tid(), 0x6000);
+    assert_eq!(frame.0.x[0], 40);
+    assert_eq!(w.venue.leader_slot().clear_child_tid(), 0x7000);
 }
 
 #[test]
