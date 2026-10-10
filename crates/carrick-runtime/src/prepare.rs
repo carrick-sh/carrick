@@ -1184,7 +1184,11 @@ impl PreparedRun {
         // and hypervisor-backend axes are distinct, and a negation silently
         // captures every future non-macOS host as well
         // (`.semgrep/typed-domains.yml::no-cfg-not-platform-macos`).
-        #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+        #[cfg(all(
+            target_os = "linux",
+            feature = "platform-linux",
+            target_arch = "x86_64"
+        ))]
         let run = if backend == ExecutionBackend::KvmX86Cpl0 {
             let dispatcher = dispatcher;
             let _ = (
@@ -1241,7 +1245,11 @@ impl PreparedRun {
                 "Linux execution backend {backend:?} is not available"
             )))
         };
-        #[cfg(all(feature = "platform-linux", target_arch = "aarch64"))]
+        #[cfg(all(
+            target_os = "linux",
+            feature = "platform-linux",
+            target_arch = "aarch64"
+        ))]
         let run = {
             let _ = (
                 arm_ring_first,
@@ -1260,7 +1268,10 @@ impl PreparedRun {
                 "Linux/AArch64 shared carrier is not yet bound".to_owned(),
             ))
         };
-        #[cfg(any(feature = "platform-freebsd", feature = "platform-netbsd"))]
+        #[cfg(any(
+            all(target_os = "freebsd", feature = "platform-freebsd"),
+            all(target_os = "netbsd", feature = "platform-netbsd")
+        ))]
         let run = {
             let _ = (
                 arm_ring_first,

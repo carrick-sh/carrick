@@ -304,7 +304,11 @@ mod macos_helper_stubs {
         // `run_elf_real_dispatch`. Per-ISA vDSO bytes come from the engine's
         // GuestArch; the x86_64 lanes now materialize the shared x86 clock vDSO
         // as well, so execve children do not fall back to real clock syscalls.
-        #[cfg(all(feature = "platform-linux", target_arch = "aarch64"))]
+        #[cfg(all(
+            target_os = "linux",
+            feature = "platform-linux",
+            target_arch = "aarch64"
+        ))]
         let image = {
             type KvmArch = <carrick_vmm_kvm::KvmTrapEngine as carrick_hal::ThreadedEngine>::Arch;
             let linux_page_size = dispatcher.linux_page_size();
@@ -340,7 +344,11 @@ mod macos_helper_stubs {
             };
         #[cfg(all(
             not(target_arch = "x86_64"),
-            not(all(feature = "platform-linux", target_arch = "aarch64"))
+            not(all(
+                target_os = "linux",
+                feature = "platform-linux",
+                target_arch = "aarch64"
+            ))
         ))]
         let image = raw
             .with_vdso_auxv(false)
@@ -353,6 +361,7 @@ mod macos_helper_stubs {
     // cross-platform `exec_helpers` module. Re-export them here under `pub(super)`
     // so the `use macos_helper_stubs::{…}` import at the bottom of this module
     // (line ~281) continues to resolve without change.
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
     pub(super) use carrick_kernel::exec_helpers::{
         forked_child_die_by_signal, stop_after_traced_exec, stop_by_signal,
     };
