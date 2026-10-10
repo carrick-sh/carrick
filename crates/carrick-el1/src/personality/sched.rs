@@ -10,6 +10,21 @@ pub use carrick_personality_linux::sched::{
 use carrick_personality_linux::sched::{FutexCall, FutexFrequency, FutexVenue, FutexWait};
 use core::sync::atomic::Ordering;
 
+/// Publish the Linux process identity from the selected registered owner.
+/// The scheduler substrate receives this required client hook at construction.
+pub fn publish_selected_identity(
+    zone: &carrick_el1_abi::ZoneTables,
+    record: carrick_sched_core::RecordRef,
+    task: &carrick_el1_abi::CurrentTask,
+) {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(pid) = super::aarch64_process::registry().visible_pid_for_record(zone, record) {
+        task.publish_visible_pid(pid);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = (zone, record, task);
+}
+
 pub fn is_served_futex_op(frame: &TrapFrame) -> bool {
     ::carrick_personality_linux::sched::is_served_futex_op(
         frame.x[8],
