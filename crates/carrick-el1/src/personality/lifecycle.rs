@@ -78,6 +78,12 @@ impl<
     Context: super::dispatch::DispatchContext,
 > LifecycleNative<'a> for El1PendingFamilies<'a, F, C, U, G, Context>
 {
+    fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
+        if let Some(venue) = self.process_venue() {
+            venue.lifecycle_admission_settled()?;
+        }
+        Ok(())
+    }
     fn process_fork(&mut self) -> Option<LifecycleOutcome> {
         Some(self.process_venue()?.fork())
     }
@@ -110,9 +116,10 @@ impl<
         result?;
         // Credentials and Born are committed under the graph guard. Runnable
         // publication takes scheduler locks only after that guard is dropped.
-        // serve_clone incremented page.live before the guarded Born callback.
-        // exit_owned checks that census while closing admission under the
-        // graph guard, so teardown refuses until this child exits/rolls back.
+        // The shared clone owner emits admission settlement only after this
+        // enqueue. A terminal close wins against a prepublication claimant
+        // under the graph guard; that caller instead rolls back live/claim
+        // custody before publishing the settlement wake.
         self.enqueue_born(birth.record);
         Ok(())
     }
