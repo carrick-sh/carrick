@@ -206,7 +206,13 @@ pub enum InitialSyscallDisposition {
 
 /// Physical services carry no guest Linux policy or host dispatch authority.
 /// Authenticated terminal outcome from a stopped production CPU.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum PhysicalProcessExit {
     Exited(GuestExitStatus),
     RunFailed(carrick_el1_abi::NativeRunFailureReason),
