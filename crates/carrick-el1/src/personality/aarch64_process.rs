@@ -735,16 +735,26 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         };
         let mut exchange =
             Box::new(ForkStockExchange::new(request).ok_or(NativeProcessError::Invalid)?);
-        self.crossing.cross_fork_stock(
-            &raw mut *exchange as *mut _ as u64,
-            u64::from(self.worker()),
-        )?;
-        let loan = Box::new(
-            exchange
-                .take(request)
-                .ok_or(NativeProcessError::Stale)?
-                .map_err(|_| NativeProcessError::Exhausted)?,
-        );
+        let crossed = self
+            .crossing
+            .cross_fork_stock(
+                &raw mut *exchange as *mut _ as u64,
+                u64::from(self.worker()),
+            )
+            .is_ok();
+        // x0 and the record's typed reply must agree. A refusal (capacity,
+        // inventory, stale) is a nonzero x0 with a typed reply: the fork
+        // fails with `EAGAIN` and there is no loan to settle. Disagreement,
+        // or no reply, is a crossing integrity fault.
+        let loan = match exchange.take(request) {
+            Some(Ok(loan)) if crossed => Box::new(loan),
+            // A granted record behind a failed x0 is still a pending loan.
+            Some(Ok(loan)) => {
+                return Err(self.abandon_loan(&loan, None, NativeProcessError::Fault));
+            }
+            Some(Err(_)) if !crossed => return Err(NativeProcessError::Exhausted),
+            _ => return Err(NativeProcessError::Fault),
+        };
         // The carrier never loans a record a live MM uses (the parent's is
         // charged to it), so this refusal is a carrier custody fault. It is
         // the one post-crossing error that keeps the loan: an abort would

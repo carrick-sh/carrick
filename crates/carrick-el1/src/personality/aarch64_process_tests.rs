@@ -72,8 +72,10 @@ impl ForkStockCrossing for TestStockCrossing {
                 let total = child_pages + parent_pages;
                 let mut tables = self.grant_tables.lock().unwrap();
                 if tables.len() < total {
+                    // Like the HVC: a refusal is a typed reply in the record
+                    // and a nonzero x0, which the crossing reports as Fault.
                     exchange.refuse(ForkStockRefusal::Capacity);
-                    return Err(NativeProcessError::Exhausted);
+                    return Err(NativeProcessError::Fault);
                 }
                 let child_slice: Vec<_> = tables.drain(..child_pages).collect();
                 let parent_slice: Vec<_> = tables.drain(..parent_pages).collect();
@@ -780,4 +782,33 @@ fn failed_prepare_after_the_loan_aborts_it_and_a_later_fork_succeeds() {
         crossing.grant_tables.lock().unwrap().len(),
         initial_stock.len()
     );
+}
+
+/// A carrier capacity refusal (live-children limit) reaches the guest as
+/// `EAGAIN` with no loan to settle and no other effect.
+#[test]
+fn capacity_refused_loan_is_eagain_with_nothing_to_settle() {
+    let fixture = Fixture::new(0x10000, asid(1));
+    let words = fixture.tables.live(&fixture.maintenance);
+    let crossing = TestStockCrossing::new(&[]);
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::new(1).unwrap(),
+        &crossing,
+    )
+    .with_words(&words);
+    let child_mm = MmGeneration::new(NonZeroU64::new(2).unwrap());
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let refused = service.prepare_mm_start(&fixture.address, parked, child_mm);
+    let Err(error) = refused else {
+        panic!("an empty stock must refuse the fork")
+    };
+    assert_eq!(error, NativeProcessError::Exhausted);
+    assert_eq!(error.errno(), -11, "EAGAIN");
+    assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 1);
+    assert_eq!(crossing.settlements_aborted.load(Ordering::Acquire), 0);
+    assert!(fixture.zone.spaces.find(2).is_none());
 }
