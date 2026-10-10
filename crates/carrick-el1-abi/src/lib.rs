@@ -202,6 +202,8 @@ pub const EL1_BOOTSTRAP_METADATA_BASE: u64 = EL1_REGION_BASE + EL1_BOOTSTRAP_MET
 pub const X86_CPL0_BOOTSTRAP_METADATA_BASE: u64 = 0xffff_ffff_a800_0000;
 /// Checked extent shared by the CPL0 linker and host ELF admission.
 pub const X86_CPL0_SUPERVISOR_IMAGE_BASE: u64 = 0xffff_ffff_8000_0000;
+/// Guest-physical base shared by the CPL0 image loader and fixture table grant.
+pub const X86_CPL0_SUPERVISOR_IMAGE_GPA: u64 = 0x10_0000;
 pub const X86_CPL0_SUPERVISOR_IMAGE_SIZE: u64 = 0x12_0000;
 /// CPL0's one upper-half supervisor window for retained physical pages.
 pub const X86_CPL0_DIRECT_VA: u64 = 0xffff_ffff_9000_0000;
