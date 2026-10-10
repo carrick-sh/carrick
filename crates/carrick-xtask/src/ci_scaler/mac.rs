@@ -694,24 +694,42 @@ fn run_user() -> Result<RunUser, ScalerError> {
     })
 }
 
-/// Kill every process of `user` as that user (`kill(-1)` from a child that
-/// dropped to it): reaping needs no sudo target a job could write.
-fn kill_all_as(user: &RunUser) {
+/// Kill every process of `user` as that user, repeatedly, until none
+/// remains (`kill(-1)` from a child that dropped to the account; it fails
+/// with ESRCH once nothing is left to signal, and never signals itself).
+/// Reaping needs no sudo target a job could write. A fork loop that keeps
+/// processes alive past the ten-second bound fails the launch.
+fn kill_all_as(user: &RunUser) -> Result<(), ScalerError> {
     let pid = unsafe { libc::fork() };
     if pid == 0 {
         unsafe {
-            if libc::setgid(user.gid) == 0 && libc::setuid(user.uid) == 0 {
-                libc::kill(-1, libc::SIGKILL);
+            if libc::setgid(user.gid) != 0 || libc::setuid(user.uid) != 0 {
+                libc::_exit(2);
             }
-            libc::_exit(0);
+            for _ in 0..200 {
+                if libc::kill(-1, libc::SIGKILL) != 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    libc::_exit(0);
+                }
+                libc::usleep(50_000);
+            }
+            libc::_exit(1);
         }
     }
-    if pid > 0 {
-        let mut status = 0;
-        unsafe {
-            libc::waitpid(pid, &mut status, 0);
-        }
+    if pid < 0 {
+        return Err(std::io::Error::last_os_error().into());
     }
+    let mut status = 0;
+    if unsafe { libc::waitpid(pid, &mut status, 0) } != pid
+        || !libc::WIFEXITED(status)
+        || libc::WEXITSTATUS(status) != 0
+    {
+        return Err(ScalerError::Guard(
+            "runner-account processes survived ten seconds of SIGKILL; launch refused",
+        ));
+    }
+    Ok(())
 }
 
 /// Whether a cron/at deny list names `user` on a line of its own.
@@ -739,9 +757,13 @@ fn wipe(path: &Path) -> Result<(), ScalerError> {
     }
 }
 
-fn copy_tree(from: &Path, to: &Path, uid: u32, gid: u32) -> Result<(), ScalerError> {
-    for entry in std::fs::read_dir(from)? {
-        let entry = entry?;
+/// Copy the skeleton into a fresh tree. Directories are created with mkdir
+/// and files with `create_new` + `O_NOFOLLOW`, so nothing is written through
+/// a symlink; every created path is returned for the final ownership pass.
+fn copy_tree(from: &Path, to: &Path, created: &mut Vec<PathBuf>) -> Result<(), ScalerError> {
+    let mut entries: Vec<_> = std::fs::read_dir(from)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
         let source = entry.path();
         let target = to.join(entry.file_name());
         let meta = std::fs::symlink_metadata(&source)?;
@@ -751,21 +773,31 @@ fn copy_tree(from: &Path, to: &Path, uid: u32, gid: u32) -> Result<(), ScalerErr
             std::fs::DirBuilder::new()
                 .mode(meta.permissions().mode() & 0o755)
                 .create(&target)?;
-            copy_tree(&source, &target, uid, gid)?;
+            copy_tree(&source, &target, created)?;
         } else if meta.is_file() {
-            std::fs::copy(&source, &target)?;
+            let mut out = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(meta.permissions().mode() & 0o755)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&target)?;
+            out.write_all(&std::fs::read(&source)?)?;
+            out.sync_all()?;
         } else {
             return Err(ScalerError::Guard("skeleton has a special file"));
         }
-        lchown(&target, uid, gid)?;
+        created.push(target);
     }
     Ok(())
 }
 
-/// Before every job: recreate the job home from the `owner`-owned skeleton
-/// and empty every runner-writable work directory, all owned by the runner
-/// account. Nothing a previous job wrote (caches, launch agents, shell rc
-/// files, toolchains) survives into the next.
+/// Before every job (all runner-account processes already gone): build a
+/// new job home entirely root-only under a fresh temporary name next to it,
+/// hand it to the runner account at the very end (contents first, the home
+/// itself last), then swap it into place by rename. The previous home is
+/// moved aside and deleted without following symlinks; every runner-writable
+/// work directory is emptied. Nothing a previous job wrote (caches, launch
+/// agents, rc files, planted symlinks) survives or redirects a root write.
 pub fn reset_job_area(
     skeleton: &Path,
     home: &Path,
@@ -780,12 +812,39 @@ pub fn reset_job_area(
             "job-home skeleton must be a root-owned directory",
         ));
     }
-    for dir in std::iter::once(home).chain(work.iter().map(PathBuf::as_path)) {
+    let (parent, name) = match (home.parent(), home.file_name().and_then(|n| n.to_str())) {
+        (Some(parent), Some(name)) => (parent, name),
+        _ => return Err(ScalerError::Guard("job home needs a parent directory")),
+    };
+    let parent_meta = std::fs::symlink_metadata(parent)?;
+    if !parent_meta.is_dir() || !owner_only(&parent_meta, owner) {
+        return Err(ScalerError::Guard(
+            "job home's parent must be root-owned and not group/other writable",
+        ));
+    }
+    let fresh = parent.join(format!(".{name}.new"));
+    let stale = parent.join(format!(".{name}.old"));
+    wipe(&fresh)?;
+    wipe(&stale)?;
+    std::fs::DirBuilder::new().mode(0o700).create(&fresh)?;
+    let mut created = Vec::new();
+    copy_tree(skeleton, &fresh, &mut created)?;
+    // Children before parents, the new home itself last.
+    for path in created.iter().rev() {
+        lchown(path, uid, gid)?;
+    }
+    lchown(&fresh, uid, gid)?;
+    if std::fs::symlink_metadata(home).is_ok() {
+        std::fs::rename(home, &stale)?;
+    }
+    std::fs::rename(&fresh, home)?;
+    wipe(&stale)?;
+    for dir in work {
         wipe(dir)?;
         std::fs::DirBuilder::new().mode(0o700).create(dir)?;
         lchown(dir, uid, gid)?;
     }
-    copy_tree(skeleton, home, uid, gid)
+    Ok(())
 }
 
 /// The read-only toolchain root and its rustup/cargo homes are owner-only.
@@ -836,7 +895,7 @@ pub(super) fn run_once(name: &str, binding: &RunBinding, pin: &str) -> Result<()
     }
     // Nothing from a previous job may still run, then nothing it wrote may
     // remain: kill every runner-account process and recreate its areas.
-    kill_all_as(&user);
+    kill_all_as(&user)?;
     reset_job_area(
         Path::new(SKELETON),
         Path::new(JOB_HOME),
@@ -912,7 +971,9 @@ pub(super) fn run_once(name: &str, binding: &RunBinding, pin: &str) -> Result<()
     unsafe {
         libc::kill(-group, libc::SIGKILL);
     }
-    kill_all_as(&user);
+    if let Err(error) = kill_all_as(&user) {
+        eprintln!("post-job reap: {error}");
+    }
     std::fs::write(state.join("runner.exit"), format!("{status:?}\n"))?;
     println!("one-job runner exited");
     Ok(())
