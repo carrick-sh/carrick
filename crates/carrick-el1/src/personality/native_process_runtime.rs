@@ -1848,17 +1848,21 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         }
     }
 
-    fn prctl_get_name(&self, buf: &mut [u8; 16]) {
+    fn prctl_get_name(
+        &self,
+        buf: &mut [u8; 16],
+    ) -> Result<(), carrick_personality_linux::identity::IdentityReadError> {
+        use carrick_personality_linux::identity::IdentityReadError;
         let graph = self.runtime.graph.lock();
-        if let Ok(task) = graph.owner.task(self.key) {
-            if let Ok(comm) = task.comm_for(self.calling_tid) {
-                *buf = *comm;
-            } else {
-                buf.fill(0);
-            }
-        } else {
-            buf.fill(0);
-        }
+        let task = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| IdentityReadError::MissingThread)?;
+        let comm = task
+            .comm_for(self.calling_tid)
+            .map_err(|_| IdentityReadError::MissingThread)?;
+        *buf = *comm;
+        Ok(())
     }
 
     fn prctl_set_name(&mut self, name: &[u8; 16]) {
@@ -3043,11 +3047,11 @@ mod tests {
         entry.prctl_set_name(b"worker\0\0\0\0\0\0\0\0\0\0");
 
         entry.set_calling_tid(41);
-        entry.prctl_get_name(&mut comm_leader);
+        entry.prctl_get_name(&mut comm_leader).unwrap();
         assert_eq!(&comm_leader[..7], b"leader\0");
 
         entry.set_calling_tid(42);
-        entry.prctl_get_name(&mut comm_worker);
+        entry.prctl_get_name(&mut comm_worker).unwrap();
         assert_eq!(&comm_worker[..7], b"worker\0");
 
         // Calling from thread 42: change UIDs to 1000
@@ -3070,7 +3074,7 @@ mod tests {
         entry.set_calling_tid(43);
         assert_eq!(entry.get_uids().unwrap(), (1000, 1000, 1000, 1000));
         let mut comm_child = [0u8; 16];
-        entry.prctl_get_name(&mut comm_child);
+        entry.prctl_get_name(&mut comm_child).unwrap();
         assert_eq!(&comm_child[..7], b"worker\0");
 
         // Fork from thread 42: child process inherits thread 42's credentials and comm
@@ -3271,6 +3275,15 @@ mod tests {
 
         // 2. Caller TID 9999 attempting modify_credentials returns ESRCH
         entry.set_calling_tid(9999);
+        let mut missing_name = [0xa5; 16];
+        assert_eq!(
+            entry.prctl_get_name(&mut missing_name),
+            Err(carrick_personality_linux::identity::IdentityReadError::MissingThread)
+        );
+        assert_eq!(
+            missing_name, [0xa5; 16],
+            "missing comm must not manufacture an empty name"
+        );
 
         assert_eq!(
             entry.set_uid(1000),
