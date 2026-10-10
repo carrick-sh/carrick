@@ -471,15 +471,18 @@ fn clone_forwards_every_other_flag_set_without_effects() {
 }
 
 #[test]
-fn clone_forwards_behind_a_closed_gate_or_the_threads_hatch() {
-    let run = |w: &mut World| {
+fn clone_closed_gate_returns_eagain_and_threads_hatch_forwards() {
+    let run = |w: &mut World, expected: Action| {
         let entry = w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
         let word = Box::new(0xaaaa_u32);
-        let (action, _) = w.syscall(
+        let (action, frame) = w.syscall(
             SYS_CLONE,
             &clone_args(GLIBC_FLAGS, addr(&*word), addr(&*word)),
         );
-        assert_eq!(action, Action::Forward);
+        assert_eq!(action, expected);
+        if expected == Action::Served {
+            assert_eq!(frame.x[0] as i64, -11);
+        }
         assert_eq!(*word, 0xaaaa);
         assert_eq!(
             w.page().state(0).unwrap(),
@@ -490,16 +493,16 @@ fn clone_forwards_behind_a_closed_gate_or_the_threads_hatch() {
     };
     let mut w = World::new(LifecycleHatches::ON);
     w.page().close_for_fork().unwrap();
-    run(&mut w);
+    run(&mut w, Action::Served);
     let mut w = World::new(LifecycleHatches::ON);
     w.page().close();
-    run(&mut w);
+    run(&mut w, Action::Served);
     // CARRICK_EL1_THREADS=0.
     let mut w = World::new(LifecycleHatches {
         threads: false,
         sigmask: true,
     });
-    run(&mut w);
+    run(&mut w, Action::Forward);
 }
 
 #[test]
@@ -1901,12 +1904,16 @@ impl crate::sched::ThreadCpu for QueueLockProbeCpu<'_> {
 }
 
 #[test]
-fn clone_queue_publication_can_reenter_the_process_graph_after_unlock() {
+fn clone_terminal_close_rolls_back_before_owned_exit_settlement() {
     // ProcessNative's Born callback is under its graph guard. The real queue
     // and timer path must run after that guard, even if it reenters the graph.
     struct GraphOwner<'a> {
         binding: carrick_el1_abi::ExecutionBinding,
         graph: &'a crate::lock::SpinLock<()>,
+        page: &'a ThreadLifecyclePage,
+        zone: &'a ZoneTables,
+        settlements: &'a core::cell::Cell<u32>,
+        refuse_birth: bool,
     }
     impl ProcessNative for GraphOwner<'_> {
         fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
@@ -1927,6 +1934,26 @@ fn clone_queue_publication_can_reenter_the_process_graph_after_unlock() {
         fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
             panic!("unexpected exit")
         }
+        fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
+            let _guard = self
+                .graph
+                .try_lock()
+                .expect("settlement retains graph guard");
+            assert_eq!(self.page.claimed_count(), 0);
+            if self.refuse_birth {
+                assert_eq!(self.page.live(), 1, "wake preceded live rollback");
+                assert_eq!(self.zone.slot(SLOT).queued(), 0);
+            } else {
+                assert_eq!(self.page.live(), 2);
+                assert_eq!(
+                    self.zone.slot(SLOT).queued(),
+                    1,
+                    "wake preceded Born enqueue"
+                );
+            }
+            self.settlements.set(self.settlements.get() + 1);
+            Ok(())
+        }
         fn thread_spawned(
             &mut self,
             caller: u32,
@@ -1936,9 +1963,16 @@ fn clone_queue_publication_can_reenter_the_process_graph_after_unlock() {
             assert_eq!(caller, PARENT_TID as u32);
             assert_eq!(child, CHILD_VISIBLE);
             let _guard = self.graph.lock();
+            if self.refuse_birth {
+                assert_eq!(self.page.claimed_count(), 1);
+                assert_eq!(self.page.live(), 2);
+                self.page.close();
+                return Err(-11);
+            }
             publish()
         }
     }
+    let settlements = core::cell::Cell::new(0);
     let w = World::new(LifecycleHatches::ON);
     assert!(w.venue.leader_slot().publish_visible_tid(PARENT_TID as u32));
     w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
@@ -1959,6 +1993,145 @@ fn clone_queue_publication_can_reenter_the_process_graph_after_unlock() {
     let mut owner = GraphOwner {
         binding: crate::personality::common_entry::execution_binding(w.task()),
         graph: &graph,
+        page: w.page(),
+        zone: &w.zone,
+        settlements: &settlements,
+        refuse_birth: true,
+    };
+    let mut frame = TrapFrame {
+        slot: SLOT_IDX as u64,
+        ..Default::default()
+    };
+    frame.x[..5].copy_from_slice(&clone_args(GO_FLAGS, 0, 0));
+    let names = InotifyNameCache::new();
+    let mut native = super::El1PendingFamilies {
+        handoff: None,
+        lifecycle_user: None,
+        frame: &mut frame,
+        counters: &w.counters,
+        current_tasks: &w.tasks,
+        fd_map: &[],
+        object_table: &[],
+        open_table: &[],
+        inotify_table: &[],
+        name_cache: &names,
+        zone: Some(Zone {
+            tables: &w.zone,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+        }),
+        ipc: None,
+        lifecycle: Some(&*w.venue),
+        process: Some(&mut owner),
+        source: None,
+        anonymous: None,
+        cache_lookup: |_| core::ptr::null_mut(),
+    };
+    assert!(
+        matches!(invoke(LifecycleCall::Clone,&mut native),Some(LifecycleOutcome::Returned {result,..}) if result.raw()==-11)
+    );
+    assert_eq!(checks.get(), 0);
+    assert_eq!(settlements.get(), 1);
+    assert_eq!(w.page().live(), 1);
+    assert_eq!(w.page().claimed_count(), 0);
+    assert_eq!(w.page().gate(), carrick_el1_abi::GateState::Closed);
+    assert_eq!(w.zone.slot(SLOT).queued(), 0);
+}
+
+#[test]
+fn clone_queue_publication_can_reenter_the_process_graph_after_unlock() {
+    // ProcessNative's Born callback is under its graph guard. The real queue
+    // and timer path must run after that guard, even if it reenters the graph.
+    struct GraphOwner<'a> {
+        binding: carrick_el1_abi::ExecutionBinding,
+        graph: &'a crate::lock::SpinLock<()>,
+        page: &'a ThreadLifecyclePage,
+        zone: &'a ZoneTables,
+        settlements: &'a core::cell::Cell<u32>,
+        refuse_birth: bool,
+    }
+    impl ProcessNative for GraphOwner<'_> {
+        fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
+            self.binding
+        }
+        fn fork(&mut self) -> LifecycleOutcome {
+            panic!("unexpected fork")
+        }
+        fn wait4(
+            &mut self,
+            _: ProcessWaitPid,
+            _: UserVa,
+            _: LinuxWaitOptions,
+            _: UserVa,
+        ) -> LifecycleOutcome {
+            panic!("unexpected wait")
+        }
+        fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
+            panic!("unexpected exit")
+        }
+        fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
+            let _guard = self
+                .graph
+                .try_lock()
+                .expect("settlement retains graph guard");
+            assert_eq!(self.page.claimed_count(), 0);
+            if self.refuse_birth {
+                assert_eq!(self.page.live(), 1, "wake preceded live rollback");
+                assert_eq!(self.zone.slot(SLOT).queued(), 0);
+            } else {
+                assert_eq!(self.page.live(), 2);
+                assert_eq!(
+                    self.zone.slot(SLOT).queued(),
+                    1,
+                    "wake preceded Born enqueue"
+                );
+            }
+            self.settlements.set(self.settlements.get() + 1);
+            Ok(())
+        }
+        fn thread_spawned(
+            &mut self,
+            caller: u32,
+            child: u32,
+            publish: &mut dyn FnMut() -> Result<(), i64>,
+        ) -> Result<(), i64> {
+            assert_eq!(caller, PARENT_TID as u32);
+            assert_eq!(child, CHILD_VISIBLE);
+            let _guard = self.graph.lock();
+            if self.refuse_birth {
+                assert_eq!(self.page.claimed_count(), 1);
+                assert_eq!(self.page.live(), 2);
+                self.page.close();
+                return Err(-11);
+            }
+            publish()
+        }
+    }
+    let settlements = core::cell::Cell::new(0);
+    let w = World::new(LifecycleHatches::ON);
+    assert!(w.venue.leader_slot().publish_visible_tid(PARENT_TID as u32));
+    w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
+    let graph = crate::lock::SpinLock::new(());
+    let checks = core::cell::Cell::new(0_u32);
+    let probe = || {
+        if w.zone.slot(SLOT).queued() != 0 {
+            let _guard = graph
+                .try_lock()
+                .expect("scheduler publication retained the process graph lock");
+            checks.set(checks.get() + 1);
+        }
+    };
+    let mut cpu = QueueLockProbeCpu {
+        inner: w.cpu.clone(),
+        probe: &probe,
+    };
+    let mut owner = GraphOwner {
+        binding: crate::personality::common_entry::execution_binding(w.task()),
+        graph: &graph,
+        page: w.page(),
+        zone: &w.zone,
+        settlements: &settlements,
+        refuse_birth: false,
     };
     let mut frame = TrapFrame {
         slot: SLOT_IDX as u64,
@@ -1997,6 +2170,7 @@ fn clone_queue_publication_can_reenter_the_process_graph_after_unlock() {
         "queue publication must exercise the graph reentry witness"
     );
     assert_eq!(w.zone.slot(SLOT).queued(), 1);
+    assert_eq!(settlements.get(), 1);
 }
 
 #[test]

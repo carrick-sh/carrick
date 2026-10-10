@@ -5,6 +5,7 @@ use carrick_el1_abi::{BornInZoneSource, CurrentTask, ReservationMm};
 use carrick_guest_arch::MmuBackend;
 use carrick_sched_core::{ParkedContextWords, SlotId, WakeEffects};
 use core::sync::atomic::Ordering;
+use carrick_personality_linux::lifecycle::ProcessNative;
 
 pub(super) fn source(slot: SlotId) -> BornInZoneSource<'static, ParkedContextWords> {
     let layout = carrick_el1::isa::x86_kernel_layout();
@@ -61,6 +62,24 @@ pub(super) fn migrate(slot: SlotId) {
     }
 }
 
+/// Publish the same terminal completion for direct and resumed root exits.
+pub(super) fn publish_root_exit(
+    current: &CurrentTask,
+    status: carrick_sched_core::process::LinuxWaitStatus,
+) -> ! {
+    let exit = carrick_el1_abi::NativeRootExit::new(
+        carrick_el1::personality::common_entry::execution_binding(current), status,
+    ).unwrap_or_else(|| initial_boot::fatal_boot());
+    // SAFETY: owned retirement authenticated this exact VM completion.
+    unsafe {
+        core::arch::asm!("out dx, al",
+            in("dx") carrick_el1_abi::NATIVE_ROOT_EXIT_PORT,
+            in("rax") &exit as *const _ as u64,
+            options(nostack, preserves_flags));
+    }
+    super::halt();
+}
+
 /// Run a queued record or sleep under the shared queue's lost-wakeup guard.
 /// A guest wait releases its record and installed-space membership before
 /// this function selects another runnable task or enters architectural HLT.
@@ -101,12 +120,27 @@ pub(super) fn schedule(slot: SlotId) -> ! {
                 let mut entry = runtime
                     .enter(source, current, words, &mut service)
                     .unwrap_or_else(|_| initial_boot::fatal_boot());
-                if let Some(outcome) = entry.resume_pending_wait() {
+                if let Some(outcome) = entry.resume_pending_lifecycle()
+                    .unwrap_or_else(|_| initial_boot::fatal_boot()) {
+                    if let Some(reason) = entry.take_run_failure() { super::complete_run_failure(current, reason); }
                     match outcome {
                         carrick_personality_linux::lifecycle::LifecycleOutcome::Returned {
                             result,
                             ..
                         } => words.set_syscall_return(result.raw() as u64),
+                        carrick_personality_linux::lifecycle::LifecycleOutcome::Transferred {
+                            progress: carrick_core::Served::Idle, ..
+                        } => {
+                            // This resumed syscall still owns the lane handoff;
+                            // it must never restore a guest exit_group frame.
+                            let _receipt = entry.take_handoff_receipt()
+                                .unwrap_or_else(|| initial_boot::fatal_boot());
+                            let root_exit = entry.take_root_exit();
+                            drop(entry);
+                            if let Some(status) = root_exit { publish_root_exit(current, status); }
+                            source.zone.release_space(slot);
+                            continue;
+                        }
                         _ => initial_boot::fatal_boot(),
                     }
                 } else if let Some(result) = selected.result {

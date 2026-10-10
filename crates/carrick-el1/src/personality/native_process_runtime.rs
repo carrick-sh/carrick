@@ -228,6 +228,14 @@ struct PendingWait {
     precheck: WaitPrecheck,
     channel: Arc<WaitChannel>,
 }
+struct ExitWakeCustody {
+    channel: Arc<WaitChannel>,
+}
+struct PendingExit {
+    status: u8,
+    channel: Arc<WaitChannel>,
+    wake: Option<ExitWakeCustody>,
+}
 struct Graph<'a, M: Clone, C: ProcessContext> {
     owner: Owner<'a, M, C>,
     root_key: TaskKey,
@@ -235,6 +243,7 @@ struct Graph<'a, M: Clone, C: ProcessContext> {
     visible_namespace: VisibleNamespace,
     serials: SerialAllocator,
     pending: BTreeMap<TaskKey, PendingWait>,
+    pending_exit: BTreeMap<TaskKey, PendingExit>,
     _root_roles: NativeClaim,
     uts: carrick_personality_linux::sysinfo::LinuxUtsname,
 }
@@ -437,6 +446,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 visible_namespace,
                 serials,
                 pending: BTreeMap::new(),
+                pending_exit: BTreeMap::new(),
                 _root_roles: root_roles,
                 uts,
             }),
@@ -506,6 +516,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             service,
             handoff: None,
             root_exit: None,
+            run_failure: None,
             calling_tid,
             slot,
         })
@@ -571,6 +582,7 @@ pub struct NativeProcessEntry<
     service: &'r mut S,
     handoff: Option<EntryHandoffReceipt<C>>,
     root_exit: Option<LinuxWaitStatus>,
+    run_failure: Option<carrick_el1_abi::NativeRunFailureReason>,
     calling_tid: u32,
     slot: Option<&'a ThreadControlSlot>,
 }
@@ -591,6 +603,28 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
     pub fn set_slot_for_test(&mut self, slot: &'a ThreadControlSlot) {
         self.slot = Some(slot);
+    }
+    pub fn take_run_failure(&mut self) -> Option<carrick_el1_abi::NativeRunFailureReason> {
+        self.run_failure.take()
+    }
+    fn run_failed(&mut self, reason: carrick_el1_abi::NativeRunFailureReason) -> LifecycleOutcome {
+        self.run_failure = Some(reason);
+        if let Some(record) = self
+            .source
+            .zone
+            .slot(self.source.slot)
+            .current()
+            .or_else(|| self.source.zone.slot(self.source.slot).host_record())
+        {
+            self.handoff =
+                carrick_core::entry::retire_current(self.binding, self.source, record, LOCK_SPINS);
+        }
+        // No graph exit or MM retirement is claimed. Even if lane retirement
+        // refuses, the authenticated carrier report stops this incomplete run.
+        LifecycleOutcome::Transferred {
+            progress: carrick_core::Served::Idle,
+            result: SyscallResult::new(0),
+        }
     }
     pub fn take_root_exit(&mut self) -> Option<LinuxWaitStatus> {
         self.root_exit.take()
@@ -824,8 +858,124 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.service.wake_effects(effects);
         Ok(())
     }
+    /// Resume owned lifecycle custody before the execution lane returns to EL0.
+    /// Exit keeps its original status and cannot become a guest syscall return.
+    pub fn resume_pending_lifecycle(
+        &mut self,
+    ) -> Result<Option<LifecycleOutcome>, NativeProcessError> {
+        let status = self
+            .runtime
+            .graph
+            .lock()
+            .pending_exit
+            .get(&self.key)
+            .map(|p| p.status);
+        if let Some(status) = status {
+            return Ok(Some(self.exit_group(status)));
+        }
+        Ok(self.resume_pending_wait())
+    }
+
+    fn park_pending_exit(
+        &mut self,
+        page: &ThreadLifecyclePage,
+        channel: &Arc<WaitChannel>,
+    ) -> Result<Option<LifecycleOutcome>, NativeProcessError> {
+        let zone = self.source.zone;
+        let record = zone
+            .slot(self.source.slot)
+            .current()
+            .or_else(|| zone.slot(self.source.slot).host_record())
+            .ok_or(NativeProcessError::Quarantined)?;
+        let start = carrick_core::entry::prepare_handoff(self.binding, self.source, record)
+            .ok_or(NativeProcessError::Quarantined)?;
+        let address = WaitChannel::address(channel);
+        let guard = zone
+            .lock(
+                ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
+                &BoundedSpin(LOCK_SPINS),
+            )
+            .ok_or(NativeProcessError::Quarantined)?;
+        // Settlement publishes under this same bucket. A claim which settled
+        // before enrollment needs no wake; a later settlement owns our wake.
+        if page.claimed_count() == 0 {
+            return Ok(None);
+        }
+        let sequence = zone.next_seq(record);
+        zone.enqueue(&guard, record, sequence, channel.mm, address, u32::MAX, 0)
+            .map_err(|_| NativeProcessError::Quarantined)?;
+        // SAFETY: the current record remains owned until its guarded park CAS.
+        unsafe { *zone.record(record).ctx_mut() = self.words };
+        let receipt = carrick_core::entry::publish_handoff_park(
+            start,
+            &guard,
+            carrick_el1_abi::EntryRecordGeneration(sequence),
+        )
+        .ok_or(NativeProcessError::Quarantined)?;
+        drop(guard);
+        zone.clear_current(self.source.slot);
+        self.handoff = Some(receipt);
+        Ok(Some(LifecycleOutcome::Transferred {
+            progress: carrick_core::Served::Idle,
+            result: SyscallResult::new(0),
+        }))
+    }
+
     #[inline(never)]
     fn exit_owned(&mut self, status: u8) -> Result<LifecycleOutcome, NativeProcessError> {
+        let (page, channel) = {
+            let mut graph = self.runtime.graph.lock();
+            let row = graph
+                .owner
+                .task_mut(self.key)
+                .map_err(|_| NativeProcessError::Stale)?;
+            row.select_exit_thread(self.calling_tid)
+                .map_err(|_| NativeProcessError::Stale)?;
+            let page = row.native().resources().page;
+            if !graph.pending_exit.contains_key(&self.key) {
+                // Already admitted sibling retirement still needs its own
+                // exact-record cancellation binding. Pre-live claims are
+                // refused by thread_spawned after this terminal close.
+                if page.live() != 1 && page.claimed_count() == 0 {
+                    drop(graph);
+                    return Ok(self
+                        .run_failed(carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody));
+                }
+                page.close();
+                let channel = Arc::new(WaitChannel {
+                    generation: ProcessWake::new(),
+                    mm: self.binding.mm.raw(),
+                });
+                let wake = Some(ExitWakeCustody {
+                    channel: channel.clone(),
+                });
+                graph.pending_exit.insert(
+                    self.key,
+                    PendingExit {
+                        status,
+                        channel,
+                        wake,
+                    },
+                );
+            }
+            (
+                page,
+                graph
+                    .pending_exit
+                    .get(&self.key)
+                    .ok_or(NativeProcessError::Quarantined)?
+                    .channel
+                    .clone(),
+            )
+        };
+        if let Some(outcome) = self.park_pending_exit(page, &channel)? {
+            return Ok(outcome);
+        }
+        if page.live() != 1 {
+            return Ok(
+                self.run_failed(carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody)
+            );
+        }
         let root_exit = self.is_root_process();
         let wait_status = LinuxWaitStatus::from_wait_encoding(i32::from(status) << 8);
 
@@ -847,18 +997,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let page = row.native().resources().page;
             let control = row.native().resources().control;
             let file_table = row.native().resources().file_table;
-            // Born membership keeps this count above one until publication
-            // and nonfinal exit finish. Close claim admission before the final
-            // census: a claim predating close must finish or roll back first.
-            if page.live() != 1 {
-                return Err(NativeProcessError::Unsupported);
-            }
-            page.close_for_fork()
-                .map_err(|_| NativeProcessError::Busy)?;
-            if page.claimed_count() != 0 {
-                let _ = page.reopen_after_fork();
-                return Err(NativeProcessError::Busy);
-            }
             let (resources, published) = match native_process_entry::publish_exit(
                 &mut graph.owner,
                 self.key,
@@ -867,12 +1005,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 wait_status,
             ) {
                 Ok(published) => published,
-                Err(_) => {
-                    let _ = page.reopen_after_fork();
-                    return Err(NativeProcessError::Busy);
-                }
+                Err(_) => return Err(NativeProcessError::Quarantined),
             };
-            page.close();
+            graph.pending_exit.remove(&self.key);
             (page, control, file_table, resources, published)
         };
         let record = self
@@ -988,6 +1123,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .owner
                 .task(self.key)
                 .map_err(|_| NativeProcessError::Stale)?;
+            if row.native().resources().page.gate() != carrick_el1_abi::GateState::Open {
+                return Err(NativeProcessError::Busy);
+            }
             let parent_mm = row.native().resources().mm.clone();
             let identity = row.identity();
             let group = row.metadata().namespace_process_group;
@@ -1382,7 +1520,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn exit_group(&mut self, status: u8) -> LifecycleOutcome {
         match self.exit_owned(status) {
             Ok(outcome) => outcome,
-            Err(error) => self.fail(error),
+            Err(_) => self.run_failed(carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody),
         }
     }
     fn as_identity_venue(
@@ -1406,6 +1544,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             .owner
             .task_mut(self.key)
             .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
+        if task.native().resources().page.gate() == carrick_el1_abi::GateState::Closed {
+            return Err(-11);
+        }
         if task.has_thread(child_tid) {
             return Err(carrick_personality_linux::identity::EINVAL);
         }
@@ -1418,6 +1559,44 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     }
     fn thread_exited(&mut self, tid: u32) {
         self.thread_exited(tid);
+    }
+    fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
+        let wake = {
+            let mut graph = self.runtime.graph.lock();
+            if graph.pending_exit.contains_key(&self.key) {
+                let settled = graph
+                    .owner
+                    .task(self.key)
+                    .map_err(|_| NativeProcessError::Quarantined)
+                    .map(|row| row.native().resources().page.claimed_count() == 0);
+                settled.map(|settled| {
+                    if settled {
+                        graph
+                            .pending_exit
+                            .get_mut(&self.key)
+                            .and_then(|pending| pending.wake.take())
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                Ok(None)
+            }
+        };
+        // Graph ownership is released before acquiring any scheduler bucket.
+        let published = wake.and_then(|wake| {
+            if let Some(wake) = wake {
+                self.publish_channel(&wake.channel)?;
+            }
+            Ok(())
+        });
+        if let Err(error) = published {
+            // The sole pending-exit wake cannot be retried or discarded. The
+            // active clone lane reports typed run failure before guest return.
+            self.run_failure = Some(carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody);
+            return Err(error.errno());
+        }
+        Ok(())
     }
     fn set_calling_tid(&mut self, tid: u32) {
         self.calling_tid = tid;
@@ -2528,6 +2707,203 @@ mod tests {
     }
 
     #[test]
+    fn exit_group_holds_terminal_custody_until_pre_live_claim_settles() {
+        for (claim_live, wake_failure) in [(false, false), (true, false), (false, true)] {
+            let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+            // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+            let zone = unsafe {
+                let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+                assert!(!ptr.is_null());
+                Box::from_raw(ptr)
+            };
+            let page = Box::new(ThreadLifecyclePage::new());
+            let control = Box::new(ThreadControlSlot::new());
+            let child_page = Box::new(ThreadLifecyclePage::new());
+            let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+                ThreadControlSlot::new()
+            }));
+            let task = CurrentTask::new();
+            task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+            task.mm.key.store(1, Ordering::Release);
+            task.mm.thread_generation.store(101, Ordering::Release);
+            task.publish_visible_pid(41);
+            task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+            let address = AddressContext {
+                root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+                mm: MmGeneration::new(NonZeroU64::MIN),
+                generation: ContextGeneration::new(NonZeroU64::MIN),
+            };
+            let slot = carrick_sched_core::SlotId::new(0);
+            let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+            zone.spaces.open(space);
+            zone.drive(slot, 1);
+            zone.publish_slot(slot, 1, Some(0), 1);
+            zone.enter_guest(slot);
+            zone.install_space(slot, 1).unwrap();
+            zone.current_or_new(
+                slot,
+                ThreadIdentity {
+                    tid: 41,
+                    serial: 101,
+                    mm: 1,
+                    file_table: 5,
+                    generation: 11,
+                    affinity: 1,
+                    lifecycle_page: &*page as *const _ as u64,
+                    control_slot: &*control as *const _ as u64,
+                },
+            )
+            .unwrap();
+            let source = BornInZoneSource { zone: &zone, slot };
+            assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
+            assert!(matches!(
+                NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                    source,
+                    &task,
+                    &page,
+                    &control,
+                    address,
+                    address,
+                    words(address),
+                ),
+                Err(NativeProcessError::Invalid)
+            ));
+            assert_eq!(page.live(), 2, "admission must not remove a live member");
+            page.release_live(1).unwrap(); // fixture settles its bootstrap census
+            let runtime =
+                NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                    source,
+                    &task,
+                    &page,
+                    &control,
+                    address,
+                    address,
+                    words(address),
+                )
+                .unwrap();
+            assert_eq!(page.live(), 1);
+            let mut service = Physical {
+                zone: &zone,
+                page: &child_page,
+                controls: &*child_controls,
+                copies: Vec::new(),
+                refuse_copy: false,
+            };
+            assert!(zone.slot(slot).current().is_none());
+            let home = zone.slot(slot).host_record().unwrap();
+            let mut entry = runtime
+                .enter(source, &task, words(address), &mut service)
+                .unwrap();
+            page.stock(
+                0,
+                EntryIdentity {
+                    tid: 42,
+                    visible_tid: 42,
+                    thread_serial: 102,
+                    uid_credit: 0,
+                },
+            )
+            .unwrap();
+            let claim = page.claim_any().unwrap();
+            if claim_live {
+                assert_eq!(page.thread_born(), Some(2));
+            }
+            assert!(
+                matches!(entry.exit_group(9), LifecycleOutcome::Transferred { .. }),
+                "exit must suspend, never return guest EAGAIN"
+            );
+            assert_eq!(page.gate(), carrick_el1_abi::GateState::Closed);
+            assert_eq!(page.live(), if claim_live { 2 } else { 1 });
+            assert!(entry.take_run_failure().is_none());
+            assert!(entry.take_root_exit().is_none());
+            assert!(entry.take_handoff_receipt().is_some());
+            assert_eq!(zone.slot(slot).queued(), 0);
+            assert_eq!(
+                entry.thread_spawned(41, 42, &mut || panic!("terminal close admitted Born")),
+                Err(-11)
+            );
+            if claim_live {
+                assert_eq!(page.try_exit(), Ok(1));
+            }
+            page.unclaim(claim).unwrap();
+            // Claim owners deliver their settlement only after rollback is complete.
+            // Direct hook invocation models that production lifecycle notification.
+            if wake_failure {
+                let channel = runtime
+                    .graph
+                    .lock()
+                    .pending_exit
+                    .get(&entry.key)
+                    .unwrap()
+                    .channel
+                    .clone();
+                let guard = zone
+                    .lock(
+                        ZoneTables::<ParkedContextWords>::bucket_of_with_context(
+                            channel.mm,
+                            WaitChannel::address(&channel),
+                        ),
+                        &BoundedSpin(LOCK_SPINS),
+                    )
+                    .unwrap();
+                assert_eq!(entry.lifecycle_admission_settled(), Err(-11));
+                assert_eq!(
+                    entry.take_run_failure(),
+                    Some(carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody)
+                );
+                assert!(entry.take_root_exit().is_none());
+                assert_eq!(zone.slot(slot).queued(), 0);
+                assert_eq!(page.live(), 1);
+                assert!(runtime.graph.lock().pending_exit.contains_key(&entry.key));
+                drop(guard);
+                continue;
+            }
+            entry.lifecycle_admission_settled().unwrap();
+            assert_eq!(zone.slot(slot).queued(), 1);
+            let channel = runtime
+                .graph
+                .lock()
+                .pending_exit
+                .get(&entry.key)
+                .unwrap()
+                .channel
+                .clone();
+            let published = channel.generation.generation();
+            entry.lifecycle_admission_settled().unwrap();
+            assert_eq!(
+                channel.generation.generation(),
+                published,
+                "wake custody has one publisher"
+            );
+            assert_eq!(zone.slot(slot).queued(), 1);
+            assert!(matches!(
+                page.claim_any(),
+                Err(carrick_el1_abi::TransitionError::GateClosed(_))
+            ));
+            assert!(
+                matches!(entry.fork(), LifecycleOutcome::Returned { result, .. } if result.raw() == -11)
+            );
+            drop(entry);
+            let selected = zone.switch_in_full(slot).unwrap();
+            assert_eq!(selected.record, home);
+            let mut entry = runtime
+                .enter(source, &task, words(address), &mut service)
+                .unwrap();
+            assert!(matches!(
+                entry.resume_pending_lifecycle().unwrap(),
+                Some(LifecycleOutcome::Transferred { .. })
+            ));
+            assert_eq!(
+                entry.take_root_exit(),
+                Some(LinuxWaitStatus::from_wait_encoding(9 << 8))
+            );
+            assert!(entry.take_handoff_receipt().is_some());
+            assert_eq!(page.live(), 0);
+            assert_eq!(zone.slot(slot).queued(), 0);
+            assert_eq!(zone.record(home).claim(), carrick_sched_core::Claim::Free);
+        }
+    }
+    #[test]
     fn clone_live_membership_blocks_exit_between_graph_unlock_and_enqueue() {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
@@ -2610,7 +2986,6 @@ mod tests {
             refuse_copy: false,
         };
         assert!(zone.slot(slot).current().is_none());
-        let home = zone.slot(slot).host_record().unwrap();
         let mut entry = runtime
             .enter(source, &task, words(address), &mut service)
             .unwrap();
@@ -2626,11 +3001,6 @@ mod tests {
             },
         )
         .unwrap();
-        let claim = page.claim_any().unwrap();
-        assert!(matches!(entry.exit_owned(9), Err(NativeProcessError::Busy)));
-        assert_eq!(page.gate(), carrick_el1_abi::GateState::Open);
-        page.unclaim(claim).unwrap();
-
         let claim = page.claim_any().unwrap();
         assert_eq!(page.thread_born(), Some(2));
         let child = zone
@@ -2663,50 +3033,28 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        // Exact requested injection: the graph guard has dropped, and the
-        // child RecordRef is not yet on the scheduler queue.
+        // The child owns Born membership but has not been enqueued yet.
+        // Group cancellation is not wired: fail the run with typed custody,
+        // preserving graph membership and MM ownership rather than guest errno.
         assert_eq!(zone.slot(slot).queued(), 0);
         assert!(matches!(
             entry.exit_owned(9),
-            Err(NativeProcessError::Unsupported)
-        ));
-        assert!(entry.has_thread(42));
-        assert_eq!(zone.record(child).claim(), carrick_sched_core::Claim::Free);
-        zone.requeue_preempted(slot, child);
-        assert_eq!(zone.slot(slot).queued(), 1);
-        let _ = zone.claim_for_host(
-            child_ref,
-            None,
-            Handback::Cancelled,
-            &BoundedSpin(LOCK_SPINS),
-        );
-        assert_eq!(zone.slot(slot).queued(), 0);
-        zone.free_record(child);
-        page.try_exit().unwrap();
-        entry.thread_exited(42);
-        assert_eq!(page.live(), 1);
-        assert!(matches!(
-            entry.exit_group(9),
-            LifecycleOutcome::Transferred {
-                progress: carrick_core::Served::Idle,
-                ..
-            }
+            Ok(LifecycleOutcome::Transferred { .. })
         ));
         assert_eq!(
-            entry.take_root_exit(),
-            Some(LinuxWaitStatus::from_wait_encoding(9 << 8))
+            entry.take_run_failure(),
+            Some(carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody)
         );
         assert!(entry.take_handoff_receipt().is_some());
-        assert_eq!(page.live(), 0);
-        assert!(zone.slot(slot).host_record().is_none());
-        assert!(zone.slot(slot).current().is_none());
-        assert_eq!(zone.record(home).claim(), carrick_sched_core::Claim::Free);
-        assert!(
-            zone.switch_in_full(slot).is_none(),
-            "no stale child RecordRef may run after teardown"
-        );
+        assert!(entry.take_root_exit().is_none());
+        assert!(entry.has_thread(42));
+        assert_eq!(page.live(), 2);
+        assert_eq!(zone.record(child).claim(), carrick_sched_core::Claim::Free);
+        assert!(runtime.graph.lock().owner.task(entry.key).is_ok());
+        assert_eq!(zone.record_ref(child), child_ref);
+        assert_eq!(zone.record(child).identity().tid, 42);
+        assert_eq!(page.state(0).unwrap().1, carrick_el1_abi::EntryState::Born);
     }
-
     #[test]
     fn actual_compact_root_forks_a_shared_owner_child_with_distinct_visible_identity() {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();

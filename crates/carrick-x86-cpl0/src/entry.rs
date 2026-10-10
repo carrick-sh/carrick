@@ -2033,6 +2033,9 @@ mod kernel {
                         None, Some(&GuestLifecycleVenue), Some(&mut process),
                         Some(source), Some(&mut anonymous), cache_lookup,
                     );
+                    if let Some(reason) = process.take_run_failure() {
+                        complete_run_failure(task, reason);
+                    }
                     root_exit = process.take_root_exit();
                     route
                 };
@@ -2045,17 +2048,7 @@ mod kernel {
                 CompletionRoute::Suspended => {
                     drop(_user_fault_gate);
                     if let Some(status) = root_exit {
-                        let exit = carrick_el1_abi::NativeRootExit::new(
-                            carrick_el1::personality::common_entry::execution_binding(task), status,
-                        ).unwrap_or_else(|| initial_boot::fatal_boot());
-                        // SAFETY: shared retirement authenticated this physical VM completion.
-                        unsafe {
-                            core::arch::asm!("out dx, al",
-                                in("dx") carrick_el1_abi::NATIVE_ROOT_EXIT_PORT,
-                                in("rax") &exit as *const _ as u64,
-                                options(nostack, preserves_flags));
-                        }
-                        halt();
+                        native_execution::publish_root_exit(task, status);
                     }
                     let slot = checked_scheduler_slot(carrick_guest_arch::CpuId::new(binding.cpu_slot))
                         .unwrap_or_else(|| initial_boot::fatal_boot());
