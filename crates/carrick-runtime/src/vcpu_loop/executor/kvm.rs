@@ -64,7 +64,7 @@ use carrick_kernel::kernel::continuation::{
     BlockedContinuation, ContinuationCapture, ContinuationResumeEffects, RestartClass,
     RestartDecision, fold_continuation_completion, resume_continuation,
 };
-use carrick_kernel::kernel::objects::{ExecutorId, ThreadExecutionLease};
+use carrick_kernel::kernel::objects::ThreadExecutionLease;
 use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
 use carrick_vmm_kvm::cpl0_boot::{
     GuestExitStatus, InitialProcessExit, InitialSyscallDisposition, ProductionCpuFactory,
@@ -77,7 +77,6 @@ pub(crate) struct KvmPersistentExecutorFactory {
     dispatcher: Arc<Mutex<SyscallDispatcher>>,
     reporter: Arc<CompatReporter>,
     completed: mpsc::Sender<Result<InitialProcessExit, String>>,
-    next_slot: AtomicUsize,
     exits: Arc<AtomicUsize>,
     max_exits: usize,
     stats: Arc<KvmForwardStats>,
@@ -265,7 +264,6 @@ impl KvmPersistentExecutorFactory {
             dispatcher,
             reporter,
             completed,
-            next_slot: AtomicUsize::new(0),
             exits: Arc::new(AtomicUsize::new(0)),
             max_exits,
             stats,
@@ -279,10 +277,25 @@ impl KvmPersistentExecutorFactory {
 impl PersistentExecutorFactory for KvmPersistentExecutorFactory {
     type Executor = KvmPersistentExecutor;
 
-    fn create(&self, _executor: ExecutorId) -> Result<Self::Executor, TrapError> {
-        let slot = self.next_slot.fetch_add(1, Ordering::AcqRel);
+    fn create(
+        &self,
+        registration: &carrick_kernel::kernel::ExecutorRegistration,
+    ) -> Result<Self::Executor, TrapError> {
+        let guest_cpu = registration.bound_cpu().ok_or_else(|| {
+            TrapError::Hypervisor("KVM physical executor has no registered guest CPU".into())
+        })?;
+        let physical = self.physical.claim(guest_cpu.as_usize())?;
+        if physical.physical_slot()
+            != Some(carrick_hal::guest_arch_binding::core_arch::CpuId::new(
+                guest_cpu.as_u32(),
+            ))
+        {
+            return Err(TrapError::Hypervisor(
+                "claimed KVM physical slot differs from registered guest CPU".into(),
+            ));
+        }
         Ok(KvmPersistentExecutor {
-            physical: self.physical.claim(slot)?,
+            physical,
             dispatcher: Arc::clone(&self.dispatcher),
             reporter: Arc::clone(&self.reporter),
             completed: self.completed.clone(),

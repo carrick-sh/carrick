@@ -438,7 +438,11 @@ impl HvpatchTaskEngineBindingState {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl PersistentExecutorFactory for HvpatchPersistentExecutorFactory {
     type Executor = HvpatchPersistentExecutor;
-    fn create(&self, executor: ExecutorId) -> Result<Self::Executor, TrapError> {
+    fn create(
+        &self,
+        registration: &carrick_kernel::kernel::ExecutorRegistration,
+    ) -> Result<Self::Executor, TrapError> {
+        let executor = registration.id();
         let (lifecycle, vcpu) = self.authority.create_executor_parts()?;
         // Guest EL1 switches a vCPU between address spaces through the
         // carrier's maintenance root (EL1 increment 2).
@@ -469,7 +473,10 @@ impl PersistentExecutorFactory for HvpatchPersistentExecutorFactory {
 pub(crate) trait PersistentExecutorFactory: Send + Sync + 'static {
     type Executor: PersistentExecutor;
 
-    fn create(&self, executor: ExecutorId) -> Result<Self::Executor, TrapError>;
+    fn create(
+        &self,
+        registration: &carrick_kernel::kernel::ExecutorRegistration,
+    ) -> Result<Self::Executor, TrapError>;
 }
 
 pub(crate) trait PersistentExecutor: 'static {
