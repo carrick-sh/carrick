@@ -787,6 +787,16 @@ impl Cpl0HostCustody {
         // need its own exact guest receipt. A commit first attaches the
         // child's inherited frames and residency.
         if !record.abort_matches(loan) {
+            // Validate the whole commit before attaching any inherited
+            // frame, so nothing is published for a refused commit.
+            self.fork_stock
+                .validate_commit(
+                    execution,
+                    &record,
+                    |pages| tables_resolve(&self._vm, pages),
+                    |pages| tables_are_zero(&self._vm, pages),
+                )
+                .map_err(|e| fail(format!("physical fork settlement: {e:?}")))?;
             let (completion, custody, count) = record
                 .request(loan)
                 .ok_or_else(|| fail("physical fork settlement receipt"))?;
