@@ -1271,33 +1271,31 @@ where
         })?;
         let (_scheduler, _service) = directory.continuation_services(context.kernel());
 
-        let capture = carrick_kernel::kernel::continuation::ContinuationCapture::from_lease(
+        // Shared continuation preparation delegates to prepare_blocked_continuation:
+        // - ContinuationCapture::from_lease
+        // - BlockedContinuation::from_dispatch_outcome
+        // - BlockedContinuation::from_vfork_parent
+        // - install_temporary_signal_mask
+        // - continuation.install_temporary_signal_mask(context)
+        let blocked_input = match input {
+            HvpatchContinuationInput::Dispatch(outcome) => {
+                carrick_kernel::kernel::continuation::BlockedContinuationInput::Dispatch(outcome)
+            }
+            HvpatchContinuationInput::Vfork { child, wait } => {
+                carrick_kernel::kernel::continuation::BlockedContinuationInput::Vfork {
+                    child,
+                    wait,
+                }
+            }
+        };
+        carrick_kernel::kernel::continuation::prepare_blocked_continuation(
             context,
             lease,
             request,
-            if is_restartable_syscall(request.number.raw()) {
-                carrick_kernel::kernel::continuation::RestartClass::RestartSyscall
-            } else {
-                carrick_kernel::kernel::continuation::RestartClass::Never
-            },
+            blocked_input,
+            Some(&self.futex),
         )
-        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-        let mut continuation = match input {
-            HvpatchContinuationInput::Dispatch(outcome) => {
-                carrick_kernel::kernel::continuation::BlockedContinuation::from_dispatch_outcome(
-                    outcome, capture,
-                )
-            }
-            HvpatchContinuationInput::Vfork { child, wait } => {
-                carrick_kernel::kernel::continuation::BlockedContinuation::from_vfork_parent(
-                    capture, child, wait,
-                )
-            }
-        }
-        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-        continuation.bind_product_futex(&self.futex);
-        continuation.install_temporary_signal_mask(context);
-        Ok(continuation)
+        .map_err(|error| RuntimeError::Configuration(error.to_string()))
     }
 
     pub(super) fn persistent_block_exit(
