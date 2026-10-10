@@ -28,6 +28,7 @@ const VA: u64 = 0x4000_0000;
 const IPA: u64 = 0x9000_0000;
 
 struct TestStockCrossing {
+    fd_map: Vec<carrick_el1_abi::FdMapSlot>,
     grant_tables: std::sync::Mutex<Vec<RootGpa>>,
     total_returned_pages: AtomicU64,
     loans_requested: AtomicUsize,
@@ -39,6 +40,9 @@ struct TestStockCrossing {
 impl TestStockCrossing {
     fn new(stock_pages: &[u64]) -> Self {
         Self {
+            fd_map: (0..carrick_el1_abi::FD_MAP_CAPACITY)
+                .map(|_| carrick_el1_abi::FdMapSlot::default())
+                .collect(),
             grant_tables: std::sync::Mutex::new(
                 stock_pages
                     .iter()
@@ -55,6 +59,10 @@ impl TestStockCrossing {
 }
 
 impl ForkStockCrossing for TestStockCrossing {
+    fn fd_map(&self) -> &[carrick_el1_abi::FdMapSlot] {
+        &self.fd_map
+    }
+
     fn cross_fork_stock(&self, record_gpa: u64, _cpu: u64) -> Result<(), NativeProcessError> {
         let tag = unsafe { *(record_gpa as *const u64) };
         match ForkStockKind::decode(tag) {
@@ -356,6 +364,128 @@ fn test_fork_child_gets_distinct_root_and_x0_zero() {
     assert_eq!(parent_record.root(), parent_ttbr);
 
     let child_binding = runtime.task_binding(child_key).unwrap();
+    assert_eq!(child_binding.words.syscall_return(), 0);
+    assert_eq!(child_binding.words.native.x[0], 0);
+    assert_ne!(child_binding.address.root, fixture.address.root);
+    assert_eq!(
+        child_binding.address.root.address().raw(),
+        0x20000 & AARCH64_ROOT_ADDRESS_MASK
+    );
+
+    // Verify child address space TTBR0 contains the host-assigned ASID in the top 16 bits
+    let child_index = fixture
+        .zone
+        .spaces
+        .find(child_binding.address.mm.raw().get())
+        .unwrap();
+    let grant = fixture
+        .zone
+        .spaces
+        .grant(child_index, child_binding.address.mm.raw().get())
+        .unwrap();
+    assert_eq!(grant.ttbr0 >> 48, 42);
+    assert_eq!(child_binding.words.root(), grant.ttbr0);
+}
+
+#[test]
+fn plain_fork_owns_an_independent_fd_table() {
+    let fixture = Fixture::new(0x10000, asid(1));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut native = ThreadCtx::ZERO;
+    native.x[0] = 99;
+    let parent_ttbr = (1_u64 << 48) | fixture.address.root.address().raw();
+    let parked = Aarch64ParkedContext::from_register(
+        native,
+        parent_ttbr,
+        fixture.address.mm.raw().get(),
+        fixture.address.generation.raw().get(),
+    );
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
+
+    let words = fixture.tables.live(&fixture.maintenance);
+    let crossing = TestStockCrossing::new(&[
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+    ]);
+    let parent_table = fixture.task.linux.file_table.load(Ordering::Acquire);
+    crossing.fd_map[0].set(parent_table, 7, 3, 1);
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::new(1).unwrap(),
+        &crossing,
+    )
+    .with_words(&words);
+
+    let mut entry = runtime
+        .enter(source, &fixture.task, parked, &mut service)
+        .unwrap();
+    let outcome = entry.fork();
+    let LifecycleOutcome::Returned { result, .. } = outcome else {
+        panic!("expected fork to return child pid");
+    };
+    let child_pid = result.raw() as u32;
+    assert_eq!(child_pid, 42);
+
+    let parent_key = TaskKey {
+        id: TaskId::from_abi_positive(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(11).unwrap(),
+    };
+    let child_key = runtime.namespace_child_key(parent_key, child_pid).unwrap();
+    assert_ne!(child_key, parent_key);
+
+    let parent_binding = runtime.task_binding(parent_key).unwrap();
+    let parent_record = unsafe { *fixture.zone.record(parent_binding.record.id).ctx_mut() };
+    assert_eq!(parent_record.root(), parent_ttbr);
+
+    let child_binding = runtime.task_binding(child_key).unwrap();
+    let parent_table = fixture
+        .zone
+        .record(parent_binding.record.id)
+        .identity()
+        .file_table;
+    let child_table = fixture
+        .zone
+        .record(child_binding.record.id)
+        .identity()
+        .file_table;
+    assert_ne!(
+        child_table, parent_table,
+        "plain fork must not share descriptor table identity"
+    );
+    assert_eq!(
+        carrick_el1_abi::fd_map_lookup(&crossing.fd_map, child_table, 7)
+            .unwrap()
+            .0,
+        3
+    );
+    assert!(
+        super::file_table::close_host_binding(&crossing.fd_map, child_table, 7)
+            .unwrap()
+            .release
+            .is_none(),
+        "parent still owns the shared open description"
+    );
+    assert!(carrick_el1_abi::fd_map_lookup(&crossing.fd_map, child_table, 7).is_none());
+    assert_eq!(
+        carrick_el1_abi::fd_map_lookup(&crossing.fd_map, parent_table, 7)
+            .unwrap()
+            .0,
+        3
+    );
     assert_eq!(child_binding.words.syscall_return(), 0);
     assert_eq!(child_binding.words.native.x[0], 0);
     assert_ne!(child_binding.address.root, fixture.address.root);
