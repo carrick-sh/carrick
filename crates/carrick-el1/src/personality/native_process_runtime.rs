@@ -508,6 +508,34 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         runtime.task_binding(process).map(|binding| binding.address)
     }
 
+    /// Diagnostic identity of the registered leader for this exact group.
+    /// Address generation remains separate from scheduler record incarnation.
+    pub fn registered_group_identity(
+        &self,
+        zone: &ZoneTables<C>,
+        address: AddressContext<RootGpa>,
+        page: &ThreadLifecyclePage,
+        visible_pid: u32,
+    ) -> Option<[u64; 7]> {
+        let group = Self::group_key(zone, address, page, visible_pid);
+        let state = self.state.lock();
+        let (_, process) = state.groups.get(&group)?;
+        let (_, keys) = state
+            .by_process
+            .get(&(core::ptr::from_ref(zone).addr(), *process))?;
+        let key = keys.iter().find(|key| key.task == *process)?;
+        let member = state.members.get(key)?;
+        Some([
+            key.task.id.raw() as u64,
+            key.task.serial.raw(),
+            key.mm,
+            key.thread_generation,
+            key.address_generation,
+            u64::from(member.record.id.raw()),
+            member.record.incarnation,
+        ])
+    }
+
     fn register_child(
         &self,
         parent: &NativeProcessRuntime<'a, M, C>,
