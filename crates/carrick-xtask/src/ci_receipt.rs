@@ -11,6 +11,7 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -50,14 +51,34 @@ impl Lane {
     }
 }
 
-/// The artifact name `kernel-runtime.yml` uploads for one lane and SHA.
-pub fn artifact_name(lane: Lane, sha: &str) -> String {
-    format!("receipt-{}-{sha}", lane.name())
+/// The artifact name `kernel-runtime.yml` uploads for one lane, SHA and run
+/// attempt. The attempt keeps a re-run from colliding with an earlier upload.
+pub fn artifact_name(lane: Lane, sha: &str, attempt: u32) -> String {
+    format!("{}{attempt}", artifact_prefix(lane, sha))
+}
+fn artifact_prefix(lane: Lane, sha: &str) -> String {
+    format!("receipt-{}-{sha}-", lane.name())
+}
+/// The newest attempt's receipt among one run's artifacts, if any.
+pub fn newest_receipt(artifacts: &Value, lane: Lane, sha: &str) -> Option<(u32, String)> {
+    let prefix = artifact_prefix(lane, sha);
+    artifacts["artifacts"]
+        .as_array()?
+        .iter()
+        .filter(|a| a["expired"] == false)
+        .filter_map(|a| {
+            let name = a["name"].as_str()?;
+            let attempt = name.strip_prefix(&prefix)?.parse::<u32>().ok()?;
+            Some((attempt, name.to_owned()))
+        })
+        .max()
 }
 
-/// Stable failure identities of one receipt. Itemized test and probe names are
-/// preferred; a failed step contributes its own key only when nothing inside
-/// it was itemized, so a crash is still a failure.
+/// Stable failure identities of one receipt: failed tests, probe diffs and
+/// unitemized failures (crashes, signals, compile errors) each by name. A
+/// failed step adds its own key whenever anything in it is unitemized, or
+/// nothing was itemized at all, so a crash is never hidden behind a test
+/// failure the base also had.
 pub fn failure_keys(receipt: &AcceptReceipt) -> BTreeSet<String> {
     let mut keys = BTreeSet::new();
     for step in &receipt.steps {
@@ -72,13 +93,25 @@ pub fn failure_keys(receipt: &AcceptReceipt) -> BTreeSet<String> {
         for diff in &probes {
             keys.insert(format!("probe:{}:{}", step.name, diff.probe));
         }
-        if !step.passed && step.failed_tests.is_empty() && probes.is_empty() {
+        for failure in &step.unitemized_failures {
+            keys.insert(format!("unitemized:{}:{failure}", step.name));
+        }
+        let itemized = !step.failed_tests.is_empty() || !probes.is_empty();
+        if !step.passed && (!itemized || !step.unitemized_failures.is_empty()) {
             keys.insert(format!("step:{}", step.name));
         }
     }
     for cleanup in &receipt.cleanup_counts {
         if cleanup.remaining_count != 0 {
             keys.insert(format!("leak:{}", cleanup.step));
+        }
+    }
+    for failure in &receipt.failures {
+        if let Some(step) = failure
+            .strip_suffix(&format!("' {}", crate::accept::CLEANUP_UNKNOWN))
+            .and_then(|head| head.strip_prefix("step '"))
+        {
+            keys.insert(format!("cleanup-unknown:{step}"));
         }
     }
     if !receipt.clean_tree {
@@ -146,18 +179,53 @@ fn print_diff(base: &str, diff: &ReceiptDiff) {
 }
 
 /// A run whose receipts may stand as the baseline of their head SHA: this
-/// repository's kernel-runtime workflow on a push to main or a merge group
-/// for main. A merge group's head becomes main's tip unchanged, so its receipt
-/// is a receipt of that same SHA; it is also the only receipt that exists
-/// for a queued entry whose base is the entry ahead of it.
+/// repository's kernel-runtime workflow on a push to main, an owner dispatch
+/// on main (the reseed path), or a merge group for main. A merge group's
+/// head becomes main's tip unchanged, so its receipt is a receipt of that
+/// same SHA; it is also the only receipt for a queued entry whose base is
+/// the entry ahead of it.
 pub fn trusted_baseline_run(run: &Value, sha: &str) -> bool {
     let branch = run["head_branch"].as_str().unwrap_or_default();
     run["head_sha"] == sha
         && run["path"] == KERNEL_RUNTIME_WORKFLOW
         && run["repository"]["full_name"] == REPOSITORY
         && run["head_repository"]["full_name"] == REPOSITORY
-        && ((run["event"] == "push" && branch == "main")
+        && (((run["event"] == "push" || run["event"] == "workflow_dispatch") && branch == "main")
             || (run["event"] == "merge_group" && branch.starts_with("gh-readonly-queue/main/")))
+}
+
+/// What the baseline search found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Baseline {
+    /// Run id and artifact name of the newest receipt.
+    Found(u64, String),
+    /// No receipt yet, but a trusted run of the SHA is still in progress.
+    Pending,
+    /// No receipt, and every trusted run of the SHA has finished.
+    Missing,
+}
+
+/// Decide from the trusted runs of a SHA (newest first) and each run's
+/// artifact listing. The newest run with a receipt wins; within a run, the
+/// newest attempt.
+pub fn baseline_decision(runs: &[(Value, Value)], lane: Lane, sha: &str) -> Baseline {
+    let mut trusted: Vec<&(Value, Value)> = runs
+        .iter()
+        .filter(|(run, _)| trusted_baseline_run(run, sha))
+        .collect();
+    trusted.sort_by_key(|(run, _)| std::cmp::Reverse(run["id"].as_u64().unwrap_or(0)));
+    for (run, artifacts) in &trusted {
+        if let (Some(id), Some((_, name))) =
+            (run["id"].as_u64(), newest_receipt(artifacts, lane, sha))
+        {
+            return Baseline::Found(id, name);
+        }
+    }
+    if trusted.iter().any(|(run, _)| run["status"] != "completed") {
+        Baseline::Pending
+    } else {
+        Baseline::Missing
+    }
 }
 
 fn gh_json(endpoint: &str) -> Result<Value, ReceiptError> {
@@ -195,48 +263,73 @@ fn validate_sha(sha: &str) -> Result<(), ReceiptError> {
     }
 }
 
-/// The newest unexpired receipt artifact for `sha` from a trusted baseline run.
-fn find_baseline(lane: Lane, sha: &str) -> Result<Option<(u64, String)>, ReceiptError> {
+/// One query round: this workflow's runs for the SHA and their artifacts.
+fn query_baseline(lane: Lane, sha: &str) -> Result<Baseline, ReceiptError> {
     validate_sha(sha)?;
-    let name = artifact_name(lane, sha);
+    let workflow = KERNEL_RUNTIME_WORKFLOW
+        .rsplit('/')
+        .next()
+        .unwrap_or(KERNEL_RUNTIME_WORKFLOW);
     let listing = gh_json(&format!(
-        "repos/{REPOSITORY}/actions/artifacts?name={name}&per_page=100"
+        "repos/{REPOSITORY}/actions/workflows/{workflow}/runs?head_sha={sha}&per_page=100"
     ))?;
-    let artifacts = listing["artifacts"]
+    let runs = listing["workflow_runs"]
         .as_array()
-        .ok_or_else(|| ReceiptError::Baseline("artifact listing has no artifacts".into()))?;
-    let mut candidates: Vec<(u64, u64)> = artifacts
-        .iter()
-        .filter(|artifact| {
-            artifact["name"] == name.as_str()
-                && artifact["expired"] == false
-                && artifact["workflow_run"]["head_sha"] == sha
-        })
-        .filter_map(|artifact| {
-            Some((
-                artifact["id"].as_u64()?,
-                artifact["workflow_run"]["id"].as_u64()?,
-            ))
-        })
-        .collect();
-    candidates.sort_unstable();
-    for (_, run_id) in candidates.into_iter().rev() {
-        let run = gh_json(&format!("repos/{REPOSITORY}/actions/runs/{run_id}"))?;
-        if trusted_baseline_run(&run, sha) {
-            return Ok(Some((run_id, name)));
-        }
+        .ok_or_else(|| ReceiptError::Baseline("run listing has no workflow_runs".into()))?;
+    let mut pairs = Vec::new();
+    for run in runs.iter().filter(|run| trusted_baseline_run(run, sha)) {
+        let Some(id) = run["id"].as_u64() else {
+            continue;
+        };
+        let artifacts = gh_json(&format!(
+            "repos/{REPOSITORY}/actions/runs/{id}/artifacts?per_page=100"
+        ))?;
+        pairs.push((run.clone(), artifacts));
     }
-    Ok(None)
+    Ok(baseline_decision(&pairs, lane, sha))
 }
 
-fn download_baseline(lane: Lane, sha: &str, dir: &Path) -> Result<PathBuf, ReceiptError> {
-    let Some((run_id, name)) = find_baseline(lane, sha)? else {
-        return Err(ReceiptError::Baseline(format!(
-            "no baseline: no unexpired '{}' artifact from a push-to-main or merge-group run of {sha}; \
-             run kernel-runtime.yml on main at that SHA (workflow_dispatch does not publish baselines) \
-             or re-queue onto a base that has one",
-            artifact_name(lane, sha)
-        )));
+/// Seeding/reseed instructions named in every missing-baseline error.
+fn reseed_hint(sha: &str) -> String {
+    format!(
+        "seed it with an owner dispatch on main at that SHA: \
+         `gh workflow run kernel-runtime.yml --repo {REPOSITORY} --ref main` while main is {sha}, \
+         then re-queue"
+    )
+}
+
+fn download_baseline(
+    lane: Lane,
+    sha: &str,
+    dir: &Path,
+    wait: Duration,
+    poll: Duration,
+) -> Result<PathBuf, ReceiptError> {
+    let deadline = Instant::now() + wait;
+    let (run_id, name) = loop {
+        match query_baseline(lane, sha)? {
+            Baseline::Found(run, name) => break (run, name),
+            Baseline::Missing => {
+                return Err(ReceiptError::Baseline(format!(
+                    "no baseline: every trusted kernel-runtime.yml run of {sha} finished without a \
+                     receipt-{}-{sha}-<attempt> artifact (or none exists); {}",
+                    lane.name(),
+                    reseed_hint(sha)
+                )));
+            }
+            Baseline::Pending if Instant::now() + poll <= deadline => {
+                println!("base {sha} run in progress; waiting for its receipt");
+                std::thread::sleep(poll);
+            }
+            Baseline::Pending => {
+                return Err(ReceiptError::Baseline(format!(
+                    "no baseline: the base run of {sha} did not publish a receipt within {} minutes; \
+                     re-queue once it finishes, or {}",
+                    wait.as_secs() / 60,
+                    reseed_hint(sha)
+                )));
+            }
+        }
     };
     // Persistent runner workspaces: never read a previous job's download.
     if dir.exists() {
@@ -299,7 +392,8 @@ pub enum ReceiptAction {
         fail_on_new: bool,
     },
     /// Fetch BASE-SHA's trusted receipt, diff CANDIDATE against it and fail on
-    /// NEW. A missing baseline fails closed.
+    /// NEW. While a trusted base run is still in progress, wait (bounded) for
+    /// its receipt; a base run that finished without one fails closed.
     Gate {
         #[arg(long, value_enum)]
         lane: Lane,
@@ -309,6 +403,11 @@ pub enum ReceiptAction {
         candidate: PathBuf,
         #[arg(long, default_value = "target/ci-receipts/baseline")]
         download_dir: PathBuf,
+        /// Upper bound on waiting for an in-progress base run's receipt.
+        #[arg(long, default_value_t = 90)]
+        wait_minutes: u64,
+        #[arg(long, default_value_t = 60)]
+        poll_seconds: u64,
     },
 }
 
@@ -335,9 +434,17 @@ pub fn run(args: ReceiptArgs) -> Result<(), ReceiptError> {
             base_sha,
             candidate,
             download_dir,
+            wait_minutes,
+            poll_seconds,
         } => {
             let candidate = load(&candidate)?;
-            let path = download_baseline(lane, &base_sha, &download_dir)?;
+            let path = download_baseline(
+                lane,
+                &base_sha,
+                &download_dir,
+                Duration::from_secs(wait_minutes * 60),
+                Duration::from_secs(poll_seconds.max(1)),
+            )?;
             let base = load(&path)?;
             if base.head != base_sha {
                 return Err(ReceiptError::Baseline(format!(
