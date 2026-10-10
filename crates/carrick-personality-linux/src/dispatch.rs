@@ -370,6 +370,7 @@ fn serve_family<'a, C: EntryContext + 'a>(
             .map_or(FamilyCompletion::Forward.into(), |result| FamilyRun {
                 completion: FamilyCompletion::Complete(result.raw()),
                 returned: Some((result, original)),
+                forward_reason: ForwardReason::FamilyFallback,
             });
     }
     if let Family::Sysinfo(call) = family {
@@ -380,6 +381,7 @@ fn serve_family<'a, C: EntryContext + 'a>(
             .map_or(FamilyCompletion::Forward.into(), |result| FamilyRun {
                 completion: FamilyCompletion::Complete(result.raw()),
                 returned: Some((result, original)),
+                forward_reason: ForwardReason::FamilyFallback,
             });
     }
     let mut returned = None;
