@@ -6900,6 +6900,45 @@ mod tests {
             carrick_kernel::kernel::FrameOwner::HostMm(exact_mm)
         );
     }
+    #[test]
+    fn alias_inventory_uses_transferred_guest_owner_without_changing_linux_mm() {
+        let context = alias_context(67_103);
+        let exact_mm = context.shared().mm().id();
+        let guest = carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::guest_arch_binding::core_arch::MmGeneration::new(
+                std::num::NonZeroU64::new(91001).unwrap(),
+            ),
+            root_generation: carrick_hal::guest_arch_binding::core_arch::ContextGeneration::new(
+                std::num::NonZeroU64::new(7).unwrap(),
+            ),
+        };
+        context
+            .kernel()
+            .transfer_frame_inventory_to_guest(&context, guest)
+            .unwrap();
+        let commit = mock_alias_commit(&context);
+
+        apply_alias_frame_inventory(&context, commit).expect("alias publication");
+
+        let snapshot = context
+            .kernel()
+            .frame_inventory()
+            .snapshot_for_mm(carrick_kernel::kernel::FrameOwner::GuestMm(guest));
+        assert_eq!(snapshot.mappings.len(), 1);
+        assert_eq!(context.shared().mm().id(), exact_mm);
+        assert!(
+            context
+                .kernel()
+                .frame_inventory()
+                .snapshot_for_mm(exact_mm)
+                .mappings
+                .is_empty()
+        );
+        assert_eq!(
+            snapshot.mappings[0].mm,
+            carrick_kernel::kernel::FrameOwner::GuestMm(guest)
+        );
+    }
 
     #[test]
     fn hvpatch_migration_endpoint_routes_task_wake_to_exact_scheduler_generation() {
