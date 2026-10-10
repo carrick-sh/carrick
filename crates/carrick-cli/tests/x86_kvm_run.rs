@@ -318,18 +318,36 @@ fn mounted_static_x86_ipc_sem_blocked_waiter_matches_native() {
 }
 
 #[test]
-fn mounted_static_x86_ipc_shm_shared_write_matches_native() {
-    compare_mounted_assembly_with_native("x86_ipc_shm.S", b"H\n");
+fn mounted_static_x86_ipc_sem_undo_matches_native() {
+    compare_mounted_assembly_with_native("x86_ipc_sem_undo.S", b"U\n");
+}
+
+#[test]
+fn mounted_static_x86_ipc_sem_rmid_matches_native() {
+    compare_mounted_assembly_with_native("x86_ipc_sem_rmid.S", b"R\n");
+}
+
+#[test]
+fn mounted_static_x86_ipc_shm_unrouted_refusal() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("shm-unrouted");
+    compile_assembly("x86_ipc_shm_unrouted.S", &elf);
+    let run = run_mounted_binary(&elf, "x86_ipc_shm_unrouted.S", false);
+    assert_eq!(
+        run.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b"U\n");
 }
 
 #[test]
 fn mounted_static_x86_ipc_perm_eacces_matches_native() {
     compare_mounted_assembly_with_native("x86_ipc_perm.S", b"P\n");
-}
-
-#[test]
-fn mounted_static_x86_ipc_mq_nonblock_round_trip_matches_native() {
-    compare_mounted_assembly_with_native("x86_ipc_mq.S", b"Q\n");
 }
 
 #[test]

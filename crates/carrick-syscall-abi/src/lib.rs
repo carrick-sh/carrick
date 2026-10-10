@@ -5,6 +5,7 @@ use bitflags::bitflags;
 
 mod capability;
 mod errno;
+pub mod ipc;
 pub mod syscall_x86_64;
 pub use capability::{
     CAP_AUDIT_CONTROL, CAP_AUDIT_READ, CAP_AUDIT_WRITE, CAP_BLOCK_SUSPEND, CAP_BPF,
@@ -16,7 +17,11 @@ pub use capability::{
     CAP_SYS_NICE, CAP_SYS_PACCT, CAP_SYS_PTRACE, CAP_SYS_RAWIO, CAP_SYS_RESOURCE, CAP_SYS_TIME,
     CAP_SYS_TTY_CONFIG, CAP_SYSLOG, CAP_WAKE_ALARM, LinuxCapabilitySet,
 };
-pub use errno::{LINUX_EAGAIN, LINUX_ECHILD, LINUX_EFAULT, LINUX_EINVAL, LinuxErrno};
+pub use errno::{
+    LINUX_E2BIG, LINUX_EACCES, LINUX_EAGAIN, LINUX_ECHILD, LINUX_EEXIST, LINUX_EFAULT, LINUX_EFBIG,
+    LINUX_EIDRM, LINUX_EINTR, LINUX_EINVAL, LINUX_ENOENT, LINUX_ENOMSG, LINUX_ENOSPC, LINUX_ENOSYS,
+    LINUX_EPERM, LINUX_ERANGE, LINUX_ESRCH, LinuxErrno,
+};
 
 /// Canonical numbers served by the shared guest lifecycle owner.
 pub mod nr {

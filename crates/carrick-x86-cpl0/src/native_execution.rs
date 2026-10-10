@@ -69,6 +69,14 @@ pub(super) fn schedule(slot: SlotId) -> ! {
     let current = task();
     source.zone.release_space(slot);
     loop {
+        let now = {
+            let (lo, hi): (u32, u32);
+            unsafe {
+                core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags));
+            }
+            ((hi as u64) << 32) | (lo as u64)
+        };
+        let _ = source.zone.expire_timer(slot, now, carrick_syscall_abi::LINUX_EAGAIN.guest_retval() as u64);
         if let Some(selected) = source.zone.switch_in_full(slot) {
             source.zone.leave_idle(slot);
             let runtime = native_process::runtime();
@@ -120,6 +128,11 @@ pub(super) fn schedule(slot: SlotId) -> ! {
                 Err(_) => initial_boot::fatal_boot(),
             }
         }
+        let dl = source.zone.timer_deadline(slot);
+        if let Some(dl) = dl {
+            use carrick_guest_arch::{CounterTick, Deadline, InterruptBackend};
+            let _ = carrick_el1::isa::x86::X86Backend.arm_timer(Some(Deadline(CounterTick::new(dl))));
+        }
         if source.zone.enter_idle(slot, true) {
             // SAFETY: the shared slot lock closed the queue-vs-sleep race;
             // STI's shadow makes the HLT atomic with enabling wake delivery.
@@ -127,6 +140,10 @@ pub(super) fn schedule(slot: SlotId) -> ! {
                 core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
             }
             source.zone.leave_idle(slot);
+        }
+        if dl.is_some() {
+            use carrick_guest_arch::InterruptBackend;
+            let _ = carrick_el1::isa::x86::X86Backend.arm_timer(None);
         }
     }
 }

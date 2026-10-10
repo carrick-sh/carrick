@@ -51,7 +51,20 @@ impl LinuxErrno {
     }
 }
 
+pub const LINUX_EPERM: LinuxErrno = LinuxErrno::new(1);
+pub const LINUX_ENOENT: LinuxErrno = LinuxErrno::new(2);
+pub const LINUX_ESRCH: LinuxErrno = LinuxErrno::new(3);
+pub const LINUX_EINTR: LinuxErrno = LinuxErrno::new(4);
+pub const LINUX_E2BIG: LinuxErrno = LinuxErrno::new(7);
 pub const LINUX_ECHILD: LinuxErrno = LinuxErrno::new(10);
 pub const LINUX_EAGAIN: LinuxErrno = LinuxErrno::new(11);
+pub const LINUX_EACCES: LinuxErrno = LinuxErrno::new(13);
 pub const LINUX_EFAULT: LinuxErrno = LinuxErrno::new(14);
+pub const LINUX_EEXIST: LinuxErrno = LinuxErrno::new(17);
 pub const LINUX_EINVAL: LinuxErrno = LinuxErrno::new(22);
+pub const LINUX_EFBIG: LinuxErrno = LinuxErrno::new(27);
+pub const LINUX_ENOSPC: LinuxErrno = LinuxErrno::new(28);
+pub const LINUX_ERANGE: LinuxErrno = LinuxErrno::new(34);
+pub const LINUX_ENOSYS: LinuxErrno = LinuxErrno::new(38);
+pub const LINUX_ENOMSG: LinuxErrno = LinuxErrno::new(42);
+pub const LINUX_EIDRM: LinuxErrno = LinuxErrno::new(43);

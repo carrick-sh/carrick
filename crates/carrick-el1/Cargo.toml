@@ -14,6 +14,7 @@ carrick-inotify-core = { path = "../carrick-inotify-core" }
 carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-sched-core = { path = "../carrick-sched-core" }
 carrick-signal-core = { path = "../carrick-signal-core" }
+carrick-syscall-abi = { path = "../carrick-syscall-abi" }
 zerocopy.workspace = true
 
 [features]

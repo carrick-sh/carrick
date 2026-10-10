@@ -167,6 +167,9 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     fn take_handoff_receipt(&mut self) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
         None
     }
+    fn guest_isa(&self) -> carrick_guest_arch::GuestIsa {
+        carrick_guest_arch::GuestIsa::Aarch64
+    }
     fn binding(&self) -> Option<carrick_core_abi::ExecutionBinding>;
     fn record_source(&self) -> Option<carrick_core_abi::BornInZoneSource<'a, C>> {
         None
@@ -366,22 +369,24 @@ fn serve_family<'a, C: EntryContext + 'a>(
     }
     if let Family::Ipc(call) = family {
         let original = pending.original_argument0();
-        return pending
-            .ipc_native()
-            .and_then(|native| crate::ipc::invoke(call, native))
-            .map_or(FamilyCompletion::Forward.into(), |outcome| {
-                let (completion, returned) = match outcome {
-                    crate::ipc::IpcOutcome::Returned(result) => (
-                        FamilyCompletion::Complete(result.raw()),
-                        Some((result, original)),
-                    ),
-                    crate::ipc::IpcOutcome::Suspended => (FamilyCompletion::Suspended, None),
-                };
-                FamilyRun {
-                    completion,
-                    returned,
-                }
-            });
+        let outcome = if let Some(native) = pending.ipc_native() {
+            crate::ipc::invoke(call, native)
+        } else {
+            crate::ipc::IpcOutcome::Returned(SyscallResult::new(
+                carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
+            ))
+        };
+        let (completion, returned) = match outcome {
+            crate::ipc::IpcOutcome::Returned(result) => (
+                FamilyCompletion::Complete(result.raw()),
+                Some((result, original)),
+            ),
+            crate::ipc::IpcOutcome::Suspended => (FamilyCompletion::Suspended, None),
+        };
+        return FamilyRun {
+            completion,
+            returned,
+        };
     }
     let mut returned = None;
     let completion = match family {
@@ -408,7 +413,7 @@ fn serve_family<'a, C: EntryContext + 'a>(
         Family::Lifecycle(_) => FamilyCompletion::Forward,
         Family::Identity(_) => FamilyCompletion::Forward,
         Family::Sysinfo(_) => FamilyCompletion::Forward,
-        Family::Ipc(_) => FamilyCompletion::Forward,
+        Family::Ipc(_) => unreachable!("Family::Ipc handled above"),
         Family::Futex => pending.futex(),
         Family::InotifyAdd => pending.inotify_add(),
         Family::InotifyRemove => pending.inotify_remove(),
@@ -536,18 +541,14 @@ pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
         nr if nr == carrick_syscall_abi::nr::PRLIMIT64.raw() => {
             Family::Sysinfo(SysinfoCall::Prlimit64)
         }
-        nr if nr == carrick_syscall_abi::nr::MQ_OPEN.raw() => Family::Ipc(IpcCall::MqOpen),
-        nr if nr == carrick_syscall_abi::nr::MQ_UNLINK.raw() => Family::Ipc(IpcCall::MqUnlink),
-        nr if nr == carrick_syscall_abi::nr::MQ_TIMEDSEND.raw() => {
-            Family::Ipc(IpcCall::MqTimedSend)
-        }
-        nr if nr == carrick_syscall_abi::nr::MQ_TIMEDRECEIVE.raw() => {
-            Family::Ipc(IpcCall::MqTimedReceive)
-        }
-        nr if nr == carrick_syscall_abi::nr::MQ_NOTIFY.raw() => Family::Ipc(IpcCall::MqNotify),
-        nr if nr == carrick_syscall_abi::nr::MQ_GETSETATTR.raw() => {
-            Family::Ipc(IpcCall::MqGetSetAttr)
-        }
+        nr if allocator_control != u64::MAX && nr == allocator_control => Family::AllocatorControl,
+        _ => Family::Unported,
+    }
+}
+
+/// Route one x86_64 Linux canonical ordinal.
+pub const fn route_x86(ordinal: u64, allocator_control: u64) -> Family {
+    match ordinal {
         nr if nr == carrick_syscall_abi::nr::MSGGET.raw() => Family::Ipc(IpcCall::MsgGet),
         nr if nr == carrick_syscall_abi::nr::MSGCTL.raw() => Family::Ipc(IpcCall::MsgCtl),
         nr if nr == carrick_syscall_abi::nr::MSGRCV.raw() => Family::Ipc(IpcCall::MsgRcv),
@@ -556,12 +557,7 @@ pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
         nr if nr == carrick_syscall_abi::nr::SEMCTL.raw() => Family::Ipc(IpcCall::SemCtl),
         nr if nr == carrick_syscall_abi::nr::SEMTIMEDOP.raw() => Family::Ipc(IpcCall::SemTimedOp),
         nr if nr == carrick_syscall_abi::nr::SEMOP.raw() => Family::Ipc(IpcCall::SemOp),
-        nr if nr == carrick_syscall_abi::nr::SHMGET.raw() => Family::Ipc(IpcCall::ShmGet),
-        nr if nr == carrick_syscall_abi::nr::SHMCTL.raw() => Family::Ipc(IpcCall::ShmCtl),
-        nr if nr == carrick_syscall_abi::nr::SHMAT.raw() => Family::Ipc(IpcCall::ShmAt),
-        nr if nr == carrick_syscall_abi::nr::SHMDT.raw() => Family::Ipc(IpcCall::ShmDt),
-        nr if allocator_control != u64::MAX && nr == allocator_control => Family::AllocatorControl,
-        _ => Family::Unported,
+        _ => route_aarch64(ordinal, allocator_control),
     }
 }
 
@@ -686,7 +682,10 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
     control: u64,
     pending: &mut dyn PendingFamilies<'a, C>,
 ) -> CompletionRoute {
-    let family = route_aarch64(ordinal, control);
+    let family = match pending.guest_isa() {
+        carrick_guest_arch::GuestIsa::X86_64 => route_x86(ordinal, control),
+        carrick_guest_arch::GuestIsa::Aarch64 => route_aarch64(ordinal, control),
+    };
     let completion = match pending.binding().and_then(|binding| {
         if let Some(token) = carrick_core::entry::admit(binding, pending.record_source()) {
             Some(CompletionAuthority::Entry(token))

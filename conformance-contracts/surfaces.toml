@@ -1078,3 +1078,32 @@ contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.el1
 [[surfaces]]
 path = "crates/carrick-vmm-kvm/src/carrier_memory/tests.rs"
 contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents"]
+
+[[surfaces]]
+path = "crates/carrick-sched-core/src/process/ipc.rs"
+contracts = ["kernel.el1.thread-lifecycle"]
+
+[[surfaces]]
+path = "crates/carrick-sched-core/src/process/credential_tests.rs"
+contracts = ["kernel.el1.thread-lifecycle"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/ipc.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/identity.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/sysinfo.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-syscall-abi/src/capability.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-syscall-abi/src/ipc.rs"
+contracts = ["core.entry.completion"]
+

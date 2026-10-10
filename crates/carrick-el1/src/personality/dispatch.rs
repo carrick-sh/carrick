@@ -604,6 +604,13 @@ impl<
         self.current_tasks.get(self.frame.task_index())?;
         Some(self)
     }
+    fn guest_isa(&self) -> carrick_guest_arch::GuestIsa {
+        if self.frame.arm_scheduler() {
+            carrick_guest_arch::GuestIsa::Aarch64
+        } else {
+            carrick_guest_arch::GuestIsa::X86_64
+        }
+    }
     fn ipc_native(&mut self) -> Option<&mut dyn carrick_personality_linux::ipc::IpcNative<'a>> {
         self.process.as_ref()?;
         self.current_tasks.get(self.frame.task_index())?;
