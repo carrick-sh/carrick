@@ -41,7 +41,7 @@ pub enum IpcOutcome {
     Suspended,
 }
 
-pub type MsgrcvMessage = (i64, Vec<u8>);
+pub type MsgrcvMessage = (usize, i64, Vec<u8>);
 pub type MsgrcvResult = Result<(IpcOutcome, Option<MsgrcvMessage>), i64>;
 
 pub trait ProcessIpcVenue {
@@ -63,7 +63,13 @@ pub trait ProcessIpcVenue {
         msgflg: i32,
         msgsz: usize,
     ) -> MsgrcvResult;
-    fn msgrcv_restore(&mut self, msqid: i32, mtype: i64, data: Vec<u8>) -> Result<(), i64>;
+    fn msgrcv_restore(
+        &mut self,
+        msqid: i32,
+        original_idx: usize,
+        mtype: i64,
+        data: Vec<u8>,
+    ) -> Result<(), i64>;
 
     fn semget(&mut self, key: i32, nsems: i32, semflg: i32) -> Result<i32, i64>;
     fn sem_nsems(&mut self, semid: i32) -> Result<usize, i64>;
@@ -251,10 +257,10 @@ fn invoke_msg<'a>(call: IpcCall, args: &[u64; 6], native: &mut dyn IpcNative<'a>
             if msgp.raw() == 0 {
                 return ret_errno(LINUX_EFAULT);
             }
-            if (msgsz_raw as i64) < 0 || msgsz_raw > MSGMAX as u64 {
+            if (msgsz_raw as i64) < 0 {
                 return ret_errno(LINUX_EINVAL);
             }
-            let msgsz = msgsz_raw as usize;
+            let msgsz = (msgsz_raw as usize).min(MSGMAX);
             let res = {
                 let Some(venue) = native.process_ipc() else {
                     return ret_errno(LINUX_ENOSYS);
@@ -262,14 +268,14 @@ fn invoke_msg<'a>(call: IpcCall, args: &[u64; 6], native: &mut dyn IpcNative<'a>
                 venue.msgrcv(msqid, msgp, msgtyp, msgflg, msgsz)
             };
             match res {
-                Ok((outcome, Some((mtype, data)))) => {
+                Ok((outcome, Some((original_idx, mtype, data)))) => {
                     let text_va = UserVa::new(msgp.raw().wrapping_add(8));
                     let copy_ok = copy_val_out(native, msgp, &mtype)
                         && (data.is_empty() || native.copy_out(text_va, &data));
                     if !copy_ok {
-                        // Restore message to head of queue so it is not lost!
+                        // Restore message to original position in queue so it is not lost!
                         if let Some(venue) = native.process_ipc() {
-                            let _ = venue.msgrcv_restore(msqid, mtype, data);
+                            let _ = venue.msgrcv_restore(msqid, original_idx, mtype, data);
                         }
                         return ret_errno(LINUX_EFAULT);
                     }

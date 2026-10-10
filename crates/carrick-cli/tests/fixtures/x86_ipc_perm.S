@@ -3,6 +3,7 @@
 .global _start
 .text
 _start:
+    mov $-1, %r12
     # 1. Drop/ensure uid 1000: setresuid(1000, 1000, 1000)
     # (On native Linux running as uid 1000, this succeeds; inside Carrick starting as root, this succeeds).
     mov $1000, %rdi
@@ -104,21 +105,33 @@ fail_msgget:
     jmp exit
 fail_owner_send:
     mov $93, %rdi
-    jmp exit
+    jmp fail_cleanup
 fail_owner_rcv:
     mov $94, %rdi
-    jmp exit
+    jmp fail_cleanup
 fail_stat:
     mov $95, %rdi
-    jmp exit
+    jmp fail_cleanup
 fail_set:
     mov $96, %rdi
-    jmp exit
+    jmp fail_cleanup
 fail_eacces:
     mov $97, %rdi
-    jmp exit
+    jmp fail_cleanup
 fail_rmid:
     mov $98, %rdi
+    jmp fail_cleanup
+
+fail_cleanup:
+    push %rdi
+    cmp $0, %r12
+    jl 1f
+    mov %r12, %rdi
+    xor %rsi, %rsi              # IPC_RMID = 0
+    xor %rdx, %rdx
+    mov $71, %rax               # SYS_msgctl
+    syscall
+1:  pop %rdi
     jmp exit
 
 exit:
