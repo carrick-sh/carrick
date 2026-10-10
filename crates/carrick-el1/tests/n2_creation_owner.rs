@@ -8,7 +8,8 @@
 //! child stack VA. Stocked identities are fixture resources, not host services.
 //!
 //! The 21-ID census is a baseline characterization, not a zero-work acceptance
-//! pass: process clone and exec still forward. The zero-dispatch budget reds
+//! pass: process clone and exec still forward under explicit OptOut. Strict
+//! separately proves counted refusal for calls lacking entry admission. The zero-dispatch budget reds
 //! live in a separate follow-on commit on work/n2a-witness for the N2 ownership
 //! landing. Hardware MM/IPC execution, loader byte batches and runtime executor
 //! exhaustion remain unsupported in this layer.
@@ -21,7 +22,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use carrick_el1::personality::lifecycle::{LifecycleThread, LifecycleVenue};
-use carrick_el1::{Zone, dispatch_syscall_with_lifecycle, dispatch_syscall_with_regions, sched};
+use carrick_el1::{Zone, dispatch_syscall_with_lifecycle, sched};
 use carrick_el1_abi::{
     Action, BlockedMask, Counters, CurrentTask, El1TaskId, EntryIdentity, EntryRef, EntryState,
     InotifyNameCache, SlotId, THREAD_POOL_ENTRIES, ThreadControlSlot, ThreadCtx,
@@ -268,8 +269,19 @@ fn admitted_thread_creation_owns_one_completion_at_1_8_32() {
     }
 }
 
+#[path = "support/policy.rs"]
+mod policy;
+use carrick_guest_mem::ArmRingFirst;
+
 #[test]
-fn complete_creation_surface_census_counts_each_nonadmitted_forward_once() {
+fn complete_creation_surface_census_counts_each_nonadmitted_forward_once_opt_out() {
+    nonadmitted_creation_census(ArmRingFirst::OptOut);
+}
+#[test]
+fn complete_creation_surface_census_counts_each_nonadmitted_refusal_once_strict() {
+    nonadmitted_creation_census(ArmRingFirst::Strict);
+}
+fn nonadmitted_creation_census(policy: ArmRingFirst) {
     for n in [1, 8, 32] {
         let counters = Counters::default();
         let tasks = [CurrentTask::new(), CurrentTask::new()];
@@ -277,6 +289,11 @@ fn complete_creation_surface_census_counts_each_nonadmitted_forward_once() {
             task.mm.key.store(mm, Ordering::Release);
         }
         for nr in CREATION_IDS {
+            let refused = policy.is_strict()
+                && matches!(
+                    nr,
+                    220 | 96 | 178 | 122 | 103 | 134 | 214 | 215 | 222 | 226 | 98 | 260 | 99
+                );
             for i in 0..n {
                 let mut frame = TrapFrame {
                     slot: (i % 2) as u64,
@@ -284,10 +301,17 @@ fn complete_creation_surface_census_counts_each_nonadmitted_forward_once() {
                 };
                 frame.x[..6].copy_from_slice(&[17, SAME_VA, 31, 41, 47, 53]);
                 frame.x[8] = nr as u64;
-                let original = frame.x;
+                let mut original = frame.x;
+                if refused {
+                    original[0] =
+                        carrick_personality_linux::crossing::LINUX_ENOSYS.guest_retval() as u64;
+                }
                 assert_eq!(
-                    dispatch_syscall_with_regions(
-                        &mut frame,
+                    dispatch_syscall_with_lifecycle(
+                        &mut policy::PolicyFrame {
+                            frame: &mut frame,
+                            policy
+                        },
                         &counters,
                         &tasks,
                         &[],
@@ -296,23 +320,45 @@ fn complete_creation_surface_census_counts_each_nonadmitted_forward_once() {
                         &[],
                         &InotifyNameCache::new(),
                         None::<Zone<'_, SaveCpu, sched::HardwareUserWord>>,
+                        None,
+                        None,
+                        None,
                         |_| core::ptr::null_mut(),
                     ),
-                    Action::Forward,
+                    if refused {
+                        Action::Served
+                    } else {
+                        Action::Forward
+                    },
                     "numeric ID {nr}"
                 );
                 assert_eq!(frame.x, original);
             }
-            assert_eq!(counters.forwarded[nr].load(Ordering::Relaxed), n as u64);
+            assert_eq!(
+                counters.forwarded[nr].load(Ordering::Relaxed),
+                if refused { 0 } else { n as u64 }
+            );
+            assert_eq!(
+                counters.refused[nr].load(Ordering::Relaxed),
+                if refused { n as u64 } else { 0 }
+            );
             assert_eq!(counters.served[nr].load(Ordering::Relaxed), 0);
         }
+        assert_eq!(
+            counters
+                .refused
+                .iter()
+                .map(|c| c.load(Ordering::Relaxed))
+                .sum::<u64>(),
+            if policy.is_strict() { 13 * n as u64 } else { 0 }
+        );
         assert_eq!(
             counters
                 .forwarded
                 .iter()
                 .map(|c| c.load(Ordering::Relaxed))
                 .sum::<u64>(),
-            21 * n as u64
+            if policy.is_strict() { 8 } else { 21 } * n as u64
         );
     }
 }
