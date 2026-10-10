@@ -245,6 +245,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                             ) {
                                 Ok(service) => service,
                                 Err(_) => {
+                                    counters.record_first_process_service_failure(ttbr0);
                                     return refuse_owner_process_call(
                                         frame,
                                         counters,
