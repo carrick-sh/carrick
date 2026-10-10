@@ -1,0 +1,168 @@
+   Compiling ring v0.17.14
+   Compiling rustls v0.23.40
+   Compiling rustls-webpki v0.103.13
+   Compiling tokio-rustls v0.26.4
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.12.28
+   Compiling oci-client v0.15.0
+   Compiling carrick-spec v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/crates/carrick-spec)
+   Compiling carrick-conformance v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/crates/carrick-conformance)
+   Compiling carrick-xtask v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/crates/carrick-xtask)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.77s
+     Running `target/debug/carrick-xtask worktree-run -- /bin/bash scripts/lib/test-signed-body.sh carrick-embed el1_fork_cow_resolves_in_guest --exact --nocapture`
+   Compiling ring v0.17.14
+   Compiling rustls v0.23.40
+   Compiling rustls-webpki v0.103.13
+   Compiling tokio-rustls v0.26.4
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.12.28
+   Compiling oci-client v0.15.0
+   Compiling carrick-spec v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/crates/carrick-spec)
+   Compiling carrick-conformance v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/crates/carrick-conformance)
+   Compiling carrick-xtask v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/crates/carrick-xtask)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.09s
+     Running `target/debug/carrick-xtask host-lease --mode carrick --check-load -- ./scripts/test-signed.sh carrick-embed el1_fork_cow_resolves_in_guest --exact --nocapture`
+host-load: no known load generators present (CARRICK_ALLOW_LOAD=0)
+host-lease: acquired carrick at /tmp/carrick-host-lease.lock
+host-load: no known load generators present (CARRICK_ALLOW_LOAD=0)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running `target/debug/carrick-xtask worktree-run -- /bin/bash scripts/lib/test-signed-body.sh carrick-embed el1_fork_cow_resolves_in_guest --exact --nocapture`
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running `target/debug/carrick-xtask host-lease --mode carrick --check-load -- true`
+host-load: no known load generators present (CARRICK_ALLOW_LOAD=0)
+host-load: no known load generators present (CARRICK_ALLOW_LOAD=0)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running `target/debug/carrick-xtask fixtures verify --receipt /var/folders/8f/dl9bkkyn1zs5ycl864wv184h0000gn/T//carrick-test-signed-fixtures.DKrSiJ`
+fixtures: verified 1135 executables for 4b62f3a6ab981de754567ea326be3e9a238ac8df by input_identity 0196f252b697e4870b2d7296ae90df34823e2fac1ecac06b659a245545b543b1 (bundle built at 4b62f3a6ab981de754567ea326be3e9a238ac8df)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.21s
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/carrick_embed-c71dc79e963f2b94.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/carrick_embed-c71dc79e963f2b94.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/carrick_embed-c71dc79e963f2b94
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/two_container_capture_identity-075c32c14a3841f8.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/two_container_capture_identity-075c32c14a3841f8.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/two_container_capture_identity-075c32c14a3841f8
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/scheduler_preemption-88df51846f78062f.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/scheduler_preemption-88df51846f78062f.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/scheduler_preemption-88df51846f78062f
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/host_wait_policy-131d256c619b8220.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/host_wait_policy-131d256c619b8220.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/host_wait_policy-131d256c619b8220
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/crash_parked_thread-ec41672b2d4057ea.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/crash_parked_thread-ec41672b2d4057ea.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/crash_parked_thread-ec41672b2d4057ea
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_files-786dcebd387f647d.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_files-786dcebd387f647d.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_files-786dcebd387f647d
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/wedge_capture_ladder-596b402b521cda3c.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/wedge_capture_ladder-596b402b521cda3c.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/wedge_capture_ladder-596b402b521cda3c
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_kick_served_loop-91b07261de392eff.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_kick_served_loop-91b07261de392eff.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_kick_served_loop-91b07261de392eff
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/entitlement_negative-cfec06300d2f41a8.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/entitlement_negative-cfec06300d2f41a8.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/entitlement_negative-cfec06300d2f41a8
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/guest_smoke-e9171aa6f7c9e6d4.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/guest_smoke-e9171aa6f7c9e6d4.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/guest_smoke-e9171aa6f7c9e6d4
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/inotify_hotpath_contract-276166b22bfd2c66.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/inotify_hotpath_contract-276166b22bfd2c66.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/inotify_hotpath_contract-276166b22bfd2c66
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/scheduler_race-342c7b6e9c3b02fc.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/scheduler_race-342c7b6e9c3b02fc.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/scheduler_race-342c7b6e9c3b02fc
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/discard_fork_threads-f88cba8cd184cf67.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/discard_fork_threads-f88cba8cd184cf67.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/discard_fork_threads-f88cba8cd184cf67
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_inotify-19486e2922cb3874.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_inotify-19486e2922cb3874.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_inotify-19486e2922cb3874
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/perf_regression-38ff981ecc241252.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/perf_regression-38ff981ecc241252.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/perf_regression-38ff981ecc241252
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_sched-3c5925ab20bafee2.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_sched-3c5925ab20bafee2.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_sched-3c5925ab20bafee2
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/arm_ring_first_hatch-3db083074e7a305b.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/arm_ring_first_hatch-3db083074e7a305b.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/arm_ring_first_hatch-3db083074e7a305b
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/fault_budget_guest-e9b40925b71f93cb.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/fault_budget_guest-e9b40925b71f93cb.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/fault_budget_guest-e9b40925b71f93cb
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/kernel_abort-b6a069056c72cdd9.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/kernel_abort-b6a069056c72cdd9.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/kernel_abort-b6a069056c72cdd9
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_host_copyout-70d5da62a5045620.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_host_copyout-70d5da62a5045620.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_host_copyout-70d5da62a5045620
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_vcpu_lifetime-c662ded9b1afa2bd.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_vcpu_lifetime-c662ded9b1afa2bd.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_vcpu_lifetime-c662ded9b1afa2bd
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/realtime_calibration-635197f5db92a9b5.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/realtime_calibration-635197f5db92a9b5.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/realtime_calibration-635197f5db92a9b5
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/conformance_contracts-3894949c50ae9600.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/conformance_contracts-3894949c50ae9600.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/conformance_contracts-3894949c50ae9600
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/two_process_parallelism-fa34b941a9af7436.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/two_process_parallelism-fa34b941a9af7436.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/two_process_parallelism-fa34b941a9af7436
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/capture_identity_lifecycle-f9d8074f98502f60.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/capture_identity_lifecycle-f9d8074f98502f60.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/capture_identity_lifecycle-f9d8074f98502f60
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/exec_publication_icache-ca027dccf1b9a516.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/exec_publication_icache-ca027dccf1b9a516.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/exec_publication_icache-ca027dccf1b9a516
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/write_seek_contract-4759d7667f3651a7.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/write_seek_contract-4759d7667f3651a7.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/write_seek_contract-4759d7667f3651a7
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/coarse_clock_vdso-1cae071185ea6a48.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/coarse_clock_vdso-1cae071185ea6a48.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/coarse_clock_vdso-1cae071185ea6a48
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_ipc_routing-e78085109104c30a.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_ipc_routing-e78085109104c30a.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_ipc_routing-e78085109104c30a
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_inotify09_probe-e3264a61e11e095f.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_inotify09_probe-e3264a61e11e095f.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_inotify09_probe-e3264a61e11e095f
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/shared_buffer_futex-d2682c4715889770.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/shared_buffer_futex-d2682c4715889770.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/shared_buffer_futex-d2682c4715889770
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_transparent-1a9f788a6aaa3b8d.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_transparent-1a9f788a6aaa3b8d.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_transparent-1a9f788a6aaa3b8d
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_gic-bceb496884f2bb1c.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_gic-bceb496884f2bb1c.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_gic-bceb496884f2bb1c
+/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/vtool warning: code signature will be invalid for /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/pt_pause_drain_pressure-43ec440a6682eaf7.tmp.58603
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/pt_pause_drain_pressure-43ec440a6682eaf7.tmp.58603: replacing existing signature
+test-signed: signed /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/pt_pause_drain_pressure-43ec440a6682eaf7
+test-signed: resolved exact filter el1_fork_cow_resolves_in_guest -> el1_fork_cow_resolves_in_guest
+test-signed: running /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_sched-3c5925ab20bafee2 el1_fork_cow_resolves_in_guest --exact --nocapture
+
+running 1 test
+test el1_fork_cow_resolves_in_guest ... 
+thread 'el1_fork_cow_resolves_in_guest' (142072807) panicked at crates/carrick-embed/tests/el1_sched.rs:3497:5:
+warm-up fork failed: exit 1 signal None stdout "fork-cow failed round=0 parent_ok=false child_ok=false\n" stderr ""; rt_sigaction (served, forwarded, refused)=Some([0, 5, 0]); owner process refusal stages=Some([0, 2, 0, 0, 0, 0]); first process admission root=Some(282136401674241); first process admission stage=Some(6); first missing entry [presence,slot_valid,task,current,host; slot; syscall]=Some(0); first native fork failure=None; fork progress=Some([1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0]); returned child stock delta=0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    el1_fork_cow_resolves_in_guest
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 88 filtered out; finished in 0.10s
+
+test-signed: FAIL /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/el1_sched-3c5925ab20bafee2
+/Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/entitlement_negative-cfec06300d2f41a8.noent.58603: replacing existing signature
+test-signed: negative control on /Volumes/CaseSensitive/carrick/.worktrees/arm-step5/target/release/deps/entitlement_negative-cfec06300d2f41a8.noent.58603
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+test-signed: FAILED (carrick-embed)
+remaining carrick procs (run-id arm-step5-sol2-4b62-fork-b) = 0
+remaining carrick procs (run-id arm-step5-sol2-4b62-fork-b-cli) = 0
