@@ -1974,8 +1974,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             );
         }
         let root_exit = self.is_root_process();
-        let wait_status = LinuxWaitStatus::from_wait_encoding(i32::from(status) << 8);
-
         let transaction = self
             .runtime
             .graph
@@ -5044,7 +5042,7 @@ mod tests {
                 while !waiting.load(Ordering::Acquire) && !attempted.load(Ordering::Acquire) {
                     assert!(
                         std::time::Instant::now() < deadline,
-                        "exit publication must reach its generation boundary"
+                        "exit publication must reach the contended bucket"
                     );
                     core::hint::spin_loop();
                 }
@@ -5234,6 +5232,7 @@ mod tests {
                 });
                 assert_eq!(entry.take_run_failure(), None);
             }
+            entry.lifecycle_admission_settled().unwrap();
             assert_eq!(zone.slot(slot).queued(), 1);
             let channel = runtime
                 .graph
@@ -5648,6 +5647,8 @@ mod tests {
         task.publish_visible_pid(42);
         task.publish_lifecycle(child_identity.lifecycle_page, child_identity.control_slot);
         {
+            let waiting = core::sync::atomic::AtomicBool::new(false);
+            let probe = |_| waiting.store(true, Ordering::Release);
             let mut child_entry = runtime
                 .enter(source, &task, child_words, &mut service)
                 .unwrap();
@@ -5803,8 +5804,6 @@ mod tests {
             } else {
                 let outcome = if let Some(parent_bucket) = parent_bucket {
                     let status = exit_wake_contended.unwrap();
-                    let waiting = core::sync::atomic::AtomicBool::new(false);
-                    let probe = |_| waiting.store(true, Ordering::Release);
                     child_entry.publication_wait_probe = Some(&probe);
                     let result =
                         release_bucket_when_publisher_waits(parent_bucket, &waiting, || {
@@ -6051,6 +6050,7 @@ mod tests {
             controls: &*child_controls,
             copies: Vec::new(),
             refuse_copy: false,
+            on_signal_clock: None,
         };
         let parent = TaskKey {
             id: TaskId::from_abi_positive(41).unwrap(),
