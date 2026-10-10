@@ -6524,6 +6524,22 @@ pub(crate) fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
             },
         );
     }
+    if engine.el1_switchable_roots().is_some() {
+        let admission = context
+            .kernel()
+            .native_frame_inventory_admission(
+                &context,
+                std::time::Instant::now() + std::time::Duration::from_millis(50),
+            )
+            .map_err(|error| {
+                RuntimeError::Configuration(format!(
+                    "initial native frame inventory admission: {error}"
+                ))
+            })?;
+        engine
+            .bind_native_frame_inventory(admission)
+            .map_err(RuntimeError::Trap)?;
+    }
     if !kernel.dispatcher.bind_deferred_anonymous_state(engine, mm) {
         return Err(RuntimeError::Configuration(
             "initial runner anonymous authority MM mismatch".to_owned(),

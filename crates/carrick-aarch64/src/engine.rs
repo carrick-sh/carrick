@@ -5393,6 +5393,13 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.bind_frame_cow(authority, identity);
     }
 
+    fn bind_native_frame_inventory(
+        &mut self,
+        admission: std::sync::Arc<dyn carrick_hal::NativeFrameInventoryAdmission>,
+    ) -> Result<(), TrapError> {
+        self.vm.bind_native_frame_inventory(admission)
+    }
+
     fn service_owner_file_fault(
         &mut self,
         mm_key: u64,
