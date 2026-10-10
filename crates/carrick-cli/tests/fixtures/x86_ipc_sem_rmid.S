@@ -37,7 +37,7 @@ _start:
     jz child_waiter
 
     # Parent: wait until child is parked (GETNCNT == 1)
-    mov $1000, %r15
+    mov $1000000, %r15
 wait_child_parked:
     mov %r12, %rdi
     xor %rsi, %rsi

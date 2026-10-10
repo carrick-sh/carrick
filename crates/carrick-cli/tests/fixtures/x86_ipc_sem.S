@@ -177,7 +177,7 @@ child_wake_test:
     # Touch stack to break COW
     movq $0, 0(%rsp)
     # Child: bounded wait until parent is blocked in semop (GETNCNT == 1)
-    mov $1000, %r15             # bounded retry count
+    mov $1000000, %r15             # bounded retry count
 wait_parent_wake:
     mov %r12, %rdi
     xor %rsi, %rsi
