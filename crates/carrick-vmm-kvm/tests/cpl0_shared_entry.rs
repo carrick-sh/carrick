@@ -72,7 +72,8 @@ fn production_sigprocmask_uses_shared_lifecycle_family() {
         carrier.physical_crossing_counts(),
         [
             (PhysicalCrossingFamily::OwnerGrant, 0),
-            (PhysicalCrossingFamily::RootExit, 1)
+            (PhysicalCrossingFamily::RootExit, 1),
+            (PhysicalCrossingFamily::ChildRetire, 0)
         ]
     );
 }
@@ -121,7 +122,8 @@ fn production_cpl0_refuses_non_allowlisted_forwards_with_enosys() {
         carrier.physical_crossing_counts(),
         [
             (PhysicalCrossingFamily::OwnerGrant, 0),
-            (PhysicalCrossingFamily::RootExit, 1)
+            (PhysicalCrossingFamily::RootExit, 1),
+            (PhysicalCrossingFamily::ChildRetire, 0)
         ]
     );
     assert_eq!(carrier.refusal_count(101), 1);
