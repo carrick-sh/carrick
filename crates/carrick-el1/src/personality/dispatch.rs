@@ -77,52 +77,6 @@ impl GuestDispatchFrame for TrapFrame {
     fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
         None
     }
-    fn restore_signal_frame(
-        &mut self,
-        copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
-    ) -> Result<carrick_signal_core::policy::SigBlockMask, carrick_syscall_abi::LinuxErrno> {
-        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-        {
-            let mut backend = crate::isa::aarch64::Aarch64Backend;
-            carrick_guest_arch::SignalBackend::restore_signal_frame(
-                &mut backend,
-                self,
-                &mut [],
-                &mut |dst, va| copy_in.copy_in(dst, va),
-            )
-            .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT)
-        }
-        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-        {
-            let _ = copy_in;
-            Err(carrick_personality_linux::abi::signal::LINUX_ENOSYS)
-        }
-    }
-    fn setup_signal_frame(
-        &mut self,
-        params: carrick_guest_arch::SignalFrameParams,
-        siginfo: Option<&[u8]>,
-        copy_out: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
-    ) -> Result<carrick_guest_arch::UserVa, carrick_syscall_abi::LinuxErrno> {
-        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-        {
-            let mut backend = crate::isa::aarch64::Aarch64Backend;
-            carrick_guest_arch::SignalBackend::setup_signal_frame(
-                &mut backend,
-                self,
-                params,
-                siginfo,
-                &[],
-                &mut |va, src| copy_out.copy_out(va, src),
-            )
-            .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT)
-        }
-        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-        {
-            let _ = (params, siginfo, copy_out);
-            Err(carrick_personality_linux::abi::signal::LINUX_ENOSYS)
-        }
-    }
 }
 
 /// T2's SVC integration point. A Work result is an owned continuation, not a
@@ -659,7 +613,11 @@ impl<
     fn signal_native(
         &mut self,
     ) -> Option<&mut dyn carrick_personality_linux::signal::SignalNative<'a>> {
-        Some(self)
+        if self.frame.arm_scheduler() {
+            None
+        } else {
+            Some(self)
+        }
     }
     fn task_state(&self) -> Option<&LinuxTaskState> {
         self.task().map(|task| &task.linux)

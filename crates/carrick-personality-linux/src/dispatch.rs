@@ -475,7 +475,7 @@ fn serve_family<'a, C: EntryContext + 'a>(
 /// another family or own completion.
 pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
     // ARM delivery still belongs to the carrier, which owns the frame ABI.
-    if ordinal == 139 {
+    if matches!(ordinal, 129..=139 | 240) {
         return Family::Unported;
     }
     route_shared(ordinal, allocator_control)

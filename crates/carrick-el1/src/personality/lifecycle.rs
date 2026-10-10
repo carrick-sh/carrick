@@ -60,9 +60,10 @@ impl<
         if let Some(user) = &mut self.lifecycle_user {
             return user.copy_out(dst.raw(), src);
         }
-        if let Some(result) = self
-            .process_venue()
-            .and_then(|venue| venue.copy_out_owned(dst, src))
+        if !self.frame.arm_scheduler()
+            && let Some(result) = self
+                .process_venue()
+                .and_then(|venue| venue.copy_out_owned(dst, src))
         {
             return result;
         }
@@ -530,6 +531,9 @@ impl<
     fn process_signals(
         &mut self,
     ) -> Option<&mut dyn carrick_personality_linux::signal::ProcessSignals> {
+        if self.frame.arm_scheduler() {
+            return None;
+        }
         self.process.as_deref_mut().and_then(|p| p.signal_venue())
     }
 

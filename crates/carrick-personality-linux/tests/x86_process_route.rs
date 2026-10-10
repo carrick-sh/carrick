@@ -64,3 +64,14 @@ fn pidfds_remain_unported_until_the_native_owner_exists() {
         Family::Unported
     );
 }
+
+#[test]
+fn arm_signal_calls_stay_with_host_delivery_owner() {
+    for ordinal in (129..=139).chain(core::iter::once(240)) {
+        assert_eq!(
+            route_aarch64(ordinal, u64::MAX),
+            Family::Unported,
+            "ARM signal ordinal {ordinal} must use its host action and delivery owner"
+        );
+    }
+}
