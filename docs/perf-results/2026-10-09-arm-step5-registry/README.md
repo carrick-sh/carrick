@@ -290,3 +290,35 @@ serves a retained frame in place; ARM has not yet been wired to an equivalent
 service here. Requeueing an incomplete syscall is not accepted as completion.
 The requested runtime syscall-service test and signed artifact runs remain
 open, as does the forwarded parent thread clone. No watchdog was changed.
+
+## Child's first COW fault (348121 state capture)
+
+Two live HVF reads eight seconds apart on carrier 70099, raw vCPU 2, both
+returned rc=0 for every requested register. PC was 0x2d00010ba8, CPSR
+0x204003c5 (EL1h), ELR 0x29fdb4 (`__post_Fork+4`), SPSR 0x60000340
+(EL0t), ESR 0x9200004f, FAR 0xfffffef860, SP_EL0 0xfffffef870, x0=0,
+TTBR0 0x2002d08080000 (child ASID 2), and TPIDR_EL0 0x60000000c8.
+The saved child context agrees on its user PC, stack, TLS and root. The
+executor had already failed and was waiting for shutdown, so these stable
+registers are a stopped fault, not an active fault loop. SP_EL1 was reset
+by `run_worker_idle_entry` after its exit; it is not the original EL1 stack.
+Evidence and modified-memory core live in `348121-state/`.
+
+Reading the pool from that core gives resolved=6, PoolEmpty=4, all other
+declines=0, with `fault_taken=25`. Missing child-MM replacement supply is
+the COW cause; the child's current MM and ASID are published. ARM uses the
+legacy mailbox fault supply, whereas x86's owner fault path selects an exact
+COW window, crosses OWNER_GRANT for physical supply, copies/repoints in the
+guest, then crosses again to settle the physical completion. ARM native
+fork stock currently lends table/lifecycle storage, not that owner COW
+supply. The legacy refill requires a host `MmAccessState`, which a native
+child does not have. A parent context or fabricated backing identity cannot
+stand in for child authority.
+
+`ChildEntered` was recorded only in later syscall admission. The scheduler
+now records native selection after publishing identity and before returning
+toward EL0. The VM-free idle-child test was red (0 != 1) before this change
+and passes afterward, as do all 31 scheduler tests. This repairs telemetry
+only: native physical supply, completion settlement and forwarded-exit
+service remain open. The idle host rejection is unchanged. No signed
+acceptance is claimed for this instrumentation change.
