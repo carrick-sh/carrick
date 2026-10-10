@@ -129,3 +129,55 @@ lands and this branch rebases onto main, ARM scheduler resume must call
 Add the VM-free exit-parked-behind-a-birth-claim / settlement / completed-exit
 witness then. The director explicitly requested continuing rehome first;
 that later integration has not been performed or claimed here.
+
+## 2026-10-10: native child stranded on host adoption
+
+The exact-input 63e4dbd50 bundle restored 1,135 verified executables. Focused
+runs `arm-step5-sol2-63e4-fork-a-20261010` and
+`arm-step5-sol2-63e4-fork-b-20261010` both hit the unchanged 120-second
+watchdog. Both negative entitlement controls passed; both scoped reaps left
+zero survivors. Run A was untraced. Run B was LLDB-paused for counters:
+admission stage 0, process refusals `[0,0,0,0,0,0]`, refused[134] 0,
+native failure 0, progress `[1,1,1,1,1,1,0,1,0,0,0]`, clone served 4,
+forwarded 1. Those counters are unavailable for run A.
+
+Retained executables under `target/arm-step5-sol2/63e4-a,b`:
+
+- A SHA256 `e04e78cffad8cfc813f8a2c3f59539dcdaa773032cf623dc9f6a87217f4a70c6`,
+  CDHash `f427bb1c79a16bd19d9836c9746c0b7d91dc4e09`.
+- B SHA256 `367844a44561762724d9be30e2b8185d044c14506a6aa79c8077b70adb10842f`,
+  CDHash `d4466a7bf97610250d031050b923f4c7fb148a78`.
+
+A diagnostic reproduction `arm-step5-sol2-63e4-capture` attached to the
+carrier PID 16553, saved all-thread backtraces, decoded the lifecycle ring
+(212 events, zero errors), and saved a modified-memory host core before the
+watchdog's scoped reap. Exact executable, core, ring/backtraces and coherent
+kernel JSON are retained in `target/arm-step5-sol2/63e4-capture`. Executable
+SHA256 `51f36991823f963bc2cd20bc1f2735930c8196339751f18b734965a7386515e7`,
+CDHash `bccbf8ce44721c5938cf75b26c16ecd1587eaede`. Zero survivors afterward.
+Attachment pauses execution; this is diagnostic evidence, not acceptance.
+
+Ring event 65 is the only host CLONESPAWN: parent TID 1 creates TID 2;
+subsequent TID 2 accesses name parent MM 2. This identifies the parent writer
+thread, rather than the native fork child in MM 9. Exact forwarded flags were
+not recorded by the old artifact. Added full-width host-clone ring records
+and watchdog/witness reporting; the next signed artifact must establish them.
+
+The child is queued but an idle slot's foreign-MM policy sends it through
+`take_service_head` to host adoption. It has no host scheduler row. Its claim
+is Host, entries 0; lost_adoptions is 1. VCPU-owning executors wait in
+Hypervisor wait_for_interrupt; spare executors park in host condition waits.
+There is no ring proof of an SGI: this ring does not record that publication.
+
+Red-first: strengthening the migrated child test to use an idle target with
+MM 0 fails migration (0 versus 1). An incarnation-bound native execution
+grant now permits that registered child to switch into its published open MM
+without a host row. Host-backed records retain the loaded-executor policy.
+A second red control proves a paused native MM must remain queued rather than
+become a host orphan. Grants reject wrong incarnations and clear on reuse.
+The ARM scheduler test exercises the actual translation load from idle.
+The full-width flags decoder test is red before the new ring records.
+
+VM-free checks: 324 EL1, 133 ABI, 189 scheduler-core tests and the focused
+kernel flags test pass. Signed confirmation, exact forwarded flags and the
+el1_ baseline comparison remain open. No batch was run on the failed artifact.
