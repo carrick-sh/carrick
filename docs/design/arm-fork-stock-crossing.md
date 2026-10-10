@@ -229,6 +229,42 @@ sequenceDiagram
 1. **Stale or Foreign Execution:** If `request.binding != execution.binding`, `request.context != execution.context`, or `request.operation.carrier != vm_carrier`, the host marks `ForkStockRefusal::Stale`. Pages are never loaned across execution or MM boundaries.
 2. **Malformed Request Geometry:** If `child_bytes` or `parent_bytes` are zero, not multiples of 4096, overflow, or if `child_mm == parent_mm`, the host marks `ForkStockRefusal::Invalid`.
 3. **Capacity Exhaustion:** If `grant_tables` cannot supply contiguous runs, or a prior loan on this vCPU remains uncompleted, the host marks `ForkStockRefusal::Capacity`.
-4. **Exposed Pages on Abort:** If guest EL1 requests `Abort` on a loan but any page in the loaned runs contains non-zero bytes, the host fails loud (`TrapError`), preventing dirty memory from re-entering the clean page pool.
+4. **Exposed Pages on Abort:** If the guest requests `Abort` on a loan but any page in the loaned runs contains non-zero bytes, the settlement is refused (`ExposedDirtyTable`; on KVM the carrier stops) and nothing re-enters the clean page pool. Guests zero their stored child tables and lifecycle record after rollback before aborting.
 5. **Exactly-Once Settlement:** Once an exchange or settlement is consumed via `take()`, its status transitions to `Taken` (3); subsequent calls return `None`. Pending loan state on the host is cleared atomically.
 6. **Root Exit Verification:** The host authenticates that the exiting task is the admitted root container task and that the wait status is a valid Linux encoding; foreign or corrupt exit requests fail closed.
+
+---
+
+## 6. Shared Child Retirement (both ISAs) and Current Limits
+
+The stock, loan, settlement and child quarantine state machine is one
+ISA-neutral type, `carrick_hal::fork_stock::ForkStock`; HVF and KVM supply
+only mechanics (address tags, grant ledger, physical page access).
+
+- **Retire record.** A fork child's final exit sends `NativeChildRetire`
+  (8 words; word 7 is the carrier's typed reply: pending, quarantined,
+  refused-stale, refused-invalid, consumed). AArch64 uses `HVC #6` with
+  `GRANT_OP_CHILD_RETIRE` (x0 agrees with the reply); x86 uses port
+  `NATIVE_CHILD_RETIRE_PORT` (0xd5). A refusal fails only that process's
+  stock return: the stock stays charged and is never reissued.
+- **Quarantine.** Retired stock is reclaimed on a later fork-stock loan only
+  when the MM is not the servicing CPU's MM and the zone occupancy authority
+  mints a `SlotAbsence` proof (no slot installs it). Guests leave the root for
+  the carrier maintenance root before publishing absence. The proof is what
+  retires the child's address tag (AArch64 ASID). Carrier per-MM state (frame
+  inventory rows, COW residency, on KVM the CR3 registration, aliases and
+  child-private memslots) is released before any of the stock is reissued.
+- **Lifecycle hygiene.** An issued lifecycle record must be all zero; a
+  returned record is cleared. A dirty record at loan time is withdrawn for
+  good and the fork is refused (`Inventory`, lowered to `EAGAIN`).
+- **Live-children limit.** Each live fork child holds one lifecycle record
+  until it is reclaimed. AArch64 has 31 records (one 512 KiB metadata extent,
+  16 KiB per record, first slot unused). x86 CPL0 has **8 records** at
+  metadata offset `0x88000`. A fork beyond the limit while children are
+  alive is refused with a counted `Capacity` refusal (`EAGAIN`), never a
+  hang. Eight covers sequential fork/wait loops and small pipelines; it
+  should grow (the mapped x86 metadata window has room for about 30 records
+  above the reservations table) once a workload is measured to need it.
+- **Not yet verified on KVM.** The x86 path type-checks for
+  `x86_64-unknown-linux-gnu` and its shared logic is exercised by VM-free
+  tests, but it has not run under KVM.
