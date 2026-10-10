@@ -16,6 +16,7 @@ pub mod native_process_custody;
 pub mod native_process_entry;
 pub mod native_process_runtime;
 pub mod native_process_signals;
+pub mod native_run_failure;
 pub mod process_owner;
 pub mod sched;
 pub mod thread_setup;

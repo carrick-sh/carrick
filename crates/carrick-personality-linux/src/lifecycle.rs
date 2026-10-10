@@ -91,6 +91,9 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     fn take_handoff_receipt(&mut self) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
         None
     }
+    fn take_run_failure(&mut self) -> Option<crate::native_run_failure::NativeRunFailureReason> {
+        None
+    }
     fn binding(&self) -> ExecutionBinding;
     fn fork(&mut self) -> LifecycleOutcome;
     fn wait4(
