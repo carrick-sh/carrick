@@ -1,0 +1,145 @@
+target/ringswitch-ci-surface-red.log
+error: unclassified paths under crates/ found without surface mapping: ['crates/carrick-personality-linux/src/crossing.rs', 'crates/carrick-vmm-hvf/src/hatch.rs']
+
+target/ringswitch-ci-policy-red.log
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.48s
+     Running tests/n2_creation_baseline.rs (target/debug/deps/n2_creation_baseline-993a4c046176e103)
+
+running 3 tests
+test shared_futex_and_waitv_are_outside_current_private_futex_route ... ok
+test first_touch_capacity_forward_is_not_a_linux_syscall_forward ... ok
+test creation_host_routes_preserve_arguments_and_count_each_forward ... FAILED
+
+failures:
+
+---- creation_host_routes_preserve_arguments_and_count_each_forward stdout ----
+
+thread 'creation_host_routes_preserve_arguments_and_count_each_forward' (137044009) panicked at crates/carrick-el1/tests/n2_creation_baseline.rs:25:13:
+assertion `left == right` failed: syscall 96
+  left: Served
+ right: Forward
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    creation_host_routes_preserve_arguments_and_count_each_forward
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-el1 --test n2_creation_baseline`
+
+target/ringswitch-ci-owner-red.log
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running tests/n2_creation_owner.rs (target/debug/deps/n2_creation_owner-f75df3ad77617d18)
+
+running 1 test
+test complete_creation_surface_census_counts_each_nonadmitted_forward_once ... FAILED
+
+failures:
+
+---- complete_creation_surface_census_counts_each_nonadmitted_forward_once stdout ----
+
+thread 'complete_creation_surface_census_counts_each_nonadmitted_forward_once' (137045201) panicked at crates/carrick-el1/tests/n2_creation_owner.rs:288:17:
+assertion `left == right` failed: numeric ID 220
+  left: Served
+ right: Forward
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    complete_creation_surface_census_counts_each_nonadmitted_forward_once
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-el1 --test n2_creation_owner`
+
+target/ringswitch-ci-musl-red.log
+/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-thread-stress: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-inet-connect: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-write-hi-to-fd1: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-pipe-dup3-exec: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-read-then-write-via-stdio: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-two-pipes-dup3-exec: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-udp-dns: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-udp-dns-debian: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-pie-hello: ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV), static-pie linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-fork-bench: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-fork-bench-10k: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-scheduler-preemption: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-discard-fork-threads: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-el1-served-loop-kick: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-el0-id-view: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-el1-vtimer-loop: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-coarse-clock-vdso: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-crash-parked-thread: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, not stripped
+   Compiling libc v0.2.189
+   Compiling carrick-linux-aarch64-hello v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/ring-switch/fixtures/linux-aarch64-hello)
+error: linker `carrick-missing-gnu-linker-proof` not found
+  |
+  = note: No such file or directory (os error 2)
+
+error: could not compile `carrick-linux-aarch64-hello` (bin "carrick-linux-aarch64-ring-first-glibc") due to 1 previous error
+
+target/ringswitch-ci-gate-5.log
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/probe_coverage.rs (target/debug/deps/probe_coverage-73e4f9be44842e62)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 25 filtered out; finished in 0.00s
+
+     Running tests/provision.rs (target/debug/deps/provision-57d76b213aa46ced)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/target_prune.rs (target/debug/deps/target_prune-87db278c35d9023d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+test: red host-lane selection: -p carrick-xtask --test asm_diff --test authority_debt --test build_cache --test ci_scaler --test ci_scaler_hook --test cli --test fixture_cli --test fixtures --test host_lease --test ledger_merge --test probe_coverage --test provision --test target_prune
+error: recipe `test` failed with exit code 1
+
+Exact stale census failure:
+test unfiltered_graph_includes_host_only_build_dependencies ... ok
+test source_tamper_and_untracked_input_are_rejected ... ok
+test target_cfg_build_dependency_is_a_fixture_input ... ok
+test roundtrip_restores_exact_paths_and_verifies_installed_bytes ... FAILED
+test unreviewed_proc_macro_refuses ... ok
+test restore_durability_flush_budget_does_not_scale_with_executable_count ... ok
+test unresolved_fixture_closure_fails_closed ... ok
+test replacing_shared_archive_after_verification_restores_captured_bytes ... ok
+test transitive_fixture_dependency_edits_are_rejected ... ok
+test wrong_target_and_toolchain_are_rejected ... ok
+test unrelated_workspace_edits_preserve_fixture_identity ... ok
+
+host-lease: waiting for gate at /tmp/carrick-host-lease.lock (HOST_LEASE_WAIT_LIMIT: 3600s)
+host-lease: acquired gate at /tmp/carrick-host-lease.lock
+
+thread 'roundtrip_restores_exact_paths_and_verifies_installed_bytes' (137427138) panicked at crates/carrick-xtask/tests/fixtures.rs:450:5:
+assertion `left == right` failed
+  left: 11
+ right: 10
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+
+
+thread 'roundtrip_restores_exact_paths_and_verifies_installed_bytes' (137427138) panicked at crates/carrick-xtask/tests/fixtures.rs:450:5:
+assertion `left == right` failed
+  left: 11
+ right: 10
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    roundtrip_restores_exact_paths_and_verifies_installed_bytes
+
