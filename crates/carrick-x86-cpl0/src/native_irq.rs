@@ -6,8 +6,10 @@
 
 use carrick_el1::isa::x86::{context::scheduler::InterruptFrame, interrupt, interrupts};
 
-// SAFETY: these interrupt gates run at CPL0 on private TSS stacks. The push
-// order is InterruptFrame's asserted layout, and the 896-byte scratch leaves
+// SAFETY: user-origin gates retain their frame on the private TSS stack,
+// then move Rust and XSAVE to the CPU syscall stack. Kernel-origin gates
+// retain the interrupted kernel stack. The push order is InterruptFrame's
+// asserted layout, and the 896-byte scratch leaves
 // at least 832 aligned bytes for the admitted XCR0=7 XSAVE image. IF stays
 // masked until IRETQ; SWAPGS is paired only for a user-origin interrupt.
 core::arch::global_asm!(
@@ -47,6 +49,14 @@ core::arch::global_asm!(
     "swapgs",
     "2:",
     "mov r12, rsp",
+    // Signal delivery on a user IRQ return exceeds the 4 KiB TSS entry
+    // stack. Retain only its hardware/GPR frame there, like user #PF.
+    // A kernel-origin IRQ must preserve the interrupted stack instead;
+    // resetting it would overwrite an outer syscall or fault operation.
+    "test byte ptr [r12 + 128], 3",
+    "jz 4f",
+    "mov rsp, gs:[0]",
+    "4:",
     "sub rsp, 896",
     "and rsp, -64",
     "mov r13d, edi",
