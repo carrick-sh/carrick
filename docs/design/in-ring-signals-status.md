@@ -71,11 +71,11 @@ these unchanged witnesses when each mechanism lands.
 
 | Witness | Exact dependency / ignore reason | Green on `ab7caeb05`? |
 | --- | --- | --- |
-| `fork_reuses_retired_stock_matches_native` | x86 child-MM retirement (work/fork-shared-retire) | No: exit 11 |
+| `fork_reuses_retired_stock_matches_native` | x86 child-MM retirement | No: exit 11 |
 | `signal_kills_reading_child_matches_native` | x86 in-ring pipe2/read fd-table continuations | No: exit 38 |
-| `signal_sigsuspend_loop_matches_native` | x86 child-MM retirement (work/fork-shared-retire) | No: exit 11 |
+| `signal_sigsuspend_loop_matches_native` | x86 child-MM retirement | No: exit 11 |
 | `signal_stop_continue_matches_native` | shared process-owner stop/continue wait events | No: exit 99 |
-| `signal_wait_child_matches_native` | x86 child-MM retirement (work/fork-shared-retire) | No: exit 11 |
+| `signal_wait_child_matches_native` | x86 child-MM retirement | No: exit 11 |
 
 The pre-ignore full run is recorded at
 `/tmp/ring-on-identity-full-kvm-red.log` (38 passed, 10 failed, 5 originally
@@ -132,3 +132,13 @@ the hardware/GPR frame on TSS and move XSAVE/Rust to the 64 KiB syscall
 stack, matching page faults. Kernel-origin IRQs keep the interrupted
 kernel stack so an outer syscall/fault operation cannot be overwritten.
 The unchanged concurrent two-MM witness is the runtime regression test.
+
+## ARM-visible scheduler changes awaiting the signed gate
+
+The shared timer heap, `clear_current` clean-state decision via
+`timer_deadline`, and removal of the single-timer-owner refusal are
+ARM-visible changes retained by this branch. They require the director's
+signed ARM `el1_` coverage for concurrent timed parks, record migration,
+and executor exit while a foreign record owns a timer. The Linux worker's
+VM-free scheduler evidence does not replace that signed coverage. Include
+these three changes and the owed scenarios explicitly in the PR body.

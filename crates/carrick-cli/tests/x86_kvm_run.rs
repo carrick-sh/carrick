@@ -691,13 +691,13 @@ fn mounted_static_x86_signal_resethand_matches_native() {
 }
 
 #[test]
-#[ignore = "x86 child-MM retirement (work/fork-shared-retire)"]
+#[ignore = "x86 child-MM retirement"]
 fn mounted_static_x86_signal_sigsuspend_loop_matches_native() {
     // Three fork rounds also expose the shared child-MM stock retirement debt.
     compare_mounted_assembly_with_native("x86_signal_sigsuspend.S", b"S\n");
 }
 #[test]
-#[ignore = "x86 child-MM retirement (work/fork-shared-retire)"]
+#[ignore = "x86 child-MM retirement"]
 fn mounted_static_x86_signal_wait_child_matches_native() {
     // Repeated child creation depends on shared child-MM stock retirement.
     compare_mounted_assembly_with_native("x86_signal_wait_child.S", b"W\n");
@@ -718,7 +718,7 @@ fn mounted_static_x86_signal_wait_pingpong_matches_native() {
 }
 
 #[test]
-#[ignore = "x86 child-MM retirement (work/fork-shared-retire)"]
+#[ignore = "x86 child-MM retirement"]
 fn mounted_static_x86_fork_reuses_retired_stock_matches_native() {
     compare_mounted_assembly_with_native("x86_fork_stock_reuse.S", b"R\n");
 }
