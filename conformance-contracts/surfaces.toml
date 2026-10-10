@@ -1159,3 +1159,24 @@ contracts = []
 path = "crates/carrick-vmm-hvf/src/hvpatch_probe_support/svc_tax.rs"
 contracts = []
 
+# Canonical signal records and architecture frames retain the shared delivery owner.
+[[surfaces]]
+path = "crates/carrick-syscall-abi/src/signal.rs"
+contracts = ["kernel.el1.signal-delivery-owner"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/abi/signal.rs"
+contracts = ["kernel.el1.signal-delivery-owner"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/personality/arm_signal.rs"
+contracts = ["kernel.el1.signal-delivery-owner"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/personality/x86_signal.rs"
+contracts = ["kernel.el1.signal-delivery-owner"]
+
+# Concurrent owned deadlines belong to the shared guest scheduler.
+[[surfaces]]
+path = "crates/carrick-sched-core/src/timer_index.rs"
+contracts = ["kernel.el1.guest-run-queue"]
