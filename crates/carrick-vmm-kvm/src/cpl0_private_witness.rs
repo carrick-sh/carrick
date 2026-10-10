@@ -97,7 +97,7 @@ impl PrivateAnonymousWitness {
                 {
                     return Err(fail("private witness grant span mismatch"));
                 }
-                let inventory = grant.inventory.bind(grant.context.mm);
+                let inventory = grant.inventory.bind(grant.context.into());
                 let length = std::num::NonZeroU64::new(span.len)
                     .ok_or_else(|| fail("private witness empty grant"))?;
                 if !inventory.mapping_is_live_exact_generation(

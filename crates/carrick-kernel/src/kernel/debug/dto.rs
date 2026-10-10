@@ -22,7 +22,7 @@ use super::super::snapshot::{
 /// Request schema tag. A client that sends anything else is refused.
 pub const KERNEL_DEBUG_REQUEST_SCHEMA: &str = "carrick.kernel-debug-request.v1";
 /// Response schema tag. A client that receives anything else fails closed.
-pub const KERNEL_DEBUG_RESPONSE_SCHEMA: &str = "carrick.kernel-debug-snapshot.v1";
+pub const KERNEL_DEBUG_RESPONSE_SCHEMA: &str = "carrick.kernel-debug-snapshot.v2";
 
 /// One selectable table. The names are the CLI's `--table` vocabulary and are
 /// part of the wire contract; renaming one is a schema change.
@@ -365,11 +365,34 @@ pub struct DebugFrameRow {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum DebugFrameOwner {
+    HostMm {
+        mm: u64,
+    },
+    GuestMm {
+        native_mm: u64,
+        root_generation: u64,
+    },
+}
+impl From<super::super::FrameOwner> for DebugFrameOwner {
+    fn from(owner: super::super::FrameOwner) -> Self {
+        match owner {
+            super::super::FrameOwner::HostMm(mm) => Self::HostMm { mm: mm.raw() },
+            super::super::FrameOwner::GuestMm(owner) => Self::GuestMm {
+                native_mm: owner.native_mm.raw().get(),
+                root_generation: owner.root_generation.raw().get(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugMappingRow {
     pub mapping: u64,
     pub frame: u64,
-    pub mm: u64,
+    pub owner: DebugFrameOwner,
     pub generation: u64,
     /// Guest-physical address. This is an IPA inside the Carrick-managed frame
     /// space, never a host virtual address.
@@ -1017,7 +1040,7 @@ impl KernelDebugSnapshot {
                     .map(|row| DebugMappingRow {
                         mapping: row.mapping.raw(),
                         frame: row.frame.raw(),
-                        mm: row.mm.raw(),
+                        owner: row.mm.into(),
                         generation: row.generation.raw(),
                         gpa: row.gpa.0,
                         length: row.length.raw(),
@@ -1422,9 +1445,16 @@ impl KernelDebugSnapshot {
         join_ids("vma.mm", "mm", self.vmas.as_deref(), &mms, |row| {
             Some(row.mm)
         })?;
-        join_ids("mapping.mm", "mm", self.mappings.as_deref(), &mms, |row| {
-            Some(row.mm)
-        })?;
+        join_ids(
+            "mapping.owner.host-mm",
+            "mm",
+            self.mappings.as_deref(),
+            &mms,
+            |row| match row.owner {
+                DebugFrameOwner::HostMm { mm } => Some(mm),
+                DebugFrameOwner::GuestMm { .. } => None,
+            },
+        )?;
         join_ids(
             "file-slot.table",
             "file-table",

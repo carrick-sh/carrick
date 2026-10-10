@@ -21,14 +21,14 @@ pub use client::{AbortAck, ClientError, abort_at, fetch, fetch_at, kernel_debug_
 pub use dto::{
     DebugAltstack, DebugClass, DebugCredentialsRow, DebugExecutorBindingRow,
     DebugExecutorReceiptRow, DebugExecutorReceiptSummary, DebugExecutorRow,
-    DebugFileDescriptionRow, DebugFileSlotRow, DebugFileTableRow, DebugFrameRow, DebugFsContextRow,
-    DebugMappingRow, DebugMmRow, DebugProcessGroupRow, DebugResidencyRow, DebugRunQueueRow,
-    DebugSchedulerRow, DebugSessionRow, DebugSighandRow, DebugTaskRow, DebugTaskSharedRow,
-    DebugTaskSignalRow, DebugThreadResourcesRow, DebugThreadRow, DebugThreadSignalRow, DebugVmaRow,
-    DebugZombieRow, DebugZoneHeldRow, DegradedMmCoordinatorDto, DegradedTaskDto, DegradedThreadDto,
-    KERNEL_DEBUG_DEGRADED_SCHEMA, KERNEL_DEBUG_REQUEST_SCHEMA, KERNEL_DEBUG_RESPONSE_SCHEMA,
-    KernelDebugAction, KernelDebugAuxProvider, KernelDebugDegraded, KernelDebugDtoError,
-    KernelDebugRequest, KernelDebugSnapshot, KernelDebugTable, UnknownTable,
+    DebugFileDescriptionRow, DebugFileSlotRow, DebugFileTableRow, DebugFrameOwner, DebugFrameRow,
+    DebugFsContextRow, DebugMappingRow, DebugMmRow, DebugProcessGroupRow, DebugResidencyRow,
+    DebugRunQueueRow, DebugSchedulerRow, DebugSessionRow, DebugSighandRow, DebugTaskRow,
+    DebugTaskSharedRow, DebugTaskSignalRow, DebugThreadResourcesRow, DebugThreadRow,
+    DebugThreadSignalRow, DebugVmaRow, DebugZombieRow, DebugZoneHeldRow, DegradedMmCoordinatorDto,
+    DegradedTaskDto, DegradedThreadDto, KERNEL_DEBUG_DEGRADED_SCHEMA, KERNEL_DEBUG_REQUEST_SCHEMA,
+    KERNEL_DEBUG_RESPONSE_SCHEMA, KernelDebugAction, KernelDebugAuxProvider, KernelDebugDegraded,
+    KernelDebugDtoError, KernelDebugRequest, KernelDebugSnapshot, KernelDebugTable, UnknownTable,
 };
 pub use endpoint::{DebugEndpoint, EndpointError};
 pub use post_mortem::{
@@ -322,7 +322,7 @@ mod tests {
     #[test]
     fn validation_rejects_an_unknown_response_schema() {
         let mut snapshot = empty_snapshot();
-        snapshot.schema = "carrick.kernel-debug-snapshot.v2".to_owned();
+        snapshot.schema = "carrick.kernel-debug-snapshot.future".to_owned();
         let error = snapshot
             .validate(&BTreeSet::new())
             .expect_err("unknown schema must be refused");
