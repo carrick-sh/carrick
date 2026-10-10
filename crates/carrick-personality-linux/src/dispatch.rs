@@ -1052,7 +1052,7 @@ mod ring_first_tests {
 
     #[test]
     fn opt_out_arm_family_declines_with_work_keep_plain_forward() {
-        for ordinal in [222, 98, 220, 260] {
+        for ordinal in [222, 98, 220, 260, 174, 160] {
             let refused = [const { AtomicU64::new(0) }; 513];
             let mut pending = CarrierOwned {
                 set: HostCrossingSet::Aarch64,
@@ -1079,6 +1079,7 @@ mod ring_first_tests {
             );
             assert_eq!(pending.refused[ordinal as usize].load(Ordering::Relaxed), 0);
             assert_eq!(pending.result, 42);
+            assert!(pending.host_work(), "forward must retain owed host work");
         }
     }
 
