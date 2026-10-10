@@ -487,7 +487,7 @@ mod tests {
         assert_eq!(e.elr_el1, saved_pc, "resume PC (ELR_EL1) must round-trip");
         assert_eq!(
             e.spsr_el1,
-            pstate & carrick_abi::LINUX_AARCH64_SIGNAL_USER_PSTATE_MASK,
+            pstate & carrick_abi::AARCH64_EL0_USER_PSTATE_MASK,
             "user PSTATE must round-trip"
         );
         assert_eq!(restore.saved_pc, saved_pc, "reported saved_pc matches");
