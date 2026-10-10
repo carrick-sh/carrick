@@ -732,6 +732,51 @@ impl<T: ChildAddressTags> ForkStock<T> {
         Ok(pending.loan)
     }
 
+    /// Every check a commit settlement must pass, without consuming the
+    /// loan. A carrier that publishes its own state for the child (KVM
+    /// inherited frames) calls this first so nothing is published for a
+    /// commit the stock would refuse; `settle` runs the same checks.
+    pub fn validate_commit(
+        &self,
+        execution: GrantExecution,
+        settlement: &ForkStockSettlement,
+        is_resolvable: impl Fn(&[RootGpa]) -> bool,
+        is_clean: impl Fn(&[RootGpa]) -> bool,
+    ) -> Result<carrick_el1_abi::PortalForkCompletion, ForkStockServiceError> {
+        let loan = self.settlement_loan(execution)?;
+        let pending = self
+            .pending(execution.cpu)
+            .ok_or(ForkStockServiceError::NoPendingLoan)?;
+        if !is_resolvable(&pending.child_tables) || !is_resolvable(&pending.parent_tables) {
+            return Err(ForkStockServiceError::MemoryAccessFailed);
+        }
+        let (completion, _custody, _count) = settlement
+            .request(loan)
+            .ok_or(ForkStockServiceError::LoanMismatch)?;
+        let child_used = usize::try_from(completion.child_tables_used / TABLE_PAGE_BYTES)
+            .map_err(|_| ForkStockServiceError::InvalidRecord)?;
+        let parent_used = usize::try_from(completion.parent_tables_used / TABLE_PAGE_BYTES)
+            .map_err(|_| ForkStockServiceError::InvalidRecord)?;
+        if child_used == 0
+            || child_used > pending.child_tables.len()
+            || parent_used > pending.parent_tables.len()
+        {
+            return Err(ForkStockServiceError::InvalidRecord);
+        }
+        if !is_clean(&pending.child_tables[child_used..])
+            || !is_clean(&pending.parent_tables[parent_used..])
+        {
+            return Err(ForkStockServiceError::ExposedDirtyTable);
+        }
+        let child_key =
+            MmKey::of(loan.request.child_mm).ok_or(ForkStockServiceError::InvalidRecord)?;
+        if self.children.contains_key(&child_key) || self.committed_tables.contains_key(&child_key)
+        {
+            return Err(ForkStockServiceError::InvalidRecord);
+        }
+        Ok(completion)
+    }
+
     /// Settle an outstanding loan: an exact abort returns every untouched
     /// page and the lifecycle record; a commit charges used pages to the
     /// child and parent and returns the unused suffixes.
@@ -778,33 +823,16 @@ impl<T: ChildAddressTags> ForkStock<T> {
             self.lifecycles.push(pending.lifecycle);
             self.tags.release_unpublished(pending.tag)?;
         } else {
-            let (completion, _custody, _count) = settlement
-                .request(loan)
-                .ok_or(ForkStockServiceError::LoanMismatch)?;
+            let completion =
+                self.validate_commit(execution, settlement, &is_resolvable, &is_clean)?;
             let child_used = usize::try_from(completion.child_tables_used / TABLE_PAGE_BYTES)
                 .map_err(|_| ForkStockServiceError::InvalidRecord)?;
             let parent_used = usize::try_from(completion.parent_tables_used / TABLE_PAGE_BYTES)
                 .map_err(|_| ForkStockServiceError::InvalidRecord)?;
-            if child_used == 0
-                || child_used > pending.child_tables.len()
-                || parent_used > pending.parent_tables.len()
-            {
-                return Err(ForkStockServiceError::InvalidRecord);
-            }
-            if !is_clean(&pending.child_tables[child_used..])
-                || !is_clean(&pending.parent_tables[parent_used..])
-            {
-                return Err(ForkStockServiceError::ExposedDirtyTable);
-            }
             let child_key =
                 MmKey::of(loan.request.child_mm).ok_or(ForkStockServiceError::InvalidRecord)?;
             let parent_key =
                 MmKey::of(loan.request.operation.mm).ok_or(ForkStockServiceError::InvalidRecord)?;
-            if self.children.contains_key(&child_key)
-                || self.committed_tables.contains_key(&child_key)
-            {
-                return Err(ForkStockServiceError::InvalidRecord);
-            }
             let mut pending = self.pending[index]
                 .take()
                 .ok_or(ForkStockServiceError::NoPendingLoan)?;

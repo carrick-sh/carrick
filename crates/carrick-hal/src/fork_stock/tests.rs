@@ -794,3 +794,38 @@ fn second_candidate_refusal_keeps_first_candidate_released_and_returned() {
     assert!(stock.is_quarantined(mm(303)));
     assert_eq!(stock.counters().returned_children, 1);
 }
+
+/// A carrier that must publish other state (KVM attaches inherited frames)
+/// validates the whole commit first, so nothing is published for a commit
+/// the stock would refuse.
+#[test]
+fn validate_commit_refuses_before_any_carrier_publication() {
+    let mut stock = stock(UntaggedRoots, 4, 1);
+    let granted = loan(&mut stock, parent(), 302, 2, 1).unwrap();
+    let completion = PortalForkCompletion {
+        request: granted.request,
+        // SAFETY: test receipt for the exact admitted loan.
+        child: unsafe {
+            El1MmHandle::from_admitted_owner(CARRIER, granted.request.child_mm, NonZeroU64::MIN)
+        },
+        parent_generation: ReservationGeneration::INITIAL,
+        child_tables_used: 4096,
+        parent_tables_used: 0,
+    };
+    let settlement =
+        ForkStockSettlement::new(granted, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
+            .unwrap();
+    assert_eq!(
+        stock.validate_commit(parent(), &settlement, |_| true, |_| false),
+        Err(ForkStockServiceError::ExposedDirtyTable)
+    );
+    assert_eq!(
+        stock.validate_commit(parent(), &settlement, |_| false, |_| true),
+        Err(ForkStockServiceError::MemoryAccessFailed)
+    );
+    assert!(stock.pending(CpuId::new(0)).is_some(), "nothing consumed");
+    assert_eq!(
+        stock.validate_commit(parent(), &settlement, |_| true, |_| true),
+        Ok(completion)
+    );
+}
