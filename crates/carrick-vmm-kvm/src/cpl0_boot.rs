@@ -215,12 +215,14 @@ pub enum InitialSyscallDisposition {
 pub enum PhysicalCrossingFamily {
     OwnerGrant,
     RootExit,
+    RunFailure,
 }
 impl PhysicalCrossingFamily {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OwnerGrant => "owner_grant",
             Self::RootExit => "root_exit",
+            Self::RunFailure => "run_failure",
         }
     }
 }
@@ -1056,6 +1058,7 @@ pub(crate) struct Cpl0HostCustody {
     anonymous_pending: [Option<anonymous_owner::PendingGrant>; 2],
     owner_grant_crossings: u64,
     root_exit_crossings: u64,
+    run_failure_crossings: u64,
     metadata_base: NonNull<u8>,
     host_forwards: u64,
     host_yields: u64,
@@ -2356,6 +2359,27 @@ impl Cpl0Carrier {
                 if matches!(
                     exit,
                     VcpuExit::IoOut {
+                        port: carrick_el1_abi::NATIVE_RUN_FAILURE_PORT,
+                        ..
+                    }
+                ) {
+                    let lease = StoppedCpuLease {
+                        cpu: cpu_id,
+                        vcpu: cpu,
+                    };
+                    let reason = custody.service_run_failure(&lease)?;
+                    custody.run_failure_crossings = custody
+                        .run_failure_crossings
+                        .checked_add(1)
+                        .ok_or_else(|| fail("physical crossing counter exhausted"))?;
+                    return Ok(ActorDecision::Finish(InitialProcessExit::RunFailed {
+                        reason,
+                        exits,
+                    }));
+                }
+                if matches!(
+                    exit,
+                    VcpuExit::IoOut {
                         port: carrick_el1_abi::NATIVE_ROOT_EXIT_PORT,
                         ..
                     }
@@ -2496,7 +2520,7 @@ impl Cpl0Carrier {
         self.custody.private_anonymous_witness.private_pages()
     }
 
-    pub fn physical_crossing_counts(&self) -> [(PhysicalCrossingFamily, u64); 2] {
+    pub fn physical_crossing_counts(&self) -> [(PhysicalCrossingFamily, u64); 3] {
         [
             (
                 PhysicalCrossingFamily::OwnerGrant,
@@ -2505,6 +2529,10 @@ impl Cpl0Carrier {
             (
                 PhysicalCrossingFamily::RootExit,
                 self.custody.root_exit_crossings,
+            ),
+            (
+                PhysicalCrossingFamily::RunFailure,
+                self.custody.run_failure_crossings,
             ),
         ]
     }
@@ -3222,6 +3250,7 @@ impl Cpl0Carrier {
                 anonymous_pending: [None, None],
                 owner_grant_crossings: 0,
                 root_exit_crossings: 0,
+                run_failure_crossings: 0,
                 metadata_base,
                 host_forwards: 0,
                 host_yields: 0,
@@ -5224,6 +5253,10 @@ impl Cpl0Carrier {
 /// A guest exception is an owned process outcome, separate from carrier failure.
 #[derive(::core::fmt::Debug)]
 pub enum InitialProcessExit {
+    RunFailed {
+        reason: carrick_el1_abi::NativeRunFailureReason,
+        exits: usize,
+    },
     Exited {
         code: i32,
         exits: usize,
