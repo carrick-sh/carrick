@@ -426,6 +426,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         let uts = carrick_personality_linux::sysinfo::LinuxUtsname::carrick_x86_64();
         #[cfg(not(target_arch = "x86_64"))]
         let uts = carrick_personality_linux::sysinfo::LinuxUtsname::carrick_aarch64();
+        if !control.publish_visible_tid(visible.get()) {
+            return Err(NativeProcessError::Stale);
+        }
         Ok(Self {
             graph: SpinLock::new(Graph {
                 owner,
@@ -478,11 +481,21 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             return Err(NativeProcessError::Stale);
         }
         *row.context_mut() = words;
-        let slot = current.lifecycle_refs().map(|(_, s)| s);
-        let calling_tid = slot
-            .and_then(|s| s.visible_tid())
-            .filter(|&t| t != 0)
-            .unwrap_or(row.metadata().namespace_pid);
+        let resources = row.native().resources();
+        if current.metadata.lifecycle_page.load(Ordering::Acquire)
+            != resources.page as *const _ as u64
+            || current.metadata.control_slot.load(Ordering::Acquire)
+                != resources.control as *const _ as u64
+        {
+            return Err(NativeProcessError::Stale);
+        }
+        let slot = Some(resources.control);
+        let calling_tid = resources
+            .control
+            .visible_tid()
+            .ok_or(NativeProcessError::Stale)?;
+        row.credentials_for(calling_tid)
+            .map_err(|_| NativeProcessError::Stale)?;
         drop(graph);
         Ok(NativeProcessEntry {
             runtime: self,
@@ -3313,6 +3326,7 @@ mod tests {
 
         // 2. Caller TID 9999 attempting modify_credentials returns ESRCH
         entry.set_calling_tid(9999);
+
         assert_eq!(
             entry.set_uid(1000),
             Err(carrick_personality_linux::identity::ESRCH)
