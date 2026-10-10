@@ -123,7 +123,7 @@ pub(crate) struct KernelFrameCowAuthority {
     pub(crate) runtime: Weak<super::KernelState>,
     pub(crate) deferred_anonymous: Option<Arc<carrick_guest_mem::DeferredAnonymousState>>,
     pub(crate) kernel: Arc<carrick_kernel::kernel::Kernel>,
-    pub(crate) mm: carrick_kernel::kernel::MmId,
+    pub(crate) inventory_owner: carrick_kernel::kernel::FrameOwnerAuthority,
     pub(crate) owner_inventory: Arc<dyn carrick_hal::FrameCowOwnerInventory>,
     pub(crate) tid: carrick_hal::ThreadId,
     pub(crate) identity: carrick_hal::FrameCowIdentity,
@@ -145,13 +145,17 @@ pub(crate) fn reserve_child_cow_authority_identity() -> Result<std::num::NonZero
 }
 
 impl KernelFrameCowAuthority {
+    fn mm(&self) -> carrick_kernel::kernel::MmId {
+        self.inventory_owner.semantic_mm()
+    }
+
     #[allow(dead_code)] // consumed by the HVPatch child publication slice
     pub(crate) fn issue_hvpatch_child_token(
         self: Arc<Self>,
         context: &carrick_kernel::kernel::KernelContext,
     ) -> Result<carrick_hal::HvpatchChildKernelToken, String> {
         if self.identity.linux_tid != self.tid.raw()
-            || self.identity.mm != self.mm.raw()
+            || self.identity.mm != self.mm().raw()
             || self.identity.asid == 0
         {
             return Err("child token identity does not match Kernel COW authority".to_owned());
@@ -220,16 +224,18 @@ pub(crate) fn fixed_frame_cow_owner_inventory_for_test(
 #[cfg(test)]
 pub(crate) fn kernel_frame_cow_authority_for_test(
     kernel: Arc<carrick_kernel::kernel::Kernel>,
-    mm: carrick_kernel::kernel::MmId,
+    mm: Arc<carrick_kernel::kernel::objects::Mm>,
     tid: carrick_hal::ThreadId,
     asid: u16,
     owner_inventory: Arc<dyn carrick_hal::FrameCowOwnerInventory>,
 ) -> Arc<dyn carrick_hal::FrameCowAuthority> {
+    let inventory_owner = mm.frame_owner_authority();
+    let mm = mm.id();
     Arc::new(KernelFrameCowAuthority {
         runtime: Weak::new(),
         deferred_anonymous: None,
         kernel,
-        mm,
+        inventory_owner,
         owner_inventory,
         tid,
         identity: carrick_hal::FrameCowIdentity {
@@ -288,7 +294,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         let dispatcher = &runtime.dispatcher;
         let mut guard = carrick_kernel::dispatch::mm_quiesce::acquire_host_write_mutation_quiesce(
             &self.pt_quiesce,
-            self.mm,
+            self.mm(),
             dispatcher.mm_mutation_coordinator(),
             self.tid,
             carrick_kernel::dispatch::mm_quiesce::PtPauseBudget::DEFAULT,
@@ -314,7 +320,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         let coordinator = dispatcher.mm_mutation_coordinator();
         let mut guard = carrick_kernel::dispatch::mm_quiesce::acquire_host_write_mutation_quiesce(
             &self.pt_quiesce,
-            self.mm,
+            self.mm(),
             coordinator,
             self.tid,
             carrick_kernel::dispatch::mm_quiesce::PtPauseBudget::DEFAULT,
@@ -342,7 +348,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         let coordinator = dispatcher.mm_mutation_coordinator();
         let mut guard = carrick_kernel::dispatch::mm_quiesce::acquire_host_write_mutation_quiesce(
             &self.pt_quiesce,
-            self.mm,
+            self.mm(),
             coordinator,
             self.tid,
             carrick_kernel::dispatch::mm_quiesce::PtPauseBudget::DEFAULT,
@@ -375,7 +381,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
     fn settle_backing_maintenance(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Borrow another count of the existing exact-MM exclusion only after
         // the owner service returned. Its normal settlement owns the receipt.
-        let _excluded = carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(self.mm)
+        let _excluded = carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(self.mm())
             .ok_or_else(|| std::io::Error::other("maintenance MM is no longer published"))?;
         Ok(())
     }
@@ -386,7 +392,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
     {
         carrick_kernel::dispatch::mm_quiesce::acquire_frame_cow_quiesce(
             &self.pt_quiesce,
-            self.mm,
+            self.mm(),
             self.tid,
             carrick_kernel::dispatch::mm_quiesce::PtPauseBudget::DEFAULT,
         )
@@ -415,9 +421,10 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         &self,
         commit: carrick_hal::FrameInventoryCommit<()>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let inventory_owner = self.inventory_owner.owner();
         self.kernel
             .frame_inventory()
-            .apply(self.mm, commit)
+            .apply(*inventory_owner, commit)
             .map(|_| ())
             .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
     }
@@ -427,9 +434,10 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         commit: carrick_hal::FrameInventoryCommit<()>,
     ) -> Result<carrick_hal::FrameInventoryApplyReceipt, Box<dyn std::error::Error + Send + Sync>>
     {
+        let inventory_owner = self.inventory_owner.owner();
         self.kernel
             .frame_inventory()
-            .apply_with_receipt(self.mm, commit)
+            .apply_with_receipt(*inventory_owner, commit)
             .map(|(_, receipt)| receipt)
             .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
     }
@@ -448,6 +456,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         ),
         Box<dyn std::error::Error + Send + Sync>,
     > {
+        let inventory_owner = self.inventory_owner.owner();
         let owner = self.owner_inventory.retain_current(gpa, length)?;
         let owner_generation = owner.generation();
         // The exact row is authenticated inside the apply: the inventory
@@ -457,7 +466,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
             .kernel
             .frame_inventory()
             .apply_grant_with_receipt(
-                self.mm,
+                *inventory_owner,
                 commit,
                 carrick_kernel::kernel::ExactMappingRow {
                     mapping,
@@ -467,11 +476,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
                 },
             )
             .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
-        let expected_mm = std::num::NonZeroU64::new(self.mm.raw()).ok_or_else(|| {
-            Box::new(std::io::Error::other(
-                "frame grant authority carries a zero MM identity",
-            )) as Box<dyn std::error::Error + Send + Sync>
-        })?;
+        let expected_mm = inventory_owner.receipt_mm();
         let authenticated =
             receipt.mm() == expected_mm && receipt.authorizes(mapping, frame) && owner.is_current();
         if !authenticated {
@@ -500,6 +505,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         ),
         Box<dyn std::error::Error + Send + Sync>,
     > {
+        let inventory_owner = self.inventory_owner.owner();
         let carrick_hal::FrameBackingAuthentication {
             mapping,
             frame,
@@ -525,7 +531,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         let revision = self
             .kernel
             .frame_inventory()
-            .mapping_live_revision(self.mm, mapping, frame, gpa, length)
+            .mapping_live_revision(*inventory_owner, mapping, frame, gpa, length)
             .filter(|_| owner.is_current())
             .and_then(std::num::NonZeroU64::new)
             .ok_or_else(|| {
@@ -536,7 +542,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
                 .ok_or_else(|| std::io::Error::other("COW destination has a zero identity"))
         };
         Ok((
-            nonzero(self.mm.raw())?,
+            inventory_owner.receipt_mm(),
             carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
                 frame_id: nonzero(frame.raw())?,
                 mapping_id: nonzero(mapping.raw())?,
@@ -550,14 +556,18 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         &self,
         receipt: &carrick_hal::FrameInventoryApplyReceipt,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let expected_mm = std::num::NonZeroU64::new(self.mm.raw()).ok_or_else(|| {
-            Box::new(std::io::Error::other(
-                "frame grant authority carries a zero MM identity",
-            )) as Box<dyn std::error::Error + Send + Sync>
-        })?;
-        if receipt.mm() != expected_mm {
+        let inventory_owner = self.inventory_owner.owner();
+        let expected_mm = inventory_owner.receipt_mm();
+        if receipt.mm() != expected_mm
+            || receipt.mapping_set().iter().any(|(mapping, frame)| {
+                self.kernel
+                    .frame_inventory()
+                    .live_mapping_row(*inventory_owner, *mapping)
+                    .is_none_or(|row| row.frame != *frame)
+            })
+        {
             return Err(Box::new(std::io::Error::other(
-                "frame grant rollback receipt names another MM",
+                "frame grant rollback receipt names another owner or frame",
             )));
         }
         self.kernel
@@ -595,7 +605,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
             .kernel
             .frame_inventory()
             .apply_grant_with_receipt(
-                self.mm,
+                self.mm(),
                 commit,
                 carrick_kernel::kernel::ExactMappingRow {
                     mapping,
@@ -605,7 +615,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
                 },
             )
             .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
-        let expected_mm = std::num::NonZeroU64::new(self.mm.raw()).unwrap_or_else(|| {
+        let expected_mm = std::num::NonZeroU64::new(self.mm().raw()).unwrap_or_else(|| {
             carrick_fatal!(
                 "kernel::mm_identity",
                 "KernelFrameCowAuthority target MmId is zero"
@@ -620,7 +630,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         }
         let proof = KernelForeignCowProof::new(
             Arc::clone(&self.kernel),
-            self.mm,
+            self.mm(),
             semantic_start,
             semantic_len,
             receipt.revision(),
@@ -665,7 +675,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
             .kernel
             .frame_inventory()
             .mapping_is_live_exact_at_revision(
-                self.mm,
+                self.mm(),
                 inventory_revision,
                 mapping,
                 frame,
@@ -680,7 +690,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         }
         let proof = KernelForeignCowProof::new(
             Arc::clone(&self.kernel),
-            self.mm,
+            self.mm(),
             semantic_start,
             semantic_len,
             inventory_revision,
@@ -703,8 +713,9 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         gpa: carrick_guest_mem::Gpa,
         length: carrick_hal::FrameLength,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let inventory_owner = self.inventory_owner.owner();
         let inventory = self.kernel.frame_inventory();
-        if inventory.mapping_is_live_exact(self.mm, mapping, frame, gpa, length) {
+        if inventory.mapping_is_live_exact(*inventory_owner, mapping, frame, gpa, length) {
             return Ok(true);
         }
         let candidates: Vec<_> = inventory
@@ -720,7 +731,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
             .collect();
         Err(Box::new(std::io::Error::other(format!(
             "frame mapping is not exact-live: expected mm={:?} mapping={mapping:?} frame={frame:?} gpa={gpa:?} length={} candidates={candidates:?}",
-            self.mm,
+            self.mm(),
             length.raw(),
         ))))
     }
@@ -743,8 +754,9 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         )],
         candidate_frames: &[carrick_hal::FrameId],
     ) -> Result<(Vec<bool>, Vec<Option<usize>>), Box<dyn std::error::Error + Send + Sync>> {
+        let inventory_owner = self.inventory_owner.owner();
         Ok(self.kernel.frame_inventory().retirement_batch_query(
-            self.mm,
+            *inventory_owner,
             candidate_extents,
             candidate_frames,
         ))
@@ -1265,7 +1277,7 @@ mod tests {
         let carrier_custody = ProductionCarrierForeignCowCustody::new();
         let authority = crate::vcpu_loop::kernel_frame_cow_authority_for_test(
             Arc::clone(kernel),
-            mm,
+            child.shared().mm(),
             caller_tid,
             projected.binding.asid().raw_for_probe(),
             carrier_custody.owner_inventory(),
@@ -3724,7 +3736,7 @@ mod tests {
             carrick_hal::ForeignOwnerGeneration::from_backend_counter(NonZeroU64::new(62).unwrap());
         let authority = crate::vcpu_loop::kernel_frame_cow_authority_for_test(
             Arc::clone(&kernel),
-            mm,
+            root.shared().mm(),
             tid,
             7,
             crate::vcpu_loop::fixed_frame_cow_owner_inventory_for_test(current_owner),
@@ -3841,7 +3853,7 @@ mod tests {
             carrick_hal::ForeignOwnerGeneration::from_backend_counter(NonZeroU64::new(5).unwrap());
         let authority = crate::vcpu_loop::kernel_frame_cow_authority_for_test(
             Arc::clone(&kernel),
-            mm,
+            root.shared().mm(),
             tid,
             7,
             crate::vcpu_loop::fixed_frame_cow_owner_inventory_for_test(owner),
@@ -3950,7 +3962,7 @@ mod tests {
         });
         let authority = crate::vcpu_loop::kernel_frame_cow_authority_for_test(
             Arc::clone(&kernel),
-            mm,
+            root.shared().mm(),
             tid,
             7,
             owners.clone(),
@@ -4061,6 +4073,194 @@ mod tests {
                 .mapping_is_live_exact(mm, mapping, frame, gpa, length)
         );
     }
+    #[test]
+    fn frame_grant_uses_transferred_owner_with_original_semantic_mm() {
+        let (kernel, root) = bootstrap(31_130);
+        let mm = root.shared().mm().id();
+        let tid = ThreadId::synthetic_for_tests(31_130);
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(2).unwrap();
+        let mut reservation = kernel.reserve_frame_inventory(1, 1, capacity).unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation =
+            carrick_hal::MappingGeneration::from_backend_counter(NonZeroU64::new(1).unwrap());
+        let gpa = Gpa(0xe000);
+        let length =
+            carrick_hal::FrameLength::from_mapping_extent(NonZeroU64::new(0x20_0000).unwrap());
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa,
+                length,
+                permissions: carrick_hal::MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        let current_owner =
+            carrick_hal::ForeignOwnerGeneration::from_backend_counter(NonZeroU64::new(71).unwrap());
+        #[derive(Debug)]
+        struct RecordingOwnerInventory {
+            generation: carrick_hal::ForeignOwnerGeneration,
+            requests: parking_lot::Mutex<Vec<(Gpa, carrick_hal::FrameLength)>>,
+        }
+        impl carrick_hal::FrameCowOwnerInventory for RecordingOwnerInventory {
+            fn retain_current(
+                &self,
+                gpa: Gpa,
+                length: carrick_hal::FrameLength,
+            ) -> Result<
+                Box<dyn carrick_hal::FrameCowOwnerLease>,
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                self.requests.lock().push((gpa, length));
+                Ok(Box::new(super::FixedFrameCowOwnerLease {
+                    generation: self.generation,
+                }))
+            }
+        }
+        let owners = Arc::new(RecordingOwnerInventory {
+            generation: current_owner,
+            requests: parking_lot::Mutex::new(Vec::new()),
+        });
+        let authority = crate::vcpu_loop::kernel_frame_cow_authority_for_test(
+            Arc::clone(&kernel),
+            root.shared().mm(),
+            tid,
+            7,
+            owners.clone(),
+        );
+
+        let guest = carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::guest_arch_binding::core_arch::MmGeneration::new(
+                NonZeroU64::new(91001).unwrap(),
+            ),
+            root_generation: carrick_hal::guest_arch_binding::core_arch::ContextGeneration::new(
+                NonZeroU64::new(7).unwrap(),
+            ),
+        };
+        kernel
+            .transfer_frame_inventory_to_guest(&root, guest)
+            .unwrap();
+        assert_eq!(root.shared().mm().id(), mm);
+        let (receipt, authenticated_owner) = authority
+            .apply_frame_grant(reservation.commit(()), mapping, frame, gpa, length)
+            .expect("apply frame-grant inventory transaction");
+        assert_eq!(receipt.mm(), guest.native_mm.raw());
+        assert!(receipt.authorizes(mapping, frame));
+        assert_eq!(authenticated_owner, current_owner);
+        assert!(kernel.frame_inventory().mapping_is_live_exact_at_revision(
+            carrick_kernel::kernel::FrameOwner::GuestMm(guest),
+            receipt.revision(),
+            mapping,
+            frame,
+            gpa,
+            length,
+        ));
+
+        let (authenticated_mm, existing) = authority
+            .authenticate_frame_backing(carrick_hal::FrameBackingAuthentication {
+                mapping,
+                frame,
+                gpa,
+                length,
+                owner_gpa: gpa,
+                owner_length: length,
+            })
+            .expect("authenticate existing COW destination without a new grant");
+        assert_eq!(authenticated_mm, guest.native_mm.raw());
+        assert_eq!(existing.mapping_id.get(), mapping.raw());
+        assert_eq!(existing.frame_id.get(), frame.raw());
+        assert_eq!(
+            existing.owner_generation.get(),
+            current_owner.raw_for_probe()
+        );
+        assert_eq!(existing.inventory_revision.get(), receipt.revision());
+        // A fragmented kernel row authenticates its exact logical extent,
+        // while the owner lookup uses the larger physical lease independently.
+        let owner_gpa = Gpa(0x8000);
+        let owner_length =
+            carrick_hal::FrameLength::from_mapping_extent(NonZeroU64::new(0x400000).unwrap());
+        let (_, fragmented) = authority
+            .authenticate_frame_backing(carrick_hal::FrameBackingAuthentication {
+                mapping,
+                frame,
+                gpa,
+                length,
+                owner_gpa,
+                owner_length,
+            })
+            .expect("logical row inside larger physical owner");
+        assert_eq!(fragmented, existing);
+        assert_eq!(
+            owners.requests.lock().last().copied(),
+            Some((owner_gpa, owner_length))
+        );
+        let count = owners.requests.lock().len();
+        assert!(
+            authority
+                .authenticate_frame_backing(carrick_hal::FrameBackingAuthentication {
+                    mapping,
+                    frame,
+                    gpa,
+                    length,
+                    owner_gpa: Gpa(gpa.0 + 4096),
+                    owner_length,
+                })
+                .is_err()
+        );
+        assert_eq!(
+            owners.requests.lock().len(),
+            count,
+            "refuse out-of-owner rows before retaining"
+        );
+        assert!(
+            authority
+                .authenticate_frame_backing(carrick_hal::FrameBackingAuthentication {
+                    mapping,
+                    frame,
+                    gpa: Gpa(gpa.0 + 4096),
+                    length,
+                    owner_gpa: gpa,
+                    owner_length: length
+                })
+                .is_err()
+        );
+
+        authority
+            .rollback_frame_grant(&receipt)
+            .expect("roll back unpublished frame grant");
+        assert!(
+            authority
+                .authenticate_frame_backing(carrick_hal::FrameBackingAuthentication {
+                    mapping,
+                    frame,
+                    gpa,
+                    length,
+                    owner_gpa: gpa,
+                    owner_length: length
+                })
+                .is_err()
+        );
+        assert!(
+            !kernel
+                .frame_inventory()
+                .mapping_is_live_exact(mm, mapping, frame, gpa, length)
+        );
+    }
 
     #[test]
     fn foreign_cow_runtime_rejects_transport_owner_after_independent_proof_issuance() {
@@ -4068,7 +4268,6 @@ mod tests {
         let execution = execution_lease(&root, 129);
         let (child, _backend, owner_generation, _bytes, _counters) =
             cow_fixture(&kernel, &root, 31_130, MockCowFault::None);
-        let mm = child.shared().mm().id();
         let current_owner = carrick_hal::ForeignOwnerGeneration::from_backend_counter(
             NonZeroU64::new(owner_generation.load(Ordering::Acquire)).unwrap(),
         );
@@ -4109,7 +4308,7 @@ mod tests {
             .unwrap();
         let proof_issuer = crate::vcpu_loop::kernel_frame_cow_authority_for_test(
             Arc::clone(&kernel),
-            mm,
+            child.shared().mm(),
             ThreadId::synthetic_for_tests(31_130),
             9,
             crate::vcpu_loop::fixed_frame_cow_owner_inventory_for_test(current_owner),

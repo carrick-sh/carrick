@@ -391,7 +391,7 @@ where
                         runtime: Arc::downgrade(&kernel),
                         deferred_anonymous: kernel.dispatcher.deferred_anonymous_state(mm),
                         kernel: process.kernel_graph().clone(),
-                        mm,
+                        inventory_owner: task.shared().mm().frame_owner_authority(),
                         owner_inventory: backend.frame_cow_owner_inventory(),
                         tid: ThreadId::from_kernel_thread_identity(thread.tid.raw()),
                         identity: carrick_hal::FrameCowIdentity {
