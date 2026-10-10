@@ -6895,7 +6895,10 @@ mod tests {
 
         let snapshot = context.kernel().frame_inventory().snapshot_for_mm(exact_mm);
         assert_eq!(snapshot.mappings.len(), 1);
-        assert_eq!(snapshot.mappings[0].mm, exact_mm);
+        assert_eq!(
+            snapshot.mappings[0].mm,
+            carrick_kernel::kernel::FrameOwner::HostMm(exact_mm)
+        );
     }
 
     #[test]
