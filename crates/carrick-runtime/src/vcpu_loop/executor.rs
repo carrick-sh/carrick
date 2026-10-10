@@ -1489,9 +1489,13 @@ fn adopt_born_record(
     };
     // SAFETY: the stopped executor owns this Host handback or claimed service head.
     let frame = unsafe { *live.ctx_mut() };
+    #[cfg(target_arch = "aarch64")]
+    let native = &frame.native;
+    #[cfg(not(target_arch = "aarch64"))]
+    let native = &frame;
     if scheduler
         .kernel()
-        .adopt_born_thread_at_first_entry(key, &frame.native)
+        .adopt_born_thread_at_first_entry(key, native)
         .map_err(NextError::Fatal)?
     {
         zone.free_record(record.id);
