@@ -803,3 +803,9 @@ fn mounted_static_x86_signal_segv_child_action_and_resume_match_native() {
 fn mounted_static_x86_signal_abort_without_core_matches_native() {
     compare_mounted_assembly_with_native("x86_signal_abort.S", b"A\n");
 }
+
+#[test]
+fn mounted_static_x86_signal_noncanonical_handler_matches_native() {
+    compare_mounted_fault_with_native("x86_signal_bad_handler.S");
+    compare_mounted_fault_with_native("x86_signal_bad_fault_handler.S");
+}
