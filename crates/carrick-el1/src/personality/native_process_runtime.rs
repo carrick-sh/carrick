@@ -6,7 +6,7 @@ use super::{
     native_process_custody::{ProcessResources, ProcessWake, RetainedProcessCustody},
     native_process_entry::{self, CopiedWaitOutcome, ForkTryError, PreparedFork, WaitWork},
     native_process_signals::{NativeExitSignals, NativeProcessSignals},
-    process_owner::{GuestProcessOwner, GuestTask, GuestTaskMetadata},
+    process_owner::{GuestProcessOwner, GuestTask, GuestTaskMetadata, NativeProcessCustody},
 };
 use crate::lock::SpinLock;
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec};
@@ -5041,6 +5041,7 @@ mod tests {
             controls: &*child_controls,
             copies: Vec::new(),
             refuse_copy: false,
+            on_signal_clock: None,
         };
         let mut entry = runtime
             .enter(source, &task, words(address), &mut service)
@@ -5218,6 +5219,7 @@ mod tests {
             controls: &*child_controls,
             copies: Vec::new(),
             refuse_copy: false,
+            on_signal_clock: None,
         };
         let mut entry = runtime
             .enter(source, &task, words(address), &mut service)
@@ -5306,6 +5308,7 @@ mod tests {
             controls: &*child_controls,
             copies: Vec::new(),
             refuse_copy: false,
+            on_signal_clock: None,
         };
         let mut entry = runtime
             .enter(source, &task, words(address), &mut service)
@@ -5432,6 +5435,7 @@ mod tests {
             controls: &*child_controls,
             copies: Vec::new(),
             refuse_copy: false,
+            on_signal_clock: None,
         };
         let mut entry = runtime
             .enter(source, &task, words(address), &mut service)
@@ -5524,6 +5528,7 @@ mod tests {
             controls: &*child_controls,
             copies: Vec::new(),
             refuse_copy: false,
+            on_signal_clock: None,
         };
         let mut entry = runtime
             .enter(source, &task, words(address), &mut service)
@@ -5665,6 +5670,7 @@ mod tests {
             controls: &*child_controls,
             copies: Vec::new(),
             refuse_copy: false,
+            on_signal_clock: None,
         };
         let mut entry = runtime
             .enter(source, &task, words(address), &mut service)
@@ -6056,6 +6062,7 @@ mod tests {
             controls: &*child_controls,
             copies: Vec::new(),
             refuse_copy: false,
+            on_signal_clock: None,
         };
         let mut entry = runtime
             .enter(source, &task, words(address), &mut service)
