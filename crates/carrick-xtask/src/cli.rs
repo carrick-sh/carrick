@@ -27,6 +27,8 @@ pub enum Commands {
 
     #[command(about = "Owner-approved JIT ephemeral runners: Willow KVM clones and cloudmac HVF")]
     CiScaler(crate::ci_scaler::ScalerArgs),
+    #[command(about = "Compare trusted-runner accept receipts against a per-SHA baseline")]
+    CiReceipt(crate::ci_receipt::ReceiptArgs),
     #[command(about = "Census clean landed worktrees; dry-run unless --apply")]
     WorktreeGc(crate::worktree_gc::WorktreeGcArgs),
 
@@ -151,6 +153,8 @@ pub enum CliError {
     AsmDiff(#[from] crate::asm_diff::AsmDiffError),
     #[error("ci-scaler: {0}")]
     CiScaler(#[from] crate::ci_scaler::ScalerError),
+    #[error("ci-receipt: {0}")]
+    CiReceipt(#[from] crate::ci_receipt::ReceiptError),
     #[error("worktree gc: {0}")]
     WorktreeGc(#[from] crate::worktree_gc::GcError),
     #[error(transparent)]
@@ -315,6 +319,10 @@ where
         }
         Commands::CiScaler(args) => {
             crate::ci_scaler::run(args)?;
+            Ok(())
+        }
+        Commands::CiReceipt(args) => {
+            crate::ci_receipt::run(args)?;
             Ok(())
         }
         Commands::TargetPrune(args) => {
