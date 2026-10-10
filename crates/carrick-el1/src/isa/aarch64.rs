@@ -305,3 +305,20 @@ pub fn complete_native_run_failure(
 }
 
 
+/// Read the EL0 stack register at the native trap boundary.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub(crate) unsafe fn signal_stack() -> carrick_guest_arch::UserVa {
+    let sp: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, sp_el0", out(reg) sp, options(nomem, nostack));
+    }
+    carrick_guest_arch::UserVa::new(sp)
+}
+
+/// Publish a validated EL0 stack register at the native trap boundary.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub(crate) unsafe fn set_signal_stack(sp: carrick_guest_arch::UserVa) {
+    unsafe {
+        core::arch::asm!("msr sp_el0, {}", in(reg) sp.raw(), options(nomem, nostack));
+    }
+}
