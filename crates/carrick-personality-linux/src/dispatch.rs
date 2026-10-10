@@ -393,22 +393,38 @@ fn serve_family<'a, C: EntryContext + 'a>(
         return pending
             .identity_native()
             .and_then(|native| crate::identity::invoke(call, native))
-            .map_or(FamilyCompletion::Forward.into(), |result| FamilyRun {
-                completion: FamilyCompletion::Complete(result.raw()),
-                returned: Some((result, original)),
-                forward_reason: ForwardReason::FamilyFallback,
-            });
+            .map_or(
+                FamilyRun {
+                    completion: FamilyCompletion::Forward,
+                    returned: None,
+                    // An absent/unported owner must still enter crossing policy.
+                    forward_reason: ForwardReason::Unported,
+                },
+                |result| FamilyRun {
+                    completion: FamilyCompletion::Complete(result.raw()),
+                    returned: Some((result, original)),
+                    forward_reason: ForwardReason::FamilyFallback,
+                },
+            );
     }
     if let Family::Sysinfo(call) = family {
         let original = pending.original_argument0();
         return pending
             .sysinfo_native()
             .and_then(|native| crate::sysinfo::invoke(call, native))
-            .map_or(FamilyCompletion::Forward.into(), |result| FamilyRun {
-                completion: FamilyCompletion::Complete(result.raw()),
-                returned: Some((result, original)),
-                forward_reason: ForwardReason::FamilyFallback,
-            });
+            .map_or(
+                FamilyRun {
+                    completion: FamilyCompletion::Forward,
+                    returned: None,
+                    // An absent/unported owner must still enter crossing policy.
+                    forward_reason: ForwardReason::Unported,
+                },
+                |result| FamilyRun {
+                    completion: FamilyCompletion::Complete(result.raw()),
+                    returned: Some((result, original)),
+                    forward_reason: ForwardReason::FamilyFallback,
+                },
+            );
     }
     let mut returned = None;
     let completion = match family {
@@ -883,7 +899,12 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
         && matches!(ordinal, 99 | 132 | 135);
     let transfer = pending.ipc_available()
         && matches!(family, Family::Read | Family::Write | Family::EpollWait);
-    if pending.host_work() && !pending.resumes_operation() && !transfer && !setup {
+    // Identity/resource operations complete synchronously under their owner.
+    // Serve them before handing back metadata work; an absent owner still
+    // declines through Unported crossing policy, never host identity replay.
+    let owned_identity = matches!(family, Family::Identity(_) | Family::Sysinfo(_));
+    if pending.host_work() && !pending.resumes_operation() && !transfer && !setup && !owned_identity
+    {
         pending.declined_for_work(ordinal);
         return finish(
             ordinal,
