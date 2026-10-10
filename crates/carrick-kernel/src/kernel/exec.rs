@@ -594,6 +594,10 @@ impl Kernel {
             .replace_process_credentials(prepared.resources.credentials());
         record.task.reset_dumpable_for_exec();
         for (tid, (_, thread)) in &old_threads {
+            // The host owner completes exec; the shared in-ring owner has no
+            // replacement receipt. Revoke every predecessor stamp, including
+            // the old leader, so stale shared identity dispatch fails closed.
+            thread.control_slot().retire_identity();
             if *tid == leader_tid {
                 continue;
             }
@@ -965,6 +969,75 @@ mod tests {
         )
         .expect("bootstrap input");
         Kernel::bootstrap_root(input).expect("kernel")
+    }
+
+    #[test]
+    fn committed_exec_revokes_predecessor_shared_identity_dispatch() {
+        use carrick_guest_arch::UserVa;
+        use carrick_personality_linux::identity::{
+            IdentityCall, IdentityNative, ProcessIdentityVenue,
+        };
+        use carrick_personality_linux::lifecycle::UserCopy;
+        struct Predecessor<'a>(&'a carrick_el1_abi::ThreadControlSlot);
+        impl UserCopy for Predecessor<'_> {
+            fn copy_in(&mut self, _: &mut [u8], _: UserVa) -> bool {
+                panic!("stale identity read user memory")
+            }
+            fn copy_out(&mut self, _: UserVa, _: &[u8]) -> bool {
+                panic!("stale identity wrote user memory")
+            }
+        }
+        impl<'a> IdentityNative<'a> for Predecessor<'a> {
+            fn arguments(&self) -> [u64; 6] {
+                [16, 0, 0, 0, 0, 0]
+            }
+            fn visible_tid(&self) -> Option<u32> {
+                self.0.visible_tid()
+            }
+            fn set_clear_child_tid(&mut self, _: u64) -> bool {
+                panic!("stale registration")
+            }
+            fn robust_list_for(&self, _: i32) -> Result<(u64, u32), i64> {
+                panic!("stale robust list")
+            }
+            fn process_identity(&mut self) -> Option<&mut dyn ProcessIdentityVenue> {
+                panic!("stale shared owner")
+            }
+        }
+        let (kernel, root) = bootstrap(9090);
+        let predecessor = root.thread().control_lease();
+        assert!(predecessor.publish_visible_tid(9090));
+        let prepared = kernel.prepare_exec(&root, None).unwrap();
+        assert_eq!(
+            predecessor.visible_tid(),
+            Some(9090),
+            "failed/prepared exec must preserve identity"
+        );
+        let replacement = kernel.commit_exec(prepared, None).unwrap();
+        assert_eq!(
+            predecessor.visible_tid(),
+            None,
+            "exec must revoke the predecessor stamp"
+        );
+        assert!(!std::ptr::eq(
+            root.thread().control_slot(),
+            replacement.thread().control_slot()
+        ));
+        let mut stale = Predecessor(&predecessor);
+        for call in [
+            IdentityCall::Prctl,
+            IdentityCall::CapGet,
+            IdentityCall::SetPgid,
+            IdentityCall::SetTidAddress,
+            IdentityCall::GetRobustList,
+        ] {
+            assert_eq!(
+                carrick_personality_linux::identity::invoke(call, &mut stale)
+                    .unwrap()
+                    .raw(),
+                carrick_personality_linux::identity::ESRCH
+            );
+        }
     }
 
     #[test]
