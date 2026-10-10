@@ -32,6 +32,50 @@ type Runtime = NativeProcessRuntime<'static, Mm, ParkedContextWords>;
 static REGISTRY: NativeProcessRegistry<'static, Mm, ParkedContextWords> =
     NativeProcessRegistry::new();
 
+/// Retired child MMs whose space entry and reservation root still wait for
+/// every zone slot to leave them (the same protocol as the AArch64 owner).
+static RETIRED_SPACES: carrick_el1::lock::SpinLock<Vec<Mm>> =
+    carrick_el1::lock::SpinLock::new(Vec::new());
+
+fn space_has_resident_slot(zone: &ZoneTables<ParkedContextWords>, mm: Mm) -> bool {
+    (0..carrick_el1::isa::x86::context::native::CPL0_CPU_COUNT).any(|slot| {
+        SlotId::from_index(slot).is_some_and(|slot| zone.installed_space(slot) == mm.mm.raw().get())
+    })
+}
+
+/// Retire the closed child's reservation root (tree nodes, notifications)
+/// and free its exact space entry so both indices can be reused.
+fn retire_closed_space(owner: &Portal, mm: Mm, worker: u32) -> Result<(), NativeProcessError> {
+    let key = ReservationMm::new(mm.mm.raw().get()).ok_or(NativeProcessError::Stale)?;
+    let index = owner
+        .spaces
+        .find(key.raw())
+        .ok_or(NativeProcessError::Stale)?;
+    owner.spaces.close(index);
+    owner
+        .root_any(key, worker)
+        .map_err(|_| NativeProcessError::Stale)?
+        .retire()
+        .map_err(|_| NativeProcessError::Busy)?;
+    owner.spaces.free(index);
+    Ok(())
+}
+
+fn drain_retired_spaces(owner: &Portal, worker: u32) -> Result<(), NativeProcessError> {
+    let zone = owner.zone.ok_or(NativeProcessError::Stale)?;
+    let pending = core::mem::take(&mut *RETIRED_SPACES.lock());
+    let mut deferred = Vec::new();
+    for mm in pending {
+        if space_has_resident_slot(zone, mm) {
+            deferred.push(mm);
+        } else {
+            retire_closed_space(owner, mm, worker)?;
+        }
+    }
+    RETIRED_SPACES.lock().extend(deferred);
+    Ok(())
+}
+
 pub(super) fn registry() -> &'static NativeProcessRegistry<'static, Mm, ParkedContextWords> {
     &REGISTRY
 }
@@ -202,6 +246,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             return Err(NativeProcessError::Stale);
         }
         let owner = portal()?;
+        drain_retired_spaces(&owner, self.worker())?;
         let mm = ReservationMm::new(parent.mm.raw().get()).ok_or(NativeProcessError::Stale)?;
         let live = anonymous::live_words(mm).ok_or(NativeProcessError::Stale)?;
         let capacity = owner.fork_mapping_count(mm, self.worker()).map_err(error)?;
@@ -575,6 +620,13 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         {
             fatal();
         }
+        // Close the child's gate first: nothing installs this MM again.
+        let owner = portal().unwrap_or_else(|_| fatal());
+        let index = owner
+            .spaces
+            .find(mm.mm.raw().get())
+            .unwrap_or_else(|| fatal());
+        owner.spaces.close(index);
         let binding = carrick_el1::personality::common_entry::execution_binding(self.task);
         let Some(mut retire) = NativeChildRetire::new(binding, mm) else {
             fatal();
@@ -598,6 +650,10 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         // Absence is published only after CR3 left the retired root; the
         // host drains this MM's quarantine on a later stopped crossing.
         if !super::native_execution::leave_space(source) {
+            fatal();
+        }
+        RETIRED_SPACES.lock().push(mm);
+        if drain_retired_spaces(&owner, self.worker()).is_err() {
             fatal();
         }
     }
