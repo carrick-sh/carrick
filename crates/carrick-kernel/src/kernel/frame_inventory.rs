@@ -112,6 +112,38 @@ pub struct FrameInventoryAuthority {
     entropy: Mutex<ProvenanceEntropyBatch>,
 }
 
+pub(in crate::kernel) struct NativeRootFrameAdmission {
+    pub kernel: std::sync::Weak<super::Kernel>,
+    pub mm: std::sync::Weak<super::objects::Mm>,
+    pub root: carrick_hal::guest_arch_binding::core_arch::RootGpa,
+}
+impl carrick_hal::NativeFrameInventoryAdmission for NativeRootFrameAdmission {
+    fn admit_root(
+        &self,
+        context: carrick_hal::guest_arch_binding::core_arch::AddressContext<
+            carrick_hal::guest_arch_binding::core_arch::RootGpa,
+        >,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if context.root != self.root {
+            return Err(Box::new(std::io::Error::other(
+                "native root admission physical root mismatch",
+            )));
+        }
+        let kernel = self
+            .kernel
+            .upgrade()
+            .ok_or_else(|| std::io::Error::other("native root admission kernel retired"))?;
+        let mm = self
+            .mm
+            .upgrade()
+            .ok_or_else(|| std::io::Error::other("native root admission MM retired"))?;
+        kernel
+            .frame_inventory()
+            .transfer_mm_to_guest(&mm, context.into())?;
+        Ok(())
+    }
+}
+
 /// A projection of the existing inventory and object ID source, never a
 /// second inventory. Bindings retain exact MM identity across publication.
 struct PhysicalInventoryProjection {
@@ -3665,6 +3697,112 @@ mod physical_projection_tests {
             })
             .unwrap();
         carrick_hal::UnpublishedFrameInventoryApply::apply(bound, reservation.commit(())).unwrap()
+    }
+
+    #[test]
+    fn native_root_admission_transfers_the_existing_inventory_without_retaining_mm() {
+        let (kernel, root) = super::super::mm_access::test_support::bootstrap(31_133);
+        let mm = root.shared().mm();
+        let mm_references = Arc::strong_count(&mm);
+        let kernel_references = Arc::strong_count(&kernel);
+        let admission = kernel
+            .native_frame_inventory_admission(
+                &root,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(Arc::strong_count(&mm), mm_references);
+        assert_eq!(Arc::strong_count(&kernel), kernel_references);
+        let source = kernel.physical_frame_inventory();
+        let mut reservation = kernel
+            .reserve_frame_inventory(1, 1, FrameEventCapacity::for_event_count(2).unwrap())
+            .unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation = MappingGeneration::from_backend_counter(NonZeroU64::MIN);
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa: Gpa(0x4000),
+                length: FrameLength::from_mapping_extent(NonZeroU64::new(4096).unwrap()),
+                permissions: MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        kernel
+            .frame_inventory()
+            .apply(mm.id(), reservation.commit(()))
+            .unwrap();
+        let address = carrick_guest_arch::AddressContext {
+            root: carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(
+                0x8000,
+            ))
+            .unwrap(),
+            mm: carrick_guest_arch::MmGeneration::new(NonZeroU64::new(91004).unwrap()),
+            generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::new(7).unwrap()),
+        };
+        let wrong_root = carrick_guest_arch::AddressContext {
+            root: carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(
+                0x9000,
+            ))
+            .unwrap(),
+            ..address
+        };
+        assert!(admission.admit_root(wrong_root).is_err());
+        assert!(
+            kernel
+                .frame_inventory()
+                .live_mapping_row(mm.id(), mapping)
+                .is_some()
+        );
+        admission.admit_root(address).unwrap();
+        assert!(
+            source
+                .bind(address.into())
+                .live_mapping_row(mapping)
+                .is_some(),
+            "admission must transfer the same inventory row"
+        );
+        assert_eq!(kernel.frame_inventory().frame_mapping_count(frame), Some(1));
+        assert_eq!(mm.id(), mm.frame_owner_authority().semantic_mm());
+        let stale = carrick_guest_arch::AddressContext {
+            generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::new(8).unwrap()),
+            ..address
+        };
+        assert!(admission.admit_root(stale).is_err());
+        admission
+            .admit_root(address)
+            .expect("same owner admission is idempotent");
+        let weak_mm = Arc::downgrade(&mm);
+        drop(root);
+        drop(mm);
+        drop(kernel);
+        assert!(
+            weak_mm.upgrade().is_none(),
+            "admission cannot retain an MM/backend cycle"
+        );
+        assert!(admission.admit_root(address).is_err());
+        assert!(
+            source
+                .bind(address.into())
+                .live_mapping_row(mapping)
+                .is_some(),
+            "the VM projection retains the one inventory independently of the host MM"
+        );
     }
 
     #[test]

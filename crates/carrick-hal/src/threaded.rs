@@ -2606,6 +2606,17 @@ impl PartialOrd for GuestFrameOwner {
     }
 }
 
+/// Admit physical custody for an authenticated native root. The VM authenticates
+/// execution and address incarnation before invoking this issued capability.
+pub trait NativeFrameInventoryAdmission: Send + Sync {
+    fn admit_root(
+        &self,
+        context: crate::guest_arch_binding::core_arch::AddressContext<
+            crate::guest_arch_binding::core_arch::RootGpa,
+        >,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
 pub trait PhysicalFrameInventory: Send + Sync {
     fn bind(&self, owner: GuestFrameOwner) -> Arc<dyn FrameCowAuthority>;
     fn allocate_backing_ids(
