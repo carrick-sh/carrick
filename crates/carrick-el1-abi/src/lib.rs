@@ -206,7 +206,11 @@ pub const X86_CPL0_BOOTSTRAP_METADATA_BASE: u64 = 0xffff_ffff_a800_0000;
 pub const X86_CPL0_SUPERVISOR_IMAGE_BASE: u64 = 0xffff_ffff_8000_0000;
 /// Guest-physical base shared by the CPL0 image loader and fixture table grant.
 pub const X86_CPL0_SUPERVISOR_IMAGE_GPA: u64 = 0x10_0000;
-pub const X86_CPL0_SUPERVISOR_IMAGE_SIZE: u64 = 0x12_0000;
+pub const X86_CPL0_SUPERVISOR_IMAGE_SIZE: u64 = 0x20_0000;
+const _: () = {
+    assert!(X86_CPL0_SUPERVISOR_IMAGE_SIZE.is_power_of_two());
+    assert!(X86_CPL0_SUPERVISOR_IMAGE_SIZE.is_multiple_of(4096));
+};
 /// CPL0's one upper-half supervisor window for retained physical pages.
 pub const X86_CPL0_DIRECT_VA: u64 = 0xffff_ffff_9000_0000;
 /// Retained initial-image frames use their own supervisor alias, never the

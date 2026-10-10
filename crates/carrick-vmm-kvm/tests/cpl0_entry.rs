@@ -187,7 +187,7 @@ fn production_cpl0_boot_requires_smep_and_smap_on_both_cpus() {
 #[test]
 fn cpl0_supervisor_stub_is_rx_while_tables_and_idt_are_rw_nx() {
     let layout = carrick_x86::BringupLayout {
-        trampoline_base: 0x10_0000,
+        trampoline_base: carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_GPA,
         gdt_base: 0x50_0000,
         pml4_base: 0x60_0000,
     };
