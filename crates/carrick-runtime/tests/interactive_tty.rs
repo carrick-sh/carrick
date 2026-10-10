@@ -119,7 +119,7 @@ fn read_until(master: i32, out: &mut Vec<u8>, secs: u64, done: impl Fn(&[u8]) ->
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs signed release binary, Docker images and a real pty"]
 fn interactive_run_provides_a_working_pty() {
     let Some(bin) = signed_bin() else { return };
     let (master, slave) = open_pty();
@@ -154,7 +154,7 @@ fn interactive_run_provides_a_working_pty() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs signed release binary, Docker images and a real pty"]
 fn interactive_ctrl_c_interrupts_foreground_command() {
     let Some(bin) = signed_bin() else { return };
     let (master, slave) = open_pty();
@@ -196,7 +196,7 @@ fn interactive_ctrl_c_interrupts_foreground_command() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs signed release binary, Docker images and a real pty"]
 fn interactive_ctrl_z_fg_and_ctrl_c_job_control() {
     let Some(bin) = signed_bin() else { return };
     let (master, slave) = open_pty();
@@ -254,7 +254,7 @@ fn interactive_ctrl_z_fg_and_ctrl_c_job_control() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs signed release binary, Docker images and a real pty"]
 fn interactive_forked_foreground_job_keeps_stdout_alive() {
     let Some(bin) = signed_bin() else { return };
     let (master, slave) = open_pty();
@@ -295,7 +295,7 @@ fn interactive_forked_foreground_job_keeps_stdout_alive() {
 /// host SIGTTOU around the tty-control passthrough when the guest ignores it, so
 /// `ls` actually runs and lists `/` instead of stopping before its first write.
 #[test]
-#[ignore]
+#[ignore = "needs signed release binary, Docker images and a real pty"]
 fn interactive_jobcontrol_foreground_command_not_stopped_by_sigttou() {
     let Some(bin) = signed_bin() else { return };
     let (master, slave) = open_pty();
@@ -342,7 +342,7 @@ fn interactive_jobcontrol_foreground_command_not_stopped_by_sigttou() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs signed release binary, Docker images and a real pty"]
 fn interactive_run_resolves_ttyname_dev_tty_and_resize() {
     let Some(bin) = signed_bin() else { return };
     let (master, slave) = open_pty();

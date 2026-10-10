@@ -65,6 +65,8 @@ pub mod posix_timer;
 // (shared by KVM/bhyve, which used to get a `lookup → None` stub). Re-exported as
 // `crate::syscall` so HVF's compat reporter + the probes provider are unchanged.
 pub use carrick_abi::syscall;
+#[doc(hidden)]
+pub mod hvpatch_probe_support;
 pub mod metadata_grant;
 pub mod signal_arrival;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

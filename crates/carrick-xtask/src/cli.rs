@@ -78,6 +78,12 @@ pub enum Commands {
     ProbeCoverage(ProbeCoverageArgs),
 
     #[command(
+        name = "probe-emitters",
+        about = "Check that declared USDT probes have live emitters in the workspace"
+    )]
+    ProbeEmitters(crate::probe_emitters::ProbeEmittersArgs),
+
+    #[command(
         name = "host-lease",
         about = "Run command under machine-global host lease flock (carrick shared, gate/docker exclusive)",
         long_about = "Run command under machine-global host lease flock. Runner death and supervisor SIGTERM/SIGINT/SIGHUP cancel supervised work before successful release. Cleanup errors or the single five-second cleanup deadline fail the run explicitly and release the lease. On macOS, either supervisor or guardian survives the other's SIGKILL and retains exclusion during cleanup; loss of both releases flock. Linux still has a sole supervisor. On Darwin, detached descendants closing all inherited scope descriptors escape; the final process-start-time check to kill also has a PID reuse window. See docs/host-lease-containment-follow-up.md."
@@ -200,6 +206,8 @@ pub enum CliError {
     RemoteAccept(#[from] crate::remote_accept::RemoteAcceptError),
     #[error("test lanes: {0}")]
     TestLanes(#[from] crate::test_lanes::TestLanesError),
+    #[error("probe emitters: {0}")]
+    ProbeEmitters(#[from] crate::probe_emitters::ProbeEmittersError),
 }
 
 pub fn resolve_repo_info(root: Option<&Path>) -> Result<RepoInfo, CliError> {
@@ -410,6 +418,11 @@ where
                 path: PathBuf::from("stdout"),
                 source: e,
             })?;
+            Ok(())
+        }
+        Commands::ProbeEmitters(args) => {
+            let info = resolve_repo_info(cli.root.as_deref())?;
+            crate::probe_emitters::run(&info.repository_root, args, writer)?;
             Ok(())
         }
         Commands::HostLease(args) => {
