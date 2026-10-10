@@ -438,14 +438,12 @@ impl<
         &mut self,
     ) -> Option<&mut dyn carrick_personality_linux::identity::ProcessIdentityVenue> {
         let binding = LifecycleNative::binding(self)?;
-        let tid = carrick_personality_linux::lifecycle::LifecycleNative::visible_tid(self);
+        let tid = carrick_personality_linux::lifecycle::LifecycleNative::visible_tid(self)?;
         let process = self.process.as_deref_mut()?;
         if process.binding() != binding {
             return None;
         }
-        if let Some(tid) = tid {
-            process.set_calling_tid(tid);
-        }
+        process.set_calling_tid(tid);
         process.as_identity_venue()
     }
 }
@@ -474,14 +472,12 @@ impl<
         &mut self,
     ) -> Option<&mut dyn carrick_personality_linux::sysinfo::ProcessSysinfoVenue> {
         let binding = LifecycleNative::binding(self)?;
-        let tid = carrick_personality_linux::lifecycle::LifecycleNative::visible_tid(self);
+        let tid = carrick_personality_linux::lifecycle::LifecycleNative::visible_tid(self)?;
         let process = self.process.as_deref_mut()?;
         if process.binding() != binding {
             return None;
         }
-        if let Some(tid) = tid {
-            process.set_calling_tid(tid);
-        }
+        process.set_calling_tid(tid);
         process.as_sysinfo_venue()
     }
 }

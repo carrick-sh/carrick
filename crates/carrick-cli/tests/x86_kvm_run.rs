@@ -342,6 +342,35 @@ fn mounted_static_x86_raise_uses_set_tid_address_returned_tid() {
 }
 
 #[test]
+fn mounted_static_x86_exec_refuses_before_replacement_identity() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("exec-dependency");
+    compile_assembly("x86_exec_dependency.S", &elf);
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), Some(7));
+    assert_eq!(native.stdout, b"E\n");
+    assert!(native.stderr.is_empty());
+    let guest = run_mounted_binary(&elf, "exec-dependency", false);
+    assert_eq!(
+        guest.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+    assert_eq!(
+        guest.stdout, b"F\n",
+        "shared-owner-exec-completion: CPL0 must refuse exec before replacement"
+    );
+    assert!(guest.stderr.is_empty());
+}
+
+#[test]
 fn mounted_static_x86_identity_eperm_matches_native() {
     compare_mounted_assembly_with_native("x86_identity_eperm.S", b"P\n");
 }

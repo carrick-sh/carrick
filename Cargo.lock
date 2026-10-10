@@ -719,6 +719,7 @@ dependencies = [
  "carrick-el1",
  "carrick-el1-abi",
  "carrick-fatal",
+ "carrick-guest-arch",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",
