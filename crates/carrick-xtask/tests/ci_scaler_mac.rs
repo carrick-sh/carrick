@@ -372,3 +372,56 @@ fn toolchain_must_be_owner_only() {
     .unwrap();
     assert!(verify_toolchain(&tool, uid).is_err());
 }
+
+#[test]
+fn reset_never_writes_through_a_symlink_planted_in_the_job_home() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    let skel = root.path().join("skel");
+    std::fs::create_dir_all(skel.join(".ssh")).unwrap();
+    std::fs::write(skel.join(".zshrc"), "export SKEL=1\n").unwrap();
+    std::fs::write(skel.join(".ssh/config"), "Host *\n").unwrap();
+    std::fs::set_permissions(&skel, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Stand-ins for /etc/sudoers.d/x and a root-owned directory.
+    let outside = root.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("sudoers"), "original\n").unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::os::unix::fs::symlink(outside.join("sudoers"), home.join(".zshrc")).unwrap();
+    std::os::unix::fs::symlink(&outside, home.join(".ssh")).unwrap();
+    // Also pre-plant the temporary build name as a symlink to a directory.
+    std::os::unix::fs::symlink(&outside, root.path().join(".home.new")).unwrap();
+    reset_job_area(&skel, &home, &[], uid, uid, gid).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(outside.join("sudoers")).unwrap(),
+        "original\n",
+        "a root write went through a planted symlink"
+    );
+    assert_eq!(
+        std::fs::read_dir(&outside).unwrap().count(),
+        1,
+        "nothing was created in the symlink target"
+    );
+    let zshrc = std::fs::symlink_metadata(home.join(".zshrc")).unwrap();
+    assert!(zshrc.is_file());
+    assert_eq!(
+        std::fs::read_to_string(home.join(".zshrc")).unwrap(),
+        "export SKEL=1\n"
+    );
+    assert!(
+        std::fs::symlink_metadata(home.join(".ssh"))
+            .unwrap()
+            .is_dir()
+    );
+    assert!(!root.path().join(".home.new").exists());
+    assert!(!root.path().join(".home.old").exists());
+    // The home itself replaced by a symlink is swapped out, not followed.
+    std::fs::remove_dir_all(&home).unwrap();
+    std::os::unix::fs::symlink(&outside, &home).unwrap();
+    reset_job_area(&skel, &home, &[], uid, uid, gid).unwrap();
+    assert!(std::fs::symlink_metadata(&home).unwrap().is_dir());
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
+}
