@@ -437,7 +437,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                 core::mem::size_of::<ThreadControlSlot>() * (carrick_el1_abi::THREAD_POOL_ENTRIES + 1),
             );
         }
-        let mut settlement = ForkStockSettlement::abort(p.loan);
+        let mut settlement = carrick_el1_abi::ForkStockSettlement::abort(p.loan);
         // SAFETY: the aborted loan is still exclusively owned across this
         // stopped crossing; the host authenticates its exact execution key.
         unsafe {
