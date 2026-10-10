@@ -433,7 +433,7 @@ pub(crate) use wait_wake::{
 pub(crate) mod terminal;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use terminal::ForkCloseAttempt;
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use terminal::ProcessExitClaim;
 pub(crate) use terminal::{
     CloneAdmissionChangeSubscription, CloneAdmissionGate, CloneAdmissionPermit, CloneEnrollment,
