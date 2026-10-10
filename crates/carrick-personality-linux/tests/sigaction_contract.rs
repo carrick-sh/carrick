@@ -341,3 +341,23 @@ fn nonpositive_queue_targets_match_native_esrch() {
         }
     }
 }
+
+#[test]
+fn x86_dispatch_retains_ipc_and_signal_owners() {
+    use carrick_personality_linux::{
+        dispatch::{Family, route_x86},
+        ipc::IpcCall,
+    };
+    assert!(matches!(
+        route_x86(carrick_syscall_abi::nr::MSGGET.raw(), 0),
+        Family::Ipc(IpcCall::MsgGet)
+    ));
+    assert!(matches!(
+        route_x86(134, 0),
+        Family::Signal(SignalCall::RtSigaction)
+    ));
+    assert!(matches!(
+        route_x86(139, 0),
+        Family::Signal(SignalCall::RtSigreturn)
+    ));
+}

@@ -594,11 +594,6 @@ pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
     }
 }
 
-/// Route canonical Linux ordinals for the x86 in-ring frame owner.
-pub const fn route_x86_64(ordinal: u64, allocator_control: u64) -> Family {
-    route_shared(ordinal, allocator_control)
-}
-
 const fn route_shared(ordinal: u64, allocator_control: u64) -> Family {
     match ordinal {
         214 => Family::Anonymous(AnonymousCall::Brk),
@@ -744,7 +739,7 @@ pub const fn route_x86(ordinal: u64, allocator_control: u64) -> Family {
         nr if nr == carrick_syscall_abi::nr::SEMCTL.raw() => Family::Ipc(IpcCall::SemCtl),
         nr if nr == carrick_syscall_abi::nr::SEMTIMEDOP.raw() => Family::Ipc(IpcCall::SemTimedOp),
         nr if nr == carrick_syscall_abi::nr::SEMOP.raw() => Family::Ipc(IpcCall::SemOp),
-        _ => route_aarch64(ordinal, allocator_control),
+        _ => route_shared(ordinal, allocator_control),
     }
 }
 
