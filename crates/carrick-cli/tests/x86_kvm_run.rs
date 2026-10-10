@@ -287,6 +287,68 @@ fn mounted_static_x86_two_live_mms_have_private_anonymous_leaves() {
     );
 }
 
+/// Sequential fork/exit rounds beyond the eight x86 fork lifecycle records:
+/// each round past eight needs a retired child's stock reclaimed (its CR3
+/// registration, inventory rows and private memslots released) and its
+/// record reissued clean. Matches native output and exit.
+#[test]
+fn mounted_static_x86_fork_rounds_beyond_lifecycle_stock_reuse_retired_children() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("fork-reuse");
+    compile_assembly("x86_fork_reuse.S", &elf);
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .expect("native fork reuse oracle");
+    assert_eq!(native.status.code(), Some(7));
+    assert_eq!(native.stdout, b"R\n");
+    let observed = run_mounted_binary(&elf, "x86-fork-reuse", true);
+    assert_eq!(
+        observed.status.code(),
+        Some(7),
+        "91 = fork refusal; 93 = mmap refusal; 94 = stale or lost leaf; 95 = wait failure; 96 = child status; stderr: {}; report: {}",
+        String::from_utf8_lossy(&observed.stderr),
+        String::from_utf8_lossy(&observed.stdout)
+    );
+    let report: serde_json::Value = serde_json::from_slice(
+        observed
+            .stdout
+            .strip_prefix(b"R\n")
+            .expect("fork reuse stdout"),
+    )
+    .unwrap();
+    let families = report["report"]["execution_witness"]["fork_stock_families"]
+        .as_array()
+        .expect("fork stock families")
+        .iter()
+        .map(|row| {
+            (
+                row["family"].as_str().unwrap().to_owned(),
+                row["count"].as_u64().unwrap(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(families.get("loan"), Some(&12), "{families:?}");
+    assert_eq!(families.get("quarantined_child"), Some(&12), "{families:?}");
+    // Rounds nine to twelve each needed a reclaimed child.
+    assert!(
+        families.get("returned_child").is_some_and(|n| *n >= 4),
+        "{families:?}"
+    );
+    for refused in [
+        "retire_refusal",
+        "capacity_refusal",
+        "inventory_refusal",
+        "withdrawn_lifecycle",
+        "reclaim_deferral",
+    ] {
+        assert!(!families.contains_key(refused), "{refused}: {families:?}");
+    }
+}
+
 #[test]
 fn mounted_static_x86_getpid_matches_guest_gettid() {
     compare_mounted_assembly_with_native("x86_dispatch_getpid.S", b"D\n");
