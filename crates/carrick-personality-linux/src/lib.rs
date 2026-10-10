@@ -19,6 +19,7 @@ pub mod lifecycle;
 pub mod thread;
 
 pub mod identity;
+pub mod ipc;
 pub mod sysinfo;
 
 pub mod native_run_failure;
