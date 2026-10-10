@@ -593,9 +593,6 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                     flags |= carrick_syscall_abi::LINUX_SA_RESTORER; // SA_RESTORER
                     oldact.sa_restorer = restorer.0;
                 }
-                if current.flags.on_stack {
-                    flags |= carrick_syscall_abi::LINUX_SA_ONSTACK;
-                }
                 oldact.sa_flags = flags;
                 oldact.sa_mask = [current.mask.bits()];
                 let bytes = IntoBytes::as_bytes(&oldact);
