@@ -357,7 +357,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     fn load(&mut self, frame: &mut TrapFrame, switched: SwitchedIn) -> bool {
         let (zone, slot) = (self.zone, self.slot);
         let rec = zone.record(switched.record);
-        if !self.enter_space(rec.identity().mm) {
+        if !self.enter_space(rec.identity().mm, rec.has_guest_execution()) {
             zone.unswitch(slot, switched.record);
             return false;
         }
@@ -388,14 +388,17 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// Dekker pair with a page-table pause or ASID retirement), and only
     /// then installs `mm`'s roots, after invalidating its ASID if a
     /// foreign-COW publication is not yet covered.
-    fn enter_space(&mut self, mm: u64) -> bool {
+    fn enter_space(&mut self, mm: u64, guest_owned: bool) -> bool {
         let (zone, slot) = (self.zone, self.slot);
         if mm != 0 && zone.installed_space(slot) == mm {
             return true;
         }
-        // Only for an executor with a task loaded: the idle entry runs no
-        // thread itself (its executor loads it), and switches nothing.
-        if mm == 0 || zone.spaces.idle_ttbr() == 0 || !zone.executor_has_task(slot) {
+        // Host-backed records need their loaded executor. Registered native
+        // records carry their own execution authority, including on idle slots.
+        if mm == 0
+            || zone.spaces.idle_ttbr() == 0
+            || (!guest_owned && !zone.executor_has_task(slot))
+        {
             return false;
         }
         // Only away from a published space (one root for both halves, the

@@ -1754,3 +1754,43 @@ fn switched_record_publishes_its_registered_visible_pid() {
     assert!(sched.load(&mut frame, selected));
     assert_eq!(task.visible_pid(), Some(42));
 }
+
+#[test]
+fn registered_guest_child_runs_from_an_idle_carrier_without_host_adoption() {
+    let zone = zone();
+    publish_space(&zone, OTHER_MM, TTBR_OTHER);
+    host_publish(&zone, SLOT, 0, Some(0), 1);
+    zone.enter_guest(SLOT);
+    let record = zone
+        .alloc_record(ThreadIdentity {
+            mm: OTHER_MM,
+            affinity: 1,
+            ..identity(202)
+        })
+        .unwrap();
+    unsafe {
+        *zone.record(record).ctx_mut() =
+            Aarch64ParkedContext::from_register(thread_ctx(0xB, 0), TTBR_OTHER, OTHER_MM, 1);
+    }
+    assert!(zone.authorize_guest_execution(zone.record_ref(record)));
+    zone.requeue_preempted(SLOT, record);
+    let task = task_for(101);
+    let (mut frame, mut cpu) = live(0xA, 0, FUTEX_WAIT_PRIVATE, 0);
+    let mut sched = Sched {
+        selected_identity: crate::personality::sched::publish_selected_identity,
+        handoff: None,
+        zone: &zone,
+        slot: SLOT,
+        task: &task,
+        cpu: &mut cpu,
+        user: &HardwareUserWord,
+        counters: counters(),
+    };
+    assert_eq!(
+        sched.run_next(&mut frame, 0),
+        Served::Returned { switched: true }
+    );
+    assert_eq!(zone.installed_space(SLOT), OTHER_MM);
+    assert_eq!(zone.slot(SLOT).current(), Some(record));
+    assert_eq!(frame.elr, 0xB000);
+}

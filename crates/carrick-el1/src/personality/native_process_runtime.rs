@@ -717,7 +717,14 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 .owner
                 .task(child.child)
                 .map_err(|_| NativeProcessError::Stale)?;
-            (row.native().resources().page, row.metadata().namespace_pid)
+            let resources = row.native().resources();
+            if !core::ptr::eq(resources.zone, parent.zone)
+                || resources.record != child.record
+                || resources.address != child.address
+            {
+                return Err(NativeProcessError::Stale);
+            }
+            (resources.page, row.metadata().namespace_pid)
         };
         let group_key = Self::group_key(parent.zone, child.address, page, visible_pid);
         if state.members.contains_key(&child_key)
@@ -725,6 +732,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             || state.groups.contains_key(&group_key)
         {
             return Err(NativeProcessError::Busy);
+        }
+        if !parent.zone.authorize_guest_execution(child.record) {
+            return Err(NativeProcessError::Stale);
         }
         state.members.insert(
             child_key,
@@ -3510,18 +3520,22 @@ mod tests {
         }
         let binding = runtime.task_binding(child).unwrap();
         zone.drive(target, 1);
-        zone.publish_slot(target, binding.address.mm.raw().get(), Some(0), 1);
+        zone.publish_slot(target, 0, Some(0), 1);
         zone.enter_guest(target);
-        zone.install_space(target, binding.address.mm.raw().get())
-            .unwrap();
         assert!(!zone.enter_idle(target, false));
         assert!(zone.enter_idle(target, true));
         let mut effects = WakeEffects::default();
         assert_eq!(zone.migrate_queued(slot, &mut effects), 1);
+        assert!(
+            !zone.head_needs_host(target),
+            "native child needs no host task row"
+        );
         assert_eq!(
             zone.switch_in_full(target).unwrap().record,
             binding.record.id
         );
+        zone.install_space(target, binding.address.mm.raw().get())
+            .unwrap();
         let identity = zone.record(binding.record.id).identity();
         task.set(
             carrick_el1_abi::El1TaskId::from_linux_tid(child.id.raw()),
