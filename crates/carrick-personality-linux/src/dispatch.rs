@@ -539,6 +539,7 @@ pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
         28 => Family::InotifyRemove,
         98 => Family::Futex,
         93 => Family::Lifecycle(LifecycleCall::Exit),
+        134 => Family::Lifecycle(LifecycleCall::SigAction),
         132 => Family::Lifecycle(LifecycleCall::SigAltStack),
         135 => Family::Lifecycle(LifecycleCall::SigProcMask),
         139 => Family::SignalReturn,
@@ -1102,6 +1103,8 @@ mod ring_first_tests {
             (98, true, true, CompletionRoute::Forward),
             (222, true, true, CompletionRoute::Forward),
             (139, false, false, CompletionRoute::Forward),
+            // Signal dispositions remain with the host kernel authority.
+            (134, false, false, CompletionRoute::Forward),
             (220, false, false, CompletionRoute::Forward),
             (260, false, false, CompletionRoute::Forward),
             (174, true, false, CompletionRoute::WithWork),

@@ -3480,8 +3480,13 @@ fn el1_fork_cow_resolves_in_guest() {
     let warmup = run_fixture(&carrier, &["fork-cow", "1", "1"], Duration::from_secs(120));
     assert!(
         warmup.result.success(),
-        "warm-up fork failed: {}; owner process refusal stages={:?}; first process service root={:?}; first native fork failure={:?}; fork progress={:?}; returned child stock delta={}",
+        "warm-up fork failed: {}; rt_sigaction (served, forwarded, refused)={:?}; owner process refusal stages={:?}; first process service root={:?}; first native fork failure={:?}; fork progress={:?}; returned child stock delta={}",
         describe(&warmup),
+        read_el1_counters().map(|c| [
+            c.served[134].load(std::sync::atomic::Ordering::Relaxed),
+            c.forwarded[134].load(std::sync::atomic::Ordering::Relaxed),
+            c.refused[134].load(std::sync::atomic::Ordering::Relaxed),
+        ]),
         read_el1_counters().map(|c| c
             .process_refusals
             .map(|n| n.load(std::sync::atomic::Ordering::Relaxed))),
