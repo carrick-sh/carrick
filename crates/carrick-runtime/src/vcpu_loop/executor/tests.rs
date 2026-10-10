@@ -683,7 +683,11 @@ struct MaliciousExecutor {
 impl PersistentExecutorFactory for MaliciousFactory {
     type Executor = MaliciousExecutor;
 
-    fn create(&self, executor: ExecutorId) -> Result<Self::Executor, TrapError> {
+    fn create(
+        &self,
+        registration: &carrick_kernel::kernel::ExecutorRegistration,
+    ) -> Result<Self::Executor, TrapError> {
+        let executor = registration.id();
         Ok(MaliciousExecutor {
             id: executor,
             current: None,
@@ -791,7 +795,11 @@ impl PersistentExecutor for BoundaryAuditProbe {
 impl PersistentExecutorFactory for FakeFactory {
     type Executor = FakeExecutor;
 
-    fn create(&self, executor: ExecutorId) -> Result<Self::Executor, TrapError> {
+    fn create(
+        &self,
+        registration: &carrick_kernel::kernel::ExecutorRegistration,
+    ) -> Result<Self::Executor, TrapError> {
+        let executor = registration.id();
         let call = self.create_calls.fetch_add(1, Ordering::SeqCst) + 1;
         self.record(BackendEventKind::Create, executor, None);
         if self.fail_create_call.load(Ordering::SeqCst) == call {
@@ -6704,7 +6712,7 @@ fn test_lazy_vcpu_typed_accessor_forces_materialization() {
     let generation = publish(&context, 204);
     let worker = Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default())));
     let registration = scheduler.register_executor(worker).unwrap();
-    let mut executor = factory.create(registration.id()).unwrap();
+    let mut executor = factory.create(&registration).unwrap();
     let authority = enqueue_root(&scheduler, &context, generation);
     let mut running = scheduler.take(&registration).unwrap();
     let lease = running.take_lease();
@@ -6780,7 +6788,7 @@ fn test_lazy_vcpu_executor_destroy_materializes_resident_task() {
     let generation = publish(&context, 205);
     let worker = Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default())));
     let registration = scheduler.register_executor(worker).unwrap();
-    let mut executor = factory.create(registration.id()).unwrap();
+    let mut executor = factory.create(&registration).unwrap();
     let authority = enqueue_root(&scheduler, &context, generation);
     let mut running = scheduler.take(&registration).unwrap();
     let lease = running.take_lease();
@@ -6852,7 +6860,7 @@ fn test_lazy_vcpu_stale_record_on_reentry_after_other_executor_run_discards_and_
     let generation = publish(&context, 206);
     let worker = Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default())));
     let registration = scheduler.register_executor(worker).unwrap();
-    let mut executor = factory.create(registration.id()).unwrap();
+    let mut executor = factory.create(&registration).unwrap();
     let authority = enqueue_root(&scheduler, &context, generation);
     let mut running = scheduler.take(&registration).unwrap();
     let lease = running.take_lease();
@@ -6947,7 +6955,7 @@ fn test_lazy_vcpu_cross_executor_claim_waits_for_idle_flush_and_overlays_materia
 
     let worker1 = Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default())));
     let reg1 = scheduler.register_executor(worker1).unwrap();
-    let mut exec1 = factory.create(reg1.id()).unwrap();
+    let mut exec1 = factory.create(&reg1).unwrap();
 
     let worker2 = Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default())));
     let reg2 = scheduler.register_executor(worker2).unwrap();
@@ -6999,10 +7007,10 @@ fn test_lazy_vcpu_cross_executor_claim_waits_for_idle_flush_and_overlays_materia
     let thread_key = context.thread().key();
 
     let factory_exec2 = Arc::clone(&factory);
-    let reg2_id = reg2.id();
+    let reg2_for_create = reg2.clone();
     let (load_done_tx, load_done_rx) = std::sync::mpsc::channel();
     let exec2_handle = thread::spawn(move || {
-        let mut exec2 = factory_exec2.create(reg2_id).unwrap();
+        let mut exec2 = factory_exec2.create(&reg2_for_create).unwrap();
         let task2 = RunnableTask {
             thread: thread_key,
             generation: task2_gen,
@@ -7357,7 +7365,11 @@ struct CrashCaptureProductionFactory {
 impl PersistentExecutorFactory for CrashCaptureProductionFactory {
     type Executor = CrashCaptureProductionExecutor;
 
-    fn create(&self, executor: ExecutorId) -> Result<Self::Executor, TrapError> {
+    fn create(
+        &self,
+        registration: &carrick_kernel::kernel::ExecutorRegistration,
+    ) -> Result<Self::Executor, TrapError> {
+        let executor = registration.id();
         Ok(CrashCaptureProductionExecutor {
             id: executor,
             factory: self.clone(),

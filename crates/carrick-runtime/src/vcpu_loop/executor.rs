@@ -92,7 +92,7 @@ where
         }
     };
     let executor_id = registration.id();
-    let mut backend = match catch_unwind(AssertUnwindSafe(|| factory.create(executor_id))) {
+    let mut backend = match catch_unwind(AssertUnwindSafe(|| factory.create(&registration))) {
         Ok(Ok(backend)) => backend,
         Ok(Err(error)) => {
             let _ = scheduler.unregister_executor(&registration);
