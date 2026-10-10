@@ -176,6 +176,20 @@ impl ForkStockHostCustody {
         self.native_roots.get(&mm).copied()
     }
 
+    pub(crate) fn register_native_root(
+        &mut self,
+        context: AddressContext<RootGpa>,
+    ) -> Result<(), ForkStockRefusal> {
+        match self.native_roots.get(&context.mm.raw()) {
+            Some(current) if *current != context => Err(ForkStockRefusal::Stale),
+            Some(_) => Ok(()),
+            None => {
+                self.native_roots.insert(context.mm.raw(), context);
+                Ok(())
+            }
+        }
+    }
+
     /// Seed the same bounded stock in production and VM-free witnesses. Both
     /// extents are carrier-owned, live stage-2 mappings admitted before guest
     /// entry by the metadata aperture; lifecycle and table pages are disjoint.

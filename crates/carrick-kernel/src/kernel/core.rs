@@ -2435,6 +2435,7 @@ impl Kernel {
         Ok(Arc::new(super::frame_inventory::NativeRootFrameAdmission {
             kernel: Arc::downgrade(context.kernel()),
             mm: Arc::downgrade(&mm),
+            source: self.physical_frame_inventory(),
             root,
         }))
     }

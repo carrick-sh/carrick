@@ -2609,6 +2609,8 @@ impl PartialOrd for GuestFrameOwner {
 /// Admit physical custody for an authenticated native root. The VM authenticates
 /// execution and address incarnation before invoking this issued capability.
 pub trait NativeFrameInventoryAdmission: Send + Sync {
+    /// The canonical inventory that issued this root admission.
+    fn inventory(&self) -> Arc<dyn PhysicalFrameInventory>;
     fn admit_root(
         &self,
         context: crate::guest_arch_binding::core_arch::AddressContext<
@@ -3358,6 +3360,15 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
         _authority: std::sync::Arc<dyn FrameCowAuthority>,
         _identity: FrameCowIdentity,
     ) {
+    }
+
+    fn bind_native_frame_inventory(
+        &mut self,
+        _admission: Arc<dyn NativeFrameInventoryAdmission>,
+    ) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "engine has no native frame inventory venue".into(),
+        ))
     }
 
     /// Service an exact file fault selected by the admitted owner. `None`

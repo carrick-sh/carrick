@@ -1057,6 +1057,12 @@ pub(crate) fn service_metadata_operation(
                     exchange.refuse(ForkStockRefusal::Stale);
                     return Ok([METADATA_GRANT_ERR_DENIED, exchange.response[0], 0, 0]);
                 };
+                let has_native_inventory = custody.native_frame_inventory.lock().is_some();
+                let _native_inventory = if has_native_inventory {
+                    Some(custody.admit_native_frame_execution(execution)?)
+                } else {
+                    None
+                };
                 let mut fork_stock = custody.fork_stock.lock();
                 let mut ledger = custody.el1_frame_grants.lock();
                 match fork_stock.service_loan(&mut ledger, execution, exchange) {

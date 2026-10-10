@@ -2603,6 +2603,15 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.bind_frame_cow(authority, identity);
     }
 
+    fn bind_native_frame_inventory(
+        &mut self,
+        admission: std::sync::Arc<dyn carrick_hal::NativeFrameInventoryAdmission>,
+    ) -> Result<(), TrapError> {
+        self.state
+            .carrier_vm_custody()
+            .bind_native_frame_inventory(admission)
+    }
+
     fn prepare_el1_frame_grant(
         &mut self,
         request: carrick_hal::El1FrameGrantRequest,

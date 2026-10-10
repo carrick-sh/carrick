@@ -115,9 +115,13 @@ pub struct FrameInventoryAuthority {
 pub(in crate::kernel) struct NativeRootFrameAdmission {
     pub kernel: std::sync::Weak<super::Kernel>,
     pub mm: std::sync::Weak<super::objects::Mm>,
+    pub source: std::sync::Arc<dyn carrick_hal::PhysicalFrameInventory>,
     pub root: carrick_hal::guest_arch_binding::core_arch::RootGpa,
 }
 impl carrick_hal::NativeFrameInventoryAdmission for NativeRootFrameAdmission {
+    fn inventory(&self) -> std::sync::Arc<dyn carrick_hal::PhysicalFrameInventory> {
+        std::sync::Arc::clone(&self.source)
+    }
     fn admit_root(
         &self,
         context: carrick_hal::guest_arch_binding::core_arch::AddressContext<

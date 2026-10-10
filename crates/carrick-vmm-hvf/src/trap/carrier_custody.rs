@@ -397,6 +397,21 @@ impl CarrierVmCustodyState {
     }
 }
 
+/// Issued views of the one canonical inventory and initial root admission.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone)]
+pub(crate) struct NativeFrameInventory {
+    pub(crate) source: std::sync::Arc<dyn carrick_hal::PhysicalFrameInventory>,
+    admission: std::sync::Arc<dyn carrick_hal::NativeFrameInventoryAdmission>,
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ::core::fmt::Debug for NativeFrameInventory {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("NativeFrameInventory")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Carrier-owned VM lifecycle authority.
 ///
 /// The state is intentionally neither static nor process-global. A failed
@@ -415,6 +430,7 @@ pub struct CarrierVmCustody {
         parking_lot::Mutex<Option<std::sync::Arc<dyn carrick_el1_abi::MetadataCompletionWake>>>,
     pub(crate) metadata_aperture: parking_lot::Mutex<crate::metadata_grant::HostApertureState>,
     pub fork_stock: parking_lot::Mutex<crate::fork_stock::ForkStockHostCustody>,
+    pub(crate) native_frame_inventory: parking_lot::Mutex<Option<NativeFrameInventory>>,
     pub asids: carrick_hal::asid::AsidAllocator,
     pub(crate) state: parking_lot::Mutex<CarrierVmCustodyState>,
     pub(crate) structural_backings: parking_lot::Mutex<
@@ -634,6 +650,7 @@ impl CarrierVmCustody {
                     asids.clone(),
                 ),
             ),
+            native_frame_inventory: parking_lot::Mutex::new(None),
             asids,
             state: parking_lot::Mutex::new(CarrierVmCustodyState {
                 next_generation: 1,
@@ -662,6 +679,67 @@ impl CarrierVmCustody {
             root_slot_pool: parking_lot::Mutex::new(CarrierRootSlotPoolState::Uninitialized),
             guest_cow_states: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    pub fn bind_native_frame_inventory(
+        &self,
+        admission: std::sync::Arc<dyn carrick_hal::NativeFrameInventoryAdmission>,
+    ) -> Result<(), TrapError> {
+        let mut retained = self.native_frame_inventory.lock();
+        if retained.is_some() {
+            return Err(TrapError::Hypervisor(
+                "native frame inventory already bound".into(),
+            ));
+        }
+        *retained = Some(NativeFrameInventory {
+            source: admission.inventory(),
+            admission,
+        });
+        Ok(())
+    }
+
+    /// The caller supplies the stopped CPU's authenticated execution/root.
+    /// Only the initial root uses a host-issued weak admission; child roots
+    /// already registered by fork commit never acquire host-MM custody.
+    pub(crate) fn admit_native_frame_execution(
+        &self,
+        execution: crate::fork_stock::GrantExecution,
+    ) -> Result<std::sync::Arc<dyn carrick_hal::PhysicalFrameInventory>, TrapError> {
+        if execution.binding.mm.raw() != execution.context.mm.raw().get()
+            || carrick_el1_abi::CowGrantScope::checked(execution.binding, execution.context)
+                .is_none()
+        {
+            return Err(TrapError::Hypervisor(
+                "native frame execution identity mismatch".into(),
+            ));
+        }
+        let retained = self
+            .native_frame_inventory
+            .lock()
+            .clone()
+            .ok_or_else(|| TrapError::Hypervisor("native frame inventory not bound".into()))?;
+        if let Some(current) = self.fork_stock.lock().root(execution.context.mm.raw()) {
+            return if current == execution.context {
+                Ok(std::sync::Arc::clone(&retained.source))
+            } else {
+                Err(TrapError::Hypervisor(
+                    "native frame root incarnation mismatch".into(),
+                ))
+            };
+        }
+        retained
+            .admission
+            .admit_root(execution.context)
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("native frame root admission: {error}"))
+            })?;
+        self.fork_stock
+            .lock()
+            .register_native_root(execution.context)
+            .map_err(|refusal| {
+                TrapError::Hypervisor(format!("native frame root publication: {refusal:?}"))
+            })?;
+        Ok(retained.source)
     }
 
     pub fn asid_allocator(&self) -> &carrick_hal::asid::AsidAllocator {
@@ -1588,6 +1666,101 @@ mod carrier_vm_custody_tests {
         CarrierVmCustody, CarrierVmCustodyError, CarrierVmGeneration, create_vm_with_custody_using,
         destroy_vm_with_custody_using,
     };
+
+    #[test]
+    fn native_frame_inventory_admission_refuses_foreign_execution_and_recycled_root() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Inventory;
+        impl carrick_hal::PhysicalFrameInventory for Inventory {
+            fn bind(
+                &self,
+                _: carrick_hal::GuestFrameOwner,
+            ) -> Arc<dyn carrick_hal::FrameCowAuthority> {
+                panic!("root admission must not create a host-MM COW authority")
+            }
+            fn allocate_backing_ids(
+                &self,
+            ) -> Result<
+                (carrick_hal::FrameId, carrick_hal::MappingId),
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                panic!("root admission cannot allocate a second inventory")
+            }
+        }
+        struct Admission {
+            address: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
+            calls: AtomicUsize,
+            source: Arc<dyn carrick_hal::PhysicalFrameInventory>,
+        }
+        impl carrick_hal::NativeFrameInventoryAdmission for Admission {
+            fn inventory(&self) -> Arc<dyn carrick_hal::PhysicalFrameInventory> {
+                Arc::clone(&self.source)
+            }
+            fn admit_root(
+                &self,
+                address: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                if address != self.address {
+                    return Err(Box::new(std::io::Error::other("foreign initial root")));
+                }
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+        let custody = CarrierVmCustody::new();
+        let scope = carrick_test_support::cow_grant_scope(9, 0x9000);
+        let execution = crate::fork_stock::GrantExecution::new(
+            carrick_guest_arch::CpuId::new(0),
+            scope.execution,
+            scope.address,
+        );
+        let admission = Arc::new(Admission {
+            address: scope.address,
+            calls: AtomicUsize::new(0),
+            source: Arc::new(Inventory),
+        });
+        assert!(custody.admit_native_frame_execution(execution).is_err());
+        assert_eq!(custody.fork_stock.lock().root(scope.address.mm.raw()), None);
+        custody
+            .bind_native_frame_inventory(admission.clone())
+            .unwrap();
+        let foreign = crate::fork_stock::GrantExecution {
+            binding: carrick_el1_abi::ExecutionBinding {
+                mm: carrick_el1_abi::EntryMmKey::from_raw(10),
+                ..execution.binding
+            },
+            ..execution
+        };
+        assert!(custody.admit_native_frame_execution(foreign).is_err());
+        assert_eq!(admission.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(custody.fork_stock.lock().root(scope.address.mm.raw()), None);
+        custody.admit_native_frame_execution(execution).unwrap();
+        assert_eq!(
+            custody.fork_stock.lock().root(scope.address.mm.raw()),
+            Some(scope.address)
+        );
+        custody.admit_native_frame_execution(execution).unwrap();
+        assert_eq!(admission.calls.load(Ordering::Relaxed), 1);
+        let stale = crate::fork_stock::GrantExecution {
+            context: carrick_guest_arch::AddressContext {
+                generation: carrick_guest_arch::ContextGeneration::new(
+                    core::num::NonZeroU64::new(5).unwrap(),
+                ),
+                ..execution.context
+            },
+            ..execution
+        };
+        assert!(custody.admit_native_frame_execution(stale).is_err());
+        assert_eq!(admission.calls.load(Ordering::Relaxed), 1);
+        assert!(custody.bind_native_frame_inventory(admission).is_err());
+        assert_eq!(
+            custody.fork_stock.lock().root(scope.address.mm.raw()),
+            Some(scope.address)
+        );
+    }
 
     /// Work budget of the instruction-cache authority: an executable
     /// publication over a fresh frame invalidates once, re-publication of the

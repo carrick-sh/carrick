@@ -978,6 +978,15 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     ) {
     }
 
+    fn bind_native_frame_inventory(
+        &mut self,
+        _admission: std::sync::Arc<dyn carrick_hal::NativeFrameInventoryAdmission>,
+    ) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "AArch64 VMM has no native inventory venue".into(),
+        ))
+    }
+
     fn prepare_el1_frame_grant(
         &mut self,
         _request: carrick_hal::El1FrameGrantRequest,
