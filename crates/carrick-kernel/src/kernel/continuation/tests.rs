@@ -3985,6 +3985,46 @@ fn host_fd_wait(
     .expect("host fd continuation")
 }
 
+#[test]
+fn bare_stdio_skips_slot_subscription_but_remains_in_host_reactor() {
+    let (kernel, context) = bootstrap(15_912);
+    let generation = publish(&context, 0x912);
+    let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+    let service = CarrierWaitService::new(scheduler);
+    let fds = pipe_pair();
+    let files = context.resources().files();
+    let number = crate::kernel::FileSlotNumber::for_open_fd(0).unwrap();
+    let authority = files.capture_slot_or_stdio_authority(number).unwrap();
+    assert!(authority.is_bare_stdio());
+    let continuation = BlockedContinuation::from_dispatch_outcome(
+        DispatchOutcome::WaitOnFds {
+            fds: WaitFds::raw(vec![(fds[0], libc::POLLIN)]).with_slot_authorities(vec![authority]),
+            timeout: None,
+            sig_mask: WaitSigMask::NONE,
+            completion: FdWaitCompletion::Fd { on_timeout: 0 },
+        },
+        capture(&context, generation),
+    )
+    .unwrap();
+    let mut registration = service.prepare_registration(&continuation);
+    service.enroll(&mut registration).unwrap();
+    assert!(
+        service
+            .inner
+            .state
+            .lock()
+            .reactor_work
+            .pollable
+            .contains(&registration.token.continuation)
+    );
+    assert_eq!(unsafe { libc::write(fds[1], b"x".as_ptr().cast(), 1) }, 1);
+    assert_eq!(
+        await_event_timeout(&service, registration.token, Duration::from_secs(2)),
+        Some(Ok(ContinuationEvent::Ready))
+    );
+    close_pair(fds);
+}
+
 fn fds_host_polls_on_this_thread() -> usize {
     super::readiness::FDS_HOST_POLLS.with(std::cell::Cell::get)
 }
