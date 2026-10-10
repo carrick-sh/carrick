@@ -175,42 +175,6 @@ impl MetadataAllocatorCore {
         }
     }
 
-    /// Minimum size for a given bin index.
-    #[inline]
-    pub fn min_size_for_bin(bin: usize) -> usize {
-        match bin {
-            0 => 32,
-            1 => 48,
-            2 => 64,
-            3 => 96,
-            4 => 128,
-            5 => 192,
-            6 => 256,
-            7 => 384,
-            8 => 512,
-            9 => 768,
-            10 => 1024,
-            11 => 1536,
-            12 => 2048,
-            13 => 3072,
-            14 => 4096,
-            15 => 6144,
-            16 => 8192,
-            17 => 12288,
-            18 => 16384,
-            19 => 24576,
-            20 => 32768,
-            21 => 49152,
-            22 => 65536,
-            23 => 131072,
-            24 => 262144,
-            25 => 524288,
-            26 => 1048576,
-            27 => 2097152,
-            _ => 2097152,
-        }
-    }
-
     #[inline]
     fn insert_free_block(&mut self, block: *mut BlockHeader) {
         unsafe {
