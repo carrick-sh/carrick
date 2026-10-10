@@ -18,6 +18,14 @@ macro_rules! fixture_dispatch_enabled {
 }
 
 #[cfg(target_os = "none")]
+core::arch::global_asm!(
+    ".global CARRICK_X86_CPL0_IMAGE_END",
+    ".set CARRICK_X86_CPL0_IMAGE_END, {end}",
+    end = const carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_BASE
+        + carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_SIZE,
+);
+
+#[cfg(target_os = "none")]
 extern crate alloc as rust_alloc;
 
 #[cfg(target_os = "none")]
@@ -864,13 +872,30 @@ mod kernel {
         working: Option<carrick_el1_abi::X86PrepareTableSpan>,
         context: Option<carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>>,
     }
+    const FIXTURE_TABLE_START: u64 = carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_GPA
+        + carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_SIZE;
+    /// Upper bound of the stopped-carrier fixture table grant window (0xd4_0000).
+    /// Fixed by the fixture's physical layout: metadata spans 0xc0_0000..0xd0_0000,
+    /// followed by fixture data pages (0xd0_0000..0xd1_0000) and fixture table pages
+    /// (0xd3_0000..0xd4_0000). The compile-time assert `FIXTURE_TABLE_START < FIXTURE_TABLE_END`
+    /// guarantees that supervisor image expansion cannot silently overrun this upper bound.
+    const FIXTURE_TABLE_END: u64 = 0xd4_0000;
+    const _: () = {
+        assert!(
+            FIXTURE_TABLE_START
+                >= carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_GPA
+                    + carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_SIZE
+        );
+        assert!(FIXTURE_TABLE_START < FIXTURE_TABLE_END);
+        assert!(FIXTURE_TABLE_START.is_multiple_of(4096));
+    };
     impl InitialWords {
         pub(crate) fn fixture() -> Self {
             let root = carrick_el1::isa::x86::hardware_live_root()
                 .unwrap_or_else(|_| carrick_el1::isa::x86::fatal_entry_binding());
             Self {
-                start: 0x20_0000,
-                end: 0xd4_0000,
+                start: FIXTURE_TABLE_START,
+                end: FIXTURE_TABLE_END,
                 edit_root: Some(root),
                 working: None,
                 context: None,
@@ -1031,7 +1056,7 @@ mod kernel {
     impl carrick_el1::isa::x86::initial_mm::InitialFrameSource for InitialFrames {
         fn take_zeroed_table(&mut self) -> Option<carrick_guest_arch::RootGpa> {
             use carrick_guest_arch::{FrameGpa, RootGpa};
-            if self.next_table >= 0xd4_0000 {
+            if self.next_table >= FIXTURE_TABLE_END {
                 return None;
             }
             let pa = self.next_table;
