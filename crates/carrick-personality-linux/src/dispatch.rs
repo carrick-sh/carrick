@@ -412,7 +412,9 @@ fn serve_family<'a, C: EntryContext + 'a>(
     FamilyRun {
         completion,
         returned,
-        forward_reason: if family == Family::Unported {
+        forward_reason: if family == Family::Unported
+            || (matches!(family, Family::Sched(_)) && completion == FamilyCompletion::Forward)
+        {
             ForwardReason::Unported
         } else {
             ForwardReason::FamilyFallback

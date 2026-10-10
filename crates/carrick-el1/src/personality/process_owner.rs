@@ -478,22 +478,53 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
         }
         Ok(task)
     }
+    /// Resolve a visible process in the caller's container, including zombies.
+    pub fn namespace_key(
+        &self,
+        caller: TaskKey,
+        visible_pid: u32,
+    ) -> Result<Option<TaskKey>, GuestProcessError<N::Error>> {
+        self.namespace_key_in(
+            caller,
+            visible_pid,
+            false,
+            self.registry
+                .tasks
+                .values()
+                .map(GuestTask::key)
+                .chain(self.registry.zombies.values().map(|row| row.receipt.key)),
+        )
+    }
     pub fn namespace_child_key(
         &self,
         caller: TaskKey,
         visible_pid: u32,
     ) -> Result<Option<TaskKey>, GuestProcessError<N::Error>> {
-        let parent = self.task(caller)?;
-        Ok(parent.children().iter().copied().find(|key| {
+        self.namespace_key_in(
+            caller,
+            visible_pid,
+            true,
+            self.task(caller)?.children().iter().copied(),
+        )
+    }
+    fn namespace_key_in(
+        &self,
+        caller: TaskKey,
+        visible_pid: u32,
+        children_only: bool,
+        mut candidates: impl Iterator<Item = TaskKey>,
+    ) -> Result<Option<TaskKey>, GuestProcessError<N::Error>> {
+        let container = self.task(caller)?.metadata.container;
+        Ok(candidates.find(|key| {
             self.registry.tasks.get(&key.id).is_some_and(|row| {
                 row.key() == *key
-                    && row.parent() == Some(caller)
-                    && row.metadata.container == parent.metadata.container
+                    && (!children_only || row.parent() == Some(caller))
+                    && row.metadata.container == container
                     && row.metadata.namespace_pid == visible_pid
             }) || self.registry.zombies.get(&key.id).is_some_and(|row| {
                 row.receipt.key == *key
-                    && row.receipt.parent == Some(caller)
-                    && row.receipt.container == parent.metadata.container
+                    && (!children_only || row.receipt.parent == Some(caller))
+                    && row.receipt.container == container
                     && row.receipt.namespace_pid == visible_pid
             })
         }))

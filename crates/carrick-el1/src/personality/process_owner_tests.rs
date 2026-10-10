@@ -947,6 +947,8 @@ fn visible_child_pid_lookup_survives_exit_and_rejects_unowned_rows() {
     assert_eq!(owner.namespace_child_key(parent, 72).unwrap(), Some(child));
     assert_eq!(owner.namespace_child_key(parent, 2).unwrap(), None);
     assert_eq!(owner.namespace_child_key(child, 72).unwrap(), None);
+    assert_eq!(owner.namespace_key(child, 72).unwrap(), Some(child));
+    assert_eq!(owner.namespace_key(parent, 999999).unwrap(), None);
     let _ = exit(&mut owner, child, None);
     assert_eq!(owner.namespace_child_key(parent, 72).unwrap(), Some(child));
     drop(
@@ -1296,6 +1298,7 @@ fn nonchild_wait_has_no_ptrace_relationship_and_preserves_own_children() {
     assert_eq!(owner.task(caller).unwrap().wait_identity().tracer, None);
     assert!(owner.task(caller).unwrap().wait_tracees().is_empty());
     assert_eq!(owner.namespace_child_key(caller, 4).unwrap(), None);
+    assert_eq!(owner.namespace_key(caller, 4).unwrap(), Some(peer));
     assert!(matches!(
         owner
             .scan_wait(caller, query(WaitTarget::Exact(peer)))
