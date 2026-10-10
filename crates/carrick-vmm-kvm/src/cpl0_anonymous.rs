@@ -590,7 +590,7 @@ impl Cpl0HostCustody {
     pub(super) fn service_root_exit(
         &self,
         lease: &StoppedCpuLease<'_>,
-    ) -> Result<GuestExitStatus, TrapError> {
+    ) -> Result<carrick_sched_core::process::LinuxWaitStatus, TrapError> {
         let execution = self.physical_execution(lease)?;
         // SAFETY: the root exit record consists of eight fully initialized u64s.
         let (_, record) = unsafe {
@@ -603,11 +603,7 @@ impl Cpl0HostCustody {
         let status = record
             .status_for(execution.binding)
             .ok_or_else(|| fail("native root exit execution/status"))?;
-        Ok(GuestExitStatus::from_linux_code(
-            status
-                .term_signal()
-                .map_or(status.raw() >> 8, |signal| 128 + i32::from(signal)),
-        ))
+        Ok(status)
     }
 
     pub(super) fn service_fork_stock(
