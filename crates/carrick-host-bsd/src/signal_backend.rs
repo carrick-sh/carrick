@@ -2,6 +2,8 @@
 //!
 //! Used by bhyve (FreeBSD, SIG=65) and NVMM (NetBSD, SIG=33).
 
+#![cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+
 use carrick_signal_linux::HostSignalGlue;
 
 /// Zero-sized marker carrying the BSD host-signal policy for kick signal `SIG`.
