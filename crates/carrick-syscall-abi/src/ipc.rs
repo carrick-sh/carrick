@@ -38,6 +38,7 @@ pub const SEMMSL: usize = 32000;
 pub const SEMMNS: usize = 1024000000;
 pub const SEMOPM: usize = 500;
 pub const SEMVMX: u16 = 32767;
+pub const SEMAEM: i32 = 32767;
 
 /// Linux IPC permissions structure (struct ipc64_perm).
 #[repr(C)]
@@ -73,10 +74,10 @@ pub struct LinuxMsqidDs {
     pub __glibc_reserved5: u64,
 }
 
-/// Linux System V semaphore set description (struct semid64_ds).
+/// Linux System V semaphore set description for x86_64 (struct semid64_ds, 104 bytes).
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug)]
-pub struct LinuxSemidDs {
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct LinuxSemidDsX86_64 {
     pub sem_perm: LinuxIpcPerm,
     pub sem_otime: i64,
     pub __glibc_reserved1: u64,
@@ -85,6 +86,50 @@ pub struct LinuxSemidDs {
     pub sem_nsems: u64,
     pub __glibc_reserved3: u64,
     pub __glibc_reserved4: u64,
+}
+
+/// Linux System V semaphore set description for AArch64 / asm-generic (struct semid64_ds, 88 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct LinuxSemidDsAarch64 {
+    pub sem_perm: LinuxIpcPerm,
+    pub sem_otime: i64,
+    pub sem_ctime: i64,
+    pub sem_nsems: u64,
+    pub __glibc_reserved3: u64,
+    pub __glibc_reserved4: u64,
+}
+
+pub type LinuxSemidDs = LinuxSemidDsX86_64;
+
+impl LinuxSemidDsX86_64 {
+    #[inline]
+    pub const fn to_aarch64(&self) -> LinuxSemidDsAarch64 {
+        LinuxSemidDsAarch64 {
+            sem_perm: self.sem_perm,
+            sem_otime: self.sem_otime,
+            sem_ctime: self.sem_ctime,
+            sem_nsems: self.sem_nsems,
+            __glibc_reserved3: self.__glibc_reserved3,
+            __glibc_reserved4: self.__glibc_reserved4,
+        }
+    }
+}
+
+impl LinuxSemidDsAarch64 {
+    #[inline]
+    pub const fn to_x86_64(&self) -> LinuxSemidDsX86_64 {
+        LinuxSemidDsX86_64 {
+            sem_perm: self.sem_perm,
+            sem_otime: self.sem_otime,
+            __glibc_reserved1: 0,
+            sem_ctime: self.sem_ctime,
+            __glibc_reserved2: 0,
+            sem_nsems: self.sem_nsems,
+            __glibc_reserved3: self.__glibc_reserved3,
+            __glibc_reserved4: self.__glibc_reserved4,
+        }
+    }
 }
 
 /// Linux System V semaphore operation (struct sembuf).
@@ -124,4 +169,18 @@ pub struct LinuxSeminfo {
     pub semusz: i32,
     pub semvmx: i32,
     pub semaem: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ipc_struct_sizes() {
+        assert_eq!(core::mem::size_of::<LinuxSemidDsX86_64>(), 104);
+        assert_eq!(core::mem::size_of::<LinuxSemidDsAarch64>(), 88);
+        assert_eq!(core::mem::size_of::<LinuxIpcPerm>(), 48);
+        assert_eq!(core::mem::size_of::<LinuxMsqidDs>(), 120);
+        assert_eq!(core::mem::size_of::<LinuxSembuf>(), 6);
+    }
 }

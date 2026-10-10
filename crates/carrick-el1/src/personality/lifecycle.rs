@@ -526,6 +526,9 @@ impl<
         }
         process.as_ipc_venue()
     }
+    fn guest_isa(&self) -> carrick_guest_arch::GuestIsa {
+        carrick_personality_linux::dispatch::PendingFamilies::guest_isa(self)
+    }
 }
 
 #[cfg(test)]
