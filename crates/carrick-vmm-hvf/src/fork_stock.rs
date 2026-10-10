@@ -20,7 +20,9 @@ use carrick_el1_abi::{
 };
 use carrick_guest_arch::{FrameGpa, RootGpa};
 use carrick_hal::asid::{AsidAllocator, AsidGeneration};
-use carrick_hal::fork_stock::{ForkStock, ForkTableLedger, LIFECYCLE_SLOT_STRIDE, lifecycle_slots};
+use carrick_hal::fork_stock::{
+    ForkStock, ForkTableLedger, LIFECYCLE_SLOT_STRIDE, SlotAbsence, lifecycle_slots,
+};
 use carrick_sched_core::process::LinuxWaitStatus;
 use core::num::NonZeroU64;
 
@@ -155,7 +157,7 @@ impl ForkStockHostCustody {
             .status_for(binding)
             .ok_or(ForkStockServiceError::StaleExecution)?;
         if let Some(mm) = ReservationMm::new(binding.mm.raw()) {
-            self.stock.retire_exited_root(mm)?;
+            self.stock.retire_exited_root(mm);
         }
         Ok(status)
     }
@@ -175,13 +177,13 @@ impl ForkStockHostCustody {
         &mut self,
         ledger: &mut El1FrameGrantLedger,
         active_mm: ReservationMm,
-        safe_to_reclaim: impl Fn(ReservationMm) -> bool,
+        occupancy: impl Fn(ReservationMm) -> Option<SlotAbsence>,
         clear_tables: impl Fn(&[RootGpa]) -> bool,
     ) -> Result<usize, ForkStockServiceError> {
         self.stock.reclaim(
             ledger,
             active_mm,
-            safe_to_reclaim,
+            occupancy,
             clear_tables,
             |_| true,
             |_| true,
@@ -687,7 +689,7 @@ mod tests {
                 .reclaim_retired(
                     &mut ledger,
                     ReservationMm::new(exec.binding.mm.raw()).unwrap(),
-                    |_| true,
+                    |mm| SlotAbsence::scan(mm, []),
                     |_| true
                 )
                 .expect("reclaim after parent resumes"),
@@ -699,7 +701,7 @@ mod tests {
                 .reclaim_retired(
                     &mut ledger,
                     ReservationMm::new(exec.binding.mm.raw()).unwrap(),
-                    |_| true,
+                    |mm| SlotAbsence::scan(mm, []),
                     |_| true
                 )
                 .expect("exactly once"),
@@ -776,7 +778,7 @@ mod tests {
                     .reclaim_retired(
                         &mut ledger,
                         ReservationMm::new(parent.binding.mm.raw()).unwrap(),
-                        |_| true,
+                        |mm| SlotAbsence::scan(mm, []),
                         |_| true
                     )
                     .expect("parent has resumed"),
@@ -894,7 +896,7 @@ mod tests {
                 .reclaim_retired(
                     &mut ledger,
                     ReservationMm::new(parent.binding.mm.raw()).unwrap(),
-                    |mm| Some(mm) != still,
+                    |mm| SlotAbsence::scan(mm, still.map(|still| still.raw())),
                     |_| true,
                 )
                 .expect("reclaim");
@@ -955,7 +957,7 @@ mod tests {
                 .reclaim_retired(
                     &mut ledger,
                     ReservationMm::new(parent.binding.mm.raw()).unwrap(),
-                    |_| false,
+                    |mm| SlotAbsence::scan(mm, [mm.raw()]),
                     |_| true
                 )
                 .unwrap(),
@@ -972,7 +974,7 @@ mod tests {
                 .reclaim_retired(
                     &mut ledger,
                     ReservationMm::new(parent.binding.mm.raw()).unwrap(),
-                    |_| true,
+                    |mm| SlotAbsence::scan(mm, []),
                     |_| true
                 )
                 .unwrap(),

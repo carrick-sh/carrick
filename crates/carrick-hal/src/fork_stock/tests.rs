@@ -152,6 +152,11 @@ fn retire<T: ChildAddressTags>(
     result
 }
 
+/// Occupancy proof for a test where no slot installs anything.
+fn absent(mm: ReservationMm) -> Option<SlotAbsence> {
+    SlotAbsence::scan(mm, [])
+}
+
 fn reclaim<T: ChildAddressTags>(
     stock: &mut ForkStock<T>,
     safe: impl Fn(ReservationMm) -> bool,
@@ -161,7 +166,10 @@ fn reclaim<T: ChildAddressTags>(
         .reclaim(
             &mut NoTableLedger,
             mm(PARENT_MM),
-            safe,
+            |mm| {
+                let installed = (!safe(mm)).then_some(mm.raw());
+                SlotAbsence::scan(mm, installed)
+            },
             |pages| {
                 cleared.borrow_mut().extend_from_slice(pages);
                 true
@@ -237,7 +245,7 @@ fn quarantined_stock_is_never_reissued_while_its_mm_is_live() {
             .reclaim(
                 &mut NoTableLedger,
                 mm(302),
-                |_| true,
+                absent,
                 |_| true,
                 |_| true,
                 |_| true
@@ -477,7 +485,7 @@ fn kvm_lifecycle_window_cycles_exceed_stock_with_cleared_records() {
             .reclaim(
                 &mut NoTableLedger,
                 mm(PARENT_MM),
-                |_| true,
+                absent,
                 |pages| {
                     cleared.borrow_mut().extend_from_slice(pages);
                     true
@@ -514,7 +522,7 @@ fn kvm_unclearable_lifecycle_record_is_never_reissued_dirty() {
         .reclaim(
             &mut NoTableLedger,
             mm(PARENT_MM),
-            |_| true,
+            absent,
             |_| true,
             |_| true,
             |_| true,
@@ -623,7 +631,7 @@ fn refused_release_keeps_the_child_quarantined_and_its_stock_held() {
         stock.reclaim(
             &mut NoTableLedger,
             mm(PARENT_MM),
-            |_| true,
+            absent,
             |_| true,
             |_| true,
             |child| {
@@ -637,4 +645,25 @@ fn refused_release_keeps_the_child_quarantined_and_its_stock_held() {
     assert!(stock.is_quarantined(mm(302)));
     assert_eq!(stock.table_stock().len(), 3);
     assert!(!stock.lifecycle_available());
+}
+
+#[test]
+fn slot_absence_is_minted_only_when_no_slot_installs_the_mm() {
+    assert!(SlotAbsence::scan(mm(302), [0, 303, 301]).is_some());
+    assert!(SlotAbsence::scan(mm(302), [0, 302]).is_none());
+    // A proof for another MM never licenses this one's reclaim.
+    let mut stock = stock(UntaggedRoots, 4, 1);
+    let granted = loan(&mut stock, parent(), 302, 1, 1).unwrap();
+    commit(&mut stock, parent(), granted, 1, 0).unwrap();
+    retire(&mut stock, child_of(granted, 900)).unwrap();
+    let foreign = stock.reclaim(
+        &mut NoTableLedger,
+        mm(PARENT_MM),
+        |_| SlotAbsence::scan(mm(999), []),
+        |_| true,
+        |_| true,
+        |_| true,
+    );
+    assert_eq!(foreign, Ok(0));
+    assert!(stock.is_quarantined(mm(302)));
 }

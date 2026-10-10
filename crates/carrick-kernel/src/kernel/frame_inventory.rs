@@ -3071,7 +3071,7 @@ mod tests {
                 .reclaim(
                     &mut NoTableLedger,
                     carrick_el1_abi::ReservationMm::new(PARENT).expect("parent"),
-                    |_| true,
+                    |mm| carrick_hal::fork_stock::SlotAbsence::scan(mm, []),
                     |_| true,
                     |life| window.clear(life),
                     |mm| release_child_mm(&*inventory, &residency, mm),
