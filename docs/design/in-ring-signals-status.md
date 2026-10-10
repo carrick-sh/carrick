@@ -150,3 +150,10 @@ Identity's `mounted_static_x86_raise_uses_set_tid_address_returned_tid`
 witness now runs by default: this branch supplies its previously named
 signal-action and handler-delivery dependency. Its unchanged native
 comparison passed when explicitly run before removing the ignore.
+
+Process wait-channel publication is also ARM-visible: committed exit and
+signal notifications use identity’s landed committed-wake owner to acquire
+the enrollment bucket unconditionally and then advance the generation, with no graph or signal lock held. Plain exit_group
+and signaled exit share this path; contention delays the wake instead of
+turning it into a terminal NativeBusy failure. VM-free tests hold the parent
+bucket across both exit forms and verify its later wake, SIGCHLD and reap.

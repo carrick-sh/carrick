@@ -48,6 +48,7 @@ use core::{
     time::Duration,
 };
 const LOCK_SPINS: u32 = 100_000;
+
 fn signal_record_exists<C: ProcessContext>(zone: &ZoneTables<C>, record: RecordRef) -> bool {
     if zone.live(record).is_some() {
         return true;
@@ -5027,6 +5028,34 @@ mod tests {
             "stale caller retains its true cause"
         );
     }
+    // A fixture actor holds the enrollment bucket until main's committed
+    // publisher reports contention. The completion flag releases it on the red
+    // implementation's refusal, without sleeps or retrying the guest operation.
+    fn release_bucket_when_publisher_waits<T>(
+        guard: carrick_sched_core::BucketGuard<'_, ParkedContextWords>,
+        waiting: &core::sync::atomic::AtomicBool,
+        publish: impl FnOnce() -> T,
+    ) -> T {
+        let attempted = core::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let attempted = &attempted;
+            let release = scope.spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !waiting.load(Ordering::Acquire) && !attempted.load(Ordering::Acquire) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "exit publication must reach its generation boundary"
+                    );
+                    core::hint::spin_loop();
+                }
+                drop(guard);
+            });
+            let result = publish();
+            attempted.store(true, Ordering::Release);
+            release.join().unwrap();
+            result
+        })
+    }
     #[test]
     fn exit_group_holds_terminal_custody_until_pre_live_claim_settles() {
         for (claim_live, wake_contention, resume_stale, signal_exit) in [
@@ -5205,7 +5234,6 @@ mod tests {
                 });
                 assert_eq!(entry.take_run_failure(), None);
             }
-            entry.lifecycle_admission_settled().unwrap();
             assert_eq!(zone.slot(slot).queued(), 1);
             let channel = runtime
                 .graph
@@ -5414,29 +5442,50 @@ mod tests {
     }
     #[test]
     fn actual_compact_root_forks_a_shared_owner_child_with_distinct_visible_identity() {
-        compact_root_fork_wait_contract(false, false, false, false);
+        compact_root_fork_wait_contract(false, false, false, false, None);
     }
     #[test]
     fn caught_signal_interrupts_an_already_parked_owned_child_wait() {
-        compact_root_fork_wait_contract(true, false, false, false);
+        compact_root_fork_wait_contract(true, false, false, false, None);
     }
     #[test]
     fn reapable_child_wins_over_its_caught_sigchld() {
-        compact_root_fork_wait_contract(false, true, false, false);
+        compact_root_fork_wait_contract(false, true, false, false, None);
     }
     #[test]
     fn pending_default_stop_does_not_interrupt_wait4() {
-        compact_root_fork_wait_contract(false, false, true, false);
+        compact_root_fork_wait_contract(false, false, true, false, None);
     }
     #[test]
     fn child_signal_exit_preserves_status_across_birth_claim_settlement() {
-        compact_root_fork_wait_contract(false, true, false, true);
+        compact_root_fork_wait_contract(false, true, false, true, None);
+    }
+    #[test]
+    fn child_exit_retains_wake_custody_across_parent_bucket_contention() {
+        compact_root_fork_wait_contract(
+            false,
+            true,
+            false,
+            false,
+            Some(LinuxWaitStatus::exited(7)),
+        );
+    }
+    #[test]
+    fn child_signal_exit_retains_wake_custody_across_parent_bucket_contention() {
+        compact_root_fork_wait_contract(
+            false,
+            true,
+            false,
+            false,
+            Some(LinuxWaitStatus::signaled(15, false)),
+        );
     }
     fn compact_root_fork_wait_contract(
         interrupt_wait: bool,
         catch_child_exit: bool,
         default_stop: bool,
         signal_exit_continuation: bool,
+        exit_wake_contended: Option<LinuxWaitStatus>,
     ) {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
@@ -5696,6 +5745,28 @@ mod tests {
                 );
                 return;
             }
+            let parent_channel = runtime
+                .graph
+                .lock()
+                .owner
+                .task(parent)
+                .unwrap()
+                .native()
+                .resources()
+                .channel
+                .as_ref()
+                .unwrap()
+                .clone();
+            let parent_bucket = exit_wake_contended.map(|_| {
+                zone.lock(
+                    ZoneTables::<ParkedContextWords>::bucket_of_with_context(
+                        parent_channel.mm,
+                        WaitChannel::address(&parent_channel),
+                    ),
+                    &BoundedSpin(LOCK_SPINS),
+                )
+                .unwrap()
+            });
             if signal_exit_continuation {
                 child_page
                     .stock(
@@ -5730,13 +5801,36 @@ mod tests {
                 assert!(resumed.take_root_exit().is_none());
                 assert!(resumed.take_handoff_receipt().is_some());
             } else {
+                let outcome = if let Some(parent_bucket) = parent_bucket {
+                    let status = exit_wake_contended.unwrap();
+                    let waiting = core::sync::atomic::AtomicBool::new(false);
+                    let probe = |_| waiting.store(true, Ordering::Release);
+                    child_entry.publication_wait_probe = Some(&probe);
+                    let result =
+                        release_bucket_when_publisher_waits(parent_bucket, &waiting, || {
+                            if let Some(signal) = status.term_signal() {
+                                child_entry.exit_with_signal(signal)
+                            } else {
+                                Ok(child_entry.exit_group(7))
+                            }
+                        });
+                    child_entry.publication_wait_probe = None;
+                    result.unwrap()
+                } else {
+                    child_entry.exit_group(7)
+                };
                 assert!(matches!(
-                    child_entry.exit_group(7),
+                    outcome,
                     LifecycleOutcome::Transferred {
                         progress: carrick_core::Served::Idle,
                         ..
                     }
                 ));
+                assert_eq!(
+                    child_entry.take_run_failure(),
+                    None,
+                    "normal parent enrollment contention must retain exit wake custody"
+                );
                 assert!(child_entry.take_handoff_receipt().is_some());
             }
         }
@@ -5771,16 +5865,28 @@ mod tests {
                 .enter(source, &task, words(address), &mut service)
                 .unwrap();
             use carrick_personality_linux::signal::ProcessSignals;
-            if signal_exit_continuation {
+            if signal_exit_continuation || exit_wake_contended.is_some() {
                 let (signal, info, _) = parent_entry
                     .take_deliverable(carrick_signal_core::policy::SigBlockMask::NONE)
                     .expect("child termination must notify its parent");
                 assert_eq!(signal.number(), 17);
                 let info = info.unwrap();
                 let code = info.si_code;
-                assert_eq!(code, carrick_syscall_abi::LINUX_CLD_KILLED);
+                let signaled = signal_exit_continuation
+                    || exit_wake_contended.is_some_and(|status| status.term_signal().is_some());
+                assert_eq!(
+                    code,
+                    if signaled {
+                        carrick_syscall_abi::LINUX_CLD_KILLED
+                    } else {
+                        carrick_syscall_abi::LINUX_CLD_EXITED
+                    }
+                );
                 assert_eq!(info.si_addr as u32, 42);
-                assert_eq!(i32::from_le_bytes(info._pad[..4].try_into().unwrap()), 15);
+                assert_eq!(
+                    i32::from_le_bytes(info._pad[..4].try_into().unwrap()),
+                    if signaled { 15 } else { 7 }
+                );
             }
             assert_eq!(
                 parent_entry.kill(
@@ -5822,9 +5928,12 @@ mod tests {
             panic!("reap return")
         };
         assert_eq!(result.raw(), 42);
-        if signal_exit_continuation {
+        if signal_exit_continuation || exit_wake_contended.is_some() {
             let copied = parent_entry.service.copies.last().unwrap();
-            assert_eq!(*copied, LinuxWaitStatus::signaled(15, false));
+            assert_eq!(
+                *copied,
+                exit_wake_contended.unwrap_or(LinuxWaitStatus::signaled(15, false))
+            );
         }
         assert!(runtime.namespace_child_key(parent, 42).is_none());
         assert!(parent_entry.take_root_exit().is_none());
