@@ -167,6 +167,12 @@ check *ARGS:
 check-fuzz:
     {{_admit}} {{_cargo}} check --manifest-path fuzz/Cargo.toml
 
+# Compile-check debug and diagnostic features that are off by default.
+check-debug-features:
+    {{_admit}} {{_cargo}} check -p carrick-cli --features debug-all,alloc-census,fs-memory
+    {{_admit}} {{_cargo}} check -p carrick-kernel-example --features allocation-metrics
+
+
 # Install git hooks (.githooks/): fmt-check at commit, clippy gate at push.
 install-hooks:
     git config core.hooksPath .githooks
@@ -220,6 +226,7 @@ lint-domains-source:
     {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-lanes check
     {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- probe-coverage
     {{_admit}} {{_cargo}} test -p carrick-xtask --test probe_coverage
+    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- probe-emitters check
     ./scripts/closure-assert-vmfree-schedule.sh
     ./scripts/lint-domains.sh
     # The self-tests run FIRST and in the same gate as --check: every one of
@@ -634,6 +641,7 @@ ci:
     j fmt-check
     j clippy
     j lint-domains
+    j check-debug-features
     j deny
     j check-matrix
     j check-layering

@@ -18,6 +18,7 @@ pub mod lease_supervisor;
 pub mod ledger_merge;
 mod lock_file;
 pub mod probe_coverage;
+pub mod probe_emitters;
 pub mod probe_inventory;
 pub mod provision;
 mod prune_fs;

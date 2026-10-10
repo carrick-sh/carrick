@@ -158,11 +158,31 @@ pub fn resolve(metadata: &Value) -> (Vec<TestTarget>, Vec<String>) {
         .unwrap_or_default();
     for package in packages {
         let name = package.get("name").and_then(Value::as_str).unwrap_or("");
-        let names: BTreeSet<&str> = package
+        let all_targets = package
             .get("targets")
             .and_then(Value::as_array)
             .map(Vec::as_slice)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        for target in all_targets {
+            let is_bin = target
+                .get("kind")
+                .and_then(Value::as_array)
+                .is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"));
+            if is_bin {
+                let target_name = target.get("name").and_then(Value::as_str).unwrap_or("");
+                let src_path_str = target.get("src_path").and_then(Value::as_str).unwrap_or("");
+                let src_path = Path::new(src_path_str);
+                let in_src_bin = src_path_str.contains("/src/bin/")
+                    || src_path_str.ends_with("/src/bin")
+                    || src_path.components().any(|c| c.as_os_str() == "bin");
+                if in_src_bin && bin_target_has_tests(src_path) {
+                    errors.push(format!(
+                        "{name}::{target_name}: bin target contains #[test]; move tests to tests/ or src/lib.rs"
+                    ));
+                }
+            }
+        }
+        let names: BTreeSet<&str> = all_targets
             .iter()
             .filter(|target| {
                 target
@@ -231,6 +251,47 @@ pub fn resolve(metadata: &Value) -> (Vec<TestTarget>, Vec<String>) {
     }
     targets.sort();
     (targets, errors)
+}
+
+fn bin_target_has_tests(src_path: &Path) -> bool {
+    if !src_path.exists() {
+        return false;
+    }
+    if file_has_test_attr(src_path) {
+        return true;
+    }
+    let stem = src_path.file_stem();
+    if let (Some(parent), Some(stem)) = (src_path.parent(), stem) {
+        let sub_dir = parent.join(stem);
+        if sub_dir.is_dir() && dir_has_test_attr(&sub_dir) {
+            return true;
+        }
+    }
+    false
+}
+
+fn file_has_test_attr(path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    content.contains("#[test]") || content.contains("#[ test")
+}
+
+fn dir_has_test_attr(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if dir_has_test_attr(&path) {
+                return true;
+            }
+        } else if path.extension().is_some_and(|ext| ext == "rs") && file_has_test_attr(&path) {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn lane_of(name: &str) -> Option<&'static Lane> {
@@ -671,5 +732,39 @@ mod tests {
             lane_args(&targets, "integration", ""),
             Err(TestLanesError::NotDerived(_))
         ));
+    }
+
+    #[test]
+    fn bin_target_with_tests_fails() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let bin_dir = temp_dir.path().join("src/bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let bin_path = bin_dir.join("probe.rs");
+        std::fs::write(&bin_path, "#[test]\nfn some_test() {}\n").unwrap();
+        let metadata = json!({
+            "packages": [{
+                "name": "my-vmm",
+                "features": {"default": []},
+                "targets": [
+                    {
+                        "name": "my_vmm",
+                        "kind": ["lib"],
+                        "src_path": "src/lib.rs",
+                    },
+                    {
+                        "name": "probe",
+                        "kind": ["bin"],
+                        "src_path": bin_path.to_str().unwrap(),
+                    }
+                ],
+                "metadata": {"carrick": {"test-lanes": {}}},
+            }]
+        });
+        let (_targets, errors) = resolve(&metadata);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("my-vmm::probe: bin target contains #[test]"),
+            "{errors:?}"
+        );
     }
 }

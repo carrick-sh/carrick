@@ -26,8 +26,8 @@ mod imp {
     use std::time::Instant;
 
     use crate::hvpatch_probe_support::platform::{REGION_ALIGN, create_or_exit, print_provenance};
-    use crate::hvpatch_probe_support::{compute_words, host_compute_words};
     use applevisor_sys::hv_reg_t;
+    use carrick_vmm_hvf::hvpatch_probe_support::{compute_words, host_compute_words};
 
     const ITERATIONS: u64 = 1_000_000;
     const BATCHES: u32 = 6;
