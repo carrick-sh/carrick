@@ -55,14 +55,17 @@ impl RetiredSpaces {
         self.len() == 0
     }
 
-    /// Retire every queued space `ready` admits; keep the rest queued. On
-    /// the first `retire` error, that entry and every later one go back to
-    /// the queue with the deferred ones, and the error is returned.
-    pub fn drain<E>(
+    /// Retire every queued space `ready` admits; keep the rest queued.
+    ///
+    /// When `retire` returns `NativeProcessError::Busy`, that space is
+    /// kept to retry at the next drain, and remaining entries stay queued.
+    /// Stale or unretireable entries are dropped/diagnosed so they do not
+    /// block the queue head forever, allowing subsequent entries to drain.
+    pub fn drain(
         &self,
         mut ready: impl FnMut(&RetiredSpace) -> bool,
-        mut retire: impl FnMut(&RetiredSpace) -> Result<(), E>,
-    ) -> Result<(), E> {
+        mut retire: impl FnMut(&RetiredSpace) -> Result<(), NativeProcessError>,
+    ) -> Result<(), NativeProcessError> {
         let pending = core::mem::take(&mut *self.pending.lock());
         let mut keep = Vec::new();
         let mut result = Ok(());
@@ -72,10 +75,18 @@ impl RetiredSpaces {
                 keep.push(space);
                 continue;
             }
-            if let Err(error) = retire(&space) {
-                keep.push(space);
-                result = Err(error);
-                break;
+            match retire(&space) {
+                Ok(()) => {}
+                Err(NativeProcessError::Busy) => {
+                    keep.push(space);
+                    result = Err(NativeProcessError::Busy);
+                    break;
+                }
+                Err(error) => {
+                    // Stale or unretireable entries are dropped from the queue
+                    // so they do not block the queue head forever.
+                    result = Err(error);
+                }
             }
         }
         keep.extend(entries);
@@ -206,6 +217,30 @@ mod tests {
         let mut done = retired.borrow().clone();
         done.sort_unstable();
         assert_eq!(done, vec![10, 11, 12, 13]);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn stale_entry_at_head_is_dropped_and_does_not_block_later_entries() {
+        let queue = RetiredSpaces::new();
+        queue.push(space(10));
+        queue.push(space(11));
+        let retired = core::cell::RefCell::new(Vec::new());
+        // 10 is Stale; 11 succeeds.
+        let result = queue.drain(
+            |_| true,
+            |space| {
+                if space.mm.raw() == 10 {
+                    Err(NativeProcessError::Stale)
+                } else {
+                    retired.borrow_mut().push(space.mm.raw());
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(result, Err(NativeProcessError::Stale));
+        assert_eq!(*retired.borrow(), vec![11]);
+        // 10 is dropped (does not sit at head forever); 11 was retired.
         assert!(queue.is_empty());
     }
 }
