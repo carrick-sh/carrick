@@ -61,8 +61,7 @@ use carrick_kernel::dispatch::{
     DispatchOutcome, FdWaitCompletion, StdioReadiness, SyscallDispatcher, SyscallRequest, WaitFds,
 };
 use carrick_kernel::kernel::continuation::{
-    BlockedContinuation, ContinuationCapture, ContinuationResumeEffects, RestartClass,
-    RestartDecision, fold_continuation_completion, resume_continuation,
+    ContinuationResumeEffects, RestartDecision, fold_continuation_completion, resume_continuation,
 };
 use carrick_kernel::kernel::objects::ThreadExecutionLease;
 use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
@@ -358,17 +357,13 @@ impl ForwardRequest {
             Self::HostReadiness(_) => None,
         }
     }
+}
 
-    fn restart_class(self) -> RestartClass {
-        match self {
-            Self::Syscall(request)
-                if carrick_kernel::kernel::continuation::is_restartable_syscall(
-                    request.number.raw(),
-                ) =>
-            {
-                RestartClass::RestartSyscall
-            }
-            Self::Syscall(_) | Self::HostReadiness(_) => RestartClass::Never,
+impl From<ForwardRequest> for carrick_kernel::kernel::continuation::BlockedContinuationRequest {
+    fn from(request: ForwardRequest) -> Self {
+        match request {
+            ForwardRequest::Syscall(syscall) => Self::Syscall(syscall),
+            ForwardRequest::HostReadiness(_) => Self::HostReadiness,
         }
     }
 }
@@ -472,21 +467,14 @@ impl KvmPersistentExecutor {
         frame: Option<ProductionForwardFrame>,
     ) -> Result<ExecutorExit, TrapError> {
         let context = binding.fresh_context()?;
-        let capture = match request {
-            ForwardRequest::Syscall(syscall) => ContinuationCapture::from_lease(
-                &context,
-                submission.execution_lease_mut()?,
-                syscall,
-                request.restart_class(),
-            ),
-            ForwardRequest::HostReadiness(_) => ContinuationCapture::from_host_readiness_lease(
-                &context,
-                submission.execution_lease_mut()?,
-            ),
-        }
+        let continuation = carrick_kernel::kernel::continuation::prepare_blocked_continuation(
+            &context,
+            submission.execution_lease_mut()?,
+            request,
+            outcome,
+            Some(binding.futex()),
+        )
         .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
-        let continuation = BlockedContinuation::from_dispatch_outcome(outcome, capture)
-            .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
         if let Some(frame) = frame {
             let mut retained = binding
                 .retained
@@ -1140,6 +1128,7 @@ pub(crate) struct KvmTaskBinding {
     kernel_binding: KernelTaskBinding,
     retained: Mutex<Option<RetainedForward>>,
     kernel_stack: Mutex<Option<carrick_vmm_kvm::cpl0_boot::KernelStackSnapshot>>,
+    futex: Arc<carrick_thread::thread::FutexTable>,
 }
 
 /// The exact running guest task that may request a stopped physical forward.
@@ -1191,7 +1180,11 @@ mod forward_owner_tests {
             sig_mask: carrick_abi::WaitSigMask::NONE,
         });
         assert!(request.syscall().is_none());
-        assert_eq!(request.restart_class(), RestartClass::Never);
+        assert_eq!(
+            carrick_kernel::kernel::continuation::BlockedContinuationRequest::from(request)
+                .restart_class(),
+            carrick_kernel::kernel::continuation::RestartClass::Never
+        );
     }
 
     #[test]
@@ -1257,6 +1250,7 @@ impl KvmTaskBinding {
             kernel_binding: context.task_binding(),
             retained: Mutex::new(None),
             kernel_stack: Mutex::new(None),
+            futex: Arc::new(carrick_thread::thread::FutexTable::new()),
         };
         binding.validate_task_state(state)?;
         Ok(binding)
@@ -1264,6 +1258,10 @@ impl KvmTaskBinding {
 
     pub(crate) const fn arch(&self) -> GuestArchBinding {
         self.arch
+    }
+
+    pub(crate) fn futex(&self) -> &Arc<carrick_thread::thread::FutexTable> {
+        &self.futex
     }
 
     pub(crate) fn fresh_context(&self) -> Result<KernelContext, TrapError> {
@@ -1331,5 +1329,273 @@ impl TaskBindingResolver<KvmTaskBinding> for KvmTaskBindingDirectory {
 
     fn retire(&self, thread: ThreadKey, generation: ExecutionGeneration) {
         TaskBindingDirectory::retire(self, thread, generation);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vcpu_loop::executor::binding::ExecutionLeaseAuthoritySlot;
+    use carrick_abi::{SigSet, WaitSigMask};
+    use carrick_hal::ThreadId;
+    use carrick_hal::guest_arch_binding::{
+        GuestArchBinding,
+        core_arch::{
+            AddressContext, CarrierGeneration, ContextGeneration,
+            ExecutionGeneration as ArchGeneration, FrameGpa, MmGeneration, RootGpa, TaskIdentity,
+            TaskSerial,
+        },
+    };
+    use carrick_hal::threaded::{
+        X86_TASK_RESUME_MAGIC, X86_TASK_RESUME_PAYLOAD_LEN, X86_TASK_XSAVE_LEN, X86TaskCpuStateV1,
+    };
+    use carrick_kernel::compat::SyscallArgs;
+    use carrick_kernel::dispatch::{DispatchOutcome, FdWaitCompletion, SyscallRequest, WaitFds};
+    use carrick_kernel::kernel::continuation::SignalReadinessProbe;
+    use carrick_kernel::kernel::objects::ExecutorId;
+    use carrick_kernel::kernel::{Kernel, KernelContext, LinuxSignal, RootBootstrap, Scheduler};
+    use std::sync::Arc;
+
+    fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
+        let input = RootBootstrap::for_reference_model(
+            pid,
+            ThreadId::synthetic_for_tests(pid),
+            "kvm continuation test".to_owned(),
+        )
+        .expect("bootstrap input");
+        Kernel::bootstrap_root(input).expect("kernel")
+    }
+
+    fn make_x86_state(context: &KernelContext) -> MigratableTaskState {
+        let root = RootGpa::page_aligned(FrameGpa::new(0x7000)).expect("aligned root");
+        let mut resume = [0u8; X86_TASK_RESUME_PAYLOAD_LEN];
+        resume[56..64].copy_from_slice(&X86_TASK_RESUME_MAGIC.to_le_bytes());
+        let mut gprs = [0; 16];
+        gprs[7] = 0x9000;
+        let cpu = X86TaskCpuStateV1::new(
+            gprs,
+            0x400000,
+            0x202,
+            gprs[7],
+            0x8000_0031,
+            root.address().raw(),
+            0x40620,
+            0xd01,
+            0,
+            0,
+            context.shared().mm().id().raw(),
+            1,
+            vec![0; X86_TASK_XSAVE_LEN],
+            resume.to_vec(),
+        )
+        .expect("valid x86 state");
+        MigratableTaskState {
+            cpu: GuestCpuState::from_x86_64_v1(cpu).expect("saved x86 CPU"),
+            mm: context.shared().mm().id(),
+            asid_generation: 1,
+        }
+    }
+
+    fn make_x86_binding(
+        context: &KernelContext,
+        state: &MigratableTaskState,
+    ) -> Arc<KvmTaskBinding> {
+        let nonzero = |raw| std::num::NonZeroU64::new(raw).expect("nonzero identity");
+        let root = RootGpa::page_aligned(FrameGpa::new(0x7000)).expect("aligned root");
+        let arch = GuestArchBinding::x86(
+            TaskIdentity {
+                carrier: CarrierGeneration::new(nonzero(8)),
+                task: TaskSerial::new(nonzero(context.task().key().serial.raw())),
+                execution: ArchGeneration::new(nonzero(ExecutionGeneration::INITIAL.raw())),
+            },
+            AddressContext {
+                root,
+                mm: MmGeneration::new(context.shared().mm().id().nonzero()),
+                generation: ContextGeneration::new(nonzero(1)),
+            },
+        );
+        let binding = KvmTaskBinding::new(context, state, arch, ExecutionGeneration::INITIAL)
+            .expect("issued KVM root binding");
+        Arc::new(binding)
+    }
+
+    #[test]
+    fn kvm_block_forward_pselect6_installs_temporary_signal_mask_and_binds_futex() {
+        let (kernel, context) = bootstrap(14_001);
+        let state = make_x86_state(&context);
+        let binding = make_x86_binding(&context, &state);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        context
+            .thread()
+            .publish_initial_task_state(state)
+            .expect("publish initial state");
+        let lease = context
+            .thread()
+            .claim_runnable(
+                ExecutorId::for_transitional_thread(ThreadId::synthetic_for_tests(41))
+                    .expect("transitional executor"),
+            )
+            .expect("claim running lease");
+
+        let authority = ExecutionLeaseAuthoritySlot::from(Some(lease));
+        let reject_descendant = |_, _| {
+            Err(TrapError::Hypervisor(
+                "test publishes no descendants".to_owned(),
+            ))
+        };
+        let mut submission = ExecutorSubmissionContext {
+            registration: None,
+            scheduler: &scheduler,
+            publish_test_descendant: &reject_descendant,
+            current: None,
+            authority,
+            exec_replacement: None,
+        };
+
+        // Signal 10 (SIGUSR1) has an installed action so it is deliverable
+        let signal = LinuxSignal::for_signal_number(10).expect("SIGUSR1");
+        let mut action = carrick_abi::LinuxSigaction::empty();
+        action.sa_handler = 0x1234;
+        context.signal_authority().install_action(signal, action);
+        context
+            .signal_authority()
+            .enqueue_thread_standard(signal, None);
+
+        // pselect6 outcome with sigmask blocking SIGUSR1 (bit 9 set in 0-indexed mask)
+        let sigmask = SigSet::from_raw(1 << 9);
+        let outcome = DispatchOutcome::WaitOnFds {
+            fds: WaitFds::empty(),
+            timeout: None,
+            sig_mask: WaitSigMask::Replace(sigmask),
+            completion: FdWaitCompletion::Fd { on_timeout: 0 },
+        };
+        let request = ForwardRequest::Syscall(SyscallRequest::new(72, SyscallArgs::new([0; 6])));
+
+        let exit =
+            KvmPersistentExecutor::block_forward(&binding, &mut submission, request, outcome, None)
+                .expect("block_forward");
+
+        let ExecutorExit::BlockedContinuation { continuation, .. } = exit else {
+            panic!("expected BlockedContinuation exit");
+        };
+
+        // Under Linux man-pages pselect(2):
+        // "A signal that is blocked by sigmask will not interrupt pselect();
+        // instead, it remains pending until the original signal mask is restored."
+        //
+        // 1. The thread's active blocked mask during the wait MUST equal sigmask
+        assert_eq!(
+            context.signal_authority().blocked(),
+            sigmask,
+            "pselect6 temporary sigmask must be installed into thread signal authority"
+        );
+        // 2. The original mask (EMPTY) must be armed for restoration on return
+        assert_eq!(
+            context.signal_authority().armed_restore_mask(),
+            Some(SigSet::EMPTY),
+            "original signal mask must be armed for restoration"
+        );
+        // 3. Futex table must be bound
+        assert!(
+            continuation.has_product_futex(),
+            "blocked continuation must have private futex bound"
+        );
+        // 4. Because SIGUSR1 is blocked by the temporary mask, the readiness probe
+        // must NOT see it as deliverable to interrupt the wait.
+        let probe_event = SignalReadinessProbe::from_continuation(&continuation).event();
+        assert!(
+            probe_event.is_none(),
+            "signal blocked by pselect6 sigmask must not interrupt the wait"
+        );
+    }
+
+    #[test]
+    fn kvm_block_forward_ppoll_host_readiness_installs_temporary_signal_mask_and_binds_futex() {
+        let (kernel, context) = bootstrap(14_002);
+        let state = make_x86_state(&context);
+        let binding = make_x86_binding(&context, &state);
+        let scheduler = Arc::new(Scheduler::new(kernel));
+        context
+            .thread()
+            .publish_initial_task_state(state)
+            .expect("publish initial state");
+        let lease = context
+            .thread()
+            .claim_runnable(
+                ExecutorId::for_transitional_thread(ThreadId::synthetic_for_tests(41))
+                    .expect("transitional executor"),
+            )
+            .expect("claim running lease");
+
+        let authority = ExecutionLeaseAuthoritySlot::from(Some(lease));
+        let reject_descendant = |_, _| {
+            Err(TrapError::Hypervisor(
+                "test publishes no descendants".to_owned(),
+            ))
+        };
+        let mut submission = ExecutorSubmissionContext {
+            registration: None,
+            scheduler: &scheduler,
+            publish_test_descendant: &reject_descendant,
+            current: None,
+            authority,
+            exec_replacement: None,
+        };
+
+        // Signal 10 (SIGUSR1) has an installed action so it is deliverable
+        let signal = LinuxSignal::for_signal_number(10).expect("SIGUSR1");
+        let mut action = carrick_abi::LinuxSigaction::empty();
+        action.sa_handler = 0x1234;
+        context.signal_authority().install_action(signal, action);
+        context
+            .signal_authority()
+            .enqueue_thread_standard(signal, None);
+
+        // ppoll HostReadiness outcome with sigmask blocking SIGUSR1
+        let sigmask = SigSet::from_raw(1 << 9);
+        let outcome = DispatchOutcome::WaitOnFds {
+            fds: WaitFds::empty(),
+            timeout: None,
+            sig_mask: WaitSigMask::Replace(sigmask),
+            completion: FdWaitCompletion::Fd { on_timeout: 0 },
+        };
+        let request = ForwardRequest::HostReadiness(HostReadinessRequest {
+            address: 0x1000,
+            count: 1,
+            deadline: None,
+            sig_mask: WaitSigMask::Replace(sigmask),
+        });
+
+        let exit =
+            KvmPersistentExecutor::block_forward(&binding, &mut submission, request, outcome, None)
+                .expect("block_forward");
+
+        let ExecutorExit::BlockedContinuation { continuation, .. } = exit else {
+            panic!("expected BlockedContinuation exit");
+        };
+
+        // 1. Temporary sigmask installed
+        assert_eq!(
+            context.signal_authority().blocked(),
+            sigmask,
+            "ppoll temporary sigmask must be installed into thread signal authority"
+        );
+        // 2. Armed restore mask
+        assert_eq!(
+            context.signal_authority().armed_restore_mask(),
+            Some(SigSet::EMPTY),
+            "original signal mask must be armed for restoration"
+        );
+        // 3. Futex table bound
+        assert!(
+            continuation.has_product_futex(),
+            "blocked continuation must have private futex bound"
+        );
+        // 4. Blocked signal must not interrupt wait
+        let probe_event = SignalReadinessProbe::from_continuation(&continuation).event();
+        assert!(
+            probe_event.is_none(),
+            "signal blocked by ppoll sigmask must not interrupt the wait"
+        );
     }
 }
