@@ -39,36 +39,6 @@ use crate::memory::reservations::{NativeReservationGeometry, SharedReservations}
 
 pub type Mm = AddressContext<RootGpa>;
 
-fn observed_address(
-    ttbr0: u64,
-    mm_key: u64,
-    _record_incarnation: u64,
-) -> Result<Mm, NativeProcessError> {
-    let mm = NonZeroU64::new(mm_key).ok_or(NativeProcessError::Stale)?;
-    Ok(Mm {
-        root: RootGpa::page_aligned(FrameGpa::new(ttbr0 & AARCH64_ROOT_ADDRESS_MASK))
-            .ok_or(NativeProcessError::Stale)?,
-        mm: MmGeneration::new(mm),
-        // A scheduler record may be retired and rehomed while this MM and
-        // root remain live. Its incarnation cannot define address identity.
-        generation: ContextGeneration::new(mm),
-    })
-}
-
-#[cfg(test)]
-mod observed_address_tests {
-    use super::*;
-
-    #[test]
-    fn scheduler_record_reuse_cannot_change_a_live_mm_context() {
-        let root = 0x0001_009a_0000_0000;
-        let original = observed_address(root, 7, 1).unwrap();
-        let rehomed = observed_address(root, 7, 2).unwrap();
-        assert_eq!(original, rehomed);
-        assert_ne!(original, observed_address(root, 8, 2).unwrap());
-    }
-}
-
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 struct CurrentMmMaintenance;
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -182,11 +152,17 @@ pub fn admit_entry(
     record_incarnation: u64,
 ) -> Result<(Arc<Runtime>, Mm, Box<Aarch64ParkedContext>), NativeProcessError> {
     let (page, control) = task.lifecycle_refs().ok_or(NativeProcessError::Stale)?;
-    let observed = observed_address(
-        ttbr0,
-        task.mm.key.load(Ordering::Acquire),
-        record_incarnation,
-    )?;
+    let observed = Mm {
+        root: RootGpa::page_aligned(FrameGpa::new(ttbr0 & AARCH64_ROOT_ADDRESS_MASK))
+            .ok_or(NativeProcessError::Stale)?,
+        mm: MmGeneration::new(
+            NonZeroU64::new(task.mm.key.load(Ordering::Acquire))
+                .ok_or(NativeProcessError::Stale)?,
+        ),
+        generation: ContextGeneration::new(
+            NonZeroU64::new(record_incarnation).ok_or(NativeProcessError::Stale)?,
+        ),
+    };
     let address = if control.entry().is_some() {
         REGISTRY
             .group_address(
@@ -791,13 +767,14 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             return Err(NativeProcessError::Stale);
         }
         let child = child.ok_or(NativeProcessError::Stale)?;
+        let completion = child.completion();
         let address = AddressContext {
             mm: child_mm,
             root: RootGpa::page_aligned(FrameGpa::new(
                 loan.request.child_tables.base & AARCH64_ROOT_ADDRESS_MASK,
             ))
             .ok_or(NativeProcessError::Stale)?,
-            generation: ContextGeneration::new(child_mm.raw()),
+            generation: ContextGeneration::new(completion.child.incarnation()),
         };
         Ok(Box::new(Prepared {
             loan: *loan,
