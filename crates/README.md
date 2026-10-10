@@ -1,6 +1,6 @@
 # Carrick Crate Map
 
-Carrick is a 33-crate Cargo workspace. The product path is:
+Carrick is a 51-crate Cargo workspace. The product path is:
 
 ```text
 carrick-cli   -> carrick-engine -> { carrick-image, carrick-runtime -> carrick-kernel -> carrick-vfs } -> carrick-spec
@@ -36,17 +36,27 @@ Platform code is selected by Cargo features. The default feature is
 | Crate | Role |
 | --- | --- |
 | `carrick-abi` | Linux ABI constants and wire structs, with compile-time layout/constant assertions. |
+| `carrick-core` | Neutral MM, fork, COW, and wait/lifecycle substrate for Carrick (shared owner algorithms; hardware and Linux lowering stay with clients). |
+| `carrick-core-abi` | Neutral owner identities and transport, shared by both ISA images. |
+| `carrick-el1-abi` | Contracts, memory layouts, and definitions shared between the host runtime and the bare-metal in-guest EL1 kernel (`carrick-el1`). |
+| `carrick-fatal` | Single fatal sink for carrier invariant violations (`carrick_fatal!`) with non-allocating stack formatting and `CARRICK_LAST_FATAL` recording. |
+| `carrick-fd-core` | Allocation-free descriptor and OFD authority as shared atomic records across host and EL1. |
+| `carrick-guest-arch` | The no_std hardware boundary and sealed `Arch` traits for Carrick's in-guest kernel. |
 | `carrick-guest-mem` | Guest-memory trait, memory error type, and syscall-frame hub types shared by handlers and VMM engines. |
+| `carrick-hal` | OS/VMM-neutral traits and shared types: trap contract, hypervisor traits, guest-arch tables, event/futex/threaded-loop/signal/timer surfaces. Depends on the platform-neutral `no_std` `carrick-el1-abi` for exact owner Fork completion receipts; it takes no EL1 implementation or VMM dependency. |
+| `carrick-inotify-core` | Platform-neutral inotify queue ring buffer, coalescing, and watch descriptor bookkeeping. |
 | `carrick-kernel-arena` | The per-run kernel arena: a file-backed `MAP_SHARED` region holding the Linux-visible cross-process delta (identity, leases, shared kernel objects) the host kernel cannot express, with no authority daemon -- processes operate on it via atomics and robust bucket locks. |
 | `carrick-mem` | Guest address-space construction: ELF layout, boot identity/hvpatch tables, trampolines, VDSO/vvar, region helpers. |
 | `carrick-mmu-core` | `no_std` + `alloc` MMU management substrate and stage-1 page-table manipulation algorithms (AArch64 `PageTableManager`). |
-| `carrick-hal` | OS/VMM-neutral traits and shared types: trap contract, hypervisor traits, guest-arch tables, event/futex/threaded-loop/signal/timer surfaces. Depends on the platform-neutral `no_std` `carrick-el1-abi` for exact owner Fork completion receipts; it takes no EL1 implementation or VMM dependency. |
-| `carrick-thread` | Thread registry, private-futex park table, and fork/page-table quiesce barriers. |
-| `carrick-signal-core` | Platform-neutral pending-signal bookkeeping. |
-| `carrick-timer-core` | Platform-neutral interval/POSIX timer slot bookkeeping and timer due-time decisions. |
-| `carrick-inotify-core` | Platform-neutral inotify queue ring buffer, coalescing, and watch descriptor bookkeeping. |
-| `carrick-sched-core` | `no_std` in-guest scheduling core shared by guest EL1 and the host: the zone of futex-parked threads (records whose claim word names their one owner, hash-bucket wait queues, per-vCPU-slot run queues), laid out `repr(C)` in the shared EL1 region. |
 | `carrick-observability` | Platform-neutral compat-reporting support. |
+| `carrick-personality-linux` | Linux interpretation of neutral owner records, shared by host and EL1. |
+| `carrick-pipe-core` | Allocation-free pipe and event counter substrate over shared or local records. |
+| `carrick-sched-core` | `no_std` in-guest scheduling core shared by guest EL1 and the host: the zone of futex-parked threads (records whose claim word names their one owner, hash-bucket wait queues, per-vCPU-slot run queues), laid out `repr(C)` in the shared EL1 region. |
+| `carrick-signal-core` | Platform-neutral pending-signal bookkeeping. |
+| `carrick-signal-linux` | Linux signal policy and host-venue pending bookkeeping shared across backends. |
+| `carrick-syscall-abi` | Guest-safe Linux syscall numbering, canonical tables, and wait-option domains. |
+| `carrick-thread` | Thread registry, private-futex park table, and fork/page-table quiesce barriers. |
+| `carrick-timer-core` | Platform-neutral interval/POSIX timer slot bookkeeping and timer due-time decisions. |
 
 ## Host Primitive Layers
 
@@ -65,12 +75,15 @@ lifecycle semantics.
 
 | Crate | Role |
 | --- | --- |
+| `carrick-aarch64` | Shared AArch64 engine (`Aarch64EngineCore`) used by the HVF AArch64 path (and shared with the KVM AArch64 lane). |
+| `carrick-el1` | Carrick guest EL1 kernel image body: neutral mechanisms and Linux personality compiled into AArch64 EL1 and x86_64 CPL0 images. |
+| `carrick-el1-image` | Precompiled in-guest EL1 kernel binary image embedded into the host runtime. |
+| `carrick-vmm-bhyve` | FreeBSD/bhyve backend; x86_64 lane through the shared x86 engine plus bhyve-specific host/VMM glue. |
 | `carrick-vmm-hvf` | macOS Hypervisor.framework backend; mature AArch64 stage-1/stage-2 projection, vCPU execution and coordination, fault/syscall exits, and observability probes. |
 | `carrick-vmm-kvm` | Linux/KVM backend; AArch64 KVM support, x86_64 lane, KVM kick/futex/fork/timer/signal glue, standalone target-host runners. |
-| `carrick-vmm-bhyve` | FreeBSD/bhyve backend; x86_64 lane through the shared x86 engine plus bhyve-specific host/VMM glue. |
 | `carrick-vmm-nvmm` | NetBSD/NVMM backend; x86_64 lane through the shared x86 engine plus NVMM-specific host/VMM glue. |
 | `carrick-x86` | Shared x86_64 engine: long-mode bring-up, register/snapshot model, fault tables, VDSO helpers, generic `X86EngineCore<V>`. |
-| `carrick-aarch64` | Shared AArch64 engine (`Aarch64EngineCore`) used by the HVF AArch64 path (and shared with the KVM AArch64 lane). |
+| `carrick-x86-cpl0` | Bare-metal x86_64 CPL0 image and fixture runner. |
 
 ## Test and Harness Support
 
@@ -82,6 +95,7 @@ lifecycle semantics.
 | `carrick-coordinator` | Host-wide resource coordinator enforcing mutual exclusion between Carrick guest execution and Docker oracle phases across checkouts, quiet timing windows, and campaign budgets. |
 | `carrick-investigation` | Durable event-sourced investigation engine driving validated stage transitions, experiment planning, and review-package assembly for contract-driven conformance investigations. |
 | `carrick-test-support` | Shared test helpers: synthetic rootfs tar/gzip assembly and aligned EL1 region backing for VM-free ABI tests. |
+| `carrick-xtask` | Repository maintenance, gate drivers, facts ledger verification, baseline recording/comparison, assembly diffs, and test lane checks. |
 
 ## Feature Closure Rules
 

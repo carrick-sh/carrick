@@ -1,7 +1,7 @@
 /*
  * Speculative "failing child" tracer for carrick.
  *
- *   carrick trace --script scripts/trace-failing-child.d -- run <image> <cmd...>
+ *   carrick trace --script scripts/dtrace/trace-failing-child.d -- run <image> <cmd...>
  *
  * Problem: a guest workload (e.g. `apt install`) forks hundreds of children;
  * only ONE fails, and the interesting evidence is the handful of syscalls it

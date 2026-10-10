@@ -15,8 +15,6 @@ from typing import Sequence
 EXCLUDED_CRATE_PREFIXES = (
     "crates/carrick-conformance",
     "crates/carrick-fatal",
-    "crates/carrick-dsr",
-    "crates/carrick-native-darwin",
 )
 
 
