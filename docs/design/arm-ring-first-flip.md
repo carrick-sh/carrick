@@ -529,21 +529,28 @@ prerequisites, not parallel implementations in the identity port.
 Production shared CPL0 thread exit needs native lifecycle scheduler/context
 integration, owned by the x86 executor-pool lane. It is not implemented by this
 identity port. Production dispatch supplies no ARM scheduler zone
-(`crates/carrick-x86-cpl0/src/entry.rs:1952`), and the common adapter requires
-`arm_scheduler()` plus a zone (`crates/carrick-el1/src/personality/lifecycle.rs:206`).
-Its wake hook requires an ARM frame (`lifecycle.rs:322`). The x86 wake adapter at
+(`crates/carrick-x86-cpl0/src/entry.rs:1961`), and the common adapter requires
+`arm_scheduler()` plus a zone (`crates/carrick-el1/src/personality/lifecycle.rs:182`).
+Its wake hook requires an ARM frame (`lifecycle.rs:298`). The x86 wake adapter at
 `crates/carrick-x86/src/cpl0_lifecycle.rs:615` is included by the fixture lane
 (`crates/carrick-x86-cpl0/src/fixture.rs:24`); that is not a production binding.
 
 ARM's existing reference clears the four-byte user word at
-`crates/carrick-personality-linux/src/lifecycle.rs:820` and invokes the single
-futex wake at `lifecycle.rs:822`. The real ARM adapter selects the MM-scoped
-scheduler wake at `crates/carrick-el1/src/personality/lifecycle.rs:308`, using
+`crates/carrick-personality-linux/src/lifecycle.rs:827` and invokes the single
+futex wake at `lifecycle.rs:829`. The real ARM adapter selects the MM-scoped
+scheduler wake at `crates/carrick-el1/src/personality/lifecycle.rs:285`, using
 `crates/carrick-el1/src/sched.rs:151`. The VM-free production-dispatch test
 `exit_of_a_born_thread_clears_cleartid_wakes_the_joiner_and_runs_it`
 (`crates/carrick-el1/src/personality/lifecycle/tests.rs:960`) starts a thread,
 parks its joiner, checks the word becomes zero and verifies the joiner resumes.
 The signed ARM binding remains director-owned.
+
+Production CPL0 `set_tid_address` therefore remains refused with ENOSYS;
+ARM keeps its in-ring setter and exit wake. The KVM witness
+`mounted_static_x86_set_tid_address_names_the_exit_custody_dependency`
+uses the same ELF on native Linux (positive tid) and CPL0 (ENOSYS), checking
+that the user word is unchanged on registration/refusal. This witness must
+flip red when the named dependency closes; startup parity covers served calls.
 
 Per set_tid_address(2), production CPL0 acceptance must witness that same
 clear-before-wake/observable-exit order through the native execution context,
