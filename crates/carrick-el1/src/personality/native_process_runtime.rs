@@ -1477,6 +1477,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> ProcessNative<C>
     for NativeProcessEntry<'_, 'a, M, C, S>
 {
+    fn take_run_failure(&mut self) -> Option<carrick_el1_abi::NativeRunFailureReason> {
+        self.run_failure.take()
+    }
     fn binding(&self) -> ExecutionBinding {
         self.binding
     }
