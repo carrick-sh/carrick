@@ -142,3 +142,8 @@ signed ARM `el1_` coverage for concurrent timed parks, record migration,
 and executor exit while a foreign record owns a timer. The Linux worker's
 VM-free scheduler evidence does not replace that signed coverage. Include
 these three changes and the owed scenarios explicitly in the PR body.
+
+Identity's `mounted_static_x86_raise_uses_set_tid_address_returned_tid`
+witness now runs by default: this branch supplies its previously named
+signal-action and handler-delivery dependency. Its unchanged native
+comparison passed when explicitly run before removing the ignore.
