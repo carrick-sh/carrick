@@ -164,11 +164,7 @@ impl<
         if process.binding() != binding {
             return None;
         }
-        self.thread()?.slot.visible_tid().or_else(|| {
-            self.current_tasks
-                .get(self.frame.task_index())?
-                .visible_pid()
-        })
+        self.thread()?.slot.visible_tid()
     }
     fn task_state(&self) -> Option<&'a LinuxTaskState> {
         self.current_tasks

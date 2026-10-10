@@ -1343,7 +1343,7 @@ fn arm_frame_rejects_slot_outside_mailbox_capacity() {
 }
 
 #[test]
-fn clone_uses_dispatch_identity_when_leader_slot_has_no_visible_tid() {
+fn clone_uses_the_exact_stamped_dispatch_identity() {
     struct BirthProbe {
         binding: carrick_el1_abi::ExecutionBinding,
     }
@@ -1382,7 +1382,7 @@ fn clone_uses_dispatch_identity_when_leader_slot_has_no_visible_tid() {
     let mut w = World::new(LifecycleHatches::ON);
     w.task().publish_visible_pid(41);
     w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
-    assert_eq!(w.venue.leader_slot().visible_tid(), None);
+    assert!(w.venue.leader_slot().publish_visible_tid(41));
     let mut probe = BirthProbe {
         binding: crate::personality::common_entry::execution_binding(w.task()),
     };
@@ -1497,4 +1497,176 @@ fn clone_refuses_missing_dispatch_identity_without_registering() {
     );
     assert_eq!(w.page().live(), 1);
     assert_eq!(w.zone.slot(SLOT).queued(), 0);
+}
+
+#[test]
+fn clone_missing_nonleader_identity_cannot_inherit_leader() {
+    struct BirthProbe {
+        binding: carrick_el1_abi::ExecutionBinding,
+    }
+    impl ProcessNative for BirthProbe {
+        fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
+            self.binding
+        }
+        fn fork(&mut self) -> LifecycleOutcome {
+            panic!("unexpected fork")
+        }
+        fn wait4(
+            &mut self,
+            _: ProcessWaitPid,
+            _: UserVa,
+            _: LinuxWaitOptions,
+            _: UserVa,
+        ) -> LifecycleOutcome {
+            panic!("unexpected wait")
+        }
+        fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
+            panic!("unexpected exit")
+        }
+        fn thread_spawned(
+            &mut self,
+            caller: u32,
+            child: u32,
+            publish: &mut dyn FnMut() -> Result<(), i64>,
+        ) -> Result<(), i64> {
+            assert_eq!(
+                caller, 42,
+                "a nonleader child must inherit the calling thread"
+            );
+            assert_eq!(child, CHILD_VISIBLE);
+            publish()
+        }
+    }
+    let mut w = World::new(LifecycleHatches::ON);
+    w.task().publish_visible_pid(41);
+    w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
+    let running = w.venue.stock(1, 70, 42);
+    w.venue
+        .child_slot(1)
+        .reset_for_birth(BlockedMask(0), 0, running);
+    w.task().set(El1TaskId::from_linux_tid(70), 1, 5);
+    assert_eq!(w.venue.child_slot(1).visible_tid(), None);
+    let mut probe = BirthProbe {
+        binding: crate::personality::common_entry::execution_binding(w.task()),
+    };
+    let mut frame = TrapFrame {
+        slot: SLOT_IDX as u64,
+        ..Default::default()
+    };
+    frame.x[..5].copy_from_slice(&clone_args(GO_FLAGS, 0, 0));
+    let names = InotifyNameCache::new();
+    let mut native = super::El1PendingFamilies {
+        handoff: None,
+        lifecycle_user: None,
+        frame: &mut frame,
+        counters: &w.counters,
+        current_tasks: &w.tasks,
+        fd_map: &[],
+        object_table: &[],
+        open_table: &[],
+        inotify_table: &[],
+        name_cache: &names,
+        zone: Some(Zone {
+            tables: &w.zone,
+            cpu: &mut w.cpu,
+            user: &HardwareUserWord,
+        }),
+        ipc: None,
+        lifecycle: Some(&*w.venue),
+        process: Some(&mut probe),
+        source: None,
+        anonymous: None,
+        cache_lookup: |_| core::ptr::null_mut(),
+    };
+    assert!(
+        matches!(invoke(LifecycleCall::Clone, &mut native), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == carrick_personality_linux::identity::ESRCH)
+    );
+    assert_eq!(w.page().live(), 1);
+    assert_eq!(w.zone.slot(SLOT).queued(), 0);
+}
+
+#[test]
+fn clone_stamped_nonleader_inherits_the_calling_thread() {
+    struct BirthProbe {
+        binding: carrick_el1_abi::ExecutionBinding,
+    }
+    impl ProcessNative for BirthProbe {
+        fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
+            self.binding
+        }
+        fn fork(&mut self) -> LifecycleOutcome {
+            panic!("unexpected fork")
+        }
+        fn wait4(
+            &mut self,
+            _: ProcessWaitPid,
+            _: UserVa,
+            _: LinuxWaitOptions,
+            _: UserVa,
+        ) -> LifecycleOutcome {
+            panic!("unexpected wait")
+        }
+        fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
+            panic!("unexpected exit")
+        }
+        fn thread_spawned(
+            &mut self,
+            caller: u32,
+            child: u32,
+            publish: &mut dyn FnMut() -> Result<(), i64>,
+        ) -> Result<(), i64> {
+            assert_eq!(
+                caller, 42,
+                "a nonleader child must inherit the calling thread"
+            );
+            assert_eq!(child, CHILD_VISIBLE);
+            publish()
+        }
+    }
+    let mut w = World::new(LifecycleHatches::ON);
+    w.task().publish_visible_pid(41);
+    w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
+    let running = w.venue.stock(1, 70, 42);
+    w.venue
+        .child_slot(1)
+        .reset_for_birth(BlockedMask(0), 0, running);
+    w.task().set(El1TaskId::from_linux_tid(70), 1, 5);
+    assert!(w.venue.child_slot(1).publish_visible_tid(42));
+    let mut probe = BirthProbe {
+        binding: crate::personality::common_entry::execution_binding(w.task()),
+    };
+    let mut frame = TrapFrame {
+        slot: SLOT_IDX as u64,
+        ..Default::default()
+    };
+    frame.x[..5].copy_from_slice(&clone_args(GO_FLAGS, 0, 0));
+    let names = InotifyNameCache::new();
+    let mut native = super::El1PendingFamilies {
+        handoff: None,
+        lifecycle_user: None,
+        frame: &mut frame,
+        counters: &w.counters,
+        current_tasks: &w.tasks,
+        fd_map: &[],
+        object_table: &[],
+        open_table: &[],
+        inotify_table: &[],
+        name_cache: &names,
+        zone: Some(Zone {
+            tables: &w.zone,
+            cpu: &mut w.cpu,
+            user: &HardwareUserWord,
+        }),
+        ipc: None,
+        lifecycle: Some(&*w.venue),
+        process: Some(&mut probe),
+        source: None,
+        anonymous: None,
+        cache_lookup: |_| core::ptr::null_mut(),
+    };
+    assert!(
+        matches!(invoke(LifecycleCall::Clone, &mut native), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == i64::from(CHILD_VISIBLE))
+    );
+    assert_eq!(w.page().live(), 2);
+    assert_eq!(w.zone.slot(SLOT).queued(), 1);
 }
