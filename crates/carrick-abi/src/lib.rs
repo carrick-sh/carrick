@@ -153,20 +153,6 @@ pub const LINUX_S_IFCHR: u32 = 0o020000;
 pub const LINUX_S_IFBLK: u32 = 0o060000;
 pub const LINUX_S_IFSOCK: u32 = 0o140000;
 
-/// Linux SCHED_* policy values (kernel ABI, not the libc-internal names).
-/// From include/uapi/linux/sched.h. Value 4 is intentionally skipped
-/// (reserved for the never-merged SCHED_ISO).
-pub const LINUX_SCHED_OTHER: i32 = 0; // a.k.a. SCHED_NORMAL
-pub const LINUX_SCHED_FIFO: i32 = 1;
-pub const LINUX_SCHED_RR: i32 = 2;
-pub const LINUX_SCHED_BATCH: i32 = 3;
-pub const LINUX_SCHED_IDLE: i32 = 5;
-pub const LINUX_SCHED_DEADLINE: i32 = 6;
-
-/// The round-robin quantum carrick publishes in
-/// `/proc/sys/kernel/sched_rr_timeslice_ms`, in milliseconds — Linux's default.
-pub const LINUX_SCHED_RR_TIMESLICE_MS: u64 = 100;
-
 /// What `sched_rr_get_interval(2)` reports for a SCHED_OTHER task.
 ///
 /// A `LinuxTimespec` rather than a bare nanosecond integer: a scheduling
@@ -4396,9 +4382,6 @@ pub const LINUX_MS_SYNC: u64 = 0x04;
 pub const LINUX_MCL_CURRENT: u64 = 0x01;
 pub const LINUX_MCL_FUTURE: u64 = 0x02;
 pub const LINUX_MCL_ONFAULT: u64 = 0x04;
-pub const LINUX_PRIO_PROCESS: u64 = 0;
-pub const LINUX_PRIO_PGRP: u64 = 1;
-pub const LINUX_PRIO_USER: u64 = 2;
 pub const LINUX_DEFAULT_UMASK: u32 = 0o022;
 pub const LINUX_RLIM_INFINITY: u64 = u64::MAX;
 /// A `getrlimit`/`setrlimit`/`prlimit64` resource (asm-generic `resource.h`,

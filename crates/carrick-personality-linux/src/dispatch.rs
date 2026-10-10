@@ -12,6 +12,8 @@ pub enum AnonymousCall {
     Mprotect,
 }
 
+pub use crate::sched::SchedCall;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Family {
     Anonymous(AnonymousCall),
@@ -19,6 +21,7 @@ pub enum Family {
     Write,
     EpollWait,
     Lifecycle(LifecycleCall),
+    Sched(SchedCall),
     Futex,
     InotifyAdd,
     InotifyRemove,
@@ -172,6 +175,9 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
         None
     }
     fn file_venue(&mut self) -> Option<&mut dyn crate::pending_file::PendingFileVenue> {
+        None
+    }
+    fn sched_venue(&mut self) -> Option<&mut dyn crate::sched::SchedVenue> {
         None
     }
     fn task_state(&self) -> Option<&crate::abi::entry::LinuxTaskState> {
@@ -375,6 +381,25 @@ fn serve_family<'a, C: EntryContext + 'a>(
         Family::Write => pending.write(),
         Family::EpollWait => pending.epoll_wait(),
         Family::Lifecycle(_) => FamilyCompletion::Forward,
+        Family::Sched(call) => {
+            let original = pending.original_argument0();
+            match pending.sched_venue() {
+                Some(venue) => {
+                    let completion = crate::sched::serve_sched(call, venue);
+                    returned = match completion {
+                        FamilyCompletion::Complete(value)
+                        | FamilyCompletion::CompleteWithWork(value)
+                        | FamilyCompletion::AccountedComplete(value)
+                        | FamilyCompletion::CommitOwed(value) => {
+                            Some((SyscallResult::new(value), original))
+                        }
+                        _ => None,
+                    };
+                    completion
+                }
+                None => FamilyCompletion::Forward,
+            }
+        }
         Family::Futex => pending.futex(),
         Family::InotifyAdd => pending.inotify_add(),
         Family::InotifyRemove => pending.inotify_remove(),
@@ -424,6 +449,15 @@ pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
         nr if nr == carrick_syscall_abi::nr::WAIT4.raw() => Family::Lifecycle(LifecycleCall::Wait4),
         nr if nr == carrick_syscall_abi::nr::EXIT_GROUP.raw() => {
             Family::Lifecycle(LifecycleCall::ExitGroup)
+        }
+        nr if nr == carrick_syscall_abi::nr::SCHED_GET_PRIORITY_MAX.raw() => {
+            Family::Sched(SchedCall::GetPriorityMax)
+        }
+        nr if nr == carrick_syscall_abi::nr::SCHED_GET_PRIORITY_MIN.raw() => {
+            Family::Sched(SchedCall::GetPriorityMin)
+        }
+        nr if nr == carrick_syscall_abi::nr::SCHED_RR_GET_INTERVAL.raw() => {
+            Family::Sched(SchedCall::RrGetInterval)
         }
         nr if allocator_control != u64::MAX && nr == allocator_control => Family::AllocatorControl,
         _ => Family::Unported,

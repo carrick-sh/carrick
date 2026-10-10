@@ -5,15 +5,61 @@ use bitflags::bitflags;
 
 mod errno;
 pub mod syscall_x86_64;
-pub use errno::{LINUX_EAGAIN, LINUX_ECHILD, LINUX_EFAULT, LINUX_EINVAL, LINUX_ENOSYS, LinuxErrno};
+pub use errno::{
+    LINUX_EAGAIN, LINUX_ECHILD, LINUX_EFAULT, LINUX_EINVAL, LINUX_ENOSYS, LINUX_EPERM, LINUX_ESRCH,
+    LinuxErrno,
+};
 
 /// Canonical numbers served by the shared guest lifecycle owner.
 pub mod nr {
     use super::CanonicalNr;
 
     pub const EXIT_GROUP: CanonicalNr = CanonicalNr(94);
+    pub const SCHED_GET_PRIORITY_MAX: CanonicalNr = CanonicalNr(125);
+    pub const SCHED_GET_PRIORITY_MIN: CanonicalNr = CanonicalNr(126);
+    pub const SCHED_RR_GET_INTERVAL: CanonicalNr = CanonicalNr(127);
     pub const WAIT4: CanonicalNr = CanonicalNr(260);
 }
+
+/// Linux SCHED_* policy values (kernel ABI, not the libc-internal names).
+/// From include/uapi/linux/sched.h. Value 4 is intentionally skipped
+/// (reserved for the never-merged SCHED_ISO).
+pub const LINUX_SCHED_OTHER: i32 = 0; // a.k.a. SCHED_NORMAL
+pub const LINUX_SCHED_FIFO: i32 = 1;
+pub const LINUX_SCHED_RR: i32 = 2;
+pub const LINUX_SCHED_BATCH: i32 = 3;
+pub const LINUX_SCHED_IDLE: i32 = 5;
+pub const LINUX_SCHED_DEADLINE: i32 = 6;
+pub const LINUX_SCHED_RESET_ON_FORK: i32 = 0x4000_0000;
+
+pub const LINUX_SCHED_RR_TIMESLICE_MS: u64 = 100;
+pub const LINUX_SCHED_OTHER_SLICE_NANOS: u64 = 2_000_000;
+
+/// Wire bytes of `LinuxTimespec { tv_sec: 0, tv_nsec: 2_000_000 }` (2 ms)
+/// reported for SCHED_OTHER tasks in sched_rr_get_interval.
+pub const LINUX_SCHED_OTHER_SLICE_BYTES: [u8; 16] = {
+    let mut b = [0u8; 16];
+    let nsec_b = (LINUX_SCHED_OTHER_SLICE_NANOS as i64).to_ne_bytes();
+    let mut i = 0;
+    while i < 8 {
+        b[8 + i] = nsec_b[i];
+        i += 1;
+    }
+    b
+};
+
+pub const LINUX_PRIO_PROCESS: u64 = 0;
+pub const LINUX_PRIO_PGRP: u64 = 1;
+pub const LINUX_PRIO_USER: u64 = 2;
+
+pub const LINUX_IOPRIO_WHO_PROCESS: u64 = 1;
+pub const LINUX_IOPRIO_WHO_PGRP: u64 = 2;
+pub const LINUX_IOPRIO_WHO_USER: u64 = 3;
+
+pub const LINUX_IOPRIO_CLASS_NONE: u32 = 0;
+pub const LINUX_IOPRIO_CLASS_RT: u32 = 1;
+pub const LINUX_IOPRIO_CLASS_BE: u32 = 2;
+pub const LINUX_IOPRIO_CLASS_IDLE: u32 = 3;
 
 /// A CANONICAL syscall number — the asm-generic/aarch64 numbering every guest
 /// ISA is normalized to before dispatch (plus the `CARRICK_PRIVATE_*` range).

@@ -46,3 +46,34 @@ fn x86_process_calls_route_to_neutral_lifecycle_hooks() {
         Family::Lifecycle(LifecycleCall::ExitGroup)
     );
 }
+
+#[test]
+fn x86_sched_calls_route_to_neutral_sched_family() {
+    for (native, expected) in [
+        (
+            146,
+            carrick_personality_linux::sched::SchedCall::GetPriorityMax,
+        ),
+        (
+            147,
+            carrick_personality_linux::sched::SchedCall::GetPriorityMin,
+        ),
+        (
+            148,
+            carrick_personality_linux::sched::SchedCall::RrGetInterval,
+        ),
+    ] {
+        let entry = lookup_x86_64(native).expect("sched syscall has a table entry");
+        let canonical = match entry.remap {
+            SyscallRemap::Direct(canonical) => canonical.raw(),
+            SyscallRemap::Private(canonical) => canonical.raw(),
+            _ => panic!("sched syscall must have a canonical route"),
+        };
+        let call = decode_x86_64(native, [0; 6], 0x7000);
+        assert_eq!(call.canonical.raw(), canonical);
+        assert_eq!(
+            route_aarch64(call.canonical.raw(), u64::MAX),
+            Family::Sched(expected)
+        );
+    }
+}
