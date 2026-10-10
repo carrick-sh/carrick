@@ -1094,3 +1094,31 @@ contracts = ["kernel.el1.arm-ring-first-crossing"]
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/hatch.rs"
 contracts = ["kernel.el1.arm-ring-first-crossing"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/personality/native_run_failure.rs"
+contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.arm-ring-first-crossing"]
+
+[[surfaces]]
+path = "crates/carrick-sched-core/src/process/credential_tests.rs"
+contracts = ["kernel.el1.thread-lifecycle"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/native_run_failure.rs"
+contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-syscall-abi/src/capability.rs"
+contracts = ["kernel.el1.thread-lifecycle"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/identity.rs"
+contracts = ["kernel.el1.thread-lifecycle", "kernel.wait.process-group", "kernel.wait.child-rusage"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/sysinfo.rs"
+contracts = ["kernel.el1.thread-lifecycle"]
+
+[[surfaces]]
+path = "crates/carrick-el1-abi/src/native_run_failure.rs"
+contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.arm-ring-first-crossing"]
