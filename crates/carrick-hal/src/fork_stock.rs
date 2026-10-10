@@ -68,6 +68,8 @@ pub enum ForkStockServiceError {
     /// Quarantined stock is waiting, but the carrier holds no zone
     /// occupancy authority to prove its MM runs nowhere.
     OccupancyUnavailable,
+    /// The carrier could not release the retired MM's per-MM state.
+    ReleaseRefused,
 }
 
 /// Per-child address-space tag. AArch64 tags every forked root with a
@@ -237,6 +239,22 @@ impl LifecycleWindow {
             true
         })
     }
+}
+
+/// Release the carrier-wide per-MM state a fork child held once it leaves
+/// quarantine: every frame-inventory mapping (frames no other MM maps
+/// retire) and every COW residency row keyed by the MM. Root-registry and
+/// memslot custody stay with the carrier's own memory owner.
+pub fn release_child_mm(
+    inventory: &dyn crate::PhysicalFrameInventory,
+    residency: &carrick_el1_abi::FrameGrantResidencyTable,
+    mm: ReservationMm,
+) -> bool {
+    let Some(generation) = NonZeroU64::new(mm.raw()).map(carrick_guest_arch::MmGeneration::new)
+    else {
+        return false;
+    };
+    inventory.retire_mm(generation).is_ok() && residency.retire_overlapping(mm.raw(), 0, u64::MAX)
 }
 
 /// Ordered key of one MM in carrier custody.
@@ -773,6 +791,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
         safe_to_reclaim: impl Fn(ReservationMm) -> bool,
         mut clear_tables: impl FnMut(&[RootGpa]) -> bool,
         mut clear_lifecycle: impl FnMut(ForkLifecycleLoan) -> bool,
+        mut release: impl FnMut(ReservationMm) -> bool,
     ) -> Result<usize, ForkStockServiceError> {
         let active = MmKey::of(active);
         let candidates: Vec<MmKey> = self
@@ -793,6 +812,11 @@ impl<T: ChildAddressTags> ForkStock<T> {
                 .get(&key)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
+            // Carrier per-MM state (root registry, inventory, residency) is
+            // released before any of the child's stock can be reissued.
+            if !release(mm) {
+                return Err(ForkStockServiceError::ReleaseRefused);
+            }
             if !clear_tables(pages) || !clear_lifecycle(child.lifecycle) {
                 return Err(ForkStockServiceError::MemoryAccessFailed);
             }

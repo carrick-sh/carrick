@@ -167,6 +167,7 @@ fn reclaim<T: ChildAddressTags>(
                 true
             },
             |_| true,
+            |_| true,
         )
         .unwrap()
 }
@@ -233,7 +234,14 @@ fn quarantined_stock_is_never_reissued_while_its_mm_is_live() {
     // The child itself is the servicing CPU's MM: nothing returns.
     assert_eq!(
         stock
-            .reclaim(&mut NoTableLedger, mm(302), |_| true, |_| true, |_| true)
+            .reclaim(
+                &mut NoTableLedger,
+                mm(302),
+                |_| true,
+                |_| true,
+                |_| true,
+                |_| true
+            )
             .unwrap(),
         0
     );
@@ -475,6 +483,7 @@ fn kvm_lifecycle_window_cycles_exceed_stock_with_cleared_records() {
                     true
                 },
                 |life| window.clear(life),
+                |_| true,
             )
             .unwrap();
         assert_eq!(returned, 1);
@@ -505,6 +514,7 @@ fn kvm_unclearable_lifecycle_record_is_never_reissued_dirty() {
         .reclaim(
             &mut NoTableLedger,
             mm(PARENT_MM),
+            |_| true,
             |_| true,
             |_| true,
             |_| true,
@@ -600,4 +610,31 @@ fn interleaved_untagged_cycles_never_reissue_installed_quarantine() {
 fn interleaved_asid_cycles_never_reissue_installed_quarantine() {
     // Two live children at a time: one installed in quarantine, one forking.
     interleaved_cycles(AsidAllocator::with_limit_for_tests(2), 20);
+}
+
+#[test]
+fn refused_release_keeps_the_child_quarantined_and_its_stock_held() {
+    let mut stock = stock(UntaggedRoots, 4, 1);
+    let granted = loan(&mut stock, parent(), 302, 1, 1).unwrap();
+    commit(&mut stock, parent(), granted, 1, 0).unwrap();
+    retire(&mut stock, child_of(granted, 900)).unwrap();
+    let released = RefCell::new(Vec::new());
+    assert_eq!(
+        stock.reclaim(
+            &mut NoTableLedger,
+            mm(PARENT_MM),
+            |_| true,
+            |_| true,
+            |_| true,
+            |child| {
+                released.borrow_mut().push(child);
+                false
+            },
+        ),
+        Err(ForkStockServiceError::ReleaseRefused)
+    );
+    assert_eq!(*released.borrow(), vec![mm(302)]);
+    assert!(stock.is_quarantined(mm(302)));
+    assert_eq!(stock.table_stock().len(), 3);
+    assert!(!stock.lifecycle_available());
 }

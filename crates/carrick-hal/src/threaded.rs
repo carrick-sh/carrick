@@ -2500,6 +2500,12 @@ pub trait PhysicalFrameInventory: Send + Sync {
     fn allocate_backing_ids(
         &self,
     ) -> Result<(crate::FrameId, crate::MappingId), Box<dyn std::error::Error + Send + Sync>>;
+    /// Unmap every published mapping of a retired MM (a fork child leaving
+    /// quarantine), retiring frames no other MM maps. Returns the count.
+    fn retire_mm(
+        &self,
+        mm: carrick_guest_arch::MmGeneration,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// An unpublished apply retains the exact authority that issued its receipt.

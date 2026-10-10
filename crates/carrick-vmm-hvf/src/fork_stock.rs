@@ -178,8 +178,14 @@ impl ForkStockHostCustody {
         safe_to_reclaim: impl Fn(ReservationMm) -> bool,
         clear_tables: impl Fn(&[RootGpa]) -> bool,
     ) -> Result<usize, ForkStockServiceError> {
-        self.stock
-            .reclaim(ledger, active_mm, safe_to_reclaim, clear_tables, |_| true)
+        self.stock.reclaim(
+            ledger,
+            active_mm,
+            safe_to_reclaim,
+            clear_tables,
+            |_| true,
+            |_| true,
+        )
     }
 
     /// Read/write helper resolving GPA through CarrierVmCustody stage-2 mappings.
