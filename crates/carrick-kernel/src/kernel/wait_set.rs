@@ -373,32 +373,6 @@ impl WaitSet {
         queue.enroll(self)
     }
 
-    /// Enroll a task's wake notifications with this wait set.
-    /// When the task is woken (e.g. by a signal), this wait set is notified.
-    pub fn enroll_task(
-        &self,
-        task: &crate::kernel::Task,
-    ) -> crate::kernel::objects::TaskWakeSubscription {
-        let ws = self.clone();
-        loop {
-            let observed = task.wake_generation();
-            let callback: std::sync::Arc<dyn Fn(u64) + Send + Sync + 'static> = {
-                let ws = ws.clone();
-                std::sync::Arc::new(move |_| {
-                    ws.wake();
-                })
-            };
-            match task.subscribe_wake(observed, callback) {
-                crate::kernel::objects::TaskWakeEnrollment::Ready(_) => {
-                    self.wake();
-                }
-                crate::kernel::objects::TaskWakeEnrollment::Subscribed(sub) => {
-                    return sub;
-                }
-            }
-        }
-    }
-
     /// Wait for a notification, timeout, or signal interruption.
     ///
     /// - If `host_fds` is provided, waits on host descriptors concurrently via `libc::poll`.

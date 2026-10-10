@@ -558,33 +558,6 @@ impl Kernel {
             .is_some_and(|record| record.task.consume_ptrace_resume_signal(signal))
     }
 
-    /// Resume one stopped Linux task. Returning false means the task was live
-    /// but already running (or absent); SIGCONT delivery itself may still
-    /// succeed and may still invoke a caught handler.
-    pub fn continue_task_from_job_control(&self, target: TaskId) -> bool {
-        let task = {
-            let state = self.registry().settled().read();
-            let Some(record) = state.tasks.get(&target) else {
-                return false;
-            };
-            if record.task.lifecycle() != TaskLifecycle::Live {
-                return false;
-            }
-            Arc::clone(&record.task)
-        };
-        let generation = task.lock_signal_generation();
-        if !task.continue_from_job_control() {
-            return false;
-        }
-        drop(generation);
-        let parent = self.current_parent_task(&task);
-        task.wake();
-        if let Some(parent) = parent {
-            parent.wake();
-        }
-        true
-    }
-
     pub fn task_is_job_control_stopped(&self, target: TaskId) -> bool {
         self.registry()
             .settled()

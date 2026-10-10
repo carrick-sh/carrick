@@ -30,7 +30,7 @@ trace-traps = []
 watchpoint = ["carrick-kernel/watchpoint"]
 event-ring-dump = ["carrick-kernel/event-ring-dump"]
 trace-hvf = ["carrick-vmm-hvf/trace-hvf"]
-trace-syscalls = ["carrick-vmm-hvf?/trace-syscalls", "carrick-observability/trace-syscalls"]
+trace-syscalls = ["carrick-observability/trace-syscalls"]
 debug-stats = ["carrick-vmm-hvf/debug-stats"]
 trace-elf = ["carrick-mem/trace-elf"]
 # The bridge-less test surface: carrick-hal's Null host-signal / guest-timer
