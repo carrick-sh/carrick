@@ -456,9 +456,14 @@ verification, acceptance.
 - **Transport-timeout deaths may leave clean diffs** — check `cargo check` and
   tests; commit with the worker's trailer. Long conversations die: brief narrowly; start fresh
   conversations on the same worktree.
+- **Workers base on GitHub main only** (`fetch https://github.com/carrick-sh/carrick`),
+  never a host mirror (which lags). Rebase onto GitHub main at dispatch and
+  before reporting review-ready.
 - **Never `git merge --ff-only` inside a worktree** (merges its own branch).
   Rebase there, fast-forward from main, then run `just lint-domains` on
   the merged tree.
+- **Worktree lifecycle:** remove the worktree and `target/` on every host when
+  a PR merges (`git worktree remove --force <path>` and prune).
 - **Linux workers run `just accept --profile linux-portable`, then `just remote-accept --ref <their commit> --phase host`** before reporting review-ready; macOS/ARM changes also require `--phase signed` coordinated with the director. Include both verdicts and receipt paths. macOS workers run `just accept`.
 
 ### GitHub-first workflow
