@@ -308,6 +308,31 @@ fn mounted_static_x86_identity_fork_matches_native() {
 }
 
 #[test]
+fn mounted_static_x86_ipc_msg_round_trip_matches_native() {
+    compare_mounted_assembly_with_native("x86_ipc_msg.S", b"M\n");
+}
+
+#[test]
+fn mounted_static_x86_ipc_sem_blocked_waiter_matches_native() {
+    compare_mounted_assembly_with_native("x86_ipc_sem.S", b"S\n");
+}
+
+#[test]
+fn mounted_static_x86_ipc_shm_shared_write_matches_native() {
+    compare_mounted_assembly_with_native("x86_ipc_shm.S", b"H\n");
+}
+
+#[test]
+fn mounted_static_x86_ipc_perm_eacces_matches_native() {
+    compare_mounted_assembly_with_native("x86_ipc_perm.S", b"P\n");
+}
+
+#[test]
+fn mounted_static_x86_ipc_mq_nonblock_round_trip_matches_native() {
+    compare_mounted_assembly_with_native("x86_ipc_mq.S", b"Q\n");
+}
+
+#[test]
 fn mounted_static_x86_guest_owned_calls_refuse_without_host_effects() {
     if skip_without_kvm() {
         return;

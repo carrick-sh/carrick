@@ -17,7 +17,14 @@ use carrick_el1_abi::{
 use carrick_guest_arch::{AddressContext, MmGeneration, ProcessContext, RootGpa, UserVa};
 use carrick_personality_linux::{
     abi::entry::SyscallResult,
+    ipc::{
+        EAGAIN, EFAULT, EINVAL, ENOMSG, IpcOutcome, LinuxMqAttr, LinuxMsqidDs, LinuxSembuf,
+        LinuxSemidDs, LinuxShmidDs,
+    },
     lifecycle::{LifecycleOutcome, LinuxWaitOptions, ProcessNative, ProcessWaitPid},
+};
+use carrick_sched_core::process::ipc::{
+    IpcNamespace, MqReceiveOutcome, MqSendOutcome, MsgrcvOutcome, MsgsndOutcome, SemopOutcome,
 };
 use carrick_sched_core::process::{
     ChildExitSignal, LinuxWaitStatus, TaskId, TaskIdentity, TaskKey, TaskRusage, TaskSerial,
@@ -30,7 +37,7 @@ use carrick_sched_core::process::{
         ClaimKind, InternalIdentity, NamespaceState, SerialAllocator, VisibleIdentity,
         VisibleNamespace,
     },
-    wait::{WaitJobControl, WaitPrecheck, WaitQuery, WaitSelection},
+    wait::{TaskWakeGeneration, WaitJobControl, WaitPrecheck, WaitQuery, WaitSelection},
 };
 use carrick_sched_core::{
     BoundedSpin, Handback, RecordRef, ThreadIdentity, WakeEffects, Waker, ZoneTables,
@@ -212,15 +219,65 @@ struct PendingWait {
     precheck: WaitPrecheck,
     channel: Arc<WaitChannel>,
 }
+
+#[derive(::core::clone::Clone)]
+enum PendingIpcPayload {
+    Msgsnd {
+        msqid: i32,
+        mtype: i64,
+        data: Vec<u8>,
+        msgflg: i32,
+    },
+    Msgrcv {
+        msqid: i32,
+        msgp: UserVa,
+        msgsz: usize,
+        msgtyp: i64,
+        msgflg: i32,
+    },
+    Semop {
+        semid: i32,
+        ops: Vec<(u16, i16, i16)>,
+    },
+    MqSend {
+        mqdes: i32,
+        data: Vec<u8>,
+        prio: u32,
+    },
+    MqReceive {
+        mqdes: i32,
+        msg_ptr_va: UserVa,
+        msg_prio_va: UserVa,
+        msg_len: usize,
+    },
+}
+
+#[allow(dead_code)]
+struct PendingIpc {
+    caller: TaskKey,
+    channel: Arc<WaitChannel>,
+    precheck_gen: TaskWakeGeneration,
+    payload: PendingIpcPayload,
+}
+
+enum PendingContinuation {
+    Wait(PendingWait),
+    Ipc(PendingIpc),
+}
+
+type IpcWaitChannels = Arc<SpinLock<Vec<(u64, Arc<WaitChannel>)>>>;
+
 struct Graph<'a, M: Clone, C: ProcessContext> {
     owner: Owner<'a, M, C>,
     root_key: TaskKey,
     namespace: Arc<SpinLock<NamespaceState>>,
     visible_namespace: VisibleNamespace,
     serials: SerialAllocator,
-    pending: BTreeMap<TaskKey, PendingWait>,
+    pending: BTreeMap<TaskKey, PendingContinuation>,
     _root_roles: NativeClaim,
     uts: carrick_personality_linux::sysinfo::LinuxUtsname,
+    ipc: Arc<SpinLock<IpcNamespace>>,
+    ipc_channels: IpcWaitChannels,
 }
 pub struct NativeProcessRuntime<'a, M: Clone, C: ProcessContext> {
     graph: SpinLock<Graph<'a, M, C>>,
@@ -401,6 +458,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         let uts = carrick_personality_linux::sysinfo::LinuxUtsname::carrick_x86_64();
         #[cfg(not(target_arch = "x86_64"))]
         let uts = carrick_personality_linux::sysinfo::LinuxUtsname::carrick_aarch64();
+        let ipc = Arc::new(SpinLock::new(IpcNamespace::default()));
+        let ipc_channels = Arc::new(SpinLock::new(Vec::new()));
         Ok(Self {
             graph: SpinLock::new(Graph {
                 owner,
@@ -411,6 +470,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 pending: BTreeMap::new(),
                 _root_roles: root_roles,
                 uts,
+                ipc,
+                ipc_channels,
             }),
             zone: source.zone,
         })
@@ -462,6 +523,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         Ok(NativeProcessEntry {
             runtime: self,
             source,
+            current,
             binding,
             key,
             words,
@@ -470,6 +532,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             root_exit: None,
             calling_tid,
             slot,
+            last_blocked: None,
         })
     }
     pub fn namespace_child_key(&self, caller: TaskKey, visible: u32) -> Option<TaskKey> {
@@ -527,6 +590,7 @@ pub struct NativeProcessEntry<
 > {
     runtime: &'r NativeProcessRuntime<'a, M, C>,
     source: BornInZoneSource<'a, C>,
+    current: &'a CurrentTask,
     binding: ExecutionBinding,
     key: TaskKey,
     words: C,
@@ -535,6 +599,7 @@ pub struct NativeProcessEntry<
     root_exit: Option<LinuxWaitStatus>,
     calling_tid: u32,
     slot: Option<&'a ThreadControlSlot>,
+    last_blocked: Option<(Arc<WaitChannel>, TaskWakeGeneration, PendingIpcPayload)>,
 }
 fn returned(value: i64) -> LifecycleOutcome {
     LifecycleOutcome::Returned {
@@ -674,62 +739,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     if nohang {
                         return Ok(returned(0));
                     }
-                    let zone = self.source.zone;
-                    let record = zone
-                        .slot(self.source.slot)
-                        .current()
-                        .or_else(|| zone.slot(self.source.slot).host_record())
-                        .ok_or(NativeProcessError::Stale)?;
-                    let start =
-                        carrick_core::entry::prepare_handoff(self.binding, self.source, record)
-                            .ok_or(NativeProcessError::Stale)?;
-                    let address = WaitChannel::address(&channel);
-                    let guard = zone
-                        .lock(
-                            ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
-                            &BoundedSpin(LOCK_SPINS),
-                        )
-                        .ok_or(NativeProcessError::Busy)?;
-                    // A changed generation denotes an actual child publication.
-                    // Reclassify that event; no clock, sleep or polling is used.
-                    if channel.generation.generation() != precheck.wake_generation() {
-                        drop(guard);
-                        continue;
-                    }
-                    {
-                        let graph = self.runtime.graph.lock();
-                        if graph.pending.contains_key(&self.key) {
-                            return Err(NativeProcessError::Busy);
-                        }
-                    }
-                    let sequence = zone.next_seq(record);
-                    zone.enqueue(&guard, record, sequence, channel.mm, address, u32::MAX, 0)
-                        .map_err(|_| NativeProcessError::Exhausted)?;
-                    // SAFETY: authenticated current ownership remains held until
-                    // this exact record's park CAS below, under its bucket guard.
-                    unsafe { *zone.record(record).ctx_mut() = self.words };
-                    self.runtime.graph.lock().pending.insert(
-                        self.key,
-                        PendingWait {
+                    let ch = channel.clone();
+                    if !self.park_continuation(
+                        &ch,
+                        precheck.wake_generation(),
+                        PendingContinuation::Wait(PendingWait {
                             caller: self.key,
                             query,
                             status,
                             precheck,
                             channel,
-                        },
-                    );
-                    let receipt = carrick_core::entry::publish_handoff_park(
-                        start,
-                        &guard,
-                        carrick_el1_abi::EntryRecordGeneration(sequence),
-                    );
-                    if receipt.is_none() {
-                        self.runtime.graph.lock().pending.remove(&self.key);
-                        return Err(NativeProcessError::Busy);
+                        }),
+                    )? {
+                        continue;
                     }
-                    drop(guard);
-                    zone.clear_current(self.source.slot);
-                    self.handoff = receipt;
                     return Ok(LifecycleOutcome::Transferred {
                         progress: carrick_core::Served::Idle,
                         result: SyscallResult::new(0),
@@ -742,18 +765,204 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// userspace. It consumes the retained wait operation instead of replaying it.
     pub fn resume_pending_wait(&mut self) -> Option<LifecycleOutcome> {
         let pending = self.runtime.graph.lock().pending.remove(&self.key)?;
-        if pending.caller != self.key
-            || pending.channel.generation.generation() == pending.precheck.wake_generation()
-        {
-            self.runtime.graph.lock().pending.insert(self.key, pending);
-            return Some(self.fail(NativeProcessError::Stale));
+        match pending {
+            PendingContinuation::Wait(pending) => {
+                if pending.caller != self.key
+                    || pending.channel.generation.generation() == pending.precheck.wake_generation()
+                {
+                    self.runtime
+                        .graph
+                        .lock()
+                        .pending
+                        .insert(self.key, PendingContinuation::Wait(pending));
+                    return Some(self.fail(NativeProcessError::Stale));
+                }
+                Some(
+                    match self.wait_query(pending.query, pending.status, false) {
+                        Ok(outcome) => outcome,
+                        Err(error) => self.fail(error),
+                    },
+                )
+            }
+            PendingContinuation::Ipc(pending) => Some(self.resume_ipc(pending)),
         }
-        Some(
-            match self.wait_query(pending.query, pending.status, false) {
-                Ok(outcome) => outcome,
-                Err(error) => self.fail(error),
-            },
+    }
+    fn park_continuation(
+        &mut self,
+        channel: &Arc<WaitChannel>,
+        precheck_gen: TaskWakeGeneration,
+        continuation: PendingContinuation,
+    ) -> Result<bool, NativeProcessError> {
+        let zone = self.source.zone;
+        let record = zone
+            .slot(self.source.slot)
+            .current()
+            .or_else(|| zone.slot(self.source.slot).host_record())
+            .ok_or(NativeProcessError::Stale)?;
+        let start = carrick_core::entry::prepare_handoff(self.binding, self.source, record)
+            .ok_or(NativeProcessError::Stale)?;
+        let address = WaitChannel::address(channel);
+        let guard = zone
+            .lock(
+                ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
+                &BoundedSpin(LOCK_SPINS),
+            )
+            .ok_or(NativeProcessError::Busy)?;
+        if channel.generation.generation() != precheck_gen {
+            drop(guard);
+            return Ok(false);
+        }
+        {
+            let graph = self.runtime.graph.lock();
+            if graph.pending.contains_key(&self.key) {
+                return Err(NativeProcessError::Busy);
+            }
+        }
+        let sequence = zone.next_seq(record);
+        zone.enqueue(&guard, record, sequence, channel.mm, address, u32::MAX, 0)
+            .map_err(|_| NativeProcessError::Exhausted)?;
+        unsafe { *zone.record(record).ctx_mut() = self.words };
+        self.runtime
+            .graph
+            .lock()
+            .pending
+            .insert(self.key, continuation);
+        let receipt = carrick_core::entry::publish_handoff_park(
+            start,
+            &guard,
+            carrick_el1_abi::EntryRecordGeneration(sequence),
+        );
+        if receipt.is_none() {
+            self.runtime.graph.lock().pending.remove(&self.key);
+            return Err(NativeProcessError::Busy);
+        }
+        drop(guard);
+        zone.clear_current(self.source.slot);
+        self.handoff = receipt;
+        Ok(true)
+    }
+
+    fn ipc_env(
+        &self,
+    ) -> Result<
+        (
+            carrick_sched_core::process::TaskCredentials,
+            u32,
+            Arc<SpinLock<IpcNamespace>>,
+        ),
+        i64,
+    > {
+        let graph = self.runtime.graph.lock();
+        let task = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_personality_linux::ipc::ESRCH)?;
+        let creds = task
+            .credentials_for(self.calling_tid)
+            .cloned()
+            .map_err(|_| carrick_personality_linux::ipc::ESRCH)?;
+        let pid = task.metadata().namespace_pid;
+        let ipc = graph.ipc.clone();
+        Ok((creds, pid, ipc))
+    }
+
+    fn get_or_create_channel(&self, channel_id: u64) -> Arc<WaitChannel> {
+        let graph = self.runtime.graph.lock();
+        let mut channels = graph.ipc_channels.lock();
+        if let Some((_, ch)) = channels.iter().find(|(id, _)| *id == channel_id) {
+            ch.clone()
+        } else {
+            let ch = Arc::new(WaitChannel {
+                generation: ProcessWake::new(),
+                mm: 0x19c0_0000,
+            });
+            channels.push((channel_id, ch.clone()));
+            ch
+        }
+    }
+
+    fn wake_ipc_channel(&mut self, channel_id: u64) {
+        if channel_id == 0 {
+            return;
+        }
+        let channel = {
+            let graph = self.runtime.graph.lock();
+            let channels = graph.ipc_channels.lock();
+            channels
+                .iter()
+                .find(|(id, _)| *id == channel_id)
+                .map(|(_, ch)| ch.clone())
+        };
+        if let Some(channel) = channel {
+            let _ = self.publish_channel(&channel);
+        }
+    }
+
+    fn park_ipc(
+        &mut self,
+        channel: Arc<WaitChannel>,
+        precheck_gen: TaskWakeGeneration,
+        payload: PendingIpcPayload,
+    ) -> Result<bool, i64> {
+        let ch = channel.clone();
+        self.park_continuation(
+            &ch,
+            precheck_gen,
+            PendingContinuation::Ipc(PendingIpc {
+                caller: self.key,
+                channel,
+                precheck_gen,
+                payload,
+            }),
         )
+        .map_err(|e| e.errno())
+    }
+
+    fn resume_ipc(&mut self, pending: PendingIpc) -> LifecycleOutcome {
+        match self.resume_ipc_immediate(pending.payload) {
+            Ok(IpcOutcome::Returned(res)) => returned(res.raw()),
+            Ok(IpcOutcome::Suspended) => LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                result: SyscallResult::new(0),
+            },
+            Err(e) => returned(e),
+        }
+    }
+
+    fn repark_or_retry(
+        &mut self,
+        ch_id: u64,
+        payload: PendingIpcPayload,
+    ) -> Result<IpcOutcome, i64> {
+        let channel = self.get_or_create_channel(ch_id);
+        let wake_gen = channel.generation.generation();
+        if self.park_ipc(channel, wake_gen, payload)? {
+            Ok(IpcOutcome::Suspended)
+        } else {
+            Err(EAGAIN)
+        }
+    }
+
+    fn defer_ipc_suspend(&mut self, ch_id: u64, payload: PendingIpcPayload) {
+        let channels = self.runtime.graph.lock().ipc_channels.clone();
+        do_defer_suspend(&channels, &mut self.last_blocked, ch_id, payload);
+    }
+
+    fn resume_ipc_immediate(&mut self, payload: PendingIpcPayload) -> Result<IpcOutcome, i64> {
+        let (creds, pid, ipc) = self.ipc_env()?;
+        match ipc_resume_step(&ipc, self.current, &creds, pid, &payload) {
+            Ok((IpcOutcome::Returned(res), ch_opt)) => {
+                if let Some(ch) = ch_opt {
+                    self.wake_ipc_channel(ch);
+                }
+                Ok(IpcOutcome::Returned(res))
+            }
+            Ok((IpcOutcome::Suspended, ch_opt)) => {
+                let ch_id = ch_opt.unwrap();
+                self.repark_or_retry(ch_id, payload)
+            }
+            Err(e) => Ok(IpcOutcome::Returned(SyscallResult::new(e))),
+        }
     }
     fn publish_channel(&mut self, channel: &Arc<WaitChannel>) -> Result<(), NativeProcessError> {
         let zone = self.source.zone;
@@ -1312,6 +1521,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn as_sysinfo_venue(
         &mut self,
     ) -> Option<&mut dyn carrick_personality_linux::sysinfo::ProcessSysinfoVenue> {
+        Some(self)
+    }
+    fn as_ipc_venue(&mut self) -> Option<&mut dyn carrick_personality_linux::ipc::ProcessIpcVenue> {
         Some(self)
     }
     fn thread_spawned(&mut self, caller_tid: u32, child_tid: u32) {
@@ -2067,6 +2279,665 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         ru.ru_stime.tv_sec = usage.system_time.as_secs() as i64;
         ru.ru_stime.tv_usec = usage.system_time.subsec_micros() as i64;
         Ok(ru)
+    }
+}
+
+impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
+    carrick_personality_linux::ipc::ProcessIpcVenue for NativeProcessEntry<'r, 'a, M, C, S>
+{
+    fn msgget(&mut self, key: i32, msgflg: i32) -> Result<i32, i64> {
+        let (creds, _, ipc) = self.ipc_env()?;
+        ipc.lock().msgget(&creds, key, msgflg)
+    }
+
+    fn msgctl(&mut self, msqid: i32, cmd: i32, buf: Option<&mut LinuxMsqidDs>) -> Result<i64, i64> {
+        let (creds, _, ipc) = self.ipc_env()?;
+        let (val, ch_opt) = ipc_msgctl(&ipc, &creds, msqid, cmd, buf)?;
+        if let Some(ch) = ch_opt {
+            self.wake_ipc_channel(ch);
+        }
+        Ok(val)
+    }
+
+    fn msgsnd(&mut self, msqid: i32, mtype: i64, mtext: &[u8], msgflg: i32) -> Result<(), i64> {
+        let (creds, pid, ipc) = self.ipc_env()?;
+        let (outcome, ch_id) = ipc
+            .lock()
+            .msgsnd(&creds, pid, msqid, mtype, mtext, msgflg)?;
+        match outcome {
+            MsgsndOutcome::Complete => {
+                self.wake_ipc_channel(ch_id);
+                Ok(())
+            }
+            MsgsndOutcome::Suspend => {
+                self.defer_ipc_suspend(
+                    ch_id,
+                    PendingIpcPayload::Msgsnd {
+                        msqid,
+                        mtype,
+                        data: mtext.to_vec(),
+                        msgflg,
+                    },
+                );
+                Err(EAGAIN)
+            }
+        }
+    }
+
+    fn msgrcv(
+        &mut self,
+        msqid: i32,
+        msgp: UserVa,
+        mtext_out: &mut [u8],
+        msgtyp: i64,
+        msgflg: i32,
+    ) -> Result<(i64, usize), i64> {
+        let (creds, pid, ipc) = self.ipc_env()?;
+        let (outcome, ch_id) =
+            ipc.lock()
+                .msgrcv(&creds, pid, msqid, mtext_out.len(), msgtyp, msgflg)?;
+        match outcome {
+            MsgrcvOutcome::Complete(msg) => {
+                self.wake_ipc_channel(ch_id);
+                let len = msg.data.len();
+                mtext_out[..len].copy_from_slice(&msg.data);
+                Ok((msg.mtype, len))
+            }
+            MsgrcvOutcome::Suspend => {
+                self.defer_ipc_suspend(
+                    ch_id,
+                    PendingIpcPayload::Msgrcv {
+                        msqid,
+                        msgp,
+                        msgsz: mtext_out.len(),
+                        msgtyp,
+                        msgflg,
+                    },
+                );
+                Err(ENOMSG)
+            }
+        }
+    }
+
+    fn semget(&mut self, key: i32, nsems: i32, semflg: i32) -> Result<i32, i64> {
+        let (creds, _, ipc) = self.ipc_env()?;
+        ipc.lock().semget(&creds, key, nsems, semflg)
+    }
+
+    fn semctl(
+        &mut self,
+        semid: i32,
+        semnum: i32,
+        cmd: i32,
+        arg: u64,
+        ds_out: Option<&mut LinuxSemidDs>,
+    ) -> Result<i64, i64> {
+        let (creds, pid, ipc) = self.ipc_env()?;
+        let (val, ch_opt) = ipc_semctl(
+            &ipc,
+            self.current,
+            &creds,
+            pid,
+            semid,
+            semnum,
+            cmd,
+            arg,
+            ds_out,
+        )?;
+        if let Some(ch_id) = ch_opt {
+            self.wake_ipc_channel(ch_id);
+        }
+        Ok(val)
+    }
+
+    fn semop(&mut self, semid: i32, sops: &[LinuxSembuf]) -> Result<(), i64> {
+        let (creds, pid, ipc) = self.ipc_env()?;
+        let mut raw_sops = Vec::with_capacity(sops.len());
+        for s in sops {
+            raw_sops.push((s.sem_num, s.sem_op, s.sem_flg));
+        }
+        let (outcome, ch_id) = ipc.lock().semop(&creds, pid, semid, &raw_sops)?;
+        match outcome {
+            SemopOutcome::Complete => {
+                self.wake_ipc_channel(ch_id);
+                Ok(())
+            }
+            SemopOutcome::Suspend => {
+                self.defer_ipc_suspend(
+                    ch_id,
+                    PendingIpcPayload::Semop {
+                        semid,
+                        ops: raw_sops,
+                    },
+                );
+                Err(EAGAIN)
+            }
+        }
+    }
+
+    fn shmget(&mut self, key: i32, size: usize, shmflg: i32) -> Result<i32, i64> {
+        let (creds, pid, ipc) = self.ipc_env()?;
+        ipc.lock().shmget(&creds, pid, key, size, shmflg)
+    }
+
+    fn shmctl(&mut self, shmid: i32, cmd: i32, buf: Option<&mut LinuxShmidDs>) -> Result<i64, i64> {
+        let (creds, _, ipc) = self.ipc_env()?;
+        ipc_shmctl(&ipc, &creds, shmid, cmd, buf)
+    }
+
+    fn shmat(&mut self, shmid: i32, shmaddr: u64, shmflg: i32) -> Result<u64, i64> {
+        let (creds, pid, ipc) = self.ipc_env()?;
+        ipc.lock()
+            .shmat(&creds, pid, shmid, shmaddr, shmflg)
+            .map(|(va, _)| va)
+    }
+
+    fn shmdt(&mut self, shmaddr: u64) -> Result<(), i64> {
+        let (_, pid, ipc) = self.ipc_env()?;
+        ipc.lock().shmdt(pid, shmaddr)
+    }
+
+    fn mq_open(
+        &mut self,
+        name: &[u8],
+        oflag: i32,
+        mode: u32,
+        attr: Option<&LinuxMqAttr>,
+    ) -> Result<i32, i64> {
+        let (creds, _, ipc) = self.ipc_env()?;
+        let name_str =
+            core::str::from_utf8(name).map_err(|_| carrick_personality_linux::ipc::EINVAL)?;
+        let attr_tuple = attr.map(|a| (a.mq_maxmsg, a.mq_msgsize));
+        ipc.lock()
+            .mq_open(&creds, name_str, oflag, mode, attr_tuple)
+    }
+
+    fn mq_unlink(&mut self, name: &[u8]) -> Result<(), i64> {
+        let (creds, _, ipc) = self.ipc_env()?;
+        let name_str =
+            core::str::from_utf8(name).map_err(|_| carrick_personality_linux::ipc::EINVAL)?;
+        ipc.lock().mq_unlink(&creds, name_str)
+    }
+
+    fn mq_timedsend(&mut self, mqdes: i32, msg_ptr: &[u8], msg_prio: u32) -> Result<(), i64> {
+        let (creds, _, ipc) = self.ipc_env()?;
+        let (outcome, ch_id) = ipc.lock().mq_timedsend(&creds, mqdes, msg_ptr, msg_prio)?;
+        match outcome {
+            MqSendOutcome::Complete => {
+                self.wake_ipc_channel(ch_id);
+                Ok(())
+            }
+            MqSendOutcome::Suspend => {
+                self.defer_ipc_suspend(
+                    ch_id,
+                    PendingIpcPayload::MqSend {
+                        mqdes,
+                        data: msg_ptr.to_vec(),
+                        prio: msg_prio,
+                    },
+                );
+                Err(EAGAIN)
+            }
+        }
+    }
+
+    fn mq_timedreceive(
+        &mut self,
+        mqdes: i32,
+        msg_ptr_va: UserVa,
+        msg_buf: &mut [u8],
+        msg_prio: &mut u32,
+        msg_prio_va: UserVa,
+    ) -> Result<usize, i64> {
+        let (creds, _, ipc) = self.ipc_env()?;
+        let (outcome, ch_id) = ipc.lock().mq_timedreceive(&creds, mqdes, msg_buf.len())?;
+        match outcome {
+            MqReceiveOutcome::Complete(data, prio) => {
+                self.wake_ipc_channel(ch_id);
+                let len = data.len();
+                msg_buf[..len].copy_from_slice(&data);
+                *msg_prio = prio;
+                Ok(len)
+            }
+            MqReceiveOutcome::Suspend => {
+                self.defer_ipc_suspend(
+                    ch_id,
+                    PendingIpcPayload::MqReceive {
+                        mqdes,
+                        msg_ptr_va,
+                        msg_prio_va,
+                        msg_len: msg_buf.len(),
+                    },
+                );
+                Err(EAGAIN)
+            }
+        }
+    }
+
+    fn mq_notify(&mut self, mqdes: i32, sevp: u64) -> Result<(), i64> {
+        let (_, _, ipc) = self.ipc_env()?;
+        ipc.lock().mq_notify(mqdes, sevp)
+    }
+
+    fn mq_getsetattr(
+        &mut self,
+        mqdes: i32,
+        new_attr: Option<&LinuxMqAttr>,
+        old_attr: Option<&mut LinuxMqAttr>,
+    ) -> Result<(), i64> {
+        let (_, _, ipc) = self.ipc_env()?;
+        let new_flags = new_attr.map(|a| a.mq_flags as i32);
+        let (flags, maxmsg, msgsize, curmsgs) = ipc.lock().mq_getsetattr(mqdes, new_flags)?;
+        if let Some(old) = old_attr {
+            old.mq_flags = flags as i64;
+            old.mq_maxmsg = maxmsg;
+            old.mq_msgsize = msgsize;
+            old.mq_curmsgs = curmsgs;
+        }
+        Ok(())
+    }
+
+    fn suspend_current(&mut self) -> Result<IpcOutcome, i64> {
+        let (channel, precheck_gen, payload) = self
+            .last_blocked
+            .take()
+            .ok_or(carrick_personality_linux::ipc::EINVAL)?;
+        if self.park_ipc(channel, precheck_gen, payload.clone())? {
+            Ok(IpcOutcome::Suspended)
+        } else {
+            self.resume_ipc_immediate(payload)
+        }
+    }
+}
+
+fn do_defer_suspend(
+    channels_lock: &IpcWaitChannels,
+    last_blocked: &mut Option<(Arc<WaitChannel>, TaskWakeGeneration, PendingIpcPayload)>,
+    ch_id: u64,
+    payload: PendingIpcPayload,
+) {
+    let mut channels = channels_lock.lock();
+    let channel = if let Some((_, ch)) = channels.iter().find(|(id, _)| *id == ch_id) {
+        ch.clone()
+    } else {
+        let ch = Arc::new(WaitChannel {
+            generation: ProcessWake::new(),
+            mm: 0x19c0_0000,
+        });
+        channels.push((ch_id, ch.clone()));
+        ch
+    };
+    let wake_gen = channel.generation.generation();
+    *last_blocked = Some((channel, wake_gen, payload));
+}
+
+fn ipc_resume_step(
+    ipc_lock: &SpinLock<IpcNamespace>,
+    current: &CurrentTask,
+    creds: &carrick_sched_core::process::TaskCredentials,
+    pid: u32,
+    payload: &PendingIpcPayload,
+) -> Result<(IpcOutcome, Option<u64>), i64> {
+    match payload {
+        PendingIpcPayload::Semop { semid, ops } => {
+            let (outcome, ch_id) = {
+                let mut ipc = ipc_lock.lock();
+                ipc.semop(creds, pid, *semid, ops)?
+            };
+            match outcome {
+                SemopOutcome::Complete => {
+                    Ok((IpcOutcome::Returned(SyscallResult::new(0)), Some(ch_id)))
+                }
+                SemopOutcome::Suspend => Ok((IpcOutcome::Suspended, Some(ch_id))),
+            }
+        }
+        PendingIpcPayload::Msgsnd {
+            msqid,
+            mtype,
+            data,
+            msgflg,
+        } => {
+            let (outcome, ch_id) = {
+                let mut ipc = ipc_lock.lock();
+                ipc.msgsnd(creds, pid, *msqid, *mtype, data.as_slice(), *msgflg)?
+            };
+            match outcome {
+                MsgsndOutcome::Complete => {
+                    Ok((IpcOutcome::Returned(SyscallResult::new(0)), Some(ch_id)))
+                }
+                MsgsndOutcome::Suspend => Ok((IpcOutcome::Suspended, Some(ch_id))),
+            }
+        }
+        PendingIpcPayload::Msgrcv {
+            msqid,
+            msgp,
+            msgsz,
+            msgtyp,
+            msgflg,
+        } => {
+            let (outcome, ch_id) = {
+                let mut ipc = ipc_lock.lock();
+                ipc.msgrcv(creds, pid, *msqid, *msgsz, *msgtyp, *msgflg)?
+            };
+            match outcome {
+                MsgrcvOutcome::Complete(msg) => {
+                    let mtype_bytes = msg.mtype.to_ne_bytes();
+                    let ok1 = unsafe {
+                        crate::file::copy_to_user_guarded(
+                            current,
+                            msgp.raw() as *mut u8,
+                            mtype_bytes.as_ptr(),
+                            8,
+                        )
+                    };
+                    let ok2 = if !msg.data.is_empty() {
+                        unsafe {
+                            crate::file::copy_to_user_guarded(
+                                current,
+                                (msgp.raw() + 8) as *mut u8,
+                                msg.data.as_ptr(),
+                                msg.data.len(),
+                            )
+                        }
+                    } else {
+                        true
+                    };
+                    if !ok1 || !ok2 {
+                        Ok((
+                            IpcOutcome::Returned(SyscallResult::new(EFAULT)),
+                            Some(ch_id),
+                        ))
+                    } else {
+                        Ok((
+                            IpcOutcome::Returned(SyscallResult::new(msg.data.len() as i64)),
+                            Some(ch_id),
+                        ))
+                    }
+                }
+                MsgrcvOutcome::Suspend => Ok((IpcOutcome::Suspended, Some(ch_id))),
+            }
+        }
+        PendingIpcPayload::MqSend { mqdes, data, prio } => {
+            let (outcome, ch_id) = {
+                let mut ipc = ipc_lock.lock();
+                ipc.mq_timedsend(creds, *mqdes, data.as_slice(), *prio)?
+            };
+            match outcome {
+                MqSendOutcome::Complete => {
+                    Ok((IpcOutcome::Returned(SyscallResult::new(0)), Some(ch_id)))
+                }
+                MqSendOutcome::Suspend => Ok((IpcOutcome::Suspended, Some(ch_id))),
+            }
+        }
+        PendingIpcPayload::MqReceive {
+            mqdes,
+            msg_ptr_va,
+            msg_prio_va,
+            msg_len,
+        } => {
+            let (outcome, ch_id) = {
+                let mut ipc = ipc_lock.lock();
+                ipc.mq_timedreceive(creds, *mqdes, *msg_len)?
+            };
+            match outcome {
+                MqReceiveOutcome::Complete(data, prio) => {
+                    let ok1 = if !data.is_empty() {
+                        unsafe {
+                            crate::file::copy_to_user_guarded(
+                                current,
+                                msg_ptr_va.raw() as *mut u8,
+                                data.as_ptr(),
+                                data.len(),
+                            )
+                        }
+                    } else {
+                        true
+                    };
+                    let ok2 = if msg_prio_va.raw() != 0 {
+                        let prio_bytes = prio.to_ne_bytes();
+                        unsafe {
+                            crate::file::copy_to_user_guarded(
+                                current,
+                                msg_prio_va.raw() as *mut u8,
+                                prio_bytes.as_ptr(),
+                                4,
+                            )
+                        }
+                    } else {
+                        true
+                    };
+                    if !ok1 || !ok2 {
+                        Ok((
+                            IpcOutcome::Returned(SyscallResult::new(EFAULT)),
+                            Some(ch_id),
+                        ))
+                    } else {
+                        Ok((
+                            IpcOutcome::Returned(SyscallResult::new(data.len() as i64)),
+                            Some(ch_id),
+                        ))
+                    }
+                }
+                MqReceiveOutcome::Suspend => Ok((IpcOutcome::Suspended, Some(ch_id))),
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ipc_semctl(
+    ipc_lock: &SpinLock<IpcNamespace>,
+    current: &CurrentTask,
+    creds: &carrick_sched_core::process::TaskCredentials,
+    pid: u32,
+    semid: i32,
+    semnum: i32,
+    cmd: i32,
+    arg: u64,
+    ds_out: Option<&mut LinuxSemidDs>,
+) -> Result<(i64, Option<u64>), i64> {
+    let mut ipc = ipc_lock.lock();
+    match cmd {
+        carrick_personality_linux::ipc::IPC_RMID => {
+            let ch_id = ipc.semctl_rmid(creds, semid)?;
+            Ok((0, Some(ch_id)))
+        }
+        carrick_personality_linux::ipc::SETVAL => {
+            let val = arg as u16;
+            let ch_id = ipc.semctl_setval(creds, pid, semid, semnum as usize, val)?;
+            Ok((0, Some(ch_id)))
+        }
+        carrick_personality_linux::ipc::GETVAL => {
+            let set = ipc.sem_set(semid)?;
+            set.perm.check_perm(creds, 0o400)?;
+            if semnum as usize >= set.sems.len() {
+                return Err(EINVAL);
+            }
+            Ok((set.sems[semnum as usize].semval as i64, None))
+        }
+        carrick_personality_linux::ipc::GETPID => {
+            let set = ipc.sem_set(semid)?;
+            set.perm.check_perm(creds, 0o400)?;
+            if semnum as usize >= set.sems.len() {
+                return Err(EINVAL);
+            }
+            Ok((set.sems[semnum as usize].sempid as i64, None))
+        }
+        carrick_personality_linux::ipc::GETNCNT | carrick_personality_linux::ipc::GETZCNT => {
+            let set = ipc.sem_set(semid)?;
+            set.perm.check_perm(creds, 0o400)?;
+            Ok((0, None))
+        }
+        carrick_personality_linux::ipc::GETALL => {
+            let set = ipc.sem_set(semid)?;
+            set.perm.check_perm(creds, 0o400)?;
+            let nsems = set.sems.len();
+            let mut vals = Vec::with_capacity(nsems);
+            for s in &set.sems {
+                vals.push(s.semval);
+            }
+            drop(ipc);
+            let byte_slice =
+                unsafe { core::slice::from_raw_parts(vals.as_ptr() as *const u8, nsems * 2) };
+            let ok = unsafe {
+                crate::file::copy_to_user_guarded(
+                    current,
+                    arg as *mut u8,
+                    byte_slice.as_ptr(),
+                    byte_slice.len(),
+                )
+            };
+            if !ok { Err(EFAULT) } else { Ok((0, None)) }
+        }
+        carrick_personality_linux::ipc::SETALL => {
+            let nsems = {
+                let set = ipc.sem_set(semid)?;
+                set.perm.check_perm(creds, 0o200)?;
+                set.sems.len()
+            };
+            drop(ipc);
+            let mut vals = alloc::vec![0u16; nsems];
+            let byte_slice =
+                unsafe { core::slice::from_raw_parts_mut(vals.as_mut_ptr() as *mut u8, nsems * 2) };
+            let ok = unsafe {
+                crate::file::copy_from_user_guarded(
+                    current,
+                    byte_slice.as_mut_ptr(),
+                    arg as *const u8,
+                    byte_slice.len(),
+                )
+            };
+            if !ok {
+                return Err(EFAULT);
+            }
+            let mut ipc = ipc_lock.lock();
+            let set = ipc.sem_set_mut(semid)?;
+            for (i, &v) in vals.iter().enumerate() {
+                if v > carrick_personality_linux::ipc::SEMVMX {
+                    return Err(carrick_personality_linux::ipc::ERANGE);
+                }
+                set.sems[i].semval = v;
+                set.sems[i].sempid = pid;
+            }
+            let ch_id = set.wait_channel;
+            Ok((0, Some(ch_id)))
+        }
+        carrick_personality_linux::ipc::IPC_STAT | carrick_personality_linux::ipc::SEM_STAT => {
+            let set = ipc.sem_set(semid)?;
+            set.perm.check_perm(creds, 0o400)?;
+            if let Some(ds) = ds_out {
+                ds.sem_perm.key = set.perm.key;
+                ds.sem_perm.uid = set.perm.uid.raw();
+                ds.sem_perm.gid = set.perm.gid.raw();
+                ds.sem_perm.cuid = set.perm.cuid.raw();
+                ds.sem_perm.cgid = set.perm.cgid.raw();
+                ds.sem_perm.mode = set.perm.mode;
+                ds.sem_perm.seq = set.perm.seq;
+                ds.sem_otime = set.otime as i64;
+                ds.sem_ctime = set.ctime as i64;
+                ds.sem_nsems = set.sems.len() as u64;
+            }
+            Ok((0, None))
+        }
+        carrick_personality_linux::ipc::IPC_INFO | carrick_personality_linux::ipc::SEM_INFO => {
+            Ok((carrick_personality_linux::ipc::SEMMNI as i64, None))
+        }
+        _ => Err(EINVAL),
+    }
+}
+
+fn ipc_msgctl(
+    ipc_lock: &SpinLock<IpcNamespace>,
+    creds: &carrick_sched_core::process::TaskCredentials,
+    msqid: i32,
+    cmd: i32,
+    buf: Option<&mut LinuxMsqidDs>,
+) -> Result<(i64, Option<u64>), i64> {
+    let mut ipc = ipc_lock.lock();
+    match cmd {
+        carrick_personality_linux::ipc::IPC_RMID => {
+            let ch_id = ipc.msgctl_rmid(creds, msqid)?;
+            Ok((0, Some(ch_id)))
+        }
+        carrick_personality_linux::ipc::IPC_STAT | carrick_personality_linux::ipc::MSG_STAT => {
+            let q = ipc.msg_queue(msqid)?;
+            q.perm.check_perm(creds, 0o400)?;
+            if let Some(ds) = buf {
+                ds.msg_perm.key = q.perm.key;
+                ds.msg_perm.uid = q.perm.uid.raw();
+                ds.msg_perm.gid = q.perm.gid.raw();
+                ds.msg_perm.cuid = q.perm.cuid.raw();
+                ds.msg_perm.cgid = q.perm.cgid.raw();
+                ds.msg_perm.mode = q.perm.mode;
+                ds.msg_perm.seq = q.perm.seq;
+                ds.msg_stime = q.stime as i64;
+                ds.msg_rtime = q.rtime as i64;
+                ds.msg_ctime = q.ctime as i64;
+                ds.msg_cbytes = q.current_bytes() as u64;
+                ds.msg_qnum = q.messages.len() as u64;
+                ds.msg_qbytes = q.qbytes as u64;
+                ds.msg_lspid = q.lspid as i32;
+                ds.msg_lrpid = q.lrpid as i32;
+            }
+            Ok((0, None))
+        }
+        carrick_personality_linux::ipc::IPC_SET => {
+            let ds = buf.ok_or(carrick_personality_linux::ipc::EFAULT)?;
+            ipc.msgctl_set(
+                creds,
+                msqid,
+                carrick_sched_core::process::TaskUid::new(ds.msg_perm.uid),
+                carrick_sched_core::process::TaskGid::new(ds.msg_perm.gid),
+                ds.msg_perm.mode,
+                ds.msg_qbytes as usize,
+            )?;
+            Ok((0, None))
+        }
+        carrick_personality_linux::ipc::IPC_INFO | carrick_personality_linux::ipc::MSG_INFO => {
+            Ok((carrick_personality_linux::ipc::MSGMNI as i64, None))
+        }
+        _ => Err(carrick_personality_linux::ipc::EINVAL),
+    }
+}
+
+fn ipc_shmctl(
+    ipc_lock: &SpinLock<IpcNamespace>,
+    creds: &carrick_sched_core::process::TaskCredentials,
+    shmid: i32,
+    cmd: i32,
+    buf: Option<&mut LinuxShmidDs>,
+) -> Result<i64, i64> {
+    let mut ipc = ipc_lock.lock();
+    match cmd {
+        carrick_personality_linux::ipc::IPC_RMID => {
+            ipc.shmctl_rmid(creds, shmid)?;
+            Ok(0)
+        }
+        carrick_personality_linux::ipc::IPC_STAT | carrick_personality_linux::ipc::SHM_STAT => {
+            let seg = ipc.shm_segment(shmid)?;
+            seg.perm.check_perm(creds, 0o400)?;
+            if let Some(ds) = buf {
+                ds.shm_perm.key = seg.perm.key;
+                ds.shm_perm.uid = seg.perm.uid.raw();
+                ds.shm_perm.gid = seg.perm.gid.raw();
+                ds.shm_perm.cuid = seg.perm.cuid.raw();
+                ds.shm_perm.cgid = seg.perm.cgid.raw();
+                ds.shm_perm.mode = seg.perm.mode;
+                ds.shm_perm.seq = seg.perm.seq;
+                ds.shm_segsz = seg.size as u64;
+                ds.shm_atime = seg.atime as i64;
+                ds.shm_dtime = seg.dtime as i64;
+                ds.shm_ctime = seg.ctime as i64;
+                ds.shm_cpid = seg.cpid as i32;
+                ds.shm_lpid = seg.lpid as i32;
+                ds.shm_nattch = seg.nattch;
+            }
+            Ok(0)
+        }
+        carrick_personality_linux::ipc::IPC_INFO | carrick_personality_linux::ipc::SHM_INFO => {
+            Ok(carrick_personality_linux::ipc::SHMMNI as i64)
+        }
+        _ => Err(carrick_personality_linux::ipc::EINVAL),
     }
 }
 

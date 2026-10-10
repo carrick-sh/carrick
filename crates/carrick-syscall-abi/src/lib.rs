@@ -58,6 +58,24 @@ pub mod nr {
     pub const GETGID: CanonicalNr = CanonicalNr(176);
     pub const GETEGID: CanonicalNr = CanonicalNr(177);
     pub const SYSINFO: CanonicalNr = CanonicalNr(179);
+    pub const MQ_OPEN: CanonicalNr = CanonicalNr(180);
+    pub const MQ_UNLINK: CanonicalNr = CanonicalNr(181);
+    pub const MQ_TIMEDSEND: CanonicalNr = CanonicalNr(182);
+    pub const MQ_TIMEDRECEIVE: CanonicalNr = CanonicalNr(183);
+    pub const MQ_NOTIFY: CanonicalNr = CanonicalNr(184);
+    pub const MQ_GETSETATTR: CanonicalNr = CanonicalNr(185);
+    pub const MSGGET: CanonicalNr = CanonicalNr(186);
+    pub const MSGCTL: CanonicalNr = CanonicalNr(187);
+    pub const MSGRCV: CanonicalNr = CanonicalNr(188);
+    pub const MSGSND: CanonicalNr = CanonicalNr(189);
+    pub const SEMGET: CanonicalNr = CanonicalNr(190);
+    pub const SEMCTL: CanonicalNr = CanonicalNr(191);
+    pub const SEMTIMEDOP: CanonicalNr = CanonicalNr(192);
+    pub const SEMOP: CanonicalNr = CanonicalNr(193);
+    pub const SHMGET: CanonicalNr = CanonicalNr(194);
+    pub const SHMCTL: CanonicalNr = CanonicalNr(195);
+    pub const SHMAT: CanonicalNr = CanonicalNr(196);
+    pub const SHMDT: CanonicalNr = CanonicalNr(197);
     pub const WAIT4: CanonicalNr = CanonicalNr(260);
     pub const PRLIMIT64: CanonicalNr = CanonicalNr(261);
 }

@@ -467,6 +467,39 @@ impl<
     }
 }
 
+impl<
+    'a,
+    F: Fn(u32) -> *mut u8,
+    C: ThreadCpu,
+    U: UserWord,
+    G: GuestDispatchFrame,
+    Context: super::dispatch::DispatchContext,
+> carrick_personality_linux::ipc::IpcNative<'a> for El1PendingFamilies<'a, F, C, U, G, Context>
+{
+    fn arguments(&self) -> [u64; 6] {
+        [
+            self.frame.argument(0).unwrap_or(0),
+            self.frame.argument(1).unwrap_or(0),
+            self.frame.argument(2).unwrap_or(0),
+            self.frame.argument(3).unwrap_or(0),
+            self.frame.argument(4).unwrap_or(0),
+            self.frame.argument(5).unwrap_or(0),
+        ]
+    }
+    fn process_ipc(&mut self) -> Option<&mut dyn carrick_personality_linux::ipc::ProcessIpcVenue> {
+        let binding = LifecycleNative::binding(self)?;
+        let tid = carrick_personality_linux::lifecycle::LifecycleNative::visible_tid(self);
+        let process = self.process.as_deref_mut()?;
+        if process.binding() != binding {
+            return None;
+        }
+        if let Some(tid) = tid {
+            process.set_calling_tid(tid);
+        }
+        process.as_ipc_venue()
+    }
+}
+
 #[cfg(test)]
 #[path = "lifecycle/tests.rs"]
 mod tests;
