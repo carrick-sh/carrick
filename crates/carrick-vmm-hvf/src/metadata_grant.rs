@@ -1017,7 +1017,9 @@ pub(crate) fn service_metadata_operation(
                     return Ok([METADATA_GRANT_ERR_DENIED, exchange.response[0], 0, 0]);
                 };
                 // Reclaim before loaning. Missing occupancy authority is a
-                // typed inventory refusal; a failed clear is fatal custody.
+                // typed inventory refusal; a failed release, clear or ASID
+                // retirement defers that child inside the stock (counted).
+                // Only a broken custody invariant reaches the error arm.
                 match drain_fork_quarantine(custody, execution, carrick_el1_abi::zone_tables()) {
                     Ok(()) => {}
                     Err(crate::fork_stock::ForkStockServiceError::OccupancyUnavailable) => {
@@ -1100,8 +1102,7 @@ pub(crate) fn service_metadata_operation(
                             | crate::fork_stock::ForkStockServiceError::InvalidRecord
                             | crate::fork_stock::ForkStockServiceError::MemoryAccessFailed
                             | crate::fork_stock::ForkStockServiceError::Asid(_)
-                            | crate::fork_stock::ForkStockServiceError::OccupancyUnavailable
-                            | crate::fork_stock::ForkStockServiceError::ReleaseRefused => {
+                            | crate::fork_stock::ForkStockServiceError::OccupancyUnavailable => {
                                 ForkStockRefusal::Invalid
                             }
                         };

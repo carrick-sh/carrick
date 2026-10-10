@@ -580,6 +580,13 @@ impl FrameInventoryAuthority {
     /// maps stay live. Used when a fork child's memory leaves quarantine.
     /// Returns the number of mappings unmapped; the receipt must prove the
     /// MM empty at the produced revision.
+    ///
+    /// Every committed row is `Published`: `apply_inner` refuses a batch
+    /// that leaves a `Prepared` mapping (`UnpublishedMapping`) and applies
+    /// nothing, so the scan takes every row of `mm` and an empty receipt
+    /// follows unless a concurrent commit maps into `mm`. A fork child is
+    /// retired only after its slot absence is proven, so nothing maps into
+    /// it. A repeated call on an emptied MM is `Ok(0)`.
     pub fn retire_mm(
         &self,
         ids: &ObjectIdRegistry,
@@ -593,7 +600,7 @@ impl FrameInventoryAuthority {
             state
                 .mappings
                 .iter()
-                .filter(|(_, entry)| entry.mm == mm && entry.state == MappingState::Published)
+                .filter(|(_, entry)| entry.mm == mm)
                 .map(|(mapping, entry)| (*mapping, entry.frame, entry.generation))
                 .collect()
         };
@@ -3147,6 +3154,27 @@ mod tests {
         });
         fixture.authority.apply(fixture.mm2, batch).expect("child");
         let private = private.unwrap();
+        // A refused batch that left a mapping unpublished commits nothing,
+        // so it cannot strand a non-Published row that blocks retirement.
+        let unpublished = fixture.batch(1, |transaction, reservation| {
+            let frame = reservation.claim_frame().expect("frame");
+            let mapping = reservation.claim_mapping().expect("mapping");
+            reservation
+                .push(FrameInventoryEvent::PrepareMapping {
+                    transaction,
+                    frame,
+                    mapping,
+                    generation: generation(1),
+                    gpa: Gpa(0x8000),
+                    length: length(0x1000),
+                    permissions: perms(true),
+                })
+                .expect("prepare");
+        });
+        assert_eq!(
+            fixture.authority.apply(fixture.mm2, unpublished),
+            Err(FrameInventoryError::UnpublishedMapping)
+        );
 
         assert_eq!(
             fixture
