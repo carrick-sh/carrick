@@ -8353,6 +8353,60 @@ impl HvfInner {
                 let far_el1 = vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
                 let spsr_el1 = vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0);
                 let x0 = vcpu.get_reg(Reg::X0).unwrap_or(0);
+                if x0 == carrick_el1_abi::NATIVE_RUN_FAILURE_SENTINEL {
+                    // Only EL1's supervisor-owned stack record may name a failure;
+                    // the active slot supplies identity, never guest-supplied words.
+                    if cpsr & 0xf != 0x5
+                        || !(carrick_mem::memory::LINUX_EL1_KERNEL_BASE
+                            ..carrick_mem::memory::LINUX_EL1_KERNEL_BASE
+                                + carrick_mem::memory::LINUX_EL1_IMAGE_SIZE)
+                            .contains(&pc)
+                    {
+                        return Err(TrapError::Hypervisor(
+                            "native run failure crossing outside EL1 image".into(),
+                        ));
+                    }
+                    let cpu = mailbox
+                        .leased_slot()
+                        .map(|slot| carrick_guest_arch::CpuId::new(u32::from(slot.raw())))
+                        .ok_or_else(|| {
+                            TrapError::Hypervisor(
+                                "native run failure crossing has no leased CPU".into(),
+                            )
+                        })?;
+                    let record_gpa = vcpu.get_reg(Reg::X1).map_err(hvf_error)?;
+                    if !record_gpa.is_multiple_of(64) {
+                        return Err(TrapError::Hypervisor(
+                            "unaligned native run failure record".into(),
+                        ));
+                    }
+                    let record_ptr = crate::fork_stock::ForkStockHostCustody::resolve_record_ptr::<
+                        carrick_el1_abi::NativeRunFailure,
+                    >(custody, record_gpa)
+                    .map_err(|_| {
+                        TrapError::Hypervisor(
+                            "native run failure record lacks physical custody".into(),
+                        )
+                    })?;
+                    // SAFETY: stopped lane retains the aligned initialized record;
+                    // exact mapped physical custody was resolved above.
+                    let record = unsafe { &*record_ptr };
+                    let (reason, crossings) = custody
+                        .fork_stock
+                        .lock()
+                        .service_run_failure(cpu, record)
+                        .map_err(|_| {
+                            TrapError::Hypervisor(
+                                "native run failure record has stale execution binding".into(),
+                            )
+                        })?;
+                    // Runtime propagates this named error through carrier cleanup;
+                    // the CLI's existing run-failure convention is exit 125.
+                    return Err(TrapError::NativeRunFailure {
+                        reason: reason.as_str(),
+                        crossings,
+                    });
+                }
                 if x0 == carrick_el1_abi::PANIC_SENTINEL {
                     let source_line = vcpu.get_reg(Reg::X1).unwrap_or(0);
                     let source_column = vcpu.get_reg(Reg::X2).unwrap_or(0);

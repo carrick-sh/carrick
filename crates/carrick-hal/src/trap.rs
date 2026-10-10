@@ -406,6 +406,12 @@ impl HostAliasBacking {
 
 #[derive(Debug, ::thiserror::Error)]
 pub enum TrapError {
+    /// Authenticated native dependency failure ends the run before guest return.
+    #[error("native run failed: {reason}; run_failure_crossings={crossings}")]
+    NativeRunFailure {
+        reason: &'static str,
+        crossings: u64,
+    },
     #[error("syscall trapping is not available on this platform")]
     UnsupportedPlatform,
     #[error("hypervisor operation failed: {0}")]

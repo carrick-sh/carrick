@@ -20,3 +20,5 @@ pub mod thread;
 
 pub mod identity;
 pub mod sysinfo;
+
+pub mod native_run_failure;

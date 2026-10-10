@@ -552,7 +552,14 @@ where
     } else {
         u64::MAX
     };
-    carrick_personality_linux::dispatch::dispatch(ordinal, control, &mut pending)
+    let route = carrick_personality_linux::dispatch::dispatch(ordinal, control, &mut pending);
+    if pending.frame.arm_frame_ref().is_some()
+        && let Some(process) = pending.process.as_deref_mut()
+        && let Some(reason) = process.take_run_failure()
+    {
+        super::native_run_failure::complete_native_run_failure(process.binding(), reason);
+    }
+    route
 }
 
 /// Native preparation, scheduling and completion retain an exact execution

@@ -2236,3 +2236,76 @@ fn birth_record_refusal_retains_the_claim_for_rollback() {
     assert_eq!(w.page().claimed_count(), 0);
     assert_eq!(w.zone.slot(SLOT).queued(), 0);
 }
+
+#[test]
+fn arm_dispatch_consumes_native_run_failure_before_return() {
+    struct Failed {
+        binding: carrick_el1_abi::ExecutionBinding,
+    }
+    impl ProcessNative for Failed {
+        fn take_run_failure(&mut self) -> Option<carrick_el1_abi::NativeRunFailureReason> {
+            Some(carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody)
+        }
+        fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
+            self.binding
+        }
+        fn fork(&mut self) -> LifecycleOutcome {
+            panic!("unexpected fork")
+        }
+        fn wait4(
+            &mut self,
+            _: ProcessWaitPid,
+            _: UserVa,
+            _: LinuxWaitOptions,
+            _: UserVa,
+        ) -> LifecycleOutcome {
+            panic!("unexpected wait")
+        }
+        fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
+            LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                result: SyscallResult::new(0),
+            }
+        }
+    }
+    let mut w = World::new(LifecycleHatches::ON);
+    let binding = crate::personality::common_entry::execution_binding(w.task());
+    let mut failed = Failed { binding };
+    let mut frame = TrapFrame {
+        slot: SLOT_IDX as u64,
+        ..Default::default()
+    };
+    frame.x[8] = 94;
+    let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::personality::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &w.counters,
+            &w.tasks,
+            &[],
+            &[],
+            &[],
+            &[],
+            &InotifyNameCache::new(),
+            Some(Zone {
+                tables: &w.zone,
+                cpu: &mut w.cpu,
+                user: &HardwareUserWord,
+            }),
+            None,
+            Some(&*w.venue),
+            Some(&mut failed),
+            None,
+            None,
+            |_| core::ptr::null_mut(),
+        )
+    }));
+    let payload = stopped.expect_err("ARM must consume the terminal failure before returning Idle");
+    let failure = payload
+        .downcast::<crate::personality::native_run_failure::NativeRunFailurePanic>()
+        .expect("typed ARM completion cause");
+    assert_eq!(failure.binding, binding);
+    assert_eq!(
+        failure.reason,
+        carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody
+    );
+}
