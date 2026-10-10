@@ -1479,7 +1479,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 
     #[inline(never)]
     fn exit_owned(&mut self, status: u8) -> Result<LifecycleOutcome, NativeProcessError> {
-        self.exit_with_status(LinuxWaitStatus::from_wait_encoding(i32::from(status) << 8))
+        self.exit_with_status(LinuxWaitStatus::exited(status))
     }
     pub fn exit_with_signal(&mut self, sig: u8) -> Result<LifecycleOutcome, NativeProcessError> {
         if self
@@ -4557,24 +4557,29 @@ mod tests {
     }
     #[test]
     fn actual_compact_root_forks_a_shared_owner_child_with_distinct_visible_identity() {
-        compact_root_fork_wait_contract(false, false, false);
+        compact_root_fork_wait_contract(false, false, false, false);
     }
     #[test]
     fn caught_signal_interrupts_an_already_parked_owned_child_wait() {
-        compact_root_fork_wait_contract(true, false, false);
+        compact_root_fork_wait_contract(true, false, false, false);
     }
     #[test]
     fn reapable_child_wins_over_its_caught_sigchld() {
-        compact_root_fork_wait_contract(false, true, false);
+        compact_root_fork_wait_contract(false, true, false, false);
     }
     #[test]
     fn pending_default_stop_does_not_interrupt_wait4() {
-        compact_root_fork_wait_contract(false, false, true);
+        compact_root_fork_wait_contract(false, false, true, false);
+    }
+    #[test]
+    fn child_signal_exit_preserves_status_across_birth_claim_settlement() {
+        compact_root_fork_wait_contract(false, true, false, true);
     }
     fn compact_root_fork_wait_contract(
         interrupt_wait: bool,
         catch_child_exit: bool,
         default_stop: bool,
+        signal_exit_continuation: bool,
     ) {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
@@ -4830,14 +4835,49 @@ mod tests {
                 );
                 return;
             }
-            assert!(matches!(
-                child_entry.exit_group(7),
-                LifecycleOutcome::Transferred {
-                    progress: carrick_core::Served::Idle,
-                    ..
-                }
-            ));
-            assert!(child_entry.take_handoff_receipt().is_some());
+            if signal_exit_continuation {
+                child_page
+                    .stock(
+                        1,
+                        EntryIdentity {
+                            tid: 43,
+                            visible_tid: 43,
+                            thread_serial: 103,
+                            uid_credit: 0,
+                        },
+                    )
+                    .unwrap();
+                let claim = child_page.claim_any().unwrap();
+                assert!(matches!(
+                    child_entry.exit_with_signal(15).unwrap(),
+                    LifecycleOutcome::Transferred { .. }
+                ));
+                assert!(child_entry.take_handoff_receipt().is_some());
+                assert!(child_entry.take_root_exit().is_none());
+                assert_eq!(child_page.live(), 1);
+                child_page.unclaim(claim).unwrap();
+                child_entry.lifecycle_admission_settled().unwrap();
+                drop(child_entry);
+                activate(&runtime, source, &task, child);
+                let mut resumed = runtime
+                    .enter(source, &task, child_words, &mut service)
+                    .unwrap();
+                assert!(matches!(
+                    resumed.resume_pending_lifecycle().unwrap(),
+                    Some(LifecycleOutcome::Transferred { .. })
+                ));
+                assert!(resumed.take_root_exit().is_none());
+                assert!(resumed.take_handoff_receipt().is_some());
+            } else {
+                assert!(matches!(
+                    child_entry.exit_group(7),
+                    LifecycleOutcome::Transferred {
+                        progress: carrick_core::Served::Idle,
+                        ..
+                    }
+                ));
+                assert!(child_entry.take_handoff_receipt().is_some());
+            }
         }
         assert_eq!(child_page.live(), 0);
         assert_eq!(page.live(), 1);
@@ -4870,6 +4910,17 @@ mod tests {
                 .enter(source, &task, words(address), &mut service)
                 .unwrap();
             use carrick_personality_linux::signal::ProcessSignals;
+            if signal_exit_continuation {
+                let (signal, info, _) = parent_entry
+                    .take_deliverable(carrick_signal_core::policy::SigBlockMask::NONE)
+                    .expect("child termination must notify its parent");
+                assert_eq!(signal.number(), 17);
+                let info = info.unwrap();
+                let code = info.si_code;
+                assert_eq!(code, carrick_syscall_abi::LINUX_CLD_KILLED);
+                assert_eq!(info.si_addr as u32, 42);
+                assert_eq!(i32::from_le_bytes(info._pad[..4].try_into().unwrap()), 15);
+            }
             assert_eq!(
                 parent_entry.kill(
                     carrick_personality_linux::signal::SignalProcessSelector::from_abi((42) as u64),
@@ -4910,6 +4961,10 @@ mod tests {
             panic!("reap return")
         };
         assert_eq!(result.raw(), 42);
+        if signal_exit_continuation {
+            let copied = parent_entry.service.copies.last().unwrap();
+            assert_eq!(*copied, LinuxWaitStatus::signaled(15, false));
+        }
         assert!(runtime.namespace_child_key(parent, 42).is_none());
         assert!(parent_entry.take_root_exit().is_none());
         assert!(matches!(
