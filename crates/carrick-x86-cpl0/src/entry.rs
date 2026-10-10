@@ -1177,8 +1177,9 @@ mod kernel {
             carrick_personality_linux::signal::SignalSet::from_bits(thread.slot.blocked().0),
         );
 
-        let (sig, info, action) = process.take_deliverable(thread_blocked)?;
         let saved_mask = process.take_suspend_mask().unwrap_or(thread_blocked);
+        thread.slot.init_blocked(carrick_el1_abi::BlockedMask(saved_mask.signals().bits()));
+        let (sig, info, action) = process.take_deliverable(thread_blocked)?;
         match action.disposition {
             policy::Disposition::Ignore => None,
             policy::Disposition::Default => {

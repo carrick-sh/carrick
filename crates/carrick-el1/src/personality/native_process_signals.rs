@@ -223,26 +223,38 @@ impl<T> NativeProcessSignals<T> {
                 .map(|i| resources.thread_pending.remove(i).1)
                 .unwrap_or_default();
             let forced = resources.forced_segv.contains(&tid);
-            let delivery = {
-                let proc_pending = resources.inbox.pending_mut();
-                let present = proc_pending.present().union(thread_pending.present());
-                let unblocked = if present
-                    .intersect(SignalSet::EMPTY.with(Signal::KILL))
-                    .bits()
-                    != 0
-                {
-                    SignalSet::EMPTY.with(Signal::KILL)
-                } else if forced {
-                    SignalSet::EMPTY.with(Signal::SEGV)
-                } else {
-                    blocked.select(present)
-                };
-                carrick_personality_linux::signal::take_pending(
-                    &mut thread_pending,
-                    proc_pending,
-                    unblocked,
-                )
+            let present = resources
+                .inbox
+                .pending()
+                .present()
+                .union(thread_pending.present());
+            let mut unblocked = if present.contains(Signal::KILL) {
+                SignalSet::EMPTY.with(Signal::KILL)
+            } else if forced {
+                SignalSet::EMPTY.with(Signal::SEGV)
+            } else {
+                blocked.select(present)
             };
+            // This lane has no process stop/wait-event custody yet. Preserve
+            // default stops for that owner instead of consuming a silent no-op.
+            let mut inspect = unblocked;
+            while let Some(number) = inspect.lowest() {
+                let Some(signal) = Signal::from_number(number) else {
+                    break;
+                };
+                if resources.actions.action(signal).disposition == Disposition::Default
+                    && carrick_signal_core::policy::default_delivery(signal)
+                        == carrick_signal_core::policy::Delivery::Stop
+                {
+                    unblocked = unblocked.without(signal);
+                }
+                inspect = inspect.without(signal);
+            }
+            let delivery = carrick_personality_linux::signal::take_pending(
+                &mut thread_pending,
+                resources.inbox.pending_mut(),
+                unblocked,
+            );
             if !thread_pending.is_empty() {
                 resources.thread_pending.push((tid, thread_pending));
             }
@@ -415,6 +427,32 @@ mod tests {
             signals.take_timedwait(old, SignalSet::EMPTY.with(usr1)),
             Some((usr1, Some(41)))
         );
+    }
+
+    #[test]
+    fn default_stop_remains_pending_until_the_job_control_owner_can_stop() {
+        let task = key(41, 11);
+        let signals = NativeProcessSignals::<()>::fresh_root(task);
+        let record = carrick_sched_core::RecordRef {
+            id: carrick_sched_core::RecordId::from_raw(1).unwrap(),
+            incarnation: 1,
+        };
+        signals.enqueue(task, Signal::STOP, None).unwrap();
+        assert!(
+            signals
+                .take_deliverable(record, SigBlockMask::NONE)
+                .is_none()
+        );
+        assert!(signals.pending_set(record).contains(Signal::STOP));
+        signals.enqueue(task, Signal::KILL, None).unwrap();
+        assert_eq!(
+            signals
+                .take_deliverable(record, SigBlockMask::NONE)
+                .unwrap()
+                .0,
+            Signal::KILL
+        );
+        assert!(signals.pending_set(record).contains(Signal::STOP));
     }
 
     #[test]
