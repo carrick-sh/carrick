@@ -552,17 +552,14 @@ impl ForkStockHostCustody {
     /// Authenticate a terminal native failure against this stopped CPU's lane.
     pub(crate) fn service_run_failure(
         &mut self,
-        cpu: CpuId,
+        binding: Option<carrick_el1_abi::ExecutionBinding>,
         record: &carrick_el1_abi::NativeRunFailure,
     ) -> Result<(carrick_el1_abi::NativeRunFailureReason, u64), ForkStockServiceError> {
-        let execution = self
-            .active_execution_for_cpu(cpu)
-            .ok_or(ForkStockServiceError::StaleExecution)?;
+        let binding = binding.ok_or(ForkStockServiceError::StaleExecution)?;
         let result = self
             .run_failure
-            .consume(record, execution.binding)
+            .consume(record, binding)
             .ok_or(ForkStockServiceError::StaleExecution)?;
-        self.clear_active_execution(cpu);
         Ok(result)
     }
 
@@ -755,18 +752,17 @@ mod tests {
         let execution = test_execution(41, 0, 301);
         let reason = carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody;
         let record = carrick_el1_abi::NativeRunFailure::new(execution.binding, reason);
-        custody.set_active_execution(execution);
         assert_eq!(
-            custody.service_run_failure(CpuId::new(1), &record),
+            custody.service_run_failure(None, &record),
             Err(ForkStockServiceError::StaleExecution)
         );
         assert_eq!(custody.run_failure.crossings(), 0);
         assert_eq!(
-            custody.service_run_failure(execution.cpu, &record),
+            custody.service_run_failure(Some(execution.binding), &record),
             Ok((reason, 1))
         );
         assert_eq!(
-            custody.service_run_failure(execution.cpu, &record),
+            custody.service_run_failure(Some(execution.binding), &record),
             Err(ForkStockServiceError::StaleExecution)
         );
         assert_eq!(custody.run_failure.crossings(), 1);

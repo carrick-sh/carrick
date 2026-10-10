@@ -76,6 +76,21 @@ pub struct GuestTaskMetadata<C, U> {
     pub diagnostic_name: String,
 }
 
+/// The caller's Linux attributes, retained off-stack across MM preparation.
+pub(crate) struct GuestForkAttributes<C> {
+    pub container: C,
+    pub identity: TaskIdentity,
+    pub group: u32,
+    pub session: u32,
+    pub credentials: TaskCredentials,
+    pub rlimits: RlimitSet,
+    pub umask: u32,
+    pub personality: u64,
+    pub dumpable: u32,
+    pub no_new_privs: bool,
+    pub comm: [u8; 16],
+}
+
 pub struct GuestTask<C, U, N: NativeProcessCustody> {
     metadata: GuestTaskMetadata<C, U>,
     exit_tid: u32,
@@ -211,17 +226,18 @@ impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
         native: N,
         claim: N::Claim,
     ) -> Self {
-        Self::new_with_boxed_context(metadata, parent, Box::new(context), native, claim)
+        *Self::new_with_boxed_context(metadata, parent, Box::new(context), native, claim)
     }
+    #[inline(never)]
     pub fn new_with_boxed_context(
         metadata: GuestTaskMetadata<C, U>,
         parent: Option<TaskKey>,
         context: Box<N::Context>,
         native: N,
         claim: N::Claim,
-    ) -> Self {
+    ) -> Box<Self> {
         let leader_tid = metadata.namespace_pid;
-        Self {
+        Box::new(Self {
             metadata,
             exit_tid: leader_tid,
             relations: ProcessRelations::new(parent),
@@ -242,7 +258,26 @@ impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
             child_subreaper: false,
             has_execed: false,
             threads: GuestThreads::new(leader_tid),
-        }
+        })
+    }
+    #[inline(never)]
+    pub(crate) fn fork_attributes(&self, tid: u32) -> Result<Box<GuestForkAttributes<C>>, i64>
+    where
+        C: Copy,
+    {
+        Ok(Box::new(GuestForkAttributes {
+            container: self.metadata.container,
+            identity: self.identity(),
+            group: self.metadata.namespace_process_group,
+            session: self.metadata.namespace_session,
+            credentials: self.credentials_for(tid)?.clone(),
+            rlimits: self.rlimits,
+            umask: self.umask,
+            personality: self.personality,
+            dumpable: self.dumpable,
+            no_new_privs: self.no_new_privs,
+            comm: *self.comm_for(tid)?,
+        }))
     }
     #[inline]
     pub fn init_leader(&mut self, tid: u32, creds: TaskCredentials, comm: [u8; 16]) {
@@ -442,6 +477,104 @@ impl<C, U, N: NativeProcessCustody> ExitNotificationSource for GuestTask<C, U, N
     }
 }
 
+// The registry retains an owned task allocation; publication never moves
+// the identity and rlimit payload through a B-tree insertion frame.
+impl<C, U, N: NativeProcessCustody> WaitIdentitySource for Box<GuestTask<C, U, N>> {
+    fn wait_identity(&self) -> WaitIdentity {
+        (**self).wait_identity()
+    }
+}
+impl<C, U, N: NativeProcessCustody> BirthLive for Box<GuestTask<C, U, N>> {
+    type Error = N::Error;
+    fn birth_lifecycle(&self) -> TaskLifecycle {
+        (**self).birth_lifecycle()
+    }
+    fn birth_revision(&self) -> TaskRevision {
+        (**self).birth_revision()
+    }
+    fn birth_session(&self) -> SessionId {
+        (**self).birth_session()
+    }
+    fn birth_prepare_parent_revision(&self) -> Result<TaskRevision, N::Error> {
+        (**self).birth_prepare_parent_revision()
+    }
+    fn birth_publish_child(&mut self, child: TaskKey, revision: TaskRevision) {
+        (**self).birth_publish_child(child, revision)
+    }
+}
+impl<C, U, N: NativeProcessCustody> WaitLive for Box<GuestTask<C, U, N>> {
+    type Event = N::Event;
+    type Revision = TaskRevision;
+    type Error = N::Error;
+    fn wait_children(&self) -> Vec<TaskKey> {
+        (**self).wait_children()
+    }
+    fn wait_tracees(&self) -> Vec<TaskKey> {
+        (**self).wait_tracees()
+    }
+    fn wait_wake_generation(&self) -> TaskWakeGeneration {
+        (**self).wait_wake_generation()
+    }
+    fn wait_event(&self, flags: WaitJobControl, consume: bool) -> Option<N::Event> {
+        (**self).wait_event(flags, consume)
+    }
+    fn prepare_reap(&self) -> Result<TaskRevision, N::Error> {
+        (**self).prepare_reap()
+    }
+    fn commit_reap(&mut self, child: TaskKey, charge: TaskRusage, revision: TaskRevision) {
+        (**self).commit_reap(child, charge, revision)
+    }
+}
+impl<C: Copy, U, N: NativeProcessCustody> ExitLive<C> for Box<GuestTask<C, U, N>> {
+    type Credit = N::Credit;
+    type Error = N::Error;
+    fn exit_container(&self) -> C {
+        (**self).exit_container()
+    }
+    fn exit_lifecycle(&self) -> TaskLifecycle {
+        (**self).exit_lifecycle()
+    }
+    fn exit_children(&self) -> BTreeSet<TaskKey> {
+        (**self).exit_children()
+    }
+    fn exit_autoreaps(&self) -> bool {
+        (**self).exit_autoreaps()
+    }
+    fn exit_revision(&self) -> TaskRevision {
+        (**self).exit_revision()
+    }
+    fn exit_reserve_credit(&self) -> Result<N::Credit, N::Error> {
+        (**self).exit_reserve_credit()
+    }
+}
+impl<C: Copy, U, N: NativeProcessCustody> ExitLivePublication<C> for Box<GuestTask<C, U, N>> {
+    fn exit_reparent(&mut self, parent: Option<TaskKey>) {
+        (**self).exit_reparent(parent)
+    }
+    fn exit_publish_children(&mut self, children: BTreeSet<TaskKey>) {
+        (**self).exit_publish_children(children)
+    }
+    fn exit_publish_credit(&mut self, participant: PreparedExitParticipant<N::Credit>) {
+        (**self).exit_publish_credit(participant)
+    }
+}
+impl<C: Copy, U, N: NativeProcessCustody> ExitEffectSource<C> for Box<GuestTask<C, U, N>> {
+    type Member = N::Member;
+    type Resources = N::Resources;
+    fn exit_members(&self) -> (Vec<N::Member>, N::Resources) {
+        (**self).exit_members()
+    }
+    fn exit_begin(&self) -> bool {
+        (**self).exit_begin()
+    }
+}
+impl<C, U, N: NativeProcessCustody> ExitNotificationSource for Box<GuestTask<C, U, N>> {
+    type Target = N::SignalTarget;
+    fn exit_notification_target(&self) -> N::SignalTarget {
+        (**self).exit_notification_target()
+    }
+}
+
 /// Owned numeric/resource custody is never cloned with the semantic receipt.
 pub struct GuestZombie<C, U, Claim> {
     pub receipt: Zombie<C, U>,
@@ -528,7 +661,7 @@ impl GuestProcessFailure for GuestRegistryFailure {
 
 type GuestRegistry<C, U, N, F> = ProcessRegistry<
     C,
-    GuestTask<C, U, N>,
+    Box<GuestTask<C, U, N>>,
     GuestZombie<C, U, <N as NativeProcessCustody>::Claim>,
     GuestRetiring<N>,
     TaskGraphReservation<<N as NativeProcessCustody>::Transaction>,
@@ -540,7 +673,7 @@ type GuestRegistry<C, U, N, F> = ProcessRegistry<
 type SharedGuestBirth<'a, C, U, N, F> = AdmittedProcessBirth<
     'a,
     C,
-    GuestTask<C, U, N>,
+    Box<GuestTask<C, U, N>>,
     GuestZombie<C, U, <N as NativeProcessCustody>::Claim>,
     GuestRetiring<N>,
     <N as NativeProcessCustody>::Transaction,
@@ -627,7 +760,7 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
             },
         );
         self.registry.container_inits.insert(container, key);
-        self.registry.tasks.insert(key.id, task);
+        self.registry.tasks.insert(key.id, Box::new(task));
         Ok(())
     }
     pub fn task(&self, key: TaskKey) -> Result<&GuestTask<C, U, N>, GuestProcessError<N::Error>> {
@@ -674,16 +807,20 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
             self.registry
                 .tasks
                 .values()
-                .map(GuestTask::key)
+                .map(|task| task.key())
                 .chain(self.registry.zombies.values().map(|row| row.receipt.key)),
         )
     }
     pub fn find_task_by_thread(&self, container: C, tid: u32) -> Option<&GuestTask<C, U, N>> {
-        self.registry.tasks.values().find(|row| {
-            row.metadata.container == container
-                && row.lifecycle() == TaskLifecycle::Live
-                && row.has_thread(tid)
-        })
+        self.registry
+            .tasks
+            .values()
+            .find(|row| {
+                row.metadata.container == container
+                    && row.lifecycle() == TaskLifecycle::Live
+                    && row.has_thread(tid)
+            })
+            .map(Box::as_ref)
     }
     pub fn group_exists_in_session(&self, session: u32, pgid: u32) -> bool {
         self.registry.tasks.values().any(|row| {
@@ -877,8 +1014,8 @@ pub struct GuestChildAdmission<'a, C, U, N: NativeProcessCustody, F> {
 impl<C: Copy + Ord, U, N: NativeProcessCustody, F: RegistryFailure>
     GuestChildAdmission<'_, C, U, N, F>
 {
-    pub fn publish(self, child: GuestTask<C, U, N>) {
-        self.admission.publish(child);
+    pub fn publish(self, child: impl Into<Box<GuestTask<C, U, N>>>) {
+        self.admission.publish(child.into());
     }
 }
 

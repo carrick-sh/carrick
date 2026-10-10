@@ -686,7 +686,7 @@ fn adapter_exit_work_visits_exactly_own_members_and_no_unrelated_native_resource
                 .unwrap()
                 .members
                 .insert(key);
-            owner.registry.tasks.insert(key.id, row);
+            owner.registry.tasks.insert(key.id, Box::new(row));
         }
         let done = exit(&mut owner, key(2, 2), None);
         let mut cancelled = 0;
@@ -781,7 +781,7 @@ fn adapter_wait_work_visits_only_own_children_with_512_unrelated_rows() {
                 .unwrap()
                 .members
                 .insert(key);
-            owner.registry.tasks.insert(key.id, row);
+            owner.registry.tasks.insert(key.id, Box::new(row));
         }
         assert!(
             matches!(owner.precheck_wait(parent, query(WaitTarget::Any)).unwrap(), WaitReadiness::StillRunning(token) if token.wake_generation().raw() == 11)
