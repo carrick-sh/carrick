@@ -2,45 +2,53 @@
 //! selection or live descriptor store occurs at this boundary.
 use super::*;
 use carrick_el1_abi::{MmPortalSlots, PortalGrantWindow};
+use carrick_hal::fork_stock::{
+    ForkStockServiceError, GrantExecution, LifecycleWindow, NoTableLedger, SlotAbsence,
+    lifecycle_slots,
+};
 use carrick_mmu_core::aarch64::descriptor_txn::{
     DescriptorOp as WireOp, DescriptorTxn as WireTxn, TableGrants,
 };
 use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa};
 use carrick_mmu_core::x86::owner_mmu::X86Mmu;
 
+/// Every I/O port this CPL0 carrier decodes from one VM; each must be
+/// distinct. `carrick_x86::FP_STUB_DOORBELL_PORT` (0xc6) is deliberately
+/// absent: only the legacy no-FP-getter x86 engine in a bhyve VM decodes
+/// it (`run_fp_stub`), never a KVM CPL0 VM, so its number is shared with
+/// [`carrick_el1_abi::X86_INITIAL_BOOT_PORT`] without aliasing.
+pub(super) const CPL0_CARRIER_PORTS: [u16; 19] = [
+    FAULT_DOORBELL_PORT,
+    FORWARD_PORT,
+    CONTROL_PORT,
+    ENTRY_KICK_PORT,
+    RETURN_KICK_PORT,
+    WORK_PORT,
+    FATAL_PORT,
+    YIELD_PORT,
+    OWNER_GRANT_PORT,
+    carrick_el1_abi::X86_INITIAL_BOOT_PORT,
+    carrick_x86::cpl0_scheduler::PROGRESS_ENTRY_PORT,
+    carrick_x86::cpl0_scheduler::PROGRESS_RETURN_PORT,
+    carrick_x86::cpl0_scheduler::PROGRESS_DONE_PORT,
+    carrick_el1_abi::FORK_STOCK_PORT,
+    carrick_el1_abi::NATIVE_ROOT_EXIT_PORT,
+    carrick_el1_abi::NATIVE_PEER_READY_PORT,
+    carrick_el1_abi::NATIVE_RUN_FAILURE_PORT,
+    carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
+    carrick_el1_abi::X86_INITIAL_RUNNER_READY_PORT,
+];
+
 const _: () = {
-    let physical = [
-        carrick_el1_abi::FORK_STOCK_PORT,
-        carrick_el1_abi::NATIVE_ROOT_EXIT_PORT,
-        carrick_el1_abi::NATIVE_PEER_READY_PORT,
-        carrick_el1_abi::NATIVE_RUN_FAILURE_PORT,
-    ];
-    let existing = [
-        FAULT_DOORBELL_PORT,
-        FORWARD_PORT,
-        CONTROL_PORT,
-        ENTRY_KICK_PORT,
-        RETURN_KICK_PORT,
-        WORK_PORT,
-        FATAL_PORT,
-        YIELD_PORT,
-        OWNER_GRANT_PORT,
-        carrick_el1_abi::X86_INITIAL_BOOT_PORT,
-        carrick_x86::FP_STUB_DOORBELL_PORT,
-        carrick_x86::cpl0_scheduler::PROGRESS_ENTRY_PORT,
-        carrick_x86::cpl0_scheduler::PROGRESS_RETURN_PORT,
-        carrick_x86::cpl0_scheduler::PROGRESS_DONE_PORT,
-    ];
+    let ports = CPL0_CARRIER_PORTS;
     let mut i = 0;
-    while i < physical.len() {
+    while i < ports.len() {
         let mut j = 0;
-        while j < existing.len() {
-            assert!(physical[i] != existing[j]);
-            j += 1;
-        }
-        j = 0;
         while j < i {
-            assert!(physical[i] != physical[j]);
+            assert!(
+                ports[i] != ports[j],
+                "CPL0 carrier ports must be pairwise distinct"
+            );
             j += 1;
         }
         i += 1;
@@ -121,61 +129,6 @@ fn kernel_pod_physical(
     ))
 }
 
-#[derive(::core::clone::Clone, ::core::marker::Copy)]
-struct GrantExecution {
-    cpu: carrick_guest_arch::CpuId,
-    binding: carrick_el1_abi::ExecutionBinding,
-    context: AddressContext<RootGpa>,
-}
-impl GrantExecution {
-    fn matches(self, current: Self) -> bool {
-        self.cpu == current.cpu
-            && self.binding == current.binding
-            && self.context == current.context
-    }
-}
-
-fn take_fork_table_stock(
-    stock: &mut Vec<RootGpa>,
-    child_bytes: u64,
-    parent_bytes: u64,
-) -> Option<(Vec<RootGpa>, Vec<RootGpa>)> {
-    if child_bytes == 0
-        || parent_bytes == 0
-        || !child_bytes.is_multiple_of(4096)
-        || !parent_bytes.is_multiple_of(4096)
-    {
-        return None;
-    }
-    let child = usize::try_from(child_bytes / 4096).ok()?;
-    let parent = usize::try_from(parent_bytes / 4096).ok()?;
-    if stock.len() < child.checked_add(parent)? {
-        return None;
-    }
-    let mut available = stock.clone();
-    available.sort_unstable_by_key(|page| page.address().raw());
-    if available.windows(2).any(|pair| pair[0] == pair[1]) {
-        return None;
-    }
-    fn take_run(pages: &mut Vec<RootGpa>, count: usize) -> Option<Vec<RootGpa>> {
-        let start = pages.windows(count).position(|run| {
-            run.windows(2).all(|pair| {
-                pair[0].address().raw().checked_add(4096) == Some(pair[1].address().raw())
-            })
-        })?;
-        Some(pages.drain(start..start + count).collect())
-    }
-    let (child_tables, parent_tables) = if child >= parent {
-        let child_tables = take_run(&mut available, child)?;
-        (child_tables, take_run(&mut available, parent)?)
-    } else {
-        let parent_tables = take_run(&mut available, parent)?;
-        (take_run(&mut available, child)?, parent_tables)
-    };
-    *stock = available;
-    Some((child_tables, parent_tables))
-}
-
 pub(super) type PrepareTableSpan = carrick_el1_abi::X86PrepareTableSpan;
 
 pub(super) fn prepare_table_working_bytes() -> Option<usize> {
@@ -249,13 +202,6 @@ fn reserve_table_stock(stock: &mut Vec<RootGpa>, required: usize) -> Option<Vec<
         return None;
     }
     Some(stock.drain(..required).collect())
-}
-
-pub(super) struct PendingForkLoan {
-    loan: carrick_el1_abi::ForkStockLoan,
-    execution: GrantExecution,
-    child_tables: Vec<RootGpa>,
-    parent_tables: Vec<RootGpa>,
 }
 
 pub(super) struct PendingPrepare {
@@ -406,6 +352,116 @@ impl<'a> CowPause<'a> {
     fn proof(&self) -> &carrick_el1_abi::ExcludedEditor<'_> {
         self.exclusion.proof()
     }
+}
+
+/// Release a reclaimed child's carrier-wide state: its frame-inventory rows
+/// and COW residency (shared composition), then its CR3/alias registrations
+/// and the memslots admitted only for it.
+fn release_retired_child(
+    memory: &mut CarrierMemory,
+    inventory: &dyn carrick_hal::PhysicalFrameInventory,
+    absence: &SlotAbsence,
+) -> Result<crate::carrier_memory::RetiredChild, TrapError> {
+    // SAFETY: the retained aligned residency table initialized at boot.
+    let residency = unsafe {
+        memory.retained_record::<carrick_el1_abi::FrameGrantResidencyTable>(FrameGpa::new(
+            KERNEL_REGION_GPA + carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET,
+        ))
+    }
+    .map_err(|e| fail(e.to_string()))?;
+    if !carrick_hal::fork_stock::release_child_mm(inventory, residency, absence.mm()) {
+        return Err(fail("retired child inventory or residency release"));
+    }
+    memory
+        .retire_child(absence, inventory)
+        .map_err(|e| fail(e.to_string()))
+}
+
+/// The fork stock exactly as KVM boot stocks it.
+pub(super) struct BootForkStock {
+    /// The dedicated maintenance-root grant (`MAINTENANCE_ROOT_TABLE_CREDITS`).
+    pub(super) maintenance: RootGpa,
+    /// The remaining unused initial table grants.
+    pub(super) tables: Vec<RootGpa>,
+    /// `FORK_LIFECYCLE_SLOTS` records in the metadata window.
+    pub(super) lifecycles: Vec<carrick_el1_abi::ForkLifecycleLoan>,
+}
+
+/// Split the unused initial table grants into the maintenance root (the
+/// first, which boot counted as its own credit) and the fork table stock,
+/// and lay out the lifecycle records.
+pub(super) fn boot_fork_stock(mut unused: Vec<RootGpa>) -> Result<BootForkStock, TrapError> {
+    if unused.len() <= super::MAINTENANCE_ROOT_TABLE_CREDITS {
+        return Err(fail(
+            "no initial table grant left after the maintenance root",
+        ));
+    }
+    let maintenance = unused.remove(0);
+    // The guest reads both roots through their retained supervisor aliases
+    // to verify the shared entries before every maintenance install.
+    if !maintenance_root_admitted(maintenance) {
+        return Err(fail("maintenance root has no CPL0 supervisor alias"));
+    }
+    let lifecycles = lifecycle_slots(
+        METADATA_VA,
+        METADATA_VA + FORK_LIFECYCLE_OFFSET,
+        FORK_LIFECYCLE_SLOTS,
+    )
+    .ok_or_else(|| fail("fork lifecycle stock layout"))?;
+    Ok(BootForkStock {
+        maintenance,
+        tables: unused,
+        lifecycles,
+    })
+}
+
+/// The guest must reach the maintenance root through a retained supervisor
+/// alias (the shared CPL0 table-alias rule) to verify it.
+fn maintenance_root_admitted(root: RootGpa) -> bool {
+    carrick_el1_abi::x86_cpl0_table_alias(root.address()).is_some()
+}
+
+/// One PML4 page as its 512 descriptor words.
+fn root_words(page: &[u8]) -> Option<[u64; 512]> {
+    if page.len() != 4096 {
+        return None;
+    }
+    let mut words = [0u64; 512];
+    for (word, bytes) in words.iter_mut().zip(page.chunks_exact(8)) {
+        *word = u64::from_le_bytes(bytes.try_into().ok()?);
+    }
+    Some(words)
+}
+
+/// The carrier maintenance root for `initial`: only its shared supervisor
+/// entries. The copy is taken once, at fork-stock installation. That is
+/// sound because shared PML4 entries are fixed at boot: every MM root
+/// already holds its own by-value copy of them (`initial_mm`, fork), so a
+/// shared entry published later would have to update every root, this one
+/// included; the guest's `install_maintenance_root` refuses a stale copy.
+fn maintenance_root_page(initial: &[u8]) -> Option<Vec<u8>> {
+    use carrick_mmu_core::owner_mmu::OwnerForkMmu;
+    let live = root_words(initial)?;
+    let mut root = vec![0u8; 4096];
+    for index in (256..512).filter(|index| X86Mmu::is_shared_root_entry(*index)) {
+        root[index * 8..index * 8 + 8].copy_from_slice(&live[index].to_le_bytes());
+    }
+    carrick_mmu_core::x86::owner_mmu::maintenance_root_matches(&live, &root_words(&root)?)
+        .then_some(root)
+}
+
+fn tables_resolve(memory: &CarrierMemory, pages: &[RootGpa]) -> bool {
+    pages
+        .iter()
+        .all(|page| memory.read(page.address(), 4096).is_ok())
+}
+
+fn tables_are_zero(memory: &CarrierMemory, pages: &[RootGpa]) -> bool {
+    pages.iter().all(|page| {
+        memory
+            .read(page.address(), 4096)
+            .is_ok_and(|bytes| bytes.iter().all(|byte| *byte == 0))
+    })
 }
 
 impl Cpl0HostCustody {
@@ -606,13 +662,167 @@ impl Cpl0HostCustody {
         Ok(status)
     }
 
+    /// Seed the bounded fork stock after the initial MM is published. One
+    /// unused initial table grant becomes the carrier's maintenance root:
+    /// only the initial root's shared supervisor branches, published as the
+    /// zone's idle root so a CPU can leave every process root before its
+    /// slot reports no installed MM. The rest become fork table stock.
+    pub(super) fn install_fork_stock(
+        &mut self,
+        initial_root: RootGpa,
+        unused: Vec<RootGpa>,
+    ) -> Result<(), TrapError> {
+        let BootForkStock {
+            maintenance,
+            tables,
+            lifecycles,
+        } = boot_fork_stock(unused)?;
+        // Every issued record must be provably cold; a record that is not
+        // zero at boot is a stocking fault, named here, never a refused fork.
+        let window = self.lifecycle_window();
+        if let Some(dirty) = lifecycles.iter().find(|life| !window.is_zero(**life)) {
+            return Err(fail(format!(
+                "fork lifecycle stock at {:#x} is not zero storage",
+                dirty.page.raw()
+            )));
+        }
+        let source = self
+            ._vm
+            .read(initial_root.address(), 4096)
+            .map_err(|e| fail(e.to_string()))?;
+        let root = maintenance_root_page(&source)
+            .ok_or_else(|| fail("maintenance root does not match the initial root"))?;
+        if self
+            ._vm
+            .read(maintenance.address(), 4096)
+            .map_err(|e| fail(e.to_string()))?
+            .iter()
+            .any(|byte| *byte != 0)
+        {
+            return Err(fail("maintenance root grant is not zero storage"));
+        }
+        self._vm
+            .write(maintenance.address(), &root)
+            .map_err(|e| fail(e.to_string()))?;
+        // Boot-time assertion of the invariant each guest exit re-checks:
+        // the published copy holds exactly the initial root's shared
+        // entries (see `maintenance_root_page`).
+        let published = self
+            ._vm
+            .read(maintenance.address(), 4096)
+            .map_err(|e| fail(e.to_string()))?;
+        if !root_words(&source)
+            .zip(root_words(&published))
+            .is_some_and(|(live, copy)| {
+                carrick_mmu_core::x86::owner_mmu::maintenance_root_matches(&live, &copy)
+            })
+        {
+            return Err(fail(
+                "published maintenance root diverged from the initial root",
+            ));
+        }
+        retained_cow_zone(&self.ram)?
+            .spaces
+            .set_idle_ttbr(maintenance.address().raw());
+        self.fork_stock
+            .install(tables, lifecycles)
+            .map_err(|e| fail(format!("fork stock install: {e:?}")))
+    }
+
+    /// The retained metadata window holding the fork lifecycle stock.
+    fn lifecycle_window(&self) -> LifecycleWindow {
+        // SAFETY: `metadata_base` retains META_LEN host bytes backing
+        // METADATA_VA for the VM lifetime.
+        unsafe { LifecycleWindow::new(self.metadata_base.0, METADATA_VA, META_LEN) }
+    }
+
+    /// Return quarantined child stock whose MM no zone slot has installed.
+    /// The servicing CPU's own MM is never a candidate. Inside the shared
+    /// reclaim, before any of the child's stock can be reissued, the child's
+    /// carrier state is released (frame inventory, COW residency, CR3 and
+    /// aliases, private memslots); a refused release keeps it quarantined.
+    fn drain_fork_quarantine(&mut self, execution: GrantExecution) -> Result<(), TrapError> {
+        let active = ReservationMm::new(execution.binding.mm.raw())
+            .ok_or_else(|| fail("fork quarantine active MM"))?;
+        let zone = retained_cow_zone(&self.ram)?;
+        // `CPL0_CPU_COUNT` has one definition (`cpl0_entry.rs`), compiled
+        // into the guest by `#[path]`; the guest drain scans the same slots.
+        const _: () =
+            assert!(carrick_x86::cpl0_entry::CPL0_CPU_COUNT <= carrick_sched_core::ZONE_SLOTS);
+        let installed: Vec<u64> = (0..carrick_x86::cpl0_entry::CPL0_CPU_COUNT)
+            .filter_map(|slot| u8::try_from(slot).ok())
+            .map(|slot| zone.installed_space(SlotId::new(slot)))
+            .collect();
+        let window = self.lifecycle_window();
+        let inventory = Arc::clone(&self.frame_inventory);
+        let memory = std::cell::RefCell::new(&mut self._vm);
+        let zero = [0u8; 4096];
+        self.fork_stock
+            .reclaim(
+                &mut NoTableLedger,
+                active,
+                |mm| SlotAbsence::scan(mm, installed.iter().copied()),
+                |tables| {
+                    let mut memory = memory.borrow_mut();
+                    tables
+                        .iter()
+                        .all(|page| memory.write(page.address(), &zero).is_ok())
+                },
+                |lifecycle| window.clear(lifecycle),
+                |absence| {
+                    release_retired_child(&mut memory.borrow_mut(), &*inventory, absence).is_ok()
+                },
+            )
+            .map(|_| ())
+            // A refused release, clear or tag retirement defers only that
+            // child (counted as `reclaim_deferral`, retried next drain).
+            // What remains is a broken custody invariant, never guest input.
+            .map_err(|e| fail(format!("fork quarantine custody invariant: {e:?}")))
+    }
+
+    /// A fork child left the shared owner graph: quarantine its stock. The
+    /// record must name this stopped CPU's live binding and child root. A
+    /// refusal is a typed reply in the record (the guest fails only that
+    /// process's stock return); only an unreadable record stops the carrier.
+    pub(super) fn service_child_retire(
+        &mut self,
+        lease: &StoppedCpuLease<'_>,
+    ) -> Result<(), TrapError> {
+        let execution = self.physical_execution(lease)?;
+        // SAFETY: the retire record consists of eight fully initialized u64s.
+        let (physical, mut record) = unsafe {
+            self.read_stack_record::<carrick_el1_abi::NativeChildRetire>(
+                lease,
+                execution.context,
+                lease.vcpu.get_gpr(X86Reg::Rax)?,
+            )
+        }?;
+        // Refusal is recorded in the reply word and counted by the stock.
+        let _ = self.fork_stock.retire_child(execution, &mut record);
+        // SAFETY: the record is a fully initialized array of eight u64 words.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&raw const record).cast::<u8>(),
+                size_of::<carrick_el1_abi::NativeChildRetire>(),
+            )
+        };
+        self._vm
+            .write(physical, bytes)
+            .map_err(|e| fail(e.to_string()))
+    }
+
+    /// Counters of the shared fork stock (loans, counted refusals, returns).
+    pub(super) fn fork_stock_counters(&self) -> carrick_hal::fork_stock::ForkStockCounters {
+        self.fork_stock.counters()
+    }
+
     pub(super) fn service_fork_stock(
         &mut self,
         lease: &StoppedCpuLease<'_>,
     ) -> Result<(), TrapError> {
-        use carrick_el1_abi::{ForkLifecycleLoan, ForkStockExchange, ForkStockRefusal};
-        use carrick_guest_arch::KernelVa;
+        use carrick_el1_abi::ForkStockExchange;
         let execution = self.physical_execution(lease)?;
+        self.drain_fork_quarantine(execution)?;
         let address = lease.vcpu.get_gpr(X86Reg::Rax)?;
         let (_, tag) = unsafe { self.read_stack_record::<u64>(lease, execution.context, address) }?;
         match carrick_el1_abi::ForkStockKind::decode(tag) {
@@ -641,88 +851,18 @@ impl Cpl0HostCustody {
             );
         }
         let mut record = unsafe { record.assume_init() };
-        let request = record
-            .request()
-            .ok_or_else(|| fail("physical fork stock malformed request"))?;
-        let index = lease.cpu.raw() as usize;
-        if request.binding != execution.binding
-            || request.context != execution.context
-            || request.operation.carrier != self._vm.identity().nonzero()
-        {
-            record.refuse(ForkStockRefusal::Stale);
-        } else if self.fork_pending[index].is_some() || !self.fork_lifecycle_available {
-            record.refuse(ForkStockRefusal::Capacity);
-        } else if let Some((child_tables, parent_tables)) = take_fork_table_stock(
-            &mut self.grant_tables,
-            request.child_bytes,
-            request.parent_bytes,
-        ) {
-            let lifecycle = ForkLifecycleLoan::new(
-                KernelVa::new(METADATA_VA + 0x4000),
-                KernelVa::new(METADATA_VA + 0x5000),
-            )
-            .ok_or_else(|| fail("physical fork lifecycle layout"))?;
-            let id = NonZeroU64::new(self.fork_next_loan)
-                .ok_or_else(|| fail("physical fork loan identity exhausted"))?;
-            self.fork_next_loan = self
-                .fork_next_loan
-                .checked_add(1)
-                .ok_or_else(|| fail("physical fork loan identity exhausted"))?;
-            let child_base = child_tables[0].address().raw();
-            let parent_base = parent_tables[0].address().raw();
-            let loan = request
-                .admit_loan(
-                    child_base,
-                    parent_base,
-                    KERNEL_REGION_GPA,
-                    id,
-                    lifecycle,
-                    None,
-                )
-                .ok_or_else(|| fail("physical fork loan geometry"))?;
-            // The one-use metadata gap is cold physical stock. The guest
-            // initializes its typed lifecycle/census before claiming a task.
-            // SAFETY: these reserved disjoint ranges remain unexposed under
-            // the host's exclusive physical loan token.
-            let fresh = unsafe {
-                std::slice::from_raw_parts(
-                    self.metadata_base.as_ptr().add(0x4000),
-                    size_of::<ThreadLifecyclePage>(),
-                )
-                .iter()
-                .all(|byte| *byte == 0)
-                    && std::slice::from_raw_parts(
-                        self.metadata_base.as_ptr().add(0x5000),
-                        size_of::<ThreadControlSlot>() * 9,
-                    )
-                    .iter()
-                    .all(|byte| *byte == 0)
-            };
-            if !fresh {
-                self.grant_tables.extend(child_tables);
-                self.grant_tables.extend(parent_tables);
-                return Err(fail("physical fork lifecycle stock is not fresh"));
-            }
-            self.fork_lifecycle_available = false;
-            self.fork_pending[index] = Some(PendingForkLoan {
-                loan,
-                execution,
-                child_tables,
-                parent_tables,
-            });
-            if !record.grant(
-                child_base,
-                parent_base,
-                KERNEL_REGION_GPA,
-                id,
-                lifecycle,
-                None,
-            ) {
-                return Err(fail("physical fork stock reply changed"));
-            }
-        } else {
-            record.refuse(ForkStockRefusal::Capacity);
+        if record.request().is_none() {
+            return Err(fail("physical fork stock malformed request"));
         }
+        // Lifecycle stock is cold zero storage until the guest initializes
+        // its typed census. The shared policy withdraws a dirty record and
+        // answers with a typed Inventory refusal (same on every carrier).
+        let window = self.lifecycle_window();
+        let _ = self
+            .fork_stock
+            .loan(&mut NoTableLedger, execution, &mut record, |lifecycle| {
+                window.is_zero(lifecycle)
+            });
         // SAFETY: expose only initialized u64 fields/padding in the copied ABI
         // record. The stopped CPU exclusively owns these validated stack bytes.
         let bytes = unsafe {
@@ -743,39 +883,28 @@ impl Cpl0HostCustody {
         address: u64,
     ) -> Result<(), TrapError> {
         use carrick_el1_abi::{ForkStockSettlement, PortalForkCustody};
-        let index = lease.cpu.raw() as usize;
-        let pending = self.fork_pending[index]
-            .as_ref()
-            .ok_or_else(|| fail("physical fork settlement without loan"))?;
-        if !pending.execution.matches(execution) {
-            return Err(fail("physical fork settlement stale execution"));
-        }
-        let loan = pending.loan;
+        let loan = self
+            .fork_stock
+            .settlement_loan(execution)
+            .map_err(|e| fail(format!("physical fork settlement: {e:?}")))?;
         let (physical, mut record) = unsafe {
             self.read_stack_record::<ForkStockSettlement>(lease, execution.context, address)
         }?;
-        if record.abort_matches(loan) {
-            // A restored descriptor tree needs its own exact guest receipt;
-            // this early-abort form licenses only untouched cold table stock.
-            for page in pending.child_tables.iter().chain(&pending.parent_tables) {
-                if self
-                    ._vm
-                    .read(page.address(), 4096)
-                    .map_err(|e| fail(e.to_string()))?
-                    .iter()
-                    .any(|byte| *byte != 0)
-                {
-                    return Err(fail("physical fork abort retains exposed table loan"));
-                }
-            }
-            let pending = self.fork_pending[index]
-                .take()
-                .ok_or_else(|| fail("physical fork abort loan changed"))?;
-            self.grant_tables.extend(pending.child_tables);
-            self.grant_tables.extend(pending.parent_tables);
-            // Initialized lifecycle stock remains exclusive and is retained;
-            // reuse requires a separate retired lifecycle receipt.
-        } else {
+        // An early abort licenses only untouched cold table stock, which the
+        // shared settlement proves zero; a restored descriptor tree would
+        // need its own exact guest receipt. A commit first attaches the
+        // child's inherited frames and residency.
+        if !record.abort_matches(loan) {
+            // Validate the whole commit before attaching any inherited
+            // frame, so nothing is published for a refused commit.
+            self.fork_stock
+                .validate_commit(
+                    execution,
+                    &record,
+                    |pages| tables_resolve(&self._vm, pages),
+                    |pages| tables_are_zero(&self._vm, pages),
+                )
+                .map_err(|e| fail(format!("physical fork settlement: {e:?}")))?;
             let (completion, custody, count) = record
                 .request(loan)
                 .ok_or_else(|| fail("physical fork settlement receipt"))?;
@@ -943,23 +1072,19 @@ impl Cpl0HostCustody {
                     return Err(fail("physical fork child commit proof"));
                 }
             }
-            let mut pending = self.fork_pending[index]
-                .take()
-                .ok_or_else(|| fail("physical fork settlement loan changed"))?;
-            self.grant_tables.extend(
-                pending
-                    .child_tables
-                    .drain(completion.child_tables_used as usize / 4096..),
-            );
-            self.grant_tables.extend(
-                pending
-                    .parent_tables
-                    .drain(completion.parent_tables_used as usize / 4096..),
-            );
         }
-        if !record.accept(loan) {
-            return Err(fail("physical fork settlement reply changed"));
-        }
+        let window = self.lifecycle_window();
+        let memory = &self._vm;
+        self.fork_stock
+            .settle(
+                &mut NoTableLedger,
+                execution,
+                &mut record,
+                |pages| tables_resolve(memory, pages),
+                |pages| tables_are_zero(memory, pages),
+                |lifecycle| window.clear(lifecycle),
+            )
+            .map_err(|e: ForkStockServiceError| fail(format!("physical fork settlement: {e:?}")))?;
         // SAFETY: settlement is a fully initialized array of sixteen u64 words.
         let bytes = unsafe {
             std::slice::from_raw_parts(
@@ -1677,36 +1802,130 @@ mod custody_tests {
         );
     }
 
+    /// The real KVM boot stock, in the worst case the credits are sized for
+    /// (the initial MM used its whole worst-case tables and its own COW
+    /// branch), still serves the first fork's COW branch after the
+    /// maintenance root is taken. Without the dedicated credit this loan
+    /// was refused for capacity.
+    #[test]
+    fn real_boot_stock_serves_the_first_fork_after_the_maintenance_root() {
+        use carrick_el1_abi::{
+            ForkStockExchange, ForkStockRequest, PortalOperation, ReservationGeneration,
+        };
+        use carrick_hal::fork_stock::{ForkStock, UntaggedRoots};
+        let data_pages = 2;
+        let table_grants = super::initial_table_grant_count(data_pages).unwrap();
+        let first_fork_branch = carrick_mmu_core::x86::copy_window::COW_COPY_TABLE_PAGES;
+        let used = table_grants - first_fork_branch - super::MAINTENANCE_ROOT_TABLE_CREDITS;
+        let frame_offset = 0x3000;
+        let unused: Vec<RootGpa> = (used..table_grants)
+            .map(|index| {
+                RootGpa::page_aligned(super::initial_grant_gpa(frame_offset, index)).unwrap()
+            })
+            .collect();
+        let boot = boot_fork_stock(unused).unwrap();
+        assert_eq!(boot.tables.len(), first_fork_branch);
+        let mut metadata = vec![0u64; (META_LEN / 8) as usize];
+        // SAFETY: the zeroed vector outlives every use of the window.
+        let window = unsafe {
+            LifecycleWindow::new(
+                core::ptr::NonNull::new(metadata.as_mut_ptr().cast::<u8>()).unwrap(),
+                METADATA_VA,
+                META_LEN,
+            )
+        };
+        assert!(boot.lifecycles.iter().all(|life| window.is_zero(*life)));
+        let carrier = NonZeroU64::new(7).unwrap();
+        let mut stock = ForkStock::new(carrier, KERNEL_REGION_GPA, UntaggedRoots);
+        stock.install(boot.tables, boot.lifecycles).unwrap();
+        let exec = execution();
+        let request = ForkStockRequest {
+            binding: exec.binding,
+            context: exec.context,
+            operation: PortalOperation {
+                carrier,
+                mm: ReservationMm::new(302).unwrap(),
+                incarnation: NonZeroU64::MIN,
+                sequence: NonZeroU64::new(2).unwrap(),
+            },
+            parent_generation: ReservationGeneration::INITIAL,
+            child_mm: ReservationMm::new(303).unwrap(),
+            child_bytes: (first_fork_branch as u64 - 1) * 4096,
+            parent_bytes: 4096,
+        };
+        let mut exchange = ForkStockExchange::new(request).unwrap();
+        let loan = stock
+            .loan(&mut NoTableLedger, exec, &mut exchange, |life| {
+                window.is_zero(life)
+            })
+            .unwrap();
+        assert_eq!(exchange.take(request), Some(Ok(loan)));
+        assert_eq!(stock.counters().loans, 1);
+    }
+
+    #[test]
+    fn real_boot_layout_maintenance_root_is_admitted() {
+        // The carrier takes the first unused initial table grant, staged in
+        // the initial extent after the boot records.
+        for (frame_offset, first_unused) in [(0x1000, 1), (0x3000, 4), (0x10_0000, 63)] {
+            let root =
+                RootGpa::page_aligned(initial_grant_gpa(frame_offset, first_unused)).unwrap();
+            assert!(
+                maintenance_root_admitted(root),
+                "{frame_offset:#x}/{first_unused}"
+            );
+        }
+        let outside = RootGpa::page_aligned(FrameGpa::new(
+            carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_GPA
+                + carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_MAX_SIZE,
+        ))
+        .unwrap();
+        assert!(!maintenance_root_admitted(outside));
+    }
+
+    #[test]
+    fn maintenance_root_copies_only_the_shared_supervisor_entries() {
+        let mut initial = vec![0u8; 4096];
+        for (index, word) in [
+            (0usize, 0x1003u64),
+            (255, 0x2003),
+            (256, 0x3003),
+            (508, 0x4003),
+            (511, 0x5003),
+        ] {
+            initial[index * 8..index * 8 + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        let root = root_words(&maintenance_root_page(&initial).unwrap()).unwrap();
+        // User half and the MM-private COW copy branch stay zero.
+        assert_eq!((root[0], root[255], root[508]), (0, 0, 0));
+        assert_eq!((root[256], root[511]), (0x3003, 0x5003));
+        // A shared entry published after the copy is detected.
+        let live = root_words(&initial).unwrap();
+        let mut changed = live;
+        changed[300] = 0x6003;
+        assert!(carrick_mmu_core::x86::owner_mmu::maintenance_root_matches(
+            &live, &root
+        ));
+        assert!(!carrick_mmu_core::x86::owner_mmu::maintenance_root_matches(
+            &changed, &root
+        ));
+        assert!(maintenance_root_page(&initial[..4088]).is_none());
+    }
+
     #[test]
     fn production_physical_ports_do_not_alias_native_or_fixture_doorbells() {
-        let physical = [
-            carrick_el1_abi::FORK_STOCK_PORT,
-            carrick_el1_abi::NATIVE_ROOT_EXIT_PORT,
-            carrick_el1_abi::NATIVE_PEER_READY_PORT,
-        ];
-        let existing = [
-            FAULT_DOORBELL_PORT,
-            FORWARD_PORT,
-            CONTROL_PORT,
-            ENTRY_KICK_PORT,
-            RETURN_KICK_PORT,
-            WORK_PORT,
-            FATAL_PORT,
-            YIELD_PORT,
-            OWNER_GRANT_PORT,
-            carrick_el1_abi::X86_INITIAL_BOOT_PORT,
-            carrick_x86::FP_STUB_DOORBELL_PORT,
-            carrick_x86::cpl0_scheduler::PROGRESS_ENTRY_PORT,
-            carrick_x86::cpl0_scheduler::PROGRESS_RETURN_PORT,
-            carrick_x86::cpl0_scheduler::PROGRESS_DONE_PORT,
-        ];
-        for (index, port) in physical.iter().enumerate() {
+        for (index, port) in CPL0_CARRIER_PORTS.iter().enumerate() {
             assert!(
-                !existing.contains(port),
-                "physical port {port:#x} aliases an existing doorbell"
+                !CPL0_CARRIER_PORTS[..index].contains(port),
+                "CPL0 carrier port {port:#x} is decoded twice"
             );
-            assert!(!physical[..index].contains(port));
         }
+        // The bhyve-only FP-stub doorbell shares its number with the
+        // initial-boot port, which this carrier decodes exactly once.
+        assert_eq!(
+            carrick_x86::FP_STUB_DOORBELL_PORT,
+            carrick_el1_abi::X86_INITIAL_BOOT_PORT
+        );
     }
 
     #[test]
@@ -1901,6 +2120,7 @@ mod custody_tests {
     }
     #[test]
     fn fork_physical_stock_requires_exact_disjoint_contiguous_capacity() {
+        use carrick_hal::fork_stock::take_fork_table_stock;
         let page = |address| RootGpa::page_aligned(FrameGpa::new(address)).unwrap();
         let mut holes = vec![page(0x1000), page(0x3000), page(0x5000)];
         let before = holes.clone();
