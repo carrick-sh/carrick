@@ -266,6 +266,16 @@ pub fn run_prepared_kvm_pool(
         guest_refusal_families: count_family(refusal_families),
     });
     let (exit_code, terminating_signal, traps, fault_record, run_failure) = match outcome {
+        carrick_vmm_kvm::cpl0_boot::InitialProcessExit::OwnedExit { status, exits } => {
+            let signal = status.term_signal().map(i32::from);
+            (
+                signal.map_or(status.raw() >> 8, |signal| 128 + signal),
+                signal,
+                exits,
+                None,
+                None,
+            )
+        }
         carrick_vmm_kvm::cpl0_boot::InitialProcessExit::RunFailed { reason, exits } => {
             (125, None, exits, None, Some(reason))
         }
