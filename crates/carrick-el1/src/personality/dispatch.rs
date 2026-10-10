@@ -587,6 +587,9 @@ impl<
     fn file_venue(&mut self) -> Option<&mut dyn PendingFileVenue> {
         Some(self)
     }
+    fn sched_venue(&mut self) -> Option<&mut dyn carrick_personality_linux::sched::SchedVenue> {
+        Some(self)
+    }
     fn task_state(&self) -> Option<&LinuxTaskState> {
         self.task().map(|task| &task.linux)
     }
@@ -958,6 +961,41 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
     }
     fn task(&self) -> Option<&CurrentTask> {
         self.current_tasks.get(self.frame.task_index())
+    }
+}
+
+impl<
+    F: Fn(u32) -> *mut u8,
+    C: sched::ThreadCpu,
+    U: sched::UserWord,
+    G: GuestDispatchFrame,
+    Context: DispatchContext,
+> carrick_personality_linux::sched::SchedVenue for El1PendingFamilies<'_, F, C, U, G, Context>
+{
+    fn argument(&self, index: usize) -> u64 {
+        self.frame.argument(index).unwrap_or(0)
+    }
+    fn current_pid(&self) -> Option<u32> {
+        self.current_tasks
+            .get(self.frame.task_index())
+            .and_then(|t| t.visible_pid())
+    }
+    fn copy_out(&mut self, dst: carrick_guest_arch::UserVa, src: &[u8]) -> bool {
+        #[cfg(test)]
+        if let Some(user) = &mut self.lifecycle_user {
+            return user.copy_out(dst.raw(), src);
+        }
+        let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
+            return false;
+        };
+        crate::file::UserCopy::copy_out(
+            &mut crate::file::ValidatedCopy {
+                task,
+                validator: &crate::file::HardwareValidator,
+            },
+            dst.raw(),
+            src,
+        )
     }
 }
 

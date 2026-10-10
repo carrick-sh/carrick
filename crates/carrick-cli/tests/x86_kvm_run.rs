@@ -349,6 +349,35 @@ fn mounted_static_x86_poll_stdio_matches_native() {
 }
 
 #[test]
+fn mounted_static_x86_sched_inring_matches_native() {
+    compare_mounted_assembly_with_native("x86_sched_inring.S", b"S\n");
+}
+
+#[test]
+fn mounted_static_x86_sched_unported_refusal_returns_enosys() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("sched-refusal");
+    compile_assembly("x86_sched_refusal.S", &elf);
+    let run = run_mounted_binary(&elf, "sched-refusal", false);
+    assert_eq!(
+        run.stdout,
+        b"R\n",
+        "status: {:?}; stderr: {}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        run.status.code(),
+        Some(7),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
 #[ignore = "CPL0 startup needs guest rt_sigaction, lifecycle copy, and anonymous mprotect"]
 fn mounted_static_x86_dispatches_libc_startup_calls() {
     compare_mounted_assembly_with_native("x86_dispatch_startup.S", b"S\n");
