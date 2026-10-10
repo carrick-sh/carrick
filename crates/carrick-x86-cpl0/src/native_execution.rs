@@ -74,7 +74,10 @@ pub(super) fn leave_space(source: BornInZoneSource<'static, ParkedContextWords>)
         else {
             initial_boot::fatal_boot();
         };
-        if x86::interrupt::install_maintenance_root(root).is_err() {
+        // Already parked on the maintenance root: no second CR3 write.
+        if x86::hardware_live_root().ok() != Some(root)
+            && x86::interrupt::install_maintenance_root(root).is_err()
+        {
             initial_boot::fatal_boot();
         }
     }
@@ -88,7 +91,6 @@ pub(super) fn leave_space(source: BornInZoneSource<'static, ParkedContextWords>)
 pub(super) fn schedule(slot: SlotId) -> ! {
     let source = source(slot);
     let current = task();
-    leave_space(source);
     loop {
         if let Some(selected) = source.zone.switch_in_full(slot) {
             source.zone.leave_idle(slot);
@@ -98,6 +100,11 @@ pub(super) fn schedule(slot: SlotId) -> ! {
                 .record_binding(record)
                 .unwrap_or_else(|| initial_boot::fatal_boot());
             let identity = source.zone.record(selected.record).identity();
+            // Resuming the MM already installed here needs no detour through
+            // the maintenance root (the context install reloads CR3 once).
+            if source.zone.installed_space(slot) != state.address.mm.raw().get() {
+                leave_space(source);
+            }
             source
                 .zone
                 .install_space(slot, state.address.mm.raw().get())
@@ -141,6 +148,8 @@ pub(super) fn schedule(slot: SlotId) -> ! {
                 Err(_) => initial_boot::fatal_boot(),
             }
         }
+        // Idle off every process root, so an idle CPU walks no MM's tables.
+        leave_space(source);
         if source.zone.enter_idle(slot, true) {
             // SAFETY: the shared slot lock closed the queue-vs-sleep race;
             // STI's shadow makes the HLT atomic with enabling wake delivery.
