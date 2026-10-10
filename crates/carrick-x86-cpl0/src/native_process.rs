@@ -664,6 +664,12 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         if !super::native_execution::leave_space(source) {
             fatal();
         }
+        // The MM never runs again (its gate is closed and this CPU left its
+        // root): forget its live context so the root page, which the carrier
+        // reclaims into fork stock, can be admitted for the next child.
+        if !anonymous::retire_context(mm) {
+            fatal();
+        }
         let roots = core::ptr::from_ref(owner.roots).addr();
         RETIRED_SPACES.push(RetiredSpace {
             carrier: owner.carrier,
@@ -705,7 +711,13 @@ fn settle(born: Box<Born>, worker: u32) -> Result<(), (NativeProcessError, Box<B
     if !matches!(exchange.take(p.loan), Some(Ok(()))) {
         return Err((NativeProcessError::Quarantined, born));
     }
-    anonymous::admit_context(p.address);
+    // The child's first syscall capture authenticates this context. A root
+    // reissued from fork stock is free here because the retired child that
+    // held it left `LIVE_CONTEXTS` in `retire_mm`; a refusal is an owner
+    // custody fault, reported rather than discovered at that capture.
+    if !anonymous::admit_context(p.address) {
+        return Err((NativeProcessError::Stale, born));
+    }
     let owner = match portal() {
         Ok(owner) => owner,
         Err(error) => return Err((error, born)),
