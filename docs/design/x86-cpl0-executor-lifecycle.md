@@ -184,6 +184,13 @@ snapshot and a safe physical detach, not the IO-exit observation alone.
 
 ### M-b physical run ownership refinement
 
+The scheduler's `ExecutorRegistration` is the authority for a worker's guest
+CPU. The shared factory receives that registration, and the KVM adapter
+claims the matching physical slot from the carrier. It checks the claimed
+vCPU's physical identity against the registered CPU before running any task.
+An independent factory counter cannot establish that relationship when a
+worker is replaced or registration order changes.
+
 The retained shootdown table is in the carrier RAM aperture, while KVM's VM
 handle and physical run flag have separate owners. A worker's production run
 context therefore retains `GuestRam`, the exact shared `VmFd`, the two physical
