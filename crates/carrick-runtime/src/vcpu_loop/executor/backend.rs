@@ -209,8 +209,12 @@ impl HvpatchResidencyHandle {
                 let guard = self.residency.lock();
                 match &*guard {
                     Some(TaskCpuResidency::Materialized(cpu)) => return Ok(Some(cpu.clone())),
-                    Some(TaskCpuResidency::Zone { base, record }) => {
-                        return super::residency::materialize_zone(base, *record).map(Some);
+                    Some(TaskCpuResidency::Zone {
+                        base,
+                        record,
+                        owner,
+                    }) => {
+                        return super::residency::materialize_zone(base, *record, *owner).map(Some);
                     }
                     None => return Ok(None),
                     Some(TaskCpuResidency::Resident { .. }) => {}
@@ -222,8 +226,12 @@ impl HvpatchResidencyHandle {
         loop {
             match &*guard {
                 Some(TaskCpuResidency::Materialized(cpu)) => return Ok(Some(cpu.clone())),
-                Some(TaskCpuResidency::Zone { base, record }) => {
-                    return super::residency::materialize_zone(base, *record).map(Some);
+                Some(TaskCpuResidency::Zone {
+                    base,
+                    record,
+                    owner,
+                }) => {
+                    return super::residency::materialize_zone(base, *record, *owner).map(Some);
                 }
                 None => return Ok(None),
                 Some(TaskCpuResidency::Resident { .. }) => {
@@ -814,8 +822,12 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             ),
             // Parked in the in-guest zone: its registers are in the record
             // its handback made host-owned (the job frees it on resume).
-            Some(TaskCpuResidency::Zone { base, record }) => (
-                Some(super::residency::materialize_zone(&base, record)?),
+            Some(TaskCpuResidency::Zone {
+                base,
+                record,
+                owner,
+            }) => (
+                Some(super::residency::materialize_zone(&base, record, owner)?),
                 "zone",
             ),
             _ => (None, "lease"),
@@ -1131,10 +1143,21 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         // A task its job parked in the in-guest zone keeps its registers in
         // the zone record: never leave it resident on this vCPU (whose
         // registers may be another thread's by now).
-        let zone_save = self
+        let mut zone_save = self
             .binding
             .as_ref()
             .and_then(|binding| binding.take_zone_save());
+        if let Some(save) = &mut zone_save {
+            let Some(binding) = self.binding.as_ref() else {
+                return Err(ExecutorSaveError::new(
+                    TrapError::Hypervisor("zone save lost task binding".into()),
+                    lease,
+                ));
+            };
+            if let Err(error) = restore_guest_idle_task_roots(&mut save.base, binding) {
+                return Err(ExecutorSaveError::new(error, lease));
+            }
+        }
         let installed_mm = zone_slot
             .zip(carrick_kernel::el1_zone::zone())
             .map_or(mm.raw(), |(slot, zone)| zone.installed_space(slot));
@@ -1225,6 +1248,13 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             backend.set_residency(TaskCpuResidency::Zone {
                 base: zone_save.base,
                 record: zone_save.record,
+                owner: super::residency::ZoneTaskIdentity {
+                    tid: carrick_el1_abi::El1TaskId::from_linux_tid(lease.thread_key().tid.raw())
+                        .raw(),
+                    serial: lease.thread_key().serial.raw(),
+                    mm: mm.raw(),
+                    generation: lease.generation().raw(),
+                },
             });
             self.resident_task = ExecutorTaskResidence::Detached;
             self.residency_generation = self.residency_generation.next();
