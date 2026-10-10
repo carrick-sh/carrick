@@ -8687,4 +8687,326 @@ mod tests {
             );
         }
     }
+
+    struct FaultyPhysical<'a> {
+        zone: &'a ZoneTables<ParkedContextWords>,
+        child_pages: Vec<ThreadLifecyclePage>,
+        child_controls: Vec<[ThreadControlSlot; 9]>,
+        active_loan: Option<usize>,
+        next_page: usize,
+        loan_in_flight: bool,
+        abort_count: usize,
+        fail_context: bool,
+        fail_fd_table: bool,
+        fail_commit: bool,
+    }
+
+    impl<'a> NativeProcessService<'a, ParkedContextWords> for FaultyPhysical<'a> {
+        type Mm = AddressContext<RootGpa>;
+        type PreparedMm = AddressContext<RootGpa>;
+        type Born = AddressContext<RootGpa>;
+
+        fn prepare_mm(
+            &mut self,
+            _: &Self::Mm,
+            _: ParkedContextWords,
+            child: MmGeneration,
+        ) -> Result<Self::PreparedMm, NativeProcessError> {
+            assert!(
+                !self.loan_in_flight,
+                "refusing loan: previous loan is still pending on this vCPU"
+            );
+            let address = AddressContext {
+                root: RootGpa::page_aligned(FrameGpa::new(
+                    0x2000 + (self.next_page as u64) * 0x1000,
+                ))
+                .unwrap(),
+                mm: child,
+                generation: ContextGeneration::new(NonZeroU64::MIN),
+            };
+            self.zone
+                .spaces
+                .publish_closed(child.raw().get(), address.root.address().raw(), 0)
+                .ok_or(NativeProcessError::Exhausted)?;
+            self.loan_in_flight = true;
+            let idx = self.next_page;
+            self.next_page += 1;
+            self.active_loan = Some(idx);
+            Ok(address)
+        }
+
+        fn prepared_mm(&self, p: &Self::PreparedMm) -> Self::Mm {
+            *p
+        }
+
+        fn prepared_context(&self, p: &Self::PreparedMm) -> AddressContext<RootGpa> {
+            if self.fail_context {
+                let mut bad = *p;
+                bad.mm = MmGeneration::new(NonZeroU64::new(bad.mm.raw().get() + 999).unwrap());
+                return bad;
+            }
+            *p
+        }
+
+        fn child_lifecycle(&self, _: &Self::PreparedMm) -> NativeLifecycleResources<'a> {
+            let idx = self.active_loan.expect("active loan for child_lifecycle");
+            // SAFETY: storage in child_pages and child_controls lives for 'a
+            unsafe {
+                NativeLifecycleResources {
+                    page: &*(&self.child_pages[idx] as *const _),
+                    controls: &*(&self.child_controls[idx][..] as *const _),
+                }
+            }
+        }
+
+        fn commit_mm(
+            &mut self,
+            p: Self::PreparedMm,
+        ) -> Result<Self::Born, (NativeProcessError, Self::PreparedMm)> {
+            if self.fail_commit {
+                return Err((NativeProcessError::Busy, p));
+            }
+            Ok(p)
+        }
+
+        fn abort_mm(
+            &mut self,
+            p: Self::PreparedMm,
+        ) -> Result<(), (NativeProcessError, Self::PreparedMm)> {
+            assert!(
+                self.loan_in_flight,
+                "abort_mm called without in-flight loan"
+            );
+            self.loan_in_flight = false;
+            self.abort_count += 1;
+            self.active_loan = None;
+            self.zone
+                .spaces
+                .free(self.zone.spaces.find(p.mm.raw().get()).unwrap());
+            Ok(())
+        }
+
+        fn settle_mm(&mut self, b: Self::Born) -> Result<(), (NativeProcessError, Self::Born)> {
+            assert!(
+                self.loan_in_flight,
+                "settle_mm called without in-flight loan"
+            );
+            self.loan_in_flight = false;
+            self.active_loan = None;
+            self.zone
+                .spaces
+                .open(self.zone.spaces.find(b.mm.raw().get()).unwrap());
+            Ok(())
+        }
+
+        fn copy_status(
+            &mut self,
+            _: &Self::Mm,
+            _: UserVa,
+            _: LinuxWaitStatus,
+        ) -> Result<(), NativeProcessError> {
+            Ok(())
+        }
+
+        fn quarantine_prepared(&mut self, _: Self::PreparedMm) {
+            panic!("unexpected quarantine")
+        }
+
+        fn quarantine_fork(
+            &mut self,
+            _: NativeForkPreparation<'a, Self::Mm, Self::PreparedMm, ParkedContextWords>,
+        ) {
+            panic!("unexpected fork quarantine")
+        }
+
+        fn quarantine_born(&mut self, _: Self::Born) {
+            panic!("unexpected quarantine")
+        }
+
+        fn retire_mm(&mut self, _: Self::Mm) {}
+
+        fn wake_effects(&mut self, _: WakeEffects) {}
+
+        fn fork_fd_table(&mut self, _: u64, _: u64) -> Result<(), NativeProcessError> {
+            if self.fail_fd_table {
+                return Err(NativeProcessError::Exhausted);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn fork_failure_injection_after_prepare_loaned_cleans_up_and_subsequent_fork_succeeds() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+
+        let mut service = FaultyPhysical {
+            zone: &zone,
+            child_pages: (0..16).map(|_| ThreadLifecyclePage::new()).collect(),
+            child_controls: (0..16)
+                .map(|_| core::array::from_fn(|_| ThreadControlSlot::new()))
+                .collect(),
+            active_loan: None,
+            next_page: 0,
+            loan_in_flight: false,
+            abort_count: 0,
+            fail_context: false,
+            fail_fd_table: false,
+            fail_commit: false,
+        };
+
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+
+        // 1. Injected failure at metadata validation (address.mm mismatch)
+        entry.service.fail_context = true;
+        let outcome1 = entry.fork();
+        assert!(matches!(
+            outcome1,
+            LifecycleOutcome::Returned { result, .. } if result.raw() == NativeProcessError::Stale.errno()
+        ));
+        assert_eq!(entry.service.abort_count, 1);
+        assert!(!entry.service.loan_in_flight);
+        entry.service.fail_context = false;
+
+        // Next fork succeeds!
+        let outcome2 = entry.fork();
+        let LifecycleOutcome::Returned { result: pid1, .. } = outcome2 else {
+            panic!("expected fork success after metadata validation recovery");
+        };
+        assert_eq!(pid1.raw(), 43);
+        assert_eq!(entry.service.abort_count, 1);
+        assert!(!entry.service.loan_in_flight);
+
+        // 2. Injected failure at fork_fd_table
+        entry.service.fail_fd_table = true;
+        let outcome3 = entry.fork();
+        assert!(matches!(
+            outcome3,
+            LifecycleOutcome::Returned { result, .. } if result.raw() == NativeProcessError::Exhausted.errno()
+        ));
+        assert_eq!(entry.service.abort_count, 2);
+        assert!(!entry.service.loan_in_flight);
+        entry.service.fail_fd_table = false;
+
+        // Next fork succeeds!
+        let outcome4 = entry.fork();
+        let LifecycleOutcome::Returned { result: pid2, .. } = outcome4 else {
+            panic!("expected fork success after fd_table recovery");
+        };
+        assert_eq!(pid2.raw(), 45);
+        assert_eq!(entry.service.abort_count, 2);
+        assert!(!entry.service.loan_in_flight);
+
+        // 3. Injected failure at commit_mm
+        entry.service.fail_commit = true;
+        let outcome5 = entry.fork();
+        assert!(matches!(
+            outcome5,
+            LifecycleOutcome::Returned { result, .. } if result.raw() == NativeProcessError::Busy.errno()
+        ));
+        assert_eq!(entry.service.abort_count, 3);
+        assert!(!entry.service.loan_in_flight);
+        entry.service.fail_commit = false;
+
+        // Next fork succeeds!
+        let outcome6 = entry.fork();
+        let LifecycleOutcome::Returned { result: pid3, .. } = outcome6 else {
+            panic!("expected fork success after commit recovery");
+        };
+        assert_eq!(pid3.raw(), 47);
+        assert_eq!(entry.service.abort_count, 3);
+        assert!(!entry.service.loan_in_flight);
+
+        // 4. Injected failure at alloc_record exhaustion
+        let mut filled_records = Vec::new();
+        while let Ok(r) = zone.alloc_record(ThreadIdentity {
+            tid: 900 + filled_records.len() as u64,
+            serial: 900,
+            mm: 1,
+            file_table: 5,
+            generation: 11,
+            affinity: 1,
+            lifecycle_page: &*page as *const _ as u64,
+            control_slot: &*control as *const _ as u64,
+        }) {
+            filled_records.push(r);
+        }
+        assert!(!filled_records.is_empty());
+
+        let outcome7 = entry.fork();
+        assert!(matches!(
+            outcome7,
+            LifecycleOutcome::Returned { result, .. } if result.raw() == NativeProcessError::Exhausted.errno()
+        ));
+        assert_eq!(entry.service.abort_count, 4);
+        assert!(!entry.service.loan_in_flight);
+
+        // Free one record so alloc_record can succeed
+        zone.free_record(filled_records.pop().unwrap());
+
+        // Next fork succeeds!
+        let outcome8 = entry.fork();
+        let LifecycleOutcome::Returned { result: pid4, .. } = outcome8 else {
+            panic!("expected fork success after alloc_record exhaustion recovery");
+        };
+        assert_eq!(pid4.raw(), 49);
+        assert_eq!(entry.service.abort_count, 4);
+        assert!(!entry.service.loan_in_flight);
+
+        for r in filled_records {
+            zone.free_record(r);
+        }
+    }
 }

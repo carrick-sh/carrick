@@ -175,7 +175,7 @@ pub(super) fn schedule(slot: SlotId) -> ! {
                                 .unwrap_or_else(|| initial_boot::fatal_boot());
                             let root_exit = entry.take_root_exit();
                             if let Some(status) = root_exit { publish_root_exit(current, status); }
-                            source.zone.release_space(slot);
+                            leave_space(source);
                             continue;
                         }
                         _ => initial_boot::fatal_boot(),
