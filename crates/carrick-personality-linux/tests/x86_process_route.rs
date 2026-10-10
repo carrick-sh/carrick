@@ -87,7 +87,7 @@ fn x86_sched_calls_route_to_neutral_sched_family() {
 fn arm_sigreturn_stays_with_host_frame_owner() {
     assert_eq!(route_aarch64(139, u64::MAX), Family::SignalReturn);
     assert_eq!(
-        carrick_personality_linux::dispatch::route_x86_64(139, u64::MAX),
+        carrick_personality_linux::dispatch::route_x86(139, u64::MAX),
         Family::Signal(carrick_personality_linux::signal::SignalCall::RtSigreturn)
     );
 }
@@ -96,7 +96,7 @@ fn arm_sigreturn_stays_with_host_frame_owner() {
 fn pidfds_remain_unported_until_the_native_owner_exists() {
     assert_eq!(route_aarch64(424, u64::MAX), Family::Unported);
     assert_eq!(
-        carrick_personality_linux::dispatch::route_x86_64(424, u64::MAX),
+        carrick_personality_linux::dispatch::route_x86(424, u64::MAX),
         Family::Unported
     );
 }
