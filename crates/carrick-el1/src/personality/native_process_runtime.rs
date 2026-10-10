@@ -1360,25 +1360,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.runtime.graph.lock().pending.insert(self.key, pending);
             return Some(self.fail(NativeProcessError::Stale));
         }
-        let graph = self.runtime.graph.lock();
-        let signals = graph
-            .owner
-            .task(self.key)
-            .ok()?
-            .native()
-            .resources()
-            .signals();
-        let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
-            carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
-        );
-        let interrupted = signals.has_deliverable(self.record, blocked);
-        drop(graph);
-        if interrupted {
-            self.interrupted_child_wait = Some(self.words);
-            return Some(returned(
-                carrick_personality_linux::abi::signal::LINUX_EINTR.guest_retval(),
-            ));
-        }
         Some(
             match self.wait_query(pending.query, pending.status, false) {
                 Ok(outcome) => outcome,
@@ -4373,13 +4354,17 @@ mod tests {
     }
     #[test]
     fn actual_compact_root_forks_a_shared_owner_child_with_distinct_visible_identity() {
-        compact_root_fork_wait_contract(false);
+        compact_root_fork_wait_contract(false, false);
     }
     #[test]
     fn caught_signal_interrupts_an_already_parked_owned_child_wait() {
-        compact_root_fork_wait_contract(true);
+        compact_root_fork_wait_contract(true, false);
     }
-    fn compact_root_fork_wait_contract(interrupt_wait: bool) {
+    #[test]
+    fn reapable_child_wins_over_its_caught_sigchld() {
+        compact_root_fork_wait_contract(false, true);
+    }
+    fn compact_root_fork_wait_contract(interrupt_wait: bool, catch_child_exit: bool) {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
         let zone = unsafe {
@@ -4457,12 +4442,12 @@ mod tests {
             let mut entry = runtime
                 .enter(source, &task, words(address), &mut service)
                 .unwrap();
-            if interrupt_wait {
+            if interrupt_wait || catch_child_exit {
                 use carrick_personality_linux::signal::ProcessSignals;
                 use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
                 entry
                     .rt_sigaction(
-                        Signal::from_number(10).unwrap(),
+                        Signal::from_number(if catch_child_exit { 17 } else { 10 }).unwrap(),
                         Some(Action {
                             disposition: Disposition::Handler(HandlerAddress(0x4000)),
                             ..Action::default()
