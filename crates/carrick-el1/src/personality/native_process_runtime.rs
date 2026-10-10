@@ -1101,14 +1101,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 ..
             } = &pending.payload
             {
-                let _ = self
-                    .ipc_env()
-                    .map(|(_, _, ipc)| ipc.lock().semop_suspend_exit(*semid, *sem_num, *is_zero));
+                let _ = self.ipc_env().map(|(_, pid, ipc)| {
+                    ipc.lock()
+                        .semop_suspend_exit(pid, *semid, *sem_num, *is_zero)
+                });
             }
             return returned(carrick_syscall_abi::LINUX_EAGAIN.guest_retval());
         }
 
-        let (_creds, _pid, ipc) = match self.ipc_env() {
+        let (_creds, pid, ipc) = match self.ipc_env() {
             Ok(env) => env,
             Err(e) => return returned(e),
         };
@@ -1190,7 +1191,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 blocking_sem,
             } => {
                 if let Some((sem_num, is_zero)) = blocking_sem {
-                    ipc.lock().semop_suspend_exit(semid, sem_num, is_zero);
+                    ipc.lock().semop_suspend_exit(pid, semid, sem_num, is_zero);
                 }
                 let raw_sops: Vec<carrick_personality_linux::ipc::LinuxSembuf> = ops
                     .iter()
@@ -1400,6 +1401,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .task(self.key)
             .ok()
             .map(|t| t.metadata().namespace_pid);
+        let _ = self.runtime.graph.lock().pending.remove(&self.key);
         if let Some(pid) = pid {
             let ipc = self.runtime.graph.lock().ipc.clone();
             let channels = ipc.lock().exit_process(pid);
@@ -2850,14 +2852,18 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             carrick_personality_linux::ipc::IPC_STAT | carrick_personality_linux::ipc::MSG_STAT => {
                 let ds = buf.ok_or(carrick_syscall_abi::LINUX_EFAULT.guest_retval())?;
                 ipc.lock()
-                    .msgctl_stat(&creds, msqid, ds)
+                    .msgctl_stat(&creds, msqid, cmd, ds)
                     .map_err(|e| e.guest_retval())
             }
             carrick_personality_linux::ipc::IPC_SET => {
                 let ds = buf.ok_or(carrick_syscall_abi::LINUX_EFAULT.guest_retval())?;
-                ipc.lock()
+                let (raised, channel) = ipc
+                    .lock()
                     .msgctl_set(&creds, msqid, ds)
                     .map_err(|e| e.guest_retval())?;
+                if raised {
+                    self.wake_ipc_channel(channel);
+                }
                 Ok(0)
             }
             _ => Err(carrick_syscall_abi::LINUX_EINVAL.guest_retval()),
@@ -3034,12 +3040,12 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         &mut self,
         semid: i32,
         _semnum: i32,
-        _cmd: i32,
+        cmd: i32,
         ds: &mut LinuxSemidDs,
     ) -> Result<i64, i64> {
         let (creds, _, ipc) = self.ipc_env()?;
         ipc.lock()
-            .semctl_stat(&creds, semid, ds)
+            .semctl_stat(&creds, semid, cmd, ds)
             .map_err(|e| e.guest_retval())
     }
 
@@ -3134,7 +3140,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             let ch_id = {
                 let mut ipc_guard = ipc.lock();
                 if let Some((num, is_zero)) = prev_blocking.take() {
-                    ipc_guard.semop_suspend_exit(semid, num, is_zero);
+                    ipc_guard.semop_suspend_exit(pid, semid, num, is_zero);
                 }
                 let set = ipc_guard.sem_set(semid).map_err(|e| {
                     if has_suspended && matches!(e, IpcError::InvalidArgument) {
@@ -3159,7 +3165,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
                         }
                     })?;
                 if let SemopOutcome::Suspend { sem_num, is_zero } = outcome {
-                    ipc_guard.semop_suspend_enter(semid, sem_num, is_zero);
+                    ipc_guard.semop_suspend_enter(pid, semid, sem_num, is_zero);
                 }
                 (outcome, ch_to_wake)
             };
@@ -3171,7 +3177,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
                 SemopOutcome::Suspend { sem_num, is_zero } => {
                     has_suspended = true;
                     if deadline_tsc.is_some_and(|dl| self.read_tsc() >= dl) {
-                        ipc.lock().semop_suspend_exit(semid, sem_num, is_zero);
+                        ipc.lock().semop_suspend_exit(pid, semid, sem_num, is_zero);
                         return Err(carrick_syscall_abi::LINUX_EAGAIN.guest_retval());
                     }
                     prev_blocking = Some((sem_num, is_zero));
@@ -3185,7 +3191,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
                         Ok(true) => return Ok(IpcOutcome::Suspended),
                         Ok(false) => continue,
                         Err(e) => {
-                            ipc.lock().semop_suspend_exit(semid, sem_num, is_zero);
+                            ipc.lock().semop_suspend_exit(pid, semid, sem_num, is_zero);
                             return Err(e);
                         }
                     }
@@ -5818,5 +5824,12 @@ mod tests {
         let channels = Arc::new(SpinLock::new(Vec::<(u64, Arc<WaitChannel>)>::new()));
         let _g = ipc.lock();
         let _c = channels.lock();
+    }
+
+    #[test]
+    #[ignore = "blocked IPC interrupted by signal delivery requires in-ring signal delivery from PR 131"]
+    fn test_blocked_ipc_returns_eintr_on_signal() {
+        // Follow-up for PR 131: parked continuations in msgsnd/msgrcv/semop/semtimedop
+        // must resume with LINUX_EINTR when interrupted by an unblocked signal.
     }
 }
