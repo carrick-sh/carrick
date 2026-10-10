@@ -725,6 +725,10 @@ impl Cpl0HostCustody {
         let active = ReservationMm::new(execution.binding.mm.raw())
             .ok_or_else(|| fail("fork quarantine active MM"))?;
         let zone = retained_cow_zone(&self.ram)?;
+        // `CPL0_CPU_COUNT` has one definition (`cpl0_entry.rs`), compiled
+        // into the guest by `#[path]`; the guest drain scans the same slots.
+        const _: () =
+            assert!(carrick_x86::cpl0_entry::CPL0_CPU_COUNT <= carrick_sched_core::ZONE_SLOTS);
         let installed: Vec<u64> = (0..carrick_x86::cpl0_entry::CPL0_CPU_COUNT)
             .filter_map(|slot| u8::try_from(slot).ok())
             .map(|slot| zone.installed_space(SlotId::new(slot)))
