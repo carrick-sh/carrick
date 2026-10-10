@@ -214,7 +214,10 @@ pub enum MsgsndOutcome {
 #[derive(Clone, Eq, PartialEq)]
 #[cfg_attr(test, derive(Debug))]
 pub enum MsgrcvOutcome {
-    Complete(SysvMessage),
+    Complete {
+        msg: SysvMessage,
+        original_idx: usize,
+    },
     Suspend,
 }
 
@@ -491,7 +494,9 @@ impl IpcNamespace {
         queue.perm.check_perm(creds, 0o200)?;
 
         let channel = queue.wait_channel;
-        if queue.current_bytes() + data.len() > queue.qbytes {
+        if queue.current_bytes() + data.len() > queue.qbytes
+            || 1 + queue.messages.len() > queue.qbytes
+        {
             if msgflg & IPC_NOWAIT != 0 {
                 return Err(IpcError::Again);
             }
@@ -563,18 +568,28 @@ impl IpcNamespace {
 
         queue.lrpid = caller_pid;
         queue.rtime = now;
-        Ok((MsgrcvOutcome::Complete(msg), channel))
+        Ok((
+            MsgrcvOutcome::Complete {
+                msg,
+                original_idx: idx,
+            },
+            channel,
+        ))
     }
 
     pub fn msgrcv_restore(
         &mut self,
         msqid: i32,
+        original_idx: usize,
         mtype: i64,
         data: Vec<u8>,
-    ) -> Result<(), IpcError> {
+    ) -> Result<u64, IpcError> {
         let queue = self.msg_queue_mut(msqid)?;
-        queue.messages.insert(0, SysvMessage { mtype, data });
-        Ok(())
+        let insert_idx = original_idx.min(queue.messages.len());
+        queue
+            .messages
+            .insert(insert_idx, SysvMessage { mtype, data });
+        Ok(queue.wait_channel)
     }
 
     // ------------------------------------------------------------------------
@@ -628,6 +643,10 @@ impl IpcNamespace {
         semflg: i32,
     ) -> Result<i32, IpcError> {
         if self.sem_slots.len() >= SEMMNI {
+            return Err(IpcError::NoSpace);
+        }
+        let total_sems: usize = self.sem_slots.iter().map(|s| s.sems.len()).sum();
+        if total_sems + nsems > SEMMNS {
             return Err(IpcError::NoSpace);
         }
         let mut idx = self.next_sem_idx;
@@ -1123,7 +1142,7 @@ mod tests {
 
         let (rcv_outcome, _) = ns.msgrcv(&creds, 42, msqid, 100, 1, 0).unwrap();
         match rcv_outcome {
-            MsgrcvOutcome::Complete(msg) => {
+            MsgrcvOutcome::Complete { msg, .. } => {
                 assert_eq!(msg.mtype, 1);
                 assert_eq!(msg.data, msg_data);
             }
@@ -1145,7 +1164,7 @@ mod tests {
         );
         let (rcv_outcome, _) = ns.msgrcv(&creds, 42, msqid, 4, 1, MSG_NOERROR).unwrap();
         match rcv_outcome {
-            MsgrcvOutcome::Complete(msg) => {
+            MsgrcvOutcome::Complete { msg, .. } => {
                 assert_eq!(msg.data, b"1234");
             }
             MsgrcvOutcome::Suspend => panic!("expected complete"),
@@ -1157,7 +1176,7 @@ mod tests {
         // MSG_EXCEPT: receive first msg where mtype != 2
         let (rcv_outcome, _) = ns.msgrcv(&creds, 42, msqid, 10, 2, MSG_EXCEPT).unwrap();
         match rcv_outcome {
-            MsgrcvOutcome::Complete(msg) => {
+            MsgrcvOutcome::Complete { msg, .. } => {
                 assert_eq!(msg.mtype, 1);
             }
             MsgrcvOutcome::Suspend => panic!("expected complete"),
@@ -1170,7 +1189,7 @@ mod tests {
         ns.msgsnd(&creds, 42, msqid, 3, b"type3", 0).unwrap();
         let (rcv_outcome, _) = ns.msgrcv(&creds, 42, msqid, 10, -4, 0).unwrap();
         match rcv_outcome {
-            MsgrcvOutcome::Complete(msg) => {
+            MsgrcvOutcome::Complete { msg, .. } => {
                 assert_eq!(msg.mtype, 3);
             }
             MsgrcvOutcome::Suspend => panic!("expected complete"),
@@ -1268,5 +1287,64 @@ mod tests {
         assert_eq!(ns.sem_set(semid).unwrap().sems[0].semval, 5);
 
         ns.semctl_rmid(&creds, semid).unwrap();
+    }
+
+    #[test]
+    fn test_msgsnd_zero_length_quota_and_msgrcv_restore() {
+        let creds = TaskCredentials::ROOT;
+        let mut ns = IpcNamespace::new();
+        let msqid = ns.msgget(&creds, IPC_PRIVATE, IPC_CREAT | 0o666).unwrap();
+
+        // artifically set qbytes to 2
+        let mut ds = LinuxMsqidDs::default();
+        ns.msgctl_stat(&creds, msqid, &mut ds).unwrap();
+        ds.msg_qbytes = 2;
+        ns.msgctl_set(&creds, msqid, &ds).unwrap();
+
+        // sending 2 zero-length messages succeeds (qnum=2, cbytes=0)
+        assert!(ns.msgsnd(&creds, 1, msqid, 1, &[], 0).is_ok());
+        assert!(ns.msgsnd(&creds, 1, msqid, 2, &[], 0).is_ok());
+
+        // 3rd zero-length message hits 1 + qnum > qbytes (1 + 2 > 2) and fails with Again under IPC_NOWAIT
+        assert_eq!(
+            ns.msgsnd(&creds, 1, msqid, 3, &[], IPC_NOWAIT).unwrap_err(),
+            IpcError::Again
+        );
+
+        // Test msgrcv_restore restores to original index
+        let mut ns2 = IpcNamespace::new();
+        let q2 = ns2.msgget(&creds, IPC_PRIVATE, IPC_CREAT | 0o666).unwrap();
+        ns2.msgsnd(&creds, 1, q2, 1, b"first", 0).unwrap();
+        ns2.msgsnd(&creds, 1, q2, 2, b"second", 0).unwrap();
+        ns2.msgsnd(&creds, 1, q2, 3, b"third", 0).unwrap();
+
+        // Receive msg at idx 1 (type 2)
+        let (rcv, _) = ns2.msgrcv(&creds, 1, q2, 10, 2, 0).unwrap();
+        if let MsgrcvOutcome::Complete { original_idx, msg } = rcv {
+            assert_eq!(original_idx, 1);
+            assert_eq!(msg.mtype, 2);
+            // Simulate copy failure -> restore at original_idx
+            ns2.msgrcv_restore(q2, original_idx, msg.mtype, msg.data)
+                .unwrap();
+        } else {
+            panic!("expected complete");
+        }
+
+        // Verify message at index 1 is indeed type 2
+        let (rcv_all1, _) = ns2.msgrcv(&creds, 1, q2, 10, 0, 0).unwrap();
+        let (rcv_all2, _) = ns2.msgrcv(&creds, 1, q2, 10, 0, 0).unwrap();
+        let (rcv_all3, _) = ns2.msgrcv(&creds, 1, q2, 10, 0, 0).unwrap();
+        if let (
+            MsgrcvOutcome::Complete { msg: m1, .. },
+            MsgrcvOutcome::Complete { msg: m2, .. },
+            MsgrcvOutcome::Complete { msg: m3, .. },
+        ) = (rcv_all1, rcv_all2, rcv_all3)
+        {
+            assert_eq!(m1.mtype, 1);
+            assert_eq!(m2.mtype, 2);
+            assert_eq!(m3.mtype, 3);
+        } else {
+            panic!("expected all complete");
+        }
     }
 }

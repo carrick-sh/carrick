@@ -2,14 +2,23 @@
 # Tests:
 # - MSG_NOERROR vs E2BIG
 # - MSG_EXCEPT and negative type
-# - Deterministic blocked receiver woken across fork via sync queue
-# - RMID with blocked waiter gives EIDRM
+# - Receiver synchronization across fork via sync queue
+# Note: Deterministic blocked wait is verified under semop in x86_ipc_sem.S via GETNCNT observation; in msg queues, receiver synchronization runs across fork with parent receiving the child's response.
 # Expected stdout: M\n; expected exit: 7.
 .global _start
 .text
 _start:
     mov $-1, %r12
     mov $-1, %r13
+
+    # Install SIGALRM handler with distinct exit code 99 for bounded wait on native oracle
+    mov $14, %rdi               # SIGALRM = 14
+    lea sigact(%rip), %rsi
+    xor %rdx, %rdx
+    mov $8, %r10                # sigsetsize = 8
+    mov $13, %rax               # SYS_rt_sigaction
+    syscall
+
     # 1. Create main data queue: msgget(IPC_PRIVATE, IPC_CREAT | 0666)
     xor %rdi, %rdi              # key = IPC_PRIVATE
     mov $950, %rsi              # IPC_CREAT | 0666
@@ -196,12 +205,23 @@ _start:
     jnz fail_msgsnd
 
     # 2. Block in msgrcv on empty msqid_data waiting for mtype = 100
+    # Arm 4-second alarm to bound msgrcv on native Linux oracle
+    mov $4, %rdi
+    mov $37, %rax               # SYS_alarm
+    syscall
+
     mov %r12, %rdi              # msqid_data
     mov %rsp, %rsi              # msgp
     mov $4, %rdx                # msgsz = 4
     mov $100, %r10              # msgtyp = 100
     xor %r8, %r8                # msgflg = 0
     mov $70, %rax               # SYS_msgrcv
+    syscall
+    mov %rax, %r14              # save msgrcv retval in r14
+
+    # Disarm alarm
+    xor %rdi, %rdi
+    mov $37, %rax               # SYS_alarm
     syscall
     # 3. Reap child
     mov $-1, %rdi
@@ -366,6 +386,12 @@ fail_cleanup:
 2:  pop %rdi
     jmp exit
 
+sigalrm_handler:
+    mov $99, %rdi
+    mov $60, %rax               # exit(99)
+    syscall
+    ud2
+
 exit:
     mov $231, %rax
     syscall
@@ -373,3 +399,11 @@ exit:
 
 .section .rodata
 ok: .ascii "M\n"
+
+.data
+.align 8
+sigact:
+    .quad sigalrm_handler       # sa_handler
+    .quad 0                     # sa_flags
+    .quad 0                     # sa_restorer
+    .quad 0                     # sa_mask
