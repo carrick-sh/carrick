@@ -2966,6 +2966,21 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             .map(|ticket| ticket.deadline)
     }
 
+    /// Expire an owned timer and choose the next hardware deadline. A busy
+    /// wake bucket retains its ticket and retries without terminating a task.
+    pub fn expire_timer_and_rearm(
+        &self,
+        slot: SlotId,
+        now: u64,
+        result: u64,
+        retry_ticks: u64,
+    ) -> Option<u64> {
+        match self.expire_timer(slot, now, result) {
+            Ok(_) => self.timer_deadline(slot),
+            Err(()) => Some(now.saturating_add(retry_ticks.max(1))),
+        }
+    }
+
     /// EL1 at `now`: end `slot`'s timed park if its deadline passed. The
     /// thread is claimed onto the slot's run queue with `result`, unless a
     /// waker won it first. `Err(())`: a bucket lock was busy or the run queue

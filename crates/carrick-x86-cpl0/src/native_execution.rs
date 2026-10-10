@@ -104,7 +104,9 @@ pub(super) fn schedule(slot: SlotId) -> ! {
                 .install_space(slot, state.address.mm.raw().get())
                 .unwrap_or_else(|| initial_boot::fatal_boot());
             current.set(
-                carrick_el1_abi::El1TaskId::from_linux_tid(i32::try_from(identity.tid).unwrap_or_else(|_| initial_boot::fatal_boot())),
+                carrick_el1_abi::El1TaskId::from_linux_tid(
+                    i32::try_from(identity.tid).unwrap_or_else(|_| initial_boot::fatal_boot()),
+                ),
                 identity.generation,
                 identity.file_table,
             );
@@ -154,21 +156,42 @@ pub(super) fn schedule(slot: SlotId) -> ! {
                     words.set_syscall_return(result);
                 }
                 if !suspended {
-                    let native = context::context_words::into_native(words, state.address).unwrap_or_else(|_| initial_boot::fatal_boot());
-                    let mut frame = context::context_words::syscall_frame_from_native(&native, state.address).unwrap_or_else(|_| initial_boot::fatal_boot());
-                    if let Some(route) = super::deliver_signal_on_syscall_return(current, &mut entry, &mut frame, &native.xsave) {
+                    let native = context::context_words::into_native(words, state.address)
+                        .unwrap_or_else(|_| initial_boot::fatal_boot());
+                    let mut frame =
+                        context::context_words::syscall_frame_from_native(&native, state.address)
+                            .unwrap_or_else(|_| initial_boot::fatal_boot());
+                    if let Some(route) = super::deliver_signal_on_syscall_return(
+                        current,
+                        &mut entry,
+                        &mut frame,
+                        &native.xsave,
+                    ) {
                         match route {
-                            carrick_personality_linux::dispatch::CompletionRoute::Suspended => suspended = true,
+                            carrick_personality_linux::dispatch::CompletionRoute::Suspended => {
+                                suspended = true
+                            }
                             _ => initial_boot::fatal_boot(),
                         }
                     }
-                    words = context::context_words::from_native(&context::context_words::from_syscall(&frame, state.address, native.fs_base, native.gs_base, &native.xsave).unwrap_or_else(|_| initial_boot::fatal_boot()));
+                    words = context::context_words::from_native(
+                        &context::context_words::from_syscall(
+                            &frame,
+                            state.address,
+                            native.fs_base,
+                            native.gs_base,
+                            &native.xsave,
+                        )
+                        .unwrap_or_else(|_| initial_boot::fatal_boot()),
+                    );
                 }
                 if let Some(status) = entry.take_root_exit() {
                     super::complete_root_exit(current, status);
                 }
             }
-            if suspended { continue; }
+            if suspended {
+                continue;
+            }
             // SAFETY: the shared claim is OnCpu on this exact slot; every
             // machine field and MM owner is checked again by the ISA return.
             match unsafe { context::resume_parked(words, state.address) } {
@@ -192,8 +215,24 @@ pub(crate) fn expire_signal_timer(slot: SlotId) {
     use carrick_guest_arch::{CounterTick, Deadline, InterruptBackend};
     let zone = source(slot).zone;
     let mut backend = x86::X86Backend;
-    let now = backend.counter().unwrap_or_else(|_| initial_boot::fatal_boot());
-    zone.expire_timer(slot, now.raw(), carrick_personality_linux::abi::signal::LINUX_EAGAIN.guest_retval() as u64).unwrap_or_else(|_| initial_boot::fatal_boot());
-    let deadline = zone.timer_deadline(slot).map(|ticks| Deadline(CounterTick::new(ticks)));
-    backend.arm_timer(deadline).unwrap_or_else(|_| initial_boot::fatal_boot());
+    let now = backend
+        .counter()
+        .unwrap_or_else(|_| initial_boot::fatal_boot());
+    let retry_ticks = backend
+        .frequency()
+        .unwrap_or_else(|_| initial_boot::fatal_boot())
+        .raw()
+        .get()
+        / 1000;
+    let deadline = zone
+        .expire_timer_and_rearm(
+            slot,
+            now.raw(),
+            carrick_personality_linux::abi::signal::LINUX_EAGAIN.guest_retval() as u64,
+            retry_ticks,
+        )
+        .map(|ticks| Deadline(CounterTick::new(ticks)));
+    backend
+        .arm_timer(deadline)
+        .unwrap_or_else(|_| initial_boot::fatal_boot());
 }
