@@ -603,7 +603,8 @@ impl Cpl0HostCustody {
 
     /// Return quarantined child stock whose MM no zone slot has installed.
     /// The servicing CPU's own MM is never a candidate. Tables and the
-    /// lifecycle record are zeroed before they reenter the stock.
+    /// lifecycle record are zeroed before they reenter the stock, and the
+    /// child's carrier-wide state is released in the same stopped crossing.
     fn drain_fork_quarantine(&mut self, execution: GrantExecution) -> Result<(), TrapError> {
         let active = ReservationMm::new(execution.binding.mm.raw())
             .ok_or_else(|| fail("fork quarantine active MM"))?;
@@ -615,6 +616,7 @@ impl Cpl0HostCustody {
         let window = self.lifecycle_window();
         let memory = &mut self._vm;
         let zero = [0u8; 4096];
+        let reclaimed = std::cell::RefCell::new(Vec::new());
         self.fork_stock
             .reclaim(
                 &mut NoTableLedger,
@@ -626,9 +628,35 @@ impl Cpl0HostCustody {
                         .all(|page| memory.write(page.address(), &zero).is_ok())
                 },
                 |lifecycle| window.clear(lifecycle),
+                |mm| {
+                    reclaimed.borrow_mut().push(mm);
+                    true
+                },
             )
-            .map(|_| ())
-            .map_err(|e| fail(format!("fork quarantine reclaim: {e:?}")))
+            .map_err(|e| fail(format!("fork quarantine reclaim: {e:?}")))?;
+        // `&mut self` excludes every loan until these releases finish; a
+        // failed release is a carrier custody fault.
+        for mm in reclaimed.into_inner() {
+            self.release_retired_child(mm)?;
+        }
+        Ok(())
+    }
+
+    /// Release a reclaimed child's frame-inventory rows, COW residency rows
+    /// and carrier CR3/alias registrations.
+    fn release_retired_child(&mut self, mm: ReservationMm) -> Result<(), TrapError> {
+        let key = NonZeroU64::new(mm.raw()).ok_or_else(|| fail("retired child MM"))?;
+        if !carrick_hal::fork_stock::release_child_mm(
+            &*self.frame_inventory,
+            self.cow_residency()?,
+            mm,
+        ) {
+            return Err(fail("retired child inventory or residency release"));
+        }
+        // Child-private memslots stay registered (alias-free): KVM has no
+        // production revoke path yet; their frames were retired above.
+        let _private = self._vm.retire_root(key).map_err(|e| fail(e.to_string()))?;
+        Ok(())
     }
 
     /// A fork child left the shared owner graph: quarantine its stock. The

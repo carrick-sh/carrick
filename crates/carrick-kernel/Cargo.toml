@@ -104,6 +104,8 @@ carrick-host-linux = { path = "../carrick-host-linux" }
 
 [dev-dependencies]
 loom = "=0.7.2"
+# Typed guest addresses for the fork-retirement witness over the inventory.
+carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 # Self dev-dependency: enables `test-support` on this crate's own lib when it

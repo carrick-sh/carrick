@@ -104,6 +104,14 @@ impl carrick_hal::PhysicalFrameInventory for PhysicalInventoryProjection {
     ) -> Result<(FrameId, MappingId), Box<dyn std::error::Error + Send + Sync>> {
         Ok((self.ids.frame_id()?, self.ids.mapping_id()?))
     }
+    fn retire_mm(
+        &self,
+        mm: carrick_hal::MmGeneration,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .inventory
+            .retire_mm(&self.ids, MmId::for_owner_binding(mm))?)
+    }
 }
 impl carrick_hal::FrameCowAuthority for PhysicalInventoryBinding {
     fn quiesce(
@@ -565,6 +573,62 @@ impl FrameInventoryAuthority {
         }
         state.revision = next_revision;
         Ok(())
+    }
+
+    /// Unmap every published mapping of `mm` in one batch, retiring each
+    /// frame whose last mapping that unmap removes; frames another MM still
+    /// maps stay live. Used when a fork child's memory leaves quarantine.
+    /// Returns the number of mappings unmapped; the receipt must prove the
+    /// MM empty at the produced revision.
+    pub fn retire_mm(
+        &self,
+        ids: &ObjectIdRegistry,
+        mm: MmId,
+    ) -> Result<usize, FrameInventoryRetireMmError> {
+        let rows: Vec<(MappingId, FrameId, MappingGeneration)> = {
+            let state = self.state.lock();
+            if state.mm_mapping_counts.get(&mm).copied().unwrap_or(0) == 0 {
+                return Ok(0);
+            }
+            state
+                .mappings
+                .iter()
+                .filter(|(_, entry)| entry.mm == mm && entry.state == MappingState::Published)
+                .map(|(mapping, entry)| (*mapping, entry.frame, entry.generation))
+                .collect()
+        };
+        let events = rows
+            .len()
+            .checked_mul(2)
+            .ok_or(FrameInventoryRetireMmError::Capacity)?;
+        let capacity = FrameEventCapacity::for_event_count(events)
+            .map_err(FrameInventoryReserveError::from)?;
+        let mut reservation = self.reserve(ids, 0, 0, capacity)?;
+        let transaction = reservation.transaction();
+        for &(mapping, frame, live) in &rows {
+            // Unmap publishes the mapping's next generation.
+            let generation = live
+                .raw()
+                .checked_add(1)
+                .and_then(NonZeroU64::new)
+                .map(MappingGeneration::from_backend_counter)
+                .ok_or(FrameInventoryRetireMmError::Capacity)?;
+            reservation.push(FrameInventoryEvent::UnmapMapping {
+                transaction,
+                mapping,
+                generation,
+            })?;
+            reservation.push(FrameInventoryEvent::RetireFrameIfLastUnmap {
+                transaction,
+                frame,
+                generation,
+            })?;
+        }
+        let (_, receipt) = self.apply_retirement_with_receipt(mm, reservation.commit(()))?;
+        if !receipt.mm_empty_at_revision() {
+            return Err(FrameInventoryRetireMmError::NotEmpty);
+        }
+        Ok(rows.len())
     }
 
     pub fn apply_retirement_with_receipt<T>(
@@ -1303,6 +1367,21 @@ fn prepare_reservation(
         FrameInventoryReservation::from_kernel_candidates(provenance, batch, frames, mappings),
         record,
     ))
+}
+
+/// Why a whole-MM inventory retirement refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum FrameInventoryRetireMmError {
+    #[error("MM retirement event count overflows")]
+    Capacity,
+    #[error("MM retirement left mappings live in the MM")]
+    NotEmpty,
+    #[error(transparent)]
+    Reserve(#[from] FrameInventoryReserveError),
+    #[error(transparent)]
+    Event(#[from] carrick_hal::FrameInventoryReservationError),
+    #[error(transparent)]
+    Apply(#[from] FrameInventoryError),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -2792,6 +2871,313 @@ mod tests {
             }
         );
         assert!(fixture.authority.state.lock().reservations.is_empty());
+    }
+
+    /// KVM-adapter witness, VM-free: more fork+retire cycles than the zone
+    /// has address-space entries (1024), through the shared fork stock with
+    /// the x86 lifecycle window and the carrier's release composition
+    /// (`release_child_mm`) over this real inventory and a real residency
+    /// table. Every child's rows and residency are gone after reclaim; the
+    /// parent's frame survives every child that mapped it.
+    #[test]
+    fn kvm_fork_retire_cycles_beyond_zone_capacity_release_child_state() {
+        use carrick_hal::fork_stock::{
+            ForkStock, LifecycleWindow, NoTableLedger, UntaggedRoots, lifecycle_slots,
+            release_child_mm,
+        };
+        use std::sync::Arc;
+
+        const CYCLES: u64 = carrick_sched_core::spaces::ADDRESS_SPACES as u64 + 76;
+        const PARENT: u64 = 301;
+        let mm_generation =
+            |raw: u64| carrick_hal::MmGeneration::new(NonZeroU64::new(raw).expect("nonzero mm"));
+        let authority = Arc::new(FrameInventoryAuthority::new());
+        let ids = Arc::new(ObjectIdRegistry::new());
+        let inventory = authority.physical_projection(Arc::clone(&ids));
+
+        // The parent maps one frame every child inherits.
+        let parent = inventory.bind(mm_generation(PARENT));
+        let mut reservation = parent.reserve(1, 1, 2).expect("parent reserve");
+        let transaction = reservation.transaction();
+        let shared = reservation.claim_frame().expect("shared frame");
+        let parent_mapping = reservation.claim_mapping().expect("parent mapping");
+        prepare_publish(
+            &mut reservation,
+            transaction,
+            shared,
+            parent_mapping,
+            0x10_0000,
+            0x1000,
+        );
+        parent.apply(reservation.commit(())).expect("parent apply");
+
+        let layout = std::alloc::Layout::new::<carrick_el1_abi::FrameGrantResidencyTable>();
+        // SAFETY: zeroed aligned storage, initialized in place below.
+        let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!raw.is_null());
+        let residency_ptr = raw.cast::<carrick_el1_abi::FrameGrantResidencyTable>();
+        unsafe { carrick_el1_abi::FrameGrantResidencyTable::init_in_place(residency_ptr) };
+        // SAFETY: initialized above; freed through the same layout at the end.
+        let residency = unsafe { Box::from_raw(residency_ptr) };
+
+        #[repr(C, align(16384))]
+        struct Metadata([u8; 0x10_0000]);
+        let mut metadata: Box<Metadata> = {
+            let layout = std::alloc::Layout::new::<Metadata>();
+            let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+            assert!(!raw.is_null());
+            unsafe { Box::from_raw(raw.cast::<Metadata>()) }
+        };
+        let base = carrick_el1_abi::X86_CPL0_DYNAMIC_METADATA_BASE;
+        let window = unsafe {
+            LifecycleWindow::new(
+                core::ptr::NonNull::new(metadata.0.as_mut_ptr()).expect("metadata"),
+                base,
+                0x10_0000,
+            )
+        };
+        let carrier = NonZeroU64::new(7).expect("carrier");
+        let mut stock = ForkStock::new(carrier, 0x1_0000_0000, UntaggedRoots);
+        stock
+            .install(
+                (0..4)
+                    .map(|n| {
+                        carrick_guest_arch::RootGpa::page_aligned(
+                            carrick_guest_arch::FrameGpa::new(0x20_0000 + n * 4096),
+                        )
+                        .expect("table page")
+                    })
+                    .collect(),
+                lifecycle_slots(base, base + 0x8_8000, 2).expect("x86 lifecycle slots"),
+            )
+            .expect("install");
+
+        let parent_execution = fork_test_execution(41, PARENT, 0x1000);
+        let mut children = Vec::new();
+        for cycle in 0..CYCLES {
+            let child_mm = 302 + cycle;
+            let request = carrick_el1_abi::ForkStockRequest {
+                binding: parent_execution.binding,
+                context: parent_execution.context,
+                operation: carrick_el1_abi::PortalOperation {
+                    carrier,
+                    mm: carrick_el1_abi::ReservationMm::new(PARENT).expect("parent"),
+                    incarnation: NonZeroU64::MIN,
+                    sequence: NonZeroU64::new(2).expect("sequence"),
+                },
+                parent_generation: carrick_el1_abi::ReservationGeneration::INITIAL,
+                child_mm: carrick_el1_abi::ReservationMm::new(child_mm).expect("child"),
+                child_bytes: 4096,
+                parent_bytes: 4096,
+            };
+            let mut exchange = carrick_el1_abi::ForkStockExchange::new(request).expect("exchange");
+            let loan = stock
+                .loan(
+                    &mut NoTableLedger,
+                    parent_execution,
+                    &mut exchange,
+                    |life| window.is_zero(life),
+                )
+                .unwrap_or_else(|refusal| panic!("cycle {cycle}: {refusal:?}"));
+            // The guest initializes its census in the loaned record.
+            assert!(window.clear(loan.lifecycle));
+            unsafe {
+                let page = metadata
+                    .0
+                    .as_mut_ptr()
+                    .add((loan.lifecycle.page.raw() - base) as usize);
+                core::ptr::write_bytes(page, 0x5a, 64);
+            }
+            let completion = carrick_el1_abi::PortalForkCompletion {
+                request: loan.request,
+                // SAFETY: test receipt naming the exact admitted loan.
+                child: unsafe {
+                    carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                        carrier,
+                        request.child_mm,
+                        NonZeroU64::MIN,
+                    )
+                },
+                parent_generation: carrick_el1_abi::ReservationGeneration::INITIAL,
+                child_tables_used: 4096,
+                parent_tables_used: 0,
+            };
+            let mut settlement = carrick_el1_abi::ForkStockSettlement::new(
+                loan,
+                completion,
+                carrick_guest_arch::KernelVa::new(0xffff_8000_0001_0000),
+                0,
+            )
+            .expect("settlement");
+            stock
+                .settle(
+                    &mut NoTableLedger,
+                    parent_execution,
+                    &mut settlement,
+                    |_| true,
+                    |_| true,
+                    |_| true,
+                )
+                .expect("commit");
+
+            // Carrier per-child state as the KVM settle publishes it.
+            let child = inventory.bind(mm_generation(child_mm));
+            let mut reservation = child.reserve(1, 2, 4).expect("child reserve");
+            let transaction = reservation.transaction();
+            let own = reservation.claim_frame().expect("child frame");
+            let inherited = reservation.claim_mapping().expect("inherited");
+            let private = reservation.claim_mapping().expect("private");
+            prepare_publish(
+                &mut reservation,
+                transaction,
+                shared,
+                inherited,
+                0x10_0000,
+                0x1000,
+            );
+            prepare_publish(
+                &mut reservation,
+                transaction,
+                own,
+                private,
+                0x20_0000,
+                0x1000,
+            );
+            child.apply(reservation.commit(())).expect("child apply");
+            residency
+                .publish(carrick_el1_abi::FrameGrantResidencyIdentity {
+                    mm_key: child_mm,
+                    semantic_base: 0x40_0000,
+                    physical_ipa: 0x10_0000,
+                    len: 0x1000,
+                    mapping_id: 1,
+                    frame_id: 1,
+                    owner_generation: 1,
+                    inventory_revision: 1,
+                })
+                .expect("residency capacity");
+
+            let child_execution =
+                fork_test_execution(900 + cycle, child_mm, loan.request.child_tables.base);
+            let mut retire = carrick_el1_abi::NativeChildRetire::new(
+                child_execution.binding,
+                child_execution.context,
+            )
+            .expect("retire record");
+            stock
+                .retire_child(child_execution, &mut retire)
+                .expect("quarantine");
+            let returned = stock
+                .reclaim(
+                    &mut NoTableLedger,
+                    carrick_el1_abi::ReservationMm::new(PARENT).expect("parent"),
+                    |_| true,
+                    |_| true,
+                    |life| window.clear(life),
+                    |mm| release_child_mm(&*inventory, &residency, mm),
+                )
+                .unwrap_or_else(|error| panic!("cycle {cycle}: {error:?}"));
+            assert_eq!(returned, 1, "cycle {cycle}");
+            assert!(residency.lookup(child_mm, 0x40_0000).is_none());
+            children.push(child_mm);
+        }
+        assert_eq!(stock.counters().returned_children, CYCLES);
+        assert_eq!(stock.counters().capacity_refusals, 0);
+        // Only the parent's row remains; the shared frame survived.
+        let live = authority.snapshot();
+        assert_eq!(live.mappings.len(), 1);
+        assert_eq!(live.mappings[0].mapping, parent_mapping);
+        assert_eq!(authority.frame_mapping_count(shared), Some(1));
+        assert!(
+            children
+                .iter()
+                .all(|mm| residency.lookup(*mm, 0x40_0000).is_none())
+        );
+    }
+
+    fn fork_test_execution(
+        task: u64,
+        mm: u64,
+        root: u64,
+    ) -> carrick_hal::fork_stock::GrantExecution {
+        carrick_hal::fork_stock::GrantExecution::new(
+            carrick_guest_arch::CpuId::new(0),
+            carrick_el1_abi::ExecutionBinding {
+                task: carrick_el1_abi::EntryTaskKey::from_raw(task),
+                generation: carrick_el1_abi::EntryGeneration::from_raw(11),
+                mm: carrick_el1_abi::EntryMmKey::from_raw(mm),
+                thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(101),
+            },
+            carrick_guest_arch::AddressContext {
+                mm: carrick_guest_arch::MmGeneration::new(NonZeroU64::new(mm).expect("mm")),
+                root: carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(
+                    root,
+                ))
+                .expect("root"),
+                generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
+            },
+        )
+    }
+
+    /// A retired fork child's every mapping is unmapped in one batch; its
+    /// private frame retires, a frame its parent still maps survives, and
+    /// the parent's rows are untouched.
+    #[test]
+    fn retire_mm_unmaps_every_row_and_keeps_frames_other_mms_map() {
+        let fixture = Fixture::new();
+        let mut shared = None;
+        let mut parent_mapping = None;
+        let batch = fixture.batch(2, |transaction, reservation| {
+            let frame = reservation.claim_frame().expect("shared frame");
+            let mapping = reservation.claim_mapping().expect("parent mapping");
+            shared = Some(frame);
+            parent_mapping = Some(mapping);
+            prepare_publish(reservation, transaction, frame, mapping, 0x1000, 0x1000);
+        });
+        fixture.authority.apply(fixture.mm1, batch).expect("parent");
+        let (shared, parent_mapping) = (shared.unwrap(), parent_mapping.unwrap());
+        let mut private = None;
+        let batch = fixture.batch(4, |transaction, reservation| {
+            let frame = reservation.claim_frame().expect("private frame");
+            let inherited = reservation.claim_mapping().expect("inherited");
+            let own = reservation.claim_mapping().expect("own");
+            private = Some(frame);
+            prepare_publish(reservation, transaction, shared, inherited, 0x1000, 0x1000);
+            prepare_publish(reservation, transaction, frame, own, 0x2000, 0x1000);
+        });
+        fixture.authority.apply(fixture.mm2, batch).expect("child");
+        let private = private.unwrap();
+
+        assert_eq!(
+            fixture
+                .authority
+                .retire_mm(&fixture.ids, fixture.mm2)
+                .unwrap(),
+            2
+        );
+        assert!(
+            fixture
+                .authority
+                .snapshot_for_mm(fixture.mm2)
+                .mappings
+                .is_empty()
+        );
+        assert_eq!(fixture.authority.frame_mapping_count(shared), Some(1));
+        assert_eq!(fixture.authority.frame_mapping_count(private), None);
+        assert!(
+            fixture
+                .authority
+                .live_mapping_row(fixture.mm1, parent_mapping)
+                .is_some()
+        );
+        // Retiring an empty MM is a no-op.
+        assert_eq!(
+            fixture
+                .authority
+                .retire_mm(&fixture.ids, fixture.mm2)
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

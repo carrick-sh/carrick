@@ -1092,7 +1092,8 @@ pub(crate) fn service_metadata_operation(
                             | crate::fork_stock::ForkStockServiceError::InvalidRecord
                             | crate::fork_stock::ForkStockServiceError::MemoryAccessFailed
                             | crate::fork_stock::ForkStockServiceError::Asid(_)
-                            | crate::fork_stock::ForkStockServiceError::OccupancyUnavailable => {
+                            | crate::fork_stock::ForkStockServiceError::OccupancyUnavailable
+                            | crate::fork_stock::ForkStockServiceError::ReleaseRefused => {
                                 ForkStockRefusal::Invalid
                             }
                         };

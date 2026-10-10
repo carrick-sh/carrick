@@ -549,6 +549,45 @@ impl CarrierMemory {
         self.roots.insert(mm, context);
         Ok(())
     }
+    /// A retired fork child left quarantine: no CPU holds its root. Drop its
+    /// CR3 registration, every descriptor alias it held (inherited frame
+    /// identities included) and its admission on shared slots. Each touched
+    /// slot remembers the context for a later revoke drain. Returns the
+    /// slots that are now alias-free and were admitted only for this MM.
+    pub fn retire_root(&mut self, mm: NonZeroU64) -> Result<Vec<BackingHandle>, MemoryError> {
+        self.admit()?;
+        let context = self
+            .roots
+            .remove(&mm)
+            .ok_or_else(|| error("retired MM has no carrier CR3 root"))?;
+        for alias in self.aliases.remove(&mm).unwrap_or_default().into_values() {
+            let Some(slot) = self.slots.get_mut(&alias.slot) else {
+                self.quarantined = true;
+                return Err(error("retired MM alias names no carrier slot"));
+            };
+            slot.alias_count = slot
+                .alias_count
+                .checked_sub(1)
+                .ok_or_else(|| error("retired MM alias count underflow"))?;
+            if let Some(gpa) = alias.inherited {
+                slot.inherited_identities.remove(&(mm, gpa.raw()));
+            }
+            if !slot.drains.contains(&context) {
+                slot.drains.push(context);
+            }
+        }
+        let mut private = Vec::new();
+        for slot in self.slots.values_mut() {
+            slot.inherited_identities
+                .retain(|(owner, _), _| *owner != mm);
+            let was_private = slot.allowed == [mm];
+            slot.allowed.retain(|allowed| *allowed != mm);
+            if was_private && slot.alias_count == 0 && !slot.bootstrap {
+                private.push(slot.handle);
+            }
+        }
+        Ok(private)
+    }
     pub fn root(&self, mm: NonZeroU64) -> Option<AddressContext<RootGpa>> {
         self.roots.get(&mm).copied()
     }
