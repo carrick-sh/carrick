@@ -3,11 +3,17 @@
 .global _start
 .text
 _start:
-    # 1. Drop/set to uid 1000: setresuid(1000, 1000, 1000)
-    # (On native Linux running as uid 1000, this succeeds; inside Carrick starting as root, this succeeds).
-    mov $1000, %rdi
-    mov $1000, %rsi
-    mov $1000, %rdx
+    # Retain the native caller's uid; root drops all uid roles to nobody.
+    # This also drops Carrick's initial root identity without assuming a host uid.
+    mov $102, %rax
+    syscall
+    test %rax, %rax
+    jne have_uid
+    mov $65534, %rax
+have_uid:
+    mov %rax, %rdi
+    mov %rax, %rsi
+    mov %rax, %rdx
     mov $117, %rax
     syscall
     test %rax, %rax
