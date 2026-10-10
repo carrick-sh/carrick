@@ -110,7 +110,9 @@ impl<
         result?;
         // Credentials and Born are committed under the graph guard. Runnable
         // publication takes scheduler locks only after that guard is dropped.
-        // It cannot fail; the clone gate retains parent/live-count custody.
+        // serve_clone incremented page.live before the guarded Born callback.
+        // exit_owned checks that census while closing admission under the
+        // graph guard, so teardown refuses until this child exits/rolls back.
         self.enqueue_born(birth.record);
         Ok(())
     }

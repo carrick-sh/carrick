@@ -561,3 +561,18 @@ clear-before-wake/observable-exit order through the native execution context,
 including a sleeping joiner. It must preserve exact thread/MM custody and the
 one-clear/one-wake work budget of `kernel.thread.clear-tid-custody`; the fixture
 adapter and successful identity queries cannot substitute for that witness.
+
+### Clone publication versus shared terminal exit
+
+`serve_clone` takes its lifecycle claim and increments `page.live()` before
+`thread_spawned` commits credentials and Born under the graph guard.
+`exit_owned` now closes admission and checks both the live census and claims
+under that same guard before publishing terminal exit. A pre-close claim
+refuses exit with Busy; an admitted Born child keeps the census above one,
+so exit refuses until that child exits or rolls back. Scheduler publication
+therefore runs after graph unlock without a graph-to-queue lock edge.
+`clone_live_membership_blocks_exit_between_graph_unlock_and_enqueue` injects
+exit in that exact window, cancels the subsequently queued child, and proves
+terminal teardown completes with no runnable stale RecordRef. Multi-thread
+exit_group remains refused by the existing native-owner dependency rather
+than pretending to perform the missing group-wide cancellation.
