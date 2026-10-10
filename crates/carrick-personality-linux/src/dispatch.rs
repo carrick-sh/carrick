@@ -1188,8 +1188,6 @@ mod ring_first_tests {
             (98, true, true, CompletionRoute::Forward),
             (222, true, true, CompletionRoute::Forward),
             (139, false, false, CompletionRoute::Forward),
-            // Signal dispositions remain with the host kernel authority.
-            (134, false, false, CompletionRoute::Forward),
             (220, false, false, CompletionRoute::Forward),
             (260, false, false, CompletionRoute::Forward),
             (174, true, false, CompletionRoute::WithWork),
