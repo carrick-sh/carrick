@@ -909,6 +909,23 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
                 .env("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER", &lld),
         )?;
     }
+    // GNU startup witnesses require the publisher's GNU CRT and linker. The
+    // shared raw/musl script must remain usable on hosted macOS without them.
+    run_build(
+        environment
+            .configure(&mut Command::new("cargo"))
+            .current_dir(source.join("fixtures/linux-aarch64-hello"))
+            .args([
+                "build",
+                "--locked",
+                "--release",
+                "--target",
+                GuestTarget::Gnu.triple(),
+                "--bin",
+                "carrick-linux-aarch64-ring-first-glibc",
+            ])
+            .env("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER", linker),
+    )?;
     if expected_head(root, Some(sha))? != expected {
         return Err(fail("checkout changed during fixture build"));
     }

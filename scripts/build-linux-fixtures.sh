@@ -167,8 +167,3 @@ build_fixture "el1_vtimer_loop.rs" "carrick-linux-aarch64-el1-vtimer-loop"
 build_fixture "coarse_clock_vdso.rs" "carrick-linux-aarch64-coarse-clock-vdso"
 build_fixture "crash_parked_thread.rs" "carrick-linux-aarch64-crash-parked-thread"
 
-# Dynamic glibc witness: unlike the raw fixtures this uses the GNU CRT and
-# ld.so. Cargo dep-info participates in the same published input identity.
-CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER:-aarch64-linux-gnu-gcc}" \
-  cargo build --locked --release --manifest-path "$fixture_dir/Cargo.toml" \
-    --target aarch64-unknown-linux-gnu --bin carrick-linux-aarch64-ring-first-glibc
