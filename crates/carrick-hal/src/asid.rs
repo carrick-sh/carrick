@@ -77,6 +77,8 @@ pub enum AsidError {
     NotLive(Asid),
     #[error("guest ASID {0:?} is not awaiting TLB invalidation")]
     NotRetired(Asid),
+    #[error("slot absence for another MM cannot retire guest ASID {0:?}")]
+    AbsenceOfAnotherMm(Asid),
 }
 
 /// Allocates nonzero process ASIDs and quarantines retired identifiers until
@@ -187,20 +189,30 @@ impl AsidAllocator {
         Ok(self.prepare_retirement(generation)?.commit())
     }
 
-    /// Make a retired ASID reusable after the caller has completed the
-    /// architectural invalidation for that ASID on every vCPU in the VM.
-    /// Retire a live generation whose MM the occupancy authority proved
-    /// absent from every slot; the proof is the TLB acknowledgement.
+    /// Retire a fork child's live generation whose own MM the occupancy
+    /// authority proved absent from every slot; the proof is the TLB
+    /// acknowledgement. The proof must name the tag's MM. Retirement and
+    /// acknowledgement are one step under the allocator lock, and a
+    /// generation left awaiting acknowledgement by an earlier split retire
+    /// is finished here, so a retry never wedges on "not live".
     pub fn retire_absent(
         &self,
-        generation: AsidGeneration,
+        tag: crate::fork_stock::ChildTag<AsidGeneration>,
         absence: crate::fork_stock::SlotAbsence,
     ) -> Result<(), AsidError> {
-        let _ = absence;
-        let retired = self.retire(generation)?;
-        self.acknowledge_tlb_flush(retired)
+        let generation = tag
+            .discharged_by(&absence)
+            .ok_or(AsidError::AbsenceOfAnotherMm(tag.tag().asid))?;
+        let mut state = self.state.lock();
+        if !state.live.remove(&generation) && !state.retired.remove(&generation) {
+            return Err(AsidError::NotLive(generation.asid));
+        }
+        state.reusable.push_back(generation.asid);
+        Ok(())
     }
 
+    /// Make a retired ASID reusable after the caller has completed the
+    /// architectural invalidation for that ASID on every vCPU in the VM.
     pub fn acknowledge_tlb_flush(&self, retired: RetiredAsid) -> Result<(), AsidError> {
         let mut state = self.state.lock();
         if !state.retired.remove(&retired.generation) {
@@ -326,6 +338,58 @@ mod tests {
             .expect("overflow preflight preserves numeric ASID");
         assert_eq!(recovered.asid(), first.asid());
         assert_eq!(recovered.generation(), 9);
+    }
+
+    fn mm(raw: u64) -> carrick_el1_abi::ReservationMm {
+        carrick_el1_abi::ReservationMm::new(raw).expect("nonzero MM")
+    }
+
+    fn absent(raw: u64) -> crate::fork_stock::SlotAbsence {
+        crate::fork_stock::SlotAbsence::scan(mm(raw), [0, 7]).expect("absent MM")
+    }
+
+    #[test]
+    fn absence_of_another_mm_cannot_retire_a_child_tag() {
+        let allocator = AsidAllocator::with_limit_for_tests(1);
+        let generation = allocator.allocate().expect("ASID");
+        let tag = crate::fork_stock::ChildTag::bind(generation, mm(3));
+
+        assert_eq!(
+            allocator.retire_absent(tag, absent(4)),
+            Err(AsidError::AbsenceOfAnotherMm(generation.asid()))
+        );
+        // The tag is still live: nothing was retired or made reusable.
+        assert_eq!(allocator.allocate(), Err(AsidError::Exhausted));
+        allocator
+            .retire_absent(tag, absent(3))
+            .expect("own absence retires the tag");
+        assert_eq!(
+            allocator.allocate().expect("recycled ASID").asid(),
+            generation.asid()
+        );
+    }
+
+    #[test]
+    fn retire_absent_finishes_a_generation_left_awaiting_acknowledgement() {
+        let allocator = AsidAllocator::with_limit_for_tests(1);
+        let generation = allocator.allocate().expect("ASID");
+        // A split retire whose acknowledgement never ran.
+        let retired = allocator.retire(generation).expect("retire");
+        let _never_acknowledged = retired;
+        let tag = crate::fork_stock::ChildTag::bind(generation, mm(3));
+
+        allocator
+            .retire_absent(tag, absent(3))
+            .expect("retry completes the retirement");
+        assert_eq!(
+            allocator.retire_absent(tag, absent(3)),
+            Err(AsidError::NotLive(generation.asid()))
+        );
+        assert_eq!(
+            allocator.allocate().expect("recycled ASID").asid(),
+            generation.asid()
+        );
+        assert_eq!(allocator.allocate(), Err(AsidError::Exhausted));
     }
 }
 
