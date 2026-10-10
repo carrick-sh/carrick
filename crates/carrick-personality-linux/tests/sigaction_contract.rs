@@ -14,6 +14,10 @@ struct Native {
 impl UserCopy for Native {
     fn copy_in(&mut self, bytes: &mut [u8], _: UserVa) -> bool {
         bytes.fill(0);
+        if bytes.len() == core::mem::size_of::<carrick_syscall_abi::LinuxSiginfo>() {
+            let info = carrick_syscall_abi::LinuxSiginfo::kill(10, -1, 1, 0);
+            bytes.copy_from_slice(zerocopy::IntoBytes::as_bytes(&info));
+        }
         true
     }
     fn copy_out(&mut self, _: UserVa, _: &[u8]) -> bool {
@@ -314,5 +318,26 @@ fn malformed_signal_sizes_and_thread_groups_are_served_einval() {
         };
         assert_eq!(result(invoke(call, &mut native)), Some(-22), "{call:?}");
         assert_eq!(native.calls, 0);
+    }
+}
+
+#[test]
+fn nonpositive_queue_targets_match_native_esrch() {
+    // Native Linux SYS_rt_sigqueueinfo, valid SI_QUEUE, timeout 10:
+    // PID 0/-1/INT_MIN with signal 0 => ESRCH (3); PID 0 with SIGUSR1
+    // also => ESRCH. A self-targeted signal-0 control succeeds.
+    for pid in [0, u64::MAX, i32::MIN as u64] {
+        for signal in [0, 10] {
+            let mut native = Native {
+                args: [pid, signal, 1, 0, 0, 0],
+                calls: 0,
+                fail: false,
+            };
+            assert_eq!(
+                result(invoke(SignalCall::RtSigqueueinfo, &mut native)),
+                Some(-3)
+            );
+            assert_eq!(native.calls, 0);
+        }
     }
 }
