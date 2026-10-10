@@ -1793,4 +1793,11 @@ fn registered_guest_child_runs_from_an_idle_carrier_without_host_adoption() {
     assert_eq!(zone.installed_space(SLOT), OTHER_MM);
     assert_eq!(zone.slot(SLOT).current(), Some(record));
     assert_eq!(frame.elr, 0xB000);
+    assert_eq!(
+        sched.counters.native_fork_progress
+            [carrick_el1_abi::NativeForkProgress::ChildEntered as usize]
+            .load(Ordering::Relaxed),
+        1,
+        "child entry must be published before the scheduler returns to EL0"
+    );
 }

@@ -248,9 +248,6 @@ pub fn admit_entry(
         address.generation.raw().get(),
     ));
     if let Ok(runtime) = REGISTRY.for_entry(source, task, address) {
-        if task.visible_pid() != Some(1) {
-            fork_progress(carrick_el1_abi::NativeForkProgress::ChildEntered);
-        }
         return Ok((runtime, address, words));
     }
     if control.entry().is_some() {
