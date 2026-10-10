@@ -127,6 +127,7 @@ use crate::runtime::hardware_tso_for_debug;
     feature = "platform-freebsd",
     feature = "platform-netbsd"
 ))]
+#[cfg(any(test, target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
 fn with_vmm_vdso_for_dispatcher<A: carrick_hal::GuestArch>(
     image: AddressSpace,
     dispatcher: &SyscallDispatcher,
@@ -163,6 +164,7 @@ fn with_vmm_vdso_for_dispatcher<A: carrick_hal::GuestArch>(
     feature = "platform-freebsd",
     feature = "platform-netbsd"
 ))]
+#[cfg(any(test, target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
 #[cfg_attr(
     all(test, feature = "platform-macos"),
     allow(dead_code, unused_imports)
@@ -366,6 +368,7 @@ mod macos_helper_stubs {
         forked_child_die_by_signal, stop_after_traced_exec, stop_by_signal,
     };
 
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
     pub(super) fn hardware_tso_for_debug(_requested: bool) -> bool {
         unreachable!("Apple-Silicon hardware TSO toggle is HVF-only; KVM has no Rosetta TSO")
     }
