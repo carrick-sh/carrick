@@ -96,18 +96,13 @@ pub(crate) fn install_address_context(context: AddressContext<RootGpa>) -> Resul
     Ok(())
 }
 
-/// A root page through the supervisor direct window, bounds-checked.
+/// A root page through its retained supervisor alias (direct window or
+/// initial-extent alias), bounds-checked by the shared table-alias rule.
 fn direct_root(root: RootGpa) -> Result<&'static [u64; 512], ArchError> {
-    let address = root.address().raw();
-    if address
-        .checked_add(4096)
-        .is_none_or(|end| end > carrick_el1_abi::X86_CPL0_DIRECT_WINDOW_BYTES)
-    {
-        return Err(ArchError::Unbound);
-    }
-    // SAFETY: boot retains the direct window over this aligned page; root
-    // pages are only read here, and shared supervisor entries never move.
-    Ok(unsafe { &*((carrick_el1_abi::X86_CPL0_DIRECT_VA + address) as *const [u64; 512]) })
+    let alias = carrick_el1_abi::x86_cpl0_table_alias(root.address()).ok_or(ArchError::Unbound)?;
+    // SAFETY: boot retains this alias over the aligned page; root pages are
+    // only read here, and shared supervisor entries never move.
+    Ok(unsafe { &*(alias.raw() as *const [u64; 512]) })
 }
 
 /// Leave every process root for the carrier's maintenance root, which holds

@@ -375,6 +375,12 @@ fn release_retired_child(
         .map_err(|e| fail(e.to_string()))
 }
 
+/// The guest must reach the maintenance root through a retained supervisor
+/// alias (the shared CPL0 table-alias rule) to verify it.
+fn maintenance_root_admitted(root: RootGpa) -> bool {
+    carrick_el1_abi::x86_cpl0_table_alias(root.address()).is_some()
+}
+
 fn tables_resolve(memory: &CarrierMemory, pages: &[RootGpa]) -> bool {
     pages
         .iter()
@@ -584,15 +590,11 @@ impl Cpl0HostCustody {
             return Err(fail("no initial table grant for the maintenance root"));
         }
         let maintenance = unused.remove(0);
-        // The guest reads both roots through its direct window to verify
-        // the shared supervisor entries before every maintenance install.
-        if maintenance
-            .address()
-            .raw()
-            .checked_add(4096)
-            .is_none_or(|end| end > carrick_el1_abi::X86_CPL0_DIRECT_WINDOW_BYTES)
-        {
-            return Err(fail("maintenance root outside the CPL0 direct window"));
+        // The guest reads both roots through their retained supervisor
+        // aliases to verify the shared entries before every maintenance
+        // install; the root must be reachable by that same rule.
+        if !maintenance_root_admitted(maintenance) {
+            return Err(fail("maintenance root has no CPL0 supervisor alias"));
         }
         let source = self
             ._vm
@@ -1672,6 +1674,26 @@ mod custody_tests {
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn real_boot_layout_maintenance_root_is_admitted() {
+        // The carrier takes the first unused initial table grant, staged in
+        // the initial extent after the boot records.
+        for (frame_offset, first_unused) in [(0x1000, 1), (0x3000, 4), (0x10_0000, 63)] {
+            let root =
+                RootGpa::page_aligned(initial_grant_gpa(frame_offset, first_unused)).unwrap();
+            assert!(
+                maintenance_root_admitted(root),
+                "{frame_offset:#x}/{first_unused}"
+            );
+        }
+        let outside = RootGpa::page_aligned(FrameGpa::new(
+            carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_GPA
+                + carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_MAX_SIZE,
+        ))
+        .unwrap();
+        assert!(!maintenance_root_admitted(outside));
     }
 
     #[test]
