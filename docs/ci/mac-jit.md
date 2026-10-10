@@ -32,6 +32,9 @@ Demand (`Admission::Standing`, `crates/carrick-xtask/src/ci_scaler.rs`):
 - job labels exactly `HVF_LABELS` = `self-hosted, macOS, ARM64, carrick-hvf`.
   The closure job uses `HVF_CLOSURE_LABELS` (`carrick-hvf-closure`) and is
   never served by `mac-jit`, so it cannot occupy the merge-queue runner.
+  **Nothing serves that label today:** an owner-started dedicated runner
+  with exactly those labels is required, and until one exists a dispatched
+  closure job stays queued (GitHub cancels it after 24 hours).
 
 Before minting a runner the controller re-reads the run (`Github::vet`): same
 admission, same attempt, and for a merge group every pull request in the
@@ -52,13 +55,33 @@ including `always()` and `failure()` steps.
 Not performed by the repository change.
 
 1. **Runner account.** Create an unprivileged, non-admin user `carrick-ci`
-   (no sudo rights, its own home, e.g. via System Settings or `sysadminctl
-   -addUser carrick-ci`). Install the job toolchain in its home: rustup,
-   `just`, `gh` (used only by the merge-queue gate with the job's
-   `GITHUB_TOKEN`). No `sudo` entry is needed for jobs: scoped reaping
+   with home `/Volumes/carrick-build/carrick-ci/job-home` (`mac-run-once`
+   refuses any other home), no sudo rights, e.g.
+   `sudo sysadminctl -addUser carrick-ci -home /Volumes/carrick-build/carrick-ci/job-home`.
+   Deny it cron and at (live configuration; `mac-run-once` refuses to launch
+   unless both lists name it):
+
+   ```sh
+   echo carrick-ci | sudo tee -a /usr/lib/cron/cron.deny /usr/lib/cron/at.deny >/dev/null
+   ```
+
+   Create the root-owned skeleton the job home is rebuilt from (dotfiles
+   only, no toolchains): `sudo install -d -o root -g wheel -m 755
+   /Volumes/carrick-build/carrick-ci/skel`.
+
+   No `sudo` entry is needed for jobs: scoped reaping
    (`scripts/sudo/kill.sh <run-id>`) only signals the runner user's own
-   processes, and `mac-run-once` kills every `carrick-ci` process after each
-   job as that user.
+   processes, and `mac-run-once` kills every `carrick-ci` process before and
+   after each job as that user.
+
+   **Toolchain, root-owned and read-only.** Install rustup as root into
+   `/Volumes/carrick-build/carrick-ci/toolchain/{rustup,cargo}` with the
+   toolchain pinned by `rust-toolchain.toml` (components, targets) plus
+   `sccache` in `cargo/bin`, then `sudo chown -R root:wheel` and
+   `sudo chmod -R go-w` it. Jobs get `RUSTUP_HOME=.../toolchain/rustup`
+   (read-only) and a fresh writable `CARGO_HOME` in the job home; tools a
+   workflow installs (`just`, `cargo-deny`) land there and are wiped. A
+   toolchain change is an owner step: update this directory.
 
 2. **Runner tree, root-owned.** Download the macOS ARM64 runner from
    <https://github.com/actions/runner/releases>, verify the SHA-256 from that
@@ -144,10 +167,13 @@ main's tip:
 gh workflow run kernel-runtime.yml --repo carrick-sh/carrick --ref main
 ```
 
-If the base SHA's run is still in progress (queue depth above one), the gate
-waits for its receipt for up to 90 minutes (`--wait-minutes`, polled every 60
-s). A base run that finished without a receipt fails closed and names this
-reseed command.
+The comparison runs in the hosted `hvf-gate`/`kvm-gate` jobs, never on the
+trusted hardware: a lane job only produces and uploads its receipt, so a
+queued entry can never hold the runner its base entry needs. If the base
+SHA's run is still in progress (queue depth above one), the hosted gate waits
+for its receipt for up to 90 minutes (polled every 60 s; job timeout 110 min,
+so the actionable message always prints). A base run that finished without a
+receipt fails closed and names this reseed command.
 
 ## Lifecycle and recovery
 
@@ -163,6 +189,11 @@ reseed command.
   `mac-quiesce` under the hook's flock. If no job started, further job starts
   are refused (and killed), the registration is removed, and `mac-run-once`
   kills the runner's session.
+- **Per-job reset.** Before every launch `mac-run-once` kills every
+  `carrick-ci` process, then deletes and recreates the job home from the
+  skeleton and empties `_work` and `_diag` (symlinks are removed, never
+  followed). Nothing a previous job wrote (caches, launch agents, rc files,
+  cargo installs) reaches the next job.
 - **Completion.** After `mac-run-once` returns (runner exited, its session and
   every `carrick-ci` process killed), the registration is removed if it
   still exists and is not busy.
@@ -175,8 +206,8 @@ reseed command.
 This is trusted-workflow infrastructure, not an adversarial isolation
 boundary. Admitted jobs are code on main or in the merge queue from this
 repository's branches. They run as `carrick-ci`, which cannot write the
-runner tree, the hook binary, the policy or the hook script, but can write
-its home, `_work` and `_diag` (toolchains and caches persist across jobs).
+runner tree, the toolchain, the hook binary, the policy or the hook script;
+its home, `_work` and `_diag` are recreated before every job.
 The JIT config is passed in the runner's environment; whether the runner
 removes it before starting job steps is the runner's behaviour, not a
 property this repository verifies. See
