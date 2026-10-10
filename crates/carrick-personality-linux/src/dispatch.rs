@@ -583,11 +583,15 @@ fn serve_family<'a, C: EntryContext + 'a>(
 /// EL1 traits until orders 6-9 move their semantic bodies; they never choose
 /// another family or own completion.
 pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
-    // ARM delivery still belongs to the carrier, which owns the frame ABI.
-    if matches!(ordinal, 129..=139 | 240) {
-        return Family::Unported;
+    // Preserve the existing ARM lifecycle owners and carrier frame handback.
+    // Only x86 binds the new signal family; strict ARM refusals stay intact.
+    match ordinal {
+        132 => Family::Lifecycle(LifecycleCall::SigAltStack),
+        135 => Family::Lifecycle(LifecycleCall::SigProcMask),
+        139 => Family::SignalReturn,
+        129..=131 | 133 | 134 | 136..=138 | 240 => Family::Unported,
+        _ => route_shared(ordinal, allocator_control),
     }
-    route_shared(ordinal, allocator_control)
 }
 
 /// Route canonical Linux ordinals for the x86 in-ring frame owner.
