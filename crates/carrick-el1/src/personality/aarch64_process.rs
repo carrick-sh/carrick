@@ -207,6 +207,24 @@ pub fn admit_entry(
             },
         )?),
     };
+    if control.entry().is_none()
+        && task.visible_pid().is_some_and(|pid| {
+            REGISTRY
+                .group_address(source.zone, observed, page, pid)
+                .is_some()
+        })
+    {
+        let super::native_process_runtime::NativeRootRehome { runtime, address } = REGISTRY
+            .rehome_root(source, task, observed, page, control)
+            .map_err(|error| admission_error(counters, AdmissionStage::RootRegistry, error))?;
+        let words = Box::new(Aarch64ParkedContext::from_register(
+            *native,
+            ttbr0,
+            address.mm.raw().get(),
+            address.generation.raw().get(),
+        ));
+        return Ok((runtime, address, words));
+    }
     let address = if control.entry().is_some() {
         REGISTRY
             .group_address(

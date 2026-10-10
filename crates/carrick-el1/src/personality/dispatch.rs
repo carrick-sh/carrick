@@ -482,6 +482,7 @@ where
         return Action::Forward;
     };
     let mut sched = sched::Sched {
+        selected_identity: crate::personality::sched::publish_selected_identity,
         handoff: None,
         zone: zone.tables,
         slot,
@@ -1488,6 +1489,7 @@ pub(super) fn native_scheduler<'s, C: sched::ThreadCpu, U: sched::UserWord>(
     handoff: &'s mut Option<carrick_el1_abi::EntryHandoffReceipt<carrick_el1_abi::ZoneContext>>,
 ) -> sched::Sched<'s, C, U> {
     sched::Sched {
+        selected_identity: crate::personality::sched::publish_selected_identity,
         handoff: Some(handoff),
         zone: zone.tables,
         slot,
