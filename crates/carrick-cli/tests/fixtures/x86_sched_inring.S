@@ -84,6 +84,33 @@ _start:
     cmpq $0, ts+8(%rip)
     jle fail
 
+    # Fork leaves a visible child (including an unreaped zombie).
+    mov $57, %rax
+    syscall
+    test %rax, %rax
+    js fail
+    jz child_exit
+    mov %rax, %r12
+    # Fault the parent's data page writable after fork before the exact copy.
+    movq $0, ts(%rip)
+    movq $0, ts+8(%rip)
+    mov %r12, %rdi
+    lea ts(%rip), %rsi
+    mov $148, %rax
+    syscall
+    test %rax, %rax
+    jnz fail
+    cmpq $0, ts+8(%rip)
+    jle fail
+    mov %r12, %rdi
+    xor %rsi, %rsi
+    xor %rdx, %rdx
+    xor %r10, %r10
+    mov $61, %rax
+    syscall
+    cmp %r12, %rax
+    jne fail
+
     # Write "S\n" to stdout
     mov $1, %rax
     mov $1, %rdi
@@ -91,6 +118,10 @@ _start:
     mov $2, %rdx
     syscall
     mov $7, %rdi
+    jmp exit
+
+child_exit:
+    xor %rdi, %rdi
     jmp exit
 
 fail:

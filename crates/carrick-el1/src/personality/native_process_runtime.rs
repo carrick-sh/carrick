@@ -1196,6 +1196,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn binding(&self) -> ExecutionBinding {
         self.binding
     }
+    fn pid_exists(&self, pid: u32) -> Option<bool> {
+        self.runtime
+            .graph
+            .lock()
+            .owner
+            .namespace_key(self.key, pid)
+            .ok()
+            .map(|key| key.is_some())
+    }
     fn take_handoff_receipt(&mut self) -> Option<EntryHandoffReceipt<C>> {
         self.handoff.take()
     }

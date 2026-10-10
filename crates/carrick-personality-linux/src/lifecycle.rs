@@ -88,6 +88,9 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
         None
     }
     fn binding(&self) -> ExecutionBinding;
+    fn pid_exists(&self, _pid: u32) -> Option<bool> {
+        None
+    }
     fn fork(&mut self) -> LifecycleOutcome;
     fn wait4(
         &mut self,

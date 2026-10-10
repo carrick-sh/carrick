@@ -140,6 +140,12 @@ pub trait SchedVenue {
     fn current_pid(&self) -> Option<u32> {
         None
     }
+    /// None means this lane has no namespace process authority.
+    fn pid_exists(&self, pid: u32) -> Option<bool> {
+        self.current_pid()
+            .filter(|current| *current == pid)
+            .map(|_| true)
+    }
     fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool {
         let _ = (dst, src);
         false
@@ -188,13 +194,16 @@ pub fn serve_sched(call: SchedCall, venue: &mut dyn SchedVenue) -> FamilyComplet
                 return FamilyCompletion::Complete(LINUX_EFAULT.guest_retval());
             }
             if pid != 0 {
-                let self_pid = venue.current_pid().unwrap_or(0) as i32;
-                if pid != self_pid {
-                    return FamilyCompletion::Complete(LINUX_ESRCH.guest_retval());
+                match venue.pid_exists(pid as u32) {
+                    Some(true) => {}
+                    Some(false) => return FamilyCompletion::Complete(LINUX_ESRCH.guest_retval()),
+                    None => return FamilyCompletion::Forward,
                 }
             }
+            // Like lifecycle output copies, an unavailable exact copy declines;
+            // it does not establish that the guest address is invalid.
             if !venue.copy_out(UserVa::new(interval), &LINUX_SCHED_OTHER_SLICE_BYTES) {
-                return FamilyCompletion::Complete(LINUX_EFAULT.guest_retval());
+                return FamilyCompletion::Forward;
             }
             FamilyCompletion::Complete(0)
         }
