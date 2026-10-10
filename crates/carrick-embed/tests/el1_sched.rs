@@ -3498,7 +3498,7 @@ fn el1_fork_cow_resolves_in_guest() {
     );
     assert!(
         warmup.result.success(),
-        "warm-up fork failed: {}; rt_sigaction (served, forwarded, refused)={:?}; owner process refusal stages={:?}; first process admission root={:?}; first missing entry [presence,slot_valid,task,current,host; slot; syscall]={:?}; first native fork failure={:?}; fork progress={:?}; returned child stock delta={}",
+        "warm-up fork failed: {}; rt_sigaction (served, forwarded, refused)={:?}; owner process refusal stages={:?}; first process admission root={:?}; first process admission stage={:?}; first missing entry [presence,slot_valid,task,current,host; slot; syscall]={:?}; first native fork failure={:?}; fork progress={:?}; returned child stock delta={}",
         describe(&warmup),
         read_el1_counters().map(|c| [
             c.served[134].load(std::sync::atomic::Ordering::Relaxed),
@@ -3510,6 +3510,9 @@ fn el1_fork_cow_resolves_in_guest() {
             .map(|n| n.load(std::sync::atomic::Ordering::Relaxed))),
         read_el1_counters().map(|c| c
             .first_process_admission_root
+            .load(std::sync::atomic::Ordering::Relaxed)),
+        read_el1_counters().map(|c| c
+            .first_process_admission_stage
             .load(std::sync::atomic::Ordering::Relaxed)),
         read_el1_counters().map(|c| c
             .first_process_missing_entry
