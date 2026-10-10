@@ -692,7 +692,23 @@ where
         };
         let syscall_state = match &action {
             OwnerMemoryAction::Syscall(_) => {
-                let state = engine.snapshot_guest_state_for_publication()?;
+                let (running_zone, slot) = zone_slot(engine).ok_or_else(|| {
+                    RuntimeError::Configuration(
+                        "owner memory wait has no loaded zone slot".to_owned(),
+                    )
+                })?;
+                if !std::ptr::eq(zone, running_zone) {
+                    return Err(RuntimeError::Configuration(
+                        "owner memory wait changed carrier zone".to_owned(),
+                    )
+                    .into());
+                }
+                let state = self.with_own_roots(
+                    zone,
+                    slot,
+                    control,
+                    engine.snapshot_guest_state_for_publication()?,
+                )?;
                 let ctx = zone_ctx_from_state(&state, ZoneExit::Syscall { completed: true })?;
                 let request = self
                     .state
