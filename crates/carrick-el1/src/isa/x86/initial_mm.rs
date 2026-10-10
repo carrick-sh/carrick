@@ -430,6 +430,10 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
     seen.insert(root.address().raw());
     // Inherit shared supervisor branches only. The fresh MM must never
     // borrow another MM's temporary copy tables; its lower half is zero.
+    // Shared PML4 entries are fixed at boot: every root (each MM's, and
+    // the carrier maintenance root built by KVM `install_fork_stock`)
+    // holds a by-value copy, so a shared entry added after boot would have
+    // to update every copy; `install_maintenance_root` refuses a stale one.
     for index in 256..512_u64 {
         if !<carrick_mmu_core::x86::owner_mmu::X86Mmu as
             carrick_mmu_core::owner_mmu::OwnerForkMmu>::is_shared_root_entry(index as usize) {
