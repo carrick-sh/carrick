@@ -29,7 +29,7 @@
  *   - Run as root (libdtrace needs /dev/dtrace).
  *
  * USAGE:
- *   sudo dtrace -s scripts/guest_stack.d -c \
+ *   sudo dtrace -s scripts/dtrace/guest_stack.d -c \
  *     '/path/to/carrick run docker.io/library/ubuntu:24.04 /usr/bin/true'
  *
  * Output: one block per trap — guest PC + syscall number, then the

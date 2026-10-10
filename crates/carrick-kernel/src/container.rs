@@ -676,7 +676,7 @@ impl ContainerState {
         serde_json::from_slice(&bytes).map_err(|error| {
             let detail = error.to_string();
             let action = if detail.contains("execution backend") {
-                "; recreate the container with --exec-backend vmm if it requires virtualized execution"
+                "; recreate the container with --exec-backend hvpatch if it requires virtualized execution"
             } else {
                 ""
             };

@@ -1096,9 +1096,7 @@ impl TypeB {
         with self.assertRaises(LedgerError):
             CHECKER.route_shard("crates/carrick-conformance/src/lib.rs")
         with self.assertRaises(LedgerError):
-            CHECKER.route_shard("crates/carrick-dsr/src/lib.rs")
-        with self.assertRaises(LedgerError):
-            CHECKER.route_shard("crates/carrick-native-darwin/src/lib.rs")
+            CHECKER.route_shard("crates/carrick-fatal/src/lib.rs")
 
 
 if __name__ == "__main__":

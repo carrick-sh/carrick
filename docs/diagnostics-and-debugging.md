@@ -396,7 +396,7 @@ publication:
 ```sh
 CARRICK_HVF_SYSCALL_TRANSPORT=mailbox target/release/carrick trace \
   -s scripts/dtrace/hvf-syscall-transport.d -- \
-  run-elf --exec-backend vmm <native-pie-probe>
+  run-elf --exec-backend hvpatch <native-pie-probe>
 ```
 
 Transport `0` is legacy and `1` is mailbox; phase `0` is decode and phase `1`
