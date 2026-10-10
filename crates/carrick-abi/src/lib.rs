@@ -453,7 +453,9 @@ impl SigBlockMask {
         thread_mask: SigSet,
         ignored_dispositions: SigSet,
     ) -> SigBlockMask {
-        SigBlockMask(!wait_set.0 & (thread_mask.0 | ignored_dispositions.0))
+        Self::blocking_all_of(SigSet(
+            !wait_set.0 & (thread_mask.0 | ignored_dispositions.0),
+        ))
     }
 
     /// Everything that must NOT complete the wait with EINTR: the wait set
@@ -473,7 +475,7 @@ impl SigBlockMask {
     /// there is deliberately no bare `from_raw` (see the type docs).
     #[inline]
     pub const fn blocking_all_of(set: SigSet) -> SigBlockMask {
-        SigBlockMask(set.0)
+        SigBlockMask(set.0 & !((1u64 << (LINUX_SIGKILL - 1)) | (1u64 << (LINUX_SIGSTOP - 1))))
     }
 
     /// The waiter/backend boundary representation (bit `signum-1` blocked).
@@ -532,7 +534,7 @@ impl WaitSigMask {
     #[inline]
     pub const fn block_mask(self) -> SigBlockMask {
         match self {
-            WaitSigMask::Additive(s) | WaitSigMask::Replace(s) => SigBlockMask(s.0),
+            WaitSigMask::Additive(s) | WaitSigMask::Replace(s) => SigBlockMask::blocking_all_of(s),
         }
     }
 }
@@ -6238,5 +6240,30 @@ mod signal_leaf_identity_tests {
         let _: carrick_syscall_abi::CarrickSigframe = super::CarrickSigframe::empty();
         let _: carrick_syscall_abi::X8664Ucontext = super::X8664Ucontext::empty();
         let _: carrick_syscall_abi::X8664Rtsigframe = super::X8664Rtsigframe::empty();
+    }
+}
+
+#[cfg(test)]
+mod unmaskable_signal_tests {
+    #[test]
+    fn every_scheduler_mask_constructor_keeps_kill_and_stop_unblocked() {
+        let all = super::SigSet::from_raw(u64::MAX);
+        let unmaskable = all
+            .without(super::LINUX_SIGKILL)
+            .without(super::LINUX_SIGSTOP)
+            .raw();
+        assert_eq!(super::SigBlockMask::blocking_all_of(all).raw(), unmaskable);
+        assert_eq!(
+            super::SigBlockMask::for_signal_wait(super::SigSet::EMPTY, all, all).raw(),
+            unmaskable
+        );
+        assert_eq!(
+            super::WaitSigMask::Replace(all).block_mask().raw(),
+            unmaskable
+        );
+        assert_eq!(
+            super::WaitSigMask::Additive(all).block_mask().raw(),
+            unmaskable
+        );
     }
 }
