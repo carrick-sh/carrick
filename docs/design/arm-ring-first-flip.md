@@ -15,7 +15,7 @@ On 2026-10-08, the owner decided that ARM EL1 moves to the **x86 CPL0 model** im
 1. **EL1 is the authority:** EL1 serves every syscall the shared kernel implements in-ring. Any syscall the shared kernel already implements on x86 CPL0 becomes `Wire-in-ring` on ARM (enabling the existing shared handler), rather than falling back or returning `-ENOSYS`.
 2. **Strict permanent forward allowlist:** Only genuine host facility crossings (host file contents/metadata, host network, CLI terminal entropy, host clock) permanently reach the host carrier per [`docs/host-facility-boundary.md`](../host-facility-boundary.md).
 3. **Temporary-forward debt tracking:** Compat-zone objects (guest pipes, fd tables, epoll, synthetic timer/signal/event descriptors) are tracked as `Temporary-forward` until the shared fd table lands (`lane x86-fdtable`), rather than permanent allowlist entries.
-4. **Counted `-ENOSYS` on the fast path (The Real Regression):** Exactly 125 unhandled syscalls return `-ENOSYS` directly from EL1 without triggering a VM exit, accounted in aperture counters (`Counters.refused`). This is the real, bounded regression accepted by the owner.
+4. **Counted `-ENOSYS` on the fast path (The Real Regression):** Exactly 134 unhandled syscalls return `-ENOSYS` directly from EL1 without triggering a VM exit, accounted in aperture counters (`Counters.refused`). This is the real, bounded regression accepted by the owner.
 5. **Ordered deletion of host paths:** Dead host emulation paths in `carrick-kernel` and `carrick-vmm-hvf` (including Step 6's N1 host fork code) are removed as their ring versions land; the landing of `lane x86-fdtable` subsequently retires the temporary forward rows.
 6. **Opt-out switch:** An exact `=0` hatch (`CARRICK_ARM_RING_FIRST=0`) is provided, defaulting to **ON (`1`)**.
 
@@ -28,7 +28,7 @@ They forward only when the native owner declines; serving them in-ring takes
 precedence over crossing evaluation. The live ARM entry on this branch does
 not yet bind Step 5 process custody, and thread exit deliberately declines
 home and last-thread exits. Refusing those terminal notifications prevents
-carrier completion. The revised set has 135 entries: the 133 permanent and temporary rows
+carrier completion. The revised set has 124 entries: the 122 permanent and temporary rows
 plus two declined terminal notifications. The census below
 still describes the primary family assignments, not fallback eligibility.
 
@@ -106,10 +106,10 @@ The 338 recognized Linux AArch64 syscalls break down into 5 mutually exclusive, 
 
 | Routing Category | Count | Proportion | Semantic Definition |
 |:---|:---:|:---:|:---|
-| **`Wire-in-ring`** | **15** | 4.4% | Sycalls already implemented in-ring in the shared kernel (served on x86 CPL0 today). Enabled on ARM EL1 by wiring existing shared handlers. |
+| **`Wire-in-ring`** | **17** | 5.0% | Sycalls already implemented in-ring in the shared kernel (served on x86 CPL0 today). Enabled on ARM EL1 by wiring existing shared handlers. |
 | **`Forward-Allowlist`** | **92** | 27.2% | Permanent forward allowlist: genuine host crossings only (host file content/metadata, host network, clock, hardware entropy, descriptor polling). |
-| **`Temporary-forward`** | **41** | 12.1% | Guest fd/IPC, descriptor polling, anonymous-memory authority and ARM signal delivery and return transport. Forwarded as debt until each in-ring owner lands. |
-| **`Counted-ENOSYS`** | **125** | 37.0% | **The Real Regression:** Guest authority syscalls not yet implemented in-ring, answered with `-ENOSYS` at EL1 fast path and accounted in `Counters.refused`. |
+| **`Temporary-forward`** | **30** | 8.9% | Guest fd/IPC, descriptor polling, anonymous-memory authority and signal-return transport. Forwarded as debt until each in-ring owner lands. |
+| **`Counted-ENOSYS`** | **134** | 39.6% | **The Real Regression:** Guest authority syscalls not yet implemented in-ring, answered with `-ENOSYS` at EL1 fast path and accounted in `Counters.refused`. |
 | **`Unclaimed-ENOSYS`** | **65** | 19.2% | Baseline unrouted syscalls (`SupportLevel::BringUp`); return `-ENOSYS`. |
 | **Total** | **338** | 100.0% | Complete Linux 6.x asm-generic table. |
 
@@ -128,11 +128,11 @@ print(f"Total               : {len(rows)}")
 ```
 Verification Output:
 ```
-Counted-ENOSYS      : 125
+Counted-ENOSYS      : 134
 Forward-Allowlist   : 92
-Temporary-forward   : 41
+Temporary-forward   : 30
 Unclaimed-ENOSYS    : 65
-Wire-in-ring        : 15
+Wire-in-ring        : 17
 Total               : 338
 ```
 
@@ -627,7 +627,3 @@ is not converted into a completed syscall or consumed by identity dispatch.
 The existing opt-out transport witness includes getuid and uname and checks
 that the pending work remains. There is no identity-specific declined-for-work
 counter; the generic decline hook only accounts lifecycle/anonymous operations.
-
-ARM canonical calls 129–139 and 240 remain temporary host crossings because
-the carrier still owns ARM signal delivery and frames. Their x86 implementations
-remain in-ring; admitting these ARM crossings does not extend the x86 allowlist.
