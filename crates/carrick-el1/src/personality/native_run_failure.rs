@@ -45,6 +45,22 @@ pub fn complete_native_run_failure(binding: ExecutionBinding, reason: NativeRunF
             }
         }
     }
-    #[cfg(not(target_os = "none"))]
+    #[cfg(all(not(target_os = "none"), test))]
+    {
+        test_terminal_failure(binding, reason)
+    }
+    #[cfg(all(not(target_os = "none"), not(test)))]
+    {
+        carrick_fatal::carrick_fatal!(
+            "el1::native_run_failure",
+            "native run failed: {} ({binding:?})",
+            reason.as_str()
+        )
+    }
+}
+
+#[cfg(all(not(target_os = "none"), test))]
+#[allow(clippy::panic)]
+fn test_terminal_failure(binding: ExecutionBinding, reason: NativeRunFailureReason) -> ! {
     std::panic::panic_any(NativeRunFailurePanic { binding, reason })
 }
