@@ -509,6 +509,41 @@ fn standing_concurrency_is_bounded_at_two_and_unknown_objects_still_block() {
     assert!(ledger.reserve(job(2), &[member(340)], 11, two).is_err());
 }
 
+fn runs_on(workflow: &str, job: &str) -> Vec<String> {
+    let docs = yaml_rust2::YamlLoader::load_from_str(workflow).unwrap();
+    docs[0]["jobs"][job]["runs-on"]
+        .as_vec()
+        .unwrap()
+        .iter()
+        .map(|label| label.as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn workflow_runner_labels_are_the_controller_label_constants() {
+    let kernel = include_str!("../../../.github/workflows/kernel-runtime.yml");
+    let pilot = include_str!("../../../.github/workflows/willow-pilot.yml");
+    assert_eq!(runs_on(kernel, "kvm-tests"), LABELS);
+    assert_eq!(runs_on(pilot, "kvm"), LABELS);
+    assert_eq!(runs_on(kernel, "hvf-kernel"), HVF_LABELS);
+    assert_eq!(runs_on(kernel, "hvf-closure"), HVF_LABELS);
+}
+
+#[test]
+fn self_hosted_jobs_never_run_on_pull_request_events() {
+    let kernel = include_str!("../../../.github/workflows/kernel-runtime.yml");
+    let docs = yaml_rust2::YamlLoader::load_from_str(kernel).unwrap();
+    let on = docs[0]["on"].as_hash().unwrap();
+    for event in on.keys() {
+        let event = event.as_str().unwrap();
+        assert!(
+            ["push", "merge_group", "workflow_dispatch"].contains(&event),
+            "kernel-runtime.yml must not trigger on {event}"
+        );
+    }
+    assert_eq!(docs[0]["on"]["push"]["branches"][0].as_str(), Some("main"));
+}
+
 #[test]
 fn job_admission_and_quiesce_share_one_durable_exclusion_boundary() {
     let dir = tempfile::tempdir().unwrap();
