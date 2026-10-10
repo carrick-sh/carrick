@@ -2290,7 +2290,7 @@ mod kernel {
         binding
             .captured_stack
             .store(call.stack.raw(), Ordering::Release);
-        let handled_by_fixture = fixture_expr!(crate::fixture_handled(frame, binding, task, counters, &call));
+        let handled_by_fixture = fixture_expr!(crate::fixture_handled(frame, _early_xstate, binding, task, counters, &call));
         if !handled_by_fixture {
             use carrick_personality_linux::dispatch::CompletionRoute;
             let layout = <carrick_el1::isa::x86::X86Backend as LayoutBackend>::KERNEL_LAYOUT;
