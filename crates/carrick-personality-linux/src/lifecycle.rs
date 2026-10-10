@@ -30,9 +30,6 @@ impl ProcessWaitPid {
 )]
 pub enum LifecycleCall {
     Exit,
-    /// Wired signal-disposition family; its kernel authority retains the
-    /// fallback until an in-zone service owns `rt_sigaction`.
-    SigAction,
     SigAltStack,
     SigProcMask,
     SetRobustList,
