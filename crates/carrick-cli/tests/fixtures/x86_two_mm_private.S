@@ -3,7 +3,8 @@
 # receipt additionally requires an overlap of the two production CPU lanes.
 # Signal rendezvous keeps the peer busy while each mm touches its pages;
 # both touch phases run concurrently; neither actor exits before the other
-# acknowledges completing its own stores.
+# acknowledges completing its own stores. Distinct signals for each phase
+# avoid standard-signal coalescing; first-phase waits allow later progress.
 # Exit 91 identifies fork refusal separately from grant/leaf failures.
 .global _start
 .text
@@ -42,7 +43,7 @@ _start:
     jz child_ready
 parent_ready_wait:
     cmpq $1, ready(%rip)
-    jne parent_ready_wait
+    jb parent_ready_wait
     mov $62, %eax
     mov %r12, %rdi
     mov $12, %esi
@@ -60,7 +61,7 @@ child_ready:
     jne wait_fail
 child_go_wait:
     cmpq $1, ready(%rip)
-    jne child_go_wait
+    jb child_go_wait
 map:
     mov $0x40000000, %rdi
     mov $65536, %rsi
@@ -92,7 +93,7 @@ verify:
     jz child_exit
     mov $62, %eax
     mov %r12, %rdi
-    mov $12, %esi
+    mov $10, %esi
     syscall
     test %rax, %rax
     jne wait_fail
@@ -128,7 +129,7 @@ final_verify:
 child_exit:
     mov $62, %eax
     mov %rbp, %rdi
-    mov $10, %esi
+    mov $12, %esi
     syscall
     test %rax, %rax
     jne wait_fail
