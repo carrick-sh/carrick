@@ -259,7 +259,15 @@ mod process_exit_tests {
         let page = ThreadLifecyclePage::new();
         let controls = core::array::from_fn(|_| ThreadControlSlot::new());
         let mut frame = NativeFrame::default();
+        #[allow(clippy::panic)]
+        fn terminal_failure(
+            _: carrick_core_abi::ExecutionBinding,
+            reason: carrick_el1_abi::NativeRunFailureReason,
+        ) -> ! {
+            std::panic::panic_any(reason)
+        }
         let mut native = NativeLane {
+            terminal_failure,
             handoff: None,
             frame: &mut frame,
             task: &task,
@@ -354,7 +362,12 @@ pub struct LifecycleLane {
     pub retirements: u64,
 }
 
+/// The image owner supplies the terminal transport with its retained custody.
+pub type TerminalFailure =
+    fn(carrick_core_abi::ExecutionBinding, carrick_el1_abi::NativeRunFailureReason) -> !;
+
 pub struct NativeLane<'a> {
+    terminal_failure: TerminalFailure,
     handoff: Option<carrick_core_abi::EntryHandoffReceipt>,
     pub frame: &'a mut NativeFrame,
     pub task: &'a CurrentTask,
@@ -513,22 +526,9 @@ impl UserCopy for NativeLane<'_> {
 }
 impl<'a> LifecycleNative<'a> for NativeLane<'a> {
     fn fail_lifecycle(&mut self, reason: carrick_el1_abi::NativeRunFailureReason) -> ! {
-        #[cfg(target_os = "none")]
-        {
-            let binding = LifecycleNative::binding(self).unwrap_or_else(|| {
-                carrick_el1::personality::dispatch::invalid_completion(
-                    carrick_el1::personality::dispatch::NativeInvariant::EntryBinding,
-                )
-            });
-            carrick_el1::personality::native_run_failure::complete_native_run_failure(
-                binding, reason,
-            )
-        }
-        #[cfg(not(target_os = "none"))]
-        carrick_fatal::carrick_fatal!(
-            "x86::fixture_lifecycle",
-            "native run failed: {}",
-            reason.as_str()
+        (self.terminal_failure)(
+            carrick_core::entry::binding(&self.task.execution, &self.task.mm),
+            reason,
         )
     }
 
@@ -1092,6 +1092,7 @@ pub unsafe fn acquire<'a>(
     task: &'a CurrentTask,
     counters: &'a Counters,
     args: [u64; 6],
+    terminal_failure: TerminalFailure,
 ) -> Option<NativeLane<'a>> {
     let address = binding.scheduler_witness.load(Ordering::Acquire);
     if address != LIFECYCLE_LANE && address != LIFECYCLE_LANE + LIFECYCLE_STRIDE {
@@ -1114,6 +1115,7 @@ pub unsafe fn acquire<'a>(
             as *const [ThreadControlSlot; 9])
     };
     Some(NativeLane {
+        terminal_failure,
         handoff: None,
         frame,
         task,
