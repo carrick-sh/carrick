@@ -526,9 +526,9 @@ pub struct Kernel {
     domain: Arc<KernelDomain>,
     registry: Registry,
     ids: IdRegistry,
-    object_ids: ObjectIdRegistry,
+    object_ids: Arc<ObjectIdRegistry>,
     boot_launch: Mutex<super::boot_launch::BootLaunchAuthority>,
-    frame_inventory: FrameInventoryAuthority,
+    frame_inventory: Arc<FrameInventoryAuthority>,
     shared_futex: carrick_thread::platform_futex::SharedFutexTable,
     fd_ceiling: Arc<super::FdCeilingAuthority>,
     hvpatch_child_token_issuer: Arc<carrick_hal::HvpatchChildTokenIssuer>,
@@ -1509,9 +1509,9 @@ impl Kernel {
             host_signal: bootstrap.host_signal,
             registry,
             ids,
-            object_ids,
+            object_ids: Arc::new(object_ids),
             boot_launch: Mutex::default(),
-            frame_inventory: FrameInventoryAuthority::new(),
+            frame_inventory: Arc::new(FrameInventoryAuthority::new()),
             shared_futex: bootstrap.shared_futex,
             fd_ceiling,
             ipc: Mutex::new(None),
@@ -2294,7 +2294,7 @@ impl Kernel {
         &self.ids
     }
 
-    pub const fn object_ids(&self) -> &ObjectIdRegistry {
+    pub fn object_ids(&self) -> &ObjectIdRegistry {
         &self.object_ids
     }
 
@@ -2390,8 +2390,14 @@ impl Kernel {
 
     /// Sole runtime authority for applied frame/mapping inventory. `Stage1Mm`
     /// remains only an mm-binding seam during K1 and does not write this state.
-    pub const fn frame_inventory(&self) -> &FrameInventoryAuthority {
+    pub fn frame_inventory(&self) -> &FrameInventoryAuthority {
         &self.frame_inventory
+    }
+
+    /// Project this carrier's sole physical inventory and ID source.
+    pub fn physical_frame_inventory(&self) -> Arc<dyn carrick_hal::PhysicalFrameInventory> {
+        self.frame_inventory
+            .physical_projection(Arc::clone(&self.object_ids))
     }
 
     #[allow(dead_code)] // consumed by the HVPatch carrier-directory publication slice
