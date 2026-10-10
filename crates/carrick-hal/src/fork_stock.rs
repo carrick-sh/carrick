@@ -206,6 +206,23 @@ pub fn lifecycle_slots(
         .collect()
 }
 
+/// The one lifecycle hygiene policy every carrier implements: an issued
+/// record must be proven cold (all zero) and a returned record is cleared
+/// before it reenters the stock. A dirty record at loan time is withdrawn.
+pub trait LifecycleHygiene {
+    fn is_zero(&self, lifecycle: ForkLifecycleLoan) -> bool;
+    fn clear(&self, lifecycle: ForkLifecycleLoan) -> bool;
+}
+
+impl LifecycleHygiene for LifecycleWindow {
+    fn is_zero(&self, lifecycle: ForkLifecycleLoan) -> bool {
+        LifecycleWindow::is_zero(*self, lifecycle)
+    }
+    fn clear(&self, lifecycle: ForkLifecycleLoan) -> bool {
+        LifecycleWindow::clear(*self, lifecycle)
+    }
+}
+
 /// Host view of a guest metadata window that holds lifecycle records, so a
 /// carrier can prove an issued record is cold storage and clear a returned
 /// one before it reenters the stock.
@@ -330,6 +347,8 @@ pub struct ForkStockCounters {
     pub quarantined_children: u64,
     /// Child retirements refused with a typed reply (stock stays charged).
     pub retire_refusals: u64,
+    /// Lifecycle records found dirty at loan time and withdrawn for good.
+    pub withdrawn_lifecycles: u64,
     /// Quarantined children whose stock returned to the reusable pool.
     pub returned_children: u64,
 }
@@ -599,12 +618,24 @@ impl<T: ChildAddressTags> ForkStock<T> {
             )
             .filter(|_| fresh);
         let Some(loan) = admitted else {
-            let refusal = if fresh {
-                ForkStockRefusal::Invalid
-            } else {
-                ForkStockRefusal::Inventory
-            };
-            return self.restore_and_refuse(ledger, exchange, reserved, 0, refusal);
+            if fresh {
+                return self.restore_and_refuse(
+                    ledger,
+                    exchange,
+                    reserved,
+                    0,
+                    ForkStockRefusal::Invalid,
+                );
+            }
+            // One hygiene policy for every carrier: a dirty lifecycle record
+            // is a custody fault in that record, not in the carrier. It is
+            // withdrawn (never reissued) and the loan refused as Inventory.
+            let result =
+                self.restore_and_refuse(ledger, exchange, reserved, 0, ForkStockRefusal::Inventory);
+            self.lifecycles.retain(|record| *record != lifecycle);
+            self.counters.withdrawn_lifecycles =
+                self.counters.withdrawn_lifecycles.saturating_add(1);
+            return result;
         };
         let charges: Vec<_> = reserved.charges().collect();
         let mut charged = 0;

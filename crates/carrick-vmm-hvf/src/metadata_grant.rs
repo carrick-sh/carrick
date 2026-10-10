@@ -752,6 +752,7 @@ pub(crate) fn drain_fork_quarantine(
             active_mm,
             occupancy,
             clear_tables,
+            &crate::fork_stock::StageTwoLifecycles { custody },
         )
         .map(|_| ())
 }
@@ -1031,7 +1032,12 @@ pub(crate) fn service_metadata_operation(
                 }
                 let mut fork_stock = custody.fork_stock.lock();
                 let mut ledger = custody.el1_frame_grants.lock();
-                match fork_stock.service_loan(&mut ledger, execution, exchange) {
+                match fork_stock.service_loan(
+                    &mut ledger,
+                    execution,
+                    exchange,
+                    &crate::fork_stock::StageTwoLifecycles { custody },
+                ) {
                     Ok(_loan) => Ok([METADATA_GRANT_SUCCESS, 0, 0, 0]),
                     Err(_refusal) => Ok([METADATA_GRANT_ERR_DENIED, exchange.response[0], 0, 0]),
                 }
@@ -1080,6 +1086,7 @@ pub(crate) fn service_metadata_operation(
                     settlement,
                     is_resolvable,
                     is_clean,
+                    &crate::fork_stock::StageTwoLifecycles { custody },
                 ) {
                     Ok(()) => Ok([METADATA_GRANT_SUCCESS, 0, 0, 0]),
                     Err(e) => {

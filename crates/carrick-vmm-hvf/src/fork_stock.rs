@@ -15,13 +15,14 @@
 //! - `CarrierVmCustody` stage-2 records resolve guest records and pages.
 
 use carrick_el1_abi::{
-    ForkStockExchange, ForkStockLoan, ForkStockRefusal, ForkStockSettlement, NativeChildRetire,
-    NativeRootExit, ReservationMm,
+    ForkLifecycleLoan, ForkStockExchange, ForkStockLoan, ForkStockRefusal, ForkStockSettlement,
+    NativeChildRetire, NativeRootExit, ReservationMm,
 };
 use carrick_guest_arch::{FrameGpa, RootGpa};
 use carrick_hal::asid::{AsidAllocator, AsidGeneration};
 use carrick_hal::fork_stock::{
-    ForkStock, ForkTableLedger, LIFECYCLE_SLOT_STRIDE, SlotAbsence, lifecycle_slots,
+    ForkStock, ForkTableLedger, LIFECYCLE_SLOT_STRIDE, LifecycleHygiene, SlotAbsence,
+    lifecycle_slots,
 };
 use carrick_sched_core::process::LinuxWaitStatus;
 use core::num::NonZeroU64;
@@ -118,10 +119,11 @@ impl ForkStockHostCustody {
         ledger: &mut El1FrameGrantLedger,
         execution: GrantExecution,
         exchange: &mut ForkStockExchange,
+        hygiene: &impl LifecycleHygiene,
     ) -> Result<ForkStockLoan, ForkStockRefusal> {
-        // Every EL1 loan initializes its lifecycle record before claiming a
-        // task; reclaimed records need no host clearing on this carrier.
-        self.stock.loan(ledger, execution, exchange, |_| true)
+        self.stock.loan(ledger, execution, exchange, |lifecycle| {
+            hygiene.is_zero(lifecycle)
+        })
     }
 
     /// Service a stopped-vCPU settlement (Commit or Abort).
@@ -132,6 +134,7 @@ impl ForkStockHostCustody {
         settlement: &mut ForkStockSettlement,
         is_resolvable: impl Fn(&[RootGpa]) -> bool,
         is_clean: impl Fn(&[RootGpa]) -> bool,
+        hygiene: &impl LifecycleHygiene,
     ) -> Result<(), ForkStockServiceError> {
         self.stock.settle(
             ledger,
@@ -139,7 +142,7 @@ impl ForkStockHostCustody {
             settlement,
             is_resolvable,
             is_clean,
-            |_| true,
+            |lifecycle| hygiene.clear(lifecycle),
         )
     }
 
@@ -179,13 +182,14 @@ impl ForkStockHostCustody {
         active_mm: ReservationMm,
         occupancy: impl Fn(ReservationMm) -> Option<SlotAbsence>,
         clear_tables: impl Fn(&[RootGpa]) -> bool,
+        hygiene: &impl LifecycleHygiene,
     ) -> Result<usize, ForkStockServiceError> {
         self.stock.reclaim(
             ledger,
             active_mm,
             occupancy,
             clear_tables,
-            |_| true,
+            |lifecycle| hygiene.clear(lifecycle),
             |_| true,
         )
     }
@@ -218,6 +222,63 @@ impl ForkStockHostCustody {
         .map_err(|_| ForkStockServiceError::MemoryAccessFailed)?;
         let host_ptr = (record.snapshot.host_addr as *mut u8).wrapping_add(offset);
         Ok(host_ptr.cast::<T>())
+    }
+}
+
+/// The HVF lifecycle hygiene: records live in carrier-owned metadata
+/// extents whose kernel VAs equal their stage-2 IPAs, reached through the
+/// carrier's stage-2 records.
+pub(crate) struct StageTwoLifecycles<'a> {
+    pub(crate) custody: &'a CarrierVmCustody,
+}
+
+impl StageTwoLifecycles<'_> {
+    fn ranges(&self, lifecycle: ForkLifecycleLoan) -> Option<[(*mut u8, usize); 2]> {
+        let page =
+            ForkStockHostCustody::resolve_record_ptr::<carrick_el1_abi::ThreadLifecyclePage>(
+                self.custody,
+                lifecycle.page.raw(),
+            )
+            .ok()?;
+        let controls = ForkStockHostCustody::resolve_record_ptr::<
+            [carrick_el1_abi::ThreadControlSlot; carrick_el1_abi::THREAD_POOL_ENTRIES + 1],
+        >(self.custody, lifecycle.controls.raw())
+        .ok()?;
+        Some([
+            (
+                page.cast::<u8>(),
+                core::mem::size_of::<carrick_el1_abi::ThreadLifecyclePage>(),
+            ),
+            (
+                controls.cast::<u8>(),
+                core::mem::size_of::<
+                    [carrick_el1_abi::ThreadControlSlot; carrick_el1_abi::THREAD_POOL_ENTRIES + 1],
+                >(),
+            ),
+        ])
+    }
+}
+
+impl LifecycleHygiene for StageTwoLifecycles<'_> {
+    fn is_zero(&self, lifecycle: ForkLifecycleLoan) -> bool {
+        self.ranges(lifecycle).is_some_and(|ranges| {
+            ranges.iter().all(|(ptr, len)| {
+                // SAFETY: resolved carrier-retained stage-2 bytes of a record
+                // no task owns while its loan is decided.
+                unsafe { core::slice::from_raw_parts(*ptr, *len) }
+                    .iter()
+                    .all(|byte| *byte == 0)
+            })
+        })
+    }
+    fn clear(&self, lifecycle: ForkLifecycleLoan) -> bool {
+        self.ranges(lifecycle).is_some_and(|ranges| {
+            for (ptr, len) in ranges {
+                // SAFETY: as above; the record is aborted or reclaimed.
+                unsafe { core::ptr::write_bytes(ptr, 0, len) };
+            }
+            true
+        })
     }
 }
 
@@ -256,6 +317,22 @@ mod tests {
     };
     use carrick_hal::asid::AsidError;
     use core::num::NonZeroU64;
+
+    /// A real lifecycle window over zeroed host bytes covering the ARM
+    /// default record and the production boot stock extent.
+    fn test_hygiene() -> carrick_hal::fork_stock::LifecycleWindow {
+        let words = carrick_el1_abi::EL1_DYNAMIC_METADATA_EXTENT_SIZE / 8;
+        let bytes: &'static mut [u64] = Box::leak(vec![0u64; words].into_boxed_slice());
+        // SAFETY: the leaked buffer lives for the test process and backs
+        // the first metadata extent's kernel VAs.
+        unsafe {
+            carrick_hal::fork_stock::LifecycleWindow::new(
+                core::ptr::NonNull::new(bytes.as_mut_ptr().cast::<u8>()).unwrap(),
+                carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE,
+                carrick_el1_abi::EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64,
+            )
+        }
+    }
 
     fn page(addr: u64) -> RootGpa {
         RootGpa::page_aligned(FrameGpa::new(addr)).unwrap()
@@ -305,6 +382,37 @@ mod tests {
             child_bytes: child_pages * 4096,
             parent_bytes: parent_pages * 4096,
         }
+    }
+
+    /// A record whose host bytes are not zero (a dirty reissue).
+    struct DirtyLifecycles;
+    impl LifecycleHygiene for DirtyLifecycles {
+        fn is_zero(&self, _: carrick_el1_abi::ForkLifecycleLoan) -> bool {
+            false
+        }
+        fn clear(&self, _: carrick_el1_abi::ForkLifecycleLoan) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn dirty_lifecycle_record_is_withdrawn_not_reissued_on_hvf() {
+        let carrier = NonZeroU64::new(7).unwrap();
+        let mut custody = ForkStockHostCustody::new(carrier);
+        custody.seed_for_tests((0..8).map(|i| page(0x20000 + i * 4096)).collect());
+        let mut ledger = El1FrameGrantLedger::default();
+        let exec = test_execution(41, 0, 301);
+        let req = test_request(exec, 302, 1, 1);
+        let mut exchange = ForkStockExchange::new(req).unwrap();
+        assert_eq!(
+            custody.service_loan(&mut ledger, exec, &mut exchange, &DirtyLifecycles),
+            Err(ForkStockRefusal::Inventory)
+        );
+        assert_eq!(exchange.take(req), Some(Err(ForkStockRefusal::Inventory)));
+        assert!(custody.stock().lifecycle_stock().is_empty());
+        assert_eq!(custody.stock().counters().withdrawn_lifecycles, 1);
+        assert_eq!(custody.stock().table_stock().len(), 8);
+        assert_eq!(ledger.snapshot().bytes_granted, 0);
     }
 
     #[test]
@@ -368,7 +476,7 @@ mod tests {
 
         // Service Loan
         let loan = custody
-            .service_loan(&mut ledger, exec, &mut exchange)
+            .service_loan(&mut ledger, exec, &mut exchange, &test_hygiene())
             .expect("loan should succeed");
         assert_eq!(custody.stock().table_stock().len(), initial_stock_len - 5);
         assert_eq!(loan.request.child_tables.base, 0x20000);
@@ -416,7 +524,14 @@ mod tests {
             .unwrap()
             .into_inner();
         custody
-            .service_settlement(&mut ledger, exec, &mut settlement, |_| true, |_| true)
+            .service_settlement(
+                &mut ledger,
+                exec,
+                &mut settlement,
+                |_| true,
+                |_| true,
+                &test_hygiene(),
+            )
             .expect("settlement commit should succeed");
 
         // Unused 3 child pages returned to stock: initial (8) - 2 used = 6 remaining
@@ -438,7 +553,8 @@ mod tests {
                 exec,
                 &mut second_settlement,
                 |_| true,
-                |_| true
+                |_| true,
+                &test_hygiene()
             ),
             Err(ForkStockServiceError::NoPendingLoan)
         );
@@ -458,7 +574,7 @@ mod tests {
         foreign_exec.binding.task = EntryTaskKey::from_raw(999);
         let req = test_request(foreign_exec, 302, 2, 1);
         let mut exchange = ForkStockExchange::new(req).unwrap();
-        let result = custody.service_loan(&mut ledger, exec, &mut exchange);
+        let result = custody.service_loan(&mut ledger, exec, &mut exchange, &test_hygiene());
         assert_eq!(result, Err(ForkStockRefusal::Stale));
         assert_eq!(exchange.take(req), Some(Err(ForkStockRefusal::Stale)));
 
@@ -468,7 +584,7 @@ mod tests {
         let req = test_request(foreign_context_exec, 302, 2, 1);
         let mut exchange = ForkStockExchange::new(req).unwrap();
         assert_eq!(
-            custody.service_loan(&mut ledger, exec, &mut exchange),
+            custody.service_loan(&mut ledger, exec, &mut exchange, &test_hygiene()),
             Err(ForkStockRefusal::Stale)
         );
 
@@ -477,7 +593,7 @@ mod tests {
         foreign_carrier_req.operation.carrier = NonZeroU64::new(99).unwrap();
         let mut exchange = ForkStockExchange::new(foreign_carrier_req).unwrap();
         assert_eq!(
-            custody.service_loan(&mut ledger, exec, &mut exchange),
+            custody.service_loan(&mut ledger, exec, &mut exchange, &test_hygiene()),
             Err(ForkStockRefusal::Stale)
         );
 
@@ -485,7 +601,7 @@ mod tests {
         let huge_req = test_request(exec, 302, 100, 100);
         let mut exchange = ForkStockExchange::new(huge_req).unwrap();
         assert_eq!(
-            custody.service_loan(&mut ledger, exec, &mut exchange),
+            custody.service_loan(&mut ledger, exec, &mut exchange, &test_hygiene()),
             Err(ForkStockRefusal::Capacity)
         );
 
@@ -507,7 +623,7 @@ mod tests {
         let mut exchange = ForkStockExchange::new(req).unwrap();
 
         let loan = custody
-            .service_loan(&mut ledger, exec, &mut exchange)
+            .service_loan(&mut ledger, exec, &mut exchange, &test_hygiene())
             .expect("loan succeeds");
         assert_eq!(custody.stock().table_stock().len(), 2);
         assert_eq!(ledger.snapshot().bytes_granted, 4 * 4096);
@@ -516,7 +632,14 @@ mod tests {
         // Abort the loan
         let mut abort_settlement = ForkStockSettlement::abort(loan);
         custody
-            .service_settlement(&mut ledger, exec, &mut abort_settlement, |_| true, |_| true)
+            .service_settlement(
+                &mut ledger,
+                exec,
+                &mut abort_settlement,
+                |_| true,
+                |_| true,
+                &test_hygiene(),
+            )
             .expect("abort succeeds");
 
         // All 4 pages restored to stock exactly once
@@ -531,7 +654,8 @@ mod tests {
                 exec,
                 &mut abort_settlement,
                 |_| true,
-                |_| true
+                |_| true,
+                &test_hygiene()
             ),
             Err(ForkStockServiceError::NoPendingLoan)
         );
@@ -541,18 +665,31 @@ mod tests {
         // Dirty page verification: if pages were modified, abort fails closed
         let mut second_exchange = ForkStockExchange::new(test_request(exec, 303, 3, 1)).unwrap();
         let second_loan = custody
-            .service_loan(&mut ledger, exec, &mut second_exchange)
+            .service_loan(&mut ledger, exec, &mut second_exchange, &test_hygiene())
             .unwrap();
         let mut dirty_abort = ForkStockSettlement::abort(second_loan);
-        let result =
-            custody.service_settlement(&mut ledger, exec, &mut dirty_abort, |_| true, |_| false);
+        let result = custody.service_settlement(
+            &mut ledger,
+            exec,
+            &mut dirty_abort,
+            |_| true,
+            |_| false,
+            &test_hygiene(),
+        );
         assert_eq!(result, Err(ForkStockServiceError::ExposedDirtyTable));
         custody
-            .service_settlement(&mut ledger, exec, &mut dirty_abort, |_| true, |_| true)
+            .service_settlement(
+                &mut ledger,
+                exec,
+                &mut dirty_abort,
+                |_| true,
+                |_| true,
+                &test_hygiene(),
+            )
             .expect("guest cleared the loan after refusal");
         let mut third_exchange = ForkStockExchange::new(test_request(exec, 304, 3, 1)).unwrap();
         custody
-            .service_loan(&mut ledger, exec, &mut third_exchange)
+            .service_loan(&mut ledger, exec, &mut third_exchange, &test_hygiene())
             .expect("same CPU can fork after clean abort");
     }
 
@@ -619,7 +756,7 @@ mod tests {
         let req = test_request(exec, 302, 1, 1);
         let mut exchange = ForkStockExchange::new(req).unwrap();
         let loan = custody
-            .service_loan(&mut ledger, exec, &mut exchange)
+            .service_loan(&mut ledger, exec, &mut exchange, &test_hygiene())
             .expect("loan granted");
 
         let child_asid = loan.asid.expect("child ASID granted");
@@ -631,7 +768,14 @@ mod tests {
         // 3. Abort releases the ASID back to reusable pool
         let mut abort = ForkStockSettlement::abort(loan);
         custody
-            .service_settlement(&mut ledger, exec, &mut abort, |_| true, |_| true)
+            .service_settlement(
+                &mut ledger,
+                exec,
+                &mut abort,
+                |_| true,
+                |_| true,
+                &test_hygiene(),
+            )
             .expect("abort settlement");
 
         // The aborted ASID was released unpublished and can now be reallocated
@@ -647,7 +791,7 @@ mod tests {
         let req2 = test_request(exec, 303, 1, 1);
         let mut exchange2 = ForkStockExchange::new(req2).unwrap();
         let loan2 = custody
-            .service_loan(&mut ledger, exec, &mut exchange2)
+            .service_loan(&mut ledger, exec, &mut exchange2, &test_hygiene())
             .expect("loan 2 granted");
         let child_asid2 = loan2.asid.expect("child ASID 2");
 
@@ -668,7 +812,14 @@ mod tests {
             ForkStockSettlement::new(loan2, completion, KernelVa::new(0xffff_8000_0001_0000), 1)
                 .unwrap();
         custody
-            .service_settlement(&mut ledger, exec, &mut commit, |_| true, |_| true)
+            .service_settlement(
+                &mut ledger,
+                exec,
+                &mut commit,
+                |_| true,
+                |_| true,
+                &test_hygiene(),
+            )
             .expect("commit settlement");
 
         // Child exit marks the MM retired while its TTBR0 may still be live.
@@ -690,7 +841,8 @@ mod tests {
                     &mut ledger,
                     ReservationMm::new(exec.binding.mm.raw()).unwrap(),
                     |mm| SlotAbsence::scan(mm, []),
-                    |_| true
+                    |_| true,
+                    &test_hygiene()
                 )
                 .expect("reclaim after parent resumes"),
             1
@@ -702,7 +854,8 @@ mod tests {
                     &mut ledger,
                     ReservationMm::new(exec.binding.mm.raw()).unwrap(),
                     |mm| SlotAbsence::scan(mm, []),
-                    |_| true
+                    |_| true,
+                    &test_hygiene()
                 )
                 .expect("exactly once"),
             0
@@ -747,7 +900,7 @@ mod tests {
             let request = test_request(parent, child_mm, 1, 1);
             let mut exchange = ForkStockExchange::new(request).unwrap();
             let loan = custody
-                .service_loan(&mut ledger, parent, &mut exchange)
+                .service_loan(&mut ledger, parent, &mut exchange, &test_hygiene())
                 .expect("bounded stock serves each fork");
             let completion = PortalForkCompletion {
                 request: loan.request,
@@ -766,7 +919,14 @@ mod tests {
                 ForkStockSettlement::new(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 1)
                     .unwrap();
             custody
-                .service_settlement(&mut ledger, parent, &mut commit, |_| true, |_| true)
+                .service_settlement(
+                    &mut ledger,
+                    parent,
+                    &mut commit,
+                    |_| true,
+                    |_| true,
+                    &test_hygiene(),
+                )
                 .expect("settle child and return unused parent page");
             let child = child_execution(42 + cycle, &loan);
             let mut retire = NativeChildRetire::new(child.binding, child.context).unwrap();
@@ -779,7 +939,8 @@ mod tests {
                         &mut ledger,
                         ReservationMm::new(parent.binding.mm.raw()).unwrap(),
                         |mm| SlotAbsence::scan(mm, []),
-                        |_| true
+                        |_| true,
+                        &test_hygiene()
                     )
                     .expect("parent has resumed"),
                 1
@@ -807,7 +968,7 @@ mod tests {
             let request = test_request(parent, child_mm, 1, 1);
             let mut exchange = ForkStockExchange::new(request).unwrap();
             let loan = custody
-                .service_loan(&mut ledger, parent, &mut exchange)
+                .service_loan(&mut ledger, parent, &mut exchange, &test_hygiene())
                 .expect("fork while prior child remains live");
             lifecycles.push(loan.lifecycle);
             let completion = PortalForkCompletion {
@@ -827,7 +988,14 @@ mod tests {
                 ForkStockSettlement::new(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 1)
                     .unwrap();
             custody
-                .service_settlement(&mut ledger, parent, &mut commit, |_| true, |_| true)
+                .service_settlement(
+                    &mut ledger,
+                    parent,
+                    &mut commit,
+                    |_| true,
+                    |_| true,
+                    &test_hygiene(),
+                )
                 .expect("committed child stays live");
         }
         assert_ne!(lifecycles[0], lifecycles[1]);
@@ -862,7 +1030,7 @@ mod tests {
             let request = test_request(parent, child_mm, 1, 1);
             let mut exchange = ForkStockExchange::new(request).unwrap();
             let loan = custody
-                .service_loan(&mut ledger, parent, &mut exchange)
+                .service_loan(&mut ledger, parent, &mut exchange, &test_hygiene())
                 .unwrap_or_else(|refusal| panic!("cycle {cycle}: {refusal:?}"));
             let issued = &custody.stock().pending(parent.cpu).unwrap().child_tables;
             assert!(issued.iter().all(|page| !held.contains(page)));
@@ -883,7 +1051,14 @@ mod tests {
                 ForkStockSettlement::new(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 1)
                     .unwrap();
             custody
-                .service_settlement(&mut ledger, parent, &mut commit, |_| true, |_| true)
+                .service_settlement(
+                    &mut ledger,
+                    parent,
+                    &mut commit,
+                    |_| true,
+                    |_| true,
+                    &test_hygiene(),
+                )
                 .expect("commit");
             let child = child_execution(42 + cycle, &loan);
             let mut retire = NativeChildRetire::new(child.binding, child.context).unwrap();
@@ -898,6 +1073,7 @@ mod tests {
                     ReservationMm::new(parent.binding.mm.raw()).unwrap(),
                     |mm| SlotAbsence::scan(mm, still.map(|still| still.raw())),
                     |_| true,
+                    &test_hygiene(),
                 )
                 .expect("reclaim");
             assert_eq!(returned, usize::from(previous.is_some()), "cycle {cycle}");
@@ -926,7 +1102,7 @@ mod tests {
         let request = test_request(parent, 302, pool_pages - 1, 1);
         let mut exchange = ForkStockExchange::new(request).unwrap();
         let loan = custody
-            .service_loan(&mut ledger, parent, &mut exchange)
+            .service_loan(&mut ledger, parent, &mut exchange, &test_hygiene())
             .expect("first child takes available table stock");
         let completion = PortalForkCompletion {
             request: loan.request,
@@ -945,7 +1121,14 @@ mod tests {
             ForkStockSettlement::new(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 1)
                 .unwrap();
         custody
-            .service_settlement(&mut ledger, parent, &mut commit, |_| true, |_| true)
+            .service_settlement(
+                &mut ledger,
+                parent,
+                &mut commit,
+                |_| true,
+                |_| true,
+                &test_hygiene(),
+            )
             .expect("commit first child");
         let child = child_execution(42, &loan);
         let mut retire = NativeChildRetire::new(child.binding, child.context).unwrap();
@@ -958,7 +1141,8 @@ mod tests {
                     &mut ledger,
                     ReservationMm::new(parent.binding.mm.raw()).unwrap(),
                     |mm| SlotAbsence::scan(mm, [mm.raw()]),
-                    |_| true
+                    |_| true,
+                    &test_hygiene()
                 )
                 .unwrap(),
             0
@@ -966,7 +1150,7 @@ mod tests {
         let next = test_request(parent, 303, pool_pages - 1, 1);
         let mut refused = ForkStockExchange::new(next).unwrap();
         assert_eq!(
-            custody.service_loan(&mut ledger, parent, &mut refused),
+            custody.service_loan(&mut ledger, parent, &mut refused, &test_hygiene()),
             Err(ForkStockRefusal::Capacity)
         );
         assert_eq!(
@@ -975,15 +1159,45 @@ mod tests {
                     &mut ledger,
                     ReservationMm::new(parent.binding.mm.raw()).unwrap(),
                     |mm| SlotAbsence::scan(mm, []),
-                    |_| true
+                    |_| true,
+                    &test_hygiene()
                 )
                 .unwrap(),
             1
         );
         let mut admitted = ForkStockExchange::new(next).unwrap();
         custody
-            .service_loan(&mut ledger, parent, &mut admitted)
+            .service_loan(&mut ledger, parent, &mut admitted, &test_hygiene())
             .expect("stock is reusable only after quarantine drains");
+    }
+
+    #[repr(C, align(16384))]
+    struct LifecycleBacking([u8; 0x4000]);
+
+    /// Back the ARM default lifecycle record with a carrier stage-2 record,
+    /// as the production boot stock extent is.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn publish_lifecycle_record(
+        custody: &CarrierVmCustody,
+        generation: crate::trap::CarrierVmGeneration,
+    ) -> Box<LifecycleBacking> {
+        let mut backing = Box::new(LifecycleBacking([0u8; 0x4000]));
+        let spec = crate::trap::CarrierStage2RecordSpec {
+            vm_generation: generation,
+            ipa: carrick_el1_abi::ForkLifecycleLoan::ARM_DEFAULT.page.raw(),
+            len: 0x4000,
+            host_addr: backing.0.as_mut_ptr() as usize,
+            mapped: true,
+            backend_map_installed: true,
+            release_ipa: false,
+            perms: 3,
+            logical_owner: Some(crate::trap::CarrierLogicalOwner {
+                id: 900,
+                generation: 1,
+            }),
+        };
+        custody.publish_stage2_record_using(spec, || 0).unwrap();
+        backing
     }
 
     #[repr(align(64))]
@@ -995,6 +1209,7 @@ mod tests {
         let custody = CarrierVmCustody::new();
         let generation = custody.begin_create().unwrap();
         custody.commit_create(generation).unwrap();
+        let _lifecycle = publish_lifecycle_record(&custody, generation);
 
         let mut record_page = Box::new(AlignedPage([0u8; 4096]));
         let record_ipa = 0x2000_0000u64;
@@ -1135,6 +1350,7 @@ mod tests {
         let custody = CarrierVmCustody::new();
         let generation = custody.begin_create().unwrap();
         custody.commit_create(generation).unwrap();
+        let _lifecycle = publish_lifecycle_record(&custody, generation);
 
         let mut record_page = Box::new(AlignedPage([0u8; 4096]));
         let record_ipa = 0x2000_0000u64;
@@ -1323,7 +1539,7 @@ mod tests {
         let request = test_request(parent, 302, 1, 1);
         let mut exchange = ForkStockExchange::new(request).unwrap();
         let loan = fork
-            .service_loan(&mut ledger, parent, &mut exchange)
+            .service_loan(&mut ledger, parent, &mut exchange, &test_hygiene())
             .expect("loan");
         let completion = PortalForkCompletion {
             request: loan.request,
@@ -1341,8 +1557,15 @@ mod tests {
         let mut commit =
             ForkStockSettlement::new(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 1)
                 .unwrap();
-        fork.service_settlement(&mut ledger, parent, &mut commit, |_| true, |_| true)
-            .expect("commit");
+        fork.service_settlement(
+            &mut ledger,
+            parent,
+            &mut commit,
+            |_| true,
+            |_| true,
+            &test_hygiene(),
+        )
+        .expect("commit");
         let child = child_execution(42, &loan);
         let mut retire = NativeChildRetire::new(child.binding, child.context).unwrap();
         fork.service_child_retire(child, &mut retire)
@@ -1356,6 +1579,7 @@ mod tests {
         let custody = CarrierVmCustody::new();
         let generation = custody.begin_create().unwrap();
         custody.commit_create(generation).unwrap();
+        let _lifecycle = publish_lifecycle_record(&custody, generation);
         let mut record_page = Box::new(AlignedPage([0u8; 4096]));
         let record_ipa = 0x2000_0000u64;
         let spec = crate::trap::CarrierStage2RecordSpec {
@@ -1402,6 +1626,7 @@ mod tests {
         let custody = CarrierVmCustody::new();
         let generation = custody.begin_create().unwrap();
         custody.commit_create(generation).unwrap();
+        let _lifecycle = publish_lifecycle_record(&custody, generation);
         let parent = test_execution(41, 0, 301);
         // Nothing quarantined: no occupancy proof is needed.
         assert_eq!(
@@ -1436,6 +1661,7 @@ mod tests {
         let custody = CarrierVmCustody::new();
         let generation = custody.begin_create().unwrap();
         custody.commit_create(generation).unwrap();
+        let _lifecycle = publish_lifecycle_record(&custody, generation);
 
         let mut record_page = Box::new(AlignedPage([0u8; 4096]));
         let record_ipa = 0x2000_0000u64;
@@ -1513,6 +1739,7 @@ mod tests {
         let custody = CarrierVmCustody::new();
         let generation = custody.begin_create().unwrap();
         custody.commit_create(generation).unwrap();
+        let _lifecycle = publish_lifecycle_record(&custody, generation);
 
         let mut record_page = Box::new(AlignedPage([0u8; 4096]));
         let record_ipa = 0x2000_0000u64;
@@ -1718,6 +1945,7 @@ mod tests {
         let custody = CarrierVmCustody::new();
         let generation = custody.begin_create().unwrap();
         custody.commit_create(generation).unwrap();
+        let _lifecycle = publish_lifecycle_record(&custody, generation);
 
         let mut record_page = Box::new(AlignedPage([0u8; 4096]));
         let record_ipa = 0x2000_0000u64;
@@ -1887,7 +2115,7 @@ mod tests {
         let req = test_request(exec, 302, 1, 1);
         let mut exchange = ForkStockExchange::new(req).unwrap();
         let loan = custody
-            .service_loan(&mut ledger, exec, &mut exchange)
+            .service_loan(&mut ledger, exec, &mut exchange, &test_hygiene())
             .expect("loan granted");
         let child_asid = loan.asid.expect("child ASID granted");
 
@@ -1899,7 +2127,14 @@ mod tests {
 
         // Now abort settlement attempts to release the same ASID generation again
         let mut abort = ForkStockSettlement::abort(loan);
-        let result = custody.service_settlement(&mut ledger, exec, &mut abort, |_| true, |_| true);
+        let result = custody.service_settlement(
+            &mut ledger,
+            exec,
+            &mut abort,
+            |_| true,
+            |_| true,
+            &test_hygiene(),
+        );
 
         // Double release must be reported as a typed error, not ignored
         assert_eq!(

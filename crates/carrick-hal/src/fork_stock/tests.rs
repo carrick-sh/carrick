@@ -393,8 +393,10 @@ fn commit_refuses_dirty_unused_tables() {
 }
 
 #[test]
-fn stale_lifecycle_record_refuses_without_consuming_stock() {
-    let mut stock = stock(UntaggedRoots, 4, 1);
+fn stale_lifecycle_record_is_withdrawn_and_refused_on_every_carrier() {
+    // One hygiene policy for every carrier: a dirty record is refused with
+    // a typed Inventory refusal and withdrawn, never reissued, never fatal.
+    let mut stock = stock(UntaggedRoots, 4, 2);
     let exec = parent();
     let mut exchange = ForkStockExchange::new(request(exec, 302, 1, 1)).unwrap();
     assert_eq!(
@@ -402,8 +404,11 @@ fn stale_lifecycle_record_refuses_without_consuming_stock() {
         Err(ForkStockRefusal::Inventory)
     );
     assert_eq!(stock.table_stock().len(), 4);
-    assert!(stock.lifecycle_available());
+    assert_eq!(stock.lifecycle_stock().len(), 1, "dirty record withdrawn");
+    assert_eq!(stock.counters().withdrawn_lifecycles, 1);
     assert!(stock.pending(CpuId::new(0)).is_none());
+    // The next clean record serves the next fork.
+    loan(&mut stock, exec, 302, 1, 1).unwrap();
 }
 
 /// Host bytes of an x86 CPL0 metadata window, aligned like the retained
@@ -532,9 +537,13 @@ fn kvm_unclearable_lifecycle_record_is_never_reissued_dirty() {
         x86_loan(&mut stock, window, 303),
         Err(ForkStockRefusal::Inventory)
     );
-    assert!(stock.lifecycle_available());
+    // Withdrawn, so even a later clear cannot bring the record back.
+    assert!(!stock.lifecycle_available());
     assert!(window.clear(granted.lifecycle));
-    x86_loan(&mut stock, window, 303).unwrap();
+    assert_eq!(
+        x86_loan(&mut stock, window, 303),
+        Err(ForkStockRefusal::Capacity)
+    );
 }
 
 #[test]
