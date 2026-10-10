@@ -248,10 +248,7 @@ pub fn admit_notified(
 }
 fn admit_access(
     region: &Region,
-    spaces: carrick_sched_core::spaces::notification::SpaceAccess<
-        '_,
-        carrick_el1_abi::Aarch64ParkedContext,
-    >,
+    spaces: carrick_sched_core::spaces::notification::SpaceAccess<'_, carrick_el1_abi::ZoneContext>,
     mm: u64,
     root: u64,
     pages: usize,
@@ -588,10 +585,7 @@ pub fn native_owner_matrix(mut make: impl FnMut() -> Box<dyn PhysicalTransferFix
 /// retaining that MM's editor. The fixture has no host policy mirror.
 pub fn change_policy(
     region: &Region,
-    spaces: carrick_sched_core::spaces::notification::SpaceAccess<
-        '_,
-        carrick_el1_abi::Aarch64ParkedContext,
-    >,
+    spaces: carrick_sched_core::spaces::notification::SpaceAccess<'_, carrick_el1_abi::ZoneContext>,
     mm: ReservationMm,
     tables: &Tables,
     protection: Option<ReservationProtection>,
