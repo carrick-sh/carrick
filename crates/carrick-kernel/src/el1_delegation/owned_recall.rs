@@ -137,8 +137,7 @@ impl Driver {
 enum Phase {
     Waiting {
         binding: Option<GuestBinding>,
-        subscription:
-            Option<HostRecallSubscription<'static, carrick_el1_abi::Aarch64ParkedContext>>,
+        subscription: Option<HostRecallSubscription<'static, carrick_el1_abi::ZoneContext>>,
     },
     Storage,
     Done,

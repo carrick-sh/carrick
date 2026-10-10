@@ -212,6 +212,7 @@ impl LockWait for HostLockWait {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 impl LockWait<carrick_el1_abi::Aarch64ParkedContext> for HostLockWait {
     fn complete_object_wake(
         &self,
@@ -596,6 +597,7 @@ pub unsafe fn read_quiesced_parked_registers(
             QuiescedParkedRegisters::Unauthenticated
         }
         carrick_el1_abi::ParkedContextRead::Found(ctx) => {
+            #[cfg(target_arch = "aarch64")]
             let ctx = ctx.native;
             QuiescedParkedRegisters::Found(carrick_hal::Aarch64CoreRegisters {
                 gprs: ctx.x,
