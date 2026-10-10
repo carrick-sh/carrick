@@ -3539,6 +3539,9 @@ fn el1_fork_cow_resolves_in_guest() {
         carrick_embed::host_cow_snapshot().complete,
         "warm-up must publish the carrier's host COW ledger"
     );
+    let mut in_ring_forks = counters.native_fork_progress
+        [carrick_el1_abi::NativeForkProgress::ParentResumed as usize]
+        .load(std::sync::atomic::Ordering::Relaxed);
     let mut runs = Vec::new();
 
     for pages in SCALES {
@@ -3636,6 +3639,20 @@ fn el1_fork_cow_resolves_in_guest() {
                 .map(|n| n.load(std::sync::atomic::Ordering::Relaxed))),
             read_el1_counters().map_or(0, |c| c.served[carrick_el1_abi::PANIC_SENTINEL_SYSCALL_NR]
                 .load(std::sync::atomic::Ordering::Relaxed)),
+        );
+        let counters = read_el1_counters().expect("EL1 counters after measured forks");
+        let resumed = counters.native_fork_progress
+            [carrick_el1_abi::NativeForkProgress::ParentResumed as usize]
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            resumed > in_ring_forks,
+            "pages={pages}: measured forks must progress in-ring"
+        );
+        in_ring_forks = resumed;
+        assert_eq!(
+            counters.forwarded[220].load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "pages={pages}: opt-out must not forward clone to host fork orchestration"
         );
         let stdout = measured.result.stdout_utf8();
         let host_line = format!(
