@@ -67,7 +67,7 @@ pub fn is_aarch64_hvc_kick(syndrome: u64) -> bool {
 /// masked (`0x3c0`), as Carrick has always run guest EL0. Under the in-kernel
 /// GIC (EL1 plan 1c) EL0 runs with `I` clear so the virtual timer and SGIs
 /// reach Carrick's EL1 kernel; the guest never sees that bit, because every
-/// PSTATE it can read (a signal frame's `pstate`, a core file's `pstate`)
+/// historical diagnostic PSTATE (such as a core file's `pstate`)
 /// passes through [`el0_visible_pstate`].
 pub const AARCH64_EL0_VISIBLE_DAIF: u64 = 0x3c0;
 
