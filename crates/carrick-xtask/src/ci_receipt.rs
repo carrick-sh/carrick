@@ -74,6 +74,45 @@ pub fn newest_receipt(artifacts: &Value, lane: Lane, sha: &str) -> Option<(u32, 
         .max()
 }
 
+/// The candidate receipt for a gate run at `attempt`: the newest attempt
+/// `<= attempt` among the downloaded artifact directory names. "Re-run
+/// failed jobs" re-runs only the gate, at an attempt with no new receipt.
+pub fn pick_candidate(names: &[String], lane: Lane, sha: &str, attempt: u32) -> Option<String> {
+    let prefix = artifact_prefix(lane, sha);
+    names
+        .iter()
+        .filter_map(|name| {
+            let n = name.strip_prefix(&prefix)?.parse::<u32>().ok()?;
+            (n <= attempt).then_some((n, name.clone()))
+        })
+        .max()
+        .map(|(_, name)| name)
+}
+
+fn candidate_receipt(
+    dir: &Path,
+    lane: Lane,
+    sha: &str,
+    attempt: u32,
+) -> Result<PathBuf, ReceiptError> {
+    let io = |source| ReceiptError::Io {
+        path: dir.to_path_buf(),
+        source,
+    };
+    let names: Vec<String> = std::fs::read_dir(dir)
+        .map_err(io)?
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .collect();
+    let name = pick_candidate(&names, lane, sha, attempt).ok_or_else(|| {
+        ReceiptError::Baseline(format!(
+            "no candidate receipt {}<= {attempt}> under {}",
+            artifact_prefix(lane, sha),
+            dir.display()
+        ))
+    })?;
+    Ok(dir.join(name).join("receipt.json"))
+}
+
 /// Stable failure identities of one receipt: failed tests, probe diffs and
 /// unitemized failures (crashes, signals, compile errors) each by name. A
 /// failed step adds its own key whenever anything in it is unitemized, or
@@ -399,8 +438,15 @@ pub enum ReceiptAction {
         lane: Lane,
         #[arg(long)]
         base_sha: String,
+        /// Directory with one `receipt-<lane>-<sha>-<attempt>` artifact
+        /// directory per downloaded candidate attempt.
         #[arg(long)]
-        candidate: PathBuf,
+        candidate_dir: PathBuf,
+        #[arg(long)]
+        candidate_sha: String,
+        /// The gate's own run attempt; the newest receipt attempt <= it wins.
+        #[arg(long)]
+        run_attempt: u32,
         #[arg(long, default_value = "target/ci-receipts/baseline")]
         download_dir: PathBuf,
         /// Upper bound on waiting for an in-progress base run's receipt.
@@ -432,12 +478,20 @@ pub fn run(args: ReceiptArgs) -> Result<(), ReceiptError> {
         ReceiptAction::Gate {
             lane,
             base_sha,
-            candidate,
+            candidate_dir,
+            candidate_sha,
+            run_attempt,
             download_dir,
             wait_minutes,
             poll_seconds,
         } => {
-            let candidate = load(&candidate)?;
+            validate_sha(&candidate_sha)?;
+            let candidate = load(&candidate_receipt(
+                &candidate_dir,
+                lane,
+                &candidate_sha,
+                run_attempt,
+            )?)?;
             let path = download_baseline(
                 lane,
                 &base_sha,

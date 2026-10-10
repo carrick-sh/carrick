@@ -5,7 +5,7 @@ use carrick_xtask::accept::{
 };
 use carrick_xtask::ci_receipt::{
     Baseline, Lane, artifact_name, baseline_decision, diff, failure_keys, newest_receipt,
-    trusted_baseline_run,
+    pick_candidate, trusted_baseline_run,
 };
 use std::path::PathBuf;
 
@@ -272,4 +272,26 @@ error: could not compile `carrick-embed` (test \"x\") due to 1 previous error
             "unitemized:el1-embed:crash:embed"
         ]
     );
+}
+
+#[test]
+fn a_gate_only_rerun_uses_the_newest_receipt_attempt_not_after_it() {
+    let sha = "b".repeat(40);
+    let names: Vec<String> = [1, 2, 4]
+        .iter()
+        .map(|n| artifact_name(Lane::Kvm, &sha, *n))
+        .chain([format!("receipt-hvf-{sha}-3"), "unrelated".into()])
+        .collect();
+    // Attempt 3 re-ran only the gate: attempt 2's receipt is the candidate.
+    assert_eq!(
+        pick_candidate(&names, Lane::Kvm, &sha, 3),
+        Some(artifact_name(Lane::Kvm, &sha, 2))
+    );
+    assert_eq!(
+        pick_candidate(&names, Lane::Kvm, &sha, 4),
+        Some(artifact_name(Lane::Kvm, &sha, 4))
+    );
+    // Never a later attempt's receipt, never another lane's.
+    assert_eq!(pick_candidate(&names, Lane::Kvm, &sha, 0), None);
+    assert_eq!(pick_candidate(&names, Lane::Hvf, &sha, 2), None);
 }

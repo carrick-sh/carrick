@@ -760,10 +760,16 @@ fn hardware_lanes_never_wait_and_hosted_gates_run_only_base_code() {
             .iter()
             .find(|s| s["uses"].as_str() == Some("actions/download-artifact@v4"))
             .unwrap();
-        assert!(download["with"]["name"].as_str().unwrap().starts_with(name));
+        assert!(
+            download["with"]["pattern"]
+                .as_str()
+                .unwrap()
+                .starts_with(name)
+        );
         let script = runs(gate).join("\n");
         assert!(script.contains("cargo build --locked --release -p carrick-xtask"));
         assert!(script.contains("--wait-minutes 90"));
+        assert!(script.contains("--run-attempt \"$GITHUB_RUN_ATTEMPT\""));
         assert!(
             !script.contains("--manifest-path"),
             "build in the base checkout itself"
