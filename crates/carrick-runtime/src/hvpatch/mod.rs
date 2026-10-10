@@ -164,7 +164,7 @@ pub(crate) fn process_context_for_tests(
     .expect("test HVPatch bootstrap");
     let (kernel, root) =
         carrick_kernel::kernel::Kernel::bootstrap_root(bootstrap).expect("test HVPatch kernel");
-    backend.bind_inventory(&kernel, root.shared().mm().id());
+    backend.bind_inventory(&kernel, root.shared().mm().frame_owner_authority());
     let resources = std::sync::Arc::new(resources);
     resources
         .publish_root(root.task().key())
@@ -482,7 +482,10 @@ impl ProcessContext {
         context: &carrick_kernel::kernel::KernelContext,
         mm_backend: std::sync::Arc<stage1_mm::Stage1MmBackend>,
     ) -> Self {
-        mm_backend.bind_inventory(context.kernel(), context.shared().mm().id());
+        mm_backend.bind_inventory(
+            context.kernel(),
+            context.shared().mm().frame_owner_authority(),
+        );
         if let Some(endpoint) = self.foreign_mm_endpoint.clone() {
             context
                 .shared()
@@ -879,9 +882,8 @@ impl ProcessContext {
             mm_resources::ExecMmCommitReceipt::Retained { replacement, .. }
             | mm_resources::ExecMmCommitReceipt::Retired { replacement, .. } => replacement,
         };
-        let replacement_mm = kernel.replacement_mm_id();
         debug_assert_eq!(backend.binding(), replacement_lease.binding());
-        backend.bind_inventory(self.kernel_graph(), replacement_mm);
+        backend.bind_inventory(self.kernel_graph(), kernel.replacement_frame_owner());
         backend.bind_vma_source(vma_source);
         *self.mm_backend.write() = backend;
         Ok(PublishedProcessExec { kernel, receipt })
@@ -1105,7 +1107,7 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
     let (root, initialization) =
         carrier.boot_kernel_root_prepared(bootstrap, |kernel, _, root_context| {
-            mm_backend.bind_inventory(kernel, root_context.shared().mm().id());
+            mm_backend.bind_inventory(kernel, root_context.shared().mm().frame_owner_authority());
             table
                 .publish_root(root_context.task().key())
                 .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
@@ -1680,7 +1682,7 @@ mod tests {
         )
         .unwrap();
         let (kernel, root) = carrick_kernel::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
-        backend.bind_inventory(&kernel, root.shared().mm().id());
+        backend.bind_inventory(&kernel, root.shared().mm().frame_owner_authority());
         backend.bind_vma_source(test_vma_source());
         let table = std::sync::Arc::new(table);
         table.publish_root(root.task().key()).unwrap();
@@ -3188,6 +3190,82 @@ mod tests {
             .apply(root.shared().mm().id(), reservation.commit(()))
             .unwrap();
 
+        let after = backend.snapshot(deadline()).expect("mutated live snapshot");
+        assert!(after.revision > before.revision);
+        assert!(after.vma_revision > before.vma_revision);
+        assert!(after.frame_inventory_revision > before.frame_inventory_revision);
+        assert_eq!(after.mapping_ids, vec![mapping]);
+    }
+    #[test]
+    fn stage1_snapshot_retains_transferred_guest_mapping_owner() {
+        let (process, root) = authoritative_root();
+        let dispatcher = SyscallDispatcher::new();
+        process.bind_vma_source(dispatcher.vma_snapshot_source());
+        let backend = process.mm_backend.read().clone();
+        let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let before = backend.snapshot(deadline()).expect("initial live snapshot");
+
+        dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
+            start: 0x1000,
+            end: 0x2000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: carrick_vfs::ProcMapSharing::Private,
+            path: "foreign-live-authority".to_owned(),
+        }]);
+        backend.publish_binding(backend.binding());
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(2).unwrap();
+        let mut reservation = root
+            .kernel()
+            .reserve_frame_inventory(1, 1, capacity)
+            .unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation = carrick_hal::MappingGeneration::from_backend_counter(
+            std::num::NonZeroU64::new(1).unwrap(),
+        );
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa: carrick_guest_mem::Gpa(0x4000),
+                length: carrick_hal::FrameLength::from_mapping_extent(
+                    std::num::NonZeroU64::new(0x4000).unwrap(),
+                ),
+                permissions: carrick_hal::MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        root.kernel()
+            .frame_inventory()
+            .apply(root.shared().mm().id(), reservation.commit(()))
+            .unwrap();
+
+        let guest = carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::guest_arch_binding::core_arch::MmGeneration::new(
+                std::num::NonZeroU64::new(91001).unwrap(),
+            ),
+            root_generation: carrick_hal::guest_arch_binding::core_arch::ContextGeneration::new(
+                std::num::NonZeroU64::new(7).unwrap(),
+            ),
+        };
+        root.kernel()
+            .transfer_frame_inventory_to_guest(&root, guest)
+            .unwrap();
         let after = backend.snapshot(deadline()).expect("mutated live snapshot");
         assert!(after.revision > before.revision);
         assert!(after.vma_revision > before.vma_revision);

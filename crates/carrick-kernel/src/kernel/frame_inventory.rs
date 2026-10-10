@@ -27,6 +27,31 @@ pub enum FrameOwner {
     HostMm(MmId),
     GuestMm(carrick_hal::GuestFrameOwner),
 }
+/// A retained capability for the single physical owner of one semantic MM.
+/// Cloning it retains the same slot, without retaining a backend or creating a table.
+#[derive(Clone, Debug)]
+pub struct FrameOwnerAuthority {
+    mm: MmId,
+    owner: std::sync::Arc<parking_lot::RwLock<FrameOwner>>,
+}
+impl FrameOwnerAuthority {
+    pub(in crate::kernel) fn host(mm: MmId) -> Self {
+        Self {
+            mm,
+            owner: std::sync::Arc::new(parking_lot::RwLock::new(FrameOwner::HostMm(mm))),
+        }
+    }
+    pub const fn semantic_mm(&self) -> MmId {
+        self.mm
+    }
+    pub fn owner(&self) -> parking_lot::RwLockReadGuard<'_, FrameOwner> {
+        self.owner.read()
+    }
+    pub(in crate::kernel) fn transfer(&self) -> parking_lot::RwLockWriteGuard<'_, FrameOwner> {
+        self.owner.write()
+    }
+}
+
 impl From<MmId> for FrameOwner {
     fn from(mm: MmId) -> Self {
         Self::HostMm(mm)

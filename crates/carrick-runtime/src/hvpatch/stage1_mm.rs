@@ -1187,7 +1187,7 @@ pub(crate) struct Stage1MmBackend {
 #[derive(Debug)]
 struct InventoryBinding {
     kernel: std::sync::Weak<carrick_kernel::kernel::Kernel>,
-    mm: carrick_kernel::kernel::MmId,
+    owner: carrick_kernel::kernel::FrameOwnerAuthority,
 }
 
 impl Stage1MmBackend {
@@ -1218,12 +1218,12 @@ impl Stage1MmBackend {
     pub(crate) fn bind_inventory(
         &self,
         kernel: &Arc<carrick_kernel::kernel::Kernel>,
-        mm: carrick_kernel::kernel::MmId,
+        owner: carrick_kernel::kernel::FrameOwnerAuthority,
     ) {
         let mut inventory = self.inventory.write();
         *inventory = Some(InventoryBinding {
             kernel: Arc::downgrade(kernel),
-            mm,
+            owner,
         });
         self.bump_revision();
     }
@@ -1261,7 +1261,10 @@ impl Stage1MmBackend {
 
     #[cfg(test)]
     pub(crate) fn inventory_mm_for_tests(&self) -> Option<carrick_kernel::kernel::MmId> {
-        self.inventory.read().as_ref().map(|binding| binding.mm)
+        self.inventory
+            .read()
+            .as_ref()
+            .map(|binding| binding.owner.semantic_mm())
     }
 
     pub(crate) fn binding(&self) -> MmBinding {
@@ -1424,7 +1427,7 @@ impl MmBackend for Stage1MmBackend {
             .ok_or_else(|| deadline_error(deadline))?
             .clone()
             .ok_or(SnapshotError::AuthorityUnavailable(SnapshotTable::Vmas))?;
-        let (kernel, mm) = {
+        let (kernel, owner) = {
             let Some(guard) = self.inventory.try_read_until(deadline) else {
                 return Err(deadline_error(deadline));
             };
@@ -1437,14 +1440,15 @@ impl MmBackend for Stage1MmBackend {
                 .ok_or(SnapshotError::AuthorityUnavailable(
                     carrick_kernel::kernel::SnapshotTable::Mappings,
                 ))?;
-            (kernel, inventory.mm)
+            (kernel, inventory.owner.clone())
         };
         // No backend lock is held while either independent authority is
         // observed. This preserves the K1 backend/frame/kernel lock boundary.
         let vma_snapshot = vma_source.snapshot(deadline)?;
+        let frame_owner = owner.owner();
         let frame_snapshot = kernel
             .frame_inventory()
-            .snapshot_for_mm_until(mm, deadline)
+            .snapshot_for_mm_until(*frame_owner, deadline)
             .ok_or_else(|| {
                 if Instant::now() >= deadline {
                     SnapshotError::TimedOut

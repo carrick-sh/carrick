@@ -94,7 +94,7 @@ pub use exec::{ExecError, ExecPrepareError, PreparedExec};
 pub use fd_ceiling::FdCeilingAuthority;
 pub use frame_inventory::{
     ExactMappingRow, FrameInventoryAuthority, FrameInventoryError, FrameInventoryReserveError,
-    FrameInventorySnapshot, FrameOwner, FrameRow, MappingRow,
+    FrameInventorySnapshot, FrameOwner, FrameOwnerAuthority, FrameRow, MappingRow,
 };
 pub use ids::{
     ChildExitSignal, CredentialsId, FileDescriptionId, FileSlotNumber, FileTableId, FsContextId,
