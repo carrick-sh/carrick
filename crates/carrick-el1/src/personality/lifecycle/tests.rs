@@ -1736,48 +1736,57 @@ impl crate::personality::dispatch::GuestDispatchFrame for Cpl0IdentityFrame {
 
 #[test]
 fn set_tid_address_cpl0_records_word_and_returns_the_exact_tid() {
-    let w = World::new(LifecycleHatches::ON);
-    assert!(w.venue.leader_slot().publish_visible_tid(40));
-    w.venue.leader_slot().set_clear_child_tid(0x6000);
-    let mut owner = IdentityOwner(crate::personality::common_entry::execution_binding(
-        w.task(),
-    ));
-    let mut frame = Cpl0IdentityFrame(TrapFrame {
-        slot: SLOT_IDX as u64,
-        ..Default::default()
-    });
-    frame.0.x[0] = 0x7000;
-    frame.0.x[8] = carrick_syscall_abi::nr::SET_TID_ADDRESS.raw() as u64;
-    let names = InotifyNameCache::new();
-    let route = crate::personality::dispatch::dispatch_syscall_with_native::<
-        _,
-        FakeCpu,
-        HardwareUserWord,
-        _,
-        ThreadCtx,
-    >(
-        &mut frame,
-        &w.counters,
-        &w.tasks,
-        &[],
-        &[],
-        &[],
-        &[],
-        &names,
-        None,
-        None,
-        Some(&*w.venue),
-        Some(&mut owner),
-        None,
-        None,
-        |_| core::ptr::null_mut(),
-    );
-    assert!(matches!(
-        route,
-        carrick_personality_linux::dispatch::CompletionRoute::Served
-    ));
-    assert_eq!(frame.0.x[0], 40);
-    assert_eq!(w.venue.leader_slot().clear_child_tid(), 0x7000);
+    for work in [false, true] {
+        let w = World::new(LifecycleHatches::ON);
+        if work {
+            w.task().linux.mark_pending_host_work();
+        }
+        assert!(w.venue.leader_slot().publish_visible_tid(40));
+        w.venue.leader_slot().set_clear_child_tid(0x6000);
+        let mut owner = IdentityOwner(crate::personality::common_entry::execution_binding(
+            w.task(),
+        ));
+        let mut frame = Cpl0IdentityFrame(TrapFrame {
+            slot: SLOT_IDX as u64,
+            ..Default::default()
+        });
+        frame.0.x[0] = 0x7000;
+        frame.0.x[8] = carrick_syscall_abi::nr::SET_TID_ADDRESS.raw() as u64;
+        let names = InotifyNameCache::new();
+        let route = crate::personality::dispatch::dispatch_syscall_with_native::<
+            _,
+            FakeCpu,
+            HardwareUserWord,
+            _,
+            ThreadCtx,
+        >(
+            &mut frame,
+            &w.counters,
+            &w.tasks,
+            &[],
+            &[],
+            &[],
+            &[],
+            &names,
+            None,
+            None,
+            Some(&*w.venue),
+            Some(&mut owner),
+            None,
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        assert_eq!(
+            route,
+            if work {
+                carrick_personality_linux::dispatch::CompletionRoute::WithWork
+            } else {
+                carrick_personality_linux::dispatch::CompletionRoute::Served
+            }
+        );
+        assert_eq!(frame.0.x[0], 40);
+        assert_eq!(w.venue.leader_slot().clear_child_tid(), 0x7000);
+    }
 }
 
 #[test]
