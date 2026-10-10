@@ -96,12 +96,34 @@ pub(crate) fn install_address_context(context: AddressContext<RootGpa>) -> Resul
     Ok(())
 }
 
+/// A root page through the supervisor direct window, bounds-checked.
+fn direct_root(root: RootGpa) -> Result<&'static [u64; 512], ArchError> {
+    let address = root.address().raw();
+    if address
+        .checked_add(4096)
+        .is_none_or(|end| end > carrick_el1_abi::X86_CPL0_DIRECT_WINDOW_BYTES)
+    {
+        return Err(ArchError::Unbound);
+    }
+    // SAFETY: boot retains the direct window over this aligned page; root
+    // pages are only read here, and shared supervisor entries never move.
+    Ok(unsafe { &*((carrick_el1_abi::X86_CPL0_DIRECT_VA + address) as *const [u64; 512]) })
+}
+
 /// Leave every process root for the carrier's maintenance root, which holds
 /// only the shared supervisor branches. The caller then releases the slot's
 /// installed space: from that point this CPU caches and walks no table of
 /// any MM, so a retired MM's tables may be cleared and reissued.
 pub fn install_maintenance_root(maintenance: RootGpa) -> Result<(), ArchError> {
-    super::mmu::hardware_live_root()?;
+    let live = super::mmu::hardware_live_root()?;
+    // The maintenance root is a copy of the shared supervisor entries taken
+    // when fork stock was installed; refuse it if they changed since.
+    if !carrick_mmu_core::x86::owner_mmu::maintenance_root_matches(
+        direct_root(live)?,
+        direct_root(maintenance)?,
+    ) {
+        return Err(ArchError::Unbound);
+    }
     let binding = super::context::current_cpu_binding().ok_or(ArchError::Unbound)?;
     let table = shootdown_table(binding)?;
     let member = table

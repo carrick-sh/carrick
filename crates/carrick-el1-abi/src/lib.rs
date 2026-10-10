@@ -209,6 +209,8 @@ pub const EL1_BOOTSTRAP_METADATA_BASE: u64 = EL1_REGION_BASE + EL1_BOOTSTRAP_MET
 pub const X86_CPL0_BOOTSTRAP_METADATA_BASE: u64 = 0xffff_ffff_a800_0000;
 /// CPL0's one upper-half supervisor window for retained physical pages.
 pub const X86_CPL0_DIRECT_VA: u64 = 0xffff_ffff_9000_0000;
+/// Bytes of guest-physical space (from GPA 0) the direct window maps.
+pub const X86_CPL0_DIRECT_WINDOW_BYTES: u64 = 0x0200_0000;
 /// Retained initial-image frames use their own supervisor alias, never the
 /// short bootstrap direct window. The full 512 MiB budget fits here.
 pub const X86_CPL0_INITIAL_EXTENT_VA: u64 = 0xffff_fffe_0000_0000;
@@ -239,7 +241,7 @@ const _: () = {
     const WINDOWS: [(u64, u64); 9] = [
         (0xffff_ffff_8000_0000, 0x10_0000), // executable image
         (X86_CPL0_COW_COPY_BASE, X86_CPL0_COW_COPY_SIZE),
-        (X86_CPL0_DIRECT_VA, 0x0200_0000), // bootstrap direct window
+        (X86_CPL0_DIRECT_VA, X86_CPL0_DIRECT_WINDOW_BYTES), // bootstrap direct window
         (X86_CPL0_DYNAMIC_METADATA_BASE, 0x0400_0000),
         (
             X86_CPL0_BOOTSTRAP_METADATA_BASE,

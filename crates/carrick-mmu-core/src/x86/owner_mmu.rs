@@ -10,6 +10,20 @@ use carrick_guest_arch::{
 /// MM-private supervisor branch for the two-page COW copy window.
 pub const COW_COPY_ROOT_INDEX: usize = 508;
 
+/// Whether a carrier maintenance PML4 may stand in for `live`: it must hold
+/// exactly `live`'s shared supervisor entries and nothing else. A maintenance
+/// root is a copy taken when fork stock is installed; this is the check that
+/// a later change to a shared upper entry cannot go unnoticed.
+pub fn maintenance_root_matches(live: &[u64; 512], maintenance: &[u64; 512]) -> bool {
+    (0..512).all(|index| {
+        if X86Mmu::is_shared_root_entry(index) {
+            live[index] == maintenance[index]
+        } else {
+            maintenance[index] == 0
+        }
+    })
+}
+
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,
@@ -246,5 +260,47 @@ impl X86Mmu {
         };
         let native = DescriptorTxn::from_intent(&intent)?;
         Ok(consume(&native))
+    }
+}
+
+#[cfg(test)]
+mod maintenance_root_tests {
+    use super::*;
+
+    fn roots() -> ([u64; 512], [u64; 512]) {
+        let mut live = [0u64; 512];
+        live[3] = 0x5_0007; // private user branch
+        live[COW_COPY_ROOT_INDEX] = 0x6_0003; // MM-private copy window
+        let mut maintenance = [0u64; 512];
+        for index in 256..512 {
+            if X86Mmu::is_shared_root_entry(index) {
+                live[index] = 0x10_0003 + (index as u64) * 0x1000;
+                maintenance[index] = live[index];
+            }
+        }
+        (live, maintenance)
+    }
+
+    #[test]
+    fn maintenance_root_matches_only_the_live_shared_entries() {
+        let (live, maintenance) = roots();
+        assert!(maintenance_root_matches(&live, &maintenance));
+    }
+
+    #[test]
+    fn a_shared_upper_entry_changed_after_install_is_caught() {
+        let (mut live, maintenance) = roots();
+        live[511] ^= 0x1000;
+        assert!(!maintenance_root_matches(&live, &maintenance));
+    }
+
+    #[test]
+    fn maintenance_root_may_not_carry_private_or_user_entries() {
+        let (live, mut maintenance) = roots();
+        maintenance[COW_COPY_ROOT_INDEX] = live[COW_COPY_ROOT_INDEX];
+        assert!(!maintenance_root_matches(&live, &maintenance));
+        let (live, mut maintenance) = roots();
+        maintenance[3] = live[3];
+        assert!(!maintenance_root_matches(&live, &maintenance));
     }
 }
