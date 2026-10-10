@@ -95,8 +95,7 @@ read -rs WILLOW_GH_TOKEN   # paste the fine-grained token
 printf '%s\n' "$WILLOW_GH_TOKEN" | ssh root@willow 'IFS= read -r GH_TOKEN; export GH_TOKEN; export PATH=/root/carrick-ci/bin:$PATH; exec /root/carrick-ci/bin/carrick-xtask ci-scaler standing --runner-group-id 1'
 ```
 
-The guest needs `gh` on its `PATH` for the merge-queue gate step (it uses
-only the job's `GITHUB_TOKEN`). The pilot (`ci-scaler pilot`) writes `pilot
+The merge-queue comparison runs in a hosted job, so guests need no `gh`. The pilot (`ci-scaler pilot`) writes `pilot
 <sha>` to the same file and keeps its one-clone, one-job contract. Every
 budget, ownership, recovery and hook rule below applies to both modes.
 

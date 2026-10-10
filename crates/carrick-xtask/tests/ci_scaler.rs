@@ -664,10 +664,14 @@ fn one_always_job_requires_both_trusted_hardware_lanes() {
         .iter()
         .map(|n| n.as_str().unwrap())
         .collect();
-    assert!(needs.contains(&"hvf-kernel") && needs.contains(&"kvm-tests"));
+    for job in ["hvf-kernel", "kvm-tests", "hvf-gate", "kvm-gate"] {
+        assert!(needs.contains(&job), "{job}");
+    }
     let script = ok["steps"][0]["run"].as_str().unwrap();
     assert!(script.contains("test \"$HVF\" = success"));
     assert!(script.contains("test \"$KVM\" = success"));
+    assert!(script.contains("test \"$HVF_GATE\" = success"));
+    assert!(script.contains("test \"$KVM_GATE\" = success"));
     // No step interpolates the merge-group base SHA into a shell script.
     for job in docs[0]["jobs"].as_hash().unwrap().values() {
         for step in job["steps"].as_vec().into_iter().flatten() {
@@ -701,4 +705,68 @@ fn durable_ledger_round_trip_rejects_corruption_without_resetting_budget() {
     assert!(restored.reserve(job(2), &[], 11, Concurrency::ONE).is_err());
     std::fs::write(&path, "{broken").unwrap();
     assert!(Ledger::load(&path).is_err());
+}
+
+#[test]
+fn hardware_lanes_never_wait_and_hosted_gates_run_only_base_code() {
+    let kernel = include_str!("../../../.github/workflows/kernel-runtime.yml");
+    let docs = yaml_rust2::YamlLoader::load_from_str(kernel).unwrap();
+    let jobs = &docs[0]["jobs"];
+    let runs = |job: &str| -> Vec<String> {
+        jobs[job]["steps"]
+            .as_vec()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["run"].as_str().map(str::to_owned))
+            .collect()
+    };
+    // A lane job waiting on a base receipt would hold the single runner the
+    // base entry's job needs (queue deadlock).
+    for lane in ["hvf-kernel", "kvm-tests"] {
+        assert!(
+            runs(lane).iter().all(|r| !r.contains("ci-receipt gate")),
+            "{lane} must only produce and upload its receipt"
+        );
+    }
+    for (gate, lane, name) in [
+        ("hvf-gate", "hvf-kernel", "receipt-hvf-"),
+        ("kvm-gate", "kvm-tests", "receipt-kvm-"),
+    ] {
+        let job = &jobs[gate];
+        assert_eq!(job["runs-on"].as_str(), Some("ubuntu-latest"));
+        assert_eq!(job["needs"][0].as_str(), Some(lane));
+        // Above the 90-minute wait bound, with margin.
+        assert!(job["timeout-minutes"].as_i64().unwrap() >= 100);
+        let steps = job["steps"].as_vec().unwrap();
+        let checkout = steps
+            .iter()
+            .find(|s| s["uses"].as_str() == Some("actions/checkout@v4"))
+            .unwrap();
+        assert_eq!(
+            checkout["with"]["ref"].as_str(),
+            Some("${{ github.event.merge_group.base_sha }}"),
+            "{gate} checks out the base, never the candidate"
+        );
+        let checkouts = steps
+            .iter()
+            .filter(|s| {
+                s["uses"]
+                    .as_str()
+                    .is_some_and(|u| u.starts_with("actions/checkout"))
+            })
+            .count();
+        assert_eq!(checkouts, 1);
+        let download = steps
+            .iter()
+            .find(|s| s["uses"].as_str() == Some("actions/download-artifact@v4"))
+            .unwrap();
+        assert!(download["with"]["name"].as_str().unwrap().starts_with(name));
+        let script = runs(gate).join("\n");
+        assert!(script.contains("cargo build --locked --release -p carrick-xtask"));
+        assert!(script.contains("--wait-minutes 90"));
+        assert!(
+            !script.contains("--manifest-path"),
+            "build in the base checkout itself"
+        );
+    }
 }
