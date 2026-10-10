@@ -1424,7 +1424,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .get(&self.key)
             .map(|p| p.status);
         if let Some(status) = status {
-            return Some(self.exit_group(status));
+            return Some(match self.exit_with_status(status) {
+                Ok(outcome) => outcome,
+                Err(error) => self.run_failed(error.run_failure_reason()),
+            });
         }
         self.resume_pending_wait()
     }
@@ -1501,8 +1504,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         wait_status: LinuxWaitStatus,
     ) -> Result<LifecycleOutcome, NativeProcessError> {
-        let child_pid = self.runtime.graph.lock().owner.task(self.key)
-            .map_err(|_| NativeProcessError::Stale)?.metadata().namespace_pid;
+        let child_pid = self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale)?
+            .metadata()
+            .namespace_pid;
         let (page, channel) = {
             let mut graph = self.runtime.graph.lock();
             let row = graph
@@ -4171,11 +4181,12 @@ mod tests {
     }
     #[test]
     fn exit_group_holds_terminal_custody_until_pre_live_claim_settles() {
-        for (claim_live, wake_failure, resume_stale) in [
-            (false, false, false),
-            (true, false, false),
-            (false, true, false),
-            (false, false, true),
+        for (claim_live, wake_failure, resume_stale, signal_exit) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
         ] {
             let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
             // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
@@ -4256,6 +4267,7 @@ mod tests {
                 controls: &*child_controls,
                 copies: Vec::new(),
                 refuse_copy: false,
+                on_signal_clock: None,
             };
             assert!(zone.slot(slot).current().is_none());
             let home = zone.slot(slot).host_record().unwrap();
@@ -4276,8 +4288,18 @@ mod tests {
             if claim_live {
                 assert_eq!(page.thread_born(), Some(2));
             }
+            let expected_status = if signal_exit {
+                LinuxWaitStatus::signaled(15, false)
+            } else {
+                LinuxWaitStatus::from_wait_encoding(9 << 8)
+            };
+            let outcome = if signal_exit {
+                entry.exit_with_signal(15).unwrap()
+            } else {
+                entry.exit_group(9)
+            };
             assert!(
-                matches!(entry.exit_group(9), LifecycleOutcome::Transferred { .. }),
+                matches!(outcome, LifecycleOutcome::Transferred { .. }),
                 "exit must suspend, never return guest EAGAIN"
             );
             assert_eq!(page.gate(), carrick_el1_abi::GateState::Closed);
@@ -4373,10 +4395,7 @@ mod tests {
                 assert_eq!(page.live(), 1);
                 continue;
             }
-            assert_eq!(
-                entry.take_root_exit(),
-                Some(LinuxWaitStatus::from_wait_encoding(9 << 8))
-            );
+            assert_eq!(entry.take_root_exit(), Some(expected_status));
             assert!(entry.take_handoff_receipt().is_some());
             assert_eq!(page.live(), 0);
             assert_eq!(zone.slot(slot).queued(), 0);
@@ -4464,6 +4483,7 @@ mod tests {
             controls: &*child_controls,
             copies: Vec::new(),
             refuse_copy: false,
+            on_signal_clock: None,
         };
         assert!(zone.slot(slot).current().is_none());
         let mut entry = runtime

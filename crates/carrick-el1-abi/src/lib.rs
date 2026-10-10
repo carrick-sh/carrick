@@ -3403,6 +3403,7 @@ impl Default for InotifyNameCache {
 const _: () = {
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
+    assert!(EL1_ABI_LAYOUT_HASH == 0xdf1ca2b1119fce67);
     assert!(
         EL1_APERTURE_CONTROL_OFFSET.is_multiple_of(core::mem::align_of::<ApertureControl>() as u64)
     );

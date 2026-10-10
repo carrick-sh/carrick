@@ -421,6 +421,7 @@ fn serve_family<'a, C: EntryContext + 'a>(
                 FamilyRun {
                     completion: crate::signal::signal_effect(&outcome),
                     returned,
+                    forward_reason: ForwardReason::FamilyFallback,
                 }
             });
     }
