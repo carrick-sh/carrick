@@ -198,7 +198,7 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, M> PreparedFork<C, U, N, 
                 return Err(ForkTryError::Commit(error, self));
             }
         };
-        admission.publish(*self.child);
+        admission.publish(self.child);
         Ok(PublishedFork {
             reservation: self.permit,
             born,
@@ -222,7 +222,7 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, M> PreparedFork<C, U, N, 
             Err(error) => return Err(Box::new((error, self))),
         };
         let born = commit_mm(self.mm);
-        admission.publish(*self.child);
+        admission.publish(self.child);
         Ok(PublishedFork {
             reservation: self.permit,
             born,

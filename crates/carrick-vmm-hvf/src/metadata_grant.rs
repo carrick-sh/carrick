@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// Authenticate a physical fork-stock crossing against the thread currently
 /// installed in the shared zone. EL1 may switch from parent to child without
 /// a host boundary, so a binding captured when the executor loaded is stale.
-fn live_fork_execution(
+pub(crate) fn live_fork_execution(
     cpu: carrick_guest_arch::CpuId,
     ttbr0: u64,
 ) -> Option<crate::fork_stock::GrantExecution> {
@@ -78,7 +78,7 @@ fn fork_execution_from_snapshot(
 /// record. Authenticate that final crossing against the still host-published
 /// per-vCPU task binding and the address space still installed on this slot.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn terminal_root_binding(
+pub(crate) fn terminal_root_binding(
     custody: &crate::trap::CarrierVmCustody,
     cpu: carrick_guest_arch::CpuId,
 ) -> Option<carrick_el1_abi::ExecutionBinding> {
@@ -993,7 +993,7 @@ pub(crate) fn service_metadata_operation(
                 Some(ForkStockKind::Loan) => {
                     let exchange = unsafe { &mut *record_ptr.cast::<ForkStockExchange>() };
                     exchange.refuse(ForkStockRefusal::Stale);
-                    return Ok([METADATA_GRANT_ERR_DENIED, exchange.response[0], 0, 0]);
+                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
                 }
                 Some(ForkStockKind::Commit | ForkStockKind::Abort) => {
                     let settlement = unsafe { &mut *record_ptr.cast::<ForkStockSettlement>() };
