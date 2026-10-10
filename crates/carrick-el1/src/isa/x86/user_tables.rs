@@ -3,19 +3,7 @@ use carrick_guest_arch::{FrameGpa, KernelVa, RootGpa, UserVa};
 
 /// Resolve a retained table frame, without conferring table edit authority.
 pub fn table_alias(frame: FrameGpa) -> Option<KernelVa> {
-    if frame.raw() & 4095 != 0 {
-        return None;
-    }
-    let address = if frame.raw() < carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_GPA {
-        carrick_el1_abi::X86_CPL0_DIRECT_VA.checked_add(frame.raw())?
-    } else {
-        let offset = frame.raw() - carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_GPA;
-        if offset >= carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_MAX_SIZE {
-            return None;
-        }
-        carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_VA.checked_add(offset)?
-    };
-    Some(KernelVa::new(address))
+    carrick_el1_abi::x86_cpl0_table_alias(frame)
 }
 
 pub(crate) fn page_allows(

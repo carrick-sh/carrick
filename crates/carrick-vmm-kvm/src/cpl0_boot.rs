@@ -130,6 +130,13 @@ const LAYOUT: BringupLayout = BringupLayout {
 };
 const _: () = assert!(FIXTURE_PML4_CAPACITY == carrick_x86::X86_PML4_CAPACITY);
 
+/// Guest-physical address of initial frame grant `index`: grants follow
+/// the staged boot records, page aligned, inside the initial extent. The
+/// first unused table grant becomes the carrier's maintenance root.
+pub(crate) fn initial_grant_gpa(frame_offset: usize, index: usize) -> FrameGpa {
+    FrameGpa::new(INITIAL_EXTENT_GPA + (frame_offset + index * 4096) as u64)
+}
+
 fn fail(message: impl Into<String>) -> TrapError {
     TrapError::Hypervisor(message.into())
 }
@@ -1686,9 +1693,7 @@ impl Cpl0Carrier {
             .ok_or_else(|| fail("initial records/grants overlap Prepare working stock"))?;
         let (mut inventory, grants) = InitialInventory::stage(
             Arc::clone(&self.custody.frame_inventory),
-            (0..grant_count).map(|index| {
-                FrameGpa::new(INITIAL_EXTENT_GPA + (frame_offset + index * 4096) as u64)
-            }),
+            (0..grant_count).map(|index| initial_grant_gpa(frame_offset, index)),
             table_grants,
             4096,
             NonZeroU64::MIN,

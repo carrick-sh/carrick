@@ -223,6 +223,35 @@ pub const X86_CPL0_COW_COPY_SIZE: u64 = carrick_mmu_core::x86::copy_window::COW_
 /// Retained CPL0 root arena reachable through the supervisor direct window.
 pub const X86_CPL0_TABLE_ARENA_BYTES: u64 = 448 * 4096;
 
+/// The supervisor alias through which CPL0 reaches a retained page-table
+/// frame: frames below the initial extent through the direct window, frames
+/// in the initial extent (initial table grants, so the carrier maintenance
+/// root) through the initial-extent alias. `None` for an unaligned frame or
+/// one whose page is not wholly inside either mapping. The one rule for the
+/// guest's root readers and the carrier's admission checks.
+pub fn x86_cpl0_table_alias(
+    frame: carrick_guest_arch::FrameGpa,
+) -> Option<carrick_guest_arch::KernelVa> {
+    let gpa = frame.raw();
+    if gpa & 4095 != 0 {
+        return None;
+    }
+    let end = gpa.checked_add(4096)?;
+    let address = if gpa < X86_CPL0_INITIAL_EXTENT_GPA {
+        if end > X86_CPL0_DIRECT_WINDOW_BYTES {
+            return None;
+        }
+        X86_CPL0_DIRECT_VA.checked_add(gpa)?
+    } else {
+        let offset = gpa - X86_CPL0_INITIAL_EXTENT_GPA;
+        if offset.checked_add(4096)? > X86_CPL0_INITIAL_EXTENT_MAX_SIZE {
+            return None;
+        }
+        X86_CPL0_INITIAL_EXTENT_VA.checked_add(offset)?
+    };
+    Some(carrick_guest_arch::KernelVa::new(address))
+}
+
 /// Size of the EL1 bootstrap metadata allocator arena (9 MiB).
 pub const EL1_BOOTSTRAP_METADATA_SIZE: u64 = 0x90_0000;
 
@@ -5200,5 +5229,48 @@ mod layout_manifest {
             8,
             8
         );
+    }
+}
+
+#[cfg(test)]
+mod x86_table_alias_tests {
+    #![allow(clippy::expect_used)]
+    use super::*;
+    use carrick_guest_arch::FrameGpa;
+
+    /// The KVM carrier's real boot layout: initial table grants (and so the
+    /// maintenance root, the first unused grant) are page frames staged in
+    /// the initial extent after the boot records, reached through the
+    /// initial-extent alias, not the short direct window.
+    #[test]
+    fn real_boot_layout_maintenance_root_is_reachable() {
+        let frame_offset = 0x3000; // records staged before the frames
+        let first_unused_grant = 5;
+        let maintenance = X86_CPL0_INITIAL_EXTENT_GPA + frame_offset + first_unused_grant * 4096;
+        assert_eq!(
+            x86_cpl0_table_alias(FrameGpa::new(maintenance)).map(|va| va.raw()),
+            Some(X86_CPL0_INITIAL_EXTENT_VA + frame_offset + first_unused_grant * 4096)
+        );
+        // The production metadata-backed roots below the extent use the
+        // direct window.
+        assert_eq!(
+            x86_cpl0_table_alias(FrameGpa::new(0x60_0000)).map(|va| va.raw()),
+            Some(X86_CPL0_DIRECT_VA + 0x60_0000)
+        );
+    }
+
+    #[test]
+    fn unreachable_or_partial_table_pages_are_refused() {
+        // Unaligned.
+        assert!(x86_cpl0_table_alias(FrameGpa::new(X86_CPL0_INITIAL_EXTENT_GPA + 8)).is_none());
+        // Past the initial extent's maximum.
+        assert!(
+            x86_cpl0_table_alias(FrameGpa::new(
+                X86_CPL0_INITIAL_EXTENT_GPA + X86_CPL0_INITIAL_EXTENT_MAX_SIZE
+            ))
+            .is_none()
+        );
+        // Below the extent but beyond the mapped direct window.
+        assert!(x86_cpl0_table_alias(FrameGpa::new(X86_CPL0_DIRECT_WINDOW_BYTES)).is_none());
     }
 }
