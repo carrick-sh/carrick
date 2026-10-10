@@ -941,11 +941,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     }
 
     fn retire_mm(&mut self, mm: Self::Mm) {
-        // The root uses the terminal root-exit crossing after graph exit.
-        // Only fork-born children own lifecycle and table stock to quarantine.
-        if self.task.visible_pid() == Some(1) {
-            return;
-        }
+        // The runtime calls this only for a fork-born process's final exit.
         if mm.mm.raw().get() != self.task.mm.key.load(Ordering::Acquire) {
             fatal();
         }

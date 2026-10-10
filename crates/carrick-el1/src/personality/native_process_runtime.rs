@@ -145,6 +145,8 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
         prepared: NativeForkPreparation<'a, Self::Mm, Self::PreparedMm, C>,
     );
     fn quarantine_born(&mut self, born: Self::Born);
+    /// Called once, for a fork-born process's final exit only (never the
+    /// root, which uses the root-exit crossing).
     fn retire_mm(&mut self, mm: Self::Mm);
     fn wake_effects(&mut self, effects: WakeEffects);
 }
@@ -1371,10 +1373,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         for channel in channels {
             self.publish_channel(&channel)?;
         }
-        if let Some(mm) = resources {
-            if !root_exit {
-                arm_fork_progress(carrick_el1_abi::NativeForkProgress::ChildExit);
-            }
+        // Only fork-born processes own stock to retire. The root is known by
+        // graph position, not by the pid it shows in its namespace (a child
+        // in a new PID namespace may show pid 1); it uses the root-exit
+        // crossing instead.
+        if let Some(mm) = resources
+            && !root_exit
+        {
+            arm_fork_progress(carrick_el1_abi::NativeForkProgress::ChildExit);
             self.service.retire_mm(mm)
         }
         drop(published.retiring);
@@ -1824,6 +1830,7 @@ mod tests {
         controls: &'a [ThreadControlSlot],
         copies: Vec<LinuxWaitStatus>,
         refuse_copy: bool,
+        retired: Vec<AddressContext<RootGpa>>,
     }
     impl<'a> NativeProcessService<'a, ParkedContextWords> for Physical<'a> {
         type Mm = AddressContext<RootGpa>;
@@ -1924,7 +1931,9 @@ mod tests {
         fn quarantine_born(&mut self, _: Self::Born) {
             panic!("unexpected quarantine")
         }
-        fn retire_mm(&mut self, _: Self::Mm) {}
+        fn retire_mm(&mut self, mm: Self::Mm) {
+            self.retired.push(mm);
+        }
         fn wake_effects(&mut self, _: WakeEffects) {}
     }
     fn words(address: AddressContext<RootGpa>) -> ParkedContextWords {
@@ -2048,6 +2057,7 @@ mod tests {
                 controls: &child_controls[index],
                 copies: Vec::new(),
                 refuse_copy: false,
+                retired: Vec::new(),
             };
             let mut entry = runtime
                 .enter(source, &tasks[index], words(addresses[index]), &mut service)
@@ -2224,6 +2234,7 @@ mod tests {
             controls: &child_controls,
             copies: Vec::new(),
             refuse_copy: false,
+            retired: Vec::new(),
         };
         let mut process = runtime
             .enter_registered(
@@ -2422,6 +2433,7 @@ mod tests {
             controls: &*child_controls,
             copies: Vec::new(),
             refuse_copy: false,
+            retired: Vec::new(),
         };
         assert!(zone.slot(slot).current().is_none());
         let home = zone.slot(slot).host_record().unwrap();
@@ -2514,6 +2526,7 @@ mod tests {
             controls: &*child_controls,
             copies: Vec::new(),
             refuse_copy: false,
+            retired: Vec::new(),
         };
         let parent = TaskKey {
             id: TaskId::from_abi_positive(41).unwrap(),
@@ -2591,6 +2604,8 @@ mod tests {
             ));
             assert!(child_entry.take_handoff_receipt().is_some());
         }
+        // The forked child's final exit retires its MM exactly once.
+        assert_eq!(service.retired, vec![child_address]);
         assert_eq!(child_page.live(), 0);
         assert_eq!(page.live(), 1);
         let parent_record = runtime
@@ -2668,6 +2683,10 @@ mod tests {
         assert!(parent_entry.take_root_exit().is_none());
         assert!(parent_entry.take_handoff_receipt().is_some());
         assert_eq!(page.live(), 0);
+        drop(parent_entry);
+        // The root (whatever pid it shows in its namespace) exits through
+        // the root-exit crossing; its MM is never retired as a fork child.
+        assert_eq!(service.retired, vec![child_address]);
     }
     fn activate<'a>(
         runtime: &NativeProcessRuntime<'a, AddressContext<RootGpa>, ParkedContextWords>,
@@ -2769,6 +2788,7 @@ mod tests {
                 controls: &*child_controls,
                 copies: Vec::new(),
                 refuse_copy: false,
+                retired: Vec::new(),
             };
             let parent = TaskKey {
                 id: TaskId::from_abi_positive(41).unwrap(),

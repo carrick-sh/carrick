@@ -577,11 +577,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         fatal();
     }
     fn retire_mm(&mut self, mm: Mm) {
-        // The root uses the terminal root-exit crossing after graph exit.
-        // Only fork-born children own lifecycle and table stock to quarantine.
-        if self.task.visible_pid() == Some(1) {
-            return;
-        }
+        // The runtime calls this only for a fork-born process's final exit.
         let source = super::native_execution::source(self.slot);
         // Fork stock is only ever loaned by a carrier that also published
         // its maintenance root; a child cannot exist without both.
