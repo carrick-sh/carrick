@@ -194,6 +194,14 @@ impl PreparedProcessExec {
         self.kernel.old_mm_id()
     }
 
+    pub(crate) fn old_frame_owner(&self) -> carrick_kernel::kernel::FrameOwnerAuthority {
+        self.kernel.old_frame_owner()
+    }
+
+    pub(crate) fn replacement_frame_owner(&self) -> carrick_kernel::kernel::FrameOwnerAuthority {
+        self.kernel.replacement_frame_owner()
+    }
+
     pub(crate) fn old_file_table(&self) -> std::sync::Arc<carrick_kernel::kernel::FileTable> {
         self.kernel.old_file_table()
     }

@@ -206,6 +206,10 @@ impl PreparedExec {
         self.old_mm.id()
     }
 
+    pub fn old_frame_owner(&self) -> super::FrameOwnerAuthority {
+        self.old_mm.frame_owner_authority()
+    }
+
     pub fn old_file_table(&self) -> Arc<FileTable> {
         self.old_caller.resources().files()
     }

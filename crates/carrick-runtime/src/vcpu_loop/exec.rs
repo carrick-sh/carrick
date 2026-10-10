@@ -15,6 +15,19 @@ use super::*;
 
 use carrick_fatal::carrick_fatal;
 
+/// Inventory publication for one exact exec address-space owner.
+pub(super) fn apply_exec_frame_inventory(
+    kernel: &carrick_kernel::kernel::Kernel,
+    owner: &carrick_kernel::kernel::FrameOwnerAuthority,
+    commit: carrick_hal::FrameInventoryCommit<()>,
+) -> Result<carrick_hal::FrameInventoryApplyReceipt, carrick_kernel::kernel::FrameInventoryError> {
+    let owner = owner.owner();
+    kernel
+        .frame_inventory()
+        .apply_with_receipt(*owner, commit)
+        .map(|(_, receipt)| receipt)
+}
+
 #[expect(
     clippy::large_enum_variant,
     reason = "guest completion stays inline so the ordinary trapped-syscall path does not allocate"
@@ -529,6 +542,20 @@ pub(super) enum ExecvePreparation {
 }
 
 impl RuntimePreparedExec {
+    fn old_frame_owner(&self) -> carrick_kernel::kernel::FrameOwnerAuthority {
+        match self {
+            Self::Hvpatch(prepared) => prepared.old_frame_owner(),
+            Self::Other(prepared) => prepared.old_frame_owner(),
+        }
+    }
+
+    fn replacement_frame_owner(&self) -> carrick_kernel::kernel::FrameOwnerAuthority {
+        match self {
+            Self::Hvpatch(prepared) => prepared.replacement_frame_owner(),
+            Self::Other(prepared) => prepared.replacement_frame_owner(),
+        }
+    }
+
     fn old_mm_id(&self) -> carrick_kernel::kernel::MmId {
         match self {
             Self::Hvpatch(prepared) => prepared.old_mm_id(),
@@ -1579,6 +1606,8 @@ where
         let exec_kernel_context = refreshed_hvpatch_context.as_ref().unwrap_or(kernel_context);
         let old_mm_id = prepared_kernel_exec.old_mm_id();
         let replacement_mm_id = prepared_kernel_exec.replacement_mm_id();
+        let old_frame_owner = prepared_kernel_exec.old_frame_owner();
+        let replacement_frame_owner = prepared_kernel_exec.replacement_frame_owner();
         let mut exec_predecessor_identity = None;
         // Allocate both complete transaction envelopes before proc-state
         // mutation or topology/backend locking. Dropping the guard on
@@ -2021,11 +2050,11 @@ where
                     table.retire_overlapping(old_mm_id.raw(), 0, u64::MAX);
                 }
                 super::signal::withdraw_guest_descriptor_work(old_mm_id.raw());
-                if let Err(error) = process
-                    .kernel_graph()
-                    .frame_inventory()
-                    .apply(old_mm_id, retired_commit)
-                {
+                if let Err(error) = apply_exec_frame_inventory(
+                    process.kernel_graph(),
+                    &old_frame_owner,
+                    retired_commit,
+                ) {
                     return Self::exec_failed_past_no_return(
                         kernel,
                         engine,
@@ -2040,12 +2069,12 @@ where
             if let Err(error) =
                 engine.apply_exec_inventory(replacement_mm_id.raw(), &mut |commit| {
                     applied_by_authority = true;
-                    process
-                        .kernel_graph()
-                        .frame_inventory()
-                        .apply_with_receipt(replacement_mm_id, commit)
-                        .map(|(_, receipt)| receipt)
-                        .map_err(|error| crate::trap::TrapError::Hypervisor(error.to_string()))
+                    apply_exec_frame_inventory(
+                        process.kernel_graph(),
+                        &replacement_frame_owner,
+                        commit,
+                    )
+                    .map_err(|error| crate::trap::TrapError::Hypervisor(error.to_string()))
                 })
             {
                 return Self::exec_failed_past_no_return(
@@ -2066,11 +2095,11 @@ where
                     )
                     .map(Some);
                 };
-                if let Err(error) = process
-                    .kernel_graph()
-                    .frame_inventory()
-                    .apply(replacement_mm_id, replacement_commit)
-                {
+                if let Err(error) = apply_exec_frame_inventory(
+                    process.kernel_graph(),
+                    &replacement_frame_owner,
+                    replacement_commit,
+                ) {
                     return Self::exec_failed_past_no_return(
                         kernel,
                         engine,
@@ -2706,6 +2735,92 @@ pub(crate) mod tests {
 
     /// Diagnostic only: production service/completion, without executor polling,
     /// signal-boundary processing or a hardware transition. Run in release mode.
+    #[test]
+    fn exec_inventory_retires_the_transferred_predecessor_owner() {
+        use carrick_hal::{
+            FrameEventCapacity, FrameInventoryEvent, FrameLength, MappingGeneration,
+        };
+        use std::num::NonZeroU64;
+        let (kernel, root) = carrick_kernel::kernel::mm_access::test_support::bootstrap(31_132);
+        let cap = root.shared().mm().frame_owner_authority();
+        let mut reservation = kernel
+            .reserve_frame_inventory(1, 1, FrameEventCapacity::for_event_count(2).unwrap())
+            .unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation = MappingGeneration::from_backend_counter(NonZeroU64::new(1).unwrap());
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa: carrick_guest_mem::Gpa(0x4000),
+                length: FrameLength::from_mapping_extent(NonZeroU64::new(0x4000).unwrap()),
+                permissions: carrick_hal::MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        apply_exec_frame_inventory(&kernel, &cap, reservation.commit(())).unwrap();
+        let guest = carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::guest_arch_binding::core_arch::MmGeneration::new(
+                NonZeroU64::new(91003).unwrap(),
+            ),
+            root_generation: carrick_hal::guest_arch_binding::core_arch::ContextGeneration::new(
+                NonZeroU64::new(7).unwrap(),
+            ),
+        };
+        kernel
+            .transfer_frame_inventory_to_guest(&root, guest)
+            .unwrap();
+        let mut retirement = kernel
+            .reserve_frame_inventory(0, 0, FrameEventCapacity::for_event_count(2).unwrap())
+            .unwrap();
+        let transaction = retirement.transaction();
+        let generation = MappingGeneration::from_backend_counter(NonZeroU64::new(2).unwrap());
+        retirement
+            .push(FrameInventoryEvent::UnmapMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        retirement
+            .push(FrameInventoryEvent::RetireFrame {
+                transaction,
+                frame,
+                generation,
+            })
+            .unwrap();
+        apply_exec_frame_inventory(&kernel, &cap, retirement.commit(()))
+            .expect("retire guest-owned exec predecessor");
+        assert!(
+            kernel
+                .frame_inventory()
+                .snapshot_for_mm(carrick_kernel::kernel::FrameOwner::GuestMm(guest))
+                .mappings
+                .is_empty()
+        );
+        assert!(
+            kernel
+                .frame_inventory()
+                .frame_mapping_count(frame)
+                .is_none()
+        );
+        assert_eq!(root.shared().mm().id(), cap.semantic_mm());
+    }
+
     #[test]
     #[ignore = "explicit release-mode syscall cost diagnostic"]
     fn invalid_inotify_service_completion_cost() {
