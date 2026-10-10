@@ -4890,6 +4890,29 @@ impl Cpl0Carrier {
     }
 }
 
+fn checked_readiness_region(base: u64, offset: u64, length: usize, extent: u64) -> Option<u64> {
+    let length = u64::try_from(length).ok()?;
+    (offset.checked_add(length)? <= extent)
+        .then(|| base.checked_add(offset))
+        .flatten()
+}
+
+#[cfg(test)]
+mod readiness_span_tests {
+    #[test]
+    fn supervisor_readiness_span_rejects_host_address_overflow() {
+        assert_eq!(
+            super::checked_readiness_region(u64::MAX - 8, 16, 16, 64),
+            None
+        );
+        assert_eq!(
+            super::checked_readiness_region(0x1000, 16, 16, 32),
+            Some(0x1010)
+        );
+        assert_eq!(super::checked_readiness_region(0x1000, 17, 16, 32), None);
+    }
+}
+
 impl ForwardVenue<'_> {
     /// Inspect a typed readiness batch in the stopped task's supervisor
     /// region. The batch stays on its task-owned kernel stack or heap while
@@ -4927,24 +4950,36 @@ impl ForwardVenue<'_> {
                 "host readiness batch outside supervisor region: {address:#x}"
             ))
         })?;
-        if offset
-            .checked_add(length as u64)
-            .is_none_or(|end| end > region_len)
-            || !address
-                .is_multiple_of(core::mem::align_of::<carrick_el1_abi::HostReadinessEntry>() as u64)
+        if !address
+            .is_multiple_of(core::mem::align_of::<carrick_el1_abi::HostReadinessEntry>() as u64)
         {
             return Err(fail("host readiness batch outside supervisor region"));
         }
+        let gpa = checked_readiness_region(region_gpa, offset, length, region_len)
+            .ok_or_else(|| fail("host readiness batch outside supervisor region"))?;
         let ptr = self
             .custody
             .ram
-            .host_ptr(region_gpa + offset, length)
+            .host_ptr(gpa, length)
             .ok_or_else(|| fail("host readiness batch has no backing"))?
             .cast::<carrick_el1_abi::HostReadinessEntry>();
-        // SAFETY: KVM_RUN stopped this task before the carrier inspects the
-        // bounded, aligned supervisor-region batch.
-        let entries = unsafe { core::slice::from_raw_parts_mut(ptr, count) };
-        Ok(use_entries(entries))
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(count)
+            .map_err(|_| fail("host readiness batch allocation failed"))?;
+        for index in 0..count {
+            // SAFETY: the checked span contains `count` aligned records. The
+            // stopped task owns this batch; no Rust reference to guest RAM is
+            // created while another vCPU may access the physical backing.
+            entries.push(unsafe { core::ptr::read_volatile(ptr.add(index)) });
+        }
+        let result = use_entries(&mut entries);
+        for (index, entry) in entries.into_iter().enumerate() {
+            // SAFETY: the same checked span remains live through this stopped
+            // carrier service; the write publishes only the staged record.
+            unsafe { core::ptr::write_volatile(ptr.add(index), entry) };
+        }
+        Ok(result)
     }
 
     fn authenticate_initial_copy_page(
