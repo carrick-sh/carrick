@@ -2,7 +2,7 @@
  * Compare guest Linux pipe I/O against the underlying macOS host syscalls,
  * to find why a pipe's host fd write fails (ENXIO/EIO) in a forked subshell.
  *
- *   carrick trace --script scripts/trace-host-fds.d -- \
+ *   carrick trace --script scripts/dtrace/trace-host-fds.d -- \
  *       run ubuntu:24.04 /usr/bin/sh -c '(echo hi | cat)'
  */
 

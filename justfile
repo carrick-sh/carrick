@@ -385,13 +385,10 @@ test *ARGS:
         # parallel harness threads lets one oracle's temporary process state
         # corrupt another; keep the other workspace crates parallel and give
         # carrick-runtime a serial test process with identical coverage.
-        # `--bins` is load-bearing, not tidiness: `carrick-cli` is a bin-only
-        # crate (no [lib], no src/lib.rs), so with `--lib` alone `cargo test`
-        # SILENTLY skips it and its 135 in-file tests never ran in any gate --
-        # including `perf_stats`'s golden-fixture contract, the only thing
-        # keeping the Rust and Python paired-statistics implementations in
-        # agreement. `--lib` on a lib-less package is not an error, it is a
-        # no-op, which is why this went unnoticed.
+        # `--bins` is load-bearing, not tidiness: it exercises bin targets in
+        # the included workspace crates that would be skipped by `--lib` alone.
+        # Note: `carrick-cli` is excluded from this command and run separately
+        # below with serialized execution and an explicit 8 MiB stack budget.
         # NOT added: carrick-cli's `tests/` integration targets. `cli.rs` and
         # `fs_backend_flag.rs` drive the cargo-built binary via assert_cmd and
         # run no guest (adding `--test cli --test fs_backend_flag` here is a

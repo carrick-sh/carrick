@@ -4,7 +4,7 @@
  * process tree, plus the guest syscall mix, and dumps after a bounded window
  * so it never runs away.
  *
- *   carrick trace --script scripts/trace-profile.d -- run-elf <fixture>
+ *   carrick trace --script scripts/dtrace/trace-profile.d -- run-elf <fixture>
  */
 
 #pragma D option quiet

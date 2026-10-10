@@ -5,7 +5,7 @@
  * Trace Carrick syscall-path guest-memory copies.
  *
  * Use with a focused workload, e.g.:
- *   carrick trace --script scripts/trace-guest-mem-copy.d --trace-out /tmp/mem.out -- run ...
+ *   carrick trace --script scripts/dtrace/trace-guest-mem-copy.d --trace-out /tmp/mem.out -- run ...
  *
  * dir: 0=guest->host read, 1=host->guest internal write,
  *      2=host->guest syscall checked write.

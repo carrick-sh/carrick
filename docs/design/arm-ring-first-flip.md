@@ -83,22 +83,22 @@ revised census, table and typed routing for implementation eligibility.
 *(Methodology: READ; Mapping Analysis: READ)*
 
 Every Linux AArch64 syscall number (0 to 449 in the asm-generic ABI, totaling 338 recognized syscalls) was audited against current source code:
-- **EL1 Personality Dispatch:** [`crates/carrick-personality-linux/src/dispatch.rs:372`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L372) (`route_aarch64`).
-- **EL1 Completion & Forwarding:** [`crates/carrick-personality-linux/src/dispatch.rs:507`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L507) (`finish` records forwarded ordinals via `pending.record_forwarded(ordinal)`).
-- **Carrier Trap Loop & Dispatch:** [`crates/carrick-vmm-hvf/src/trap.rs:434`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-vmm-hvf/src/trap.rs#L434), [`crates/carrick-vmm-hvf/src/vcpu_loop/mod.rs:388`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-vmm-hvf/src/vcpu_loop/mod.rs#L388).
-- **Host SyscallDispatcher:** [`crates/carrick-kernel/src/dispatch/mod.rs:260`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/mod.rs#L260) (`dispatch`), [`crates/carrick-kernel/src/dispatch/routing.rs:38`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/routing.rs#L38) (`route_syscall` macro matching `SyscallNr::*`).
+- **EL1 Personality Dispatch:** [`crates/carrick-personality-linux/src/dispatch.rs:372`](../../crates/carrick-personality-linux/src/dispatch.rs#L372) (`route_aarch64`).
+- **EL1 Completion & Forwarding:** [`crates/carrick-personality-linux/src/dispatch.rs:507`](../../crates/carrick-personality-linux/src/dispatch.rs#L507) (`finish` records forwarded ordinals via `pending.record_forwarded(ordinal)`).
+- **Carrier Trap Loop & Dispatch:** [`crates/carrick-vmm-hvf/src/trap.rs:434`](../../crates/carrick-vmm-hvf/src/trap.rs#L434), [`crates/carrick-vmm-hvf/src/vcpu_loop/mod.rs:388`](../../crates/carrick-vmm-hvf/src/vcpu_loop/mod.rs#L388).
+- **Host SyscallDispatcher:** [`crates/carrick-kernel/src/dispatch/mod.rs:260`](../../crates/carrick-kernel/src/dispatch/mod.rs#L260) (`dispatch`), [`crates/carrick-kernel/src/dispatch/routing.rs:38`](../../crates/carrick-kernel/src/dispatch/routing.rs#L38) (`route_syscall` macro matching `SyscallNr::*`).
 - **Host Subsystem Handlers:**
-  - Filesystem: [`crates/carrick-kernel/src/dispatch/fs.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/fs.rs) (`fs::*`)
-  - Memory: [`crates/carrick-kernel/src/dispatch/mem.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/mem.rs) (`mem::*`)
-  - Process: [`crates/carrick-kernel/src/dispatch/proc.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/proc.rs) (`proc::*`)
-  - Signals: [`crates/carrick-kernel/src/dispatch/signal.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/signal.rs) (`signal::*`)
-  - Networking: [`crates/carrick-kernel/src/dispatch/net.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/net.rs) (`net::*`)
-  - Synchronization: [`crates/carrick-kernel/src/dispatch/sync.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/sync.rs) (`sync::*`)
-  - Time & Clocks: [`crates/carrick-kernel/src/dispatch/time.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/time.rs) (`time::*`)
-  - System: [`crates/carrick-kernel/src/dispatch/sys.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/sys.rs) (`sys::*`)
-  - Identity / Credentials: [`crates/carrick-kernel/src/dispatch/identity.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/identity.rs) (`identity::*`)
-  - IPC: [`crates/carrick-kernel/src/dispatch/ipc.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/ipc.rs) (`ipc::*`)
-- **Metadata & Deferred Support:** [`crates/carrick-abi/src/syscall.rs:188`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-abi/src/syscall.rs#L188) (`SupportLevel::BringUp`).
+  - Filesystem: [`crates/carrick-kernel/src/dispatch/fs.rs`](../../crates/carrick-kernel/src/dispatch/fs.rs) (`fs::*`)
+  - Memory: [`crates/carrick-kernel/src/dispatch/mem.rs`](../../crates/carrick-kernel/src/dispatch/mem.rs) (`mem::*`)
+  - Process: [`crates/carrick-kernel/src/dispatch/proc.rs`](../../crates/carrick-kernel/src/dispatch/proc.rs) (`proc::*`)
+  - Signals: [`crates/carrick-kernel/src/dispatch/signal.rs`](../../crates/carrick-kernel/src/dispatch/signal.rs) (`signal::*`)
+  - Networking: [`crates/carrick-kernel/src/dispatch/net.rs`](../../crates/carrick-kernel/src/dispatch/net.rs) (`net::*`)
+  - Synchronization: [`crates/carrick-kernel/src/dispatch/sync.rs`](../../crates/carrick-kernel/src/dispatch/sync.rs) (`sync::*`, retired/deleted)
+  - Time & Clocks: [`crates/carrick-kernel/src/dispatch/time.rs`](../../crates/carrick-kernel/src/dispatch/time.rs) (`time::*`)
+  - System: [`crates/carrick-kernel/src/dispatch/sys.rs`](../../crates/carrick-kernel/src/dispatch/sys.rs) (`sys::*`, retired/deleted)
+  - Identity / Credentials: [`crates/carrick-kernel/src/dispatch/identity.rs`](../../crates/carrick-kernel/src/dispatch/identity.rs) (`identity::*`, retired/deleted)
+  - IPC: [`crates/carrick-kernel/src/dispatch/ipc.rs`](../../crates/carrick-kernel/src/dispatch/ipc.rs) (`ipc::*`, retired/deleted)
+- **Metadata & Deferred Support:** [`crates/carrick-abi/src/syscall.rs:188`](../../crates/carrick-abi/src/syscall.rs#L188) (`SupportLevel::BringUp`).
 
 ### 1.2 Quantitative Census Summary
 
@@ -144,7 +144,7 @@ Total               : 338
 *(Evidence: READ)*
 
 In x86 CPL0, the boundary is strictly enforced at native entry completion:
-- **Allowlist Definition:** [`crates/carrick-x86-cpl0/src/entry.rs:441`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-x86-cpl0/src/entry.rs#L441):
+- **Allowlist Definition:** [`crates/carrick-x86-cpl0/src/entry.rs:441`](../../crates/carrick-x86-cpl0/src/entry.rs#L441):
   ```rust
   #[repr(u64)]
   pub enum AllowedHostCrossing {
@@ -158,7 +158,7 @@ In x86 CPL0, the boundary is strictly enforced at native entry completion:
       EpollPwait = 281,
   }
   ```
-- **Filter and Ring Exit Gate:** [`crates/carrick-x86-cpl0/src/entry.rs:1995-2002`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-x86-cpl0/src/entry.rs#L1995-L2002):
+- **Filter and Ring Exit Gate:** [`crates/carrick-x86-cpl0/src/entry.rs:1995-2002`](../../crates/carrick-x86-cpl0/src/entry.rs#L1995-L2002):
   ```rust
   CompletionRoute::Forward => {
       if AllowedHostCrossing::from_native(call.native.raw()).is_some() {
@@ -168,7 +168,7 @@ In x86 CPL0, the boundary is strictly enforced at native entry completion:
       }
   }
   ```
-- **Fast-Path Refusal & Accounting:** [`crates/carrick-x86-cpl0/src/entry.rs:468-488`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-x86-cpl0/src/entry.rs#L468-L488):
+- **Fast-Path Refusal & Accounting:** [`crates/carrick-x86-cpl0/src/entry.rs:468-488`](../../crates/carrick-x86-cpl0/src/entry.rs#L468-L488):
   ```rust
   fn record_refusal(counters: &Counters, frame: &mut NativeFrame, native: Option<u64>) {
       frame.rax = (-38_i64) as u64; // -ENOSYS
@@ -179,7 +179,7 @@ In x86 CPL0, the boundary is strictly enforced at native entry completion:
       counters.refused[bucket].fetch_add(1, Ordering::Relaxed);
   }
   ```
-- **Shared Aperture Counters:** [`crates/carrick-el1-abi/src/lib.rs:1979-2002`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-el1-abi/src/lib.rs#L1979-L2002):
+- **Shared Aperture Counters:** [`crates/carrick-el1-abi/src/lib.rs:1979-2002`](../../crates/carrick-el1-abi/src/lib.rs#L1979-L2002):
   ```rust
   pub struct Counters {
       pub served: [AtomicU64; 512],
@@ -196,29 +196,29 @@ The shared kernel in `carrick-personality-linux` and `carrick-el1` already imple
 
 | Nr | Name | Subsystem | x86 CPL0 In-Ring Evidence & Seam |
 |:---:|:---|:---|:---|
-| **27** | `inotify_add_watch` | fs | Inotify watch registration in `carrick_el1::personality::inotify` ([`dispatch.rs:384`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L384)). |
-| **28** | `inotify_rm_watch` | fs | Inotify watch removal in `carrick_el1::personality::inotify` ([`dispatch.rs:385`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L385)). |
-| **93** | `exit` | process | Thread exit in `carrick_personality_linux::lifecycle` ([`lifecycle.rs:31`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/lifecycle.rs#L31), [`dispatch.rs:387`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L387)). |
-| **94** | `exit_group` | process | Process termination in `carrick_x86_cpl0::native_process::Service` ([`lifecycle.rs:323`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/lifecycle.rs#L323), [`dispatch.rs:395`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L395)). |
-| **98** | `futex` | sched | Kernel wait/wake synchronization in `carrick_sched_core::futex` ([`dispatch.rs:386`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L386)). |
-| **99** | `set_robust_list` | process | Robust futex list registration in `carrick_personality_linux::thread` ([`thread.rs:137`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/thread.rs#L137), [`dispatch.rs:390`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L390)). |
-| **132** | `sigaltstack` | signal | Signal stack setup in `carrick_personality_linux::lifecycle` ([`lifecycle.rs:341`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/lifecycle.rs#L341), [`dispatch.rs:388`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L388)). |
-| **135** | `rt_sigprocmask` | signal | Signal mask mutation in `carrick_personality_linux::lifecycle` ([`lifecycle.rs:361`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/lifecycle.rs#L361), [`dispatch.rs:389`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L389)). |
-| **172** | `getpid` | process | PID query in `carrick_personality_linux::lifecycle` ([`lifecycle.rs:347`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/lifecycle.rs#L347), [`dispatch.rs:392`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L392)). |
-| **178** | `gettid` | process | TID query in `carrick_personality_linux::lifecycle` ([`lifecycle.rs:333`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/lifecycle.rs#L333), [`dispatch.rs:391`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L391)). |
-| **214** | `brk` | mm | Program break in `carrick_x86_cpl0::anonymous::X86AnonymousVenue` ([`anonymous.rs:11`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-x86-cpl0/src/anonymous.rs#L11), [`dispatch.rs:374`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L374)). |
-| **215** | `munmap` | mm | Address unmapping in `carrick_x86_cpl0::anonymous::X86AnonymousVenue` ([`dispatch.rs:375`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L375)). |
-| **216** | `mremap` | mm | Address remapping in `carrick_x86_cpl0::anonymous::X86AnonymousVenue` ([`dispatch.rs:376`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L376)). |
-| **220** | `clone` | process | Process/thread cloning in `carrick_x86_cpl0::native_process::Service` ([`lifecycle.rs:300`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/lifecycle.rs#L300), [`dispatch.rs:393`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L393)). |
-| **222** | `mmap` | mm | Anonymous mapping in `carrick_x86_cpl0::anonymous::X86AnonymousVenue` ([`dispatch.rs:377`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L377)). |
-| **226** | `mprotect` | mm | Memory protection in `carrick_x86_cpl0::anonymous::X86AnonymousVenue` ([`dispatch.rs:378`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L378)). |
-| **260** | `wait4` | process | Child waiting in `carrick_x86_cpl0::native_process::Service` ([`lifecycle.rs:315`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/lifecycle.rs#L315), [`dispatch.rs:394`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L394)). |
+| **27** | `inotify_add_watch` | fs | Inotify watch registration in `carrick_el1::personality::inotify` ([`dispatch.rs:384`](../../crates/carrick-personality-linux/src/dispatch.rs#L384)). |
+| **28** | `inotify_rm_watch` | fs | Inotify watch removal in `carrick_el1::personality::inotify` ([`dispatch.rs:385`](../../crates/carrick-personality-linux/src/dispatch.rs#L385)). |
+| **93** | `exit` | process | Thread exit in `carrick_personality_linux::lifecycle` ([`lifecycle.rs:31`](../../crates/carrick-personality-linux/src/lifecycle.rs#L31), [`dispatch.rs:387`](../../crates/carrick-personality-linux/src/dispatch.rs#L387)). |
+| **94** | `exit_group` | process | Process termination in `carrick_x86_cpl0::native_process::Service` ([`lifecycle.rs:323`](../../crates/carrick-personality-linux/src/lifecycle.rs#L323), [`dispatch.rs:395`](../../crates/carrick-personality-linux/src/dispatch.rs#L395)). |
+| **98** | `futex` | sched | Kernel wait/wake synchronization in `carrick_sched_core::futex` ([`dispatch.rs:386`](../../crates/carrick-personality-linux/src/dispatch.rs#L386)). |
+| **99** | `set_robust_list` | process | Robust futex list registration in `carrick_personality_linux::thread` ([`thread.rs:137`](../../crates/carrick-personality-linux/src/thread.rs#L137), [`dispatch.rs:390`](../../crates/carrick-personality-linux/src/dispatch.rs#L390)). |
+| **132** | `sigaltstack` | signal | Signal stack setup in `carrick_personality_linux::lifecycle` ([`lifecycle.rs:341`](../../crates/carrick-personality-linux/src/lifecycle.rs#L341), [`dispatch.rs:388`](../../crates/carrick-personality-linux/src/dispatch.rs#L388)). |
+| **135** | `rt_sigprocmask` | signal | Signal mask mutation in `carrick_personality_linux::lifecycle` ([`lifecycle.rs:361`](../../crates/carrick-personality-linux/src/lifecycle.rs#L361), [`dispatch.rs:389`](../../crates/carrick-personality-linux/src/dispatch.rs#L389)). |
+| **172** | `getpid` | process | PID query in `carrick_personality_linux::lifecycle` ([`lifecycle.rs:347`](../../crates/carrick-personality-linux/src/lifecycle.rs#L347), [`dispatch.rs:392`](../../crates/carrick-personality-linux/src/dispatch.rs#L392)). |
+| **178** | `gettid` | process | TID query in `carrick_personality_linux::lifecycle` ([`lifecycle.rs:333`](../../crates/carrick-personality-linux/src/lifecycle.rs#L333), [`dispatch.rs:391`](../../crates/carrick-personality-linux/src/dispatch.rs#L391)). |
+| **214** | `brk` | mm | Program break in `carrick_x86_cpl0::anonymous::X86AnonymousVenue` ([`anonymous.rs:11`](../../crates/carrick-x86-cpl0/src/anonymous.rs#L11), [`dispatch.rs:374`](../../crates/carrick-personality-linux/src/dispatch.rs#L374)). |
+| **215** | `munmap` | mm | Address unmapping in `carrick_x86_cpl0::anonymous::X86AnonymousVenue` ([`dispatch.rs:375`](../../crates/carrick-personality-linux/src/dispatch.rs#L375)). |
+| **216** | `mremap` | mm | Address remapping in `carrick_x86_cpl0::anonymous::X86AnonymousVenue` ([`dispatch.rs:376`](../../crates/carrick-personality-linux/src/dispatch.rs#L376)). |
+| **220** | `clone` | process | Process/thread cloning in `carrick_x86_cpl0::native_process::Service` ([`lifecycle.rs:300`](../../crates/carrick-personality-linux/src/lifecycle.rs#L300), [`dispatch.rs:393`](../../crates/carrick-personality-linux/src/dispatch.rs#L393)). |
+| **222** | `mmap` | mm | Anonymous mapping in `carrick_x86_cpl0::anonymous::X86AnonymousVenue` ([`dispatch.rs:377`](../../crates/carrick-personality-linux/src/dispatch.rs#L377)). |
+| **226** | `mprotect` | mm | Memory protection in `carrick_x86_cpl0::anonymous::X86AnonymousVenue` ([`dispatch.rs:378`](../../crates/carrick-personality-linux/src/dispatch.rs#L378)). |
+| **260** | `wait4` | process | Child waiting in `carrick_x86_cpl0::native_process::Service` ([`lifecycle.rs:315`](../../crates/carrick-personality-linux/src/lifecycle.rs#L315), [`dispatch.rs:394`](../../crates/carrick-personality-linux/src/dispatch.rs#L394)). |
 
 Six additional syscalls have `shared_inring_x86 = Partial`:
-- `read` (63), `write` (64), `lseek` (62), `pread64` (67), `pwrite64` (68): served in-ring for delegated files / IPC ([`file.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-el1/src/personality/file.rs)), but forward to host for non-delegated host files ([`x86 entry.rs:441`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-x86-cpl0/src/entry.rs#L441)).
+- `read` (63), `write` (64), `lseek` (62), `pread64` (67), `pwrite64` (68): served in-ring for delegated files / IPC ([`file.rs`](../../crates/carrick-el1/src/personality/file.rs)), but forward to host for non-delegated host files ([`x86 entry.rs:441`](../../crates/carrick-x86-cpl0/src/entry.rs#L441)).
 - `epoll_pwait` (22): served in-ring when IPC transfers are available, but forwards to host when host descriptors or pending host work exist.
 
-On ARM, these 17 syscalls will NOT be refused with `-ENOSYS`. They are marked **`Wire-in-ring`**, binding ARM EL1 directly to the existing shared handlers (enabled via Step 5 wiring of `Aarch64Process` in [`crates/carrick-el1/src/personality/aarch64_process.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-el1/src/personality/aarch64_process.rs)).
+On ARM, these 17 syscalls will NOT be refused with `-ENOSYS`. They are marked **`Wire-in-ring`**, binding ARM EL1 directly to the existing shared handlers (enabled via Step 5 wiring of `Aarch64Process` in [`crates/carrick-el1/src/personality/aarch64_process.rs`](../../crates/carrick-el1/src/personality/aarch64_process.rs)).
 
 ---
 
@@ -310,7 +310,7 @@ The real regression accepted by the owner comprises exactly **140 syscalls** tha
    - *Impact:* Async I/O LTP suites flip to `TCONF`.
 8. **Tracing, Memory Inspection & Keys (16 syscalls):**
    - `ptrace` (117), `process_vm_readv` (270), `process_vm_writev` (271), `kcmp` (272), `membarrier` (283), `rseq` (293), `seccomp` (277), `add_key` (217), `request_key` (218), `keyctl` (219), `memfd_create` (279), `memfd_secret` (447), `process_madvise` (440), `process_mrelease` (448), `userfaultfd` (282), `bpf` (280).
-   - *Impact:* Ptrace refusal satisfies [`docs/conformance-contracts.md:741`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/docs/conformance-contracts.md#L741).
+   - *Impact:* Ptrace refusal satisfies [`docs/conformance-contracts.md:741`](../../docs/conformance-contracts.md#L741).
 9. **POSIX Timers & Clock Tuning (11 syscalls):**
    - `settimeofday` (170), `adjtimex` (171), `clock_adjtime` (266), `clock_settime` (112), `timer_create` (107), `timer_gettime` (108), `timer_getoverrun` (109), `timer_settime` (110), `timer_delete` (111), `getitimer` (102), `setitimer` (103).
    - *Impact:* Timer suites flip to `TCONF`.
@@ -335,16 +335,16 @@ flowchart TD
 ### 4.1 Deletion Phases
 
 #### Phase 1: Immediate Post-Flip Deletions (Unused Host Authority Stubs)
-1. **Identity & Credentials:** Delete [`crates/carrick-kernel/src/dispatch/identity.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/identity.rs) host handlers (`sys_setuid`, `sys_setgid`, `sys_setresuid`, `sys_getresuid`, `sys_capget`, `sys_capset`).
-2. **System V IPC & POSIX MQ:** Delete [`crates/carrick-kernel/src/dispatch/ipc.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/ipc.rs) (`sys_msgget`, `sys_semget`, `sys_shmget`, etc.).
-3. **Linux AIO Stubs:** Delete host stubs in [`crates/carrick-kernel/src/dispatch/fs.rs:92-96`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/fs.rs#L92-L96) (`io_setup`, `io_submit`, etc.).
-4. **Host Ptrace Stub:** Delete [`crates/carrick-kernel/src/dispatch/proc.rs:340`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/proc.rs#L340) (`sys_ptrace`).
-5. **Keyctl Stubs:** Delete [`crates/carrick-kernel/src/dispatch/sys.rs:114-125`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/sys.rs#L114-L125).
+1. **Identity & Credentials:** Delete [`crates/carrick-kernel/src/dispatch/identity.rs`](../../crates/carrick-kernel/src/dispatch/identity.rs) host handlers (completed: file deleted).
+2. **System V IPC & POSIX MQ:** Delete [`crates/carrick-kernel/src/dispatch/ipc.rs`](../../crates/carrick-kernel/src/dispatch/ipc.rs) (completed: file deleted).
+3. **Linux AIO Stubs:** Delete host stubs in [`crates/carrick-kernel/src/dispatch/fs.rs:92-96`](../../crates/carrick-kernel/src/dispatch/fs.rs#L92-L96) (`io_setup`, `io_submit`, etc.).
+4. **Host Ptrace Stub:** Delete [`crates/carrick-kernel/src/dispatch/proc.rs:340`](../../crates/carrick-kernel/src/dispatch/proc.rs#L340) (`sys_ptrace`).
+5. **Keyctl Stubs:** Delete [`crates/carrick-kernel/src/dispatch/sys.rs:114-125`](../../crates/carrick-kernel/src/dispatch/sys.rs#L114-L125) (completed: file deleted).
 
 #### Phase 2: Step 6 N1 Host Fork Deletion
-1. **Host Process Forking:** Delete host fork implementation in [`crates/carrick-kernel/src/dispatch/proc.rs:180-245`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/proc.rs#L180-L245) (`sys_fork`, `sys_vfork`, and host clone task emulation).
-2. **Host Fork Quiescence Barrier:** Delete [`crates/carrick-vmm-hvf/src/fork_quiesce.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-vmm-hvf/src/fork_quiesce.rs).
-3. **Host Thread Carrier Pool:** Delete host carrier thread-spawning for guest forks in [`crates/carrick-runtime/src/task_pool.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-runtime/src/task_pool.rs).
+1. **Host Process Forking:** Delete host fork implementation in [`crates/carrick-kernel/src/dispatch/proc.rs:180-245`](../../crates/carrick-kernel/src/dispatch/proc.rs#L180-L245) (`sys_fork`, `sys_vfork`, and host clone task emulation).
+2. **Host Fork Quiescence Barrier:** Delete [`crates/carrick-vmm-hvf/src/fork_quiesce.rs`](../../crates/carrick-vmm-hvf/src/fork_quiesce.rs).
+3. **Host Thread Carrier Pool:** Delete host carrier thread-spawning for guest forks in [`crates/carrick-runtime/src/task_pool.rs`](../../crates/carrick-runtime/src/task_pool.rs) (completed: file deleted).
 
 #### Phase 3: Retirement of Temporary-Forward Rows (`lane x86-fdtable`)
 When the shared fd table lands:
@@ -353,11 +353,11 @@ When the shared fd table lands:
 3. Deletes host descriptor routing in `crates/carrick-kernel/src/dispatch/fs.rs`.
 
 #### Phase 4: Post-Memory Ring Authority Deletions
-1. **Host Mmap Arena:** Delete host anonymous memory handlers in [`crates/carrick-kernel/src/dispatch/mem.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/mem.rs) (`sys_mmap`, `sys_mprotect`, `sys_munmap`, `sys_brk`).
-2. **Host Page Allocator Fallback:** Remove carrier memory allocation fallbacks in [`crates/carrick-vmm-hvf/src/trap/cow_engine.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-vmm-hvf/src/trap/cow_engine.rs).
+1. **Host Mmap Arena:** Delete host anonymous memory handlers in [`crates/carrick-kernel/src/dispatch/mem.rs`](../../crates/carrick-kernel/src/dispatch/mem.rs) (`sys_mmap`, `sys_mprotect`, `sys_munmap`, `sys_brk`).
+2. **Host Page Allocator Fallback:** Remove carrier memory allocation fallbacks in [`crates/carrick-vmm-hvf/src/trap/cow_engine.rs`](../../crates/carrick-vmm-hvf/src/trap/cow_engine.rs).
 
 #### Phase 5: Final Dispatcher Purge
-1. Remove all deleted syscall entries from [`crates/carrick-kernel/src/dispatch/routing.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/routing.rs).
+1. Remove all deleted syscall entries from [`crates/carrick-kernel/src/dispatch/routing.rs`](../../crates/carrick-kernel/src/dispatch/routing.rs).
 
 ---
 
@@ -381,7 +381,7 @@ CARRICK_ARM_RING_FIRST=0
 
 ### 5.2 Aperture Control Word Communication
 Because bare-metal EL1 does not access host environment variables directly, the host carrier sets a flag in the shared aperture control word during VM initialization:
-- In [`crates/carrick-el1-abi/src/lib.rs`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-el1-abi/src/lib.rs):
+- In [`crates/carrick-el1-abi/src/lib.rs`](../../crates/carrick-el1-abi/src/lib.rs):
   ```rust
   pub const APERTURE_CONTROL_ARM_RING_FIRST_OPT_OUT: u64 = 1 << 3;
   ```
@@ -429,7 +429,7 @@ exit_group. The signed filter is `just test-embed arm_ring_first_ --nocapture`:
    - Define `AllowedHostCrossing` with `from_native_aarch64(nr: u64)` matching the 100 allowlisted host crossings, 16 temporary forward crossings and two declined terminal notifications.
    - Refactor `crates/carrick-x86-cpl0/src/entry.rs` to reuse this shared enum for x86.
 2. **ARM EL1 Refusal Hook:**
-   - In [`crates/carrick-personality-linux/src/dispatch.rs:507`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L507), intercept `CompletionRoute::Forward`.
+   - In [`crates/carrick-personality-linux/src/dispatch.rs:507`](../../crates/carrick-personality-linux/src/dispatch.rs#L507), intercept `CompletionRoute::Forward`.
    - If not allowlisted and strict hatch enabled: set result to `-38` (`-ENOSYS`), increment `counters.refused[ordinal]`, return `CompletionRoute::Served`.
 3. **Wire-in-Ring Enabling:**
    - Ensure the 17 shared in-ring syscalls (`brk`, `mmap`, `munmap`, `mprotect`, `mremap`, `clone`, `wait4`, `exit`, `exit_group`, `getpid`, `gettid`, `set_robust_list`, `sigaltstack`, `sigprocmask`, `futex`, `inotify_add_watch`, `inotify_rm_watch`) dispatch directly to shared personality handlers on ARM EL1.
@@ -470,16 +470,16 @@ exit_group. The signed filter is `just test-embed arm_ring_first_ --nocapture`:
 
 | Section | Finding / Item | Status | Primary Code Reference |
 |:---|:---|:---:|:---|
-| **1.1** | 23 EL1-first routed syscalls | **READ** | [`crates/carrick-personality-linux/src/dispatch.rs:372-401`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L372-L401) |
-| **1.1** | 250 Host dispatcher syscalls | **READ** | [`crates/carrick-kernel/src/dispatch/routing.rs:38-340`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/routing.rs#L38-L340) |
-| **1.1** | 65 Deferred BringUp syscalls | **READ** | [`crates/carrick-abi/src/syscall.rs:188-340`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-abi/src/syscall.rs#L188-L340) |
-| **2.1** | x86 `AllowedHostCrossing` & `record_refusal` | **READ** | [`crates/carrick-x86-cpl0/src/entry.rs:441-488`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-x86-cpl0/src/entry.rs#L441-L488) |
-| **2.1** | `Counters.refused: [AtomicU64; 513]` | **READ** | [`crates/carrick-el1-abi/src/lib.rs:1979-2002`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-el1-abi/src/lib.rs#L1979-L2002) |
-| **2.2** | 17 x86 shared in-ring syscalls (`shared_inring_x86 = Yes`) | **READ** | [`crates/carrick-x86-cpl0/src/entry.rs:1942-1963`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-x86-cpl0/src/entry.rs#L1942-L1963), [`crates/carrick-personality-linux/src/dispatch.rs:372-395`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-personality-linux/src/dispatch.rs#L372-L395) |
+| **1.1** | 23 EL1-first routed syscalls | **READ** | [`crates/carrick-personality-linux/src/dispatch.rs:372-401`](../../crates/carrick-personality-linux/src/dispatch.rs#L372-L401) |
+| **1.1** | 250 Host dispatcher syscalls | **READ** | [`crates/carrick-kernel/src/dispatch/routing.rs:38-340`](../../crates/carrick-kernel/src/dispatch/routing.rs#L38-L340) |
+| **1.1** | 65 Deferred BringUp syscalls | **READ** | [`crates/carrick-abi/src/syscall.rs:188-340`](../../crates/carrick-abi/src/syscall.rs#L188-L340) |
+| **2.1** | x86 `AllowedHostCrossing` & `record_refusal` | **READ** | [`crates/carrick-x86-cpl0/src/entry.rs:441-488`](../../crates/carrick-x86-cpl0/src/entry.rs#L441-L488) |
+| **2.1** | `Counters.refused: [AtomicU64; 513]` | **READ** | [`crates/carrick-el1-abi/src/lib.rs:1979-2002`](../../crates/carrick-el1-abi/src/lib.rs#L1979-L2002) |
+| **2.2** | 17 x86 shared in-ring syscalls (`shared_inring_x86 = Yes`) | **READ** | [`crates/carrick-x86-cpl0/src/entry.rs:1942-1963`](../../crates/carrick-x86-cpl0/src/entry.rs#L1942-L1963), [`crates/carrick-personality-linux/src/dispatch.rs:372-395`](../../crates/carrick-personality-linux/src/dispatch.rs#L372-L395) |
 | **3.2** | 100 Permanent forward allowlist entries | **INFERENCE** | Mapped against [`docs/host-facility-boundary.md`](../host-facility-boundary.md) host facility definitions |
 | **3.3** | 16 Temporary-forward compat-zone object entries | **INFERENCE** | Derived from AGENTS compat-zone object definitions and `lane x86-fdtable` tracking |
 | **3.4** | 140 Counted-ENOSYS real regression size | **INFERENCE** | 338 total minus (17 in-ring + 100 allowlist + 16 temp-forward + 65 unclaimed) |
-| **4.1** | Step 6 N1 host fork deletion | **READ** | [`crates/carrick-vmm-hvf/src/fork_quiesce.rs:1-120`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-vmm-hvf/src/fork_quiesce.rs#L1-L120), [`crates/carrick-kernel/src/dispatch/proc.rs:180-245`](file:///Volumes/CaseSensitive/carrick/.worktrees/arm-flip/crates/carrick-kernel/src/dispatch/proc.rs#L180-L245) |
+| **4.1** | Step 6 N1 host fork deletion | **READ** | [`crates/carrick-vmm-hvf/src/fork_quiesce.rs:1-120`](../../crates/carrick-vmm-hvf/src/fork_quiesce.rs#L1-L120), [`crates/carrick-kernel/src/dispatch/proc.rs:180-245`](../../crates/carrick-kernel/src/dispatch/proc.rs#L180-L245) |
 | **5.1** | `=0` Hatch naming and aperture control word | **INFERENCE** | Patterned after existing `CARRICK_DSR_ZERO_REMAP` and aperture control bitfields |
 | **6.1** | Multi-phase PR rollout ordering | **INFERENCE** | Ordered to keep each PR atomically verifiable and under review budget |
 

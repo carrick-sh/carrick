@@ -2,7 +2,7 @@
  * Prove (a) whether carrick's RLIMIT_NOFILE raise + self-pipe F_DUPFD_CLOEXEC
  * relocation actually engage, and (b) who closes the guest pipe's read end.
  *
- *   carrick trace --script scripts/trace-relocation.d -- run-elf <fixture>
+ *   carrick trace --script scripts/dtrace/trace-relocation.d -- run-elf <fixture>
  */
 
 #pragma D option quiet

@@ -436,7 +436,7 @@ In Carrick, guest-visible correctness includes Linux semantics and non-pathologi
   two answers forever.
 - **Opt-OUT:** new work ON with an exact `=0` hatch; default-off = abandoned;
   measured-worse = deleted. Ungated tests aren't tests (`carrick-cli` has no
-  lib target; in-file `mod tests` never ran under `just test`).
+  lib target; in-file `mod tests` required explicit `--bin carrick` wiring in `just test` to run).
 - **Rust first:** new capability = `carrick trace` profile or `carrick debug`
   subcommand; D scripts hashed by a Rust profile; Python only for lldb; the rest
   Rust under `-D warnings`.

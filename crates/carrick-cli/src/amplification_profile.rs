@@ -1021,7 +1021,7 @@ impl Amp1Reader {
         let guest_total = self.totals.get("guest-syscall-total").copied().unwrap_or(0);
         if guest_total == 0 {
             bail!(
-                "AMP1 capture recorded no guest syscalls (wrong-backend): `native-syscall-service-*` never fires under the VMM backend, so every host call would land in `carrick-only`. Re-run with `--exec-backend native`."
+                "AMP1 capture recorded no guest syscalls (wrong-backend): `native-syscall-service-*` did not fire; legacy backends (`--exec-backend native`, `--exec-backend vmm`) are retired. Verify guest execution under `--exec-backend hvpatch`."
             );
         }
         // EVERY seeded total must be nonzero, and the reason is the seed's own

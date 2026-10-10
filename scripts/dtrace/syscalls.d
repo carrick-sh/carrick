@@ -1,7 +1,7 @@
 /*
  * carrick syscall trace + aggregation.
  *
- * Use:  sudo dtrace -s scripts/syscalls.d -c '<carrick command line>'
+ * Use:  sudo dtrace -s scripts/dtrace/syscalls.d -c '<carrick command line>'
  *
  * Emits a per-event line for every Linux syscall the guest issues, plus
  * an END action that prints frequency-sorted aggregations.
