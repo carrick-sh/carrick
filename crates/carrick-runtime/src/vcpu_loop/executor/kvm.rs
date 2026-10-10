@@ -1,9 +1,45 @@
 //! KVM task binding onto the shared executor submission authority.
 use std::collections::BTreeMap;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
+
+#[cfg(test)]
+mod host_fd_binding_tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn live_unbound_host_fd_cannot_be_named_by_cpl0() {
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let fd = carrick_el1_abi::HostBoundFd::new(file.as_raw_fd()).unwrap();
+        let bindings = BoundHostFds::from_readiness([
+            Some(StdioReadiness::Host(fd)),
+            Some(StdioReadiness::AlwaysWritable),
+            Some(StdioReadiness::AlwaysWritable),
+        ])
+        .unwrap();
+        assert!(
+            bindings
+                .resolve(carrick_el1_abi::HostObjectBinding::STDIN)
+                .is_some()
+        );
+        assert!(
+            bindings
+                .resolve(carrick_el1_abi::HostObjectBinding::from_host_fd(fd))
+                .is_none()
+        );
+        drop(file);
+        let Some(BoundReadiness::Host(owned)) =
+            bindings.resolve(carrick_el1_abi::HostObjectBinding::STDIN)
+        else {
+            panic!("bound descriptor was not retained");
+        };
+        assert!(unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_GETFD) } >= 0);
+    }
+}
 
 use carrick_guest_mem::GuestMemory;
 use carrick_hal::TrapError;
@@ -47,6 +83,57 @@ pub(crate) struct KvmPersistentExecutorFactory {
     stats: Arc<KvmForwardStats>,
     scheduler: Arc<Scheduler>,
     host_objects: Arc<Mutex<[u32; 3]>>,
+    bound_host_fds: Arc<BoundHostFds>,
+}
+
+enum BoundReadiness {
+    Host(OwnedFd),
+    AlwaysWritable,
+    Invalid,
+}
+
+/// Host-owned descriptor authority for the current CPL0 stdio bindings.
+/// A guest-supplied raw host number is never admitted by this table.
+struct BoundHostFds {
+    stdio: [BoundReadiness; 3],
+}
+
+impl BoundHostFds {
+    fn from_readiness(readiness: [Option<StdioReadiness>; 3]) -> Result<Self, TrapError> {
+        let [stdin, stdout, stderr] = readiness;
+        Ok(Self {
+            stdio: [Self::bind(stdin)?, Self::bind(stdout)?, Self::bind(stderr)?],
+        })
+    }
+
+    fn bind(readiness: Option<StdioReadiness>) -> Result<BoundReadiness, TrapError> {
+        match readiness {
+            Some(StdioReadiness::AlwaysWritable) => Ok(BoundReadiness::AlwaysWritable),
+            None => Ok(BoundReadiness::Invalid),
+            Some(StdioReadiness::Host(fd)) => {
+                // The host dispatcher, rather than CPL0, supplied this fd.
+                // Duplicate it now so close/reuse of the source number cannot
+                // redirect a later poll or reactor registration.
+                let owned = unsafe { libc::fcntl(fd.raw(), libc::F_DUPFD_CLOEXEC, 0) };
+                if owned < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EBADF) {
+                        return Ok(BoundReadiness::Invalid);
+                    }
+                    return Err(TrapError::Hypervisor(format!(
+                        "bind stdio readiness descriptor: {error}"
+                    )));
+                }
+                // SAFETY: F_DUPFD_CLOEXEC returned a fresh owned host fd.
+                Ok(BoundReadiness::Host(unsafe { OwnedFd::from_raw_fd(owned) }))
+            }
+        }
+    }
+
+    fn resolve(&self, binding: carrick_el1_abi::HostObjectBinding) -> Option<&BoundReadiness> {
+        let index = usize::try_from(binding.stdio_fd()?).ok()?;
+        self.stdio.get(index)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -162,8 +249,18 @@ impl KvmPersistentExecutorFactory {
         max_exits: usize,
         stats: Arc<KvmForwardStats>,
         scheduler: Arc<Scheduler>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, TrapError> {
+        let bound_host_fds = {
+            let dispatcher = dispatcher
+                .lock()
+                .map_err(|_| TrapError::Hypervisor("KVM dispatcher poisoned".into()))?;
+            Arc::new(BoundHostFds::from_readiness([
+                dispatcher.stdio_readiness(0),
+                dispatcher.stdio_readiness(1),
+                dispatcher.stdio_readiness(2),
+            ])?)
+        };
+        Ok(Self {
             physical,
             dispatcher,
             reporter,
@@ -174,7 +271,8 @@ impl KvmPersistentExecutorFactory {
             stats,
             scheduler,
             host_objects: Arc::new(Mutex::new([1; 3])),
-        }
+            bound_host_fds,
+        })
     }
 }
 
@@ -197,6 +295,7 @@ impl PersistentExecutorFactory for KvmPersistentExecutorFactory {
             loaded_generation: None,
             completion_sent: false,
             host_objects: Arc::clone(&self.host_objects),
+            bound_host_fds: Arc::clone(&self.bound_host_fds),
             idle_kick: carrick_vmm_kvm::KvmKickHandle::for_current_thread(),
         })
     }
@@ -217,6 +316,7 @@ pub(crate) struct KvmPersistentExecutor {
     loaded_generation: Option<ExecutionGeneration>,
     completion_sent: bool,
     host_objects: Arc<Mutex<[u32; 3]>>,
+    bound_host_fds: Arc<BoundHostFds>,
 }
 
 struct RetainedForward {
@@ -274,28 +374,25 @@ impl KvmPersistentExecutor {
     fn sample_host_readiness(
         venue: &mut carrick_vmm_kvm::cpl0_boot::ForwardVenue<'_>,
         request: HostReadinessRequest,
-        dispatcher: &SyscallDispatcher,
+        bound_host_fds: &BoundHostFds,
     ) -> Result<HostReadinessStep, TrapError> {
         venue.with_host_readiness_entries(request.address, request.count, |entries| {
             let mut pollfds: Vec<libc::pollfd> = entries
                 .iter()
-                .map(|entry| libc::pollfd {
-                    fd: match entry
-                        .binding
-                        .stdio_fd()
-                        .and_then(|fd| dispatcher.stdio_readiness(fd))
-                    {
-                        Some(StdioReadiness::AlwaysWritable) => -1,
-                        Some(StdioReadiness::Host(fd)) => fd.raw(),
-                        None => entry
-                            .binding
-                            .host_fd()
-                            .map_or(-1, carrick_el1_abi::HostBoundFd::raw),
-                    },
-                    events: entry.events,
-                    revents: 0,
+                .map(|entry| {
+                    let bound = bound_host_fds.resolve(entry.binding).ok_or_else(|| {
+                        TrapError::Hypervisor("unbound CPL0 host readiness descriptor".into())
+                    })?;
+                    Ok(libc::pollfd {
+                        fd: match bound {
+                            BoundReadiness::Host(fd) => fd.as_raw_fd(),
+                            BoundReadiness::AlwaysWritable | BoundReadiness::Invalid => -1,
+                        },
+                        events: entry.events,
+                        revents: 0,
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, TrapError>>()?;
             let result =
                 unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 0) };
             if result < 0 {
@@ -306,16 +403,15 @@ impl KvmPersistentExecutor {
             }
             let mut ready = 0i64;
             for (entry, pollfd) in entries.iter_mut().zip(&pollfds) {
-                entry.revents = if pollfd.fd < 0
-                    && entry
-                        .binding
-                        .stdio_fd()
-                        .and_then(|fd| dispatcher.stdio_readiness(fd))
-                        == Some(StdioReadiness::AlwaysWritable)
-                {
-                    entry.events & libc::POLLOUT
-                } else {
-                    pollfd.revents
+                entry.revents = match bound_host_fds.resolve(entry.binding) {
+                    Some(BoundReadiness::AlwaysWritable) => entry.events & libc::POLLOUT,
+                    Some(BoundReadiness::Invalid) => libc::POLLNVAL,
+                    Some(BoundReadiness::Host(_)) => pollfd.revents,
+                    None => {
+                        return Err(TrapError::Hypervisor(
+                            "host readiness binding disappeared".into(),
+                        ));
+                    }
                 };
                 ready += i64::from(entry.revents != 0);
             }
@@ -543,7 +639,7 @@ impl PersistentExecutor for KvmPersistentExecutor {
                                     match Self::sample_host_readiness(
                                         venue,
                                         readiness,
-                                        &dispatcher,
+                                        &self.bound_host_fds,
                                     )? {
                                         HostReadinessStep::Ready(value) => {
                                             Ok(DispatchOutcome::Returned { value })
@@ -747,7 +843,7 @@ impl PersistentExecutor for KvmPersistentExecutor {
                                 return match Self::sample_host_readiness(
                                     venue,
                                     readiness,
-                                    &dispatcher,
+                                    &self.bound_host_fds,
                                 )? {
                                     HostReadinessStep::Ready(value) => {
                                         Ok(ForwardDecision::Immediate(
