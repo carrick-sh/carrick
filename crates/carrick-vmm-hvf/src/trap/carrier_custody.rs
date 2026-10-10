@@ -399,7 +399,7 @@ impl CarrierVmCustodyState {
 
 /// Issued views of the one canonical inventory and initial root admission.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub(crate) struct NativeFrameInventory {
     pub(crate) source: std::sync::Arc<dyn carrick_hal::PhysicalFrameInventory>,
     admission: std::sync::Arc<dyn carrick_hal::NativeFrameInventoryAdmission>,
