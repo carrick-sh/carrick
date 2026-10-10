@@ -598,8 +598,13 @@ pub struct ZoneRecord<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     deadline: AtomicU64,
     affinity: AtomicU64,
     object: object_wait::ObjectRecord,
+    /// Exact native-owner publication permits this incarnation to run without a host task row.
+    guest_execution: IncarnationRequest,
     ctx: UnsafeCell<C>,
 }
+
+pub const ZONE_RECORD_GUEST_EXECUTION_OFFSET: usize =
+    core::mem::offset_of!(ZoneRecord, guest_execution);
 
 const _: () = {
     assert!(core::mem::offset_of!(ZoneRecord, ctx) == 192);
@@ -664,6 +669,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         } else {
             Handback::from_raw(self.handback.load(Ordering::Acquire))
         }
+    }
+
+    /// Whether this exact incarnation has a registered guest execution owner.
+    pub fn has_guest_execution(&self) -> bool {
+        self.guest_execution.is_for(self.incarnation())
     }
 
     /// Whether resuming it needs its executor ([`Handback::Service`]), or
@@ -1580,6 +1590,17 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         (record.incarnation() == r.incarnation && record.claim() != Claim::Free).then_some(record)
     }
 
+    /// Register native execution ownership while the exact new record is unpublished.
+    /// The personality calls this only after binding its owner graph and MM.
+    pub fn authorize_guest_execution(&self, record: RecordRef) -> bool {
+        let owned = self.record(record.id);
+        if owned.incarnation() != record.incarnation || owned.claim() != Claim::Free {
+            return false;
+        }
+        owned.guest_execution.publish(record.incarnation);
+        true
+    }
+
     /// Take the lock of `bucket`, waiting per `wait`.
     pub fn lock(&self, bucket: usize, wait: &impl LockWait<C>) -> Option<BucketGuard<'_, C>> {
         let lock = &self.buckets[bucket % ZONE_BUCKETS].lock;
@@ -1657,6 +1678,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         record.first_entry.store(NIL, Ordering::Relaxed);
         record.entry_count.store(0, Ordering::Relaxed);
         record.cancelled.clear();
+        record.guest_execution.clear();
         record.home.store(0, Ordering::Relaxed);
         record.last_slot.store(0, Ordering::Relaxed);
         record.next.store(NIL, Ordering::Relaxed);
@@ -2228,12 +2250,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// it: a thread that needs its executor runs through the host on any
     /// slot; any other on a slot running its address space, or on a slot
     /// whose executor has a task loaded when EL1 may install the thread's
-    /// address space there (a hint: [`Self::install_space`] decides). A vCPU
-    /// in the idle entry (no task loaded) runs no thread itself; its
-    /// executor loads it.
+    /// address space there (a hint: [`Self::install_space`] decides). An idle
+    /// vCPU may additionally run an exact native-owned
+    /// record in a published open space; host-backed records still require
+    /// their executor to load them.
     fn runs_mm_of(&self, slot: SlotId, rec: &ZoneRecord<C>) -> bool {
         let mm = rec.mm.load(Ordering::Relaxed);
-        rec.needs_host() || self.installed_space(slot) == mm || self.may_switch_to(slot, mm)
+        rec.needs_host() || self.installed_space(slot) == mm || self.may_switch_record(slot, rec)
     }
 
     /// Whether EL1 on `slot` may install address space `mm` itself: the
@@ -2242,6 +2265,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// the gate after publishing the slot).
     fn may_switch_to(&self, slot: SlotId, mm: u64) -> bool {
         self.slot(slot).mm() != 0 && self.spaces.is_open(mm)
+    }
+
+    fn may_switch_record(&self, slot: SlotId, rec: &ZoneRecord<C>) -> bool {
+        let mm = rec.mm.load(Ordering::Relaxed);
+        self.may_switch_to(slot, mm) || (rec.has_guest_execution() && self.spaces.is_open(mm))
     }
 
     /// Whether EL1 on `slot` runs for an executor with a task loaded (not
@@ -2600,7 +2628,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// pause of it is raised, or it is retiring), which its executor loads.
     fn needs_executor(&self, slot: SlotId, rec: &ZoneRecord<C>) -> bool {
         let mm = rec.mm.load(Ordering::Relaxed);
-        rec.needs_host() || (self.installed_space(slot) != mm && !self.may_switch_to(slot, mm))
+        rec.needs_host()
+            || (!rec.has_guest_execution()
+                && self.installed_space(slot) != mm
+                && !self.may_switch_to(slot, mm))
     }
 
     /// The address space installed on `slot`'s vCPU, by the occupancy
@@ -4342,6 +4373,7 @@ mod layout_manifest {
                      deadline: _,
                      affinity: _,
                      object: _,
+                     guest_execution: _,
                      ctx: _,
                  }: ZoneRecord| {};
         field!(ZoneRecord, claim, AtomicU64, 0, 8, 8);
@@ -4366,6 +4398,7 @@ mod layout_manifest {
         field!(ZoneRecord, deadline, AtomicU64, 128, 8, 8);
         field!(ZoneRecord, affinity, AtomicU64, 136, 8, 8);
         field!(ZoneRecord, object, object_wait::ObjectRecord, 144, 40, 8);
+        field!(ZoneRecord, guest_execution, IncarnationRequest, 184, 8, 8);
         field!(ZoneRecord, ctx, UnsafeCell<ThreadCtx>, 192, 832, 16);
     }
 }

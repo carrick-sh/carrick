@@ -2216,6 +2216,8 @@ where
             clear_child_tid_addr,
         } = request;
 
+        carrick_kernel::event_ring::rec_host_clone(parent_context, flags);
+
         let clone_permit = match self.kernel.enroll_thread_clone() {
             CloneEnrollment::Admitted(permit) => permit,
             CloneEnrollment::Deferred { observed_epoch } => {

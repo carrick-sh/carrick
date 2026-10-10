@@ -2741,3 +2741,37 @@ mod ipc_wait {
         assert_eq!(zone.record(record).claim(), Claim::Free);
     }
 }
+
+#[test]
+fn guest_execution_is_exact_and_does_not_authorize_host_record_reuse() {
+    let zone = zone();
+    let record = zone.alloc_record(identity(1)).unwrap();
+    let registered = zone.record_ref(record);
+    assert!(!zone.record(record).has_guest_execution());
+    assert!(!zone.authorize_guest_execution(RecordRef {
+        incarnation: registered.incarnation + 1,
+        ..registered
+    }));
+    assert!(zone.authorize_guest_execution(registered));
+    assert!(zone.record(record).has_guest_execution());
+    zone.free_record(record);
+    assert_eq!(zone.alloc_record(identity(2)).unwrap(), record);
+    assert!(!zone.record(record).has_guest_execution());
+    assert!(!zone.authorize_guest_execution(registered));
+}
+
+#[test]
+fn paused_guest_execution_waits_in_zone_instead_of_becoming_a_host_orphan() {
+    let zone = zone();
+    let space = zone.spaces.publish_closed(MM, 0x1000, 0x1000).unwrap();
+    host_publish(&zone, SLOT, 0, Some(0), 1);
+    zone.enter_guest(SLOT);
+    let record = zone.alloc_record(identity(1)).unwrap();
+    assert!(zone.authorize_guest_execution(zone.record_ref(record)));
+    zone.requeue_preempted(SLOT, record);
+    assert!(!zone.head_needs_host(SLOT));
+    assert!(zone.take_service_head(SLOT).is_none());
+    assert!(zone.switch_in_full(SLOT).is_none());
+    zone.spaces.open(space);
+    assert_eq!(zone.switch_in_full(SLOT).unwrap().record, record);
+}

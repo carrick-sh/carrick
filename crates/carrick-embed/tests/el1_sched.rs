@@ -3658,7 +3658,18 @@ fn el1_fork_cow_resolves_in_guest() {
         assert_eq!(
             counters.forwarded[220].load(std::sync::atomic::Ordering::Relaxed),
             0,
-            "pages={pages}: opt-out must not forward clone to host fork orchestration"
+            "pages={pages}: opt-out must not forward clone to host fork orchestration; host clone crossings={:?}",
+            carrick_kernel::event_ring::drain_recent(8192)
+                .into_iter()
+                .filter(|row| match row {
+                    Ok(event) => matches!(
+                        event.kind,
+                        carrick_kernel::event_ring::HOST_CLONE
+                            | carrick_kernel::event_ring::HOST_CLONE_FLAGS
+                    ),
+                    Err(_) => true,
+                })
+                .collect::<Vec<_>>()
         );
         let stdout = measured.result.stdout_utf8();
         let host_line = format!(

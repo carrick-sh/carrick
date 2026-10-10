@@ -751,6 +751,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::size_of::<ZoneTables>() as u64,
         core::mem::align_of::<ZoneTables>() as u64,
         core::mem::size_of::<ZoneRecord>() as u64,
+        carrick_sched_core::ZONE_RECORD_GUEST_EXECUTION_OFFSET as u64,
         core::mem::size_of::<carrick_sched_core::ZoneSlot>() as u64,
         GIC_RESCHED_INTID as u64,
         GIC_KICK_INTID as u64,
@@ -4040,9 +4041,9 @@ const _: () = {
     );
 };
 #[cfg(target_arch = "aarch64")]
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x9cdc6e5153bc05c7);
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x8d073720691132df);
 #[cfg(not(target_arch = "aarch64"))]
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x872a389c195ace73);
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x8962fea85d21210b);
 
 #[cfg(test)]
 mod tests {

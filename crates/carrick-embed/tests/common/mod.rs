@@ -219,6 +219,25 @@ impl Watchdog {
                     let _ = carrick_el1_abi::write_current_task_census(&mut census);
                     eprintln!("WATCHDOG zone census:\n{census}");
                 }
+                for row in carrick_kernel::event_ring::drain_recent(8192) {
+                    match row {
+                        Ok(event) if event.kind == carrick_kernel::event_ring::HOST_CLONE => {
+                            eprintln!(
+                                "WATCHDOG host clone event={} task={} tid={}",
+                                event.logical_index, event.a, event.b
+                            );
+                        }
+                        Ok(event) if event.kind == carrick_kernel::event_ring::HOST_CLONE_FLAGS => {
+                            let flags = (event.b as u32 as u64) | ((event.c as u32 as u64) << 32);
+                            eprintln!(
+                                "WATCHDOG host clone flags event={} task={} flags={flags:#018x}",
+                                event.logical_index, event.a
+                            );
+                        }
+                        Err(error) => eprintln!("WATCHDOG clone ring unreadable: {error}"),
+                        _ => {}
+                    }
+                }
                 // The abort's post-mortem names every blocked thread's
                 // continuation and whether the wait service still holds it
                 // (never woken) or published its wake (woken, never run).

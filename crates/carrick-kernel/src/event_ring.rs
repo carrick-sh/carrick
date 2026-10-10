@@ -364,8 +364,25 @@ fn clone_refusal_label(producer: i32) -> &'static str {
     }
 }
 
+/// Caller of a thread clone crossing to the host: task ID, TID, reserved.
+pub const HOST_CLONE: u8 = 82;
+/// Full flags for that crossing: task ID, low word, high word.
+pub const HOST_CLONE_FLAGS: u8 = 83;
 /// Highest event kind a reader accepts.
-const LAST_KIND: u8 = CLONE_REFUSAL;
+const LAST_KIND: u8 = HOST_CLONE_FLAGS;
+
+/// Host thread-clone crossing, paired by task and ring order. Full-width flags
+/// distinguish a thread fallback from the process fork owned in the zone.
+pub fn rec_host_clone(context: &crate::kernel::KernelContext, flags: u64) {
+    let task = context.task().key().id.raw();
+    rec(HOST_CLONE, task, context.thread().key().tid.raw(), 0);
+    rec(
+        HOST_CLONE_FLAGS,
+        task,
+        flags as u32 as i32,
+        (flags >> 32) as u32 as i32,
+    );
+}
 
 /// At most this many [`FAULTSIG_MBOX`] records follow one fault signal, so a
 /// census of all mailboxes never floods the ring.
@@ -1573,6 +1590,11 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
         ),
         FDOWNER => format!("FDOWNER pid={a} tid={b} gfd={c}"),
         FDREF => format!("FDREF    pid={a} gfd={b} refs_before={c}"),
+        HOST_CLONE => format!("HOSTCLONE task_id={a} tid={b}"),
+        HOST_CLONE_FLAGS => format!(
+            "HOSTCLONE_FLAGS task_id={a} flags=0x{:016x}",
+            (b as u32 as u64) | ((c as u32 as u64) << 32)
+        ),
         CLONESPAWN => format!("CLONESPAWN parent_pid={a} child_tid={b} errno={c}"),
         CLONE_REFUSAL => format!(
             "CLONEREFUSE task_id={a} tid={b} errno=11 producer={}",
@@ -1994,6 +2016,15 @@ mod tests {
             lo: AtomicU64::new(0),
             hi: AtomicU64::new(0),
         }
+    }
+
+    #[test]
+    fn host_clone_crossing_preserves_full_flags_and_caller() {
+        assert_eq!(decode(82, 41, 43, 0), "HOSTCLONE task_id=41 tid=43");
+        assert_eq!(
+            decode(83, 41, 0x3d0f00, 1),
+            "HOSTCLONE_FLAGS task_id=41 flags=0x00000001003d0f00"
+        );
     }
 
     #[test]
