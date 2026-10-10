@@ -333,7 +333,6 @@ fn mounted_static_x86_thread_exit_clears_and_wakes_clear_tid() {
 }
 
 #[test]
-#[ignore = "CPL0 signal-entry dependency: rt_sigaction and handler delivery"]
 fn mounted_static_x86_raise_uses_set_tid_address_returned_tid() {
     compare_mounted_assembly_with_native("x86_clear_tid_raise.S", b"S\n");
 }
