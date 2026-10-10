@@ -1051,9 +1051,12 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             roots: core::ptr::from_ref(self.roots).addr(),
             mm: ReservationMm::new(mm.mm.raw().get()).unwrap_or_else(|| fatal()),
         });
-        if drain_retired_spaces(&owner, self.zone, self.worker()).is_err() {
-            fatal();
-        }
+        // A refused drain is not fatal: the failed entry and every entry
+        // after it stay queued (`RetiredSpaces::drain`), and the next drain
+        // (the next fork's `prepare_mm_start`, or the next child exit)
+        // retries them. `prepare_mm_start` already lowers its own drain
+        // failure to a counted refusal; the exit path never aborts on it.
+        let _retry_at_next_drain = drain_retired_spaces(&owner, self.zone, self.worker());
     }
 
     fn wake_effects(&mut self, effects: WakeEffects) {
@@ -1171,5 +1174,73 @@ mod retirement_tests {
             }
             assert!(zone.spaces.find(mm).is_none());
         }
+    }
+
+    /// A refused drain inside the child's own `retire_mm` is not fatal:
+    /// the entries stay queued and the next drain retires them.
+    #[test]
+    fn refused_drain_in_retire_mm_keeps_entries_queued_for_the_next_drain() {
+        // Leaked so no later fixture reuses this zone's address while an
+        // entry naming it could still be queued.
+        let region = Box::leak(Box::new(carrick_test_support::TestEl1Region::zeroed()));
+        let base = region.as_ptr() as usize;
+        // SAFETY: the leaked typed fixture owns aligned, zeroed EL1 storage;
+        // both offsets name disjoint ABI records.
+        let zone = unsafe {
+            &*((base + carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+                as *const ZoneTables<Aarch64ParkedContext>)
+        };
+        let roots = unsafe {
+            &*((base + carrick_el1_abi::EL1_RESERVATIONS_OFFSET as usize)
+                as *const SharedReservations)
+        };
+        let task = CurrentTask::new();
+        task.execution.task.store(2, Ordering::Release);
+        task.execution.generation.store(1, Ordering::Release);
+        task.mm.thread_generation.store(1, Ordering::Release);
+        task.publish_visible_pid(2);
+        let slot = SlotId::new(0);
+        let layout = Layout {
+            heap: ReservationRange::new(0x1000, 0x100000).unwrap(),
+            arena: ReservationRange::new(0x100000, 0x1000000).unwrap(),
+            brk: 0x1000,
+            address_limit: u64::MAX,
+            data_limit: u64::MAX,
+            external_address_bytes: 0,
+            external_data_bytes: 0,
+        };
+        let mut service = Aarch64NativeProcessService::with_crossing(
+            &task,
+            slot,
+            zone,
+            roots,
+            NonZeroU64::MIN,
+            Crossing,
+        );
+        let mm = 7;
+        task.mm.key.store(mm, Ordering::Release);
+        let index = zone.spaces.publish_closed(mm, 0x4000, 0x4000).unwrap();
+        roots
+            .publish(index.index(), ReservationMm::new(mm).unwrap(), layout)
+            .unwrap();
+        // Another slot holds the child's reservation root, so the retire
+        // inside the child's own drain is refused (Busy).
+        let held = roots
+            .lock_el1_with_context::<Aarch64ParkedContext>(
+                index.index(),
+                ReservationMm::new(mm).unwrap(),
+                1,
+            )
+            .unwrap();
+        service.retire_mm(AddressContext {
+            mm: MmGeneration::new(NonZeroU64::new(mm).unwrap()),
+            root: RootGpa::page_aligned(FrameGpa::new(0x4000)).unwrap(),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        });
+        assert!(zone.spaces.find(mm).is_some(), "child entry stays queued");
+        drop(held);
+        let owner = service.portal().unwrap();
+        drain_retired_spaces(&owner, zone, u32::from(slot.raw())).unwrap();
+        assert!(zone.spaces.find(mm).is_none());
     }
 }
