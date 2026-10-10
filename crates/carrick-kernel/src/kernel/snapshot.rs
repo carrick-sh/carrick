@@ -1428,12 +1428,16 @@ fn audit_snapshot(snapshot: &KernelSnapshotV1) -> Vec<SnapshotFinding> {
     let mm_ids: BTreeSet<_> = snapshot.mms.iter().map(|row| row.id).collect();
     let mut pruned = snapshot.clone();
     pruned.mappings.retain(|mapping| {
-        if mm_ids.contains(&mapping.mm) {
+        let super::FrameOwner::HostMm(mm) = mapping.mm else {
+            // Native owners join the EL1 registry, never host-MM rows.
+            return true;
+        };
+        if mm_ids.contains(&mm) {
             return true;
         }
         findings.push(SnapshotFinding::DanglingMapping {
             mapping: mapping.mapping,
-            mm: mapping.mm,
+            mm,
         });
         false
     });
@@ -1929,7 +1933,9 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
         // mapping, a frame whose alias list was never updated, and a length
         // that drifted between the two records — so each one names itself and
         // the rows involved.
-        if !mm_ids.contains(&mapping.mm) {
+        if let super::FrameOwner::HostMm(mm) = mapping.mm
+            && !mm_ids.contains(&mm)
+        {
             return invariant(format!(
                 "mapping {:?} names mm {:?}, which is not in the snapshot",
                 mapping.mapping, mapping.mm
@@ -1970,7 +1976,9 @@ fn validate_snapshot(snapshot: &KernelSnapshotV1) -> Result<(), AttemptError> {
         let actual: Vec<_> = snapshot
             .mappings
             .iter()
-            .filter_map(|mapping| (mapping.mm == mm.id).then_some(mapping.mapping))
+            .filter_map(|mapping| {
+                (mapping.mm == super::FrameOwner::HostMm(mm.id)).then_some(mapping.mapping)
+            })
             .collect();
         if mm.mapping_ids != actual {
             return invariant("backend and frame inventory mappings disagree");
@@ -2434,7 +2442,7 @@ mod tests {
         let dangling_row = |raw: u64| MappingRow {
             mapping: MappingId::from_kernel_allocation(NonZeroU64::new(raw).expect("mapping id")),
             frame: FrameId::from_kernel_allocation(NonZeroU64::new(raw).expect("frame id")),
-            mm: retired,
+            mm: crate::kernel::FrameOwner::HostMm(retired),
             generation: carrick_hal::MappingGeneration::from_backend_counter(
                 NonZeroU64::new(1).expect("generation"),
             ),
