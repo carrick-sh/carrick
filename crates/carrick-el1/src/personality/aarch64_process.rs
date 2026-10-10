@@ -789,16 +789,41 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 .abort(&owner, &*prepared.words, self.worker())
                 .map_err(|e| err(carrick_el1_abi::NativeForkFailureStage::Abort, e))
         });
-        let mut settlement = carrick_el1_abi::ForkStockSettlement::abort(prepared.loan);
-        let _ = self.crossing.cross_fork_stock(
-            &raw mut settlement as *mut _ as u64,
-            u64::from(self.worker()),
-        );
-        let _ = settlement.take(prepared.loan);
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) => Err((e, prepared)),
+        if let Err(e) = result {
+            return Err((e, prepared));
         }
+        // The child was never executable, but invalidate its reserved ASID
+        // before returning the table stock to a future address space.
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, prepared.ttbr0);
+        // SAFETY: this aborted birth still exclusively owns both lifecycle
+        // extents; the graph rollback removed every possible reader.
+        unsafe {
+            core::ptr::write_bytes(
+                prepared.loan.lifecycle.page.raw() as *mut u8,
+                0,
+                core::mem::size_of::<ThreadLifecyclePage>(),
+            );
+            core::ptr::write_bytes(
+                prepared.loan.lifecycle.controls.raw() as *mut u8,
+                0,
+                core::mem::size_of::<ThreadControlSlot>()
+                    * (carrick_el1_abi::THREAD_POOL_ENTRIES + 1),
+            );
+        }
+        let mut settlement = carrick_el1_abi::ForkStockSettlement::abort(prepared.loan);
+        if self
+            .crossing
+            .cross_fork_stock(
+                &raw mut settlement as *mut _ as u64,
+                u64::from(self.worker()),
+            )
+            .is_err()
+            || !matches!(settlement.take(prepared.loan), Some(Ok(())))
+        {
+            return Err((NativeProcessError::Quarantined, prepared));
+        }
+        Ok(())
     }
 
     fn settle_mm(&mut self, born: Self::Born) -> Result<(), (NativeProcessError, Self::Born)> {

@@ -573,6 +573,14 @@ impl<B: OwnerForkMmu> UnpublishedChild<B> {
         rollback(words, &self.scratch.edits)?;
         words.publish_barrier();
         words.invalidate_range(0, 1 << 48);
+        // The unpublished child must no longer be reachable by a walker
+        // before its loaned table pages can return to carrier stock.
+        for offset in (0..self.completion.child_tables_used).step_by(8) {
+            words
+                .store_unlinked(request.child_tables.base + offset, 0)
+                .map_err(|_| ForkError::Core)?;
+        }
+        words.publish_barrier();
         parent.finish_fork_publication(request.operation)?;
         self.completion.parent_generation = parent.commit_fork_generation()?;
         if !self.scratch.edits.iter().any(|edit| {

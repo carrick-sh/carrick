@@ -779,7 +779,15 @@ fn test_arm_fork_geometry_and_cow_lifecycle() {
 
     // Abort and test rollback
     let mut abort_child = unpublished;
+    let child_stock_bytes = abort_child.completion.child_tables_used;
+    let parent_stock_bytes = abort_child.completion.parent_tables_used;
     abort_child.abort(&mem, parent_root, child_root).unwrap();
+    for offset in (0..child_stock_bytes).step_by(8) {
+        assert_eq!(mem.load(req.child_tables.base + offset).unwrap(), 0);
+    }
+    for offset in (0..parent_stock_bytes).step_by(8) {
+        assert_eq!(mem.load(req.parent_tables.base + offset).unwrap(), 0);
+    }
 
     // Bit-for-bit restoration check
     let post_rollback_memory = mem.snapshot();
