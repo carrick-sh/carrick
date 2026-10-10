@@ -1422,11 +1422,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             false
         }
     }
-    #[inline(never)]
-    fn robust_list_permission(&self, tid: u32) -> Result<(), i64> {
-        let graph = self.runtime.graph.lock();
-        self.robust_target(&graph.owner, tid).map(|_| ())
-    }
     fn read_robust_list(
         &self,
         tid: u32,
@@ -1479,12 +1474,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return Ok(target);
         }
         let peer = target.credentials_for(tid)?;
-        let uid_matches = peer.ruid == credentials.ruid
-            && peer.euid == credentials.ruid
-            && peer.suid == credentials.ruid;
-        let gid_matches = peer.rgid == credentials.rgid
-            && peer.egid == credentials.rgid
-            && peer.sgid == credentials.rgid;
+        let uid_matches = peer.ruid == credentials.fsuid
+            && peer.euid == credentials.fsuid
+            && peer.suid == credentials.fsuid;
+        let gid_matches = peer.rgid == credentials.fsgid
+            && peer.egid == credentials.fsgid
+            && peer.sgid == credentials.fsgid;
         if uid_matches
             && gid_matches
             && target.dumpable == 1
@@ -3616,7 +3611,7 @@ mod tests {
     }
 
     #[test]
-    fn get_robust_list_permission_checks() {
+    fn get_robust_list_foreign_nonleader_dispatch_checks() {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         let zone = unsafe {
             let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
@@ -3687,15 +3682,22 @@ mod tests {
 
         // 1. Calling thread itself is permitted
         use carrick_personality_linux::lifecycle::ProcessNative;
-        assert_eq!(entry.robust_list_permission(41), Ok(()));
+        assert_eq!(
+            entry.read_robust_list(41, &mut |_, _| None).map(|_| ()),
+            Ok(())
+        );
 
         // 2. Sibling thread in caller's thread group is permitted without special capability
         entry.thread_spawned(41, 50, &mut || Ok(())).unwrap();
-        assert_eq!(entry.robust_list_permission(50), Ok(()));
+        assert!(entry.has_thread(50));
+        assert_eq!(
+            entry.read_robust_list(50, &mut |_, _| None),
+            Err(carrick_personality_linux::identity::ESRCH)
+        );
 
         // 3. Non-existent PID returns ESRCH
         assert_eq!(
-            entry.robust_list_permission(999),
+            entry.read_robust_list(999, &mut |_, _| None).map(|_| ()),
             Err(carrick_personality_linux::identity::ESRCH)
         );
 
@@ -3705,7 +3707,9 @@ mod tests {
         use carrick_personality_linux::identity::ProcessIdentityVenue;
         entry.set_uid(1000).unwrap();
         assert_eq!(
-            entry.robust_list_permission(child_pid),
+            entry
+                .read_robust_list(child_pid, &mut |_, _| None)
+                .map(|_| ()),
             Err(carrick_personality_linux::identity::EPERM)
         );
         {
@@ -3721,8 +3725,16 @@ mod tests {
             *peer.credentials_for_mut(child_pid).unwrap() = credentials;
             peer.spawn_thread(child_pid, 987).unwrap();
         }
-        assert_eq!(entry.robust_list_permission(child_pid), Ok(()));
-        assert_eq!(entry.robust_list_permission(987), Ok(()));
+        assert_eq!(
+            entry
+                .read_robust_list(child_pid, &mut |_, _| None)
+                .map(|_| ()),
+            Ok(())
+        );
+        assert_eq!(
+            entry.read_robust_list(987, &mut |_, _| None),
+            Err(carrick_personality_linux::identity::ESRCH)
+        );
         child_controls[1].set_robust_list(0xbeef, 24);
         assert_eq!(
             entry.read_robust_list(child_pid, &mut |_, _| None),
@@ -3743,6 +3755,26 @@ mod tests {
                 },
             )
             .unwrap();
+        child_page
+            .bind_control_address(peer_entry, &child_controls[2] as *const _ as u64)
+            .unwrap();
+        child_controls[2].reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, peer_entry);
+        assert!(child_controls[2].publish_visible_tid(987));
+        use carrick_el1_abi::Lifecycle;
+        child_page.thread_born().unwrap();
+        let born = child_page
+            .record_born(
+                child_page.claim(peer_entry).unwrap(),
+                carrick_el1_abi::BornRecord {
+                    caller_task: u64::from(child_pid),
+                    caller_serial: 1,
+                    clone_flags: 0,
+                    clear_child_tid: 0,
+                    blocked: carrick_el1_abi::BlockedMask(0),
+                },
+            )
+            .unwrap();
+        child_page.publish(born).unwrap();
         child_controls[2].set_robust_list(0xcafe, 24);
         assert_eq!(
             entry.read_robust_list(987, &mut |page, reference| {
@@ -3751,6 +3783,178 @@ mod tests {
                 Some(child_controls[2].robust_list())
             }),
             Ok((0xcafe, 24))
+        );
+        // PTRACE_MODE_READ_FSCREDS compares filesystem credentials, not the
+        // caller's real ids. Read a peer nonleader through the shared router.
+        entry
+            .update_calling_creds(&mut |c| {
+                c.fsuid = carrick_sched_core::process::TaskUid::new(2000);
+                c.fsgid = carrick_sched_core::process::TaskGid::new(2000);
+                Ok(())
+            })
+            .unwrap();
+        {
+            let mut graph = runtime.graph.lock();
+            let peer = graph.owner.find_task_by_pid_mut(child_pid).unwrap();
+            for tid in [child_pid, 987] {
+                let c = peer.credentials_for_mut(tid).unwrap();
+                c.ruid = carrick_sched_core::process::TaskUid::new(2000);
+                c.euid = c.ruid;
+                c.suid = c.ruid;
+                c.rgid = carrick_sched_core::process::TaskGid::new(2000);
+                c.egid = c.rgid;
+                c.sgid = c.rgid;
+            }
+        }
+        struct RetainedVenue<'a> {
+            page: &'a ThreadLifecyclePage,
+            control: &'a ThreadControlSlot,
+            peer: NativeLifecycleResources<'a>,
+            foreign_reads: core::cell::Cell<u32>,
+        }
+        impl super::super::thread_setup::LifecycleVenue for RetainedVenue<'_> {
+            fn thread<'a>(
+                &'a self,
+                _: &'a CurrentTask,
+            ) -> Option<carrick_personality_linux::thread::LifecycleThread<'a>> {
+                Some(carrick_personality_linux::thread::LifecycleThread {
+                    page: self.page,
+                    slot: self.control,
+                })
+            }
+            fn born_slot(
+                &self,
+                page: &ThreadLifecyclePage,
+                entry: EntryRef,
+            ) -> Option<&ThreadControlSlot> {
+                assert!(
+                    core::ptr::eq(page, self.peer.page),
+                    "foreign lifecycle page must reach born_slot"
+                );
+                self.foreign_reads.set(self.foreign_reads.get() + 1);
+                let slot = self.peer.born_slot(entry)?;
+                assert_eq!(page.control_address(entry), Some(slot as *const _ as u64));
+                Some(slot)
+            }
+        }
+        struct HostCopy;
+        impl crate::file::UserCopy for HostCopy {
+            fn copy_in(&mut self, _: &mut [u8], _: u64) -> bool {
+                false
+            }
+            fn copy_out(&mut self, address: u64, bytes: &[u8]) -> bool {
+                // SAFETY: this fixture supplies live aligned u64 output words.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len());
+                }
+                true
+            }
+        }
+        let venue = RetainedVenue {
+            page: &page,
+            control: &control,
+            peer: NativeLifecycleResources {
+                page: &child_page,
+                controls: &*child_controls,
+            },
+            foreign_reads: core::cell::Cell::new(0),
+        };
+        let mut head = 0_u64;
+        let mut len = 0_u64;
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[0] = 987;
+        frame.x[1] = &mut head as *mut u64 as u64;
+        frame.x[2] = &mut len as *mut u64 as u64;
+        frame.x[8] = carrick_syscall_abi::nr::GET_ROBUST_LIST.raw() as u64;
+        let names = carrick_el1_abi::InotifyNameCache::new();
+        let mut copy = HostCopy;
+        let mut pending: super::super::dispatch::El1PendingFamilies<
+            '_,
+            _,
+            super::super::sched::FakeCpu,
+            super::super::sched::HardwareUserWord,
+            _,
+            ParkedContextWords,
+        > = super::super::dispatch::El1PendingFamilies {
+            handoff: None,
+            lifecycle_user: Some(&mut copy),
+            frame: &mut frame,
+            counters: &carrick_el1_abi::Counters::new(),
+            current_tasks: core::slice::from_ref(&task),
+            fd_map: &[],
+            object_table: &[],
+            open_table: &[],
+            inotify_table: &[],
+            name_cache: &names,
+            zone: None,
+            ipc: None,
+            lifecycle: Some(&venue),
+            process: Some(&mut entry),
+            source: Some(source),
+            anonymous: None,
+            cache_lookup: |_| core::ptr::null_mut(),
+        };
+        assert_eq!(
+            carrick_personality_linux::dispatch::dispatch(
+                carrick_syscall_abi::nr::GET_ROBUST_LIST.raw() as u64,
+                u64::MAX,
+                &mut pending
+            ),
+            carrick_personality_linux::dispatch::CompletionRoute::Served
+        );
+        drop(pending);
+        assert_eq!(
+            frame.x[0] as i64, 0,
+            "filesystem credential match must permit the peer read"
+        );
+        assert_eq!((head, len), (0xcafe, 24));
+        assert_eq!(venue.foreign_reads.get(), 1);
+        {
+            let mut graph = runtime.graph.lock();
+            graph
+                .owner
+                .find_task_by_pid_mut(child_pid)
+                .unwrap()
+                .dumpable = 0;
+        }
+        assert_eq!(
+            entry.read_robust_list(987, &mut |_, _| Some((0xcafe, 24))),
+            Err(carrick_personality_linux::identity::EPERM)
+        );
+        {
+            let mut graph = runtime.graph.lock();
+            let peer = graph.owner.find_task_by_pid_mut(child_pid).unwrap();
+            peer.dumpable = 1;
+            peer.credentials_for_mut(987).unwrap().cap_permitted =
+                carrick_sched_core::process::LinuxCapabilitySet::CAP_SETUID;
+        }
+        assert_eq!(
+            entry.read_robust_list(987, &mut |_, _| Some((0xcafe, 24))),
+            Err(carrick_personality_linux::identity::EPERM)
+        );
+        {
+            let mut graph = runtime.graph.lock();
+            graph
+                .owner
+                .find_task_by_pid_mut(child_pid)
+                .unwrap()
+                .credentials_for_mut(987)
+                .unwrap()
+                .cap_permitted = carrick_sched_core::process::LinuxCapabilitySet::empty();
+        }
+        // A matching real uid cannot bypass mismatched filesystem credentials.
+        entry
+            .update_calling_creds(&mut |c| {
+                c.ruid = carrick_sched_core::process::TaskUid::new(2000);
+                c.rgid = carrick_sched_core::process::TaskGid::new(2000);
+                c.fsuid = carrick_sched_core::process::TaskUid::new(1000);
+                c.fsgid = carrick_sched_core::process::TaskGid::new(1000);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            entry.read_robust_list(987, &mut |_, _| Some((0xcafe, 24))),
+            Err(carrick_personality_linux::identity::EPERM)
         );
         {
             let mut graph = runtime.graph.lock();
@@ -3765,7 +3969,9 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            entry.robust_list_permission(child_pid),
+            entry
+                .read_robust_list(child_pid, &mut |_, _| None)
+                .map(|_| ()),
             Err(carrick_personality_linux::identity::EPERM)
         );
         entry
