@@ -27,7 +27,7 @@ pub struct AcceptArgs {
         value_enum,
         default_value = "no-docker",
         overrides_with = "profile",
-        help = "Acceptance profile: no-docker (default for workers), linux-portable (host only), or full (director)"
+        help = "Acceptance profile: no-docker (default for workers), linux-portable (host only), kvm (KVM runner lane, host only), or full (director)"
     )]
     pub profile: AcceptProfile,
 
@@ -61,6 +61,8 @@ impl fmt::Display for AcceptPhase {
 pub enum AcceptProfile {
     NoDocker,
     LinuxPortable,
+    /// The trusted KVM runner's lane: every kvm-lane test target, nothing else.
+    Kvm,
     Full,
 }
 
@@ -69,6 +71,7 @@ impl fmt::Display for AcceptProfile {
         match self {
             Self::NoDocker => write!(f, "no-docker"),
             Self::LinuxPortable => write!(f, "linux-portable"),
+            Self::Kvm => write!(f, "kvm"),
             Self::Full => write!(f, "full"),
         }
     }
@@ -102,6 +105,10 @@ pub struct StepResult {
     pub passed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Qualified `<test-binary>::<test>` names a host step reported FAILED.
+    /// `ci-receipt diff` keys NEW/FIXED on these, never on exit codes alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_tests: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,6 +240,16 @@ pub const HOST_STEPS: &[StepSpec] = &[
         log_name: "06-closure-probe-inventory.log",
     },
 ];
+
+/// The CI KVM runner's receipt covers exactly `just test-kvm`; the portable
+/// host steps already run on hosted CI.
+pub const KVM_STEPS: &[StepSpec] = &[StepSpec {
+    name: "kvm-tests",
+    program: "just",
+    args: &["test-kvm"],
+    env: &[],
+    log_name: "01-kvm-tests.log",
+}];
 
 pub const LINUX_PORTABLE_STEPS: &[StepSpec] = &[
     StepSpec {
@@ -367,6 +384,7 @@ pub const LINUX_PORTABLE_STEPS: &[StepSpec] = &[
 pub fn host_steps(profile: AcceptProfile) -> &'static [StepSpec] {
     match profile {
         AcceptProfile::LinuxPortable => LINUX_PORTABLE_STEPS,
+        AcceptProfile::Kvm => KVM_STEPS,
         AcceptProfile::NoDocker | AcceptProfile::Full => HOST_STEPS,
     }
 }
@@ -375,11 +393,11 @@ pub fn profile_phase(
     profile: AcceptProfile,
     phase: AcceptPhase,
 ) -> Result<AcceptPhase, AcceptError> {
-    if profile == AcceptProfile::LinuxPortable {
+    if matches!(profile, AcceptProfile::LinuxPortable | AcceptProfile::Kvm) {
         if phase == AcceptPhase::Signed {
-            return Err(AcceptError::UnsupportedPlatform(
-                "linux-portable supports the host phase only; use remote-accept --phase signed on the gate Mac".to_string(),
-            ));
+            return Err(AcceptError::UnsupportedPlatform(format!(
+                "{profile} supports the host phase only; use remote-accept --phase signed on the gate Mac"
+            )));
         }
         return Ok(AcceptPhase::Host);
     }
@@ -412,6 +430,44 @@ fn linux_host_failure_details(log: &str, exceptions: &[LinuxHostTestException]) 
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// Every `test <name> ... FAILED` line, qualified by the cargo test binary
+/// announced in the preceding `Running ... (target/.../deps/<bin>-<hash>)`
+/// line, so equally named tests in different targets stay distinct.
+pub fn parse_failed_tests(log: &str) -> Vec<String> {
+    let mut binary = String::new();
+    let mut failed = std::collections::BTreeSet::new();
+    for line in log.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Running ") {
+            let path = rest
+                .rsplit_once('(')
+                .and_then(|(_, tail)| tail.strip_suffix(')'))
+                .unwrap_or(rest);
+            let file = path.rsplit('/').next().unwrap_or(path);
+            binary = match file.rsplit_once('-') {
+                Some((stem, hash))
+                    if !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()) =>
+                {
+                    stem.to_string()
+                }
+                _ => file.to_string(),
+            };
+            continue;
+        }
+        if let Some(name) = trimmed
+            .strip_prefix("test ")
+            .and_then(|rest| rest.strip_suffix(" ... FAILED"))
+        {
+            failed.insert(if binary.is_empty() {
+                name.to_string()
+            } else {
+                format!("{binary}::{name}")
+            });
+        }
+    }
+    failed.into_iter().collect()
 }
 
 pub fn generate_timestamp() -> String {
@@ -616,6 +672,30 @@ pub fn extract_probe_diffs(step_name: &str, log: &str) -> Vec<ProbeDiff> {
         }
     }
     diffs
+}
+
+/// Remaining process count from a scoped `kill.sh` reap. A reap that failed
+/// or printed no count is itself a failure: cleanup was not proven.
+pub fn cleanup_remaining(
+    reap: &Result<command::CommandOutput, command::CommandError>,
+    step: &str,
+    failures: &mut Vec<String>,
+) -> u64 {
+    // kill.sh exits non-zero when processes remain; its count is still on
+    // stdout and must not be lost with the exit status.
+    let stdout = match reap {
+        Ok(out) => Some(out.stdout.as_str()),
+        Err(error) => error.stdout(),
+    };
+    match stdout.and_then(parse_cleanup_count) {
+        Some(count) => count,
+        None => {
+            failures.push(format!(
+                "step '{step}' scoped cleanup failed or reported no remaining count"
+            ));
+            0
+        }
+    }
 }
 
 pub fn parse_cleanup_count(output: &str) -> Option<u64> {
@@ -935,6 +1015,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 duration_s,
                 passed,
                 error,
+                failed_tests: Vec::new(),
             });
         }
     }
@@ -989,6 +1070,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
             duration_s: start.elapsed().as_secs_f64(),
             passed: fixtures_valid,
             error,
+            failed_tests: Vec::new(),
         });
     }
 
@@ -1020,11 +1102,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
 
             let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
 
-            let remaining_count = reap
-                .as_ref()
-                .ok()
-                .and_then(|out| parse_cleanup_count(&out.stdout))
-                .unwrap_or(0);
+            let remaining_count = cleanup_remaining(&reap, step_name, &mut failures);
             cleanup_counts.push(CleanupCount {
                 step: step_name.to_string(),
                 run_id: run_id.clone(),
@@ -1103,6 +1181,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 duration_s,
                 passed,
                 error,
+                failed_tests: Vec::new(),
             });
         }
 
@@ -1129,11 +1208,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
 
             let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
 
-            let remaining_count = reap
-                .as_ref()
-                .ok()
-                .and_then(|out| parse_cleanup_count(&out.stdout))
-                .unwrap_or(0);
+            let remaining_count = cleanup_remaining(&reap, step_name, &mut failures);
             cleanup_counts.push(CleanupCount {
                 step: step_name.to_string(),
                 run_id: run_id.clone(),
@@ -1190,6 +1265,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 duration_s,
                 passed,
                 error,
+                failed_tests: Vec::new(),
             });
         }
 
@@ -1217,11 +1293,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
 
             let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
 
-            let remaining_count = reap
-                .as_ref()
-                .ok()
-                .and_then(|out| parse_cleanup_count(&out.stdout))
-                .unwrap_or(0);
+            let remaining_count = cleanup_remaining(&reap, step_name, &mut failures);
             cleanup_counts.push(CleanupCount {
                 step: step_name.to_string(),
                 run_id: run_id.clone(),
@@ -1254,6 +1326,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 duration_s,
                 passed,
                 error,
+                failed_tests: Vec::new(),
             });
         }
 
@@ -1284,11 +1357,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
 
             let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
 
-            let remaining_count = reap
-                .as_ref()
-                .ok()
-                .and_then(|out| parse_cleanup_count(&out.stdout))
-                .unwrap_or(0);
+            let remaining_count = cleanup_remaining(&reap, step_name, &mut failures);
             cleanup_counts.push(CleanupCount {
                 step: step_name.to_string(),
                 run_id: run_id.clone(),
@@ -1333,6 +1402,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 duration_s,
                 passed,
                 error,
+                failed_tests: Vec::new(),
             });
         }
 
@@ -1359,11 +1429,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
 
             let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
 
-            let remaining_count = reap
-                .as_ref()
-                .ok()
-                .and_then(|out| parse_cleanup_count(&out.stdout))
-                .unwrap_or(0);
+            let remaining_count = cleanup_remaining(&reap, step_name, &mut failures);
             cleanup_counts.push(CleanupCount {
                 step: step_name.to_string(),
                 run_id: run_id.clone(),
@@ -1408,6 +1474,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 duration_s,
                 passed,
                 error,
+                failed_tests: Vec::new(),
             });
         }
 
@@ -1436,11 +1503,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
 
                 let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
 
-                let remaining_count = reap
-                    .as_ref()
-                    .ok()
-                    .and_then(|out| parse_cleanup_count(&out.stdout))
-                    .unwrap_or(0);
+                let remaining_count = cleanup_remaining(&reap, step_name, &mut failures);
                 cleanup_counts.push(CleanupCount {
                     step: step_name.to_string(),
                     run_id: run_id.clone(),
@@ -1467,6 +1530,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                     duration_s,
                     passed,
                     error,
+                    failed_tests: Vec::new(),
                 });
             }
 
@@ -1517,11 +1581,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
 
                 let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
 
-                let remaining_count = reap
-                    .as_ref()
-                    .ok()
-                    .and_then(|out| parse_cleanup_count(&out.stdout))
-                    .unwrap_or(0);
+                let remaining_count = cleanup_remaining(&reap, step_name, &mut failures);
                 cleanup_counts.push(CleanupCount {
                     step: step_name.to_string(),
                     run_id: run_id.clone(),
@@ -1548,6 +1608,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                     duration_s,
                     passed,
                     error,
+                    failed_tests: Vec::new(),
                 });
             }
 
@@ -1586,11 +1647,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
 
                 let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
 
-                let remaining_count = reap
-                    .as_ref()
-                    .ok()
-                    .and_then(|out| parse_cleanup_count(&out.stdout))
-                    .unwrap_or(0);
+                let remaining_count = cleanup_remaining(&reap, &step_name, &mut failures);
                 cleanup_counts.push(CleanupCount {
                     step: step_name.clone(),
                     run_id: run_id.clone(),
@@ -1628,6 +1685,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                     duration_s,
                     passed,
                     error,
+                    failed_tests: Vec::new(),
                 });
             }
         } else {
@@ -1655,6 +1713,12 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
         failures.push(error.to_string());
     }
     let overall = if failures.is_empty() { "PASS" } else { "FAIL" };
+    // Allowlisted failures still count: baseline comparison needs the whole
+    // failing set, not only what made this receipt FAIL.
+    for step in &mut step_results {
+        step.failed_tests =
+            parse_failed_tests(&fs::read_to_string(&step.log_path).unwrap_or_default());
+    }
 
     let receipt = AcceptReceipt {
         schema_version: 1,
@@ -1986,6 +2050,27 @@ thread 'test_probe_futex' panicked at 'explicit panic', tests/foo.rs:12:5
     }
 
     #[test]
+    fn cleanup_count_survives_a_failing_reap_and_a_missing_count_fails() {
+        let mut failures = Vec::new();
+        let leaked: Result<command::CommandOutput, command::CommandError> =
+            Err(command::CommandError::NonZeroExit {
+                program: "scripts/sudo/kill.sh".into(),
+                status: std::process::Command::new("false").status().unwrap(),
+                stdout: "remaining carrick procs (run-id r) = 2\n".into(),
+                stderr: String::new(),
+            });
+        assert_eq!(cleanup_remaining(&leaked, "build", &mut failures), 2);
+        assert!(failures.is_empty());
+        let silent: Result<command::CommandOutput, command::CommandError> =
+            Err(command::CommandError::Spawn {
+                program: "scripts/sudo/kill.sh".into(),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            });
+        assert_eq!(cleanup_remaining(&silent, "build", &mut failures), 0);
+        assert_eq!(failures.len(), 1);
+    }
+
+    #[test]
     fn test_parse_cleanup_count() {
         let sample_zero =
             "pass 1: killing 0 procs\nremaining carrick procs (run-id accept-test) = 0\n";
@@ -2014,6 +2099,7 @@ thread 'test_probe_futex' panicked at 'explicit panic', tests/foo.rs:12:5
                 duration_s: 1.23,
                 passed: true,
                 error: None,
+                failed_tests: Vec::new(),
             }],
             skipped_steps: vec!["ltp".to_string()],
             artifact: None,
