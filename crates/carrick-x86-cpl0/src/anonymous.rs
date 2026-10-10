@@ -33,6 +33,9 @@ pub(super) fn live_context(mm: carrick_guest_arch::MmGeneration, root: RootGpa) 
 pub(super) fn admit_context(context: carrick_guest_arch::AddressContext<RootGpa>) -> bool {
     LIVE_CONTEXTS.lock().admit(context)
 }
+pub(super) fn retire_context(context: carrick_guest_arch::AddressContext<RootGpa>) -> bool {
+    LIVE_CONTEXTS.lock().retire(context.mm, context.root)
+}
 pub(super) fn live_words(mm: carrick_el1_abi::ReservationMm) -> Option<InitialWords> {
     let root = carrick_el1::isa::x86::hardware_live_root().ok()?;
     let mm = carrick_guest_arch::MmGeneration::new(core::num::NonZeroU64::new(mm.raw())?);
