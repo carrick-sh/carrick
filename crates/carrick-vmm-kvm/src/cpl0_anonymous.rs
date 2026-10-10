@@ -707,7 +707,10 @@ impl Cpl0HostCustody {
                 },
             )
             .map(|_| ())
-            .map_err(|e| fail(format!("fork quarantine reclaim: {e:?}")))
+            // A refused release, clear or tag retirement defers only that
+            // child (counted as `reclaim_deferral`, retried next drain).
+            // What remains is a broken custody invariant, never guest input.
+            .map_err(|e| fail(format!("fork quarantine custody invariant: {e:?}")))
     }
 
     /// A fork child left the shared owner graph: quarantine its stock. The

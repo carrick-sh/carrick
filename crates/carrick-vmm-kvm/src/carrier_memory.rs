@@ -614,6 +614,14 @@ impl CarrierMemory {
     /// only for it. Their frames must already be retired from `inventory`;
     /// the revoke checks that rather than retiring them again. Shared slots
     /// keep no drain entry for the retired context.
+    ///
+    /// Two phases: every precondition (root, alias slots and counts,
+    /// admitted slots, and each private slot's revoke preconditions) is
+    /// checked before anything mutates, so a refusal leaves the carrier
+    /// exactly as it was and the stock's retry is idempotent. After the
+    /// checks only the memslot deletion ioctl can fail; that is a host
+    /// fault, never guest-reachable, and it quarantines the carrier as every
+    /// other indeterminate memslot change does.
     pub fn retire_child(
         &mut self,
         absence: &carrick_hal::fork_stock::SlotAbsence,
@@ -621,22 +629,65 @@ impl CarrierMemory {
     ) -> Result<RetiredChild, MemoryError> {
         self.admit()?;
         let mm = NonZeroU64::new(absence.mm().raw()).ok_or_else(|| error("retired MM key"))?;
-        let context = self
+        let generation = carrick_guest_arch::MmGeneration::new(mm);
+        let authority = inventory.bind(generation);
+        let context = *self
             .roots
-            .remove(&mm)
+            .get(&mm)
             .ok_or_else(|| error("retired MM has no carrier CR3 root"))?;
+        // Phase 1: validate, mutating nothing.
+        let mut held: BTreeMap<u32, usize> = BTreeMap::new();
+        for alias in self.aliases.get(&mm).into_iter().flat_map(BTreeMap::values) {
+            *held.entry(alias.slot).or_default() += 1;
+        }
+        for (index, count) in &held {
+            let slot = self
+                .slots
+                .get(index)
+                .ok_or_else(|| error("retired MM alias names no carrier slot"))?;
+            if slot.alias_count < *count {
+                return Err(error("retired MM alias count underflow"));
+            }
+        }
+        let mut private = Vec::new();
+        for index in self.admitted.get(&mm).into_iter().flatten() {
+            let slot = self
+                .slots
+                .get(index)
+                .ok_or_else(|| error("retired MM admitted to no carrier slot"))?;
+            let remaining = slot.alias_count - held.get(index).copied().unwrap_or(0);
+            if slot.allowed != [mm] || remaining != 0 || slot.bootstrap {
+                continue;
+            }
+            // `revoke`'s preconditions, checked now so the revoke cannot
+            // refuse after the bookkeeping below has run.
+            let extent = &slot.backing.extent;
+            let start = extent.base.raw();
+            let end = start + extent.len as u64;
+            if self.roots.iter().any(|(owner, root)| {
+                *owner != mm && (start..end).contains(&root.root.address().raw())
+            }) {
+                return Err(error("retired child slot holds a live CR3/table arena"));
+            }
+            if slot.drains.iter().any(|drained| drained.mm.raw() != mm) {
+                return Err(error("retired child slot owes a live context drain"));
+            }
+            let mapping =
+                carrick_hal::MappingId::from_kernel_allocation(slot.backing.identity.mapping_id);
+            if authority.live_mapping_row(mapping).is_some() {
+                return Err(error("retired child memslot frame is still mapped"));
+            }
+            private.push(slot.handle);
+        }
+        // Phase 2: bookkeeping, infallible after the checks above.
+        self.roots.remove(&mm);
         let mut aliases = 0;
         for alias in self.aliases.remove(&mm).unwrap_or_default().into_values() {
-            let Some(slot) = self.slots.get_mut(&alias.slot) else {
-                self.quarantined = true;
-                return Err(error("retired MM alias names no carrier slot"));
-            };
-            slot.alias_count = slot
-                .alias_count
-                .checked_sub(1)
-                .ok_or_else(|| error("retired MM alias count underflow"))?;
-            if let Some(gpa) = alias.inherited {
-                slot.inherited_identities.remove(&(mm, gpa.raw()));
+            if let Some(slot) = self.slots.get_mut(&alias.slot) {
+                slot.alias_count -= 1;
+                if let Some(gpa) = alias.inherited {
+                    slot.inherited_identities.remove(&(mm, gpa.raw()));
+                }
             }
             aliases += 1;
         }
@@ -647,22 +698,14 @@ impl CarrierMemory {
                 slot.drains.retain(|drained| drained.mm.raw() != mm);
             }
         }
-        let mut private = Vec::new();
         for index in self.admitted.remove(&mm).unwrap_or_default() {
-            let Some(slot) = self.slots.get_mut(&index) else {
-                continue;
-            };
-            let was_private = slot.allowed == [mm];
-            slot.allowed.retain(|allowed| *allowed != mm);
-            if was_private && slot.alias_count == 0 && !slot.bootstrap {
-                private.push(slot.handle);
+            if let Some(slot) = self.slots.get_mut(&index) {
+                slot.allowed.retain(|allowed| *allowed != mm);
             }
         }
-        let generation = carrick_guest_arch::MmGeneration::new(mm);
+        // Phase 3: revoke the private slots (only the ioctl can fail).
         let mut drain = QuarantinedContextDrain { context };
-        let mut retired = AlreadyRetiredInventory {
-            authority: inventory.bind(generation),
-        };
+        let mut retired = AlreadyRetiredInventory { authority };
         for handle in &private {
             self.revoke(*handle, &mut drain, &mut retired)?;
         }

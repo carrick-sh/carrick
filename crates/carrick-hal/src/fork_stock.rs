@@ -68,8 +68,6 @@ pub enum ForkStockServiceError {
     /// Quarantined stock is waiting, but the carrier holds no zone
     /// occupancy authority to prove its MM runs nowhere.
     OccupancyUnavailable,
-    /// The carrier could not release the retired MM's per-MM state.
-    ReleaseRefused,
 }
 
 /// Per-child address-space tag. AArch64 tags every forked root with a
@@ -393,6 +391,9 @@ pub struct ForkStockCounters {
     pub withdrawn_lifecycles: u64,
     /// Quarantined children whose stock returned to the reusable pool.
     pub returned_children: u64,
+    /// Reclaim attempts that left a child quarantined because its release,
+    /// clear or tag retirement failed; the next drain retries it.
+    pub reclaim_deferrals: u64,
 }
 
 impl ForkStockCounters {
@@ -409,6 +410,7 @@ impl ForkStockCounters {
             ("quarantined_child", self.quarantined_children),
             ("retire_refusal", self.retire_refusals),
             ("returned_child", self.returned_children),
+            ("reclaim_deferral", self.reclaim_deferrals),
         ]
         .into_iter()
         .filter(|(_, count)| *count != 0)
@@ -969,7 +971,10 @@ impl<T: ChildAddressTags> ForkStock<T> {
     /// Drain quarantine. A child MM is reclaimed only when it is not
     /// `active` and `occupancy` proves no zone slot has it installed.
     /// Its tables and lifecycle record are cleared and its tag retired
-    /// before anything reenters the reusable stock.
+    /// before anything reenters the reusable stock. A child whose release,
+    /// clear or tag retirement fails is deferred (counted, still
+    /// quarantined, retried at the next drain); only a broken custody
+    /// invariant (a quarantined MM with no committed child) is an error.
     pub fn reclaim(
         &mut self,
         ledger: &mut impl ForkTableLedger,
@@ -1003,17 +1008,24 @@ impl<T: ChildAddressTags> ForkStock<T> {
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             // Carrier per-MM state (root registry, inventory, residency) is
-            // released before any of the child's stock can be reissued.
-            if self.quarantine.get(&key) == Some(&false) {
-                if !release(&absence) {
-                    return Err(ForkStockServiceError::ReleaseRefused);
-                }
+            // released before any of the child's stock can be reissued. Each
+            // step is idempotent on retry (release runs once, tracked by the
+            // quarantine flag; clears and tag retirement are restartable), so
+            // a failed step defers only this child: it stays quarantined, its
+            // stock stays held, the deferral is counted, and the next drain
+            // retries it. Guest behaviour never turns into a carrier fault.
+            let deferred = if self.quarantine.get(&key) == Some(&false) && !release(&absence) {
+                true
+            } else {
                 self.quarantine.insert(key, true);
+                !clear_tables(pages)
+                    || !clear_lifecycle(child.lifecycle)
+                    || self.tags.retire(child.tag, absence).is_err()
+            };
+            if deferred {
+                self.counters.reclaim_deferrals = self.counters.reclaim_deferrals.saturating_add(1);
+                continue;
             }
-            if !clear_tables(pages) || !clear_lifecycle(child.lifecycle) {
-                return Err(ForkStockServiceError::MemoryAccessFailed);
-            }
-            self.tags.retire(child.tag, absence)?;
             self.children.remove(&key);
             if let Some(pages) = self.committed_tables.remove(&key) {
                 for page in &pages {

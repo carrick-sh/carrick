@@ -648,12 +648,80 @@ fn refused_release_keeps_the_child_quarantined_and_its_stock_held() {
                 false
             },
         ),
-        Err(ForkStockServiceError::ReleaseRefused)
+        Ok(0)
     );
     assert_eq!(*released.borrow(), vec![mm(302)]);
     assert!(stock.is_quarantined(mm(302)));
     assert_eq!(stock.table_stock().len(), 3);
     assert!(!stock.lifecycle_available());
+    // A refused release is a counted deferral, never a carrier fault; the
+    // next drain retries it and returns the stock.
+    assert_eq!(stock.counters().reclaim_deferrals, 1);
+    assert!(
+        stock
+            .counters()
+            .families()
+            .contains(&("reclaim_deferral", 1))
+    );
+    assert_eq!(reclaim(&mut stock, |_| true, &RefCell::new(Vec::new())), 1);
+    assert!(!stock.is_quarantined(mm(302)));
+    assert!(stock.lifecycle_available());
+}
+
+/// A child whose release is refused does not hold back the children
+/// behind it: each candidate is reclaimed or deferred on its own.
+#[test]
+fn deferred_candidate_does_not_block_later_candidates() {
+    let mut stock = stock(UntaggedRoots, 8, 2);
+    for child_mm in [302, 303] {
+        let granted = loan(&mut stock, parent(), child_mm, 1, 1).unwrap();
+        commit(&mut stock, parent(), granted, 1, 0).unwrap();
+        retire(&mut stock, child_of(granted, 600 + child_mm)).unwrap();
+    }
+    let result = stock.reclaim(
+        &mut NoTableLedger,
+        mm(PARENT_MM),
+        absent,
+        |_| true,
+        |_| true,
+        |absence| absence.mm() != mm(302),
+    );
+    assert_eq!(result, Ok(1));
+    assert!(stock.is_quarantined(mm(302)));
+    assert!(!stock.is_quarantined(mm(303)));
+    assert_eq!(stock.counters().reclaim_deferrals, 1);
+    assert_eq!(stock.counters().returned_children, 1);
+}
+
+/// A clear that fails after a successful release is retried without
+/// releasing again.
+#[test]
+fn failed_clear_after_release_is_retried_without_a_second_release() {
+    let mut stock = stock(UntaggedRoots, 4, 1);
+    let granted = loan(&mut stock, parent(), 302, 1, 1).unwrap();
+    commit(&mut stock, parent(), granted, 1, 0).unwrap();
+    retire(&mut stock, child_of(granted, 900)).unwrap();
+    let releases = core::cell::Cell::new(0);
+    let clear_ok = core::cell::Cell::new(false);
+    let attempt = |stock: &mut ForkStock<UntaggedRoots>| {
+        stock.reclaim(
+            &mut NoTableLedger,
+            mm(PARENT_MM),
+            absent,
+            |_| clear_ok.get(),
+            |_| true,
+            |_| {
+                releases.set(releases.get() + 1);
+                true
+            },
+        )
+    };
+    assert_eq!(attempt(&mut stock), Ok(0));
+    assert!(stock.is_quarantined(mm(302)));
+    clear_ok.set(true);
+    assert_eq!(attempt(&mut stock), Ok(1));
+    assert_eq!(releases.get(), 1);
+    assert_eq!(stock.counters().reclaim_deferrals, 1);
 }
 
 #[test]
@@ -751,7 +819,7 @@ fn reclaim_releases_each_child_once_across_a_retire_failure() {
             },
         )
     };
-    assert!(attempt(&mut stock).is_err());
+    assert_eq!(attempt(&mut stock), Ok(0));
     assert!(stock.is_quarantined(mm(302)));
     assert_eq!(attempt(&mut stock), Ok(1));
     assert_eq!(releases.get(), 1, "release ran exactly once");
@@ -787,7 +855,7 @@ fn second_candidate_refusal_keeps_first_candidate_released_and_returned() {
             absence.mm() == mm(302)
         },
     );
-    assert_eq!(result, Err(ForkStockServiceError::ReleaseRefused));
+    assert_eq!(result, Ok(1));
     // 302 was released before its tables were cleared and returned.
     assert_eq!(*order.borrow(), vec!["release 302", "clear", "refuse 303"]);
     assert!(!stock.is_quarantined(mm(302)));
