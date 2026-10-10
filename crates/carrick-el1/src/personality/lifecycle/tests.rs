@@ -322,7 +322,8 @@ fn serve_directly(w: &mut World, frame: &mut TrapFrame, user: &mut FaultingUser)
         lifecycle_user: Some(user),
     };
     let carrick_personality_linux::dispatch::Family::Lifecycle(call) =
-        carrick_personality_linux::dispatch::route_aarch64(ordinal, u64::MAX)
+        // Exercise shared lifecycle policy independently of ARM host routing.
+        carrick_personality_linux::dispatch::route_x86_64(ordinal, u64::MAX)
     else {
         return None;
     };
@@ -628,8 +629,9 @@ fn lifecycle_setup_completes_once_before_pending_host_work() {
         };
         let (action, _) = w.syscall(nr, args);
         assert_eq!(action, Action::ServedWithWork, "syscall {nr}");
-        assert_eq!(w.served(nr), 1);
-        assert_eq!(w.forwarded(nr), 0);
+        let host_owned = cfg!(target_arch = "aarch64") && nr != SYS_SET_ROBUST_LIST;
+        assert_eq!(w.served(nr), u64::from(!host_owned));
+        assert_eq!(w.forwarded(nr), u64::from(host_owned));
     }
 }
 
@@ -651,6 +653,18 @@ fn sigprocmask_unblocking_a_pending_signal_serves_with_work() {
         SYS_RT_SIGPROCMASK,
         &[SIG_UNBLOCK, addr(&*set), addr(&*old), 8],
     );
+    if cfg!(target_arch = "aarch64") {
+        assert_eq!(action, Action::Forward);
+        assert_eq!(frame.x[0], SIG_UNBLOCK);
+        assert_eq!(*old, 0);
+        assert_eq!(
+            w.venue.leader_slot().blocked(),
+            BlockedMask(SIGUSR1_BIT | 1)
+        );
+        assert_eq!(w.served(SYS_RT_SIGPROCMASK), 0);
+        assert_eq!(w.forwarded(SYS_RT_SIGPROCMASK), 1);
+        return;
+    }
     assert_eq!(action, Action::ServedWithWork);
     assert_eq!(frame.x[0], 0);
     assert_eq!(*old, SIGUSR1_BIT | 1);
@@ -677,6 +691,18 @@ fn sigprocmask_unblocking_a_process_pending_signal_serves_with_work() {
         SYS_RT_SIGPROCMASK,
         &[SIG_UNBLOCK, addr(&*set), addr(&*old), 8],
     );
+    if cfg!(target_arch = "aarch64") {
+        assert_eq!(action, Action::Forward);
+        assert_eq!(frame.x[0], SIG_UNBLOCK);
+        assert_eq!(*old, 0);
+        assert_eq!(
+            w.venue.leader_slot().blocked(),
+            BlockedMask(SIGUSR1_BIT | 1)
+        );
+        assert_eq!(w.served(SYS_RT_SIGPROCMASK), 0);
+        assert_eq!(w.forwarded(SYS_RT_SIGPROCMASK), 1);
+        return;
+    }
     assert_eq!(action, Action::ServedWithWork);
     assert_eq!(frame.x[0], 0);
     assert_eq!(*old, SIGUSR1_BIT | 1);
@@ -687,6 +713,25 @@ fn sigprocmask_unblocking_a_process_pending_signal_serves_with_work() {
 
 #[test]
 fn sigprocmask_serves_block_setmask_and_query() {
+    if cfg!(target_arch = "aarch64") {
+        let mut w = World::new(LifecycleHatches::ON);
+        let set = Box::new(u64::MAX);
+        let old = Box::new(u64::MAX);
+        for args in [
+            [SIG_BLOCK, addr(&*set), addr(&*old), 8],
+            [SIG_SETMASK, addr(&*set), 0, 8],
+            [99, 0, addr(&*old), 8],
+        ] {
+            let (action, frame) = w.syscall(SYS_RT_SIGPROCMASK, &args);
+            assert_eq!(action, Action::Forward);
+            assert_eq!(&frame.x[..4], &args);
+            assert_eq!(*old, u64::MAX);
+            assert_eq!(w.venue.leader_slot().blocked(), BlockedMask(0));
+        }
+        assert_eq!(w.served(SYS_RT_SIGPROCMASK), 0);
+        assert_eq!(w.forwarded(SYS_RT_SIGPROCMASK), 3);
+        return;
+    }
     let mut w = World::new(LifecycleHatches::ON);
     let set = Box::new(SIGUSR1_BIT);
     let old = Box::new(u64::MAX);
@@ -863,6 +908,28 @@ fn stack_t(sp: u64, flags: u32, size: u64) -> [u8; 24] {
 
 #[test]
 fn sigaltstack_serves_off_the_alternate_stack() {
+    if cfg!(target_arch = "aarch64") {
+        let mut w = World::new(LifecycleHatches::ON);
+        let old = Box::new([0xffu8; 24]);
+        let new = Box::new(stack_t(0x10_0000, 0, 0x4000));
+        let off = Box::new(stack_t(0, SS_DISABLE, 0));
+        let before = w.venue.leader_slot().read_altstack();
+        for args in [
+            [0, addr(&*old)],
+            [addr(&*new), 0],
+            [0, addr(&*old)],
+            [addr(&*off), addr(&*old)],
+        ] {
+            let (action, frame) = w.syscall(SYS_SIGALTSTACK, &args);
+            assert_eq!(action, Action::Forward);
+            assert_eq!(&frame.x[..2], &args);
+            assert_eq!(*old, [0xff; 24]);
+            assert_eq!(w.venue.leader_slot().read_altstack(), before);
+        }
+        assert_eq!(w.served(SYS_SIGALTSTACK), 0);
+        assert_eq!(w.forwarded(SYS_SIGALTSTACK), 4);
+        return;
+    }
     let mut w = World::new(LifecycleHatches::ON);
     let old = Box::new([0xffu8; 24]);
     // Query: none installed.

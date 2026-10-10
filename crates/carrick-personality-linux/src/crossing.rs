@@ -146,7 +146,10 @@ pub mod nr {
     pub const EXECVEAT: CanonicalNr = CanonicalNr(281);
     pub const MLOCKALL: CanonicalNr = CanonicalNr(230);
     pub const MUNLOCKALL: CanonicalNr = CanonicalNr(231);
-    pub const RT_SIGRETURN: CanonicalNr = CanonicalNr(139);
+    pub use carrick_syscall_abi::nr::{
+        KILL, RT_SIGACTION, RT_SIGPENDING, RT_SIGPROCMASK, RT_SIGQUEUEINFO, RT_SIGRETURN,
+        RT_SIGSUSPEND, RT_SIGTIMEDWAIT, RT_TGSIGQUEUEINFO, SIGALTSTACK, TGKILL, TKILL,
+    };
 
     // Terminal carrier notifications when the native process owner declines:
     pub const EXIT: CanonicalNr = CanonicalNr(93);
@@ -298,7 +301,18 @@ host_crossings! {
     Execveat = nr::EXECVEAT, false, Permanent;
     Mlockall = nr::MLOCKALL, false, Temporary;
     Munlockall = nr::MUNLOCKALL, false, Temporary;
+    Kill = nr::KILL, false, Temporary;
+    Tkill = nr::TKILL, false, Temporary;
+    Tgkill = nr::TGKILL, false, Temporary;
+    Sigaltstack = nr::SIGALTSTACK, false, Temporary;
+    RtSigsuspend = nr::RT_SIGSUSPEND, false, Temporary;
+    RtSigaction = nr::RT_SIGACTION, false, Temporary;
+    RtSigprocmask = nr::RT_SIGPROCMASK, false, Temporary;
+    RtSigpending = nr::RT_SIGPENDING, false, Temporary;
+    RtSigtimedwait = nr::RT_SIGTIMEDWAIT, false, Temporary;
+    RtSigqueueinfo = nr::RT_SIGQUEUEINFO, false, Temporary;
     RtSigreturn = nr::RT_SIGRETURN, false, Temporary;
+    RtTgsigqueueinfo = nr::RT_TGSIGQUEUEINFO, false, Temporary;
     Exit = nr::EXIT, true, Terminal;
     ExitGroup = nr::EXIT_GROUP, true, Terminal;
 }
@@ -458,6 +472,25 @@ mod tests {
     }
 
     #[test]
+    fn arm_host_owned_signal_calls_cross_without_result_installation() {
+        for ordinal in (129..=139).chain(core::iter::once(240)) {
+            assert_eq!(
+                evaluate_host_crossing(
+                    HostCrossingSet::Aarch64,
+                    true,
+                    Some(CanonicalNr::new(ordinal)),
+                    Some(NativeNr(ordinal)),
+                    None,
+                    |_| panic!("carrier-owned signal call installed a refusal"),
+                ),
+                HostCrossingDecision::Forward,
+                "ordinal={ordinal}",
+            );
+            assert!(!HostCrossingSet::X86.is_allowed(CanonicalNr::new(ordinal)));
+        }
+    }
+
+    #[test]
     fn both_sets_match_the_exhaustive_census_through_512() {
         let mut arm = [None; 513];
         for row in include_str!("../../../docs/design/arm-ring-first-flip.tsv")
@@ -534,7 +567,7 @@ mod tests {
 
     #[test]
     fn test_aarch64_crossings_exact() {
-        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 124);
+        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 135);
         for (crossing, _, _) in HOST_CROSSINGS.iter().flatten() {
             let nr = crossing.canonical();
             assert!(
@@ -550,8 +583,6 @@ mod tests {
             CanonicalNr(28),  // inotify_rm_watch
             CanonicalNr(98),  // futex
             CanonicalNr(99),  // set_robust_list
-            CanonicalNr(132), // sigaltstack
-            CanonicalNr(135), // rt_sigprocmask
             CanonicalNr(172), // getpid
             CanonicalNr(178), // gettid
             CanonicalNr(214), // brk
@@ -574,8 +605,6 @@ mod tests {
             CanonicalNr(90),  // capget
             CanonicalNr(91),  // capset
             CanonicalNr(117), // ptrace
-            CanonicalNr(129), // kill
-            CanonicalNr(134), // rt_sigaction
             CanonicalNr(144), // setgid
             CanonicalNr(146), // setuid
             CanonicalNr(148), // getresuid
