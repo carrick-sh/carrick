@@ -108,7 +108,7 @@ pub trait ProcessIdentityVenue {
     fn get_sid(&self, pid: i32) -> Result<u32, i64>;
     fn set_sid(&mut self) -> Result<u32, i64>;
     fn personality(&mut self, persona: u64) -> u64;
-    fn prctl_get_name(&self, buf: &mut [u8; 16]);
+    fn prctl_get_name(&self, buf: &mut [u8; 16]) -> Result<(), IdentityReadError>;
     fn prctl_set_name(&mut self, name: &[u8; 16]);
     fn prctl_get_pdeathsig(&self) -> u8;
     fn prctl_set_pdeathsig(&mut self, sig: u8) -> Result<(), i64>;
@@ -562,7 +562,9 @@ pub fn invoke<'a>(
                     let mut name = [0u8; 16];
                     {
                         let venue = native.process_identity()?;
-                        venue.prctl_get_name(&mut name);
+                        if let Err(error) = venue.prctl_get_name(&mut name) {
+                            return Some(SyscallResult::new(error.errno()));
+                        }
                     }
                     if !native.copy_out(UserVa::new(arg2), &name) {
                         return Some(SyscallResult::new(EFAULT));
@@ -756,6 +758,7 @@ mod tests {
         sid: u32,
         personality: u64,
         comm: [u8; 16],
+        get_name_error: Option<IdentityReadError>,
         pdeathsig: u8,
         dumpable: u32,
         no_new_privs: bool,
@@ -901,8 +904,12 @@ mod tests {
             }
             old
         }
-        fn prctl_get_name(&self, buf: &mut [u8; 16]) {
+        fn prctl_get_name(&self, buf: &mut [u8; 16]) -> Result<(), IdentityReadError> {
+            if let Some(error) = self.get_name_error {
+                return Err(error);
+            }
             *buf = self.comm;
+            Ok(())
         }
         fn prctl_set_name(&mut self, name: &[u8; 16]) {
             self.comm = *name;
@@ -941,6 +948,20 @@ mod tests {
         let mut mock = MockNative::new();
         mock.args[0] = 999; // unknown option
         assert_eq!(invoke(IdentityCall::Prctl, &mut mock), None);
+    }
+
+    #[test]
+    fn prctl_get_name_missing_thread_returns_esrch_without_copyout() {
+        let mut mock = MockNative::new();
+        mock.args[0] = LINUX_PR_GET_NAME;
+        mock.args[1] = 0x1000;
+        mock.venue.get_name_error = Some(IdentityReadError::MissingThread);
+        for i in 0..16 {
+            mock.memory.insert(0x1000 + i, 0xa5);
+        }
+        let before = mock.memory.clone();
+        assert_eq!(invoke(IdentityCall::Prctl, &mut mock).unwrap().raw(), ESRCH);
+        assert_eq!(mock.memory, before);
     }
 
     #[test]
