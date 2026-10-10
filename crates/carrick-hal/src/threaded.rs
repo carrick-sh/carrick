@@ -2500,6 +2500,12 @@ pub trait PhysicalFrameInventory: Send + Sync {
     fn allocate_backing_ids(
         &self,
     ) -> Result<(crate::FrameId, crate::MappingId), Box<dyn std::error::Error + Send + Sync>>;
+    /// Unmap every published mapping of a retired MM (a fork child leaving
+    /// quarantine), retiring frames no other MM maps. Returns the count.
+    fn retire_mm(
+        &self,
+        mm: carrick_guest_arch::MmGeneration,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// An unpublished apply retains the exact authority that issued its receipt.
@@ -3120,6 +3126,11 @@ impl HvpatchVerifiedChildKernelBinding {
 }
 
 pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
+    /// Commit a host-loaded in-kernel home only after exact MM occupancy has
+    /// been published. Engines without a guest process owner have no home.
+    fn commit_prepared_home(&mut self) -> Result<(), TrapError> {
+        Ok(())
+    }
     /// The loaded task's translation roots (`TTBR0`, `TTBR1`) when guest EL1
     /// may install them on a vCPU itself (EL1 increment 2): see
     /// `carrick_aarch64::vmm::Aarch64Vcpu::el1_switchable_roots`. `None` on
