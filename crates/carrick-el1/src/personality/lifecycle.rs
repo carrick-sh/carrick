@@ -2,7 +2,6 @@
 use super::dispatch::{El1PendingFamilies, GuestDispatchFrame, native_scheduler};
 use super::sched::{ThreadCpu, UserWord};
 pub use super::thread_setup::{GuestLifecycleVenue, LifecycleVenue, guest_venue};
-use crate::file::UserCopy as ArmUserCopy;
 use carrick_el1_abi::EntryMmKey;
 use carrick_el1_abi::{
     Claim, EntryRef, LifecycleDecline, RecordRef, ThreadControlSlot, ThreadCtx, ThreadIdentity,
@@ -47,11 +46,14 @@ impl<
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return false;
         };
-        crate::file::ValidatedCopy {
-            task,
-            validator: &crate::file::HardwareValidator,
-        }
-        .copy_in(dst, src.raw())
+        crate::file::UserCopy::copy_in(
+            &mut crate::file::ValidatedCopy {
+                task,
+                validator: &crate::file::HardwareValidator,
+            },
+            dst,
+            src.raw(),
+        )
     }
     fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool {
         #[cfg(test)]
@@ -67,11 +69,14 @@ impl<
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return false;
         };
-        crate::file::ValidatedCopy {
-            task,
-            validator: &crate::file::HardwareValidator,
-        }
-        .copy_out(dst.raw(), src)
+        crate::file::UserCopy::copy_out(
+            &mut crate::file::ValidatedCopy {
+                task,
+                validator: &crate::file::HardwareValidator,
+            },
+            dst.raw(),
+            src,
+        )
     }
 }
 
