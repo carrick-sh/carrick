@@ -120,6 +120,7 @@ impl NativeProcessError {
             Self::Busy => R::NativeBusy,
             Self::Quarantined => R::NativeQuarantined,
             Self::NoChild => R::NativeNoChild,
+            Self::GroupExitCustody => R::X86GroupExitCustody,
         }
     }
     pub fn errno(self) -> i64 {
@@ -4163,6 +4164,7 @@ mod tests {
             controls: &*child_controls,
             copies: Vec::new(),
             refuse_copy: false,
+            on_signal_clock: None,
         };
         assert!(zone.slot(slot).current().is_none());
         let mut entry = runtime
@@ -4863,7 +4865,7 @@ mod tests {
                     .enter(source, &task, child_words, &mut service)
                     .unwrap();
                 assert!(matches!(
-                    resumed.resume_pending_lifecycle().unwrap(),
+                    resumed.resume_pending_lifecycle(),
                     Some(LifecycleOutcome::Transferred { .. })
                 ));
                 assert!(resumed.take_root_exit().is_none());

@@ -1251,16 +1251,9 @@ mod kernel {
     }
 
     fn complete_run_failure(task: &CurrentTask, reason: carrick_el1_abi::NativeRunFailureReason) -> ! {
-        let failure = carrick_el1_abi::NativeRunFailure::new(
+        carrick_el1::isa::x86::complete_native_run_failure(
             carrick_el1::personality::common_entry::execution_binding(task), reason,
-        );
-        // SAFETY: the native lane retains this initialized supervisor-stack
-        // record until the carrier authenticates and ends the run.
-        unsafe {
-            core::arch::asm!("out dx, al", in("dx") carrick_el1_abi::NATIVE_RUN_FAILURE_PORT,
-                in("rax") &failure as *const _ as u64, options(nostack, preserves_flags));
-        }
-        halt();
+        )
     }
 
     pub(super) fn complete_root_exit(task: &CurrentTask, status: carrick_sched_core::process::LinuxWaitStatus) -> ! {

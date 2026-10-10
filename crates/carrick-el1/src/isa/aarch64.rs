@@ -304,7 +304,6 @@ pub fn complete_native_run_failure(
     hw::fatal_entry_binding()
 }
 
-
 /// Read the EL0 stack register at the native trap boundary.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub(crate) unsafe fn signal_stack() -> carrick_guest_arch::UserVa {
