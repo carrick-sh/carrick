@@ -1639,7 +1639,13 @@ esac
     let producer = &jobs["signed-fixtures"];
     if !producer.is_badvalue() {
         assert_eq!(producer["runs-on"].as_str(), Some("ubuntu-24.04-arm"));
-        assert_eq!(producer["if"], jobs["hvf-kernel"]["if"]);
+        // The signed job runs exactly when the producer succeeded.
+        assert!(
+            jobs["hvf-kernel"]["if"]
+                .as_str()
+                .unwrap()
+                .contains("needs.signed-fixtures.result == 'success'")
+        );
         let publish = step(producer, "Publish exact-SHA fixture bundle");
         let out = run(publish["run"].as_str().unwrap());
         assert!(
