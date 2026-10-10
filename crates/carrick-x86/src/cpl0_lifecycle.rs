@@ -5,9 +5,7 @@
 use crate::cpl0_entry::{CpuBinding, NativeFrame};
 use crate::cpl0_scheduler::XsaveArea;
 #[cfg(target_os = "none")]
-use crate::cpl0_scheduler::{
-    NativeTlsRegister, read_tls, restore_extended, save_extended, write_tls,
-};
+use crate::cpl0_scheduler::{NativeTlsRegister, read_tls, write_tls};
 use carrick_core_abi::EntryMmKey;
 use carrick_el1_abi::{Counters, CurrentTask, EntryRef, ThreadControlSlot, ThreadLifecyclePage};
 use carrick_guest_arch::{RootGpa, UserVa};
@@ -254,11 +252,13 @@ mod process_exit_tests {
         };
         lane.contexts[0].record = Some(zone.record_ref(id));
         lane.contexts[0].frame.rax = 0xabcdef;
+        lane.contexts[0].xsave.0.fill(0x5a);
         let task = CurrentTask::new();
         let counters = Counters::new();
         let page = ThreadLifecyclePage::new();
         let controls = core::array::from_fn(|_| ThreadControlSlot::new());
         let mut frame = NativeFrame::default();
+        let mut xsave = XsaveArea::ZERO;
         #[allow(clippy::panic)]
         fn terminal_failure(
             _: carrick_core_abi::ExecutionBinding,
@@ -270,6 +270,7 @@ mod process_exit_tests {
             terminal_failure,
             handoff: None,
             frame: &mut frame,
+            xsave: &mut xsave,
             task: &task,
             counters: &counters,
             zone: &zone,
@@ -280,6 +281,7 @@ mod process_exit_tests {
         };
         assert!(native.resume_after_child_exit().is_some());
         assert_eq!(native.frame.rax, 0xabcdef);
+        assert!(native.xsave.0.iter().all(|byte| *byte == 0x5a));
         assert_eq!(task.mm.key.load(Ordering::Acquire), parent.mm);
     }
 
@@ -372,6 +374,7 @@ pub struct NativeLane<'a> {
     terminal_failure: TerminalFailure,
     handoff: Option<carrick_core_abi::EntryHandoffReceipt>,
     pub frame: &'a mut NativeFrame,
+    pub xsave: &'a mut XsaveArea,
     pub task: &'a CurrentTask,
     pub counters: &'a Counters,
     pub zone: &'a ZoneTables,
@@ -493,11 +496,11 @@ impl NativeLane<'_> {
             .execution
             .generation
             .store(identity.generation, Ordering::Release);
+        *self.xsave = context.xsave.clone();
         #[cfg(target_os = "none")]
         {
             write_tls(NativeTlsRegister::Fs, context.fs_base);
             write_tls(NativeTlsRegister::UserGs, context.gs_base);
-            restore_extended(&context.xsave);
         }
         Some(carrick_core::Served::Returned { switched: true })
     }
@@ -601,13 +604,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         let gs_base = read_tls(NativeTlsRegister::UserGs);
         #[cfg(not(target_os = "none"))]
         let gs_base = self.lane.contexts[self.current_index()].gs_base;
-        let mut xsave = XsaveArea::ZERO;
-        #[cfg(target_os = "none")]
-        save_extended(&mut xsave);
-        #[cfg(not(target_os = "none"))]
-        xsave
-            .0
-            .copy_from_slice(&self.lane.contexts[self.current_index()].xsave.0);
+        let xsave = self.xsave.clone();
         self.lane.contexts[1] = NativeBirthContext {
             record: Some(record),
             frame,
@@ -828,8 +825,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             LifecycleInvariant::WaitEnrollment,
         );
         let reference = self.zone.record_ref(record);
-        let mut xsave = XsaveArea::ZERO;
-        save_extended(&mut xsave);
+        let xsave = self.xsave.clone();
         let mut saved_frame = *self.frame;
         saved_frame.rax = child_pid;
         let context = NativeBirthContext {
@@ -990,11 +986,7 @@ impl FutexVenue for NativeLane<'_> {
         let gs_base = read_tls(NativeTlsRegister::UserGs);
         #[cfg(not(target_os = "none"))]
         let gs_base = 0;
-        let mut xsave = XsaveArea::ZERO;
-        #[cfg(target_os = "none")]
-        save_extended(&mut xsave);
-        #[cfg(not(target_os = "none"))]
-        xsave.0.copy_from_slice(&self.lane.contexts[0].xsave.0);
+        let xsave = self.xsave.clone();
         self.lane.contexts[0] = NativeBirthContext {
             record: Some(reference),
             frame: *self.frame,
@@ -1090,6 +1082,7 @@ impl<'a> PendingFamilies<'a> for NativeLane<'a> {
 /// at these supervisor-only addresses until both fixture vCPUs stop.
 pub unsafe fn acquire<'a>(
     frame: &'a mut NativeFrame,
+    xsave: &'a mut XsaveArea,
     binding: &CpuBinding,
     task: &'a CurrentTask,
     counters: &'a Counters,
@@ -1120,6 +1113,7 @@ pub unsafe fn acquire<'a>(
         terminal_failure,
         handoff: None,
         frame,
+        xsave,
         task,
         counters,
         zone,
