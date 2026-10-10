@@ -4120,9 +4120,9 @@ const _: () = {
     );
 };
 #[cfg(target_arch = "aarch64")]
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x1842e1c773c58023);
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0xf6faf21e6ada22af);
 #[cfg(not(target_arch = "aarch64"))]
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x1c4fc2733ccf4bb7);
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x9e93477f69d16743);
 
 #[cfg(test)]
 mod tests {

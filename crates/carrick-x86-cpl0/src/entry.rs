@@ -349,6 +349,16 @@ mod user_fault_gate {
 
 #[cfg(target_os = "none")]
 mod kernel {
+    fixture_items! {
+    /// This bounded fixture declares one root incarnation at bootstrap.
+    pub(super) fn fixture_cow_scope(task: &carrick_el1_abi::CurrentTask) -> Option<carrick_el1_abi::CowGrantScope> {
+        let execution = carrick_core::entry::binding(&task.execution, &task.mm);
+        let mm = carrick_guest_arch::MmGeneration::new(core::num::NonZeroU64::new(execution.mm.raw())?);
+        let root = carrick_el1::isa::x86::hardware_live_root().ok()?;
+        let address = carrick_guest_arch::AddressContext { mm, root, generation: carrick_guest_arch::ContextGeneration::new(core::num::NonZeroU64::MIN) };
+        carrick_el1_abi::CowGrantScope::checked(execution, address)
+    }
+    }
     mod initial_boot {
         include!("initial_boot.rs");
     }
@@ -641,7 +651,7 @@ mod kernel {
             // retains it across the exact CPU's space-edit transaction.
             let zone = unsafe { &*(zone_address.raw() as *const carrick_sched_core::ZoneTables) };
             let words = InitialWords::fixture();
-            let mut cow = X86CowResolver { words: &words, pool, residency, completion: None };
+            let mut cow = X86CowResolver { scope: fixture_cow_scope(task), words: &words, pool, residency, completion: None };
             let result = dispatch_x86_fault_with_prepared(
                 carrick_guest_arch::CpuId::new(0), fault, counters, task,
                 carrick_el1::substrate::sched::object_wait::space_access(
@@ -706,6 +716,7 @@ mod kernel {
         let mut prepared =
             unsafe { carrick_el1::fault::X86PreparedResolver::under_editor(prepared_mm, &words) };
         let mut cow = carrick_el1::fault::X86CowResolver {
+            scope: anonymous::cow_scope(task),
             words: &words,
             pool: cow_pool,
             residency,
@@ -779,6 +790,7 @@ mod kernel {
                 cross_owner_grant(carrick_guest_arch::CpuId::new(binding.cpu_slot), fault.address);
                 let supply = carrick_el1::fault::OwnerFaultSupply::new(portal);
                 let mut cow = carrick_el1::fault::X86CowResolver {
+            scope: anonymous::cow_scope(task),
                     words: &words,
                     pool: cow_pool,
                     residency,
@@ -2160,13 +2172,14 @@ mod kernel {
                 halt();
             };
             if !residency.record_commit(old_page)
-                || SHARED_COW_POOL.publish(mm, 0xd1_4000, backing).is_none()
+                || fixture_cow_scope(task).and_then(|scope| SHARED_COW_POOL.publish(scope, 0xd1_4000, backing)).is_none()
             {
                 doorbell(FATAL_PORT, frame);
                 halt();
             }
             let words = InitialWords::fixture();
             let mut cow = X86CowResolver {
+                scope: fixture_cow_scope(task),
                 words: &words,
                 pool: &SHARED_COW_POOL,
                 residency,

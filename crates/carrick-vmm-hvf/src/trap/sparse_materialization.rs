@@ -2449,22 +2449,32 @@ impl PublicationContext<'static> {
                 TrapError::Hypervisor(format!("owner maintenance settlement: {error}"))
             })
     }
-    pub(super) fn refill_transfer_cow(&self) -> Result<bool, TrapError> {
+    pub(super) fn refill_transfer_cow(
+        &self,
+        scope: carrick_el1_abi::CowGrantScope,
+    ) -> Result<bool, TrapError> {
         let Some(pool) = carrick_el1_abi::cow_grant_pool_host() else {
             return Ok(false);
         };
-        self.refill_transfer_cow_in(pool)
+        self.refill_transfer_cow_in(pool, scope)
     }
     pub(super) fn refill_transfer_cow_in(
         &self,
         pool: &carrick_el1_abi::CowGrantPool,
+        scope: carrick_el1_abi::CowGrantScope,
     ) -> Result<bool, TrapError> {
-        if pool.ready(self.mm_key.get()).next().is_some() {
+        if pool.ready_for_scope(scope).next().is_some() {
             return Ok(true);
         }
         // The exact EL1 receipt classified a live COW run. Supply physical
         // inventory only; do not reclassify through the host table mirror.
-        Ok(super::guest_cow::provision_guest_cow_grants(&self.state, &self.custody, pool, 1)? != 0)
+        Ok(super::guest_cow::provision_guest_cow_grants(
+            &self.state,
+            &self.custody,
+            pool,
+            1,
+            scope,
+        )? != 0)
     }
     pub(super) fn prepare_transfer(
         self,

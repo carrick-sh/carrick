@@ -340,6 +340,72 @@ pub struct HardwareCowResolver {
     pub publication: Option<&'static carrick_el1_abi::PortalExecutableSlot>,
 }
 
+/// Authenticate the stopped executor and the independently retained target
+/// address incarnation before allowing it to consume physical COW stock.
+///
+/// # Safety
+/// The caller owns this slot's stopped execution or guest entry claim. Its
+/// current/host record and save area cannot change during this read.
+pub unsafe fn cow_scope_for_record(
+    zone: &carrick_sched_core::ZoneTables<carrick_sched_core::Aarch64ParkedContext>,
+    task: &CurrentTask,
+    slot: carrick_sched_core::SlotId,
+    mm: carrick_guest_arch::MmGeneration,
+    root: carrick_guest_arch::RootGpa,
+    registered: Option<carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>>,
+) -> Option<carrick_el1_abi::CowGrantScope> {
+    let binding = carrick_core::entry::binding(&task.execution, &task.mm);
+    let lane = zone.slot(slot);
+    let record = zone.record(lane.current().or_else(|| lane.host_record())?);
+    let identity = record.identity();
+    // SAFETY: the caller retains the stopped record across this snapshot.
+    let source = unsafe { record.ctx_mut() }.address_context()?;
+    if identity.tid != binding.task.raw()
+        || identity.generation != binding.generation.raw()
+        || identity.serial != binding.thread_generation.raw()
+        || identity.mm != binding.mm.raw()
+        || source.mm.raw().get() != binding.mm.raw()
+        || lane.mm() != binding.mm.raw()
+    {
+        return None;
+    }
+    let address =
+        registered.or_else(|| (source.mm == mm && source.root == root).then_some(source))?;
+    (address.mm == mm && address.root == root)
+        .then(|| carrick_el1_abi::CowGrantScope::checked(binding, address))
+        .flatten()
+}
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+fn hardware_cow_scope(
+    slot: carrick_el1_abi::SlotId,
+    mm_key: u64,
+    ttbr0: u64,
+) -> Option<carrick_el1_abi::CowGrantScope> {
+    use carrick_guest_arch::{FrameGpa, MmGeneration, RootGpa};
+    let mm = MmGeneration::new(NonZeroU64::new(mm_key)?);
+    let root = RootGpa::page_aligned(FrameGpa::new(ttbr0 & TTBR_BADDR_MASK))?;
+    // SAFETY: hardware guest dispatch retains the installed shared region.
+    let zone = unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
+    let tasks = unsafe {
+        &*(carrick_el1_abi::EL1_CURRENT_TASKS_BASE
+            as *const [CurrentTask; carrick_el1_abi::EL1_STACK_SLOTS as usize])
+    };
+    let address =
+        crate::personality::aarch64_process::registry().registered_address(zone, mm, root);
+    // SAFETY: dispatch and the service portal run on this owned executor slot.
+    unsafe {
+        cow_scope_for_record(
+            zone,
+            tasks.get(slot.raw() as usize)?,
+            slot,
+            mm,
+            root,
+            address,
+        )
+    }
+}
+
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl CowResolver for HardwareCowResolver {
     fn reconcile_parent_write<
@@ -372,8 +438,12 @@ impl CowResolver for HardwareCowResolver {
         self.resolve_cow_outcome(ttbr0, mm_key, far) == CowResolution::Resolved
     }
     fn resolve_cow_outcome(&mut self, ttbr0: u64, mm_key: u64, far: u64) -> CowResolution {
-        let outcome =
-            with_hardware_cow_venue(ttbr0, self.service_slot, self.publication, |venue| {
+        let outcome = with_hardware_cow_venue(
+            ttbr0,
+            mm_key,
+            self.service_slot,
+            self.publication,
+            |venue| {
                 crate::cow::resolve_guest_cow(
                     venue,
                     mm_key,
@@ -394,7 +464,8 @@ impl CowResolver for HardwareCowResolver {
                         crate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
                     },
                 )
-            });
+            },
+        );
         let Ok(outcome) = outcome else {
             return CowResolution::Refused;
         };
@@ -413,6 +484,7 @@ impl CowResolver for HardwareCowResolver {
 /// records while exercising the production resolver.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub struct X86CowResolver<'a, W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords> {
+    pub scope: Option<carrick_el1_abi::CowGrantScope>,
     pub words: &'a W,
     pub pool: &'a dyn carrick_el1_abi::CowGrantVenue,
     pub residency: &'a carrick_el1_abi::FrameGrantResidencyTable,
@@ -447,6 +519,9 @@ impl<D: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords> CowResol
     }
 
     fn resolve_cow_outcome(&mut self, root: u64, mm_key: u64, far: u64) -> CowResolution {
+        let Some(scope) = self.scope else {
+            return CowResolution::Refused;
+        };
         let copy_page = |source: u64, destination: u64| {
             // SAFETY: the x86 adapter verified both retained supervisor
             // translations for these distinct page frames.
@@ -467,6 +542,7 @@ impl<D: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords> CowResol
             }
         };
         let venue = carrick_core::mm::cow::GuestCowVenue::<crate::cow::X86CowMmu, _> {
+            scope,
             words: self.words,
             root: carrick_mmu_core::aarch64::SubstrateGpa(root),
             pool: self.pool,
@@ -717,6 +793,7 @@ pub trait CowCopyWindow {
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub(crate) fn with_hardware_cow_venue<R>(
     ttbr0: u64,
+    mm_key_for_cow: u64,
     service_slot: Option<carrick_el1_abi::SlotId>,
     publication: Option<&'static carrick_el1_abi::PortalExecutableSlot>,
     run: impl for<'a> FnOnce(
@@ -815,7 +892,9 @@ pub(crate) fn with_hardware_cow_venue<R>(
             )
         })
     };
+    let scope = hardware_cow_scope(service_slot.ok_or(())?, mm_key_for_cow, ttbr0).ok_or(())?;
     Ok(run(&crate::cow::GuestCowVenue {
+        scope,
         publish_executable: publication.map(|_| &publish as &dyn Fn(_, _, _) -> bool),
         words: &words,
         root: carrick_mmu_core::aarch64::SubstrateGpa(ttbr0 & TTBR_BADDR_MASK),
@@ -1106,7 +1185,7 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 }),
             }),
             &mut HardwareCowResolver {
-                service_slot: None,
+                service_slot: Some(carrick_el1_abi::SlotId::new(frame.slot as u8)),
                 publication: None,
                 completion: None,
             },
@@ -2405,6 +2484,7 @@ mod tests {
                 let live = self.0.live(&CallerInvalidatesAsid);
                 let result = crate::cow::resolve_guest_cow(
                     &crate::cow::GuestCowVenue {
+                        scope: carrick_test_support::cow_grant_scope(mm, ttbr),
                         words: &live,
                         root: carrick_mmu_core::aarch64::SubstrateGpa(ttbr),
                         pool: self.1,

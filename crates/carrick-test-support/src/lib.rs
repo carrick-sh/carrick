@@ -30,6 +30,27 @@ use std::io::Write;
 mod el1_region;
 pub use el1_region::TestEl1Region;
 
+/// Explicit execution/root fixture identity for descriptor COW tests.
+pub fn cow_grant_scope(mm: u64, root: u64) -> carrick_el1_abi::CowGrantScope {
+    use carrick_el1_abi::{EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration};
+    use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
+    use std::num::NonZeroU64;
+    carrick_el1_abi::CowGrantScope::checked(
+        carrick_el1_abi::ExecutionBinding {
+            task: EntryTaskKey::from_raw(1),
+            generation: EntryGeneration::from_raw(2),
+            mm: EntryMmKey::from_raw(mm),
+            thread_generation: EntryThreadGeneration::from_raw(3),
+        },
+        AddressContext {
+            mm: MmGeneration::new(NonZeroU64::new(mm).unwrap()),
+            root: RootGpa::page_aligned(FrameGpa::new(root)).unwrap(),
+            generation: ContextGeneration::new(NonZeroU64::new(4).unwrap()),
+        },
+    )
+    .unwrap()
+}
+
 pub fn gzip_tar<const N: usize>(files: [(&str, &[u8]); N]) -> Vec<u8> {
     gzip_tar_with_modes(files.map(|(path, contents)| (path, contents, 0o644)))
 }

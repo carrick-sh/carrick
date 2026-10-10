@@ -4747,6 +4747,7 @@ impl HvfVmState {
         syndrome: u64,
         far: u64,
         ttbr0: u64,
+        slot: Option<carrick_guest_arch::SlotId>,
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<carrick_hal::CowFaultResolution, TrapError> {
         if is_stage1_cow_write_fault(syndrome) {
@@ -4754,7 +4755,18 @@ impl HvfVmState {
             let custody = std::sync::Arc::clone(&self.carrier_foreign_mm_transport.custody);
             // EL1 found no grant for a fault it could resolve itself: refill
             // the MM's pool and let EL1 take the retry, with no host COW.
-            if self.task.refill_guest_cow_pool(&custody, fault_va)? {
+            let scope = slot.and_then(|slot| {
+                let execution = crate::metadata_grant::live_fork_execution(
+                    carrick_guest_arch::CpuId::new(usize::from(slot.raw()) as u32),
+                    ttbr0,
+                )?;
+                crate::metadata_grant::live_cow_scope(slot, execution.context)
+            });
+            if scope
+                .map(|scope| self.task.refill_guest_cow_pool(&custody, fault_va, scope))
+                .transpose()?
+                .unwrap_or(false)
+            {
                 return Ok(carrick_hal::CowFaultResolution::Resolved {
                     translation: self.translate_va(fault_va),
                     arm_generation: self.task.cow_armed.lock().generation(),

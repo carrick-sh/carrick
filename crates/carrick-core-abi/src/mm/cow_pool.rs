@@ -46,7 +46,7 @@ pub const COW_GRANT_POOL_SLOTS: usize = 1024;
 /// Probe chain length for one MM's records.
 pub const COW_GRANT_PROBES: usize = 64;
 /// Protocol revision, included in each image ABI layout identity.
-pub const COW_GRANT_PROTOCOL_VERSION: u64 = 2;
+pub const COW_GRANT_PROTOCOL_VERSION: u64 = 3;
 
 const EMPTY: u64 = 0;
 const WRITING: u64 = 1;
@@ -73,9 +73,25 @@ pub struct CowGrantRecord {
     old_ipa: AtomicU64,
     new_ipa: AtomicU64,
     purpose: AtomicU64,
+    execution_task: AtomicU64,
+    execution_generation: AtomicU64,
+    execution_mm: AtomicU64,
+    execution_thread_generation: AtomicU64,
+    root: AtomicU64,
+    root_generation: AtomicU64,
 }
 
 impl CowGrantRecord {
+    fn matches_scope(&self, scope: crate::CowGrantScope) -> bool {
+        self.mm_key.load(Ordering::Relaxed) == scope.address.mm.raw().get()
+            && self.execution_task.load(Ordering::Relaxed) == scope.execution.task.raw()
+            && self.execution_generation.load(Ordering::Relaxed) == scope.execution.generation.raw()
+            && self.execution_mm.load(Ordering::Relaxed) == scope.execution.mm.raw()
+            && self.execution_thread_generation.load(Ordering::Relaxed)
+                == scope.execution.thread_generation.raw()
+            && self.root.load(Ordering::Relaxed) == scope.address.root.address().raw()
+            && self.root_generation.load(Ordering::Relaxed) == scope.address.generation.raw().get()
+    }
     pub const fn new() -> Self {
         Self {
             state: AtomicU64::new(EMPTY),
@@ -90,6 +106,12 @@ impl CowGrantRecord {
             old_ipa: AtomicU64::new(0),
             new_ipa: AtomicU64::new(0),
             purpose: AtomicU64::new(0),
+            execution_task: AtomicU64::new(0),
+            execution_generation: AtomicU64::new(0),
+            execution_mm: AtomicU64::new(0),
+            execution_thread_generation: AtomicU64::new(0),
+            root: AtomicU64::new(0),
+            root_generation: AtomicU64::new(0),
         }
     }
 
@@ -152,11 +174,12 @@ impl CowGrantPool {
     /// caller keeps the backing and rolls it back).
     pub fn publish(
         &self,
-        mm_key: u64,
+        scope: crate::CowGrantScope,
         physical_ipa: u64,
         backing: BackingIdentity,
     ) -> Option<CowGrant> {
-        if mm_key == 0 || physical_ipa == 0 || !physical_ipa.is_multiple_of(COW_GRANT_SIZE) {
+        let mm_key = scope.address.mm.raw().get();
+        if !scope.is_valid() || physical_ipa == 0 || !physical_ipa.is_multiple_of(COW_GRANT_SIZE) {
             return None;
         }
         for offset in 0..COW_GRANT_PROBES {
@@ -178,6 +201,24 @@ impl CowGrantPool {
                 continue;
             }
             record.mm_key.store(mm_key, Ordering::Relaxed);
+            record
+                .execution_task
+                .store(scope.execution.task.raw(), Ordering::Relaxed);
+            record
+                .execution_generation
+                .store(scope.execution.generation.raw(), Ordering::Relaxed);
+            record
+                .execution_mm
+                .store(scope.execution.mm.raw(), Ordering::Relaxed);
+            record
+                .execution_thread_generation
+                .store(scope.execution.thread_generation.raw(), Ordering::Relaxed);
+            record
+                .root
+                .store(scope.address.root.address().raw(), Ordering::Relaxed);
+            record
+                .root_generation
+                .store(scope.address.generation.raw().get(), Ordering::Relaxed);
             record.physical_ipa.store(physical_ipa, Ordering::Relaxed);
             record
                 .frame_id
@@ -212,16 +253,18 @@ impl CowGrantPool {
         None
     }
 
-    /// EL1, holding `mm_key`'s editor: take one ready grant of this MM.
-    pub fn claim(&self, mm_key: u64) -> Option<CowGrant> {
-        if mm_key == 0 {
+    /// EL1, holding the address MM's editor: consume only stock licensed to
+    /// this exact execution and root incarnation. Refusal leaves it ready.
+    pub fn claim(&self, scope: crate::CowGrantScope) -> Option<CowGrant> {
+        let mm_key = scope.address.mm.raw().get();
+        if !scope.is_valid() {
             return None;
         }
         for offset in 0..COW_GRANT_PROBES {
             let slot = Self::probe(mm_key, offset);
             let record = &self.records[slot];
             let word = record.state.load(Ordering::Acquire);
-            if word & STATE_MASK != READY || record.mm_key.load(Ordering::Relaxed) != mm_key {
+            if word & STATE_MASK != READY || !record.matches_scope(scope) {
                 continue;
             }
             let Some(grant) = record.grant(slot, word) else {
@@ -251,6 +294,25 @@ impl CowGrantPool {
         };
         let state = record.state.load(Ordering::Acquire);
         state == (grant.epoch | CLAIMED) && record.grant(grant.slot, state) == Some(*grant)
+    }
+
+    /// Authenticate the original audience before settling a pending owner grant.
+    pub fn authenticates_scope(&self, grant: &CowGrant, scope: crate::CowGrantScope) -> bool {
+        let Some(record) = self.records.get(grant.slot) else {
+            return false;
+        };
+        let state = record.state.load(Ordering::Acquire);
+        matches!(state & STATE_MASK, READY | CLAIMED | USED)
+            && record.grant(grant.slot, state) == Some(*grant)
+            && record.matches_scope(scope)
+    }
+
+    pub fn ready_for_scope(
+        &self,
+        scope: crate::CowGrantScope,
+    ) -> impl Iterator<Item = CowGrant> + '_ {
+        self.ready(scope.address.mm.raw().get())
+            .filter(move |grant| self.authenticates_scope(grant, scope))
     }
     /// EL1, still holding the editor: the claimed grant was not used (the
     /// repoint refused before storing anything); it is ready again.
@@ -499,8 +561,8 @@ pub trait CowGrantSettlement: Send + Sync {
 }
 
 impl crate::CowGrantVenue for CowGrantPool {
-    fn claim(&self, mm_key: u64) -> Option<CowGrant> {
-        self.claim(mm_key)
+    fn claim(&self, scope: crate::CowGrantScope) -> Option<CowGrant> {
+        self.claim(scope)
     }
     fn abandon(&self, grant: &CowGrant) -> bool {
         self.abandon(grant)
@@ -523,6 +585,26 @@ pub const COW_GRANT_RECORDS_OFFSET: u64 = core::mem::offset_of!(CowGrantPool, re
 
 #[cfg(test)]
 mod tests {
+    fn scope(mm: u64) -> crate::CowGrantScope {
+        use crate::{EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration};
+        use carrick_guest_arch::{
+            AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa,
+        };
+        crate::CowGrantScope {
+            execution: crate::ExecutionBinding {
+                task: EntryTaskKey::from_raw(1),
+                generation: EntryGeneration::from_raw(2),
+                mm: EntryMmKey::from_raw(mm),
+                thread_generation: EntryThreadGeneration::from_raw(3),
+            },
+            address: AddressContext {
+                mm: MmGeneration::new(core::num::NonZeroU64::new(mm.max(1)).unwrap()),
+                root: RootGpa::page_aligned(FrameGpa::new(0x8000)).unwrap(),
+                generation: ContextGeneration::new(core::num::NonZeroU64::new(4).unwrap()),
+            },
+        }
+    }
+
     extern crate std;
     use super::*;
     use std::vec;
@@ -556,18 +638,102 @@ mod tests {
     }
 
     #[test]
+    fn claim_refuses_another_execution_or_recycled_root_without_consuming_stock() {
+        use crate::{EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration};
+        use carrick_guest_arch::{
+            AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa,
+        };
+        let issued = crate::CowGrantScope::checked(
+            crate::ExecutionBinding {
+                task: EntryTaskKey::from_raw(11),
+                generation: EntryGeneration::from_raw(12),
+                mm: EntryMmKey::from_raw(7),
+                thread_generation: EntryThreadGeneration::from_raw(13),
+            },
+            AddressContext {
+                mm: MmGeneration::new(NonZeroU64::new(7).unwrap()),
+                root: RootGpa::page_aligned(FrameGpa::new(0x8000)).unwrap(),
+                generation: ContextGeneration::new(NonZeroU64::new(14).unwrap()),
+            },
+        )
+        .unwrap();
+        for wrong in [
+            crate::CowGrantScope {
+                execution: crate::ExecutionBinding {
+                    mm: EntryMmKey::from_raw(25),
+                    ..issued.execution
+                },
+                ..issued
+            },
+            crate::CowGrantScope {
+                address: AddressContext {
+                    mm: MmGeneration::new(NonZeroU64::new(26).unwrap()),
+                    ..issued.address
+                },
+                ..issued
+            },
+            crate::CowGrantScope {
+                execution: crate::ExecutionBinding {
+                    task: EntryTaskKey::from_raw(21),
+                    ..issued.execution
+                },
+                ..issued
+            },
+            crate::CowGrantScope {
+                execution: crate::ExecutionBinding {
+                    generation: EntryGeneration::from_raw(22),
+                    ..issued.execution
+                },
+                ..issued
+            },
+            crate::CowGrantScope {
+                execution: crate::ExecutionBinding {
+                    thread_generation: EntryThreadGeneration::from_raw(23),
+                    ..issued.execution
+                },
+                ..issued
+            },
+            crate::CowGrantScope {
+                address: AddressContext {
+                    generation: ContextGeneration::new(NonZeroU64::new(24).unwrap()),
+                    ..issued.address
+                },
+                ..issued
+            },
+            crate::CowGrantScope {
+                address: AddressContext {
+                    root: RootGpa::page_aligned(FrameGpa::new(0x9000)).unwrap(),
+                    ..issued.address
+                },
+                ..issued
+            },
+        ] {
+            let pool = CowGrantPool::new();
+            let published = pool.publish(issued, 0x8_0000_4000, backing(10)).unwrap();
+            assert!(
+                pool.claim(wrong).is_none(),
+                "foreign scope must leave ready stock untouched"
+            );
+            assert_eq!(pool.claim(issued), Some(published));
+        }
+    }
+
+    #[test]
     fn a_grant_moves_ready_claimed_used_and_back_to_empty() {
         let spaces = carrick_sched_core::AddressSpaces::new();
         let seven = excluded(&spaces, 7);
         let eight = excluded(&spaces, 8);
         let pool = CowGrantPool::new();
-        let published = pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
+        let published = pool.publish(scope(7), 0x8_0000_4000, backing(10)).unwrap();
         assert_eq!(pool.ready(7).collect::<Vec<_>>(), vec![published]);
-        assert!(pool.claim(8).is_none(), "another MM never takes this grant");
-        let claimed = pool.claim(7).unwrap();
+        assert!(
+            pool.claim(scope(8)).is_none(),
+            "another MM never takes this grant"
+        );
+        let claimed = pool.claim(scope(7)).unwrap();
         assert_eq!(claimed, published);
         assert!(
-            pool.claim(7).is_none(),
+            pool.claim(scope(7)).is_none(),
             "one owner: a claimed grant is gone"
         );
         assert!(pool.claimed_by(&seven));
@@ -599,12 +765,12 @@ mod tests {
     fn an_abandoned_claim_is_ready_again_and_revocable() {
         let spaces = carrick_sched_core::AddressSpaces::new();
         let pool = CowGrantPool::new();
-        let grant = pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
-        let claimed = pool.claim(7).unwrap();
+        let grant = pool.publish(scope(7), 0x8_0000_4000, backing(10)).unwrap();
+        let claimed = pool.claim(scope(7)).unwrap();
         assert!(pool.abandon(&claimed));
         assert!(!pool.abandon(&claimed));
         assert!(pool.revoke(&excluded(&spaces, 7), &grant));
-        assert!(pool.claim(7).is_none());
+        assert!(pool.claim(scope(7)).is_none());
         assert_eq!(pool.ready(7).count(), 0);
     }
 
@@ -613,16 +779,16 @@ mod tests {
         let spaces = carrick_sched_core::AddressSpaces::new();
         let seven = excluded(&spaces, 7);
         let pool = CowGrantPool::new();
-        let first = pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
+        let first = pool.publish(scope(7), 0x8_0000_4000, backing(10)).unwrap();
         assert!(pool.revoke(&seven, &first));
-        let second = pool.publish(7, 0x8_0000_8000, backing(20)).unwrap();
+        let second = pool.publish(scope(7), 0x8_0000_8000, backing(20)).unwrap();
         assert_eq!(second.slot, first.slot, "the chain reuses the freed record");
         assert_ne!(second.epoch, first.epoch);
         assert!(
             !pool.revoke(&seven, &first),
             "the old epoch names no live grant"
         );
-        let claimed = pool.claim(7).unwrap();
+        let claimed = pool.claim(scope(7)).unwrap();
         assert_eq!(claimed.backing, backing(20));
         assert!(pool.complete(&completion(claimed)));
         assert!(!pool.finish(&seven, &first));
@@ -632,8 +798,8 @@ mod tests {
     #[test]
     fn a_completion_must_describe_one_compound_at_the_old_offset() {
         let pool = CowGrantPool::new();
-        pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
-        let claimed = pool.claim(7).unwrap();
+        pool.publish(scope(7), 0x8_0000_4000, backing(10)).unwrap();
+        let claimed = pool.claim(scope(7)).unwrap();
         let mut bad = completion(claimed);
         bad.new_ipa = claimed.physical_ipa + 0x2000; // offset differs from old
         assert!(!pool.complete(&bad));
@@ -649,16 +815,20 @@ mod tests {
     #[test]
     fn publication_refuses_bad_grants_and_a_full_chain() {
         let pool = CowGrantPool::new();
-        assert!(pool.publish(0, 0x8_0000_4000, backing(1)).is_none());
-        assert!(pool.publish(7, 0x8_0000_1000, backing(1)).is_none());
+        assert!(pool.publish(scope(0), 0x8_0000_4000, backing(1)).is_none());
+        assert!(pool.publish(scope(7), 0x8_0000_1000, backing(1)).is_none());
         for index in 0..COW_GRANT_PROBES as u64 {
             assert!(
-                pool.publish(7, 0x8_0000_0000 + (index + 1) * COW_GRANT_SIZE, backing(1))
-                    .is_some()
+                pool.publish(
+                    scope(7),
+                    0x8_0000_0000 + (index + 1) * COW_GRANT_SIZE,
+                    backing(1)
+                )
+                .is_some()
             );
         }
         assert!(
-            pool.publish(7, 0x9_0000_0000, backing(1)).is_none(),
+            pool.publish(scope(7), 0x9_0000_0000, backing(1)).is_none(),
             "an MM's chain is bounded"
         );
         assert_eq!(pool.ready(7).count(), COW_GRANT_PROBES);
@@ -668,10 +838,10 @@ mod tests {
     fn a_retiring_mm_releases_exactly_its_own_records() {
         let spaces = carrick_sched_core::AddressSpaces::new();
         let pool = CowGrantPool::new();
-        pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
-        pool.publish(7, 0x8_0000_8000, backing(20)).unwrap();
-        pool.publish(8, 0x8_0000_c000, backing(30)).unwrap();
-        let used = pool.claim(7).unwrap();
+        pool.publish(scope(7), 0x8_0000_4000, backing(10)).unwrap();
+        pool.publish(scope(7), 0x8_0000_8000, backing(20)).unwrap();
+        pool.publish(scope(8), 0x8_0000_c000, backing(30)).unwrap();
+        let used = pool.claim(scope(7)).unwrap();
         assert!(pool.complete(&completion(used)));
         assert_eq!(pool.release_mm(&excluded(&spaces, 7)), 2);
         assert_eq!(pool.ready(7).count(), 0);
@@ -683,8 +853,8 @@ mod tests {
     fn pending_completions_are_visible_per_mm_until_settled() {
         let spaces = carrick_sched_core::AddressSpaces::new();
         let pool = CowGrantPool::new();
-        pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
-        let claimed = pool.claim(7).unwrap();
+        pool.publish(scope(7), 0x8_0000_4000, backing(10)).unwrap();
+        let claimed = pool.claim(scope(7)).unwrap();
         assert!(!pool.has_completions_for(7), "a claim is not a completion");
         assert!(pool.complete(&completion(claimed)));
         assert!(pool.has_completions_for(7));
@@ -697,8 +867,8 @@ mod tests {
     fn completion_and_abandon_require_the_exact_claimed_identity() {
         for field in 0..3 {
             let pool = CowGrantPool::new();
-            pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
-            let claimed = pool.claim(7).unwrap();
+            pool.publish(scope(7), 0x8_0000_4000, backing(10)).unwrap();
+            let claimed = pool.claim(scope(7)).unwrap();
             let mut wrong = claimed;
             match field {
                 0 => wrong.mm_key = 8,
@@ -723,14 +893,14 @@ mod tests {
         let spaces = carrick_sched_core::AddressSpaces::new();
         let seven = excluded(&spaces, 7);
         let pool = CowGrantPool::new();
-        let original = pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
+        let original = pool.publish(scope(7), 0x8_0000_4000, backing(10)).unwrap();
         let mut wrong = original;
         wrong.backing = backing(20);
         assert!(
             !pool.revoke(&seven, &wrong),
             "wrong backing revoked a live record"
         );
-        let claimed = pool.claim(7).unwrap();
+        let claimed = pool.claim(scope(7)).unwrap();
         assert!(pool.complete(&completion(claimed)));
         assert!(
             !pool.finish(&seven, &wrong),
@@ -756,7 +926,7 @@ mod tests {
                 .store(!STATE_MASK, Ordering::Relaxed);
         }
         assert!(
-            pool.publish(7, 0x8_0000_4000, backing(10)).is_none(),
+            pool.publish(scope(7), 0x8_0000_4000, backing(10)).is_none(),
             "exhausted epoch minted a reused incarnation"
         );
     }
@@ -764,8 +934,8 @@ mod tests {
     #[test]
     fn overflowed_completion_span_is_refused_without_panicking() {
         let pool = CowGrantPool::new();
-        pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
-        let claimed = pool.claim(7).unwrap();
+        pool.publish(scope(7), 0x8_0000_4000, backing(10)).unwrap();
+        let claimed = pool.claim(scope(7)).unwrap();
         let mut bad = completion(claimed);
         bad.span_len = !4095;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pool.complete(&bad)));
@@ -804,7 +974,7 @@ mod layout_manifest {
     fn cow_grant_record() {
         assert_eq!(
             (size_of::<CowGrantRecord>(), align_of::<CowGrantRecord>()),
-            (128, 64)
+            (192, 64)
         );
         // Exhaustive pattern makes newly added fields require a manifest entry.
         let _ = |CowGrantRecord {
@@ -820,6 +990,12 @@ mod layout_manifest {
                      old_ipa: _,
                      new_ipa: _,
                      purpose: _,
+                     execution_task: _,
+                     execution_generation: _,
+                     execution_mm: _,
+                     execution_thread_generation: _,
+                     root: _,
+                     root_generation: _,
                  }: CowGrantRecord| {};
         field!(CowGrantRecord, state, AtomicU64, 0, 8, 8);
         field!(CowGrantRecord, mm_key, AtomicU64, 8, 8, 8);
@@ -833,13 +1009,26 @@ mod layout_manifest {
         field!(CowGrantRecord, old_ipa, AtomicU64, 72, 8, 8);
         field!(CowGrantRecord, new_ipa, AtomicU64, 80, 8, 8);
         field!(CowGrantRecord, purpose, AtomicU64, 88, 8, 8);
+        field!(CowGrantRecord, execution_task, AtomicU64, 96, 8, 8);
+        field!(CowGrantRecord, execution_generation, AtomicU64, 104, 8, 8);
+        field!(CowGrantRecord, execution_mm, AtomicU64, 112, 8, 8);
+        field!(
+            CowGrantRecord,
+            execution_thread_generation,
+            AtomicU64,
+            120,
+            8,
+            8
+        );
+        field!(CowGrantRecord, root, AtomicU64, 128, 8, 8);
+        field!(CowGrantRecord, root_generation, AtomicU64, 136, 8, 8);
     }
 
     #[test]
     fn cow_grant_pool() {
         assert_eq!(
             (size_of::<CowGrantPool>(), align_of::<CowGrantPool>()),
-            (131328, 64)
+            (196864, 64)
         );
         // Exhaustive pattern makes newly added fields require a manifest entry.
         let _ = |CowGrantPool {
@@ -870,7 +1059,7 @@ mod layout_manifest {
             records,
             [CowGrantRecord; COW_GRANT_POOL_SLOTS],
             256,
-            131072,
+            196608,
             64
         );
     }

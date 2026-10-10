@@ -9,10 +9,26 @@ use std::sync::Arc;
 #[derive(::core::clone::Clone)]
 pub struct UserTransferCustody {
     custody: Arc<CarrierVmCustody>,
+    slot: Option<carrick_guest_arch::SlotId>,
     transport: Option<Arc<CarrierForeignMmTransport>>,
     metadata: Option<crate::metadata_grant::CarrierMetadataAccess>,
 }
 impl UserTransferCustody {
+    fn cow_scope(
+        &self,
+        target: carrick_aarch64::user_transfer::TransferTarget,
+    ) -> Result<carrick_el1_abi::CowGrantScope, TrapError> {
+        let refused = || TrapError::Hypervisor("stale owner COW scope".into());
+        let slot = self.slot.ok_or_else(refused)?;
+        let mm = target.handle().mm().raw();
+        let address = self
+            .custody
+            .fork_stock
+            .lock()
+            .root(NonZeroU64::new(mm).ok_or_else(refused)?)
+            .ok_or_else(refused)?;
+        crate::metadata_grant::live_cow_scope(slot, address).ok_or_else(refused)
+    }
     /// Retain an exact external physical source for pre-admission copying.
     /// This never transfers its source frame or directory into the target.
     pub fn retain_import_source(
@@ -87,9 +103,11 @@ impl UserTransferCustody {
     pub(crate) fn from_transport(
         transport: Arc<CarrierForeignMmTransport>,
         carrier: Option<Arc<PersistentCarrierMappings>>,
+        slot: Option<carrick_guest_arch::SlotId>,
     ) -> Self {
         Self {
             custody: Arc::clone(&transport.custody),
+            slot,
             transport: Some(transport),
             metadata: carrier.and_then(crate::metadata_grant::CarrierMetadataAccess::new),
         }
@@ -98,6 +116,7 @@ impl UserTransferCustody {
     pub(crate) fn new(custody: Arc<CarrierVmCustody>) -> Self {
         Self {
             custody,
+            slot: None,
             transport: None,
             metadata: None,
         }
@@ -301,7 +320,7 @@ impl TransferCustody for UserTransferCustody {
             target,
             window,
         )?;
-        context.refill_transfer_cow()
+        context.refill_transfer_cow(self.cow_scope(target)?)
     }
     fn finish_maintenance(
         &self,
@@ -341,7 +360,7 @@ impl TransferCustody for UserTransferCustody {
             target,
             request,
         )?
-        .refill_transfer_cow()
+        .refill_transfer_cow(self.cow_scope(target)?)
     }
     fn retain(
         &self,
@@ -1336,7 +1355,7 @@ pub(super) mod tests {
                 ));
                 let pool = carrick_el1_abi::CowGrantPool::new();
                 pool.publish(
-                    77,
+                    carrick_test_support::cow_grant_scope(77, ROOT),
                     source_ipa + 0x4000,
                     BackingIdentity {
                         frame_id: nz(7),
@@ -1371,6 +1390,7 @@ pub(super) mod tests {
                 };
                 let result = carrick_el1::cow::resolve_guest_cow(
                     &carrick_el1::cow::GuestCowVenue {
+                        scope: carrick_test_support::cow_grant_scope(77, ROOT),
                         publish_executable: Some(&publish),
                         words: &words,
                         root: SubstrateGpa(ROOT),

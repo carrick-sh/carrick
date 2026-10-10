@@ -1022,6 +1022,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         _syndrome: u64,
         _far: u64,
         _ttbr0: u64,
+        _slot: Option<carrick_sched_core::SlotId>,
         _flush_stage1: &mut dyn Stage1Services,
     ) -> Result<carrick_hal::CowFaultResolution, TrapError> {
         Ok(carrick_hal::CowFaultResolution::NotCow)
@@ -1382,7 +1383,10 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         Ok(crate::user_transfer::TransferPreparation::Declined)
     }
 
-    fn owner_transfer_custody(&self) -> Option<Box<crate::user_transfer::ErasedPhysicalCustody>> {
+    fn owner_transfer_custody(
+        &self,
+        _slot: Option<carrick_sched_core::SlotId>,
+    ) -> Option<Box<crate::user_transfer::ErasedPhysicalCustody>> {
         None
     }
 

@@ -12653,6 +12653,7 @@ mod guest_cow {
         .unwrap();
         resolve_guest_cow(
             &GuestCowVenue {
+                scope: carrick_test_support::cow_grant_scope(child.snapshot.mm.get(), root),
                 publish_executable: None,
                 words: &words,
                 root: SubstrateGpa(root),
@@ -12694,7 +12695,14 @@ mod guest_cow {
         let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
 
         assert_eq!(
-            provision_guest_cow_grants(&child.state, &custody, pool, 1).unwrap(),
+            provision_guest_cow_grants(
+                &child.state,
+                &custody,
+                pool,
+                1,
+                carrick_test_support::cow_grant_scope(child.snapshot.mm.get(), child.owners.0[0].0)
+            )
+            .unwrap(),
             1
         );
         let grant = pool.ready(mm).next().expect("published grant");
@@ -12819,7 +12827,14 @@ mod guest_cow {
         let (mut child, pool) = forked_guest_child(746, 0x9a01_3300_0000, 0x9b01_3300_0000);
         let mm = child.snapshot.mm.get();
         let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
-        provision_guest_cow_grants(&child.state, &custody, pool, 1).unwrap();
+        provision_guest_cow_grants(
+            &child.state,
+            &custody,
+            pool,
+            1,
+            carrick_test_support::cow_grant_scope(child.snapshot.mm.get(), child.owners.0[0].0),
+        )
+        .unwrap();
         let grant = pool.ready(mm).next().unwrap();
         child
             .owners
@@ -12863,7 +12878,14 @@ mod guest_cow {
             authority.old_frame_mappings = mappings;
             child.state.cow_runtime.write().as_mut().unwrap().authority = Arc::new(authority);
             let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
-            provision_guest_cow_grants(&child.state, &custody, pool, 1).unwrap();
+            provision_guest_cow_grants(
+                &child.state,
+                &custody,
+                pool,
+                1,
+                carrick_test_support::cow_grant_scope(child.snapshot.mm.get(), child.owners.0[0].0),
+            )
+            .unwrap();
             let grant = pool.ready(child.snapshot.mm.get()).next().unwrap();
             child
                 .owners
@@ -12912,19 +12934,52 @@ mod guest_cow {
         let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
         let mm = child.snapshot.mm.get();
         assert!(
-            !refill_guest_cow_pool(&child.state, &custody, pool, TEST_VA, |_| false).unwrap(),
+            !refill_guest_cow_pool(
+                &child.state,
+                &custody,
+                pool,
+                TEST_VA,
+                |_| false,
+                carrick_test_support::cow_grant_scope(child.snapshot.mm.get(), child.owners.0[0].0)
+            )
+            .unwrap(),
             "EL1 cannot install an unpublished MM: no grants for it"
         );
         assert!(
-            !refill_guest_cow_pool(&child.state, &custody, pool, TEST_VA + 0x10_0000, |_| true)
-                .unwrap(),
+            !refill_guest_cow_pool(
+                &child.state,
+                &custody,
+                pool,
+                TEST_VA + 0x10_0000,
+                |_| true,
+                carrick_test_support::cow_grant_scope(child.snapshot.mm.get(), child.owners.0[0].0)
+            )
+            .unwrap(),
             "an unarmed page is the host's"
         );
         assert_eq!(pool.ready(mm).count(), 0);
-        assert!(refill_guest_cow_pool(&child.state, &custody, pool, TEST_VA, |_| true).unwrap());
+        assert!(
+            refill_guest_cow_pool(
+                &child.state,
+                &custody,
+                pool,
+                TEST_VA,
+                |_| true,
+                carrick_test_support::cow_grant_scope(child.snapshot.mm.get(), child.owners.0[0].0)
+            )
+            .unwrap()
+        );
         assert_eq!(pool.ready(mm).count(), GUEST_COW_FIRST_BATCH);
         assert!(
-            !refill_guest_cow_pool(&child.state, &custody, pool, TEST_VA, |_| true).unwrap(),
+            !refill_guest_cow_pool(
+                &child.state,
+                &custody,
+                pool,
+                TEST_VA,
+                |_| true,
+                carrick_test_support::cow_grant_scope(child.snapshot.mm.get(), child.owners.0[0].0)
+            )
+            .unwrap(),
             "EL1 declined with grants in the pool: the host resolves it"
         );
         let spaces = AddressSpaces::new();
@@ -12936,7 +12991,17 @@ mod guest_cow {
                 .push((grant.physical_ipa, CowArmedRanges::COMPOUND_SIZE));
             assert!(pool.revoke(&excluded, &grant));
         }
-        assert!(refill_guest_cow_pool(&child.state, &custody, pool, TEST_VA, |_| true).unwrap());
+        assert!(
+            refill_guest_cow_pool(
+                &child.state,
+                &custody,
+                pool,
+                TEST_VA,
+                |_| true,
+                carrick_test_support::cow_grant_scope(child.snapshot.mm.get(), child.owners.0[0].0)
+            )
+            .unwrap()
+        );
         assert_eq!(
             pool.ready(mm).count(),
             2 * GUEST_COW_FIRST_BATCH,
@@ -13126,7 +13191,14 @@ mod guest_cow {
             forked_guest_child_with(751, 0x9a01_3700_0000, 0x9b01_3700_0000, true);
         let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
         let mm = child.snapshot.mm.get();
-        provision_guest_cow_grants(&child.state, &custody, pool, 1).unwrap();
+        provision_guest_cow_grants(
+            &child.state,
+            &custody,
+            pool,
+            1,
+            carrick_test_support::cow_grant_scope(child.snapshot.mm.get(), child.owners.0[0].0),
+        )
+        .unwrap();
         let grant = pool.ready(mm).next().unwrap();
         child
             .owners
@@ -13177,7 +13249,14 @@ mod guest_cow {
         }
         let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
         let mm = child.snapshot.mm.get();
-        provision_guest_cow_grants(&child.state, &custody, pool, 1).unwrap();
+        provision_guest_cow_grants(
+            &child.state,
+            &custody,
+            pool,
+            1,
+            carrick_test_support::cow_grant_scope(child.snapshot.mm.get(), child.owners.0[0].0),
+        )
+        .unwrap();
         let grant = pool.ready(mm).next().unwrap();
         child
             .owners
@@ -13259,7 +13338,14 @@ mod guest_cow {
         child.state.cow_armed.lock().restore(Vec::new());
         let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
         let mm = child.snapshot.mm.get();
-        provision_guest_cow_grants(&child.state, &custody, pool, 1).unwrap();
+        provision_guest_cow_grants(
+            &child.state,
+            &custody,
+            pool,
+            1,
+            carrick_test_support::cow_grant_scope(child.snapshot.mm.get(), child.owners.0[0].0),
+        )
+        .unwrap();
         let grant = pool.ready(mm).next().unwrap();
         child
             .owners
@@ -13553,8 +13639,14 @@ mod guest_cow {
             .select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Host);
         let before = format!("{:?}", *child.state.frame_inventory.ledger.lock());
         assert!(
-            provision_guest_cow_grants(&child.state, legacy_test_carrier_vm_custody_arc(), pool, 4)
-                .is_err()
+            provision_guest_cow_grants(
+                &child.state,
+                legacy_test_carrier_vm_custody_arc(),
+                pool,
+                4,
+                carrick_test_support::cow_grant_scope(child.snapshot.mm.get(), child.owners.0[0].0)
+            )
+            .is_err()
         );
         assert_eq!(pool.ready(child.snapshot.mm.get()).count(), 0);
         assert_eq!(
@@ -14159,7 +14251,14 @@ fn transfer_cow_refill_uses_exact_target_physical_inventory_once() {
     .unwrap();
 
     let pool = carrick_el1_abi::CowGrantPool::new();
-    assert!(context.refill_transfer_cow_in(&pool).unwrap());
+    assert!(
+        context
+            .refill_transfer_cow_in(
+                &pool,
+                carrick_test_support::cow_grant_scope(mm.raw(), installed.owners.0[0].0)
+            )
+            .unwrap()
+    );
     let grants = pool.ready(mm.raw()).collect::<Vec<_>>();
     assert_eq!(grants.len(), 1);
     assert!(pool.ready(mm.raw() + 1).next().is_none());
@@ -14182,7 +14281,14 @@ fn transfer_cow_refill_uses_exact_target_physical_inventory_once() {
         extent.stage2_owner.generation,
         grant.backing.owner_generation.get()
     );
-    assert!(context.refill_transfer_cow_in(&pool).unwrap());
+    assert!(
+        context
+            .refill_transfer_cow_in(
+                &pool,
+                carrick_test_support::cow_grant_scope(mm.raw(), installed.owners.0[0].0)
+            )
+            .unwrap()
+    );
     assert_eq!(
         pool.ready(mm.raw()).collect::<Vec<_>>(),
         grants,
@@ -14229,8 +14335,11 @@ fn exercise_retained_import(journal_case: u8) {
         *b"peer",
     );
     let (authority, _lease, _invalidator) = prepare_foreign_cow(&installed);
-    let target =
-        super::super::user_transfer::UserTransferCustody::from_transport(transport.clone(), None);
+    let target = super::super::user_transfer::UserTransferCustody::from_transport(
+        transport.clone(),
+        None,
+        None,
+    );
     let source_custody = Arc::new(CarrierVmCustody::new_live_fixture());
     let source_ipa = 0xa088_2300_0000;
     let source_owner = super::super::user_transfer::tests::backing(&source_custody, source_ipa);

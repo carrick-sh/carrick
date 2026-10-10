@@ -58,6 +58,7 @@ pub(crate) fn provision_guest_cow_grants(
     custody: &std::sync::Arc<CarrierVmCustody>,
     pool: &CowGrantPool,
     count: usize,
+    scope: carrick_el1_abi::CowGrantScope,
 ) -> Result<usize, TrapError> {
     let runtime =
         state.cow_runtime.read().clone().ok_or_else(|| {
@@ -71,6 +72,9 @@ pub(crate) fn provision_guest_cow_grants(
         return Err(TrapError::Hypervisor(
             "guest COW grants serve only a guest-owned MM".to_owned(),
         ));
+    }
+    if !scope.is_valid() || scope.address.mm.raw() != mm {
+        return Err(TrapError::Hypervisor("guest COW scope MM mismatch".into()));
     }
     let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
     let mut published = 0;
@@ -108,7 +112,7 @@ pub(crate) fn provision_guest_cow_grants(
             owner_rollback,
         )?;
         let backing = grant.backing()?;
-        if pool.publish(mm.get(), new_physical_ipa, backing).is_none() {
+        if pool.publish(scope, new_physical_ipa, backing).is_none() {
             // Dropping the armed grant rolls back the kernel mapping, the
             // inventory extent and the new owner.
             drop(grant);
@@ -130,13 +134,19 @@ impl HvfTaskState {
         &self,
         custody: &std::sync::Arc<CarrierVmCustody>,
         fault_va: u64,
+        scope: carrick_el1_abi::CowGrantScope,
     ) -> Result<bool, TrapError> {
         let Some(pool) = carrick_el1_abi::cow_grant_pool_host() else {
             return Ok(false);
         };
-        refill_guest_cow_pool(&self.mm_access, custody, pool, fault_va, |mm| {
-            carrick_el1_abi::zone_tables().is_some_and(|zone| zone.spaces.find(mm).is_some())
-        })
+        refill_guest_cow_pool(
+            &self.mm_access,
+            custody,
+            pool,
+            fault_va,
+            |mm| carrick_el1_abi::zone_tables().is_some_and(|zone| zone.spaces.find(mm).is_some()),
+            scope,
+        )
     }
 }
 
@@ -152,6 +162,7 @@ pub(crate) fn refill_guest_cow_pool(
     pool: &CowGrantPool,
     fault_va: u64,
     published: impl FnOnce(u64) -> bool,
+    scope: carrick_el1_abi::CowGrantScope,
 ) -> Result<bool, TrapError> {
     let tables = state.page_tables_authority();
     if tables.live_descriptor_owner() != carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest {
@@ -174,7 +185,7 @@ pub(crate) fn refill_guest_cow_pool(
             )
         })
         .unwrap_or(false);
-    if !armed || pool.ready(mm).next().is_some() || !published(mm) {
+    if !armed || pool.ready_for_scope(scope).next().is_some() || !published(mm) {
         return Ok(false);
     }
     let batch = state
@@ -182,7 +193,7 @@ pub(crate) fn refill_guest_cow_pool(
         .load(std::sync::atomic::Ordering::Relaxed);
     // A grant that cannot be made (no frame, a full kernel reservation)
     // leaves this fault to the host COW path; grants already published stay.
-    let provisioned = match provision_guest_cow_grants(state, custody, pool, batch) {
+    let provisioned = match provision_guest_cow_grants(state, custody, pool, batch, scope) {
         Ok(provisioned) => provisioned,
         Err(error) => {
             tracing::debug!(target: "carrick::guest_cow", %error, "guest COW refill failed");

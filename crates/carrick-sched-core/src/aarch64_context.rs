@@ -108,6 +108,20 @@ impl Aarch64ParkedContext {
     }
 }
 
+impl Aarch64ParkedContext {
+    pub fn address_context(&self) -> Option<AddressContext<RootGpa>> {
+        use carrick_guest_arch::{ContextGeneration, FrameGpa, MmGeneration};
+        use core::num::NonZeroU64;
+        Some(AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(
+                self.root & crate::AARCH64_ROOT_ADDRESS_MASK,
+            ))?,
+            mm: MmGeneration::new(NonZeroU64::new(self.mm)?),
+            generation: ContextGeneration::new(NonZeroU64::new(self.generation)?),
+        })
+    }
+}
+
 impl carrick_guest_arch::ProcessContext for Aarch64ParkedContext {
     fn authenticates(&self, expected: AddressContext<RootGpa>) -> bool {
         Aarch64ParkedContext::authenticates(self, expected)

@@ -998,6 +998,7 @@ name = "carrick-test-support"
 version = "0.1.0"
 dependencies = [
  "carrick-el1-abi",
+ "carrick-guest-arch",
  "flate2",
  "tar",
 ]

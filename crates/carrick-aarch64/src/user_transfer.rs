@@ -589,7 +589,10 @@ pub fn scrub_pending_backing<V: Aarch64Vmm>(
     let failure = || TrapError::Hypervisor("owner backing maintenance refused".into());
     let custody = engine
         .backend()
-        .owner_transfer_custody()
+        .owner_transfer_custody(
+            carrick_hal::ThreadedEngine::mailbox_slot(engine)
+                .and_then(carrick_sched_core::SlotId::from_index),
+        )
         .ok_or_else(failure)?;
     let ttbr0 = engine.transfer_service_loan()?.target_ttbr0()?;
     let target = TransferTarget::from_handle(handle, ttbr0);

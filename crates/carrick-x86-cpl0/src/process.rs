@@ -318,6 +318,8 @@ pub(crate) fn fork_mm(parent_root: RootGpa) -> Option<(RootGpa, GuestMmuPublicat
 pub(crate) fn publish_child_stack(
     residency: &FrameGrantResidencyTable,
     parent_root: RootGpa,
+    parent_scope: carrick_el1_abi::CowGrantScope,
+    child_scope: carrick_el1_abi::CowGrantScope,
 ) -> bool {
     let Ok(leaf) = translate_leaf(
         &InitialWords::fixture(),
@@ -355,7 +357,7 @@ pub(crate) fn publish_child_stack(
         inventory_revision: NonZeroU64::MIN,
     };
     if SHARED_COW_POOL
-        .publish(CHILD_MM, 0x41_4000, child_backing)
+        .publish(child_scope, 0x41_4000, child_backing)
         .is_none()
     {
         return false;
@@ -367,7 +369,7 @@ pub(crate) fn publish_child_stack(
         inventory_revision: NonZeroU64::MIN,
     };
     SHARED_COW_POOL
-        .publish(PARENT_MM, 0x41_8000, parent_backing)
+        .publish(parent_scope, 0x41_8000, parent_backing)
         .is_some()
 }
 
@@ -485,6 +487,7 @@ fn prepare_parent_output(
     let words = InitialWords::fixture();
     if translate_leaf(&words, root, address, Access::Write, true).is_err() {
         let mut cow = X86CowResolver {
+            scope: crate::kernel::fixture_cow_scope(lane.task),
             words: &words,
             pool: &SHARED_COW_POOL,
             residency: residency()?,
