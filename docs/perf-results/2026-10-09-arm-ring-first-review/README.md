@@ -1,5 +1,35 @@
 # ARM ring-first independent review follow-up
 
+Current CI follow-up source: `da45a9f6870de8ad46404a2125eab19010e07c31`.
+
+The three CI fixes are separate commits: surface mapping `e08b6d198`,
+explicit OptOut/Strict creation census tests `c7a229f34`, and GNU startup
+fixture publication `0bc20ef4941964aee2627c1d4097bdc42e425a06`.
+The full host test then exposed a stale 10-versus-11 inventory assertion;
+`da45a9f68` updates the exact census, explicitly requires the GNU entry,
+and retains artifact-byte hash checks. `ci-red-first.txt` preserves failures.
+
+VM-free suites, `just test`, `just test-integration`, clippy, formatting,
+lint-domains with the real PR base, and contract-change classification PASS.
+Integration ran with the GNU linker deliberately unavailable. The shared
+musl builder does not invoke GNU; the trusted Linux publisher does.
+The published bundle SHA-256 is
+`2265262b6ff0c9ec91259fd00496a81393d3e6c5237eca7c60f456ca0966e966`;
+its input identity is `665910c3a91ccc1cf10d81a98d152f128798cec1b8b224efc5729ea1a2d0ce55`.
+`ci-host-verification.json` records commands and output tails.
+
+Raw Strict/OptOut and GNU loader-only Strict/OptOut PASS, including counter
+assertions and all unentitled negative controls. Strict getuid refusal is
+exactly one, with zero forwarding; OptOut getuid has zero refusals and one
+forward. All three scoped recipes leave zero survivors and release their
+own leases promptly. Lease snapshots sometimes show the independent ARM
+step-5 shared run, never a surviving ring-switch run. Authentic receipts,
+binary hashes/CDHashes/UUIDs, counters and cleanup are in `ci-*` evidence.
+The earlier fork/wait A/B remains a main-owned ARM copy-on-write defect.
+
+Historical review evidence follows; older hashes below are historical.
+
+
 Current product/fixture checkpoint: `ec8279a7235eb7044fbebd1b59d021c7fcf22a5f`.
 This final correction gates owed-work replay on strict policy. OptOut
 retains plain Forward for mmap, futex, clone and wait4 family declines;
