@@ -241,6 +241,11 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     fn native_number(&self) -> Option<carrick_syscall_abi::NativeNr> {
         None
     }
+    /// Reject a guest descriptor that cannot use this host crossing before
+    /// the crossing table evaluates the syscall ordinal.
+    fn preflight_host_crossing(&mut self, _ordinal: u64) -> bool {
+        true
+    }
     /// Access to the refusal counters array, if available.
     fn refused_counters(&self) -> Option<&'a [core::sync::atomic::AtomicU64]> {
         None
@@ -628,6 +633,9 @@ fn finish<'a, C: EntryContext + 'a>(
                     | FamilyCompletion::Handback
             ))
     {
+        if !pending.preflight_host_crossing(ordinal) {
+            return CompletionRoute::Served;
+        }
         let canonical = carrick_syscall_abi::CanonicalNr::new(ordinal);
         let crossing_set = pending.crossing_set();
         let ring_first_strict = pending.ring_first_strict();
@@ -686,13 +694,24 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
     pending: &mut dyn PendingFamilies<'a, C>,
 ) -> CompletionRoute {
     let original_argument0 = pending.original_argument0();
-    let family = if pending.may_serve_descriptor() && matches!(ordinal, 23 | 24 | 57)
+    let descriptor_ordinal = [
+        crate::crossing::nr::DUP,
+        crate::crossing::nr::DUP3,
+        crate::crossing::nr::CLOSE,
+    ]
+    .iter()
+    .any(|nr| nr.raw() == ordinal);
+    let family = if pending.may_serve_descriptor() && descriptor_ordinal
         || (pending.may_serve_descriptor()
             && ordinal == carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2)
     {
         Family::Descriptor
     } else if ordinal == carrick_syscall_abi::nr::PPOLL.raw() {
-        if pending.may_serve_poll() { Family::Poll } else { Family::Unported }
+        if pending.may_serve_poll() {
+            Family::Poll
+        } else {
+            Family::Unported
+        }
     } else {
         route_aarch64(ordinal, control)
     };
@@ -709,6 +728,9 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
         Some(authority) => authority,
         None if family == Family::AllocatorControl => CompletionAuthority::AllocatorDiagnostic,
         None => {
+            if !pending.preflight_host_crossing(ordinal) {
+                return CompletionRoute::Served;
+            }
             let set = pending.crossing_set();
             let strict = pending.ring_first_strict();
             let counters = pending.refused_counters();

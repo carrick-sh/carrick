@@ -3,6 +3,7 @@
 .equ SYS_close, 3
 .equ SYS_dup, 32
 .equ SYS_dup2, 33
+.equ SYS_lseek, 8
 .equ SYS_exit_group, 231
 .global _start
 .text
@@ -53,6 +54,13 @@ _start:
     syscall
     cmp $1, %rax
     jne fail_redirect_stdout
+    mov $SYS_lseek, %rax
+    mov $1, %rdi
+    xor %rsi, %rsi
+    mov $1, %rdx
+    syscall
+    cmp $-29, %rax
+    jne fail_remapped_seek
     mov $SYS_write, %rax
     mov $5, %rdi
     lea out(%rip), %rsi
@@ -70,6 +78,7 @@ fail_dup_reuse: mov $95, %rdi; jmp exit
 fail_close_reused_stdin: mov $96, %rdi; jmp exit
 fail_closed_read: mov $97, %rdi; jmp exit
 fail_redirect_stdout: mov $98, %rdi; jmp exit
+fail_remapped_seek: mov $99, %rdi; jmp exit
 fail_write_saved: mov $100, %rdi
 exit:
     mov $SYS_exit_group, %rax

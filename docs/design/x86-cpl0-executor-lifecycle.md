@@ -408,3 +408,18 @@ The ARM `PollContinuation` also needs a separate repair in that milestone:
 register its IPC producer wake and shared timer before `clear_current`, then
 complete from re-sampled `revents` exactly once. Merely clearing the slot
 without those registrations returns a false zero and can lose the wake.
+
+### Open conformance gaps after host-bound descriptor cutover
+
+- Reserved-signal requeue can livelock a forwarded wait: the signal is
+  requeued, wakes every new wait, and an EINTR retry loop spins. A default
+  termination action never runs in that loop. On a partially completed write,
+  the retry can also replace real progress with EINTR. Signal delivery and
+  continuation completion need one owner before this can be called conformant.
+- `writev` and other forwarded calls on remapped standard descriptors are
+  refused when their binding cannot be faithfully routed. The fixture
+  `mounted_static_x86_remapped_writev_is_refused_without_wrong_stream` is a
+  known refusal and stream-isolation witness, not a Linux conformance pass.
+- The in-ring `dup` allocator uses its fixed guest descriptor limit and does
+  not yet honor per-task `RLIMIT_NOFILE`. Exhaustion below that limit can
+  therefore differ from Linux's EMFILE boundary.
