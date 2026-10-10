@@ -76,7 +76,7 @@ pub(super) fn schedule(slot: SlotId) -> ! {
             }
             ((hi as u64) << 32) | (lo as u64)
         };
-        let _ = source.zone.expire_timer(slot, now, carrick_syscall_abi::LINUX_EAGAIN.guest_retval() as u64);
+        let _ = source.zone.expire_timer(slot, now, carrick_syscall_abi::LINUX_ETIMEDOUT.guest_retval() as u64);
         if let Some(selected) = source.zone.switch_in_full(slot) {
             source.zone.leave_idle(slot);
             let runtime = native_process::runtime();

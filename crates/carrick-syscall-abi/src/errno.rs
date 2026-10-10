@@ -68,3 +68,4 @@ pub const LINUX_ERANGE: LinuxErrno = LinuxErrno::new(34);
 pub const LINUX_ENOSYS: LinuxErrno = LinuxErrno::new(38);
 pub const LINUX_ENOMSG: LinuxErrno = LinuxErrno::new(42);
 pub const LINUX_EIDRM: LinuxErrno = LinuxErrno::new(43);
+pub const LINUX_ETIMEDOUT: LinuxErrno = LinuxErrno::new(110);

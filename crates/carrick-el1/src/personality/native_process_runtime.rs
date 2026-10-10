@@ -23,7 +23,9 @@ use carrick_personality_linux::{
     },
     lifecycle::{LifecycleOutcome, LinuxWaitOptions, ProcessNative, ProcessWaitPid},
 };
-use carrick_sched_core::process::ipc::{IpcNamespace, MsgrcvOutcome, MsgsndOutcome, SemopOutcome};
+use carrick_sched_core::process::ipc::{
+    IpcError, IpcNamespace, MsgrcvOutcome, MsgsndOutcome, SemopOutcome,
+};
 use carrick_sched_core::process::{
     ChildExitSignal, LinuxWaitStatus, TaskId, TaskIdentity, TaskKey, TaskRusage, TaskSerial,
     WaitChildClass, WaitTarget,
@@ -267,11 +269,11 @@ struct Graph<'a, M: Clone, C: ProcessContext> {
     _root_roles: NativeClaim,
     uts: carrick_personality_linux::sysinfo::LinuxUtsname,
     ipc: Arc<SpinLock<IpcNamespace>>,
-    ipc_channels: IpcWaitChannels,
 }
 pub struct NativeProcessRuntime<'a, M: Clone, C: ProcessContext> {
     graph: SpinLock<Graph<'a, M, C>>,
     zone: &'a ZoneTables<C>,
+    ipc_channels: IpcWaitChannels,
 }
 pub struct NativeRecordBinding<M, C: ProcessContext> {
     pub key: TaskKey,
@@ -461,9 +463,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 _root_roles: root_roles,
                 uts,
                 ipc,
-                ipc_channels,
             }),
             zone: source.zone,
+            ipc_channels,
         })
     }
     pub fn enter<'r, S: NativeProcessService<'a, C, Mm = M>>(
@@ -856,8 +858,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 
     fn get_or_create_channel(&self, channel_id: u64) -> Arc<WaitChannel> {
         const IPC_WAIT_CHANNEL_MM: u64 = 0x19c0_0000;
-        let graph = self.runtime.graph.lock();
-        let mut channels = graph.ipc_channels.lock();
+        let mut channels = self.runtime.ipc_channels.lock();
         if let Some((_, ch)) = channels.iter().find(|(id, _)| *id == channel_id) {
             ch.clone()
         } else {
@@ -871,8 +872,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
 
     fn prune_ipc_channel(&self, channel_id: u64) {
-        let graph = self.runtime.graph.lock();
-        let mut channels = graph.ipc_channels.lock();
+        let mut channels = self.runtime.ipc_channels.lock();
         channels.retain(|(id, _)| *id != channel_id);
     }
 
@@ -881,8 +881,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return;
         }
         let channel = {
-            let graph = self.runtime.graph.lock();
-            let channels = graph.ipc_channels.lock();
+            let channels = self.runtime.ipc_channels.lock();
             channels
                 .iter()
                 .find(|(id, _)| *id == channel_id)
@@ -912,15 +911,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
         {
             2_000_000_000
-        }
-    }
-
-    fn pending_signal_count(&self) -> usize {
-        let graph = self.runtime.graph.lock();
-        if let Ok(task) = graph.owner.task(self.key) {
-            task.native().resources().signals.pending_count()
-        } else {
-            0
         }
     }
 
@@ -993,20 +983,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
 
     fn resume_ipc(&mut self, pending: PendingIpc) -> LifecycleOutcome {
-        if self.pending_signal_count() > 0 {
-            if let PendingIpcPayload::Semop {
-                semid,
-                blocking_sem: Some((sem_num, is_zero)),
-                ..
-            } = &pending.payload
-            {
-                let _ = self
-                    .ipc_env()
-                    .map(|(_, _, ipc)| ipc.lock().semop_suspend_exit(*semid, *sem_num, *is_zero));
-            }
-            return returned(carrick_syscall_abi::LINUX_EINTR.guest_retval());
-        }
-
         let is_timed_out = matches!(
             &pending.payload,
             PendingIpcPayload::Semop { timeout_deadline: Some(dl), .. } if self.read_tsc() >= *dl
@@ -1064,7 +1040,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 msgtyp,
                 msgflg,
             } => match self.msgrcv(msqid, msgp, msgtyp, msgflg, msgsz) {
-                Ok((IpcOutcome::Returned(r), Some((mtype, data)))) => {
+                Ok((IpcOutcome::Returned(r), Some((original_idx, mtype, data)))) => {
                     let mtype_bytes = mtype.to_ne_bytes();
                     let ok1 = unsafe {
                         crate::file::copy_to_user_guarded(
@@ -1087,7 +1063,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         true
                     };
                     if !ok1 || !ok2 {
-                        let _ = self.msgrcv_restore(msqid, mtype, data);
+                        let _ = self.msgrcv_restore(msqid, original_idx, mtype, data);
                         returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval())
                     } else {
                         returned(r.raw())
@@ -1206,7 +1182,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .ok()
             .map(|t| t.metadata().namespace_pid);
         if let Some(pid) = pid {
-            let channels = self.runtime.graph.lock().ipc.lock().exit_process(pid);
+            let ipc = self.runtime.graph.lock().ipc.clone();
+            let channels = ipc.lock().exit_process(pid);
             for ch in channels {
                 self.wake_ipc_channel(ch);
             }
@@ -2526,17 +2503,32 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         msgflg: i32,
     ) -> Result<IpcOutcome, i64> {
         let (creds, pid, ipc) = self.ipc_env()?;
+        let mut has_suspended = false;
         loop {
-            let (channel, precheck_gen, outcome, ch_to_wake) = {
+            let ch_id = {
+                let ipc_guard = ipc.lock();
+                let queue = ipc_guard.msg_queue(msqid).map_err(|e| {
+                    if has_suspended && matches!(e, IpcError::InvalidArgument) {
+                        carrick_syscall_abi::LINUX_EIDRM.guest_retval()
+                    } else {
+                        e.guest_retval()
+                    }
+                })?;
+                queue.wait_channel
+            };
+            let channel = self.get_or_create_channel(ch_id);
+            let precheck_gen = channel.generation.generation();
+            let (outcome, ch_to_wake) = {
                 let mut ipc_guard = ipc.lock();
-                let queue = ipc_guard.msg_queue(msqid).map_err(|e| e.guest_retval())?;
-                let ch_id = queue.wait_channel;
-                let channel = self.get_or_create_channel(ch_id);
-                let precheck_gen = channel.generation.generation();
-                let (outcome, ch_to_wake) = ipc_guard
+                ipc_guard
                     .msgsnd(&creds, pid, msqid, mtype, mtext, msgflg)
-                    .map_err(|e| e.guest_retval())?;
-                (channel, precheck_gen, outcome, ch_to_wake)
+                    .map_err(|e| {
+                        if has_suspended && matches!(e, IpcError::InvalidArgument) {
+                            carrick_syscall_abi::LINUX_EIDRM.guest_retval()
+                        } else {
+                            e.guest_retval()
+                        }
+                    })?
             };
             match outcome {
                 MsgsndOutcome::Complete => {
@@ -2544,6 +2536,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
                     return Ok(IpcOutcome::Returned(SyscallResult::new(0)));
                 }
                 MsgsndOutcome::Suspend => {
+                    has_suspended = true;
                     let payload = PendingIpcPayload::Msgsnd {
                         msqid,
                         mtype,
@@ -2568,28 +2561,44 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         msgsz: usize,
     ) -> MsgrcvResult {
         let (creds, pid, ipc) = self.ipc_env()?;
+        let mut has_suspended = false;
         loop {
-            let (channel, precheck_gen, outcome, ch_to_wake) = {
+            let ch_id = {
+                let ipc_guard = ipc.lock();
+                let queue = ipc_guard.msg_queue(msqid).map_err(|e| {
+                    if has_suspended && matches!(e, IpcError::InvalidArgument) {
+                        carrick_syscall_abi::LINUX_EIDRM.guest_retval()
+                    } else {
+                        e.guest_retval()
+                    }
+                })?;
+                queue.wait_channel
+            };
+            let channel = self.get_or_create_channel(ch_id);
+            let precheck_gen = channel.generation.generation();
+            let (outcome, ch_to_wake) = {
                 let mut ipc_guard = ipc.lock();
-                let queue = ipc_guard.msg_queue(msqid).map_err(|e| e.guest_retval())?;
-                let ch_id = queue.wait_channel;
-                let channel = self.get_or_create_channel(ch_id);
-                let precheck_gen = channel.generation.generation();
-                let (outcome, ch_to_wake) = ipc_guard
+                ipc_guard
                     .msgrcv(&creds, pid, msqid, msgsz, msgtyp, msgflg)
-                    .map_err(|e| e.guest_retval())?;
-                (channel, precheck_gen, outcome, ch_to_wake)
+                    .map_err(|e| {
+                        if has_suspended && matches!(e, IpcError::InvalidArgument) {
+                            carrick_syscall_abi::LINUX_EIDRM.guest_retval()
+                        } else {
+                            e.guest_retval()
+                        }
+                    })?
             };
             match outcome {
-                MsgrcvOutcome::Complete(msg) => {
+                MsgrcvOutcome::Complete { msg, original_idx } => {
                     self.wake_ipc_channel(ch_to_wake);
                     let len = msg.data.len();
                     return Ok((
                         IpcOutcome::Returned(SyscallResult::new(len as i64)),
-                        Some((msg.mtype, msg.data)),
+                        Some((original_idx, msg.mtype, msg.data)),
                     ));
                 }
                 MsgrcvOutcome::Suspend => {
+                    has_suspended = true;
                     let payload = PendingIpcPayload::Msgrcv {
                         msqid,
                         msgp,
@@ -2606,11 +2615,20 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         }
     }
 
-    fn msgrcv_restore(&mut self, msqid: i32, mtype: i64, data: Vec<u8>) -> Result<(), i64> {
+    fn msgrcv_restore(
+        &mut self,
+        msqid: i32,
+        original_idx: usize,
+        mtype: i64,
+        data: Vec<u8>,
+    ) -> Result<(), i64> {
         let (_, _, ipc) = self.ipc_env()?;
-        ipc.lock()
-            .msgrcv_restore(msqid, mtype, data)
-            .map_err(|e| e.guest_retval())
+        let ch = ipc
+            .lock()
+            .msgrcv_restore(msqid, original_idx, mtype, data)
+            .map_err(|e| e.guest_retval())?;
+        self.wake_ipc_channel(ch);
+        Ok(())
     }
 
     fn semget(&mut self, key: i32, nsems: i32, semflg: i32) -> Result<i32, i64> {
@@ -2730,33 +2748,46 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             .map(|s| (s.sem_num, s.sem_op, s.sem_flg))
             .collect();
         let deadline_tsc = timeout.map(|d| {
-            let ticks = (d.as_nanos() as u64).saturating_mul(self.tsc_freq()) / 1_000_000_000;
+            let nanos = d.as_nanos();
+            let freq = self.tsc_freq() as u128;
+            let ticks_128 = nanos.saturating_mul(freq) / 1_000_000_000;
+            let ticks = u64::try_from(ticks_128).unwrap_or(u64::MAX);
             self.read_tsc().saturating_add(ticks)
         });
         let mut prev_blocking: Option<(u16, bool)> = None;
+        let mut has_suspended = false;
         loop {
-            if deadline_tsc.is_some_and(|dl| self.read_tsc() >= dl) {
-                if let Some((num, is_zero)) = prev_blocking {
-                    ipc.lock().semop_suspend_exit(semid, num, is_zero);
-                }
-                return Err(carrick_syscall_abi::LINUX_EAGAIN.guest_retval());
-            }
-            let (channel, precheck_gen, outcome, ch_to_wake) = {
+            let ch_id = {
                 let mut ipc_guard = ipc.lock();
                 if let Some((num, is_zero)) = prev_blocking.take() {
                     ipc_guard.semop_suspend_exit(semid, num, is_zero);
                 }
-                let set = ipc_guard.sem_set(semid).map_err(|e| e.guest_retval())?;
-                let ch_id = set.wait_channel;
-                let channel = self.get_or_create_channel(ch_id);
-                let precheck_gen = channel.generation.generation();
+                let set = ipc_guard.sem_set(semid).map_err(|e| {
+                    if has_suspended && matches!(e, IpcError::InvalidArgument) {
+                        carrick_syscall_abi::LINUX_EIDRM.guest_retval()
+                    } else {
+                        e.guest_retval()
+                    }
+                })?;
+                set.wait_channel
+            };
+            let channel = self.get_or_create_channel(ch_id);
+            let precheck_gen = channel.generation.generation();
+            let (outcome, ch_to_wake) = {
+                let mut ipc_guard = ipc.lock();
                 let (outcome, ch_to_wake) = ipc_guard
                     .semop(&creds, pid, semid, &raw_sops)
-                    .map_err(|e| e.guest_retval())?;
+                    .map_err(|e| {
+                        if has_suspended && matches!(e, IpcError::InvalidArgument) {
+                            carrick_syscall_abi::LINUX_EIDRM.guest_retval()
+                        } else {
+                            e.guest_retval()
+                        }
+                    })?;
                 if let SemopOutcome::Suspend { sem_num, is_zero } = outcome {
                     ipc_guard.semop_suspend_enter(semid, sem_num, is_zero);
                 }
-                (channel, precheck_gen, outcome, ch_to_wake)
+                (outcome, ch_to_wake)
             };
             match outcome {
                 SemopOutcome::Complete => {
@@ -2764,6 +2795,11 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
                     return Ok(IpcOutcome::Returned(SyscallResult::new(0)));
                 }
                 SemopOutcome::Suspend { sem_num, is_zero } => {
+                    has_suspended = true;
+                    if deadline_tsc.is_some_and(|dl| self.read_tsc() >= dl) {
+                        ipc.lock().semop_suspend_exit(semid, sem_num, is_zero);
+                        return Err(carrick_syscall_abi::LINUX_EAGAIN.guest_retval());
+                    }
                     prev_blocking = Some((sem_num, is_zero));
                     let payload = PendingIpcPayload::Semop {
                         semid,
@@ -2771,10 +2807,14 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
                         timeout_deadline: deadline_tsc,
                         blocking_sem: Some((sem_num, is_zero)),
                     };
-                    if !self.park_ipc(channel, precheck_gen, payload, deadline_tsc)? {
-                        continue;
+                    match self.park_ipc(channel, precheck_gen, payload, deadline_tsc) {
+                        Ok(true) => return Ok(IpcOutcome::Suspended),
+                        Ok(false) => continue,
+                        Err(e) => {
+                            ipc.lock().semop_suspend_exit(semid, sem_num, is_zero);
+                            return Err(e);
+                        }
                     }
-                    return Ok(IpcOutcome::Suspended);
                 }
             }
         }
@@ -4552,5 +4592,22 @@ mod tests {
         // Calling prlimit64 on truly nonexistent TID 999 still returns ESRCH
         let res_missing = entry.prlimit64(999, 7, None);
         assert_eq!(res_missing, Err(carrick_personality_linux::sysinfo::ESRCH));
+    }
+
+    #[test]
+    fn test_lock_order_graph_and_ipc_never_nested() {
+        // Documented lock order invariant (N1):
+        // Rule: Graph lock and IpcNamespace lock must NEVER be held concurrently.
+        // Specifically:
+        // 1. exit_owned() clones Arc<SpinLock<IpcNamespace>> out of Graph and drops the Graph guard
+        //    before locking IpcNamespace to call exit_process(pid).
+        // 2. msgsnd, msgrcv, and semop acquire IpcNamespace lock without holding Graph lock.
+        //    Furthermore, get_or_create_channel, prune_ipc_channel, and wake_ipc_channel access
+        //    ipc_channels directly on NativeProcessRuntime, so they never acquire Graph lock.
+        // 3. Neither lock may be nested within the other on any execution path.
+        let ipc = Arc::new(SpinLock::new(IpcNamespace::default()));
+        let channels = Arc::new(SpinLock::new(Vec::<(u64, Arc<WaitChannel>)>::new()));
+        let _g = ipc.lock();
+        let _c = channels.lock();
     }
 }

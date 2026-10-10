@@ -369,13 +369,10 @@ fn serve_family<'a, C: EntryContext + 'a>(
     }
     if let Family::Ipc(call) = family {
         let original = pending.original_argument0();
-        let outcome = if let Some(native) = pending.ipc_native() {
-            crate::ipc::invoke(call, native)
-        } else {
-            crate::ipc::IpcOutcome::Returned(SyscallResult::new(
-                carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
-            ))
+        let Some(native) = pending.ipc_native() else {
+            return FamilyCompletion::Forward.into();
         };
+        let outcome = crate::ipc::invoke(call, native);
         let (completion, returned) = match outcome {
             crate::ipc::IpcOutcome::Returned(result) => (
                 FamilyCompletion::Complete(result.raw()),
@@ -413,7 +410,7 @@ fn serve_family<'a, C: EntryContext + 'a>(
         Family::Lifecycle(_) => FamilyCompletion::Forward,
         Family::Identity(_) => FamilyCompletion::Forward,
         Family::Sysinfo(_) => FamilyCompletion::Forward,
-        Family::Ipc(_) => unreachable!("Family::Ipc handled above"),
+        Family::Ipc(_) => FamilyCompletion::Forward,
         Family::Futex => pending.futex(),
         Family::InotifyAdd => pending.inotify_add(),
         Family::InotifyRemove => pending.inotify_remove(),

@@ -518,7 +518,7 @@ fn compare_mounted_binary_with_native(
     run_id: &str,
 ) {
     let native = Command::new(elf)
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(5))
         .output()
         .expect("run native x86 Linux oracle");
     assert_eq!(native.stdout, expected_stdout);
