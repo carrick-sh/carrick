@@ -64,6 +64,7 @@ include!("entry.rs");
 #[cfg(target_os = "none")]
 fn fixture_handled(
     frame: &mut carrick_el1::isa::x86::context::native::NativeFrame,
+    xsave: &mut carrick_el1::isa::x86::context::scheduler::XsaveArea,
     binding: &carrick_el1::isa::x86::context::native::CpuBinding,
     task: &carrick_el1_abi::CurrentTask,
     counters: &carrick_el1_abi::Counters,
@@ -83,6 +84,7 @@ fn fixture_handled(
         let Some(mut lane) = (unsafe {
             crate::lifecycle::acquire(
                 frame,
+                xsave,
                 binding,
                 task,
                 counters,
