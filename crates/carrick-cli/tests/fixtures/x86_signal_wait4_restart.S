@@ -62,8 +62,10 @@ child:
  xor %edi, %edi
  jmp exit
 handler:
+ # A signal can precede the parent's post-fork r13 store.
+ # SA_SIGINFO supplies the actual child sender in either ordering.
+ mov 16(%rsi), %edi
  mov $62, %eax
- mov %r13, %rdi
  mov $12, %esi
  syscall
  ret
@@ -79,7 +81,7 @@ exit:
  ud2
 .data
 .align 8
-action: .quad 0, 0x14000000, 0, 0
+action: .quad 0, 0x14000004, 0, 0
 mask: .quad 0x800
 timeout: .quad 1, 0
 status: .quad 0
