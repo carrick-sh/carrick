@@ -9,6 +9,7 @@ pub mod birth;
 pub mod context;
 pub mod exit;
 pub mod identity_allocator;
+pub mod ipc;
 pub mod registry;
 pub mod wait;
 
