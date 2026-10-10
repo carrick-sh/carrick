@@ -5,8 +5,8 @@
 
 #[path = "common/kvm_pool_fixture.rs"]
 mod kvm_pool_fixture;
-use kvm_pool_fixture::run_pool_fixture;
 use carrick_vmm_kvm::cpl0_boot::PhysicalCrossingFamily;
+use kvm_pool_fixture::run_pool_fixture;
 
 fn tiny_elf(code: &[u8]) -> Vec<u8> {
     let mut bytes = vec![0; 0xb0 + code.len()];
@@ -88,11 +88,14 @@ fn production_cpl0_refuses_non_allowlisted_forwards_with_enosys() {
     let outcome = run_pool_fixture(&elf, 8);
     assert_eq!(outcome.run.exit_code, 42);
     assert_eq!(outcome.physical.initial_execution_witness().unwrap().1, 0);
-    assert_eq!(outcome.physical.physical_crossing_counts().unwrap(), [
-        (PhysicalCrossingFamily::OwnerGrant, 0),
-        (PhysicalCrossingFamily::RootExit, 1),
-        (PhysicalCrossingFamily::RunFailure, 0),
-    ]);
+    assert_eq!(
+        outcome.physical.physical_crossing_counts().unwrap(),
+        [
+            (PhysicalCrossingFamily::OwnerGrant, 0),
+            (PhysicalCrossingFamily::RootExit, 1),
+            (PhysicalCrossingFamily::RunFailure, 0),
+        ]
+    );
     assert_eq!(
         outcome
             .physical
