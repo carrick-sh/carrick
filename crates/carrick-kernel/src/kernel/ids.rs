@@ -94,12 +94,6 @@ impl MmId {
     pub const fn nonzero(self) -> NonZeroU64 {
         self.0
     }
-
-    /// Reify the native owner's retained MM key for its physical inventory.
-    /// The owner already guarantees nonzero identity; this allocates no ID.
-    pub(crate) const fn for_owner_binding(mm: carrick_hal::MmGeneration) -> Self {
-        Self(mm.raw())
-    }
 }
 
 impl LinuxTid {
