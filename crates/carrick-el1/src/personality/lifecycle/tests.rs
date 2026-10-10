@@ -1754,7 +1754,7 @@ fn set_tid_address_cpl0_records_word_and_returns_the_exact_tid() {
             ..Default::default()
         });
         frame.0.x[0] = 0x7000;
-        frame.0.x[8] = carrick_syscall_abi::nr::SET_TID_ADDRESS.raw() as u64;
+        frame.0.x[8] = carrick_syscall_abi::nr::SET_TID_ADDRESS.raw();
         let names = InotifyNameCache::new();
         let route = crate::personality::dispatch::dispatch_syscall_with_native::<
             _,
@@ -1821,7 +1821,7 @@ fn set_tid_address_arm_child_registers_the_word_that_exit_clears_and_wakes() {
     ));
     frame.slot = SLOT_IDX as u64;
     frame.x[0] = addr(&*word);
-    frame.x[8] = carrick_syscall_abi::nr::SET_TID_ADDRESS.raw() as u64;
+    frame.x[8] = carrick_syscall_abi::nr::SET_TID_ADDRESS.raw();
     let names = InotifyNameCache::new();
     let route = crate::personality::dispatch::dispatch_syscall_with_native(
         &mut frame,
@@ -2231,7 +2231,6 @@ fn birth_record_refusal_retains_the_claim_for_rollback() {
         claim.is_some(),
         "record_born refusal lost the consumed claim"
     );
-    drop(native);
     assert_eq!(w.page().unclaim(claim.take().unwrap()), Ok(entry));
     assert_eq!(w.page().claimed_count(), 0);
     assert_eq!(w.zone.slot(SLOT).queued(), 0);

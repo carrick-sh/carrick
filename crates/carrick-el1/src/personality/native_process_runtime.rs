@@ -3931,7 +3931,7 @@ mod tests {
         let t = graph.owner.task(key).unwrap();
         // The list must stay bounded to just the leader thread.
         assert_eq!(t.threads.threads.len(), 1);
-        assert_eq!(t.has_thread(1050), false);
+        assert!(!t.has_thread(1050));
     }
 
     #[test]
@@ -4143,16 +4143,16 @@ mod tests {
 
         // capset on another thread (leader 41) must fail with EPERM
         assert_eq!(
-            entry.capset(41, caps.clone()),
+            entry.capset(41, caps),
             Err(carrick_personality_linux::identity::EPERM)
         );
         // capset on negative pid must fail with EPERM
         assert_eq!(
-            entry.capset(-1, caps.clone()),
+            entry.capset(-1, caps),
             Err(carrick_personality_linux::identity::EPERM)
         );
         // capset on own tid 42 and pid 0 must succeed
-        assert_eq!(entry.capset(42, caps.clone()), Ok(()));
+        assert_eq!(entry.capset(42, caps), Ok(()));
         assert_eq!(entry.capset(0, caps), Ok(()));
     }
 
@@ -4552,7 +4552,7 @@ mod tests {
         frame.x[0] = 987;
         frame.x[1] = &mut head as *mut u64 as u64;
         frame.x[2] = &mut len as *mut u64 as u64;
-        frame.x[8] = carrick_syscall_abi::nr::GET_ROBUST_LIST.raw() as u64;
+        frame.x[8] = carrick_syscall_abi::nr::GET_ROBUST_LIST.raw();
         let names = carrick_el1_abi::InotifyNameCache::new();
         let mut copy = HostCopy;
         let mut pending: super::super::dispatch::El1PendingFamilies<
@@ -4583,7 +4583,7 @@ mod tests {
         };
         assert_eq!(
             carrick_personality_linux::dispatch::dispatch(
-                carrick_syscall_abi::nr::GET_ROBUST_LIST.raw() as u64,
+                carrick_syscall_abi::nr::GET_ROBUST_LIST.raw(),
                 u64::MAX,
                 &mut pending
             ),
