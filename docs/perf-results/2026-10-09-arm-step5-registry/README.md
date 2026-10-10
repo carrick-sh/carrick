@@ -181,3 +181,67 @@ The full-width flags decoder test is red before the new ring records.
 VM-free checks: 324 EL1, 133 ABI, 189 scheduler-core tests and the focused
 kernel flags test pass. Signed confirmation, exact forwarded flags and the
 el1_ baseline comparison remain open. No batch was run on the failed artifact.
+
+## 2026-10-10: exact native grant survives, handback routing drops custody
+
+On 0d6e003a53405b7a85657f2ce2d333efe066c1fb, the published bundle SHA256
+`1d4a68ea3a154af89d37684bbf7d26d80de9a1792e7170f3777adfa839c98069`
+restored 1,135 verified executables. Runs `arm-step5-sol2-0d6e-fork-a` and
+`arm-step5-sol2-0d6e-fork-b` both hit the unchanged 120-second watchdog.
+Both report ChildEntered 0, admission stage 0, six process refusals all zero,
+native fork failure 0, refused[134] 0, clone served 4 / forwarded 1, and
+progress `[1,1,1,1,1,1,0,1,0,0,0]`. Both entitlement controls pass, and both
+scoped cleanups report zero survivors. No el1_ batch prerequisite was met.
+
+Retained signed binaries, coherent kernel JSON, carrier all-thread
+backtraces, rings, and modified-memory cores: `target/arm-step5-sol2/0d6e-a`
+and `0d6e-b`. LLDB paused already-stalled carriers; these are diagnostic
+samples, not unperturbed timing measurements. Rings contain respectively
+219 / 212 events with zero decode errors.
+
+- A SHA256 `4279237511c799187f74d7039206eb6b19c74b5a2a6a6861fbb5bdfa101956a9`,
+  CDHash `36ac2b27392f558ebd1a32d46ae7642255921ff6`.
+- B SHA256 `f147d6bc5394b81bcbea6288944cd5f0eac4e5fc189e1e49f3b7746c7ddb0452`,
+  CDHash `59b3ea9cb151be2f1a3a7900cc9cd5888267efb4`.
+
+Both rings have exactly one HOSTCLONE at event 65, caller task 1 / TID 1,
+flags event 66 `0x00000000007d0f00`, CLONESPAWN event 67 child TID 2.
+Flags: VM, FS, FILES, SIGHAND, THREAD, SYSVSEM, SETTLS, PARENT_SETTID,
+CHILD_CLEARTID, DETACHED; CSIGNAL zero. It is the parent's writer thread,
+subsequently executing in MM 2, after the fixture's libc fork. It is not
+the native child in MM 9. This flag set is accepted by the thread-clone
+mask; telemetry does not identify which other thread admission prerequisite
+caused its host crossing. Ring positions are ordering evidence, not a
+wall-clock timestamp.
+
+Offline reads in both cores agree: native record 2, claim 65540
+(`Host { seq: 1 }`), incarnation 1, TID 2, serial 8, MM 9, generation 7,
+handback Resumed, last_seq 1, last_slot 0, host_wanted 0, and execution grant
+1. Run B additionally proves cancelled 0, entries 0 and home 0. Thus the
+exact grant reached the record. The prior missing-grant explanation is
+insufficient. Some stopped-slot evacuation handed it to the host, but the
+ring does not identify which transfer producer or an SGI publication.
+
+Both ISAs use `NativeProcessEntry::fork_owned`: commit publishes the owned
+MM, registration grants exact guest execution, and `requeue_preempted`
+publishes `ZoneRecord.claim` Free -> Queued. `switch_in_full` changes Queued
+-> OnCpu. x86 `Service::commit_mm` and ARM `Service::commit_mm` both call
+`UnpublishedEl1Child::commit`; KVM `settle_fork_stock` settles physical frame
+custody, not a host scheduler child. There is no x86 host-owned zone record
+transition at fork commit to copy to ARM.
+
+The ARM carrier's handback router only recognized unadopted births
+(generation zero). This native child has generation 7; it falls through
+to host continuation lookup, where no exact native child row exists.
+Extend that existing route to an incarnation-authenticated native execution
+grant when no host service is required. Keep cancelled records and host
+service requests on their existing paths.
+
+Red-first witnesses: the actual registered/rehome fork test evacuates the
+new child's queue and fails `native fork child must bypass host continuation
+lookup`; the carrier router test fails `native fork has no host continuation`.
+After routing correction, the first returns the child to Queued, migrates
+to an idle target, switches OnCpu and admits it, retaining the negative
+visible-pid control. The second exercises actual carrier handback routing
+while no guest slot is available, preserving queue custody until entry.
+Signed confirmation and the thread-clone crossing remain open.

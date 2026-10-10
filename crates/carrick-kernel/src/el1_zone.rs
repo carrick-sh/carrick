@@ -798,21 +798,21 @@ fn publish_handback_in_zone(
     zone.counters
         .host_handbacks
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if route_first_entry_in_zone(zone, record) {
+    if route_guest_custody_in_zone(zone, record) {
         return;
     }
     publish(record);
 }
 
-/// An uninitialized Born thread has reserved activation capacity, but no
-/// continuation to wake. Keep its exact record on an executor service queue.
-pub(crate) fn route_first_entry_handback(record: RecordRef) -> bool {
-    zone_tables().is_some_and(|zone| route_first_entry_in_zone(zone, record))
+/// A Born thread or a native-owned runnable child has no host continuation
+/// to wake. Keep its exact record on a guest scheduler queue.
+pub(crate) fn route_guest_custody_handback(record: RecordRef) -> bool {
+    zone_tables().is_some_and(|zone| route_guest_custody_in_zone(zone, record))
 }
 
-fn route_first_entry_in_zone(zone: &ZoneTables, record: RecordRef) -> bool {
+fn route_guest_custody_in_zone(zone: &ZoneTables, record: RecordRef) -> bool {
     let Some(rec) = zone.live(record).filter(|rec| {
-        rec.is_unadopted_birth()
+        rec.requires_guest_handback()
             && !rec.is_cancelled()
             && matches!(rec.claim(), carrick_el1_abi::Claim::Host { .. })
     }) else {
@@ -1419,6 +1419,42 @@ mod tests {
             zone.live(replacement).unwrap().claim(),
             Claim::Parked { seq }
         );
+    }
+
+    #[test]
+    fn native_fork_handback_keeps_guest_custody_without_host_continuation() {
+        let zone = heap_zone();
+        let slot = SlotId::new(0);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 0, Some(0), 0);
+        let space = zone.spaces.publish_closed(9, 0x9000, 0).unwrap();
+        zone.spaces.open(space);
+        let id = zone
+            .alloc_record(ThreadIdentity {
+                mm: 9,
+                generation: 7,
+                affinity: 1,
+                ..identity(2)
+            })
+            .unwrap();
+        let record = zone.record_ref(id);
+        assert!(zone.authorize_guest_execution(record));
+        zone.requeue_preempted(slot, id);
+        let mut handed = Vec::new();
+        zone.drain_slot(slot, &mut |record, discard| {
+            assert!(!discard);
+            handed.push(record);
+        });
+        assert_eq!(handed, vec![record]);
+        let mut published = Vec::new();
+        publish_handback_in_zone(&zone, record, &mut |record| published.push(record));
+        assert!(published.is_empty(), "native fork has no host continuation");
+        assert!(
+            matches!(zone.record(id).claim(), Claim::Queued { slot: owner, .. } if owner == slot)
+        );
+        zone.enter_guest(slot);
+        assert_eq!(zone.switch_in_full(slot).unwrap().record, id);
+        assert!(matches!(zone.record(id).claim(), Claim::OnCpu { .. }));
     }
 
     #[test]
