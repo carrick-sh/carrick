@@ -4,6 +4,25 @@ use crate::trap::TrapError;
 use carrick_hal::threaded::GuestCpuState;
 use carrick_kernel::kernel::objects::ExecutorId;
 
+/// The task whose lease may consume a zone record. The record incarnation
+/// alone proves liveness, not that it belongs to the loading task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ZoneTaskIdentity {
+    pub tid: u64,
+    pub serial: u64,
+    pub mm: u64,
+    pub generation: u64,
+}
+
+impl ZoneTaskIdentity {
+    fn matches(self, record: carrick_el1_abi::ThreadIdentity) -> bool {
+        self.tid == record.tid
+            && self.serial == record.serial
+            && self.mm == record.mm
+            && self.generation == record.generation
+    }
+}
+
 /// Typed residency generation counter for a persistent executor vCPU.
 ///
 /// Bumping this generation invalidates any previous resident tokens held by
@@ -49,6 +68,7 @@ pub enum TaskCpuResidency {
     Zone {
         base: GuestCpuState,
         record: carrick_el1_abi::RecordRef,
+        owner: ZoneTaskIdentity,
     },
 }
 
@@ -88,8 +108,13 @@ impl TaskCpuResidency {
         &mut self,
         materialize: impl FnOnce(ExecutorId, ResidencyGeneration) -> Result<GuestCpuState, TrapError>,
     ) -> Result<&GuestCpuState, TrapError> {
-        if let Self::Zone { base, record } = self {
-            let cpu = materialize_zone(base, *record)?;
+        if let Self::Zone {
+            base,
+            record,
+            owner,
+        } = self
+        {
+            let cpu = materialize_zone(base, *record, *owner)?;
             *self = Self::Materialized(cpu);
         }
         match self {
@@ -117,16 +142,18 @@ impl TaskCpuResidency {
 pub(crate) fn materialize_zone(
     base: &GuestCpuState,
     record: carrick_el1_abi::RecordRef,
+    owner: ZoneTaskIdentity,
 ) -> Result<GuestCpuState, TrapError> {
     let zone = carrick_el1_abi::zone_tables()
         .ok_or_else(|| TrapError::Hypervisor("zone residency without zone tables".to_owned()))?;
-    materialize_zone_in(zone, base, record)
+    materialize_zone_in(zone, base, record, owner)
 }
 
 fn materialize_zone_in(
     zone: &carrick_el1_abi::ZoneTables,
     base: &GuestCpuState,
     record: carrick_el1_abi::RecordRef,
+    owner: ZoneTaskIdentity,
 ) -> Result<GuestCpuState, TrapError> {
     let GuestCpuState::Aarch64V1(base) = base else {
         return Err(TrapError::Hypervisor(
@@ -148,6 +175,12 @@ fn materialize_zone_in(
             rec.claim()
         )));
     }
+    if !owner.matches(rec.identity()) {
+        return Err(TrapError::Hypervisor(format!(
+            "zone record {record:?} belongs to {:?}, not task {owner:?}",
+            rec.identity()
+        )));
+    }
     if rec.object_host_continuation() {
         if !rec.has_object_operation() || base.syscall_continuation.is_none() {
             return Err(TrapError::Hypervisor(
@@ -166,8 +199,10 @@ fn materialize_zone_in(
     let ctx = parked.native;
     let mut state = (**base).clone();
     state.gprs = ctx.x;
-    state.ttbr0 = parked.root();
-    state.ttbr1 = parked.root();
+    // The task's stage-1 lease produced `base`; a parked context can carry
+    // the maintenance TTBR after an EL1 handback and cannot replace it.
+    state.ttbr0 = base.ttbr0;
+    state.ttbr1 = base.ttbr1;
     state.pc = ctx.pc;
     state.pstate = ctx.pstate;
     state.trap_pc = ctx.pc;
@@ -215,6 +250,8 @@ mod tests {
             panic!("AArch64 fixture");
         };
         let mut cpu = (*cpu).clone();
+        cpu.ttbr0 = 0x1_1234_5000;
+        cpu.ttbr1 = 0x1_1234_5000;
         cpu.trap_pc = 0x8000;
         cpu.trap_pstate = 0x3c5;
         cpu.pending_resume_pc = Some(0x4004);
@@ -240,6 +277,16 @@ mod tests {
             resume_x17: 0x1717,
         });
         GuestCpuState::from_aarch64_v1(cpu)
+    }
+
+    fn owner(zone: &ZoneTables, record: RecordRef) -> ZoneTaskIdentity {
+        let identity = zone.record(record.id).identity();
+        ZoneTaskIdentity {
+            tid: identity.tid,
+            serial: identity.serial,
+            mm: identity.mm,
+            generation: identity.generation,
+        }
     }
 
     #[test]
@@ -306,10 +353,26 @@ mod tests {
                 }
                 .unwrap();
             }
-            assert!(materialize_zone_in(&zone, &saved, reference).is_err());
+            let expected = owner(&zone, reference);
+            assert!(materialize_zone_in(&zone, &saved, reference, expected).is_err());
             source.publish(Waker::Host, &complete);
             assert_eq!(delivered.borrow_mut().pop(), Some(reference));
-            saved = materialize_zone_in(&zone, &saved, reference).unwrap();
+            let foreign = ZoneTaskIdentity {
+                serial: expected.serial + 1,
+                ..expected
+            };
+            assert!(materialize_zone_in(&zone, &saved, reference, foreign).is_err());
+            let foreign_mm = ZoneTaskIdentity {
+                mm: expected.mm + 1,
+                ..expected
+            };
+            assert!(materialize_zone_in(&zone, &saved, reference, foreign_mm).is_err());
+            let stale_generation = ZoneTaskIdentity {
+                generation: expected.generation + 1,
+                ..expected
+            };
+            assert!(materialize_zone_in(&zone, &saved, reference, stale_generation).is_err());
+            saved = materialize_zone_in(&zone, &saved, reference, expected).unwrap();
             let GuestCpuState::Aarch64V1(cpu) = &saved else {
                 panic!("AArch64 restore");
             };
@@ -327,6 +390,8 @@ mod tests {
                 );
             } else {
                 assert!(cpu.syscall_continuation.is_none());
+                assert_eq!(cpu.ttbr0, 0x1_1234_5000, "the task lease owns the root");
+                assert_eq!(cpu.ttbr1, 0x1_1234_5000);
                 assert!(cpu.pending_resume_pc.is_none());
                 assert!(cpu.last_syscall_nr.is_none());
                 assert_eq!((cpu.trap_pc, cpu.trap_pstate), (ctx.pc, ctx.pstate));
@@ -344,7 +409,7 @@ mod tests {
             // SAFETY: the same host owns the record; consuming is one-shot.
             assert!(unsafe { rec.take_object_operation() }.is_none());
             zone.free_record(record);
-            assert!(materialize_zone_in(&zone, &saved, reference).is_err());
+            assert!(materialize_zone_in(&zone, &saved, reference, expected).is_err());
             retired = Some(reference);
         }
         (zone, retired.unwrap())
@@ -414,7 +479,7 @@ mod tests {
             transfers.pop().unwrap().finish(&BoundedSpin(0)),
             Some(reference)
         );
-        let restored = materialize_zone_in(&zone, &saved, reference)
+        let restored = materialize_zone_in(&zone, &saved, reference, owner(&zone, reference))
             .expect("a completed futex must not inherit a previous owner's continuation");
         let GuestCpuState::Aarch64V1(cpu) = restored else {
             panic!("AArch64 fixture");
@@ -567,7 +632,8 @@ mod tests {
                 carrick_abi::SigSet::EMPTY,
             );
             source.publish(Waker::Host, &complete);
-            let restored = materialize_zone_in(&zone, &saved, reference).unwrap();
+            let restored =
+                materialize_zone_in(&zone, &saved, reference, owner(&zone, reference)).unwrap();
             assert_eq!(restored, saved);
             let mut result = continuation
                 .resume(ContinuationEvent::ReservedSignal(reserved), &context)
