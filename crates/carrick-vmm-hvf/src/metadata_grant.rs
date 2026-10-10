@@ -35,7 +35,10 @@ pub(crate) fn live_fork_execution(
         ttbr0,
         zone.slot(slot).mm(),
         zone.record(record).identity(),
-        zone.record_ref(record).incarnation,
+        // SAFETY: this synchronous crossing stops the exact CPU that owns
+        // this slot's current/host record; its parked address identity stays
+        // retained until this crossing returns to that CPU.
+        unsafe { zone.record(record).ctx_mut() },
     )
 }
 
@@ -44,7 +47,7 @@ fn fork_execution_from_snapshot(
     ttbr0: u64,
     installed_mm: u64,
     identity: carrick_sched_core::ThreadIdentity,
-    incarnation: u64,
+    parked: &carrick_sched_core::Aarch64ParkedContext,
 ) -> Option<crate::fork_stock::GrantExecution> {
     use carrick_core_abi::{
         EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
@@ -52,7 +55,12 @@ fn fork_execution_from_snapshot(
     use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
     use std::num::NonZeroU64;
 
-    if identity.tid == 0 || identity.mm == 0 || installed_mm != identity.mm {
+    if identity.tid == 0
+        || identity.mm == 0
+        || installed_mm != identity.mm
+        || parked.mm() != identity.mm
+        || parked.root() != ttbr0
+    {
         return None;
     }
     let root = RootGpa::page_aligned(FrameGpa::new(
@@ -61,7 +69,7 @@ fn fork_execution_from_snapshot(
     let context = AddressContext {
         root,
         mm: MmGeneration::new(NonZeroU64::new(identity.mm)?),
-        generation: ContextGeneration::new(NonZeroU64::new(incarnation)?),
+        generation: ContextGeneration::new(NonZeroU64::new(parked.generation())?),
     };
     let binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(identity.tid),
@@ -1473,18 +1481,50 @@ mod tests {
             identity.mm,
             3,
         );
-        let execution = fork_execution_from_snapshot(cpu, parked.root(), 2, identity, 3)
+        let execution = fork_execution_from_snapshot(cpu, parked.root(), 2, identity, &parked)
             .expect("live crossing");
         assert_eq!(parked.root(), tagged_root);
         assert_eq!(execution.context.root.address().raw(), physical_root);
         assert_eq!(execution.context.mm.raw().get(), 2);
         assert_eq!(execution.context.generation.raw().get(), 3);
         assert_eq!(execution.binding.thread_generation.raw(), identity.serial);
-        assert!(fork_execution_from_snapshot(cpu, tagged_root, 9, identity, 3).is_none());
+        assert!(fork_execution_from_snapshot(cpu, tagged_root, 9, identity, &parked).is_none());
         let foreign_root = tagged_root + 0x1000;
-        let foreign = fork_execution_from_snapshot(cpu, foreign_root, 2, identity, 3)
-            .expect("different live root still creates a typed context");
-        assert_ne!(foreign.context, execution.context);
+        assert!(fork_execution_from_snapshot(cpu, foreign_root, 2, identity, &parked).is_none());
+    }
+
+    #[test]
+    fn fork_crossing_keeps_address_generation_separate_from_record_incarnation() {
+        let identity = carrick_sched_core::ThreadIdentity {
+            tid: 42,
+            serial: 13,
+            mm: 9,
+            file_table: 1,
+            generation: 11,
+            affinity: 0,
+            lifecycle_page: 1,
+            control_slot: 1,
+        };
+        let parked = carrick_sched_core::Aarch64ParkedContext::from_register(
+            carrick_sched_core::ThreadCtx::ZERO,
+            (2_u64 << 48) | 0x800000,
+            9,
+            7,
+        );
+        let execution = fork_execution_from_snapshot(
+            carrick_guest_arch::CpuId::new(2),
+            parked.root(),
+            9,
+            identity,
+            &parked,
+        )
+        .expect("child crossing");
+        assert_eq!(
+            execution.context.generation.raw().get(),
+            parked.generation()
+        );
+        assert_eq!(execution.binding.generation.raw(), 11);
+        assert_eq!(execution.binding.thread_generation.raw(), 13);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
