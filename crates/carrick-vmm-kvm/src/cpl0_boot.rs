@@ -92,12 +92,54 @@ const IMAGE_VA: u64 = carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_BASE;
 const IMAGE_SIZE: u64 = carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_SIZE;
 const IMAGE_GPA: u64 = carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_GPA;
 const METADATA_VA: u64 = X86_CPL0_DYNAMIC_METADATA_BASE;
+// Fork lifecycle stock: each 16 KiB slot holds a lifecycle page and, 4 KiB
+// above it, the thread control slots. More records than CPUs keep a parent's
+// fork from racing a reaped child that has not yet left its slot.
+const FORK_LIFECYCLE_OFFSET: u64 = 0x8_8000;
+const FORK_LIFECYCLE_STRIDE: u64 = carrick_hal::fork_stock::LIFECYCLE_SLOT_STRIDE;
+const FORK_LIFECYCLE_SLOTS: u64 = 8;
+const _: () = {
+    assert!(
+        carrick_el1_abi::X86_CPL0_RESERVATIONS_OFFSET + size_of::<X86Cpl0Reservations>() as u64
+            <= FORK_LIFECYCLE_OFFSET
+    );
+    assert!(FORK_LIFECYCLE_OFFSET.is_multiple_of(0x4000));
+    assert!(
+        carrick_hal::fork_stock::LIFECYCLE_CONTROLS_OFFSET
+            + (carrick_el1_abi::THREAD_POOL_ENTRIES as u64 + 1)
+                * size_of::<ThreadControlSlot>() as u64
+            <= FORK_LIFECYCLE_STRIDE
+    );
+    assert!(
+        size_of::<ThreadLifecyclePage>() as u64
+            <= carrick_hal::fork_stock::LIFECYCLE_CONTROLS_OFFSET
+    );
+    assert!(FORK_LIFECYCLE_OFFSET + FORK_LIFECYCLE_SLOTS * FORK_LIFECYCLE_STRIDE <= META_LEN);
+};
 pub const USER_CODE: u64 = 0x1_0000;
 pub(crate) use carrick_x86::cpl0_entry::DIRECT_VA;
 // Startup stocks one initial MM and its first fork child's private COW branch.
 // Later population admission remains bounded by actual available table grants.
 const fn initial_copy_branch_table_credits() -> usize {
     2 * carrick_mmu_core::x86::copy_window::COW_COPY_TABLE_PAGES
+}
+/// The carrier's maintenance root is one dedicated initial table grant. It
+/// is counted on top of the copy-branch credits so taking it never shrinks
+/// the fork table stock the first fork was sized against.
+pub(crate) const MAINTENANCE_ROOT_TABLE_CREDITS: usize = 1;
+const fn initial_carrier_table_credits() -> usize {
+    initial_copy_branch_table_credits() + MAINTENANCE_ROOT_TABLE_CREDITS
+}
+/// Initial table grants for `data_pages` user pages: the initial MM's worst
+/// case (three tables per page plus its root) and the carrier credits.
+pub(crate) const fn initial_table_grant_count(data_pages: usize) -> Option<usize> {
+    let Some(tables) = data_pages.checked_mul(3) else {
+        return None;
+    };
+    let Some(tables) = tables.checked_add(1) else {
+        return None;
+    };
+    tables.checked_add(initial_carrier_table_credits())
 }
 
 /// Fixed physical base of the initial GDT (0x50_0000), immediately following the
@@ -128,6 +170,13 @@ const _: () = {
     assert!(LAYOUT.pml4_base + carrick_x86::X86_PML4_CAPACITY as u64 <= META_GPA);
 };
 const _: () = assert!(FIXTURE_PML4_CAPACITY == carrick_x86::X86_PML4_CAPACITY);
+
+/// Guest-physical address of initial frame grant `index`: grants follow
+/// the staged boot records, page aligned, inside the initial extent. The
+/// first unused table grant becomes the carrier's maintenance root.
+pub(crate) fn initial_grant_gpa(frame_offset: usize, index: usize) -> FrameGpa {
+    FrameGpa::new(INITIAL_EXTENT_GPA + (frame_offset + index * 4096) as u64)
+}
 
 fn fail(message: impl Into<String>) -> TrapError {
     TrapError::Hypervisor(message.into())
@@ -257,6 +306,7 @@ impl PhysicalProcessExit {
 pub enum PhysicalCrossingFamily {
     OwnerGrant,
     RootExit,
+    ChildRetire,
     RunFailure,
 }
 impl PhysicalCrossingFamily {
@@ -264,6 +314,7 @@ impl PhysicalCrossingFamily {
         match self {
             Self::OwnerGrant => "owner_grant",
             Self::RootExit => "root_exit",
+            Self::ChildRetire => "child_retire",
             Self::RunFailure => "run_failure",
         }
     }
@@ -979,6 +1030,22 @@ fn admit_forward_execution(
 }
 
 #[cfg(test)]
+mod design_doc_tests {
+    /// The design doc's x86 live-children limit is this stock's layout.
+    #[test]
+    fn design_doc_names_the_kvm_lifecycle_record_count_and_offset() {
+        let doc = include_str!("../../../docs/design/arm-fork-stock-crossing.md");
+        let text = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+        let claim = format!(
+            "x86 CPL0 has **{} records** at metadata offset `{:#x}`",
+            super::FORK_LIFECYCLE_SLOTS,
+            super::FORK_LIFECYCLE_OFFSET,
+        );
+        assert!(text.contains(&claim), "doc must say: {claim}");
+    }
+}
+
+#[cfg(test)]
 mod forward_execution_tests {
     use super::*;
 
@@ -1327,6 +1394,14 @@ impl ProductionCpuLease {
                     custody.service_fork_stock(&lease)?;
                     Ok(None)
                 }
+                carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT => {
+                    custody.child_retire_crossings = custody
+                        .child_retire_crossings
+                        .checked_add(1)
+                        .ok_or_else(|| fail("physical crossing counter exhausted"))?;
+                    custody.service_child_retire(&lease)?;
+                    Ok(None)
+                }
                 carrick_el1_abi::NATIVE_RUN_FAILURE_PORT => {
                     let reason = custody.service_run_failure(&lease)?;
                     custody.run_failure_crossings = custody
@@ -1518,6 +1593,14 @@ impl ProductionCpuLease {
                     custody.service_fork_stock(&lease)?;
                     Ok(None)
                 }
+                carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT => {
+                    custody.child_retire_crossings = custody
+                        .child_retire_crossings
+                        .checked_add(1)
+                        .ok_or_else(|| fail("physical crossing counter exhausted"))?;
+                    custody.service_child_retire(&lease)?;
+                    Ok(None)
+                }
                 carrick_el1_abi::NATIVE_RUN_FAILURE_PORT => {
                     let reason = custody.service_run_failure(&lease)?;
                     custody.run_failure_crossings = custody.run_failure_crossings
@@ -1680,7 +1763,7 @@ impl ProductionCpuFactory {
 
     pub fn physical_crossing_counts(
         &self,
-    ) -> Result<[(PhysicalCrossingFamily, u64); 3], TrapError> {
+    ) -> Result<[(PhysicalCrossingFamily, u64); 4], TrapError> {
         let custody = self
             .custody
             .lock()
@@ -1695,10 +1778,24 @@ impl ProductionCpuFactory {
                 custody.root_exit_crossings,
             ),
             (
+                PhysicalCrossingFamily::ChildRetire,
+                custody.child_retire_crossings,
+            ),
+            (
                 PhysicalCrossingFamily::RunFailure,
                 custody.run_failure_crossings,
             ),
         ])
+    }
+
+    pub fn fork_stock_counters(
+        &self,
+    ) -> Result<carrick_hal::fork_stock::ForkStockCounters, TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        Ok(custody.fork_stock_counters())
     }
 
     pub fn claim(&self, slot: usize) -> Result<ProductionCpuLease, TrapError> {
@@ -1783,15 +1880,14 @@ pub(crate) struct Cpl0HostCustody {
     peer_entry: Option<carrick_guest_arch::KernelVa>,
     peer_admission: InitialPeerAdmission,
     initial_task: Option<InitialTaskBinding>,
-    grant_tables: Vec<RootGpa>,
     prepare_table_stock: Option<anonymous_owner::PrepareTableStock>,
-    fork_pending: [Option<anonymous_owner::PendingForkLoan>; 2],
-    fork_next_loan: u64,
-    fork_lifecycle_available: bool,
+    /// The ISA-neutral fork stock, loans and child quarantine.
+    fork_stock: carrick_hal::fork_stock::ForkStock<carrick_hal::fork_stock::UntaggedRoots>,
     anonymous_next_gpa: FrameGpa,
     anonymous_pending: [Option<anonymous_owner::PendingGrant>; 2],
     owner_grant_crossings: u64,
     root_exit_crossings: u64,
+    child_retire_crossings: u64,
     run_failure_crossings: u64,
     metadata_base: RetainedMetadataPtr,
     host_forwards: u64,
@@ -1950,10 +2046,7 @@ impl Cpl0Carrier {
         let user_pages = image_pages
             .checked_add(initial_stack_pages(image, argv, env)?)
             .ok_or_else(|| fail("initial user pages"))?;
-        let table_pages = user_pages
-            .checked_mul(3)
-            .and_then(|n| n.checked_add(1))
-            .and_then(|n| n.checked_add(initial_copy_branch_table_credits()))
+        let table_pages = initial_table_grant_count(user_pages)
             .ok_or_else(|| fail("initial table grant count"))?;
         let grants = table_pages
             .checked_add(user_pages)
@@ -2469,11 +2562,8 @@ impl Cpl0Carrier {
         let data_grants = image_pages
             .checked_add(initial_stack_pages(image, argv, env)?)
             .ok_or_else(|| fail("initial data grants"))?;
-        let table_grants = data_grants
-            .checked_mul(3)
-            .and_then(|n| n.checked_add(1))
-            .and_then(|n| n.checked_add(initial_copy_branch_table_credits()))
-            .ok_or_else(|| fail("initial table grants"))?;
+        let table_grants =
+            initial_table_grant_count(data_grants).ok_or_else(|| fail("initial table grants"))?;
         let grant_count = table_grants
             .checked_add(data_grants)
             .ok_or_else(|| fail("initial grants"))?;
@@ -2529,9 +2619,7 @@ impl Cpl0Carrier {
             .ok_or_else(|| fail("initial records/grants overlap Prepare working stock"))?;
         let (mut inventory, grants) = InitialInventory::stage(
             Arc::clone(&self.custody.frame_inventory),
-            (0..grant_count).map(|index| {
-                FrameGpa::new(INITIAL_EXTENT_GPA + (frame_offset + index * 4096) as u64)
-            }),
+            (0..grant_count).map(|index| initial_grant_gpa(frame_offset, index)),
             table_grants,
             4096,
             NonZeroU64::MIN,
@@ -2895,15 +2983,16 @@ impl Cpl0Carrier {
             )?;
             inventory.finish()?;
             self.custody.bind_grant_portal()?;
-            for grant in grants
+            let unused = grants
                 .get(reply.result_table_used as usize..table_grants)
                 .ok_or_else(|| fail("initial unused table grants"))?
-            {
-                self.custody.grant_tables.push(
+                .iter()
+                .map(|grant| {
                     RootGpa::page_aligned(FrameGpa::new(grant.gpa))
-                        .ok_or_else(|| fail("initial unused table alignment"))?,
-                );
-            }
+                        .ok_or_else(|| fail("initial unused table alignment"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.custody.install_fork_stock(root, unused)?;
             let stock_bytes = self
                 .custody
                 ._vm
@@ -3168,7 +3257,13 @@ impl Cpl0Carrier {
         self.custody.private_anonymous_witness.private_pages()
     }
 
-    pub fn physical_crossing_counts(&self) -> [(PhysicalCrossingFamily, u64); 3] {
+    /// Shared fork-stock counters: loans, counted capacity refusals (each
+    /// lowered to `EAGAIN` by the guest), quarantined and returned children.
+    pub fn fork_stock_counters(&self) -> carrick_hal::fork_stock::ForkStockCounters {
+        self.custody.fork_stock_counters()
+    }
+
+    pub fn physical_crossing_counts(&self) -> [(PhysicalCrossingFamily, u64); 4] {
         [
             (
                 PhysicalCrossingFamily::OwnerGrant,
@@ -3177,6 +3272,10 @@ impl Cpl0Carrier {
             (
                 PhysicalCrossingFamily::RootExit,
                 self.custody.root_exit_crossings,
+            ),
+            (
+                PhysicalCrossingFamily::ChildRetire,
+                self.custody.child_retire_crossings,
             ),
             (
                 PhysicalCrossingFamily::RunFailure,
@@ -3877,6 +3976,11 @@ impl Cpl0Carrier {
             )
             .ok_or_else(|| fail("null metadata backing"))?,
         );
+        let fork_stock = carrick_hal::fork_stock::ForkStock::new(
+            vm.identity().nonzero(),
+            KERNEL_REGION_GPA,
+            carrick_hal::fork_stock::UntaggedRoots,
+        );
         Ok(Self {
             cpus: [a, b],
             custody: Cpl0HostCustody {
@@ -3893,15 +3997,13 @@ impl Cpl0Carrier {
                 peer_entry: None,
                 peer_admission: InitialPeerAdmission::Cold,
                 initial_task: None,
-                grant_tables: Vec::new(),
                 prepare_table_stock: None,
-                fork_pending: std::array::from_fn(|_| None),
-                fork_next_loan: 1,
-                fork_lifecycle_available: true,
+                fork_stock,
                 anonymous_next_gpa: FrameGpa::new(0x2_0000_0000),
                 anonymous_pending: [None, None],
                 owner_grant_crossings: 0,
                 root_exit_crossings: 0,
+                child_retire_crossings: 0,
                 run_failure_crossings: 0,
                 metadata_base,
                 host_forwards: 0,
