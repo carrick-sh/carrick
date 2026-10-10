@@ -3601,6 +3601,17 @@ mod tests {
     }
     #[test]
     fn signal_wait_owns_context_and_shared_deadline() {
+        signal_wait_contract(false, false);
+    }
+    #[test]
+    fn pending_default_stop_does_not_interrupt_sigtimedwait_or_sigsuspend() {
+        signal_wait_contract(true, false);
+    }
+    #[test]
+    fn pending_default_stop_does_not_interrupt_sigsuspend() {
+        signal_wait_contract(true, true);
+    }
+    fn signal_wait_contract(default_stop: bool, suspend_only: bool) {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
         let zone = unsafe {
@@ -3750,6 +3761,33 @@ mod tests {
             .unwrap();
         assert_eq!(entry.rt_sigpending(blocked), 0);
         control.init_blocked(carrick_el1_abi::BlockedMask(0));
+        if default_stop {
+            entry
+                .kill(
+                    carrick_personality_linux::signal::SignalProcessSelector::from_abi(41),
+                    carrick_personality_linux::signal::SignalRequest::Deliver(
+                        carrick_signal_core::policy::Signal::STOP,
+                    ),
+                    carrick_personality_linux::signal::SignalInfo::Generated(None),
+                )
+                .unwrap();
+        }
+        if suspend_only {
+            assert!(
+                matches!(
+                    entry.rt_sigsuspend(
+                        carrick_signal_core::policy::SigBlockMask::NONE,
+                        carrick_signal_core::policy::SigBlockMask::NONE,
+                    ),
+                    Ok(true)
+                ),
+                "default stop must park sigsuspend, not return EINTR"
+            );
+            assert!(entry.take_handoff_receipt().is_some());
+            drop(entry);
+            assert!(zone.slot(slot).current().is_none());
+            return;
+        }
         assert!(matches!(
             entry.rt_sigtimedwait(set, Some(1000), UserVa::new(0)),
             Ok(SignalWaitOutcome::Pending)
@@ -3781,6 +3819,22 @@ mod tests {
                 .contains_key(&entry.record)
         );
         assert!(zone.timer_owner(slot).is_none());
+        if default_stop {
+            assert!(
+                matches!(
+                    entry.rt_sigsuspend(
+                        carrick_signal_core::policy::SigBlockMask::NONE,
+                        carrick_signal_core::policy::SigBlockMask::NONE,
+                    ),
+                    Ok(true)
+                ),
+                "default stop must park sigsuspend, not return EINTR"
+            );
+            assert!(entry.take_handoff_receipt().is_some());
+            drop(entry);
+            assert!(zone.slot(slot).current().is_none());
+            return;
+        }
         drop(entry);
 
         // Inject precisely after the pending check and before park enrollment.
@@ -4483,17 +4537,25 @@ mod tests {
     }
     #[test]
     fn actual_compact_root_forks_a_shared_owner_child_with_distinct_visible_identity() {
-        compact_root_fork_wait_contract(false, false);
+        compact_root_fork_wait_contract(false, false, false);
     }
     #[test]
     fn caught_signal_interrupts_an_already_parked_owned_child_wait() {
-        compact_root_fork_wait_contract(true, false);
+        compact_root_fork_wait_contract(true, false, false);
     }
     #[test]
     fn reapable_child_wins_over_its_caught_sigchld() {
-        compact_root_fork_wait_contract(false, true);
+        compact_root_fork_wait_contract(false, true, false);
     }
-    fn compact_root_fork_wait_contract(interrupt_wait: bool, catch_child_exit: bool) {
+    #[test]
+    fn pending_default_stop_does_not_interrupt_wait4() {
+        compact_root_fork_wait_contract(false, false, true);
+    }
+    fn compact_root_fork_wait_contract(
+        interrupt_wait: bool,
+        catch_child_exit: bool,
+        default_stop: bool,
+    ) {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
         let zone = unsafe {
@@ -4598,6 +4660,18 @@ mod tests {
                 runtime.graph.lock().owner.task(child).unwrap().parent(),
                 Some(parent)
             );
+            if default_stop {
+                use carrick_personality_linux::signal::ProcessSignals;
+                entry
+                    .kill(
+                        carrick_personality_linux::signal::SignalProcessSelector::from_abi(41),
+                        carrick_personality_linux::signal::SignalRequest::Deliver(
+                            carrick_signal_core::policy::Signal::STOP,
+                        ),
+                        carrick_personality_linux::signal::SignalInfo::Generated(None),
+                    )
+                    .unwrap();
+            }
             assert!(matches!(
                 entry.wait4(
                     ProcessWaitPid::from_syscall_argument(u64::MAX),
