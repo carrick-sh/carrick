@@ -1903,7 +1903,10 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         }
         let target = graph
             .owner
-            .find_task_by_pid(target_tid)
+            .namespace_key(self.key, target_tid)
+            .ok()
+            .flatten()
+            .and_then(|key| graph.owner.task(key).ok())
             .filter(|row| row.native().resources().control.visible_tid().is_some())
             .ok_or(carrick_personality_linux::identity::ESRCH)?;
         let creds = target.credentials_for(target_tid)?;
@@ -1980,7 +1983,10 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             Ok(caller.metadata().namespace_process_group)
         } else if let Some(target) = graph
             .owner
-            .find_task_by_pid(pid as u32)
+            .namespace_key(self.key, pid as u32)
+            .ok()
+            .flatten()
+            .and_then(|key| graph.owner.task(key).ok())
             .filter(|row| row.native().resources().control.visible_tid().is_some())
         {
             Ok(target.metadata().namespace_process_group)
@@ -2007,7 +2013,10 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         if target_pid != caller_pid {
             let target = graph
                 .owner
-                .find_task_by_pid(target_pid)
+                .namespace_key(self.key, target_pid)
+                .ok()
+                .flatten()
+                .and_then(|key| graph.owner.task(key).ok())
                 .filter(|row| row.native().resources().control.visible_tid().is_some())
                 .ok_or(carrick_personality_linux::identity::ESRCH)?;
             if target.parent() != Some(caller_key) {
@@ -2024,7 +2033,10 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             } else {
                 graph
                     .owner
-                    .find_task_by_pid(target_pid)
+                    .namespace_key(self.key, target_pid)
+                    .ok()
+                    .flatten()
+                    .and_then(|key| graph.owner.task(key).ok())
                     .filter(|row| row.native().resources().control.visible_tid().is_some())
                     .ok_or(carrick_personality_linux::identity::ESRCH)?
             };
@@ -2056,7 +2068,10 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         } else {
             graph
                 .owner
-                .find_task_by_pid_mut(target_pid)
+                .namespace_key(self.key, target_pid)
+                .ok()
+                .flatten()
+                .and_then(|key| graph.owner.task_mut(key).ok())
                 .filter(|row| row.native().resources().control.visible_tid().is_some())
                 .ok_or(carrick_personality_linux::identity::ESRCH)?
         };
@@ -2079,7 +2094,10 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             Ok(caller.metadata().namespace_session)
         } else if let Some(target) = graph
             .owner
-            .find_task_by_pid(pid as u32)
+            .namespace_key(self.key, pid as u32)
+            .ok()
+            .flatten()
+            .and_then(|key| graph.owner.task(key).ok())
             .filter(|row| row.native().resources().control.visible_tid().is_some())
         {
             Ok(target.metadata().namespace_session)
@@ -2321,7 +2339,10 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         if !is_self_process && !caller_privileged {
             let target = graph
                 .owner
-                .find_task_by_pid(target_pid)
+                .namespace_key(self.key, target_pid)
+                .ok()
+                .flatten()
+                .and_then(|key| graph.owner.task(key).ok())
                 .filter(|row| row.native().resources().control.visible_tid().is_some())
                 .ok_or(carrick_personality_linux::sysinfo::ESRCH)?;
             let target_creds = target
@@ -2340,7 +2361,10 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         } else {
             graph
                 .owner
-                .find_task_by_pid_mut(target_pid)
+                .namespace_key(self.key, target_pid)
+                .ok()
+                .flatten()
+                .and_then(|key| graph.owner.task_mut(key).ok())
                 .filter(|row| row.native().resources().control.visible_tid().is_some())
                 .ok_or(carrick_personality_linux::sysinfo::ESRCH)?
         };
@@ -3830,7 +3854,10 @@ mod tests {
         let graph = runtime.graph.lock();
         let child_task = graph
             .owner
-            .find_task_by_pid(child_pid)
+            .namespace_key(graph.root_key, child_pid)
+            .ok()
+            .flatten()
+            .and_then(|key| graph.owner.task(key).ok())
             .expect("child task found");
         let child_creds = child_task.credentials_for(child_pid).unwrap();
         assert_eq!(
@@ -4249,7 +4276,10 @@ mod tests {
             let graph = runtime.graph.lock();
             graph
                 .owner
-                .find_task_by_pid(child_pid as u32)
+                .namespace_key(graph.root_key, child_pid as u32)
+                .ok()
+                .flatten()
+                .and_then(|key| graph.owner.task(key).ok())
                 .unwrap()
                 .key()
         };
@@ -4408,7 +4438,13 @@ mod tests {
                 .credentials_for(41)
                 .unwrap()
                 .clone();
-            let peer = graph.owner.find_task_by_pid_mut(child_pid).unwrap();
+            let peer = graph
+                .owner
+                .namespace_key(graph.root_key, child_pid)
+                .ok()
+                .flatten()
+                .and_then(|key| graph.owner.task_mut(key).ok())
+                .unwrap();
             *peer.credentials_for_mut(child_pid).unwrap() = credentials;
             peer.spawn_thread(child_pid, 987).unwrap();
         }
@@ -4482,7 +4518,13 @@ mod tests {
             .unwrap();
         {
             let mut graph = runtime.graph.lock();
-            let peer = graph.owner.find_task_by_pid_mut(child_pid).unwrap();
+            let peer = graph
+                .owner
+                .namespace_key(graph.root_key, child_pid)
+                .ok()
+                .flatten()
+                .and_then(|key| graph.owner.task_mut(key).ok())
+                .unwrap();
             for tid in [child_pid, 987] {
                 let c = peer.credentials_for_mut(tid).unwrap();
                 c.ruid = carrick_sched_core::process::TaskUid::new(2000);
@@ -4600,7 +4642,10 @@ mod tests {
             let mut graph = runtime.graph.lock();
             graph
                 .owner
-                .find_task_by_pid_mut(child_pid)
+                .namespace_key(graph.root_key, child_pid)
+                .ok()
+                .flatten()
+                .and_then(|key| graph.owner.task_mut(key).ok())
                 .unwrap()
                 .dumpable = 0;
         }
@@ -4610,7 +4655,13 @@ mod tests {
         );
         {
             let mut graph = runtime.graph.lock();
-            let peer = graph.owner.find_task_by_pid_mut(child_pid).unwrap();
+            let peer = graph
+                .owner
+                .namespace_key(graph.root_key, child_pid)
+                .ok()
+                .flatten()
+                .and_then(|key| graph.owner.task_mut(key).ok())
+                .unwrap();
             peer.dumpable = 1;
             peer.credentials_for_mut(987).unwrap().cap_permitted =
                 carrick_sched_core::process::LinuxCapabilitySet::CAP_SETUID;
@@ -4623,7 +4674,10 @@ mod tests {
             let mut graph = runtime.graph.lock();
             graph
                 .owner
-                .find_task_by_pid_mut(child_pid)
+                .namespace_key(graph.root_key, child_pid)
+                .ok()
+                .flatten()
+                .and_then(|key| graph.owner.task_mut(key).ok())
                 .unwrap()
                 .credentials_for_mut(987)
                 .unwrap()
@@ -4645,7 +4699,13 @@ mod tests {
         );
         {
             let mut graph = runtime.graph.lock();
-            let peer = graph.owner.find_task_by_pid_mut(child_pid).unwrap();
+            let peer = graph
+                .owner
+                .namespace_key(graph.root_key, child_pid)
+                .ok()
+                .flatten()
+                .and_then(|key| graph.owner.task_mut(key).ok())
+                .unwrap();
             *peer.credentials_for_mut(child_pid).unwrap() =
                 carrick_sched_core::process::TaskCredentials::ROOT;
         }
