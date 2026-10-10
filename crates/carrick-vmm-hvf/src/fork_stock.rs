@@ -936,7 +936,7 @@ mod tests {
         assert_eq!(ledger.snapshot().bytes_returned, 4 * 4096);
 
         // Dirty page verification: if pages were modified, abort fails closed
-        let mut second_exchange = ForkStockExchange::new(req).unwrap();
+        let mut second_exchange = ForkStockExchange::new(test_request(exec, 303, 3, 1)).unwrap();
         let second_loan = custody
             .service_loan(&mut ledger, exec, &mut second_exchange)
             .unwrap();
@@ -944,6 +944,13 @@ mod tests {
         let result =
             custody.service_settlement(&mut ledger, exec, &mut dirty_abort, |_| true, |_| false);
         assert_eq!(result, Err(ForkStockServiceError::ExposedDirtyTable));
+        custody
+            .service_settlement(&mut ledger, exec, &mut dirty_abort, |_| true, |_| true)
+            .expect("guest cleared the loan after refusal");
+        let mut third_exchange = ForkStockExchange::new(test_request(exec, 304, 3, 1)).unwrap();
+        custody
+            .service_loan(&mut ledger, exec, &mut third_exchange)
+            .expect("same CPU can fork after clean abort");
     }
 
     #[test]
