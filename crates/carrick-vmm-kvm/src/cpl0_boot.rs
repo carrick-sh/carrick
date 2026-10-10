@@ -1319,18 +1319,13 @@ impl ProductionCpuLease {
             .map_err(|_| fail("physical custody poisoned"))?;
         self.cpu.with_stopped_vcpu(task, |vcpu| {
             let address = vcpu.get_gpr(X86Reg::Rax)?;
-            let stack_end = custody.binding(slot).kernel_stack + 16;
-            if address & 7 != 0
-                || address < stack_end - 0x1_0000
-                || address
-                    .checked_add(size_of::<NativeFrame>() as u64)
-                    .is_none_or(|end| end > stack_end)
-            {
-                return Err(fail("forward frame outside private kernel stack"));
-            }
+            let stack_end = checked_stack_end(custody.binding(slot).kernel_stack)
+                .ok_or_else(|| fail("forward kernel stack overflow"))?;
+            let gpa = checked_private_stack_frame_gpa(stack_end, address, size_of::<NativeFrame>())
+                .ok_or_else(|| fail("forward frame outside private kernel stack"))?;
             let ptr = custody
                 .ram
-                .host_ptr(address - DIRECT_VA, size_of::<NativeFrame>())
+                .host_ptr(gpa, size_of::<NativeFrame>())
                 .ok_or_else(|| fail("forward frame backing"))?
                 .cast::<NativeFrame>();
             // SAFETY: KVM_RUN stopped after the exact frame publication; no
@@ -1380,9 +1375,14 @@ impl ProductionCpuLease {
             {
                 return Err(fail("forward completion MM binding changed"));
             }
+            let stack_end = checked_stack_end(custody.binding(token.slot).kernel_stack)
+                .ok_or_else(|| fail("forward completion kernel stack overflow"))?;
+            let gpa =
+                checked_private_stack_frame_gpa(stack_end, token.address, size_of::<NativeFrame>())
+                    .ok_or_else(|| fail("forward completion frame outside private kernel stack"))?;
             let ptr = custody
                 .ram
-                .host_ptr(token.address - DIRECT_VA, size_of::<NativeFrame>())
+                .host_ptr(gpa, size_of::<NativeFrame>())
                 .ok_or_else(|| fail("forward completion frame backing"))?
                 .cast::<NativeFrame>();
             let mut frame = token.frame;
@@ -1542,7 +1542,10 @@ impl ProductionCpuFactory {
         } else {
             let bytes = custody
                 ._vm
-                .read(FrameGpa::new(frame - DIRECT_VA + 120), 16)
+                .read(
+                    checked_fault_error_gpa(frame).ok_or_else(|| fail("fault frame overflow"))?,
+                    16,
+                )
                 .map_err(|error| fail(error.to_string()))?;
             (
                 u64::from_le_bytes(
@@ -4239,21 +4242,14 @@ impl Cpl0Carrier {
         };
         self.custody.host_forwards += 1;
         let address = self.cpus[index].get_gpr(X86Reg::Rax)?;
-        let stack_end = self.binding(index).kernel_stack + 16;
-        if address & 7 != 0
-            || address < stack_end - 0x1_0000
-            || address
-                .checked_add(size_of::<NativeFrame>() as u64)
-                .is_none_or(|end| end > stack_end)
-        {
-            return Err(fail(
-                "CPL0 control frame outside its private supervisor stack",
-            ));
-        }
+        let stack_end = checked_stack_end(self.binding(index).kernel_stack)
+            .ok_or_else(|| fail("CPL0 control kernel stack overflow"))?;
+        let gpa = checked_private_stack_frame_gpa(stack_end, address, size_of::<NativeFrame>())
+            .ok_or_else(|| fail("CPL0 control frame outside its private supervisor stack"))?;
         let ptr = self
             .custody
             .ram
-            .host_ptr(address - DIRECT_VA, size_of::<NativeFrame>())
+            .host_ptr(gpa, size_of::<NativeFrame>())
             .ok_or_else(|| fail("CPL0 control frame outside backing"))?
             .cast::<NativeFrame>();
         let frame = unsafe { *ptr };
@@ -4468,16 +4464,14 @@ impl Cpl0Carrier {
                         port: CONTROL_PORT, ..
                     } => {
                         let address = cpu.get_gpr(X86Reg::Rax)?;
-                        if address & 7 != 0
-                            || address < stack_end - 0x1_0000
-                            || address
-                                .checked_add(size_of::<NativeFrame>() as u64)
-                                .is_none_or(|end| end > stack_end)
-                        {
-                            return Err(fail("paired control frame outside private stack"));
-                        }
+                        let gpa = checked_private_stack_frame_gpa(
+                            stack_end,
+                            address,
+                            size_of::<NativeFrame>(),
+                        )
+                        .ok_or_else(|| fail("paired control frame outside private stack"))?;
                         let ptr = ram
-                            .host_ptr(address - DIRECT_VA, size_of::<NativeFrame>())
+                            .host_ptr(gpa, size_of::<NativeFrame>())
                             .ok_or_else(|| fail("paired control frame outside backing"))?
                             .cast::<NativeFrame>();
                         // SAFETY: this thread exclusively owns the stopped
@@ -4505,8 +4499,10 @@ impl Cpl0Carrier {
         }
         let ram = Arc::clone(&self.custody.ram);
         let stacks = [
-            self.binding(0).kernel_stack + 16,
-            self.binding(1).kernel_stack + 16,
+            checked_stack_end(self.binding(0).kernel_stack)
+                .ok_or_else(|| fail("first kernel stack overflow"))?,
+            checked_stack_end(self.binding(1).kernel_stack)
+                .ok_or_else(|| fail("second kernel stack overflow"))?,
         ];
         // SAFETY: the retained table outlives both scoped guest-run threads.
         let table = unsafe {
@@ -4623,7 +4619,8 @@ impl Cpl0Carrier {
         }
         self.fixture_write_backing_byte(0x4_0008, 0)?;
         let ram = Arc::clone(&self.custody.ram);
-        let stack_end = self.binding(editor).kernel_stack + 16;
+        let stack_end = checked_stack_end(self.binding(editor).kernel_stack)
+            .ok_or_else(|| fail("editor kernel stack overflow"))?;
         let table = unsafe {
             &*self
                 .custody
@@ -4712,16 +4709,14 @@ impl Cpl0Carrier {
                             port: CONTROL_PORT, ..
                         } => {
                             let address = editor_cpu.get_gpr(X86Reg::Rax)?;
-                            if address & 7 != 0
-                                || address < stack_end - 0x1_0000
-                                || address
-                                    .checked_add(size_of::<NativeFrame>() as u64)
-                                    .is_none_or(|end| end > stack_end)
-                            {
-                                return Err(fail("editor control frame outside private stack"));
-                            }
+                            let gpa = checked_private_stack_frame_gpa(
+                                stack_end,
+                                address,
+                                size_of::<NativeFrame>(),
+                            )
+                            .ok_or_else(|| fail("editor control frame outside private stack"))?;
                             let ptr = ram
-                                .host_ptr(address - DIRECT_VA, size_of::<NativeFrame>())
+                                .host_ptr(gpa, size_of::<NativeFrame>())
                                 .ok_or_else(|| fail("editor control frame outside backing"))?
                                 .cast::<NativeFrame>();
                             return Ok(unsafe { (*ptr).rdi });
@@ -4807,21 +4802,14 @@ impl Cpl0Carrier {
                 continue;
             }
             let address = self.cpus[index].get_gpr(X86Reg::Rax)?;
-            let stack_end = self.binding(index).kernel_stack + 16;
-            if address & 7 != 0
-                || address < stack_end - 0x1_0000
-                || address
-                    .checked_add(size_of::<NativeFrame>() as u64)
-                    .is_none_or(|end| end > stack_end)
-            {
-                return Err(fail(
-                    "CPL0 control frame outside its private supervisor stack",
-                ));
-            }
+            let stack_end = checked_stack_end(self.binding(index).kernel_stack)
+                .ok_or_else(|| fail("CPL0 control kernel stack overflow"))?;
+            let gpa = checked_private_stack_frame_gpa(stack_end, address, size_of::<NativeFrame>())
+                .ok_or_else(|| fail("CPL0 control frame outside its private supervisor stack"))?;
             let ptr = self
                 .custody
                 .ram
-                .host_ptr(address - DIRECT_VA, size_of::<NativeFrame>())
+                .host_ptr(gpa, size_of::<NativeFrame>())
                 .ok_or_else(|| fail("CPL0 control frame outside backing"))?
                 .cast::<NativeFrame>();
             // SAFETY: the exclusive stopped vCPU published this supervisor
@@ -4897,6 +4885,27 @@ fn checked_readiness_region(base: u64, offset: u64, length: usize, extent: u64) 
         .flatten()
 }
 
+fn checked_stack_end(kernel_stack: u64) -> Option<u64> {
+    kernel_stack.checked_add(16)
+}
+
+fn checked_private_stack_frame_gpa(stack_end: u64, address: u64, length: usize) -> Option<u64> {
+    let stack_start = stack_end.checked_sub(0x1_0000)?;
+    let length = u64::try_from(length).ok()?;
+    if address & 7 != 0 || address < stack_start || address.checked_add(length)? > stack_end {
+        return None;
+    }
+    let gpa = address.checked_sub(DIRECT_VA)?;
+    gpa.checked_add(length)?;
+    Some(gpa)
+}
+
+fn checked_fault_error_gpa(frame: u64) -> Option<FrameGpa> {
+    let gpa = frame.checked_sub(DIRECT_VA)?.checked_add(120)?;
+    gpa.checked_add(16)?;
+    Some(FrameGpa::new(gpa))
+}
+
 #[cfg(test)]
 mod readiness_span_tests {
     #[test]
@@ -4910,6 +4919,14 @@ mod readiness_span_tests {
             Some(0x1010)
         );
         assert_eq!(super::checked_readiness_region(0x1000, 17, 16, 32), None);
+    }
+
+    #[test]
+    fn private_stack_and_fault_frame_reject_wrapped_metadata() {
+        assert_eq!(super::checked_stack_end(u64::MAX), None);
+        assert_eq!(super::checked_private_stack_frame_gpa(8, 0, 16), None);
+        assert_eq!(super::checked_fault_error_gpa(0), None);
+        assert_eq!(super::checked_fault_error_gpa(super::DIRECT_VA - 1), None);
     }
 }
 
@@ -5875,7 +5892,10 @@ impl Cpl0Carrier {
             let bytes = self
                 .custody
                 ._vm
-                .read(FrameGpa::new(frame - DIRECT_VA + 120), 16)
+                .read(
+                    checked_fault_error_gpa(frame).ok_or_else(|| fail("fault frame overflow"))?,
+                    16,
+                )
                 .map_err(|error| fail(error.to_string()))?;
             (
                 u64::from_le_bytes(
