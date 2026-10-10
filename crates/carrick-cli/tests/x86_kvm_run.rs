@@ -445,14 +445,8 @@ fn mounted_static_x86_guest_owned_calls_refuse_without_host_effects() {
     let witness = &report["report"]["execution_witness"];
     assert_eq!(witness["host_forwards"], 1); // write only; exit uses its owned receipt
     assert_eq!(witness["portal_exits"], 2); // write and the owned root-exit receipt
-    assert_eq!(
-        witness["guest_refusal_families"],
-        serde_json::json!([
-            {"family": "memory", "count": 1},
-            {"family": "unclassified", "count": 1}
-        ])
-    );
-    assert_eq!(report["report"]["summary"]["distinct_partial_syscalls"], 3);
+    assert!(witness["guest_refusal_families"].is_null(), "{report}");
+    assert_eq!(report["report"]["summary"]["distinct_partial_syscalls"], 0);
 }
 
 #[test]
