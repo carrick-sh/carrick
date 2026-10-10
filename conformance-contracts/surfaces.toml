@@ -53,6 +53,10 @@ path = "crates/carrick-thread/src/platform_futex.rs"
 contracts = ["kernel.futex.contention", "kernel.futex.requeue"]
 
 [[surfaces]]
+path = "crates/carrick-host-bsd/src/futex.rs"
+contracts = ["kernel.futex.contention", "kernel.futex.requeue"]
+
+[[surfaces]]
 path = "crates/carrick-thread/src/thread.rs"
 contracts = ["kernel.futex.contention", "kernel.futex.requeue"]
 
@@ -785,6 +789,10 @@ path = "crates/carrick-vmm-hvf/src/vcpu_kick.rs"
 contracts = ["kernel.timer.delivery-gate"]
 
 [[surfaces]]
+path = "crates/carrick-hal/src/posix_signal_kick.rs"
+contracts = ["kernel.timer.delivery-gate"]
+
+[[surfaces]]
 path = "crates/carrick-el1/src/personality/native_ownership_tests.rs"
 contracts = ["kernel.el1.mm-exclusive-owner"]
 
@@ -893,6 +901,10 @@ contracts = ["kernel.el1.signal-delivery-owner"]
 
 [[surfaces]]
 path = "crates/carrick-personality-linux/tests/signal_policy_contract.rs"
+contracts = ["kernel.el1.signal-delivery-owner"]
+
+[[surfaces]]
+path = "crates/carrick-host-bsd/src/signal_backend.rs"
 contracts = ["kernel.el1.signal-delivery-owner"]
 
 [[surfaces]]

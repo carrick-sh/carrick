@@ -1,0 +1,16 @@
+schema = "carrick.conformance-exemption.v1"
+base = "4ff4c9450eb1a172d49bafb890b7b825d3bfd8af"
+head = "b4d88066a6dd3e58072a1a01dc73c9d414cd793f"
+paths = [
+  "crates/carrick-hal/src/posix_signal_kick.rs",
+  "crates/carrick-hal/src/timer_delivery.rs",
+  "crates/carrick-host-bsd/src/futex.rs",
+  "crates/carrick-host-bsd/src/signal_backend.rs",
+]
+contracts = [
+  "kernel.timer.delivery-gate",
+  "kernel.futex.contention",
+  "kernel.futex.requeue",
+  "kernel.el1.signal-delivery-owner",
+]
+rationale = "Behavior-preserving consolidation of duplicated VMM host primitives into carrick-hal (PosixSignalKick, FallbackTimerDelivery) and carrick-host-bsd (BsdFutex, BsdSignalGlue). No guest-visible semantics, memory layouts, or operational complexity are modified; timer delivery, kick delivery, futex operations, and host signal translation preserve existing host behavior."
