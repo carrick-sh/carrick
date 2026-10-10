@@ -320,6 +320,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                             carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion => invalid_completion(NativeInvariant::EntryBinding),
                         };
                     } else {
+                        counters.record_first_process_admission_failure(ttbr0);
                         return refuse_owner_process_call(
                             frame,
                             counters,
