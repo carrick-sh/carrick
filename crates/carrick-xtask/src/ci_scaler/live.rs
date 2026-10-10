@@ -1,7 +1,7 @@
 //! Local-only PVE transport and foreground lifecycle; secrets have no Debug impl.
 use super::github::Github;
 #[cfg(test)]
-use super::github::{observed_assignment, recover_registration};
+use super::github::recover_registration;
 use super::*;
 use serde_json::{Value, json};
 use std::net::Ipv4Addr;
@@ -779,6 +779,10 @@ fn boot_and_register(
         row,
         &["/bin/sh", "-c", "rm -f /usr/local/bin/carrick-ci-admit-job"],
     )?;
+    // Re-vet the reserved run now and bind the runner to it: the hook admits
+    // only this run, attempt and SHA (and, for a merge group, only groups
+    // whose pull-request heads all live in this repository).
+    let policy = gh.vet(admission, row.key)?;
     // The job-start hook reads this root-owned policy; jobs cannot write it.
     pve.agent(
         row,
@@ -787,7 +791,7 @@ fn boot_and_register(
             "-c",
             &format!(
                 "install -d -m 755 /etc/carrick-ci; printf '%s\\n' {} > /etc/carrick-ci/policy; chmod 644 /etc/carrick-ci/policy",
-                crate::remote_accept::shell_quote(&admission.render())
+                crate::remote_accept::shell_quote(&policy.render())
             ),
         ],
     )?;
@@ -1069,12 +1073,21 @@ fn reconcile_one(
         row.failure = Some("recorded PVE task failed; owned VM retained for reap".into());
         row.task = None;
     }
-    let assignment = gh.assignment(&mut row)?;
+    let mut assignment = gh.assignment(&mut row)?;
     update(ledger, &row, path)?;
+    if assignment == Assignment::Unknown && runner_exited(pve, &row) {
+        // Registration gone, reserved job never ran here, and the guest's
+        // one-use runner has written its exit status: nothing is live.
+        assignment = Assignment::Completed;
+    }
     if reap_decision(&row, now()?, assignment) == Reap::Destroy {
         return cleanup(pve, gh, ledger, &mut row, dir, path, assignment);
     }
     Ok(false)
+}
+fn runner_exited(pve: &Pve, row: &Record) -> bool {
+    pve.agent_output(row, &["/usr/bin/test", "-e", "/home/runner/runner.exit"])
+        .is_ok_and(|out| out.exit == GuestExit(0))
 }
 fn pending_owned_job(row: &Record, job: &Value, run: &Value, admission: &Admission) -> bool {
     let labels: Vec<&str> = job["labels"]
@@ -1173,6 +1186,7 @@ pub(super) fn controller(
     let mut ledger = Ledger::load(&path)?;
     let mut reconcile = Instant::now() - Duration::from_secs(60);
     let mut frozen = true;
+    let mut backoff = Backoff::default();
     loop {
         if reconcile.elapsed() >= Duration::from_secs(60) {
             let pass = reconcile_all(&pve, &gh, &mut ledger, dir, &path, (group, admission))?;
@@ -1194,39 +1208,73 @@ pub(super) fn controller(
             .filter(|r| r.state != State::Destroyed)
             .count();
         if !frozen && active < usize::from(limit.get()) {
-            for job in gh.demand(admission, &LABELS)? {
-                if ledger.rows.iter().any(|r| r.key == job) {
-                    continue;
-                }
-                if !resource_admission()? {
-                    break;
-                }
-                let inventory = pve.inventory()?;
-                let mut row = ledger.reserve(job, &inventory, now()?, limit)?;
-                ledger.save(&path)?; // Must reach durable storage before clone.
-                println!("reserved vm={} job={}", row.vm.get(), job.job.0);
-                if let Err(error) = provision(
-                    &pve,
-                    &gh,
-                    &mut ledger,
-                    &mut row,
-                    dir,
-                    &path,
-                    (group, admission),
-                ) {
-                    row.failure = Some(error.to_string());
-                    update(&mut ledger, &row, &path)?;
-                    if matches!(error, ScalerError::CpuCeiling { .. }) {
-                        return Err(error);
-                    }
-                    eprintln!("provision failed: {error}; preserving ledger for reconciliation");
+            match admit_one(
+                &pve,
+                &gh,
+                &mut ledger,
+                dir,
+                &path,
+                (group, admission),
+                limit,
+            ) {
+                Ok(()) => backoff.reset(),
+                Err(error @ ScalerError::CpuCeiling { .. }) => return Err(error),
+                Err(error) => {
+                    // Transient GitHub/PVE failures never end the controller.
+                    eprintln!("admission pass failed: {error}; backing off");
                     frozen = true;
+                    backoff.grow();
                 }
-                break;
             }
         }
-        std::thread::sleep(Duration::from_secs(30));
+        std::thread::sleep(backoff.delay());
     }
+}
+
+/// Poll delay: 30 s, doubling on consecutive failures up to 10 minutes.
+#[derive(Debug, Default)]
+pub(super) struct Backoff(u32);
+impl Backoff {
+    pub(super) fn reset(&mut self) {
+        self.0 = 0;
+    }
+    pub(super) fn grow(&mut self) {
+        self.0 = (self.0 + 1).min(5);
+    }
+    pub(super) fn delay(&self) -> Duration {
+        Duration::from_secs((30_u64 << self.0).min(600))
+    }
+}
+
+fn admit_one(
+    pve: &Pve,
+    gh: &Github,
+    ledger: &mut Ledger,
+    dir: &Path,
+    path: &Path,
+    approval: (u64, &Admission),
+    limit: Concurrency,
+) -> Result<(), ScalerError> {
+    let Some(job) = gh
+        .demand(approval.1, &LABELS)?
+        .into_iter()
+        .find(|job| !ledger.served(*job))
+    else {
+        return Ok(());
+    };
+    if !resource_admission()? {
+        return Ok(());
+    }
+    let inventory = pve.inventory()?;
+    let mut row = ledger.reserve(job, &inventory, now()?, limit)?;
+    ledger.save(path)?; // Must reach durable storage before clone.
+    println!("reserved vm={} job={}", row.vm.get(), job.job.0);
+    if let Err(error) = provision(pve, gh, ledger, &mut row, dir, path, approval) {
+        row.failure = Some(error.to_string());
+        update(ledger, &row, path)?;
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1539,19 +1587,5 @@ mod tests {
             recover_registration(&row, &[json!({"id":99,"name":"someone-else"})]).unwrap(),
             None
         );
-    }
-    #[test]
-    fn completed_alternate_assignment_is_recovered_by_runner_id() {
-        let mut row = row();
-        row.runner = Some(RunnerId(99));
-        let jobs = [
-            json!({"id":500,"runner_id":98,"status":"completed"}),
-            json!({"id":501,"runner_id":99,"status":"completed"}),
-        ];
-        assert_eq!(
-            observed_assignment(&mut row, &jobs),
-            Some(Assignment::Completed)
-        );
-        assert_eq!(row.assigned, Some(JobId(501)));
     }
 }

@@ -3,6 +3,8 @@
 use super::*;
 use serde_json::{Value, json};
 
+const MERGE_QUEUE_QUERY: &str = "query { repository(owner: \"carrick-sh\", name: \"carrick\") { mergeQueue(branch: \"main\") { entries(first: 100) { nodes { position headCommit { oid } pullRequest { number headRepository { nameWithOwner } } } } } } }";
+
 pub(super) struct Github;
 impl Github {
     pub(super) fn request(
@@ -29,10 +31,18 @@ impl Github {
         }
         Ok(serde_json::from_slice(&output)?)
     }
-    pub(super) fn runs(&self, status: &str) -> Result<Vec<Value>, ScalerError> {
+    /// Runs of one workflow file only: demand never lists every run.
+    pub(super) fn workflow_runs(
+        &self,
+        admission: &Admission,
+        status: &str,
+    ) -> Result<Vec<Value>, ScalerError> {
         let data = self.request(
             "GET",
-            &format!("repos/{REPOSITORY}/actions/runs?status={status}&per_page=100"),
+            &format!(
+                "repos/{REPOSITORY}/actions/workflows/{}/runs?status={status}&per_page=100",
+                admission.workflow_file()
+            ),
             None,
             true,
         )?;
@@ -59,7 +69,7 @@ impl Github {
     ) -> Result<Vec<JobKey>, ScalerError> {
         let mut demand = Vec::new();
         for status in ["queued", "in_progress"] {
-            for run in self.runs(status)? {
+            for run in self.workflow_runs(admission, status)? {
                 if !admission.admits_run(&run) {
                     continue;
                 }
@@ -114,6 +124,49 @@ impl Github {
             .to_owned();
         Ok((id, jit))
     }
+    /// Re-read the reserved run immediately before minting a runner and
+    /// return the policy its hook enforces: the same admission, the same
+    /// attempt, and for a merge group only pull requests whose heads live in
+    /// this repository. The runner is bound to this exact run and SHA.
+    pub(super) fn vet(&self, admission: &Admission, key: JobKey) -> Result<JobPolicy, ScalerError> {
+        let run = self.request(
+            "GET",
+            &format!("repos/{REPOSITORY}/actions/runs/{}", key.run.0),
+            None,
+            false,
+        )?;
+        if !admission.admits_run(&run)
+            || run["id"].as_u64() != Some(key.run.0)
+            || run["run_attempt"].as_u64() != Some(u64::from(key.attempt))
+        {
+            return Err(ScalerError::Guard("reserved run is no longer admitted"));
+        }
+        let sha = run["head_sha"]
+            .as_str()
+            .ok_or(ScalerError::External("run head SHA"))?
+            .to_ascii_lowercase();
+        if run["event"] == "merge_group" {
+            let queue = self.request(
+                "POST",
+                "graphql",
+                Some(json!({ "query": MERGE_QUEUE_QUERY })),
+                false,
+            )?;
+            if !merge_group_heads_trusted(&queue, &sha) {
+                return Err(ScalerError::Guard(
+                    "merge group contains a pull request from another repository, or is not queued",
+                ));
+            }
+        }
+        Ok(match admission {
+            Admission::Pilot { sha } => JobPolicy::Pilot { sha: sha.clone() },
+            Admission::Standing => JobPolicy::Bound(RunBinding {
+                run: key.run,
+                attempt: key.attempt,
+                sha,
+            }),
+        })
+    }
     pub(super) fn job(&self, id: JobId) -> Result<Value, ScalerError> {
         self.request(
             "GET",
@@ -139,8 +192,8 @@ impl Github {
         let Some(runner) = row.runner() else {
             return Ok(Assignment::Unassigned);
         };
-        // The reservation is demand, never a job binding. Prefer the recorded
-        // actual assignment; inspect all active runs if GitHub assigned another.
+        // Only the reserved job is examined: the hook binds the runner to
+        // its vetted run, so any other assignment is killed before a step.
         let job = self.job(row.assigned().unwrap_or(row.key().job))?;
         if job["runner_id"].as_u64() == Some(runner.0) {
             row.set_assigned(JobId(
@@ -153,13 +206,6 @@ impl Github {
             } else {
                 Assignment::Busy
             });
-        }
-        for status in ["in_progress", "completed"] {
-            for run in self.runs(status)? {
-                if let Some(assignment) = observed_assignment(row, &self.jobs(&run)?) {
-                    return Ok(assignment);
-                }
-            }
         }
         let runners = self.request(
             "GET",
@@ -176,8 +222,9 @@ impl Github {
                 });
             }
         }
-        // An absent ephemeral registration can mean a completed job missed by
-        // polling. Never infer unassigned from absence and destroy live work.
+        // Registration gone and the reserved job never ran on it: the runner
+        // ended (rejected, killed or exited). The caller confirms the runner
+        // process is gone before destroying anything.
         Ok(Assignment::Unknown)
     }
     pub(super) fn remove_runner(&self, row: &impl RunnerRegistration) -> Result<(), ScalerError> {
@@ -224,22 +271,6 @@ pub(super) fn recover_registration(
         )),
     }
 }
-pub(super) fn observed_assignment(
-    row: &mut impl RunnerRegistration,
-    jobs: &[Value],
-) -> Option<Assignment> {
-    let runner = row.runner()?;
-    let job = jobs
-        .iter()
-        .find(|job| job["runner_id"].as_u64() == Some(runner.0))?;
-    row.set_assigned(JobId(job["id"].as_u64()?));
-    Some(if job["status"] == "completed" {
-        Assignment::Completed
-    } else {
-        Assignment::Busy
-    })
-}
-
 fn pages(data: &Value, field: &str) -> Result<Vec<Value>, ScalerError> {
     let mut result = Vec::new();
     for page in data
