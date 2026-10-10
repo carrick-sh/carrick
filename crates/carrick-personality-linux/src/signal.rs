@@ -418,6 +418,28 @@ pub trait ProcessSignals {
         None
     }
 
+    /// A restored suspend mask can expose a different pending signal at this
+    /// same user-return checkpoint. Never select a second handler after one
+    /// was already selected under the temporary mask.
+    fn take_deliverable_after_suspend(
+        &mut self,
+        temporary: &mut carrick_signal_core::policy::SigBlockMask,
+        restored: carrick_signal_core::policy::SigBlockMask,
+    ) -> Option<(
+        carrick_signal_core::policy::Signal,
+        Option<crate::abi::signal::LinuxSiginfo>,
+        carrick_signal_core::policy::Action,
+    )> {
+        self.take_deliverable(*temporary).or_else(|| {
+            if restored != *temporary {
+                *temporary = restored;
+                self.take_deliverable(restored)
+            } else {
+                None
+            }
+        })
+    }
+
     fn take_deliverable(
         &mut self,
         blocked: carrick_signal_core::policy::SigBlockMask,
