@@ -1296,6 +1296,7 @@ mod kernel {
                     // This lane has no core writer; publish a signal-only exit.
                     Some(match process.exit_with_signal(sig.number() as u8) {
                         Ok(_) => carrick_personality_linux::dispatch::CompletionRoute::Suspended,
+                        Err(carrick_el1::personality::native_process_runtime::NativeProcessError::GroupExitCustody) => complete_run_failure(task, carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody),
                         Err(_) => carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion,
                     })
                 } else {
@@ -1355,6 +1356,19 @@ mod kernel {
                 None
             }
         }
+    }
+
+    fn complete_run_failure(task: &CurrentTask, reason: carrick_el1_abi::NativeRunFailureReason) -> ! {
+        let failure = carrick_el1_abi::NativeRunFailure::new(
+            carrick_el1::personality::common_entry::execution_binding(task), reason,
+        );
+        // SAFETY: the native lane retains this initialized supervisor-stack
+        // record until the carrier authenticates and ends the run.
+        unsafe {
+            core::arch::asm!("out dx, al", in("dx") carrick_el1_abi::NATIVE_RUN_FAILURE_PORT,
+                in("rax") &failure as *const _ as u64, options(nostack, preserves_flags));
+        }
+        halt();
     }
 
     pub(super) fn complete_root_exit(task: &CurrentTask, status: carrick_sched_core::process::LinuxWaitStatus) -> ! {
@@ -1481,6 +1495,7 @@ mod kernel {
         if original == Signal::SEGV {
             return Some(match process.exit_with_signal(Signal::SEGV.number() as u8) {
                 Ok(_) => CompletionRoute::Suspended,
+                Err(carrick_el1::personality::native_process_runtime::NativeProcessError::GroupExitCustody) => complete_run_failure(task, carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody),
                 Err(_) => CompletionRoute::InvalidCompletion,
             });
         }
@@ -2463,20 +2478,6 @@ mod kernel {
             unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) };
         }
     }
-
-    fn complete_run_failure(task: &CurrentTask, reason: carrick_el1_abi::NativeRunFailureReason) -> ! {
-        let failure = carrick_el1_abi::NativeRunFailure::new(
-            carrick_el1::personality::common_entry::execution_binding(task), reason,
-        );
-        // SAFETY: the native lane retains this initialized supervisor-stack
-        // record until the carrier authenticates and ends the run.
-        unsafe {
-            core::arch::asm!("out dx, al", in("dx") carrick_el1_abi::NATIVE_RUN_FAILURE_PORT,
-                in("rax") &failure as *const _ as u64, options(nostack, preserves_flags));
-        }
-        halt();
-    }
-
 }
 
 // The production macro removes every fixture state access; this image seam
