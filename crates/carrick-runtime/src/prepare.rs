@@ -291,8 +291,7 @@ pub fn run_prepared_kvm_pool(
         (dispatcher.stdout(), dispatcher.stderr())
     };
     if let Some(reason) = run_failure {
-        stderr.extend_from_slice(reason.diagnostic().as_bytes());
-        stderr.push(b'\n');
+        stderr.extend_from_slice(format!("carrick: run failed: {}\n", reason.as_str()).as_bytes());
     }
     Ok(PreparedKvmPoolOutcome {
         run: RunResult {
