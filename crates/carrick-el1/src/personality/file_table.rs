@@ -45,6 +45,7 @@ pub struct GuestDescriptorChange {
 }
 
 pub const GUEST_FD_CLOEXEC: u32 = 1;
+pub const GUEST_FD_LIMIT: i32 = 1024;
 
 fn last_reference(fd_map: &[FdMapSlot], description: ReleasedDescription) -> bool {
     !fd_map.iter().take(FD_MAP_CAPACITY).any(|slot| {
@@ -111,7 +112,7 @@ pub fn dup2_host_binding(
     new_fd: i32,
     cloexec: bool,
 ) -> Option<GuestDescriptorChange> {
-    if new_fd < 0 {
+    if !(0..GUEST_FD_LIMIT).contains(&new_fd) {
         return None;
     }
     let _guard = FD_MAP_LOCK.lock();
@@ -839,6 +840,22 @@ mod tests {
         admit_stdio(&fd_map, &open_table, &object_table, 10, [true; 3]);
         assert_eq!(fd_map_lookup(&fd_map, 10, 1), None);
         assert!(is_closed_stdio_tombstone(&fd_map, 10, 1));
+    }
+
+    #[test]
+    fn dup_reuses_closed_stdin_number() {
+        let (fd_map, open_table, object_table) = setup_tables();
+        admit_stdio(&fd_map, &open_table, &object_table, 10, [true; 3]);
+        close_host_binding(&fd_map, 10, 0).unwrap();
+        assert_eq!(
+            dup_host_binding(&fd_map, 10, 1, 0, 1024, false).unwrap().fd,
+            0
+        );
+        assert_eq!(fd_map_lookup(&fd_map, 10, 0).unwrap().0, 2);
+        assert_eq!(
+            dup2_host_binding(&fd_map, 10, 1, GUEST_FD_LIMIT, false),
+            None
+        );
     }
 
     #[test]

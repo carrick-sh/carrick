@@ -2019,13 +2019,15 @@ mod kernel {
                 }
                 CompletionRoute::Forward => {
                     let mut handled_in_ring = false;
-                    if call.native.raw() == 1 {
+                    if matches!(call.native.raw(), 0 | 1 | 8 | 17 | 18) {
                         let table = task.linux.file_table.load(Ordering::Acquire).max(1);
                         let guest_fd = call.args[0] as i32;
-                        if let Some((handle, _)) = carrick_el1_abi::fd_map_lookup(fd_map(), table, guest_fd)
-                            && let Some(binding) = OPEN_TABLE.get(handle as usize - 1).and_then(DelegatedOpenFile::host_object)
-                            && binding.stdio_fd() != Some(guest_fd)
-                        {
+                        let binding = carrick_el1_abi::fd_map_lookup(fd_map(), table, guest_fd)
+                            .and_then(|(handle, _)| handle.checked_sub(1))
+                            .and_then(|index| OPEN_TABLE.get(index as usize))
+                            .and_then(DelegatedOpenFile::host_object);
+                        if call.native.raw() == 1 && let Some(binding) = binding
+                            && binding.stdio_fd() != Some(guest_fd) {
                             let saved = (frame.rax, frame.rdi, frame.rcx);
                             frame.rax = carrick_el1_abi::HostObjectWriteCrossing::NUMBER;
                             frame.rdi = binding.encoded() as u64;
@@ -2037,9 +2039,9 @@ mod kernel {
                             handled_in_ring = true;
                         }
                         if !handled_in_ring && (0..=2).contains(&guest_fd)
-                            && carrick_el1_abi::fd_map_lookup(fd_map(), table, guest_fd).is_none()
+                            && (binding.is_none() || binding.is_some_and(|binding| binding.stdio_fd() != Some(guest_fd)))
                         {
-                            frame.rax = (-9_i64) as u64;
+                            frame.rax = carrick_syscall_abi::LINUX_EBADF.guest_retval() as u64;
                             handled_in_ring = true;
                         }
                     }
