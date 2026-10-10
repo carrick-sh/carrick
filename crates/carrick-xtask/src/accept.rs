@@ -109,6 +109,10 @@ pub struct StepResult {
     /// `ci-receipt diff` keys NEW/FIXED on these, never on exit codes alone.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed_tests: Vec<String>,
+    /// Failures no test name explains: a crashed or signalled test binary, a
+    /// compile error, a step killed by a signal. Each is its own identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unitemized_failures: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -470,6 +474,39 @@ pub fn parse_failed_tests(log: &str) -> Vec<String> {
     failed.into_iter().collect()
 }
 
+/// Failures in a step's log that no `test ... FAILED` line names: a test
+/// binary that exited other than cargo's ordinary test failure (101), e.g. a
+/// signal, and compile errors.
+pub fn parse_unitemized_failures(log: &str) -> Vec<String> {
+    let mut found = std::collections::BTreeSet::new();
+    for line in log.lines() {
+        let trimmed = line.trim();
+        if let Some((_, rest)) = trimmed.split_once("process didn't exit successfully: `") {
+            if trimmed.contains("(exit status: 101)") {
+                continue;
+            }
+            let program = rest.split([' ', '`']).next().unwrap_or(rest);
+            let file = program.rsplit('/').next().unwrap_or(program);
+            let binary = match file.rsplit_once('-') {
+                Some((stem, hash))
+                    if !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()) =>
+                {
+                    stem
+                }
+                _ => file,
+            };
+            found.insert(format!("crash:{binary}"));
+        } else if let Some(rest) = trimmed.strip_prefix("error: could not compile `") {
+            let krate = rest.split('`').next().unwrap_or(rest);
+            found.insert(format!("compile:{krate}"));
+        }
+    }
+    found.into_iter().collect()
+}
+
+/// The failure text `cleanup_remaining` records for an unproven reap.
+pub const CLEANUP_UNKNOWN: &str = "scoped cleanup failed or reported no remaining count";
+
 pub fn generate_timestamp() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -690,9 +727,7 @@ pub fn cleanup_remaining(
     match stdout.and_then(parse_cleanup_count) {
         Some(count) => count,
         None => {
-            failures.push(format!(
-                "step '{step}' scoped cleanup failed or reported no remaining count"
-            ));
+            failures.push(format!("step '{step}' {CLEANUP_UNKNOWN}"));
             0
         }
     }
@@ -1016,6 +1051,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 passed,
                 error,
                 failed_tests: Vec::new(),
+                unitemized_failures: Vec::new(),
             });
         }
     }
@@ -1071,6 +1107,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
             passed: fixtures_valid,
             error,
             failed_tests: Vec::new(),
+            unitemized_failures: Vec::new(),
         });
     }
 
@@ -1182,6 +1219,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 passed,
                 error,
                 failed_tests: Vec::new(),
+                unitemized_failures: Vec::new(),
             });
         }
 
@@ -1266,6 +1304,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 passed,
                 error,
                 failed_tests: Vec::new(),
+                unitemized_failures: Vec::new(),
             });
         }
 
@@ -1327,6 +1366,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 passed,
                 error,
                 failed_tests: Vec::new(),
+                unitemized_failures: Vec::new(),
             });
         }
 
@@ -1403,6 +1443,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 passed,
                 error,
                 failed_tests: Vec::new(),
+                unitemized_failures: Vec::new(),
             });
         }
 
@@ -1475,6 +1516,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 passed,
                 error,
                 failed_tests: Vec::new(),
+                unitemized_failures: Vec::new(),
             });
         }
 
@@ -1531,6 +1573,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                     passed,
                     error,
                     failed_tests: Vec::new(),
+                    unitemized_failures: Vec::new(),
                 });
             }
 
@@ -1609,6 +1652,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                     passed,
                     error,
                     failed_tests: Vec::new(),
+                    unitemized_failures: Vec::new(),
                 });
             }
 
@@ -1686,6 +1730,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                     passed,
                     error,
                     failed_tests: Vec::new(),
+                    unitemized_failures: Vec::new(),
                 });
             }
         } else {
@@ -1716,8 +1761,12 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
     // Allowlisted failures still count: baseline comparison needs the whole
     // failing set, not only what made this receipt FAIL.
     for step in &mut step_results {
-        step.failed_tests =
-            parse_failed_tests(&fs::read_to_string(&step.log_path).unwrap_or_default());
+        let log = fs::read_to_string(&step.log_path).unwrap_or_default();
+        step.failed_tests = parse_failed_tests(&log);
+        step.unitemized_failures = parse_unitemized_failures(&log);
+        if !step.passed && step.exit_code.is_none() {
+            step.unitemized_failures.push("signal".into());
+        }
     }
 
     let receipt = AcceptReceipt {
@@ -2100,6 +2149,7 @@ thread 'test_probe_futex' panicked at 'explicit panic', tests/foo.rs:12:5
                 passed: true,
                 error: None,
                 failed_tests: Vec::new(),
+                unitemized_failures: Vec::new(),
             }],
             skipped_steps: vec!["ltp".to_string()],
             artifact: None,

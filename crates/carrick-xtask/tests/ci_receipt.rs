@@ -1,8 +1,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use carrick_xtask::accept::{
-    AcceptReceipt, CleanupCount, ProbeDiff, StepResult, parse_failed_tests,
+    AcceptReceipt, CLEANUP_UNKNOWN, CleanupCount, ProbeDiff, StepResult, parse_failed_tests,
+    parse_unitemized_failures,
 };
-use carrick_xtask::ci_receipt::{Lane, artifact_name, diff, failure_keys, trusted_baseline_run};
+use carrick_xtask::ci_receipt::{
+    Baseline, Lane, artifact_name, baseline_decision, diff, failure_keys, newest_receipt,
+    trusted_baseline_run,
+};
 use std::path::PathBuf;
 
 fn step(name: &str, passed: bool, failed: &[&str]) -> StepResult {
@@ -15,6 +19,7 @@ fn step(name: &str, passed: bool, failed: &[&str]) -> StepResult {
         passed,
         error: None,
         failed_tests: failed.iter().map(|t| (*t).to_owned()).collect(),
+        unitemized_failures: vec![],
     }
 }
 
@@ -142,16 +147,21 @@ fn run(event: &str, branch: &str, path: &str) -> serde_json::Value {
 }
 
 #[test]
-fn only_push_to_main_and_merge_queue_runs_publish_baselines() {
+fn push_dispatch_on_main_and_merge_queue_runs_publish_baselines() {
     let sha = "b".repeat(40);
     let kernel = ".github/workflows/kernel-runtime.yml";
     assert!(trusted_baseline_run(&run("push", "main", kernel), &sha));
+    // The owner's reseed path.
+    assert!(trusted_baseline_run(
+        &run("workflow_dispatch", "main", kernel),
+        &sha
+    ));
     assert!(trusted_baseline_run(
         &run("merge_group", "gh-readonly-queue/main/pr-1-abc", kernel),
         &sha
     ));
     for rejected in [
-        run("workflow_dispatch", "main", kernel),
+        run("workflow_dispatch", "work/x", kernel),
         run("pull_request", "main", kernel),
         run("push", "work/x", kernel),
         run("push", "main", ".github/workflows/ci.yml"),
@@ -165,5 +175,101 @@ fn only_push_to_main_and_merge_queue_runs_publish_baselines() {
         &run("push", "main", kernel),
         &"c".repeat(40)
     ));
-    assert_eq!(artifact_name(Lane::Hvf, &sha), format!("receipt-hvf-{sha}"));
+    assert_eq!(
+        artifact_name(Lane::Hvf, &sha, 2),
+        format!("receipt-hvf-{sha}-2")
+    );
+}
+
+fn listed(id: u64, status: &str, event: &str, branch: &str) -> serde_json::Value {
+    let mut value = run(event, branch, ".github/workflows/kernel-runtime.yml");
+    value["id"] = id.into();
+    value["status"] = status.into();
+    value
+}
+fn artifacts(names: &[&str]) -> serde_json::Value {
+    serde_json::json!({"artifacts": names.iter().map(|n| serde_json::json!({"name": n, "expired": false})).collect::<Vec<_>>()})
+}
+
+#[test]
+fn baseline_waits_for_an_in_progress_base_run_and_fails_closed_when_finished() {
+    let sha = "b".repeat(40);
+    let one = format!("receipt-hvf-{sha}-1");
+    let two = format!("receipt-hvf-{sha}-2");
+    let queue = "gh-readonly-queue/main/pr-1-abc";
+    // The newest attempt of the newest trusted run wins.
+    let found = baseline_decision(
+        &[
+            (listed(5, "completed", "push", "main"), artifacts(&[&one])),
+            (
+                listed(9, "completed", "merge_group", queue),
+                artifacts(&[&one, &two, &format!("receipt-kvm-{sha}-3")]),
+            ),
+        ],
+        Lane::Hvf,
+        &sha,
+    );
+    assert_eq!(found, Baseline::Found(9, two.clone()));
+    assert_eq!(
+        newest_receipt(&artifacts(&[&one, &two]), Lane::Hvf, &sha),
+        Some((2, two))
+    );
+    // Queue depth above one: the base entry's run has not uploaded yet.
+    let pending = baseline_decision(
+        &[(
+            listed(9, "in_progress", "merge_group", queue),
+            artifacts(&[]),
+        )],
+        Lane::Hvf,
+        &sha,
+    );
+    assert_eq!(pending, Baseline::Pending);
+    // Finished without a receipt: fail closed, never wait.
+    let missing = baseline_decision(
+        &[(listed(9, "completed", "merge_group", queue), artifacts(&[]))],
+        Lane::Hvf,
+        &sha,
+    );
+    assert_eq!(missing, Baseline::Missing);
+    assert_eq!(baseline_decision(&[], Lane::Hvf, &sha), Baseline::Missing);
+    // An untrusted run never stands in, even with a matching artifact.
+    let untrusted = baseline_decision(
+        &[(
+            listed(3, "completed", "pull_request", "main"),
+            artifacts(&[&one]),
+        )],
+        Lane::Hvf,
+        &sha,
+    );
+    assert_eq!(untrusted, Baseline::Missing);
+}
+
+#[test]
+fn crashes_and_unknown_cleanup_are_failure_identities_beside_itemized_tests() {
+    let log = "\
+test a::b ... FAILED
+error: test failed, to rerun pass `-p x --test t`
+Caused by:
+  process didn't exit successfully: `/w/target/debug/deps/t-0123abcd --nocapture` (signal: 11, SIGSEGV: invalid memory reference)
+  process didn't exit successfully: `/w/target/debug/deps/u-0123abcd` (exit status: 101)
+error: could not compile `carrick-embed` (test \"x\") due to 1 previous error
+";
+    assert_eq!(
+        parse_unitemized_failures(log),
+        vec!["compile:carrick-embed", "crash:t"]
+    );
+    let base = receipt(vec![step("el1-embed", false, &["embed::a"])]);
+    let mut next = receipt(vec![step("el1-embed", false, &["embed::a"])]);
+    next.steps[0].unitemized_failures = vec!["crash:embed".into()];
+    next.failures
+        .push(format!("step 'probe-cases' {CLEANUP_UNKNOWN}"));
+    let result = diff(&base, &next).unwrap();
+    assert_eq!(
+        result.new,
+        vec![
+            "cleanup-unknown:probe-cases",
+            "step:el1-embed",
+            "unitemized:el1-embed:crash:embed"
+        ]
+    );
 }
