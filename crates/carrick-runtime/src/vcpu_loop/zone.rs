@@ -124,6 +124,19 @@ fn parked_context(
     ))
 }
 
+/// Zone saves are task projections. EL1 may leave the vCPU on a maintenance
+/// root even while occupancy still names the task's MM; the stage-1 lease is
+/// the authority for the task roots, not the stopped vCPU's TTBR registers.
+fn restore_own_roots(state: GuestCpuState, ttbr0: u64) -> GuestCpuState {
+    let GuestCpuState::Aarch64V1(cpu) = &state else {
+        return state;
+    };
+    let mut cpu = (**cpu).clone();
+    cpu.ttbr0 = ttbr0;
+    cpu.ttbr1 = ttbr0;
+    GuestCpuState::from_aarch64_v1(cpu)
+}
+
 /// `state` with argument 0 restored to `x0`, so re-issuing its syscall runs
 /// the ORIGINAL call (EL1 overwrote x0 with the result it served).
 pub(super) fn with_original_arg0(state: GuestCpuState, x0: u64) -> GuestCpuState {
@@ -421,34 +434,27 @@ where
         Ok(Some(exit))
     }
 
-    /// The vCPU state `state` with this job's own translation roots, when the
-    /// address space installed on the vCPU is not the job's.
+    /// Save this job's task projection with its leased roots. EL1 may have
+    /// switched the vCPU to maintenance even when the slot still names its MM.
     fn with_own_roots(
         &self,
-        zone: &ZoneTables,
+        _zone: &ZoneTables,
         slot: SlotId,
         control: &executor::HvpatchQuantumControl<'_, '_>,
         state: GuestCpuState,
     ) -> Result<GuestCpuState, ProductionHvpatchPollError> {
-        let installed = zone.installed_space(slot);
-        if self.state.zone_mm.is_none_or(|mm| mm == installed) {
+        if !matches!(state, GuestCpuState::Aarch64V1(_)) {
             return Ok(state);
         }
-        let GuestCpuState::Aarch64V1(cpu) = &state else {
-            return Ok(state);
-        };
         let ttbr0 = control
             .binding
             .and_then(|binding| binding.stage1_ttbr0())
             .ok_or_else(|| {
                 RuntimeError::Configuration(format!(
-                    "EL1 zone slot {slot:?} switched address spaces under a task with no stage-1 lease"
+                    "EL1 zone slot {slot:?} saved a task with no stage-1 lease"
                 ))
             })?;
-        let mut cpu = (**cpu).clone();
-        cpu.ttbr0 = ttbr0;
-        cpu.ttbr1 = ttbr0;
-        Ok(GuestCpuState::from_aarch64_v1(cpu))
+        Ok(restore_own_roots(state, ttbr0))
     }
 
     /// This job's own thread is on the vCPU again: EL1 installed its address
@@ -1584,6 +1590,24 @@ mod ipc_tests {
     use carrick_el1_abi::ipc::{EventMode, IpcOperation, IpcRegion};
     use carrick_kernel::dispatch::SyscallDispatcher;
     use std::alloc::Layout;
+
+    #[test]
+    fn zone_save_restores_lease_roots_from_zero_ttbr() {
+        let GuestCpuState::Aarch64V1(cpu) =
+            crate::vcpu_loop::executor::tests::test_guest_cpu_state(0x100)
+        else {
+            unreachable!()
+        };
+        let mut cpu = (*cpu).clone();
+        cpu.ttbr0 = 0;
+        cpu.ttbr1 = 0;
+        let restored = restore_own_roots(GuestCpuState::from_aarch64_v1(cpu), 0x1_1234_5000);
+        let GuestCpuState::Aarch64V1(restored) = restored else {
+            unreachable!()
+        };
+        assert_eq!(restored.ttbr0, 0x1_1234_5000);
+        assert_eq!(restored.ttbr1, 0x1_1234_5000);
+    }
 
     #[test]
     fn ignored_signal_preserves_zone_group_stop_interruption() {
