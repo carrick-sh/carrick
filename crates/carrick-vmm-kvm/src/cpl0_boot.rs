@@ -90,7 +90,7 @@ const _: () = {
 const IST_STACK_BASE: u64 = 0xf0_0000;
 const IMAGE_VA: u64 = carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_BASE;
 const IMAGE_SIZE: u64 = carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_SIZE;
-const IMAGE_GPA: u64 = 0x10_0000;
+const IMAGE_GPA: u64 = carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_GPA;
 const METADATA_VA: u64 = X86_CPL0_DYNAMIC_METADATA_BASE;
 pub const USER_CODE: u64 = 0x1_0000;
 pub(crate) use carrick_x86::cpl0_entry::DIRECT_VA;

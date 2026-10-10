@@ -824,13 +824,22 @@ mod kernel {
         working: Option<carrick_el1_abi::X86PrepareTableSpan>,
         context: Option<carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>>,
     }
+    const FIXTURE_TABLE_START: u64 = carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_GPA
+        + carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_SIZE;
+    const FIXTURE_TABLE_END: u64 = 0xd4_0000;
+    const _: () = {
+        assert!(FIXTURE_TABLE_START >= carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_GPA
+            + carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_SIZE);
+        assert!(FIXTURE_TABLE_START < FIXTURE_TABLE_END);
+        assert!(FIXTURE_TABLE_START.is_multiple_of(4096));
+    };
     impl InitialWords {
         pub(crate) fn fixture() -> Self {
             let root = carrick_el1::isa::x86::hardware_live_root()
                 .unwrap_or_else(|_| carrick_el1::isa::x86::fatal_entry_binding());
             Self {
-                start: 0x20_0000,
-                end: 0xd4_0000,
+                start: FIXTURE_TABLE_START,
+                end: FIXTURE_TABLE_END,
                 edit_root: Some(root),
                 working: None,
                 context: None,
