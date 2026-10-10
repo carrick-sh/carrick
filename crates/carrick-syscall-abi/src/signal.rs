@@ -965,4 +965,4 @@ pub const LINUX_SS_AUTODISARM: u64 = 0x8000_0000;
 
 /// EL0 signal-return PSTATE: NZCV, SSBS and DIT are user-modifiable. All mode,
 /// interrupt-mask and privileged state bits must remain clear.
-pub const LINUX_AARCH64_SIGNAL_USER_PSTATE_MASK: u64 = 0xf000_0000 | (1 << 12) | (1 << 24);
+pub const AARCH64_EL0_USER_PSTATE_MASK: u64 = 0xf000_0000 | (1 << 12) | (1 << 24);
