@@ -461,6 +461,21 @@ verification, acceptance.
   the merged tree.
 - **Linux workers run `just accept --profile linux-portable`, then `just remote-accept --ref <their commit> --phase host`** before reporting review-ready; macOS/ARM changes also require `--phase signed` coordinated with the director. Include both verdicts and receipt paths. macOS workers run `just accept`.
 
+### GitHub-first workflow
+
+GitHub is the system of record; chat and worker mailboxes are not.
+
+- **Open a draft PR from the first commit**, linked to its issue
+  (`Closes #N`), using `.github/pull_request_template.md`.
+- **Progress and blockers are PR comments**, not chat, so the next worker
+  and the reviewer see them.
+- **Facts and defects are labelled issues** (`main-defect`,
+  `false-fixture`, `flaky`, `lint-debt`, `follow-up`, plus lane and wave
+  labels), with file:line on a named main SHA and an acceptance criterion.
+  Search before filing; cite the issue number instead of re-deriving a fact.
+- **One owner per hot file via [`.github/CODEOWNERS`](.github/CODEOWNERS)**;
+  a second lane stacks on the owner's lane instead of carrying a copy.
+
 ## Commits, hooks & CI
 
 - **NEVER `git stash`** — repo-global across worktrees; a sibling's `pop`
