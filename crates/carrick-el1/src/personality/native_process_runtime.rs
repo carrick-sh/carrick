@@ -198,10 +198,9 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     fn quarantine_born(&mut self, born: Self::Born);
     fn retire_mm(&mut self, mm: Self::Mm);
     fn wake_effects(&mut self, effects: WakeEffects);
-    /// ARM keeps the parent's shared file table; a separately owned x86
-    /// table takes a graph-issued identity for the new process.
-    fn child_file_table(&self, parent_table: u64, _issued: u64) -> u64 {
-        parent_table
+    /// Plain fork copies descriptors into a graph-issued table identity.
+    fn child_file_table(&self, _parent_table: u64, issued: u64) -> u64 {
+        issued
     }
     fn fork_fd_table(
         &mut self,
@@ -6612,9 +6611,9 @@ mod tests {
         zone.install_space(slot, child_address.mm.raw().get())
             .unwrap();
         let child_identity = zone.record(child_record.id).identity();
-        assert_eq!(
+        assert_ne!(
             child_identity.file_table, 5,
-            "ARM fork inherits the shared file table"
+            "plain fork owns its descriptor table"
         );
         task.set(
             carrick_el1_abi::El1TaskId::from_linux_tid(child.id.raw()),
