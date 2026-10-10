@@ -16,7 +16,7 @@ use carrick_guest_arch::{AddressContext, Asid, KernelVa, RootGpa};
 use core::num::NonZeroU64;
 
 #[allow(unused_imports)]
-pub use crate::{GRANT_OP_FORK_STOCK, GRANT_OP_ROOT_EXIT};
+pub use crate::{GRANT_OP_CHILD_RETIRE, GRANT_OP_FORK_STOCK, GRANT_OP_ROOT_EXIT};
 
 /// x86 synchronous I/O port for physical fork stock loans and settlements.
 pub const FORK_STOCK_PORT: u16 = 0xd2;
@@ -24,6 +24,9 @@ pub const FORK_STOCK_PORT: u16 = 0xd2;
 pub const NATIVE_ROOT_EXIT_PORT: u16 = 0xd3;
 /// x86 synchronous I/O port for native peer readiness notification.
 pub const NATIVE_PEER_READY_PORT: u16 = 0xd4;
+/// x86 synchronous I/O port for [`NativeChildRetire`], the twin of AArch64
+/// `HVC #6` with [`GRANT_OP_CHILD_RETIRE`].
+pub const NATIVE_CHILD_RETIRE_PORT: u16 = 0xd6;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ForkStockKind {
@@ -496,6 +499,113 @@ impl NativeRootExit {
     }
 }
 
+/// Why the carrier refused a child retirement. The guest fails the retiring
+/// process cleanly; its stock stays charged rather than being reclaimed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildRetireRefusal {
+    /// The record does not name the executing binding, root, or a live child.
+    Stale,
+    /// The carrier could not accept the record for any other reason.
+    Invalid,
+}
+
+/// A child process has left the shared owner graph. Its physical table pages
+/// enter quarantine until no live slot owns the MM and its ASID is flushed.
+///
+/// Word 7 is the carrier's typed reply: [`Self::PENDING`] on request,
+/// [`Self::QUARANTINED`] or a refusal code, then [`Self::CONSUMED`] once the
+/// guest took it. On AArch64 the `HVC #6` x0 status agrees with this word.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub struct NativeChildRetire {
+    pub words: [u64; 8],
+}
+
+impl NativeChildRetire {
+    pub const MAGIC: u64 = 0x4352_4348_5245_5449;
+    pub const PENDING: u64 = 0;
+    pub const QUARANTINED: u64 = 1;
+    pub const REFUSED_STALE: u64 = 2;
+    pub const REFUSED_INVALID: u64 = 3;
+    pub const CONSUMED: u64 = 4;
+
+    pub fn new(binding: ExecutionBinding, context: AddressContext<RootGpa>) -> Option<Self> {
+        (binding.issued() && binding.mm.raw() == context.mm.raw().get()).then_some(Self {
+            words: Self::identity(binding, context, Self::PENDING),
+        })
+    }
+
+    fn identity(
+        binding: ExecutionBinding,
+        context: AddressContext<RootGpa>,
+        status: u64,
+    ) -> [u64; 8] {
+        [
+            Self::MAGIC,
+            binding.task.raw(),
+            binding.generation.raw(),
+            binding.mm.raw(),
+            binding.thread_generation.raw(),
+            context.root.address().raw(),
+            context.generation.raw().get(),
+            status,
+        ]
+    }
+
+    fn names(&self, binding: ExecutionBinding, context: AddressContext<RootGpa>) -> bool {
+        self.words[..7] == Self::identity(binding, context, Self::PENDING)[..7]
+    }
+
+    /// Carrier: an unanswered request naming exactly this execution.
+    pub fn request_matches(
+        &self,
+        binding: ExecutionBinding,
+        context: AddressContext<RootGpa>,
+    ) -> bool {
+        self.words[7] == Self::PENDING && self.names(binding, context)
+    }
+
+    fn reply(&mut self, status: u64) -> bool {
+        if self.words[0] != Self::MAGIC || self.words[7] != Self::PENDING {
+            return false;
+        }
+        self.words[7] = status;
+        true
+    }
+
+    /// Carrier: the child's stock entered quarantine.
+    pub fn accept(&mut self) -> bool {
+        self.reply(Self::QUARANTINED)
+    }
+
+    /// Carrier: refuse with a typed reason.
+    pub fn refuse(&mut self, refusal: ChildRetireRefusal) -> bool {
+        self.reply(match refusal {
+            ChildRetireRefusal::Stale => Self::REFUSED_STALE,
+            ChildRetireRefusal::Invalid => Self::REFUSED_INVALID,
+        })
+    }
+
+    /// Guest: take the reply for exactly this execution, once.
+    pub fn take(
+        &mut self,
+        binding: ExecutionBinding,
+        context: AddressContext<RootGpa>,
+    ) -> Option<Result<(), ChildRetireRefusal>> {
+        if !self.names(binding, context) {
+            return None;
+        }
+        let result = match self.words[7] {
+            Self::QUARANTINED => Ok(()),
+            Self::REFUSED_STALE => Err(ChildRetireRefusal::Stale),
+            Self::REFUSED_INVALID => Err(ChildRetireRefusal::Invalid),
+            _ => return None,
+        };
+        self.words[7] = Self::CONSUMED;
+        Some(result)
+    }
+}
+
 /// Exact stopped-CPU completion of a retained physical loan. Every word is
 /// initialized; no Rust enum or nonzero representation is read from guest bytes.
 #[repr(C, align(64))]
@@ -638,11 +748,13 @@ const _: () = {
     assert!(core::mem::size_of::<ForkStockExchange>() == 24 * 8);
     assert!(core::mem::size_of::<ForkStockSettlement>() == 16 * 8);
     assert!(core::mem::size_of::<NativeRootExit>() == 8 * 8);
+    assert!(core::mem::size_of::<NativeChildRetire>() == 8 * 8);
 
     // 2. Wire alignment constants
     assert!(core::mem::align_of::<ForkStockExchange>() == 64);
     assert!(core::mem::align_of::<ForkStockSettlement>() == 64);
     assert!(core::mem::align_of::<NativeRootExit>() == 64);
+    assert!(core::mem::align_of::<NativeChildRetire>() == 64);
 
     // 3. Exact field byte offsets against the previous x86 layout (origin/main)
     assert!(core::mem::offset_of!(ForkStockExchange, tag) == 0);
@@ -662,6 +774,9 @@ const _: () = {
     assert!(FORK_STOCK_PORT == 0xd2);
     assert!(NATIVE_ROOT_EXIT_PORT == 0xd3);
     assert!(NATIVE_PEER_READY_PORT == 0xd4);
+    assert!(NATIVE_CHILD_RETIRE_PORT == 0xd6);
+    assert!(NativeChildRetire::MAGIC == 0x4352_4348_5245_5449);
+    assert!(GRANT_OP_CHILD_RETIRE == 5);
     assert!(GRANT_OP_FORK_STOCK == 3);
     assert!(GRANT_OP_ROOT_EXIT == 4);
 };
@@ -727,6 +842,36 @@ mod tests {
         assert!(lifecycle_arm().page.raw() >= crate::EL1_DYNAMIC_METADATA_BASE);
         // Misaligned or out of bounds is refused
         assert!(ForkLifecycleLoan::new(KernelVa::new(0x1000), KernelVa::new(0x2000)).is_none());
+    }
+
+    #[test]
+    fn native_child_retire_carries_one_typed_status_reply() {
+        let req = request();
+        let (binding, context) = (req.binding, req.context);
+        let mut refused = NativeChildRetire::new(binding, context).unwrap();
+        assert!(refused.request_matches(binding, context));
+        assert_eq!(refused.take(binding, context), None, "no reply yet");
+        assert!(refused.refuse(ChildRetireRefusal::Stale));
+        assert!(!refused.request_matches(binding, context));
+        assert!(!refused.accept(), "one reply only");
+        assert_eq!(
+            refused.take(binding, context),
+            Some(Err(ChildRetireRefusal::Stale))
+        );
+        assert_eq!(refused.take(binding, context), None, "consumed once");
+
+        let mut accepted = NativeChildRetire::new(binding, context).unwrap();
+        assert!(accepted.accept());
+        let mut foreign = binding;
+        foreign.task = crate::EntryTaskKey::from_raw(999);
+        assert_eq!(accepted.take(foreign, context), None);
+        assert_eq!(accepted.take(binding, context), Some(Ok(())));
+
+        let mut garbage = NativeChildRetire::new(binding, context).unwrap();
+        garbage.words[7] = 0x77;
+        assert!(!garbage.request_matches(binding, context));
+        assert_eq!(garbage.take(binding, context), None);
+        assert!(!garbage.accept() && !garbage.refuse(ChildRetireRefusal::Invalid));
     }
 
     #[test]

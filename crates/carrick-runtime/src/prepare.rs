@@ -264,6 +264,15 @@ pub fn run_prepared_kvm_pool(
         physical_crossing_families,
         host_forward_families: count_family(forward_families),
         guest_refusal_families: count_family(refusal_families),
+        fork_stock_families: physical
+            .fork_stock_counters()?
+            .families()
+            .into_iter()
+            .map(|(family, count)| crate::compat::ExecutionFamilyCount {
+                family: family.to_owned(),
+                count,
+            })
+            .collect(),
     });
     let (exit_code, terminating_signal, traps, fault_record, run_failure) = match outcome {
         carrick_vmm_kvm::cpl0_boot::InitialProcessExit::OwnedExit { status, exits } => {
