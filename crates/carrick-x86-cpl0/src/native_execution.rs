@@ -222,6 +222,11 @@ pub(super) fn schedule(slot: SlotId) -> ! {
 /// Consume the shared timer claim; hardware only supplies a counter interrupt.
 pub(crate) fn expire_signal_timer(slot: SlotId) {
     use carrick_guest_arch::{CounterTick, Deadline, InterruptBackend};
+    // A native IRQ can arrive before process admission, and timer-only
+    // fixtures do not admit the production scheduler zone at all.
+    if native_process::runtime_opt().is_none() {
+        return;
+    }
     let zone = source(slot).zone;
     let mut backend = x86::X86Backend;
     let now = backend
