@@ -634,8 +634,8 @@ fn refused_release_keeps_the_child_quarantined_and_its_stock_held() {
             absent,
             |_| true,
             |_| true,
-            |child| {
-                released.borrow_mut().push(child);
+            |absence| {
+                released.borrow_mut().push(absence.mm());
                 false
             },
         ),
@@ -746,4 +746,42 @@ fn reclaim_releases_each_child_once_across_a_retire_failure() {
     assert!(stock.is_quarantined(mm(302)));
     assert_eq!(attempt(&mut stock), Ok(1));
     assert_eq!(releases.get(), 1, "release ran exactly once");
+}
+
+/// Release happens inside reclaim, per candidate, before that candidate's
+/// stock is reissued: a later candidate's refusal neither skips nor undoes
+/// an earlier candidate's completed release and return.
+#[test]
+fn second_candidate_refusal_keeps_first_candidate_released_and_returned() {
+    let mut stock = stock(UntaggedRoots, 8, 2);
+    for child_mm in [302, 303] {
+        let granted = loan(&mut stock, parent(), child_mm, 1, 1).unwrap();
+        commit(&mut stock, parent(), granted, 1, 0).unwrap();
+        retire(&mut stock, child_of(granted, 600 + child_mm)).unwrap();
+    }
+    let order = RefCell::new(Vec::new());
+    let result = stock.reclaim(
+        &mut NoTableLedger,
+        mm(PARENT_MM),
+        absent,
+        |_| {
+            order.borrow_mut().push("clear");
+            true
+        },
+        |_| true,
+        |absence| {
+            order.borrow_mut().push(if absence.mm() == mm(302) {
+                "release 302"
+            } else {
+                "refuse 303"
+            });
+            absence.mm() == mm(302)
+        },
+    );
+    assert_eq!(result, Err(ForkStockServiceError::ReleaseRefused));
+    // 302 was released before its tables were cleared and returned.
+    assert_eq!(*order.borrow(), vec!["release 302", "clear", "refuse 303"]);
+    assert!(!stock.is_quarantined(mm(302)));
+    assert!(stock.is_quarantined(mm(303)));
+    assert_eq!(stock.counters().returned_children, 1);
 }

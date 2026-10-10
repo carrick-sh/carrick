@@ -3074,7 +3074,7 @@ mod tests {
                     |mm| carrick_hal::fork_stock::SlotAbsence::scan(mm, []),
                     |_| true,
                     |life| window.clear(life),
-                    |mm| release_child_mm(&*inventory, &residency, mm),
+                    |absence| release_child_mm(&*inventory, &residency, absence.mm()),
                 )
                 .unwrap_or_else(|error| panic!("cycle {cycle}: {error:?}"));
             assert_eq!(returned, 1, "cycle {cycle}");

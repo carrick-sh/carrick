@@ -285,6 +285,56 @@ pub unsafe trait TranslationDrain {
     fn drain(&mut self, plan: ShootdownPlan) -> Result<(), MemoryError>;
 }
 
+/// What `CarrierMemory::retire_child` released.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub struct RetiredChild {
+    pub aliases: usize,
+    pub revoked_slots: usize,
+}
+
+/// Drain for a retired child's own contexts only.
+struct QuarantinedContextDrain {
+    context: AddressContext<RootGpa>,
+}
+// SAFETY: constructed only by `retire_child` from a `SlotAbsence` proof: no
+// slot runs this MM, every CPU that ran it reloaded CR3 (maintenance root,
+// no PCID/PGE) before publishing absence, and the MM can never be installed
+// again. Plans for any other context are refused, never acknowledged.
+unsafe impl TranslationDrain for QuarantinedContextDrain {
+    fn drain(&mut self, plan: ShootdownPlan) -> Result<(), MemoryError> {
+        if plan.context.mm == self.context.mm {
+            Ok(())
+        } else {
+            Err(error("retired child slot names a live context"))
+        }
+    }
+}
+
+/// Inventory side of revoking a retired child's private memslot: its
+/// frames were retired with the MM, so this only proves none is still live.
+struct AlreadyRetiredInventory {
+    authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
+}
+impl InventoryRetirement for AlreadyRetiredInventory {
+    fn retire(&mut self, identity: BackingIdentity) -> Result<(), MemoryError> {
+        let mapping = carrick_hal::MappingId::from_kernel_allocation(identity.mapping_id);
+        if self.authority.live_mapping_row(mapping).is_some() {
+            return Err(error("retired child memslot frame is still mapped"));
+        }
+        Ok(())
+    }
+    fn rollback(&mut self) -> Result<(), MemoryError> {
+        Ok(())
+    }
+}
+
 /// Drops VM before all registered backing. It exclusively owns its slot
 /// namespace; legacy HvVm::map_memory is never called on this VM.
 pub struct CarrierMemory {
@@ -296,6 +346,12 @@ pub struct CarrierMemory {
     aliases: BTreeMap<NonZeroU64, BTreeMap<u64, Alias>>,
     alias_visits: usize,
     roots: BTreeMap<NonZeroU64, AddressContext<RootGpa>>,
+    /// Slots each MM is admitted to (`Slot::allowed`), so retiring an MM
+    /// never scans every slot.
+    admitted: BTreeMap<NonZeroU64, BTreeSet<u32>>,
+    /// Slots whose `drains` name a context of each MM (from unlinked
+    /// aliases), so a retired MM's drain debt is dropped without a scan.
+    drained_by: BTreeMap<NonZeroU64, BTreeSet<u32>>,
     limit: u32,
     generation: u64,
     quarantined: bool,
@@ -392,6 +448,8 @@ impl CarrierMemory {
             aliases: BTreeMap::new(),
             alias_visits: 0,
             roots: BTreeMap::new(),
+            admitted: BTreeMap::new(),
+            drained_by: BTreeMap::new(),
             limit,
             generation: 0,
             quarantined: false,
@@ -549,17 +607,25 @@ impl CarrierMemory {
         self.roots.insert(mm, context);
         Ok(())
     }
-    /// A retired fork child left quarantine: no CPU holds its root. Drop its
-    /// CR3 registration, every descriptor alias it held (inherited frame
-    /// identities included) and its admission on shared slots. Each touched
-    /// slot remembers the context for a later revoke drain. Returns the
-    /// slots that are now alias-free and were admitted only for this MM.
-    pub fn retire_root(&mut self, mm: NonZeroU64) -> Result<Vec<BackingHandle>, MemoryError> {
+    /// A retired fork child left quarantine (`absence` proves no slot runs
+    /// it, and every CPU that ran it reloaded CR3 since). Drop its CR3
+    /// registration and every descriptor alias it held (inherited frame
+    /// identities with them), then revoke the memslots that were admitted
+    /// only for it. Their frames must already be retired from `inventory`;
+    /// the revoke checks that rather than retiring them again. Shared slots
+    /// keep no drain entry for the retired context.
+    pub fn retire_child(
+        &mut self,
+        absence: &carrick_hal::fork_stock::SlotAbsence,
+        inventory: &dyn carrick_hal::PhysicalFrameInventory,
+    ) -> Result<RetiredChild, MemoryError> {
         self.admit()?;
+        let mm = NonZeroU64::new(absence.mm().raw()).ok_or_else(|| error("retired MM key"))?;
         let context = self
             .roots
             .remove(&mm)
             .ok_or_else(|| error("retired MM has no carrier CR3 root"))?;
+        let mut aliases = 0;
         for alias in self.aliases.remove(&mm).unwrap_or_default().into_values() {
             let Some(slot) = self.slots.get_mut(&alias.slot) else {
                 self.quarantined = true;
@@ -572,22 +638,40 @@ impl CarrierMemory {
             if let Some(gpa) = alias.inherited {
                 slot.inherited_identities.remove(&(mm, gpa.raw()));
             }
-            if !slot.drains.contains(&context) {
-                slot.drains.push(context);
+            aliases += 1;
+        }
+        // The absence proof discharges every pending drain of this MM's
+        // contexts, so shared slots do not accumulate retired children.
+        for index in self.drained_by.remove(&mm).unwrap_or_default() {
+            if let Some(slot) = self.slots.get_mut(&index) {
+                slot.drains.retain(|drained| drained.mm.raw() != mm);
             }
         }
         let mut private = Vec::new();
-        for slot in self.slots.values_mut() {
-            slot.inherited_identities
-                .retain(|(owner, _), _| *owner != mm);
+        for index in self.admitted.remove(&mm).unwrap_or_default() {
+            let Some(slot) = self.slots.get_mut(&index) else {
+                continue;
+            };
             let was_private = slot.allowed == [mm];
             slot.allowed.retain(|allowed| *allowed != mm);
             if was_private && slot.alias_count == 0 && !slot.bootstrap {
                 private.push(slot.handle);
             }
         }
-        Ok(private)
+        let generation = carrick_guest_arch::MmGeneration::new(mm);
+        let mut drain = QuarantinedContextDrain { context };
+        let mut retired = AlreadyRetiredInventory {
+            authority: inventory.bind(generation),
+        };
+        for handle in &private {
+            self.revoke(*handle, &mut drain, &mut retired)?;
+        }
+        Ok(RetiredChild {
+            aliases,
+            revoked_slots: private.len(),
+        })
     }
+
     pub fn root(&self, mm: NonZeroU64) -> Option<AddressContext<RootGpa>> {
         self.roots.get(&mm).copied()
     }
@@ -650,6 +734,10 @@ impl CarrierMemory {
             .ok_or_else(|| error("missing shared slot"))?;
         if !slot.allowed.contains(&mm) {
             slot.allowed.push(mm);
+            self.admitted
+                .entry(mm)
+                .or_default()
+                .insert(edge.handle.slot);
         }
         Ok(())
     }
@@ -1074,6 +1162,10 @@ impl CarrierMemory {
             };
             if slot.allowed.is_empty() {
                 slot.allowed.push(txn.id.mm_key);
+                self.admitted
+                    .entry(txn.id.mm_key)
+                    .or_default()
+                    .insert(index);
             }
             slot.alias_count += 1;
             self.aliases.entry(txn.id.mm_key).or_default().insert(
@@ -1255,6 +1347,7 @@ impl CarrierMemory {
             }
             if !slot.drains.contains(&context) {
                 slot.drains.push(context);
+                self.drained_by.entry(mm).or_default().insert(alias.slot);
             }
         }
     }
@@ -1305,6 +1398,11 @@ impl CarrierMemory {
         }
         if let Some(slot) = self.slots.remove(&handle.slot) {
             self.by_gpa.remove(&slot.backing.extent.base.raw());
+            for mm in &slot.allowed {
+                if let Some(slots) = self.admitted.get_mut(mm) {
+                    slots.remove(&handle.slot);
+                }
+            }
         }
         self.free.insert(handle.slot);
         Ok(())

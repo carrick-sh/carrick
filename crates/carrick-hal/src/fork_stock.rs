@@ -851,7 +851,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
         occupancy: impl Fn(ReservationMm) -> Option<SlotAbsence>,
         mut clear_tables: impl FnMut(&[RootGpa]) -> bool,
         mut clear_lifecycle: impl FnMut(ForkLifecycleLoan) -> bool,
-        mut release: impl FnMut(ReservationMm) -> bool,
+        mut release: impl FnMut(&SlotAbsence) -> bool,
     ) -> Result<usize, ForkStockServiceError> {
         let active = MmKey::of(active);
         let candidates: Vec<(MmKey, SlotAbsence)> = self
@@ -879,7 +879,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
             // Carrier per-MM state (root registry, inventory, residency) is
             // released before any of the child's stock can be reissued.
             if self.quarantine.get(&key) == Some(&false) {
-                if !release(mm) {
+                if !release(&absence) {
                     return Err(ForkStockServiceError::ReleaseRefused);
                 }
                 self.quarantine.insert(key, true);
